@@ -43,8 +43,9 @@ pub struct LaunchPlan {
     pub acp: Option<acp::AcpConfig>,
 }
 
-/// The run's CA bundle (system roots plus the run CA) inside the box, built by wicket-entry. Tools that
-/// don't read SSL_CERT_FILE can be pointed at it through the manifest's env (e.g. CARGO_HTTP_CAINFO).
+/// The run's CA bundle (system roots plus the run CA) inside the box, built by wicket-entry, which
+/// points SSL_CERT_FILE and the variables of tools that read their own (PIP_CERT, AWS_CA_BUNDLE,
+/// CARGO_HTTP_CAINFO, DENO_CERT, …) at it. Others can be pointed at it through the manifest's env.
 pub const CA_BUNDLE: &str = "/tmp/ca-bundle.pem";
 
 /// One user turn in Claude Code's stream-json input format.
