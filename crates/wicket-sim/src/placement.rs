@@ -344,11 +344,16 @@ impl World {
         m.boxes.clear();
     }
 
-    /// The box for `run` starts on machine `k` (or is there already: an attach).
-    fn on_start(&mut self, k: usize, run: &str, work_s: i64, now: i64) -> bool {
+    /// The box for `run` starts on machine `k` (or is there already: an attach), unless the start
+    /// reaches the node at or past `start_by` (`nodesrv::start_box_steps`, #395).
+    fn on_start(&mut self, k: usize, run: &str, work_s: i64, start_by: Option<i64>, now: i64) -> bool {
         let m = &mut self.machines[k];
         if m.boxes.contains_key(run) {
             return true;
+        }
+        if let Some(by) = start_by.filter(|by| now >= *by) {
+            self.trace.note(now, format!("{run}'s start refused on m{k}: past its node's lease (ended {by})"));
+            return false;
         }
         let Some(n) = m.inst.clone() else { return false };
         m.boxes.insert(run.to_string(), Boxed { started: now, until: now + work_s, forgotten: false });
@@ -516,8 +521,14 @@ impl SpendApprover for PlanApprover {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Up {
-    Hello { run: String },
-    Start { work_s: i64 },
+    Hello {
+        run: String,
+    },
+    /// `BoxStart`, with `start_by`: its placed node's lease end, when the run began (#395).
+    Start {
+        work_s: i64,
+        start_by: Option<i64>,
+    },
     Status,
     Fetch,
     Forget,
@@ -548,6 +559,8 @@ pub struct CtlDisk {
     pub enrolled: BTreeMap<String, String>,
     /// Each run's machine.
     pub run_host: BTreeMap<String, String>,
+    /// Each run's `BoxStart::start_by`: its placed node's lease end when the run began (#395).
+    pub run_start_by: BTreeMap<String, i64>,
     /// `nodes/<name>/feed/issued`, per machine: the last statement time any run signed.
     pub feed_issued: BTreeMap<String, i64>,
 }
@@ -663,8 +676,11 @@ async fn serve_run(env: Rc<Env>, k: usize, replica: Rc<RefCell<Replica<BoxAuthor
         let resp = {
             let mut w = env.world.lock().expect("world");
             match req {
-                Up::Start { work_s } => Down::Started { ok: w.on_start(k, &run, work_s, now) },
-                Up::Status => match w.machines[k].boxes.get(&run) {
+                Up::Start { work_s, start_by } => Down::Started { ok: w.on_start(k, &run, work_s, start_by, now) },
+                // A forgotten box is gone from the node (`nodesrv`'s `Msg::Forget` removes it from
+                // its boxes): a supervisor that comes back finds nothing (#397). The world keeps it,
+                // forgotten, for the invariants.
+                Up::Status => match w.machines[k].boxes.get(&run).filter(|b| !b.forgotten) {
                     Some(b) if b.running(now) => Down::Running,
                     Some(_) => Down::Exited,
                     None => Down::Unknown,
@@ -805,6 +821,12 @@ async fn runs(env: Rc<Env>) {
                 env.note(format!("wicket run {} --node {name}: refused, past its lease (ended {})", r.run, p.lease_until));
                 continue;
             }
+            // `refuse_past_lease`'s answer: the lease's end, which the box's start carries (#395).
+            if env.options.start_by {
+                if let Some(p) = l.placed_nodes(&["active"]).expect("placed nodes").into_iter().find(|p| p.name == name) {
+                    env.ctl.borrow_mut().run_start_by.insert(r.run.clone(), p.lease_until);
+                }
+            }
             l.run_started(&TenantId(TENANT.into()), &RunId(r.run.clone()), "z", "a").expect("run recorded");
             l.set_run_node(&r.run, &name).expect("its node recorded");
             env.ctl.borrow_mut().run_host.insert(r.run.clone(), host);
@@ -919,6 +941,8 @@ async fn supervise(env: Rc<Env>, run: String, attach: bool) {
             env.world.lock().expect("world").collected.insert(run.clone());
             env.stat(|s| s.fetched += 1);
             env.note(format!("{run}: fetched {} files from {host}", files.len()));
+            // `run.rs`: the collection is on the ledger before the node may delete the files.
+            let _ = env.ledger().record_collected(&run, "fetched");
             forget(&env, &run, &host).await;
             end_run(&env, &run, "succeeded", "")
         }
@@ -1010,7 +1034,8 @@ async fn session(env: &Rc<Env>, run: &str, host: &str, work_s: i64, feed: &mut F
         if wire::write_frame(&mut c.1, wire::KIND_FEED, f.to_line().as_bytes()).await.is_err() {
             return Session::Dropped;
         }
-        match call(&mut c, &Up::Start { work_s }).await {
+        let start_by = env.ctl.borrow().run_start_by.get(run).copied();
+        match call(&mut c, &Up::Start { work_s, start_by }).await {
             Some(Down::Started { ok: true }) => *started = true,
             Some(_) => return Session::Lost,
             None => return Session::Dropped,
@@ -1170,6 +1195,9 @@ pub struct Options {
     pub keep_trace: bool,
     /// `wicket run --node` refuses a placed node past its lease (`place::refuse_past_lease`).
     pub refuse_past_lease: bool,
+    /// The box's start carries its node's lease end, and the node refuses a start past it
+    /// (`BoxStart::start_by`, #395). Off: only the check when the run begins, which races the start.
+    pub start_by: bool,
     /// A run whose files a fetch didn't bring back holds its node (`runs.uncollected`).
     pub hold_uncollected: bool,
     /// The machine half leaves a node nothing records alone while it is new
@@ -1179,7 +1207,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Options {
-        Options { keep_trace: false, refuse_past_lease: true, hold_uncollected: true, young_grace: true }
+        Options { keep_trace: false, refuse_past_lease: true, start_by: true, hold_uncollected: true, young_grace: true }
     }
 }
 
