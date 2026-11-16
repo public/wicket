@@ -176,13 +176,11 @@ pub fn root_only(cmd: &Cmd) -> bool {
     )
 }
 
-/// Arguments only wicket itself passes (a parent starting a child, the console starting a run): a
-/// caller of the socket could otherwise claim to be a child of another run, or of a lease.
+/// Arguments only wicket itself passes (the console starting a run, a node's key): a caller of the
+/// socket could otherwise take another run's id.
 pub fn internal_args(cmd: &Cmd) -> Option<&'static str> {
     match cmd {
         Cmd::Run { run_id: Some(_), .. } => Some("--run-id"),
-        Cmd::Run { parent_run: Some(_), .. } => Some("--parent-run"),
-        Cmd::Run { lease: Some(_), .. } => Some("--lease"),
         // ssh keys for nodes belong to the wicket user, not to the caller.
         Cmd::Run { ssh_key: Some(_), .. } => Some("--ssh-key"),
         // What woke an agent is recorded as fact: a message's arrival, set by wicket.
@@ -387,8 +385,11 @@ mod tests {
     fn internal_arguments_are_refused_from_callers() {
         assert_eq!(internal_args(&cmd(&["run", "m.yaml"])), None);
         assert_eq!(internal_args(&cmd(&["run", "--run-id", "r1", "m.yaml"])), Some("--run-id"));
-        assert_eq!(internal_args(&cmd(&["run", "--parent-run", "r0", "m.yaml"])), Some("--parent-run"));
-        assert_eq!(internal_args(&cmd(&["run", "--lease", "l1", "m.yaml"])), Some("--lease"));
+        // A child's parent and lease, and a takeover, aren't arguments at all: a child's supervisor
+        // runs in its parent's process (#257 slice 4c).
+        for internal in ["--parent-run", "--lease", "--adopt"] {
+            assert!(crate::Cli::try_parse_from(["wicket", "run", internal, "x", "m.yaml"]).is_err(), "{internal}");
+        }
         assert_eq!(internal_args(&cmd(&["run", "--node", "n1", "--ssh-key", "/k", "m.yaml"])), Some("--ssh-key"));
         assert_eq!(internal_args(&cmd(&["run", "--node", "n1", "m.yaml"])), None);
         assert_eq!(internal_args(&cmd(&["wake", "--by", "message", "a1"])), Some("--by"));

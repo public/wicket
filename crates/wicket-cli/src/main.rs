@@ -5,6 +5,8 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+#[macro_use]
+mod out;
 mod audit_export;
 mod capacity;
 mod chan;
@@ -118,18 +120,9 @@ enum Cmd {
         /// ssh identity for --node (default: the one it was enrolled with).
         #[arg(long)]
         ssh_key: Option<PathBuf>,
-        /// Internal: the run id to use (set by a parent starting a child agent).
+        /// Internal: the run id to use (set by the console starting a run).
         #[arg(long, hide = true)]
         run_id: Option<String>,
-        /// Internal: the run that started this one (`spawn`).
-        #[arg(long, hide = true)]
-        parent_run: Option<String>,
-        /// Internal: the capacity lease this run is placed on (`spawn` with `placement: {lease}`).
-        #[arg(long, hide = true)]
-        lease: Option<String>,
-        /// Internal: take over a child its node started (#164): `<started ms>:<session id>`.
-        #[arg(long, hide = true)]
-        adopt: Option<String>,
     },
     /// Open a running agent's session in this terminal, as its operator: what it says and does, live.
     /// An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's

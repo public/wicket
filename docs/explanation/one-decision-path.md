@@ -94,12 +94,22 @@ node's own `Llm`.
      (`Gateway::serve*`), `ctl/gateway.sock`, the `gateway` tunnel target (`TUNNEL_TARGETS`,
      `Node::open_tunnel`, `noderun`'s tunnel handler), and `refuse_older_node`'s per-feature
      floors and `forwarded_host`, all below 13. A box goes only to nodes at 13 or later.
-   - **4c (left): spawns on the node's side.** Spawns the node doesn't start (placement on another
-     node, an org layer not alike, a renewed authority) still go to `Gateway::spawn` and the
-     `Spawner`, which re-executes `wicket run --parent-run`. Starting the child run's supervisor in
-     process removes `spawn.rs`'s `launch_as` re-exec, `Cmd::Run.parent_run` and its daemon guard,
-     and the `Spawner` type. The control host's tool bodies stay as the answerers of
-     `ControlTool`s: what needs the ledger has to be answered where the ledger is.
+   - **4c (done): a child's supervisor in its parent's process.** A spawn the node doesn't start
+     (placement on another node, an org layer not alike, a renewed authority, beyond the zone) is a
+     `ControlTool::Spawn` call that `noderun` answers itself with `spawn::tool`, and a child the
+     node started is adopted as before; either way the child's supervisor (`run::run`) runs on a
+     thread of the parent's process with its own runtime, printing to `children/<run>.log`, and
+     its parent stops it through a `Notify` instead of a SIGINT. Gone: `launch_as`'s
+     `wicket run --parent-run` re-exec, `Cmd::Run`'s `--parent-run`, `--lease` and `--adopt` and
+     their daemon guards, `RunCtx.spawner`, the `Spawner` type and `Gateway::spawn`. A run's owner
+     in the ledger is its process, so a parent and its children share one; if it dies the
+     reconciler re-attaches each (`wicket attach`), as their own processes.
+   - **Left of slice 4: the tool bodies.** The control host's tool bodies stay in
+     `wicket-proxy/src/gateway.rs` as the answerers of `ControlTool`s: what needs the ledger has
+     to be answered where the ledger is. Moving them next to `noderun` would leave the gateway
+     module the handshake, but the deterministic simulation (`wicket-sim`, which depends on
+     `wicket-proxy`, not on the `wicket` binary crate) calls them through `Gateway::call_tool`, so
+     they move only with a library the simulation can use.
 5. **Slice 5 (done): `run.rs` starts no proxies.** (Its gateway socket went with 4b.) With nothing
    left on `ctl/*.sock`, the run supervisor keeps the vault, the ledger, approvals and the feed. The
    control host is forward-only: it relays secrets and asks, and decides nothing per request. Its

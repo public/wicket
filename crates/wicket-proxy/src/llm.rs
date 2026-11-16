@@ -1012,7 +1012,6 @@ mod tests {
             escalate: true,
             attribute: None,
             identity: None,
-            spawner: None,
             swaps: vec![],
             boxes: None,
             capacity: None,
