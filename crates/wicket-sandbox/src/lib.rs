@@ -572,6 +572,11 @@ impl Docker {
             // to synthetic addresses for HTTP/3, the rest to NXDOMAIN.
             "--dns".into(),
             "198.18.0.1".into(),
+            // And no search domain: Docker otherwise copies the host's (a cloud host's names its region,
+            // `<region>.compute.internal`), which every name the box looks up then carries to wicket's
+            // DNS, and its own hostname resolves under.
+            "--dns-search".into(),
+            ".".into(),
             "--memory".into(),
             spec.memory.clone(),
             // The limit is the box's memory, swap included: Docker's default lets a box swap as much
@@ -1139,6 +1144,8 @@ fn create_body(spec: &SandboxSpec, log_cap: u64) -> Result<serde_json::Value> {
         "Runtime": runtime,
         "NetworkMode": "none",
         "Dns": ["198.18.0.1"],
+        // "." is Docker's "no search domain" (see `build_args`).
+        "DnsSearch": ["."],
         "Memory": mem,
         "MemorySwap": mem,
         "NanoCpus": nano_cpus,
@@ -1325,6 +1332,7 @@ mod tests {
         assert!(a.contains("--user 0:0") && a.contains("WICKET_AS_USER=1000:1000"), "starts as root only to set up, then drops");
         assert!(a.contains("--add-host wicket.internal:198.18.0.1"));
         assert!(a.contains("--dns 198.18.0.1"));
+        assert!(a.contains("--dns-search ."), "the host's search domain stays out of the box");
         assert!(a.contains("--memory 1g --memory-swap 1g"), "the limit includes swap: a box can't swap past it");
         assert!(a.contains("--tmpfs /tmp:rw,nosuid,size=512m"));
         assert!(!a.contains("SYS_ADMIN") && !a.contains("--privileged"));
@@ -1671,6 +1679,7 @@ mod tests {
         assert_eq!((h["NanoCpus"].as_i64(), h["PidsLimit"].as_i64()), (Some(1_500_000_000), Some(64)));
         assert_eq!(h["ReadonlyRootfs"], true);
         assert_eq!(h["Dns"], serde_json::json!(["198.18.0.1"]));
+        assert_eq!(h["DnsSearch"], serde_json::json!(["."]), "the host's search domain stays out of the box");
         assert_eq!(h["Tmpfs"], serde_json::json!({"/tmp": "rw,nosuid,size=512m"}));
         assert!(h.get("ExtraHosts").is_none(), "wicket's own hosts file is mounted");
         assert_eq!(h["LogConfig"], serde_json::json!({"Type": "json-file", "Config": {"max-size": "512k", "max-file": "2"}}));

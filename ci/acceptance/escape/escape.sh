@@ -53,6 +53,10 @@ case "$addr" in
   ''|198.19.*) note dns-exfil blocked "answered: ${addr:-nothing}" ;;
   *) note dns-exfil ESCAPED "a real answer: $addr" ;;
 esac
+# The host's DNS search domain (a cloud host's names its region) isn't in the box's resolver config,
+# where every lookup would carry it and the box's own hostname would resolve under it.
+search=$(grep -E '^[[:space:]]*(search|domain)[[:space:]]' /etc/resolv.conf 2>/dev/null | head -1)
+if [ -n "$search" ]; then note resolv-search ESCAPED "the host's: $search"; else note resolv-search blocked "no search domain"; fi
 
 # wicket's other endpoints: the model proxy has no route for a program, and the gateway grants nothing.
 http model-proxy http://wicket.internal:8080/api/oauth/profile

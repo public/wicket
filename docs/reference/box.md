@@ -51,7 +51,9 @@ all of localhost for its own servers.
 
 wicket answers every DNS query itself, so a lookup can't carry data out. A host the zone can reach
 resolves to its synthetic address; hidden and forbidden hosts get NXDOMAIN. wicket also answers
-HTTPS records with `alpn=h3` (unless `WICKET_H3_HTTPS_RECORDS=0`).
+HTTPS records with `alpn=h3` (unless `WICKET_H3_HTTPS_RECORDS=0`). The box's `/etc/resolv.conf`
+has no search domain, so neither its lookups nor its hostname carry the host's (on a cloud host, one
+that names its region).
 
 The box's connections go through `wicket-fwd` over bind-mounted unix sockets to the proxies on its
 node. QUIC sent to a synthetic address is relayed to wicket over a unix socket and served as that
