@@ -1036,16 +1036,16 @@ pub fn fold_case_glob(glob: &str) -> String {
                 if !closed {
                     out.push_str(&body);
                 } else {
-                    // The other case of each letter and letter range (`a-z` gains `A-Z`), put right
-                    // after a leading `]` or `-` (literals there), so it never joins another range.
+                    // The other case of each letter, and of the letters inside each range (`a-z`
+                    // gains `A-Z`; a mixed range such as `0-z` or `a-~` gains the other case of the
+                    // letters it holds), put right after a leading `]` or `-` (literals there), so it
+                    // never joins another range.
                     let b: Vec<char> = body.chars().collect();
                     let mut extra = String::new();
                     let mut i = 0;
                     while i < b.len() {
                         if i + 2 < b.len() && b[i + 1] == '-' {
-                            if b[i].is_ascii_alphabetic() && b[i + 2].is_ascii_alphabetic() {
-                                extra.extend([swap(b[i]), '-', swap(b[i + 2])]);
-                            }
+                            fold_range(b[i], b[i + 2], &mut extra);
                             i += 3;
                         } else {
                             if b[i].is_ascii_alphabetic() {
@@ -1054,7 +1054,14 @@ pub fn fold_case_glob(glob: &str) -> String {
                             i += 1;
                         }
                     }
-                    let lead = usize::from(matches!(b.first(), Some(']' | '-')));
+                    // What stays first: a leading `]` or `-` (a literal only there), and the whole
+                    // range if it starts one (`--a`, `]-a`): the folded spelling of every other class
+                    // is what it always was.
+                    let lead = match b.first() {
+                        Some(']' | '-') if b.len() > 2 && b[1] == '-' => 3,
+                        Some(']' | '-') => 1,
+                        _ => 0,
+                    };
                     out.extend(&b[..lead]);
                     out.push_str(&extra);
                     out.extend(&b[lead..]);
@@ -1066,6 +1073,23 @@ pub fn fold_case_glob(glob: &str) -> String {
         }
     }
     out
+}
+
+/// Adds to `extra` the other case of the ASCII letters in the class range `lo-hi`: the lowercase
+/// letters it holds, as capitals, and the capitals it holds, as lowercase. Nothing for a reversed
+/// range (which globset refuses anyway) or one without letters.
+fn fold_range(lo: char, hi: char, extra: &mut String) {
+    for (first, last) in [('a', 'z'), ('A', 'Z')] {
+        let (from, to) = (lo.max(first), hi.min(last));
+        if from <= to {
+            let swap = |c: char| if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+            if from == to {
+                extra.push(swap(from));
+            } else {
+                extra.extend([swap(from), '-', swap(to)]);
+            }
+        }
+    }
 }
 
 impl ReachRule {
