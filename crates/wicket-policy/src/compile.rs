@@ -19,6 +19,7 @@ use crate::schema::METHODS;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use wicket_authz::{HostPat, HttpMatch, PathPat, SpawnMatch};
+use wicket_core::manifest::is_principal_entry;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
@@ -71,6 +72,9 @@ enum Atom {
     Resource(Vec<String>),
     /// `context.host == s` / `context.header == s` (inject).
     Ctx(String, String),
+    /// `context.sender == s` (or `[s, …].contains(context.sender)`): the sending box's principal
+    /// id (message).
+    Sender(Vec<String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +232,10 @@ fn formula(cx: &Cx, e: &Value) -> Result<F, CompileError> {
                     let n = long(r).ok_or(()).or_else(|_| cx.err(format!("context.{a} compared with a non-integer")))?;
                     int_cmp(cx, op, n, a)
                 }
+                Some(("context", "sender")) if op == "==" || op == "!=" => {
+                    let s = string(r).ok_or(()).or_else(|_| cx.err("context.sender compared with a non-string"))?;
+                    Ok(F::Lit(Lit { atom: Atom::Sender(vec![s.to_string()]), neg }))
+                }
                 Some(("context", a @ ("host" | "header"))) if op == "==" || op == "!=" => {
                     let s = string(r).ok_or(()).or_else(|_| cx.err(format!("context.{a} compared with a non-string")))?;
                     Ok(F::Lit(Lit { atom: Atom::Ctx(a.to_string(), s.to_string()), neg }))
@@ -273,7 +281,13 @@ fn formula(cx: &Cx, e: &Value) -> Result<F, CompileError> {
                         .map_err(|e| CompileError::Unsupported { id: cx.id.clone(), msg: e.to_string() })?;
                     Ok(F::Lit(Lit { atom: Atom::PathGlob(g.to_string(), a == "path_matches_any_case"), neg: false }))
                 }
-                _ => cx.err("contains on anything but resource.path_matches(_any_case)"),
+                _ if attr(r) == Some(("context", "sender")) => {
+                    let ids: Option<Vec<String>> =
+                        l.get("Set").and_then(Value::as_array).and_then(|set| set.iter().map(|v| string(v).map(String::from)).collect());
+                    let ids = ids.ok_or(()).or_else(|_| cx.err("context.sender in anything but a set of strings"))?;
+                    Ok(F::Lit(Lit { atom: Atom::Sender(ids), neg: false }))
+                }
+                _ => cx.err("contains on anything but resource.path_matches(_any_case), or a set of senders' ids"),
             }
         }
         "in" => {
@@ -432,6 +446,39 @@ fn names(cx: &Cx, scope: Option<Vec<String>>, conj: &[Lit], kind: &str) -> Resul
     Ok(out)
 }
 
+/// Who a message conjunction lets in, as `accept_from` entries (zone names, principal ids), or None
+/// for anyone. Exact only as one kind: the sender's zone (the resource) or its id (`context.sender`),
+/// a zone by a zone's name and an id by an id's form, as `accepts` reads them (#411).
+fn msg_names(cx: &Cx, scope: Option<Vec<String>>, conj: &[Lit]) -> Result<Option<Vec<String>>, CompileError> {
+    let mut senders: Option<Vec<String>> = None;
+    let mut rest = vec![];
+    for l in conj {
+        match (&l.atom, l.neg) {
+            (Atom::Sender(ids), false) => {
+                senders = Some(match senders.take() {
+                    Some(have) => have.into_iter().filter(|i| ids.contains(i)).collect(),
+                    None => ids.clone(),
+                })
+            }
+            (Atom::Sender(_), true) => return cx.err("a message permit names the senders it lets in, never the ones it doesn't"),
+            _ => rest.push(l.clone()),
+        }
+    }
+    let zones = names(cx, scope, &rest, "message")?;
+    match (zones, senders) {
+        (Some(_), Some(_)) => cx.err("a message permit names the sender's zone or its id (context.sender), not both: write two permits"),
+        (Some(zs), None) => match zs.iter().find(|z| is_principal_entry(z)) {
+            Some(z) => cx.err(format!("Zone::{z:?} is a principal's id: name it as context.sender")),
+            None => Ok(Some(zs)),
+        },
+        (None, Some(ids)) => match ids.iter().find(|p| !is_principal_entry(p)) {
+            Some(p) => cx.err(format!("context.sender {p:?} isn't a principal's id (spiffe://…): name a zone as the resource")),
+            None => Ok(Some(ids)),
+        },
+        (None, None) => Ok(None),
+    }
+}
+
 /// The action kinds (and HTTP methods) a policy's scope covers.
 fn scope_actions(cx: &Cx, a: &Value) -> Result<Vec<String>, CompileError> {
     let all: Vec<String> = METHODS.iter().map(|m| m.to_string()).chain(["spawn", "message", "inject"].map(String::from)).collect();
@@ -547,7 +594,7 @@ pub fn compile(set: &cedar_policy::PolicySet, mint: &MintCtx) -> Result<Layer, C
                         a.spawn_all |= m == SpawnMatch::default();
                         a.spawn.push(m);
                     }
-                    Kind::Message => match names(&cx, res_scope.clone(), c, "message")? {
+                    Kind::Message => match msg_names(&cx, res_scope.clone(), c)? {
                         Some(z) => a.msg.extend(z),
                         None => a.msg_all = true,
                     },

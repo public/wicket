@@ -5,7 +5,8 @@
 //!   unless the rule has `allow_dangerous`;
 //! - each forbid path a `forbid` on every method, its glob matched ignoring case;
 //! - the spawn ceiling one `permit` on `spawn` (images, isolation floor, limits);
-//! - `accept_from` one `permit` on `message`, each injection one on `inject`.
+//! - `accept_from` one `permit` on `message` (its zone entries the sender's zone, its principal
+//!   entries the sender's id, `context.sender`), each injection one on `inject`.
 //!
 //! [`ceiling_fields`] takes the compiled layer back to the token's zone fields, refusing anything a
 //! zone layer can't hold (a zone's Cedar must say what a manifest can).
@@ -13,6 +14,7 @@
 use crate::compile::{CompileError, Layer};
 use crate::schema::METHODS;
 use wicket_authz::{Ceiling, Forbid, HostPat, HttpMatch, Inject, PathPat, Reach, SpawnLimits, SpawnMatch, MAX_REACH_RISK};
+use wicket_core::manifest::is_principal_entry;
 use wicket_core::ZoneSpec;
 
 /// A Cedar string literal.
@@ -95,11 +97,19 @@ pub fn cedar(zone: &ZoneSpec, base: &Ceiling) -> String {
             s.timeout_s
         ));
     }
-    let from: Vec<String> = base.accept_from.iter().map(|z| format!("Zone::{}", lit(z))).collect();
+    // A zone entry names the sender's zone, a principal entry (#250) its id: `accepts` (#411).
+    let (ids, zones): (Vec<&String>, Vec<&String>) = base.accept_from.iter().partition(|a| is_principal_entry(a));
+    let mut from = vec![];
+    if !zones.is_empty() {
+        from.push(format!("resource in [{}]", zones.iter().map(|z| format!("Zone::{}", lit(z))).collect::<Vec<_>>().join(", ")));
+    }
+    if !ids.is_empty() {
+        from.push(format!("[{}].contains(context.sender)", ids.iter().map(|p| lit(p)).collect::<Vec<_>>().join(", ")));
+    }
     if !from.is_empty() {
         out.push_str(&format!(
-            "@id(\"messages\")\npermit(principal, action == Action::\"message\", resource) when {{ resource in [{}] }};\n",
-            from.join(", ")
+            "@id(\"messages\")\npermit(principal, action == Action::\"message\", resource) when {{ {} }};\n",
+            from.join(" || ")
         ));
     }
     for (i, j) in base.inject.iter().enumerate() {
@@ -173,7 +183,7 @@ pub fn ceiling_fields(layer: &Layer, base: &Ceiling) -> Result<Ceiling, CompileE
         Some([]) if base.spawn.images.is_empty() => base.spawn.clone(),
         _ => return bad("a zone has one spawn permit, naming its images, isolation floor and every limit"),
     };
-    let Some(accept_from) = layer.msg_from.clone() else { return bad("a zone names the zones it accepts messages from") };
+    let Some(accept_from) = layer.msg_from.clone() else { return bad("a zone names who it accepts messages from") };
     let Some(keys) = &layer.inject else { return bad("a zone names its injections") };
     let mut inject = vec![];
     for k in keys {

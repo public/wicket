@@ -268,7 +268,7 @@ fn empty_lists_encode_as_empty_sets() {
             };
             assert!(is_grant(&d(gh)), "{msg}: no methods");
             assert!(is_forbidden(&d(http("GET", "docs.rs", "/x", RiskClass::R1ReadScoped))), "{msg}: no injections");
-            assert!(is_forbidden(&d(Action::Msg { from: "ops".into() })), "{msg}: nobody may message");
+            assert!(is_forbidden(&d(Action::Msg { from: "ops".into(), sender: None })), "{msg}: nobody may message");
             assert!(is_forbidden(&d(scenarios(0)[3].1.action.clone())), "{msg}: no images");
         } else {
             assert!(is_forbidden(&d(docs)), "{msg}");

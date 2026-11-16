@@ -9,7 +9,9 @@
 //!   a segment, `**` across), case-sensitively or ignoring ASCII case. `context.risk` is
 //!   wicket-core's risk rank.
 //! - **spawn:** the image started, with the spawn's isolation and resource limits.
-//! - **message:** the sending box's zone.
+//! - **message:** the sending box's zone, with its principal id (`spiffe://…`, or "" when the node
+//!   doesn't know it) as `context.sender`. An `accept_from` zone entry names the zone, a principal
+//!   entry (#250) the id, as [`wicket_core::manifest::accepts`] reads them (#411).
 //! - **inject:** the credential injected, with the host and header it goes in.
 
 /// The schema, in Cedar's human-readable format.
@@ -39,7 +41,7 @@ action "spawn" appliesTo {
   principal: [Box], resource: [Image],
   context: { "isolation": Long, "memory": Long, "cpus_milli": Long, "pids": Long, "timeout_s": Long }
 };
-action "message" appliesTo { principal: [Box], resource: [Zone], context: {} };
+action "message" appliesTo { principal: [Box], resource: [Zone], context: { "sender": String } };
 action "inject" appliesTo {
   principal: [Box], resource: [Secret], context: { "host": String, "header": String }
 };
