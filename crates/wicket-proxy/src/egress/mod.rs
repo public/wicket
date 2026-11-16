@@ -24,6 +24,7 @@ use std::sync::Arc;
 use wicket_core::{canonical_path, manifest::host_matches};
 
 mod canary;
+pub mod caps;
 mod connect;
 mod hosts;
 mod outgoing;
@@ -66,6 +67,8 @@ pub struct Egress {
     registered: std::sync::Mutex<std::collections::HashMap<String, crate::exists::Exists>>,
     /// Per wildcard reach rule, the names under it that have had an allowed request this run (#20).
     wild: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    /// The run's windowed egress counter (#368), on a node whose zone caps egress.
+    counter: std::sync::OnceLock<Arc<caps::EgressCounter>>,
 }
 
 /// How many distinct registered domains one run may have checked (#19); past that, unnamed hosts
@@ -205,6 +208,7 @@ impl Egress {
             skipped: Default::default(),
             registered: Default::default(),
             wild: Default::default(),
+            counter: Default::default(),
         }))
     }
 
@@ -476,10 +480,39 @@ impl Egress {
             }
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
-        if let Some(llm) = self.model_gate.get().filter(|l| l.is_model_call(&host, &path)) {
-            return llm.clone().through_egress(&self, req, &host, &pq, via).await;
+        // Windowed egress caps (#368): counted, and held to this node's slice, before anything goes.
+        let declared = req.headers().get(http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+        let counter = match self.admit_egress(declared) {
+            Ok(c) => c,
+            Err(why) => {
+                emit("capped", why.0.clone());
+                return problem(
+                    429,
+                    "egress-cap",
+                    "Blocked by wicket box: egress cap reached",
+                    &format!(
+                        "{why}. Requests through wicket are capped over a sliding window, for this agent across all its sessions: wait for the window to have room, or do less. {}",
+                        crate::BOX_FACT
+                    ),
+                    None,
+                );
+            }
+        };
+        let Some(counter) = counter else { return self.send(req, &host, scheme, &pq, &path, via).await };
+        let r = self.send(caps::counted_request(req, counter.clone()), &host, scheme, &pq, &path, via).await;
+        caps::counted_response(r, counter)
+    }
+
+    /// Sends a decided request upstream: through the model gate if it is a model call, else forwarded.
+    async fn send<B>(self: Arc<Self>, req: Request<B>, host: &str, scheme: &str, pq: &str, path: &str, via: Via) -> Response<BoxBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        if let Some(llm) = self.model_gate.get().filter(|l| l.is_model_call(host, path)) {
+            return llm.clone().through_egress(&self, req, host, pq, via).await;
         }
-        match self.forward(req, &host, scheme, &pq, via).await {
+        match self.forward(req, host, scheme, pq, via).await {
             Ok(r) => r,
             // The tripwire (#362) refuses; otherwise the whole chain: a refused dial (#116) says why at its end.
             Err(e) => canary::tripped_response(&e).unwrap_or_else(|| problem(502, "upstream", "Upstream error", &format!("{e:#}"), None)),

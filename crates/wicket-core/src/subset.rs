@@ -79,6 +79,19 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     if c.limits.on_output_full != p.limits.on_output_full && p.limits.on_output_full == crate::manifest::OnOutputFull::Stop {
         v.push("on_output_full: this zone stops a box whose output is full; a child can't keep going".into());
     }
+    // Windowed egress caps (#368): every cap the parent has, the child has, no looser.
+    if let Some(pc) = p.limits.egress_caps() {
+        match c.limits.egress_caps() {
+            Some(cc) if cc.within(&pc) => {}
+            _ => v.push(format!(
+                "egress caps {}: looser than this zone's (window {}s, requests {:?}, bytes {:?}), or missing",
+                c.limits.egress.as_ref().map(|e| format!("{e:?}")).unwrap_or_else(|| "none".into()),
+                pc.window_secs,
+                pc.requests,
+                pc.bytes
+            )),
+        }
+    }
     if !(c.limits.pids >= 1 && c.limits.pids <= p.limits.pids) {
         v.push(format!("pids {}: more than this zone's {} (or zero)", c.limits.pids, p.limits.pids));
     }
@@ -612,6 +625,27 @@ pub(crate) mod tests {
         }
         assert!(wrong.is_empty(), "{} unsound proofs, e.g.:\n{}", wrong.len(), wrong[..wrong.len().min(10)].join("\n"));
         assert!(proved > 2_000, "only {proved} proofs: the check got too weak");
+    }
+
+    /// #368: a child of a zone with egress caps has them too, no looser; a parent without them
+    /// leaves the child free to have its own or none.
+    #[test]
+    fn egress_caps_narrow() {
+        let p = zone("  limits: { memory: 2g, cpus: 2, timeout: 1h, egress: { window: 1h, requests: 100, bytes: 1m } }\n");
+        let child = |e: &str| {
+            zone(&format!("  llm: {{ max_requests: 10, max_output_tokens: 1000 }}\n  limits: {{ memory: 1g, cpus: 1, timeout: 10m{e} }}\n"))
+        };
+        assert_eq!(check(&ask(&child(", egress: { window: 1h, requests: 10, bytes: 1k }")), &bounds(&p)), Ok(()));
+        for (e, why) in [
+            ("", "missing"),
+            (", egress: { window: 1h, requests: 101, bytes: 1m }", "looser"),
+            (", egress: { window: 30m, requests: 1, bytes: 1k }", "looser"),
+            (", egress: { window: 1h, requests: 10 }", "looser"),
+        ] {
+            let v = check(&ask(&child(e)), &bounds(&p)).unwrap_err();
+            assert!(v.iter().any(|x| x.starts_with("egress caps") && x.contains(why)), "{e}: {v:?}");
+        }
+        assert_eq!(check(&ask(&child("")), &bounds(&parent())), Ok(()), "a parent without caps");
     }
 
     /// #153: a child's authority (default its timeout) is never longer than its parent's; an

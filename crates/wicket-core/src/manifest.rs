@@ -633,6 +633,12 @@ pub struct Limits {
     /// the manifest.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_advice: Option<String>,
+    /// Windowed egress caps (#368): at most so many requests and bytes through the egress proxy
+    /// over a sliding window of at most 24 h, counted for the agent over all its activations (see
+    /// [`crate::window`]). A spawned zone's are never looser. (Left out when unset, so a node of an
+    /// earlier version reads the manifest.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<crate::window::EgressSpec>,
 }
 
 /// The longest `limits.memory_advice`, in characters.
@@ -659,6 +665,7 @@ impl Default for Limits {
             on_output_full: OnOutputFull::default(),
             exit_grace: default_exit_grace(),
             memory_advice: None,
+            egress: None,
         }
     }
 }
@@ -719,6 +726,11 @@ impl Limits {
         crate::subset::parse_bytes(&self.memory)
     }
 
+    /// The windowed egress caps, if set and readable (#368).
+    pub fn egress_caps(&self) -> Option<crate::window::EgressCaps> {
+        self.egress.as_ref().and_then(|e| e.caps().ok())
+    }
+
     /// The output cap in bytes, if readable.
     pub fn output_bytes(&self) -> Option<u64> {
         crate::subset::parse_bytes(&self.output)
@@ -743,6 +755,9 @@ impl Limits {
         }
         if self.timeout()?.is_zero() {
             return bad(format!("timeout {:?}", self.timeout));
+        }
+        if let Some(e) = &self.egress {
+            e.caps().map_err(ManifestError::Invalid)?;
         }
         if let Some(a) = &self.memory_advice {
             if a.chars().count() > MEMORY_ADVICE_MAX || a.chars().any(char::is_control) {

@@ -14,6 +14,10 @@ impl Egress {
         if self.model_gate.get().is_some_and(|l| l.is_model_host(host)) {
             return None;
         }
+        // A zone that caps egress (#368) is counted request by request: nothing is spliced.
+        if self.capped() {
+            return None;
+        }
         // A name under a wildcard is only dialled (so resolved) after a request to it has been
         // decided and allowed (#20): until then its connections are inspected, never spliced, since
         // splicing dials at CONNECT.

@@ -19,6 +19,7 @@ pub mod subset;
 pub mod text;
 pub mod timing;
 pub mod version;
+pub mod window;
 
 pub use canon::{canonical_host, canonical_path, prefix_covers, prefix_dir, CanonError};
 pub use manifest::{
