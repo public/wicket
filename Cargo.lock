@@ -3986,6 +3986,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "wicket-chan"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures-util",
+ "hex",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "thiserror",
+ "tokio",
+ "wicket-agent",
+ "wicket-authz",
+ "wicket-core",
+ "wicket-feed",
+ "wicket-identity",
+ "wicket-proxy",
+ "wicket-store",
+ "zeroize",
+]
+
+[[package]]
 name = "wicket-cli"
 version = "0.0.1"
 dependencies = [
@@ -4027,6 +4053,7 @@ dependencies = [
  "wicket-agent",
  "wicket-auth",
  "wicket-authz",
+ "wicket-chan",
  "wicket-core",
  "wicket-feed",
  "wicket-identity",

@@ -5,9 +5,12 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+// The control/node channel and the modules its messages carry: a crate of their own (#219), under
+// their old names here.
+use wicket_chan::{chan, health, nodesecrets, oci, registry};
+
 mod audit_export;
 mod capacity;
-mod chan;
 mod ci_update;
 mod cli_reference;
 mod cmd;
@@ -19,7 +22,6 @@ mod enrol;
 mod exitcause;
 mod gitguard;
 mod grant;
-mod health;
 mod hibernate;
 mod image;
 mod images_policy;
@@ -32,9 +34,7 @@ mod nodeauth;
 mod nodecall;
 mod nodecreate;
 mod noderun;
-mod nodesecrets;
 mod nodesrv;
-mod oci;
 mod operators;
 mod owner;
 mod pin;
@@ -42,7 +42,6 @@ mod policy;
 mod program;
 mod quotas;
 mod reconcile;
-mod registry;
 mod rootcopy;
 mod roots;
 mod run;
