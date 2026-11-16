@@ -15,6 +15,7 @@ mod control;
 mod daemon;
 mod doctor;
 mod effect;
+mod egress_window;
 mod enrol;
 mod exitcause;
 mod grant;

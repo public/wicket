@@ -249,6 +249,8 @@ struct Node {
     mem: Mutex<HashMap<String, BoxMem>>,
     /// Each box's model proxy, for its budget slice and spend reports (#152).
     llms: Mutex<HashMap<String, Arc<wicket_proxy::llm::Llm>>>,
+    /// Each run's egress counter, when its zone caps egress (#368).
+    egress_counters: Mutex<HashMap<String, Arc<wicket_proxy::egress::caps::EgressCounter>>>,
     /// Images being received (#191), by stream.
     images: images::Incoming,
     /// What `wicket node top` shows beyond the rest: boxes starting, egress decisions, connections.
@@ -711,6 +713,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         causes: Mutex::new(HashMap::new()),
         mem: Mutex::new(HashMap::new()),
         llms: Mutex::new(HashMap::new()),
+        egress_counters: Mutex::new(HashMap::new()),
         images: Default::default(),
         seen: Default::default(),
     });
@@ -1331,6 +1334,8 @@ fn child_start(
         durable: vec![],
         name,
         llm_prior: (0, 0, 0),
+        // A child started here gets its egress slices from its control host once it learns of it.
+        egress_slice: None,
         output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
         output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
         swaps: vec![],
@@ -1903,11 +1908,12 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     n.edge.drop_run(run);
     n.replica.lock().expect("replica").drop_local(run);
     let llm = n.llms.lock().expect("llms").remove(run);
+    let egress = n.egress_counters.lock().expect("egress counters").remove(run).map(|c| c.used());
     // The run's last spend goes ahead of its exit, on the same channel: the once-a-second report
     // can miss a model call made just before the box ended (an agent that hibernates or finishes
-    // right after its turn, #249), and the box would not be charged for it.
+    // right after its turn, #249), and the box would not be charged for it. Its egress count too.
     if let Some(l) = llm {
-        n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent(), first_request_ms: l.first_request_ms() }));
+        n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent(), first_request_ms: l.first_request_ms(), egress }));
     }
     t.step("node.teardown.release");
     eprintln!("[node] {run}: box exited ({code})");
@@ -1984,6 +1990,32 @@ async fn serve_box(
     // with the credential from this node's cache (fetched on first use; without it, the call fails
     // clearly), the control host isn't asked, and this node is the counter of record (its spend
     // persisted beside the box, and reported).
+    // Windowed egress caps (#368): this activation's count, held to the slice its control host
+    // leased (from the start, or as last sent: on disk), journaled before each request goes, and
+    // reported with the model spend.
+    let egress_counter = ctx.zone.limits.egress_caps().map(|caps| {
+        let c = wicket_proxy::egress::caps::EgressCounter::new(caps);
+        if let Some(u) = std::fs::read(dir.join(EGRESS_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+            c.merge_used(u);
+        }
+        match node.slices.get_egress(&bs.run) {
+            Some(s) => c.set_slice(Some(s)),
+            None => {
+                if let Some(s) = &bs.egress_slice {
+                    let _ = node.slices.put_egress(&bs.run, s);
+                }
+                c.set_slice(bs.egress_slice);
+            }
+        }
+        let path = dir.join(EGRESS_FILE);
+        c.set_journal(move |u| {
+            if let Ok(b) = serde_json::to_vec(&u) {
+                let _ = crate::nodesecrets::write_atomic(&path, &b);
+            }
+        });
+        node.egress_counters.lock().expect("egress counters").insert(bs.run.clone(), c.clone());
+        c
+    });
     let llm = {
         let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel::<wicket_proxy::Event>();
         let mut c = ctx.clone();
@@ -2014,9 +2046,10 @@ async fn serve_box(
         l.set_journal(move |s| write_spend(&path, &s));
         // And reported when it moves, and every 10 s anyway (a new connection learns it without
         // waiting for the next call); persisted again as calls settle.
-        let (n, run, l2) = (node.clone(), bs.run.clone(), l.clone());
+        let (n, run, l2, ec) = (node.clone(), bs.run.clone(), l.clone(), egress_counter.clone());
         tasks.push(tokio::spawn(async move {
             let mut last = wicket_proxy::llm::Spent::default();
+            let mut last_egress = None;
             let mut last_charged = wicket_proxy::llm::Spent::default();
             let mut last_first = None;
             let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -2033,11 +2066,19 @@ async fn serve_box(
                 // When the box's first model request came (#287): reported with its spend, as soon
                 // as there is one.
                 let first = l2.first_request_ms();
-                if now != last || first != last_first || i.is_multiple_of(10) {
-                    n.send_run(&run, Frame::Msg(Msg::Spent { run: run.clone(), spent: now, first_request_ms: first }));
+                // The egress count's bytes (requests are journaled as they go) persisted as they move.
+                let egress = ec.as_ref().map(|c| c.used());
+                if egress != last_egress {
+                    if let Some(c) = &ec {
+                        c.journal();
+                    }
+                }
+                if now != last || first != last_first || egress != last_egress || i.is_multiple_of(10) {
+                    n.send_run(&run, Frame::Msg(Msg::Spent { run: run.clone(), spent: now, first_request_ms: first, egress }));
                 }
                 last = now;
                 last_first = first;
+                last_egress = egress;
             }
         }));
         l
@@ -2047,6 +2088,9 @@ async fn serve_box(
     // (#257): they get this node's budget, filter and accounting, as they did on the control host
     // (#112).
     egress.set_model_gate(llm.clone());
+    if let Some(c) = &egress_counter {
+        egress.set_egress_counter(c.clone());
+    }
     // DNS and HTTP/3 for the box (#92), decided here like CONNECT: by the node's policy, with the
     // node's CA; hosts it can't cover get a 403 over HTTP/3 that points at the proxy, which
     // splices them if the box's token allows them wholesale (#257).
@@ -2160,6 +2204,8 @@ async fn sample_memory(n: &Arc<Node>) {
 
 /// A box's model spend as its node counted it (#152), beside its record.
 const SPEND_FILE: &str = "node-spend.json";
+/// A box's egress count (#368), persisted beside it on its node.
+const EGRESS_FILE: &str = "node-egress.json";
 
 /// When a CA certificate (PEM) expires (Unix s).
 fn ca_not_after(pem: &[u8]) -> Option<i64> {
@@ -2365,6 +2411,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             causes: Mutex::new(HashMap::new()),
             mem: Mutex::new(HashMap::new()),
             llms: Mutex::new(HashMap::new()),
+            egress_counters: Mutex::new(HashMap::new()),
             images: Default::default(),
             seen: Default::default(),
         })
@@ -2437,6 +2484,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 durable: vec![],
                 name: None,
                 llm_prior: (0, 0, 0),
+                egress_slice: None,
                 output_cap: 64 << 20,
                 output_stop: false,
                 swaps: vec![],
@@ -3405,6 +3453,18 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(crate::noderun::refuse_older_node("n1", 5, &start, false, None).unwrap_err().to_string().contains("pinned"));
         start.image_pin = None;
         assert!(crate::noderun::refuse_older_node("n1", 8, &start, true, None).unwrap_err().to_string().contains("model budget"));
+    }
+
+    /// #368: a box whose zone caps egress starts only on a node at protocol 12, which holds it to
+    /// its egress slice; an older one is refused, saying why.
+    #[test]
+    fn a_box_with_egress_caps_is_refused_by_a_node_before_protocol_12() {
+        let mut start = fake_record("run_a").start;
+        assert!(crate::noderun::refuse_older_node("n1", 11, &start, false, None).is_ok(), "no caps: 11 will do");
+        start.egress_slice = Some(wicket_core::window::EgressSlice { requests: Some(5), bytes: None });
+        let why = crate::noderun::refuse_older_node("n1", 11, &start, false, None).unwrap_err().to_string();
+        assert!(why.contains("caps egress") && why.contains("from protocol 12") && why.contains("wicket node install n1"), "{why}");
+        assert!(crate::noderun::refuse_older_node("n1", chan::EGRESS_SLICE, &start, false, None).is_ok());
     }
 
     /// #257, slice 3: a box a node before protocol 11 would forward a host of (outside its CA, or

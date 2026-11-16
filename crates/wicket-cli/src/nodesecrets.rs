@@ -473,8 +473,25 @@ impl Slices {
         std::fs::read(self.file(run).ok()?).ok().and_then(|b| serde_json::from_slice(&b).ok())
     }
 
+    /// A run's egress slice (#368), kept beside its budget slice.
+    pub fn put_egress(&self, run: &str, s: &wicket_core::window::EgressSlice) -> Result<()> {
+        write_atomic(&self.egress_file(run)?, &serde_json::to_vec(s)?)
+    }
+
+    pub fn get_egress(&self, run: &str) -> Option<wicket_core::window::EgressSlice> {
+        std::fs::read(self.egress_file(run).ok()?).ok().and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    fn egress_file(&self, run: &str) -> Result<PathBuf> {
+        crate::run::check_run_id(run)?;
+        Ok(self.dir.join(format!("{run}.egress.json")))
+    }
+
     pub fn drop_run(&self, run: &str) {
         if let Ok(f) = self.file(run) {
+            let _ = std::fs::remove_file(f);
+        }
+        if let Ok(f) = self.egress_file(run) {
             let _ = std::fs::remove_file(f);
         }
     }

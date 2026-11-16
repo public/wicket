@@ -1016,6 +1016,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // Its budget is its quota grants' amounts (#256), whatever its zone says.
     let llm = Llm::with_quota(ctx.clone(), limits.model)?;
     let _ = llm_slot.set(llm.clone());
+    // Windowed egress caps (#368): the principal's window (a long-lived agent's over all its
+    // activations), which the node's counts go into and its egress slices come from.
+    let egress_window = match m.zone.limits.egress_caps() {
+        Some(caps) => {
+            let key = crate::egress_window::key(fence.as_ref().map(|f| f.agent.as_str()), &run.0);
+            Some(Arc::new(crate::egress_window::Window::open(ledger.clone(), key, &run.0, caps, wicket_store::now())?))
+        }
+        None => None,
+    };
     // A woken agent's budget continues from what its earlier activations spent (#70); a re-attached
     // long-lived agent's from what its agent row records (this activation's spend included, up to its
     // supervisor's last heartbeat), any other re-attached run's from what its supervisor last saved.
@@ -1251,6 +1260,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             long_lived: box_tmp,
             name: Some(spec.name.clone()),
             llm_prior: llm.spent_total(),
+            egress_slice: egress_window.as_ref().map(|w| w.next_slice(wicket_store::now())),
             output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
             // Swapped on the node (#257): their names and placeholders only, the credentials
@@ -1331,6 +1341,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             vault: ctx.vault.clone(),
             swaps: ctx.swaps.clone(),
             spent_counted: attach_agent.is_some(),
+            egress: egress_window.clone(),
             adopt: adopter.clone(),
             timings: timings.clone(),
         })

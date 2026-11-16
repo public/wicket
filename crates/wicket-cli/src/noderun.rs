@@ -404,6 +404,9 @@ pub struct Start {
     /// the model proxy's `prior` counters, so the node's first report is the base its later ones
     /// count from (#152).
     pub spent_counted: bool,
+    /// The run's egress window (#368), when its zone caps egress: it sends the node egress slices
+    /// and takes the node's egress count.
+    pub egress: Option<Arc<crate::egress_window::Window>>,
     /// Takes over children the node starts for the box (#164): None, it may start none.
     pub adopt: Option<Adopter>,
     /// Where the box start's time goes (#287): this host's steps, the node's (`node.start.*`), and
@@ -442,6 +445,8 @@ struct Shared {
     vault: wicket_proxy::vault::Vault,
     /// What the node had counted when this supervisor took over, if that was already counted.
     spent_base: Mutex<Option<Option<wicket_proxy::llm::Spent>>>,
+    /// The run's egress window (#368).
+    egress: Option<Arc<crate::egress_window::Window>>,
     /// The run's credential swaps, which its node makes (#257): what this host releases to it for
     /// them ([`fetch_secret`]).
     swaps: Vec<wicket_proxy::CredentialSwap>,
@@ -601,6 +606,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         llm: s.llm.clone(),
         vault: s.vault.clone(),
         spent_base: Mutex::new(s.spent_counted.then_some(None)),
+        egress: s.egress.clone(),
         swaps: s.swaps.clone(),
         adopt: s.adopt.clone(),
         attach: s.attach,
@@ -797,6 +803,9 @@ struct Progress {
     /// Whether a budget slice went on this connection, and the last one sent (#152).
     slice_sent: bool,
     slice: Option<wicket_proxy::llm::Slice>,
+    /// The same for the run's egress slice (#368).
+    egress_sent: bool,
+    egress_slice: Option<wicket_core::window::EgressSlice>,
     /// The secrets released to the node for this run, and what each was (to tell a change).
     fetched: std::collections::HashMap<String, String>,
     /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
@@ -829,6 +838,8 @@ async fn manage(
         proto: 0,
         slice_sent: false,
         slice: None,
+        egress_sent: false,
+        egress_slice: None,
         fetched: std::collections::HashMap::new(),
         remint_failed: 0,
         link: crate::top::LinkRecord { node: sh.node.clone(), ..Default::default() },
@@ -984,6 +995,10 @@ async fn session(
     if let Some(f) = slice_due(sh, p) {
         send(f);
     }
+    p.egress_sent = false;
+    if let Some(f) = egress_due(sh, p) {
+        send(f);
+    }
     if first {
         sh.timings.since("budget.slice", slicing);
     }
@@ -1056,6 +1071,9 @@ async fn session(
             }
             _ = leases.tick() => {
                 if let Some(f) = slice_due(sh, p) {
+                    send(f);
+                }
+                if let Some(f) = egress_due(sh, p) {
                     send(f);
                 }
                 for f in secrets_changed(sh, p) {
@@ -1234,7 +1252,11 @@ async fn on_frame(
                     let _ = out.send(Frame::Msg(Msg::Adopted { child, error }));
                 });
             }
-            Msg::Spent { run, spent, first_request_ms } if run == sh.run.0 => {
+            Msg::Spent { run, spent, first_request_ms, egress } if run == sh.run.0 => {
+                // The node's egress count (#368): what is new goes into the principal's window.
+                if let (Some(w), Some(u)) = (&sh.egress, egress) {
+                    w.report(u, wicket_store::now());
+                }
                 if p.link.spent != spent {
                     p.link.spent = spent;
                     p.link.updated_ms = wicket_feed::now_ms();
@@ -1587,6 +1609,23 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     Some(Frame::Msg(Msg::BudgetSlice { run: sh.run.0.clone(), slice }))
 }
 
+/// The run's egress slice for its node (#368), if it differs from the last one sent on this
+/// connection: renewed once less than half of it is left, or at once if the window has less left.
+fn egress_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
+    // A node before #368 holds no box to a slice: no box whose zone caps egress starts there.
+    if p.proto < crate::chan::EGRESS_SLICE {
+        return None;
+    }
+    let w = sh.egress.as_ref()?;
+    let slice = wicket_core::window::EgressSlice::renewed(p.egress_slice, w.next_slice(wicket_store::now()), w.seen());
+    if p.egress_sent && p.egress_slice == Some(slice) {
+        return None;
+    }
+    p.egress_sent = true;
+    p.egress_slice = Some(slice);
+    Some(Frame::Msg(Msg::EgressSlice { run: sh.run.0.clone(), slice }))
+}
+
 /// A host of the box that a node before protocol 11 would forward to the control host instead of
 /// terminating (#257): one its zone reaches, injects into or swaps a credential for, outside the
 /// node CA's name constraints; or every host, without a live CA. None: such a node forwards
@@ -1628,6 +1667,14 @@ pub(crate) fn refuse_older_node(name: &str, proto: u32, start: &BoxStart, budget
         bail!(
             "node {name} talks protocol {proto}, and this box has a model budget, whose slice needs {}: update the node (`wicket node install {name}`)",
             crate::chan::BUDGET_SLICE
+        );
+    }
+    // A node before #368 would hold the box to no egress slice: a box whose zone caps egress goes
+    // only where its node counts it.
+    if start.egress_slice.is_some() && proto < crate::chan::EGRESS_SLICE {
+        bail!(
+            "node {name} talks protocol {proto}, and this box's zone caps egress, which its node counts from protocol {}: update the node (`wicket node install {name}`)",
+            crate::chan::EGRESS_SLICE
         );
     }
     // A node before #257 would neither make a swap nor forward its host: a box with swaps goes only

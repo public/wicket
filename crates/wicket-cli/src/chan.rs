@@ -77,7 +77,10 @@ use wicket_proxy::llm::Slice;
 ///   The control host no longer serves the `egress` tunnel target, and `BoxStart::swap_hosts`
 ///   (the hosts a control host before 10 swapped itself) is gone. A box that a node before 11
 ///   would forward a host of goes only to nodes talking [`NO_FORWARDED_EGRESS`] or later.
-pub const PROTOCOL: u32 = 11;
+/// - 12: windowed egress caps (#368): [`Msg::EgressSlice`], [`BoxStart::egress_slice`] and the
+///   egress count in [`Msg::Spent`]. A box whose zone caps egress goes only to nodes talking
+///   [`EGRESS_SLICE`] or later.
+pub const PROTOCOL: u32 = 12;
 /// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
 pub const EDGE_DECISIONS: u32 = 5;
 /// The first protocol version whose nodes check a box's image against its pin (#192).
@@ -92,6 +95,8 @@ pub const BUDGET_SLICE: u32 = 9;
 pub const CREDENTIAL_SWAPS: u32 = 10;
 /// The first protocol version whose nodes forward no egress to the control host (#257).
 pub const NO_FORWARDED_EGRESS: u32 = 11;
+/// The first protocol version whose nodes hold a box to its egress slice (#368).
+pub const EGRESS_SLICE: u32 = 12;
 /// The run's sockets on the control host a node may open a tunnel to ([`Msg::TunnelOpen`]): its MCP
 /// gateway, for the tools the node relays. Not the model proxy nor the egress proxy: those are the
 /// node's alone (#257).
@@ -113,7 +118,8 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // Every feature's first version is one this build speaks, and a peer at the oldest version it
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
-    let floors = [EDGE_DECISIONS, IMAGE_PINS, IMAGE_DELIVERY, IMAGE_PULL, BUDGET_SLICE, CREDENTIAL_SWAPS];
+    let floors =
+        [EDGE_DECISIONS, IMAGE_PINS, IMAGE_DELIVERY, IMAGE_PULL, BUDGET_SLICE, CREDENTIAL_SWAPS, NO_FORWARDED_EGRESS, EGRESS_SLICE];
     let mut i = 0;
     while i < floors.len() {
         assert!(floors[i] <= PROTOCOL);
@@ -204,6 +210,10 @@ pub struct BoxStart {
     /// input and output tokens. The node's model proxy starts from it (#151).
     #[serde(default)]
     pub llm_prior: (u64, u64, u64),
+    /// The box's first egress slice (#368), when its zone caps egress: the node holds the box to it
+    /// from its first request (with none, a capped box sends nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_slice: Option<wicket_core::window::EgressSlice>,
     /// What the box's output may take on the node's disk (#151; the zone's `limits.output`), and
     /// whether the box is stopped when its output passes it (else the oldest output goes).
     #[serde(default = "default_output_cap")]
@@ -425,6 +435,12 @@ pub enum Msg {
     BudgetSlice {
         run: String,
         slice: Slice,
+    },
+    /// A run's egress slice (#368): the totals of its own egress count its node may reach, offline
+    /// too, before it is sent more.
+    EgressSlice {
+        run: String,
+        slice: wicket_core::window::EgressSlice,
     },
     /// The answer to a [`Msg::SecretFetch`]: the secret, released for that run, or why not.
     SecretFetched {
@@ -682,6 +698,9 @@ pub enum Msg {
         /// node's clock; #287).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         first_request_ms: Option<i64>,
+        /// The box's egress count, when its zone caps egress (#368): cumulative for this activation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        egress: Option<wicket_core::window::EgressUse>,
     },
     /// Open a tunnel to the run's `target` socket on the control host: `egress` or `gateway`. (`llm`
     /// is refused: a node's model proxy calls the model itself, since protocol 3, #152, #257.)
@@ -1146,8 +1165,28 @@ mod tests {
     /// below [`NO_FORWARDED_EGRESS`], and is gated per box (`noderun::refuse_older_node`).
     #[test]
     fn a_node_forwards_no_egress_from_protocol_11() {
-        assert_eq!((PROTOCOL, NO_FORWARDED_EGRESS), (11, 11));
-        assert!(negotiate(PROTOCOL, 10).unwrap() < NO_FORWARDED_EGRESS);
+        assert_eq!(NO_FORWARDED_EGRESS, 11);
+        assert!(negotiate(NO_FORWARDED_EGRESS, 10).unwrap() < NO_FORWARDED_EGRESS);
+    }
+
+    /// #368: egress slices from protocol 12. A node at 11 talks 11 to a control host at 12, below
+    /// [`EGRESS_SLICE`] (a box whose zone caps egress doesn't start there,
+    /// `noderun::refuse_older_node`); a start and a spend report from before have no egress fields.
+    #[test]
+    fn egress_slices_and_counts_from_protocol_12() {
+        assert_eq!((PROTOCOL, EGRESS_SLICE), (12, 12));
+        assert!(negotiate(PROTOCOL, 11).unwrap() < EGRESS_SLICE);
+        let slice = wicket_core::window::EgressSlice { requests: Some(25), bytes: None };
+        let v = serde_json::to_value(Msg::EgressSlice { run: "r".into(), slice }).unwrap();
+        assert_eq!(v, serde_json::json!({"m":"egress_slice","run":"r","slice":{"requests":25}}));
+        assert!(matches!(serde_json::from_value(v).unwrap(), Msg::EgressSlice { slice: s, .. } if s == slice));
+        let old = serde_json::json!({"m":"spent","run":"r","spent":{"requests":1,"input_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"output_tokens":0}});
+        assert!(matches!(serde_json::from_value(old).unwrap(), Msg::Spent { egress: None, .. }));
+        let used = wicket_core::window::EgressUse { requests: 3, bytes: 10 };
+        let new =
+            serde_json::to_value(Msg::Spent { run: "r".into(), spent: Default::default(), first_request_ms: None, egress: Some(used) })
+                .unwrap();
+        assert_eq!(new["egress"], serde_json::json!({"requests":3,"bytes":10}));
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values; a control host

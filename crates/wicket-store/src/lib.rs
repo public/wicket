@@ -300,6 +300,9 @@ CREATE TABLE IF NOT EXISTS operator_messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, text TEXT NOT NULL, by TEXT NOT NULL,
   created_at INTEGER NOT NULL, consumed_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS egress_windows (
+  key TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS turn_cancels (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, by TEXT NOT NULL,
   created_at INTEGER NOT NULL, consumed_at INTEGER
@@ -713,6 +716,23 @@ impl Ledger {
         tx.execute("UPDATE mode_changes SET consumed_at = ?2 WHERE run = ?1 AND consumed_at IS NULL", params![run, t])?;
         tx.commit()?;
         Ok(asked)
+    }
+
+    // ---- windowed egress caps (#368) ----
+
+    /// A principal's egress window (`wicket-cli`'s `egress_window`: JSON), if it has one.
+    pub fn egress_window(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT state FROM egress_windows WHERE key = ?1", params![key], |r| r.get(0)).optional()?)
+    }
+
+    /// Saves a principal's egress window.
+    pub fn put_egress_window(&self, key: &str, state: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO egress_windows (key, state, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+            params![key, state, now()],
+        )?;
+        Ok(())
     }
 
     // ---- identities and messages (design §3.2) ----

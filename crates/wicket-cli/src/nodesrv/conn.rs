@@ -321,6 +321,14 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     l.set_slice(Some(slice));
                 }
             }
+            Msg::EgressSlice { run, slice } => {
+                if let Err(e) = node.slices.put_egress(&run, &slice) {
+                    eprintln!("[node] {run}: keeping its egress slice: {e:#}");
+                }
+                if let Some(c) = node.egress_counters.lock().expect("egress counters").get(&run) {
+                    c.set_slice(Some(slice));
+                }
+            }
             Msg::SecretRevoke { run, name } => node.secrets.revoke(&run, &name),
             m @ Msg::SecretFetched { .. } => {
                 let Msg::SecretFetched { id, .. } = &m else { unreachable!() };
