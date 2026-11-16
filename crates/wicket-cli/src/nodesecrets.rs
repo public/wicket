@@ -414,24 +414,36 @@ impl wicket_proxy::vault::SecretSource for RunSecrets {
     }
 
     fn fetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let lock = {
-                let mut m = self.cache.inflight.lock().expect("inflight");
-                m.entry((self.run.clone(), name.to_string())).or_default().clone()
-            };
-            let _one = lock.lock().await;
-            if self.has(name) {
-                return Ok(());
+        Box::pin(self.fetch_from_control_host(name, false))
+    }
+
+    /// The upstream refused the value held (#360): ask the control host for the current one, even
+    /// though it is held (it may not have said yet that the secret changed).
+    fn refetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
+        Box::pin(self.fetch_from_control_host(name, true))
+    }
+}
+
+impl RunSecrets {
+    /// Fetches `name` for this run, one fetch at a time per run and name: if it isn't held, or
+    /// always with `again`.
+    async fn fetch_from_control_host(&self, name: &str, again: bool) -> Result<()> {
+        let lock = {
+            let mut m = self.cache.inflight.lock().expect("inflight");
+            m.entry((self.run.clone(), name.to_string())).or_default().clone()
+        };
+        let _one = lock.lock().await;
+        if !again && wicket_proxy::vault::SecretSource::has(self, name) {
+            return Ok(());
+        }
+        match (self.fetch)(self.run.clone(), name.to_string()).await {
+            Ok(f) if f.name == name => {
+                self.cache.put(&self.run, &f);
+                Ok(())
             }
-            match (self.fetch)(self.run.clone(), name.to_string()).await {
-                Ok(f) if f.name == name => {
-                    self.cache.put(&self.run, &f);
-                    Ok(())
-                }
-                Ok(_) => bail!("the control host sent another secret"),
-                Err(e) => bail!("{e}"),
-            }
-        })
+            Ok(_) => bail!("the control host sent another secret"),
+            Err(e) => bail!("{e}"),
+        }
     }
 }
 
@@ -701,6 +713,26 @@ mod tests {
         // Never on disk: nothing but the control host's own vault, in this test's directory, holds it.
         std::fs::remove_dir_all(d.join("vault")).unwrap();
         assert!(!grep_tree(&d, VALUE), "the value reached a file");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// #360: an upstream refused the value a node holds (the login refreshed on the control host,
+    /// which hasn't said so yet): a refetch asks the control host again though the value is held,
+    /// and takes the new value; a plain `ensure` still doesn't.
+    #[tokio::test]
+    async fn a_refetch_asks_the_control_host_again_though_held() {
+        let d = tmp("refetch");
+        let v = control(&d);
+        let z = zone("name: za\ninject: [{ host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: gh }]\n");
+        let (up, calls) = (Arc::new(AtomicI64::new(1)), Arc::new(AtomicU64::new(0)));
+        let cache = Cache::new(Arc::new(|| 1_000));
+        let a = Vault::from_source(cache.source(RA, fetcher(v.clone(), z, up, calls.clone())));
+        a.ensure("gh").await.unwrap();
+        v.set("gh", "ghp_wicket-test-refreshed").unwrap();
+        a.ensure("gh").await.unwrap();
+        assert_eq!((a.get("gh").unwrap().as_str(), calls.load(Ordering::SeqCst)), (VALUE, 1), "held: not fetched again");
+        a.refetch("gh").await.unwrap();
+        assert_eq!((a.get("gh").unwrap().as_str(), calls.load(Ordering::SeqCst)), ("ghp_wicket-test-refreshed", 2));
         let _ = std::fs::remove_dir_all(d);
     }
 
