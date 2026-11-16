@@ -38,3 +38,4 @@
 {"label":"base-j1c","step":"cli-test","secs":6.71,"peak_mib":2179,"commit":"8275c33","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
 {"label":"base-j1c","step":"cli-test","secs":6.76,"peak_mib":2172,"commit":"8275c33","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
 {"label":"base-j1c","step":"cli-clippy-clean","secs":190.64,"peak_mib":1860,"commit":"8275c33","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"after-j1c","step":"cli-clean","secs":329.42,"peak_mib":2401,"commit":"907de73","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
