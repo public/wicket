@@ -1168,7 +1168,10 @@ async fn on_frame(
                 if let Some(r) = result {
                     let out = sh.dir.join("workspace/out");
                     let _ = std::fs::create_dir_all(&out);
-                    let _ = std::fs::write(out.join("result.json"), r);
+                    // The outbox taken is the run's work collected (#377), once it is here.
+                    if std::fs::write(out.join("result.json"), r).is_ok() {
+                        let _ = sh.ledger.lock().expect("ledger").record_collected(&sh.run.0, "outbox");
+                    }
                 }
                 // End of output: the run loop's readers see EOF, then the exit.
                 io.stdout.take();
@@ -1176,8 +1179,22 @@ async fn on_frame(
                 if let Some(t) = io.exit.take() {
                     let _ = t.send(code);
                 }
+                // The node may delete the run's files once its work is collected (#377): this host's own
+                // node keeps them anyway (they are the run's directory here); a remote node's
+                // workspace, with nothing of it collected, stays until an operator forces it.
                 if !sh.ctl.keep {
-                    send(Frame::Msg(Msg::Forget { run }));
+                    match forget_refused(&sh.ledger.lock().expect("ledger"), &sh.node, &sh.run.0) {
+                        None => send(Frame::Msg(Msg::Forget { run })),
+                        Some(why) => {
+                            println!("[wicket] {why}");
+                            let _ = sh.ledger.lock().expect("ledger").audit(
+                                &sh.tenant,
+                                Some(&sh.run),
+                                "run.cleanup_refused",
+                                &serde_json::json!({ "node": sh.node, "why": why }),
+                            );
+                        }
+                    }
                 }
                 // The box is gone: its token leaves the feed (the node no longer needs it).
                 let dropped = sh.ctl.publisher.lock().and_then(|mut f| {
@@ -2122,5 +2139,66 @@ mod tests {
         let o = egress("GET", "api.example.com", "/x");
         let (_, why) = check_node_op(&t, &run, &zone, "run_a", &o).unwrap();
         assert_eq!(wicket_core::evaluate(&zone, &o), wicket_core::Verdict::NeedsGrant(why));
+    }
+}
+
+/// Why `run`'s files on `node` aren't deleted yet (#377): its work hasn't been collected, and it is
+/// a remote node's (this host's own node keeps a run's files as its run directory). None: they may be.
+pub fn forget_refused(l: &wicket_store::Ledger, node: &str, run: &str) -> Option<String> {
+    if node == crate::localnode::NAME || l.collected(run).is_ok_and(|c| !c.is_empty()) {
+        return None;
+    }
+    Some(format!(
+        "run {run}'s work hasn't been collected (no fetch, outbox, push or bundle is recorded): node {node} keeps its workspace; `wicket node forget {run} --force` deletes it"
+    ))
+}
+
+/// `wicket node forget <run>`: lets the run's node delete its files, its workspace among them
+/// (#377). Refused while the run's work isn't collected, unless `force`; a forced delete is audited.
+pub async fn forget_command(run: &str, force: bool, by: &str) -> anyhow::Result<()> {
+    crate::run::check_run_id(run)?;
+    let ledger = Arc::new(Mutex::new(wicket_store::Ledger::open(&crate::ledger_path())?));
+    let (node, refused) = {
+        let l = ledger.lock().expect("ledger");
+        let node = l.run_node(run)?.with_context(|| format!("run {run} wasn't placed on a node"))?;
+        let refused = forget_refused(&l, &node, run);
+        (node, refused)
+    };
+    match (&refused, force) {
+        (Some(why), false) => anyhow::bail!("{why}"),
+        (Some(_), true) => {
+            ledger.lock().expect("ledger").audit(
+                &wicket_core::TenantId::single(),
+                Some(&wicket_core::RunId(run.into())),
+                "run.cleanup_forced",
+                &serde_json::json!({ "node": node, "by": by, "why": "its work was never collected" }),
+            )?;
+        }
+        (None, _) => {}
+    }
+    let link = crate::nodecall::Link::connect(&node, &format!("forget:{}", std::process::id()), &ledger).await?;
+    if !link.runs.iter().any(|r| r.run == run) {
+        println!("node {node} has no files for run {run}");
+        return Ok(());
+    }
+    link.calls.forget(run);
+    // A round trip after it: the node has handled the forget once this is answered.
+    let _ = link.calls.has_image("sha256:0000000000000000000000000000000000000000000000000000000000000000").await;
+    println!("node {node} deletes run {run}'s files{}", if refused.is_some() { " (forced: its work was never collected)" } else { "" });
+    Ok(())
+}
+
+#[cfg(test)]
+mod forget_tests {
+    /// #377: a remote node's files for a run whose work was never collected stay; collected any
+    /// way, or on this host's own node, they may go.
+    #[test]
+    fn an_uncollected_workspace_is_not_forgotten() {
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        let why = super::forget_refused(&l, "n1", "run_a").expect("refused");
+        assert!(why.contains("hasn't been collected") && why.contains("--force"), "{why}");
+        assert!(super::forget_refused(&l, crate::localnode::NAME, "run_a").is_none(), "this host's own node keeps them anyway");
+        l.record_collected("run_a", "outbox").unwrap();
+        assert!(super::forget_refused(&l, "n1", "run_a").is_none());
     }
 }

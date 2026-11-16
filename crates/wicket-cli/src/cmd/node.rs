@@ -71,6 +71,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
+            NodeCmd::Forget { run, force } => noderun::forget_command(&run, force, &operator()).await,
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
@@ -188,6 +189,16 @@ pub enum NodeCmd {
         /// Print the node's status once, as JSON.
         #[arg(long, conflicts_with = "once")]
         json: bool,
+    },
+    /// Let a run's node delete the run's files, its workspace among them. Refused while the run's
+    /// work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation
+    /// bundle), unless --force; a forced delete is audited.
+    Forget {
+        /// The run.
+        run: String,
+        /// Delete them even though the run's work was never collected.
+        #[arg(long)]
+        force: bool,
     },
     /// On the node: join stdin and stdout to `node serve`'s control socket (what the control host
     /// runs over ssh).

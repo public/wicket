@@ -115,6 +115,8 @@ pub fn route(cmd: &Cmd) -> Route {
             NodeCmd::Token { .. } | NodeCmd::Enrol { .. } | NodeCmd::Revoke { .. } | NodeCmd::RenewCa { .. } | NodeCmd::Install { .. } => {
                 Forward(Privileged)
             }
+            // Deletes a run's files on its node, perhaps uncollected work.
+            NodeCmd::Forget { .. } => Forward(Privileged),
             NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } => Local,
         },
         // Applying an org policy changes what every box may do, and revokes runs.

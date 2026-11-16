@@ -151,6 +151,22 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// Records that `run`'s work was collected, and how (#377): `fetched` (its files came back to
+    /// the control host), `outbox` (its result was taken), `pushed` (a git push it made was
+    /// allowed), `bundled` (its state was pushed as it hibernated). The first time each way counts.
+    pub fn record_collected(&self, run: &str, how: &str) -> Result<()> {
+        self.conn.execute("INSERT OR IGNORE INTO run_collected (run, how, at) VALUES (?1, ?2, ?3)", params![run, how, crate::now()])?;
+        Ok(())
+    }
+
+    /// How (and when, Unix s) `run`'s work was collected; empty: it hasn't been, and a cleanup
+    /// doesn't delete its workspace unless forced.
+    pub fn collected(&self, run: &str) -> Result<Vec<(String, i64)>> {
+        let mut st = self.conn.prepare("SELECT how, at FROM run_collected WHERE run = ?1 ORDER BY at, how")?;
+        let rows = st.query_map([run], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn node_feed_at(&self, node: &str, epoch: i64) -> Result<()> {
         self.conn.execute("UPDATE grants SET node_epoch = NULL WHERE node = ?1 AND node_epoch <= ?2", params![node, epoch])?;
         Ok(())
@@ -519,5 +535,19 @@ mod health_tests {
         l.set_node_health("n1", 2, "{}").unwrap();
         l.set_node_health("n2", 3, "{\"a\":2}").unwrap();
         assert_eq!(l.node_health().unwrap(), [("n1".to_string(), 2, "{}".to_string()), ("n2".to_string(), 3, "{\"a\":2}".to_string())]);
+    }
+
+    /// #377: a run's work is collected once each way, and a run never collected has nothing.
+    #[test]
+    fn a_runs_collection_is_recorded_once_each_way() {
+        let l = Ledger::open_in_memory().unwrap();
+        assert!(l.collected("run_a").unwrap().is_empty());
+        l.record_collected("run_a", "outbox").unwrap();
+        l.record_collected("run_a", "outbox").unwrap();
+        l.record_collected("run_a", "fetched").unwrap();
+        let hows: Vec<String> = l.collected("run_a").unwrap().into_iter().map(|(h, _)| h).collect();
+        assert_eq!(hows.len(), 2);
+        assert!(hows.contains(&"outbox".to_string()) && hows.contains(&"fetched".to_string()));
+        assert!(l.collected("run_b").unwrap().is_empty());
     }
 }

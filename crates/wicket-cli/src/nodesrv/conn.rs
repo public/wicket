@@ -346,6 +346,7 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     // but for the run's caches (#377).
                     if !node.paths.shares_host() && b.dir.starts_with(node.paths.runs()) {
                         let _ = std::fs::remove_dir_all(&b.dir);
+                        node.audit_note(&run, "run.files_deleted", serde_json::json!({ "dir": b.dir.display().to_string() }));
                     } else if b.dir.starts_with(node.paths.runs()) {
                         super::volumes::drop_caches(&b.dir);
                     }
