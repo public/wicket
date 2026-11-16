@@ -502,9 +502,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         bail!("{} is not an enrolled node: enrol it (wicket node enrol) and install wicket there (wicket node install); boxes run only through a node's `wicket node serve`", n.target);
     }
     let node_name = node.as_ref().and_then(|n| n.name.clone()).unwrap_or_else(|| crate::localnode::NAME.to_string());
-    if node.is_some() {
-        crate::nodecreate::refuse_past_lease(&Ledger::open(&ledger_path())?, &node_name, wicket_store::now())?;
-    }
+    let start_by = match node.is_some() {
+        true => crate::nodecreate::refuse_past_lease(&Ledger::open(&ledger_path())?, &node_name, wicket_store::now())?,
+        false => None,
+    };
     // This host's own node shares its filesystem. That is only transport: it lays the box out in the
     // run's own directory (so the run's trees needn't be sent to it), reaches the run's proxies by
     // their sockets, and can mount a directory of this host's in the box (in place, or wrapped).
@@ -1257,6 +1258,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             long_lived: box_tmp,
             name: Some(spec.name.clone()),
             llm_prior: llm.spent_total(),
+            start_by,
             output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
             // Swapped on the node (#257): their names and placeholders only, the credentials

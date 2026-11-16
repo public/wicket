@@ -124,9 +124,10 @@ fn placement_without(name: &str, seed: u64, options: wicket_sim::placement::Opti
 }
 
 /// `wicket run --node` started boxes on a placed node past its lease, each run then holding it.
+/// (Since #395 the node refuses such a start too: both halves of the lease guard are off here.)
 #[test]
 fn without_the_lease_check_runs_start_on_a_node_past_its_lease() {
-    let o = wicket_sim::placement::Options { refuse_past_lease: false, ..Default::default() };
+    let o = wicket_sim::placement::Options { refuse_past_lease: false, start_by: false, ..Default::default() };
     placement_without("lease", 2, o, "past its lease");
 }
 
@@ -181,4 +182,59 @@ fn a_node_that_decided_hosts_its_ca_cannot_cover_would_honour_their_grants() {
     assert!(r.violations.iter().all(|v| v.contains("outside the node's CA")), "and breaks nothing else: {r}");
     let ok = wicket_sim::run(1, &dir().join("uncovered-ok"));
     assert!(ok.ok() && ok.stats.spliced > 0 && ok.stats.uncovered_refused > 0, "both ways exercised: {:?}", ok.stats);
+}
+
+/// The placement seeds the nightly run filed (#395–#399), each its own regression test through
+/// [`nightly_placement_seed`]: they hold with the fixes.
+fn nightly_placement_seed(seed: u64) {
+    let r = wicket_sim::placement::run(seed, &dir().join(format!("nightly-{seed}")), Default::default());
+    assert!(r.ok(), "placement seed {seed} breaks an invariant again: {r}");
+}
+
+/// #395: a run's box started on its node 3 s past the node's lease (checked when the run began).
+#[test]
+fn placement_seed_32000006_starts_no_box_past_a_lease() {
+    nightly_placement_seed(32_000_006);
+}
+
+/// #396: the same race, around control-host crashes.
+#[test]
+fn placement_seed_32000129_starts_no_box_past_a_lease() {
+    nightly_placement_seed(32_000_129);
+}
+
+/// #397: a node billed past its lease with nothing on it: the stand-in node still answered for a
+/// box its supervisor had fetched and forgotten, so the supervisor re-attached after a control-host
+/// crash fetched again, failed, and held the node for files that were gone.
+#[test]
+fn placement_seed_32000134_releases_a_node_whose_work_was_collected() {
+    nightly_placement_seed(32_000_134);
+}
+
+/// #398: the start race on a partitioned node.
+#[test]
+fn placement_seed_32000183_starts_no_box_past_a_lease() {
+    nightly_placement_seed(32_000_183);
+}
+
+/// #399: as #397, with the crash between the fetch and the run's end.
+#[test]
+fn placement_seed_32000274_releases_a_node_whose_work_was_collected() {
+    nightly_placement_seed(32_000_274);
+}
+
+/// #395: with only the check when the run begins (no `BoxStart::start_by`), the start races it and
+/// a box starts on a node past its lease.
+#[test]
+fn without_the_start_by_a_box_starts_past_its_nodes_lease() {
+    let o = wicket_sim::placement::Options { start_by: false, ..Default::default() };
+    placement_without("start-by", 32_000_006, o, "started on node");
+}
+
+/// Found by the fresh-seed sweep after #395–#399: a run's statement, signed before another run's
+/// and delivered late, named an epoch older than the history its node held (the node had been
+/// caught up from a later snapshot) and was refused as a rollback. It is superseded.
+#[test]
+fn placement_seed_50002077_takes_a_late_statement_as_superseded() {
+    nightly_placement_seed(50_002_077);
 }
