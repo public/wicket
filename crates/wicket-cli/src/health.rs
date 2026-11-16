@@ -261,6 +261,97 @@ pub fn admit(want_mib: u64, room_mib: u64, m: &Memory, d: &Disk) -> Result<(), S
     Ok(())
 }
 
+/// The node's disk reserve (#377): a file of preallocated space in its data directory that box
+/// volumes can't use, because it is already taken. When the node can't write its own state (feed,
+/// audit log, replica, spend journal) it releases the reserve and writes again; it takes it back
+/// once the disk has room for it above the floor.
+pub struct Reserve {
+    pub path: std::path::PathBuf,
+    pub size: u64,
+}
+
+/// The environment variable that sets a node's reserve, MiB (0: none).
+pub const RESERVE_ENV: &str = "WICKET_NODE_RESERVE_MIB";
+
+impl Reserve {
+    /// The reserve for the node at `root`: [`RESERVE_ENV`] MiB, else 2% of the disk, at least
+    /// 256 MiB and at most 2 GiB.
+    pub fn for_node(root: &Path) -> Reserve {
+        let size = match std::env::var(RESERVE_ENV).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(mib) => mib << 20,
+            None => (disk(root).total_bytes / 50).clamp(256 << 20, 2 << 30),
+        };
+        Reserve { path: root.join("reserve"), size }
+    }
+
+    /// The space it holds now.
+    pub fn held(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Takes the reserve if it isn't held and the disk has room for it above the floor. Returns
+    /// whether it was taken now.
+    pub fn take(&self) -> std::io::Result<bool> {
+        if self.size == 0 || self.held() >= self.size {
+            return Ok(false);
+        }
+        let d = disk(&self.path);
+        if d.avail_bytes < self.size + disk_floor(&d) {
+            return Ok(false);
+        }
+        let tmp = self.path.with_extension("tmp");
+        let r = preallocate(&tmp, self.size).and_then(|_| std::fs::rename(&tmp, &self.path));
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r.map(|_| true)
+    }
+
+    /// Gives the reserve's space back to the disk (for the node's own writes). Returns whether it
+    /// held any.
+    pub fn release(&self) -> bool {
+        let held = self.held() > 0;
+        let _ = std::fs::remove_file(&self.path);
+        held
+    }
+}
+
+/// A file of `len` bytes whose blocks are allocated (not sparse): `posix_fallocate`, or zeros where
+/// the filesystem doesn't support it.
+fn preallocate(path: &Path, len: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(path)?;
+    // SAFETY: posix_fallocate on a file descriptor this function owns.
+    let rc = unsafe { libc::posix_fallocate(f.as_raw_fd(), 0, len as libc::off_t) };
+    if rc == 0 {
+        return f.sync_all();
+    }
+    if rc == libc::ENOSPC {
+        return Err(std::io::Error::from_raw_os_error(rc));
+    }
+    let mut w = std::io::BufWriter::new(&f);
+    let zeros = vec![0u8; 1 << 20];
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(zeros.len() as u64) as usize;
+        w.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    w.flush()?;
+    drop(w);
+    f.sync_all()
+}
+
+/// Whether `dir` can be written now: a small file written, synced and removed (how a node with a
+/// feed stalled for want of space learns the space is back).
+pub fn writable(dir: &Path) -> bool {
+    let p = dir.join(".probe");
+    let ok = std::fs::write(&p, vec![0u8; 64 << 10]).and_then(|_| std::fs::File::open(&p)?.sync_all()).is_ok();
+    let _ = std::fs::remove_file(&p);
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +437,24 @@ mod tests {
         assert!(admit(512, room_mib(&m, 0), &m, &d).unwrap_err().contains("inodes"));
         // A disk wicket can't read refuses nothing for it.
         assert!(refuses(&Disk::default()).is_none());
+    }
+
+    #[test]
+    fn the_reserve_is_taken_released_and_taken_back() {
+        let dir = std::env::temp_dir().join(format!("wicket-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = Reserve { path: dir.join("reserve"), size: 4 << 20 };
+        assert!(r.take().unwrap(), "taken");
+        assert_eq!(r.held(), 4 << 20);
+        assert!(!r.take().unwrap(), "already held");
+        assert!(r.release());
+        assert_eq!(r.held(), 0);
+        assert!(!r.release(), "nothing held");
+        assert!(r.take().unwrap(), "taken back");
+        assert!(Reserve { path: dir.join("none"), size: 0 }.take().is_ok_and(|t| !t), "no reserve configured");
+        assert!(writable(&dir));
+        assert!(!writable(&dir.join("missing")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -258,6 +258,11 @@ struct Node {
     /// Boxes admitted and still starting (#377), by run: their memory limits (MiB), counted as
     /// committed until the box is up or its start fails.
     admitting: Mutex<HashMap<String, u64>>,
+    /// The node's disk reserve (#377), released for its own writes when the disk is full.
+    reserve: crate::health::Reserve,
+    /// Since when (ms) feed frames have failed to persist, if they are failing: the node asks for
+    /// them again once it can write (#377).
+    feed_stalled: Mutex<Option<i64>>,
 }
 
 impl Node {
@@ -426,7 +431,7 @@ impl Node {
         let (persist_failures, last_persist_failure) = self.persists.get();
         crate::health::NodeHealth {
             at_ms: now,
-            disk: crate::health::disk(&self.paths.root),
+            disk: crate::health::Disk { reserve_bytes: self.reserve.held(), ..crate::health::disk(&self.paths.root) },
             memory: crate::health::Memory { total_mib, available_mib, committed_mib: self.capacity().used_memory_mib },
             feed_mode: mode,
             feed_fresh_until_ms: fresh_until,
@@ -435,6 +440,49 @@ impl Node {
             persist_failures,
             last_persist_failure,
         }
+    }
+
+    /// A feed frame wasn't persisted for want of space (#377): the reserve is released for it, and
+    /// the frame is tried again once. Returns the second try's result, if there was one.
+    fn feed_storage_failed(&self, bytes: &[u8], why: &wicket_feed::Refusal) -> Option<Result<(), wicket_feed::Refusal>> {
+        let now = (self.clock)();
+        self.persists.note(now, format!("feed: {why}"));
+        let again = self.reserve.release().then(|| {
+            eprintln!("[node] the disk reserve is released for the node's feed");
+            self.replica.lock().expect("replica").accept_bytes(bytes, now).map(|_| ())
+        });
+        if !matches!(again, Some(Ok(()))) {
+            self.feed_stalled.lock().expect("stalled").get_or_insert(now);
+        }
+        again
+    }
+
+    /// While feed frames fail to persist (#377): once the feed's directory can be written again,
+    /// the node asks every control connection for what it is missing (a catch-up), so it recovers
+    /// without a restart. Returns whether it did.
+    fn recover_feed(&self) -> bool {
+        let mut stalled = self.feed_stalled.lock().expect("stalled");
+        let Some(since) = *stalled else { return false };
+        if !crate::health::writable(&self.paths.feed()) {
+            return false;
+        }
+        *stalled = None;
+        drop(stalled);
+        eprintln!("[node] the feed can be written again (it couldn't since {since} ms): asking for what it missed");
+        let _ = self.audit.lock().expect("audit").audit(
+            &wicket_core::TenantId::single(),
+            None,
+            "feed.recovered",
+            &serde_json::json!({ "stalled_since_ms": since }),
+        );
+        let status = {
+            let r = self.replica.lock().expect("replica");
+            Msg::FeedStatus { mode: r.mode((self.clock)()), epoch: r.state().map(|s| s.epoch), refused: None, catch_up: Some(r.hello()) }
+        };
+        for l in self.links.lock().expect("links").values() {
+            let _ = l.out.send(Frame::Msg(status.clone()));
+        }
+        true
     }
 
     /// Sends this node's health on every connection that takes it (#377).
@@ -766,6 +814,14 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         Err(e) => eprintln!("[node] the secret cache handed over is refused: {e:#}"),
     }
     let slices = crate::nodesecrets::Slices::new(&node_root)?;
+    // The disk reserve (#377): taken now if the disk has room for it, and again whenever it has.
+    let reserve = crate::health::Reserve::for_node(&node_root);
+    match reserve.take() {
+        Ok(true) => eprintln!("[node] disk reserve: {} MiB held for the node's own state", reserve.size >> 20),
+        Ok(false) if reserve.held() > 0 => {}
+        Ok(false) => eprintln!("[node] disk reserve: not held (no room for {} MiB above the floor)", reserve.size >> 20),
+        Err(e) => eprintln!("[node] disk reserve: not held ({e})"),
+    }
     let node = Arc::new(Node {
         name: name.clone(),
         paths,
@@ -799,6 +855,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         ooms: Default::default(),
         persists: Default::default(),
         admitting: Default::default(),
+        reserve,
+        feed_stalled: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -879,6 +937,16 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                 // Its health, to the control host (#377).
                 if tick5.is_multiple_of(crate::health::REPORT_EVERY.as_secs()) {
                     n.report_health();
+                }
+                // A stalled feed is asked for again once it can be written; the reserve is taken
+                // back once there is room for it (#377).
+                if tick5.is_multiple_of(5) {
+                    n.recover_feed();
+                }
+                if tick5.is_multiple_of(60) && n.feed_stalled.lock().expect("stalled").is_none() {
+                    if let Ok(true) = n.reserve.take() {
+                        eprintln!("[node] disk reserve: taken back ({} MiB)", n.reserve.size >> 20);
+                    }
                 }
                 // Secrets past their expiry are dropped (#152); their use already ended.
                 n.secrets.sweep();
@@ -2477,6 +2545,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             ooms: Default::default(),
             persists: Default::default(),
             admitting: Default::default(),
+            reserve: crate::health::Reserve { path: i.dir.join("reserve"), size: 1 << 20 },
+            feed_stalled: Default::default(),
         })
     }
 
@@ -2666,6 +2736,29 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let h = node.status().health.expect("health in the status");
         assert_eq!((h.oom_kills, h.persist_failures), (1, 2));
         assert_eq!(h.last_persist_failure.map(|e| e.at_ms), Some(7));
+    }
+
+    /// #377: a feed frame not persisted for want of space releases the node's reserve and is tried
+    /// again; still failing, the feed is stalled until it can be written, then asked for again.
+    #[tokio::test]
+    async fn a_feed_that_cannot_be_persisted_recovers_once_it_can() {
+        let inst = Install::new("nodesrv-stall");
+        let node = test_node(&inst);
+        std::fs::create_dir_all(node.paths.feed()).unwrap();
+        assert!(node.reserve.take().unwrap());
+        let full = wicket_feed::Refusal::Storage("No space left on device".into());
+        let again = node.feed_storage_failed(b"not a frame", &full);
+        assert!(again.is_some_and(|r| r.is_err()), "tried again with the reserve released");
+        assert_eq!(node.reserve.held(), 0);
+        assert!(node.feed_stalled.lock().unwrap().is_some());
+        assert_eq!(node.health().persist_failures, 1);
+        // Once the feed's directory can be written, it is asked for again (and only once).
+        assert!(node.recover_feed());
+        assert!(node.feed_stalled.lock().unwrap().is_none());
+        assert!(!node.recover_feed());
+        // With no reserve left to release, the frame isn't tried again; the feed is stalled.
+        assert!(node.feed_storage_failed(b"x", &full).is_none());
+        assert!(node.feed_stalled.lock().unwrap().is_some());
     }
 
     /// #377: a box is admitted only into memory that is actually free, counting what the boxes

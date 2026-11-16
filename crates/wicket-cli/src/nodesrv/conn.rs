@@ -160,12 +160,18 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
     match f {
         Frame::Feed(bytes) => {
             let now = (node.clock)();
-            let r = node.replica.lock().expect("replica").accept_bytes(&bytes, now);
+            let mut r = node.replica.lock().expect("replica").accept_bytes(&bytes, now);
+            // Not persisted for want of space (#377): the node's reserve is released and the frame
+            // tried again; still failing, it is asked for again once the disk can be written.
+            if let Err(e) = r.clone() {
+                if e.kind() == "storage" {
+                    if let Some(again) = node.feed_storage_failed(&bytes, &e) {
+                        r = again;
+                    }
+                }
+            }
             if let Err(e) = &r {
                 eprintln!("[node] feed frame refused: {} ({e})", e.kind());
-                if e.kind() == "storage" {
-                    node.persists.note(now, format!("feed: {e}"));
-                }
                 let _ = node.audit.lock().expect("audit").audit(
                     &wicket_core::TenantId::single(),
                     None,
