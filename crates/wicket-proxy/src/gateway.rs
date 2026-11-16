@@ -1759,7 +1759,7 @@ mod spawn_request_tests {
         let s = spawn_request(&wide).unwrap();
         assert_eq!((s.kind.as_str(), s.command.len(), s.max_children, s.escalate), ("program", 1, 3, true));
         assert!(s.image.is_some() && s.zone.is_some() && s.placement.is_some());
-        // A task is the spawner's to require, not the parser's.
+        // A task is spawn.rs's to require, not the parser's.
         assert!(spawn_request(&json!({ "name": "x" })).is_ok());
     }
 

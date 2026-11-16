@@ -588,7 +588,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         (None, Some(r)) => wicket_agent::AgentSession { id: r.session_id.clone(), resume: true },
         (None, None) => match &adopt {
             Some((_, id)) if wicket_agent::AgentSession::valid(id) => wicket_agent::AgentSession { id: id.clone(), resume: false },
-            Some(_) => bail!("--adopt: not a session id"),
+            Some(_) => bail!("the adopted child's session isn't a session id"),
             None => wicket_agent::AgentSession::new(),
         },
     };

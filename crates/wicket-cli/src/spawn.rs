@@ -282,7 +282,7 @@ fn unrecord_quotas(c: &SpawnCtx, ids: &[String]) {
     }
 }
 
-/// A child its node started (#164), to take over: `wicket run --adopt`.
+/// A child its node started (#164), to take over: its supervisor adopts its box.
 pub struct Adopt {
     pub started_ms: i64,
     pub session: String,
