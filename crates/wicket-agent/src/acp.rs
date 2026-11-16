@@ -651,8 +651,9 @@ impl AcpClient {
 
 /// Which once-option a tool call gets, and why: the agent may attempt anything in its box except
 /// lowering its own oversight or writing a control file (research 21 §2.2). Decided on the kind and
-/// the paths, never on titles, option names or command text.
-fn decide(kind: &str, tc: &Value) -> (&'static str, String) {
+/// the paths, never on titles, option names or command text. The Claude adapter's `can_use_tool`
+/// answers use it too ([`crate::claude::control`]), with the tool's input as `rawInput`.
+pub fn decide(kind: &str, tc: &Value) -> (&'static str, String) {
     if kind == "switch_mode" {
         return ("reject_once", "a mode change is wicket's to make, not the agent's".into());
     }
