@@ -282,7 +282,6 @@ sys.exit(2)
         let (mut rd, mut wr) = s.into_split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
         calls.set_out(Some(tx));
-        calls.set_proto(chan::PROTOCOL);
         tokio::spawn(async move {
             while let Some(f) = rx.recv().await {
                 if wr.write_all(&f.encode()).await.is_err() {

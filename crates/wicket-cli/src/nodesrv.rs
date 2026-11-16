@@ -3027,7 +3027,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(node.queue.of(RUN).is_empty(), "answered: off the queue");
         assert_eq!(node.slices.get(RUN), Some(slice));
         assert!(crate::nodesecrets::Asks::open(&inst.dir).of(RUN).is_empty(), "and off the disk");
-        assert_eq!(node.proto_of(RUN), chan::PROTOCOL);
+        let owner = node.owner(RUN).expect("the run's connection");
+        assert_eq!(node.links.lock().unwrap().get(&owner).map(|l| l.proto), Some(chan::PROTOCOL), "it talks the negotiated version");
     }
 
     /// Done-when for #16: a node with an unexpected certificate is refused (wrong installation, wrong
