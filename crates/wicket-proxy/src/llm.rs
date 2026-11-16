@@ -342,6 +342,7 @@ impl Llm {
 
     fn event(&self, model: Option<String>, status: u16, u: Usage, outcome: &str) {
         self.ctx.emit(Event::Llm {
+            provider: self.ctx.zone.llm.as_ref().map(|l| l.provider.clone()),
             model,
             status,
             input_tokens: u.input,
