@@ -6,6 +6,10 @@
 //!   the replica refuses with a catch-up reason makes it redial and say hello again.
 //! - **Decisions**: every egress request is `Replica::decide` on the node's own clock (skewed),
 //!   in whatever mode the replica is in. Cut off, the node keeps deciding on the grants it holds.
+//!   First `wicket_proxy::decide::route` says whether the node's CA covers the host: one it can't
+//!   cover is spliced if the box's token allows it wholesale (`Replica::splice`, the `Decider`'s
+//!   splice) and refused otherwise, as the node's egress proxy does since #257's slice 3. Nothing
+//!   is forwarded to the control host.
 //! - **The model proxy** (`serve_box`'s `Llm::new`): the zone's budget, bounded by the run's slice
 //!   (`set_slice`). It restarts from the spend file and the slice on disk (`SPEND_FILE`,
 //!   `nodesecrets::Slices`). The spend file is written before each call goes upstream, with calls
@@ -18,7 +22,7 @@
 use crate::control::AbortOnDrop;
 use crate::oracle::OpClass;
 use crate::wire::{self, BoxReq, BoxResp, Ctl};
-use crate::{true_now, Env, CONTROL_PORT, FORBIDDEN_HOST, GRANT_PATHS, NODE, NODE_PORT, READ_PATH, RUNS, SILENCE_MS};
+use crate::{true_now, Env, CONTROL_PORT, EPOCH_MS, FORBIDDEN_HOST, GRANT_PATHS, NODE, NODE_CA, NODE_PORT, READ_PATH, RUNS, SILENCE_MS};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -202,13 +206,27 @@ async fn serve_box(node: Rc<Node>, s: turmoil::net::TcpStream) {
             Ok(BoxReq::Egress { method, host, path }) => {
                 let class = if host == FORBIDDEN_HOST {
                     OpClass::Forbidden
-                } else if method == "GET" && path == READ_PATH {
+                } else if (method == "GET" && path == READ_PATH) || host == crate::SPLICED_HOST {
                     OpClass::Reach
                 } else {
                     OpClass::NeedsGrant
                 };
-                let op = Op::egress(&TenantId(crate::TENANT.into()), &RunId(run.clone()), &env.zone.name, &method, &host, &path);
+                let tenant = TenantId(crate::TENANT.into());
+                let op = Op::egress(&tenant, &RunId(run.clone()), &env.zone.name, &method, &host, &path);
                 let now = node.now();
+                // The node's CA, name-constrained to NODE_CA and valid for a day.
+                let ca: Vec<String> = NODE_CA.iter().map(|h| h.to_string()).collect();
+                let not_after = (EPOCH_MS + 86_400_000) / 1000;
+                let route = wicket_proxy::decide::route(&host, Some((&ca[..], not_after)), now / 1000);
+                if let (wicket_proxy::decide::Route::Uncovered(why), true) = (&route, env.options.refuse_uncovered) {
+                    let spliced = node.replica.borrow().splice(&tenant, &run, &host, now);
+                    env.oracle.borrow_mut().uncovered(true_now(), &run, &host, &path, spliced);
+                    let resp = BoxResp::Egress { allowed: spliced.is_some(), why: format!("{why}: spliced {spliced:?}") };
+                    if wire::write_json(&mut wr, &resp).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let (d, mode, epoch) = {
                     let mut r = node.replica.borrow_mut();
                     let mode = r.mode(now);
@@ -221,6 +239,9 @@ async fn serve_box(node: Rc<Node>, s: turmoil::net::TcpStream) {
                     format!("{method} {path}")
                 };
                 env.oracle.borrow_mut().decided(true_now(), now, &run, class, &label, &d, mode, epoch);
+                if let (wicket_proxy::decide::Route::Uncovered(_), true) = (&route, d.is_allow()) {
+                    env.oracle.borrow_mut().decided_uncovered(true_now(), &run, &host, &path, &d);
+                }
                 BoxResp::Egress { allowed: d.is_allow(), why: format!("{d:?}") }
             }
             Ok(BoxReq::Model { max_tokens }) => model_call(&node, &run, max_tokens).await,

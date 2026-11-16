@@ -21,6 +21,7 @@ Safety (invariants):
 | `NoAllowAfterRevocation` | no allow with a grant whose revocation the decider has: the ledger for Central, the replica for the node |
 | `SpendWithinBudget` | what the provider billed for the box, plus every child's carve-out (each assumed spent in full), stays within the run's budget, across slices, crashes and reconnections |
 | `PeerNeverGrants` | every grant in the ledger was decided by a human, and every grant the node holds came from the publisher's feed |
+| `LedgerNeverDecides` | from #257's slice 3 the ledger records grants and never decides a request by one (`CentralAllow` never fires): one decision path, the node's |
 
 Liveness, under weak fairness for the plumbing only: the node restarts and reconnects, the feed
 is delivered, spend is written and reported, a call in flight lands, a child is adopted, and an
@@ -67,7 +68,7 @@ is not modelled here.
 | value | what decides | model actions |
 |---|---|---|
 | `"today"` | slices 1 and 2 done. Central decides forwarded hosts from the ledger, the control host's egress model gate makes model calls, and the gateway on the control host spawns | `CentralAllow`, `ChCall`, `ChSpawn`, and every node action |
-| `"slice3"` | no forwarded egress (Central and the model gate gone); the gateway still spawns on the control host | `ChSpawn`, and the node's |
+| `"slice3"` | no forwarded egress (done, #257 slice 3): Central and the model gate gone; `Hand` publishes every grant, `FwdGrants` (on hosts the node's CA can't cover) included, and `NodeAllow` never uses one, since such a host is spliced or refused; the gateway still spawns on the control host | `ChSpawn`, and the node's |
 | `"end"` | slices 4–5: only the node decides, and spawns | the node's only |
 
 Each #257 slice PR should update this table and the switch, and keep every `pass_*.cfg` passing.
@@ -109,12 +110,12 @@ After #257's slice 3, `SeparateCounters` and the control host's own calls are mo
 | `PeerAsk` | `noderun.rs` `ask`, `check_node_ask` (a node's `Msg::Ask`); `nodegw.rs` `request_access` and the queue while cut off; the gateway's `request_access` |
 | `PeerForge` | `wicket-feed/src/replica.rs` `Replica::accept` → `plan`, `verify`: only frames the publisher signed are applied |
 | `Approve` | `wicket-cli/src/grant.rs` `decide` → `approve`; `wicket-store` `Ledger::approve` |
-| `Hand` | `noderun.rs` `sync_grants` (`route_sealed` = Terminate) → `wicket-store/src/node.rs` `hand_grant_to_node`, `live_grant`, `Publisher::commit` (`Change::PutZone`) |
+| `Hand` | `noderun.rs` `sync_grants` (today: `route_sealed` = Terminate; since slice 3 every egress grant) → `wicket-store/src/node.rs` `hand_grant_to_node`, `live_grant`, `Publisher::commit` (`Change::PutZone`) |
 | `Renew` | `grant.rs` `renew`; `node.rs` `renew_grant`; `noderun.rs` `renew_live`, `sync_grants` |
 | `Revoke` | `node.rs` `revoke_grant`; `noderun.rs` `sync_grants` (`Change::Revoke`) |
 | `Deliver` | `nodesrv/conn.rs` (feed frames from the channel) → `Replica::accept`; it resumes from the node's epoch on reconnect (`Replica::hello`) |
-| `NodeAllow` | `wicket-proxy/src/decide.rs` `NodeDecider` → `wicket-feed/src/token.rs` `Replica::<BoxAuthority>::decide` (`request`: whole seconds) |
-| `CentralAllow` | `decide.rs` `Central` → `wicket-store/src/lib.rs` `Ledger::consume_grant`, `live_grant` (`expires_at > now`, `node IS NULL`) |
+| `NodeAllow` | `wicket-proxy/src/decide.rs` `route` (only a host the node's CA covers; else `egress/connect.rs` splices or `refuse_uncovered`), then `NodeDecider` → `wicket-feed/src/token.rs` `Replica::<BoxAuthority>::decide` (`request`: whole seconds) |
+| `CentralAllow` | today only (removed in slice 3): `decide.rs` `Central` → `wicket-store/src/lib.rs` `Ledger::consume_grant`, which since slice 3 refuses an egress op |
 | `NodeAdmit` | `wicket-proxy/src/llm.rs` `Llm::admit` (slice, then zone), `filter`, `reserve_output`; with #333, `Llm::journal` |
 | `NodeUpstream` | `llm.rs` `Llm::handle`: the call sent upstream |
 | `NodePersist` | `nodesrv.rs` `serve_box`'s spend task (`SPEND_FILE`; with #333, `write_spend`) |
@@ -154,7 +155,7 @@ a 1 GiB heap:
 | cfg | half | states (distinct) | time |
 |---|---|---|---|
 | `GrantsOnNodes.cfg` | both, end state: 1 grant, 4 ticks, budget 2, 1 spawn, 2 faults | 101,762 | 26 s |
-| `pass_grants_end`, `pass_grants_today` | grants: 2 grants (one forwarded), 5 ticks at 2 per second, 1 renewal, 2 faults | 424,704 | 90 s each |
+| `pass_grants_end`, `pass_grants_slice3`, `pass_grants_today` | grants: 2 grants (one on a host the node's CA can't cover), 5 ticks at 2 per second, 1 renewal, 2 faults | 424,704 (today) | 90 s each |
 | `pass_budget_end`, `_slice3`, `_today` | budget: budget 4, step 2, 2 spawns of 1, 3 faults | 5,591 to 14,803 | under 10 s |
 | `fail_*` | as their half | (stops at the violation) | under 10 s |
 

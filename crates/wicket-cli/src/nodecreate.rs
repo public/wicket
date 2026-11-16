@@ -1,7 +1,8 @@
 //! `wicket node create`, `release` and `plans`: nodes leased from a provider, through the placement
 //! interface (`wicket-placement`, #37), and the provider half of `wicket node list`.
 //!
-//! `create` runs the whole path for one Vultr node: the money envelope and a terminal approval, a
+//! `create` runs the whole path for one Vultr node: the money envelope and a CAPACITY request
+//! ([`CapacityApprover`]: approved by a capacity grant that covers it, else by an operator), a
 //! tagged instance whose cloud-init runs `deploy/vultr/node-setup.sh` with an ssh host key generated
 //! here and pinned before boot, the wait for it to be active and set up, and `wicket node enrol` with
 //! that key (no trust on first use). Then the boot host key is scrubbed from the instance's user data.
@@ -18,7 +19,6 @@
 //! API's Authorization header.
 
 use anyhow::{bail, Context, Result};
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 use wicket_core::TenantId;
@@ -95,6 +95,10 @@ pub struct CreateArgs {
     /// 15 minutes for setup.
     #[arg(long, default_value = "4m")]
     give_up_silent: String,
+    /// How long to wait for an operator when none of your capacity grants covers the node (the
+    /// request is pending meanwhile, on the console and in `wicket pending`); 0: don't wait.
+    #[arg(long, default_value = "15m")]
+    wait: String,
 }
 
 fn owner_name(c: &Common) -> String {
@@ -218,61 +222,135 @@ fn fmt_time(t: i64) -> String {
     humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
 }
 
-/// Asks on the terminal. Without one, nothing is approved.
-///
-/// Through wicketd (an installed host) the command runs in the daemon, which has no controlling
-/// terminal: there the caller's own stdin and stderr, passed over the socket, are the terminal when
-/// both are one. Piped input is never taken as an approval.
-struct TerminalApprover;
-
-/// The caller's terminal: /dev/tty, else stdin (read) and stderr (write) when both are terminals.
-fn approval_terminal() -> Option<(Box<dyn std::io::Read + Send>, Box<dyn std::io::Write + Send>)> {
-    use std::io::IsTerminal;
-    if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
-        let w = tty.try_clone().ok()?;
-        return Some((Box::new(tty), Box::new(w)));
-    }
-    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-        return Some((Box::new(std::io::stdin()), Box::new(std::io::stderr())));
-    }
-    None
+/// Decides a node's spend as a CAPACITY request (#256): `CAPACITY wicket.internal
+/// /capacity/node/<name>`, filed by the principal running `create`. A live capacity grant of that
+/// principal's that covers the node approves it at once, through [`crate::grant::decide`], and the
+/// decision is audited against the grant. Otherwise it waits, pending, for an operator (`wicket
+/// approve`, or the console, which notifies) for up to `wait`, and is denied when nobody decides.
+/// The placer calls it only for a node already inside the money envelope.
+pub struct CapacityApprover {
+    pub ledger: PathBuf,
+    pub tenant: TenantId,
+    /// Who asks: the operator's identity.
+    pub principal: String,
+    pub wait: Duration,
+    pub poll: Duration,
+    /// The request filed, once it is.
+    pub request: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
-impl SpendApprover for TerminalApprover {
-    async fn approve(&self, r: &SpendRequest) -> Approval {
-        let r = r.clone();
-        tokio::task::spawn_blocking(move || {
-            let Some((tty, mut w)) = approval_terminal() else {
-                return Approval::Denied("no terminal to ask on".into());
-            };
-            let _ = writeln!(
-                w,
-                "\nspend approval: {} node {:?} for {:?}\n  plan {} in {}: {}/h, for {} (worst case {})\n  already committed: {}/h, {} (envelope: {}/h, {} total)",
-                r.backend,
-                r.node_name,
-                r.purpose,
-                r.plan,
-                r.region.as_deref().unwrap_or("?"),
-                r.hourly,
-                humantime::format_duration(Duration::from_secs(r.lifetime_secs.max(0) as u64)),
-                r.worst_case,
-                r.committed_hourly,
-                r.committed_total,
-                r.max_hourly,
-                r.max_total
-            );
-            let _ = write!(w, "approve? type yes: ");
-            let _ = w.flush();
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(tty).read_line(&mut line);
-            if line.trim() == "yes" {
-                Approval::Approved
-            } else {
-                Approval::Denied("the operator did not type yes".into())
+impl CapacityApprover {
+    pub fn new(ledger: PathBuf, tenant: TenantId, principal: String, wait: Duration) -> CapacityApprover {
+        CapacityApprover { ledger, tenant, principal, wait, poll: Duration::from_secs(2), request: Default::default() }
+    }
+
+    fn ask(r: &SpendRequest) -> wicket_store::CapacityAsk {
+        wicket_store::CapacityAsk {
+            node: r.node_name.clone(),
+            plan: r.plan.clone(),
+            region: r.region.clone().unwrap_or_default(),
+            hourly: i64::try_from(r.hourly.0).unwrap_or(i64::MAX),
+            worst: i64::try_from(r.worst_case.0).unwrap_or(i64::MAX),
+        }
+    }
+
+    /// Files the request (or finds the one still pending for this node).
+    fn file(&self, l: &Ledger, r: &SpendRequest) -> Result<String> {
+        let op = wicket_core::Op::egress(
+            &self.tenant,
+            &wicket_core::RunId(self.principal.clone()),
+            OPERATOR_ZONE,
+            crate::capacity::METHOD,
+            crate::capacity::HOST,
+            &crate::grant::node_request_path(&r.node_name),
+        );
+        let reason = format!(
+            "node {} on {}: plan {} in {}, {}/h for {} (worst case {}), for {}. Already committed: {}/h, {} (envelope {}/h, {} total)",
+            r.node_name,
+            r.backend,
+            r.plan,
+            r.region.as_deref().unwrap_or("?"),
+            r.hourly,
+            humantime::format_duration(Duration::from_secs(r.lifetime_secs.max(0) as u64)),
+            r.worst_case,
+            r.purpose,
+            r.committed_hourly,
+            r.committed_total,
+            r.max_hourly,
+            r.max_total
+        );
+        let (id, _) = l.pending_for(&op, &reason, None)?;
+        l.audit(
+            &self.tenant,
+            None,
+            "capacity.requested",
+            &serde_json::json!({ "request": id, "principal": self.principal, "ask": Self::ask(r), "backend": r.backend,
+                                 "lifetime_secs": r.lifetime_secs, "purpose": r.purpose }),
+        )?;
+        Ok(id)
+    }
+
+    async fn decide(&self, r: &SpendRequest) -> Result<Approval> {
+        let ask = Self::ask(r);
+        let id = {
+            let mut l = Ledger::open(&self.ledger)?;
+            let id = self.file(&l, r)?;
+            *self.request.lock().expect("request") = Some(id.clone());
+            match crate::grant::decide_by_capacity_grants(&mut l, &self.tenant, &self.principal, &id, &ask)? {
+                Ok((g, _)) => {
+                    println!("approved by capacity grant {g} (request {id})");
+                    return Ok(Approval::Approved);
+                }
+                Err(why) => {
+                    println!("no capacity grant covers node {}:", r.node_name);
+                    for w in why {
+                        println!("  {w}");
+                    }
+                }
             }
-        })
-        .await
-        .unwrap_or(Approval::Denied("approval prompt failed".into()))
+            id
+        };
+        if self.wait.is_zero() {
+            Ledger::open(&self.ledger)?.deny(&id, "wicket:no-wait")?;
+            return Ok(Approval::Denied(format!("no capacity grant covers it, and --wait 0 (request {id} withdrawn)")));
+        }
+        println!(
+            "waiting up to {} for an operator to decide request {id} (wicket approve {id}, or the console)",
+            humantime::format_duration(self.wait)
+        );
+        let deadline = tokio::time::Instant::now() + self.wait;
+        loop {
+            let status = Ledger::open(&self.ledger)?.request(&id)?.status;
+            match status.as_str() {
+                "granted" => return Ok(Approval::Approved),
+                "pending" => {}
+                s => return Ok(Approval::Denied(format!("request {id} is {s}"))),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let l = Ledger::open(&self.ledger)?;
+                l.deny(&id, "wicket:timed-out")?;
+                l.audit(
+                    &self.tenant,
+                    None,
+                    "decision",
+                    &serde_json::json!({ "request": id, "decision": "deny", "by": "wicket:timed-out" }),
+                )?;
+                return Ok(Approval::Denied(format!("nobody decided request {id} within {}", humantime::format_duration(self.wait))));
+            }
+            tokio::time::sleep(self.poll).await;
+        }
+    }
+}
+
+/// The zone a request an operator files is recorded in (it has no run's).
+pub const OPERATOR_ZONE: &str = "operator";
+
+impl SpendApprover for CapacityApprover {
+    async fn approve(&self, r: &SpendRequest) -> Approval {
+        match self.decide(r).await {
+            Ok(a) => a,
+            Err(e) => Approval::Denied(format!("the capacity request failed: {e:#}")),
+        }
     }
 }
 
@@ -346,6 +424,7 @@ pub async fn create(args: CreateArgs) -> Result<()> {
         no_enrol,
         ca_ttl,
         give_up_silent,
+        wait,
     } = args;
     crate::enrol::validate_name(&name)?;
     if !no_enrol {
@@ -368,7 +447,10 @@ pub async fn create(args: CreateArgs) -> Result<()> {
     let o = Owner::new(&owner_name);
     let config = VultrConfig { os_id, sshkey_ids: ssh_key_ids, default_region: region.clone(), ..VultrConfig::default() };
     let envelope = MoneyEnvelope { max_hourly: dollars(&max_hourly)?, max_total: dollars(&max_total)? };
-    let placer = Placer::new(provider(&common, config)?, TerminalApprover, o.clone(), envelope);
+    let principal = crate::operators::Operator::cli(&TenantId::single().0)?.id;
+    let approver = CapacityApprover::new(crate::ledger_path(), TenantId::single(), principal, humantime::parse_duration(&wait)?);
+    let filed = approver.request.clone();
+    let placer = Placer::new(provider(&common, config)?, approver, o.clone(), envelope);
 
     let host_key = boot::generate_host_key(&format!("wicket-node-{name}")).await?;
     let user_data = boot::cloud_config(boot::NODE_SETUP, &host_key)?;
@@ -388,7 +470,16 @@ pub async fn create(args: CreateArgs) -> Result<()> {
         purpose: format!("wicket node create {name}"),
         boot: Some(Boot { user_data, host_key: pinned.clone() }),
     };
-    let n = placer.acquire(&req).await?;
+    let acquired = placer.acquire(&req).await;
+    let filed = filed.lock().ok().and_then(|r| r.clone());
+    if let Some(rid) = filed {
+        let l = Ledger::open(&crate::ledger_path())?;
+        match &acquired {
+            Ok(n) => l.capacity_use_created(&rid, &n.id.0)?,
+            Err(e) => l.capacity_use_failed(&rid, &format!("{e}"))?,
+        };
+    }
+    let n = acquired?;
     // Recorded at once, so the reconciler releases it at its lease end whatever happens next.
     let lease_until = n.lease_until.unwrap_or(n.created_at + req.lifetime_secs);
     Ledger::open(&crate::ledger_path())?.record_placed_node(&wicket_store::PlacedNodeRow {
@@ -881,5 +972,109 @@ mod tests {
         assert_eq!(un.len(), 2, "{un:?}");
         assert!(un[0].starts_with("n2  not enrolled") && un[0].contains("i-2"), "{un:?}");
         assert!(un[1].contains("capacity lease l-a for run run_a") && un[1].contains("at most $0.0200/h"), "{un:?}");
+    }
+
+    // ---- #256: the spend is a CAPACITY request, decided against the caller's capacity grants ----
+
+    const ALEX: &str = "spiffe://wicket.test/t/default/op/unix/alex";
+
+    fn granted_placer(base: &str, path: &std::path::Path, wait: Duration) -> Placer<VultrProvider, CapacityApprover> {
+        let client = Client::with_base(base, ApiKey::new(KEY)).unwrap();
+        let config = VultrConfig { sshkey_ids: vec!["k1".into()], ..VultrConfig::default() };
+        let mut a = CapacityApprover::new(path.to_path_buf(), TenantId::single(), ALEX.into(), wait);
+        a.poll = Duration::from_millis(20);
+        Placer::new(
+            VultrProvider::new(client, config),
+            a,
+            Owner::new("example"),
+            MoneyEnvelope { max_hourly: MicroUsd::parse_dollars("0.05").unwrap(), max_total: MicroUsd::parse_dollars("0.10").unwrap() },
+        )
+        .with_clock(std::sync::Arc::new(|| CREATED + 60))
+    }
+
+    fn issue(path: &std::path::Path, nodes: u32) -> String {
+        let mut l = Ledger::open(path).unwrap();
+        let op = crate::grant::Granter::Human(crate::operators::Operator {
+            id: "spiffe://wicket.test/t/default/op/passkey/laptop".into(),
+            label: "passkey:laptop".into(),
+            authority: crate::operators::Authority::Anything,
+        });
+        let terms = wicket_store::CapacityTerms {
+            plans: vec!["vc2-1c-2gb".into()],
+            regions: vec!["lhr".into()],
+            hourly: 30_000,
+            daily: 50_000,
+            nodes,
+        };
+        crate::grant::issue_capacity_grant(&mut l, &op, &TenantId::single(), ALEX, &terms, Duration::from_secs(3600), serde_json::json!({}))
+            .unwrap()
+    }
+
+    fn requests(path: &std::path::Path) -> Vec<wicket_store::Request> {
+        let l = Ledger::open(path).unwrap();
+        let mut out = l.pending(&TenantId::single()).unwrap();
+        out.extend(l.decided(&TenantId::single(), 50).unwrap());
+        out
+    }
+
+    #[tokio::test]
+    async fn a_node_within_the_callers_capacity_grant_is_created_without_asking() {
+        let (base, st) = serve().await;
+        let path = ledger_path("granted");
+        let g = issue(&path, 1);
+        let p = granted_placer(&base, &path, Duration::from_millis(200));
+        let n = p.acquire(&request("n1")).await.unwrap();
+        assert_eq!(st.lock().unwrap().instances.len(), 1);
+        let rs = requests(&path);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(
+            (rs[0].method.as_str(), rs[0].path.as_str(), rs[0].run.as_str(), rs[0].status.as_str()),
+            ("CAPACITY", "/capacity/node/n1", ALEX, "granted")
+        );
+        let l = Ledger::open(&path).unwrap();
+        let rec: serde_json::Value = serde_json::from_str(&l.audit_of_kind("decision").unwrap().last().unwrap().body).unwrap();
+        assert_eq!((rec["capacity_grant"].as_str(), rec["ask"]["plan"].as_str()), (Some(g.as_str()), Some("vc2-1c-2gb")));
+        // The use counts while the node is being created; then while it is an active placed node.
+        assert_eq!(l.capacity_used(&g).unwrap().nodes, 1);
+        assert!(!n.id.0.is_empty());
+
+        // A second node is beyond the grant (one at once): it waits for an operator, and nobody
+        // deciding is a denial. Nothing is created.
+        let e = p.acquire(&request("n2")).await.unwrap_err();
+        assert!(matches!(&e, PlacementError::NotApproved(w) if w.contains("nobody decided")), "{e:?}");
+        assert_eq!(st.lock().unwrap().instances.len(), 1);
+        let r2 = requests(&path).into_iter().find(|r| r.path == "/capacity/node/n2").unwrap();
+        assert_eq!(r2.status, "denied");
+    }
+
+    #[tokio::test]
+    async fn beyond_every_grant_an_operator_decides_the_pending_request() {
+        let (base, st) = serve().await;
+        let path = ledger_path("operator");
+        let p = granted_placer(&base, &path, Duration::from_secs(10));
+        let decider = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                loop {
+                    let pending = Ledger::open(&path).unwrap().pending(&TenantId::single()).unwrap();
+                    if let Some(r) = pending.into_iter().find(|r| r.method == "CAPACITY") {
+                        let mut l = Ledger::open(&path).unwrap();
+                        let by = crate::grant::Granter::Human(crate::operators::Operator {
+                            id: "spiffe://wicket.test/t/default/op/unix/root".into(),
+                            label: "root".into(),
+                            authority: crate::operators::Authority::Anything,
+                        });
+                        let t = crate::grant::Terms { uses: Some(1), ttl: Duration::from_secs(600), prefix: None, zone_wide: false };
+                        crate::grant::decide(&mut l, &by, &r.id, &crate::grant::Verdict::Approve(t), serde_json::json!({})).unwrap();
+                        return r.reason;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+        };
+        p.acquire(&request("n1")).await.unwrap();
+        let reason = decider.await.unwrap();
+        assert!(reason.contains("plan vc2-1c-2gb in lhr") && reason.contains("worst case"), "{reason}");
+        assert_eq!(st.lock().unwrap().instances.len(), 1);
     }
 }

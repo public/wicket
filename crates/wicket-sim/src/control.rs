@@ -2,7 +2,8 @@
 //!
 //! It follows `wicket-cli/src/noderun.rs`:
 //! - **Grants** (`sync_grants`): the plan's approvals, renewals and revocations are carried out as
-//!   the control host's clock passes them. Each change republishes the box's token from its
+//!   the control host's clock passes them. It only publishes (#257's slice 3): every grant goes
+//!   to the node, one on a host the node's CA can't cover included, and nothing is decided here. Each change republishes the box's token from its
 //!   unchanged base with the live grants (`Issuer::publish`). A revocation goes in the same delta
 //!   as `Change::Revoke { kind: Grant, until: expiry }`. Grants past their expiry drop out of the
 //!   token.
@@ -18,7 +19,7 @@
 
 use crate::oracle::Oracle;
 use crate::wire::{self, Ctl};
-use crate::{true_now, Env, GrantKind, CONTROL_PORT, EPOCH_MS, GRANT_PATHS, HOST, NODE, QUOTA, REFRESH_MS, RUNS, SILENCE_MS, TTL_MS};
+use crate::{grant_host, true_now, Env, GrantKind, CONTROL_PORT, EPOCH_MS, GRANT_PATHS, NODE, QUOTA, REFRESH_MS, RUNS, SILENCE_MS, TTL_MS};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -173,7 +174,7 @@ fn apply(env: &Env, st: &mut State, run_i: usize, action: Option<(usize, &str, &
     let grants: Vec<LiveGrant> = live
         .iter()
         .map(|(gid, (path, na))| {
-            let op = Op::egress(&tenant, &RunId(run.into()), &env.zone.name, "POST", HOST, GRANT_PATHS[*path]);
+            let op = Op::egress(&tenant, &RunId(run.into()), &env.zone.name, "POST", grant_host(*path), GRANT_PATHS[*path]);
             LiveGrant {
                 grant: wicket_authz::Grant {
                     gid: gid.clone(),

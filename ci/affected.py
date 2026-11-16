@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TABLE = ROOT / "ci" / "affected.map"
 # Every end-to-end suite the table can name, in the order they run.
-E2E = ["docs", "policy", "lean", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
+E2E = ["docs", "policy", "lean", "kani", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
        "node-e2e", "acceptance-nodes", "update", "tla"]
 # The fuzz targets (#323, fuzz/), each a suite `fuzz-<target>` that ci/fuzz.sh runs for a short while.
 FUZZ = ["egress", "gateway", "chan", "feed", "token", "manifest", "store", "git"]

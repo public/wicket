@@ -4,7 +4,7 @@ type: Added
 ---
 - Node health ([#377](https://github.com/public/wicket/issues/377)): every node reports its data
   directory's disk and inodes, memory, feed freshness, out-of-memory kills and failures to persist its
-  own state to the control host every 30 s (protocol 11). `wicket top` shows a DISK column and the
+  own state to the control host every 30 s (protocol 12). `wicket top` shows a DISK column and the
   alerts, `wicket node top` and the console show the report, and the console pushes to operators when
   a node's disk passes 85%, its feed is stale for more than 5 min, a box is killed for memory, or it
   can't persist its state (and when the control host's own disk passes 85%).

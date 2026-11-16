@@ -72,7 +72,14 @@ use wicket_proxy::llm::Slice;
 ///   [`Msg::SecretFetch`] on first use and swapped by the node's own egress proxy, which then
 ///   decides the swapped hosts from the feed. A box with swaps goes only to nodes talking
 ///   [`CREDENTIAL_SWAPS`] or later.
-pub const PROTOCOL: u32 = 11;
+/// - 11: no forwarded egress (#257): a node terminates what its CA covers and decides it, splices
+///   a host its CA can't cover if the box's token allows it wholesale, and refuses it otherwise.
+///   The control host no longer serves the `egress` tunnel target, and `BoxStart::swap_hosts`
+///   (the hosts a control host before 10 swapped itself) is gone. A box that a node before 11
+///   would forward a host of goes only to nodes talking [`NO_FORWARDED_EGRESS`] or later.
+/// - 12: node health (#377): a node reports its disk, inodes, memory, feed freshness and failures
+///   as [`Msg::Health`], sent only on connections talking [`NODE_HEALTH`] or later.
+pub const PROTOCOL: u32 = 12;
 /// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
 pub const EDGE_DECISIONS: u32 = 5;
 /// The first protocol version whose nodes check a box's image against its pin (#192).
@@ -85,12 +92,14 @@ pub const IMAGE_PULL: u32 = 8;
 pub const BUDGET_SLICE: u32 = 9;
 /// The first protocol version whose nodes swap a box's credentials themselves (#257).
 pub const CREDENTIAL_SWAPS: u32 = 10;
+/// The first protocol version whose nodes forward no egress to the control host (#257).
+pub const NO_FORWARDED_EGRESS: u32 = 11;
 /// The first protocol version whose nodes report their health as [`Msg::Health`] (#377).
-pub const NODE_HEALTH: u32 = 11;
-/// The run's sockets on the control host a node may open a tunnel to ([`Msg::TunnelOpen`]): its egress
-/// proxy, for hosts the node forwards, and its MCP gateway, for the tools the node relays. Not the
-/// model proxy: that is the node's alone (#257).
-pub const TUNNEL_TARGETS: [&str; 2] = ["egress", "gateway"];
+pub const NODE_HEALTH: u32 = 12;
+/// The run's sockets on the control host a node may open a tunnel to ([`Msg::TunnelOpen`]): its MCP
+/// gateway, for the tools the node relays. Not the model proxy nor the egress proxy: those are the
+/// node's alone (#257).
+pub const TUNNEL_TARGETS: [&str; 1] = ["gateway"];
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -100,11 +109,22 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
     if theirs == 0 {
         return Err(format!("it runs a wicket from before protocol versions (this one speaks protocol {ours})"));
     }
-    if ours.abs_diff(theirs) > PROTOCOL_SKEW {
-        return Err(format!("it speaks protocol {theirs}, this one {ours} (at most {PROTOCOL_SKEW} apart)"));
-    }
-    Ok(ours.min(theirs))
+    // The rule itself is wicket_core::version's, which Kani checks (#325).
+    wicket_core::version::talk_at(ours, theirs, PROTOCOL_SKEW)
+        .ok_or_else(|| format!("it speaks protocol {theirs}, this one {ours} (at most {PROTOCOL_SKEW} apart)"))
 }
+
+// Every feature's first version is one this build speaks, and a peer at the oldest version it
+// talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
+const _: () = {
+    let floors = [EDGE_DECISIONS, IMAGE_PINS, IMAGE_DELIVERY, IMAGE_PULL, BUDGET_SLICE, CREDENTIAL_SWAPS];
+    let mut i = 0;
+    while i < floors.len() {
+        assert!(floors[i] <= PROTOCOL);
+        i += 1;
+    }
+    assert!(PROTOCOL > PROTOCOL_SKEW);
+};
 
 /// The largest frame body: a feed snapshot (`wicket_feed::MAX_FRAME_BYTES`) plus framing.
 pub const MAX_FRAME: usize = wicket_feed::MAX_FRAME_BYTES + 4096;
@@ -194,12 +214,6 @@ pub struct BoxStart {
     pub output_cap: u64,
     #[serde(default)]
     pub output_stop: bool,
-    /// Hosts whose credential a control host before protocol 10 swaps in for the box (a remote
-    /// session's login, #169): the node forwards them to the run's egress proxy, never terminating
-    /// them itself. Names only. A control host talking [`CREDENTIAL_SWAPS`] sends [`Self::swaps`]
-    /// instead and leaves this empty.
-    #[serde(default)]
-    pub swap_hosts: Vec<String>,
     /// The box's credential swaps, made by the node's egress proxy (#257): the box holds only each
     /// one's placeholder, and the node fetches the real credential on first use
     /// ([`Msg::SecretFetch`]), as it does injected secrets. Never a value: this is kept in the
@@ -947,11 +961,12 @@ impl Tunnels {
 mod tests {
     use super::*;
 
-    /// #257: a box's model proxy is its node's only; a node can't reach the control host's.
+    /// #257: a box's model and egress proxies are its node's only; a node can't reach the control
+    /// host's (slice 1 removed `llm`, slice 3 `egress`).
     #[test]
-    fn a_node_tunnels_to_the_runs_egress_and_gateway_only() {
-        assert_eq!(TUNNEL_TARGETS, ["egress", "gateway"]);
-        assert!(!TUNNEL_TARGETS.contains(&"llm"));
+    fn a_node_tunnels_to_the_runs_gateway_only() {
+        assert_eq!(TUNNEL_TARGETS, ["gateway"]);
+        assert!(!TUNNEL_TARGETS.contains(&"llm") && !TUNNEL_TARGETS.contains(&"egress"));
     }
 
     fn samples() -> Vec<Frame> {
@@ -1175,12 +1190,20 @@ mod tests {
         assert!(negotiate(BUDGET_SLICE, 8).unwrap() < BUDGET_SLICE, "a node at 8 talks 8: no slice goes to it");
     }
 
+    /// #257, slice 3: a node at 11 forwards no egress; one at 10 talks 10 to a control host at 11,
+    /// below [`NO_FORWARDED_EGRESS`], and is gated per box (`noderun::refuse_older_node`).
+    #[test]
+    fn a_node_forwards_no_egress_from_protocol_11() {
+        assert_eq!(NO_FORWARDED_EGRESS, 11);
+        assert!(negotiate(PROTOCOL, 10).unwrap() < NO_FORWARDED_EGRESS);
+    }
+
     /// #257: a box's swaps go in its start as names and placeholders, never values; a control host
     /// before protocol 10 sends none (a node takes its start as having none), and a node at 9
     /// talks 9 to a control host at 10, below [`CREDENTIAL_SWAPS`].
     #[test]
     fn a_start_carries_its_swaps_by_name_from_protocol_10() {
-        assert_eq!((PROTOCOL, CREDENTIAL_SWAPS, NODE_HEALTH), (11, 10, 11));
+        assert_eq!((PROTOCOL, CREDENTIAL_SWAPS, NO_FORWARDED_EGRESS, NODE_HEALTH), (12, 10, 11, 12));
         assert!(negotiate(CREDENTIAL_SWAPS, 9).unwrap() < CREDENTIAL_SWAPS);
         let swaps = vec![
             wicket_proxy::CredentialSwap {

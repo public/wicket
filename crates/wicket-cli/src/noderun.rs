@@ -442,9 +442,6 @@ struct Shared {
     vault: wicket_proxy::vault::Vault,
     /// What the node had counted when this supervisor took over, if that was already counted.
     spent_base: Mutex<Option<Option<wicket_proxy::llm::Spent>>>,
-    /// Hosts this host swaps a credential in for (#169), for a box a control host before protocol
-    /// 10 started: the node forwards them here, so their grants stay here too.
-    swap_hosts: Vec<String>,
     /// The run's credential swaps, which its node makes (#257): what this host releases to it for
     /// them ([`fetch_secret`]).
     swaps: Vec<wicket_proxy::CredentialSwap>,
@@ -604,7 +601,6 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         llm: s.llm.clone(),
         vault: s.vault.clone(),
         spent_base: Mutex::new(s.spent_counted.then_some(None)),
-        swap_hosts: s.start.swap_hosts.clone(),
         swaps: s.swaps.clone(),
         adopt: s.adopt.clone(),
         attach: s.attach,
@@ -657,7 +653,15 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         if ctl.proto.load(Ordering::SeqCst) < crate::chan::EDGE_DECISIONS {
             start.edge = None;
         }
-        refuse_older_node(&name, ctl.proto.load(Ordering::SeqCst), &start, shared.llm.is_some())?;
+        // A node before #257's slice 3 would forward the hosts its CA can't cover to this host, which
+        // no longer serves them.
+        let forwarded = {
+            let l = shared.ledger.lock().expect("ledger");
+            let now = wicket_store::now();
+            let ca = l.node_cas(&name).ok().and_then(|cs| cs.into_iter().find(|c| c.status == "active" && c.not_after > now));
+            forwarded_host(&shared.zone, &shared.swaps, ca.as_ref().map(|c| (&c.hosts[..], c.not_after)), now)
+        };
+        refuse_older_node(&name, ctl.proto.load(Ordering::SeqCst), &start, shared.llm.is_some(), forwarded.as_deref())?;
         // A remote node gets a pinned image it lacks from here, verified there before it imports it
         // (#191); the control host's own node shares its runtime.
         if let (Some(pin), crate::nodecall::Via::Ssh(_)) = (&start.image_pin, &shared.via) {
@@ -774,6 +778,8 @@ struct Progress {
     next: [u64; 2],
     published: HashSet<String>,
     revoked: HashSet<String>,
+    /// Grants waiting for room in the box's token (at most `MAX_GRANTS` live), each noted once.
+    waiting: HashSet<String>,
     /// The grants the box's token carries now.
     live: Vec<LiveGrant>,
     /// The node has listed the run at least once (a re-attached run that it doesn't list is gone).
@@ -812,6 +818,7 @@ async fn manage(
         next: [sh.ctl.next[0].load(Ordering::SeqCst), sh.ctl.next[1].load(Ordering::SeqCst)],
         published: sh.carried.iter().map(|g| g.grant.gid.clone()).collect(),
         revoked: HashSet::new(),
+        waiting: HashSet::new(),
         live: sh.carried.clone(),
         ever: false,
         ever_resumed: false,
@@ -1604,9 +1611,41 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     Some(Frame::Msg(Msg::BudgetSlice { run: sh.run.0.clone(), slice }))
 }
 
+/// A host of the box that a node before protocol 11 would forward to the control host instead of
+/// terminating (#257): one its zone reaches, injects into or swaps a credential for, outside the
+/// node CA's name constraints; or every host, without a live CA. None: such a node forwards
+/// nothing the box is known to use (a host approved later under `unlisted_hosts: escalate` may
+/// still be, and is refused there).
+pub(crate) fn forwarded_host(
+    zone: &wicket_core::ZoneSpec,
+    swaps: &[wicket_proxy::CredentialSwap],
+    ca: Option<(&[String], i64)>,
+    now_secs: i64,
+) -> Option<String> {
+    let hosts = zone.reach.iter().map(|r| &r.host).chain(zone.inject.iter().map(|r| &r.host)).chain(swaps.iter().map(|s| &s.host));
+    for h in hosts {
+        // A wildcard is covered if a name under it is.
+        let probe = h.strip_prefix("*.").map(|b| format!("wicket-probe.{b}")).unwrap_or_else(|| h.clone());
+        if let wicket_proxy::decide::Route::Uncovered(why) = wicket_proxy::decide::route(&probe, ca, now_secs) {
+            return Some(format!("{h} ({why})"));
+        }
+    }
+    None
+}
+
 /// Why a box can't start on node `name` talking `proto`: it needs something an older node wouldn't
 /// do, and so would run unbounded or unchecked there (or fail closed, as a swap would).
-pub(crate) fn refuse_older_node(name: &str, proto: u32, start: &BoxStart, budget: bool) -> Result<()> {
+/// `forwarded` is a host of the box such a node would forward ([`forwarded_host`]).
+pub(crate) fn refuse_older_node(name: &str, proto: u32, start: &BoxStart, budget: bool, forwarded: Option<&str>) -> Result<()> {
+    // A node before #257's slice 3 would forward a host its CA can't cover to the control host,
+    // which decides no request now: the box goes only where such a host is spliced or refused, and
+    // the refusal says why.
+    if let Some(host) = forwarded.filter(|_| proto < crate::chan::NO_FORWARDED_EGRESS) {
+        bail!(
+            "node {name} talks protocol {proto}, and would forward {host} to the control host, which decides no egress from protocol {}: update the node (`wicket node install {name}`)",
+            crate::chan::NO_FORWARDED_EGRESS
+        );
+    }
     // A node before #256 would take no budget slice: a box with a model budget goes only where its
     // node is bounded by one.
     if budget && proto < crate::chan::BUDGET_SLICE {
@@ -1742,25 +1781,26 @@ fn check_node_ask(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &st
     }
 }
 
-/// Publishes grants approved for this run's requests to hosts the node terminates (and hands them
-/// over, so the ledger stops consuming them), and revocations of grants it published. Grants for
-/// hosts the node forwards stay in the ledger: the control host's egress proxy decides those.
+/// Publishes grants approved for this run's requests to its node, and revocations of grants it
+/// published. It only publishes: since #257's slice 3 the node alone decides a box's egress and
+/// counts a grant's uses, and the ledger records issuance (the grant, its renewals and its
+/// revocation, and that it was handed to the node). No egress grant is kept back for the control
+/// host to decide: one the node can't honour as approved is never published, and the box's request
+/// is asked about again.
 ///
 /// A grant reaches the node as a block of the box's token: whenever the live grants change, the
 /// token is rebuilt from its base with one block per live grant (signed with the approver key) and
 /// published whole, in the same delta as any grant revocations. At most
-/// [`wicket_feed::token::MAX_GRANTS`] are live at once; more stay in the ledger until some expire.
+/// [`wicket_feed::token::MAX_GRANTS`] are live at once; more wait in the ledger until some expire.
 ///
 /// Renewals (#56) go out the same way: a renewed grant's block is rebuilt with its new end, and a
 /// renewed authority re-mints block 0 with its new end (the same ceiling, minted again), so the
 /// node holds the box past its old end. Nothing new on the feed: one `PutZone`, as for any grant.
 fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
-    let (grants, ca, authority) = {
+    let (grants, authority) = {
         let l = sh.ledger.lock().expect("ledger");
         let g = l.grants_for_run(&sh.run.0).unwrap_or_default();
-        let now = wicket_store::now();
-        let ca = l.node_cas(&sh.node).ok().and_then(|cs| cs.into_iter().find(|c| c.status == "active" && c.not_after > now));
-        (g, ca, l.run_authority(&sh.run.0).ok().flatten())
+        (g, l.run_authority(&sh.run.0).ok().flatten())
     };
     let now_s = wicket_store::now();
     let mut changes = vec![];
@@ -1823,42 +1863,30 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         if Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path).refused_for_agents().is_some() {
             continue;
         }
-        // As the node routes it: a host injected with a secret released to the node is decided there,
-        // and so is a swapped one (#257), unless a control host before protocol 10 started the box
-        // and swaps it here.
-        if sh.swap_hosts.iter().any(|h| wicket_core::manifest::host_matches(h, &g.host)) {
-            continue;
-        }
-        let route = wicket_proxy::decide::route_sealed(
-            &g.host,
-            &sh.zone,
-            &[],
-            ca.as_ref().map(|c| (&c.hosts[..], c.not_after)),
-            now_s,
-            // A node fetches a zone's injected secrets on first use, and decides those hosts itself.
-            &|_| true,
-        );
-        if route != wicket_proxy::decide::Route::Terminate {
-            continue;
-        }
+        // Every egress grant goes to the node, whatever its host (#257): one on a host the node's
+        // CA can't cover is held there too, and allows nothing, since that host is spliced (when the
+        // token allows it wholesale) or refused before any request to it is decided.
         if p.live.len() >= wicket_feed::token::MAX_GRANTS {
-            println!(
-                "[wicket] node {} holds {} live grants for {}: grant {} stays with the control host for now",
-                sh.node,
-                p.live.len(),
-                sh.run,
-                g.id
-            );
+            if p.waiting.insert(g.id.clone()) {
+                println!(
+                    "[wicket] node {} holds {} live grants for {}: grant {} waits until one ends",
+                    sh.node,
+                    p.live.len(),
+                    sh.run,
+                    g.id
+                );
+            }
             continue;
         }
         // A node's grant covers its path whatever the query, and carries no risk bound: hand it over
         // only if no query makes that path riskier than the human approved (#119; a fetch's ref
-        // discovery approved at R1 is a push's at R4). Otherwise the control host keeps deciding it.
+        // discovery approved at R1 is a push's at R4). Otherwise it is never published: nothing else
+        // decides egress, so the box's request is asked about again.
         let worst = Op::egress_with_query(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path, "any=query");
         if worst.risk.rank() > g.max_risk.unwrap_or(0) {
             if p.published.insert(g.id.clone()) {
                 println!(
-                    "[wicket] grant {} is bounded below what {} {}{} can be; it stays with the control host",
+                    "[wicket] grant {} is bounded below what {} {}{} can be, which a node can't honour: it isn't published",
                     g.id, g.method, g.host, g.path
                 );
             }
@@ -1868,9 +1896,9 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         let mut trial = p.live.clone();
         trial.push(live.clone());
         if let Err(e) = loads(&trial) {
-            // Never handed over: the control host keeps deciding it.
+            // Never handed over, and nothing else decides it.
             if p.published.insert(g.id.clone()) {
-                println!("[wicket] grant {} can't go in {}'s token ({e}); it stays with the control host", g.id, sh.run);
+                println!("[wicket] grant {} can't go in {}'s token ({e}): it isn't published", g.id, sh.run);
             }
             continue;
         }

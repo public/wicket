@@ -5,13 +5,18 @@
 
 use crate::rng::Rng;
 use crate::wire::{self, BoxReq};
-use crate::{Env, DURATION_MS, FORBIDDEN_HOST, GRANT_PATHS, HOST, NEVER_PATH, NODE_PORT, READ_PATH, RUNS};
+use crate::{
+    Env, DURATION_MS, FORBIDDEN_HOST, GRANT_PATHS, HOST, NEVER_PATH, NODE_PORT, READ_PATH, RUNS, SPLICED_HOST, UNCOVERED_HOST,
+    UNCOVERED_PATH,
+};
 use std::rc::Rc;
 use std::time::Duration;
 
 pub async fn run(env: Rc<Env>, i: usize, mut rng: Rng) -> turmoil::Result {
     let run = RUNS[i];
-    let _ = env;
+    // Requests to hosts the node's CA can't cover (#257's slice 3), from a generator of their own,
+    // so the box's other choices are those it made before them.
+    let mut beyond = Rng::new(env.plan.seed.rotate_left(41) ^ i as u64);
     let start = tokio::time::Instant::now();
     let mut conn = None;
     while start.elapsed() < Duration::from_millis(DURATION_MS as u64) {
@@ -33,11 +38,18 @@ pub async fn run(env: Rc<Env>, i: usize, mut rng: Rng) -> turmoil::Result {
             6 => BoxReq::Egress { method: "GET".into(), host: FORBIDDEN_HOST.into(), path: "/".into() },
             _ => BoxReq::Model { max_tokens: rng.range(50, 1_500) },
         };
-        let (rd, wr) = conn.as_mut().expect("connected");
-        let ok = wire::write_json(wr, &req).await.is_ok()
-            && matches!(tokio::time::timeout(Duration::from_secs(3), wire::read_frame(rd)).await, Ok(Ok(Some(_))));
-        if !ok {
-            conn = None;
+        let extra = beyond.chance(0.15).then(|| match beyond.chance(0.5) {
+            true => BoxReq::Egress { method: "POST".into(), host: UNCOVERED_HOST.into(), path: UNCOVERED_PATH.into() },
+            false => BoxReq::Egress { method: "GET".into(), host: SPLICED_HOST.into(), path: "/blob".into() },
+        });
+        for req in std::iter::once(req).chain(extra) {
+            let (rd, wr) = conn.as_mut().expect("connected");
+            let ok = wire::write_json(wr, &req).await.is_ok()
+                && matches!(tokio::time::timeout(Duration::from_secs(3), wire::read_frame(rd)).await, Ok(Ok(Some(_))));
+            if !ok {
+                conn = None;
+                break;
+            }
         }
     }
     Ok(())

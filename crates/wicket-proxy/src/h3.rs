@@ -28,10 +28,11 @@
 //!   up measured faster still (545–573 Mbit/s at 60000) but added ~60 ms to the first request on a
 //!   new connection, unexplained; 16000 is the value to use.
 //!
-//! On a remote node, hosts the node forwards to the control host (`decide::route`: credentials to
-//! inject, or outside what the node's CA may mint) aren't served over HTTP/3: the QUIC handshake is
-//! refused (audited once, with the reason), so clients fall back to TCP through the proxy, which
-//! forwards them. Should a host's route change mid-connection, its requests get a 403 that says so.
+//! On a node, hosts its CA can't cover (`decide::route`: outside what the node's CA may mint, or no
+//! usable CA) aren't served over HTTP/3: the QUIC handshake is refused (audited once, with the
+//! reason), so clients fall back to TCP through the proxy, which splices such a host if the box's
+//! token allows it wholesale and refuses it otherwise (#257). Should a host's route change
+//! mid-connection, its requests get a 403 that says so.
 
 use crate::dns::{self, Answered, Names};
 use crate::egress::{Egress, Outgoing, Upstream, Via};
@@ -358,12 +359,12 @@ impl H3 {
             inc.refuse();
             return;
         }
-        // On a node, a host it forwards to the control host isn't served over HTTP/3 (the node
-        // usually can't mint a leaf for it, and the control host isn't reached over UDP): the
-        // handshake is refused, and HTTP/3 clients fall back to TCP through the proxy, which forwards it.
-        if let Some(relay) = &self.egress.relay {
-            if let crate::decide::Route::Forward(why) = relay.route(&host) {
-                self.refused(&host, format!("HTTP/3 to {host} isn't served on this node ({why}); HTTPS through the proxy reaches it"));
+        // On a node, a host its CA can't cover isn't served over HTTP/3 (no leaf can be minted for
+        // it): the handshake is refused, and HTTP/3 clients fall back to TCP through the proxy,
+        // which splices the host if the box's token allows it wholesale (#257).
+        if let Some(router) = &self.egress.router {
+            if let crate::decide::Route::Uncovered(why) = router.route(&host) {
+                self.refused(&host, format!("HTTP/3 to {host} isn't served on this node ({why}); HTTPS through the proxy may splice it"));
                 inc.refuse();
                 return;
             }
@@ -465,14 +466,14 @@ impl H3 {
                 None,
             );
         }
-        if let Some(relay) = &self.egress.relay {
-            if let crate::decide::Route::Forward(why) = relay.route(host) {
+        if let Some(router) = &self.egress.router {
+            if let crate::decide::Route::Uncovered(why) = router.route(host) {
                 return self.egress.refuse(
                     host,
                     &method,
                     "/",
                     &format!(
-                        "HTTP/3 to {host} isn't served on this node ({why}); use HTTPS through the proxy (HTTPS_PROXY), which reaches it"
+                        "HTTP/3 to {host} isn't served on this node ({why}); HTTPS through the proxy (HTTPS_PROXY) reaches it only if this box may use the host wholesale"
                     ),
                 );
             }

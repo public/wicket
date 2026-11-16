@@ -1,6 +1,6 @@
-//! What the ledger keeps for remote nodes running `wicket node serve` (#57): grants handed to a node
-//! (whose uses the node then counts, so the ledger stops consuming them), and the audit records a
-//! node ships back.
+//! What the ledger keeps for nodes running `wicket node serve` (#57): grants handed to a node (whose
+//! uses the node counts: since #257 the ledger never consumes an egress grant, it records its
+//! issuance and where it was published), and the audit records a node ships back.
 //!
 //! **Node audit.** A node keeps its own hash-chained audit log (a ledger of its own, same
 //! [`chain_hash`]) and ships records past the control host's watermark when it reconnects. Each
@@ -37,7 +37,7 @@ pub struct GrantRow {
     pub expires_at: i64,
     pub request_id: Option<String>,
     pub revoked: bool,
-    /// The node it was handed to; the ledger no longer consumes it.
+    /// The node it was published to, which counts its uses.
     pub node: Option<String>,
     /// The riskiest op it covers (`RiskClass::rank`); None for grants from older ledgers (#119).
     pub max_risk: Option<i64>,
@@ -106,8 +106,8 @@ impl Ledger {
         Ok(self.conn.query_row(&format!("SELECT {GRANT_COLS} FROM grants g WHERE g.id = ?1"), params![id], row_to_grant).optional()?)
     }
 
-    /// Hands a grant to a node: from now on the node counts its uses, and the ledger never consumes
-    /// it. Returns false if it was already handed to a node.
+    /// Records that a grant is published to a node, which counts its uses (the ledger never
+    /// consumes an egress grant, #257). Returns false if it was already handed to a node.
     pub fn hand_grant_to_node(&self, id: &str, node: &str) -> Result<bool> {
         // Not delivered yet: its epoch is set once it is published ([`Ledger::grants_published`]).
         Ok(self.conn.execute("UPDATE grants SET node = ?2, node_epoch = ?3 WHERE id = ?1 AND node IS NULL", params![id, node, i64::MAX])?
@@ -187,7 +187,8 @@ impl Ledger {
     }
 
     /// Whether request `id` has a live grant not handed to any node: one the run's process hands to
-    /// its node on its next tick, or keeps deciding on the control host (#231).
+    /// its node on its next tick (#231), or one it can't honour as approved, which no one decides
+    /// (#257).
     pub fn grant_unhanded(&self, request_id: &str) -> Result<bool> {
         Ok(self
             .conn
@@ -408,7 +409,7 @@ mod tests {
         assert!(l.grant_in_flight(&rid).unwrap());
         l.node_feed_at("n1", 5).unwrap();
         assert!(!l.grant_in_flight(&rid).unwrap(), "the node has it");
-        assert_eq!(l.consume_grant(&op).unwrap(), None, "the node counts it now");
+        assert_eq!(l.grant_covering(&op).unwrap(), None, "the node counts it now");
         l.revoke_grant(&gid).unwrap();
         assert!(l.grant(&gid).unwrap().unwrap().revoked);
         assert!(l.revoke_grant("g-nope").is_err());
