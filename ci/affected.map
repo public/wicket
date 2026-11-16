@@ -11,7 +11,8 @@
 # them, and a pattern without a slash matches the file name anywhere.
 #
 # Suites: docs (check-public, Markdown links, terms, the plugin),
-# policy (SymCC policy diffs), lean (the Lean spec's proofs and its oracle test, #322), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
+# policy (SymCC policy diffs), lean (the Lean spec's proofs and its oracle test, #322), kani (Kani
+# harnesses and the loom test, ci/kani.sh, #325), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
 # install-test, tla (TLC on verification/tla/, #321), and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
 # (acceptance --nodes local), update. And one per fuzz target (#323, ci/fuzz.sh): fuzz-egress,
 # fuzz-gateway, fuzz-chan, fuzz-feed, fuzz-token, fuzz-manifest, fuzz-store, fuzz-git.
@@ -120,6 +121,14 @@ crates/wicket-cli/src/cmd/policy.rs  | - | restore acceptance policy
 crates/wicket-cli/src/cmd/zone.rs    | - | acceptance
 # Not listed on purpose, so they select every suite: the node protocol (chan.rs), the ledger's
 # schema (wicket-store), token formats (wicket-authz, wicket-feed), wicket-core, run.rs.
+
+# ---- Kani proof harnesses and the loom test (#325) ----
+# The functions they check are wicket-core's (manifest, subset, canon, op, version, budget,
+# authority), which select every suite, kani included. The harnesses, the loom test and the script
+# select only it (and, as crate files, their crate).
+crates/*/src/proofs/**             | -   | kani
+crates/wicket-core/tests/loom_budget.rs | - | kani
+ci/kani.sh                         | -   | kani
 
 # ---- the end-to-end scripts themselves ----
 ci/smoke.sh                        | -   | smoke

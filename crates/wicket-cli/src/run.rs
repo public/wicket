@@ -1037,11 +1037,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         (None, None, Some(r)) => {
             use std::sync::atomic::Ordering::SeqCst;
             let p: RunProgress = read_json(&dir.join("ctl/progress.json")).unwrap_or_default();
-            llm.requests.store(p.requests, SeqCst);
-            llm.input_tokens.store(p.input_tokens, SeqCst);
-            llm.cache_read_tokens.store(p.cache_read_tokens, SeqCst);
-            llm.cache_creation_tokens.store(p.cache_creation_tokens, SeqCst);
-            llm.output_tokens.store(p.output_tokens, SeqCst);
+            llm.count.requests.store(p.requests, SeqCst);
+            llm.count.input_tokens.store(p.input_tokens, SeqCst);
+            llm.count.cache_read_tokens.store(p.cache_read_tokens, SeqCst);
+            llm.count.cache_creation_tokens.store(p.cache_creation_tokens, SeqCst);
+            llm.count.output_tokens.store(p.output_tokens, SeqCst);
             r.prior_secs + u64::try_from((wicket_feed::now_ms() - r.started_ms).max(0) / 1000).unwrap_or(0)
         }
         // Taken over from its node (#164): its time counts from when it started there.
@@ -1808,11 +1808,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 use std::sync::atomic::Ordering::SeqCst;
                 let (o, e) = stopper.0.offsets();
                 let _ = write_json(&dir.join("ctl/progress.json"), &RunProgress {
-                    requests: llm.requests.load(SeqCst),
-                    input_tokens: llm.input_tokens.load(SeqCst),
-                    cache_read_tokens: llm.cache_read_tokens.load(SeqCst),
-                    cache_creation_tokens: llm.cache_creation_tokens.load(SeqCst),
-                    output_tokens: llm.output_tokens.load(SeqCst),
+                    requests: llm.count.requests.load(SeqCst),
+                    input_tokens: llm.count.input_tokens.load(SeqCst),
+                    cache_read_tokens: llm.count.cache_read_tokens.load(SeqCst),
+                    cache_creation_tokens: llm.count.cache_creation_tokens.load(SeqCst),
+                    output_tokens: llm.count.output_tokens.load(SeqCst),
                     stdout: o,
                     stderr: e,
                 });
@@ -2304,12 +2304,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // Pending requests are withdrawn by run_ended below; report them first.
     let summary = serde_json::json!({
         "status": status, "cause": cause, "note": end_note, "seconds": started.elapsed().as_secs(),
-        "model_requests": llm.requests.load(std::sync::atomic::Ordering::SeqCst),
-        "input_tokens": llm.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
-        "cache_read_input_tokens": llm.cache_read_tokens.load(std::sync::atomic::Ordering::SeqCst),
-        "cache_creation_input_tokens": llm.cache_creation_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "model_requests": llm.count.requests.load(std::sync::atomic::Ordering::SeqCst),
+        "input_tokens": llm.count.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "cache_read_input_tokens": llm.count.cache_read_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "cache_creation_input_tokens": llm.count.cache_creation_tokens.load(std::sync::atomic::Ordering::SeqCst),
         "input_tokens_total": llm.input_total(),
-        "output_tokens": llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "output_tokens": llm.count.output_tokens.load(std::sync::atomic::Ordering::SeqCst),
         "pending_requests": pending, "result": result,
     });
     {
@@ -2333,7 +2333,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         summary["seconds"],
         summary["model_requests"],
         summary["input_tokens_total"],
-        llm.input_total() - llm.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        llm.input_total() - llm.count.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
         summary["output_tokens"]
     );
     match &result {

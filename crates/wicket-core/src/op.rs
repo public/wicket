@@ -326,37 +326,64 @@ impl CompiledZone {
         if let Some(why) = never_reachable(&op.host) {
             return Verdict::Forbidden(why);
         }
-        let forbidden = zone
-            .forbid
-            .iter()
-            .zip(&self.forbid)
-            .any(|(f, globs)| host_matches(&f.host, &op.host) && globs.iter().any(|g| g.is_match(&op.path)));
-        if forbidden {
-            return Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path));
-        }
-        let risky = op.risk >= RiskClass::R3ExternalOrIrreversible;
-        let mut first_match = None;
-        for (i, (rule, globs)) in zone.reach.iter().zip(&self.reach).enumerate() {
-            if !rule.host_matches(&op.host) {
-                continue;
+        let forbidden = || {
+            zone.forbid
+                .iter()
+                .zip(&self.forbid)
+                .any(|(f, globs)| host_matches(&f.host, &op.host) && globs.iter().any(|g| g.is_match(&op.path)))
+        };
+        let reach = zone.reach.iter().zip(&self.reach).map(|(rule, globs)| {
+            let matches = rule.host_matches(&op.host)
+                && rule.methods.iter().any(|m| m.eq_ignore_ascii_case(&op.method))
+                && globs.iter().any(|g| g.is_match(&op.path));
+            (matches, rule.allow_dangerous)
+        });
+        match decide(forbidden, op.risk, reach) {
+            Decision::Forbidden => Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path)),
+            Decision::AllowByReach(i) => Verdict::AllowByReach(i),
+            Decision::NeedsGrant(Some(i)) => {
+                Verdict::NeedsGrant(format!("matches reach rule {i} but is {:?}: {}", op.risk, op.effects.join("; ")))
             }
-            if !rule.methods.iter().any(|m| m.eq_ignore_ascii_case(&op.method)) {
-                continue;
-            }
-            if !globs.iter().any(|g| g.is_match(&op.path)) {
-                continue;
-            }
-            if !risky || rule.allow_dangerous {
-                return Verdict::AllowByReach(i);
-            }
-            first_match.get_or_insert(i);
-        }
-        match first_match {
-            Some(i) => Verdict::NeedsGrant(format!("matches reach rule {i} but is {:?}: {}", op.risk, op.effects.join("; "))),
-            None => Verdict::NeedsGrant(format!("{} {}{} is outside the zone's reach", op.method, op.host, op.path)),
+            Decision::NeedsGrant(None) => Verdict::NeedsGrant(format!("{} {}{} is outside the zone's reach", op.method, op.host, op.path)),
         }
     }
 }
+
+/// A decision without its reasons: what [`CompiledZone::evaluate`] decides once matching is done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Decision {
+    Forbidden,
+    /// Allowed by the first reach rule that matches and allows the op's risk.
+    AllowByReach(usize),
+    /// Needs a grant; the first reach rule that matched but doesn't allow the op's risk, if any.
+    NeedsGrant(Option<usize>),
+}
+
+/// The decision, given whether a forbid rule matches (asked first, and only then the reach rules)
+/// and, per reach rule in order, whether it matches the op (host, method and path) and has
+/// `allow_dangerous`. R3 and R4 are allowed by reach only with `allow_dangerous`. Allocation-free,
+/// so the Kani harnesses (#325, `proofs/decide.rs`) check this function itself.
+pub(crate) fn decide(forbidden: impl FnOnce() -> bool, risk: RiskClass, reach: impl IntoIterator<Item = (bool, bool)>) -> Decision {
+    if forbidden() {
+        return Decision::Forbidden;
+    }
+    let risky = risk >= RiskClass::R3ExternalOrIrreversible;
+    let mut first_match = None;
+    for (i, (matches, allow_dangerous)) in reach.into_iter().enumerate() {
+        if !matches {
+            continue;
+        }
+        if !risky || allow_dangerous {
+            return Decision::AllowByReach(i);
+        }
+        first_match.get_or_insert(i);
+    }
+    Decision::NeedsGrant(first_match)
+}
+
+#[cfg(kani)]
+#[path = "proofs/decide.rs"]
+mod decide_proofs;
 
 impl std::ops::Deref for CompiledZone {
     type Target = ZoneSpec;
