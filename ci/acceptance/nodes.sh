@@ -82,14 +82,14 @@ vultr_teardown() {
   wroot identity revoke "$cap_run" --reason "acceptance teardown" >/dev/null 2>&1
   [ -n "${lease:-}" ] && wroot lease release "$lease" >/dev/null 2>&1
   wroot reconcile >/dev/null 2>&1
-  if wroot place list --owner acc.wicket.test 2>/dev/null | grep -q "^0 node(s) tagged"; then
+  if wroot node list --owner acc.wicket.test 2>/dev/null | grep -q "^0 node(s) tagged"; then
     echo "teardown: no tagged Vultr machine remains"
   else
     ACC_KEEP=1   # keep the ledger: it is how this machine is found and released
     echo "!!!! TEARDOWN: a Vultr machine tagged for this test may remain, and it bills by the hour. Now:"
-    echo "!!!!   WICKET_HOME=${WICKET_HOME:-$datadir} wicket place list --owner acc.wicket.test"
-    echo "!!!!   WICKET_HOME=${WICKET_HOME:-$datadir} wicket place release --owner acc.wicket.test <instance id>"
-    wroot place list --owner acc.wicket.test 2>&1 | sed 's/^/!!!! /'
+    echo "!!!!   WICKET_HOME=${WICKET_HOME:-$datadir} wicket node list --owner acc.wicket.test"
+    echo "!!!!   WICKET_HOME=${WICKET_HOME:-$datadir} wicket node release --owner acc.wicket.test <instance id>"
+    wroot node list --owner acc.wicket.test 2>&1 | sed 's/^/!!!! /'
   fi
   if [ "$mode" = installed ]; then sudo -n rm -f "$datadir/placement.yaml"; fi
 }
@@ -178,7 +178,7 @@ multihost() {
   check "  and the lease records what its node billed" 'grep -q "billed [$][0-9]" <<<"$lrow"'
   billed=$(grep -o 'billed \$[0-9.]*' <<<"$lrow" || true)
   if [ "$nodes" = vultr ]; then
-    check "  no tagged machine remains (wicket place list)" 'wroot place list --owner acc.wicket.test 2>/dev/null | grep -q "^0 node(s) tagged"'
+    check "  no tagged machine remains (wicket node list)" 'wroot node list --owner acc.wicket.test 2>/dev/null | grep -q "^0 node(s) tagged"'
     echo "   Vultr: the lease ${billed:-billed ?}; compare with the account's billing for this instance"
   else
     check "  no box remains on the node" '[ -z "$(for r in $(all_descendants); do box_of "$r"; done)" ]'

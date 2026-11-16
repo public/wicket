@@ -23,10 +23,12 @@ use std::path::Path;
 use std::sync::Arc;
 use wicket_core::{canonical_path, manifest::host_matches};
 
+mod canary;
 mod connect;
 mod hosts;
 mod outgoing;
 
+pub(crate) use canary::tripped_response;
 #[cfg(test)]
 use connect::parse_head;
 use outgoing::refused_shape;
@@ -123,6 +125,8 @@ pub(crate) struct Outgoing {
     pub body: OutBody,
     /// What must never be reflected back into the box (injected secrets and their rendering).
     pub injected: Vec<String>,
+    /// Set when a streamed body is cut off by the tripwire (#362): what it held.
+    pub tripped: Arc<std::sync::OnceLock<String>>,
 }
 
 /// A request body on its way upstream.
@@ -404,9 +408,9 @@ impl Egress {
                 if let Some((w, why)) = self.admit_wildcard(&host) {
                     emit("forbidden", why.clone());
                     let note = self.strike(&format!("wildcard {w}"));
-                    return problem(403, "forbidden", "Blocked by wicket sandbox: never allowed", &format!(
+                    return problem(403, "forbidden", "Blocked by wicket box: never allowed", &format!(
                         "{why}. No more new names under {w} are reached in this run, and no approval can change that; the names already reached keep working. {} Do not retry it; tell the user if you need it.{note}",
-                        crate::SANDBOX_FACT
+                        crate::BOX_FACT
                     ), None);
                 }
                 // A grant's use must be on the record before the request goes ahead (fail closed).
@@ -423,10 +427,10 @@ impl Egress {
                     return problem(
                         503,
                         "audit-unavailable",
-                        "Blocked by wicket sandbox: the audit log is unavailable",
+                        "Blocked by wicket box: the audit log is unavailable",
                         &format!(
                             "wicket could not record this request in its audit log, so it was not sent; retry later. {}",
-                            crate::SANDBOX_FACT
+                            crate::BOX_FACT
                         ),
                         None,
                     );
@@ -435,9 +439,9 @@ impl Egress {
             Outcome::Forbidden(why) => {
                 emit("forbidden", why.clone());
                 let note = self.strike(&op.digest());
-                return problem(403, "forbidden", "Blocked by wicket sandbox: never allowed", &format!(
-                    "{why}. This will never be allowed from this sandbox, and no approval can change that. {} Do not retry it; tell the user it is blocked.{note}",
-                    crate::SANDBOX_FACT
+                return problem(403, "forbidden", "Blocked by wicket box: never allowed", &format!(
+                    "{why}. This will never be allowed from this box, and no approval can change that. {} Do not retry it; tell the user it is blocked.{note}",
+                    crate::BOX_FACT
                 ), None);
             }
             Outcome::NoEscalation(why) => {
@@ -445,10 +449,10 @@ impl Egress {
                 return problem(
                     403,
                     "forbidden",
-                    "Blocked by wicket sandbox: never allowed",
+                    "Blocked by wicket box: never allowed",
                     &format!(
-                        "{why}. This sandbox may not ask for anything outside its reach (its zone's escalation.request is false), so this will never be allowed from here. {} Do not retry it; tell the user it is blocked.",
-                        crate::SANDBOX_FACT
+                        "{why}. This box may not ask for anything outside its reach (its zone's escalation.request is false), so this will never be allowed from here. {} Do not retry it; tell the user it is blocked.",
+                        crate::BOX_FACT
                     ),
                     None,
                 );
@@ -456,32 +460,38 @@ impl Egress {
             Outcome::Denied { request: rid } => {
                 emit("denied", format!("request {rid} was denied"));
                 let note = self.strike(&op.digest());
-                return problem(403, "denied", "Blocked by wicket sandbox: denied by a human", &format!(
-                    "A human denied request {rid} for exactly this request. {} Do not retry it; continue without it and tell the user.{note}",
-                    crate::SANDBOX_FACT
-                ), None);
+                return problem(
+                    403,
+                    "denied",
+                    "Blocked by wicket box: denied",
+                    &format!(
+                    "Request {rid} for exactly this request was denied. {} Do not retry it; continue without it and tell the user.{note}",
+                    crate::BOX_FACT
+                ),
+                    None,
+                );
             }
             Outcome::Pending { request: rid, fresh, why } => {
                 let for_line = who.as_ref().map(|(_, l)| format!("; for {l}")).unwrap_or_default();
                 emit("pending", format!("{rid}{}: {why}{for_line}", if fresh { " (new)" } else { "" }));
                 let note = self.strike(&op.digest());
-                return problem(403, "pending-approval", "Blocked by wicket sandbox: needs human approval", &format!(
-                    "{why}. wicket has asked a human to approve request {rid}; until they do, this request fails every time. {} Call await_grant with {rid} to wait, or tell the user that request {rid} is waiting for their approval in wicket (approvals happen in wicket, not in this conversation).{note}",
-                    crate::SANDBOX_FACT
+                return problem(403, "pending-approval", "Blocked by wicket box: needs approval", &format!(
+                    "{why}. wicket has asked for request {rid} to be approved (an operator decides it, or an agent above you may); until it is, this request fails every time. {} Call await_grant with {rid} to wait, or tell the user that request {rid} is waiting for their approval in wicket (approvals happen in wicket, not in this conversation).{note}",
+                    crate::BOX_FACT
                 ), Some(&rid));
             }
             Outcome::Queued { id, why } => {
                 let for_line = who.as_ref().map(|(_, l)| format!("; for {l}")).unwrap_or_default();
                 emit("queued", format!("{id}: {why}{for_line}"));
                 let note = self.strike(&op.digest());
-                return problem(403, "queued", "Blocked by wicket sandbox: needs human approval (queued offline)", &format!(
-                    "{why}. wicket's control host is unreachable from this node, so this ask is queued here as {id} and will be put to a human when it is back; nothing new can be approved until then. {} Continue without it for now, or retry later.{note}",
-                    crate::SANDBOX_FACT
+                return problem(403, "queued", "Blocked by wicket box: needs approval (queued offline)", &format!(
+                    "{why}. wicket's control host is unreachable from this node, so this ask is queued here as {id} and will be put to an operator when it is back; nothing new can be approved until then. {} Continue without it for now, or retry later.{note}",
+                    crate::BOX_FACT
                 ), None);
             }
             Outcome::Unavailable(why) => {
                 emit("unavailable", why.clone());
-                return crate::unavailable(&format!("{why}. {}", crate::SANDBOX_FACT));
+                return crate::unavailable(&format!("{why}. {}", crate::BOX_FACT));
             }
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
@@ -490,8 +500,8 @@ impl Egress {
         }
         match self.forward(req, &host, scheme, &pq, via).await {
             Ok(r) => r,
-            // The whole chain: a refused dial (#116) says why at its end.
-            Err(e) => problem(502, "upstream", "Upstream error", &format!("{e:#}"), None),
+            // The tripwire (#362) refuses; otherwise the whole chain: a refused dial (#116) says why at its end.
+            Err(e) => canary::tripped_response(&e).unwrap_or_else(|| problem(502, "upstream", "Upstream error", &format!("{e:#}"), None)),
         }
     }
 }
@@ -501,9 +511,9 @@ mod tests {
     #[test]
     fn forwarded_response_heads_parse_and_garbage_does_not() {
         let (st, reason, h) =
-            super::parse_head(b"HTTP/1.1 403 Blocked by wicket sandbox: x\r\nContent-Length: 12\r\nX-Wicket: pending-approval\r\n\r\n")
+            super::parse_head(b"HTTP/1.1 403 Blocked by wicket box: x\r\nContent-Length: 12\r\nX-Wicket: pending-approval\r\n\r\n")
                 .unwrap();
-        assert_eq!((st, reason.as_str()), (403, "Blocked by wicket sandbox: x"));
+        assert_eq!((st, reason.as_str()), (403, "Blocked by wicket box: x"));
         assert!(h.contains(&("x-wicket".into(), "pending-approval".into())));
         assert!(super::parse_head(b"\xff\xfe").is_none());
         assert!(super::parse_head(b"HTTP/1.1 x\r\n\r\n").is_none());
@@ -930,7 +940,7 @@ mod tests {
 
         let (st, body) = get(&e, "anything.example.co.uk").await;
         assert_eq!(st, 403, "{body}");
-        assert!(body.contains("needs human approval"), "{body}");
+        assert!(body.contains("needs approval"), "{body}");
         assert_eq!(e.domains_checked(), ["example.co.uk", "no-such-domain-wkt.com"]);
 
         // A host the zone names is never checked, and a run that doesn't escalate checks nothing.

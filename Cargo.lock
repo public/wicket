@@ -4210,6 +4210,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "memchr",
  "psl",
  "quinn",
  "rcgen 0.13.2",

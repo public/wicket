@@ -2,7 +2,7 @@
 //! the ssh host key the control host generates and pins before the node exists, and the readiness
 //! probe that uses that pin.
 //!
-//! **Trust bootstrap, step by step** (what `wicket place create` does):
+//! **Trust bootstrap, step by step** (what `wicket node create` does):
 //! 1. The control host generates an ed25519 host key pair with `ssh-keygen` in a private temporary
 //!    directory, reads it and deletes the files.
 //! 2. The user data installs it as the node's only host key (`ssh_deletekeys`, no generated types), writes

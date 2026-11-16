@@ -1,0 +1,13 @@
+{
+  "name": "wicket",
+  "displayName": "wicket",
+  "description": "Skills for working with wicket: an agent inside a box, an operator running wicket, writing manifests, and coordinating boxes",
+  "author": {
+    "name": "wicket",
+    "url": "https://github.com/public/wicket"
+  },
+  "homepage": "https://github.com/public/wicket/blob/main/docs/how-to/use-wickets-skills.md",
+  "repository": "https://github.com/public/wicket",
+  "license": "MIT",
+  "keywords": ["wicket", "sandbox", "agents", "gvisor"]
+}

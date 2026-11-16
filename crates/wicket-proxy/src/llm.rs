@@ -438,13 +438,7 @@ impl Llm {
     ) -> std::result::Result<Filtered, Box<Response<BoxBody>>> {
         let refuse = |status: u16, why: String| {
             self.event(None, status, Usage::default(), &format!("refused: {why}"));
-            Box::new(problem(
-                status,
-                "forbidden",
-                "Blocked by wicket: model request refused",
-                &format!("{why}. {}", crate::SANDBOX_FACT),
-                None,
-            ))
+            Box::new(problem(status, "forbidden", "Blocked by wicket: model request refused", &format!("{why}. {}", crate::BOX_FACT), None))
         };
         let path = parts.uri.path();
         if matches!(parts.method, http::Method::GET | http::Method::HEAD) {
@@ -548,7 +542,7 @@ impl Llm {
                                     "Model token budget too low for this request",
                                     &format!(
                                         "{why}. Send it without extended thinking or with a smaller max_tokens, or ask for more budget. {}",
-                                        crate::SANDBOX_FACT
+                                        crate::BOX_FACT
                                     ),
                                     None,
                                 )));
@@ -634,6 +628,10 @@ impl Llm {
             }
             Err(e) => {
                 self.settle(reserved, Usage::default(), true);
+                if let Some(r) = crate::egress::tripped_response(&e) {
+                    self.event(f.model, 403, Usage::default(), &format!("{e}"));
+                    return r;
+                }
                 self.event(f.model, 502, Usage::default(), &format!("upstream error: {e:#}"));
                 problem(502, "upstream", "Model upstream error", &format!("{e:#}"), None)
             }
@@ -971,7 +969,7 @@ mod tests {
                 manifest: "m",
                 image: "i",
                 workspace: None,
-                lease_until: 0,
+                claim_until: 0,
             })
             .unwrap();
         assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
