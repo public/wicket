@@ -104,8 +104,6 @@ pub struct Calls {
     /// Link sockets listened on: where their connections go.
     incoming: Mutex<HashMap<(String, String), mpsc::UnboundedSender<BoxStream>>>,
     next: AtomicU64,
-    /// The protocol version the connection talks (0: none up yet).
-    proto: std::sync::atomic::AtomicU32,
     /// Images being sent (#191): how far the node has taken each, by stream.
     acks: Mutex<HashMap<u64, tokio::sync::watch::Sender<u64>>>,
 }
@@ -139,14 +137,6 @@ impl Calls {
 
     pub fn connected(&self) -> bool {
         self.out.lock().expect("out").is_some()
-    }
-
-    pub fn set_proto(&self, p: u32) {
-        self.proto.store(p, Ordering::SeqCst);
-    }
-
-    pub fn proto(&self) -> u32 {
-        self.proto.load(Ordering::SeqCst)
     }
 
     fn send(&self, f: Frame) -> bool {
@@ -368,8 +358,7 @@ impl Calls {
         }
     }
 
-    /// Whether the node has the image `digest` names (#191). Only on connections talking
-    /// [`chan::IMAGE_DELIVERY`].
+    /// Whether the node has the image `digest` names (#191).
     pub async fn has_image(&self, digest: &str) -> Result<bool> {
         let id = self.id();
         match self.answer(id, Frame::Msg(Msg::ImageHave { id, digest: digest.into() }), "an image query").await? {
@@ -380,7 +369,7 @@ impl Calls {
     }
 
     /// Has the node pull image `digest` from registry `from` for `run`, host-side (#191): returns
-    /// once it has verified and imported it. Only on connections talking [`chan::IMAGE_PULL`].
+    /// once it has verified and imported it.
     pub async fn pull_image(&self, run: &str, digest: &str, name: Option<&str>, from: &crate::registry::Source) -> Result<()> {
         let id = self.id();
         let (tx, rx) = oneshot::channel();
@@ -402,7 +391,7 @@ impl Calls {
 
     /// Sends the node image `digest`, read as an OCI image layout archive from `from`, to import as
     /// `name` (#191): returns once the node has verified and imported it. At most [`IMAGE_WINDOW`]
-    /// bytes are in flight. Only on connections talking [`chan::IMAGE_DELIVERY`].
+    /// bytes are in flight.
     pub async fn put_image(&self, digest: &str, name: Option<&str>, mut from: impl AsyncRead + Unpin) -> Result<u64> {
         let stream = TUNNEL_BIT | CONTROL_TUNNEL_BIT | self.id();
         let (atx, mut acked) = tokio::sync::watch::channel(0u64);
@@ -503,9 +492,6 @@ impl Calls {
     /// `sock` in `run`'s box itself, so the bytes never leave the node and the link outlives this
     /// connection.
     pub async fn listen_direct(&self, run: &str, sock: &str, to: &str, port: u16) -> Result<()> {
-        if self.proto() < crate::chan::EDGE_DECISIONS {
-            bail!("the node talks protocol {}: links are relayed here", self.proto());
-        }
         let id = self.id();
         let msg = Msg::Listen { id, run: run.into(), sock: sock.into(), dial: Some((to.into(), port)) };
         match self.answer(id, Frame::Msg(msg), "a listen").await? {
@@ -568,7 +554,6 @@ impl Link {
         let calls = Arc::new(Calls::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
         calls.set_out(Some(tx));
-        calls.set_proto(proto);
         let c = calls.clone();
         let task = tokio::spawn(async move {
             let _child = child;

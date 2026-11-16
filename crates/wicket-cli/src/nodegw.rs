@@ -19,7 +19,7 @@
 //! connection is back, and its answer kept for `await_grant` on that id. Nothing is approved on
 //! the node alone. Every other tool is relayed to the run's gateway on the control host.
 
-use super::{Node, OLD_CONTROL};
+use super::Node;
 use crate::chan::{Frame, Msg};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -727,7 +727,7 @@ async fn start_child(
         "node.spawned",
         json!({ "child": child.0, "zone": m.zone.name, "image": plan.image, "box_path": record.box_path, "secrets": shared, "authority_until": until }),
     );
-    if connected(node, run) && node.proto_of(run) >= crate::chan::EDGE_DECISIONS {
+    if connected(node, run) {
         node.send_run(run, Frame::Msg(c.msg()));
     }
     let kind = if plan.is_agent { "agent" } else { "program" };
@@ -997,9 +997,6 @@ pub(super) fn replay(node: &Arc<Node>, run: &str) {
 
 /// Calls tool `name` on the run's gateway on the control host: its text and whether it is an error.
 pub(super) async fn relay_tool(node: &Arc<Node>, run: &str, name: &str, args: &Value) -> std::io::Result<(String, bool)> {
-    if (1..crate::chan::EDGE_DECISIONS).contains(&node.proto_of(run)) {
-        return Err(std::io::Error::other(OLD_CONTROL));
-    }
     let rpc = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
     let resp = super::relay_rpc(node, run, None, bytes::Bytes::from(rpc.to_string())).await?;
     let body = http_body_util::BodyExt::collect(resp.into_body()).await.map_err(std::io::Error::other)?.to_bytes();
