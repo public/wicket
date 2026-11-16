@@ -59,6 +59,7 @@ mod gateway;
 mod gw;
 mod images;
 mod links;
+mod volumes;
 use conn::*;
 use gateway::*;
 use links::*;
@@ -203,7 +204,6 @@ struct Link {
     /// Tunnels opened for the boxes this connection owns; they die with it.
     tunnels: Arc<Tunnels>,
     /// The protocol version it talks ([`chan::negotiate`]): a message newer than this isn't sent on it.
-    #[allow(dead_code)]
     proto: u32,
 }
 
@@ -253,6 +253,17 @@ struct Node {
     images: images::Incoming,
     /// What `wicket node top` shows beyond the rest: boxes starting, egress decisions, connections.
     seen: crate::top::NodeSeen,
+    /// Boxes killed for memory, and failures to persist the node's own state (#377), for its health.
+    ooms: Arc<crate::health::Counter>,
+    persists: Arc<crate::health::Counter>,
+    /// Boxes admitted and still starting (#377), by run: their memory limits (MiB), counted as
+    /// committed until the box is up or its start fails.
+    admitting: Mutex<HashMap<String, u64>>,
+    /// The node's disk reserve (#377), released for its own writes when the disk is full.
+    reserve: crate::health::Reserve,
+    /// Since when (ms) feed frames have failed to persist, if they are failing: the node asks for
+    /// them again once it can write (#377).
+    feed_stalled: Mutex<Option<i64>>,
 }
 
 impl Node {
@@ -338,6 +349,7 @@ impl Node {
         }
         st.boxes.sort_by(|a, b| a.started_ms.cmp(&b.started_ms).then_with(|| a.run.cmp(&b.run)));
         st.egress = self.seen.recent();
+        st.health = Some(self.health());
         st
     }
 
@@ -369,7 +381,145 @@ impl Node {
             c.used_memory_mib += b.memory_mib;
             c.boxes += 1;
         }
+        let (m, d, unused) = self.room_with(&self.admitting.lock().expect("admitting"));
+        c.room_mib = Some(crate::health::room_mib(&m, unused));
+        c.full = crate::health::refuses(&d).is_some();
         c
+    }
+
+    /// What admission reckons with (#377): the machine's memory (with the limits committed, those of
+    /// boxes still starting among them), the data directory's disk, and what the boxes may still
+    /// take up to their limits (MiB: each one's limit less what it uses now, as last sampled; its
+    /// whole limit if not sampled yet). `admitting` is the boxes starting.
+    fn room_with(&self, admitting: &HashMap<String, u64>) -> (crate::health::Memory, crate::health::Disk, u64) {
+        let (total_mib, available_mib) = crate::health::memory();
+        let starting: u64 = admitting.values().sum();
+        let (committed, unused) = {
+            let mem = self.mem.lock().expect("mem");
+            let boxes = self.boxes.lock().expect("boxes");
+            let running = boxes.iter().filter(|(_, b)| b.exited.is_none());
+            running.fold((starting, starting), |(c, u), (run, b)| {
+                (c + b.memory_mib, u + b.memory_mib.saturating_sub(mem.get(run).map_or(0, |e| e.1.current >> 20)))
+            })
+        };
+        (crate::health::Memory { total_mib, available_mib, committed_mib: committed }, crate::health::disk(&self.paths.root), unused)
+    }
+
+    /// Admits a box with a `want_mib` memory limit for `run`, or says why not (#377). Admitted, it
+    /// counts as committed until [`Self::admitted`]; two starts are admitted one after the other.
+    fn admit(&self, run: &str, want_mib: u64) -> Result<()> {
+        let mut admitting = self.admitting.lock().expect("admitting");
+        let (m, d, unused) = self.room_with(&admitting);
+        let room = crate::health::room_mib(&m, unused);
+        crate::health::admit(want_mib, room, &m, &d).map_err(|why| anyhow::anyhow!("node {}: {why}", self.name))?;
+        admitting.insert(run.to_string(), want_mib);
+        Ok(())
+    }
+
+    fn admitted(&self, run: &str) {
+        self.admitting.lock().expect("admitting").remove(run);
+    }
+
+    /// This node's health (#377): its data directory's disk, memory, feed, and what went wrong.
+    fn health(&self) -> crate::health::NodeHealth {
+        let now = (self.clock)();
+        let (total_mib, available_mib) = crate::health::memory();
+        let (mode, fresh_until) = {
+            let r = self.replica.lock().expect("replica");
+            (serde_json::to_value(r.mode(now)).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(), r.fresh_until())
+        };
+        let (oom_kills, last_oom) = self.ooms.get();
+        let (persist_failures, last_persist_failure) = self.persists.get();
+        crate::health::NodeHealth {
+            at_ms: now,
+            disk: crate::health::Disk { reserve_bytes: self.reserve.held(), ..crate::health::disk(&self.paths.root) },
+            memory: crate::health::Memory { total_mib, available_mib, committed_mib: self.capacity().used_memory_mib },
+            feed_mode: mode,
+            feed_fresh_until_ms: fresh_until,
+            oom_kills,
+            last_oom,
+            persist_failures,
+            last_persist_failure,
+        }
+    }
+
+    /// A feed frame wasn't persisted for want of space (#377): the reserve is released for it, and
+    /// the frame is tried again once. Returns the second try's result, if there was one.
+    fn feed_storage_failed(&self, bytes: &[u8], why: &wicket_feed::Refusal) -> Option<Result<(), wicket_feed::Refusal>> {
+        let now = (self.clock)();
+        self.persists.note(now, format!("feed: {why}"));
+        let again = self.reserve.release().then(|| {
+            eprintln!("[node] the disk reserve is released for the node's feed");
+            self.replica.lock().expect("replica").accept_bytes(bytes, now).map(|_| ())
+        });
+        if !matches!(again, Some(Ok(()))) {
+            self.feed_stalled.lock().expect("stalled").get_or_insert(now);
+        }
+        again
+    }
+
+    /// While feed frames fail to persist (#377): once the feed's directory can be written again,
+    /// the node asks every control connection for what it is missing (a catch-up), so it recovers
+    /// without a restart. Returns whether it did.
+    fn recover_feed(&self) -> bool {
+        let mut stalled = self.feed_stalled.lock().expect("stalled");
+        let Some(since) = *stalled else { return false };
+        if !crate::health::writable(&self.paths.feed()) {
+            return false;
+        }
+        *stalled = None;
+        drop(stalled);
+        eprintln!("[node] the feed can be written again (it couldn't since {since} ms): asking for what it missed");
+        let _ = self.audit.lock().expect("audit").audit(
+            &wicket_core::TenantId::single(),
+            None,
+            "feed.recovered",
+            &serde_json::json!({ "stalled_since_ms": since }),
+        );
+        let status = {
+            let r = self.replica.lock().expect("replica");
+            Msg::FeedStatus { mode: r.mode((self.clock)()), epoch: r.state().map(|s| s.epoch), refused: None, catch_up: Some(r.hello()) }
+        };
+        for l in self.links.lock().expect("links").values() {
+            let _ = l.out.send(Frame::Msg(status.clone()));
+        }
+        true
+    }
+
+    /// Deletes what has outlived its retention (#377): runs' caches and unused kept volumes, never
+    /// a workspace, and never a volume a running box has. Audited.
+    fn sweep_volumes(&self) -> usize {
+        let (running, in_use): (std::collections::HashSet<String>, Vec<PathBuf>) = {
+            let boxes = self.boxes.lock().expect("boxes");
+            let live = boxes.iter().filter(|(_, b)| b.exited.is_none());
+            let mut in_use = vec![];
+            for (_, b) in live.clone() {
+                let st = &b.record.start;
+                for (name, _) in &st.volumes {
+                    in_use.push(volumes::dir_for(st, name, self.paths.volumes().join(&st.tenant).join(&st.zone).join(name), &b.dir));
+                }
+            }
+            (boxes.keys().cloned().collect(), in_use)
+        };
+        let swept = volumes::sweep(&self.paths.volumes(), &self.paths.runs(), &|r| running.contains(r), &in_use, (self.clock)());
+        for (dir, why) in &swept {
+            eprintln!("[node] deleted {}: {why}", dir.display());
+            let _ = self.audit.lock().expect("audit").audit(
+                &wicket_core::TenantId::single(),
+                None,
+                "volume.expired",
+                &serde_json::json!({ "dir": dir.display().to_string(), "why": why }),
+            );
+        }
+        swept.len()
+    }
+
+    /// Sends this node's health on every connection that takes it (#377).
+    fn report_health(&self) {
+        let h = self.health();
+        for l in self.links.lock().expect("links").values().filter(|l| l.proto >= chan::NODE_HEALTH) {
+            let _ = l.out.send(Frame::Msg(Msg::Health { health: h.clone() }));
+        }
     }
 
     /// The box on this node running as principal `id` (#250), as its control host named it in the
@@ -683,6 +833,14 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         Err(e) => eprintln!("[node] the secret cache handed over is refused: {e:#}"),
     }
     let slices = crate::nodesecrets::Slices::new(&node_root)?;
+    // The disk reserve (#377): taken now if the disk has room for it, and again whenever it has.
+    let reserve = crate::health::Reserve::for_node(&node_root);
+    match reserve.take() {
+        Ok(true) => eprintln!("[node] disk reserve: {} MiB held for the node's own state", reserve.size >> 20),
+        Ok(false) if reserve.held() > 0 => {}
+        Ok(false) => eprintln!("[node] disk reserve: not held (no room for {} MiB above the floor)", reserve.size >> 20),
+        Err(e) => eprintln!("[node] disk reserve: not held ({e})"),
+    }
     let node = Arc::new(Node {
         name: name.clone(),
         paths,
@@ -713,6 +871,11 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         llms: Mutex::new(HashMap::new()),
         images: Default::default(),
         seen: Default::default(),
+        ooms: Default::default(),
+        persists: Default::default(),
+        admitting: Default::default(),
+        reserve,
+        feed_stalled: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -789,6 +952,24 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                 tick5 = tick5.wrapping_add(1);
                 if tick5.is_multiple_of(5) {
                     sample_memory(&n).await;
+                }
+                // Its health, to the control host (#377).
+                if tick5.is_multiple_of(crate::health::REPORT_EVERY.as_secs()) {
+                    n.report_health();
+                }
+                // A stalled feed is asked for again once it can be written; the reserve is taken
+                // back once there is room for it (#377).
+                if tick5.is_multiple_of(5) {
+                    n.recover_feed();
+                }
+                // Volumes past their retention, hourly (and soon after start).
+                if tick5 % 3600 == 30 {
+                    n.sweep_volumes();
+                }
+                if tick5.is_multiple_of(60) && n.feed_stalled.lock().expect("stalled").is_none() {
+                    if let Ok(true) = n.reserve.take() {
+                        eprintln!("[node] disk reserve: taken back ({} MiB)", n.reserve.size >> 20);
+                    }
                 }
                 // Secrets past their expiry are dropped (#152); their use already ended.
                 n.secrets.sweep();
@@ -1023,6 +1204,7 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: Arc<Ti
         node.seen.starting(&run, &bs.zone, wicket_feed::now_ms());
     }
     let r = start_box_steps(node, owner, bs, t).await;
+    node.admitted(&run);
     node.seen.started(&run);
     r
 }
@@ -1064,6 +1246,13 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
             .await?
             .with_context(|| format!("image {} not found on node {} (run: wicket image there)", bs.image, node.name))?,
     };
+    // Admission (#377): the box's memory limit against what is actually free, and the disk floor.
+    // Refused, nothing of it is made; the refusal names why, and placement tries another node.
+    if let Err(e) = node.admit(&bs.run, bs.memory.parse::<u64>().unwrap_or(0) >> 20) {
+        eprintln!("[node] {}: refused: {e:#}", bs.run);
+        node.audit_note(&bs.run, "box.refused", serde_json::json!({ "why": format!("{e:#}") }));
+        return Err(e);
+    }
     if !bs.binds.is_empty() && !node.paths.shares_host() {
         bail!("this node doesn't share the control host's filesystem: it can't mount the control host's directories");
     }
@@ -1126,12 +1315,14 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
         }
         // A long-lived agent's durable volume is its own, kept with its state in the run's
         // directory (and moved when it hibernates); any other is the zone's.
+        // Otherwise it is the zone's, kept across runs, or the run's own cache (#377).
         let d = match bs.long_lived && bs.durable.iter().any(|(n, _)| n == name) {
             true => dir.join("volumes").join(name),
-            false => node.paths.volumes().join(&bs.tenant).join(&bs.zone).join(name),
+            false => volumes::dir_for(&bs, name, node.paths.volumes().join(&bs.tenant).join(&bs.zone).join(name), &dir),
         };
         std::fs::create_dir_all(&d)?;
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
+        volumes::used(&bs, name, &d, (node.clock)());
         volume_mounts.push(Mount { host: d, target: target.clone(), read_only: false });
     }
 
@@ -1338,6 +1529,7 @@ fn child_start(
         image_pin: plan.image_pin.clone(),
         timings: parent.timings,
         memory_advice: m.zone.limits.memory_advice().map(str::to_string),
+        volume_life: Some(chan::VolumeLife::of(m)),
     })
 }
 
@@ -1890,9 +2082,19 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
                 "memory_peak": mem.map(|m| m.peak), "memory_limit": mem.and_then(|m| m.max).or(limit) }),
         );
         n.causes.lock().expect("causes").insert(run.to_string(), c.clone());
+        if info.as_ref().is_some_and(|i| i.oom_killed) || mem.is_some_and(|m| m.oom_kills > 0) {
+            n.ooms.note((n.clock)(), format!("{run}: {c}"));
+        }
     }
     let _ = n.docker.remove(box_name).await;
     t.step("node.teardown.rm");
+    // Its caches' retention starts now; its kept volumes were last used now (#377).
+    if let Some(d) = &dir {
+        let start = n.boxes.lock().expect("boxes").get(run).map(|b| b.record.start.clone());
+        if let Some(bs) = start {
+            volumes::box_ended(&bs, &n.paths.volumes(), d, (n.clock)());
+        }
+    }
     if let Some(d) = &dir {
         let _ = std::fs::remove_file(d.join(BoxRecord::FILE));
     }
@@ -2011,7 +2213,12 @@ async fn serve_box(
         // whole reservation (#324): a `serve` that crashes mid-call, or within a second of one,
         // restarts counting every call the provider billed, so its slice still bounds the spend.
         let path = dir.join(SPEND_FILE);
-        l.set_journal(move |s| write_spend(&path, &s));
+        let (persists, clock) = (node.persists.clone(), node.clock.clone());
+        l.set_journal(move |s| {
+            if let Err(e) = write_spend(&path, &s) {
+                persists.note(clock(), format!("spend journal {}: {e}", path.display()));
+            }
+        });
         // And reported when it moves, and every 10 s anyway (a new connection learns it without
         // waiting for the next call); persisted again as calls settle.
         let (n, run, l2) = (node.clone(), bs.run.clone(), l.clone());
@@ -2171,11 +2378,10 @@ fn ca_not_after(pem: &[u8]) -> Option<i64> {
 /// Writes a box's spend file whole or not at all (a temporary file renamed over it): a crash
 /// mid-write must not leave a short file, which a restarted `serve` would read as nothing spent.
 /// Called under the model proxy's journal lock only ([`wicket_proxy::llm::Llm::journal`]).
-fn write_spend(path: &std::path::Path, s: &wicket_proxy::llm::Spent) {
+fn write_spend(path: &std::path::Path, s: &wicket_proxy::llm::Spent) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_vec(s).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    std::fs::write(&tmp, serde_json::to_vec(s).unwrap_or_default())?;
+    std::fs::rename(&tmp, path)
 }
 
 /// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).
@@ -2367,6 +2573,11 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             llms: Mutex::new(HashMap::new()),
             images: Default::default(),
             seen: Default::default(),
+            ooms: Default::default(),
+            persists: Default::default(),
+            admitting: Default::default(),
+            reserve: crate::health::Reserve { path: i.dir.join("reserve"), size: 1 << 20 },
+            feed_stalled: Default::default(),
         })
     }
 
@@ -2408,7 +2619,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert_eq!(a.feed(b"yy\nyy\nz"), Some(b"yy\nz".to_vec()));
     }
 
-    fn fake_record(run: &str) -> BoxRecord {
+    pub(super) fn fake_record(run: &str) -> BoxRecord {
         BoxRecord {
             start: BoxStart {
                 run: run.into(),
@@ -2444,6 +2655,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 image_pin: None,
                 timings: false,
                 memory_advice: None,
+                volume_life: None,
             },
             image_digest: None,
             name: format!("wicket-{run}"),
@@ -2538,6 +2750,64 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             Frame::Data { stream: b.streams[1], offset: at, bytes: bytes.to_vec() }
         };
         node.send_run("run_a", f);
+    }
+
+    /// #377: a node's health names its data directory's disk, its memory, its feed, and the boxes
+    /// killed for memory and failed writes it has seen; its status carries the same.
+    #[tokio::test]
+    async fn the_health_counts_what_went_wrong() {
+        let inst = Install::new("nodesrv-health");
+        let node = test_node(&inst);
+        let h = node.health();
+        assert!(h.disk.total_bytes > 0 && h.memory.total_mib > 0, "{h:?}");
+        assert_eq!((h.oom_kills, h.persist_failures, h.feed_mode.as_str()), (0, 0, "closed"));
+        node.ooms.note(5, "run_a: killed: out of memory");
+        node.persists.note(6, "feed: could not persist: No space left on device");
+        node.persists.note(7, "spend journal: No space left on device");
+        let h = node.status().health.expect("health in the status");
+        assert_eq!((h.oom_kills, h.persist_failures), (1, 2));
+        assert_eq!(h.last_persist_failure.map(|e| e.at_ms), Some(7));
+    }
+
+    /// #377: a feed frame not persisted for want of space releases the node's reserve and is tried
+    /// again; still failing, the feed is stalled until it can be written, then asked for again.
+    #[tokio::test]
+    async fn a_feed_that_cannot_be_persisted_recovers_once_it_can() {
+        let inst = Install::new("nodesrv-stall");
+        let node = test_node(&inst);
+        std::fs::create_dir_all(node.paths.feed()).unwrap();
+        assert!(node.reserve.take().unwrap());
+        let full = wicket_feed::Refusal::Storage("No space left on device".into());
+        let again = node.feed_storage_failed(b"not a frame", &full);
+        assert!(again.is_some_and(|r| r.is_err()), "tried again with the reserve released");
+        assert_eq!(node.reserve.held(), 0);
+        assert!(node.feed_stalled.lock().unwrap().is_some());
+        assert_eq!(node.health().persist_failures, 1);
+        // Once the feed's directory can be written, it is asked for again (and only once).
+        assert!(node.recover_feed());
+        assert!(node.feed_stalled.lock().unwrap().is_none());
+        assert!(!node.recover_feed());
+        // With no reserve left to release, the frame isn't tried again; the feed is stalled.
+        assert!(node.feed_storage_failed(b"x", &full).is_none());
+        assert!(node.feed_stalled.lock().unwrap().is_some());
+    }
+
+    /// #377: a box is admitted only into memory that is actually free, counting what the boxes
+    /// starting already took; refused, it says why.
+    #[tokio::test]
+    async fn admission_refuses_a_box_that_does_not_fit() {
+        let inst = Install::new("nodesrv-admit");
+        let node = test_node(&inst);
+        let e = node.admit("run_big", 1 << 40).unwrap_err().to_string();
+        assert!(e.contains(crate::health::NO_ROOM) && e.contains("memory: its limit is"), "{e}");
+        assert!(node.admitting.lock().unwrap().is_empty(), "a refused box takes nothing");
+        let room = node.capacity().room_mib.expect("room");
+        node.admit("run_a", room / 2).unwrap();
+        let after = node.capacity().room_mib.expect("room");
+        assert!(after + room / 2 <= room + 64, "the starting box counts as committed: {room} then {after}");
+        assert!(node.admit("run_b", room / 2 + 128).is_err(), "the second doesn't fit beside the first");
+        node.admitted("run_a");
+        assert!(node.admitting.lock().unwrap().is_empty());
     }
 
     /// `wicket node top`'s status: the node's identity, connections, boxes (with their state, agent,

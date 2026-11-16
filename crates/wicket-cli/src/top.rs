@@ -53,6 +53,9 @@ pub struct NodeStatus {
     pub boxes: Vec<BoxStatus>,
     /// The last egress decisions across its boxes, newest first.
     pub egress: Vec<EgressSeen>,
+    /// Its health (#377), as it reports it to the control host.
+    #[serde(default)]
+    pub health: Option<crate::health::NodeHealth>,
 }
 
 /// The node's control connections: how many are up, and since when (Unix ms) the node has been
@@ -331,6 +334,13 @@ pub fn render_node(f: &NodeFrame, width: usize) -> Vec<String> {
     out.push(control);
     out.push(feed);
     out.push(host_line(&f.host));
+    // What the node reports to its control host (#377), and what of it an operator is alerted to.
+    if let Some(h) = &s.health {
+        out.push(format!("health: {}", clean(&crate::health::summary(h, now), 300)));
+        for a in crate::health::alerts(&clean(&s.node, 64), h, now) {
+            out.push(format!("  ! {}", clean(&a.text, 300)));
+        }
+    }
     out.push(String::new());
     // Two lines a box, so a box's row reads on an 80-column console: what it is and takes, then its
     // model use, slice, egress and asks.
@@ -460,6 +470,8 @@ pub struct NodeLine {
     pub link: Option<(bool, i64)>,
     pub boxes: usize,
     pub capacity: Option<crate::chan::NodeCapacity>,
+    /// Its latest health report (#377), if it has sent one.
+    pub health: Option<crate::health::NodeHealth>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -535,6 +547,8 @@ pub fn control_frame(l: &wicket_store::Ledger, runs_dir: &Path, now_ms: i64) -> 
             connected: None,
         });
     }
+    let mut health: HashMap<String, crate::health::NodeHealth> =
+        l.node_health()?.into_iter().filter_map(|(n, _, j)| serde_json::from_str(&j).ok().map(|h| (n, h))).collect();
     let mut names: Vec<(String, String)> = vec![(crate::localnode::NAME.to_string(), "active".to_string())];
     names.extend(l.nodes()?.into_iter().map(|n| (n.name, n.status)));
     for (name, status) in names {
@@ -545,7 +559,8 @@ pub fn control_frame(l: &wicket_store::Ledger, runs_dir: &Path, now_ms: i64) -> 
             Some(k) => Some((true, k.since_ms)),
             None => links.iter().map(|k| k.since_ms).max().map(|t| (false, t)),
         };
-        f.nodes.push(NodeLine { name, status, link, boxes, capacity: freshest.and_then(|k| k.capacity) });
+        let health = health.remove(&name);
+        f.nodes.push(NodeLine { name, status, link, boxes, capacity: freshest.and_then(|k| k.capacity), health });
     }
     f.pending = l.pending(&tenant)?.len();
     for x in l.leases(&["active"])? {
@@ -577,8 +592,9 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
             plural(f.leases.len())
         ),
         String::new(),
-        format!("{:<16} {:<26} {:>5} {:>10} {:>12}", "NODE", "CONTROL", "BOXES", "CPU", "MEM"),
+        format!("{:<16} {:<26} {:>5} {:>10} {:>12} {:>5}", "NODE", "CONTROL", "BOXES", "CPU", "MEM", "DISK"),
     ];
+    let mut alerts = Vec::new();
     for n in &f.nodes {
         let link = match (n.status.as_str(), n.link) {
             ("revoked", _) => "revoked".to_string(),
@@ -593,7 +609,14 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
             }
             None => ("-".into(), "-".into()),
         };
-        out.push(format!("{:<16} {:<26} {:>5} {:>10} {:>12}", cut(&clean(&n.name, 64), 16), link, n.boxes, cpu, mem));
+        let disk = n.health.as_ref().map_or("-".into(), |h| format!("{:.0}%", h.disk.used_pct()));
+        out.push(format!("{:<16} {:<26} {:>5} {:>10} {:>12} {:>5}", cut(&clean(&n.name, 64), 16), link, n.boxes, cpu, mem, disk));
+        if let Some(h) = &n.health {
+            alerts.extend(crate::health::alerts(&clean(&n.name, 64), h, now));
+        }
+    }
+    for a in alerts {
+        out.push(format!("  ! {}", clean(&a.text, 300)));
     }
     out.push(String::new());
     out.push(format!("{:<8}  {:<12} {:<20} {:<11} {:>6} {:>5} {:>9}", "RUN", "NODE", "AGENT/ZONE", "STATUS", "UP", "REQ", "TOK in/out"));
@@ -963,6 +986,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            health: None,
             egress: vec![
                 EgressSeen {
                     at_ms: NOW - 1000,
@@ -1039,7 +1063,14 @@ mod tests {
 
     #[test]
     fn the_control_frame_reads_on_an_80_column_console() {
-        let cap = crate::chan::NodeCapacity { vcpus: 4.0, memory_mib: 8192, used_vcpus: 1.5, used_memory_mib: 2560, boxes: 2 };
+        let cap = crate::chan::NodeCapacity {
+            vcpus: 4.0,
+            memory_mib: 8192,
+            used_vcpus: 1.5,
+            used_memory_mib: 2560,
+            boxes: 2,
+            ..Default::default()
+        };
         let f = ControlFrame {
             now_ms: NOW,
             nodes: vec![
@@ -1049,6 +1080,7 @@ mod tests {
                     link: Some((true, NOW - 600_000)),
                     boxes: 1,
                     capacity: Some(cap),
+                    health: None,
                 },
                 NodeLine {
                     name: "hyperv1".into(),
@@ -1056,9 +1088,26 @@ mod tests {
                     link: Some((false, NOW - 95_000)),
                     boxes: 1,
                     capacity: Some(cap),
+                    // Nearly full, and a box killed for memory (#377): both alerted.
+                    health: Some(crate::health::NodeHealth {
+                        at_ms: NOW - 20_000,
+                        disk: crate::health::Disk {
+                            total_bytes: 100 << 30,
+                            avail_bytes: 9 << 30,
+                            files_total: 0,
+                            files_avail: 0,
+                            reserve_bytes: 0,
+                        },
+                        oom_kills: 1,
+                        last_oom: Some(crate::health::HealthEvent {
+                            at_ms: NOW - 60_000,
+                            what: "run_01JCAAAA: killed: out of memory".into(),
+                        }),
+                        ..Default::default()
+                    }),
                 },
-                NodeLine { name: "spare".into(), status: "active".into(), link: None, boxes: 0, capacity: None },
-                NodeLine { name: "old".into(), status: "revoked".into(), link: None, boxes: 0, capacity: None },
+                NodeLine { name: "spare".into(), status: "active".into(), link: None, boxes: 0, capacity: None, health: None },
+                NodeLine { name: "old".into(), status: "revoked".into(), link: None, boxes: 0, capacity: None, health: None },
             ],
             runs: vec![
                 RunLine {
@@ -1123,7 +1172,14 @@ mod tests {
         l.run_ended(&wicket_core::RunId("run_01jccccccccccccccccccccccc".into()), "done", "").unwrap();
         let a = dir.join("run_01jcaaaaaaaaaaaaaaaaaaaaaa");
         std::fs::create_dir_all(a.join("ctl")).unwrap();
-        let cap = crate::chan::NodeCapacity { vcpus: 2.0, memory_mib: 4096, used_vcpus: 1.0, used_memory_mib: 1024, boxes: 1 };
+        let cap = crate::chan::NodeCapacity {
+            vcpus: 2.0,
+            memory_mib: 4096,
+            used_vcpus: 1.0,
+            used_memory_mib: 1024,
+            boxes: 1,
+            ..Default::default()
+        };
         let spent = Spent { requests: 5, input_tokens: 100, output_tokens: 20, ..Default::default() };
         LinkRecord { node: "local".into(), connected: true, since_ms: NOW - 5000, spent, capacity: Some(cap), updated_ms: NOW }.save(&a);
         let b = dir.join("run_01jcbbbbbbbbbbbbbbbbbbbbbb");

@@ -1298,6 +1298,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             image_pin: image_pin.clone(),
             timings: wicket_core::timing::enabled(),
             memory_advice: m.zone.limits.memory_advice().map(str::to_string),
+            volume_life: Some(crate::chan::VolumeLife::of(&m)),
         };
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
@@ -1812,7 +1813,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
                 None => break,
             },
-            Some(ev) = rx.recv() => print_event(&ev),
+            Some(ev) = rx.recv() => {
+                note_collected(&ledger, &run.0, &ev);
+                print_event(&ev)
+            }
             Some(w) = want_rx.recv() => {
                 let when = if turn_running { ": at the end of this turn" } else { "" };
                 match w {
@@ -2150,6 +2154,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;
     }
     while let Ok(ev) = rx.try_recv() {
+        note_collected(&ledger, &run.0, &ev);
         print_event(&ev);
     }
     // (A node box that couldn't be reached has no end of stderr: don't wait for one.)
@@ -2197,7 +2202,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         )
         .await
         {
-            Ok(()) => fetched = true,
+            Ok(()) => {
+                fetched = true;
+                let _ = ledger.lock().expect("ledger").record_collected(&run.0, "fetched");
+            }
             Err(e) => {
                 // Loudly (#300): the box's work isn't here. Its node keeps it (not forgotten).
                 let msg = format!("fetching the box's files from node {node_name} failed: {e:#} (the node keeps them)");
@@ -2244,6 +2252,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
             match pushed {
                 Ok(Some(st)) => {
+                    let _ = ledger.lock().expect("ledger").record_collected(&run.0, "bundled");
                     // The node is released: what was bundled goes (an in-place workspace is the
                     // operator's own directory, and stays).
                     for (name, p, _) in &trees {
@@ -2519,6 +2528,15 @@ pub fn egress_line(ev: &Event) -> Option<String> {
     Some(format!("[egress] {tag} {} {}{}  ({}; {})", clip(method, 16), clip(host, 120), clip(path, 120), clip(risk, 24), clip(detail, 240)))
 }
 
+/// A git push the run made, allowed, is its work collected (#377).
+fn note_collected(ledger: &Arc<Mutex<Ledger>>, run: &str, ev: &Event) {
+    if let Event::Egress { method, path, outcome, .. } = ev {
+        if outcome == "allow" && method == "POST" && path.ends_with("/git-receive-pack") {
+            let _ = ledger.lock().expect("ledger").record_collected(run, "pushed");
+        }
+    }
+}
+
 fn print_event(ev: &Event) {
     match ev {
         Event::Egress { outcome, detail, .. } => {
@@ -2532,7 +2550,7 @@ fn print_event(ev: &Event) {
         }
         Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
         Event::Box { what, detail } => println!("[box] {}: {}", wicket_agent::clip(what, 40), wicket_agent::clip(detail, 400)),
-        Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome } => {
+        Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome, .. } => {
             println!(
                 "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({})",
                 wicket_agent::clip(model.as_deref().unwrap_or("?"), 80),
@@ -2778,5 +2796,27 @@ mod tests {
         let e = format!("{:#}", box_image(None, &m).unwrap_err());
         assert!(e.contains("img:rust") && e.contains("zone.images"), "{e}");
         assert!(wicket_agent::load(&AGENT.replace("image: img:rust", "image: \"\"")).is_err(), "an empty image is invalid");
+    }
+}
+
+#[cfg(test)]
+mod collected_tests {
+    /// #377: an allowed git push is the run's work collected; one refused, or another request, isn't.
+    #[test]
+    fn an_allowed_push_is_collection() {
+        let l = std::sync::Arc::new(std::sync::Mutex::new(wicket_store::Ledger::open_in_memory().unwrap()));
+        let ev = |method: &str, path: &str, outcome: &str| wicket_proxy::Event::Egress {
+            method: method.into(),
+            host: "github.com".into(),
+            path: path.into(),
+            risk: "write".into(),
+            outcome: outcome.into(),
+            detail: String::new(),
+        };
+        super::note_collected(&l, "run_a", &ev("POST", "/o/r.git/git-receive-pack", "pending"));
+        super::note_collected(&l, "run_a", &ev("GET", "/o/r.git/info/refs", "allow"));
+        assert!(l.lock().unwrap().collected("run_a").unwrap().is_empty());
+        super::note_collected(&l, "run_a", &ev("POST", "/o/r.git/git-receive-pack", "allow"));
+        assert_eq!(l.lock().unwrap().collected("run_a").unwrap()[0].0, "pushed");
     }
 }

@@ -41,6 +41,9 @@ pub const MIN_INTERVAL: i64 = 30;
 /// The `Topic` every push carries, so a push service holding undelivered pushes for a device keeps
 /// only the latest. (Also the notification's tag, so the device shows one.)
 pub const TOPIC: &str = "wicket-pending";
+/// The `Topic` (and tag) of node health alerts (#377): apart from the pending ones, so neither
+/// replaces the other.
+pub const HEALTH_TOPIC: &str = "wicket-health";
 /// The push services the console sends to: (host, whether subdomains of it are meant instead).
 pub const PUSH_SERVICES: &[(&str, bool)] =
     &[("fcm.googleapis.com", false), ("push.apple.com", true), ("updates.push.services.mozilla.com", false), ("notify.windows.com", true)];
@@ -389,6 +392,8 @@ pub struct Waiting {
 pub struct Outgoing {
     pub sub: Subscription,
     pub payload: Vec<u8>,
+    /// [`TOPIC`] or [`HEALTH_TOPIC`].
+    pub topic: &'static str,
 }
 
 /// Decides which pushes to send, from successive looks at what is waiting. Requests already waiting
@@ -436,11 +441,39 @@ impl Notifier {
                 continue; // sent less than MIN_INTERVAL ago: coalesced into the next one
             }
             let open = waiting.iter().find(|w| &w.id == rid).unwrap_or(last);
-            out.push(Outgoing { sub: s.clone(), payload: payload(waiting, open, s.details) });
+            out.push(Outgoing { sub: s.clone(), payload: payload(waiting, open, s.details), topic: TOPIC });
             self.owed.remove(&s.id);
             self.last_sent.insert(s.id.clone(), now);
         }
         out
+    }
+}
+
+/// Decides which health alerts to push (#377): each condition once when it first appears, and again
+/// only after it has cleared. Every device is told; alerts appearing together go in one push.
+#[derive(Default)]
+pub struct HealthNotifier {
+    announced: HashSet<String>,
+}
+
+impl HealthNotifier {
+    pub fn tick(&mut self, alerts: &[crate::health::Alert], subs: &[Subscription]) -> Vec<Outgoing> {
+        let new: Vec<&crate::health::Alert> = alerts.iter().filter(|a| !self.announced.contains(&a.key)).collect();
+        self.announced = alerts.iter().map(|a| a.key.clone()).collect();
+        if new.is_empty() {
+            return Vec::new();
+        }
+        // A device that takes no details is told how many, not what (the pending pushes' rule).
+        let texts: Vec<String> = new.iter().map(|a| wicket_core::text::clip(&a.text, MAX_SUMMARY)).collect();
+        let n = new.len();
+        let bare = if n == 1 { "1 node health alert".to_string() } else { format!("{n} node health alerts") };
+        subs.iter()
+            .map(|s| {
+                let body = if s.details { texts.join("; ") } else { bare.clone() };
+                let payload = json!({ "title": "wicket", "body": body, "kind": "health", "tag": HEALTH_TOPIC }).to_string().into_bytes();
+                Outgoing { sub: s.clone(), payload, topic: HEALTH_TOPIC }
+            })
+            .collect()
     }
 }
 
@@ -452,7 +485,7 @@ pub struct PushRequest {
     pub body: Vec<u8>,
 }
 
-pub fn build_request(vapid: &Vapid, sub: &Subscription, plaintext: &[u8], contact: &str, now: i64) -> Result<PushRequest> {
+pub fn build_request(vapid: &Vapid, sub: &Subscription, plaintext: &[u8], topic: &str, contact: &str, now: i64) -> Result<PushRequest> {
     let url = check_endpoint(&sub.endpoint)?;
     let ua = unb64u(&sub.p256dh).map_err(|_| anyhow!("bad p256dh"))?;
     let auth = unb64u(&sub.auth).map_err(|_| anyhow!("bad auth"))?;
@@ -465,7 +498,7 @@ pub fn build_request(vapid: &Vapid, sub: &Subscription, plaintext: &[u8], contac
         ("content-type", "application/octet-stream".to_string()),
         ("ttl", TTL_SECS.to_string()),
         ("urgency", "high".to_string()),
-        ("topic", TOPIC.to_string()),
+        ("topic", topic.to_string()),
     ];
     Ok(PushRequest { url, headers, body })
 }
@@ -515,7 +548,7 @@ impl Push {
         let mut results = Vec::new();
         for o in out {
             let host = url::Url::parse(&o.sub.endpoint).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
-            let req = match build_request(&self.vapid, &o.sub, &o.payload, &self.contact, now) {
+            let req = match build_request(&self.vapid, &o.sub, &o.payload, o.topic, &self.contact, now) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("push to device {} ({host}) not sent: {e:#}", o.sub.id);
@@ -853,5 +886,24 @@ mod tests {
         let v: Value = serde_json::from_slice(&plain[..plain.len() - 1]).unwrap();
         assert_eq!(v["body"], "1 request waiting");
         assert_eq!(v["id"], "r-1");
+    }
+
+    /// #377: a health condition is pushed when it first appears, to every device, and again only
+    /// after it has cleared; a device without details gets a count.
+    #[test]
+    fn a_health_alert_is_pushed_once_until_it_clears() {
+        let a = |k: &str| crate::health::Alert { key: k.into(), text: format!("node n1: {k}") };
+        let subs = vec![sub("d1", true), sub("d2", false)];
+        let mut h = HealthNotifier::default();
+        let out = h.tick(&[a("n1/disk")], &subs);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|o| o.topic == HEALTH_TOPIC));
+        assert_eq!(body(&out[0])["body"], "node n1: n1/disk");
+        assert_eq!(body(&out[1])["body"], "1 node health alert");
+        assert!(h.tick(&[a("n1/disk")], &subs).is_empty(), "still full: not again");
+        let out = h.tick(&[a("n1/disk"), a("n1/feed")], &subs);
+        assert_eq!(body(&out[0])["body"], "node n1: n1/feed", "only what is new");
+        assert!(h.tick(&[], &subs).is_empty());
+        assert_eq!(h.tick(&[a("n1/disk")], &subs).len(), 2, "cleared, then back: pushed again");
     }
 }

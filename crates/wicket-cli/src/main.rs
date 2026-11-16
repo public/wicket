@@ -19,6 +19,7 @@ mod enrol;
 mod exitcause;
 mod gitguard;
 mod grant;
+mod health;
 mod hibernate;
 mod image;
 mod images_policy;

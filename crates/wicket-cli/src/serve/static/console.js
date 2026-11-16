@@ -275,6 +275,15 @@ function line(op) {
   return el("div", "", op.kind);
 }
 
+// A node's latest health report (#377): disk, memory, what went wrong, and what is alerted.
+function healthRow(n) {
+  const d = el("div", "row");
+  d.append(el("span", "mono", strip(n.node)));
+  d.append(el("span", (n.alerts || []).length ? "blocked" : "", strip(n.summary) + " · reported " + whenMs(n.received_ms)));
+  for (const a of n.alerts || []) d.append(el("div", "blocked", "! " + strip(a)));
+  return d;
+}
+
 // A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
 // a run still holds it, which is a warning until renewals exist (#56).
 function placedRow(p) {
@@ -946,6 +955,8 @@ async function refresh() {
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
     renderPending(s);
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
+    renderRows("health", ((s.health || {}).nodes) || [], healthRow, "No node has reported its health yet.");
+    if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
