@@ -1589,8 +1589,18 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // Long-lived agents (#70) hibernate at a quiet point after their turn, when they or an operator
     // asked; an agent that asked to finish has its session closed at the end of its turn.
     let mut hibernating = false;
-    let mut hib_asked = false;
-    let mut finish_asked = false;
+    // What the agent asked of this run is on the record (#444): a supervisor re-attaching after a
+    // control-host restart acts on a finish or hibernate asked of the one before it.
+    let asked = match &record {
+        Some(_) => asked_of(&ledger, &run),
+        None => Asked::default(),
+    };
+    if asked.finish || asked.hibernate {
+        let what = if asked.finish { "finish" } else { "hibernate" };
+        say!("[wicket] the agent asked to {what} before this supervisor took the run over: at the end of its turn");
+    }
+    let mut hib_asked = asked.hibernate;
+    let mut finish_asked = asked.finish;
     let mut notified_msgs = 0i64;
     // The turn state last reported as the run's presence (#252).
     let mut reported_turn: Option<bool> = None;
@@ -2626,6 +2636,19 @@ fn report_turn(ctx: &RunCtx, result: Option<&str>, is_error: bool) {
         Some(Err(e)) => say!("[wicket] could not send its report to its parent: {e}"),
         None => {}
     }
+}
+
+/// What the agent asked of its own run, as the ledger records it (`Ledger::record_run_want`,
+/// #444): a finish, or (only without one) a hibernate.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Asked {
+    pub finish: bool,
+    pub hibernate: bool,
+}
+
+pub(crate) fn asked_of(ledger: &Mutex<Ledger>, run: &RunId) -> Asked {
+    let want = ledger.lock().ok().and_then(|l| l.run_want(&run.0).ok().flatten());
+    Asked { finish: want.as_deref() == Some("finish"), hibernate: want.as_deref() == Some("hibernate") }
 }
 
 /// What to write to an agent's stdin for a new user turn: a stream-json user message, or for an ACP

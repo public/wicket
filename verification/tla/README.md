@@ -228,15 +228,14 @@ over an agent whose holder let its claim lapse. Messages are a peer's (`#250`) o
 | `NoMessageTwice` | no box is given a message twice |
 | `FinishKnown` | a live supervisor of an agent that asked to finish, whose session is still open, knows it: a finished run's harness never keeps running |
 
-The switches are the opposite of `GrantsOnNodes`': here `TRUE` is a **proposed** design, and each
-`fail_lifecycle_*` variant is **today's code**, which TLC refuses. These are findings to fix, not
-past bugs:
+`TRUE` is the pass design. Each `fail_lifecycle_*` variant is the code before its fix (or, for a
+switch still marked open, today's code), which TLC refuses:
 
-| switch (proposed value) | today | fails |
+| switch (pass value) | the code without it | fails |
 |---|---|---|
-| `FinishInLedger = TRUE` | the agent's `finish` reaches only its supervisor (`run.rs`: `finish_asked`, from `want_rx`). A control-host restart between the call and the end of its turn loses it; the re-attached supervisor never closes the session, and the harness runs until its timeout | `fail_lifecycle_finish_lost`: `FinishKnown` |
-| `AckAfterHand = TRUE` | a message is marked delivered when it is taken (`Ledger::take_message`, `take_operator_messages_with_ids`), before the box has it. If the control host stops in between, the only copy was the dead supervisor's. The proposal acknowledges once the box has it, and a box drops a repeat by id | `fail_lifecycle_message_lost`: `NoMessageLost` |
-| `WakeAfterAuthority = TRUE` | `Ledger::claim_wake` takes over an `active` agent whose claim lapsed (`CLAIM_SECS`, 30 s). A control-host outage longer than that leaves its box running on its node, so a wake then starts a second box until the first's re-attached supervisor finds it superseded. The proposal wakes a lapsed agent only once its old box's authority has ended (its node stops it then) | `fail_lifecycle_twin_wake`: `OneHarness` |
+| `FinishInLedger = TRUE` (the code, #444) | before #444, the agent's `finish` reached only its supervisor (`run.rs`: `finish_asked`, from `want_rx`). A control-host restart between the call and the end of its turn lost it; the re-attached supervisor never closed the session, and the harness ran until its timeout. Now the gateway records it (`Ledger::record_run_want`, `runs.want`) before the tool answers, and a re-attached supervisor reads it (`run.rs` `asked_of`) | `fail_lifecycle_finish_lost`: `FinishKnown` |
+| `AckAfterHand = TRUE` (open: #445) | a message is marked delivered when it is taken (`Ledger::take_message`, `take_operator_messages_with_ids`), before the box has it. If the control host stops in between, the only copy was the dead supervisor's. The proposal acknowledges once the box has it, and a box drops a repeat by id | `fail_lifecycle_message_lost`: `NoMessageLost` |
+| `WakeAfterAuthority = TRUE` (open: #446) | `Ledger::claim_wake` takes over an `active` agent whose claim lapsed (`CLAIM_SECS`, 30 s). A control-host outage longer than that leaves its box running on its node, so a wake then starts a second box until the first's re-attached supervisor finds it superseded. The proposal wakes a lapsed agent only once its old box's authority has ended (its node stops it then) | `fail_lifecycle_twin_wake`: `OneHarness` |
 
 `fail_lifecycle_today` has every switch as on main. `NoMessageTwice` holds in every variant: with
 `AckAfterHand` a message is queued again after a crash, and the box's record of what it has had
