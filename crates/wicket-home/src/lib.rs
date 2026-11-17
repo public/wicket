@@ -3,7 +3,11 @@
 //! the principal behind a root run ([`cli_principal`]) and the operator deciding ([`operator`]).
 //!
 //! A library split from wicket-cli, whose modules nearly all use these, so the ones that need
-//! nothing else of the CLI's can leave it too. wicket-cli imports them under their old names.
+//! nothing else of the CLI's can leave it too, and have: the node control channel's
+//! authentication ([`nodeauth`]), the state store and audit export ([`s3`], [`statestore`],
+//! [`audit_export`]), the image policy ([`images_policy`]), program digests ([`program`]), box
+//! owners and exit causes ([`owner`], [`exitcause`]) and a driven harness's control channel
+//! ([`control`]). wicket-cli imports them all under their old names.
 
 pub mod audit_export;
 pub mod control;

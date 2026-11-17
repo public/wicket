@@ -2122,6 +2122,9 @@ crates/
   wicket-fwd         in-box forwarders to wicket.internal
   wicket-chan        the control/node channel's protocol and what its messages carry (health, a
                      node's secrets, OCI images and registries); fuzzed as it is
+  wicket-home        the installation's paths, issuer and caller, and the modules that need only
+                     them: node authentication, the state store and audit export, image policy,
+                     program digests, box owners and exit causes, a harness's control channel
   wicket-cli         the `wicket` binary: CLI, daemon, console, node, reconciler
 ```
 
