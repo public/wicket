@@ -279,6 +279,9 @@ struct Node {
     /// Boxes admitted and still starting (#377), by run: their memory limits (MiB), counted as
     /// committed until the box is up or its start fails.
     admitting: Mutex<HashMap<String, u64>>,
+    /// Runs' directories with no record of their box (#449), as the last scan measured them
+    /// ([`Node::scan_orphans`]): in its health and `wicket node top`.
+    orphaned: Mutex<Vec<crate::health::OrphanedRun>>,
     /// The node's disk reserve (#377), released for its own writes when the disk is full.
     reserve: crate::health::Reserve,
     /// Since when (ms) feed frames have failed to persist, if they are failing: the node asks for
@@ -475,6 +478,95 @@ impl Node {
             last_oom,
             persist_failures,
             last_persist_failure,
+            orphaned: self.orphaned.lock().expect("orphaned").clone(),
+        }
+    }
+
+    /// Runs' directories under `runs/` with no record of their box (#449): not a box this node
+    /// has (running, or exited and not yet forgotten), nor one starting, and no `node-box.json`.
+    /// What a box leaves when its record goes (its exit) and the node restarts before its work is
+    /// collected. Names only: [`Node::scan_orphans`] measures them. None on the control host's
+    /// own node, whose `runs/` is the control host's run directory.
+    fn orphan_runs(&self) -> Vec<String> {
+        if self.paths.shares_host() {
+            return vec![];
+        }
+        let mut out: Vec<String> = std::fs::read_dir(self.paths.runs())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|r| wicket_chan::check_run_id(r).is_ok())
+            .filter(|r| !self.paths.runs().join(r).join(BoxRecord::FILE).exists())
+            .collect();
+        let boxes = self.boxes.lock().expect("boxes");
+        let admitting = self.admitting.lock().expect("admitting");
+        out.retain(|r| !boxes.contains_key(r) && !admitting.contains_key(r));
+        out.sort();
+        out
+    }
+
+    /// The orphaned runs' directories now (#449), with what the last scan measured of each (0 if
+    /// it hasn't yet): what a control connection is told at its start, so `wicket node forget`
+    /// knows them without waiting for the hourly scan.
+    pub(super) fn orphaned_now(&self) -> Vec<crate::health::OrphanedRun> {
+        let measured = self.orphaned.lock().expect("orphaned").clone();
+        self.orphan_runs()
+            .into_iter()
+            .map(|run| {
+                let bytes = measured.iter().find(|o| o.run == run).map_or(0, |o| o.bytes);
+                crate::health::OrphanedRun { run, bytes }
+            })
+            .collect()
+    }
+
+    /// Finds and measures the orphaned runs' directories ([`Node::orphan_runs`]), for the node's
+    /// health and `wicket node top`. Their sizes are a walk of each tree: hourly, with the sweep,
+    /// and after a `Forget`.
+    fn scan_orphans(&self) -> Vec<crate::health::OrphanedRun> {
+        let found: Vec<crate::health::OrphanedRun> = self
+            .orphan_runs()
+            .into_iter()
+            .map(|run| {
+                let bytes = crate::boxfiles::used_bytes(&self.paths.runs().join(&run));
+                crate::health::OrphanedRun { run, bytes }
+            })
+            .collect();
+        *self.orphaned.lock().expect("orphaned") = found.clone();
+        found
+    }
+
+    /// The control host's `Forget` (#377): the run's box is let go, and its files deleted (on the
+    /// control host's own node, only its caches: its directory is the run's). A run this node has
+    /// no box for is found by its path (#449): an orphaned directory is deleted the same way.
+    /// Audited (`run.files_deleted`).
+    fn forget(&self, run: &str) {
+        let b = self.boxes.lock().expect("boxes").remove(run);
+        self.seen.forget(run);
+        let dir = match &b {
+            Some(b) => {
+                b.tasks.iter().for_each(|t| t.abort());
+                Some(b.dir.clone())
+            }
+            None => self.orphan_runs().iter().any(|r| r == run).then(|| self.paths.runs().join(run)),
+        };
+        let Some(dir) = dir.filter(|d| d.starts_with(self.paths.runs())) else { return };
+        if self.paths.shares_host() {
+            volumes::drop_caches(&dir);
+            return;
+        }
+        let bytes = if b.is_none() { Some(crate::boxfiles::used_bytes(&dir)) } else { None };
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut what = serde_json::json!({ "dir": dir.display().to_string() });
+        if let Some(n) = bytes {
+            // No box record: what the node knew of it was its directory (#449).
+            what["orphaned"] = serde_json::json!(true);
+            what["bytes"] = serde_json::json!(n);
+        }
+        self.audit_note(run, "run.files_deleted", what);
+        if b.is_none() {
+            self.scan_orphans();
         }
     }
 
@@ -895,6 +987,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         llms: Mutex::new(HashMap::new()),
         images: Default::default(),
         seen: Default::default(),
+        orphaned: Mutex::new(vec![]),
         ooms: Default::default(),
         persists: Default::default(),
         admitting: Default::default(),
@@ -991,6 +1084,15 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                 // Volumes past their retention, hourly (and soon after start).
                 if tick5 % 3600 == 30 {
                     n.sweep_volumes();
+                    // Runs' files with no record of their box (#449), for its health.
+                    let o = n.scan_orphans();
+                    if !o.is_empty() {
+                        say_err!(
+                            "[node] {} run directories have no box record ({} MiB): wicket node forget <run> --force deletes one",
+                            o.len(),
+                            o.iter().map(|x| x.bytes).sum::<u64>() >> 20
+                        );
+                    }
                 }
                 if tick5.is_multiple_of(60) && n.feed_stalled.lock().expect("stalled").is_none() {
                     if let Ok(true) = n.reserve.take() {
@@ -2615,6 +2717,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             llms: Mutex::new(HashMap::new()),
             images: Default::default(),
             seen: Default::default(),
+            orphaned: Mutex::new(vec![]),
             ooms: Default::default(),
             persists: Default::default(),
             admitting: Default::default(),
@@ -2899,6 +3002,41 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(node.admit("run_b", room / 2 + 128).is_err(), "the second doesn't fit beside the first");
         node.admitted("run_a");
         assert!(node.admitting.lock().unwrap().is_empty());
+    }
+
+    /// #449: a run's directory whose box record is gone (its box exited, then the node restarted,
+    /// its work never collected) is reported as orphaned, with its size, and `Forget` still finds
+    /// it by its path and deletes it, audited. A directory with a record isn't orphaned.
+    #[tokio::test]
+    async fn a_runs_files_without_a_record_are_reported_and_forgotten() {
+        const RUN: &str = "run_0rphan00000000000000000000";
+        const KEPT: &str = "run_kept0000000000000000000000";
+        let inst = Install::new("nodesrv-orphan");
+        let node = test_node(&inst);
+        let dir = node.paths.runs().join(RUN);
+        std::fs::create_dir_all(dir.join("workspace/out")).unwrap();
+        std::fs::write(dir.join("workspace/big"), vec![7u8; 64 * 1024]).unwrap();
+        std::fs::create_dir_all(node.paths.runs().join(KEPT)).unwrap();
+        std::fs::write(node.paths.runs().join(KEPT).join(BoxRecord::FILE), b"{}").unwrap();
+        std::fs::create_dir_all(node.paths.runs().join("not-a-run")).unwrap();
+
+        let found = node.scan_orphans();
+        assert_eq!(found.iter().map(|o| o.run.as_str()).collect::<Vec<_>>(), [RUN]);
+        assert!(found[0].bytes >= 64 * 1024, "{found:?}");
+        assert_eq!(node.health().orphaned, found, "in its health");
+        assert_eq!(node.orphaned_now(), found, "and told to a control connection");
+        let alerts = crate::health::alerts("n1", &node.health(), (node.clock)());
+        assert!(alerts.iter().any(|a| a.key == "n1/orphaned" && a.text.contains(RUN)), "{alerts:?}");
+
+        node.forget(RUN);
+        assert!(!dir.exists(), "deleted by its path");
+        assert!(node.paths.runs().join(KEPT).exists(), "a run with a record is left alone");
+        assert!(node.health().orphaned.is_empty());
+        let rows = node.audit.lock().unwrap().audit_of_kind("run.files_deleted").unwrap();
+        let body: serde_json::Value = serde_json::from_str(&rows.last().expect("audited").body).unwrap();
+        assert_eq!((body["orphaned"].as_bool(), body["bytes"].as_u64().is_some_and(|b| b >= 64 * 1024)), (Some(true), true), "{body}");
+        // A run it has no directory for: nothing to do.
+        node.forget("run_n0thing0000000000000000000");
     }
 
     /// A box of most of the room there is, started the moment its predecessor of the same size

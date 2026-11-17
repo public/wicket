@@ -108,8 +108,16 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
         .collect();
     let feed = node.replica.lock().expect("replica").hello();
     let capacity = Some(node.capacity());
-    let _ =
-        tx.send(Frame::Msg(Msg::Welcome { node: node.name.clone(), build: node.build.clone(), proto: negotiated, feed, runs, capacity }));
+    let orphaned = node.orphaned_now();
+    let _ = tx.send(Frame::Msg(Msg::Welcome {
+        node: node.name.clone(),
+        build: node.build.clone(),
+        proto: negotiated,
+        feed,
+        runs,
+        capacity,
+        orphaned,
+    }));
     say_err!(
         "[node] control host connected{} (protocol {negotiated})",
         if scope.is_empty() { String::new() } else { format!(" ({scope})") }
@@ -332,21 +340,7 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     let _ = tx.send(m);
                 }
             }
-            Msg::Forget { run } => {
-                let b = node.boxes.lock().expect("boxes").remove(&run);
-                node.seen.forget(&run);
-                if let Some(b) = b {
-                    b.tasks.iter().for_each(|t| t.abort());
-                    // The control host's own node shares the run's directory with the run: that stays,
-                    // but for the run's caches (#377).
-                    if !node.paths.shares_host() && b.dir.starts_with(node.paths.runs()) {
-                        let _ = std::fs::remove_dir_all(&b.dir);
-                        node.audit_note(&run, "run.files_deleted", serde_json::json!({ "dir": b.dir.display().to_string() }));
-                    } else if b.dir.starts_with(node.paths.runs()) {
-                        super::volumes::drop_caches(&b.dir);
-                    }
-                }
-            }
+            Msg::Forget { run } => node.forget(&run),
             Msg::Called { id, text, is_error } => {
                 if let Some((_, tx)) = node.calls.lock().expect("calls").remove(&id) {
                     let _ = tx.send((text, is_error));

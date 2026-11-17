@@ -96,6 +96,8 @@ pub struct Link {
     /// What the node reported when this connection was made: its capacity, and the runs it has.
     pub capacity: Option<crate::chan::NodeCapacity>,
     pub runs: Vec<crate::chan::RunState>,
+    /// Runs' directories it keeps with no record of their box (#449).
+    pub orphaned: Vec<wicket_chan::health::OrphanedRun>,
     /// The node's build (sha256 of its binary), and the protocol version this connection talks.
     pub build: String,
     pub proto: u32,
@@ -129,9 +131,9 @@ impl Link {
             .await
             .map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
         let proto = authed.proto;
-        let (capacity, runs, build) = match authed.welcome {
-            Msg::Welcome { capacity, runs, build, .. } => (capacity, runs, build),
-            _ => (None, vec![], String::new()),
+        let (capacity, runs, orphaned, build) = match authed.welcome {
+            Msg::Welcome { capacity, runs, orphaned, build, .. } => (capacity, runs, orphaned, build),
+            _ => (None, vec![], vec![], String::new()),
         };
         let calls = Arc::new(Calls::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
@@ -153,6 +155,6 @@ impl Link {
             writer.abort();
             c.set_out(None);
         });
-        Ok(Link { calls, capacity, runs, build, proto, task })
+        Ok(Link { calls, capacity, runs, orphaned, build, proto, task })
     }
 }
