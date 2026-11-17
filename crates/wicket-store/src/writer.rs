@@ -219,7 +219,9 @@ fn writer_loop(mut conn: Connection, rx: Receiver<Msg>, cfg: WriterConfig) {
             Err(e) => {
                 let lost = recs.iter().filter(|r| r.reply.is_none()).count();
                 if lost > 0 {
-                    eprintln!("wicket: audit writer: {lost} record(s) not written: {e}");
+                    // Not eprintln!: a closed stderr mustn't panic the writer (#422).
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr(), "wicket: audit writer: {lost} record(s) not written: {e}");
                 }
                 for r in recs.drain(..) {
                     if let Some(tx) = r.reply {

@@ -80,9 +80,9 @@ pub(super) fn put(node: &Arc<Node>, gen: u64, stream: u64, digest: String, name:
             Err(e) => body["why"] = format!("{e:#}").into(),
         }
         if let Some(e) = &error {
-            eprintln!("[node] image {digest} refused: {e}");
+            say_err!("[node] image {digest} refused: {e}");
         } else {
-            eprintln!("[node] image {digest} received and imported");
+            say_err!("[node] image {digest} received and imported");
         }
         let _ = n.audit.lock().expect("audit").audit(&wicket_core::TenantId::single(), None, kind, &body);
         n.send_to(gen, Frame::Msg(Msg::ImagePut { stream, error }));
@@ -140,12 +140,12 @@ pub(super) fn pull(node: &Arc<Node>, gen: u64, id: u64, run: String, digest: Str
         let error = match &r {
             Ok(u) => {
                 body["bytes"] = u.bytes.into();
-                eprintln!("[node] image {digest} pulled from {} and imported", from.host);
+                say_err!("[node] image {digest} pulled from {} and imported", from.host);
                 None
             }
             Err(e) => {
                 body["why"] = format!("{e:#}").into();
-                eprintln!("[node] pulling image {digest} from {} failed: {e:#}", from.host);
+                say_err!("[node] pulling image {digest} from {} failed: {e:#}", from.host);
                 Some(format!("{e:#}"))
             }
         };

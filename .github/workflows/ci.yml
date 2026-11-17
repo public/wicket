@@ -26,14 +26,14 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # #218: what a pull request can affect (ci/affected.py, ci/affected.map): its crates and their
-  # reverse dependencies, and the end-to-end suites its paths map to. Pushes to main, the merge queue,
-  # the nightly run and a PR labelled full-ci select everything. Every job below runs in full when this job fails or
-  # says nothing: an empty output means run.
+  # #218: what a pull request can affect (ci/determinator: guppy's determinator with its rules.toml,
+  # and suites.toml): its crates and their reverse dependencies, and the end-to-end suites. Pushes to
+  # main, the merge queue, the nightly run and a PR labelled full-ci select everything. Every job
+  # below runs in full when this job fails or says nothing: an empty output means run.
   select:
     name: What this change can affect
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     # Reading the pull request's labels (#246).
     permissions:
       contents: read
@@ -41,8 +41,8 @@ jobs:
     outputs:
       crates: ${{ steps.select.outputs.crates }}
       all_crates: ${{ steps.select.outputs.all_crates }}
-      doc_crates: ${{ steps.select.outputs.doc_crates }}
       args: ${{ steps.select.outputs.args }}
+      filter: ${{ steps.select.outputs.filter }}
       doc_args: ${{ steps.select.outputs.doc_args }}
       rust: ${{ steps.select.outputs.rust }}
       suites: ${{ steps.select.outputs.suites }}
@@ -52,8 +52,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: The selection's own test (synthetic changes, every out-of-crate input mapped)
-        run: ci/affected.py --self-test
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ci/determinator -> target
+      - name: The rules' own tests (synthetic changes, every file claimed, every out-of-crate input mapped)
+        run: cargo test --locked --manifest-path ci/determinator/Cargo.toml
       - name: The label check's own test
         run: ci/pr-has-label_test.sh
       - id: select
@@ -68,15 +71,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          affected() { cargo run -q --locked --manifest-path ci/determinator/Cargo.toml -- "$@"; }
           FULL=
           if [ "$EVENT" = pull_request ]; then
             FULL=$(ci/pr-has-label.sh full-ci) || FULL="unknown (the labels couldn't be read)"
           fi
           if [ "$EVENT" = pull_request ] && [ "$FULL" = false ]; then
-            ci/affected.py --base "origin/$BASE" --github-output "$GITHUB_OUTPUT"
+            affected --base "origin/$BASE" --github-output "$GITHUB_OUTPUT"
           else
             echo "the full set ($EVENT; full-ci label: ${FULL:-n/a})"
-            ci/affected.py --files /dev/null --github-output "$GITHUB_OUTPUT"
+            affected --files /dev/null --github-output "$GITHUB_OUTPUT"
           fi
           cat "$GITHUB_OUTPUT" >>"$GITHUB_STEP_SUMMARY"
 
@@ -153,16 +157,20 @@ jobs:
         id: pkgs
         env:
           ARGS: ${{ needs.select.outputs.args }}
+          FILTER: ${{ needs.select.outputs.filter }}
           DOC_ARGS: ${{ needs.select.outputs.doc_args }}
           ALL: ${{ needs.select.outputs.all_crates }}
-        # ci/affected.py builds the package arguments (its self-test covers them): `-p` per crate,
-        # empty when none (a doctest step then skips). No selection (its job failed): everything.
+        # ci/determinator builds the package arguments and nextest's filterset (its tests cover
+        # them): `-p` per affected crate and rdeps() of each changed one, empty when none (a doctest
+        # step then skips). No selection (its job failed): everything.
         run: |
           if [ "$ALL" = false ]; then
             echo "args=$ARGS" >>"$GITHUB_OUTPUT"
+            echo "filter=$FILTER" >>"$GITHUB_OUTPUT"
             echo "doc_args=$DOC_ARGS" >>"$GITHUB_OUTPUT"
           else
             echo "args=--workspace" >>"$GITHUB_OUTPUT"
+            echo "filter=all()" >>"$GITHUB_OUTPUT"
             echo "doc_args=--workspace" >>"$GITHUB_OUTPUT"
           fi
       - name: cargo-nextest (a CI tool, checksum-verified)
@@ -177,9 +185,11 @@ jobs:
         run: cargo clippy ${{ steps.pkgs.outputs.args }} --all-targets --locked -- -D warnings
       - name: Tests (nextest; a test that passed only on a retry is reported as flaky)
         if: ${{ steps.pkgs.outputs.args != '' }}
+        env:
+          FILTER: ${{ steps.pkgs.outputs.filter }}
         run: |
           set -o pipefail
-          cargo nextest run ${{ steps.pkgs.outputs.args }} --locked --profile ci 2>&1 | tee nextest.log
+          cargo nextest run ${{ steps.pkgs.outputs.args }} -E "$FILTER" --locked --profile ci 2>&1 | tee nextest.log
           if grep -q FLAKY nextest.log; then
             { echo "### Flaky tests (passed on a retry)"; grep FLAKY nextest.log | sed 's/^/    /'; } >>"$GITHUB_STEP_SUMMARY"
           fi
@@ -187,7 +197,7 @@ jobs:
         if: ${{ steps.pkgs.outputs.doc_args != '' }}
         run: cargo test ${{ steps.pkgs.outputs.doc_args }} --locked --doc
 
-  # #323: the fuzz targets a change selects (ci/affected.map's fuzz-<target> suites; none selected
+  # #323: the fuzz targets a change selects (ci/determinator/suites.toml's fuzz targets; none selected
   # says `none`, no selection says nothing: every target), 60 s each after the corpora are replayed.
   # Coverage only (no ASan): the optimized build that also fits a 4 GiB box. Findings are minimized
   # and uploaded; the nightly run (fuzz.yml) runs every target for longer.
@@ -291,8 +301,8 @@ jobs:
 
   # #325: Kani proof harnesses (bounded model checking of wicket-core's decision functions, each
   # naming the Lean theorem of #322 it restates) and the budget counter's loom test, one harness at
-  # a time (ci/kani.sh). Selected by ci/affected.map's kani suite: the harnessed crate's code, the
-  # harnesses, the script.
+  # a time (ci/kani.sh). Selected by ci/determinator/suites.toml's kani suite: the harnessed crate
+  # (its code, its harnesses), the script.
   kani:
     name: Kani proofs and loom
     needs: select
@@ -313,7 +323,7 @@ jobs:
       - run: ci/kani.sh
 
   # #324: the deterministic simulation (crates/wicket-sim). A pull request runs its fixed seeds with
-  # the crate's tests, whenever ci/affected.py selects it. This runs a few hundred more, a different
+  # the crate's tests, whenever ci/determinator selects it. This runs a few hundred more, a different
   # block each night, and files an issue for each failing seed with its replay command.
   simulation:
     name: Simulation seeds (nightly)

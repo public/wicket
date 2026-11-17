@@ -1,0 +1,78 @@
+# The suites that aren't a crate's tests (#218), read by ci/determinator: the end-to-end scripts,
+# the proofs and models, the fuzz targets. A suite runs when a changed path matches one of its
+# `paths` (`*` within a directory, `**` across them), or a crate it names is affected (changed, or
+# depending on a changed crate: wicket-cli is affected by nearly every change). A change that marks
+# everything (rules.toml) runs every suite.
+
+[suite.policy]
+packages = ["wicket-policy", "wicket-policy-diff"]
+paths = ["examples/policy/**", "ci/policy-diff.sh"]
+
+[suite.lean]
+packages = ["wicket-authz"]
+paths = ["ci/lean.sh"]
+
+[suite.kani]
+packages = ["wicket-core"]
+paths = ["ci/kani.sh"]
+
+[suite.tla]
+packages = ["wicket-cli"]
+paths = ["verification/tla/**", "ci/tla.sh"]
+
+[suite.smoke]
+packages = ["wicket-cli", "wicket-fwd"]
+paths = ["ci/smoke.sh", "ci/smoke.yaml", "ci/h3get/**", "images/**"]
+
+[suite.hibernate]
+packages = ["wicket-cli"]
+paths = ["ci/hibernate.sh", "ci/hibernate.yaml"]
+
+[suite.restore]
+packages = ["wicket-cli"]
+paths = ["ci/restore.sh"]
+
+[suite.acceptance]
+packages = ["wicket-cli"]
+paths = ["ci/acceptance.sh", "ci/acceptance/**", "ci/h3get/**", "images/**"]
+
+[suite.daemon-uids]
+packages = ["wicket-cli"]
+paths = ["ci/daemon-uids.sh", "deploy/install.sh"]
+
+[suite.install-test]
+packages = ["wicket-cli"]
+paths = ["ci/install-test.sh", "ci/install-acceptance.sh", "deploy/install.sh", "deploy/systemd/**"]
+
+# Run by local gates and nightly, not on pull requests.
+[suite.node-e2e]
+packages = ["wicket-cli"]
+paths = ["ci/node-e2e.sh", "ci/node-e2e/**"]
+
+[suite.acceptance-nodes]
+packages = ["wicket-cli"]
+paths = ["ci/acceptance.sh", "ci/acceptance/**"]
+
+[suite.update]
+packages = ["wicket-cli"]
+paths = ["ci/update.sh", "ci/update/**", "deploy/systemd/**"]
+
+# The fuzz targets (#323, fuzz/, its own workspace), each a suite `fuzz-<target>` that ci/fuzz.sh
+# runs for a short while. `{t}` in these paths is the target; every target has them. A target's
+# packages are the crates its harness links (their dependencies reach it through them).
+[fuzz]
+paths = [
+  "fuzz/*/{t}.rs", "fuzz/corpus/{t}/**", "fuzz/regressions/{t}/**",
+  "fuzz/src/lib.rs", "fuzz/tests/**", "fuzz/examples/**", "fuzz/Cargo.toml", "fuzz/Cargo.lock", "ci/fuzz.sh",
+]
+
+[fuzz.target]
+egress = { packages = ["wicket-proxy", "wicket-store"], paths = ["fuzz/src/util.rs"] }
+gateway = { packages = ["wicket-proxy", "wicket-store"], paths = ["fuzz/src/util.rs"] }
+chan = { packages = ["wicket-chan"], paths = ["fuzz/src/node_chan.rs"] }
+feed = { packages = ["wicket-feed"] }
+token = { packages = ["wicket-authz"] }
+manifest = { packages = ["wicket-agent", "wicket-policy"] }
+store = { packages = ["wicket-store"] }
+git = { packages = ["wicket-core"] }
+canon = { packages = ["wicket-core"] }

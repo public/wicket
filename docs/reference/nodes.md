@@ -441,7 +441,10 @@ a pass at once; everything else (lease ends, approvals on the console) waits for
 - **Runs** whose supervisor is gone (#151) are asked about on their node. If it still has the box, the run
   is **adopted**: `wicket attach <run>` takes it over (logged in `<run dir>/ctl/attach.log`), the box
   untouched. If the node says the box is gone, the run ends as `lost`; if the node can't be reached, the run is
-  left for the next pass. A run supervised on another machine is left to it.
+  left for the next pass. A run supervised on another machine is left to it. A child whose supervisor
+  is **stuck** (it runs in its parent's process, and hadn't ended 30 s after its parent asked it to
+  stop, #409) is reported as `run_stuck` on every pass while that process lives, and taken over like any
+  other once it ends. `wicket top` shows its status as `stuck`, and counts it apart from the running runs.
 - **A restart of the control host** is a pass away from normal: kill every wicket process on it, start
   again, and one `wicket reconcile` restarts this host's own node (whose `serve` adopts its boxes) and takes
   every run over, on every node. What a supervisor needs for that is in the run's `ctl/` directory: the run's

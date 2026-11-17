@@ -42,3 +42,54 @@ macro_rules! say {
 macro_rules! say_err {
     ($($t:tt)*) => { $crate::out::line(true, format_args!($($t)*)) };
 }
+
+#[cfg(test)]
+mod tests {
+    /// #422: `println!` and `eprintln!` panic when stdout or stderr is closed (a journal that went
+    /// away, a pipe whose reader ended). The long-running processes (`node serve`, `wicketd`, the
+    /// console, the reconciler, run supervisors) and what they call print with [`say!`] and
+    /// [`say_err!`] instead, outside their tests.
+    #[test]
+    fn long_running_processes_print_without_panicking() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![];
+        for f in [
+            "nodesrv.rs",
+            "nodeauth.rs",
+            "nodeca.rs",
+            "noderun.rs",
+            "nodegw.rs",
+            "run.rs",
+            "spawn.rs",
+            "reconcile.rs",
+            "localnode.rs",
+            "enrol.rs",
+            "nodecreate.rs",
+            "daemon/mod.rs",
+        ] {
+            files.push(src.join(f));
+        }
+        for d in ["nodesrv", "serve"] {
+            for e in std::fs::read_dir(src.join(d)).unwrap() {
+                let p = e.unwrap().path();
+                if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        let mut found = vec![];
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if line.starts_with("mod tests") || line.trim_end() == "#[cfg(test)]" {
+                    break;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                if ["println!", "print!", "eprintln!", "eprint!"].iter().any(|m| code.contains(m)) {
+                    found.push(format!("{}:{}: {}", f.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(found.is_empty(), "use say!/say_err! (or a write whose error is ignored):\n{}", found.join("\n"));
+    }
+}

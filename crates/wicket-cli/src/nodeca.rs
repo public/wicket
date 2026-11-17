@@ -64,7 +64,7 @@ impl CaRenewal {
         match &self.step {
             Some(Step::Asked { at } | Step::Sent { at, .. }) if now - at < STEP_SECS => return None,
             Some(_) => {
-                println!("[wicket] node {node} did not answer its CA renewal; trying again");
+                say!("[wicket] node {node} did not answer its CA renewal; trying again");
                 self.step = None;
                 self.after = now;
             }
@@ -108,7 +108,7 @@ impl CaRenewal {
                 Some(Msg::NodeCa { pem })
             }
             Err(e) => {
-                println!("[wicket] could not renew node {node}'s CA: {e:#}; retrying in a minute");
+                say!("[wicket] could not renew node {node}'s CA: {e:#}; retrying in a minute");
                 self.step = None;
                 self.after = now + STEP_SECS;
                 None
@@ -121,7 +121,7 @@ impl CaRenewal {
     pub fn on_installed(&mut self, ledger: &Mutex<Ledger>, node: &str, serial: &str, error: Option<String>, now: i64) -> Option<NodeCaRow> {
         let Some(Step::Sent { cert, .. }) = self.step.take() else { return None };
         if let Some(e) = error.or_else(|| (serial != cert.serial).then(|| format!("it installed {serial}, not {}", cert.serial))) {
-            println!("[wicket] node {node} did not take its renewed CA ({e}); retrying in a minute");
+            say!("[wicket] node {node} did not take its renewed CA ({e}); retrying in a minute");
             self.after = now + STEP_SECS;
             return None;
         }
@@ -146,12 +146,12 @@ impl CaRenewal {
         });
         match recorded {
             Ok(()) => {
-                println!("[wicket] node {node}'s CA renewed over the channel: serial {} until {}", cert.serial, cert.not_after);
+                say!("[wicket] node {node}'s CA renewed over the channel: serial {} until {}", cert.serial, cert.not_after);
                 Some(row)
             }
             Err(e) => {
                 // The node has the CA; the ledger doesn't say so. Renewed again in a minute, so it does.
-                println!("[wicket] node {node} took its renewed CA {}, but recording it failed: {e:#}", cert.serial);
+                say!("[wicket] node {node} took its renewed CA {}, but recording it failed: {e:#}", cert.serial);
                 self.after = now + STEP_SECS;
                 None
             }
@@ -162,9 +162,7 @@ impl CaRenewal {
 /// The installation CA, for renewals, if this control host has one (never created here).
 pub fn installation_ca() -> Option<InstallationCa> {
     let key = crate::enrol::Paths::installation().ca_key;
-    key.exists()
-        .then(|| InstallationCa::load_or_create(&key))
-        .and_then(|r| r.map_err(|e| eprintln!("[wicket] installation CA: {e:#}")).ok())
+    key.exists().then(|| InstallationCa::load_or_create(&key)).and_then(|r| r.map_err(|e| say_err!("[wicket] installation CA: {e:#}")).ok())
 }
 
 #[cfg(test)]

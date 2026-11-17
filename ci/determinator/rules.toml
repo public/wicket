@@ -1,0 +1,116 @@
+# guppy's determinator rules for wicket (#218), read by ci/determinator (wicket-affected). Reviewed
+# like code. Format: https://docs.rs/determinator/0.13/determinator/rules/
+#
+# A changed file in a workspace crate marks that crate changed; a change to a manifest or to
+# Cargo.lock marks the crates whose simulated builds differ before and after it. Every crate that
+# depends on a changed one is affected (normal, dev and build dependencies), and nextest runs the
+# tests of rdeps(<crate>) for each changed crate.
+#
+# The rules below are for paths outside the crates, and for files a crate reads from outside its
+# own directory or that another crate's code follows (the tests check that each such file is
+# here). They apply in order: a path takes the first rule it matches, then stops ("skip", the
+# default), also marks the crate it is in ("skip-rules"), or goes on to the next rule
+# ("fallthrough"). A path outside the crates that no rule matches marks everything: add a rule when
+# a path is safe to narrow, never a catch-all. Globs are globset's, where `*` also crosses `/`.
+# After these, the determinator's default rules: Cargo.toml marks everything, Cargo.lock and
+# rustfmt.toml nothing (the lockfile through the simulated builds).
+#
+# The end-to-end suites, the fuzz targets and the proofs are in suites.toml: a suite runs when a
+# path it lists changes or a crate it lists is affected.
+
+# ---- the selection itself, the toolchain, cargo's configuration and CI: everything ----
+[[path-rule]]
+globs = [
+  "ci/determinator/**", "ci/gates.sh", "ci/pr-has-label.sh", "ci/pr-has-label_test.sh",
+  ".github/**",
+  "rust-toolchain.toml", "rust-toolchain", ".cargo/**", ".config/**",
+  # The vendored Biscuit fork: path dependencies, not members, so their changes reach no package.
+  "third_party/**",
+]
+mark-changed = "all"
+
+# ---- inputs the crates read from outside their directories ----
+[[path-rule]]
+globs = ["examples/**"]
+mark-changed = ["wicket-core", "wicket-authz", "wicket-feed", "wicket-policy", "wicket-home", "wicket-cli"]
+
+# The console's session view (#327), embedded by crates/wicket-cli/build.rs; the agent image the
+# CLI builds; the install and unit files it writes.
+[[path-rule]]
+globs = ["images/claude-code/wicket-entry"]
+mark-changed = ["wicket-cli", "wicket-fwd"]
+
+[[path-rule]]
+globs = [
+  "web/**", "images/**", "ci/session-view.sh", "ci/install-node.sh", "docs/reference/cli.md",
+  "ci/gen-cli-reference.sh", "deploy/systemd/**", "deploy/systemd-user/**",
+]
+mark-changed = ["wicket-cli"]
+
+# wicket-home's state store test reads the install script (#219); wicket-cli depends on wicket-home.
+[[path-rule]]
+globs = ["deploy/install.sh"]
+mark-changed = ["wicket-home"]
+
+# The wicket-box skill: the Claude adapter installs it in every box (crates/wicket-agent/src/lib.rs).
+[[path-rule]]
+globs = ["plugins/wicket/skills/wicket-box/SKILL.md"]
+mark-changed = ["wicket-agent"]
+
+[[path-rule]]
+globs = ["deploy/vultr/node-setup.sh"]
+mark-changed = ["wicket-placement"]
+
+# The Lean spec: wicket-authz's oracle test reads it (#322).
+[[path-rule]]
+globs = ["verification/lean/**"]
+mark-changed = ["wicket-authz"]
+
+# wicket-policy's test that no node crate depends on Cedar reads the lockfile. The crates whose
+# builds a lockfile change alters are marked as well, by the simulated builds.
+[[path-rule]]
+globs = ["Cargo.lock"]
+mark-changed = ["wicket-policy"]
+
+# ---- virtual dependencies: test code one crate includes from another ----
+[[path-rule]]
+globs = ["crates/wicket-core/tests/integration/subset_cases.rs"]
+mark-changed = ["wicket-authz", "wicket-feed"]
+post-rule = "skip-rules"
+
+[[path-rule]]
+globs = ["crates/wicket-authz/tests/common/**"]
+mark-changed = ["wicket-feed"]
+post-rule = "skip-rules"
+
+# The simulation's stand-ins follow the node's and the control host's run loops (#324): the node's
+# gateway, `node create`, the reconciler and a run's supervisor.
+[[path-rule]]
+globs = [
+  "crates/wicket-cli/src/nodesrv.rs", "crates/wicket-cli/src/noderun.rs", "crates/wicket-cli/src/nodegw.rs",
+  "crates/wicket-cli/src/nodecreate.rs", "crates/wicket-cli/src/reconcile.rs", "crates/wicket-cli/src/hibernate.rs",
+]
+mark-changed = ["wicket-sim"]
+post-rule = "skip-rules"
+
+# A crate's own Markdown stays its crate's (the rule after this one would drop it).
+[[path-rule]]
+globs = ["crates/**/*.md"]
+mark-changed = []
+post-rule = "skip-rules"
+
+# ---- paths no crate reads: the documentation, the end-to-end suites, the fuzz workspace, the
+# models (suites.toml selects their suites) ----
+[[path-rule]]
+globs = [
+  "**/*.md", "docs/**", "experiments/**", "refs/**", "changes/**", "LICENSE", "README.md", "CHANGELOG.md",
+  ".gitleaks.toml", ".gitignore", ".claude-plugin/**", "plugins/**",
+  "ci/check-public.py", "ci/check-doc-links.sh", "ci/check-terms.sh", "ci/check-terms.allow", "ci/check-plugin.py",
+  "ci/changelog.py", "ci/changelog_test.py", "ci/preflight.sh",
+  "deny.toml", "ci/mutants.sh", "ci/mutants.accepted", "ci/package.sh", "ci/sim.sh",
+  "ci/smoke.sh", "ci/smoke.yaml", "ci/h3get/**", "ci/hibernate.sh", "ci/hibernate.yaml", "ci/restore.sh",
+  "ci/acceptance.sh", "ci/acceptance/**", "ci/install-acceptance.sh", "ci/install-test.sh", "ci/daemon-uids.sh",
+  "ci/node-e2e.sh", "ci/node-e2e/**", "ci/update.sh", "ci/update/**", "ci/policy-diff.sh", "ci/kani.sh",
+  "ci/lean.sh", "ci/tla.sh", "ci/fuzz.sh", "fuzz/**", "verification/**", "deploy/**", "programs/**",
+]
+mark-changed = []

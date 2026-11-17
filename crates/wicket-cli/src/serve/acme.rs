@@ -166,7 +166,7 @@ pub fn run(cfg: AcmeConfig, resolver: Arc<CertResolver>, http: HttpFactory, ever
                 let poll = RetryPolicy::new().initial_delay(Duration::from_secs(1)).backoff(1.5).timeout(Duration::from_secs(180));
                 if let Err(e) = order(&cfg, &resolver, &http, poll).await {
                     tracing::warn!("ACME: {e:#}");
-                    eprintln!(
+                    say_err!(
                         "wicket serve: ACME certificate for {} failed: {e:#} (retrying in {})",
                         cfg.domain,
                         humantime::format_duration(every)

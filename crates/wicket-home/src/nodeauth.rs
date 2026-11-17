@@ -177,12 +177,12 @@ impl NodeIdentity {
         let issuer = wicket_identity::verifying_key_from_jwk(&jwk).context("issuer.pub.json")?;
         let id = NodeIdentity { key, issuer };
         match std::fs::read_to_string(root.join(CERT_FILE)) {
-            Err(_) => eprintln!(
+            Err(_) => say_err!(
                 "[node] no identity certificate ({CERT_FILE}): control hosts will refuse this node until `wicket node renew-ca {name}`"
             ),
             Ok(c) => match id.check_cert(c.trim(), name, now) {
-                Ok(c) => eprintln!("[node] identity {} (certificate {}…, expires in {} s)", c.sub, &c.jti[..12], c.exp - now),
-                Err(e) => eprintln!("[node] the identity certificate is unusable ({e:#}): renew it with `wicket node renew-ca {name}`"),
+                Ok(c) => say_err!("[node] identity {} (certificate {}…, expires in {} s)", c.sub, &c.jti[..12], c.exp - now),
+                Err(e) => say_err!("[node] the identity certificate is unusable ({e:#}): renew it with `wicket node renew-ca {name}`"),
             },
         }
         Ok(id)
@@ -259,7 +259,7 @@ pub fn untrusted(ledger: &Ledger, node: &str, cert: Option<&NodeCertClaims>, now
         Ok(Some(n)) => return Some(format!("node {node} is {}", n.status)),
         Ok(None) => return Some(format!("node {node} is no longer enrolled")),
         Err(e) => {
-            eprintln!("[wicket] could not check node {node}'s status: {e}");
+            say_err!("[wicket] could not check node {node}'s status: {e}");
             return None;
         }
     }

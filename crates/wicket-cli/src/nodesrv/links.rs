@@ -166,7 +166,7 @@ pub(super) fn listen_direct(node: &Arc<Node>, run: &str, sock: &str, to: &str, p
             }
         }
         conns.abort_all();
-        eprintln!("[node] {run2}: link socket {sock2} to {to2} closed on this node (a box's authority ended)");
+        say_err!("[node] {run2}: link socket {sock2} to {to2} closed on this node (a box's authority ended)");
     });
     if let Some(b) = node.boxes.lock().expect("boxes").get_mut(run) {
         if let Some(old) = b.listeners.insert(sock.to_string(), task) {
