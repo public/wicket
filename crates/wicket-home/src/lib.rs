@@ -9,6 +9,10 @@
 //! owners and exit causes ([`owner`], [`exitcause`]) and a driven harness's control channel
 //! ([`control`]). wicket-cli imports them all under their old names.
 
+// First, so the modules after it can use say! and say_err!.
+#[macro_use]
+pub mod out;
+
 pub mod audit_export;
 pub mod control;
 pub mod exitcause;

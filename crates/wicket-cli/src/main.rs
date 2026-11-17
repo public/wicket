@@ -5,7 +5,9 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+// say! and say_err!, from wicket-home (#219), for every module here.
 #[macro_use]
+extern crate wicket_home;
 mod out;
 
 // The control/node channel and the modules its messages carry: a crate of their own (#219), under
