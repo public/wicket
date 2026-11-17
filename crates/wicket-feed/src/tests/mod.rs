@@ -174,8 +174,16 @@ impl Cp {
 
     /// A publisher on this feed's log (a control-plane restart, or another process).
     pub(crate) fn open_publisher(&self, cfg: PublisherConfig) -> Publisher<BoxAuthority> {
-        Publisher::open_with(self.dir.path(), NODE, &self.root.verifying_key(), self.feed_key.clone(), &self.cert, cfg, self.authz_root.public())
-            .unwrap()
+        Publisher::open_with(
+            self.dir.path(),
+            NODE,
+            &self.root.verifying_key(),
+            self.feed_key.clone(),
+            &self.cert,
+            cfg,
+            self.authz_root.public(),
+        )
+        .unwrap()
     }
 
     /// Reopens the publisher from its log (a control-plane restart).

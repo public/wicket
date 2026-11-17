@@ -87,23 +87,6 @@ fn check_cert(root: &VerifyingKey, key: &SigningKey, cert_jws: &str, cfg: &Publi
     Ok(cert)
 }
 
-impl<P: Policy> Publisher<P>
-where
-    P::Ctx: Default,
-{
-    /// [`Publisher::open_with`] for payloads that compile without context ([`wicket_core::ZoneSpec`]).
-    pub fn open(
-        dir: &Path,
-        feed: &str,
-        root: &VerifyingKey,
-        key: SigningKey,
-        cert_jws: &str,
-        cfg: PublisherConfig,
-    ) -> Result<Publisher<P>, PublishError> {
-        Self::open_with(dir, feed, root, key, cert_jws, cfg, P::Ctx::default())
-    }
-}
-
 /// A delta log's complete lines, parsed (not verified: the log is the publisher's own), or the
 /// epoch of the first that doesn't read (counted from 1, as a log starts at epoch 1).
 fn parse_log<P: Policy>(lines: &[&str]) -> Result<Vec<Delta<P>>, u64> {

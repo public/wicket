@@ -104,9 +104,14 @@ fn corrupt_files_are_refused_not_trusted() {
         let err = open(&cp, &dir).err().unwrap_or_else(|| panic!("{file} corrupted, yet loaded"));
         assert!(matches!(err, LoadError::Corrupt { .. }), "{file}: {err}");
         // The node starts again with nothing: closed until a live statement arrives. Use counts stay.
-        let mut r =
-            Replica::<BoxAuthority>::reset_with(dir.path(), NODE, cp.root.verifying_key(), ReplicaConfig::default(), cp.authz_root.public())
-                .unwrap();
+        let mut r = Replica::<BoxAuthority>::reset_with(
+            dir.path(),
+            NODE,
+            cp.root.verifying_key(),
+            ReplicaConfig::default(),
+            cp.authz_root.public(),
+        )
+        .unwrap();
         assert_eq!(r.mode(T0 + 20), Mode::Closed);
         assert_eq!(r.uses("g-0"), 1);
         let mut cp = cp;
@@ -131,10 +136,14 @@ fn other_bad_states_are_refused() {
     assert!(Replica::<BoxAuthority>::open_with(dir.path(), NODE, key().verifying_key(), ReplicaConfig::default(), authz_root).is_err());
     // Another node's files.
     let (cp, dir) = persisted();
-    assert!(
-        Replica::<BoxAuthority>::open_with(dir.path(), "n2", cp.root.verifying_key(), ReplicaConfig::default(), cp.authz_root.public())
-            .is_err()
-    );
+    assert!(Replica::<BoxAuthority>::open_with(
+        dir.path(),
+        "n2",
+        cp.root.verifying_key(),
+        ReplicaConfig::default(),
+        cp.authz_root.public()
+    )
+    .is_err());
     // Deltas reordered.
     let (cp, dir) = persisted();
     let p = dir.path().join("deltas.jsonl");

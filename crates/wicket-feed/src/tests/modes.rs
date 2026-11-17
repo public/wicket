@@ -161,7 +161,10 @@ fn use_counts_and_box_binding() {
     assert_eq!(r.decide(&merge("r2"), T0 + 5), Decision::Allow(Allowed::Grant("r2-only".into())));
     // A token's grants are always its box's (there is no grant for any box in the zone): r1's
     // `keep-1` is not r2's.
-    assert!(matches!(r.decide(&op(ZONE, "r2", "POST", "api.github.com", "/repos/acme/app/issues/1/comments"), T0 + 6), Decision::NeedsGrant(_)));
+    assert!(matches!(
+        r.decide(&op(ZONE, "r2", "POST", "api.github.com", "/repos/acme/app/issues/1/comments"), T0 + 6),
+        Decision::NeedsGrant(_)
+    ));
     // And never for another zone: the box's authority is for its own zone only.
     assert!(matches!(
         r.decide(&op("z2", "r1", "POST", "api.github.com", "/repos/acme/app/issues/1/comments"), T0 + 6),
@@ -185,7 +188,8 @@ fn a_counted_grant_must_name_its_box() {
     assert_eq!(r.uses("unbound"), 0);
     // Nor is a bound, uncounted feed grant: only the token's grants allow.
     let bound = Grant { box_id: Some("r1".into()), ..grant("bound", &evil(), T0 + 3_600_000) };
-    let d = Delta { feed: NODE.into(), version: 1, epoch: 3, prev: r.state().unwrap().head.clone(), issued_at: T0, changes: vec![add(bound)] };
+    let d =
+        Delta { feed: NODE.into(), version: 1, epoch: 3, prev: r.state().unwrap().head.clone(), issued_at: T0, changes: vec![add(bound)] };
     r.accept(&Frame::new(FrameKind::Delta, sign(&cp.feed_key, TYP_DELTA, &d)), T0 + 3).unwrap();
     assert!(r.state().unwrap().grants.contains_key("bound"));
     assert!(matches!(r.decide(&evil(), T0 + 4), Decision::NeedsGrant(_)));

@@ -42,13 +42,13 @@
 //!
 //! # Persistence
 //!
-//! With a directory ([`Replica::open`]), every accepted artifact is written durably *before* it is
+//! With a directory ([`Replica::open_with`]), every accepted artifact is written durably *before* it is
 //! applied: `cert.jws`, `snapshot.jws` (the base), `deltas.jsonl` (applied since the base),
 //! `statements.json` (the last statement and the last vouching one, with their receipt times and the
 //! `issued_at` floor), and `uses.log` (grant uses). On start the node re-verifies all of it and
 //! resumes in whatever mode the signed deadlines allow; replay protection survives the restart. Any
-//! file that doesn't verify makes [`Replica::open`] fail: the caller starts again with
-//! [`Replica::reset`], which keeps only the use counts and comes up [`Mode::Closed`] until a live
+//! file that doesn't verify makes [`Replica::open_with`] fail: the caller starts again with
+//! [`Replica::reset_with`], which keeps only the use counts and comes up [`Mode::Closed`] until a live
 //! statement arrives.
 
 use crate::format::{Delta, Frame, FrameKind, Fresh, Hello, KeyCert, RevokeKind, Snapshot};
@@ -94,7 +94,8 @@ impl Default for ReplicaConfig {
 /// What a decision allowed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Allowed {
-    /// By the zone's reach rule `n`.
+    /// By the zone's reach rule `n`. No decision of this crate's returns it (tokens allow by
+    /// [`Allowed::Ceiling`]); kept for callers that match on it.
     Reach(usize),
     /// By the ceilings of the box's token (every block's reach), without a grant.
     Ceiling,
@@ -249,26 +250,6 @@ enum Plan<P: Policy> {
     Fresh(Statement),
     /// A valid statement not newer than the one held: nothing to apply.
     Superseded,
-}
-
-impl<P: Policy> Replica<P>
-where
-    P::Ctx: Default,
-{
-    /// [`Replica::new_with`] for payloads that compile without context ([`wicket_core::ZoneSpec`]).
-    pub fn new(node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Replica<P> {
-        Self::new_with(node, root, cfg, P::Ctx::default())
-    }
-
-    /// [`Replica::reset_with`] without context.
-    pub fn reset(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Result<Replica<P>, LoadError> {
-        Self::reset_with(dir, node, root, cfg, P::Ctx::default())
-    }
-
-    /// [`Replica::open_with`] without context.
-    pub fn open(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Result<Replica<P>, LoadError> {
-        Self::open_with(dir, node, root, cfg, P::Ctx::default())
-    }
 }
 
 impl<P: Policy> Replica<P> {

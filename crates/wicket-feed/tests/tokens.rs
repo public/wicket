@@ -49,7 +49,7 @@ impl Drop for TempDir {
 }
 
 /// A control plane: the feed root and key, the authority root and approver, and a publisher of
-/// [`BoxAuthority`] records (plus, for the oracle, one of `ZoneSpec`s under the same feed root).
+/// [`BoxAuthority`] records.
 struct Cp {
     root: FeedKey,
     feed_key: FeedKey,
