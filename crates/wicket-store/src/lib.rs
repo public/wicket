@@ -22,7 +22,7 @@ mod node;
 mod quota;
 mod receipts;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
-pub use receipts::{MessageMeta, MessageRow, Priority, Receipt};
+pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
@@ -111,7 +111,9 @@ pub enum StoreError {
 /// wicket's notices are rows of `messages` (`kind` `prompt` or `notice`, beside peers' `message`),
 /// with `text`, `label` (who it shows as) and `stdin_start`/`stdin_end`; `operator_messages` rows
 /// are copied over once, and the table stays, unread, until a contract step drops it.
-pub const SCHEMA_VERSION: u32 = 17;
+/// Version 18 (expand) adds the read-only `principals` view (#11, #253): every agent's latest identity
+/// and every passkey operator, one record (`Ledger::principals`).
+pub const SCHEMA_VERSION: u32 = 18;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
