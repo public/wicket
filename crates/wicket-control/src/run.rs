@@ -2321,6 +2321,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
                 Err(e) => {
                     say!("[wicket] hibernating agent {} failed: {e:#} (its state stays on this node, in {})", f.agent, dir.display());
+                    // Why, on the record too (#258: a name the bundle format can't hold is one reason).
+                    let _ = ledger.lock().expect("ledger").audit(
+                        &m.tenant,
+                        Some(&run),
+                        "agent.hibernate_failed",
+                        &serde_json::json!({ "agent": f.agent, "generation": f.generation, "error": format!("{e:#}") }),
+                    );
                     set_state("failed", Some(&format!("hibernate failed: {e:#}")));
                     status = format!("failed (hibernate: {e})");
                 }

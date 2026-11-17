@@ -659,6 +659,37 @@ pub fn restore(stores: Stores, v1: &dyn ObjectStore, m: &StateManifest, name: &s
     res
 }
 
+/// #258: a version-1 bundle as a version-2 one, for the migration of version-1 heads. Each of its
+/// trees is restored from `v1` into `scratch/<name>` (with version 1's checks), then they are pushed
+/// as a version-2 bundle `to` names. `scratch` is emptied first (an interrupted conversion's
+/// leftovers) and removed after. Every version-1 bundle converts: version 1 kept a name that isn't
+/// UTF-8 lossily (U+FFFD), so its trees restore to names the version-2 format holds.
+pub fn convert_v1(stores: Stores, v1: &dyn ObjectStore, m: &StateManifest, to: &PushTo, scratch: &Path) -> Result<(StateManifest, String)> {
+    if m.version != 1 || m.bundle.is_some() {
+        return Err(BundleError::Invalid(format!("agent {}'s head is already version {}", m.agent, m.version)));
+    }
+    let clear = |d: &Path| {
+        let _ = make_writable(d);
+        let _ = std::fs::remove_dir_all(d);
+    };
+    clear(scratch);
+    std::fs::create_dir_all(scratch)?;
+    let res = (|| {
+        let mut srcs = Vec::new();
+        for t in &m.trees {
+            if t.name.is_empty() || t.name.contains('/') || t.name == "." || t.name == ".." {
+                return Err(BundleError::Invalid(format!("agent {}'s bundle names a tree {:?}", m.agent, t.name)));
+            }
+            let dest = scratch.join(&t.name);
+            restore(stores, v1, m, &t.name, &dest)?;
+            srcs.push(TreeSrc { name: t.name.clone(), path: dest, exclude: &[] });
+        }
+        push_tree(stores, to, &srcs)
+    })();
+    clear(scratch);
+    res
+}
+
 /// Makes every directory under `root` writable by its owner, so the tree can be removed.
 pub fn make_writable(root: &Path) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(root)?;
@@ -912,6 +943,58 @@ mod tests {
         let e = push_tree(stores, &to(2), &trees).unwrap_err();
         assert!(unrepresentable(&e), "{e}");
         for d in [src, root, v1, out] {
+            rm(&d);
+        }
+    }
+
+    /// #258: a version-1 bundle converts to a version-2 one that restores to the same trees (contents,
+    /// modes, times, links: the same tree digest), with the seq and generation it is pushed as; a
+    /// version-2 head isn't converted again.
+    #[test]
+    fn a_version_one_bundle_converts_to_the_same_trees() {
+        let (src, vol, root, v1, scratch, out1, out2) =
+            (tmp("cvsrc"), tmp("cvvol"), tmp("cvcas"), tmp("cvv1"), tmp("cvscratch"), tmp("cvout1"), tmp("cvout2"));
+        sample(&src);
+        std::fs::create_dir_all(&vol).unwrap();
+        std::fs::write(vol.join("data"), "kept").unwrap();
+        let v1s = DirStore::new(&v1);
+        let trees = [
+            TreeSrc { name: "workspace".into(), path: src.clone(), exclude: &[] },
+            TreeSrc { name: "volume.data".into(), path: vol.clone(), exclude: &[] },
+        ];
+        let (old, _) = push(&v1s, &to(1), &trees, None, &v1.join(".scratch")).unwrap();
+        let local = Cas::new(DirStore::new(&root));
+        let stores = Stores { local: &local, shared: None, written: None };
+        let (new, head) = convert_v1(stores, &v1s, &old, &to(2), &scratch).unwrap();
+        assert!(is_tree_head(&head));
+        assert!(!scratch.exists(), "the scratch directory is removed");
+        let read = read_head(stores, &v1s, &head, "agt_x").unwrap();
+        assert_eq!((read.version, read.seq, read.generation), (TREE_VERSION, 2, 1));
+        assert_eq!(read, new);
+        let opts = crate::cas::DirOpts { exclude: &[], plain: false };
+        for name in ["workspace", "volume.data"] {
+            let (a, b) = (out1.join(name), out2.join(name));
+            std::fs::create_dir_all(&out1).unwrap();
+            std::fs::create_dir_all(&out2).unwrap();
+            restore(stores, &v1s, &old, name, &a).unwrap();
+            restore(stores, &v1s, &read, name, &b).unwrap();
+            assert_eq!(crate::cas::dir_digest(&a, &opts).unwrap(), crate::cas::dir_digest(&b, &opts).unwrap(), "{name}");
+        }
+        assert!(convert_v1(stores, &v1s, &read, &to(3), &scratch).is_err(), "version 2 isn't converted");
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::write(src.join(std::ffi::OsStr::from_bytes(b"caf\xe9")), "latin-1").unwrap();
+        // Version 1 kept a name that isn't UTF-8 lossily (U+FFFD), so every version-1 bundle
+        // converts: the name comes back as version 1 restored it.
+        let (odd, _) = push(&v1s, &to(3), &trees, None, &v1.join(".scratch")).unwrap();
+        let (_, head) = convert_v1(stores, &v1s, &odd, &to(4), &scratch).unwrap();
+        let read = read_head(stores, &v1s, &head, "agt_x").unwrap();
+        let (a, b) = (out1.join("odd"), out2.join("odd"));
+        restore(stores, &v1s, &odd, "workspace", &a).unwrap();
+        restore(stores, &v1s, &read, "workspace", &b).unwrap();
+        assert!(b.join("caf\u{fffd}").exists());
+        assert_eq!(crate::cas::dir_digest(&a, &opts).unwrap(), crate::cas::dir_digest(&b, &opts).unwrap());
+        assert!(!scratch.exists());
+        for d in [src, vol, root, v1, out1, out2] {
             rm(&d);
         }
     }

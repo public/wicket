@@ -936,11 +936,39 @@ pub fn print(done: &[Done], dry_run: bool) {
     say!("reconcile: {changed} change(s){}", if dry_run { " (dry run: nothing changed)" } else { "" });
 }
 
+/// #258: converts version-1 bundle heads to version 2 (`hibernate::convert_v1_heads`, which audits
+/// each), before the reconciler's first pass: when the control host's reconciler starts, again
+/// after `wicket self update` re-executes it, and on a one-off `wicket reconcile`.
+async fn convert_bundles() -> Vec<Done> {
+    let conv =
+        tokio::task::spawn_blocking(|| crate::hibernate::convert_v1_heads(&std::sync::Mutex::new(Ledger::open(&crate::ledger_path())?)))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r);
+    match conv {
+        Ok(cs) => cs
+            .into_iter()
+            .map(|c| Done {
+                kind: "bundle_convert",
+                target: c.agent,
+                detail: match c.to {
+                    Ok(d) => format!("{} -> {d}", c.from),
+                    Err(why) => format!("{} kept: {why}", c.from),
+                },
+            })
+            .collect(),
+        Err(e) => vec![Done { kind: "bundle_convert", target: "agents".into(), detail: format!("failed: {e:#}") }],
+    }
+}
+
 /// `wicket reconcile [--dry-run] [--every <interval>]`.
 pub async fn command(dry_run: bool, every: Option<std::time::Duration>) -> Result<()> {
     if every.is_some() {
         // `wicket self update` moves the reconciler service to the new build with SIGHUP.
         crate::update::reexec_on_hangup(crate::update::pidfile("reconcile"), crate::update::Versions::control().root, || {});
+    }
+    if !dry_run {
+        print(&convert_bundles().await, dry_run);
     }
     loop {
         match pass(dry_run).await {
