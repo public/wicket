@@ -21,14 +21,13 @@ use wicket_home::{
 };
 
 // Modules that need only wicket-home's helpers moved with them (#219), under their old names here.
-use wicket_home::{exitcause, images_policy, owner, program};
+use wicket_home::{control, exitcause, images_policy, owner, program};
 
 mod audit_export;
 mod capacity;
 mod ci_update;
 mod cli_reference;
 mod cmd;
-mod control;
 mod daemon;
 mod doctor;
 mod effect;
