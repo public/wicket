@@ -372,14 +372,18 @@ runs on it stops.
 ## `request_update`
 
 Asks the operator to update the installation to a build the agent made. It files an R4 request,
-`UPDATE wicket.internal/self/<sha256>`, and nothing else: once an operator approves it, the operator's
-`wicket self update` accepts that artifact once. See
+`UPDATE wicket.internal/self/<sha256>`, and nothing else. Put the artifact directly in `/workspace/out`.
+If an operator approves the request in the console, wicket takes the file with that sha256 from the
+run's outbox and updates the control host and then its nodes, rolling back on a failed health gate;
+the agent is told how it ended in a notice from wicket, and `await_grant` says not to ask again.
+Approved with `wicket approve`, the operator's `wicket self update` accepts that artifact once. See
 [run wicket in wicket](../how-to/run-wicket-in-wicket.md).
 
 | argument | type | |
 |---|---|---|
 | `sha256` | string, required | the artifact's sha256, 64 hex digits |
 | `reason` | string, required, at most 1000 characters | what the build changes, and where the artifact is |
+| `commit` | string, 7–40 hex digits | the commit the build is of: shown to the operator as the agent's word |
 
 ## `expose`
 

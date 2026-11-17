@@ -50,17 +50,32 @@ wicket session <run>               # its session, live: type prompts while it ru
 2. Ask the agent to build, test and package:
    `cargo build --release --locked -p wicket-cli && ci/package.sh target/release/wicket /workspace/out`,
    with `cargo test --workspace --locked`, and then to call `request_update` with the archive's
-   sha256 and where it is. That files an R4 request, `UPDATE wicket.internal/self/<sha256>`, and
-   nothing else.
-3. Read the request (`wicket pending`). Copy the archive out of the run's workspace
-   (`<data dir>/runs/<run>/workspace/out/`, or the node's run directory for a box on a node), check
-   its sha256 against the request, and approve it: `sudo wicket approve <request>`.
-4. Update: `sudo wicket self update /tmp/wicket-…tar.gz --nodes all`
-   ([update and roll back](update-and-roll-back.md)).
+   sha256 (and, if it likes, the commit it built). That files an R4 request,
+   `UPDATE wicket.internal/self/<sha256>`, and nothing else.
+3. Approve it in the console. Its confirmation shows what approving installs: the file in the run's
+   `/workspace/out` with that sha256, its size, the commit the agent says it is (its word, not
+   checked), and the nodes it reaches after the control host. Signing the approval with your
+   passkey applies it: wicket copies that file from the run's outbox, hashes it again, and runs
+   `wicket self update <it> --nodes all` as the `wicket` user, as wicketd would, with its health
+   gate and rollback ([update and roll back](update-and-roll-back.md)). Its log is
+   `<data dir>/runs/<run>/update-<request>.log`. The agent is told how it ended (done, rolled back,
+   or failed and why) in a notice from wicket, and its run carries on through the update.
 
 The approval is used up by the update that accepts it, whatever uses the grant had left; a second
 update to the same artifact needs a second approval. Like every grant made for an agent's request, it
 lapses if the agent's identity is revoked first, so update before ending the agent.
+
+**From a terminal instead.** Only a box on the control host's own node has its outbox on the control
+host; for a box on another node, the card says so and approving only accepts the sha256. Then, or
+if you approve with `sudo wicket approve <request>`, copy the archive out of the run's workspace
+(`<data dir>/runs/<run>/workspace/out/`, or the node's run directory), check its sha256 against the
+request, and run `sudo wicket self update /tmp/wicket-…tar.gz --nodes all`; or
+`sudo wicket self apply-update <request>`, which takes it from the outbox as the console does.
+
+An update applied from the console moves the `wicket` user's versions (`/var/lib/wicket-versions`)
+and the services that run from them; root's own copy and `/usr/local/bin/wicket` (#261) stay where
+they were, as root never runs what the `wicket` user staged. `sudo wicket self admit <artifact>`
+moves root's link.
 
 What isn't covered: wicket's own end-to-end tests need Docker in the box, which a box doesn't have
 ([design](../explanation/design.md) §21).

@@ -53,6 +53,14 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   approval that widens (a prefix, more than one use, over an hour, or zone-wide), the confirmation
   shows its blast radius: what else it would allow, with requests this run made, and how many of
   the run's last 200 egress requests it would have covered.
+- **approve an agent's `request_update`, which installs its build** (#465): the confirmation shows,
+  and the passkey signs as `update`, the file in the run's `/workspace/out` with the requested
+  sha256, its size, the commit the agent says it is, and the nodes it reaches after the control
+  host. Approving runs `wicket self apply-update <request>` (log:
+  `<data dir>/runs/<run>/update-<request>.log`): the blue/green update with its health gate and
+  rollback, then the nodes; the agent is told how it ended. If the file isn't there (or the box is
+  on another node), the confirmation says why, and approving only accepts the sha256 for a
+  `sudo wicket self update` on the host ([run wicket in wicket](../how-to/run-wicket-in-wicket.md)).
 - **register a device for notifications, and show the request on one** (`push_subscribe`,
   `push_details`): see [notifications](#notifications). Removing a device and hiding the request
   need only the session.

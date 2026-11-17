@@ -158,7 +158,10 @@ pub enum SelfCmd {
     /// Apply an agent's approved update request (#465): the file in its run's outbox with the
     /// sha256 the request names, as `self update <it> --nodes all` would, then tell the agent how
     /// it ended. The console runs it when an operator approves the request.
-    ApplyUpdate { request: String },
+    ApplyUpdate {
+        /// The approved request (`UPDATE wicket.internal/self/<sha256>`, from `request_update`).
+        request: String,
+    },
     /// This build's systemd units (JSON: name to contents).
     #[command(hide = true)]
     Units,
