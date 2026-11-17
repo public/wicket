@@ -49,8 +49,9 @@ pub fn reexec(versions: &Path) -> anyhow::Error {
 
 /// Writes this process's pid to `pidfile`, and on SIGHUP runs `before` and then re-executes from
 /// the current version in `versions` ([`reexec`]): how a long-running wicket process moves to a new
-/// build without a service manager. Must be called inside a tokio runtime.
-pub fn reexec_on_hangup(pidfile: PathBuf, versions: PathBuf, before: impl FnOnce() + Send + 'static) {
+/// build without a service manager. What `before` returns is held across the exec, and dropped only
+/// if the exec fails (wicketd's handoff, #455). Must be called inside a tokio runtime.
+pub fn reexec_on_hangup<G: 'static>(pidfile: PathBuf, versions: PathBuf, before: impl FnOnce() -> G + Send + 'static) {
     use tokio::signal::unix::{signal, SignalKind};
     if let Some(d) = pidfile.parent() {
         let _ = std::fs::create_dir_all(d);
@@ -72,8 +73,9 @@ pub fn reexec_on_hangup(pidfile: PathBuf, versions: PathBuf, before: impl FnOnce
         hup.recv().await;
         eprintln!("wicket: SIGHUP: re-executing from the current version");
         let _ = tokio::task::spawn_blocking(move || {
-            before();
+            let held = before();
             eprintln!("wicket: {:#}", reexec(&versions));
+            drop(held);
         })
         .await;
     });
