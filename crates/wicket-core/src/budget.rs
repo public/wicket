@@ -56,6 +56,25 @@ pub struct Slice {
 }
 
 impl Slice {
+    /// `self`, counted from `base` instead of from zero: a slice the control host works out from
+    /// what it counted since its node's report `base`, in the node's own counts (#422). A
+    /// re-attached supervisor counts the node's spend from its first report (`noderun`'s
+    /// `spent_base`), and a node holding a slice below its own count can't spend.
+    pub fn offset(self, base: Spent) -> Slice {
+        Slice {
+            requests: self.requests.saturating_add(base.requests),
+            output_tokens: self.output_tokens.saturating_add(base.output_tokens),
+            input_tokens: self.input_tokens.map(|i| i.saturating_add(base.input_total())),
+        }
+    }
+
+    /// [`Slice::renewed`] in the node's counts, for a control host that counts the node's spend
+    /// since its report `base` (zero for one that counts it all): `next`, `spent` and `input_total`
+    /// are the control host's, `cur` and the result the node's.
+    pub fn renewed_from(cur: Option<Slice>, next: Slice, spent: Spent, input_total: u64, base: Spent) -> Slice {
+        Slice::renewed(cur, next.offset(base), spent.plus(base), input_total.saturating_add(base.input_total()))
+    }
+
     /// The slice to send a node next (#152), given the one it holds (`cur`, None before the first),
     /// the control host's [`Counter::next_slice`], what it has counted (`spent`, and `input_total`
     /// with cached tokens): `cur` until less than half a slice of it is left, else `next`; and
@@ -92,6 +111,22 @@ pub struct Spent {
 }
 
 impl Spent {
+    /// Its input tokens, cached ones included.
+    pub fn input_total(&self) -> u64 {
+        sum(&[self.input_tokens, self.cache_read_tokens, self.cache_creation_tokens])
+    }
+
+    /// `self` and `base` added up, saturating: what was counted since `base`, as counted from zero.
+    pub fn plus(self, base: Spent) -> Spent {
+        Spent {
+            requests: self.requests.saturating_add(base.requests),
+            input_tokens: self.input_tokens.saturating_add(base.input_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_add(base.cache_read_tokens),
+            cache_creation_tokens: self.cache_creation_tokens.saturating_add(base.cache_creation_tokens),
+            output_tokens: self.output_tokens.saturating_add(base.output_tokens),
+        }
+    }
+
     /// What was counted since `base`.
     pub fn since(self, base: Spent) -> Spent {
         Spent {
