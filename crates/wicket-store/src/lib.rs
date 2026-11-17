@@ -1107,6 +1107,16 @@ impl Ledger {
         )?)
     }
 
+    /// Gives `run` message `id` again if it is in flight (#453): its answer never reached the box's
+    /// node (the link dropped first). False if it wasn't in flight for `run`.
+    pub fn requeue_message(&self, run: &str, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE messages SET taken_at = NULL WHERE id = ?1 AND to_run = ?2 AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            params![id, run],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Every stored envelope (id, envelope, created_at), for offline verification.
     pub fn envelopes(&self) -> Result<Vec<(String, String, i64)>> {
         let mut st = self.conn.prepare("SELECT id, envelope, created_at FROM messages ORDER BY created_at")?;
@@ -2380,10 +2390,27 @@ mod tests {
         assert!(l.grant_covering(&later).unwrap().is_some(), "every path under the prefix");
     }
 
+    /// #453: one message whose answer couldn't be sent is given again; one read, or not in flight,
+    /// isn't.
+    fn a_message_whose_answer_never_went_is_given_again() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId("t".into());
+        l.add_message("m1", &t, "run_p", "run_a", "{}").unwrap();
+        assert!(!l.requeue_message("run_a", "m1").unwrap(), "not in flight");
+        let m = l.take_message_in_flight("run_a").unwrap().unwrap();
+        assert!(!l.requeue_message("run_b", &m.id).unwrap(), "only its own run's");
+        assert!(l.requeue_message("run_a", &m.id).unwrap());
+        let again = l.take_message_in_flight("run_a").unwrap().unwrap();
+        assert_eq!(again.id, m.id);
+        assert!(l.message_read("run_a", &m.id).unwrap());
+        assert!(!l.requeue_message("run_a", &m.id).unwrap(), "read: never again");
+    }
+
     /// #445: a message taken in flight isn't taken again, isn't read until its box has had it, and
     /// is given again when the supervisor that took it goes; a read one never is.
     #[test]
     fn a_message_in_flight_is_given_again_until_its_box_has_had_it() {
+        a_message_whose_answer_never_went_is_given_again();
         let mut l = Ledger::open_in_memory().unwrap();
         let t = TenantId("t".into());
         l.add_message("m1", &t, "run_p", "run_a", "{}").unwrap();

@@ -19,10 +19,12 @@ CONSTANTS
     AuthTtl,            \* how long a box's authority lasts past its last renewal, in ticks
     MaxTime,
     MaxCrashes,
+    MaxDrops,           \* link drops between a node and a live supervisor
     \* Design switches: TRUE is the pass design and the code (#444, #445, #446), FALSE the code
     \* before its fix (README.md).
     FinishInLedger,     \* the agent's finish is recorded in the ledger, not only in its supervisor (#444)
     AckAfterHand,       \* a message is marked delivered once the box has it, and a box drops a repeat (#445)
+    RequeueOnReconnect, \* a supervisor gives again, on every reconnect, what it gave on the link that dropped (#453)
     WakeAfterAuthority  \* a lapsed holder's agent is woken only once every box of it has stopped
 
 NONE == "none"
@@ -42,10 +44,13 @@ VARIABLES
     msg,        \* m -> "unsent" | "queued" | "taken" | "handed" | "done" | "lost"
     msgTo,      \* m -> the run it is queued for, or NONE (held for the agent's principal)
     handedTo,   \* m -> r -> how many times r's harness was given m
-    seen        \* r -> the messages r's box has had (its own record, outliving its supervisor)
+    seen,       \* r -> the messages r's box has had (its own record, outliving its supervisor)
+    link,       \* r -> [up, epoch]: the link between r's supervisor and its box's node, and which one
+    takenOn,    \* m -> the epoch of the link it was taken on
+    drops       \* link drops so far
 
 vars == <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
-          stdinOpen, msg, msgTo, handedTo, seen>>
+          stdinOpen, msg, msgTo, handedTo, seen, link, takenOn, drops>>
 
 TypeOK ==
     /\ now \in 0..MaxTime
@@ -63,6 +68,8 @@ TypeOK ==
     /\ msg \in [Msgs -> {"unsent", "queued", "taken", "handed", "done", "lost"}]
     /\ msgTo \in [Msgs -> Runs \cup {NONE}]
     /\ seen \in [Runs -> SUBSET Msgs]
+    /\ \A r \in Runs : link[r].up \in BOOLEAN
+    /\ drops \in 0..MaxDrops
 
 Init ==
     /\ now = 0
@@ -82,6 +89,9 @@ Init ==
     /\ msgTo = [m \in Msgs |-> NONE]
     /\ handedTo = [m \in Msgs |-> [r \in Runs |-> 0]]
     /\ seen = [r \in Runs |-> {}]
+    /\ link = [r \in Runs |-> [up |-> FALSE, epoch |-> 0]]
+    /\ takenOn = [m \in Msgs |-> 0]
+    /\ drops = 0
 
 (* Time passes. A node stops a box whose authority has ended (it can't renew it). *)
 Tick ==
@@ -91,7 +101,7 @@ Tick ==
        /\ box' = [r \in Runs |-> IF ends(r) THEN "stopped" ELSE box[r]]
        /\ harness' = [r \in Runs |-> IF ends(r) THEN "exited" ELSE harness[r]]
     /\ UNCHANGED <<host, crashes, agent, sup, gen, authUntil, asked, finLedger, finSup, stdinOpen, msg,
-                   msgTo, handedTo, seen>>
+                   msgTo, handedTo, seen, link, takenOn, drops>>
 
 (* hibernate::wake and Ledger::claim_wake: a hibernated agent, or one whose holder's claim has *)
 (* lapsed, becomes r's: a new generation, its claim, its box started; whatever was queued for  *)
@@ -110,8 +120,9 @@ Wake(r) ==
     /\ gen' = [gen EXCEPT ![r] = agent.gen + 1]
     /\ authUntil' = [authUntil EXCEPT ![r] = now + AuthTtl]
     /\ stdinOpen' = [stdinOpen EXCEPT ![r] = TRUE]
+    /\ link' = [link EXCEPT ![r] = [up |-> TRUE, epoch |-> @.epoch + 1]]
     /\ msgTo' = [m \in Msgs |-> IF msg[m] = "queued" THEN r ELSE msgTo[m]]
-    /\ UNCHANGED <<now, host, crashes, asked, finLedger, finSup, msg, handedTo, seen>>
+    /\ UNCHANGED <<now, host, crashes, asked, finLedger, finSup, msg, handedTo, seen, takenOn, drops>>
 
 (* run.rs's heartbeat: the holder renews its claim (and its box's authority). *)
 Renew(r) ==
@@ -120,7 +131,7 @@ Renew(r) ==
     /\ agent' = [agent EXCEPT !.claimUntil = now + ClaimTtl]
     /\ authUntil' = [authUntil EXCEPT ![r] = now + AuthTtl]
     /\ UNCHANGED <<now, host, crashes, box, harness, sup, gen, asked, finLedger, finSup, stdinOpen, msg,
-                   msgTo, handedTo, seen>>
+                   msgTo, handedTo, seen, link, takenOn, drops>>
 
 (* run.rs's heartbeat, superseded: a newer activation has the agent, so this box stops. *)
 Supersede(r) ==
@@ -130,7 +141,7 @@ Supersede(r) ==
     /\ harness' = [harness EXCEPT ![r] = "exited"]
     /\ sup' = [sup EXCEPT ![r] = "none"]
     /\ UNCHANGED <<now, host, crashes, agent, gen, authUntil, asked, finLedger, finSup, stdinOpen, msg,
-                   msgTo, handedTo, seen>>
+                   msgTo, handedTo, seen, link, takenOn, drops>>
 
 (* The control host stops: every supervisor with it, and what only they knew. Boxes run on. *)
 Crash ==
@@ -143,13 +154,14 @@ Crash ==
     \* delivered as far as the ledger knows, and the only copy was the dead supervisor's: lost.
     /\ msg' = [m \in Msgs |-> IF msg[m] \in {"taken", "handed"} THEN (IF AckAfterHand THEN "queued" ELSE "lost")
                              ELSE msg[m]]
-    /\ UNCHANGED <<now, agent, box, harness, gen, authUntil, asked, finLedger, stdinOpen, msgTo, handedTo, seen>>
+    /\ link' = [r \in Runs |-> [link[r] EXCEPT !.up = FALSE]]
+    /\ UNCHANGED <<now, agent, box, harness, gen, authUntil, asked, finLedger, stdinOpen, msgTo, handedTo, seen, takenOn, drops>>
 
 Restart ==
     /\ host = "down"
     /\ host' = "up"
     /\ UNCHANGED <<now, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
-                   stdinOpen, msg, msgTo, handedTo, seen>>
+                   stdinOpen, msg, msgTo, handedTo, seen, link, takenOn, drops>>
 
 (* reconcile.rs (run_adopted): a box whose supervisor is gone gets a new one, which knows what *)
 (* the ledger knows.                                                                           *)
@@ -157,15 +169,15 @@ Adopt(r) ==
     /\ host = "up" /\ sup[r] = "dead" /\ box[r] = "running"
     /\ sup' = [sup EXCEPT ![r] = "alive"]
     /\ finSup' = [finSup EXCEPT ![r] = FinishInLedger /\ finLedger[r]]
-    /\ UNCHANGED <<now, host, crashes, agent, box, harness, gen, authUntil, asked, finLedger, stdinOpen,
-                   msg, msgTo, handedTo, seen>>
+    /\ link' = [link EXCEPT ![r] = [up |-> TRUE, epoch |-> @.epoch + 1]]
+    /\ UNCHANGED <<now, host, crashes, agent, box, harness, gen, authUntil, asked, finLedger, stdinOpen, msg, msgTo, handedTo, seen, takenOn, drops>>
 
 (* reconcile.rs (run_lost): no box left, so the run ends. *)
 Lost(r) ==
     /\ host = "up" /\ sup[r] = "dead" /\ box[r] # "running"
     /\ sup' = [sup EXCEPT ![r] = "none"]
     /\ UNCHANGED <<now, host, crashes, agent, box, harness, gen, authUntil, asked, finLedger, finSup,
-                   stdinOpen, msg, msgTo, handedTo, seen>>
+                   stdinOpen, msg, msgTo, handedTo, seen, link, takenOn, drops>>
 
 (* The agent calls wicket's finish tool: the ledger records it (gateway.rs `want` →          *)
 (* Ledger::record_run_want, #444), and its supervisor is told (want_rx).                       *)
@@ -175,14 +187,14 @@ AskFinish(r) ==
     /\ finSup' = [finSup EXCEPT ![r] = TRUE]
     /\ finLedger' = [finLedger EXCEPT ![r] = FinishInLedger]
     /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, stdinOpen, msg, msgTo,
-                   handedTo, seen>>
+                   handedTo, seen, link, takenOn, drops>>
 
 (* run.rs: at the end of the turn, the session closes (StdinClose, which the node records). *)
 CloseSession(r) ==
     /\ host = "up" /\ sup[r] = "alive" /\ finSup[r] /\ stdinOpen[r]
     /\ stdinOpen' = [stdinOpen EXCEPT ![r] = FALSE]
     /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
-                   msg, msgTo, handedTo, seen>>
+                   msg, msgTo, handedTo, seen, link, takenOn, drops>>
 
 (* The harness exits at the end of its session (or is stopped after its grace, #293); its box *)
 (* ends with it.                                                                               *)
@@ -191,7 +203,7 @@ HarnessExits(r) ==
     /\ harness' = [harness EXCEPT ![r] = "exited"]
     /\ box' = [box EXCEPT ![r] = "stopped"]
     /\ UNCHANGED <<now, host, crashes, agent, sup, gen, authUntil, asked, finLedger, finSup, stdinOpen,
-                   msg, msgTo, handedTo, seen>>
+                   msg, msgTo, handedTo, seen, link, takenOn, drops>>
 
 (* send_message: to the agent's holder while it holds the agent, else held for its principal. *)
 Send(m) ==
@@ -199,37 +211,58 @@ Send(m) ==
     /\ msg' = [msg EXCEPT ![m] = "queued"]
     /\ msgTo' = [msgTo EXCEPT ![m] = IF agent.state = "active" THEN agent.holder ELSE NONE]
     /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
-                   stdinOpen, handedTo, seen>>
+                   stdinOpen, handedTo, seen, link, takenOn, drops>>
 
 (* Ledger::take_message (await_message) and take_operator_messages: the supervisor takes it,  *)
 (* and today the ledger marks it delivered.                                                    *)
 Take(m, r) ==
     /\ host = "up" /\ sup[r] = "alive" /\ box[r] = "running"
     /\ msg[m] = "queued" /\ msgTo[m] = r
+    /\ link[r].up
+    /\ takenOn' = [takenOn EXCEPT ![m] = link[r].epoch]
     /\ msg' = [msg EXCEPT ![m] = "taken"]
-    /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
-                   stdinOpen, msgTo, handedTo, seen>>
+    /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup, stdinOpen, msgTo, handedTo, seen, link, drops>>
 
 (* ...and gives it to the harness (the tool's reply, or stdin). A box that has had it drops it *)
 (* in the proposed design.                                                                     *)
 Hand(m, r) ==
     /\ host = "up" /\ sup[r] = "alive" /\ harness[r] = "running"
+    /\ link[r].up
     /\ msg[m] = "taken" /\ msgTo[m] = r
     /\ handedTo' = [handedTo EXCEPT ![m][r] = IF AckAfterHand /\ m \in seen[r] THEN @ ELSE @ + 1]
     /\ seen' = [seen EXCEPT ![r] = @ \cup {m}]
     /\ msg' = [msg EXCEPT ![m] = IF AckAfterHand THEN "handed" ELSE "done"]
     /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
-                   stdinOpen, msgTo>>
+                   stdinOpen, msgTo, link, takenOn, drops>>
 
 (* The proposed design's acknowledgement: marked delivered once the box has it. *)
 Ack(m) ==
     /\ host = "up" /\ msg[m] = "handed" /\ sup[msgTo[m]] = "alive"
+    /\ link[msgTo[m]].up
     /\ msg' = [msg EXCEPT ![m] = "done"]
     /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
-                   stdinOpen, msgTo, handedTo, seen>>
+                   stdinOpen, msgTo, handedTo, seen, link, takenOn, drops>>
+
+(* The link between a live supervisor and its box's node drops (#453): the supervisor lives on. *)
+LinkDrop(r) ==
+    /\ host = "up" /\ sup[r] = "alive" /\ link[r].up /\ drops < MaxDrops
+    /\ link' = [link EXCEPT ![r].up = FALSE]
+    /\ drops' = drops + 1
+    /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
+                   stdinOpen, msg, msgTo, handedTo, seen, takenOn>>
+
+(* noderun.rs `session`: the node reconnects, a new link. What the supervisor gave on the one that *)
+(* dropped and the node never said the box had is given again (requeue_on_resume, #453).          *)
+LinkUp(r) ==
+    /\ host = "up" /\ sup[r] = "alive" /\ ~link[r].up /\ box[r] = "running"
+    /\ link' = [link EXCEPT ![r] = [up |-> TRUE, epoch |-> @.epoch + 1]]
+    /\ msg' = [m \in Msgs |-> IF RequeueOnReconnect /\ msgTo[m] = r /\ msg[m] \in {"taken", "handed"} THEN "queued" ELSE msg[m]]
+    /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
+                   stdinOpen, msgTo, handedTo, seen, takenOn, drops>>
 
 Next ==
     \/ Tick \/ Crash \/ Restart
+    \/ \E r \in Runs : LinkDrop(r) \/ LinkUp(r)
     \/ \E r \in Runs : Wake(r) \/ Renew(r) \/ Supersede(r) \/ Adopt(r) \/ Lost(r) \/ AskFinish(r)
                        \/ CloseSession(r) \/ HarnessExits(r)
     \/ \E m \in Msgs : Send(m) \/ Ack(m) \/ \E r \in Runs : Take(m, r) \/ Hand(m, r)
@@ -245,6 +278,12 @@ OneHarness == Cardinality({r \in Runs : harness[r] = "running"}) <= 1
 
 (* No message is lost: none the ledger counts as delivered without the agent ever having it. *)
 NoMessageLost == \A m \in Msgs : msg[m] # "lost"
+
+(* A message in flight on a live supervisor's open link was taken on that link: one taken on a *)
+(* link that dropped is given again, not left in flight until a later supervisor (#453).        *)
+NoMessageStuck ==
+    \A m \in Msgs : (msg[m] \in {"taken", "handed"} /\ msgTo[m] \in Runs /\ sup[msgTo[m]] = "alive" /\ link[msgTo[m]].up)
+        => takenOn[m] = link[msgTo[m]].epoch
 
 (* No box is given a message twice. *)
 NoMessageTwice == \A m \in Msgs, r \in Runs : handedTo[m][r] <= 1

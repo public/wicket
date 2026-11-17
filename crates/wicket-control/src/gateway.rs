@@ -60,6 +60,12 @@ impl Gateway {
         (r["content"][0]["text"].as_str().unwrap_or_default().to_string(), r["isError"].as_bool().unwrap_or(true), in_flight)
     }
 
+    /// Message `id`'s answer never reached the box's node (#453): given again. False if it wasn't
+    /// in flight.
+    pub fn message_not_read(&self, id: &str) -> bool {
+        self.ctx.ledger.lock().ok().and_then(|l| l.requeue_message(&self.ctx.run.0, id).ok()).unwrap_or(false)
+    }
+
     /// The box has had message `id` (#445): read, on its receipt. False if it wasn't in flight.
     pub fn message_read(&self, id: &str) -> bool {
         self.ctx.ledger.lock().ok().and_then(|l| l.message_read(&self.ctx.run.0, id).ok()).unwrap_or(false)
