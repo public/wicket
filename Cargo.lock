@@ -4057,6 +4057,7 @@ dependencies = [
  "wicket-chan",
  "wicket-core",
  "wicket-feed",
+ "wicket-home",
  "wicket-identity",
  "wicket-placement",
  "wicket-policy",
@@ -4106,6 +4107,38 @@ dependencies = [
 [[package]]
 name = "wicket-fwd"
 version = "0.0.1"
+
+[[package]]
+name = "wicket-home"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "http-body-util",
+ "humantime",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "time",
+ "tokio",
+ "url",
+ "wicket-agent",
+ "wicket-chan",
+ "wicket-core",
+ "wicket-identity",
+ "wicket-proxy",
+ "wicket-sandbox",
+ "wicket-store",
+]
 
 [[package]]
 name = "wicket-identity"

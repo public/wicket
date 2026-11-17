@@ -32,7 +32,7 @@ mark-changed = "all"
 # ---- inputs the crates read from outside their directories ----
 [[path-rule]]
 globs = ["examples/**"]
-mark-changed = ["wicket-core", "wicket-authz", "wicket-feed", "wicket-policy", "wicket-cli"]
+mark-changed = ["wicket-core", "wicket-authz", "wicket-feed", "wicket-policy", "wicket-home", "wicket-cli"]
 
 # The console's session view (#327), embedded by crates/wicket-cli/build.rs; the agent image the
 # CLI builds; the install and unit files it writes.
@@ -43,9 +43,14 @@ mark-changed = ["wicket-cli", "wicket-fwd"]
 [[path-rule]]
 globs = [
   "web/**", "images/**", "ci/session-view.sh", "ci/install-node.sh", "docs/reference/cli.md",
-  "ci/gen-cli-reference.sh", "deploy/install.sh", "deploy/systemd/**", "deploy/systemd-user/**",
+  "ci/gen-cli-reference.sh", "deploy/systemd/**", "deploy/systemd-user/**",
 ]
 mark-changed = ["wicket-cli"]
+
+# wicket-home's state store test reads the install script (#219); wicket-cli depends on wicket-home.
+[[path-rule]]
+globs = ["deploy/install.sh"]
+mark-changed = ["wicket-home"]
 
 # The wicket-box skill: the Claude adapter installs it in every box (crates/wicket-agent/src/lib.rs).
 [[path-rule]]
