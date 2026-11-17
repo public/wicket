@@ -24,7 +24,7 @@ set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
 CARGO_FUZZ_VERSION=0.13.2
-ALL_TARGETS="egress gateway chan feed token manifest store git canon"
+ALL_TARGETS="egress gateway chan feed token manifest store git canon time"
 secs=60 affected=0 base=origin/main sanitizer=none replay=1 targets=()
 while [ $# -gt 0 ]; do
   case "$1" in

@@ -51,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [egress, gateway, chan, feed, token, manifest, store, git, canon]
+        target: [egress, gateway, chan, feed, token, manifest, store, git, canon, time]
     env:
       FUZZ_WORK: ${{ github.workspace }}/fuzz-work
       SECS: ${{ inputs.secs || '1200' }}
