@@ -15,6 +15,7 @@
 //! which `wicket doctor` labels insecure.
 
 pub mod client;
+pub mod handoff;
 pub mod policy;
 pub mod proto;
 pub mod upload;
@@ -70,21 +71,35 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         vault_dir: wicket_proxy::vault::Vault::default_dir(),
     });
     let listener = listen(socket)?;
+    // The commands a previous image of this process handed over (#455): followed on to their end.
+    let handoff_path = d.data_dir.join(handoff::FILE);
+    if let Some(h) = handoff::take(&handoff_path) {
+        say_err!("wicketd: following {} command(s) handed over by the previous build", h.children.len());
+        handoff::adopt(h);
+    }
     // `wicket self update` moves the daemon to the new build last: on SIGHUP it re-executes itself
-    // once no command is running through it (each holds its caller's connection, which an exec
-    // would cut).
-    crate::update::reexec_on_hangup(crate::update::pidfile("daemon"), crate::update::Versions::control().root, || {
+    // at once, handing its running commands (long-lived runs among them) to the new image
+    // ([`handoff`]). Only commands not yet started (admission, uploads: seconds) are waited for;
+    // new ones are refused meanwhile, to be tried again.
+    crate::update::reexec_on_hangup(crate::update::pidfile("daemon"), crate::update::Versions::control().root, move || {
+        DRAINING.store(true, Ordering::SeqCst);
         let mut waited = 0u64;
-        while IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-            if waited.is_multiple_of(60) {
+        while IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+            if waited.is_multiple_of(10) {
                 say_err!(
-                    "wicketd: waiting for {} running command(s) to end before moving to the new build",
-                    IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst)
+                    "wicketd: waiting for {} command(s) being started before moving to the new build",
+                    IN_FLIGHT.load(Ordering::SeqCst)
                 );
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             waited += 1;
         }
+        let held = handoff::prepare(&handoff_path);
+        match &held {
+            Ok(_) => say_err!("wicketd: handing {} running command(s) to the new build", handoff::followed()),
+            Err(e) => say_err!("wicketd: no handoff ({e:#}): its running commands lose their callers' connections"),
+        }
+        Draining(held.ok())
     });
     say_err!("wicketd: {} as {} (uid {uid}), data {}, policy {}", socket.display(), d.user, d.data_dir.display(), d.policy_path.display());
     for conn in listener.incoming() {
@@ -105,8 +120,19 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Commands running through the daemon.
+/// Commands being started through the daemon (admitted, uploading, not yet followed as a child).
 static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set while the daemon moves to a new build: new commands are refused, to be tried again.
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Held across the exec; if the exec fails, the daemon takes commands again.
+struct Draining(#[allow(dead_code)] Option<handoff::Prepared>);
+impl Drop for Draining {
+    fn drop(&mut self) {
+        DRAINING.store(false, Ordering::SeqCst);
+    }
+}
 
 struct InFlight;
 impl InFlight {
@@ -161,7 +187,7 @@ struct Plan {
 
 impl Daemon {
     fn handle(&self, conn: UnixStream) -> Result<()> {
-        let _busy = InFlight::enter();
+        let busy = InFlight::enter();
         let peer = proto::peer(&conn)?;
         let mut fds = proto::recv_fds(&conn)?;
         let mut w = conn.try_clone()?;
@@ -170,6 +196,9 @@ impl Daemon {
             Some((kind::HELLO, p)) => serde_json::from_slice(&p).context("bad hello")?,
             _ => bail!("uid {}: no hello", peer.uid),
         };
+        if DRAINING.load(Ordering::SeqCst) {
+            return refuse(&mut w, "wicketd is moving to a new build: try again in a few seconds");
+        }
         if fds.len() < 3 || (hello.dir_fd && fds.len() < 4) {
             return refuse(&mut w, "the caller's stdin, stdout and stderr did not arrive");
         }
@@ -238,7 +267,8 @@ impl Daemon {
             words(&hello.argv),
             plan.argv.first().map(String::as_str).unwrap_or("")
         );
-        let code = self.run_child(&plan, fds, &hello, &mut r)?;
+        let stage = plan.stage.as_ref().map(|s| s.dir.clone());
+        let code = self.run_child(&plan, fds, &hello, &r, stage, busy)?;
         drop(plan.stage.take());
         proto::write_frame(&mut w, kind::EXIT, &code.to_be_bytes())?;
         Ok(())
@@ -393,8 +423,18 @@ impl Daemon {
         Ok(path)
     }
 
-    fn run_child(&self, plan: &Plan, fds: Vec<OwnedFd>, hello: &Hello, r: &mut UnixStream) -> Result<i32> {
-        use std::os::unix::process::{CommandExt, ExitStatusExt};
+    /// Runs the command as a child and follows it to its end ([`handoff::follow`]); `busy` is
+    /// released once it is followed, so a handoff from then on carries it.
+    fn run_child(
+        &self,
+        plan: &Plan,
+        fds: Vec<OwnedFd>,
+        hello: &Hello,
+        r: &UnixStream,
+        stage: Option<PathBuf>,
+        busy: InFlight,
+    ) -> Result<i32> {
+        use std::os::unix::process::CommandExt;
         let mut fds = fds.into_iter();
         let (i, o, e) = (fds.next().expect("3 fds"), fds.next().expect("3 fds"), fds.next().expect("3 fds"));
         let mut c = std::process::Command::new(&self.exe);
@@ -415,36 +455,11 @@ impl Daemon {
             Some(l) => c.env("WICKET_LOG", l),
             None => c.env_remove("WICKET_LOG"),
         };
-        let mut child = c.spawn().context("starting the command")?;
+        let child = c.spawn().context("starting the command")?;
+        // Reaped by `follow` (by pid), possibly in the next image: never waited for here.
         let pid = child.id() as i32;
-        let done = Arc::new(AtomicBool::new(false));
-        // Signals from the caller go to the command's process group; the caller going away stops it.
-        let mut rc = r.try_clone()?;
-        let done2 = done.clone();
-        std::thread::spawn(move || {
-            loop {
-                match proto::read_frame(&mut rc) {
-                    Ok(Some((kind::SIGNAL, p))) if p.len() == 4 => {
-                        let sig = i32::from_be_bytes(p[..4].try_into().expect("4 bytes"));
-                        if [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT].contains(&sig) && !done2.load(Ordering::SeqCst) {
-                            // SAFETY: signalling the child's own process group.
-                            unsafe { libc::kill(-pid, sig) };
-                        }
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => {
-                        if !done2.load(Ordering::SeqCst) {
-                            // SAFETY: as above.
-                            unsafe { libc::kill(-pid, libc::SIGTERM) };
-                        }
-                        return;
-                    }
-                }
-            }
-        });
-        let st = child.wait()?;
-        done.store(true, Ordering::SeqCst);
-        Ok(st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0)))
+        drop(child);
+        handoff::follow(pid, r, stage, move || drop(busy))
     }
 }
 

@@ -148,7 +148,11 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
                     Some((kind::EXIT, p)) if p.len() == 4 => return Ok(i32::from_be_bytes(p[..4].try_into().expect("4 bytes"))),
                     Some((kind::ERROR, p)) => bail!("wicketd: {}", String::from_utf8_lossy(&p)),
                     Some(_) => {}
-                    None => bail!("wicketd closed the connection before the command finished"),
+                    // A restart by the service manager (#455): the command itself goes on.
+                    None => bail!(
+                        "wicketd closed the connection before the command finished (it restarted?): a run it started goes on; \
+                         see it with `wicket top`, and open its session with `wicket session <run>`"
+                    ),
                 }
             }
         })();

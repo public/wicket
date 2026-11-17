@@ -49,7 +49,16 @@ Arguments only wicket itself passes are refused from any caller: `run --run-id` 
 and `wake --by`. (A child run's parent, lease and takeover are no arguments: its supervisor runs
 in its parent's process.) Manifests and `--workdir` are sent to the daemon as
 content; mounting a directory in place (`run --workspace-dir`, and `wrap`, which mounts its
-launcher's directory) is root's only. Restarting `wicketd` stops the runs started through it.
+launcher's directory) is root's only.
+
+Runs outlive the daemon (#455). `wicket self update` moves `wicketd` to the new build at once: on
+SIGHUP it re-executes, handing every running command to the new build, which goes on relaying its
+caller's signals and sends its exit code; the caller and the run don't notice. Only commands still
+being started (admission, uploads) are waited for, and new ones are refused for those seconds, to
+be tried again. A restart by systemd (`deploy/install.sh`, `systemctl restart wicketd`) stops only
+the daemon (`KillMode=process`): its runs go on supervising their boxes, and only their callers'
+connections end (`wicket session <run>` opens one again). To end runs too, end them first (`wicket identity revoke <run>`, or `wicket
+hibernate` for a long-lived agent).
 
 ## The policy file
 
