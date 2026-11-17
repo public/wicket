@@ -1120,7 +1120,7 @@ Usage: wicket doctor [OPTIONS]
 
 Options:
       --image <IMAGE>              The agent image to check [default: the default harness's agent image]
-      --invariants                 Instead, check this installation's ledger for #321's invariants (#326): every allowed egress request had a reach rule or a live grant, no run's model spend passed its budget, and no node ran past its lease. Read only; exits non-zero on any violation
+      --invariants                 Instead, check this installation's ledger for #321's invariants (#326): every allowed egress request had a reach rule or a live grant, no run's model spend passed its budget, no node ran past its lease, no node was released with a run's work on it uncollected, and no message was pushed to a box twice (#324). Read only; exits non-zero on any violation
       --lease-grace <LEASE_GRACE>  With --invariants: how long past a lease's end a run or the lease may still have ended (the reconciler's cadence), in seconds [default: 600]
   -h, --help                       Print help
 ```

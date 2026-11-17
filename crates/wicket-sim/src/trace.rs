@@ -92,3 +92,34 @@ impl fmt::Display for Report {
         Ok(())
     }
 }
+
+/// What [`check_ledger`] looked at, for a scenario's stats.
+pub fn ledger_stats(s: &wicket_store::invariants::EndState) -> String {
+    format!(
+        "ledger check: {} ended placed nodes, {} failed fetches, {} messages, {} pushes",
+        s.placed_ended, s.fetch_failures, s.messages, s.pushes
+    )
+}
+
+/// Trace validation (#324): the ledger's own check of #321's invariants
+/// ([`wicket_store::invariants::check_end_state`], which `wicket doctor --invariants` runs on real
+/// installations' and CI's acceptance ledgers) over the ledger a scenario's control host wrote, so
+/// the simulation's oracle and the check on real records are held to each other. Every finding is
+/// a violation: either the code broke an invariant the oracle missed, or the check and the code
+/// have drifted. Its findings' text names ids the OS made (message ids), so only their count is
+/// hashed into the trace.
+pub fn check_ledger(trace: &mut Trace, t: i64, ledger: &wicket_store::Ledger) -> wicket_store::invariants::EndState {
+    let s = match wicket_store::invariants::check_end_state(ledger) {
+        Ok(s) => s,
+        Err(e) => {
+            trace.note(t, "ledger check: failed");
+            trace.violations.push(format!("the ledger's trace check failed: {e}"));
+            return Default::default();
+        }
+    };
+    trace.note(t, format!("ledger check: {} finding(s), {} known loss(es)", s.findings.len(), s.known_lost.len()));
+    for f in &s.findings {
+        trace.violations.push(format!("the ledger's trace check: {} (run {}): {}", f.invariant, f.run, f.what));
+    }
+    s
+}

@@ -27,6 +27,7 @@ pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD};
 pub use links::{ExposeRow, LinkRow};
+pub mod invariants;
 mod lease;
 pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, PlacedNodeRow, LEASE_QUOTA_BY, LIVE as LIVE_LEASES};
 pub use node::{AuditRecord, GrantRow, NodeAuditSummary};

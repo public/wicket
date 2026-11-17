@@ -84,7 +84,9 @@ wicket.
   equivalent. Results and how to run it: [verification/mutants](../../verification/mutants/README.md).
 - **Acceptance** (`ci/acceptance.sh`, on pull requests in the smoke job and nightly) includes a box
   that tries every way out of its reach, and ends with `wicket doctor --invariants` over the ledger
-  it made (#326).
+  it made (#326). The node end-to-end run (`ci/node-e2e.sh`) ends with it too, its node's shipped
+  records included, and the simulation's placement and messages seeds run its clock-free checks over
+  the ledgers they write (#324's trace validation).
 
 If the `select` job fails, every job runs in full.
 

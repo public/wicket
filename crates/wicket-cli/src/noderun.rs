@@ -1642,7 +1642,11 @@ fn slice_fraction() -> f64 {
 fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     let l = sh.llm.as_ref()?;
     let next = l.next_slice(slice_fraction())?;
-    let slice = wicket_proxy::llm::Slice::renewed(p.slice, next, l.spent(), l.input_total());
+    // A re-attached supervisor counts the node's spend from its first report (#422): the slice goes
+    // out in the node's own counts, or a node that had spent the first report's amount would hold a
+    // slice that much short, and none at all once that passed a slice (its calls all refused).
+    let base = sh.spent_base.lock().expect("spent base").flatten().unwrap_or_default();
+    let slice = wicket_proxy::llm::Slice::renewed_from(p.slice, next, l.spent(), l.input_total(), base);
     if p.slice_sent && p.slice == Some(slice) {
         return None;
     }

@@ -393,7 +393,8 @@ enum Cmd {
         image: Option<String>,
         /// Instead, check this installation's ledger for #321's invariants (#326): every allowed
         /// egress request had a reach rule or a live grant, no run's model spend passed its budget,
-        /// and no node ran past its lease. Read only; exits non-zero on any violation.
+        /// no node ran past its lease, no node was released with a run's work on it uncollected, and
+        /// no message was pushed to a box twice (#324). Read only; exits non-zero on any violation.
         #[arg(long)]
         invariants: bool,
         /// With --invariants: how long past a lease's end a run or the lease may still have ended
