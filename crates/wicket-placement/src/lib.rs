@@ -23,9 +23,10 @@
 //!   and a maximum total (every owned node's billed cost through its lease end, plus the new node's
 //!   worst case). A request beyond either is refused outright: no approval can widen it. A request's own
 //!   `max_hourly` bounds the plans considered.
-//! - **A human approves spend.** Any node with a non-zero worst-case cost is created only after the
-//!   [`SpendApprover`] says yes, with the plan, rate and worst case on the request. wicket supplies no
-//!   UI here: the CLI prompts on the terminal, the console will show an approval card.
+//! - **Spend is approved.** Any node with a non-zero worst-case cost is created only after the
+//!   [`SpendApprover`] says yes, with the plan, rate and worst case on the request. wicket's approver
+//!   files a CAPACITY request, decided by the operator's standing capacity grants or, beyond them, by
+//!   an operator (#256); this crate supplies no UI.
 //! - **Worst case, reserved first.** The worst case is what the provider bills for the requested
 //!   lifetime under its [`BillingModel`], every partial unit rounded up.
 //!

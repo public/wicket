@@ -191,7 +191,7 @@ fn host_line(h: &HostStats) -> String {
 }
 
 /// What is left of a box's budget slice: requests and output tokens (`-`: no slice; its zone has no
-/// budget, or none was leased yet).
+/// budget, or none was sliced to it yet).
 fn slice_left(slice: Option<&Slice>, spent: &Spent) -> String {
     match slice {
         Some(s) => {
