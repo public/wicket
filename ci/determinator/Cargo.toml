@@ -1,0 +1,25 @@
+# What a change can affect (#218): guppy's determinator on the workspace's package graphs, before
+# and after the change, with the rules in rules.toml, and the suites in suites.toml. A CI tool, not
+# part of wicket: standalone, with its own lockfile, so its dependencies stay out of wicket's.
+[package]
+name = "wicket-affected"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Standalone: not a member of the repository's workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+camino = "1"
+determinator = "0.13.0"
+globset = "0.4"
+guppy = "0.19.1"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[dev-dependencies]
+nextest-filtering = "0.23.0"
+nextest-metadata = "0.15"
