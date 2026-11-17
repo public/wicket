@@ -69,6 +69,23 @@ An operator is named by `<via>/<name>` or by its full identity. A file that does
 operator's decision until it is fixed: an authority is never guessed. Roles, several operators with their
 own enrolment, and two-person approval are later steps of #11.
 
+What agents may grant their descendants (a zone with `escalation.grant`) is policy too, under
+`agents` (#256, #50). Each rule defaults to what agents always could; a missing or broken file gives
+the defaults, the narrowest:
+
+```yaml
+agents:
+  kinds: [http]      # the request kinds an agent may decide (only http so far)
+  prefix: false      # a request for every path under a prefix, and grants or renewals of one
+  zone_wide: false   # grants or renewals to the asking run's whole zone
+  git_push: false    # a git push's grant (a window, not a number of uses)
+  unbounded: false   # grants or renewals with no number of uses
+```
+
+No rule widens an agent past its own authority: it decides only its descendants' requests, only
+what its own zone allows by reach and its org layer doesn't refuse, ending no later than its own
+authority, with at most 100 uses. Capacity grants stay an operator's.
+
 ## Environment variables
 
 ### For operators

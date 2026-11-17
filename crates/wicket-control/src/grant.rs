@@ -843,6 +843,7 @@ mod tests {
             zone: Arc::new(CompiledZone::new(z).unwrap()),
             org: None,
             until: wicket_store::now() + 3600,
+            rules: Default::default(),
         });
         let t =
             |uses: Option<u32>, secs: u64| Verdict::Approve(Terms { uses, ttl: Duration::from_secs(secs), prefix: None, zone_wide: false });
@@ -1232,6 +1233,59 @@ mod tests {
         // The first decision wins.
         let e = hook.decide(&t.signed(&id, "deny", 1, 60)).unwrap_err();
         assert!(e.contains("no longer pending") && !e.contains("stays pending"), "{e}");
+    }
+
+    /// #256, #50: who may grant is policy. The default rules are the refusals agents always had,
+    /// each pinned here; a rule that allows one lifts that refusal alone, and no rule lifts the
+    /// agent's own bounds (its authority's end, its descendants, its reach).
+    #[test]
+    fn the_agents_rules_decide_what_an_agent_may_grant() {
+        use crate::operators::AgentRules;
+        let t = Tree::new();
+        let hook = t.hook(PARENT_ZONE);
+        let a = AgentAuthority { rules: AgentRules::default(), ..hook.authority() };
+        let req = |method: &str, path: &str| {
+            let id = t.ask("run_c", method, path);
+            t.ledger.lock().unwrap().request(&id).unwrap()
+        };
+        let get = req("GET", "/v1/items");
+        let push = req("POST", "/acme/app.git/git-receive-pack");
+        let rule = |f: fn(&mut AgentRules)| {
+            let mut r = AgentRules::default();
+            f(&mut r);
+            AgentAuthority { rules: r, ..a.clone() }
+        };
+        let cases: [(&Request, Terms, &str, AgentAuthority); 4] = [
+            (&get, Terms { zone_wide: true, ..terms(60) }, "asking run only", rule(|r| r.zone_wide = true)),
+            (&get, Terms { prefix: Some("/v1/".into()), ..terms(60) }, "the asked path", rule(|r| r.prefix = true)),
+            (&get, Terms { uses: None, ..terms(60) }, "number of uses", rule(|r| r.unbounded = true)),
+            (&push, terms(60), "git push is decided by an operator", rule(|r| r.git_push = true)),
+        ];
+        for (req, terms, why, allowed) in cases {
+            let e = format!("{:#}", agent_terms(&a, req, &terms).unwrap_err());
+            assert!(e.contains(why), "refused by default: {e}");
+            assert!(agent_terms(&allowed, req, &terms).is_ok(), "{why}: allowed by its rule");
+            // Its rule lifts no other refusal.
+            let other = Terms { zone_wide: !terms.zone_wide, ..terms.clone() };
+            if !allowed.rules.zone_wide {
+                assert!(agent_terms(&allowed, req, &other).is_err(), "{why}: a zone-wide grant stays refused");
+            }
+            // And never the agent's own authority's end.
+            let short = AgentAuthority { until: wicket_store::now() + 30, ..allowed.clone() };
+            let long = Terms { ttl: Duration::from_secs(600), ..terms.clone() };
+            assert!(format!("{:#}", agent_terms(&short, req, &long).unwrap_err()).contains("outlast"), "{why}");
+        }
+        // Deciding at all: a prefix request is an operator's by default, the rule's with it.
+        let mut prefix_req = req("GET", "/v1/");
+        prefix_req.scope_prefix = true;
+        let e = format!("{:#}", within_authority(&t.ledger.lock().unwrap(), &a, &prefix_req).unwrap_err());
+        assert!(e.contains("every path under a prefix is decided by an operator"), "{e}");
+        let open = rule(|r| r.prefix = true);
+        let e = within_authority(&t.ledger.lock().unwrap(), &open, &prefix_req).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(!e.contains("decided by an operator"), "{e}");
+        // An agent's grant without a number of uses: refused by the bounds, unless the rule says.
+        assert!(bounds(&Granter::Agent(a.clone()), &Verdict::Approve(Terms { uses: None, ..terms(60) })).is_err());
+        assert!(bounds(&Granter::Agent(rule(|r| r.unbounded = true)), &Verdict::Approve(Terms { uses: None, ..terms(60) })).is_ok());
     }
 
     /// #342: the uses and ttl caps on an agent's grant hold in `grant::decide`, not only in the

@@ -382,9 +382,25 @@ mod tests {
             "operators:\n  unix/x: { kinds: [root] }\n",
             "operators:\n  unix/x: { max_risk: R9 }\n",
             "default: anything\nroles: []\n",
+            "agents:\n  kinds: [http, spawn]\n",
+            "agents:\n  push: true\n",
         ] {
             assert!(Policy::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// #256, #50: what agents may grant is the policy's `agents`, and without it (or the file)
+    /// exactly what they always could: HTTP requests, one run, one path, counted, no push.
+    #[test]
+    fn agents_rules_default_to_what_agents_always_could() {
+        let narrow = AgentRules { kinds: vec!["http".into()], prefix: false, zone_wide: false, git_push: false, unbounded: false };
+        assert_eq!(Policy::default().agents(), &narrow);
+        assert_eq!(Policy::parse("default: anything\n").unwrap().agents(), &narrow);
+        assert_eq!(Policy::parse("agents: {}\n").unwrap().agents(), &narrow);
+        let p = Policy::parse("agents:\n  prefix: true\n  git_push: true\n").unwrap();
+        assert_eq!(p.agents(), &AgentRules { prefix: true, git_push: true, ..narrow.clone() });
+        assert!(narrow.decides("GET") && narrow.decides("post") && !narrow.decides("SPAWN"));
+        assert!(!Policy::parse("agents:\n  kinds: []\n").unwrap().agents().decides("GET"), "no kinds: decides nothing");
     }
 
     #[test]
