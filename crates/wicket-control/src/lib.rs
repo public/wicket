@@ -24,7 +24,8 @@ use wicket_node::nodesrv;
 pub mod capacity;
 pub mod effect;
 pub mod enrol;
-pub mod gateway;
+// The control host's gateway tools (#257), a crate of their own: what the simulation calls.
+pub use wicket_gateway as gateway;
 pub mod gitguard;
 pub mod grant;
 pub mod hibernate;

@@ -2,8 +2,14 @@
 //! ledger, the other boxes' records, the placement backend or the run's own supervisor. The box's
 //! node serves the gateway itself (MCP's handshake, `tools/list`, and the tools it decides from the
 //! box's token: `wicket_proxy::gateway`) and asks these with a typed call (`Msg::Call`, answered
-//! by [`crate::noderun`] through [`Gateway::call_tool`]). Moved here from wicket-proxy (#257), with
-//! the link tools ([`link`]) and the delegation tools ([`delegate`]).
+//! by wicket-control's `noderun` through [`Gateway::call_tool`]), with the link tools ([`link`])
+//! and the delegation tools ([`delegate`]).
+//!
+//! A crate of its own (moved from wicket-proxy, #257, then out of wicket-control): it needs
+//! nothing of the control host's but the run's context (`wicket_proxy::RunCtx`) and the ledger, and
+//! the deterministic simulation (`wicket-sim`) calls it without depending on the rest of the
+//! control host, so a change there doesn't run the simulation. wicket-control re-exports it as
+//! `gateway`.
 //! `await_grant` lets a blocked agent wait for the human's decision instead of sleeping and
 //! retrying; `pending_requests` shows what this run is waiting on.
 
@@ -49,7 +55,7 @@ impl Gateway {
     }
 
     /// [`Gateway::call_tool`], for a node that says when its box has had a message (#445,
-    /// [`wicket_chan::chan::MESSAGE_READ`]): a message `await_message` gives is left in flight,
+    /// `wicket_chan::chan::MESSAGE_READ`): a message `await_message` gives is left in flight,
     /// and its id returned, until the node's `MessageRead` ([`Gateway::message_read`]). A
     /// supervisor that takes the run over before then gives it again.
     pub async fn call_tool_read(&self, name: &str, args: Value) -> (String, bool, Option<String>) {
@@ -1625,12 +1631,11 @@ mod tests {
         // it what it knew.
         drop(rx);
         drop(gw);
-        let run = RunId("run_f".into());
-        let asked = crate::run::asked_of(&w.ledger, &run);
-        assert_eq!(asked, crate::run::Asked { finish: true, hibernate: false }, "the re-attached supervisor knows");
+        // What the re-attached supervisor reads (wicket-control's `run::asked_of`).
+        assert_eq!(w.ledger.lock().unwrap().run_want("run_f").unwrap().as_deref(), Some("finish"), "on the record");
         // A run whose agent asked nothing re-attaches with nothing to do.
         let _other = w.agent("t0", "z", "b", "run_g", None, &[]);
-        assert_eq!(crate::run::asked_of(&w.ledger, &RunId("run_g".into())), crate::run::Asked::default());
+        assert_eq!(w.ledger.lock().unwrap().run_want("run_g").unwrap(), None);
     }
 
     #[tokio::test]
