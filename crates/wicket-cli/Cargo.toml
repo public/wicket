@@ -70,6 +70,7 @@ ring = "0.17"
 
 [dev-dependencies]
 wicket-chan = { workspace = true, features = ["testkit"] }
+wicket-home = { workspace = true, features = ["testkit"] }
 rusqlite.workspace = true
 ciborium = "0.2"
 wicket-placement = { workspace = true, features = ["mock"] }

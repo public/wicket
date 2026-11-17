@@ -9,6 +9,7 @@ pub mod audit_export;
 pub mod control;
 pub mod exitcause;
 pub mod images_policy;
+pub mod nodeauth;
 pub mod owner;
 pub mod program;
 pub mod s3;

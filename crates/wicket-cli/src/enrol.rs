@@ -895,4 +895,19 @@ mod tests {
         assert!(install_script(&[("../x", "a".into())], false).is_err());
         assert!(install_script(&[("ca.pem", format!("a\n{EOF_MARK}\nrm -rf /\n"))], false).is_err());
     }
+
+    #[test]
+    fn node_keys_from_openssl_load_and_match_what_enrolment_parses() {
+        if std::process::Command::new("openssl").arg("version").output().is_err() {
+            eprintln!("openssl not found: skipping");
+            return;
+        }
+        let i = crate::nodeauth::testkit::Install::new("openssl");
+        let out = std::process::Command::new("sh").arg("-c").arg(keygen_script("n1", true)).env("HOME", &i.dir).output().unwrap();
+        assert!(out.status.success());
+        let g = parse_generated(&String::from_utf8_lossy(&out.stdout), true).unwrap();
+        let pem = std::fs::read_to_string(i.dir.join(NODE_DIR).join("node.key.new")).unwrap();
+        let k = wicket_identity::node::signing_key_from_pkcs8_pem(&pem).unwrap();
+        assert_eq!(k.verifying_key().to_bytes(), g.node_key.unwrap().0);
+    }
 }

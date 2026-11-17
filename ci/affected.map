@@ -100,7 +100,7 @@ crates/wicket-cli/src/node.rs      | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodesrv.rs   | -   | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/noderun.rs   | -   | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/nodegw.rs    | -   | node-e2e acceptance-nodes tla
-crates/wicket-cli/src/nodeauth.rs  | -   | node-e2e acceptance-nodes
+crates/wicket-home/src/nodeauth.rs | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodecall.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-chan/src/nodesecrets.rs | - | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/enrol.rs     | -   | node-e2e acceptance-nodes

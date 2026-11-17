@@ -29,11 +29,11 @@
 //!   can only send feed frames, which the node checks against the feed root's signatures anyway, and
 //!   they never take over the control connection.
 
-use crate::chan::{self, Frame, Msg};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use wicket_chan::chan::{self, Frame, Msg};
 use wicket_identity::node::{ControlHandshake, NodeCertClaims, NodeHandshake};
 use wicket_identity::{Issuer, SigningKey, VerifyingKey};
 use wicket_store::{Ledger, NodeCertRow};
@@ -273,8 +273,9 @@ pub fn untrusted(ledger: &Ledger, node: &str, cert: Option<&NodeCertClaims>, now
 }
 
 /// A test installation: an issuer, a ledger with node `n1` enrolled, and the node's key and
-/// certificate in a directory, as enrolment leaves them.
-#[cfg(test)]
+/// certificate in a directory, as enrolment leaves them. For other crates' tests behind the
+/// `testkit` feature.
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit {
     use super::*;
 
@@ -404,21 +405,5 @@ mod tests {
         assert_eq!(untrusted(&run_side, "n1", Some(&c), c.iat), None);
         a.revoke_node("n1").unwrap();
         assert!(untrusted(&run_side, "n1", Some(&c), c.iat).unwrap().contains("revoked"));
-    }
-
-    #[test]
-    fn node_keys_from_openssl_load_and_match_what_enrolment_parses() {
-        if std::process::Command::new("openssl").arg("version").output().is_err() {
-            eprintln!("openssl not found: skipping");
-            return;
-        }
-        let i = Install::new("openssl");
-        let out =
-            std::process::Command::new("sh").arg("-c").arg(crate::enrol::keygen_script("n1", true)).env("HOME", &i.dir).output().unwrap();
-        assert!(out.status.success());
-        let g = crate::enrol::parse_generated(&String::from_utf8_lossy(&out.stdout), true).unwrap();
-        let pem = std::fs::read_to_string(i.dir.join(crate::enrol::NODE_DIR).join("node.key.new")).unwrap();
-        let k = wicket_identity::node::signing_key_from_pkcs8_pem(&pem).unwrap();
-        assert_eq!(k.verifying_key().to_bytes(), g.node_key.unwrap().0);
     }
 }
