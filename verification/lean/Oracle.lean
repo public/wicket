@@ -15,6 +15,11 @@ Input: `{"zones": [zone…], "cases": [case…]}`. A case is one of
 - `{"kind": "reach_within", "outer": i, "inner": j}` → `true`/`false`;
 - `{"kind": "host", "pattern": p, "host": h}` → `true`/`false`;
 - `{"kind": "canon", "path": pq}` → the canonical path as a JSON string, or `null`.
+- `{"kind": "model", "zone": i, "model": m}` → whether the zone's boxes may call model `m`;
+- `{"kind": "accepts", "list": [e…], "zone": z, "principal": p}` → `manifest::accepts` (`p` may be
+  `null`);
+- `{"kind": "chain", "zones": [i…], "op": {…}}` → how a token of one block per zone (block 0, then
+  spawn blocks) decides the request.
 
 Every string is read as its UTF-8 bytes (`bytesOf`): the spec is over any alphabet, and wicket's
 matchers and checks work on bytes.
@@ -46,6 +51,13 @@ def jOptNat (j : Json) (k : String) : Except String (Option Nat) := do
   | .ok v => return some (← v.getNat?)
   | .error _ => return none
 
+/-- A list of strings, or `null` (or absent): `none`. -/
+def jOptStrs (j : Json) (k : String) : Except String (Option (List Str)) := do
+  match j.getObjVal? k with
+  | .ok .null => return none
+  | .ok v => return some ((← v.getArr?).toList.map (fun x => bytesOf (x.getStr?.toOption.getD "")))
+  | .error _ => return none
+
 def jStrs (j : Json) (k : String) : Except String (List Str) := do
   let a ← j.getObjValAs? (Array String) k
   return a.toList.map bytesOf
@@ -73,7 +85,8 @@ def parseLlm (j : Json) : Except String (Option Llm) := do
   | .null => return none
   | _ => return some { provider := ← jStr j "provider", secret := ← jStr j "secret", upstream := ← jStr j "upstream",
                        serverTools := ← jBool j "server_tools", maxRequests := ← jNat j "max_requests",
-                       maxOutput := ← jNat j "max_output", maxInput := ← jOptNat j "max_input" }
+                       maxOutput := ← jNat j "max_output", maxInput := ← jOptNat j "max_input",
+                       models := ← jOptStrs j "models" }
 
 /-- An `f32` sent as `{m, e}` (`m × 2^e`), as an integer times 2^160. -/
 def parseCpus (j : Json) : Except String (Option Int) := do
@@ -111,14 +124,16 @@ def zoneAt (zs : Array Zone) (c : Json) (k : String) : Except String Zone := do
   let i ← jNat c k
   (zs[i]?).elim (.error s!"no zone {i}") pure
 
+def parseOp (o : Json) : Except String Op :=
+  return { method := ← jStr o "method", host := ← jStr o "host", path := ← jStr o "path",
+           risk := ← jNat o "risk", unreachable := ← jBool o "unreachable" }
+
 def decideCase (zs : Array Zone) (c : Json) : Except String String := do
   let kind ← c.getObjValAs? String "kind"
   match kind with
   | "eval" =>
     let z ← zoneAt zs c "zone"
-    let o ← c.getObjVal? "op"
-    let op : Op := { method := ← jStr o "method", host := ← jStr o "host", path := ← jStr o "path",
-                     risk := ← jNat o "risk", unreachable := ← jBool o "unreachable" }
+    let op ← parseOp (← c.getObjVal? "op")
     if !z.supported then return "unsupported"
     return verdictName (evaluate z op)
   | "check" =>
@@ -143,6 +158,21 @@ def decideCase (zs : Array Zone) (c : Json) : Except String String := do
     match canonicalPath (← jStr c "path") with
     | some p => return (Json.str (stringOf p)).compress
     | none => return "null"
+  | "model" =>
+    let z ← zoneAt zs c "zone"
+    return toString (z.allowsModel (← jStr c "model"))
+  | "accepts" =>
+    let pr ← match c.getObjVal? "principal" with
+      | .ok .null => pure none
+      | .ok v => pure (some (bytesOf (← v.getStr?)))
+      | .error _ => pure none
+    return toString (accepts (← jStrs c "list") (← jStr c "zone") pr)
+  | "chain" =>
+    let bs ← (← jArr c "zones").mapM (fun i => do
+      let n ← i.getNat?
+      (zs[n]?).elim (.error s!"no zone {n}") pure)
+    if !(bs.all Zone.supported) then return "unsupported"
+    return verdictName (chainVerdict bs (← parseOp (← c.getObjVal? "op")))
   | k => throw s!"unknown case kind {k}"
 
 def main (args : List String) : IO UInt32 := do
