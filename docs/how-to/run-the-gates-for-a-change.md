@@ -23,40 +23,44 @@ including uncommitted and untracked files, so you can run it before a commit. Th
 it selected and why, file by file. To see the selection without running anything:
 
 ```sh
-ci/affected.py --worktree
+cargo run -q --locked --manifest-path ci/determinator/Cargo.toml -- --worktree
 ```
 
 ## What it selects
 
-- **Crates.** Each changed file under a workspace crate selects that crate. `ci/affected.py` then
-  adds every crate that depends on it (normal, dev and build dependencies, from `cargo metadata`).
-  Clippy and the tests run with `-p` for those crates only. A change to `wicket-core` selects 10
-  of the 14 crates; a change to `wicket-fwd` selects it, `wicket-proxy` and `wicket-cli`.
-- **End-to-end suites.** `ci/affected.map` maps paths to suites, and is reviewed like code. A
-  change to `wicket-fwd` or the agent image runs the smoke test. Hibernation and state code runs
-  `hibernate.sh` (both modes) and `restore.sh`. Node code runs `node-e2e.sh --local` and
-  `acceptance.sh --nodes local`. Update code runs `update.sh`. A CLI command group under
-  `crates/wicket-cli/src/cmd/` runs the suites that call its commands.
-  The exceptions are `run`, `dev`, `secret`, `identity`, `audit` and `image`: nearly every suite calls
-  them, so changing one of those groups runs every suite.
-- **Docs only.** A change to Markdown, `docs/`, `experiments/` or `refs/` runs the doc checks only:
-  `check-public.py` and the Markdown links. A change to `docs/reference/cli.md` also runs
-  `wicket-cli`'s tests, one of which checks that page against every command's `--help`.
+The selection is `ci/determinator`, a small CI tool around [guppy's
+determinator](https://docs.rs/determinator), with its rules in `ci/determinator/rules.toml` and the
+suites in `ci/determinator/suites.toml`. Both are reviewed like code.
+
+- **Crates.** Each changed file under a workspace crate marks that crate changed. A change to a
+  crate's `Cargo.toml` or to `Cargo.lock` marks every crate whose build it changes: the determinator
+  simulates cargo's builds before and after the change and compares them. The rules mark crates for
+  files outside the crates that a crate reads (`examples/`, `web/`, `images/`, the Lean spec), and for
+  code another crate's tests follow (the simulation follows the node's run loops). Every crate that
+  depends on a changed one is affected (normal, dev and build dependencies). Clippy runs with `-p`
+  for the affected crates, and nextest with `-p` for them and `-E 'rdeps(=<crate>) | …'` for the
+  changed ones. A change to `wicket-core` affects 12 of the 16 crates. A change to `wicket-fwd`
+  affects it, `wicket-proxy`, `wicket-chan`, `wicket-cli` and `wicket-sim`.
+- **Suites.** A suite runs when a path it lists changes (its script, its scenarios), or when a crate
+  it lists is affected. Every end-to-end suite lists `wicket-cli`, which nearly every crate change
+  affects. Kani lists `wicket-core`, and Lean lists `wicket-authz`. Each fuzz target lists the crates
+  its harness links.
+- **Docs only.** A change to Markdown, `docs/`, `experiments/` or `refs/` selects no crate and no
+  suite: only the doc checks run. A change to `docs/reference/cli.md` also runs `wicket-cli`'s tests,
+  one of which checks that page against every command's `--help`.
 - **Everything.** These select every crate and suite:
-  - the workspace's `Cargo.toml` or `Cargo.lock`, any crate's `Cargo.toml`, `third_party/`, or the
-    toolchain;
-  - `.github/`, or the selection itself (`ci/affected.py`, `ci/affected.map`, `ci/gates.sh`);
-  - a file no rule maps (outside a crate);
+  - the toolchain (`rust-toolchain.toml`), cargo's configuration (`.cargo/`, `.config/`), the
+    workspace's `Cargo.toml`, or `third_party/`;
+  - `.github/`, or the selection itself (`ci/determinator/`, `ci/gates.sh`);
+  - a file outside the crates that no rule claims;
   - an empty change, or an error in the selection.
-- **Every suite.** Crate code the map doesn't list selects every suite. That includes the node
-  protocol, the ledger's schema, token formats, `wicket-core` and `run.rs`.
 
 rustfmt, `check-public.py` and the Markdown link check always run.
 
 ## Tests with cargo-nextest
 
 When `cargo-nextest` is installed, `ci/gates.sh` runs the tests with it (`--profile ci`, in
-`.config/nextest.toml`). Then it runs the doctests with `cargo test --doc`, since nextest doesn't run
+`.config/nextest.toml`, and the selection's filterset). Then it runs the doctests with `cargo test --doc`, since nextest doesn't run
 them, over the same crates as the tests, so cargo reuses what the tests built. It runs them only when
 a selected crate has a doc-comment code block rustdoc would run, and the workspace has none today.
 A test that fails and then passes on a retry is reported as `FLAKY` in the summary, and never passes
@@ -90,9 +94,11 @@ wicket.
 
 If the `select` job fails, every job runs in full.
 
-## Keep the map honest
+## Keep the rules honest
 
-`ci/affected.py --self-test` runs in CI. It checks the mapping on synthetic changes, and finds every
-file a crate reads from outside its own directory (`include_str!`, paths such as `../../examples`).
-For each such file, a change to it must select that crate. When you add one, add a rule to
-`ci/affected.map`, or let the file stay unmapped, which selects everything.
+CI runs the rules' own tests (`cargo test --manifest-path ci/determinator/Cargo.toml`). They check
+the selection on synthetic changes, with nextest's own filterset code evaluating each filterset over
+the workspace. They also check that every tracked file is in a crate or claimed by a rule, and that
+every path the rules name exists. Last, they find every file a crate reads from outside its own
+directory (`include_str!`, paths such as `../../examples`), and check that a change to it selects
+that crate. When you add such a file, add a rule to `ci/determinator/rules.toml`.
