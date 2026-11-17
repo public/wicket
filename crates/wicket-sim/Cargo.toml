@@ -13,7 +13,7 @@ wicket-feed.workspace = true
 wicket-store.workspace = true
 wicket-proxy = { workspace = true, features = ["sim"] }
 # The control host's gateway tools (#257), as a run's supervisor answers them.
-wicket-control.workspace = true
+wicket-gateway.workspace = true
 wicket-placement.workspace = true
 wicket-identity.workspace = true
 anyhow.workspace = true

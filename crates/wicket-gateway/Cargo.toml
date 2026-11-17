@@ -1,0 +1,16 @@
+[package]
+name = "wicket-gateway"
+description = "The control host's MCP gateway tools (#257): links, decide, finish and hibernate, messages, principals, receipts, delegations, capacity, update, await_grant and pending_requests, as a run's supervisor answers a node's typed calls. Split from wicket-control so the simulation calls them without the rest of the control host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wicket-core.workspace = true
+wicket-store.workspace = true
+wicket-proxy.workspace = true
+wicket-identity.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -2,7 +2,7 @@
 //! across agent restarts, a hibernated agent's wake, node and control-host crashes and cut-offs.
 //!
 //! **What is real and what stands in.**
-//! - Real, on the control host: the run's MCP gateway ([`wicket_control::gateway::Gateway`], through
+//! - Real, on the control host: the run's MCP gateway ([`wicket_gateway::Gateway`], through
 //!   `Gateway::call_tool`, which a box's node asks with a typed `Msg::Call`): `send_message`
 //!   (`RunCtx::send`: addressing by principal, `accept_from`, refusals with their receipts,
 //!   holding, waking a hibernated agent),
@@ -42,8 +42,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
-use wicket_control::gateway::Gateway;
 use wicket_core::{RunId, TenantId, ZoneSpec};
+use wicket_gateway::Gateway;
 use wicket_store::{IdentityRow, Ledger};
 
 pub const EPOCH_MS: i64 = crate::EPOCH_MS;

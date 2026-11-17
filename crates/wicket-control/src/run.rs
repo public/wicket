@@ -2846,4 +2846,22 @@ mod collected_tests {
         super::note_collected(&l, "run_a", &ev("POST", "/o/r.git/git-receive-pack", "allow"));
         assert_eq!(l.lock().unwrap().collected("run_a").unwrap()[0].0, "pushed");
     }
+
+    /// #444: what a re-attached supervisor reads of what the agent asked (the gateway records it;
+    /// its test is wicket-gateway's): a finish wins over a hibernate; nothing asked, nothing to do.
+    #[test]
+    fn a_reattached_supervisor_reads_what_the_agent_asked() {
+        use super::{asked_of, Asked};
+        use wicket_core::RunId;
+        let l = std::sync::Mutex::new(wicket_store::Ledger::open_in_memory().unwrap());
+        for run in ["run_f", "run_h", "run_n"] {
+            l.lock().unwrap().run_started(&wicket_core::TenantId::single(), &RunId(run.into()), "z", "a").unwrap();
+        }
+        l.lock().unwrap().record_run_want("run_f", "finish").unwrap();
+        l.lock().unwrap().record_run_want("run_f", "hibernate").unwrap();
+        l.lock().unwrap().record_run_want("run_h", "hibernate").unwrap();
+        assert_eq!(asked_of(&l, &RunId("run_f".into())), Asked { finish: true, hibernate: false });
+        assert_eq!(asked_of(&l, &RunId("run_h".into())), Asked { finish: false, hibernate: true });
+        assert_eq!(asked_of(&l, &RunId("run_n".into())), Asked::default());
+    }
 }

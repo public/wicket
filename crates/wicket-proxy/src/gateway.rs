@@ -1,7 +1,7 @@
 //! A box's MCP gateway, the part every gateway shares (design §9.2, #257): MCP's handshake and
 //! `tools/list` ([`handshake`]), and a `spawn` call's arguments ([`spawn_request`]), which the box's
 //! node reads. The node serves the gateway and answers the tools it decides from the box's token;
-//! the rest are the control host's (`wicket_control::gateway`), which the node asks with a typed
+//! the rest are the control host's (`wicket_gateway`), which the node asks with a typed
 //! call.
 
 use serde_json::{json, Value};

@@ -47,7 +47,7 @@ pub fn run(data: &[u8]) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
     let (ctx, _events) = crate::util::ctx("reach: [{host: api.example.com, methods: [GET], paths: ['/**']}]", vault());
     let answered = rt.block_on(async {
-        let gw = wicket_control::gateway::Gateway::new(ctx);
+        let gw = wicket_gateway::Gateway::new(ctx);
         // Paused time: an hour passes in no time when nothing else can run.
         tokio::time::timeout(Duration::from_secs(3600), gw.call_tool(&tool.name(), args)).await
     });

@@ -4085,6 +4085,7 @@ dependencies = [
  "wicket-chan",
  "wicket-core",
  "wicket-feed",
+ "wicket-gateway",
  "wicket-home",
  "wicket-identity",
  "wicket-node",
@@ -4133,6 +4134,19 @@ dependencies = [
 [[package]]
 name = "wicket-fwd"
 version = "0.0.1"
+
+[[package]]
+name = "wicket-gateway"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wicket-core",
+ "wicket-identity",
+ "wicket-proxy",
+ "wicket-store",
+]
 
 [[package]]
 name = "wicket-home"
@@ -4333,9 +4347,9 @@ dependencies = [
  "tokio",
  "turmoil",
  "wicket-authz",
- "wicket-control",
  "wicket-core",
  "wicket-feed",
+ "wicket-gateway",
  "wicket-identity",
  "wicket-placement",
  "wicket-proxy",
