@@ -3357,7 +3357,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         c.write_all(&Frame::Msg(Msg::Asked { id: mid, pending: Some(("r-1".into(), true)), denied: None, error: None }).encode())
             .await
             .unwrap();
-        // A lease's slice: kept on disk for a restarted `serve`.
+        // A budget slice: kept on disk for a restarted `serve`.
         let slice = wicket_proxy::llm::Slice { requests: 3, output_tokens: 300, input_tokens: None };
         c.write_all(&Frame::Msg(Msg::BudgetSlice { run: RUN.into(), slice }).encode()).await.unwrap();
         for _ in 0..200 {

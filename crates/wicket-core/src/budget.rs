@@ -516,7 +516,7 @@ mod tests {
         assert!(format!("{k:?}").starts_with("Counter(Counts { requests: 1"));
         k.merge_spent(Spent { requests: 9, input_tokens: 1, cache_read_tokens: 6, cache_creation_tokens: 1, output_tokens: 11 });
         assert_eq!(k.spent(), Spent { requests: 9, input_tokens: 100, cache_read_tokens: 6, cache_creation_tokens: 7, output_tokens: 11 });
-        // 9 + 2 + 3 committed of 10: nothing more to lease; 11 output tokens + 500 of what is left.
+        // 9 + 2 + 3 committed of 10: nothing more to slice; 11 output tokens + 500 of what is left.
         assert_eq!(k.next_slice(Q, 0.5), Slice { requests: 9, output_tokens: 11 + 500, input_tokens: Some(113 + 2500) });
     }
 

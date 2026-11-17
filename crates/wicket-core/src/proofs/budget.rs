@@ -49,7 +49,7 @@ fn within(c: &Counts, q: ModelQuota) -> bool {
         && q.input_tokens.is_none_or(|m| sum(&[c.input_total, c.reserved_input_tokens, c.prior_input_tokens]) <= u128::from(m))
 }
 
-/// A slice never leases a node more than is left: counting up to it, the node takes the run to
+/// A slice never gives a node more than is left: counting up to it, the node takes the run to
 /// its budget at most (or nowhere further, if merged reports already took it past). For every
 /// share of a limit a slice may add (`part`), and nothing overflows.
 #[kani::proof]
@@ -70,7 +70,7 @@ fn a_slice_never_exceeds_what_is_left() {
 }
 
 /// The slice renewal rule keeps a node's slice only while it is no more than the next one would be,
-/// and otherwise leases the next; for every slice and count (twice what is left of a slice larger
+/// and otherwise gives the next; for every slice and count (twice what is left of a slice larger
 /// than half of `u64::MAX` overflowed before #325).
 #[kani::proof]
 fn a_renewed_slice_is_the_next_or_no_more_than_it() {
