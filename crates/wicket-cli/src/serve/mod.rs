@@ -2023,7 +2023,7 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "open the run's session",
         );
-        assert!(t.ledger().take_operator_messages("run_a").unwrap().is_empty());
+        assert!(t.ledger().take_prompts("run_a").unwrap().is_empty());
     }
 
     #[test]

@@ -151,7 +151,7 @@ and turn ends from the transcript. Its records carry `via: terminal`. `wicket sa
 **Follow-up** box are gone (#198): prompts are sent in a session.
 
 **Audit:** `session.opened` (with the signed assertion), `session.attached`, `session.prompt` (by
-principal, with the operator message it queued and the text's length and sha256), `session.cancel`
+principal, with the prompt it queued (its message id) and the text's length and sha256), `session.cancel`
 and the supervisor's `run.turn_cancel` (whether a turn was running), `session.escalation_answered`,
 and `session.closed`; decisions are `decision` records, as from anywhere.
 

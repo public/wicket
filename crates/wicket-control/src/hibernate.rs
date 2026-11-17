@@ -526,9 +526,11 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         };
         let by = by.unwrap_or_else(|| format!("wicket wake by {}", crate::cli_principal()["id"].as_str().unwrap_or("operator")));
         if let Some(t) = &text {
-            l.add_operator_message(&run.0, t, &by)?;
+            // The operator running this wake, by its authenticated principal (#253).
+            let op = crate::operators::Operator::cli(&a.tenant)?;
+            l.add_prompt(&run.0, t, &by, &op.id)?;
         }
-        let said = l.take_operator_messages(&run.0)?;
+        let said: Vec<(String, String)> = l.take_prompts(&run.0)?.into_iter().map(|p| (p.text, p.label)).collect();
         let first = wake_text(&by, &said, l.waiting_messages(&run.0)?);
         l.audit(
             &TenantId(a.tenant.clone()),

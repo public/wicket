@@ -267,9 +267,7 @@ pub struct NodeBox {
 /// again from the node's count. How many messages, and prompts.
 fn requeue_on_resume(l: &wicket_store::Ledger, run: &str, first: bool, took_over: bool, stdin_received: u64) -> (usize, usize) {
     match (first, took_over) {
-        (true, true) => {
-            (l.requeue_in_flight(run).unwrap_or(0), l.requeue_operator_messages(run, stdin_received).map(|v| v.len()).unwrap_or(0))
-        }
+        (true, true) => (l.requeue_in_flight(run).unwrap_or(0), l.requeue_prompts(run, stdin_received).map(|v| v.len()).unwrap_or(0)),
         (true, false) => (0, 0),
         (false, _) => (l.requeue_in_flight(run).unwrap_or(0), 0),
     }
@@ -1284,7 +1282,7 @@ async fn on_frame(
                     // can scale down before the kernel kills the box.
                     if let wicket_proxy::Event::Box { what, detail } = &ev {
                         if what == "memory_pressure" {
-                            let _ = sh.ledger.lock().expect("ledger").add_operator_message(&sh.run.0, detail, "wicket");
+                            let _ = sh.ledger.lock().expect("ledger").add_notice(&sh.run.0, detail);
                         }
                     }
                     let _ = sh.events.send(ev);
@@ -2286,5 +2284,32 @@ mod forget_tests {
         assert!(l.take_message_in_flight("run_a").unwrap().is_none(), "once, and never m2");
         assert!(l.message_read("run_a", &m1).unwrap());
         assert_eq!(super::requeue_on_resume(&l, "run_a", false, true, 0), (0, 0), "a reconnect with nothing in flight");
+    }
+
+    /// #253, #445: prompts share the inbox with peers' messages but keep their own guarantee. A
+    /// supervisor that takes the run over gives again the prompts whose bytes the node never had
+    /// (and the peers' messages in flight), never one it had; a plain reconnect gives no prompt
+    /// again (the supervisor's own stdin buffer resends from the node's count).
+    #[test]
+    fn a_takeover_gives_again_the_prompts_and_messages_the_box_never_had() {
+        let mut l = wicket_store::Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId("t".into());
+        let op = "spiffe://test.local/t/t/op/unix/alice";
+        let had = l.add_prompt("run_a", "had", "alice", op).unwrap();
+        let lost = l.add_prompt("run_a", "lost", "alice", op).unwrap();
+        l.add_message("m1", &t, "run_p", "run_a", "{}").unwrap();
+        let taken: Vec<String> = l.take_prompts("run_a").unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(taken, [had.clone(), lost.clone()]);
+        l.set_prompt_stdin(&had, 0, 40).unwrap();
+        l.set_prompt_stdin(&lost, 40, 80).unwrap();
+        assert_eq!(l.take_message_in_flight("run_a").unwrap().unwrap().id, "m1");
+        // A reconnect of the same supervisor: the message again, no prompt.
+        assert_eq!(super::requeue_on_resume(&l, "run_a", false, false, 40), (1, 0));
+        assert_eq!(l.take_message_in_flight("run_a").unwrap().unwrap().id, "m1");
+        // The control host restarts; the new supervisor's node had 40 bytes: "lost" and m1 again.
+        assert_eq!(super::requeue_on_resume(&l, "run_a", true, true, 40), (1, 1));
+        assert_eq!(l.take_prompts("run_a").unwrap().into_iter().map(|p| p.text).collect::<Vec<_>>(), ["lost"]);
+        assert!(l.take_prompts("run_a").unwrap().is_empty(), "never twice");
+        assert_eq!(l.prompt_taken(&had).unwrap(), Some(true));
     }
 }

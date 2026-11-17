@@ -47,7 +47,7 @@ fn wicket_wrote(dir: &Path, v: Value) {
     log.wrote(transcript_len(dir), &v.to_string());
 }
 
-fn wicket_queued(dir: &Path, by: &str, op: Option<i64>) {
+fn wicket_queued(dir: &Path, by: &str, op: Option<&str>) {
     let mut log = crate::transcript::AcpLog::open(dir, 1 << 20, true);
     log.queued(transcript_len(dir), by, op);
 }
@@ -126,7 +126,7 @@ fn wickets_answers_to_the_agents_permission_requests_are_shown_as_decided() {
 }
 
 #[test]
-fn a_prompt_is_an_audited_operator_message_answered_when_its_turn_ends() {
+fn a_prompt_is_an_audited_message_from_its_operator_answered_when_its_turn_ends() {
     let (t, mut b, dir) = bridged("sess-prompt");
     // The task's turn is running: wicket sent it, and the agent is answering.
     wicket_queued(&dir, "task", None);
@@ -136,12 +136,14 @@ fn a_prompt_is_an_audited_operator_message_answered_when_its_turn_ends() {
     );
     let p = json!({ "jsonrpc": "2.0", "id": "p1", "method": "session/prompt", "params": { "sessionId": RUN, "prompt": [{ "type": "text", "text": "and then?" }] } });
     assert!(b.on_client(&p.to_string()).is_empty(), "answered when its turn ends, not now");
-    // Queued for the supervisor as the operator's message, and audited with the principal.
+    // Queued for the supervisor as a prompt in the run's inbox, from the operator's principal
+    // (#253), and audited with it.
     let mut l = t.ledger();
-    let msgs = l.take_operator_messages_with_ids(RUN).unwrap();
+    let msgs = l.take_prompts(RUN).unwrap();
     assert_eq!(msgs.len(), 1);
-    let (op, text, by) = msgs[0].clone();
+    let wicket_store::Prompt { id: op, text, label: by, from_principal } = msgs[0].clone();
     assert_eq!((text.as_str(), by.as_str()), ("and then?", "passkey:laptop"));
+    assert_eq!(from_principal.as_deref(), Some(who().principal.as_str()));
     let audit = t.audit_kinds();
     let (_, a) = audit.iter().find(|(k, _)| k == "session.prompt").expect("audited");
     assert_eq!(a["principal"], who().principal);
@@ -155,7 +157,7 @@ fn a_prompt_is_an_audited_operator_message_answered_when_its_turn_ends() {
     agent(&dir, json!({ "jsonrpc": "2.0", "id": 2, "result": { "stopReason": "end_turn" } }));
     assert!(b.poll().is_empty());
     // The supervisor takes the operator's message up as the next turn.
-    wicket_queued(&dir, &by, Some(op));
+    wicket_queued(&dir, &by, Some(&op));
     wicket_wrote(
         &dir,
         json!({ "jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": { "sessionId": "agent-session-1", "prompt": [{ "type": "text", "text": "and then?" }] } }),
@@ -183,7 +185,7 @@ fn prompts_for_another_session_empty_ones_and_for_an_ended_run_are_refused() {
     t.ledger().run_ended(&RunId(RUN.into()), "succeeded", "").unwrap();
     let e = b.on_client(&p(RUN, "hi"));
     assert!(e[0]["error"]["message"].as_str().unwrap().contains("not running"), "{e:?}");
-    assert!(t.ledger().take_operator_messages(RUN).unwrap().is_empty(), "nothing was queued");
+    assert!(t.ledger().take_prompts(RUN).unwrap().is_empty(), "nothing was queued");
     assert!(!t.audit_kinds().iter().any(|(k, _)| k == "session.prompt"));
 }
 
@@ -418,7 +420,7 @@ async fn the_socket_needs_a_session_the_consoles_origin_and_a_fresh_passkey_tick
     let end = recv(&mut ws).await;
     assert!(end.get("closed").is_some(), "{end}");
     let mut l = Ledger::open(&ledger).unwrap();
-    assert!(l.take_operator_messages(RUN).unwrap().is_empty(), "no prompt after the session ended");
+    assert!(l.take_prompts(RUN).unwrap().is_empty(), "no prompt after the session ended");
     // Closed, and audited.
     for _ in 0..50 {
         if l.audit_tail(100).unwrap().iter().any(|r| r.2 == "session.closed") {
@@ -554,7 +556,7 @@ fn history(dir: &Path) {
     agent(dir, json!({ "jsonrpc": "2.0", "id": 2, "result": { "stopReason": "end_turn" } }));
 }
 
-/// Plays the supervisor: each operator message becomes a turn the agent answers, except one that
+/// Plays the supervisor: each prompt becomes a turn the agent answers, except one that
 /// says "wait", whose turn runs until a `session/cancel` (taken from the ledger, as `wicket run` does)
 /// ends it with `cancelled`.
 async fn supervisor(ledger: PathBuf, dir: PathBuf) {
@@ -569,9 +571,9 @@ async fn supervisor(ledger: PathBuf, dir: PathBuf) {
                 waiting = None;
             }
         }
-        let msgs = if waiting.is_none() { l.take_operator_messages_with_ids(RUN).unwrap() } else { vec![] };
-        for (op, text, by) in msgs {
-            wicket_queued(&dir, &by, Some(op));
+        let msgs = if waiting.is_none() { l.take_prompts(RUN).unwrap() } else { vec![] };
+        for wicket_store::Prompt { id: op, text, label: by, .. } in msgs {
+            wicket_queued(&dir, &by, Some(&op));
             wicket_wrote(
                 &dir,
                 json!({ "jsonrpc": "2.0", "id": id, "method": "session/prompt", "params": { "sessionId": "s1", "prompt": [{ "type": "text", "text": text }] } }),

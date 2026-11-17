@@ -885,7 +885,7 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
     }
     assert_eq!(t.state.authed.load(Ordering::Relaxed), 0, "seed {seed:#x}: a fuzzed request reached an authenticated handler");
     assert!(statuses.len() >= 4, "the fuzzer exercised several outcomes: {statuses:?}");
-    assert!(t.ledger().take_operator_messages("run_x").unwrap().is_empty());
+    assert!(t.ledger().take_prompts("run_x").unwrap().is_empty());
 }
 
 // ---- over the network ----
