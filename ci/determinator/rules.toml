@@ -101,7 +101,7 @@ globs = [
   "**/*.md", "docs/**", "experiments/**", "refs/**", "changes/**", "LICENSE", "README.md", "CHANGELOG.md",
   ".gitleaks.toml", ".gitignore", ".claude-plugin/**", "plugins/**",
   "ci/check-public.py", "ci/check-doc-links.sh", "ci/check-terms.sh", "ci/check-terms.allow", "ci/check-plugin.py",
-  "ci/changelog.py", "ci/changelog_test.py",
+  "ci/changelog.py", "ci/changelog_test.py", "ci/preflight.sh",
   "deny.toml", "ci/mutants.sh", "ci/mutants.accepted", "ci/package.sh", "ci/sim.sh",
   "ci/smoke.sh", "ci/smoke.yaml", "ci/h3get/**", "ci/hibernate.sh", "ci/hibernate.yaml", "ci/restore.sh",
   "ci/acceptance.sh", "ci/acceptance/**", "ci/install-acceptance.sh", "ci/install-test.sh", "ci/daemon-uids.sh",
