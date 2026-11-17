@@ -10,30 +10,22 @@
 //! head is the bundle tree's digest (`sha256:…`); a write-once ref `agents/<agent>/<seq>.<generation>`
 //! names it too, so a push still can't take another push's place.
 //!
-//! **Version 1**, still read (heads pushed before #365): one tar + zstd (-3) blob per tree,
-//! content-addressed in an [`ObjectStore`], and a [`StateManifest`] naming them. Pushed now only for a
-//! tree the version-2 format can't hold (a name that isn't UTF-8), so such an agent still hibernates.
+//! A tree holds directories, regular files and symlinks (stored as links, never followed), with
+//! their permission bits and modification times. Sockets, FIFOs and devices are skipped: they mean
+//! nothing without the processes that made them. A name that isn't UTF-8 can't be held, and such a
+//! tree isn't hibernated ([`unrepresentable`], #258).
 //!
-//! - **What a tree holds.** Directories, regular files and symlinks (stored as links, never
-//!   followed), with their permission bits and modification times. Sockets, FIFOs and devices are
-//!   skipped: they mean nothing without the processes that made them.
-//! - **Tree digest.** SHA-256 over every entry's type, path, mode, size and content (or link target),
-//!   in path order. A tree whose digest is unchanged since the previous manifest reuses its blob, so
-//!   an unchanged tree costs no upload. It is checked again after unpacking.
-//! - **Unpacking** refuses anything but those three entry types, absolute paths and `..`, and any
-//!   path that would leave the destination through a symlink.
+//! **Version 1** (one tar + zstd blob per tree and a JSON manifest, before #365) is gone (#258): the
+//! control host converted every version-1 head to a bundle tree before this build, and refuses to
+//! start while one remains.
 //!
 //! Not yet: encryption with the agent's data key and a signed manifest (design §13.5).
 
 use crate::cas::{Cas, Digest as CasDigest, DirOpts, Entry as CasEntry, Kind as CasKind, Tree};
-use crate::objects::ObjectStore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-
-pub const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
@@ -89,236 +81,6 @@ impl StateManifest {
     }
 }
 
-/// The key a manifest is stored under: its sequence number and the generation that wrote it.
-pub fn manifest_key(agent: &str, seq: i64, generation: i64) -> String {
-    format!("a/{agent}/m/{seq}.{generation}")
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Dir,
-    File,
-    Link,
-}
-
-struct Item {
-    rel: String,
-    path: PathBuf,
-    kind: Kind,
-    meta: std::fs::Metadata,
-}
-
-/// Every entry under `root` worth keeping, in path order, the root itself first (as ".").
-/// `exclude` lists top-level names to leave out.
-fn walk(root: &Path, exclude: &[&str]) -> io::Result<Vec<Item>> {
-    fn rec(root: &Path, dir: &Path, exclude: &[&str], out: &mut Vec<Item>) -> io::Result<()> {
-        let mut names: Vec<_> = std::fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
-        names.sort_by_key(|e| e.file_name());
-        for e in names {
-            let path = e.path();
-            let rel = path.strip_prefix(root).expect("under root").to_string_lossy().into_owned();
-            if dir == root && exclude.contains(&rel.as_str()) {
-                continue;
-            }
-            let meta = std::fs::symlink_metadata(&path)?;
-            let ft = meta.file_type();
-            let kind = if ft.is_dir() {
-                Kind::Dir
-            } else if ft.is_file() {
-                Kind::File
-            } else if ft.is_symlink() {
-                Kind::Link
-            } else {
-                continue; // sockets, FIFOs, devices
-            };
-            out.push(Item { rel, path: path.clone(), kind, meta });
-            if kind == Kind::Dir {
-                rec(root, &path, exclude, out)?;
-            }
-        }
-        Ok(())
-    }
-    let meta = std::fs::symlink_metadata(root)?;
-    if !meta.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a directory", root.display())));
-    }
-    let mut out = vec![Item { rel: ".".into(), path: root.to_path_buf(), kind: Kind::Dir, meta }];
-    rec(root, root, exclude, &mut out)?;
-    Ok(out)
-}
-
-fn digest_line(h: &mut Sha256, kind: Kind, rel: &str, mode: u32, size: u64, content: &str) {
-    let k = match kind {
-        Kind::Dir => "d",
-        Kind::File => "f",
-        Kind::Link => "l",
-    };
-    h.update(format!("{k}\0{rel}\0{:o}\0{size}\0{content}\n", mode & 0o7777).as_bytes());
-}
-
-/// Reads through, hashing and counting.
-struct HashRead<R> {
-    inner: R,
-    h: Sha256,
-    n: u64,
-}
-
-impl<R: Read> Read for HashRead<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let k = self.inner.read(buf)?;
-        self.h.update(&buf[..k]);
-        self.n += k as u64;
-        Ok(k)
-    }
-}
-
-/// Counts what passes through a writer.
-struct CountWrite<W> {
-    inner: W,
-    n: u64,
-    h: Sha256,
-}
-
-impl<W: Write> Write for CountWrite<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let k = self.inner.write(buf)?;
-        self.n += k as u64;
-        self.h.update(&buf[..k]);
-        Ok(k)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// What packing a tree produced.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Packed {
-    pub digest: String,
-    pub files: u64,
-    pub raw_bytes: u64,
-    pub stored_bytes: u64,
-    /// SHA-256 of the blob itself.
-    pub blob_sha256: String,
-}
-
-/// Packs `root` as tar + zstd into `out`, computing its tree digest on the way.
-pub fn pack_tree(root: &Path, exclude: &[&str], out: impl Write) -> Result<Packed> {
-    let items = walk(root, exclude)?;
-    let cw = CountWrite { inner: out, n: 0, h: Sha256::new() };
-    let enc = zstd::Encoder::new(cw, ZSTD_LEVEL)?;
-    let mut b = tar::Builder::new(enc);
-    b.follow_symlinks(false);
-    let mut h = Sha256::new();
-    let (mut files, mut raw) = (0u64, 0u64);
-    for it in &items {
-        let mode = it.meta.permissions().mode();
-        let mut hd = tar::Header::new_gnu();
-        hd.set_mode(mode & 0o7777);
-        hd.set_mtime(it.meta.mtime().max(0) as u64);
-        hd.set_uid(0);
-        hd.set_gid(0);
-        match it.kind {
-            Kind::Dir => {
-                hd.set_entry_type(tar::EntryType::Directory);
-                hd.set_size(0);
-                b.append_data(&mut hd, if it.rel == "." { "./" } else { &it.rel }, io::empty())?;
-                digest_line(&mut h, Kind::Dir, &it.rel, mode, 0, "");
-            }
-            Kind::File => {
-                let size = it.meta.len();
-                hd.set_entry_type(tar::EntryType::Regular);
-                hd.set_size(size);
-                let mut r = HashRead { inner: std::fs::File::open(&it.path)?.take(size), h: Sha256::new(), n: 0 };
-                b.append_data(&mut hd, &it.rel, &mut r)?;
-                if r.n != size {
-                    return Err(BundleError::Invalid(format!("{} changed while it was packed", it.rel)));
-                }
-                digest_line(&mut h, Kind::File, &it.rel, mode, size, &hex::encode(r.h.finalize()));
-                files += 1;
-                raw += size;
-            }
-            Kind::Link => {
-                let target = std::fs::read_link(&it.path)?;
-                hd.set_entry_type(tar::EntryType::Symlink);
-                hd.set_size(0);
-                b.append_link(&mut hd, &it.rel, &target)?;
-                digest_line(&mut h, Kind::Link, &it.rel, 0o777, 0, &target.to_string_lossy());
-            }
-        }
-    }
-    let enc = b.into_inner()?;
-    let mut cw = enc.finish()?;
-    cw.flush()?;
-    Ok(Packed { digest: hex::encode(h.finalize()), files, raw_bytes: raw, stored_bytes: cw.n, blob_sha256: hex::encode(cw.h.finalize()) })
-}
-
-/// The tree digest of `root`, as [`pack_tree`] computes it.
-pub fn tree_digest(root: &Path, exclude: &[&str]) -> Result<String> {
-    let mut h = Sha256::new();
-    for it in walk(root, exclude)? {
-        let mode = it.meta.permissions().mode();
-        match it.kind {
-            Kind::Dir => digest_line(&mut h, Kind::Dir, &it.rel, mode, 0, ""),
-            Kind::File => {
-                let mut fh = Sha256::new();
-                io::copy(&mut std::fs::File::open(&it.path)?, &mut crate::cas::HashWrite(&mut fh))?;
-                digest_line(&mut h, Kind::File, &it.rel, mode, it.meta.len(), &hex::encode(fh.finalize()));
-            }
-            Kind::Link => digest_line(&mut h, Kind::Link, &it.rel, 0o777, 0, &std::fs::read_link(&it.path)?.to_string_lossy()),
-        }
-    }
-    Ok(hex::encode(h.finalize()))
-}
-
-/// Unpacks a blob made by [`pack_tree`] into `dest` (created if needed; should be empty).
-pub fn unpack_tree(blob: impl Read, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
-    let dec = zstd::Decoder::new(blob)?;
-    let mut a = tar::Archive::new(dec);
-    a.set_preserve_permissions(true);
-    a.set_preserve_mtime(true);
-    a.set_unpack_xattrs(false);
-    a.set_overwrite(true);
-    // Directory modes are applied last, deepest first, so a read-only directory doesn't stop its
-    // own contents from being written.
-    let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
-    for e in a.entries()? {
-        let mut e = e?;
-        let path = e.path()?.into_owned();
-        let rel = path.strip_prefix(".").unwrap_or(&path).to_path_buf();
-        if rel.is_absolute() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
-            return Err(BundleError::Invalid(format!("bundle entry {} leaves its tree", path.display())));
-        }
-        let mode = e.header().mode()?;
-        match e.header().entry_type() {
-            tar::EntryType::Directory => {
-                let d = dest.join(&rel);
-                if rel.as_os_str().is_empty() {
-                    dirs.push((dest.to_path_buf(), mode));
-                    continue;
-                }
-                if !e.unpack_in(dest)? {
-                    return Err(BundleError::Invalid(format!("bundle entry {} leaves its tree", path.display())));
-                }
-                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
-                dirs.push((d, mode));
-            }
-            tar::EntryType::Regular | tar::EntryType::Symlink => {
-                if !e.unpack_in(dest)? {
-                    return Err(BundleError::Invalid(format!("bundle entry {} leaves its tree", path.display())));
-                }
-            }
-            t => return Err(BundleError::Invalid(format!("bundle entry {} has type {t:?}", path.display()))),
-        }
-    }
-    dirs.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
-    for (d, mode) in dirs {
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode & 0o7777))?;
-    }
-    Ok(())
-}
-
 /// Whose bundle a push writes: the agent, the generation pushing it, its sequence number, and the
 /// agent's session.
 #[derive(Clone, Copy)]
@@ -334,103 +96,6 @@ pub struct TreeSrc<'a> {
     pub name: String,
     pub path: PathBuf,
     pub exclude: &'a [&'a str],
-}
-
-/// Pushes trees as one bundle: packs each (reusing the previous manifest's blob for a tree whose
-/// digest hasn't changed), uploads new blobs and then the manifest, both put-if-absent. Returns the
-/// manifest and its key; the caller commits the key in the ledger, which is the commit point.
-pub fn push(
-    store: &dyn ObjectStore,
-    to: &PushTo,
-    trees: &[TreeSrc],
-    prev: Option<&StateManifest>,
-    scratch: &Path,
-) -> Result<(StateManifest, String)> {
-    let PushTo { agent, generation, seq, session_id } = *to;
-    std::fs::create_dir_all(scratch)?;
-    let mut out = Vec::new();
-    for t in trees {
-        let tmp = scratch.join(format!("pack-{}-{}", std::process::id(), t.name));
-        let packed = {
-            let f = std::fs::File::create(&tmp)?;
-            let mut w = io::BufWriter::new(f);
-            let p = pack_tree(&t.path, t.exclude, &mut w)?;
-            w.flush()?;
-            p
-        };
-        let entry = match prev.and_then(|p| p.tree(&t.name)).filter(|e| e.digest == packed.digest) {
-            Some(e) => e.clone(),
-            None => {
-                let blob = format!("a/{agent}/p/{}", packed.blob_sha256);
-                store.put_if_absent(&blob, &mut io::BufReader::new(std::fs::File::open(&tmp)?))?;
-                TreeEntry {
-                    name: t.name.clone(),
-                    digest: packed.digest,
-                    blob,
-                    files: packed.files,
-                    raw_bytes: packed.raw_bytes,
-                    stored_bytes: packed.stored_bytes,
-                }
-            }
-        };
-        let _ = std::fs::remove_file(&tmp);
-        out.push(entry);
-    }
-    let m = StateManifest {
-        version: 1,
-        agent: agent.into(),
-        generation,
-        seq,
-        created_at: crate::now(),
-        session_id: session_id.into(),
-        trees: out,
-        bundle: None,
-    };
-    let key = manifest_key(agent, seq, generation);
-    if !store.put_if_absent(&key, &mut &serde_json::to_vec_pretty(&m)?[..])? {
-        return Err(BundleError::Invalid(format!("state manifest {key} already exists")));
-    }
-    Ok((m, key))
-}
-
-/// Reads a state manifest and checks it is the agent's.
-pub fn read_manifest(store: &dyn ObjectStore, key: &str, agent: &str) -> Result<StateManifest> {
-    let mut r = store.get(key)?.ok_or_else(|| BundleError::Invalid(format!("state manifest {key} is missing")))?;
-    let mut b = Vec::new();
-    r.read_to_end(&mut b)?;
-    let m: StateManifest = serde_json::from_slice(&b)?;
-    if m.agent != agent || m.version != 1 {
-        return Err(BundleError::Invalid(format!("state manifest {key} is not agent {agent}'s")));
-    }
-    Ok(m)
-}
-
-/// Restores one tree into `dest` (which must not exist yet), and verifies both the blob's hash and
-/// the unpacked tree's digest. On any failure `dest` is removed.
-pub fn pull_tree(store: &dyn ObjectStore, t: &TreeEntry, dest: &Path) -> Result<()> {
-    if dest.exists() {
-        return Err(BundleError::Invalid(format!("{} already exists", dest.display())));
-    }
-    let res = (|| {
-        let r = store.get(&t.blob)?.ok_or_else(|| BundleError::Invalid(format!("blob {} is missing", t.blob)))?;
-        let mut hr = HashRead { inner: r, h: Sha256::new(), n: 0 };
-        unpack_tree(&mut hr, dest)?;
-        io::copy(&mut hr, &mut io::sink())?; // zstd's trailing bytes
-        let sha = hex::encode(hr.h.finalize());
-        if !t.blob.ends_with(&format!("/{sha}")) {
-            return Err(BundleError::Invalid(format!("tree {}: blob {} does not match its hash", t.name, t.blob)));
-        }
-        let d = tree_digest(dest, &[])?;
-        if d != t.digest {
-            return Err(BundleError::Invalid(format!("tree {} does not verify: digest {d}, the manifest says {}", t.name, t.digest)));
-        }
-        Ok(())
-    })();
-    if res.is_err() {
-        let _ = make_writable(dest);
-        let _ = std::fs::remove_dir_all(dest);
-    }
-    res
 }
 
 // ---- version 2: bundle trees in the content-addressed store (#365) ----
@@ -511,6 +176,31 @@ pub fn unrepresentable(e: &BundleError) -> bool {
     matches!(e, BundleError::Io(io) if io.kind() == io::ErrorKind::InvalidData && io.to_string().contains("isn't a UTF-8 name"))
 }
 
+/// The files and symlinks under `root` (not following links, without `exclude`'s top-level names,
+/// sockets, FIFOs or devices), and their bytes: the counts a bundle's `meta` records.
+fn counts(root: &Path, exclude: &[&str]) -> io::Result<(u64, u64)> {
+    fn rec(dir: &Path, exclude: &[&str], n: &mut (u64, u64)) -> io::Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            if exclude.iter().any(|x| e.file_name() == **x) {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(e.path())?;
+            let ft = meta.file_type();
+            if ft.is_dir() {
+                rec(&e.path(), &[], n)?;
+            } else if ft.is_file() || ft.is_symlink() {
+                n.0 += 1;
+                n.1 += meta.len();
+            }
+        }
+        Ok(())
+    }
+    let mut n = (0, 0);
+    rec(root, exclude, &mut n)?;
+    Ok(n)
+}
+
 /// Pushes trees as a version-2 bundle: each into the local store (only files and directories not
 /// already there are written), then, with a shared store, everything it lacks of them, then the
 /// `meta` blob and the bundle tree, and last the write-once ref. Returns the manifest and the head
@@ -527,13 +217,7 @@ pub fn push_tree(stores: Stores, to: &PushTo, trees: &[TreeSrc]) -> Result<(Stat
             stored = stores.local.send_tree(sh, &d)?.0;
         }
         let meta = std::fs::symlink_metadata(&t.path)?;
-        let (mut files, mut raw) = (0, 0);
-        for i in walk(&t.path, t.exclude)? {
-            if i.kind != Kind::Dir {
-                files += 1;
-                raw += i.meta.len();
-            }
-        }
+        let (files, raw) = counts(&t.path, t.exclude)?;
         entries.push(CasEntry {
             name: t.name.clone(),
             kind: CasKind::Dir,
@@ -598,10 +282,13 @@ fn bundle_tree(stores: Stores, d: &CasDigest) -> Result<Tree> {
     }
 }
 
-/// Reads the head the ledger holds: a version-2 bundle (a digest) from `stores`, or a version-1
-/// manifest from `v1`. Checks it is the agent's, and that a bundle's `meta` names exactly its trees.
-pub fn read_head(stores: Stores, v1: &dyn ObjectStore, head: &str, agent: &str) -> Result<StateManifest> {
-    let Some(d) = CasDigest::parse(head) else { return read_manifest(v1, head, agent) };
+/// Reads the head the ledger holds, a bundle tree's digest, from `stores`. Checks it is the agent's,
+/// and that its `meta` names exactly its trees. A version-1 head (a manifest key, from before #365)
+/// isn't read any more: the control host converts those before this build runs (#258).
+pub fn read_head(stores: Stores, head: &str, agent: &str) -> Result<StateManifest> {
+    let Some(d) = CasDigest::parse(head) else {
+        return Err(BundleError::Invalid(format!("agent {agent}'s head {head:?} is a version-1 bundle, which this build can't read")));
+    };
     let t = bundle_tree(stores, &d)?;
     let me =
         t.get(META).filter(|e| e.kind == CasKind::File).ok_or_else(|| BundleError::Invalid(format!("state bundle {d} has no meta")))?;
@@ -628,13 +315,17 @@ pub fn read_head(stores: Stores, v1: &dyn ObjectStore, head: &str, agent: &str) 
     Ok(manifest_of(meta, &d, &t))
 }
 
-/// Restores tree `name` of a bundle into `dest` (which must not exist yet): a version-2 tree checked
-/// out of the local store (fetching what it lacks from the shared one), with its root's mode and
-/// time; a version-1 tree unpacked from `v1`. Every object is verified as it is read. On any failure
-/// `dest` is removed. A bundle without the tree restores nothing.
-pub fn restore(stores: Stores, v1: &dyn ObjectStore, m: &StateManifest, name: &str, dest: &Path) -> Result<()> {
-    let Some(t) = m.tree(name) else { return Ok(()) };
-    let Some(b) = m.bundle.as_deref() else { return pull_tree(v1, t, dest) };
+/// Restores tree `name` of a bundle into `dest` (which must not exist yet): checked out of the local
+/// store (fetching what it lacks from the shared one), with its root's mode and time. Every object
+/// is verified as it is read. On any failure `dest` is removed. A bundle without the tree restores
+/// nothing.
+pub fn restore(stores: Stores, m: &StateManifest, name: &str, dest: &Path) -> Result<()> {
+    if m.tree(name).is_none() {
+        return Ok(());
+    }
+    let Some(b) = m.bundle.as_deref() else {
+        return Err(BundleError::Invalid(format!("agent {}'s bundle is version 1, which this build can't read", m.agent)));
+    };
     if dest.exists() {
         return Err(BundleError::Invalid(format!("{} already exists", dest.display())));
     }
@@ -656,37 +347,6 @@ pub fn restore(stores: Stores, v1: &dyn ObjectStore, m: &StateManifest, name: &s
         let _ = make_writable(dest);
         let _ = std::fs::remove_dir_all(dest);
     }
-    res
-}
-
-/// #258: a version-1 bundle as a version-2 one, for the migration of version-1 heads. Each of its
-/// trees is restored from `v1` into `scratch/<name>` (with version 1's checks), then they are pushed
-/// as a version-2 bundle `to` names. `scratch` is emptied first (an interrupted conversion's
-/// leftovers) and removed after. Every version-1 bundle converts: version 1 kept a name that isn't
-/// UTF-8 lossily (U+FFFD), so its trees restore to names the version-2 format holds.
-pub fn convert_v1(stores: Stores, v1: &dyn ObjectStore, m: &StateManifest, to: &PushTo, scratch: &Path) -> Result<(StateManifest, String)> {
-    if m.version != 1 || m.bundle.is_some() {
-        return Err(BundleError::Invalid(format!("agent {}'s head is already version {}", m.agent, m.version)));
-    }
-    let clear = |d: &Path| {
-        let _ = make_writable(d);
-        let _ = std::fs::remove_dir_all(d);
-    };
-    clear(scratch);
-    std::fs::create_dir_all(scratch)?;
-    let res = (|| {
-        let mut srcs = Vec::new();
-        for t in &m.trees {
-            if t.name.is_empty() || t.name.contains('/') || t.name == "." || t.name == ".." {
-                return Err(BundleError::Invalid(format!("agent {}'s bundle names a tree {:?}", m.agent, t.name)));
-            }
-            let dest = scratch.join(&t.name);
-            restore(stores, v1, m, &t.name, &dest)?;
-            srcs.push(TreeSrc { name: t.name.clone(), path: dest, exclude: &[] });
-        }
-        push_tree(stores, to, &srcs)
-    })();
-    clear(scratch);
     res
 }
 
@@ -712,72 +372,6 @@ mod tests {
         let _ = make_writable(&d);
         let _ = std::fs::remove_dir_all(&d);
         d
-    }
-
-    #[test]
-    fn a_tree_round_trips_and_verifies() {
-        let (src, out, root) = (tmp("src"), tmp("out"), tmp("store"));
-        std::fs::create_dir_all(src.join("home/.config")).unwrap();
-        std::fs::write(src.join("home/.gitconfig"), "[user]\n\tname = a\n").unwrap();
-        std::fs::write(src.join("run.sh"), "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(src.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", src.join("link")).unwrap();
-        std::fs::create_dir_all(src.join("ro")).unwrap();
-        std::fs::write(src.join("ro/keep"), "x").unwrap();
-        std::fs::set_permissions(src.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
-        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        // A socket is skipped.
-        let _l = std::os::unix::net::UnixListener::bind(src.join("sock")).unwrap();
-        std::fs::create_dir_all(src.join("skip")).unwrap();
-
-        let store = DirStore::new(&root);
-        let trees = [TreeSrc { name: "tmp".into(), path: src.clone(), exclude: &["skip"] }];
-        let (m, key) =
-            push(&store, &PushTo { agent: "agt_x", generation: 1, seq: 1, session_id: "s" }, &trees, None, &root.join(".scratch")).unwrap();
-        assert_eq!(key, "a/agt_x/m/1.1");
-        assert_eq!(read_manifest(&store, &key, "agt_x").unwrap(), m);
-        assert!(read_manifest(&store, &key, "agt_y").is_err());
-        let t = m.tree("tmp").unwrap();
-        assert_eq!(t.files, 3);
-        pull_tree(&store, t, &out).unwrap();
-        assert_eq!(std::fs::read_to_string(out.join("home/.gitconfig")).unwrap(), "[user]\n\tname = a\n");
-        assert_eq!(std::fs::read_link(out.join("link")).unwrap(), PathBuf::from("/etc/passwd"));
-        assert_eq!(std::fs::metadata(out.join("run.sh")).unwrap().permissions().mode() & 0o7777, 0o755);
-        assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o7777, 0o1777);
-        assert_eq!(std::fs::metadata(out.join("ro")).unwrap().permissions().mode() & 0o7777, 0o555);
-        assert!(!out.join("sock").exists() && !out.join("skip").exists());
-        assert_eq!(tree_digest(&out, &[]).unwrap(), t.digest);
-        assert!(pull_tree(&store, t, &out).is_err(), "never over an existing tree");
-
-        // Unchanged: the next push reuses the blob. Changed: a new blob.
-        let (m2, _) =
-            push(&store, &PushTo { agent: "agt_x", generation: 1, seq: 2, session_id: "s" }, &trees, Some(&m), &root.join(".scratch"))
-                .unwrap();
-        assert_eq!(m2.trees[0].blob, t.blob);
-        std::fs::write(src.join("home/.gitconfig"), "changed").unwrap();
-        let (m3, _) =
-            push(&store, &PushTo { agent: "agt_x", generation: 1, seq: 3, session_id: "s" }, &trees, Some(&m2), &root.join(".scratch"))
-                .unwrap();
-        assert_ne!(m3.trees[0].blob, t.blob);
-        assert!(
-            push(&store, &PushTo { agent: "agt_x", generation: 1, seq: 3, session_id: "s" }, &trees, Some(&m2), &root.join(".scratch"))
-                .is_err(),
-            "a manifest is never replaced"
-        );
-
-        // A blob that was tampered with doesn't verify, and leaves nothing behind.
-        let blob_path = root.join(&m3.trees[0].blob);
-        let mut other = Vec::new();
-        pack_tree(&out, &[], &mut other).unwrap();
-        std::fs::remove_file(&blob_path).unwrap();
-        std::fs::write(&blob_path, &other).unwrap();
-        let bad = tmp("bad");
-        assert!(pull_tree(&store, &m3.trees[0], &bad).is_err());
-        assert!(!bad.exists());
-        for d in [src, out, root] {
-            let _ = make_writable(&d);
-            let _ = std::fs::remove_dir_all(&d);
-        }
     }
 
     fn rm(d: &Path) {
@@ -826,19 +420,18 @@ mod tests {
         let t = m.tree("tmp").unwrap();
         assert_eq!((t.files, t.raw_bytes), (5, 17 + (256 << 10) + 10 + 11 + 1));
         assert!(t.stored_bytes > 0 && t.digest.starts_with("sha256:"));
-        let v1s = DirStore::new(&v1);
-        assert_eq!(read_head(stores, &v1s, &head, "agt_x").unwrap(), m);
-        assert!(read_head(stores, &v1s, &head, "agt_y").is_err(), "another agent's bundle");
-        restore(stores, &v1s, &m, "tmp", &out).unwrap();
+        assert_eq!(read_head(stores, &head, "agt_x").unwrap(), m);
+        assert!(read_head(stores, &head, "agt_y").is_err(), "another agent's bundle");
+        restore(stores, &m, "tmp", &out).unwrap();
         assert_eq!(std::fs::read_to_string(out.join("home/.gitconfig")).unwrap(), "[user]\n\tname = a\n");
         assert_eq!(std::fs::read_link(out.join("link")).unwrap(), PathBuf::from("/etc/passwd"));
         assert_eq!(std::fs::metadata(out.join("run.sh")).unwrap().permissions().mode() & 0o7777, 0o755);
         assert_eq!(std::fs::metadata(out.join("ro")).unwrap().permissions().mode() & 0o7777, 0o555);
         assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o7777, 0o1777, "the root's own mode");
         assert!(!out.join("sock").exists() && !out.join("skip").exists());
-        assert!(restore(stores, &v1s, &m, "tmp", &out).is_err(), "never over an existing tree");
+        assert!(restore(stores, &m, "tmp", &out).is_err(), "never over an existing tree");
         // A tree the bundle doesn't have restores nothing.
-        restore(stores, &v1s, &m, "volume.cache", &tmp("v2none")).unwrap();
+        restore(stores, &m, "volume.cache", &tmp("v2none")).unwrap();
         assert!(!tmp("v2none").exists());
         // The same seq and generation again: refused, the first stands.
         let e = push_tree(stores, &to(1), &trees).unwrap_err();
@@ -900,10 +493,9 @@ mod tests {
         // Another host: nothing local; the bundle comes from the shared store, verified.
         let other = Cas::new(DirStore::new(&b));
         let there = Stores { local: &other, shared: Some(&shared), written: None };
-        let v1s = DirStore::new(&v1);
-        let read = read_head(there, &v1s, &head2, "agt_x").unwrap();
+        let read = read_head(there, &head2, "agt_x").unwrap();
         assert_eq!(read, m2);
-        restore(there, &v1s, &read, "state", &out).unwrap();
+        restore(there, &read, "state", &out).unwrap();
         assert_eq!(std::fs::read_to_string(out.join("run.sh")).unwrap(), "#!/bin/sh\necho changed\n");
         assert_eq!(std::fs::read(out.join("big.bin")).unwrap().len(), 256 << 10);
         // A tampered object in the shared store doesn't verify, and leaves nothing behind.
@@ -914,124 +506,10 @@ mod tests {
         std::fs::remove_file(&obj).unwrap();
         std::fs::write(&obj, zstd::encode_all(&b"not the file"[..], 3).unwrap()).unwrap();
         let s3 = Stores { local: &fresh, shared: Some(&shared), written: None };
-        assert!(restore(s3, &v1s, &read, "state", &out2).is_err());
+        assert!(restore(s3, &read, "state", &out2).is_err());
         assert!(!out2.exists());
         for d in [src, a, b, sh, out, v1, other2] {
             rm(&d);
         }
-    }
-
-    /// #365: heads pushed before version 2 are still read and restored, and a tree whose names the
-    /// tree format can't hold is said to be so (its agent is kept as a version-1 bundle).
-    #[test]
-    fn version_one_heads_still_restore_and_odd_names_are_recognised() {
-        let (src, root, v1, out) = (tmp("oldsrc"), tmp("oldcas"), tmp("oldv1"), tmp("oldout"));
-        sample(&src);
-        let v1s = DirStore::new(&v1);
-        let trees = [TreeSrc { name: "tmp".into(), path: src.clone(), exclude: &[] }];
-        let (m, key) = push(&v1s, &to(1), &trees, None, &v1.join(".scratch")).unwrap();
-        let local = Cas::new(DirStore::new(&root));
-        let stores = Stores { local: &local, shared: None, written: None };
-        assert!(!is_tree_head(&key));
-        let read = read_head(stores, &v1s, &key, "agt_x").unwrap();
-        assert_eq!((read.version, read.bundle.as_deref()), (1, None));
-        assert_eq!(read, m);
-        restore(stores, &v1s, &read, "tmp", &out).unwrap();
-        assert_eq!(std::fs::read_to_string(out.join("home/.gitconfig")).unwrap(), "[user]\n\tname = a\n");
-        use std::os::unix::ffi::OsStrExt;
-        std::fs::write(src.join(std::ffi::OsStr::from_bytes(b"caf\xe9")), "latin-1").unwrap();
-        let e = push_tree(stores, &to(2), &trees).unwrap_err();
-        assert!(unrepresentable(&e), "{e}");
-        for d in [src, root, v1, out] {
-            rm(&d);
-        }
-    }
-
-    /// #258: a version-1 bundle converts to a version-2 one that restores to the same trees (contents,
-    /// modes, times, links: the same tree digest), with the seq and generation it is pushed as; a
-    /// version-2 head isn't converted again.
-    #[test]
-    fn a_version_one_bundle_converts_to_the_same_trees() {
-        let (src, vol, root, v1, scratch, out1, out2) =
-            (tmp("cvsrc"), tmp("cvvol"), tmp("cvcas"), tmp("cvv1"), tmp("cvscratch"), tmp("cvout1"), tmp("cvout2"));
-        sample(&src);
-        std::fs::create_dir_all(&vol).unwrap();
-        std::fs::write(vol.join("data"), "kept").unwrap();
-        let v1s = DirStore::new(&v1);
-        let trees = [
-            TreeSrc { name: "workspace".into(), path: src.clone(), exclude: &[] },
-            TreeSrc { name: "volume.data".into(), path: vol.clone(), exclude: &[] },
-        ];
-        let (old, _) = push(&v1s, &to(1), &trees, None, &v1.join(".scratch")).unwrap();
-        let local = Cas::new(DirStore::new(&root));
-        let stores = Stores { local: &local, shared: None, written: None };
-        let (new, head) = convert_v1(stores, &v1s, &old, &to(2), &scratch).unwrap();
-        assert!(is_tree_head(&head));
-        assert!(!scratch.exists(), "the scratch directory is removed");
-        let read = read_head(stores, &v1s, &head, "agt_x").unwrap();
-        assert_eq!((read.version, read.seq, read.generation), (TREE_VERSION, 2, 1));
-        assert_eq!(read, new);
-        let opts = crate::cas::DirOpts { exclude: &[], plain: false };
-        for name in ["workspace", "volume.data"] {
-            let (a, b) = (out1.join(name), out2.join(name));
-            std::fs::create_dir_all(&out1).unwrap();
-            std::fs::create_dir_all(&out2).unwrap();
-            restore(stores, &v1s, &old, name, &a).unwrap();
-            restore(stores, &v1s, &read, name, &b).unwrap();
-            assert_eq!(crate::cas::dir_digest(&a, &opts).unwrap(), crate::cas::dir_digest(&b, &opts).unwrap(), "{name}");
-        }
-        assert!(convert_v1(stores, &v1s, &read, &to(3), &scratch).is_err(), "version 2 isn't converted");
-        use std::os::unix::ffi::OsStrExt;
-        std::fs::write(src.join(std::ffi::OsStr::from_bytes(b"caf\xe9")), "latin-1").unwrap();
-        // Version 1 kept a name that isn't UTF-8 lossily (U+FFFD), so every version-1 bundle
-        // converts: the name comes back as version 1 restored it.
-        let (odd, _) = push(&v1s, &to(3), &trees, None, &v1.join(".scratch")).unwrap();
-        let (_, head) = convert_v1(stores, &v1s, &odd, &to(4), &scratch).unwrap();
-        let read = read_head(stores, &v1s, &head, "agt_x").unwrap();
-        let (a, b) = (out1.join("odd"), out2.join("odd"));
-        restore(stores, &v1s, &odd, "workspace", &a).unwrap();
-        restore(stores, &v1s, &read, "workspace", &b).unwrap();
-        assert!(b.join("caf\u{fffd}").exists());
-        assert_eq!(crate::cas::dir_digest(&a, &opts).unwrap(), crate::cas::dir_digest(&b, &opts).unwrap());
-        assert!(!scratch.exists());
-        for d in [src, vol, root, v1, out1, out2] {
-            rm(&d);
-        }
-    }
-
-    #[test]
-    fn unpacking_refuses_escapes_and_odd_entries() {
-        let mk = |f: &dyn Fn(&mut tar::Builder<Vec<u8>>)| {
-            let mut b = tar::Builder::new(Vec::new());
-            f(&mut b);
-            zstd::encode_all(&b.into_inner().unwrap()[..], 3).unwrap()
-        };
-        let (dest, victim) = (tmp("esc"), tmp("victim"));
-        std::fs::create_dir_all(&victim).unwrap();
-        // A symlink pointing out, then a file through it.
-        let v = victim.clone();
-        let blob = mk(&move |b| {
-            let mut h = tar::Header::new_gnu();
-            h.set_entry_type(tar::EntryType::Symlink);
-            h.set_size(0);
-            b.append_link(&mut h, "out", &v).unwrap();
-            let mut h = tar::Header::new_gnu();
-            h.set_size(1);
-            h.set_mode(0o644);
-            b.append_data(&mut h, "out/pwned", &b"x"[..]).unwrap();
-        });
-        assert!(unpack_tree(&blob[..], &dest).is_err());
-        assert!(!victim.join("pwned").exists());
-        let _ = std::fs::remove_dir_all(&dest);
-        let _ = std::fs::remove_dir_all(&victim);
-        // A FIFO.
-        let blob = mk(&|b| {
-            let mut h = tar::Header::new_gnu();
-            h.set_entry_type(tar::EntryType::Fifo);
-            h.set_size(0);
-            b.append_data(&mut h, "fifo", io::empty()).unwrap();
-        });
-        assert!(unpack_tree(&blob[..], &dest).is_err());
-        let _ = std::fs::remove_dir_all(&dest);
     }
 }

@@ -337,6 +337,8 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     let plan = net::plan(&opts, &data_dir())?;
     let tenant = TenantId::single();
     let l = Ledger::open(&ledger_path())?;
+    // #258: not while an agent's head is a version-1 bundle, which this build can't read.
+    crate::hibernate::refuse_v1_heads(&l)?;
     // The console is the control host's long-lived process: it feeds the audit sinks (#91).
     crate::audit_export::spawn_background();
     let has_passkeys = !l.operator_credentials(&tenant)?.is_empty();

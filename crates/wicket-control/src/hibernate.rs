@@ -46,16 +46,6 @@ pub const CLAIM_SECS: i64 = 30;
 /// can be woken again.
 pub const BUSY_CLAIM_SECS: i64 = 900;
 
-/// The object store agent state goes to, sealed under `state.key`: the installation's S3-compatible
-/// store if `state-store.yaml` puts bundles there (#154), or a directory under wicket's data dir.
-pub fn store() -> Result<SealedStore<Box<dyn wicket_store::objects::ObjectStore>>> {
-    let inner: Box<dyn wicket_store::objects::ObjectStore> = match crate::statestore::StateStore::load()? {
-        Some(s) if s.bundles == crate::statestore::Where::S3 => Box::new(s.open_s3()?),
-        _ => Box::new(DirStore::new(data_dir().join("objects"))),
-    };
-    Ok(SealedStore::new(inner, &state_key()?))
-}
-
 /// The control host's local content-addressed store (#258, #365), sealed under `state.key` with no
 /// plain reads, and the count of what its backend writes.
 pub fn local_store() -> Result<(wicket_store::cas::Cas, std::sync::Arc<std::sync::atomic::AtomicU64>)> {
@@ -80,7 +70,7 @@ pub fn read_head(head: &str, agent: &str) -> Result<StateManifest> {
     let (local, _) = local_store()?;
     let shared = shared_store()?;
     let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: None };
-    Ok(bundle::read_head(stores, &store()?, head, agent)?)
+    Ok(bundle::read_head(stores, head, agent)?)
 }
 
 /// The key agent state is sealed with at rest (`<data dir>/state.key`, 0600, made on first use): it
@@ -219,64 +209,24 @@ pub fn push(
     Ok(Some(m))
 }
 
-/// What the migration of version-1 heads did with one agent's head.
-#[derive(Debug)]
-pub struct Converted {
-    pub agent: String,
-    /// The version-1 head (a manifest key).
-    pub from: String,
-    /// The version-2 head it moved to, or why it didn't move.
-    pub to: std::result::Result<String, String>,
+/// #258: the agents whose head is still a version-1 bundle (a manifest key, not a digest), which
+/// this build can't read. Builds before it converted them as the reconciler started.
+pub fn v1_heads(l: &Ledger) -> Result<Vec<String>> {
+    Ok(l.agent_heads()?.into_iter().filter(|(_, h, _)| !bundle::is_tree_head(h)).map(|(a, _, _)| a).collect())
 }
 
-/// #258: converts every version-1 head to a version-2 bundle (`bundle::convert_v1`), so that the
-/// version-1 reader can go. The control host's reconciler runs this as it starts.
-/// Each conversion holds the stores as a push does, and moves the head only while nothing else
-/// moved it and the agent isn't awake (`Ledger::convert_agent_head`): an awake agent's own push
-/// is version 2. Each moved head is audited `agent.bundle_converted`, each that couldn't move
-/// `agent.bundle_not_converted`, and the old objects are left to the stores' collection.
-pub fn convert_v1_heads(ledger: &std::sync::Mutex<Ledger>) -> Result<Vec<Converted>> {
-    let heads: Vec<(String, String, i64)> =
-        ledger.lock().expect("ledger").agent_heads()?.into_iter().filter(|(_, h, _)| !bundle::is_tree_head(h)).collect();
-    if heads.is_empty() {
-        return Ok(Vec::new());
+/// Refuses to start the control host while any agent's head is a version-1 bundle (#258), naming
+/// them: the build before this one converts them when its reconciler starts.
+pub fn refuse_v1_heads(l: &Ledger) -> Result<()> {
+    let left = v1_heads(l)?;
+    if !left.is_empty() {
+        bail!(
+            "agent(s) {} still have a version-1 hibernation bundle, which this build can't read: run the previous \
+             build's reconciler once (`wicket reconcile`), which converts them, then this one",
+            left.join(", ")
+        );
     }
-    let (local, written) = local_store()?;
-    let shared = shared_store()?;
-    let v1 = store()?;
-    let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: Some(&written) };
-    let mut out = Vec::new();
-    for (id, head, seq) in heads {
-        let Some(a) = ledger.lock().expect("ledger").agent(&id)? else { continue };
-        let to = if matches!(a.state.as_str(), "active" | "waking" | "hibernating") {
-            Err(format!("it is {}: its next hibernation is version 2", a.state))
-        } else {
-            let by = format!("the conversion of agent {id}'s bundle");
-            let held = (|| -> Result<_> { Ok((local.writing(&by)?, shared.as_ref().map(|s| s.writing(&by)).transpose()?)) })();
-            let res = held.and_then(|_held| {
-                let m = bundle::read_manifest(&v1, &head, &id)?;
-                let to = bundle::PushTo { agent: &id, generation: a.generation, seq: seq + 1, session_id: &a.session_id };
-                let scratch = data_dir().join("convert-scratch").join(&id);
-                let (m2, digest) = bundle::convert_v1(stores, &v1, &m, &to, &scratch)?;
-                let l = ledger.lock().expect("ledger");
-                if !l.convert_agent_head(&id, a.generation, &head, seq, seq + 1, &digest, m2.raw_bytes() as i64)? {
-                    bail!("it changed meanwhile (woken, or pushed again): its next hibernation is version 2");
-                }
-                Ok(digest)
-            });
-            res.map_err(|e| format!("{e:#}"))
-        };
-        let tenant = TenantId(a.tenant.clone());
-        let l = ledger.lock().expect("ledger");
-        let _ = match &to {
-            Ok(d) => {
-                l.audit(&tenant, None, "agent.bundle_converted", &serde_json::json!({ "agent": id, "from": head, "to": d, "seq": seq + 1 }))
-            }
-            Err(why) => l.audit(&tenant, None, "agent.bundle_not_converted", &serde_json::json!({ "agent": id, "head": head, "why": why })),
-        };
-        out.push(Converted { agent: id, from: head, to });
-    }
-    Ok(out)
+    Ok(())
 }
 
 /// Moves the agent's durable volumes into the run's directory before they are packed, so that once the
@@ -382,7 +332,7 @@ pub fn restore(m: &StateManifest, name: &str, dest: &Path) -> Result<()> {
     // Held while it fetches and reads: the cache cap doesn't evict what it has just fetched (#258).
     let _held = local.writing(&format!("the restore of agent {}", m.agent))?;
     let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: None };
-    bundle::restore(stores, &store()?, m, name, dest).with_context(|| format!("restoring {name}"))?;
+    bundle::restore(stores, m, name, dest).with_context(|| format!("restoring {name}"))?;
     Ok(())
 }
 

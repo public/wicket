@@ -236,24 +236,26 @@ those two.
    files only, every file `0644` or `0755` by its executable bit, every directory `0755` and every
    time 0, so the same source has one digest in every checkout. Old `wicket-program-v1` pins are
    accepted with a warning while the source is unchanged, and `wicket zone pin` rewrites them.
-3. **Hibernation bundles as bundle trees** (done, #365), through the local store; push to the state
-   store by negotiation; manifest version 2 alongside a reader for version 1 until no agent's head
-   is version 1. The ledger's head is the bundle tree's digest, and a write-once ref
-   `agents/<agent>/<seq>.<generation>` names it in the bundles' home store (the state store with
-   `bundles: s3`, else the local one). Not yet: resuming on the same host before the upload ends,
-   and packs.
-   **Decided (#258): version 1 goes, in two PRs.** The first stops writing version 1. A tree with a
-   name that isn't UTF-8 now refuses to hibernate, with an error naming the file, and the
-   hibernation fails as on any other push error. The agent stays as it was, and the operator's
-   output, the agent's note and the audit (`agent.hibernate_failed`) say why. The first PR also
-   converts every version-1 head to a version-2 bundle when the control host's reconciler starts
-   (`wicket reconcile`, before its first pass, and again after `wicket self update` re-executes it). The conversion restores each tree with the version-1 reader and pushes it as
-   version 2. The head moves only while the agent's generation, head and seq are unchanged and it
-   isn't awake (`Ledger::convert_agent_head`). Each conversion is audited
-   (`agent.bundle_converted`, or `agent.bundle_not_converted` with why). Every version-1 bundle
-   converts, because version 1 kept non-UTF-8 names lossily. An awake agent's own next hibernation
-   is version 2. The second PR removes the version-1 writer and reader, and the control host
-   refuses to start, naming the agents, while any version-1 head remains.
+3. **Hibernation bundles as bundle trees** (done, #365 and #258). Bundles go through the local
+   store and are pushed to the state store by negotiation. The ledger's head is the bundle tree's
+   digest, and a write-once ref `agents/<agent>/<seq>.<generation>` names it in the bundles' home
+   store (the state store with `bundles: s3`, else the local one). Not yet: resuming on the same
+   host before the upload ends, and packs.
+   **Version 1 is gone (#258, decided in two PRs).** Version 1 was tar and zstd per tree with a JSON
+   manifest.
+   - **Non-UTF-8 names.** A tree with a name that isn't UTF-8 refuses to hibernate, with an error
+     naming the file. The hibernation fails as on any other push error, and the agent stays as it
+     was. The operator's output, the agent's note and the audit (`agent.hibernate_failed`) say why.
+   - **The first PR (#467)** converts every version-1 head to version 2 when the control host's
+     reconciler starts (`wicket reconcile`). It restores each tree with the version-1 reader and
+     pushes it as version 2. The head moves only while the agent's generation, head and seq are
+     unchanged and the agent isn't awake. Each conversion is audited (`agent.bundle_converted`, or
+     `agent.bundle_not_converted` with why). Every version-1 bundle converts, because version 1 kept
+     non-UTF-8 names lossily. An awake agent's own next hibernation is version 2.
+   - **The second PR** removes the version-1 writer and reader. `wicket serve` and
+     `wicket reconcile` refuse to start, naming the agents, while any version-1 head remains: the
+     previous build's reconciler converts them. The old objects under `objects/` (or the state
+     store's `a/<agent>/` keys) are no longer read.
 4. **Garbage collection** in the reconciler, and the local store's cache cap (done): mark from the
    ledger's heads and the store's refs, sweep trees first, push and collection locks in the store,
    `wicket state gc`. Ledger snapshots' blobs are no longer deleted by hand when their ref goes: the
