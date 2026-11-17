@@ -11,6 +11,7 @@ pub mod git;
 pub mod manifest;
 pub mod node_chan;
 pub mod store;
+pub mod time;
 pub mod token;
 
 pub(crate) mod util;

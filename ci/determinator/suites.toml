@@ -76,3 +76,4 @@ manifest = { packages = ["wicket-agent", "wicket-policy"] }
 store = { packages = ["wicket-store"] }
 git = { packages = ["wicket-core"] }
 canon = { packages = ["wicket-core"] }
+time = { packages = ["wicket-core"] }

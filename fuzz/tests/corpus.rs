@@ -57,6 +57,10 @@ fn git() {
 fn canon() {
     replay("canon", wicket_fuzz::canon::run);
 }
+#[test]
+fn time() {
+    replay("time", wicket_fuzz::time::run);
+}
 
 /// The egress oracle is only as good as its view of the origins: allowed requests get there.
 #[test]

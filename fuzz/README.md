@@ -16,6 +16,7 @@ These [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets fuzz those p
 | `store` | tree decoding and `Cas::checkout` | a tree that decodes re-encodes to its bytes; nothing is written outside the target, and no tampered object is checked out |
 | `git` | how a git push's requests are decided (`wicket_core::git`) | a push is decided as the push of its repository |
 | `canon` | canonicalize-or-reject: `canonical_host` and `canonical_path` (#361) | a host or path taken is taken again unchanged, and is what a URL parser makes of it (never an IP address; the path decided is the path sent) |
+| `time` | durations and times as manifests, operator files and flags write them (`wicket_core::time`, #437) | a duration or time that parses prints as one that parses back to itself; whitespace around a duration's terms changes nothing |
 
 Each target is a one-line binary in `fuzz_targets/` calling `wicket_fuzz::<target>::run`; the
 harnesses live in `src/`, with their oracles documented at the top of each file. The seed corpora in

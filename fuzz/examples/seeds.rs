@@ -21,6 +21,7 @@ fn main() {
     store();
     git();
     canon();
+    time();
 }
 
 const OLD: &str = "0000000000000000000000000000000000000000";
@@ -298,6 +299,36 @@ fn canon() {
         ("path-escape-lower", "/a%7bb"),
         ("path-unreserved-escape", "/%41"),
         ("path-trailing", "/a/b/"),
+    ] {
+        w(name, s);
+    }
+}
+
+/// Durations as manifests, operator files and flags write them, and times as `--at` and wicket
+/// print them (`wicket_core::time`'s tests, #437).
+fn time() {
+    let w = |name: &str, s: &str| write("time", name, s.as_bytes());
+    for (name, s) in [
+        ("zero", "0"),
+        ("timeout", "30m"),
+        ("ttl", "24h"),
+        ("terms", "1h 30m"),
+        ("terms-unspaced", "1d2h3m4s"),
+        ("fraction", "1.5h"),
+        ("words", "5 minutes"),
+        ("small", "1ms 2us 3ns"),
+        ("micro-sign", "1\u{b5}s"),
+        ("months-years", "1M 2years"),
+        ("largest", "18446744073709551615s"),
+        ("carry", "18446744073709551615s 500ms 500ms"),
+        ("bad-unit", "1x"),
+        ("no-unit", "3600"),
+        ("time", "2026-11-12T19:05:05Z"),
+        ("time-space", "2026-11-12 19:05:05"),
+        ("time-offset", "2026-11-12T19:05:05.123456789+00:00"),
+        ("time-leap", "2024-02-29T23:59:60Z"),
+        ("time-last", "9999-12-31T23:59:59Z"),
+        ("time-zz", "2026-11-12T19:05:05ZZ"),
     ] {
         w(name, s);
     }
