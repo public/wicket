@@ -260,6 +260,21 @@ pub struct NodeBox {
     pub ctl: Arc<NodeCtl>,
 }
 
+/// What a supervisor gives the box again when it hears from its node (#445, #453): on its first
+/// resume of a run it took over, the messages and prompts the supervisor before it took and the
+/// box never had; on every later resume (a reconnect), the messages it gave on the link that
+/// dropped and the node never said the box had. Its own prompts are in its stdin buffer, sent
+/// again from the node's count. How many messages, and prompts.
+fn requeue_on_resume(l: &wicket_store::Ledger, run: &str, first: bool, took_over: bool, stdin_received: u64) -> (usize, usize) {
+    match (first, took_over) {
+        (true, true) => {
+            (l.requeue_in_flight(run).unwrap_or(0), l.requeue_operator_messages(run, stdin_received).map(|v| v.len()).unwrap_or(0))
+        }
+        (true, false) => (0, 0),
+        (false, _) => (l.requeue_in_flight(run).unwrap_or(0), 0),
+    }
+}
+
 /// Stops and revokes a run's box on its node, connected or not (sent on the next connect).
 pub struct NodeCtl {
     node: String,
@@ -1038,13 +1053,13 @@ async fn session(
         // The first time this supervisor hears how far the node got (#445): a re-attached one gives
         // again what the supervisor before it took and its box never had, before this connection
         // answers anything.
-        if sh.ctl.stdin_base.set(p.stdin.end()).is_ok() && sh.attach {
-            let l = sh.ledger.lock().expect("ledger");
-            let messages = l.requeue_in_flight(&sh.run.0).unwrap_or(0);
-            let prompts = l.requeue_operator_messages(&sh.run.0, r.stdin_received).map(|v| v.len()).unwrap_or(0);
-            if messages + prompts > 0 {
-                say!("[wicket] giving the box again what it never had before this supervisor took over: {messages} message(s), {prompts} prompt(s)");
-            }
+        // And on every reconnect after that (#453): what it gave on the link that dropped and its
+        // node never said the box had. The node drops a repeat its box has had.
+        let first = sh.ctl.stdin_base.set(p.stdin.end()).is_ok();
+        let (messages, prompts) = requeue_on_resume(&sh.ledger.lock().expect("ledger"), &sh.run.0, first, sh.attach, r.stdin_received);
+        if messages + prompts > 0 {
+            let when = if first { "before this supervisor took over" } else { "before the link to its node dropped" };
+            say!("[wicket] giving the box again what it never had {when}: {messages} message(s), {prompts} prompt(s)");
         }
         say!("[wicket] node {} reconnected; resuming the box's output", sh.node);
         send(Frame::Msg(Msg::Resume { run: r.run.clone(), stdout_from: p.next[0], stderr_from: p.next[1] }));
@@ -1358,8 +1373,15 @@ async fn on_frame(
                         },
                         // Its node says when the box has had a message it carries (`MessageRead`).
                         (true, ..) if read_by_node => {
-                            let (text, is_error, _in_flight) = gw.call_tool_read(&tool.name(), args).await;
-                            (text, is_error)
+                            let (text, is_error, in_flight) = gw.call_tool_read(&tool.name(), args).await;
+                            // An answer that can't go (its link dropped while it waited) gives its
+                            // message again (#453): the reconnect's re-send may have come first.
+                            if out.send(Frame::Msg(Msg::Called { id, text, is_error })).is_err() {
+                                if let Some(m) = in_flight {
+                                    gw.message_not_read(&m);
+                                }
+                            }
+                            return;
                         }
                         (true, ..) => gw.call_tool(&tool.name(), args).await,
                     };
@@ -2248,6 +2270,30 @@ mod forget_tests {
         assert!(super::forget_refused(&l, crate::localnode::NAME, "run_a").is_none(), "this host's own node keeps them anyway");
         l.record_collected("run_a", "outbox").unwrap();
         assert!(super::forget_refused(&l, "n1", "run_a").is_none());
+    }
+
+    /// #453: a message the gateway gave on a link that dropped before its node said the box had
+    /// it is given again when the link comes back, once, by the same supervisor; one the box had
+    /// isn't. A supervisor that started the box has nothing to give again on its first resume.
+    #[test]
+    fn a_message_in_flight_when_the_link_drops_is_given_again_on_the_reconnect() {
+        let mut l = wicket_store::Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId("t".into());
+        l.add_message("m1", &t, "run_p", "run_a", "{}").unwrap();
+        l.add_message("m2", &t, "run_p", "run_a", "{}").unwrap();
+        // The box's first connection: nothing to give again.
+        assert_eq!(super::requeue_on_resume(&l, "run_a", true, false, 0), (0, 0));
+        // await_message gives m1 and m2; the node says the box had m2; the link drops before m1's.
+        let m1 = l.take_message_in_flight("run_a").unwrap().unwrap().id;
+        let m2 = l.take_message_in_flight("run_a").unwrap().unwrap().id;
+        assert!(l.message_read("run_a", &m2).unwrap());
+        assert!(l.take_message_in_flight("run_a").unwrap().is_none(), "m1 is in flight, not waiting");
+        // The link comes back, the same supervisor: m1 is given again, once.
+        assert_eq!(super::requeue_on_resume(&l, "run_a", false, false, 0), (1, 0));
+        assert_eq!(l.take_message_in_flight("run_a").unwrap().unwrap().id, m1);
+        assert!(l.take_message_in_flight("run_a").unwrap().is_none(), "once, and never m2");
+        assert!(l.message_read("run_a", &m1).unwrap());
+        assert_eq!(super::requeue_on_resume(&l, "run_a", false, true, 0), (0, 0), "a reconnect with nothing in flight");
     }
 
     /// #257 slice 4b: a box starts only on a node talking protocol 13, where its gateway's control
