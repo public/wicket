@@ -21,7 +21,7 @@ CONSTANTS
     MaxCrashes,
     \* Design switches: TRUE is the proposed design, FALSE today's code.
     FinishInLedger,     \* the agent's finish is recorded in the ledger, not only in its supervisor
-    AckAfterHand,       \* a message is marked delivered once the box has it (and a box drops a repeat)
+    AckAfterHand,       \* a message is marked delivered once the box has it, and a box drops a repeat (#445)
     WakeAfterAuthority  \* a lapsed holder's agent is woken only once every box of it has stopped
 
 NONE == "none"
