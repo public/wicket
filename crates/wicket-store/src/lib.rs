@@ -101,8 +101,10 @@ pub enum StoreError {
 /// table: when and how a run's work was collected, which a cleanup checks before it deletes the
 /// run's workspace (#377). Version 14 (expand) adds `runs.stuck_at`: when the parent of a child run
 /// whose supervisor runs in its process found it still running after asking it to stop, so the
-/// reconciler and `wicket top` show it as stuck (#409).
-pub const SCHEMA_VERSION: u32 = 14;
+/// reconciler and `wicket top` show it as stuck (#409). Version 15 (expand) adds `runs.want`: what
+/// the agent asked of its own run, `finish` or `hibernate` (#249), recorded when it asks, so a
+/// supervisor that re-attaches after a control-host restart still acts on it (#444).
+pub const SCHEMA_VERSION: u32 = 15;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
@@ -279,7 +281,7 @@ CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
   status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT, policy TEXT,
   authority_until INTEGER, authority_cap INTEGER, activity TEXT, activity_at INTEGER, uncollected TEXT,
-  stuck_at INTEGER
+  stuck_at INTEGER, want TEXT
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -523,6 +525,8 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN uncollected TEXT", []);
         // Ledgers created before a child's stuck supervisor was recorded (#409).
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN stuck_at INTEGER", []);
+        // Ledgers created before an agent's finish or hibernate was recorded for its run (#444).
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN want TEXT", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 

@@ -428,6 +428,15 @@ impl Gateway {
         if w == wicket_proxy::Want::Hibernate && self.ctx.fence.is_none() {
             return ("this run can't hibernate: only a long-lived agent wicket started itself can (not a child, a wrapped session or a Remote Control session); call finish when you are done".into(), true);
         }
+        // On the record first (#444): a supervisor that re-attaches after a control-host restart
+        // acts on it, as this one would have at the end of the turn.
+        let recorded = match w {
+            wicket_proxy::Want::Finish => "finish",
+            wicket_proxy::Want::Hibernate => "hibernate",
+        };
+        if let Err(e) = self.ctx.ledger.lock().expect("ledger").record_run_want(&self.ctx.run.0, recorded) {
+            return (format!("not recorded: {e}"), true);
+        }
         if tx.send(w).is_err() {
             return ("this run's supervisor is gone".into(), true);
         }
@@ -1517,6 +1526,30 @@ mod tests {
             waker: None,
             lifecycle: None,
         }
+    }
+
+    /// #444: the agent's finish is on the record when its tool answers, so a control-host restart
+    /// between the call and the end of its turn doesn't lose it: the supervisor that re-attaches
+    /// (`run --attach`, after the reconciler adopts the box) reads it and closes the session.
+    #[tokio::test]
+    async fn a_finish_asked_before_a_restart_is_known_to_the_supervisor_after_it() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let mut ctx = w.agent("t0", "z", "a", "run_f", None, &[]);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.lifecycle = Some(tx);
+        let gw = Gateway::new(ctx);
+        let (text, is_error) = gw.call_tool("finish", serde_json::json!({})).await;
+        assert!(!is_error, "{text}");
+        // The control host stops before the turn ends: the supervisor that was told goes, and with
+        // it what it knew.
+        drop(rx);
+        drop(gw);
+        let run = RunId("run_f".into());
+        let asked = crate::run::asked_of(&w.ledger, &run);
+        assert_eq!(asked, crate::run::Asked { finish: true, hibernate: false }, "the re-attached supervisor knows");
+        // A run whose agent asked nothing re-attaches with nothing to do.
+        let _other = w.agent("t0", "z", "b", "run_g", None, &[]);
+        assert_eq!(crate::run::asked_of(&w.ledger, &RunId("run_g".into())), crate::run::Asked::default());
     }
 
     #[tokio::test]

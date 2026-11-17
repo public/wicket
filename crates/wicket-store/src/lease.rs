@@ -317,6 +317,25 @@ impl Ledger {
             .flatten())
     }
 
+    /// Records what the agent asked of its own run (#249, #444): `finish` (its session ends at the
+    /// end of its turn) or `hibernate`. Recorded when it asks, before its supervisor acts, so a
+    /// supervisor that re-attaches after a control-host restart ([`Ledger::run_want`]) acts on it
+    /// too. A finish is never replaced by a later hibernate: the session ends either way.
+    pub fn record_run_want(&self, run: &str, want: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE runs SET want = CASE WHEN want = 'finish' THEN 'finish' ELSE ?2 END WHERE id = ?1", params![run, want])?;
+        Ok(())
+    }
+
+    /// What the agent asked of `run` ([`Ledger::record_run_want`]), if anything.
+    pub fn run_want(&self, run: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT want FROM runs WHERE id = ?1", params![run], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten())
+    }
+
     /// Records that a run was placed on a lease's node (`spawn` with `placement: {lease}`): when the
     /// lease ends, the reconciler stops it.
     pub fn set_run_lease(&self, run: &str, lease: &str) -> Result<()> {
@@ -590,6 +609,22 @@ mod tests {
         l.set_run_stuck("run_c", 2000).unwrap();
         assert_eq!(l.run_stuck("run_c").unwrap(), None);
         assert_eq!(l.run_stuck("run_none").unwrap(), None);
+    }
+
+    /// #444: what the agent asked of its run is on the record for a supervisor that re-attaches,
+    /// and a finish isn't replaced by a hibernate asked after it.
+    #[test]
+    fn an_agents_finish_or_hibernate_is_recorded_on_its_run() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.run_started(&TenantId("t".into()), &RunId("run_a".into()), "z", "a").unwrap();
+        assert_eq!(l.run_want("run_a").unwrap(), None);
+        l.record_run_want("run_a", "hibernate").unwrap();
+        assert_eq!(l.run_want("run_a").unwrap().as_deref(), Some("hibernate"));
+        l.record_run_want("run_a", "finish").unwrap();
+        assert_eq!(l.run_want("run_a").unwrap().as_deref(), Some("finish"));
+        l.record_run_want("run_a", "hibernate").unwrap();
+        assert_eq!(l.run_want("run_a").unwrap().as_deref(), Some("finish"), "a finish stays");
+        assert_eq!(l.run_want("run_none").unwrap(), None);
     }
 
     #[test]
