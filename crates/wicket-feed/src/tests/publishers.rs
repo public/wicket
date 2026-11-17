@@ -6,8 +6,8 @@ use super::*;
 
 /// A second publisher on the control plane's feed (another process), as `wicket` keeps one: reopened
 /// from the log, and told the last statement time the others signed.
-fn other(cp: &Cp, last_issued: i64) -> Publisher<ZoneSpec> {
-    let mut p = Publisher::open(cp.dir.path(), NODE, &cp.root.verifying_key(), cp.feed_key.clone(), &cp.cert, cfg()).unwrap();
+fn other(cp: &Cp, last_issued: i64) -> Publisher<BoxAuthority> {
+    let mut p = cp.open_publisher(cfg());
     p.note_issued(last_issued);
     p
 }
@@ -111,7 +111,8 @@ fn a_delta_another_publishers_catch_up_carried_first_is_not_a_replay() {
 #[test]
 fn a_late_statement_older_than_the_nodes_history_is_superseded() {
     let mut cp = Cp::new();
-    cp.p.commit(vec![Change::PutZone { zone: zone("z") }], T0 - 10).unwrap();
+    let put = cp.put("r1");
+    cp.p.commit(vec![put], T0 - 10).unwrap();
     // Another run signs for the feed's first epoch, then two deltas are committed and signed for.
     let early = cp.p.statement(T0);
     let early_epoch = cp.p.epoch();

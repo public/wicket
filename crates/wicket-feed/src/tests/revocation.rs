@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn revoke(kind: RevokeKind, id: &str, until: i64) -> Change<ZoneSpec> {
+fn revoke(kind: RevokeKind, id: &str, until: i64) -> Change<BoxAuthority> {
     Change::Revoke { kind, id: id.into(), until }
 }
 
@@ -13,11 +13,15 @@ fn a_revoked_grant_stops_as_soon_as_the_delta_applies() {
     let d = cp.p.commit(vec![revoke(RevokeKind::Grant, "keep-1", T0 + 3_600_000)], T0 + 2).unwrap();
     r.accept(&d, T0 + 2).unwrap();
     assert!(matches!(r.decide(&granted(), T0 + 2), Decision::NeedsGrant(_)));
-    assert!(matches!(r.escalate(&Escalation::GrantHold { zone: "z", grant: "keep-1", ttl_ms: 1_000 }, T0 + 2), Decision::NeedsGrant(_)));
-    // Re-adding a revoked id does nothing.
-    let d = cp.p.commit(vec![add(grant("keep-1", &granted(), T0 + 3_600_000))], T0 + 3).unwrap();
+    assert!(matches!(r.escalate(&Escalation::GrantHold { zone: ZONE, grant: "keep-1", ttl_ms: 1_000 }, T0 + 2), Decision::NeedsGrant(_)));
+    // The token itself still decides.
+    assert!(allowed(&mut r, &read(), T0 + 2));
+    // Publishing the token with the revoked grant again (and re-adding the feed grant) does nothing.
+    let again = cp.put("r1");
+    let d = cp.p.commit(vec![again, add(grant("keep-1", &granted(), T0 + 3_600_000))], T0 + 3).unwrap();
     r.accept(&d, T0 + 3).unwrap();
     assert!(!allowed(&mut r, &granted(), T0 + 3));
+    assert!(!r.state().unwrap().grants.contains_key("keep-1"));
 }
 
 #[test]
@@ -26,16 +30,21 @@ fn a_revoked_run_is_refused_everything_at_once() {
     let d = cp.p.commit(vec![revoke(RevokeKind::Run, "r1", T0 + 3_600_000)], T0 + 2).unwrap();
     r.accept(&d, T0 + 2).unwrap();
     for o in [read(), write(), granted()] {
-        assert!(matches!(r.decide(&o, T0 + 2), Decision::Forbidden(_)), "{o:?}");
+        let d = r.decide(&o, T0 + 2);
+        assert!(matches!(&d, Decision::Forbidden(w) if w.contains("revoked")), "{o:?}: {d:?}");
     }
-    assert!(allowed(&mut r, &op("z", "r2", "GET", "api.github.com", "/repos/acme/app"), T0 + 2), "other runs carry on");
+    assert!(allowed(&mut r, &op(ZONE, "r2", "GET", "api.github.com", "/repos/acme/app"), T0 + 2), "other runs carry on");
     // Still refused while offline.
     assert!(matches!(r.decide(&read(), T0 + TTL + 1), Decision::Forbidden(_)));
-    // Token revocation ids are held for the capability layer.
-    let d = cp.p.commit(vec![revoke(RevokeKind::Token, "link-abc", T0 + 3_600_000)], T0 + 3).unwrap();
+    // Token revocation ids are held for the capability layer, and refuse every token containing
+    // the block they name: r2's block 0 takes r2.
+    let block0 = cp.block_ids("r2")[0].clone();
+    let d = cp.p.commit(vec![revoke(RevokeKind::Token, &block0, T0 + 3_600_000)], T0 + 3).unwrap();
     r.accept(&d, T0 + 3).unwrap();
-    assert!(r.state().unwrap().is_revoked(RevokeKind::Token, "link-abc"));
-    assert!(!r.state().unwrap().is_revoked(RevokeKind::Grant, "link-abc"));
+    assert!(r.state().unwrap().is_revoked(RevokeKind::Token, &block0));
+    assert!(!r.state().unwrap().is_revoked(RevokeKind::Grant, &block0));
+    let d = r.decide(&op(ZONE, "r2", "GET", "api.github.com", "/repos/acme/app"), T0 + 3);
+    assert!(matches!(&d, Decision::Forbidden(w) if w.contains("revoked")), "{d:?}");
 }
 
 #[test]
@@ -71,7 +80,7 @@ fn the_revoked_set_stays_bounded() {
     let d = cp.p.commit(vec![revoke(RevokeKind::Grant, "a", T0 + 1_000), revoke(RevokeKind::Run, "b", T0 + 9_000_000)], T0 + 1).unwrap();
     r.accept(&d, T0 + 1).unwrap();
     assert_eq!(r.state().unwrap().revoked_len(), 2);
-    // A snapshot after `until` no longer carries the entry; nor the expired grant.
+    // A snapshot after `until` no longer carries the entry; nor the expired feed grant.
     let mut r2 = cp.replica();
     let frames = cp.p.catch_up(&r2.hello(), T0 + 3_600_001).unwrap();
     feed(&mut r2, frames, T0 + 3_600_001);

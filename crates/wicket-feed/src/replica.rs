@@ -51,8 +51,6 @@
 //! [`Replica::reset`], which keeps only the use counts and comes up [`Mode::Closed`] until a live
 //! statement arrives.
 
-#[cfg(test)]
-use crate::format::Grant;
 use crate::format::{Delta, Frame, FrameKind, Fresh, Hello, KeyCert, RevokeKind, Snapshot};
 use crate::jws::{kid, open, sha, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
 use crate::state::{Policy, State, Zone};
@@ -63,8 +61,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use wicket_core::Op;
-#[cfg(test)]
-use wicket_core::{Verdict, ZoneSpec};
 
 /// The node's mode, from its own clock and the signed deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -848,54 +844,6 @@ impl<P: Policy> Replica<P> {
         }
         *self.used.entry(id.to_string()).or_default() += 1;
         Ok(())
-    }
-}
-
-/// The test-only decide path for zones as plain specs (this crate's tests of the feed itself).
-#[cfg(test)]
-impl Replica<ZoneSpec> {
-    fn live_grant(&self, st: &State<ZoneSpec>, g: &Grant, op: &Op, now: i64) -> bool {
-        g.zone == op.zone
-            && g.not_after > now
-            && !st.is_revoked(RevokeKind::Grant, &g.id)
-            && g.box_id.as_ref().is_none_or(|b| *b == op.run.0)
-            // A counted grant without a box could be honoured on several nodes, each counting
-            // separately: never here (the publisher refuses to publish one; this covers older feeds).
-            && (g.uses.is_none() || g.box_id.is_some())
-            && g.uses.is_none_or(|max| self.uses(&g.id) < max)
-    }
-
-    /// The decision for one op at `now`: the mode, the zone's compiled policy, the live grants
-    /// (consuming one use of a counted grant) and the revocations. See the crate docs for the rule.
-    pub fn decide(&mut self, op: &Op, now: i64) -> Decision {
-        let (mode, st) = match self.gate(op, now) {
-            Ok(v) => v,
-            Err(d) => return d,
-        };
-        let refused = |why: String| Decision::Refused { mode, why };
-        let Some(zone) = st.zones.get(&op.zone) else { return Decision::Forbidden(format!("unknown zone {}", op.zone)) };
-        match zone.evaluate(op) {
-            Verdict::Forbidden(r) => Decision::Forbidden(r),
-            Verdict::AllowByReach(i) => Decision::Allow(Allowed::Reach(i)),
-            Verdict::NeedsGrant(r) => {
-                let digest = op.digest();
-                let found = st
-                    .by_op
-                    .get(&digest)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|id| st.grants.get(id))
-                    .find(|g| self.live_grant(st, g, op, now))
-                    .map(|g| (g.id.clone(), g.uses.is_some()));
-                let Some((id, counted)) = found else { return Decision::NeedsGrant(r) };
-                if counted {
-                    if let Err(e) = self.record_use(&id) {
-                        return refused(e);
-                    }
-                }
-                Decision::Allow(Allowed::Grant(id))
-            }
-        }
     }
 }
 

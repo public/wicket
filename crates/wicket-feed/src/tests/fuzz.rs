@@ -67,7 +67,10 @@ fn random_and_mutated_frames_never_panic_and_never_verify() {
     let (mut cp, mut r) = setup();
     // Valid frames the node has not accepted yet: a delta, a statement, a snapshot and a new
     // certificate. Each would be accepted as is.
-    let next_delta = cp.p.commit(vec![add(grant("next", &evil(), T0 + 3_600_000))], T0 + 1).unwrap();
+    // The delta publishes r1's token with a grant for the attacker's op: a mutation that verified
+    // would hand it over.
+    let next = Change::PutZone { zone: cp.boxed_with("r1", &[token_grant("next", &evil(), T0 + 3_600_000, None)]) };
+    let next_delta = cp.p.commit(vec![next], T0 + 1).unwrap();
     let next_fresh = cp.p.statement(T0 + 2);
     let next_snap = cp.p.snapshot(T0 + 3);
     let v2 = cert(&cp.root, &cp.feed_key, 2, T0 + 86_400_000);
@@ -106,10 +109,12 @@ fn random_and_mutated_frames_never_panic_and_never_verify() {
     assert_eq!((st.epoch, &st.head, st.version), (epoch, &head, 1));
     assert_eq!(r.stats.accepted, accepted_before);
     assert_eq!(r.mode(now), Mode::Fresh);
+    assert!(matches!(r.decide(&evil(), now), Decision::NeedsGrant(_)));
     // The seeds themselves are fine.
     for seed in &seeds[..2] {
         r.accept_bytes(seed.to_line().as_bytes(), now).unwrap();
     }
+    assert_eq!(r.decide(&evil(), now), Decision::Allow(Allowed::Grant("next".into())));
 }
 
 #[test]
