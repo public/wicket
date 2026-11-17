@@ -127,6 +127,13 @@ pub struct AgentSpec {
     /// Harness adapters that have no such mode refuse it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteSpec>,
+    /// The box's hostname (#469): a name of 1-63 letters, digits and '-' (not starting or ending
+    /// with '-'), or `node` for the name of the node it runs on (the control host's own node: the
+    /// host's name). Unset: Docker's (the container's id), except for a Remote Control server
+    /// (`remote.spawn: same-dir`), whose machine the Claude apps show by its hostname: its node's
+    /// name, so each node shows up as itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     /// For `harness: acp`: how to start the agent in its box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp: Option<AcpSpec>,
@@ -162,6 +169,75 @@ pub struct RemoteSpec {
     /// Left out when false, so manifests that don't set it serialize as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub drive: bool,
+    /// What the session is (#469): `session` (the default), one session the box ends with; or
+    /// `same-dir`, a Remote Control server that registers the box as a machine in the Claude apps
+    /// and starts a session there each time one is asked for, in the same directory. Left out when
+    /// `session`, so manifests that don't set it serialize as before.
+    #[serde(default, skip_serializing_if = "RemoteSpawn::is_session")]
+    pub spawn: RemoteSpawn,
+}
+
+/// `agent.remote.spawn`: the values `claude remote-control --spawn` takes that wicket runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteSpawn {
+    /// One session; the box ends with it.
+    #[default]
+    Session,
+    /// A server: sessions started from the apps, each in the box's directory.
+    SameDir,
+}
+
+impl RemoteSpawn {
+    fn is_session(&self) -> bool {
+        *self == RemoteSpawn::Session
+    }
+
+    /// As `claude remote-control --spawn` takes it.
+    pub fn as_arg(&self) -> &'static str {
+        match self {
+            RemoteSpawn::Session => "session",
+            RemoteSpawn::SameDir => "same-dir",
+        }
+    }
+}
+
+/// Whether `s` is a hostname a box may be given (#469): 1-63 ASCII letters, digits and '-', not
+/// starting or ending with '-'.
+pub fn hostname_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+}
+
+impl AgentSpec {
+    /// The box's hostname on node `node` (#469): `agent.hostname`, with `node` meaning the node's
+    /// name, or the node's name for a Remote Control server; None: Docker's own. A node name that
+    /// can't be a hostname (it can't, by enrolment's rules, but the local host's may) is made one:
+    /// lowercase, other characters as '-', at most 63.
+    pub fn hostname_on(&self, node: &str) -> Option<String> {
+        let server = self.remote.as_ref().is_some_and(|r| r.spawn == RemoteSpawn::SameDir);
+        match self.hostname.as_deref() {
+            Some("node") => Some(as_hostname(node)),
+            Some(h) => Some(h.to_string()),
+            None if server => Some(as_hostname(node)),
+            None => None,
+        }
+    }
+}
+
+/// `name` as a hostname: lowercase ASCII letters, digits and '-' (anything else as '-'), trimmed of
+/// '-' at either end, at most 63; `wicket` if nothing is left.
+fn as_hostname(name: &str) -> String {
+    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).take(63).collect();
+    let s = s.trim_matches('-');
+    if s.is_empty() {
+        "wicket".into()
+    } else {
+        s.into()
+    }
 }
 
 impl RemoteSpec {
@@ -911,6 +987,11 @@ impl Manifest {
                         )));
                     }
                 }
+                if let Some(h) = a.hostname.as_deref().filter(|h| *h != "node" && !hostname_ok(h)) {
+                    return Err(ManifestError::Invalid(format!(
+                        "agent.hostname {h:?}: 1-63 letters, digits and '-' (not first or last), or `node` for its node's name"
+                    )));
+                }
                 if a.image.as_deref().is_some_and(|i| i.trim().is_empty()) {
                     return Err(ManifestError::Invalid("agent.image is empty: name an image, or leave it out for the default".into()));
                 }
@@ -921,6 +1002,11 @@ impl Manifest {
                             && r.name.chars().all(|c| c.is_ascii_alphanumeric() || " -_.".contains(c));
                         if !ok {
                             return Err(ManifestError::Invalid("agent.remote.name: 1-64 letters, digits, spaces, '-', '_' or '.'".into()));
+                        }
+                        if r.drive && r.spawn == RemoteSpawn::SameDir {
+                            return Err(ManifestError::Invalid(
+                                "agent.remote: a server (spawn: same-dir) starts the sessions the apps ask for, so wicket doesn't drive it (drive)".into(),
+                            ));
                         }
                         if r.drive && self.task.trim().is_empty() {
                             return Err(ManifestError::Invalid(
@@ -1461,6 +1547,28 @@ zone:
 
     fn m_mode(y: &dyn Fn(&str) -> Result<Manifest, ManifestError>, extra: &str) -> Result<RemotePermissionMode, ManifestError> {
         Ok(y(&format!(", remote: {{ name: x{extra} }}"))?.agent.unwrap().remote.unwrap().permission_mode())
+    }
+
+    /// #469: a box's hostname is a name or its node's; a Remote Control server takes its node's
+    /// unless it says otherwise; and a server isn't driven.
+    #[test]
+    fn a_box_hostname_is_a_name_or_its_nodes_and_a_server_takes_its_nodes() {
+        let y = |agent: &str| Manifest::from_yaml(&format!("agent: {{ name: a{agent} }}\nzone: {{ name: z, llm: {{}} }}\n"));
+        let host = |agent: &str, node: &str| y(agent).unwrap().agent.unwrap().hostname_on(node);
+        assert_eq!(host(", remote: { name: x }", "pc5800"), None, "a session keeps Docker's");
+        assert_eq!(host(", remote: { name: x }, hostname: dev-1", "pc5800").as_deref(), Some("dev-1"));
+        assert_eq!(host(", remote: { name: x }, hostname: node", "pc5800").as_deref(), Some("pc5800"));
+        assert_eq!(host(", remote: { name: x, spawn: same-dir }", "claude-box").as_deref(), Some("claude-box"));
+        assert_eq!(host(", remote: { name: x, spawn: same-dir }, hostname: other", "claude-box").as_deref(), Some("other"));
+        assert_eq!(host(", remote: { name: x, spawn: same-dir }", "My_Host.lan").as_deref(), Some("my-host-lan"), "made a hostname");
+        for bad in ["''", "-a", "a-", "a.b", "'a b'", &"x".repeat(64)] {
+            assert!(y(&format!(", remote: {{ name: x }}, hostname: {bad}")).is_err(), "{bad}");
+        }
+        assert!(y(", remote: { name: x, spawn: forever }").is_err());
+        assert!(y(", remote: { name: x, spawn: same-dir, drive: true }").is_err(), "a server isn't driven");
+        let rc = crate::yaml::to_string(&y(", remote: { name: x }").unwrap()).unwrap();
+        assert!(!rc.contains("spawn") && !rc.contains("hostname"), "unset, left out: {rc}");
+        assert_eq!(RemoteSpawn::SameDir.as_arg(), "same-dir");
     }
 
     #[test]
