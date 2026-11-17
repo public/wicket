@@ -1523,6 +1523,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         run: run.clone(),
                         zone: m.zone.name.clone(),
                         may_ask: m.zone.escalation.request,
+                        bypass: match mode {
+                            Some(wicket_agent::harness::Mode::DrivenRemote(r)) => {
+                                r.permission_mode() == wicket_core::manifest::RemotePermissionMode::BypassPermissions
+                            }
+                            // The driven mode runs in bypassPermissions (wicket-agent's driven plan).
+                            _ => true,
+                        },
                     },
                 )
             })
