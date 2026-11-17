@@ -1,4 +1,11 @@
 //! Tests. Keys are generated at runtime; time is injected (`T0` and offsets, Unix ms).
+//!
+//! The feed carries boxes' authority ([`BoxAuthority`]: one record per run id, its token minted
+//! with a test authority root), and the node decides through [`Replica::<BoxAuthority>::decide`],
+//! the same path nodes use. Grants a decision relies on are the token's own grant blocks (signed
+//! with a test approver key); the feed's [`Grant`]s are still carried (and read by
+//! [`Replica::escalate`]'s grant holds), and serve as plain chain content where a test only needs a
+//! delta.
 
 mod attacks;
 mod fuzz;
@@ -10,13 +17,17 @@ mod skew;
 
 use crate::*;
 use ed25519_dalek::SigningKey;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use wicket_authz as authz;
 use wicket_core::{Op, RunId, TenantId, ZoneSpec};
 
 pub(crate) const T0: i64 = 1_800_000_000_000;
 pub(crate) const NODE: &str = "n1";
 /// A scaled-down TTL and window so the arithmetic in tests is easy to read.
 pub(crate) const TTL: i64 = 3_000;
+/// The zone every box's token is minted from.
+pub(crate) const ZONE: &str = "z";
 
 pub(crate) fn key() -> SigningKey {
     SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng))
@@ -45,9 +56,10 @@ impl Drop for TempDir {
     }
 }
 
-pub(crate) fn zone(name: &str) -> ZoneSpec {
+/// The zone boxes' tokens are minted from: reads and writes by reach, a forbidden host.
+pub(crate) fn zone_spec() -> ZoneSpec {
     serde_json::from_value(serde_json::json!({
-        "name": name,
+        "name": ZONE,
         "reach": [{"host": "api.github.com", "methods": ["GET", "PUT", "POST"], "paths": ["/repos/acme/**"]}],
         "forbid": [{"host": "evil.example.com"}],
     }))
@@ -58,26 +70,53 @@ pub(crate) fn op(zone: &str, run: &str, method: &str, host: &str, path: &str) ->
     Op::egress(&TenantId::single(), &RunId(run.into()), zone, method, host, path)
 }
 
-/// A plain read (R1, allowed by reach).
+/// A plain read (R1, allowed by the token's ceiling).
 pub(crate) fn read() -> Op {
-    op("z", "r1", "GET", "api.github.com", "/repos/acme/app/issues")
+    op(ZONE, "r1", "GET", "api.github.com", "/repos/acme/app/issues")
 }
-/// A write allowed by reach (R2).
+/// A write allowed by the token's ceiling (R2).
 pub(crate) fn write() -> Op {
-    op("z", "r1", "PUT", "api.github.com", "/repos/acme/app/contents/README.md")
+    op(ZONE, "r1", "PUT", "api.github.com", "/repos/acme/app/contents/README.md")
 }
-/// Posts a comment (R3): needs a grant; `keep-1` grants it.
+/// Posts a comment (R3): needs a grant; `keep-1` (in r1's token) grants it.
 pub(crate) fn granted() -> Op {
-    op("z", "r1", "POST", "api.github.com", "/repos/acme/app/issues/1/comments")
+    op(ZONE, "r1", "POST", "api.github.com", "/repos/acme/app/issues/1/comments")
 }
 /// Adds a webhook (R4): needs a grant nobody has; the attacker's target.
 pub(crate) fn evil() -> Op {
-    op("z", "r1", "POST", "api.github.com", "/repos/acme/app/hooks")
+    op(ZONE, "r1", "POST", "api.github.com", "/repos/acme/app/hooks")
 }
 pub(crate) fn forbidden() -> Op {
-    op("z", "r1", "GET", "evil.example.com", "/")
+    op(ZONE, "r1", "GET", "evil.example.com", "/")
 }
 
+/// Whole seconds of a time in ms.
+pub(crate) fn secs(ms: i64) -> u64 {
+    u64::try_from(ms.div_euclid(1000)).unwrap()
+}
+
+/// A token grant for `o` (whichever box it is published in: [`Issuer::publish`] binds it), live
+/// while `now < not_after` (ms, a whole second), as the ledger's grants are.
+pub(crate) fn token_grant(id: &str, o: &Op, not_after: i64, uses: Option<u32>) -> LiveGrant {
+    assert_eq!(not_after % 1000, 0, "token grants end on a whole second");
+    LiveGrant {
+        grant: authz::Grant {
+            gid: id.into(),
+            box_id: String::new(),
+            epoch: 0,
+            host: o.host.clone(),
+            method: o.method.clone(),
+            path: o.path.clone(),
+            not_after: authz::Grant::not_after_for(not_after / 1000),
+            approver: "human:test".into(),
+            digest: o.digest().into_bytes(),
+        },
+        uses,
+    }
+}
+
+/// A feed grant: carried by the feed's state and read by [`Replica::escalate`]'s grant holds, never
+/// by decisions (those use the token's grants).
 pub(crate) fn grant(id: &str, o: &Op, not_after: i64) -> Grant {
     Grant {
         id: id.into(),
@@ -90,17 +129,22 @@ pub(crate) fn grant(id: &str, o: &Op, not_after: i64) -> Grant {
     }
 }
 
-pub(crate) fn add(g: Grant) -> Change<ZoneSpec> {
+pub(crate) fn add(g: Grant) -> Change<BoxAuthority> {
     Change::AddGrant { grant: g }
 }
 
-/// The control plane: a root key, a feed key and its certificate, and a publisher.
+/// The control plane: a feed root key, a feed key and its certificate, a publisher, and the
+/// authority root and approver that mint boxes' tokens and sign their grants.
 pub(crate) struct Cp {
     pub(crate) root: SigningKey,
     pub(crate) feed_key: SigningKey,
     pub(crate) cert: String,
-    pub(crate) p: Publisher<ZoneSpec>,
+    pub(crate) authz_root: authz::SigningKey,
+    pub(crate) approver: authz::SigningKey,
+    pub(crate) p: Publisher<BoxAuthority>,
     pub(crate) dir: TempDir,
+    /// Each box's issuer and the live grants its token carries.
+    boxes: BTreeMap<String, (Issuer, Vec<LiveGrant>)>,
 }
 
 pub(crate) fn cfg() -> PublisherConfig {
@@ -118,32 +162,100 @@ impl Cp {
 
     pub(crate) fn with(cfg: PublisherConfig, cert_not_after: i64) -> Cp {
         let (root, feed_key, dir) = (key(), key(), TempDir::new());
+        let authz_root = authz::SigningKey::generate();
         let cert = cert(&root, &feed_key, 1, cert_not_after);
-        let p = Publisher::open(dir.path(), NODE, &root.verifying_key(), feed_key.clone(), &cert, cfg).unwrap();
-        Cp { root, feed_key, cert, p, dir }
+        let p = Publisher::open_with(dir.path(), NODE, &root.verifying_key(), feed_key.clone(), &cert, cfg, authz_root.public()).unwrap();
+        Cp { root, feed_key, cert, authz_root, approver: authz::SigningKey::generate(), p, dir, boxes: BTreeMap::new() }
     }
 
-    pub(crate) fn replica(&self) -> Replica<ZoneSpec> {
-        Replica::new(NODE, self.root.verifying_key(), ReplicaConfig::default())
+    pub(crate) fn replica(&self) -> Replica<BoxAuthority> {
+        Replica::new_with(NODE, self.root.verifying_key(), ReplicaConfig::default(), self.authz_root.public())
+    }
+
+    /// A publisher on this feed's log (a control-plane restart, or another process).
+    pub(crate) fn open_publisher(&self, cfg: PublisherConfig) -> Publisher<BoxAuthority> {
+        Publisher::open_with(
+            self.dir.path(),
+            NODE,
+            &self.root.verifying_key(),
+            self.feed_key.clone(),
+            &self.cert,
+            cfg,
+            self.authz_root.public(),
+        )
+        .unwrap()
     }
 
     /// Reopens the publisher from its log (a control-plane restart).
     pub(crate) fn restart(&mut self, cfg: PublisherConfig) {
-        self.p = Publisher::open(self.dir.path(), NODE, &self.root.verifying_key(), self.feed_key.clone(), &self.cert, cfg).unwrap();
+        self.p = self.open_publisher(cfg);
+    }
+
+    /// Box `run`'s issuer: block 0 minted by the authority root from [`zone_spec`], for a day,
+    /// accepting the approver's grants. Minted once per box.
+    fn issuer(&mut self, run: &str) -> Issuer {
+        let (root, approver) = (&self.authz_root, self.approver.public());
+        let tenant = TenantId::single().0;
+        self.boxes
+            .entry(run.to_string())
+            .or_insert_with(|| {
+                let i = Issuer::root(root, &tenant, "trigger:t", run, 0, &zone_spec(), &[], secs(T0) + 86_400, vec![approver]).unwrap();
+                (i, vec![])
+            })
+            .0
+            .clone()
+    }
+
+    /// Box `run`'s record as published now: its token with the live grants it holds.
+    pub(crate) fn boxed(&mut self, run: &str) -> BoxAuthority {
+        self.boxed_with(run, &[])
+    }
+
+    /// Box `run`'s record with `extra` grants besides the ones it holds, without keeping them (what
+    /// an attacker with the approver key would publish).
+    pub(crate) fn boxed_with(&mut self, run: &str, extra: &[LiveGrant]) -> BoxAuthority {
+        let issuer = self.issuer(run);
+        let mut grants = self.boxes[run].1.clone();
+        grants.extend(extra.iter().cloned());
+        issuer.publish(&self.approver, &grants).unwrap()
+    }
+
+    /// Box `run`'s token's revocation ids (block 0 first).
+    pub(crate) fn block_ids(&mut self, run: &str) -> Vec<String> {
+        self.issuer(run).block_ids()
+    }
+
+    /// Adds `g` to box `run`'s live grants: the change that publishes its rebuilt token.
+    pub(crate) fn grant(&mut self, run: &str, g: LiveGrant) -> Change<BoxAuthority> {
+        self.issuer(run);
+        self.boxes.get_mut(run).unwrap().1.push(g);
+        self.put(run)
+    }
+
+    /// The change that publishes box `run`'s record.
+    pub(crate) fn put(&mut self, run: &str) -> Change<BoxAuthority> {
+        Change::PutZone { zone: self.boxed(run) }
+    }
+
+    /// The first delta of a control plane: boxes `r1` (holding `keep-1`, for [`granted`], until
+    /// T0 + 1 h) and `r2`, and the feed grant `keep-1` (for grant holds).
+    pub(crate) fn initial(&mut self) -> Vec<Change<BoxAuthority>> {
+        let keep = self.grant("r1", token_grant("keep-1", &granted(), T0 + 3_600_000, None));
+        vec![keep, self.put("r2"), add(grant("keep-1", &granted(), T0 + 3_600_000))]
     }
 }
 
-pub(crate) fn feed(r: &mut Replica<ZoneSpec>, frames: Vec<Frame>, now: i64) {
+pub(crate) fn feed(r: &mut Replica<BoxAuthority>, frames: Vec<Frame>, now: i64) {
     for f in frames {
         r.accept(&f, now).unwrap_or_else(|e| panic!("{:?} refused: {e}", f.kind));
     }
 }
 
-/// A control plane with zone `z` and grant `keep-1` (for [`granted`]) at epoch 1, and a node that
-/// caught up and is fresh at `T0`.
-pub(crate) fn setup() -> (Cp, Replica<ZoneSpec>) {
+/// A control plane with [`Cp::initial`] at epoch 1, and a node that caught up and is fresh at `T0`.
+pub(crate) fn setup() -> (Cp, Replica<BoxAuthority>) {
     let mut cp = Cp::new();
-    cp.p.commit(vec![Change::PutZone { zone: zone("z") }, add(grant("keep-1", &granted(), T0 + 3_600_000))], T0 - 10).unwrap();
+    let changes = cp.initial();
+    cp.p.commit(changes, T0 - 10).unwrap();
     let mut r = cp.replica();
     let frames = cp.p.catch_up(&r.hello(), T0).unwrap();
     feed(&mut r, frames, T0);
@@ -151,6 +263,6 @@ pub(crate) fn setup() -> (Cp, Replica<ZoneSpec>) {
     (cp, r)
 }
 
-pub(crate) fn allowed(r: &mut Replica<ZoneSpec>, o: &Op, now: i64) -> bool {
+pub(crate) fn allowed(r: &mut Replica<BoxAuthority>, o: &Op, now: i64) -> bool {
     r.decide(o, now).is_allow()
 }

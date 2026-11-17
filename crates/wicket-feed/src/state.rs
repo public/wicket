@@ -6,12 +6,10 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
-#[cfg(test)]
-use wicket_core::{CompiledZone, Op, Verdict, ZoneSpec};
 
-/// A policy entry as the feed carries it: a box's capability token ([`crate::token::BoxAuthority`],
-/// what nodes decide with), or in this crate's tests a zone's `ZoneSpec`. The feed, the replica and
-/// the publisher don't depend on which.
+/// A policy entry as the feed carries it: a box's capability token
+/// ([`crate::token::BoxAuthority`], what nodes decide with). The feed, the replica and the
+/// publisher don't depend on what the entry is.
 pub trait Policy: Clone + Debug + Serialize + DeserializeOwned {
     /// The policy in the form decisions use, built once when an update is applied.
     type Compiled;
@@ -30,44 +28,10 @@ pub trait Policy: Clone + Debug + Serialize + DeserializeOwned {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// How many times this thread compiled a [`ZoneSpec`] (the replay tests count them, #287).
-    pub(crate) static COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Zones as plain specs: the feed's own tests' policy, with no context to compile. Nodes decide
-/// with tokens ([`crate::token::BoxAuthority`]).
-#[cfg(test)]
-impl Policy for ZoneSpec {
-    type Compiled = CompiledZone;
-    type Ctx = ();
-
-    fn zone_name(&self) -> &str {
-        &self.name
-    }
-
-    fn compile(&self, _: &(), _: &dyn Fn(RevokeKind, &str) -> bool) -> Result<CompiledZone, String> {
-        COMPILES.with(|c| c.set(c.get() + 1));
-        CompiledZone::new(self.clone()).map_err(|e| e.to_string())
-    }
-}
-
 /// A zone's policy, and its compiled form (or why it didn't compile).
 pub struct Zone<P: Policy> {
     pub spec: P,
     pub compiled: Result<P::Compiled, String>,
-}
-
-#[cfg(test)]
-impl Zone<ZoneSpec> {
-    /// The verdict for one op; `Forbidden` if the policy didn't compile.
-    pub fn evaluate(&self, op: &Op) -> Verdict {
-        match &self.compiled {
-            Ok(c) => c.evaluate(op),
-            Err(e) => Verdict::Forbidden(format!("this zone's policy is invalid: {e}")),
-        }
-    }
 }
 
 /// The compiled form of a zone a replay skipped compiling: a later change in the replay replaces or
@@ -254,13 +218,16 @@ impl<P: Policy> State<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::token::BoxAuthority;
 
-    fn delta(changes: Vec<Change<ZoneSpec>>) -> Delta<ZoneSpec> {
+    fn delta(changes: Vec<Change<BoxAuthority>>) -> Delta<BoxAuthority> {
         Delta { feed: "n".into(), version: 1, epoch: 1, prev: GENESIS.into(), issued_at: 0, changes }
     }
 
-    fn put(name: &str) -> Change<ZoneSpec> {
-        Change::PutZone { zone: serde_json::from_value(serde_json::json!({ "name": name })).unwrap() }
+    /// A record for run `name` (only its key matters here: nothing is compiled).
+    fn put(name: &str) -> Change<BoxAuthority> {
+        let zone = serde_json::json!({ "run": name, "box_path": name, "epoch": 0, "zone": { "name": "z" }, "token": "" });
+        Change::PutZone { zone: serde_json::from_value(zone).unwrap() }
     }
 
     #[test]

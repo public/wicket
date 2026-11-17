@@ -4,7 +4,8 @@ use super::*;
 
 fn fresh_cp() -> Cp {
     let mut cp = Cp::new();
-    cp.p.commit(vec![Change::PutZone { zone: zone("z") }], T0).unwrap();
+    let put = cp.put("r1");
+    cp.p.commit(vec![put], T0).unwrap();
     cp
 }
 

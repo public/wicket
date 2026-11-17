@@ -42,17 +42,15 @@
 //!
 //! # Persistence
 //!
-//! With a directory ([`Replica::open`]), every accepted artifact is written durably *before* it is
+//! With a directory ([`Replica::open_with`]), every accepted artifact is written durably *before* it is
 //! applied: `cert.jws`, `snapshot.jws` (the base), `deltas.jsonl` (applied since the base),
 //! `statements.json` (the last statement and the last vouching one, with their receipt times and the
 //! `issued_at` floor), and `uses.log` (grant uses). On start the node re-verifies all of it and
 //! resumes in whatever mode the signed deadlines allow; replay protection survives the restart. Any
-//! file that doesn't verify makes [`Replica::open`] fail: the caller starts again with
-//! [`Replica::reset`], which keeps only the use counts and comes up [`Mode::Closed`] until a live
+//! file that doesn't verify makes [`Replica::open_with`] fail: the caller starts again with
+//! [`Replica::reset_with`], which keeps only the use counts and comes up [`Mode::Closed`] until a live
 //! statement arrives.
 
-#[cfg(test)]
-use crate::format::Grant;
 use crate::format::{Delta, Frame, FrameKind, Fresh, Hello, KeyCert, RevokeKind, Snapshot};
 use crate::jws::{kid, open, sha, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
 use crate::state::{Policy, State, Zone};
@@ -63,8 +61,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use wicket_core::Op;
-#[cfg(test)]
-use wicket_core::{Verdict, ZoneSpec};
 
 /// The node's mode, from its own clock and the signed deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +94,8 @@ impl Default for ReplicaConfig {
 /// What a decision allowed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Allowed {
-    /// By the zone's reach rule `n`.
+    /// By the zone's reach rule `n`. No decision of this crate's returns it (tokens allow by
+    /// [`Allowed::Ceiling`]); kept for callers that match on it.
     Reach(usize),
     /// By the ceilings of the box's token (every block's reach), without a grant.
     Ceiling,
@@ -253,26 +250,6 @@ enum Plan<P: Policy> {
     Fresh(Statement),
     /// A valid statement not newer than the one held: nothing to apply.
     Superseded,
-}
-
-impl<P: Policy> Replica<P>
-where
-    P::Ctx: Default,
-{
-    /// [`Replica::new_with`] for payloads that compile without context ([`wicket_core::ZoneSpec`]).
-    pub fn new(node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Replica<P> {
-        Self::new_with(node, root, cfg, P::Ctx::default())
-    }
-
-    /// [`Replica::reset_with`] without context.
-    pub fn reset(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Result<Replica<P>, LoadError> {
-        Self::reset_with(dir, node, root, cfg, P::Ctx::default())
-    }
-
-    /// [`Replica::open_with`] without context.
-    pub fn open(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Result<Replica<P>, LoadError> {
-        Self::open_with(dir, node, root, cfg, P::Ctx::default())
-    }
 }
 
 impl<P: Policy> Replica<P> {
@@ -848,54 +825,6 @@ impl<P: Policy> Replica<P> {
         }
         *self.used.entry(id.to_string()).or_default() += 1;
         Ok(())
-    }
-}
-
-/// The test-only decide path for zones as plain specs (this crate's tests of the feed itself).
-#[cfg(test)]
-impl Replica<ZoneSpec> {
-    fn live_grant(&self, st: &State<ZoneSpec>, g: &Grant, op: &Op, now: i64) -> bool {
-        g.zone == op.zone
-            && g.not_after > now
-            && !st.is_revoked(RevokeKind::Grant, &g.id)
-            && g.box_id.as_ref().is_none_or(|b| *b == op.run.0)
-            // A counted grant without a box could be honoured on several nodes, each counting
-            // separately: never here (the publisher refuses to publish one; this covers older feeds).
-            && (g.uses.is_none() || g.box_id.is_some())
-            && g.uses.is_none_or(|max| self.uses(&g.id) < max)
-    }
-
-    /// The decision for one op at `now`: the mode, the zone's compiled policy, the live grants
-    /// (consuming one use of a counted grant) and the revocations. See the crate docs for the rule.
-    pub fn decide(&mut self, op: &Op, now: i64) -> Decision {
-        let (mode, st) = match self.gate(op, now) {
-            Ok(v) => v,
-            Err(d) => return d,
-        };
-        let refused = |why: String| Decision::Refused { mode, why };
-        let Some(zone) = st.zones.get(&op.zone) else { return Decision::Forbidden(format!("unknown zone {}", op.zone)) };
-        match zone.evaluate(op) {
-            Verdict::Forbidden(r) => Decision::Forbidden(r),
-            Verdict::AllowByReach(i) => Decision::Allow(Allowed::Reach(i)),
-            Verdict::NeedsGrant(r) => {
-                let digest = op.digest();
-                let found = st
-                    .by_op
-                    .get(&digest)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|id| st.grants.get(id))
-                    .find(|g| self.live_grant(st, g, op, now))
-                    .map(|g| (g.id.clone(), g.uses.is_some()));
-                let Some((id, counted)) = found else { return Decision::NeedsGrant(r) };
-                if counted {
-                    if let Err(e) = self.record_use(&id) {
-                        return refused(e);
-                    }
-                }
-                Decision::Allow(Allowed::Grant(id))
-            }
-        }
     }
 }
 

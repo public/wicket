@@ -137,6 +137,12 @@ impl BoxAuthority {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread compiled a [`BoxAuthority`] (the replay tests count them, #287).
+    pub(crate) static COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Policy for BoxAuthority {
     type Compiled = CompiledAuthority;
     /// The authority root's public key, pinned on the node.
@@ -147,6 +153,8 @@ impl Policy for BoxAuthority {
     }
 
     fn compile(&self, root: &authz::PublicKey, revoked: &dyn Fn(RevokeKind, &str) -> bool) -> Result<CompiledAuthority, String> {
+        #[cfg(test)]
+        COMPILES.with(|c| c.set(c.get() + 1));
         if self.run.is_empty() || self.run.contains('/') {
             return Err(format!("bad run id {:?}", self.run));
         }

@@ -7,7 +7,7 @@ use serde_json::Value;
 
 /// Asserts `f` is refused as `kind`, and that nothing changed: same epoch and head, still fresh,
 /// `keep-1` still honoured, the attacker's op still not allowed.
-fn refused(r: &mut Replica<ZoneSpec>, f: Frame, now: i64, kind: &str) {
+fn refused(r: &mut Replica<BoxAuthority>, f: Frame, now: i64, kind: &str) {
     let (epoch, head) = (r.state().unwrap().epoch, r.state().unwrap().head.clone());
     let e = r.accept(&f, now).expect_err("must be refused");
     assert_eq!(e.kind(), kind, "{e}");
@@ -19,9 +19,15 @@ fn refused(r: &mut Replica<ZoneSpec>, f: Frame, now: i64, kind: &str) {
     assert!(!allowed(r, &evil(), now));
 }
 
-fn delta(cp: &Cp, epoch: u64, prev: &str, feed: &str, changes: Vec<Change<ZoneSpec>>) -> Frame {
+fn delta(cp: &Cp, epoch: u64, prev: &str, feed: &str, changes: Vec<Change<BoxAuthority>>) -> Frame {
     let d = Delta { feed: feed.into(), version: 1, epoch, prev: prev.into(), issued_at: T0, changes };
     Frame::new(FrameKind::Delta, sign(&cp.feed_key, TYP_DELTA, &d))
+}
+
+/// What the attacker wants on the node: r1's token with a grant for [`evil`] (as if the approver
+/// key had signed one), which the node would honour if the delta carrying it were accepted.
+fn evil_put(cp: &mut Cp) -> Change<BoxAuthority> {
+    Change::PutZone { zone: cp.boxed_with("r1", &[token_grant("evil", &evil(), T0 + 3_600_000, None)]) }
 }
 
 fn statement(key: &SigningKey, kid_: Option<&str>, f: &Fresh) -> Frame {
@@ -33,7 +39,7 @@ fn statement(key: &SigningKey, kid_: Option<&str>, f: &Fresh) -> Frame {
 }
 
 /// A node at epoch 3 with a statement at T0 + 10.
-fn at_epoch_3() -> (Cp, Replica<ZoneSpec>, Vec<Frame>) {
+fn at_epoch_3() -> (Cp, Replica<BoxAuthority>, Vec<Frame>) {
     let (mut cp, mut r) = setup();
     let mut deltas = vec![];
     for i in 0..2 {
@@ -46,7 +52,7 @@ fn at_epoch_3() -> (Cp, Replica<ZoneSpec>, Vec<Frame>) {
     (cp, r, deltas)
 }
 
-fn honest(r: &Replica<ZoneSpec>, issued_at: i64) -> Fresh {
+fn honest(r: &Replica<BoxAuthority>, issued_at: i64) -> Fresh {
     let st = r.state().unwrap();
     Fresh {
         feed: NODE.into(),
@@ -62,9 +68,11 @@ fn honest(r: &Replica<ZoneSpec>, issued_at: i64) -> Fresh {
 #[test]
 fn a01_tampered_delta() {
     let (mut cp, mut r, _) = at_epoch_3();
-    let d = cp.p.commit(vec![add(grant("ok", &read(), T0 + 3_600_000))], T0 + 20).unwrap();
+    let put = cp.put("r1");
+    let d = cp.p.commit(vec![put], T0 + 20).unwrap();
     let mut p: Value = payload_unverified(&d.jws).unwrap();
-    p["changes"][0]["grant"] = serde_json::to_value(grant("evil", &evil(), T0 + 3_600_000)).unwrap();
+    let Change::PutZone { zone } = evil_put(&mut cp) else { unreachable!() };
+    p["changes"][0]["zone"] = serde_json::to_value(zone).unwrap();
     refused(&mut r, Frame::new(FrameKind::Delta, tamper(&d.jws, &p)), T0 + 20, "bad_signature");
 }
 
@@ -161,30 +169,34 @@ fn a11_delta_sent_as_a_statement() {
 
 #[test]
 fn a12_delta_for_another_node() {
-    let (cp, mut r, _) = at_epoch_3();
+    let (mut cp, mut r, _) = at_epoch_3();
     let head = r.state().unwrap().head.clone();
-    refused(&mut r, delta(&cp, 4, &head, "n2", vec![add(grant("evil", &evil(), i64::MAX))]), T0 + 20, "wrong_audience");
+    let bad = evil_put(&mut cp);
+    refused(&mut r, delta(&cp, 4, &head, "n2", vec![bad]), T0 + 20, "wrong_audience");
 }
 
 #[test]
 fn a13_delta_skipping_an_epoch() {
-    let (cp, mut r, _) = at_epoch_3();
+    let (mut cp, mut r, _) = at_epoch_3();
     let head = r.state().unwrap().head.clone();
     let e = r.accept(&delta(&cp, 5, &head, NODE, vec![]), T0 + 20).unwrap_err();
     assert!(e.wants_catch_up());
-    refused(&mut r, delta(&cp, 5, &head, NODE, vec![add(grant("evil", &evil(), i64::MAX))]), T0 + 20, "gap");
+    let bad = evil_put(&mut cp);
+    refused(&mut r, delta(&cp, 5, &head, NODE, vec![bad]), T0 + 20, "gap");
 }
 
 #[test]
 fn a14_delta_on_another_chain() {
-    let (cp, mut r, _) = at_epoch_3();
-    refused(&mut r, delta(&cp, 4, GENESIS, NODE, vec![add(grant("evil", &evil(), i64::MAX))]), T0 + 20, "fork");
+    let (mut cp, mut r, _) = at_epoch_3();
+    let bad = evil_put(&mut cp);
+    refused(&mut r, delta(&cp, 4, GENESIS, NODE, vec![bad]), T0 + 20, "fork");
 }
 
 #[test]
 fn stolen_feed_key_is_useless_past_its_certificate() {
     let mut cp = Cp::with(cfg(), T0 + 5_000);
-    cp.p.commit(vec![Change::PutZone { zone: zone("z") }], T0).unwrap();
+    let put = cp.put("r1");
+    cp.p.commit(vec![put], T0).unwrap();
     let mut r = cp.replica();
     let frames = cp.p.catch_up(&r.hello(), T0).unwrap();
     feed(&mut r, frames, T0);
@@ -192,11 +204,15 @@ fn stolen_feed_key_is_useless_past_its_certificate() {
     // The thief keeps signing statements after the certificate's not_after.
     let f = cp.p.statement(T0 + 5_000);
     assert_eq!(r.accept(&f, T0 + 5_000).unwrap_err().kind(), "key_expired");
-    let d = cp.p.commit(vec![add(grant("evil", &evil(), i64::MAX))], T0 + 5_001).unwrap();
+    let bad = evil_put(&mut cp);
+    let d = cp.p.commit(vec![bad], T0 + 5_001).unwrap();
     assert_eq!(r.accept(&d, T0 + 5_001).unwrap_err().kind(), "key_expired");
     // And the node is closed from not_after, whatever the statements said.
     assert_eq!(r.mode(T0 + 4_999), Mode::Offline);
+    assert!(allowed(&mut r, &read(), T0 + 4_999));
+    assert!(!allowed(&mut r, &evil(), T0 + 4_999));
     assert_eq!(r.mode(T0 + 5_000), Mode::Closed);
+    assert!(matches!(r.decide(&read(), T0 + 5_000), Decision::Refused { mode: Mode::Closed, .. }));
     // An expired certificate is refused, too.
     let old = cert(&cp.root, &cp.feed_key, 1, T0 + 5_000);
     assert_eq!(r.accept(&Frame::new(FrameKind::Key, old), T0 + 6_000).unwrap_err().kind(), "key_expired");

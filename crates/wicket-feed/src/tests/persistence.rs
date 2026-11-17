@@ -3,30 +3,28 @@
 
 use super::*;
 
-fn open(cp: &Cp, dir: &TempDir) -> Result<Replica<ZoneSpec>, LoadError> {
-    Replica::open(dir.path(), NODE, cp.root.verifying_key(), ReplicaConfig::default())
+fn open(cp: &Cp, dir: &TempDir) -> Result<Replica<BoxAuthority>, LoadError> {
+    Replica::open_with(dir.path(), NODE, cp.root.verifying_key(), ReplicaConfig::default(), cp.authz_root.public())
 }
 
-/// A persisting node at epoch 3 (snapshot + 2 deltas), with a statement received at T0 + 10.
+/// A persisting node at epoch 3 (snapshot + 2 deltas, each publishing r1's token with one more
+/// grant for [`evil`], of three uses), with a statement received at T0 + 10.
 fn persisted() -> (Cp, TempDir) {
     let mut cp = Cp::new();
-    cp.p.commit(vec![Change::PutZone { zone: zone("z") }, add(grant("keep-1", &granted(), T0 + 3_600_000))], T0 - 10).unwrap();
+    let changes = cp.initial();
+    cp.p.commit(changes, T0 - 10).unwrap();
     let dir = TempDir::new();
     let mut r = open(&cp, &dir).unwrap();
     assert_eq!(r.mode(T0), Mode::Closed);
     let frames = cp.p.catch_up(&r.hello(), T0).unwrap();
     feed(&mut r, frames, T0);
     for i in 0..2 {
-        let d =
-            cp.p.commit(
-                vec![add(Grant { uses: Some(3), box_id: Some("r1".into()), ..grant(&format!("g-{i}"), &evil(), T0 + 3_600_000) })],
-                T0 + 1 + i,
-            )
-            .unwrap();
+        let g = cp.grant("r1", token_grant(&format!("g-{i}"), &evil(), T0 + 3_600_000, Some(3)));
+        let d = cp.p.commit(vec![g], T0 + 1 + i).unwrap();
         r.accept(&d, T0 + 5).unwrap();
     }
     r.accept(&cp.p.statement(T0 + 10), T0 + 10).unwrap();
-    assert!(allowed(&mut r, &evil(), T0 + 11), "uses g-0 once");
+    assert_eq!(r.decide(&evil(), T0 + 11), Decision::Allow(Allowed::Grant("g-0".into())), "uses g-0 once");
     (cp, dir)
 }
 
@@ -39,10 +37,18 @@ fn reload_resumes_in_the_mode_the_signed_deadlines_allow() {
     assert_eq!(r.mode(T0 + 20), Mode::Fresh);
     assert!(allowed(&mut r, &granted(), T0 + 20));
     assert_eq!(r.uses("g-0"), 1, "use counts survive");
+    // g-0's other two uses, then g-1's: a counted grant is spent across reboots.
+    for _ in 0..2 {
+        assert_eq!(r.decide(&evil(), T0 + 21), Decision::Allow(Allowed::Grant("g-0".into())));
+    }
+    let mut r = open(&cp, &dir).unwrap();
+    assert_eq!(r.uses("g-0"), 3);
+    assert_eq!(r.decide(&evil(), T0 + 22), Decision::Allow(Allowed::Grant("g-1".into())));
     // Rebooted during an outage: offline on what it holds, until the feed key's certificate ends.
     let mut r = open(&cp, &dir).unwrap();
     assert_eq!(r.mode(T0 + 10 + TTL), Mode::Offline);
     assert!(allowed(&mut r, &granted(), T0 + 10 + TTL + 60_000), "grants held survive the reboot offline");
+    assert!(allowed(&mut r, &read(), T0 + 10 + TTL + 60_000), "and so does the token's ceiling");
 }
 
 #[test]
@@ -98,7 +104,14 @@ fn corrupt_files_are_refused_not_trusted() {
         let err = open(&cp, &dir).err().unwrap_or_else(|| panic!("{file} corrupted, yet loaded"));
         assert!(matches!(err, LoadError::Corrupt { .. }), "{file}: {err}");
         // The node starts again with nothing: closed until a live statement arrives. Use counts stay.
-        let mut r = Replica::<ZoneSpec>::reset(dir.path(), NODE, cp.root.verifying_key(), ReplicaConfig::default()).unwrap();
+        let mut r = Replica::<BoxAuthority>::reset_with(
+            dir.path(),
+            NODE,
+            cp.root.verifying_key(),
+            ReplicaConfig::default(),
+            cp.authz_root.public(),
+        )
+        .unwrap();
         assert_eq!(r.mode(T0 + 20), Mode::Closed);
         assert_eq!(r.uses("g-0"), 1);
         let mut cp = cp;
@@ -119,10 +132,18 @@ fn other_bad_states_are_refused() {
     assert!(open(&cp, &dir).is_err(), "deltas without a snapshot");
     // A different root: nothing verifies.
     let (_cp, dir) = persisted();
-    assert!(Replica::<ZoneSpec>::open(dir.path(), NODE, key().verifying_key(), ReplicaConfig::default()).is_err());
+    let authz_root = wicket_authz::SigningKey::generate().public();
+    assert!(Replica::<BoxAuthority>::open_with(dir.path(), NODE, key().verifying_key(), ReplicaConfig::default(), authz_root).is_err());
     // Another node's files.
     let (cp, dir) = persisted();
-    assert!(Replica::<ZoneSpec>::open(dir.path(), "n2", cp.root.verifying_key(), ReplicaConfig::default()).is_err());
+    assert!(Replica::<BoxAuthority>::open_with(
+        dir.path(),
+        "n2",
+        cp.root.verifying_key(),
+        ReplicaConfig::default(),
+        cp.authz_root.public()
+    )
+    .is_err());
     // Deltas reordered.
     let (cp, dir) = persisted();
     let p = dir.path().join("deltas.jsonl");
@@ -147,8 +168,10 @@ fn a_torn_delta_append_is_dropped() {
 #[test]
 fn publisher_log_survives_restarts_and_torn_writes() {
     let mut cp = Cp::new();
-    cp.p.commit(vec![Change::PutZone { zone: zone("z") }], T0).unwrap();
-    cp.p.commit(vec![add(grant("a", &granted(), T0 + 3_600_000))], T0 + 1).unwrap();
+    let put = cp.put("r1");
+    cp.p.commit(vec![put], T0).unwrap();
+    let a = cp.grant("r1", token_grant("a", &granted(), T0 + 3_600_000, None));
+    cp.p.commit(vec![a], T0 + 1).unwrap();
     let head = cp.p.state().head.clone();
     // Every committed delta is on disk (fsynced) by the time commit returns.
     assert_eq!(std::fs::read_to_string(cp.p.log_path()).unwrap().lines().count(), 2);
@@ -168,23 +191,35 @@ fn publisher_log_survives_restarts_and_torn_writes() {
     r.accept(&d, T0 + 3).expect("already in the snapshot: superseded");
     assert_eq!((r.state().unwrap().epoch, r.stats.superseded), (3, 1));
     assert!(r.state().unwrap().grants.contains_key("b"));
+    assert_eq!(r.decide(&granted(), T0 + 3), Decision::Allow(Allowed::Grant("a".into())), "the token from before the restarts");
     // A log that isn't a chain is refused.
     let log = std::fs::read_to_string(cp.p.log_path()).unwrap();
     let mut lines: Vec<&str> = log.lines().collect();
     lines.swap(0, 1);
     std::fs::write(cp.p.log_path(), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
-    assert!(Publisher::<ZoneSpec>::open(cp.dir.path(), NODE, &cp.root.verifying_key(), cp.feed_key.clone(), &cp.cert, cfg()).is_err());
+    let reopened = Publisher::<BoxAuthority>::open_with(
+        cp.dir.path(),
+        NODE,
+        &cp.root.verifying_key(),
+        cp.feed_key.clone(),
+        &cp.cert,
+        cfg(),
+        cp.authz_root.public(),
+    );
+    assert!(reopened.is_err());
 }
 
 #[test]
 fn publisher_refuses_settings_beyond_its_certificate() {
     let (root, k, dir) = (key(), key(), TempDir::new());
+    let authz_root = wicket_authz::SigningKey::generate().public();
     let c = sign(&root, TYP_KEY, &KeyCert::new(&k.verifying_key(), 1, T0 + 86_400_000, 10_000));
-    let open = |cfg: PublisherConfig| Publisher::<ZoneSpec>::open(dir.path(), NODE, &root.verifying_key(), k.clone(), &c, cfg);
-    assert!(open(PublisherConfig::default()).is_err(), "30 s TTL > certified 10 s");
-    assert!(open(PublisherConfig { ttl_ms: 10_000, ..PublisherConfig::default() }).is_ok());
-    let other = key();
-    assert!(Publisher::<ZoneSpec>::open(dir.path(), NODE, &root.verifying_key(), other, &c, cfg()).is_err(), "certificate for another key");
+    let open = |k: &SigningKey, cfg: PublisherConfig| {
+        Publisher::<BoxAuthority>::open_with(dir.path(), NODE, &root.verifying_key(), k.clone(), &c, cfg, authz_root)
+    };
+    assert!(open(&k, PublisherConfig::default()).is_err(), "30 s TTL > certified 10 s");
+    assert!(open(&k, PublisherConfig { ttl_ms: 10_000, ..PublisherConfig::default() }).is_ok());
+    assert!(open(&key(), cfg()).is_err(), "certificate for another key");
 }
 
 #[test]
@@ -230,22 +265,25 @@ fn a_crash_while_installing_a_snapshot_loads_closed_not_corrupt() {
 /// (each run puts its entry and drops it at exit), and reaches the same state as applying it all.
 #[test]
 fn reopening_compiles_only_the_entries_still_held() {
-    use crate::state::COMPILES;
+    use crate::token::COMPILES;
     let mut cp = Cp::new();
     for i in 0..20 {
         let z = format!("run-{i}");
-        cp.p.commit(vec![Change::PutZone { zone: zone(&z) }, add(grant(&format!("g-{i}"), &granted(), T0 + 3_600_000))], T0 + i).unwrap();
+        let put = cp.grant(&z, token_grant(&format!("g-{i}"), &granted(), T0 + 3_600_000, None));
+        cp.p.commit(vec![put, add(grant(&format!("g-{i}"), &granted(), T0 + 3_600_000))], T0 + i).unwrap();
         if i % 5 != 4 {
             cp.p.commit(vec![Change::DropZone { name: z }], T0 + i).unwrap();
         }
     }
     // Replaced, then dropped, in the same delta; and replaced and kept.
-    cp.p.commit(vec![Change::PutZone { zone: zone("x") }, Change::DropZone { name: "x".into() }], T0 + 30).unwrap();
-    cp.p.commit(vec![Change::PutZone { zone: zone("z") }], T0 + 31).unwrap();
-    cp.p.commit(vec![Change::PutZone { zone: zone("z") }, Change::PutZone { zone: zone("z") }], T0 + 32).unwrap();
+    let x = cp.put("x");
+    cp.p.commit(vec![x, Change::DropZone { name: "x".into() }], T0 + 30).unwrap();
+    let r1 = cp.put("r1");
+    cp.p.commit(vec![r1.clone()], T0 + 31).unwrap();
+    cp.p.commit(vec![r1.clone(), r1], T0 + 32).unwrap();
     let before: Vec<String> = cp.p.state().zones.keys().cloned().collect();
     let (head, grants) = (cp.p.state().head.clone(), cp.p.state().grants.len());
-    assert_eq!(before, ["run-14", "run-19", "run-4", "run-9", "z"]);
+    assert_eq!(before, ["r1", "run-14", "run-19", "run-4", "run-9"]);
 
     COMPILES.with(|c| c.set(0));
     cp.restart(cfg());
@@ -256,7 +294,7 @@ fn reopening_compiles_only_the_entries_still_held() {
     assert_eq!((st.head.clone(), st.grants.len()), (head.clone(), grants));
 
     COMPILES.with(|c| c.set(0));
-    let viewed = read_state::<ZoneSpec>(cp.dir.path(), NODE, ()).unwrap();
+    let viewed = read_state::<BoxAuthority>(cp.dir.path(), NODE, cp.authz_root.public()).unwrap();
     assert_eq!(COMPILES.with(|c| c.get()), 5);
     assert_eq!(viewed.zones.keys().cloned().collect::<Vec<_>>(), before);
     assert!(viewed.zones.values().all(|z| z.compiled.is_ok()));

@@ -51,9 +51,13 @@ The feed is generic over its entries (`Policy`):
   below. A `NeedsGrant` tries the record's grants for that exact request one at a time (the token's
   grant rule needs a `uses_left` fact, which the node supplies from its own count), so the node
   knows which grant to count, and a grant without a block in the token never fires.
-- **`ZoneSpec`**, the original payload: zone policies compiled into `CompiledZone`, with the feed's own
-  grant records. Kept as the differential oracle (`tests/tokens.rs` checks token decisions match it
-  on every example and subset-test zone, fresh and offline).
+
+`Replica::<BoxAuthority>::decide` is the only decision path; the crate's own tests (`src/tests`)
+run the feed's modes, freshness, revocation and persistence through it, with tokens minted by a
+test authority root and grants signed by a test approver. The zone's `CompiledZone` is the
+differential oracle: `tests/tokens.rs` checks token decisions match it on every example and
+subset-test zone, fresh and offline. The feed's own grant records (`Grant`) are still carried, and
+read by `Replica::escalate`'s grant holds, but never allow a request.
 
 **Revocation by block id.** `Revoke { kind: Token, id }` names a block's revocation id (hex) and
 refuses every token containing that block. Revoking a spawn block therefore revokes the box it
@@ -83,7 +87,7 @@ node's clock in every mode. There is no separate offline window (#153): a node w
 as what it holds is valid, and `Replica::authority_until(run)` says when a box's token stops allowing
 anything (the earliest expiry of its first-party blocks), so the node can stop the box then.
 
-`Replica::decide(op, now)` returns `Allow(Reach | Ceiling | Grant)`, `NeedsGrant` (the caller raises it,
+`Replica::decide(op, now)` returns `Allow(Ceiling | Grant)`, `NeedsGrant` (the caller raises it,
 or queues it offline), `Forbidden` or `Refused { mode }`. `Replica::escalate` answers whether the node
 may issue a lease, start a spawn or sign an approval (fresh only).
 
@@ -114,16 +118,17 @@ Statements issued up to 2 s in the future (node clock) are accepted.
    with `version + 1` and call `Publisher::rotate`. Key rotation is the same operation.
 5. **The node persists what it verified** (`cert.jws`, `snapshot.jws`, `deltas.jsonl`,
    `statements.json` with receipt times and the `issued_at` floor, `uses.log`), each write fsynced
-   before the update is applied. `Replica::open` re-verifies everything and resumes in whatever mode
-   the signed deadlines allow; any file that doesn't verify fails the load, and `Replica::reset`
+   before the update is applied. `Replica::open_with` re-verifies everything and resumes in whatever mode
+   the signed deadlines allow; any file that doesn't verify fails the load, and `Replica::reset_with`
    starts closed (keeping use counts) until a live statement arrives.
 6. **Clock-skew guard.** Effective deadline = min(signed deadline, receipt + (deadline − `issued_at`)),
    capped at the certificate's `not_after`; `issued_at` may be at most 2 s ahead of the node's clock.
 7. **Batching**: a delta carries a list of changes; `Publisher::stage` and `flush` batch them.
 
-Also: zone policy is compiled once when an update is applied (#74's `CompiledZone`); a zone whose
-globs don't compile can't be committed by the publisher, and if one arrives anyway it forbids
-everything rather than being refused (refusing a signed delta would desynchronise the chain).
+Also: each entry is compiled once when an update is applied (a box's token loaded, its zone's
+`CompiledZone` built); an entry that doesn't compile can't be committed by the publisher, and if one
+arrives anyway it forbids everything rather than being refused (refusing a signed delta would
+desynchronise the chain).
 
 ## Decisions
 
@@ -131,9 +136,10 @@ everything rather than being refused (refusing a signed delta would desynchronis
   node is closed between accepting the new certificate and its snapshot, which catch-up sends right
   after it. Renewing a certificate (same version and key, later `not_after`) is routine.
 - **Uses of counted grants are appended to `uses.log` and fsynced before the op is allowed.** Counts
-  are per node, so a counted grant must name its box: one box lives on one node. The publisher refuses a
-  counted grant without a box, and a node never honours one.
-- **Use counts survive `Replica::reset`**: they are local and only ever restrictive.
+  are per node, so a counted grant must name its box: one box lives on one node. A token's grants
+  are bound to its box (`Issuer::publish`); the publisher also refuses a counted feed `Grant`
+  without a box (and nodes never decide from feed grants).
+- **Use counts survive `Replica::reset_with`**: they are local and only ever restrictive.
 - **The publisher trusts its own log's signatures** (it checks the chain, feed and versions on open,
   not the signatures, which older versions' keys made).
 - **Approvals stay central** (implementation plan, 2026-11-11): `escalate(Approval)` only says
