@@ -181,6 +181,10 @@ struct BoxState {
     stdin_next: u64,
     out: [OutBuf; 2],
     exited: Option<(i32, Option<String>)>,
+    /// Docker said its container ended. Its limit stops counting as committed then, not once its
+    /// output has been read and `exited` set, which can be seconds later: a box started the moment
+    /// its predecessor exits is admitted into the memory that one gave back.
+    ended: bool,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// uid:gid the box runs as (execs in it run as this, unless asked otherwise).
     user: String,
@@ -194,6 +198,13 @@ struct BoxState {
     /// The control connection that started or last resumed it: its stdio, events, asks and
     /// tunnels go there.
     owner: Option<u64>,
+}
+
+impl BoxState {
+    /// Whether its limits count as committed: its container hasn't ended.
+    fn holds_limits(&self) -> bool {
+        !self.ended && self.exited.is_none()
+    }
 }
 
 struct Link {
@@ -389,7 +400,7 @@ impl Node {
             memory_mib: mem,
             ..Default::default()
         };
-        for b in self.boxes.lock().expect("boxes").values().filter(|b| b.exited.is_none()) {
+        for b in self.boxes.lock().expect("boxes").values().filter(|b| b.holds_limits()) {
             c.used_vcpus += b.cpus;
             c.used_memory_mib += b.memory_mib;
             c.boxes += 1;
@@ -410,7 +421,7 @@ impl Node {
         let (committed, unused) = {
             let mem = self.mem.lock().expect("mem");
             let boxes = self.boxes.lock().expect("boxes");
-            let running = boxes.iter().filter(|(_, b)| b.exited.is_none());
+            let running = boxes.iter().filter(|(_, b)| b.holds_limits());
             running.fold((starting, starting), |(c, u), (run, b)| {
                 (c + b.memory_mib, u + b.memory_mib.saturating_sub(mem.get(run).map_or(0, |e| e.1.current >> 20)))
             })
@@ -431,6 +442,14 @@ impl Node {
 
     fn admitted(&self, run: &str) {
         self.admitting.lock().expect("admitting").remove(run);
+    }
+
+    /// `run`'s container ended: its limits no longer count as committed, though its output may
+    /// still be being read before [`finish`] records its exit.
+    fn box_ended(&self, run: &str) {
+        if let Some(b) = self.boxes.lock().expect("boxes").get_mut(run) {
+            b.ended = true;
+        }
     }
 
     /// This node's health (#377): its data directory's disk, memory, feed, and what went wrong.
@@ -1745,6 +1764,7 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             stdin_next: rec.stdin_received,
             out: [OutBuf::starting_at(OUTPUT_CAP, rec.out_end[0]), OutBuf::starting_at(OUTPUT_CAP, rec.out_end[1])],
             exited: None,
+            ended: false,
             tasks,
             user,
             cpus: bs.cpus,
@@ -1791,6 +1811,7 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
                 n.docker.wait(&box_name).await.unwrap_or(-1)
             }
         };
+        n.box_ended(&run);
         let mut t = ExitTimings::new();
         for r in readers {
             let _ = r.await;
@@ -2880,6 +2901,50 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(node.admitting.lock().unwrap().is_empty());
     }
 
+    /// A box of most of the room there is, started the moment its predecessor of the same size
+    /// exits, is admitted: the exited box's limit stops counting when its container ends, not once
+    /// its output has been read and its exit recorded (`finish`), seconds later.
+    #[tokio::test]
+    async fn a_box_is_admitted_the_moment_its_predecessor_exits() {
+        let inst = Install::new("nodesrv-admit-after-exit");
+        let node = test_node(&inst);
+        // Three quarters of the room: two don't fit, and the machine's free memory may move a little.
+        let size = node.capacity().room_mib.expect("room") * 3 / 4;
+        assert!(size > 0, "the test machine has room for a box");
+        node.admit("run_old", size).unwrap();
+        node.boxes.lock().unwrap().insert(
+            "run_old".into(),
+            BoxState {
+                streams: [1, 2, 3],
+                name: "wicket-run-old".into(),
+                dir: inst.dir.join("runs/run_old"),
+                stdin: None,
+                stdin_next: 0,
+                out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
+                exited: None,
+                ended: false,
+                tasks: vec![],
+                user: String::new(),
+                cpus: 1.0,
+                memory_mib: size,
+                listeners: HashMap::new(),
+                owner: Some(1),
+                record: fake_record("run_old"),
+            },
+        );
+        node.admitted("run_old");
+        let e = node.admit("run_new", size).unwrap_err().to_string();
+        assert!(e.contains(crate::health::NO_ROOM), "no room beside the running box: {e}");
+        assert_eq!(node.capacity().boxes, 1);
+
+        // Its container ends; its exit isn't recorded yet (its output is still being read).
+        node.box_ended("run_old");
+        assert!(node.boxes.lock().unwrap()["run_old"].exited.is_none());
+        assert_eq!(node.capacity().boxes, 0, "an ended box isn't counted among the running");
+        node.admit("run_new", size).expect("admitted into the room the exited box gave back");
+        node.admitted("run_new");
+    }
+
     /// `wicket node top`'s status: the node's identity, connections, boxes (with their state, agent,
     /// model use and egress counts) and its last egress decisions, newest first.
     #[tokio::test]
@@ -2907,6 +2972,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 stdin_next: 0,
                 out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
                 exited: None,
+                ended: false,
                 tasks: vec![],
                 user: String::new(),
                 cpus: 1.5,
@@ -2993,6 +3059,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 stdin_next: 0,
                 out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
                 exited: None,
+                ended: false,
                 tasks: vec![],
                 user: String::new(),
                 cpus: 0.0,
@@ -3069,6 +3136,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             stdin_next: 0,
             out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
             exited: None,
+            ended: false,
             tasks: vec![],
             user: String::new(),
             cpus: 0.0,
@@ -3239,6 +3307,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                     stdin_next: 0,
                     out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
                     exited: None,
+                    ended: false,
                     tasks: vec![],
                     user: String::new(),
                     cpus: 0.0,
@@ -3355,6 +3424,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             stdin_next: 0,
             out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
             exited: None,
+            ended: false,
             tasks: vec![],
             user: String::new(),
             cpus: 0.0,
