@@ -132,7 +132,6 @@ impl Decider for NodeDecider {
                 d => d,
             };
             match decision {
-                Decision::Allow(Allowed::Reach(i)) => Outcome::Allow(format!("reach rule {i} (node)")),
                 Decision::Allow(Allowed::Ceiling) => Outcome::Allow("the box's token (node)".into()),
                 Decision::Allow(Allowed::Grant(g)) => Outcome::Allow(format!("grant {g} (counted on the node)")),
                 Decision::Allow(other) => Outcome::Allow(format!("{other:?}")),
