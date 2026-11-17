@@ -84,7 +84,7 @@ fn everything(files: &[&str]) {
 
 // wicket-cli's suites: every end-to-end suite but policy, kani and lean.
 const CLI: &[&str] =
-    &["tla", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test", "node-e2e", "acceptance-nodes", "update"];
+    &["smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test", "node-e2e", "acceptance-nodes", "update"];
 
 fn with(a: &[&'static str], b: &[&'static str]) -> Vec<&'static str> {
     a.iter().chain(b).copied().collect()
@@ -127,8 +127,9 @@ fn wicket_core_is_nearly_everything_but_not_everything() {
     }
     assert!(s.affected.len() >= 10);
     assert_eq!(nextest_selects(&s.filter()), s.affected);
-    // Every suite: kani and lean through wicket-core and wicket-authz, every fuzz target.
-    let all: BTreeSet<String> = Suites::parse(SUITES).unwrap().names().map(String::from).collect();
+    // Every suite but tla (its models only): kani and lean through wicket-core and wicket-authz,
+    // every fuzz target.
+    let all: BTreeSet<String> = Suites::parse(SUITES).unwrap().names().filter(|n| *n != "tla").map(String::from).collect();
     assert_eq!(s.suites, all);
 }
 
@@ -261,6 +262,10 @@ fn inputs_from_outside_the_crates() {
 #[test]
 fn end_to_end_scripts_select_their_suites() {
     check(&["verification/tla/GrantsOnNodes.tla", "verification/tla/README.md"], &[], &["tla"]);
+    // TLC reads only the models: the code their READMEs map their actions to doesn't select them.
+    for f in ["crates/wicket-control/src/noderun.rs", "crates/wicket-node/src/nodesrv.rs", "crates/wicket-proxy/src/llm.rs"] {
+        assert!(!select(&[f]).suites.contains("tla"), "{f}");
+    }
     check(&["ci/acceptance/acp.yaml"], &[], &["acceptance", "acceptance-nodes"]);
     check(&["ci/smoke.sh"], &[], &["smoke"]);
     check(&["ci/h3get/src/main.rs"], &[], &["smoke", "acceptance"]);
