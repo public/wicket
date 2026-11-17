@@ -123,7 +123,7 @@ After #257's slice 3, `SeparateCounters` and the control host's own calls are mo
 | `SliceDue` | `noderun.rs` `slice_due` (with #333, `Slice::renewed`), `Llm::next_slice` → `nodesrv/conn.rs` `Msg::BudgetSlice` → `Slices::put`, `Llm::set_slice` |
 | `ChCall` | `wicket-proxy/src/egress/mod.rs` (model gate) → `llm.rs` `Llm::through_egress` |
 | `ChSpawn` | `wicket-cli/src/spawn.rs` (the gateway's spawn): `remaining()`, `reserved_*` |
-| `EdgeSpawn` | `wicket-cli/src/nodegw.rs` spawn: `llm_left` within the slice; the parent's slice lowered, the child's own `Slices::put` |
+| `EdgeSpawn` | `wicket-node/src/nodegw.rs` spawn: `llm_left` within the slice; the parent's slice lowered, the child's own `Slices::put` |
 | `Adopt` | `noderun.rs` (`Msg::Spawned`) → `spawn.rs` `adopt` (`reserved_*`) |
 | `BoxDone`, `Release` | the box's end: `nodesrv.rs`'s last `Msg::Spent`, `Slices::drop_run`. No slice is returned today, since none is held (`SliceReserved`) |
 | `Cut`, `Reconnect` | the channel (`chan.rs`); `noderun.rs`'s connection loop (`Progress::slice_sent` starts again; `p.slice` from the holdings) |

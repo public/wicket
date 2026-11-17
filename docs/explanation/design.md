@@ -2125,7 +2125,10 @@ crates/
   wicket-home        the installation's paths, issuer and caller, and the modules that need only
                      them: node authentication, the state store and audit export, image policy,
                      program digests, box owners and exit causes, a harness's control channel
-  wicket-cli         the `wicket` binary: CLI, daemon, console, node, reconciler
+  wicket-node        `wicket node serve` and its MCP gateway, with what they share with the control
+                     host: the node's status, a spawn's plan, untrusted box files, re-executing on
+                     a new build, the control host's calls on a node and its half of CA renewal
+  wicket-cli         the `wicket` binary: CLI, daemon, console, reconciler, a run's supervisor
 ```
 
 Dependency rule: `wicket-core` depends on nothing internal. Nothing that decides depends on

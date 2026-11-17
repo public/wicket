@@ -1,6 +1,6 @@
 //! The node: the feed's replica, which decides every box request (#257), and each box's model proxy.
 //!
-//! It follows `wicket-cli/src/nodesrv.rs`:
+//! It follows `wicket-node/src/nodesrv.rs`:
 //! - **The feed**: `Replica::<BoxAuthority>::open_with` on the node's feed directory, so a
 //!   restarted node decides from what it verified before the crash, until it catches up. A frame
 //!   the replica refuses with a catch-up reason makes it redial and say hello again.

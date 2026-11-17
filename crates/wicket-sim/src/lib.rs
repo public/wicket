@@ -23,8 +23,8 @@
 //!   (`Llm::sim_begin`, `Llm::sim_settle`: the `sim` feature's seam).
 //!
 //! The hosts' run loops are stand-ins, written to follow `wicket-cli`'s `noderun.rs` (control
-//! host) and `nodesrv.rs` (node). Those files open unix sockets and docker themselves, and live in
-//! the CLI binary. The stand-ins keep what those loops persist: the node's spend file, written
+//! host) and `wicket-node`'s `nodesrv.rs` (node). Those files open unix sockets and docker
+//! themselves. The stand-ins keep what those loops persist: the node's spend file, written
 //! before each model call goes upstream and every second, and its slices, written as they arrive. A box stub stands in for the box
 //! and its proxies' sockets, and the stand-in upstream bills each call it serves. See [`control`],
 //! [`node`] and [`boxes`].
