@@ -4,3 +4,4 @@ import Wicket.Zone
 import Wicket.Subset
 import Wicket.Canon
 import Wicket.Grant
+import Wicket.Spawn

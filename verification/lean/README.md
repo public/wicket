@@ -11,6 +11,7 @@ definitions as an oracle that wicket-core's decisions are checked against.
 | `Wicket/Zone.lean` | `CompiledZone::evaluate` | `forbid_wins`: a matching forbid rule forbids, whatever the reach rules say; `forbid_any_case`; `evaluate_reach_set`: reach rules are a set; `allow_lower_risk` |
 | `Wicket/Subset.lean` | `subset::check`, `reach_within`, `path_covered`, `segments_cover`, `segment_covers` | `pathCovered_sound`; `reach_sound` and `forbidden_sound`: an admitted child is allowed by reach nothing its parent isn't, and forbids all it forbids; `check_within`: an admitted child is `Within` its parent (reach, forbid, escalation, isolation, hidden hosts, wildcards, injections, model route, memory, cpus, output, pids, authority); `within_trans` and `grandchild_within`: narrowing composes |
 | `Wicket/Canon.lean` | `canon::canonical_path` | `upstream_eq`: an upstream that percent-decodes and resolves dot segments, in either order, names the canonical path's segments; `decode_eq_unreserved`: no escape spells an unreserved character; `reach_no_escape`, `forbid_no_escape`: a canonical path can't get out from under a rule `Q/**` |
+| `Wicket/Spawn.lean` | `manifest::model_covers`, `LlmSpec::allows_model`, `subset::model_violations`, `manifest::accepts`, `Token::attenuate`, a node's spawn (`nodegw::spawn`: `plan_child`, `peek_spawn`, `derive_child`) | `check_models`: an admitted child calls no model its parent may not (for well-formed patterns, as manifests require); `accept_narrow`, `check_accepts`: it hears only from its parent's zone or a sender its parent hears from; `attenuate_allow`, `attenuate_forbid`, `attenuate_live`, `attenuate_spawns`: an appended spawn block never widens a token; `node_spawn_within`: a child its node starts is within its parent, and its token allows, outlives and starts nothing its parent's doesn't |
 | `Wicket/Grant.lean` | `grant::within_authority`, `check_terms`, `agent_terms`, `outlasts`, `operators::may_decide` | `agent_grant_within`: every use an agent's grant permits is one the agent's own zone allows by reach, by a strict descendant, before the agent's authority ends, for one or more uses; `grant_within_ancestor`: and within every zone the agent's is within; `agent_renewal_within`; `operator_within` (#320) |
 
 ## What it doesn't cover
@@ -26,9 +27,11 @@ wicket-core decides as the spec does on its fixtures and generated cases. They d
   upstream crate itself.
 - **The Cedar compiler** (org and zone policies to token checks): differentially tested against
   Cedar's own evaluation, not proved.
-- **Which path builds a child's token.** `check_within` is about `subset::check`; a spawn its node
-  decides is also narrowed by the spawn block appended to its parent's token, which the proofs don't
-  model.
+- **How a token of blocks decides.** `Spawn.lean` models a token as its first-party blocks, deciding
+  as their intersection (`chainVerdict`), and proves that an appended spawn block never widens it.
+  That the Biscuit evaluator decides as `chainVerdict` is tested (the oracle's `chain` cases mint
+  tokens and append spawn blocks), not proved. What each block allows a box to start (`peek_spawn`'s
+  facts) is a predicate of the block.
 - Everything else: the proxies, parsing, the ledger, the feed's signatures and the node's replica.
 
 ## What the spec takes as given
@@ -63,7 +66,9 @@ wicket-core decides as the spec does on its fixtures and generated cases. They d
 default. It writes every case to a JSON file and runs `lake env lean --run Oracle.lean` on it, then
 compares each decision with wicket-core's and fails on any difference, with the case. The cases are
 the fixtures (the zones and probes of `oracles.rs`, and the parents and children of
-`subset_cases.rs`), plus generated globs, paths, hosts, path spellings and parent/child zones.
+`subset_cases.rs`), plus generated globs, paths, hosts, path spellings and parent/child zones, model
+allowlists and `accept_from` lists (`check`, `allows_model`, `accepts`), and tokens of up to four
+blocks, minted and attenuated by wicket-authz and decided by its evaluator (`chain`).
 
 With elan, `lake build` here builds the spec, and `LAKE=lake cargo test -p wicket-authz --test
 lean_oracle -- --ignored` runs the oracle.

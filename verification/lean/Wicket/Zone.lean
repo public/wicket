@@ -54,6 +54,9 @@ structure Llm where
   maxRequests : Nat
   maxOutput : Nat
   maxInput : Option Nat
+  /-- `zone.llm.models` (#366): the models its boxes may call, each a name or a prefix ending in
+  `*`; `none`: any. -/
+  models : Option (List Str)
   deriving Repr
 
 structure Inject where

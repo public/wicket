@@ -396,6 +396,53 @@ def limitsOk (c p : Limits) (timeRemaining : Nat) : Bool :=
      | some ca, some pa => decide (ca ≤ pa)
      | _, _ => false)
 
+/-! ### The model allowlist (#366) -/
+
+/-- `str::starts_with`: `s` starts with `p`. -/
+def startsWith : Str → Str → Bool
+  | [], [] => true
+  | [], _ :: _ => false
+  | _ :: _, [] => true
+  | a :: s, b :: p => a == b && startsWith s p
+
+/-- `pattern.strip_suffix('*')`: the prefix a pattern ending in `*` stands for. -/
+def stripStar : Str → Option Str
+  | [] => none
+  | [c] => if c = '*' then some [] else none
+  | c :: d :: s =>
+    match stripStar (d :: s) with
+    | some r => some (c :: r)
+    | none => none
+
+/-- `manifest::model_covers(pattern, other)`: a prefix pattern covers what starts with its prefix,
+a name only itself. -/
+def modelCovers (q m : Str) : Bool :=
+  match stripStar q with
+  | some p => startsWith m p
+  | none => q == m
+
+/-- `LlmSpec::allows_model`. -/
+def Llm.allowsModel (l : Llm) (n : Str) : Bool :=
+  match l.models with
+  | none => true
+  | some ms => ms.any (fun q => modelCovers q n)
+
+/-- `model_violations(c, p)` is empty: with a parent list, the child has one, each entry covered by
+one of the parent's. -/
+def llmModelsOk (cl pl : Llm) : Bool :=
+  match pl.models with
+  | none => true
+  | some pm =>
+    match cl.models with
+    | none => false
+    | some cm => cm.all (fun m => pm.any (fun q => modelCovers q m))
+
+/-- The model part of `check`'s route check (both zones have a route). -/
+def modelsOk (c p : Zone) : Bool :=
+  match c.llm, p.llm with
+  | some cl, some pl => llmModelsOk cl pl
+  | _, _ => true
+
 def acceptOk (c p : Zone) : Bool := c.acceptFrom.all (fun z => z == p.name || p.acceptFrom.contains z)
 
 def escalationOk (c p : Escalation) : Bool := !(c.request && !p.request) && !(c.grant && !p.grant)
@@ -405,7 +452,8 @@ def check (a : Ask) (b : Bounds) : Bool :=
   let c := a.zone
   let p := b.zone
   decide (p.isolation ≤ c.isolation) && reachOk p c && llmOk c b && limitsOk c.limits p.limits b.timeRemaining &&
-    b.imagesOk && acceptOk c p && escalationOk c.escalation p.escalation && decide (a.maxChildren < b.childSlots)
+    b.imagesOk && acceptOk c p && escalationOk c.escalation p.escalation && decide (a.maxChildren < b.childSlots) &&
+    modelsOk c p
 
 /-! ## Within: what narrowing means -/
 
@@ -464,7 +512,7 @@ theorem within_trans {g c p : Zone} (h1 : Within g c) (h2 : Within c p) : Within
 /-- **A spawned zone admitted by `subset::check` is within its parent's.** -/
 theorem check_within {a : Ask} {b : Bounds} (h : check a b = true) : Within a.zone b.zone := by
   simp only [check, Bool.and_eq_true, decide_eq_true_eq] at h
-  obtain ⟨⟨⟨⟨⟨⟨⟨hiso, hreach⟩, hllm⟩, hlim⟩, _⟩, _⟩, hesc⟩, _⟩ := h
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨hiso, hreach⟩, hllm⟩, hlim⟩, _⟩, _⟩, hesc⟩, _⟩, _⟩ := h
   have hr := hreach
   simp only [reachOk, Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq] at hr
   obtain ⟨⟨⟨⟨⟨hhide, hwild⟩, hnames⟩, _⟩, _⟩, hinj⟩ := hr

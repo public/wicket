@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+use wicket_authz::{load, mint, Ceiling, Loaded};
 use wicket_core::manifest::{ForbidRule, Isolation, OnOutputFull, ReachRule, UnlistedHosts};
 use wicket_core::{subset, CompiledZone, ZoneSpec};
 
@@ -42,6 +43,7 @@ fn zone_json(z: &ZoneSpec) -> Value {
         "llm": z.llm.as_ref().map(|l| json!({
             "provider": l.provider, "secret": l.secret, "upstream": l.upstream, "server_tools": l.allow_server_tools,
             "max_requests": l.max_requests, "max_output": l.max_output_tokens, "max_input": l.max_input_tokens,
+            "models": l.models,
         })),
         "escalation": { "request": z.escalation.request, "grant": z.escalation.grant },
         "limits": {
@@ -103,6 +105,32 @@ impl Cases {
         self.push(case, rust, format!("check {what}"));
         let rust = subset::reach_within(parent, child).is_ok().to_string();
         self.push(json!({ "kind": "reach_within", "outer": pi, "inner": ci }), rust, format!("reach_within {what}"));
+    }
+
+    /// Whether zone `zi`'s boxes may call `model` (#366).
+    fn model(&mut self, zi: usize, z: &ZoneSpec, model: &str) {
+        let rust = z.llm.as_ref().is_some_and(|l| l.allows_model(model)).to_string();
+        let what = format!("zone {} ({:?}) calls {model}", z.name, z.llm.as_ref().and_then(|l| l.models.clone()));
+        self.push(json!({ "kind": "model", "zone": zi, "model": model }), rust, what);
+    }
+
+    /// `manifest::accepts` (#250, #411).
+    fn accepts(&mut self, list: &[String], zone: &str, principal: Option<&str>) {
+        let rust = wicket_core::manifest::accepts(list, zone, principal).to_string();
+        let case = json!({ "kind": "accepts", "list": list, "zone": zone, "principal": principal });
+        self.push(case, rust, format!("accepts({list:?}, {zone:?}, {principal:?})"));
+    }
+
+    /// One request against a token of one block per zone (block 0, then spawn blocks appended as a
+    /// node's `derive_child` appends them), decided by the token.
+    fn chain(&mut self, zis: &[usize], l: &Loaded, depth: usize, m: &str, h: &str, p: &str) {
+        let o = op("z", m, h, p);
+        let rust = ["allow", "forbidden", "needs_grant"][kind_of(&l.decide(&http_request(&box_id(depth), &o))) as usize].to_string();
+        let case = json!({ "kind": "chain", "zones": zis, "op": {
+            "method": o.method, "host": o.host, "path": o.path, "risk": o.risk.rank(),
+            "unreachable": wicket_core::never_reachable(&o.host).is_some(),
+        }});
+        self.push(case, rust, format!("chain {zis:?}: {m} {h}{p} (risk {:?})", o.risk));
     }
 }
 
@@ -209,6 +237,45 @@ fn gen_child(rng: &mut Rng, p: &ZoneSpec) -> ZoneSpec {
         c.forbid.push(gen_forbid(rng));
     }
     c
+}
+
+const MODELS: [&str; 6] = ["claude-opus-4-5", "claude-opus-4-5-x", "claude-sonnet-4-5", "claude-", "claude", "gpt-x"];
+const MODEL_PATTERNS: [&str; 9] =
+    ["claude-*", "claude-opus-*", "claude-sonnet-*", "claude-opus-4-5", "claude-sonnet-4-5", "c*", "*", "gpt-x", "claude-opus-4-5*"];
+const SENDERS: [&str; 6] = ["g", "ops", "dev", "other", "spiffe://acc.test/t/t0/z/ops/a/x", "spiffe://acc.test/t/t0/z/dev/a/y"];
+
+/// A model list (#366): any model, or one to three of `MODEL_PATTERNS`.
+fn gen_models(rng: &mut Rng, none_pct: u64) -> Option<Vec<String>> {
+    if rng.chance(none_pct) {
+        return None;
+    }
+    let mut ms: Vec<String> = (0..1 + rng.below(3)).map(|_| rng.pick(&MODEL_PATTERNS).to_string()).collect();
+    ms.dedup();
+    Some(ms)
+}
+
+/// An `accept_from` list of zone and principal entries.
+fn gen_accept(rng: &mut Rng) -> Vec<String> {
+    let mut a: Vec<String> = (0..rng.below(4)).map(|_| rng.pick(&SENDERS).to_string()).collect();
+    a.dedup();
+    a
+}
+
+/// A zone with a model route, whose models and `accept_from` vary, and a child of it that narrows
+/// or widens them.
+fn gen_route_pair(rng: &mut Rng) -> (ZoneSpec, ZoneSpec) {
+    let mut p = wicket_core::Manifest::from_yaml(
+        "task: t\nagent: { name: a }\nzone:\n  name: g\n  llm: { max_requests: 10, max_output_tokens: 1000 }\n  limits: { memory: 1g, cpus: 1, timeout: 30m }\n",
+    )
+    .unwrap()
+    .zone;
+    p.llm.as_mut().unwrap().models = gen_models(rng, 25);
+    p.accept_from = gen_accept(rng);
+    let mut c = p.clone();
+    c.name = "c".into();
+    c.llm.as_mut().unwrap().models = gen_models(rng, 15);
+    c.accept_from = gen_accept(rng);
+    (p, c)
 }
 
 fn gen_canon(rng: &mut Rng) -> String {
@@ -363,6 +430,110 @@ fn rust_decides_as_the_lean_spec() {
         }
     }
 
+    // 4. The model allowlist and accept_from (#366, #411): generated parents and children through
+    // `check`, every zone's models, and `accepts` on generated lists.
+    let mut routes_admitted = 0;
+    for i in 0..600 {
+        let (p, ch) = gen_route_pair(&mut rng);
+        let b = subset::Bounds {
+            zone: &p,
+            images: vec!["img".into()],
+            llm_remaining: None,
+            llm_input_remaining: None,
+            time_remaining: Duration::from_secs(3600),
+            child_slots: 2,
+        };
+        let ask = subset::Ask { zone: &ch, image: "img", max_children: 0 };
+        routes_admitted += usize::from(subset::check(&ask, &b).is_ok());
+        let what = format!(
+            "route pair {i}: models {:?} in {:?}, accept_from {:?} in {:?}",
+            ch.llm.as_ref().and_then(|l| l.models.clone()),
+            p.llm.as_ref().and_then(|l| l.models.clone()),
+            ch.accept_from,
+            p.accept_from
+        );
+        c.check(&p, &ch, &b, &ask, &what);
+        for z in [&p, &ch] {
+            let zi = c.zone(z);
+            for m in MODELS.iter().chain(&MODEL_PATTERNS[..3]) {
+                c.model(zi, z, m);
+            }
+            for _ in 0..3 {
+                let pr = match rng.below(4) {
+                    0 => None,
+                    _ => Some(rng.pick(&SENDERS[3..]).to_string()),
+                };
+                c.accepts(&z.accept_from, rng.pick(&SENDERS[..4]), pr.as_deref());
+            }
+        }
+    }
+
+    // 5. Tokens (#164): block 0 and spawn blocks appended to it, decided by the token, against the
+    // spec's chain of zones. Half the children are admitted by `check`, as a node requires.
+    let keys = Keys::new(0);
+    let mut chains = 0;
+    let mut node_admitted = 0;
+    for _ in 0..250 {
+        let depth = 1 + rng.below(3);
+        let mut zs = vec![gen_zone(&mut rng, &base)];
+        for i in 1..=depth {
+            let mut ch = gen_child(&mut rng, &zs[i - 1]);
+            ch.name = format!("z{i}");
+            zs.push(ch);
+        }
+        if zs.iter().any(|z| CompiledZone::new(z.clone()).is_err()) {
+            skipped += 1;
+            continue;
+        }
+        let Ok(cs) = zs
+            .iter()
+            .enumerate()
+            .map(|(i, z)| Ceiling::from_zone(z, &box_id(i), T0 + 3600, vec![keys.approver.public()]))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(mut tok) = mint(&keys.root, TENANT, "trigger:z0", &cs[0]) else {
+            skipped += 1;
+            continue;
+        };
+        let mut ok = true;
+        for c in &cs[1..] {
+            match tok.attenuate(c) {
+                Ok(t) => tok = t,
+                Err(_) => ok = false,
+            }
+        }
+        let Ok(l) = (if ok { load(&tok.to_bytes().unwrap(), &keys.root.public(), &never_revoked) } else { continue }) else {
+            skipped += 1;
+            continue;
+        };
+        chains += 1;
+        let leaf = &zs[depth];
+        let parent = &zs[depth - 1];
+        let pb = subset::Bounds {
+            zone: parent,
+            images: vec!["img".into()],
+            llm_remaining: None,
+            llm_input_remaining: None,
+            time_remaining: Duration::from_secs(3600),
+            child_slots: 2,
+        };
+        node_admitted += usize::from(subset::check(&subset::Ask { zone: leaf, image: "img", max_children: 0 }, &pb).is_ok());
+        let zis: Vec<usize> = zs.iter().map(|z| c.zone(z)).collect();
+        for _ in 0..12 {
+            // Half aim at one of the leaf's rules, so that enough are allowed.
+            let (m, h, p) = match leaf.reach.get(rng.below(leaf.reach.len() + 1)) {
+                Some(r) if rng.chance(50) && !r.methods.is_empty() => {
+                    (r.methods[0].clone(), r.host.replace("*.", "x."), gen_path(&mut rng))
+                }
+                _ => (rng.pick(&["GET", "POST", "PUT"]).to_string(), rng.pick(&HOSTS).to_string(), gen_path(&mut rng)),
+            };
+            c.chain(&zis, &l, depth, &m, &h, &p);
+        }
+    }
+
     let file = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lean-oracle-cases.json");
     std::fs::write(&file, serde_json::to_vec(&json!({ "zones": c.zones, "cases": c.cases })).unwrap()).unwrap();
     let lean = run_lean(&file);
@@ -386,6 +557,9 @@ fn rust_decides_as_the_lean_spec() {
         c.cases.len() - fixtures
     );
     assert!(admitted > 50, "too few generated children admitted ({admitted}) to test the check");
+    println!("lean oracle: {routes_admitted} of 600 route children admitted; {chains} token chains, {node_admitted} of their leaves admitted by check");
+    assert!(routes_admitted > 50 && routes_admitted < 550, "route children admitted: {routes_admitted} of 600");
+    assert!(chains > 100, "too few token chains ({chains})");
     assert!(
         divergent.is_empty(),
         "{} divergences from the Lean spec:\n{}",
