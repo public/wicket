@@ -160,6 +160,10 @@ pub struct RunOf {
     pub zone: String,
     /// The zone's `escalation.request`.
     pub may_ask: bool,
+    /// The harness runs in `bypassPermissions` (a driven box's default): a prompt it still raises
+    /// that wicket's rule allows is answered at once, as the mode says, not left waiting on a human.
+    /// Whatever the mode, wicket's proxies decide what the box can reach.
+    pub bypass: bool,
 }
 
 /// What the supervisor does after a step: lines to write to the harness's stdin, lines to show
@@ -198,6 +202,13 @@ impl Supervised {
                     out.say.push(format!("[wicket] refused the agent's {tool} ({kind}): {why}"));
                     out.audit
                         .push(("run.agent_prompt", json!({ "tool": tool, "kind": kind, "detail": detail, "answer": "deny", "why": why })));
+                }
+                ControlEvent::Prompt { id, tool, kind, detail, refused: None, .. } if self.of.bypass => {
+                    let why = "bypassPermissions: the box acts without asking; wicket's proxies decide what it reaches";
+                    out.write.extend(self.control.answer(&id, true, why));
+                    out.say.push(format!("[wicket] allowed the agent's {tool} ({kind}): {why}"));
+                    out.audit
+                        .push(("run.agent_prompt", json!({ "tool": tool, "kind": kind, "detail": detail, "answer": "allow", "why": why })));
                 }
                 ControlEvent::Prompt { id, tool, kind, detail, input, refused: None } => {
                     let c = Call { tool: &tool, kind: &kind, detail: &detail, input: &input };
@@ -271,6 +282,7 @@ impl Supervised {
 
     /// Changes the permission mode.
     pub fn set_mode(&mut self, mode: RemotePermissionMode) -> Vec<String> {
+        self.of.bypass = mode == RemotePermissionMode::BypassPermissions;
         self.control.set_mode(mode)
     }
 }
@@ -455,12 +467,35 @@ mod tests {
     fn supervised(may_ask: bool) -> (Supervised, Ledger) {
         let a = wicket_agent::harness::adapter(wicket_core::Harness::ClaudeCode);
         let m = wicket_agent::load("task: t\nagent: { name: a }\nzone: { name: z, llm: {} }\n").unwrap();
-        let of = RunOf { tenant: TenantId::single(), run: RunId("run_a".into()), zone: "z".into(), may_ask };
+        let of = RunOf { tenant: TenantId::single(), run: RunId("run_a".into()), zone: "z".into(), may_ask, bypass: false };
         (Supervised::new(a.controller(&m).expect("Claude Code has a control channel"), of), Ledger::open_in_memory().unwrap())
     }
 
     fn kinds(o: &Out) -> Vec<String> {
         o.audit.iter().map(|(k, b)| format!("{k}:{}", b.get("answer").or(b.get("asked")).and_then(|a| a.as_str()).unwrap_or(""))).collect()
+    }
+
+    /// In bypassPermissions (a driven box's default) a prompt the harness still raises is allowed
+    /// at once, with no request for a human, and audited; what wicket's rule refuses stays refused.
+    #[test]
+    fn in_bypass_permissions_a_prompt_is_allowed_at_once() {
+        let (mut s, mut l) = supervised(true);
+        s.of.bypass = true;
+        let mut cc = FakeClaude::default();
+        let mut seen = Out::default();
+        let input = json!({ "command": "cat > changes/x.md <<'EOF'\nhi\nEOF" });
+        let ask = cc.ask("Bash", input.clone());
+        pump(&mut s, &mut l, &mut cc, vec![ask], &mut seen);
+        assert!(l.pending(&TenantId::single()).unwrap().is_empty(), "nobody is asked");
+        assert_eq!(cc.answers, [("cc-1".to_string(), json!({ "behavior": "allow", "updatedInput": input }))]);
+        assert_eq!(kinds(&seen), ["run.agent_prompt:allow"]);
+        // A control file is still refused, whatever the mode.
+        let ask = cc.ask("Write", json!({ "file_path": "/workspace/.claude/settings.json", "content": "{}" }));
+        pump(&mut s, &mut l, &mut cc, vec![ask], &mut seen);
+        assert_eq!(cc.answers.last().unwrap().1["behavior"], "deny");
+        // Leaving bypassPermissions asks again.
+        let _ = s.set_mode(RemotePermissionMode::Default);
+        assert!(!s.of.bypass);
     }
 
     #[test]
