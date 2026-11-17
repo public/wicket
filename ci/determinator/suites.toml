@@ -2,7 +2,23 @@
 # the proofs and models, the fuzz targets. A suite runs when a changed path matches one of its
 # `paths` (`*` within a directory, `**` across them), or a crate it names is affected (changed, or
 # depending on a changed crate: wicket-cli is affected by nearly every change). A change that marks
-# everything (rules.toml) runs every suite.
+# everything (rules.toml) runs every suite, and so does a path no rule or crate claims.
+#
+# The end-to-end suites (`binary = true`) run the built `wicket`, so a change only to tests (the
+# `[tests]` paths) doesn't select them through their packages. smoke and acceptance still list
+# wicket-cli: any change to what the binary is built from runs them. The others name what they
+# exercise that smoke and acceptance don't (#218): a node change runs the node suites, a change to
+# hibernation or the state store runs hibernate and restore, a change to the install path runs
+# install-test.
+
+# Files only a crate's tests read (integration tests, benches, test modules and their data, each
+# compiled under #[cfg(test)] or read only there): a change to them leaves every binary as it was.
+[tests]
+paths = [
+  "crates/*/tests/**", "crates/*/benches/**",
+  "crates/wicket-cli/src/daemon/tests.rs", "crates/wicket-cli/src/serve/tests/**",
+  "crates/wicket-cli/src/top/testdata/**", "crates/wicket-feed/src/tests/**",
+]
 
 [suite.policy]
 packages = ["wicket-policy", "wicket-policy-diff"]
@@ -23,39 +39,77 @@ paths = ["ci/kani.sh"]
 paths = ["verification/tla/**", "ci/tla.sh"]
 
 [suite.smoke]
+binary = true
 packages = ["wicket-cli", "wicket-fwd"]
 paths = ["ci/smoke.sh", "ci/smoke.yaml", "ci/h3get/**", "images/**"]
 
+# Hibernation and its stores: bundles, the content-addressed store, git guards, the transcript a
+# woken agent resumes from.
 [suite.hibernate]
-packages = ["wicket-cli"]
-paths = ["ci/hibernate.sh", "ci/hibernate.yaml"]
+binary = true
+packages = ["wicket-store"]
+paths = [
+  "ci/hibernate.sh", "ci/hibernate.yaml",
+  "crates/wicket-control/src/hibernate.rs", "crates/wicket-control/src/snapstore.rs",
+  "crates/wicket-control/src/storegc.rs", "crates/wicket-control/src/gitguard.rs",
+  "crates/wicket-control/src/transcript.rs",
+]
 
+# Control-plane state off the host (#154): the ledger streamed to S3, the recovery kit, the roots
+# taken offline, a standby restored, and the hibernated agent's bundle there.
 [suite.restore]
-packages = ["wicket-cli"]
-paths = ["ci/restore.sh"]
+binary = true
+packages = ["wicket-store"]
+paths = [
+  "ci/restore.sh",
+  "crates/wicket-control/src/hibernate.rs", "crates/wicket-control/src/snapstore.rs",
+  "crates/wicket-control/src/storegc.rs", "crates/wicket-control/src/roots.rs",
+  "crates/wicket-home/src/s3.rs", "crates/wicket-home/src/statestore.rs", "crates/wicket-home/src/audit_export.rs",
+  "crates/wicket-cli/src/state.rs",
+]
 
 [suite.acceptance]
+binary = true
 packages = ["wicket-cli"]
 paths = ["ci/acceptance.sh", "ci/acceptance/**", "ci/h3get/**", "images/**"]
 
 [suite.daemon-uids]
+binary = true
 packages = ["wicket-cli"]
 paths = ["ci/daemon-uids.sh", "deploy/install.sh"]
 
+# deploy/install.sh from the release archive in a fresh container: the install path, the daemon
+# with its users and groups, the units and the root copies the CLI writes, `wicket self`.
 [suite.install-test]
-packages = ["wicket-cli"]
-paths = ["ci/install-test.sh", "ci/install-acceptance.sh", "deploy/install.sh", "deploy/systemd/**"]
+binary = true
+paths = [
+  "ci/install-test.sh", "ci/install-acceptance.sh", "ci/package.sh", "deploy/**",
+  "crates/wicket-cli/src/daemon/**", "crates/wicket-cli/src/units.rs", "crates/wicket-cli/src/rootcopy.rs",
+  "crates/wicket-cli/src/cmd/itself.rs",
+]
 
-# Run by local gates and nightly, not on pull requests.
+# Run by local gates and nightly, not on pull requests. The node suites: the node (wicket-node, the
+# channel it talks, wicket-chan) and the control host's side of that channel.
 [suite.node-e2e]
-packages = ["wicket-cli"]
-paths = ["ci/node-e2e.sh", "ci/node-e2e/**"]
+binary = true
+packages = ["wicket-node", "wicket-chan"]
+paths = [
+  "ci/node-e2e.sh", "ci/node-e2e/**",
+  "crates/wicket-control/src/noderun.rs", "crates/wicket-control/src/nodecall.rs",
+  "crates/wicket-control/src/enrol.rs", "crates/wicket-control/src/nodeca.rs",
+]
 
 [suite.acceptance-nodes]
-packages = ["wicket-cli"]
-paths = ["ci/acceptance.sh", "ci/acceptance/**"]
+binary = true
+packages = ["wicket-node", "wicket-chan"]
+paths = [
+  "ci/acceptance.sh", "ci/acceptance/**",
+  "crates/wicket-control/src/noderun.rs", "crates/wicket-control/src/nodecall.rs",
+  "crates/wicket-control/src/enrol.rs", "crates/wicket-control/src/nodeca.rs",
+]
 
 [suite.update]
+binary = true
 packages = ["wicket-cli"]
 paths = ["ci/update.sh", "ci/update/**", "deploy/systemd/**"]
 
