@@ -73,9 +73,18 @@ request, and run `sudo wicket self update /tmp/wicket-…tar.gz --nodes all`; or
 `sudo wicket self apply-update <request>`, which takes it from the outbox as the console does.
 
 An update applied from the console moves the `wicket` user's versions (`/var/lib/wicket-versions`)
-and the services that run from them; root's own copy and `/usr/local/bin/wicket` (#261) stay where
-they were, as root never runs what the `wicket` user staged. `sudo wicket self admit <artifact>`
-moves root's link.
+and the services that run from them. Root's own copy and `/usr/local/bin/wicket` (#261) follow too,
+once root trusts the passkey you approve with. Do this once per passkey, as root:
+
+```sh
+sudo wicket self trust-operator laptop      # the passkey's name, as `wicket operator list` shows it
+```
+
+Then `wicket-admit.path` (enabled by `deploy/install.sh`) starts root's `wicket self admit-approved`
+after each console-applied update. It makes root's copy of the build only if the approval was signed
+by a passkey in root's list, for exactly that sha256, and moves root's link to it; its journal
+(`journalctl -u wicket-admit`) says what it did. Without a trusted passkey, root's link stays on its
+build, and `sudo wicket self admit <artifact>` moves it by hand.
 
 What isn't covered: wicket's own end-to-end tests need Docker in the box, which a box doesn't have
 ([design](../explanation/design.md) §21).

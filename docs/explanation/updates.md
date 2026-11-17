@@ -90,10 +90,35 @@ sha256, found without following links), its size, the commit the agent says it i
 reaches, and the passkey signs them with the decision. The console then runs `wicket self apply-update
 <request>` as its own process, as the `wicket` user: it copies the file to a private staging file and
 runs the same update as `self update <copy> --nodes all`, which hashes the copy again and accepts it
-only by that approval, used up. The requester is told the outcome as a notice from wicket. It moves the
-`wicket` user's versions only: root's copies and link stay, as root never runs what the `wicket` user
-staged (#261). A box on another node keeps its outbox there, so its update is still applied from a
-terminal.
+only by that approval, used up. The requester is told the outcome as a notice from wicket. A box on
+another node keeps its outbox there, so its update is still applied from a terminal.
+
+**Root's link after a console update.** The update moves the `wicket` user's versions. Root's copy
+follows through one narrow root step that trusts neither the `wicket` user nor the ledger, which
+that user can write. What it does trust is an operator's passkey:
+
+- **Root's own list.** `/etc/wicket/update-approvers/` holds the public keys of the passkeys root
+  trusts to approve updates. Root adds them with `sudo wicket self trust-operator <name>`, which
+  reads the key once from the ledger, as `self trust-key` reads a key file. The list is refused
+  if the `wicket` user could write it.
+- **The queue.** Once the control host has switched, `apply-update` queues the artifact and the
+  console's signed decision in `<data dir>/self-admit/`. Both are untrusted.
+- **The root unit.** `wicket-admit.path` starts the root oneshot `wicket-admit.service`, which runs
+  `/usr/local/bin/wicket self admit-approved`, root's own copy. For each entry:
+  - the WebAuthn assertion must verify with a key in root's list, over the challenge for exactly
+    the decision JSON;
+  - that JSON must approve `UPDATE wicket.internal/self/<sha256>` for one build, not a prefix;
+  - root's own copy of the artifact, opened without following links, must have that sha256;
+  - only then is it root's copy, and root's link moves as after any update: to root's copy of the
+    versions root's `current`.
+
+Whatever the `wicket` user writes, root runs only builds a trusted operator's passkey approved, and
+chooses among them by `current` as it always has. Without the passkey's private key, an approval
+for some other build can't be forged.
+
+The step does not limit when an approval may be used: an approval stays valid, so the `wicket`
+user could queue an older build a trusted passkey once approved. It can already roll the versions
+root back to such a build.
 
 ## Builds CI signed
 
