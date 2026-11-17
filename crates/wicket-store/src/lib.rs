@@ -25,7 +25,7 @@ pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOU
 pub use receipts::{MessageMeta, MessageRow, Priority, Receipt};
 pub mod objects;
 pub mod sealed;
-pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD};
+pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
 pub use links::{ExposeRow, LinkRow};
 pub mod invariants;
 mod lease;
@@ -101,11 +101,13 @@ pub enum StoreError {
 /// table: when and how a run's work was collected, which a cleanup checks before it deletes the
 /// run's workspace (#377). Version 14 (expand) adds `runs.stuck_at`: when the parent of a child run
 /// whose supervisor runs in its process found it still running after asking it to stop, so the
-/// reconciler and `wicket top` show it as stuck (#409). Version 16 (expand) keeps a message a box
-/// was given in flight until the box has had it (#445): `messages.taken_at`, and
-/// `operator_messages.stdin_start` and `stdin_end` (where a prompt is in the box's stdin), so a
-/// supervisor that takes a run over after a control-host restart gives again what never arrived.
-/// (Version 15 is #444's `runs.want`.)
+/// reconciler and `wicket top` show it as stuck (#409). Version 15 (expand) adds `runs.want`: what
+/// the agent asked of its own run, `finish` or `hibernate` (#249), recorded when it asks, so a
+/// supervisor that re-attaches after a control-host restart still acts on it (#444). Version 16
+/// (expand) keeps a message a box was given in flight until the box has had it (#445):
+/// `messages.taken_at`, and `operator_messages.stdin_start` and `stdin_end` (where a prompt is in
+/// the box's stdin), so a supervisor that takes a run over after a control-host restart gives again
+/// what never arrived.
 pub const SCHEMA_VERSION: u32 = 16;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
@@ -283,7 +285,7 @@ CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
   status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT, policy TEXT,
   authority_until INTEGER, authority_cap INTEGER, activity TEXT, activity_at INTEGER, uncollected TEXT,
-  stuck_at INTEGER
+  stuck_at INTEGER, want TEXT
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -528,6 +530,8 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN uncollected TEXT", []);
         // Ledgers created before a child's stuck supervisor was recorded (#409).
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN stuck_at INTEGER", []);
+        // Ledgers created before an agent's finish or hibernate was recorded for its run (#444).
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN want TEXT", []);
         // Ledgers created before a message was in flight until its box had it (#445).
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN taken_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE operator_messages ADD COLUMN stdin_start INTEGER", []);

@@ -82,12 +82,19 @@ fn everything(files: &[&str]) {
     assert_eq!(s.cargo_args(&members(head())), "--workspace");
 }
 
-// wicket-cli's suites: every end-to-end suite but policy, kani and lean.
-const CLI: &[&str] =
-    &["smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test", "node-e2e", "acceptance-nodes", "update"];
+// The end-to-end suites a change to what wicket-cli is built from selects (#218): the broad ones.
+const CLI: &[&str] = &["smoke", "acceptance", "daemon-uids", "update"];
+// The node suites: wicket-node and wicket-chan, and the control host's side of their channel.
+const NODES: &[&str] = &["node-e2e", "acceptance-nodes"];
+// Hibernation and the state store: wicket-store, and the paths of hibernation and restore.
+const STORE: &[&str] = &["hibernate", "restore"];
 
 fn with(a: &[&'static str], b: &[&'static str]) -> Vec<&'static str> {
     a.iter().chain(b).copied().collect()
+}
+
+fn with3(a: &[&'static str], b: &[&'static str], c: &[&'static str]) -> Vec<&'static str> {
+    a.iter().chain(b).chain(c).copied().collect()
 }
 
 #[test]
@@ -105,15 +112,17 @@ fn the_cli_reference_is_checked_by_a_cli_test() {
 fn a_crate_selects_its_reverse_dependencies() {
     let fwd = ["wicket-fwd", "wicket-proxy", "wicket-chan", "wicket-home", "wicket-node", "wicket-control", "wicket-cli", "wicket-sim"];
     let fuzz = ["fuzz-egress", "fuzz-gateway", "fuzz-chan"];
-    check(&["crates/wicket-fwd/src/copy.rs"], &fwd, &with(CLI, &fuzz));
+    check(&["crates/wicket-fwd/src/copy.rs"], &fwd, &with3(CLI, NODES, &fuzz));
     let s = select(&["crates/wicket-fwd/src/copy.rs"]);
     assert_eq!(s.filter(), "rdeps(=wicket-fwd)");
     assert_eq!(s.cargo_args(&members(head())), "-p wicket-chan -p wicket-cli -p wicket-control -p wicket-fwd -p wicket-home -p wicket-node -p wicket-proxy -p wicket-sim");
-    check(&["crates/wicket-sandbox/tests/x.rs"], &["wicket-sandbox", "wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &with(CLI, &["fuzz-gateway"]));
+    // A crate's tests only: its tests and its reverse dependencies' run, but no end-to-end suite
+    // (the binaries are as they were); the fuzz targets linking it still run.
+    check(&["crates/wicket-sandbox/tests/x.rs"], &["wicket-sandbox", "wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &["fuzz-gateway"]);
     // A deleted file is still its crate's.
-    check(&["crates/wicket-sandbox/src/gone.rs"], &["wicket-sandbox", "wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &with(CLI, &["fuzz-gateway"]));
+    check(&["crates/wicket-sandbox/src/gone.rs"], &["wicket-sandbox", "wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &with3(CLI, NODES, &["fuzz-gateway"]));
     // A crate's own notes stay its crate's.
-    check(&["crates/wicket-fwd/NOTES.md"], &fwd, &with(CLI, &fuzz));
+    check(&["crates/wicket-fwd/NOTES.md"], &fwd, &with3(CLI, NODES, &fuzz));
 }
 
 #[test]
@@ -127,9 +136,10 @@ fn wicket_core_is_nearly_everything_but_not_everything() {
     }
     assert!(s.affected.len() >= 10);
     assert_eq!(nextest_selects(&s.filter()), s.affected);
-    // Every suite but tla (its models only): kani and lean through wicket-core and wicket-authz,
-    // every fuzz target.
-    let all: BTreeSet<String> = Suites::parse(SUITES).unwrap().names().filter(|n| *n != "tla").map(String::from).collect();
+    // Every suite but tla (its models only) and install-test (its install path only): kani and lean
+    // through wicket-core and wicket-authz, every fuzz target.
+    let all: BTreeSet<String> =
+        Suites::parse(SUITES).unwrap().names().filter(|n| !["tla", "install-test"].contains(n)).map(String::from).collect();
     assert_eq!(s.suites, all);
 }
 
@@ -138,7 +148,8 @@ fn policy_code() {
     check(
         &["crates/wicket-policy/tests/cedar.rs"],
         &["wicket-policy", "wicket-policy-diff", "wicket-control", "wicket-sim", "wicket-cli"],
-        &with(CLI, &["policy", "fuzz-manifest", "fuzz-gateway"]),
+        // Its tests only: no end-to-end suite.
+        &["policy", "fuzz-manifest", "fuzz-gateway"],
     );
 }
 
@@ -149,12 +160,14 @@ fn the_simulation_follows_the_run_loops() {
     assert_eq!(select(&[f]).filter(), "rdeps(=wicket-cli) | rdeps(=wicket-sim)");
     // wicket-sim depends on wicket-control (the gateway's tools, #257), and through it on
     // wicket-node: a run's supervisor and the node select it as a reverse dependency, with no rule.
-    for f in ["crates/wicket-control/src/hibernate.rs", "crates/wicket-control/src/noderun.rs"] {
-        check(&[f], &["wicket-control", "wicket-cli", "wicket-sim"], &with(CLI, &["fuzz-gateway"]));
-        assert_eq!(select(&[f]).filter(), "rdeps(=wicket-control)");
-    }
+    let f = "crates/wicket-control/src/hibernate.rs";
+    check(&[f], &["wicket-control", "wicket-cli", "wicket-sim"], &with3(CLI, STORE, &["fuzz-gateway"]));
+    assert_eq!(select(&[f]).filter(), "rdeps(=wicket-control)");
+    let f = "crates/wicket-control/src/noderun.rs";
+    check(&[f], &["wicket-control", "wicket-cli", "wicket-sim"], &with3(CLI, NODES, &["fuzz-gateway"]));
+    assert_eq!(select(&[f]).filter(), "rdeps(=wicket-control)");
     for f in ["crates/wicket-node/src/nodesrv.rs", "crates/wicket-node/src/nodegw.rs"] {
-        check(&[f], &["wicket-node", "wicket-control", "wicket-cli", "wicket-sim"], &with(CLI, &["fuzz-gateway"]));
+        check(&[f], &["wicket-node", "wicket-control", "wicket-cli", "wicket-sim"], &with3(CLI, NODES, &["fuzz-gateway"]));
         assert_eq!(select(&[f]).filter(), "rdeps(=wicket-node)");
     }
     check(&["crates/wicket-cli/src/cmd/run.rs"], &["wicket-cli"], CLI);
@@ -163,10 +176,18 @@ fn the_simulation_follows_the_run_loops() {
 /// The modules that left wicket-cli for wicket-home (#219) still select wicket-cli and its suites.
 #[test]
 fn wicket_home_selects_wicket_cli() {
-    check(&["crates/wicket-home/src/statestore.rs"], &["wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &with(CLI, &["fuzz-gateway"]));
+    check(
+        &["crates/wicket-home/src/statestore.rs"],
+        &["wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"],
+        &with3(CLI, NODES, &["restore", "fuzz-gateway"]),
+    );
     let s = select(&["crates/wicket-home/src/nodeauth.rs"]);
     assert_eq!(s.filter(), "rdeps(=wicket-home)");
-    check(&["deploy/install.sh"], &["wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &with(CLI, &["fuzz-gateway"]));
+    check(
+        &["deploy/install.sh"],
+        &["wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"],
+        &with3(CLI, NODES, &["install-test", "fuzz-gateway"]),
+    );
     let s = select(&["examples/program-repo-stats.pinned.yaml"]);
     assert!(set(&["wicket-home", "wicket-cli"]).is_subset(&s.affected));
 }
@@ -175,7 +196,7 @@ fn wicket_home_selects_wicket_cli() {
 /// and only a node module the simulation doesn't follow leaves wicket-sim out.
 #[test]
 fn wicket_node_selects_wicket_cli() {
-    check(&["crates/wicket-node/src/nodesrv/volumes.rs"], &["wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &with(CLI, &["fuzz-gateway"]));
+    check(&["crates/wicket-node/src/nodesrv/volumes.rs"], &["wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &with3(CLI, NODES, &["fuzz-gateway"]));
     assert_eq!(select(&["crates/wicket-node/src/status.rs"]).filter(), "rdeps(=wicket-node)");
 }
 
@@ -189,6 +210,41 @@ fn wicket_control_selects_wicket_cli() {
     check(&["crates/wicket-cli/src/serve/web.rs"], &["wicket-cli"], CLI);
     let s = select(&["images/claude-code/Dockerfile"]);
     assert!(set(&["wicket-control", "wicket-sim", "wicket-cli"]).is_subset(&s.affected) && s.suites.contains("smoke"));
+}
+
+/// #218: each end-to-end suite is selected by what it exercises; smoke and acceptance by anything
+/// the binary is built from; none by a change to tests only; everything by a path nothing claims.
+#[test]
+fn each_suite_is_selected_by_what_it_exercises() {
+    let suites = |f: &str| select(&[f]).suites;
+    // A change to the CLI's tests only: its tests run, no end-to-end suite.
+    check(&["crates/wicket-cli/src/serve/tests/http.rs"], &["wicket-cli"], &[]);
+    check(&["crates/wicket-proxy/tests/integration/h3.rs"], &["wicket-proxy", "wicket-chan", "wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &["fuzz-egress", "fuzz-gateway", "fuzz-chan"]);
+    // The node suites: the node, its channel, and the control host's side of it; not a store change.
+    for f in ["crates/wicket-node/src/nodesrv.rs", "crates/wicket-chan/src/chan.rs", "crates/wicket-control/src/nodecall.rs"] {
+        assert!(suites(f).contains("node-e2e") && suites(f).contains("acceptance-nodes"), "{f}");
+        assert!(!suites(f).contains("hibernate") && !suites(f).contains("restore"), "{f}");
+    }
+    // hibernate and restore: wicket-store, hibernation, the state store; not a node change.
+    for f in ["crates/wicket-store/src/bundle.rs", "crates/wicket-control/src/snapstore.rs"] {
+        assert!(suites(f).contains("hibernate") && suites(f).contains("restore"), "{f}");
+    }
+    assert!(suites("crates/wicket-home/src/s3.rs").contains("restore"));
+    assert!(!suites("crates/wicket-home/src/s3.rs").contains("hibernate"));
+    // install-test: the install path only.
+    for f in ["deploy/systemd/wicketd.service", "crates/wicket-cli/src/daemon/mod.rs", "crates/wicket-cli/src/units.rs"] {
+        assert!(suites(f).contains("install-test"), "{f}");
+    }
+    assert!(!suites("crates/wicket-control/src/run.rs").contains("install-test"));
+    // smoke and acceptance: anything the binary is built from.
+    for f in ["crates/wicket-cli/src/serve/web.rs", "crates/wicket-control/src/run.rs", "crates/wicket-proxy/src/egress/mod.rs"] {
+        assert!(suites(f).contains("smoke") && suites(f).contains("acceptance"), "{f}");
+    }
+    // The five changes the selection was measured on (`/workspace/out/suitesnarrow`).
+    check(&["crates/wicket-control/src/run.rs"], &["wicket-control", "wicket-sim", "wicket-cli"], &with(CLI, &["fuzz-gateway"]));
+    check(&["docs/explanation/limits.md"], &[], &[]);
+    // The safe default stays: a path no rule or crate claims selects everything.
+    everything(&["somewhere/new.txt"]);
 }
 
 #[test]
@@ -255,7 +311,7 @@ fn inputs_from_outside_the_crates() {
     check(
         &["plugins/wicket/skills/wicket-box/SKILL.md"],
         &["wicket-agent", "wicket-chan", "wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"],
-        &with(CLI, &["fuzz-manifest", "fuzz-chan", "fuzz-gateway"]),
+        &with3(CLI, NODES, &["fuzz-manifest", "fuzz-chan", "fuzz-gateway"]),
     );
 }
 

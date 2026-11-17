@@ -53,8 +53,10 @@ there instead of `/tmp`.
 
 ## In CI
 
-- A pull request fuzzes the targets its change selects, 60 s each (`ci.yml`'s fuzz job). The crates a
-  harness links are listed with it in `ci/determinator/suites.toml`.
+- A pull request fuzzes the targets its change selects, 60 s each, one job per target
+  (`ci.yml`'s `fuzz-target` matrix, after which `Fuzz (short)` passes when they all did), so its
+  fuzzing takes as long as its slowest target. The corpora are replayed once, in a job of their
+  own. The crates a harness links are listed with it in `ci/determinator/suites.toml`.
 - Every night, every target runs for 20 minutes on its own runner (`fuzz.yml`), and a finding is
   filed as an issue.
 - A finding is minimized (`cargo fuzz tmin`) and uploaded. Keep it: add the minimized input to
