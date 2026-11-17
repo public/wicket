@@ -201,33 +201,82 @@ pub fn push(
     let by = format!("the push of agent {}", agent.id);
     let _held = (local.writing(&by)?, shared.as_ref().map(|s| s.writing(&by)).transpose()?);
     let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: Some(&written) };
-    // The ledger's bundle size: a version-2 bundle's is what it restores to (its objects are shared
-    // with other bundles), a version-1 bundle's what it stores.
-    let (m, key, bytes) = match bundle::push_tree(stores, &to, &src) {
-        Ok((m, head)) => {
-            let raw = m.raw_bytes();
-            (m, head, raw)
-        }
+    // The ledger's bundle size is what it restores to (its objects are shared with other bundles).
+    // A tree with a name that isn't UTF-8 isn't hibernated (#258: no format rule for such names, and
+    // nothing renamed silently): the error names the file, and the agent stays as it is.
+    let (m, key) = match bundle::push_tree(stores, &to, &src) {
+        Ok(pushed) => pushed,
         Err(e) if bundle::unrepresentable(&e) => {
-            say!("[wicket] agent {}'s state is kept as a version-1 bundle (a full copy each time): {e}", agent.id);
-            let store = store()?;
-            let prev = match agent.head.as_deref().filter(|h| !bundle::is_tree_head(h)) {
-                Some(k) => Some(bundle::read_manifest(&store, k, &agent.id)?),
-                None => None,
-            };
-            let scratch = data_dir().join("objects-scratch");
-            let (m, key) =
-                bundle::push(&store, &to, &src, prev.as_ref(), &scratch).with_context(|| format!("pushing agent {}'s state", agent.id))?;
-            let stored = m.stored_bytes();
-            (m, key, stored)
+            anyhow::bail!("agent {}'s state can't be hibernated: {e} (rename the file to hibernate it)", agent.id)
         }
         Err(e) => return Err(anyhow::Error::from(e).context(format!("pushing agent {}'s state", agent.id))),
     };
+    let bytes = m.raw_bytes();
     let l = ledger.lock().expect("ledger");
     if !l.commit_agent_push(&agent.id, generation, agent.head_seq, seq, &key, bytes as i64)? {
         return Ok(None);
     }
     Ok(Some(m))
+}
+
+/// What the migration of version-1 heads did with one agent's head.
+#[derive(Debug)]
+pub struct Converted {
+    pub agent: String,
+    /// The version-1 head (a manifest key).
+    pub from: String,
+    /// The version-2 head it moved to, or why it didn't move.
+    pub to: std::result::Result<String, String>,
+}
+
+/// #258: converts every version-1 head to a version-2 bundle (`bundle::convert_v1`), so that the
+/// version-1 reader can go. The control host's first reconciler pass after it starts runs this.
+/// Each conversion holds the stores as a push does, and moves the head only while nothing else
+/// moved it and the agent isn't awake (`Ledger::convert_agent_head`): an awake agent's own push
+/// is version 2. Each moved head is audited `agent.bundle_converted`, each that couldn't move
+/// `agent.bundle_not_converted`, and the old objects are left to the stores' collection.
+pub fn convert_v1_heads(ledger: &std::sync::Mutex<Ledger>) -> Result<Vec<Converted>> {
+    let heads: Vec<(String, String, i64)> =
+        ledger.lock().expect("ledger").agent_heads()?.into_iter().filter(|(_, h, _)| !bundle::is_tree_head(h)).collect();
+    if heads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (local, written) = local_store()?;
+    let shared = shared_store()?;
+    let v1 = store()?;
+    let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: Some(&written) };
+    let mut out = Vec::new();
+    for (id, head, seq) in heads {
+        let Some(a) = ledger.lock().expect("ledger").agent(&id)? else { continue };
+        let to = if matches!(a.state.as_str(), "active" | "waking" | "hibernating") {
+            Err(format!("it is {}: its next hibernation is version 2", a.state))
+        } else {
+            let by = format!("the conversion of agent {id}'s bundle");
+            let held = (|| -> Result<_> { Ok((local.writing(&by)?, shared.as_ref().map(|s| s.writing(&by)).transpose()?)) })();
+            let res = held.and_then(|_held| {
+                let m = bundle::read_manifest(&v1, &head, &id)?;
+                let to = bundle::PushTo { agent: &id, generation: a.generation, seq: seq + 1, session_id: &a.session_id };
+                let scratch = data_dir().join("convert-scratch").join(&id);
+                let (m2, digest) = bundle::convert_v1(stores, &v1, &m, &to, &scratch)?;
+                let l = ledger.lock().expect("ledger");
+                if !l.convert_agent_head(&id, a.generation, &head, seq, seq + 1, &digest, m2.raw_bytes() as i64)? {
+                    bail!("it changed meanwhile (woken, or pushed again): its next hibernation is version 2");
+                }
+                Ok(digest)
+            });
+            res.map_err(|e| format!("{e:#}"))
+        };
+        let tenant = TenantId(a.tenant.clone());
+        let l = ledger.lock().expect("ledger");
+        let _ = match &to {
+            Ok(d) => {
+                l.audit(&tenant, None, "agent.bundle_converted", &serde_json::json!({ "agent": id, "from": head, "to": d, "seq": seq + 1 }))
+            }
+            Err(why) => l.audit(&tenant, None, "agent.bundle_not_converted", &serde_json::json!({ "agent": id, "head": head, "why": why })),
+        };
+        out.push(Converted { agent: id, from: head, to });
+    }
+    Ok(out)
 }
 
 /// Moves the agent's durable volumes into the run's directory before they are packed, so that once the

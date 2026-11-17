@@ -329,6 +329,30 @@ impl Ledger {
         Ok(n == 1)
     }
 
+    /// #258's migration of version-1 heads: moves the head from `from_head` to its version-2
+    /// conversion at `seq`, and nothing else (no state, claim or want changes, unlike
+    /// [`Ledger::commit_agent_push`]): only while the generation, head and seq are what the
+    /// conversion read, and the agent isn't awake (active, waking or hibernating), so a live
+    /// activation's own push still commits. False: it moved meanwhile, and nothing changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn convert_agent_head(
+        &self,
+        id: &str,
+        generation: i64,
+        from_head: &str,
+        from_seq: i64,
+        seq: i64,
+        head: &str,
+        bytes: i64,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE agents SET head = ?6, head_seq = ?5, bundle_bytes = ?7, updated_at = ?8 \
+             WHERE id = ?1 AND generation = ?2 AND head = ?3 AND head_seq = ?4 AND state NOT IN ('active', 'waking', 'hibernating')",
+            params![id, generation, from_head, from_seq, seq, head, bytes, now()],
+        )?;
+        Ok(n == 1)
+    }
+
     /// A wake that failed after its claim: back to `hibernated` (the head is untouched), so it can be
     /// woken again. Only by the claim's own generation.
     pub fn release_failed_wake(&self, id: &str, generation: i64, why: &str) -> Result<bool> {
@@ -442,6 +466,27 @@ mod tests {
         drop(l);
         assert_eq!(Ledger::open(&path).unwrap().agent(&id).unwrap().unwrap().claim_until, Some(until + 60), "copied only once");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #258: a version-1 head moves to its conversion only while nothing else moved it, and only the
+    /// head changes; an awake agent's head is left for its own push.
+    #[test]
+    fn a_converted_head_moves_only_while_unchanged_and_asleep() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let id = new_agent_id();
+        agent(&mut l, &id);
+        assert!(!l.convert_agent_head(&id, 1, "a/x/m/0.1", 0, 1, "sha256:aa", 5).unwrap(), "no such head");
+        assert!(l.commit_agent_push(&id, 1, 0, 1, "a/x/m/1.1", 10).unwrap());
+        assert!(l.set_agent_state(&id, 1, "failed", Some("why")).unwrap());
+        assert!(!l.convert_agent_head(&id, 2, "a/x/m/1.1", 1, 2, "sha256:aa", 5).unwrap(), "another generation");
+        assert!(!l.convert_agent_head(&id, 1, "a/x/m/1.1", 0, 2, "sha256:aa", 5).unwrap(), "another seq");
+        assert!(l.convert_agent_head(&id, 1, "a/x/m/1.1", 1, 2, "sha256:aa", 5).unwrap());
+        let a = l.agent(&id).unwrap().unwrap();
+        assert_eq!((a.head.as_deref(), a.head_seq, a.bundle_bytes), (Some("sha256:aa"), 2, 5));
+        assert_eq!((a.state.as_str(), a.note.as_deref()), ("failed", Some("why")), "nothing else changes");
+        assert!(l.set_agent_state(&id, 1, "hibernated", None).unwrap());
+        assert!(l.claim_wake(&id, "run_2", now() + 30).unwrap().is_some());
+        assert!(!l.convert_agent_head(&id, 2, "sha256:aa", 2, 3, "sha256:bb", 5).unwrap(), "waking");
     }
 
     #[test]

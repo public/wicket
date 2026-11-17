@@ -880,6 +880,26 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     let now = wicket_store::now();
     let mut done = machines_pass(&mut ledger, asked, &local, now, dry_run).await?;
     done.extend(placed_nodes(&mut ledger, now, dry_run).await?);
+    // #258: the first pass after the control host starts converts version-1 bundle heads to
+    // version 2 (each audited by the conversion itself).
+    static CONVERTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !dry_run && !CONVERTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let conv = tokio::task::spawn_blocking(|| {
+            crate::hibernate::convert_v1_heads(&std::sync::Mutex::new(Ledger::open(&crate::ledger_path())?))
+        })
+        .await?;
+        match conv {
+            Ok(cs) => done.extend(cs.into_iter().map(|c| Done {
+                kind: "bundle_convert",
+                target: c.agent,
+                detail: match c.to {
+                    Ok(d) => format!("{} -> {d}", c.from),
+                    Err(why) => format!("{} kept: {why}", c.from),
+                },
+            })),
+            Err(e) => done.push(Done { kind: "bundle_convert", target: "agents".into(), detail: format!("failed: {e:#}") }),
+        }
+    }
     if !dry_run && crate::storegc::due() {
         // The store clients block: off the async runtime.
         let passes = tokio::task::spawn_blocking(|| crate::storegc::run(&Ledger::open(&crate::ledger_path())?, false)).await?;

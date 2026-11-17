@@ -240,8 +240,20 @@ those two.
    store by negotiation; manifest version 2 alongside a reader for version 1 until no agent's head
    is version 1. The ledger's head is the bundle tree's digest, and a write-once ref
    `agents/<agent>/<seq>.<generation>` names it in the bundles' home store (the state store with
-   `bundles: s3`, else the local one). A tree with a name that isn't UTF-8 is still pushed as
-   version 1. Not yet: resuming on the same host before the upload ends, and packs.
+   `bundles: s3`, else the local one). Not yet: resuming on the same host before the upload ends,
+   and packs.
+   **Decided (#258): version 1 goes, in two PRs.** The first stops writing version 1. A tree with a
+   name that isn't UTF-8 now refuses to hibernate, with an error naming the file, and the
+   hibernation fails as on any other push error. The agent stays as it was, and the operator's
+   output, the agent's note and the audit (`agent.hibernate_failed`) say why. The first PR also
+   converts every version-1 head to a version-2 bundle on the control host's first reconciler pass
+   after it starts. The conversion restores each tree with the version-1 reader and pushes it as
+   version 2. The head moves only while the agent's generation, head and seq are unchanged and it
+   isn't awake (`Ledger::convert_agent_head`). Each conversion is audited
+   (`agent.bundle_converted`, or `agent.bundle_not_converted` with why). Every version-1 bundle
+   converts, because version 1 kept non-UTF-8 names lossily. An awake agent's own next hibernation
+   is version 2. The second PR removes the version-1 writer and reader, and the control host
+   refuses to start, naming the agents, while any version-1 head remains.
 4. **Garbage collection** in the reconciler, and the local store's cache cap (done): mark from the
    ledger's heads and the store's refs, sweep trees first, push and collection locks in the store,
    `wicket state gc`. Ledger snapshots' blobs are no longer deleted by hand when their ref goes: the
@@ -262,8 +274,10 @@ those two.
   re-sealing)?
 - **Chunking large files.** Content-defined chunking (FastCDC is about a hundred lines) for big files
   that change a little at a time, or whole files only?
-- **Non-UTF-8 names.** Today's bundles convert them lossily. The tree format refuses them; is that
-  right for every user?
+- **Non-UTF-8 names.** *Decided (#258):* the tree format refuses them, and so does hibernation. A
+  tree holding one isn't hibernated, and the error names the file. Such names are rare, nothing is
+  renamed silently, and no format rule is added for them. Version 1 kept them lossily (U+FFFD),
+  and that is how converted version-1 bundles restore them.
 - **Copy-on-write restores** (#177's "later"). Objects in the local store are compressed, so a restore
   copies. Would large files be kept uncompressed locally, so a restore can reflink them?
 - **Unsealed local caches.** A node's local store is sealed under the store's key, so nodes need the
