@@ -5,7 +5,8 @@
 //! A link carries authority: whoever connects to a box can make it do whatever its zone allows. So
 //! a link opens without a human only when
 //! - the target is the connector's own child (connectable by default), or it exposed the port and
-//!   its zone's `accept_from` lists the connector's zone; and
+//!   its zone's `accept_from` lists the connector's zone or principal (the one test messages use,
+//!   [`crate::manifest::accepts`]); and
 //! - the target's reach is within the connector's ([`subset::reach_within`]).
 //!
 //! Anything else needs a human's approval of exactly that link. A target that never exposed the port
@@ -29,6 +30,9 @@ pub struct End<'a> {
     pub run: &'a str,
     pub parent_run: Option<&'a str>,
     pub zone_name: &'a str,
+    /// The end's principal id (#250), when wicket knows it: an `accept_from` principal entry
+    /// matches only this.
+    pub principal: Option<&'a str>,
     pub accept_from: &'a [String],
     /// The end's zone, if wicket knows it (from the caller's own spawn record or from the end's
     /// `expose`). Unknown is treated as not contained.
@@ -40,7 +44,8 @@ pub struct End<'a> {
 pub enum Basis {
     /// The target is the connector's own child.
     Child,
-    /// The target exposed the port, and its zone accepts links from the connector's zone.
+    /// The target exposed the port, and its zone's `accept_from` lists the connector's zone or
+    /// principal.
     Accepted,
     /// `link`: the caller controls both ends (itself or its own children).
     Controller,
@@ -92,13 +97,14 @@ pub fn connect(caller: &End<'_>, target: &End<'_>, exposed: bool) -> Result<Deci
         Some(Basis::Child)
     } else if !exposed {
         return Err(format!("{} has not exposed that port (it must call expose first)", target.run));
-    } else if target.accept_from.iter().any(|z| z == caller.zone_name) {
+    } else if crate::manifest::accepts(target.accept_from, caller.zone_name, caller.principal) {
         Some(Basis::Accepted)
     } else {
-        needs.push(format!(
-            "zone {} does not accept links from zone {} (its accept_from does not list it)",
-            target.zone_name, caller.zone_name
-        ));
+        let who = match caller.principal {
+            Some(p) => format!("zone {} or {p} (its accept_from lists neither)", caller.zone_name),
+            None => format!("zone {} (its accept_from does not list it)", caller.zone_name),
+        };
+        needs.push(format!("zone {} does not accept links from {who}", target.zone_name));
         None
     };
     containment(caller, target, &mut needs);
@@ -198,7 +204,7 @@ mod tests {
     }
 
     fn end<'a>(run: &'a str, parent: Option<&'a str>, zone_name: &'a str, accept: &'a [String], z: Option<&'a ZoneSpec>) -> End<'a> {
-        End { run, parent_run: parent, zone_name, accept_from: accept, zone: z }
+        End { run, parent_run: parent, zone_name, principal: None, accept_from: accept, zone: z }
     }
 
     #[test]
@@ -226,6 +232,25 @@ mod tests {
         let accepting = end("run_other", None, "other", &acc, Some(&narrow));
         let d = connect(&lead, &accepting, true).unwrap();
         assert_eq!((d.basis, d.allowed()), (Some(Basis::Accepted), true));
+
+        // #250: an accept_from principal entry lets in that principal, from whatever zone, and no
+        // one else in its zone; a zone entry still lets in its whole zone, whoever the principal.
+        let id = "spiffe://test.local/t/single/z/lead/a/lead";
+        let by_id = vec![id.to_string()];
+        let accepting_id = end("run_other", None, "other", &by_id, Some(&narrow));
+        let lead_p = End { principal: Some(id), ..lead };
+        let d = connect(&lead_p, &accepting_id, true).unwrap();
+        assert_eq!((d.basis, d.allowed()), (Some(Basis::Accepted), true));
+        let sibling = End { run: "run_lead2", principal: Some("spiffe://test.local/t/single/z/lead/a/other"), ..lead };
+        let d = connect(&sibling, &accepting_id, true).unwrap();
+        assert_eq!(d.basis, None);
+        assert!(
+            d.needs_human[0].contains("does not accept links from zone lead or spiffe://") && d.needs_human[0].contains("lists neither"),
+            "{d:?}"
+        );
+        // Unknown principal: a principal entry never matches.
+        assert_eq!(connect(&lead, &accepting_id, true).unwrap().basis, None);
+        assert_eq!(connect(&lead_p, &accepting, true).unwrap().basis, Some(Basis::Accepted));
 
         // A child connecting to its parent is not the parent's child: it needs the parent's consent.
         assert!(connect(&child, &lead, false).is_err());

@@ -31,7 +31,7 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
 - Boxes reach each other's ports only through links, which wicket relays (boxes still have no network):
   `expose(port)` offers a port, `connect(box, port)` returns `<name>.wicket.internal:<port>` in the caller's box,
   and `link(from, to, port)` wires two boxes the caller controls. A box's own children are connectable without
-  `expose`; others need its `expose` and its zone's `accept_from`, or an operator. The target's reach must be within
+  `expose`; others need its `expose` and its zone's `accept_from` (listing their principal or zone), or an operator. The target's reach must be within
   the connector's, or an operator approves. Every link is audited (`wicket links`, `wicket unlink <id>`), and closes
   when cut, when either end is revoked or when either run ends. See `examples/links/`.
 - Identities are short-lived: valid 10 minutes, re-issued every 5 with a fresh key (`WICKET_IDENTITY_TTL` to change).
