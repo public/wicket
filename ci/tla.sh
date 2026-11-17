@@ -67,7 +67,7 @@ expect_fail() {
     fail_lifecycle_finish_lost) echo 'FinishKnown' ;;
     fail_lifecycle_message_lost) echo 'NoMessageLost' ;;
     fail_lifecycle_twin_wake) echo 'OneHarness' ;;
-    fail_lifecycle_today) echo 'FinishKnown|NoMessageLost|OneHarness' ;;
+    fail_lifecycle_today) echo 'FinishKnown|NoMessageLost' ;;
     # #321's placement (Placement.tla): the bugs its switches fixed.
     fail_placement_no_start_by) echo 'NoStartPastLease' ;;
     fail_placement_no_admission) echo 'NoOvercommit' ;;
