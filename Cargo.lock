@@ -4367,7 +4367,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tar",
  "thiserror",
  "wicket-core",
  "zstd",

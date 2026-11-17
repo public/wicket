@@ -1639,9 +1639,12 @@ gate exists for. A skill is an instruction to every future activation, so it is 
   - all of `/wicket/state`;
   - `/tmp`, now a per-box host directory;
   - `durable` volumes. `node` and `cache` volumes stay out of the bundle; on one node they behave the same.
-- Trees are tar + zstd -3, content-addressed in an `ObjectStore` (a directory, or an S3-compatible store,
-  #154), and each object is sealed at rest with our own chunked AES-256-GCM (#148). Each is verified by its
-  tree digest on restore. An unchanged tree reuses its object; a changed one is stored again whole.
+- A bundle is a bundle tree in the content-addressed store (#258, `docs/explanation/store.md`). Each file
+  is a blob and each directory a tree named by sha256, kept in the host's local store and in the state
+  store with `bundles: s3` (#154). Each object is sealed at rest with our own chunked AES-256-GCM
+  (#148) and verified as it is read. Unchanged files are stored once across hibernations. Until #258
+  the trees were tar + zstd -3 blobs, each stored again whole when it changed. Those version-1 bundles
+  were converted, and their code removed.
 - **Format decision (owner, 2026-11-13, #195):** wicket keeps this format of its own and its dependencies
   minimal, with no `rustic_core`/restic and no `age` for now. Experiment E5
   (`experiments/bundle-formats/RESULTS.md`) measured the restic format storing 5–18× less after many
