@@ -88,13 +88,27 @@ wicket node revoke n1
   half-life the run renews the certificate over the channel; a node that was unreachable until its certificate
   expired gets a new one with `wicket node renew-ca`. The handshake doesn't depend on ssh: a QUIC or mTLS
   transport would reuse it, passing its TLS exporter as the channel binding (`wicket_identity::node`).
+- **Node CA renewal** (#416, protocol 14). Like the identity certificate, the node CA is renewed over the
+  channel at half its life by whichever run is connected to the node: the node makes a new P-256 key (in memory
+  until certified) and sends its signing request; the control host signs it for the same hosts and lifetime;
+  the node checks it is for that key, signed by its installation root and unexpired, writes `ca.key`, `ca.pem`
+  and `ca-chain.pem`, and swaps it in for every box it runs, running ones included (their next connection is
+  served by the new CA). Then the ledger records it, revokes the CA it replaced early, and audits
+  `node.ca_renewed` (new serial, end, the revoked serials). One renewal per node at a time; a failed step is
+  retried a minute later. A node that was unreachable through its CA's end is renewed as soon as a run
+  connects, and the box's start waits for that (up to 30 s). A node at protocol 13 isn't asked: renew it with
+  `wicket node renew-ca`, which still works for any node over ssh.
+- **An expired node CA** is a node health alert (`<node>/ca-expired`; and `<node>/ca-expiring` once less than
+  a quarter of its life is left), in `wicket top`, the console's health panel and push, and the health summary
+  shows the CA's end. Such a node refuses to start a box whose zone needs the CA (a model route, or a reach or
+  inject host inside its name constraints), saying why, instead of starting one whose every request fails.
 - **Name constraints are subtrees.** `api.example.com` also permits names under it (`x.api.example.com`), and
   `*.example.org` permits every name under `example.org` but not `example.org` itself. X.509 can't express
   "exactly this host". The reach rules stay the exact gate, and the constraint bounds what a stolen node CA can
   do until it expires.
 - **Revoking** deletes the pinned key, revokes the node's identity certificates (a run connected to the node
   stops its box there and drops it within a second, and nothing reconnects), and records the node CA's serials
-  for the feed's revocation list (not distributed yet).
+  for the feed's revocation list (not distributed yet), as a renewal over the channel does for the CA it replaces.
 
 ## `wicket node serve`: boxes that outlive the control channel
 
@@ -173,7 +187,7 @@ wicket node revoke n1
   | a run's use of a secret its node fetched | the box's authority, or the upstream token's own expiry if earlier | the zone; the upstream |
   | a budget slice | until spent, renewed while connected | `WICKET_NODE_BUDGET_SLICE` on the control host (fraction, default 0.25) |
   | an agent identity | 10 min, re-issued every 5 by the run's supervisor | `WICKET_IDENTITY_TTL` |
-  | the node's certificate and node CA | 24 h, renewed over the channel at half-life, or by `renew-ca` | `enrol --cert-ttl`, `--ca-ttl` |
+  | the node's certificate and node CA | 24 h, each renewed over the channel at half-life (the CA from protocol 14), or by `renew-ca` | `enrol --cert-ttl`, `--ca-ttl` |
   | the node feed key's certificate | 7 days, renewed when a run starts with less than a day left | (fixed) |
   | a capacity lease | its duration | `request_capacity`'s duration |
   | a join token | its TTL | `wicket node token --ttl` |
