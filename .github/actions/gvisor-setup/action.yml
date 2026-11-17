@@ -10,11 +10,22 @@ inputs:
 runs:
   using: composite
   steps:
+    # What the static HTTP/3 client is built from: rustc's version and every file under ci/h3get but
+    # its target dir. Part of the cache's key, so a cache is saved with the client built from them.
+    - id: h3get
+      name: The HTTP/3 client's stamp
+      shell: bash
+      run: |
+        stamp=$({ rustc -vV; find ci/h3get -path ci/h3get/target -prune -o -type f -print | LC_ALL=C sort | xargs sha256sum; } | sha256sum | cut -d' ' -f1)
+        echo "stamp=$stamp" >>"$GITHUB_OUTPUT"
     - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         # The smoke job's cache, as before the split; the acceptance job reads it.
         shared-key: smoke
+        key: h3get-${{ steps.h3get.outputs.stamp }}
         save-if: ${{ inputs.save-cache == 'true' }}
+        # The static HTTP/3 client as last built, with its stamp (below).
+        cache-directories: ~/.cache/wicket-h3get
     - name: Install gVisor as a Docker runtime
       shell: bash
       run: |
@@ -38,12 +49,30 @@ runs:
     - name: Build wicket
       shell: bash
       run: cargo build -p wicket-cli --locked
-    - name: Rust's musl target, for the static HTTP/3 client (the smoke test and acceptance)
+    # The static HTTP/3 client (the smoke test and acceptance): Rust's musl target, musl-tools and a
+    # release build, 27-45 s, unless the cache holds the binary with the same stamp. A cache
+    # restored from an older key can hold another stamp's: then it is built again.
+    - name: The static HTTP/3 client (h3get, for musl)
       shell: bash
+      env:
+        STAMP: ${{ steps.h3get.outputs.stamp }}
       run: |
-        rustup target add x86_64-unknown-linux-musl
-        sudo apt-get install -y -q musl-tools
-        cargo build -q --release --locked --target x86_64-unknown-linux-musl --manifest-path ci/h3get/Cargo.toml
+        out=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get
+        kept=$HOME/.cache/wicket-h3get
+        stamp=$STAMP
+        if [ -x "$kept/h3get" ] && [ "$(cat "$kept/stamp" 2>/dev/null)" = "$stamp" ]; then
+          echo "h3get: from the cache, built from these sources ($stamp)"
+          mkdir -p "$(dirname "$out")"
+          cp "$kept/h3get" "$out"
+        else
+          echo "h3get: building ($stamp)"
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y -q musl-tools
+          cargo build -q --release --locked --target x86_64-unknown-linux-musl --manifest-path ci/h3get/Cargo.toml
+          mkdir -p "$kept"
+          cp "$out" "$kept/h3get"
+          echo "$stamp" >"$kept/stamp"
+        fi
     - name: Build the agent image
       shell: bash
       run: target/debug/wicket image
