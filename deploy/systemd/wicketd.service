@@ -21,8 +21,12 @@ UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=full
 Restart=on-failure
-# Runs started through the daemon are its children: stopping it sends them SIGTERM, and each stops
-# its box before exiting (the reconciler ends any that don't as "lost").
+# Commands started through the daemon are its children, each in its own process group. A restart
+# (deploy/install.sh, an operator's) stops only the daemon: its runs go on supervising their boxes,
+# and only their callers' connections end (#455). `wicket self update` doesn't restart it at all:
+# on SIGHUP it re-executes, handing its running commands to the new build. To end runs too, end
+# them first (`wicket identity revoke <run>`, `wicket hibernate`).
+KillMode=process
 TimeoutStopSec=90
 
 [Install]

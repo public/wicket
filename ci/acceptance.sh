@@ -672,6 +672,46 @@ restart_flow() {
 }
 if [ "$mode" = dev ]; then restart_flow; else skip "a control-host restart" "dev mode only (installed: wicketd's processes)"; fi
 
+# ---- 5c. wicketd moves and restarts under a long-lived run (#455) ----
+# Installed only: a long-lived agent started through wicketd. wicketd re-executes (SIGHUP, as
+# `wicket self update` sends it): at once, handing the run over with its caller still connected.
+# Then it is stopped and started again (what deploy/install.sh's restart does): the run goes on, and
+# its caller's connection ends saying so. After each, the agent's next turn is in the same run, on
+# the same box.
+daemon_flow() {
+  log "wicketd moves to a new build and restarts under a long-lived run (#455)"
+  local r b p t0 starts
+  r=$(restart_start daemon)
+  b=$(box_of "$r")
+  p=$(data pids/daemon.pid 2>/dev/null | head -1)
+  check "  the run started through wicketd took its first turn" '[ "$(restart_result "$r" | jq -r .turn 2>/dev/null)" = 1 ] && [ -n "$p" ]'
+  starts() { grep -c "wicketd: /run/wicket/wicketd.sock as" /tmp/wicketd.log 2>/dev/null || true; }
+  local before; before=$(starts)
+  t0=$(date +%s)
+  sudo -n kill -HUP "$p"
+  wait_for 30 '[ "$(starts)" -gt "$before" ]' || true
+  check "  on SIGHUP wicketd re-executed at once, handing the run over" \
+    '[ $(( $(date +%s) - t0 )) -lt 30 ] && grep -q "following [0-9]* command(s) handed over" /tmp/wicketd.log'
+  w session --no-wait "$r" "Again, after wicketd moved." >/dev/null 2>&1 || true
+  wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 2 ]' || true
+  check "  its next turn was in the same run, on the same box" '[ "$(restart_result "$r" | jq -r .turn)" = 2 ] && [ "$(box_of "$r")" = "$b" ]'
+  check "  and its caller stayed connected" '! grep -q "wicketd closed the connection" "$work/restart-daemon.log"'
+  # A restart, as systemd's KillMode=process does it: the daemon alone stops, then starts again.
+  before=$(starts)
+  sudo -n kill -TERM "$p"
+  wait_for 20 'grep -q "wicketd closed the connection" "$work/restart-daemon.log"' || true
+  check "  stopping wicketd ended the caller's connection, saying the run goes on" 'grep -q "a run it started goes on" "$work/restart-daemon.log"'
+  check "  and left its box running" '[ "$(box_of "$r")" = "$b" ]'
+  sudo -n sh -c 'cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /var/lib/wicket-versions/current/wicket daemon >>/tmp/wicketd.log 2>&1 &'
+  wait_for 30 '[ "$(starts)" -gt "$before" ]' || true
+  w session --no-wait "$r" "Again, after wicketd restarted." >/dev/null 2>&1 || true
+  wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 3 ]' || true
+  check "  after the restart, its next turn was in the same run, on the same box" '[ "$(restart_result "$r" | jq -r .turn)" = 3 ] && [ "$(box_of "$r")" = "$b" ]'
+  wroot identity revoke "$r" --reason "acceptance: wicketd check done" >/dev/null 2>&1 || true
+  wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true
+}
+if [ "$mode" = installed ]; then daemon_flow; else skip "wicketd moving and restarting under a run" "installed only (wicketd)"; fi
+
 # ---- 3c. an org policy in Cedar (#51) ----
 # The installation's org policy forbids one path the zone allows: the box's token, compiled at mint,
 # refuses it at the edge. A new version revokes the runs minted under the old one. Development mode

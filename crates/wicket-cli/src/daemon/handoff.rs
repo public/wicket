@@ -287,13 +287,9 @@ mod tests {
         let pid = child("sleep 30");
         let stage = dir.join("stage");
         let s2 = stage.clone();
-        let t = std::thread::spawn(move || follow(pid, &daemon, Some(s2), || {}).unwrap());
-        for _ in 0..50 {
-            if followed() > 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || follow(pid, &daemon, Some(s2), move || tx.send(()).unwrap()).unwrap());
+        rx.recv().unwrap();
         {
             let held = prepare(&path).unwrap();
             let h: Handoff = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

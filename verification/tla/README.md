@@ -248,7 +248,7 @@ keeps the repeat out.
 |---|---|
 | `Wake` | `wicket-control/src/hibernate.rs` `wake` → `wicket-store/src/agents.rs` `Ledger::claim_wake` (moves undelivered and held messages, and operator messages, to the new run; `WakeAfterAuthority`: `FENCING_RUNS`, `Ledger::agent_fenced_until`) |
 | `Renew`, `Supersede` | `wicket-control/src/run.rs`, the heartbeat: `Ledger::renew_agent_claim`, and `superseded` when it fails |
-| `Crash`, `Restart` | the control host's processes stopping (`ci/acceptance.sh`, `restart_flow`) |
+| `Crash`, `Restart` | the control host's processes stopping (`ci/acceptance.sh`, `restart_flow`). wicketd stopping or moving to a new build is no step of the model (#455): its runs' supervisors are processes of their own, which a restart (`KillMode=process`) or a re-exec (the daemon's handoff) leaves running (`ci/acceptance.sh`, `daemon_flow`) |
 | `Adopt`, `Lost` | `wicket-cli/src/reconcile.rs`: `run_adopted` (a new `wicket run --attach`), `run_lost` |
 | `AskFinish`, `CloseSession`, `HarnessExits` | the gateway's `finish` tool (`wicket_proxy::Want::Finish`) → `run.rs` `finish_asked` → the session's close (`stdin = None`, `StdinClose`, recorded by the node) and `Linger::Finish` (#293) |
 | `Send` | `send_message` (the gateway), and `wicket session`'s and the console's `add_prompt` (an operator's prompt, a row of the same `messages` inbox since #253) |
