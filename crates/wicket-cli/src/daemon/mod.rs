@@ -77,7 +77,7 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         let mut waited = 0u64;
         while IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             if waited.is_multiple_of(60) {
-                eprintln!(
+                say_err!(
                     "wicketd: waiting for {} running command(s) to end before moving to the new build",
                     IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst)
                 );
@@ -86,19 +86,19 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
             waited += 1;
         }
     });
-    eprintln!("wicketd: {} as {} (uid {uid}), data {}, policy {}", socket.display(), d.user, d.data_dir.display(), d.policy_path.display());
+    say_err!("wicketd: {} as {} (uid {uid}), data {}, policy {}", socket.display(), d.user, d.data_dir.display(), d.policy_path.display());
     for conn in listener.incoming() {
         let conn = match conn {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("wicketd: accept: {e}");
+                say_err!("wicketd: accept: {e}");
                 continue;
             }
         };
         let d = d.clone();
         std::thread::spawn(move || {
             if let Err(e) = d.handle(conn) {
-                eprintln!("wicketd: {e:#}");
+                say_err!("wicketd: {e:#}");
             }
         });
     }
@@ -129,7 +129,7 @@ pub fn prepare_data_dir(dir: &Path, uid: u32) -> Result<()> {
         bail!("{} is owned by uid {}, not by this user (uid {uid})", dir.display(), m.uid());
     }
     if m.permissions().mode() & 0o077 != 0 {
-        eprintln!("wicketd: {} was mode {:o}; setting 0700", dir.display(), m.permissions().mode() & 0o7777);
+        say_err!("wicketd: {} was mode {:o}; setting 0700", dir.display(), m.permissions().mode() & 0o7777);
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
@@ -177,7 +177,7 @@ impl Daemon {
         let (cmd, class, basis) = match self.admit(&peer, &hello) {
             Ok(x) => x,
             Err(why) => {
-                eprintln!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
+                say_err!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
                 self.audit_refusal(&peer, &hello, &why);
                 return refuse(&mut w, &why);
             }
@@ -186,7 +186,7 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => {
                 let why = format!("{e:#}");
-                eprintln!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
+                say_err!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
                 self.audit_refusal(&peer, &hello, &why);
                 return refuse(&mut w, &why);
             }
@@ -225,12 +225,12 @@ impl Daemon {
         if let Some(s) = plan.stage.as_mut() {
             if let Err(e) = s.finish().and_then(|_| check_staged(&cmd, &hello, s, &self.vault_dir)) {
                 let why = format!("{e:#}");
-                eprintln!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
+                say_err!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
                 self.audit_refusal(&peer, &hello, &why);
                 return refuse(&mut w, &why);
             }
         }
-        eprintln!(
+        say_err!(
             "wicketd: uid {} ({}) {}: {} [{}]",
             peer.uid,
             peer.user,
@@ -278,7 +278,7 @@ impl Daemon {
             )
         });
         if let Err(e) = r {
-            eprintln!("wicketd: recording the refusal: {e}");
+            say_err!("wicketd: recording the refusal: {e}");
         }
     }
 
