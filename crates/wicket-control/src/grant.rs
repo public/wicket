@@ -29,7 +29,7 @@ pub const MAX_TTL: Duration = Duration::from_secs(24 * 3600);
 /// The most uses an agent's grant may have (#291): an agent's grants are always bounded. The
 /// gateway's `decide` tool refuses more before signing, but the bound is held here (#342), where
 /// every grant is made, whatever a signed decision envelope says.
-pub const MAX_AGENT_USES: u32 = wicket_proxy::gateway::MAX_DECIDE_USES;
+pub const MAX_AGENT_USES: u32 = crate::gateway::MAX_DECIDE_USES;
 
 /// The principal deciding.
 #[derive(Clone, Debug)]

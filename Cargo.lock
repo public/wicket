@@ -4333,6 +4333,7 @@ dependencies = [
  "tokio",
  "turmoil",
  "wicket-authz",
+ "wicket-control",
  "wicket-core",
  "wicket-feed",
  "wicket-identity",

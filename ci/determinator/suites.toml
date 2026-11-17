@@ -16,8 +16,10 @@ paths = ["ci/lean.sh"]
 packages = ["wicket-core"]
 paths = ["ci/kani.sh"]
 
+# TLC reads only the models (ci/tla.sh): no crate's code reaches it, so only its own paths select it.
+# Each README maps the models' actions to the code; a change to that code is reviewed against them,
+# but rerunning TLC can't catch a drift.
 [suite.tla]
-packages = ["wicket-cli"]
 paths = ["verification/tla/**", "ci/tla.sh"]
 
 [suite.smoke]
@@ -68,7 +70,7 @@ paths = [
 
 [fuzz.target]
 egress = { packages = ["wicket-proxy", "wicket-store"], paths = ["fuzz/src/util.rs"] }
-gateway = { packages = ["wicket-proxy", "wicket-store"], paths = ["fuzz/src/util.rs"] }
+gateway = { packages = ["wicket-control", "wicket-proxy", "wicket-store"], paths = ["fuzz/src/util.rs"] }
 chan = { packages = ["wicket-chan"], paths = ["fuzz/src/node_chan.rs"] }
 feed = { packages = ["wicket-feed"] }
 token = { packages = ["wicket-authz"] }
