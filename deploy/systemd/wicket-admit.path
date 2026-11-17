@@ -1,0 +1,12 @@
+# Starts wicket-admit.service when the console has applied an update (#261): an entry queued in
+# /var/lib/wicket/self-admit/. Enabled by deploy/install.sh.
+[Unit]
+Description=wicket: root's copies of the updates operators approved
+Documentation=https://github.com/public/wicket
+
+[Path]
+DirectoryNotEmpty=/var/lib/wicket/self-admit
+MakeDirectory=no
+
+[Install]
+WantedBy=multi-user.target

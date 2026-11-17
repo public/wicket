@@ -1679,6 +1679,19 @@ impl Ledger {
         Ok(v)
     }
 
+    /// The body of the newest `decision` record for request `id`, if any: who decided it and, for a
+    /// passkey's decision, what it signed.
+    pub fn decision_record(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT body FROM audit WHERE kind = 'decision' AND json_extract(body, '$.request') = ?1 ORDER BY seq DESC LIMIT 1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// The body of a run's newest audit record of `kind`, if any.
     pub fn audit_latest(&self, run: &str, kind: &str) -> Result<Option<String>> {
         Ok(self

@@ -51,6 +51,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             SelfCmd::ApplyUnits { dir } => units::apply(dir),
             SelfCmd::Admit { artifact } => rootcopy::admit_cmd(&artifact),
             SelfCmd::ApplyUpdate { request } => apply_update::apply(&request).await,
+            SelfCmd::TrustOperator { name } => rootadmit::trust_operator_cmd(&name),
+            SelfCmd::AdmitApproved => rootadmit::admit_approved_cmd(),
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
@@ -162,6 +164,17 @@ pub enum SelfCmd {
         /// The approved request (`UPDATE wicket.internal/self/<sha256>`, from `request_update`).
         request: String,
     },
+    /// Trust an enrolled operator's passkey to approve the updates root copies (#261): root's own
+    /// list, /etc/wicket/update-approvers/. An update an operator approves with it in the console
+    /// then moves /usr/local/bin/wicket too (`self admit-approved`).
+    TrustOperator {
+        /// The passkey's name, as `wicket operator list` shows it.
+        name: String,
+    },
+    /// Root's copies of the updates the console applied (#261), run by wicket-admit.service: each
+    /// queued build whose approval a passkey in root's list signed, checked by its sha256; then
+    /// /usr/local/bin/wicket moves to root's copy of the current version.
+    AdmitApproved,
     /// This build's systemd units (JSON: name to contents).
     #[command(hide = true)]
     Units,

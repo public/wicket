@@ -171,6 +171,14 @@ impl Layout {
                 );
             }
         }
+        self.admit_file(&f, artifact, None)
+    }
+
+    /// Makes root's copy of the build in the open artifact `f` (named `label` in messages). With
+    /// `expect` (an artifact sha256 an operator approved, [`crate::rootadmit`]), wherever `f` came
+    /// from: root's own copy of it must have that sha256, or nothing is made. Without, the caller
+    /// has checked the `wicket` user couldn't have written it ([`Layout::admit`]).
+    pub fn admit_file(&self, f: &std::fs::File, artifact: &Path, expect: Option<&str>) -> Result<String> {
         std::fs::create_dir_all(&self.copies).with_context(|| self.copies.display().to_string())?;
         std::fs::set_permissions(&self.copies, std::fs::Permissions::from_mode(0o755))?;
         if let Some(why) = self.untrusted.as_ref().and_then(|a| writable_by(&self.copies, a)) {
@@ -184,7 +192,13 @@ impl Layout {
         let copy = stage.join("artifact");
         {
             let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&copy)?;
-            std::io::copy(&mut &f, &mut out).with_context(|| format!("copying {}", artifact.display()))?;
+            std::io::copy(&mut &*f, &mut out).with_context(|| format!("copying {}", artifact.display()))?;
+        }
+        if let Some(want) = expect {
+            let got = crate::update::sha256_file(&copy)?;
+            if got != want {
+                bail!("refused: {} has sha256 {got}, not the approved {want}", artifact.display());
+            }
         }
         let bin = crate::update::binary_in(&copy, &stage.join("bin"))?;
         let sha = crate::update::sha256_file(&bin)?;

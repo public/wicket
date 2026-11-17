@@ -43,6 +43,7 @@ mod invariants;
 mod mock;
 mod pin;
 mod reconcile;
+mod rootadmit;
 mod rootcopy;
 mod serve;
 mod session;

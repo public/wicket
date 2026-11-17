@@ -23,6 +23,7 @@
 #   - a release public key to accept updates signed with (--release-key, from `wicket self keygen`);
 #   - systemd units for wicketd, the console (wicket serve) and the reconciler, enabled and started;
 #     wicket-follow's (following main's signed builds, #190) installed but not enabled;
+#     wicket-admit.path (root's copies of updates applied from the console, #261) enabled;
 #   - the identity issuer, and the agent image (wicket/claude-code:<build id>, and :poc as an alias).
 # Then the one secret: sudo wicket secret set claude-oauth (from `claude setup-token`).
 set -euo pipefail
@@ -252,7 +253,7 @@ for u in wicketd wicket-console wicket-reconcile wicket-state; do
     fi
 done
 # Following main's signed builds (#190): installed, never enabled here (docs/how-to/update-from-ci.md).
-for u in wicket-follow.service wicket-follow.timer; do
+for u in wicket-follow.service wicket-follow.timer wicket-admit.service wicket-admit.path; do
     if ! cmp -s "$here/systemd/$u" "/etc/systemd/system/$u"; then
         install -m 0644 "$here/systemd/$u" "/etc/systemd/system/$u"
         units_changed=1
@@ -263,6 +264,9 @@ if [ "$systemd" = 1 ]; then
     if [ "$start" = 1 ]; then
         # wicket-state starts only once state-store.yaml exists (docs/how-to/state-off-host-and-restore.md).
         systemctl enable wicketd wicket-console wicket-reconcile wicket-state >/dev/null 2>&1
+        # Root's copies of updates applied from the console (#261): it acts only on approvals signed
+        # by a passkey root trusts (sudo wicket self trust-operator <name>), so on with none trusted.
+        systemctl enable --now wicket-admit.path >/dev/null 2>&1 || true
         # Restarting wicketd stops the runs started through it: only when something changed.
         if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q wicketd; then
             systemctl restart wicketd

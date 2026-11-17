@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 /// This build's units: `deploy/systemd/`, every file (a test keeps the list equal to the directory).
 pub const UNITS: &[(&str, &str)] = &[
+    ("wicket-admit.path", include_str!("../../../deploy/systemd/wicket-admit.path")),
+    ("wicket-admit.service", include_str!("../../../deploy/systemd/wicket-admit.service")),
     ("wicket-console.service", include_str!("../../../deploy/systemd/wicket-console.service")),
     ("wicket-follow.service", include_str!("../../../deploy/systemd/wicket-follow.service")),
     ("wicket-follow.timer", include_str!("../../../deploy/systemd/wicket-follow.timer")),

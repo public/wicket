@@ -1,0 +1,19 @@
+# Root's copy of each build the console applied (#261), started by wicket-admit.path. As root, with
+# root's own copy of wicket (/usr/local/bin/wicket), never the wicket user's versions root. It reads
+# only the queue under /var/lib/wicket/self-admit/ (the wicket user's, so untrusted) and copies a
+# build only if a passkey in root's own list (/etc/wicket/update-approvers/, `sudo wicket self
+# trust-operator <name>`) signed its approval and root's copy has the approved sha256; then
+# /usr/local/bin/wicket moves to root's copy of the versions root's current. Nothing else.
+[Unit]
+Description=wicket: root's copies of the updates operators approved
+Documentation=https://github.com/public/wicket
+After=wicketd.service
+
+[Service]
+Type=oneshot
+Environment=WICKET_HOME=/var/lib/wicket
+ExecStart=/usr/local/bin/wicket self admit-approved
+UMask=0022
+NoNewPrivileges=yes
+PrivateNetwork=yes
+ProtectHome=yes

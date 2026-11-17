@@ -160,6 +160,9 @@ pub fn route(cmd: &Cmd) -> Route {
             // Root's own copy of a build (#261), made by root from an artifact root names: never
             // through the daemon, whose user root mustn't trust.
             SelfCmd::Admit { .. } => Local,
+            // Root's list of update approvers, and root's copies of what they approved (#261): as
+            // admit, root's own acts, never through the daemon.
+            SelfCmd::TrustOperator { .. } | SelfCmd::AdmitApproved => Local,
         },
         Cmd::Dev { cmd } => match cmd {
             DevCmd::MockLlm { .. } => Local,
@@ -382,6 +385,8 @@ mod tests {
             (&["self", "keygen", "/tmp/k"], Route::Local),
             (&["self", "sign", "--key", "/tmp/k", "/tmp/w"], Route::Local),
             (&["self", "admit", "/tmp/w"], Route::Local),
+            (&["self", "trust-operator", "laptop"], Route::Local),
+            (&["self", "admit-approved"], Route::Local),
             (&["dev", "mock-llm", "--command", "true"], Route::Local),
         ];
         for (args, want) in cases {

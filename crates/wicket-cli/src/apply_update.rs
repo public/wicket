@@ -193,8 +193,9 @@ pub async fn apply(request: &str) -> Result<()> {
     );
     say!("applying {request}: {name} ({size} bytes, sha256 {sha}) from {}'s outbox, then {} node(s)", req.run, nodes.len());
     drop(l);
+    let before = crate::update::Versions::control().pointer("current");
     let r = crate::update::update(crate::update::UpdateOpts {
-        artifact,
+        artifact: artifact.clone(),
         sig: None,
         nodes: (!nodes.is_empty()).then(|| "all".to_string()),
         only_nodes: false,
@@ -218,7 +219,29 @@ pub async fn apply(request: &str) -> Result<()> {
         serde_json::json!({ "request": request, "artifact_sha256": sha, "outcome": o, "why": r.as_ref().err().map(|e| format!("{e:#}")) }),
     );
     told(&l, &notice(request, &sha, o, &r));
+    // The control host moved: root's link follows, through root's own check of the passkey's
+    // approval (crate::rootadmit), on an installed host.
+    if crate::update::Versions::control().pointer("current") != before && Path::new(crate::rootcopy::COPIES).is_dir() {
+        match queue_for_root(&l, &data, request, &sha, &artifact) {
+            Ok(m) => say!("{m}"),
+            Err(e) => say_err!("root's link stays on its build: {e:#}"),
+        }
+    }
     r
+}
+
+/// Queues the applied artifact and the passkey-signed approval for root ([`crate::rootadmit`]).
+fn queue_for_root(l: &Ledger, data: &Path, request: &str, sha: &str, artifact: &Path) -> Result<String> {
+    let rec: serde_json::Value = serde_json::from_str(&l.decision_record(request)?.context("no decision record for the request")?)?;
+    let Some(signed) = rec.get("signed").filter(|s| s.get("decision_json").is_some()) else {
+        bail!("{request} wasn't approved with a passkey (`wicket approve`): for root's copy, sudo wicket self admit <artifact>");
+    };
+    let e = crate::rootadmit::Entry { v: 1, request: request.into(), sha256: sha.into(), signed: signed.clone() };
+    crate::rootadmit::queue(data, &e, artifact)?;
+    Ok(format!(
+        "queued for root (wicket-admit): root copies the build if it trusts the passkey that approved {request} (sudo wicket self trust-operator <name>), and moves {} to it",
+        crate::rootcopy::LINK
+    ))
 }
 
 struct RemoveDir(PathBuf);
@@ -303,6 +326,32 @@ mod tests {
         let mut r = req("UPDATE", &format!("/self/{sha}"), "x");
         r.run = "../x".into();
         assert!(!preview(&l, &d, &r).unwrap().applies);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #261: what root is handed is the passkey's signed decision from the audit log, with the
+    /// artifact; an approval without a passkey (`wicket approve`) hands root nothing.
+    #[test]
+    fn root_is_queued_the_signed_approval_only() {
+        let d = std::env::temp_dir().join(format!("wicket-apply-queue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let l = Ledger::open(&d.join("ledger.db")).unwrap();
+        let sha = "ab".repeat(32);
+        let signed = serde_json::json!({ "credential": "c", "decision_json": "{}" });
+        l.audit(&TenantId::single(), None, "decision", &serde_json::json!({ "request": "req_1", "decision": "approve", "signed": signed }))
+            .unwrap();
+        l.audit(&TenantId::single(), None, "decision", &serde_json::json!({ "request": "req_2", "decision": "approve", "by": "alex" }))
+            .unwrap();
+        std::fs::write(d.join("artifact"), b"bytes").unwrap();
+        queue_for_root(&l, &d, "req_1", &sha, &d.join("artifact")).unwrap();
+        let e: crate::rootadmit::Entry =
+            serde_json::from_slice(&std::fs::read(crate::rootadmit::spool(&d).join(format!("{sha}.json"))).unwrap()).unwrap();
+        assert_eq!((e.request.as_str(), e.signed), ("req_1", signed));
+        assert_eq!(std::fs::read(crate::rootadmit::spool(&d).join(format!("{sha}.artifact"))).unwrap(), b"bytes");
+        std::fs::write(d.join("artifact"), b"bytes").unwrap();
+        assert!(queue_for_root(&l, &d, "req_2", &sha, &d.join("artifact")).unwrap_err().to_string().contains("passkey"));
+        assert!(queue_for_root(&l, &d, "req_3", &sha, &d.join("artifact")).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 }
