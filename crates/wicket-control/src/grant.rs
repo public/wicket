@@ -68,6 +68,8 @@ pub struct AgentAuthority {
     pub org: Option<Arc<wicket_authz::OrgLayer>>,
     /// When the run's authority ends (Unix seconds).
     pub until: i64,
+    /// What agents may decide and grant (operators.yaml's `agents`).
+    pub rules: crate::operators::AgentRules,
 }
 
 impl std::fmt::Debug for AgentAuthority {
@@ -94,10 +96,10 @@ pub fn within_authority(l: &Ledger, a: &AgentAuthority, req: &Request) -> Result
         bail!("your zone may not grant requests (escalation.grant: false)");
     }
     let method = req.method.to_ascii_uppercase();
-    if !wicket_core::op::HTTP_METHODS.contains(&method.as_str()) {
+    if !wicket_core::op::HTTP_METHODS.contains(&method.as_str()) || !a.rules.decides(&method) {
         bail!("a {} request is decided by an operator", req.method);
     }
-    if req.scope_prefix {
+    if req.scope_prefix && !a.rules.prefix {
         bail!("a request for every path under a prefix is decided by an operator");
     }
     let mut op = Op::egress(&a.tenant, &RunId(req.run.clone()), &req.zone, &method, &req.host, &req.path);
@@ -131,15 +133,18 @@ fn descendant_chain(l: &Ledger, a: &AgentAuthority, run: &str) -> Result<Vec<Str
 /// What an agent may grant within what it may decide: exactly the asked path, to the asking run
 /// only, for a bounded number of uses, ending no later than its own authority.
 fn agent_terms(a: &AgentAuthority, req: &Request, t: &Terms) -> Result<()> {
-    if t.zone_wide {
+    let r = &a.rules;
+    if t.zone_wide && !r.zone_wide {
         bail!("an agent grants to the asking run only, not its whole zone");
     }
-    if t.prefix.is_some() {
+    if t.prefix.is_some() && !r.prefix {
         bail!("an agent grants exactly the asked path, not a prefix");
     }
-    let Some(uses) = t.uses else { bail!("an agent's grant needs a number of uses") };
-    // A push's grant is a window, not a number of uses (#26): a human's.
-    if wicket_core::git::grant_terms(&req.method, &req.path, Some(uses), t.ttl.as_secs()) != (Some(uses), t.ttl.as_secs()) {
+    if t.uses.is_none() && !r.unbounded {
+        bail!("an agent's grant needs a number of uses");
+    }
+    // A push's grant is a window, not a number of uses (#26): a human's, unless the rules say.
+    if !r.git_push && wicket_core::git::grant_terms(&req.method, &req.path, t.uses, t.ttl.as_secs()) != (t.uses, t.ttl.as_secs()) {
         bail!("a git push is decided by an operator");
     }
     let now = wicket_store::now();
@@ -406,7 +411,7 @@ fn bounds(by: &Granter, v: &Verdict) -> Result<()> {
     check_ttl(ttl)?;
     match (by, uses) {
         (_, Some(Some(0))) => bail!("a grant needs at least one use"),
-        (Granter::Agent(_), Some(None)) => bail!("an agent's grant needs a number of uses"),
+        (Granter::Agent(a), Some(None)) if !a.rules.unbounded => bail!("an agent's grant needs a number of uses"),
         (Granter::Agent(_), Some(Some(n))) if n > MAX_AGENT_USES => {
             bail!("an agent's grant has at most {MAX_AGENT_USES} uses, not {n}")
         }
@@ -568,16 +573,17 @@ fn renew(l: &mut Ledger, by: &Granter, id: &str, ttl: Duration, extra: serde_jso
 /// could grant now: a grant to the asking run only, for exactly the asked path, with a number of
 /// uses, not a push's window, ending no later than its own authority.
 fn agent_renews(a: &AgentAuthority, g: &wicket_store::GrantRow, req: &Request, until: i64) -> Result<()> {
-    if g.run.as_deref() != Some(req.run.as_str()) {
+    let r = &a.rules;
+    if g.run.as_deref() != Some(req.run.as_str()) && !r.zone_wide {
         bail!("an agent renews a grant to the asking run only, not its whole zone");
     }
-    if g.prefix {
+    if g.prefix && !r.prefix {
         bail!("an agent renews a grant for exactly the asked path, not a prefix");
     }
-    if g.uses_left.is_none() {
+    if g.uses_left.is_none() && !r.unbounded {
         bail!("an agent renews only a grant with a number of uses");
     }
-    if wicket_core::git::grant_terms(&g.method, &g.path, Some(1), 60) != (Some(1), 60) {
+    if !r.git_push && wicket_core::git::grant_terms(&g.method, &g.path, Some(1), 60) != (Some(1), 60) {
         bail!("a git push is decided by an operator");
     }
     outlasts(a, wicket_store::now(), Some(until), "grant")
@@ -673,6 +679,7 @@ impl AgentDecisions {
             zone: self.zone.clone(),
             org: self.org.clone(),
             until: self.until.load(Ordering::SeqCst),
+            rules: crate::operators::Policy::agent_rules(),
         }
     }
 }
