@@ -1473,7 +1473,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // The task is the first user turn on stdin; prompts from the operator's session (#198) are
     // written the same way while the session is open. wicket closes stdin only when the agent asked
     // to finish or hibernate (#249): the harness decides when it is done.
-    let mut stdin = stdin;
+    // What this supervisor writes to the box's stdin, counted (#445): an operator prompt is
+    // recorded by where it is in it, from `stdin_base` (0 for a box started here, the node's count
+    // for one re-attached or adopted, once its node said).
+    let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut stdin = stdin.map(|w| Box::new(Counted { inner: w, n: written.clone() }) as Writer);
+    let taken_over = record.is_some() || adopt.is_some();
     // A child its node started (#164) has its task from the node already.
     if let (Some(si), Some(t), None, None) = (stdin.as_mut(), &stdin_task, &record, &adopt) {
         use tokio::io::AsyncWriteExt;
@@ -1880,7 +1885,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     }
                     reported_turn = Some(turn_running);
                 }
-                let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages_with_ids(&run.0).ok()).unwrap_or_default();
+                // Where this supervisor's writes begin in the box's stdin; a supervisor that took the
+                // run over takes no prompt before its node says (it may give some again, #445).
+                let base = if taken_over { stopper.0.stdin_base.get().copied() } else { Some(0) };
+                let msgs = match base {
+                    Some(_) => ledger.lock().ok().and_then(|mut l| l.take_operator_messages_with_ids(&run.0).ok()).unwrap_or_default(),
+                    None => vec![],
+                };
                 for (op, text, by) in msgs {
                     use tokio::io::AsyncWriteExt;
                     say!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
@@ -1892,9 +1903,21 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         if let Some(log) = acp_log.as_mut() {
                             log.wrote(transcript_f.offset(), &input);
                         }
+                        let start = written.load(std::sync::atomic::Ordering::SeqCst);
                         if si.write_all(input.as_bytes()).await.is_err() {
                             stdin = None;
                             break;
+                        }
+                        // Where it is in the box's stdin (#445). An ACP prompt behind a running turn
+                        // is queued in the client's state, which a supervisor that takes over
+                        // carries (acp.json): 0..0, never given again.
+                        let end = written.load(std::sync::atomic::Ordering::SeqCst);
+                        let (at, to) = match (input.is_empty(), base) {
+                            (false, Some(b)) => (b + start, b + end),
+                            _ => (0, 0),
+                        };
+                        if let Ok(l) = ledger.lock() {
+                            let _ = l.set_operator_message_stdin(op, at, to);
                         }
                     }
                     turn_running = true;
@@ -2625,6 +2648,34 @@ fn report_turn(ctx: &RunCtx, result: Option<&str>, is_error: bool) {
         Some(Ok(s)) => say!("[wicket] sent {} (report) to its parent {}", s.id, s.to),
         Some(Err(e)) => say!("[wicket] could not send its report to its parent: {e}"),
         None => {}
+    }
+}
+
+/// The box's stdin, counting the bytes written to it (#445).
+struct Counted {
+    inner: Writer,
+    n: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl tokio::io::AsyncWrite for Counted {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(k)) = &r {
+            self.n.fetch_add(*k as u64, std::sync::atomic::Ordering::SeqCst);
+        }
+        r
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 

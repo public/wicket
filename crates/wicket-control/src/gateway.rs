@@ -48,20 +48,52 @@ impl Gateway {
         (r["content"][0]["text"].as_str().unwrap_or_default().to_string(), r["isError"].as_bool().unwrap_or(true))
     }
 
+    /// [`Gateway::call_tool`], for a node that says when its box has had a message (#445,
+    /// [`wicket_chan::chan::MESSAGE_READ`]): a message `await_message` gives is left in flight,
+    /// and its id returned, until the node's `MessageRead` ([`Gateway::message_read`]). A
+    /// supervisor that takes the run over before then gives it again.
+    pub async fn call_tool_read(&self, name: &str, args: Value) -> (String, bool, Option<String>) {
+        if let Some(why) = self.ctx.superseded() {
+            return (why, true, None);
+        }
+        let (r, in_flight) = self.call_read(&json!({ "name": name, "arguments": args })).await;
+        (r["content"][0]["text"].as_str().unwrap_or_default().to_string(), r["isError"].as_bool().unwrap_or(true), in_flight)
+    }
+
+    /// The box has had message `id` (#445): read, on its receipt. False if it wasn't in flight.
+    pub fn message_read(&self, id: &str) -> bool {
+        self.ctx.ledger.lock().ok().and_then(|l| l.message_read(&self.ctx.run.0, id).ok()).unwrap_or(false)
+    }
+
     /// Why this activation may do nothing more (#70), if it is superseded: for the tools the run
     /// answers outside this gateway (`spawn`, #257 slice 4c).
     pub fn superseded(&self) -> Option<String> {
         self.ctx.superseded()
     }
 
+    /// A tool's answer, with a message it gave read at once (as before #445).
     async fn call(&self, params: &Value) -> Value {
+        let (r, in_flight) = self.call_read(params).await;
+        if let Some(id) = in_flight {
+            self.message_read(&id);
+        }
+        r
+    }
+
+    /// A tool's answer, and the id of a message it gave and left in flight (#445).
+    async fn call_read(&self, params: &Value) -> (Value, Option<String>) {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        let mut in_flight = None;
         let (text, is_error) = match name {
             "await_grant" => self.await_grant(&args).await,
             "pending_requests" => self.pending_requests(),
             "send_message" => self.send_message(&args),
-            "await_message" => self.await_message(&args).await,
+            "await_message" => {
+                let (text, is_error, id) = self.await_message(&args).await;
+                in_flight = id;
+                (text, is_error)
+            }
             "principals" => self.principals(),
             "receipts" => self.receipts(&args).await,
             "continue_child" => delegate::continue_child(&self.ctx, &args),
@@ -91,7 +123,7 @@ impl Gateway {
             _ => (format!("unknown tool {name}"), true),
         };
         self.ctx.emit(Event::Tool { name: name.to_string(), detail: text.lines().next().unwrap_or("").to_string() });
-        json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+        (json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }), in_flight)
     }
 
     async fn await_grant(&self, args: &Value) -> (String, bool) {
@@ -277,15 +309,17 @@ impl Gateway {
         }
     }
 
-    async fn await_message(&self, args: &Value) -> (String, bool) {
-        let Some(cell) = self.ctx.identity.clone() else { return ("this run has no wicket identity".into(), true) };
+    /// The next message for the box, and (delivered) its id: in flight until the box has had it
+    /// (#445). One refused or dropped on delivery is read at once, with its receipt saying why.
+    async fn await_message(&self, args: &Value) -> (String, bool, Option<String>) {
+        let Some(cell) = self.ctx.identity.clone() else { return ("this run has no wicket identity".into(), true, None) };
         let timeout = Duration::from_secs(args.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(300).clamp(1, 600));
         let start = Instant::now();
         let _waiting = Waiting::start(&self.ctx);
         loop {
             let m = {
                 let mut l = self.ctx.ledger.lock().expect("ledger");
-                l.take_message(&self.ctx.run.0).map(|m| {
+                l.take_message_in_flight(&self.ctx.run.0).map(|m| {
                     m.map(|m| {
                         let revoked = l.revoked_in_chain(&m.from_run).ok().flatten().is_some();
                         // A long-lived agent's earlier activations: messages sent to them are its own (#70).
@@ -302,6 +336,7 @@ impl Gateway {
                 // The org policy decides which zones' boxes this one hears from (#51), parent and
                 // children included: refused, the message is dropped, and the agent told.
                 Ok(Some((m, _, _, Some((z, id))))) if self.ctx.org.as_ref().is_some_and(|o| !o.allows_message_from(&z, Some(&id))) => {
+                    self.message_read(&m.id);
                     self.refused_on_delivery(&m, &cell.current().claims.sub, &format!("the org policy doesn't let you hear from zone {z}"));
                     return (
                         format!(
@@ -309,21 +344,24 @@ impl Gateway {
                             m.from_run
                         ),
                         false,
+                        None,
                     );
                 }
                 Ok(Some((m, sender_revoked, earlier, _))) => {
                     let me = cell.current();
                     let (text, dropped) = deliver(&me, &self.ctx.run.0, &earlier, &m, sender_revoked);
                     if dropped {
+                        self.message_read(&m.id);
                         self.refused_on_delivery(&m, &me.claims.sub, text.split_once(": ").map_or(text.as_str(), |(_, why)| why));
+                        return (text, dropped, None);
                     }
-                    return (text, dropped);
+                    return (text, dropped, Some(m.id));
                 }
                 Ok(None) => {}
-                Err(e) => return (e.to_string(), true),
+                Err(e) => return (e.to_string(), true, None),
             }
             if start.elapsed() >= timeout {
-                return (format!("no message after {}s. You may call await_message again.", timeout.as_secs()), false);
+                return (format!("no message after {}s. You may call await_message again.", timeout.as_secs()), false, None);
             }
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
@@ -1517,6 +1555,43 @@ mod tests {
             waker: None,
             lifecycle: None,
         }
+    }
+
+    /// #445: a message `await_message` gives a node that says when its box has had it stays in
+    /// flight. A control-host restart before the box has it doesn't lose it: the supervisor that
+    /// takes the run over gives it again (`requeue_in_flight`, at its node's first resume). One
+    /// the box has had (`MessageRead`) is never given again.
+    #[tokio::test]
+    async fn a_message_taken_before_a_restart_is_given_again_after_it() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let a = w.agent("t0", "z", "a", "run_a", None, &["z"]);
+        let b = w.agent("t0", "z", "b", "run_b", None, &["z"]);
+        let to_b = id_of(&b);
+        let sender = Gateway::new(a);
+        for body in ["first", "second"] {
+            let (text, is_error) = sender.call_tool("send_message", serde_json::json!({ "to": to_b, "body": body })).await;
+            assert!(!is_error, "{text}");
+        }
+        let gw = Gateway::new(b.clone());
+        let (text, is_error, in_flight) = gw.call_tool_read("await_message", serde_json::json!({ "timeout_seconds": 1 })).await;
+        assert!(!is_error && text.contains("first"), "{text}");
+        let first = in_flight.expect("in flight until the box has had it");
+        // The control host stops before the box has it: the gateway, and the supervisor, go.
+        drop(gw);
+        assert_eq!(w.ledger.lock().unwrap().requeue_in_flight("run_b").unwrap(), 1, "the new supervisor gives it again");
+        let gw = Gateway::new(b);
+        let (text, _, again) = gw.call_tool_read("await_message", serde_json::json!({ "timeout_seconds": 1 })).await;
+        assert!(text.contains("first"), "the same message, again: {text}");
+        assert_eq!(again.as_deref(), Some(first.as_str()));
+        // Its box has it now; the next one is the second, and the first never comes again.
+        assert!(gw.message_read(&first));
+        let (text, _, second) = gw.call_tool_read("await_message", serde_json::json!({ "timeout_seconds": 1 })).await;
+        assert!(text.contains("second"), "{text}");
+        assert!(gw.message_read(&second.unwrap()));
+        assert_eq!(w.ledger.lock().unwrap().requeue_in_flight("run_b").unwrap(), 0, "nothing read is given again");
+        // Without a node that says (call_tool), a message is read when it is given, as before.
+        let (text, _) = gw.call_tool("await_message", serde_json::json!({ "timeout_seconds": 1 })).await;
+        assert!(text.contains("no message"), "{text}");
     }
 
     #[tokio::test]
