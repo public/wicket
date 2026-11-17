@@ -228,7 +228,9 @@ mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
 
-    /// A child in its own process group, as the daemon starts each command; not waited for here.
+    /// A child in its own process group, as the daemon starts each command; not waited for here
+    /// (`follow` reaps it by pid, as the daemon does).
+    #[allow(clippy::zombie_processes)]
     fn child(script: &str) -> i32 {
         let c = std::process::Command::new("sh").args(["-c", script]).process_group(0).spawn().unwrap();
         c.id() as i32
