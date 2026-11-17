@@ -61,7 +61,8 @@ comments in `crates/wicket-cli/src/main.rs` (and `cmd/` and `nodecreate.rs`), no
 
 On an installed host most commands go through the daemon, which allows each one for some callers
 only: [the daemon](daemon.md#who-may-run-what) lists which commands need `sudo`. Durations are
-humantime strings (`90s`, `10m`, `1h`).
+numbers with units (`90s`, `10m`, `1h`, `1h 30m`; the units in [the manifest
+reference](manifest.md)).
 
 EOF
     toc ""

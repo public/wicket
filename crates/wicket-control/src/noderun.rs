@@ -888,9 +888,9 @@ async fn manage(
                 }
                 return;
             }
-            Err(e) => say!("[wicket] node {} unreachable ({e:#}); retrying in {}", sh.node, humantime::format_duration(backoff)),
+            Err(e) => say!("[wicket] node {} unreachable ({e:#}); retrying in {}", sh.node, wicket_core::time::format_duration(backoff)),
             Ok(()) => {
-                say!("[wicket] node {} channel closed; reconnecting in {}", sh.node, humantime::format_duration(backoff));
+                say!("[wicket] node {} channel closed; reconnecting in {}", sh.node, wicket_core::time::format_duration(backoff));
                 backoff = std::time::Duration::from_millis(500);
             }
         }

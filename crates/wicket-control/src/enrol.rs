@@ -351,7 +351,7 @@ pub fn token(name: Option<String>, ttl: Duration) -> Result<()> {
     say!("{t}");
     say_err!(
         "one-time join token for node {name}, valid for {}: wicket node enrol <ssh-target> --token <token> --hosts …",
-        humantime::format_duration(ttl)
+        wicket_core::time::format_duration(ttl)
     );
     Ok(())
 }
@@ -646,7 +646,7 @@ pub fn resolve_installed(arg: &str, ssh_key: Option<&Path>) -> Result<Node> {
 }
 
 fn fmt_time(t: i64) -> String {
-    humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
+    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
 }
 
 #[cfg(test)]

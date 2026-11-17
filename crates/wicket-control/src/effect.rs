@@ -67,7 +67,7 @@ pub fn blast_radius(l: &Ledger, zone: Option<&ZoneSpec>, req: &Request, t: &Term
         _ => {}
     }
     if terms.ttl_secs > effect::WIDE_TTL_SECS {
-        widens.push(format!("it lasts {}", humantime::format_duration(std::time::Duration::from_secs(terms.ttl_secs))));
+        widens.push(format!("it lasts {}", wicket_core::time::format_duration(std::time::Duration::from_secs(terms.ttl_secs))));
     }
     if terms.scope == "zone" {
         widens.push(format!("any run in zone {}, not only {}", e.zone, e.run));

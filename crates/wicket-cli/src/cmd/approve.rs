@@ -20,7 +20,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Approve { id, uses, unlimited, ttl, prefix, yes, zone_wide } => {
-            let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
+            let ttl = wicket_core::time::parse_duration(&ttl).context("bad --ttl")?;
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
             let t = grant::Terms { uses: if unlimited { None } else { Some(uses) }, ttl, prefix: prefix.clone(), zone_wide };
@@ -57,7 +57,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 wicket_agent::clip(&req.host, 255),
                 wicket_agent::clip(&prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path), 400),
                 if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") },
-                humantime::format_duration(ttl),
+                wicket_core::time::format_duration(ttl),
                 if zone_wide { format!("any run in zone {}", wicket_agent::clip(&req.zone, 64)) } else { format!("run {} only", req.run) }
             );
             if let Some(lease) = lease.as_deref() {
@@ -148,7 +148,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Grant { cmd: GrantCmd::Renew { id, ttl } } => {
-            let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
+            let ttl = wicket_core::time::parse_duration(&ttl).context("bad --ttl")?;
             let mut l = Ledger::open(&ledger_path())?;
             let grant::Decided::Renewed { what, until } = grant::decide(
                 &mut l,
@@ -160,7 +160,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             else {
                 unreachable!("a renewal renews")
             };
-            let left = humantime::format_duration(std::time::Duration::from_secs(u64::try_from(until - wicket_store::now()).unwrap_or(0)));
+            let left =
+                wicket_core::time::format_duration(std::time::Duration::from_secs(u64::try_from(until - wicket_store::now()).unwrap_or(0)));
             match what {
                 grant::Renewed::Grant(g) => match l.grant(&g)?.and_then(|g| g.node) {
                     Some(n) => println!("renewed grant {g} for {left}; its run republishes it to node {n}"),
@@ -217,7 +218,10 @@ fn show_grant(r: &wicket_store::GrantListing, now: i64) -> String {
     } else if g.expires_at <= now {
         "expired".to_string()
     } else {
-        format!("ends in {}", humantime::format_duration(std::time::Duration::from_secs(u64::try_from(g.expires_at - now).unwrap_or(0))))
+        format!(
+            "ends in {}",
+            wicket_core::time::format_duration(std::time::Duration::from_secs(u64::try_from(g.expires_at - now).unwrap_or(0)))
+        )
     };
     let node = g.node.as_deref().map(|n| format!(", on node {n}")).unwrap_or_default();
     format!("{}  {what}  {to}{uses}, {state}{node}  by {}", g.id, wicket_agent::clip(&r.decided_by, 80))

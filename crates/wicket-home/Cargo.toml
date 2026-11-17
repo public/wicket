@@ -25,7 +25,6 @@ thiserror.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 url.workspace = true
-humantime.workspace = true
 getrandom.workspace = true
 futures-util.workspace = true
 sha2.workspace = true

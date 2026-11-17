@@ -426,7 +426,7 @@ pub fn exhausted(a: &AgentRow) -> Option<String> {
     }
     match m.zone.limits.timeout() {
         Ok(t) if a.used_secs as u64 >= t.as_secs() => {
-            Some(format!("its time budget (limits.timeout, {}) is spent over its activations", humantime::format_duration(t)))
+            Some(format!("its time budget (limits.timeout, {}) is spent over its activations", wicket_core::time::format_duration(t)))
         }
         Ok(_) => None,
         Err(e) => Some(format!("its limits.timeout doesn't parse: {e}")),

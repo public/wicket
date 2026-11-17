@@ -1466,7 +1466,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
 /// sandbox and gofer); `docker.run.return`, from then until the CLI returned. They are placed by
 /// `run`'s start (wall time, monotonic) and end; a timestamp that can't be read leaves them out.
 fn runtime_spans(t: &Timings, run: (std::time::SystemTime, Instant), end: (std::time::SystemTime, Instant), created: &str, started: &str) {
-    let (Ok(c), Ok(s)) = (humantime::parse_rfc3339_weak(created), humantime::parse_rfc3339_weak(started)) else { return };
+    let (Ok(c), Ok(s)) = (wicket_core::time::parse_rfc3339_weak(created), wicket_core::time::parse_rfc3339_weak(started)) else { return };
     // Wall times, placed on the monotonic clock from where `run` started on both.
     let at = |w: std::time::SystemTime| match w.duration_since(run.0) {
         Ok(d) => run.1 + d,
@@ -2005,7 +2005,7 @@ impl ExitTimings {
     /// ([`entry_spans`]).
     fn the_box(&mut self, info: Option<&wicket_sandbox::ExitInfo>, entry: Option<&str>) {
         use wicket_core::timing::wall_span;
-        let at = |t: &Option<String>| t.as_deref().and_then(|t| humantime::parse_rfc3339_weak(t).ok());
+        let at = |t: &Option<String>| t.as_deref().and_then(|t| wicket_core::time::parse_rfc3339_weak(t).ok());
         let started = info.and_then(|i| at(&i.started_at));
         if let Some(s) = started {
             self.spans.push(wall_span("box.started", s, s));
@@ -2561,7 +2561,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
     #[test]
     fn docker_timestamps_split_docker_run_into_create_runtime_and_return() {
         let t = Timings::new();
-        let w0 = humantime::parse_rfc3339("2026-11-14T10:00:00Z").unwrap();
+        let w0 = wicket_core::time::parse_rfc3339_weak("2026-11-14T10:00:00Z").unwrap();
         let i0 = t.origin() + std::time::Duration::from_millis(10);
         let end = (w0 + std::time::Duration::from_millis(300), i0 + std::time::Duration::from_millis(300));
         // Docker's own: nanoseconds, UTC.

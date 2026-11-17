@@ -138,7 +138,7 @@ pub fn expired_for(ca: Option<&NodeCa>, zone: &wicket_core::ZoneSpec, node: &str
         format!(
             "node {node}'s CA expired at {}, so it can't serve this box's inspected hosts{}: the control host renews it over \
              the channel (protocol 14), or run `wicket node renew-ca {node}`",
-            humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(ca.not_after.max(0) as u64)),
+            wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(ca.not_after.max(0) as u64)),
             if zone.llm.is_some() { " (its model API among them)" } else { "" }
         )
     })

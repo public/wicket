@@ -431,7 +431,7 @@ pub async fn follow() -> Result<()> {
             return skip(&mut st, format!("unsigned:{}", b.commit), format!("the build of {} isn't signed as it must be: {e:#}", b.commit));
         }
     };
-    let soak = humantime::parse_duration(&p.soak).context("follow.soak")?.as_secs() as i64;
+    let soak = wicket_core::time::parse_duration(&p.soak).context("follow.soak")?.as_secs() as i64;
     if now - claims.signed_at < soak {
         return skip(
             &mut st,
@@ -451,7 +451,7 @@ pub async fn follow() -> Result<()> {
     )?;
     drop(ledger);
     let gate = Gate {
-        window: humantime::parse_duration(&p.gate_window).context("follow.gate_window")?,
+        window: wicket_core::time::parse_duration(&p.gate_window).context("follow.gate_window")?,
         interval: Duration::from_secs(10),
         checks: vec![],
         canary: None,

@@ -13,8 +13,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             SelfCmd::Follow => ci_update::follow().await,
             SelfCmd::Update { artifact, from_ci, sig, nodes, only_nodes, window, interval, check, canary, image, no_prune } => {
                 let gate = update::Gate {
-                    window: humantime::parse_duration(&window).context("bad --window")?,
-                    interval: humantime::parse_duration(&interval).context("bad --interval")?.max(Duration::from_secs(1)),
+                    window: wicket_core::time::parse_duration(&window).context("bad --window")?,
+                    interval: wicket_core::time::parse_duration(&interval).context("bad --interval")?.max(Duration::from_secs(1)),
                     checks: check,
                     canary,
                     image,

@@ -86,8 +86,8 @@ pub fn sinks_path() -> PathBuf {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SinksConfig {
-    /// How often each sink gets a signed checkpoint (humantime, e.g. `5m`).
-    #[serde(default = "default_every", with = "humantime_serde_compat")]
+    /// How often each sink gets a signed checkpoint (a duration, e.g. `5m`).
+    #[serde(default = "default_every", with = "duration_serde")]
     pub checkpoint_every: Duration,
     /// The most records per delivery.
     #[serde(default = "default_batch")]
@@ -102,12 +102,12 @@ fn default_batch() -> usize {
     500
 }
 
-mod humantime_serde_compat {
+mod duration_serde {
     use serde::{Deserialize, Deserializer};
     use std::time::Duration;
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         let s = String::deserialize(d)?;
-        humantime::parse_duration(&s).map_err(serde::de::Error::custom)
+        wicket_core::time::parse_duration(&s).map_err(serde::de::Error::custom)
     }
 }
 

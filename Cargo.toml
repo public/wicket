@@ -63,7 +63,6 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
-humantime = "2"
 getrandom = "0.4"
 base64 = "0.22"
 # HTTP/3 (#92). ring everywhere, as rustls above; quinn's default provider would be aws-lc-rs.

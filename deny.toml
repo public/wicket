@@ -17,9 +17,6 @@ ignore = [
     # Cedar's datetime extension, which wicket's policies don't use; wicket calls none of it. Accepted
     # until Cedar moves off it.
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; only via cedar-policy-core (Cedar's datetime extension, unused by wicket's policies); no safe upgrade" },
-    # humantime is unmaintained (2026-11-17). wicket uses it directly to parse and print durations
-    # and RFC 3339 times; replacing it is tracked in its own issue. Accepted until then.
-    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained; wicket's direct use (durations, RFC 3339 times) is being replaced; no safe upgrade" },
 ]
 
 [licenses]

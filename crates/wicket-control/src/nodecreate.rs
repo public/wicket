@@ -233,7 +233,7 @@ fn dollars(s: &str) -> Result<MicroUsd> {
 }
 
 fn fmt_time(t: i64) -> String {
-    humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
+    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
 }
 
 /// Decides a node's spend as a CAPACITY request (#256): `CAPACITY wicket.internal
@@ -285,7 +285,7 @@ impl CapacityApprover {
             r.plan,
             r.region.as_deref().unwrap_or("?"),
             r.hourly,
-            humantime::format_duration(Duration::from_secs(r.lifetime_secs.max(0) as u64)),
+            wicket_core::time::format_duration(Duration::from_secs(r.lifetime_secs.max(0) as u64)),
             r.worst_case,
             r.purpose,
             r.committed_hourly,
@@ -330,7 +330,7 @@ impl CapacityApprover {
         }
         say!(
             "waiting up to {} for an operator to decide request {id} (wicket approve {id}, or the console)",
-            humantime::format_duration(self.wait)
+            wicket_core::time::format_duration(self.wait)
         );
         let deadline = tokio::time::Instant::now() + self.wait;
         loop {
@@ -349,7 +349,10 @@ impl CapacityApprover {
                     "decision",
                     &serde_json::json!({ "request": id, "decision": "deny", "by": "wicket:timed-out" }),
                 )?;
-                return Ok(Approval::Denied(format!("nobody decided request {id} within {}", humantime::format_duration(self.wait))));
+                return Ok(Approval::Denied(format!(
+                    "nobody decided request {id} within {}",
+                    wicket_core::time::format_duration(self.wait)
+                )));
             }
             tokio::time::sleep(self.poll).await;
         }
@@ -455,14 +458,14 @@ pub async fn create(args: CreateArgs) -> Result<()> {
             )
         })?;
     }
-    let lifetime = humantime::parse_duration(&lifetime)?;
-    let ca_ttl = humantime::parse_duration(&ca_ttl)?;
+    let lifetime = wicket_core::time::parse_duration(&lifetime)?;
+    let ca_ttl = wicket_core::time::parse_duration(&ca_ttl)?;
     let owner_name = owner_name(&common);
     let o = Owner::new(&owner_name);
     let config = VultrConfig { os_id, sshkey_ids: ssh_key_ids, default_region: region.clone(), ..VultrConfig::default() };
     let envelope = MoneyEnvelope { max_hourly: dollars(&max_hourly)?, max_total: dollars(&max_total)? };
     let principal = crate::operators::Operator::cli(&TenantId::single().0)?.id;
-    let approver = CapacityApprover::new(crate::ledger_path(), TenantId::single(), principal, humantime::parse_duration(&wait)?);
+    let approver = CapacityApprover::new(crate::ledger_path(), TenantId::single(), principal, wicket_core::time::parse_duration(&wait)?);
     let filed = approver.request.clone();
     let placer = Placer::new(provider(&common, config)?, approver, o.clone(), envelope);
 
@@ -526,7 +529,7 @@ pub async fn create(args: CreateArgs) -> Result<()> {
                              "hourly_usd_micros": n.billing.hourly_rate().0, "lease_until": n.lease_until, "owner": o.tag() }),
     )?;
     let hosts = (!no_enrol).then_some(hosts);
-    let wait = boot::ReadyWait { silent_limit: humantime::parse_duration(&give_up_silent)?, ..boot::ReadyWait::default() };
+    let wait = boot::ReadyWait { silent_limit: wicket_core::time::parse_duration(&give_up_silent)?, ..boot::ReadyWait::default() };
     let ready =
         bring_up_or_release::<_, boot::SshProbe>(&placer, &crate::ledger_path(), &n, &name, &pinned, ssh_key, hosts, ca_ttl, &wait, None)
             .await?;
@@ -619,7 +622,7 @@ async fn bring_up_with<Q: boot::Probe>(
     let target = ready.ssh_target.clone().context("no address")?;
     say!(
         "{id} is active at {target}; waiting for node setup (host key pinned: {pinned}; giving up after {} without any answer on port {})",
-        humantime::format_duration(wait.silent_limit),
+        wicket_core::time::format_duration(wait.silent_limit),
         wait.port
     );
     let r = match probe {

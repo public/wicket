@@ -169,7 +169,7 @@ pub fn run(cfg: AcmeConfig, resolver: Arc<CertResolver>, http: HttpFactory, ever
                     say_err!(
                         "wicket serve: ACME certificate for {} failed: {e:#} (retrying in {})",
                         cfg.domain,
-                        humantime::format_duration(every)
+                        wicket_core::time::format_duration(every)
                     );
                 }
             }

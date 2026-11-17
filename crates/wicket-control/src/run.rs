@@ -96,7 +96,7 @@ fn finish_note(grace: std::time::Duration, left: &std::result::Result<Vec<String
     };
     format!(
         "the agent finished, but its harness had not exited {} after its session closed: wicket stopped what was left ({what})",
-        humantime::format_duration(grace)
+        wicket_core::time::format_duration(grace)
     )
 }
 
@@ -2005,7 +2005,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             Err(why) if why.starts_with("other processes run in the box") => {
                                 // They get the harness's grace to end, then are stopped (#293). It
                                 // goes on running meanwhile, as it was: nothing is paused.
-                                let note = format!("hibernating in {}, stopping what still runs then: {why}", humantime::format_duration(exit_grace));
+                                let note = format!("hibernating in {}, stopping what still runs then: {why}", wicket_core::time::format_duration(exit_grace));
                                 say!("[wicket] not quiet yet: {note}");
                                 set_state("active", Some(&note));
                                 lingering = Some(Linger::Hibernate);
@@ -2064,7 +2064,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             let note = (!left.is_empty()).then(|| {
                                 format!(
                                     "hibernated: the box wasn't quiet {} after the agent asked; wicket stopped what was left ({})",
-                                    humantime::format_duration(exit_grace),
+                                    wicket_core::time::format_duration(exit_grace),
                                     names(&left)
                                 )
                             });
@@ -2104,7 +2104,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             _ = &mut deadline, if !timed_out => {
                 timed_out = true;
                 hibernating = false;
-                say!("[wicket] timeout after {}; stopping the box", humantime::format_duration(timeout));
+                say!("[wicket] timeout after {}; stopping the box", wicket_core::time::format_duration(timeout));
                 stopper.kill().await?;
                 status = "timeout".into();
                 if !stopping {

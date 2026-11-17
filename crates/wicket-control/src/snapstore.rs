@@ -122,8 +122,10 @@ pub fn print_list() -> Result<()> {
     }
     for n in names {
         let (t, id) = n.trim_end_matches(".db").split_once('-').unwrap_or(("?", "?"));
-        let when =
-            t.parse::<u64>().ok().map(|s| humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s)));
+        let when = t
+            .parse::<u64>()
+            .ok()
+            .map(|s| wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s)));
         println!("{n}  (the ledger before switching away from {id}, {})", when.map(|w| w.to_string()).unwrap_or_else(|| "?".into()));
     }
     Ok(())
