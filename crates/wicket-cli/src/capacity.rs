@@ -380,10 +380,10 @@ pub fn list() -> Result<()> {
     let l = Ledger::open(&crate::ledger_path())?;
     let leases = l.leases(&[])?;
     if leases.is_empty() {
-        println!("no capacity leases");
+        say!("no capacity leases");
     }
     for x in leases {
-        println!(
+        say!(
             "{}  {:<9} run {}  {}  {}  reserved {}  until {}  {}{}",
             x.id,
             x.status,
