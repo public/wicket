@@ -1013,6 +1013,7 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
     let ledger = Ledger::open(&env.ledger_path()).expect("the control host's ledger");
     let mut o = env.oracle.borrow_mut();
     o.check_end(EPOCH_MS + END_MS, &ledger, &inbox);
+    let checked = crate::trace::check_ledger(&mut o.trace, EPOCH_MS + END_MS, &ledger);
     drop(ledger);
     let _ = std::fs::remove_dir_all(&dir);
     if let Some(e) = host_error {
@@ -1024,7 +1025,7 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
         plan: plan.to_string(),
         violations: o.trace.violations.clone(),
         hash: o.trace.hash(),
-        stats: format!("{:?}, {} known relay losses", o.stats, o.known.len()),
+        stats: format!("{:?}, {} known relay losses, {}", o.stats, o.known.len(), crate::trace::ledger_stats(&checked)),
         known: o.known.clone(),
         trace: o.trace.lines().to_vec(),
     }

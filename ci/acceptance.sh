@@ -709,8 +709,10 @@ fi
 # ---- 6. audit ----
 log "audit"
 check "wicket audit --verify" 'w audit --verify >"$work/verify.log" 2>&1'
-# #326: #321's invariants over everything this test did: allowed egress had a rule or a grant, no
-# run passed its model budget, no node outlived its lease.
+# #326, #324: #321's invariants over everything this test did, the nodes' shipped records
+# (node.audit) included: allowed egress had a rule or a grant, no run passed its model budget, no
+# node outlived its lease, no node was released with a run's work uncollected, no message was pushed
+# twice. Its order-free half is the check `wicket-sim` runs over every seed's ledger.
 check "wicket doctor --invariants holds over the whole ledger" 'w doctor --invariants >"$work/invariants.log" 2>&1 || { cat "$work/invariants.log"; false; }'
 sed 's/^/   /' "$work/invariants.log" 2>/dev/null || true
 if [ -n "${sink:-}" ]; then

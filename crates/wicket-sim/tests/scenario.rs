@@ -138,6 +138,16 @@ fn without_the_uncollected_hold_a_node_is_released_with_a_runs_files() {
     placement_without("uncollected", 2, o, "work on it uncollected");
 }
 
+/// Trace validation (#324): the ledger check `wicket doctor --invariants` runs on real ledgers
+/// finds, in the ledger the placement scenario's control host wrote, the release the oracle saw.
+#[test]
+fn the_ledger_check_finds_a_node_released_with_a_runs_files() {
+    let o = wicket_sim::placement::Options { hold_uncollected: false, ..Default::default() };
+    let r = wicket_sim::placement::run(2, &dir().join("ledger-uncollected"), o);
+    assert!(r.violations.iter().any(|v| v.contains("work on it uncollected")), "the oracle: {r}");
+    assert!(r.violations.iter().any(|v| v.starts_with("the ledger's trace check: collected")), "the ledger's check: {r}");
+}
+
 /// A reconciler pass listed a node `place create` had just made, before it was recorded, and
 /// destroyed it as having no lease.
 #[test]

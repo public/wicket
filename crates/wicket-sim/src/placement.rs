@@ -1338,10 +1338,13 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
     let now = EPOCH_S + sim.elapsed().as_millis() as i64;
     drop(sim);
     let started: BTreeSet<String> = env.ctl.borrow().run_host.keys().cloned().collect();
-    let _ = std::fs::remove_dir_all(&dir);
     let mut w = world.lock().expect("world");
     w.check_leases(now);
     w.check_end(now, &started);
+    let ledger = env.ledger();
+    let checked = crate::trace::check_ledger(&mut w.trace, now, &ledger);
+    drop(ledger);
+    let _ = std::fs::remove_dir_all(&dir);
     if let Some(e) = host_error {
         w.trace.violations.push(format!("a host failed: {e}"));
     }
@@ -1352,7 +1355,7 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
         violations: w.trace.violations.clone(),
         known: vec![],
         hash: w.trace.hash(),
-        stats: format!("{:?}", w.stats),
+        stats: format!("{:?}, {}", w.stats, crate::trace::ledger_stats(&checked)),
         trace: w.trace.lines().to_vec(),
     }
 }

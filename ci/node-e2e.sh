@@ -234,4 +234,9 @@ grep -q '^bad_signature' "$work/probe.out" && echo "ok   a tampered statement is
 grep -q '^replay' "$work/probe.out" && echo "ok   a replayed statement is refused" || { echo "FAIL replayed statement"; exit 1; }
 "$WICKET" audit --verify | tee -a "$work/summary.txt"
 "$WICKET" audit --verify | grep -q "node $NODE audit chain OK" && echo "ok   the node's audit records were shipped and verify"
+# #324's trace validation: #321's invariants (the checks `wicket-sim` also runs over its ledgers)
+# over this run's ledger, the node's shipped records (node.audit) included.
+"$WICKET" doctor --invariants >"$work/invariants.log" 2>&1 && echo "ok   wicket doctor --invariants holds over the ledger and the node's records" \
+  || { cat "$work/invariants.log"; echo "FAIL wicket doctor --invariants"; exit 1; }
+sed 's/^/   /' "$work/invariants.log" | tee -a "$work/summary.txt"
 echo "node e2e passed"
