@@ -43,6 +43,15 @@ expect_fail() {
     fail_effect_check_at_decision) echo 'NoActionAfterExpiry' ;;
     fail_effect_relay_as_self) echo 'IdentityKeptAcrossHops' ;;
     fail_effect_unbound_args) echo 'ArgumentsBound' ;;
+    # #321's run lifecycle (RunLifecycle.tla): today's code, one switch at a time.
+    fail_lifecycle_finish_lost) echo 'FinishKnown' ;;
+    fail_lifecycle_message_lost) echo 'NoMessageLost' ;;
+    fail_lifecycle_twin_wake) echo 'OneHarness' ;;
+    fail_lifecycle_today) echo 'FinishKnown|NoMessageLost|OneHarness' ;;
+    # #321's placement (Placement.tla): the bugs its switches fixed.
+    fail_placement_no_start_by) echo 'NoStartPastLease' ;;
+    fail_placement_no_admission) echo 'NoOvercommit' ;;
+    fail_placement_release_running) echo 'NoReleaseWithWork' ;;
     *) echo "" ;;
   esac
 }
