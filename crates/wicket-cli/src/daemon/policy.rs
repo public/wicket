@@ -134,6 +134,9 @@ pub fn route(cmd: &Cmd) -> Route {
             StateCmd::Replicate => Refuse("the ledger's stream runs as the wicket user under systemd: systemctl status wicket-state"),
             // The list of snapshots' names: what `state check` reads.
             StateCmd::Snapshots => Forward(Read),
+            // A dry run lists what a collection would delete; a collection deletes it.
+            StateCmd::Gc { dry_run: true } => Forward(Read),
+            StateCmd::Gc { dry_run: false } => Forward(Privileged),
             // Writes the unsealed ledger to a file the caller names, as the wicket user.
             StateCmd::Kit { .. } | StateCmd::Restore { .. } | StateCmd::Snapshot { .. } => Forward(Privileged),
         },
