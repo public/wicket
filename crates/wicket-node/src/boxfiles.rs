@@ -101,6 +101,22 @@ pub fn used_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// Makes sure each of `dirs` is a real directory, not a symlink or a file: they come from a bundle the
+/// agent wrote, and wicket mounts them and writes into them on the host.
+pub fn real_dirs(dirs: &[PathBuf]) -> Result<()> {
+    for d in dirs {
+        match std::fs::symlink_metadata(d) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                std::fs::remove_file(d)?;
+                std::fs::create_dir_all(d)?;
+            }
+            Err(_) => std::fs::create_dir_all(d)?,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod outbox_tests {
     use super::{read_outbox, write_owned};
@@ -174,19 +190,4 @@ mod outbox_tests {
         assert!(write_owned(&st, "../x", b"").is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
-}
-/// Makes sure each of `dirs` is a real directory, not a symlink or a file: they come from a bundle the
-/// agent wrote, and wicket mounts them and writes into them on the host.
-pub fn real_dirs(dirs: &[PathBuf]) -> Result<()> {
-    for d in dirs {
-        match std::fs::symlink_metadata(d) {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => {
-                std::fs::remove_file(d)?;
-                std::fs::create_dir_all(d)?;
-            }
-            Err(_) => std::fs::create_dir_all(d)?,
-        }
-    }
-    Ok(())
 }
