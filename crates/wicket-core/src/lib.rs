@@ -17,6 +17,7 @@ pub mod op;
 pub mod splice;
 pub mod subset;
 pub mod text;
+pub mod time;
 pub mod timing;
 pub mod version;
 pub mod yaml;
