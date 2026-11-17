@@ -9,7 +9,7 @@
 //!   ledger ([`wicket_store::Ledger`] on the control host's disk: runs, their nodes, placed nodes,
 //!   audit), and the node's feed ([`wicket_feed::Publisher`] per run, [`wicket_feed::Replica`] on
 //!   the node), so several runs publish to one node as #300 has them.
-//! - Stand-ins, each following a file in `wicket-cli` (which lives in the CLI binary):
+//! - Stand-ins, each following a file in `wicket-control` (or `wicket-cli`, for the reconciler):
 //!   - `node create` follows `nodecreate.rs` (`create`): acquire, then record the placed node
 //!     at once, then enrol it. A create the control host's crash interrupted is run again with the
 //!     same idempotency key, as its human would.

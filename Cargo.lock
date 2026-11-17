@@ -4055,6 +4055,7 @@ dependencies = [
  "wicket-auth",
  "wicket-authz",
  "wicket-chan",
+ "wicket-control",
  "wicket-core",
  "wicket-feed",
  "wicket-home",
@@ -4067,6 +4068,40 @@ dependencies = [
  "wicket-store",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "wicket-control"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "humantime",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
+ "tracing",
+ "wicket-agent",
+ "wicket-authz",
+ "wicket-chan",
+ "wicket-core",
+ "wicket-feed",
+ "wicket-home",
+ "wicket-identity",
+ "wicket-node",
+ "wicket-placement",
+ "wicket-policy",
+ "wicket-proxy",
+ "wicket-sandbox",
+ "wicket-store",
 ]
 
 [[package]]

@@ -67,7 +67,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => {
                 enrol::renew_ca(&name, hosts, humantime::parse_duration(&ca_ttl)?, humantime::parse_duration(&cert_ttl)?).await
             }
-            NodeCmd::Install { name, ssh_key, no_service } => enrol::install(&name, ssh_key.as_deref(), no_service).await,
+            NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,

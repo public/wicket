@@ -1,6 +1,6 @@
 //! The control host: the node's feed publisher, the runs' grants and their model budgets.
 //!
-//! It follows `wicket-cli/src/noderun.rs`:
+//! It follows `wicket-control/src/noderun.rs`:
 //! - **Grants** (`sync_grants`): the plan's approvals, renewals and revocations are carried out as
 //!   the control host's clock passes them. It only publishes (#257's slice 3): every grant goes
 //!   to the node, one on a host the node's CA can't cover included, and nothing is decided here. Each change republishes the box's token from its

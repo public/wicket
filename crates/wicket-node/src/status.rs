@@ -240,3 +240,35 @@ pub fn egress_line(ev: &Event) -> Option<String> {
     let clip = wicket_agent::clip;
     Some(format!("[egress] {tag} {} {}{}  ({}; {})", clip(method, 16), clip(host, 120), clip(path, 120), clip(risk, 24), clip(detail, 240)))
 }
+/// What a run's supervisor on the control host last saw of its node (`ctl/link.json`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkRecord {
+    pub node: String,
+    pub connected: bool,
+    /// Since when (Unix ms) it has been connected, or cut off.
+    pub since_ms: i64,
+    /// What the node last reported the run's box has spent of its model budget.
+    #[serde(default)]
+    pub spent: Spent,
+    /// The node's size and what its boxes were given, at the last connect.
+    #[serde(default)]
+    pub capacity: Option<crate::chan::NodeCapacity>,
+    pub updated_ms: i64,
+}
+
+impl LinkRecord {
+    pub const FILE: &'static str = "link.json";
+
+    /// Written aside and renamed, in the run's `ctl/` directory.
+    pub fn save(&self, run_dir: &Path) {
+        let f = run_dir.join("ctl").join(Self::FILE);
+        let tmp = f.with_extension("tmp");
+        if std::fs::write(&tmp, serde_json::to_vec(self).unwrap_or_default()).is_ok() {
+            let _ = std::fs::rename(&tmp, &f);
+        }
+    }
+
+    pub fn load(run_dir: &Path) -> Option<LinkRecord> {
+        serde_json::from_slice(&std::fs::read(run_dir.join("ctl").join(Self::FILE)).ok()?).ok()
+    }
+}

@@ -2551,7 +2551,7 @@ pub fn spawn_attach(run: &str) -> Result<()> {
     let dir = data_dir().join("runs").join(run).join("ctl");
     std::fs::create_dir_all(&dir)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("attach.log"))?;
-    let mut c = std::process::Command::new(crate::update::self_exe()?);
+    let mut c = std::process::Command::new(wicket_node::reexec::self_exe()?);
     c.args(["attach", run]).current_dir(&dir).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // SAFETY: async-signal-safe calls only, in the child before exec: its own session, and no
     // descriptor of the reconciler's but stdio.
@@ -2733,17 +2733,12 @@ mod tests {
         assert_eq!(again.agent.unwrap().image.as_deref(), Some("img:rust"));
     }
 
-    /// `wicket run --image` overrides agent.image, and without it nothing is named.
+    /// `wicket run --image` overrides agent.image (its parsing: wicket-cli's
+    /// `the_image_flag_names_no_default`).
     #[test]
     fn the_image_flag_overrides_agent_image() {
         let m = wicket_agent::load(AGENT).unwrap();
         assert_eq!(box_image(Some("img:other"), &m).unwrap(), "img:other");
-        let parse = |args: &[&str]| match <crate::Cli as clap::Parser>::try_parse_from(args).unwrap().cmd {
-            crate::Cmd::Run { image, .. } => image,
-            _ => unreachable!(),
-        };
-        assert_eq!(parse(&["wicket", "run", "m.yaml"]), None, "no default that would hide the manifest's");
-        assert_eq!(parse(&["wicket", "run", "--image", "img:other", "m.yaml"]).as_deref(), Some("img:other"));
     }
 
     /// An agent.image outside zone.images is refused, like a spawn of it.

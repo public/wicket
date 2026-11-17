@@ -45,7 +45,7 @@ pub fn tag_for(build_id: &str) -> String {
 /// The image a new box gets for `image`: the default, from a staged version (`wicket self`), is
 /// that version's own image; anything else is what it says.
 pub fn effective(image: &str) -> String {
-    if image == DEFAULT && crate::update::is_staged() {
+    if image == DEFAULT && wicket_node::reexec::running_root().is_some() {
         if let Ok(b) = crate::nodesrv::build_id() {
             return tag_for(&b);
         }

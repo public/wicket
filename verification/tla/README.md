@@ -109,7 +109,7 @@ After #257's slice 3, `SeparateCounters` and the control host's own calls are mo
 | `Tick` | clocks: `wicket_store::now`, `wicket_feed::now_ms` |
 | `PeerAsk` | `noderun.rs` `ask`, `check_node_ask` (a node's `Msg::Ask`); `nodegw.rs` `request_access` and the queue while cut off; the gateway's `request_access` |
 | `PeerForge` | `wicket-feed/src/replica.rs` `Replica::accept` → `plan`, `verify`: only frames the publisher signed are applied |
-| `Approve` | `wicket-cli/src/grant.rs` `decide` → `approve`; `wicket-store` `Ledger::approve` |
+| `Approve` | `wicket-control/src/grant.rs` `decide` → `approve`; `wicket-store` `Ledger::approve` |
 | `Hand` | `noderun.rs` `sync_grants` (today: `route_sealed` = Terminate; since slice 3 every egress grant) → `wicket-store/src/node.rs` `hand_grant_to_node`, `live_grant`, `Publisher::commit` (`Change::PutZone`) |
 | `Renew` | `grant.rs` `renew`; `node.rs` `renew_grant`; `noderun.rs` `renew_live`, `sync_grants` |
 | `Revoke` | `node.rs` `revoke_grant`; `noderun.rs` `sync_grants` (`Change::Revoke`) |
@@ -122,7 +122,7 @@ After #257's slice 3, `SeparateCounters` and the control host's own calls are mo
 | `Report` | `nodesrv.rs` `serve_box` (`Msg::Spent`) → `noderun.rs` (`Msg::Spent`) → `Llm::merge_spent` |
 | `SliceDue` | `noderun.rs` `slice_due` (with #333, `Slice::renewed`), `Llm::next_slice` → `nodesrv/conn.rs` `Msg::BudgetSlice` → `Slices::put`, `Llm::set_slice` |
 | `ChCall` | `wicket-proxy/src/egress/mod.rs` (model gate) → `llm.rs` `Llm::through_egress` |
-| `ChSpawn` | `wicket-cli/src/spawn.rs` (the gateway's spawn): `remaining()`, `reserved_*` |
+| `ChSpawn` | `wicket-control/src/spawn.rs` (the gateway's spawn): `remaining()`, `reserved_*` |
 | `EdgeSpawn` | `wicket-node/src/nodegw.rs` spawn: `llm_left` within the slice; the parent's slice lowered, the child's own `Slices::put` |
 | `Adopt` | `noderun.rs` (`Msg::Spawned`) → `spawn.rs` `adopt` (`reserved_*`) |
 | `BoxDone`, `Release` | the box's end: `nodesrv.rs`'s last `Msg::Spent`, `Slices::drop_run`. No slice is returned today, since none is held (`SliceReserved`) |
@@ -193,9 +193,9 @@ the model on a `\* model: ApprovalEffect` line (`GrantsOnNodes`'s variants name 
 | action | code (file, function) |
 |---|---|
 | `Ask` | `wicket-store/src/effect.rs` `Ledger::file_request` (`held_by`: `Filed::Held`); `pending_for` for egress, spawn, link, capacity and update asks |
-| `Approve` | `wicket-cli/src/grant.rs` `decide` (the shown descriptor, `effect::SHOWN_EFFECT`) → `approve` → `Ledger::approve` (`args_sha256` copied to the grant) and `bind_grant_effect` |
-| `Deny` | `wicket-cli/src/grant.rs` `decide` → `deny` |
-| `Run` | `wicket-store/src/effect.rs` `Ledger::use_effect_grant` (exact target, arguments, one use, `expires_at > now`, held while pending) from `wicket-cli/src/spawn.rs` `spawn` and `wicket-proxy/src/link.rs` `open`; `wicket-cli/src/reconcile.rs` `lease_unbound` for capacity; `Ledger::consume_grant` (in its transaction) for egress, where the hold is at `Ask`: an egress op is asked for only when no grant covers it, so no request for its exact effect is pending while a grant for it is used |
+| `Approve` | `wicket-control/src/grant.rs` `decide` (the shown descriptor, `effect::SHOWN_EFFECT`) → `approve` → `Ledger::approve` (`args_sha256` copied to the grant) and `bind_grant_effect` |
+| `Deny` | `wicket-control/src/grant.rs` `decide` → `deny` |
+| `Run` | `wicket-store/src/effect.rs` `Ledger::use_effect_grant` (exact target, arguments, one use, `expires_at > now`, held while pending) from `wicket-control/src/spawn.rs` `spawn` and `wicket-proxy/src/link.rs` `open`; `wicket-cli/src/reconcile.rs` `lease_unbound` for capacity; `Ledger::consume_grant` (in its transaction) for egress, where the hold is at `Ask`: an egress op is asked for only when no grant covers it, so no request for its exact effect is pending while a grant for it is used |
 | `Via` | the identity a request is filed under: the asking run's (`Op::run`), never a relaying parent's; `Effect::run` and `requested_by` in the descriptor |
 
 Bounds: two request ids, one effect, two argument values, `Lifetime = 1`, `MaxTime = 2`
