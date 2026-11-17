@@ -33,6 +33,11 @@ pub fn owner_label() -> String {
     format!("{}:{pid}:{}", machine_id(), start_time(pid).unwrap_or(0))
 }
 
+/// Process `pid`'s owner label, if it is running.
+pub fn owner_label_of(pid: u32) -> Option<String> {
+    Some(format!("{}:{pid}:{}", machine_id(), start_time(pid)?))
+}
+
 /// Whether the process an owner label names is still running: None if it's on another machine (or
 /// the label is unreadable), so this machine can't tell.
 pub fn owner_alive(label: &str) -> Option<bool> {

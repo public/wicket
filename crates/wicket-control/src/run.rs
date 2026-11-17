@@ -2576,7 +2576,8 @@ pub fn attach_failed(run: &str, e: &anyhow::Error) {
     if let Ok(l) = Ledger::open(&ledger_path()) {
         if l.run_status(run).ok().flatten().as_deref() == Some("running") {
             let reason = format!("its supervisor is gone and it could not be taken over: {}", wicket_agent::clip(&why, 300));
-            let _ = l.run_ended(&RunId(run.to_string()), crate::owner::LOST, &reason);
+            // And its agent, if it was the agent's activation (#474).
+            let _ = l.run_lost(run, &reason);
             let _ =
                 l.audit(&wicket_core::TenantId::single(), Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
         }

@@ -33,6 +33,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use wicket_store::Ledger;
 
 /// Where the daemon listens (systemd's RuntimeDirectory=wicket).
 pub const SOCKET_PATH: &str = "/run/wicket/wicketd.sock";
@@ -77,6 +78,13 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         say_err!("wicketd: following {} command(s) handed over by the previous build", h.children.len());
         handoff::adopt(h);
     }
+    // Runs that outlived a previous wicketd (#468: `deploy/install.sh` restarts it) go on with
+    // supervisors on the build they started on, which may not read this build's ledger (#475): each
+    // moves to this build, as `wicket self update` moves them.
+    {
+        let exe = d.exe.clone();
+        std::thread::spawn(move || hand_over_runs(&exe));
+    }
     // `wicket self update` moves the daemon to the new build last: on SIGHUP it re-executes itself
     // at once, handing its running commands (long-lived runs among them) to the new image
     // ([`handoff`]). Only commands not yet started (admission, uploads: seconds) are waited for;
@@ -118,6 +126,28 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Hands each run whose supervisor runs another build than `exe` over to `exe` (#475): the
+/// supervisor is stopped without its box, and `exe`'s reconciler starts a new one that re-attaches.
+fn hand_over_runs(exe: &Path) {
+    let killed =
+        match Ledger::open(&crate::ledger_path()).map_err(anyhow::Error::from).and_then(|l| crate::update::stop_stale_supervisors(&l, exe))
+        {
+            Ok(k) => k,
+            Err(e) => {
+                say_err!("wicketd: checking runs' supervisors: {e:#}");
+                return;
+            }
+        };
+    if killed.is_empty() {
+        return;
+    }
+    say_err!("wicketd: {} run(s) were supervised by another build: handing them to this one", killed.len());
+    match crate::update::adopt_handed(exe, &killed) {
+        Ok(s) => say_err!("wicketd: {s}"),
+        Err(e) => say_err!("wicketd: {e:#}"),
+    }
 }
 
 /// Commands being started through the daemon (admitted, uploading, not yet followed as a child).

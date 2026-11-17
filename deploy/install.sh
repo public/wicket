@@ -263,7 +263,8 @@ if [ "$systemd" = 1 ]; then
     if [ "$start" = 1 ]; then
         # wicket-state starts only once state-store.yaml exists (docs/how-to/state-off-host-and-restore.md).
         systemctl enable wicketd wicket-console wicket-reconcile wicket-state >/dev/null 2>&1
-        # Restarting wicketd stops the runs started through it: only when something changed.
+        # Restarting wicketd leaves the runs started through it running (#468); at its start, the new
+        # wicketd moves their supervisors to the installed build (#475). Only when something changed.
         if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q wicketd; then
             systemctl restart wicketd
         fi
