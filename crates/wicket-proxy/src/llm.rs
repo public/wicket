@@ -983,19 +983,10 @@ pub struct Usage {
     pub output: u64,
 }
 
-/// Best-effort usage from a Messages response, streamed (SSE) or not: the largest value seen for
-/// each field (streamed counts are cumulative). The keys include their opening quote, so
+/// Anthropic's usage fields in a response body (the Anthropic profile's [`crate::provider::Profile::usage`]):
+/// best-effort, from a Messages response streamed (SSE) or not, the largest value seen for each
+/// field (streamed counts are cumulative). The keys include their opening quote, so
 /// `"input_tokens":` doesn't also match `"cache_read_input_tokens":`.
-/// The only requests the model route forwards, as (method, path): inference and token counting
-/// (and listing models). Everything else under the upstream would also carry the real token, so
-/// it is refused here, before any budget is spent.
-/// Ok if `method` and `path_and_query` name an allowed Anthropic model route (the [`crate::provider`]
-/// profile's), exactly and canonically.
-pub fn allowed_route(method: &str, path_and_query: &str) -> std::result::Result<(), String> {
-    crate::provider::ANTHROPIC.allowed_route(method, path_and_query)
-}
-
-/// Anthropic's usage fields in a response body (the Anthropic profile's [`crate::provider::Profile::usage`]).
 pub fn usage(body: &[u8]) -> Usage {
     let s = String::from_utf8_lossy(body);
     Usage {
@@ -1256,8 +1247,11 @@ mod tests {
     }
 
     #[test]
+    /// The only requests the model route forwards: inference and token counting (and listing
+    /// models). Everything else under the upstream would also carry the real token, so it is refused
+    /// before any budget is spent.
     fn only_model_routes_are_allowed() {
-        use super::allowed_route as a;
+        let a = |m, p| crate::provider::ANTHROPIC.allowed_route(m, p);
         assert!(a("POST", "/v1/messages").is_ok());
         assert!(a("POST", "/v1/messages?beta=true").is_ok());
         assert!(a("POST", "/v1/messages/count_tokens?beta=true").is_ok());

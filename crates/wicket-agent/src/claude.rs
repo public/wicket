@@ -7,6 +7,12 @@ pub mod control;
 /// nothing names another.
 pub const IMAGE_REPO: &str = "wicket/claude-code";
 pub const DEFAULT_IMAGE: &str = "wicket/claude-code:poc";
+/// The image directory (`images/claude-code`), embedded so a binary alone can build the image: each
+/// file's path relative to it and its contents. wicket-control's tests check the list is complete.
+pub const IMAGE_FILES: &[(&str, &str)] = &[
+    ("Dockerfile", include_str!("../../../images/claude-code/Dockerfile")),
+    ("wicket-entry", include_str!("../../../images/claude-code/wicket-entry")),
+];
 
 /// The secret a wrapped session's account login comes from when the zone has no model route, and the
 /// host its placeholders are swapped toward.

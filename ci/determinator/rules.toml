@@ -34,15 +34,15 @@ mark-changed = "all"
 globs = ["examples/**"]
 mark-changed = ["wicket-core", "wicket-authz", "wicket-feed", "wicket-policy", "wicket-home", "wicket-cli"]
 
-# The agent image wicket builds, embedded by wicket-control's image.rs (#219); wicket-cli depends on
-# wicket-control.
+# The agent image wicket builds, embedded by the Claude adapter (wicket-agent's claude.rs) and built
+# by wicket-control's image.rs (#219), whose tests read the directory; wicket-cli depends on both.
 [[path-rule]]
 globs = ["images/claude-code/wicket-entry"]
-mark-changed = ["wicket-control", "wicket-fwd"]
+mark-changed = ["wicket-agent", "wicket-control", "wicket-fwd"]
 
 [[path-rule]]
 globs = ["images/**"]
-mark-changed = ["wicket-control"]
+mark-changed = ["wicket-agent", "wicket-control"]
 
 # The console's session view (#327), embedded by crates/wicket-cli/build.rs; the install and unit
 # files the CLI writes.
