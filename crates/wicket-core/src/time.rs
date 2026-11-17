@@ -369,7 +369,7 @@ fn two_digits(a: u8, b: u8) -> Result<u64, TimestampError> {
 }
 
 fn is_leap_year(y: u64) -> bool {
-    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+    y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400))
 }
 
 /// A UTC time written `2026-11-12T19:05:05Z`, with a space for the `T`, without the `Z`, with
@@ -456,13 +456,16 @@ mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
 
+    /// An input, and what it parsed to (seconds and nanoseconds) or the error's text.
+    type Case = (&'static str, Result<(u64, u32), &'static str>);
+
     /// Every duration spelling wicket takes (the manifests' limits, operator files, `--ttl`,
     /// `--ca-ttl 24h`, `--every`, `--window`, ...), and the edges of the grammar, with what
     /// humantime 2.4 made of each: seconds and nanoseconds, or its error. Generated from humantime
     /// before it was replaced (#437); the replacement must agree byte for byte.
     #[test]
     fn duration_spellings_are_humantime_s() {
-        let cases: &[(&str, Result<(u64, u32), &str>)] = &[
+        let cases: &[Case] = &[
 ("0", Ok((0, 0))),
         ("0s", Ok((0, 0))),
         ("0d", Ok((0, 0))),
@@ -624,7 +627,7 @@ mod tests {
     /// `wicket state --at`'s times: what humantime's weak RFC 3339 parser took, and refused.
     #[test]
     fn times_parse_as_humantime_parsed_them() {
-        let cases: &[(&str, Result<(u64, u32), &str>)] = &[
+        let cases: &[Case] = &[
             ("2026-11-12T19:05:05Z", Ok((1794510305, 0))),
             ("2026-11-12 19:05:05Z", Ok((1794510305, 0))),
             ("2026-11-12T19:05:05", Ok((1794510305, 0))),
