@@ -1,31 +1,454 @@
 //! Durations and times as people write and read them (#437): `30m`, `1h 30m`, `24h`, `7d` in
 //! manifests, operator files and CLI flags, and `2026-11-12T19:05:05Z` in what wicket prints.
 //!
-//! The spellings and the output are humantime 2.x's, which wicket used before, kept exactly.
+//! The spellings, the output and the error messages are humantime 2.4's, which wicket used until
+//! it was declared unmaintained (RUSTSEC-2026-0542), restated here (humantime is MIT or
+//! Apache-2.0): the tests below pin what it did. A duration's terms may be spaced or not (`1h30m`),
+//! a number may have a fraction (`1.5h`), and whitespace between a number and its unit is
+//! allowed (`5 minutes`). Times are UTC.
 
-use std::time::{Duration, SystemTime};
+use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use humantime::{DurationError, FormattedDuration, Rfc3339Timestamp, TimestampError};
+/// Why a duration didn't parse.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum DurationError {
+    /// A character no duration has, at this byte offset.
+    InvalidCharacter(usize),
+    /// A number was expected at this byte offset.
+    NumberExpected(usize),
+    /// A unit that isn't one (or none), after `value`.
+    UnknownUnit {
+        unit: String,
+        value: u64,
+    },
+    /// Too large, or finer than a nanosecond.
+    NumberOverflow,
+    Empty,
+}
+
+impl std::error::Error for DurationError {}
+
+impl fmt::Display for DurationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DurationError::InvalidCharacter(offset) => write!(f, "invalid character at {offset}"),
+            DurationError::NumberExpected(offset) => write!(f, "expected number at {offset}"),
+            DurationError::UnknownUnit { unit, value } if unit.is_empty() => {
+                write!(f, "time unit needed, for example {value}sec or {value}ms")
+            }
+            DurationError::UnknownUnit { unit, .. } => write!(
+                f,
+                "unknown time unit {unit:?}, supported units: ns, us/µs, ms, sec, min, hours, days, weeks, months, years (and few variations)"
+            ),
+            DurationError::NumberOverflow => f.write_str(
+                "number is too large or cannot be represented without a lack of precision (values below 1ns are not supported)",
+            ),
+            DurationError::Empty => f.write_str("value was empty"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Unit {
+    Nanosecond,
+    Microsecond,
+    Millisecond,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl Unit {
+    fn of(s: &str) -> Option<Unit> {
+        Some(match s {
+            "nanos" | "nsec" | "ns" => Unit::Nanosecond,
+            "usec" | "us" | "µs" => Unit::Microsecond,
+            "millis" | "msec" | "ms" => Unit::Millisecond,
+            "seconds" | "second" | "secs" | "sec" | "s" => Unit::Second,
+            "minutes" | "minute" | "min" | "mins" | "m" => Unit::Minute,
+            "hours" | "hour" | "hr" | "hrs" | "h" => Unit::Hour,
+            "days" | "day" | "d" => Unit::Day,
+            "weeks" | "week" | "wk" | "wks" | "w" => Unit::Week,
+            "months" | "month" | "M" => Unit::Month,
+            "years" | "year" | "yr" | "yrs" | "y" => Unit::Year,
+            _ => return None,
+        })
+    }
+}
+
+/// A month: 30.44 days.
+const MONTH_SECS: u64 = 2_630_016;
+/// A year: 365.25 days.
+const YEAR_SECS: u64 = 31_557_600;
+
+fn mul(a: u64, b: u64) -> Result<u64, DurationError> {
+    a.checked_mul(b).ok_or(DurationError::NumberOverflow)
+}
+
+/// `a / b`, exactly (a fraction finer than the unit's nanosecond or second can't be).
+fn div_exact(a: u64, b: u64) -> Result<u64, DurationError> {
+    match a % b {
+        0 => Ok(a / b),
+        _ => Err(DurationError::NumberOverflow),
+    }
+}
+
+fn is_letter(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == 'µ'
+}
+
+struct Parser<'a> {
+    iter: std::str::Chars<'a>,
+    src: &'a str,
+}
+
+impl Parser<'_> {
+    fn off(&self) -> usize {
+        self.src.len() - self.iter.as_str().len()
+    }
+
+    /// The first digit of the next term, skipping whitespace; None at the end.
+    fn first_digit(&mut self) -> Result<Option<u64>, DurationError> {
+        let off = self.off();
+        for c in self.iter.by_ref() {
+            match c {
+                '0'..='9' => return Ok(Some(u64::from(c) - u64::from('0'))),
+                c if c.is_whitespace() => continue,
+                _ => return Err(DurationError::NumberExpected(off)),
+            }
+        }
+        Ok(None)
+    }
+
+    /// The digits after a `.`: (numerator, denominator).
+    fn fraction(&mut self, off: &mut usize) -> Result<(u64, u64), DurationError> {
+        let (mut num, mut den, mut zeros) = (0u64, 1u64, true);
+        while let Some(c) = self.iter.next() {
+            match c {
+                '0' => {
+                    den = mul(den, 10)?;
+                    if !zeros {
+                        num = mul(num, 10)?;
+                    }
+                }
+                '1'..='9' => {
+                    zeros = false;
+                    den = mul(den, 10)?;
+                    num = mul(num, 10)?.checked_add(u64::from(c) - u64::from('0')).ok_or(DurationError::NumberOverflow)?;
+                }
+                c if c.is_whitespace() => {}
+                c if is_letter(c) => break,
+                _ => return Err(DurationError::InvalidCharacter(*off)),
+            }
+            *off = self.off();
+        }
+        if den == 1 {
+            // No digits after the `.`.
+            return Err(DurationError::InvalidCharacter(*off));
+        }
+        Ok((num, den))
+    }
+
+    /// Adds `n` (and its fraction) of the unit spelt `src[start..end]`.
+    fn add(&self, n: u64, frac: Option<(u64, u64)>, start: usize, end: usize, out: &mut Duration) -> Result<(), DurationError> {
+        let unit = Unit::of(&self.src[start..end])
+            .ok_or_else(|| DurationError::UnknownUnit { unit: self.src[start..end].to_owned(), value: n })?;
+        let (sec, nsec) = match unit {
+            Unit::Nanosecond => (0, n),
+            Unit::Microsecond => (0, mul(n, 1000)?),
+            Unit::Millisecond => (0, mul(n, 1_000_000)?),
+            Unit::Second => (n, 0),
+            Unit::Minute => (mul(n, 60)?, 0),
+            Unit::Hour => (mul(n, 3600)?, 0),
+            Unit::Day => (mul(n, 86_400)?, 0),
+            Unit::Week => (mul(n, 86_400 * 7)?, 0),
+            Unit::Month => (mul(n, MONTH_SECS)?, 0),
+            Unit::Year => (mul(n, YEAR_SECS)?, 0),
+        };
+        add_to(sec, nsec, out)?;
+        if let Some((n, d)) = frac {
+            let (sec, nsec) = match unit {
+                Unit::Nanosecond => return Err(DurationError::NumberOverflow),
+                Unit::Microsecond => (0, div_exact(mul(n, 1000)?, d)?),
+                Unit::Millisecond => (0, div_exact(mul(n, 1_000_000)?, d)?),
+                Unit::Second => (0, div_exact(mul(n, 1_000_000_000)?, d)?),
+                Unit::Minute => (0, div_exact(mul(n, 60_000_000_000)?, d)?),
+                Unit::Hour => (div_exact(mul(n, 3600)?, d)?, 0),
+                Unit::Day => (div_exact(mul(n, 86_400)?, d)?, 0),
+                Unit::Week => (div_exact(mul(n, 86_400 * 7)?, d)?, 0),
+                Unit::Month => (div_exact(mul(n, MONTH_SECS)?, d)?, 0),
+                Unit::Year => (div_exact(mul(n, YEAR_SECS)?, d)?, 0),
+            };
+            add_to(sec, nsec, out)?;
+        }
+        Ok(())
+    }
+
+    fn parse(mut self) -> Result<Duration, DurationError> {
+        let mut n = self.first_digit()?.ok_or(DurationError::Empty)?;
+        let mut out = Duration::ZERO;
+        'terms: loop {
+            // The number (digits may be spaced), and a fraction.
+            let mut frac = None;
+            let mut off = self.off();
+            while let Some(c) = self.iter.next() {
+                match c {
+                    '0'..='9' => {
+                        n = n
+                            .checked_mul(10)
+                            .and_then(|x| x.checked_add(u64::from(c) - u64::from('0')))
+                            .ok_or(DurationError::NumberOverflow)?;
+                    }
+                    c if c.is_whitespace() => {}
+                    c if is_letter(c) => break,
+                    '.' => {
+                        frac = Some(self.fraction(&mut off)?);
+                        break;
+                    }
+                    _ => return Err(DurationError::InvalidCharacter(off)),
+                }
+                off = self.off();
+            }
+            // Its unit: letters up to whitespace, or up to the next term's first digit.
+            let start = off;
+            let mut off = self.off();
+            while let Some(c) = self.iter.next() {
+                match c {
+                    '0'..='9' => {
+                        self.add(n, frac, start, off, &mut out)?;
+                        n = u64::from(c) - u64::from('0');
+                        continue 'terms;
+                    }
+                    c if c.is_whitespace() => break,
+                    c if is_letter(c) => {}
+                    _ => return Err(DurationError::InvalidCharacter(off)),
+                }
+                off = self.off();
+            }
+            self.add(n, frac, start, off, &mut out)?;
+            n = match self.first_digit()? {
+                Some(n) => n,
+                None => return Ok(out),
+            };
+        }
+    }
+}
+
+fn add_to(sec: u64, nsec: u64, out: &mut Duration) -> Result<(), DurationError> {
+    let mut sec = sec;
+    let mut nsec = u64::from(out.subsec_nanos()).checked_add(nsec).ok_or(DurationError::NumberOverflow)?;
+    if nsec > 1_000_000_000 {
+        sec = sec.checked_add(nsec / 1_000_000_000).ok_or(DurationError::NumberOverflow)?;
+        nsec %= 1_000_000_000;
+    }
+    sec = out.as_secs().checked_add(sec).ok_or(DurationError::NumberOverflow)?;
+    *out = Duration::new(sec, nsec as u32);
+    Ok(())
+}
 
 /// A duration: one or more `<number><unit>` terms (`30m`, `1h 30m`, `1.5h`, `250ms`), or `0`.
 pub fn parse_duration(s: &str) -> Result<Duration, DurationError> {
-    humantime::parse_duration(s)
+    if s == "0" {
+        return Ok(Duration::ZERO);
+    }
+    Parser { iter: s.chars(), src: s }.parse()
 }
+
+/// A duration, displayed by [`format_duration`].
+#[derive(Debug, Clone, Copy)]
+pub struct FormattedDuration(Duration);
 
 /// A duration as its largest units, `1day 2h 3m` (a month is 30.44 days, a year 365.25).
 pub fn format_duration(d: Duration) -> FormattedDuration {
-    humantime::format_duration(d)
+    FormattedDuration(d)
 }
 
-/// A time as `2026-11-12T19:05:05Z` (UTC, whole seconds).
+impl fmt::Display for FormattedDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (secs, nanos) = (self.0.as_secs(), self.0.subsec_nanos());
+        if secs == 0 && nanos == 0 {
+            return f.write_str("0s");
+        }
+        let ydays = secs % YEAR_SECS;
+        let mdays = ydays % MONTH_SECS;
+        let day_secs = mdays % 86_400;
+        let mut started = false;
+        let mut item = |f: &mut fmt::Formatter<'_>, name: &str, value: u64, plural: bool| -> fmt::Result {
+            if value > 0 {
+                if started {
+                    f.write_str(" ")?;
+                }
+                write!(f, "{value}{name}")?;
+                if plural && value > 1 {
+                    f.write_str("s")?;
+                }
+                started = true;
+            }
+            Ok(())
+        };
+        item(f, "year", secs / YEAR_SECS, true)?;
+        item(f, "month", ydays / MONTH_SECS, true)?;
+        item(f, "day", mdays / 86_400, true)?;
+        item(f, "h", day_secs / 3600, false)?;
+        item(f, "m", day_secs % 3600 / 60, false)?;
+        item(f, "s", day_secs % 60, false)?;
+        item(f, "ms", u64::from(nanos / 1_000_000), false)?;
+        item(f, "us", u64::from(nanos / 1000 % 1000), false)?;
+        item(f, "ns", u64::from(nanos % 1000), false)
+    }
+}
+
+/// Why a time didn't parse.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TimestampError {
+    OutOfRange,
+    InvalidDigit,
+    InvalidFormat,
+}
+
+impl std::error::Error for TimestampError {}
+
+impl fmt::Display for TimestampError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TimestampError::OutOfRange => "numeric component is out of range",
+            TimestampError::InvalidDigit => "bad character where digit is expected",
+            TimestampError::InvalidFormat => "timestamp format is invalid",
+        })
+    }
+}
+
+/// The first second of year 10000: the formats here have four-digit years.
+const YEAR_10000: u64 = 253_402_300_800;
+
+/// A time, displayed by [`format_rfc3339_seconds`].
+#[derive(Debug, Clone, Copy)]
+pub struct Rfc3339Timestamp(SystemTime);
+
+/// A time as `2026-11-12T19:05:05Z` (UTC, whole seconds). Displaying a time before 1970 panics,
+/// and one from year 10000 on fails, as humantime's did.
 pub fn format_rfc3339_seconds(t: SystemTime) -> Rfc3339Timestamp {
-    humantime::format_rfc3339_seconds(t)
+    Rfc3339Timestamp(t)
+}
+
+/// The civil date of a day since 1970-01-01 (Howard Hinnant's `civil_from_days`).
+fn civil(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+impl fmt::Display for Rfc3339Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secs = self.0.duration_since(UNIX_EPOCH).expect("all times should be after the epoch").as_secs();
+        if secs >= YEAR_10000 {
+            return Err(fmt::Error);
+        }
+        let (y, m, d) = civil((secs / 86_400) as i64);
+        let s = secs % 86_400;
+        write!(f, "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", s / 3600, s % 3600 / 60, s % 60)
+    }
+}
+
+fn two_digits(a: u8, b: u8) -> Result<u64, TimestampError> {
+    match ((a as char).to_digit(10), (b as char).to_digit(10)) {
+        (Some(a), Some(b)) => Ok(u64::from(a * 10 + b)),
+        _ => Err(TimestampError::InvalidDigit),
+    }
+}
+
+fn is_leap_year(y: u64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
 
 /// A UTC time written `2026-11-12T19:05:05Z`, with a space for the `T`, without the `Z`, with
-/// `+00:00` for it, or with a fraction of a second.
+/// `+00:00` for it, or with a fraction of a second. A leap second (`:60`) is the second before.
 pub fn parse_rfc3339_weak(s: &str) -> Result<SystemTime, TimestampError> {
-    humantime::parse_rfc3339_weak(s)
+    if s.len() < "2018-02-14T00:28:07".len() {
+        return Err(TimestampError::InvalidFormat);
+    }
+    let b = s.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b' ') || b[13] != b':' || b[16] != b':' {
+        return Err(TimestampError::InvalidFormat);
+    }
+    let year = two_digits(b[0], b[1])? * 100 + two_digits(b[2], b[3])?;
+    let month = two_digits(b[5], b[6])?;
+    let day = two_digits(b[8], b[9])?;
+    let hour = two_digits(b[11], b[12])?;
+    let minute = two_digits(b[14], b[15])?;
+    let mut second = two_digits(b[17], b[18])?;
+    if year < 1970 || hour > 23 || minute > 59 || second > 60 {
+        return Err(TimestampError::OutOfRange);
+    }
+    if second == 60 {
+        second = 59;
+    }
+    let leap = is_leap_year(year);
+    let (mut ydays, mdays) = match month {
+        1 => (0, 31),
+        2 if leap => (31, 29),
+        2 => (31, 28),
+        3 => (59, 31),
+        4 => (90, 30),
+        5 => (120, 31),
+        6 => (151, 30),
+        7 => (181, 31),
+        8 => (212, 31),
+        9 => (243, 30),
+        10 => (273, 31),
+        11 => (304, 30),
+        12 => (334, 31),
+        _ => return Err(TimestampError::OutOfRange),
+    };
+    if day > mdays || day == 0 {
+        return Err(TimestampError::OutOfRange);
+    }
+    ydays += day - 1;
+    if leap && month > 2 {
+        ydays += 1;
+    }
+    let leap_years = ((year - 1) - 1968) / 4 - ((year - 1) - 1900) / 100 + ((year - 1) - 1600) / 400;
+    let days = (year - 1970) * 365 + leap_years + ydays;
+    let time = second + minute * 60 + hour * 3600;
+
+    let mut nanos = 0;
+    let mut mult = 100_000_000;
+    if b.get(19) == Some(&b'.') {
+        for (idx, &c) in b.iter().enumerate().skip(20) {
+            if c == b'Z' {
+                if idx == b.len() - 1 {
+                    break;
+                }
+                return Err(TimestampError::InvalidDigit);
+            } else if c == b'+' {
+                // `+00:00`, which must end it.
+                if idx == b.len() - 6 {
+                    break;
+                }
+                return Err(TimestampError::InvalidDigit);
+            }
+            nanos += mult * (c as char).to_digit(10).ok_or(TimestampError::InvalidDigit)?;
+            mult /= 10;
+        }
+    } else if b.len() != 19 && (b.len() > 25 || (b[19] != b'Z' && (&b[19..] != b"+00:00"))) {
+        return Err(TimestampError::InvalidFormat);
+    }
+    let total = time + days * 86_400;
+    if total >= YEAR_10000 {
+        return Err(TimestampError::OutOfRange);
+    }
+    Ok(UNIX_EPOCH + Duration::new(total, nanos))
 }
 
 #[cfg(test)]

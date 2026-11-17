@@ -16,7 +16,6 @@ sha2.workspace = true
 hex.workspace = true
 ulid.workspace = true
 getrandom.workspace = true
-humantime.workspace = true
 url.workspace = true
 
 # The budget counter's atomics under loom (#325, tests/loom_budget.rs): RUSTFLAGS="--cfg loom".

@@ -34,7 +34,6 @@ anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
-humantime.workspace = true
 # The node's in-memory secret cache (#152): values zeroized when dropped.
 zeroize = "1"
 rustls.workspace = true
