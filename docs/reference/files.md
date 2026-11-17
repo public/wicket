@@ -25,7 +25,7 @@ Where wicket keeps what. On an installed control host the data directory is `/va
 | `state.key` | The key every hibernated agent's bundle is sealed under. Back it up with the data directory; without it no hibernated agent can be woken. |
 | `runs/<run>/` | A [run's directory](#a-runs-directory). |
 | `agents/<agent>/` | A long-lived agent's own files (`wake.log`, its durable volumes while it runs). |
-| `store/` | The content-addressed store (sealed under `state.key`): hibernated agents' bundles as trees, file by file (#365). With `bundles: s3` it is the local copy and the state store holds every bundle too. |
+| `store/` | The content-addressed store (sealed under `state.key`): hibernated agents' bundles as trees, file by file (#365). With `bundles: s3` it is the local copy and the state store holds every bundle too; the hourly collection (`wicket state gc`) deletes what nothing reaches and cuts it down to `local_cache:`. `store-gc.last`'s time is the last collection's. |
 | `objects/` | The object store for bundles pushed before #365, and for an agent kept as a full copy (names that aren't UTF-8), unless `state-store.yaml` sends bundles to S3. `objects-scratch/` is its staging area. |
 | `volumes/` | Zone volumes of the `node` class for this host's own node. |
 | `nodes/<name>/` | Each enrolled node: `known_hosts` (its pinned host key), its feed's publisher state and delta log (`feed/`, `feed.lock`). |

@@ -73,6 +73,31 @@ fn fill(r: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 impl<S: ObjectStore> SealedStore<S> {
+    /// Opens `key`, all of it, or (`head`) its first `head` bytes of plaintext at least: the
+    /// sealed chunks that cover them.
+    fn open(&self, key: &str, head: Option<u64>) -> io::Result<Option<Box<dyn Read + Send>>> {
+        let name = format!("{PREFIX}{key}");
+        let partial = head.is_some();
+        let got = match head {
+            Some(n) => self.inner.get_head(&name, 20 + n.div_ceil(CHUNK as u64).max(1) * (4 + CHUNK + TAG) as u64)?,
+            None => self.inner.get(&name)?,
+        };
+        let Some(mut r) = got else {
+            // Written before objects were sealed.
+            return if self.plain { self.inner.get(key) } else { Ok(None) };
+        };
+        let mut head = [0u8; 20];
+        if fill(&mut *r, &mut head)? != 20 || &head[..4] != MAGIC {
+            return Err(bad("not a sealed object"));
+        }
+        if head[4..12] != self.kid {
+            return Err(bad("sealed under another key"));
+        }
+        let prefix: [u8; 8] = head[12..20].try_into().expect("8 bytes");
+        let key2 = self.key_clone();
+        Ok(Some(Box::new(Opener { inner: r, key: key2, object: key.into(), prefix, i: 0, buf: vec![], pos: 0, done: false, partial })))
+    }
+
     pub fn new(inner: S, key: &[u8; 32]) -> SealedStore<S> {
         SealedStore { inner, raw: *key, kid: kid(key), plain: true }
     }
@@ -161,13 +186,23 @@ struct Opener {
     buf: Vec<u8>,
     pos: usize,
     done: bool,
+    /// Only the object's first chunks were asked for ([`ObjectStore::get_head`]): the end of them,
+    /// at a chunk's boundary, ends the read. Every chunk returned is still authenticated.
+    partial: bool,
 }
 
 impl Opener {
     fn next_chunk(&mut self) -> io::Result<()> {
         let mut len = [0u8; 4];
-        if fill(&mut *self.inner, &mut len)? != 4 {
-            return Err(bad("sealed object cut short"));
+        match fill(&mut *self.inner, &mut len)? {
+            4 => {}
+            0 if self.partial && self.i > 0 => {
+                self.done = true;
+                self.buf.clear();
+                self.pos = 0;
+                return Ok(());
+            }
+            _ => return Err(bad("sealed object cut short")),
         }
         let len = u32::from_be_bytes(len) as usize;
         if !(TAG..=CHUNK + TAG).contains(&len) {
@@ -229,20 +264,15 @@ impl<S: ObjectStore> ObjectStore for SealedStore<S> {
     }
 
     fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
-        let Some(mut r) = self.inner.get(&format!("{PREFIX}{key}"))? else {
-            // Written before objects were sealed.
-            return if self.plain { self.inner.get(key) } else { Ok(None) };
-        };
-        let mut head = [0u8; 20];
-        if fill(&mut *r, &mut head)? != 20 || &head[..4] != MAGIC {
-            return Err(bad("not a sealed object"));
-        }
-        if head[4..12] != self.kid {
-            return Err(bad("sealed under another key"));
-        }
-        let prefix: [u8; 8] = head[12..20].try_into().expect("8 bytes");
-        let key2 = self.key_clone();
-        Ok(Some(Box::new(Opener { inner: r, key: key2, object: key.into(), prefix, i: 0, buf: vec![], pos: 0, done: false })))
+        self.open(key, None)
+    }
+
+    fn get_head(&self, key: &str, n: u64) -> io::Result<Option<Box<dyn Read + Send>>> {
+        self.open(key, Some(n))
+    }
+
+    fn stat(&self, key: &str) -> io::Result<Option<crate::objects::Stat>> {
+        self.inner.stat(&format!("{PREFIX}{key}"))
     }
 
     fn has(&self, key: &str) -> io::Result<bool> {
@@ -310,6 +340,49 @@ mod tests {
         assert_eq!(s.list_prefix("a/").unwrap(), ["a/big", "a/empty", "a/exact", "a/small"]);
         s.delete("a/small").unwrap();
         assert!(s.get("a/small").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A backend that reads only the range asked for (as S3's ranged GET does).
+    struct Ranged(DirStore);
+    impl ObjectStore for Ranged {
+        fn put_if_absent(&self, key: &str, data: &mut dyn Read) -> io::Result<bool> {
+            self.0.put_if_absent(key, data)
+        }
+        fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
+            self.0.get(key)
+        }
+        fn get_head(&self, key: &str, n: u64) -> io::Result<Option<Box<dyn Read + Send>>> {
+            let Some(r) = self.0.get(key)? else { return Ok(None) };
+            let mut v = vec![];
+            r.take(n).read_to_end(&mut v)?;
+            Ok(Some(Box::new(io::Cursor::new(v))))
+        }
+        fn delete(&self, key: &str) -> io::Result<()> {
+            self.0.delete(key)
+        }
+        fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
+            self.0.list_prefix(prefix)
+        }
+    }
+
+    #[test]
+    fn the_head_of_an_object_is_read_from_its_first_chunks_alone() {
+        let d = std::env::temp_dir().join(format!("wicket-sealed-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let s = SealedStore::sealed_only(Ranged(DirStore::new(&d)), &[7u8; 32]);
+        let data: Vec<u8> = (0..3 * CHUNK + 5).map(|i| (i % 251) as u8).collect();
+        s.put_if_absent("o/big", &mut &data[..]).unwrap();
+        let mut head = vec![];
+        s.get_head("o/big", 10).unwrap().unwrap().read_to_end(&mut head).unwrap();
+        assert_eq!(head, data[..CHUNK], "the first chunk, authenticated, and no more");
+        let mut two = vec![];
+        s.get_head("o/big", CHUNK as u64 + 1).unwrap().unwrap().read_to_end(&mut two).unwrap();
+        assert_eq!(two, data[..2 * CHUNK]);
+        // A whole read of the same backend still refuses an object cut at a chunk's boundary.
+        let mut all = vec![];
+        s.get("o/big").unwrap().unwrap().read_to_end(&mut all).unwrap();
+        assert_eq!(all, data);
         let _ = std::fs::remove_dir_all(&d);
     }
 

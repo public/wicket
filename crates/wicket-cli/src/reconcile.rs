@@ -36,6 +36,10 @@
 //!   left to its run (above). **A box whose run this ledger doesn't know is left alone**: Docker may
 //!   be shared.
 //!
+//! - *Stores*: once an hour ([`crate::storegc::EVERY_SECS`]), the content-addressed stores'
+//!   collection (#258, `wicket state gc`): the local store and the state store's, then the local
+//!   store's cache cap. Audited as `store.gc` and `store.deleted`, not `reconcile.*`.
+//!
 //! **Order.** Runs, then leases, then machines, then boxes, so killing every control-plane process
 //! mid-run and restarting leaves nothing behind after one pass: the lost runs end, their leases end,
 //! their machines go, and their boxes stop.
@@ -865,6 +869,16 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     let now = wicket_store::now();
     let mut done = machines_pass(&mut ledger, asked, &local, now, dry_run).await?;
     done.extend(placed_nodes(&mut ledger, now, dry_run).await?);
+    if !dry_run && crate::storegc::due() {
+        // The store clients block: off the async runtime.
+        let passes = tokio::task::spawn_blocking(|| crate::storegc::run(&Ledger::open(&crate::ledger_path())?, false)).await?;
+        match passes {
+            Ok(ps) => {
+                done.extend(ps.iter().map(|p| Done { kind: "store_gc", target: p.store.into(), detail: crate::storegc::summary(p, false) }))
+            }
+            Err(e) => done.push(Done { kind: "store_gc", target: "stores".into(), detail: format!("failed: {e:#}") }),
+        }
+    }
     Ok(done)
 }
 
@@ -904,7 +918,10 @@ pub fn print(done: &[Done], dry_run: bool) {
     for d in done {
         println!("{:<15} {}  {}", d.kind, d.target, d.detail);
     }
-    let changed = done.iter().filter(|d| !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held")).count();
+    let changed = done
+        .iter()
+        .filter(|d| !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held" | "store_gc"))
+        .count();
     println!("reconcile: {changed} change(s){}", if dry_run { " (dry run: nothing changed)" } else { "" });
 }
 

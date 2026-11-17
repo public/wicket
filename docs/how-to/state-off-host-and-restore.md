@@ -39,6 +39,7 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
      secret: s3-wicket            # the vault secret above
      conditional_put: true        # default: If-None-Match: *; false: a HEAD before each PUT
    bundles: s3                    # default local
+   local_cache: 20g               # with bundles: s3, the most <data dir>/store keeps (default 20g)
    ledger:
      sync_interval: 1s            # the most a lost control host loses
      retention: 72h               # how far back --at can go

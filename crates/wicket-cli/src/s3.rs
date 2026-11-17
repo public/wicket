@@ -160,6 +160,43 @@ impl S3Store {
         Ok(f)
     }
 
+    /// GETs `key`, all of it or (`head`) its first `head` bytes at least (a ranged GET).
+    fn fetch(&self, key: &str, head: Option<u64>) -> io::Result<Option<Box<dyn Read + Send>>> {
+        if !valid_key(key) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad object key {key:?}")));
+        }
+        let mut req = self.request(reqwest::Method::GET, key, &[], EMPTY_SHA256).map_err(io_err)?;
+        if let Some(n) = head.filter(|n| *n > 0) {
+            req = req.header("range", format!("bytes=0-{}", n - 1));
+        }
+        let f = self.scratch_file()?;
+        let mut out = f.try_clone()?;
+        let key2 = key.to_string();
+        let found = block(async move {
+            use futures_util::StreamExt;
+            let r = req.send().await.map_err(io_err)?;
+            match r.status().as_u16() {
+                200 | 206 => {}
+                // A range past the end: the object is empty.
+                416 => return Ok(true),
+                404 => return Ok(false),
+                s => return Err(io_err(format!("GET {key2}: HTTP {s}"))),
+            }
+            let mut s = r.bytes_stream();
+            while let Some(c) = s.next().await {
+                out.write_all(&c.map_err(io_err)?)?;
+            }
+            out.flush()?;
+            Ok::<_, io::Error>(true)
+        })?;
+        if !found {
+            return Ok(None);
+        }
+        let mut f = f;
+        f.rewind()?;
+        Ok(Some(Box::new(io::BufReader::new(f))))
+    }
+
     fn exists(&self, key: &str) -> io::Result<bool> {
         let req = self.request(reqwest::Method::HEAD, key, &[], EMPTY_SHA256).map_err(io_err)?;
         let status = block(async move { req.send().await.map(|r| r.status()) }).map_err(io_err)?;
@@ -259,34 +296,11 @@ impl ObjectStore for S3Store {
     }
 
     fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
-        if !valid_key(key) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad object key {key:?}")));
-        }
-        let req = self.request(reqwest::Method::GET, key, &[], EMPTY_SHA256).map_err(io_err)?;
-        let f = self.scratch_file()?;
-        let mut out = f.try_clone()?;
-        let key2 = key.to_string();
-        let found = block(async move {
-            use futures_util::StreamExt;
-            let r = req.send().await.map_err(io_err)?;
-            match r.status().as_u16() {
-                200 => {}
-                404 => return Ok(false),
-                s => return Err(io_err(format!("GET {key2}: HTTP {s}"))),
-            }
-            let mut s = r.bytes_stream();
-            while let Some(c) = s.next().await {
-                out.write_all(&c.map_err(io_err)?)?;
-            }
-            out.flush()?;
-            Ok::<_, io::Error>(true)
-        })?;
-        if !found {
-            return Ok(None);
-        }
-        let mut f = f;
-        f.rewind()?;
-        Ok(Some(Box::new(io::BufReader::new(f))))
+        self.fetch(key, None)
+    }
+
+    fn get_head(&self, key: &str, n: u64) -> io::Result<Option<Box<dyn Read + Send>>> {
+        self.fetch(key, Some(n))
     }
 
     fn has(&self, key: &str) -> io::Result<bool> {

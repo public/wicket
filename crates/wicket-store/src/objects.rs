@@ -19,6 +19,25 @@ pub trait ObjectStore: Send + Sync {
     fn delete(&self, key: &str) -> io::Result<()>;
     /// Every key under `prefix` (garbage collection only).
     fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>>;
+    /// Opens `key` for reading its first `n` bytes at least (it may give more, up to all of it):
+    /// garbage collection's look at what an object is. A backend that can read a range says so.
+    fn get_head(&self, key: &str, n: u64) -> io::Result<Option<Box<dyn Read + Send>>> {
+        let _ = n;
+        self.get(key)
+    }
+    /// What `key` takes as stored, and when it was last written or read (Unix seconds), if the
+    /// backend keeps that (a directory does): the local store's cache cap orders by it.
+    fn stat(&self, key: &str) -> io::Result<Option<Stat>> {
+        let _ = key;
+        Ok(None)
+    }
+}
+
+/// An object's size as stored, and when it was last used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stat {
+    pub len: u64,
+    pub used: i64,
 }
 
 /// Any store behind a box (the installation's choice of backend, #154).
@@ -37,6 +56,12 @@ impl ObjectStore for Box<dyn ObjectStore> {
     }
     fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
         (**self).list_prefix(prefix)
+    }
+    fn get_head(&self, key: &str, n: u64) -> io::Result<Option<Box<dyn Read + Send>>> {
+        (**self).get_head(key, n)
+    }
+    fn stat(&self, key: &str) -> io::Result<Option<Stat>> {
+        (**self).stat(key)
     }
 }
 
@@ -88,6 +113,12 @@ impl<S: ObjectStore> ObjectStore for Counting<S> {
     }
     fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
         self.inner.list_prefix(prefix)
+    }
+    fn get_head(&self, key: &str, n: u64) -> io::Result<Option<Box<dyn Read + Send>>> {
+        self.inner.get_head(key, n)
+    }
+    fn stat(&self, key: &str) -> io::Result<Option<Stat>> {
+        self.inner.stat(key)
     }
 }
 
@@ -150,7 +181,11 @@ impl ObjectStore for DirStore {
 
     fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
         match std::fs::File::open(self.path(key)?) {
-            Ok(f) => Ok(Some(Box::new(io::BufReader::new(f)))),
+            Ok(f) => {
+                // Used now: the cache cap evicts the least recently used first (#258).
+                let _ = f.set_modified(std::time::SystemTime::now());
+                Ok(Some(Box::new(io::BufReader::new(f))))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -158,6 +193,18 @@ impl ObjectStore for DirStore {
 
     fn has(&self, key: &str) -> io::Result<bool> {
         Ok(self.path(key)?.is_file())
+    }
+
+    fn stat(&self, key: &str) -> io::Result<Option<Stat>> {
+        match std::fs::metadata(self.path(key)?) {
+            Ok(m) if m.is_file() => {
+                let used = m.modified()?.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+                Ok(Some(Stat { len: m.len(), used }))
+            }
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn delete(&self, key: &str) -> io::Result<()> {

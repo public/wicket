@@ -872,6 +872,7 @@ Commands:
   restore    Make this fresh host the control host: the kit's files, then the ledger from the state store (as of now, or of --at), audit records the store has beyond it, agents fenced, and each node feed set to start a new generation
   snapshots  The ledger snapshots `wicket self update` pushed to the state store before each switch (#167): the way back past a contract step after losing the control host
   snapshot   Fetch one of them (unsealed with state.key) into a new file, to restore as docs/how-to/update-and-roll-back.md says
+  gc         Collect the content-addressed stores (#258): delete what no agent's head and no ref reaches, in this host's store and the state store's, and cut this host's down to its cache cap (`local_cache:`, with bundles in the state store). The reconciler does this hourly
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -953,6 +954,18 @@ Arguments:
 Options:
       --out <OUT>  
   -h, --help       Print help
+```
+
+### `wicket state gc`
+
+```text
+Collect the content-addressed stores (#258): delete what no agent's head and no ref reaches, in this host's store and the state store's, and cut this host's down to its cache cap (`local_cache:`, with bundles in the state store). The reconciler does this hourly
+
+Usage: wicket state gc [OPTIONS]
+
+Options:
+      --dry-run  Say what would be deleted, and delete nothing
+  -h, --help     Print help
 ```
 
 ## `wicket keys`

@@ -20,7 +20,9 @@ use std::io::{self, Read};
 use std::path::Path;
 
 mod dir;
+mod gc;
 pub use dir::{dir_digest, DirOpts};
+pub use gc::{Plan as GcPlan, Report as GcReport, Writing, CHECK_EVERY, GC_STALE_SECS, PUSH_STALE_SECS};
 
 const OBJECTS: &str = "o/";
 const REFS: &str = "r/";

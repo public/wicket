@@ -76,6 +76,10 @@ started in the background.
   what the agent's state restores to; the hibernation's own line and audit record say what it
   stored. Agents hibernated by an earlier wicket are woken as before. One whose files have names that
   aren't UTF-8 is still hibernated, as a full copy each time, and the log says so.
+- Old bundles don't pile up: the reconciler collects the stores hourly, deleting what no agent's
+  current head and no ref reaches, and with `bundles: s3` cuts `<data dir>/store` down to
+  `local_cache:` (default `20g`) by evicting what the state store already holds. `wicket state gc
+  --dry-run` says what it would delete; each collection is audited (`store.gc`, `store.deleted`).
 
 ## When it won't wake
 
