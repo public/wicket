@@ -255,13 +255,13 @@ structure SpawnAsk where
 authority ends, and the starts it allows. -/
 structure Block where
   zone : Zone
-  until : Nat
+  ends : Nat
   spawns : SpawnAsk → Bool
 
 def tokenVerdict (t : List Block) (o : Op) : Verdict := chainVerdict (t.map (·.zone)) o
 
 /-- Every block's authority lasts past `now`. -/
-def tokenLive (t : List Block) (now : Nat) : Bool := t.all (fun b => decide (now < b.until))
+def tokenLive (t : List Block) (now : Nat) : Bool := t.all (fun b => decide (now < b.ends))
 
 /-- Every block allows the start. -/
 def tokenSpawns (t : List Block) (s : SpawnAsk) : Bool := t.all (fun b => b.spawns s)
@@ -286,7 +286,7 @@ theorem attenuate_forbid {t : List Block} {b : Block} {o : Op} (h : tokenVerdict
 
 /-- **An appended block outlives no block of the token.** -/
 theorem attenuate_live {t : List Block} {b : Block} {now : Nat} (h : tokenLive (attenuate t b) now = true) :
-    tokenLive t now = true ∧ now < b.until := by
+    tokenLive t now = true ∧ now < b.ends := by
   simp only [tokenLive, attenuate, List.all_eq_true, decide_eq_true_eq] at h ⊢
   exact ⟨fun y hy => h y (by simp [hy]), h b (by simp)⟩
 
@@ -316,7 +316,7 @@ the parent's token allows the start (`peek_spawn`), and `derive_child` appends t
 whose authority ends no later than its parent's (`start_child`). -/
 def nodeSpawn (n : NodeAsk) : Option (List Block) :=
   if check n.ask n.bounds && tokenSpawns n.base n.spawn then
-    some (attenuate n.base { zone := n.ask.zone, until := min n.wantUntil n.parentUntil, spawns := n.childSpawns })
+    some (attenuate n.base { zone := n.ask.zone, ends := min n.wantUntil n.parentUntil, spawns := n.childSpawns })
   else none
 
 /-- **A child its node starts stays within its parent**: its zone is `Within` the parent's, its
