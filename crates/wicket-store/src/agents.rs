@@ -144,6 +144,19 @@ pub struct NewAgent<'a> {
     pub claim_until: i64,
 }
 
+/// How long past a box's authority wicket allows for the node's clock and its stop (#153, #446): a
+/// lapsed claim is taken over this long after its run's authority ends (`noderun::WAKE_SKEW_MS`
+/// is the same allowance for the wake fence on the control host's disk).
+pub const WAKE_SKEW_SECS: i64 = 30;
+
+/// The runs of the agent in `agents` whose box may still be running at `?4` (Unix seconds),
+/// with `?5` [`WAKE_SKEW_SECS`]: recorded `running` (not ended, nor lost once its node confirmed the
+/// box gone), with an authority whose end, past its last allowed second, isn't `?5` behind. A
+/// subquery of [`Ledger::claim_wake`]; [`Ledger::agent_fenced_until`] states the same condition.
+const FENCING_RUNS: &str = "SELECT 1 FROM runs r \
+     WHERE (r.id = agents.run OR r.id IN (SELECT run FROM agent_runs WHERE agent = agents.id)) \
+     AND r.status = 'running' AND r.authority_until IS NOT NULL AND r.authority_until + 1 + ?5 > ?4";
+
 impl Ledger {
     /// Records a new agent, active in its first run at generation 1.
     pub fn create_agent(&mut self, a: &NewAgent) -> Result<()> {
@@ -227,6 +240,24 @@ impl Ledger {
         Ok(n == 1)
     }
 
+    /// The run of agent `id` whose box may still be running at `at` (Unix seconds), and when that
+    /// ends for certain (its authority's end plus [`WAKE_SKEW_SECS`]): what keeps
+    /// [`Ledger::claim_wake`] from taking over its lapsed claim (#446). None when no run fences it.
+    /// The same condition as [`FENCING_RUNS`].
+    pub fn agent_fenced_until(&self, id: &str, at: i64) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT r.id, r.authority_until + 1 + ?3 FROM agents \
+                 JOIN runs r ON (r.id = agents.run OR r.id IN (SELECT run FROM agent_runs WHERE agent = agents.id)) \
+                 WHERE agents.id = ?1 AND r.status = 'running' AND r.authority_until IS NOT NULL AND r.authority_until + 1 + ?3 > ?2 \
+                 ORDER BY 2 DESC LIMIT 1",
+                params![id, at, WAKE_SKEW_SECS],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Renews the holder's claim until `until`, if `generation` is still current.
     pub fn renew_agent_claim(&self, id: &str, generation: i64, until: i64) -> Result<bool> {
         let n = self.conn.execute(
@@ -240,14 +271,24 @@ impl Ledger {
     /// claim ran out) to `waking`, bumps its generation and names `run` as its activation. Exactly
     /// one of any number of concurrent claims succeeds; the others get None. Revoked agents and
     /// agents with nothing to restore can't be claimed.
+    ///
+    /// A lapsed claim is taken over only once none of the agent's runs' boxes can still be running
+    /// (#446): a control-host outage stops its supervisors, never its boxes, and a box runs on its
+    /// node until its authority ends. So a run recorded `running` whose authority (`runs`,
+    /// recorded at its box's start and each renewal) hasn't ended, plus [`WAKE_SKEW_SECS`],
+    /// fences the takeover ([`Ledger::agent_fenced_until`]). A run its node confirmed stopped
+    /// (ended, lost) doesn't.
     pub fn claim_wake(&mut self, id: &str, run: &str, claim_until: i64) -> Result<Option<i64>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let t = now();
         let n = tx.execute(
-            "UPDATE agents SET state = 'waking', generation = generation + 1, run = ?2, claim_until = ?3, lease_until = ?3, want = NULL, updated_at = ?4 \
-             WHERE id = ?1 AND restorable = 1 AND head IS NOT NULL \
-             AND (state = 'hibernated' OR (state IN ('active', 'hibernating', 'waking') AND COALESCE(claim_until, 0) < ?4))",
-            params![id, run, claim_until, t],
+            &format!(
+                "UPDATE agents SET state = 'waking', generation = generation + 1, run = ?2, claim_until = ?3, lease_until = ?3, want = NULL, updated_at = ?4 \
+                 WHERE id = ?1 AND restorable = 1 AND head IS NOT NULL \
+                 AND (state = 'hibernated' OR (state IN ('active', 'hibernating', 'waking') AND COALESCE(claim_until, 0) < ?4 \
+                      AND NOT EXISTS ({FENCING_RUNS})))"
+            ),
+            params![id, run, claim_until, t, WAKE_SKEW_SECS],
         )?;
         if n != 1 {
             return Ok(None);
@@ -433,6 +474,54 @@ mod tests {
         // Revoked: never woken again.
         l.agent_not_restorable(&id, "revoked").unwrap();
         assert_eq!(l.claim_wake(&id, "run_4", now() + 30).unwrap(), None);
+    }
+
+    /// #446: a wake right after a control-host outage longer than the claim. The outage stopped the
+    /// holder's supervisor, so its claim lapsed, but not its box, which runs on its node until its
+    /// authority ends: the lapsed claim isn't taken over until then, or until the run is known
+    /// to have ended (its node confirmed the box gone).
+    #[test]
+    fn a_wake_after_an_outage_waits_for_the_old_boxs_authority() {
+        // An agent woken once, in a ledger of its own: run_2 holds it, its box on a node with
+        // authority for 5 minutes.
+        let activate = || {
+            let mut l = Ledger::open_in_memory().unwrap();
+            let id = new_agent_id();
+            agent(&mut l, &id);
+            assert!(l.commit_agent_push(&id, 1, 0, 1, "a/x/m/1.1", 10).unwrap());
+            assert_eq!(l.claim_wake(&id, "run_2", now() + 30).unwrap(), Some(2));
+            let run = wicket_core::RunId("run_2".into());
+            l.run_started(&wicket_core::TenantId::single(), &run, "z", "a").unwrap();
+            l.set_run_authority(&run.0, now() + 300, now() + 3600).unwrap();
+            (l, id, run)
+        };
+        let (mut l, id, run) = activate();
+        // The outage: no supervisor renews the claim, which lapses; the box runs on.
+        assert!(l.renew_agent_claim(&id, 2, now() - 1).unwrap());
+        assert_eq!(l.claim_wake(&id, "run_3", now() + 30).unwrap(), None, "its box may still run");
+        let (by, until) = l.agent_fenced_until(&id, now()).unwrap().expect("fenced");
+        assert_eq!(by, run.0);
+        assert!(until >= now() + 300 + WAKE_SKEW_SECS, "until its authority ends, and the skew: {until}");
+        let a = l.agent(&id).unwrap().unwrap();
+        assert_eq!((a.generation, a.run.as_str()), (2, run.0.as_str()), "nothing changed");
+        // Once its node confirmed the box gone (the reconciler ends the run as lost), it wakes.
+        l.run_ended(&run, "lost", "its node has no box for it").unwrap();
+        assert_eq!(l.agent_fenced_until(&id, now()).unwrap(), None);
+        assert_eq!(l.claim_wake(&id, "run_3", now() + 30).unwrap(), Some(3));
+
+        // Or once its authority has ended, past the skew, even with no word from its node.
+        let (mut l, id, run) = activate();
+        assert!(l.renew_agent_claim(&id, 2, now() - 1).unwrap());
+        l.set_run_authority(&run.0, now() - WAKE_SKEW_SECS + 5, now() + 3600).unwrap();
+        assert!(l.agent_fenced_until(&id, now()).unwrap().is_some(), "within the skew");
+        assert_eq!(l.claim_wake(&id, "run_3b", now() + 30).unwrap(), None);
+        l.set_run_authority(&run.0, now() - WAKE_SKEW_SECS - 2, now() + 3600).unwrap();
+        assert_eq!(l.agent_fenced_until(&id, now()).unwrap(), None);
+        assert_eq!(l.claim_wake(&id, "run_3b", now() + 30).unwrap(), Some(3));
+
+        // A live claim still refuses, whatever the authority.
+        let (mut l, id, _) = activate();
+        assert_eq!(l.claim_wake(&id, "run_3c", now() + 30).unwrap(), None, "its claim is live");
     }
 
     #[test]

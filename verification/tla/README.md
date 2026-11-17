@@ -235,15 +235,15 @@ switch still marked open, today's code), which TLC refuses:
 |---|---|---|
 | `FinishInLedger = TRUE` (the code, #444) | before #444, the agent's `finish` reached only its supervisor (`run.rs`: `finish_asked`, from `want_rx`). A control-host restart between the call and the end of its turn lost it; the re-attached supervisor never closed the session, and the harness ran until its timeout. Now the gateway records it (`Ledger::record_run_want`, `runs.want`) before the tool answers, and a re-attached supervisor reads it (`run.rs` `asked_of`) | `fail_lifecycle_finish_lost`: `FinishKnown` |
 | `AckAfterHand = TRUE` (open: #445) | a message is marked delivered when it is taken (`Ledger::take_message`, `take_operator_messages_with_ids`), before the box has it. If the control host stops in between, the only copy was the dead supervisor's. The proposal acknowledges once the box has it, and a box drops a repeat by id | `fail_lifecycle_message_lost`: `NoMessageLost` |
-| `WakeAfterAuthority = TRUE` (open: #446) | `Ledger::claim_wake` takes over an `active` agent whose claim lapsed (`CLAIM_SECS`, 30 s). A control-host outage longer than that leaves its box running on its node, so a wake then starts a second box until the first's re-attached supervisor finds it superseded. The proposal wakes a lapsed agent only once its old box's authority has ended (its node stops it then) | `fail_lifecycle_twin_wake`: `OneHarness` |
+| `WakeAfterAuthority = TRUE` (done, #446) | before #446, `Ledger::claim_wake` took over an `active` agent whose claim lapsed (`CLAIM_SECS`, 30 s). A control-host outage longer than that left its box running on its node, so a wake then started a second box until the first's re-attached supervisor found it superseded. Now `claim_wake` takes over a lapsed agent only once no run of it is recorded running with authority left (its box's authority end, recorded in the ledger at its start and each renewal, plus 30 s): its node stops the box then, or the reconciler ends the run once its node says the box is gone | `fail_lifecycle_twin_wake`: `OneHarness` |
 
-`fail_lifecycle_today` has every switch as on main. `NoMessageTwice` holds in every variant: with
+`fail_lifecycle_today` has every switch as on main (`FinishInLedger` since #444, `WakeAfterAuthority` since #446). `NoMessageTwice` holds in every variant: with
 `AckAfterHand` a message is queued again after a crash, and the box's record of what it has had
 keeps the repeat out.
 
 | action | code (file, function) |
 |---|---|
-| `Wake` | `wicket-control/src/hibernate.rs` `wake` → `wicket-store/src/agents.rs` `Ledger::claim_wake` (moves undelivered and held messages, and operator messages, to the new run) |
+| `Wake` | `wicket-control/src/hibernate.rs` `wake` → `wicket-store/src/agents.rs` `Ledger::claim_wake` (moves undelivered and held messages, and operator messages, to the new run; `WakeAfterAuthority`: `FENCING_RUNS`, `Ledger::agent_fenced_until`) |
 | `Renew`, `Supersede` | `wicket-control/src/run.rs`, the heartbeat: `Ledger::renew_agent_claim`, and `superseded` when it fails |
 | `Crash`, `Restart` | the control host's processes stopping (`ci/acceptance.sh`, `restart_flow`) |
 | `Adopt`, `Lost` | `wicket-cli/src/reconcile.rs`: `run_adopted` (a new `wicket run --attach`), `run_lost` |

@@ -25,7 +25,7 @@ pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOU
 pub use receipts::{MessageMeta, MessageRow, Priority, Receipt};
 pub mod objects;
 pub mod sealed;
-pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD};
+pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
 pub use links::{ExposeRow, LinkRow};
 pub mod invariants;
 mod lease;
