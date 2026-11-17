@@ -4113,7 +4113,9 @@ name = "wicket-home"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "hex",
  "serde_json",
+ "sha2",
  "wicket-agent",
  "wicket-core",
  "wicket-identity",

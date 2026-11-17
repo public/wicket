@@ -7,6 +7,7 @@
 
 pub mod exitcause;
 pub mod owner;
+pub mod program;
 
 use anyhow::Result;
 use std::path::PathBuf;

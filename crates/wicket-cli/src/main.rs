@@ -21,7 +21,7 @@ use wicket_home::{
 };
 
 // Modules that need only wicket-home's helpers moved with them (#219), under their old names here.
-use wicket_home::{exitcause, owner};
+use wicket_home::{exitcause, owner, program};
 
 mod audit_export;
 mod capacity;
@@ -52,7 +52,6 @@ mod nodesrv;
 mod operators;
 mod pin;
 mod policy;
-mod program;
 mod quotas;
 mod reconcile;
 mod rootcopy;
