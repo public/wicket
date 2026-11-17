@@ -4057,6 +4057,7 @@ dependencies = [
  "wicket-chan",
  "wicket-core",
  "wicket-feed",
+ "wicket-home",
  "wicket-identity",
  "wicket-placement",
  "wicket-policy",
@@ -4106,6 +4107,18 @@ dependencies = [
 [[package]]
 name = "wicket-fwd"
 version = "0.0.1"
+
+[[package]]
+name = "wicket-home"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "wicket-agent",
+ "wicket-identity",
+ "wicket-proxy",
+ "wicket-store",
+]
 
 [[package]]
 name = "wicket-identity"

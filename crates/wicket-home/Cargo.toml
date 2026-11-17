@@ -1,0 +1,15 @@
+[package]
+name = "wicket-home"
+description = "An installation's home (#219): where its data and keys are, its identity issuer, and who is calling (the principal and the operator). Split from wicket-cli so the modules that need only these build and test without the rest of it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wicket-store.workspace = true
+wicket-proxy.workspace = true
+wicket-agent.workspace = true
+wicket-identity.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
