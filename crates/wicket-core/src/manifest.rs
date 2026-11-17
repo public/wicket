@@ -499,7 +499,7 @@ impl VolumeSpec {
     /// default if unset).
     pub fn retention(&self) -> Result<Option<std::time::Duration>, ManifestError> {
         match &self.retention {
-            Some(r) => humantime::parse_duration(r).map(Some).map_err(|_| ManifestError::Duration(r.clone())),
+            Some(r) => crate::time::parse_duration(r).map(Some).map_err(|_| ManifestError::Duration(r.clone())),
             None if self.keep => Ok(None),
             None => Ok(Some(CACHE_RETENTION)),
         }
@@ -767,12 +767,12 @@ fn default_pids() -> u32 {
 
 impl Limits {
     pub fn timeout(&self) -> Result<Duration, ManifestError> {
-        humantime::parse_duration(&self.timeout).map_err(|_| ManifestError::Duration(self.timeout.clone()))
+        crate::time::parse_duration(&self.timeout).map_err(|_| ManifestError::Duration(self.timeout.clone()))
     }
 
     /// [`Limits::exit_grace`], read.
     pub fn exit_grace(&self) -> Result<Duration, ManifestError> {
-        humantime::parse_duration(&self.exit_grace).map_err(|_| ManifestError::Duration(self.exit_grace.clone()))
+        crate::time::parse_duration(&self.exit_grace).map_err(|_| ManifestError::Duration(self.exit_grace.clone()))
     }
 
     /// How long the box's authority lasts from the run's start (#153): `authority`, or the
@@ -781,7 +781,7 @@ impl Limits {
         let t = self.timeout()?;
         match &self.authority {
             None => Ok(t),
-            Some(a) => match humantime::parse_duration(a) {
+            Some(a) => match crate::time::parse_duration(a) {
                 Ok(d) if !d.is_zero() => Ok(d.min(t)),
                 _ => Err(ManifestError::Duration(a.clone())),
             },

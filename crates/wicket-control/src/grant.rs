@@ -457,7 +457,7 @@ fn refused(l: &Ledger, by: &Granter, id: &str, v: &Verdict, why: anyhow::Error) 
 /// A lifetime any grant may have: above 0 and at most [`MAX_TTL`].
 fn check_ttl(ttl: Duration) -> Result<()> {
     if ttl > MAX_TTL {
-        bail!("grants last at most {}; renew it with a new decision", humantime::format_duration(MAX_TTL));
+        bail!("grants last at most {}; renew it with a new decision", wicket_core::time::format_duration(MAX_TTL));
     }
     if ttl.is_zero() {
         bail!("a grant needs a lifetime");

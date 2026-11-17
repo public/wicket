@@ -75,7 +75,7 @@ impl VultrSettings {
     pub fn ready_wait(&self) -> Result<wicket_placement::boot::ReadyWait> {
         let mut w = wicket_placement::boot::ReadyWait::default();
         if let Some(d) = &self.give_up_silent {
-            w.silent_limit = humantime::parse_duration(d).with_context(|| format!("vultr.give_up_silent {d:?}"))?;
+            w.silent_limit = wicket_core::time::parse_duration(d).with_context(|| format!("vultr.give_up_silent {d:?}"))?;
         }
         Ok(w)
     }
@@ -307,7 +307,7 @@ pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId
         a.memory_mib,
         iso,
         a.region.as_deref().map(|r| format!(", region {r} preferred")).unwrap_or_default(),
-        humantime::format_duration(Duration::from_secs(a.duration_secs.max(0) as u64)),
+        wicket_core::time::format_duration(Duration::from_secs(a.duration_secs.max(0) as u64)),
         cfg.provider_id()
     );
     let money = if worst == MicroUsd::ZERO {
@@ -360,7 +360,7 @@ pub fn status(l: &Ledger, run: &RunId, id: &str) -> Result<CapacityState> {
 }
 
 pub fn fmt_time(t: i64) -> String {
-    humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
+    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
 }
 
 /// Whether a request is a capacity ask, and for which lease.

@@ -326,7 +326,7 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     let list = lineages(&st)?;
     let at_ms = match at {
         Some(t) => Some(
-            humantime::parse_rfc3339_weak(t)
+            wicket_core::time::parse_rfc3339_weak(t)
                 .with_context(|| format!("--at {t}: a time like 2026-11-12T19:05:05Z"))?
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_millis() as i64,
@@ -344,9 +344,9 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     std::fs::create_dir_all(db.parent().expect("a parent"))?;
     let mut args = vec!["restore".to_string()];
     if let Some(t) = at {
-        let t = humantime::parse_rfc3339_weak(t).with_context(|| format!("--at {t}: a time like 2026-11-12T19:05:05Z"))?;
+        let t = wicket_core::time::parse_rfc3339_weak(t).with_context(|| format!("--at {t}: a time like 2026-11-12T19:05:05Z"))?;
         args.push("-timestamp".into());
-        args.push(humantime::format_rfc3339_seconds(t).to_string());
+        args.push(wicket_core::time::format_rfc3339_seconds(t).to_string());
     }
     args.extend(["-o".to_string(), tmp.to_string_lossy().to_string(), db.to_string_lossy().to_string()]);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();

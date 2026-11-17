@@ -6,8 +6,10 @@ the zone it runs in. This page lists every field. The source of truth is
 schema ([MCP tools](mcp-tools.md#spawn)).
 
 Every object refuses fields it doesn't know (`deny_unknown_fields`), so a misspelt key is an error,
-not a silent default. Durations are [humantime](https://docs.rs/humantime) strings (`90s`, `15m`,
-`2h`, `1h 30m`). Sizes are numbers with an optional `b`, `k`, `m` or `g` suffix, in binary units
+not a silent default. Durations are numbers with units, one or more terms (`90s`, `15m`,
+`2h`, `1h 30m`, `1.5h`): `ns`, `us`, `ms`, `s` (`sec`, `seconds`), `m` (`min`, `minutes`), `h`
+(`hr`, `hours`), `d` (`days`), `w` (`weeks`), `M` (`months`, 30.44 days) and `y` (`years`,
+365.25 days), or `0`. Sizes are numbers with an optional `b`, `k`, `m` or `g` suffix, in binary units
 (`2g` is 2 GiB, `1500m` is 1500 MiB).
 
 ```yaml

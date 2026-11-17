@@ -45,5 +45,5 @@ pub fn past_lease(node: &str, until: i64) -> String {
 }
 
 fn fmt_time(t: i64) -> String {
-    humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
+    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
 }

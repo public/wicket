@@ -9,7 +9,7 @@ use crate::*;
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
         Cmd::Reconcile { dry_run, every } => {
-            let every = every.as_deref().map(humantime::parse_duration).transpose().context("bad --every")?;
+            let every = every.as_deref().map(wicket_core::time::parse_duration).transpose().context("bad --every")?;
             reconcile::command(dry_run, every).await
         }
         Cmd::Lease { cmd: LeaseCmd::List } => capacity::list(),
@@ -32,7 +32,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Node { cmd } => match cmd {
-            NodeCmd::Token { name, ttl } => enrol::token(name, humantime::parse_duration(&ttl)?),
+            NodeCmd::Token { name, ttl } => enrol::token(name, wicket_core::time::parse_duration(&ttl)?),
             NodeCmd::Enrol { target, token, name, ssh_key, host_key, trust_first_use, hosts, ca_ttl, cert_ttl } => {
                 enrol::enrol(enrol::EnrolOpts {
                     target,
@@ -42,8 +42,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     host_key,
                     trust_first_use,
                     hosts,
-                    ca_ttl: humantime::parse_duration(&ca_ttl)?,
-                    cert_ttl: humantime::parse_duration(&cert_ttl)?,
+                    ca_ttl: wicket_core::time::parse_duration(&ca_ttl)?,
+                    cert_ttl: wicket_core::time::parse_duration(&cert_ttl)?,
                 })
                 .await
             }
@@ -65,7 +65,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => {
-                enrol::renew_ca(&name, hosts, humantime::parse_duration(&ca_ttl)?, humantime::parse_duration(&cert_ttl)?).await
+                enrol::renew_ca(&name, hosts, wicket_core::time::parse_duration(&ca_ttl)?, wicket_core::time::parse_duration(&cert_ttl)?).await
             }
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,

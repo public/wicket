@@ -25,13 +25,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     }
                 }
                 OperatorCmd::EnrolLink { ttl, origin } => {
-                    let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
+                    let ttl = wicket_core::time::parse_duration(&ttl).context("bad --ttl")?;
                     if ttl.is_zero() || ttl > Duration::from_secs(3600) {
                         bail!("--ttl must be more than 0 and at most 1h");
                     }
                     let token = serve::issue_enrol_link(&l, &TenantId::single(), ttl.as_secs() as i64, &operator())?;
                     let origin = origin.as_deref().map(|o| o.trim_end_matches('/')).unwrap_or("");
-                    println!("open within {} (single use) to enrol a passkey:", humantime::format_duration(ttl));
+                    println!("open within {} (single use) to enrol a passkey:", wicket_core::time::format_duration(ttl));
                     println!("  {origin}/enrol?t={token}");
                     if origin.is_empty() {
                         println!("(prefix the console's origin, e.g. https://console.example.com)");
@@ -39,7 +39,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 }
                 OperatorCmd::Sessions => {
                     let now = wicket_store::now();
-                    let ago = |t: i64| humantime::format_duration(Duration::from_secs((now - t).max(0) as u64)).to_string();
+                    let ago = |t: i64| wicket_core::time::format_duration(Duration::from_secs((now - t).max(0) as u64)).to_string();
                     for s in l.console_sessions(&TenantId::single(), now)? {
                         println!(
                             "{}  {}  {}  from {}  signed in {} ago, last seen {} ago",

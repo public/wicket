@@ -120,8 +120,8 @@ impl StateStore {
             bail!("bundles: s3 and ledger: need an s3: store");
         }
         if let Some(l) = &self.ledger {
-            humantime::parse_duration(&l.sync_interval).context("ledger.sync_interval")?;
-            humantime::parse_duration(&l.retention).context("ledger.retention")?;
+            wicket_core::time::parse_duration(&l.sync_interval).context("ledger.sync_interval")?;
+            wicket_core::time::parse_duration(&l.retention).context("ledger.retention")?;
             if l.litestream.binary.is_some() && l.litestream.image.is_some() {
                 bail!("ledger.litestream: binary or image, not both");
             }

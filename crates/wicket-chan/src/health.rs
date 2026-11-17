@@ -211,7 +211,7 @@ fn human_secs(s: i64) -> String {
 }
 
 fn rfc3339(s: i64) -> String {
-    humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s.max(0) as u64)).to_string()
+    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s.max(0) as u64)).to_string()
 }
 
 /// The disk thresholds of `key` (a node's, or the control host's own), named `who` in the text.
