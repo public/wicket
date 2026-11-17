@@ -256,7 +256,7 @@ impl Ledger {
         tx.execute("INSERT INTO agent_runs (run, agent, generation, started_at) VALUES (?1, ?2, ?3, ?4)", params![run, id, generation, t])?;
         // Whatever was sent to any earlier activation (and not yet read) is now this one's.
         tx.execute(
-            "UPDATE messages SET to_run = ?2 WHERE delivered_at IS NULL AND to_run IN (SELECT run FROM agent_runs WHERE agent = ?1 AND run != ?2)",
+            "UPDATE messages SET to_run = ?2, taken_at = NULL WHERE delivered_at IS NULL AND to_run IN (SELECT run FROM agent_runs WHERE agent = ?1 AND run != ?2)",
             params![id, run],
         )?;
         // And so is whatever is held for the agent's principal (#250), sent while no run held it.
@@ -327,7 +327,11 @@ impl Ledger {
 
     /// Undelivered peer messages waiting for `run`.
     pub fn waiting_messages(&self, run: &str) -> Result<i64> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM messages WHERE to_run = ?1 AND delivered_at IS NULL", params![run], |r| r.get(0))?)
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE to_run = ?1 AND delivered_at IS NULL AND taken_at IS NULL",
+            params![run],
+            |r| r.get(0),
+        )?)
     }
 
     /// Operator messages queued for `run` and not yet handed to it.

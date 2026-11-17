@@ -48,12 +48,16 @@ use wicket_proxy::llm::Slice;
 /// 13 or 14, so only the versions above 12 have a check here; the checks for features of 12 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health) went once every peer had them.
-pub const PROTOCOL: u32 = 14;
+pub const PROTOCOL: u32 = 15;
 /// The first protocol version whose nodes send the control host's tools as [`Msg::Call`] (#257).
 pub const ONE_GATEWAY: u32 = 13;
 /// The first protocol version whose node CA is renewed over the channel (#416): [`Msg::CaRenew`],
 /// [`Msg::CaCsr`], [`Msg::NodeCa`] and [`Msg::NodeCaInstalled`].
 pub const CA_RENEWAL: u32 = 14;
+/// The first protocol version whose nodes say when a box has had a message the control host gave
+/// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
+/// hands it over.
+pub const MESSAGE_READ: u32 = 15;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -648,6 +652,14 @@ pub enum Msg {
     NodeCaInstalled {
         serial: String,
         error: Option<String>,
+    },
+    /// Node → control host (#445): run `run`'s box has had message `id`, which the control host's
+    /// `await_message` gave it: the reply that carried it is written to the box (or pushed to its
+    /// session). Until this, the message is in flight, and a supervisor that takes the run over
+    /// gives it again; the node drops one its box has had.
+    MessageRead {
+        run: String,
+        id: String,
     },
     Welcome {
         node: String,
