@@ -18,7 +18,17 @@
 //!     hosts: ["*.example.com"] # an http request's host; empty or absent: any host
 //!     max_risk: R2             # the highest risk it may decide; absent: any
 //!   unix/auditor: nothing      # sees requests, decides none
+//! agents:                      # what agents may decide for their descendants (#256, #50)
+//!   kinds: [http]              # the request kinds (only http so far)
+//!   prefix: false              # a request for every path under a prefix, and grants of one
+//!   zone_wide: false           # grants (and renewals) to the asking run's whole zone
+//!   git_push: false            # a git push's grant, a window rather than a number of uses (#26)
+//!   unbounded: false           # grants (and renewals) with no number of uses
 //! ```
+//!
+//! An agent decides only within its own authority whatever these say: requests from its
+//! descendants, what its own zone allows by reach and its org layer doesn't refuse, ending no later
+//! than its own authority, at most `MAX_AGENT_USES` uses ([`crate::grant::within_authority`]).
 //!
 //! Left for later (#11): roles, several operators with their own enrolment, and two-person
 //! approval for R4.
@@ -95,11 +105,56 @@ fn risk_rank(r: &str) -> Option<i64> {
     }
 }
 
+/// What agents may decide and grant for their descendants (#256, #50): rules of the policy, each
+/// defaulting to what agents could do before it was one (an operator decides the rest).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AgentRules {
+    /// The request kinds an agent may decide: only `http` so far (`spawn`, `link`, `capacity`,
+    /// `update` and `tool` have no agent decision path yet: an operator's).
+    #[serde(deserialize_with = "wicket_core::yaml::null_as_default")]
+    pub kinds: Vec<String>,
+    /// A request for every path under a prefix; a grant or renewal of a prefix.
+    pub prefix: bool,
+    /// A grant or renewal to the asking run's whole zone, not the run alone.
+    pub zone_wide: bool,
+    /// A git push's grant: a window, not a number of uses (#26).
+    pub git_push: bool,
+    /// A grant or renewal with no number of uses.
+    pub unbounded: bool,
+}
+
+impl Default for AgentRules {
+    fn default() -> Self {
+        AgentRules { kinds: vec!["http".into()], prefix: false, zone_wide: false, git_push: false, unbounded: false }
+    }
+}
+
+/// The request kinds agents can decide at all.
+const AGENT_KINDS: &[&str] = &["http"];
+
+impl AgentRules {
+    fn check(&self) -> Result<()> {
+        if let Some(k) = self.kinds.iter().find(|k| !AGENT_KINDS.contains(&k.as_str())) {
+            bail!("agents.kinds: {k:?} can't be decided by an agent (only {} so far)", AGENT_KINDS.join(", "));
+        }
+        Ok(())
+    }
+
+    /// Whether an agent may decide a request of this method at all.
+    pub fn decides(&self, method: &str) -> bool {
+        let kind = Asked::of_op(method, "", None).kind;
+        self.kinds.contains(&kind)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
     #[serde(default)]
     default: Option<RawAuthority>,
+    #[serde(default)]
+    agents: Option<AgentRules>,
     #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     operators: BTreeMap<String, RawAuthority>,
 }
@@ -109,11 +164,12 @@ struct File {
 pub struct Policy {
     default: Authority,
     operators: BTreeMap<String, Authority>,
+    agents: AgentRules,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        Policy { default: Authority::Anything, operators: BTreeMap::new() }
+        Policy { default: Authority::Anything, operators: BTreeMap::new(), agents: AgentRules::default() }
     }
 }
 
@@ -129,7 +185,20 @@ impl Policy {
             let a = Authority::try_from(v).with_context(|| format!("operator {k}"))?;
             operators.insert(k, a);
         }
-        Ok(Policy { default, operators })
+        let agents = f.agents.unwrap_or_default();
+        agents.check()?;
+        Ok(Policy { default, operators, agents })
+    }
+
+    /// What agents may decide and grant.
+    pub fn agents(&self) -> &AgentRules {
+        &self.agents
+    }
+
+    /// The agents' rules from the installation's policy: the defaults when there is none, and when
+    /// it doesn't load (they are the narrowest).
+    pub fn agent_rules() -> AgentRules {
+        Policy::load(&policy_path()).map(|p| p.agents).unwrap_or_default()
     }
 
     /// The policy at `path`; every operator may decide anything when there is none. A file that
@@ -313,9 +382,25 @@ mod tests {
             "operators:\n  unix/x: { kinds: [root] }\n",
             "operators:\n  unix/x: { max_risk: R9 }\n",
             "default: anything\nroles: []\n",
+            "agents:\n  kinds: [http, spawn]\n",
+            "agents:\n  push: true\n",
         ] {
             assert!(Policy::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// #256, #50: what agents may grant is the policy's `agents`, and without it (or the file)
+    /// exactly what they always could: HTTP requests, one run, one path, counted, no push.
+    #[test]
+    fn agents_rules_default_to_what_agents_always_could() {
+        let narrow = AgentRules { kinds: vec!["http".into()], prefix: false, zone_wide: false, git_push: false, unbounded: false };
+        assert_eq!(Policy::default().agents(), &narrow);
+        assert_eq!(Policy::parse("default: anything\n").unwrap().agents(), &narrow);
+        assert_eq!(Policy::parse("agents: {}\n").unwrap().agents(), &narrow);
+        let p = Policy::parse("agents:\n  prefix: true\n  git_push: true\n").unwrap();
+        assert_eq!(p.agents(), &AgentRules { prefix: true, git_push: true, ..narrow.clone() });
+        assert!(narrow.decides("GET") && narrow.decides("post") && !narrow.decides("SPAWN"));
+        assert!(!Policy::parse("agents:\n  kinds: []\n").unwrap().agents().decides("GET"), "no kinds: decides nothing");
     }
 
     #[test]
