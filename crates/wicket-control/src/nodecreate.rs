@@ -349,7 +349,10 @@ impl CapacityApprover {
                     "decision",
                     &serde_json::json!({ "request": id, "decision": "deny", "by": "wicket:timed-out" }),
                 )?;
-                return Ok(Approval::Denied(format!("nobody decided request {id} within {}", wicket_core::time::format_duration(self.wait))));
+                return Ok(Approval::Denied(format!(
+                    "nobody decided request {id} within {}",
+                    wicket_core::time::format_duration(self.wait)
+                )));
             }
             tokio::time::sleep(self.poll).await;
         }

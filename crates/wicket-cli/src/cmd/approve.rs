@@ -160,7 +160,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             else {
                 unreachable!("a renewal renews")
             };
-            let left = wicket_core::time::format_duration(std::time::Duration::from_secs(u64::try_from(until - wicket_store::now()).unwrap_or(0)));
+            let left =
+                wicket_core::time::format_duration(std::time::Duration::from_secs(u64::try_from(until - wicket_store::now()).unwrap_or(0)));
             match what {
                 grant::Renewed::Grant(g) => match l.grant(&g)?.and_then(|g| g.node) {
                     Some(n) => println!("renewed grant {g} for {left}; its run republishes it to node {n}"),
@@ -217,7 +218,10 @@ fn show_grant(r: &wicket_store::GrantListing, now: i64) -> String {
     } else if g.expires_at <= now {
         "expired".to_string()
     } else {
-        format!("ends in {}", wicket_core::time::format_duration(std::time::Duration::from_secs(u64::try_from(g.expires_at - now).unwrap_or(0))))
+        format!(
+            "ends in {}",
+            wicket_core::time::format_duration(std::time::Duration::from_secs(u64::try_from(g.expires_at - now).unwrap_or(0)))
+        )
     };
     let node = g.node.as_deref().map(|n| format!(", on node {n}")).unwrap_or_default();
     format!("{}  {what}  {to}{uses}, {state}{node}  by {}", g.id, wicket_agent::clip(&r.decided_by, 80))
