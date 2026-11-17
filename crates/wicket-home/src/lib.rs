@@ -11,6 +11,7 @@ pub mod images_policy;
 pub mod owner;
 pub mod program;
 pub mod s3;
+pub mod statestore;
 
 use anyhow::Result;
 use std::path::PathBuf;
