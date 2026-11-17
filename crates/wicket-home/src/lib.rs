@@ -10,6 +10,7 @@ pub mod exitcause;
 pub mod images_policy;
 pub mod owner;
 pub mod program;
+pub mod s3;
 
 use anyhow::Result;
 use std::path::PathBuf;

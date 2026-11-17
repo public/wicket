@@ -21,7 +21,7 @@ use wicket_home::{
 };
 
 // Modules that need only wicket-home's helpers moved with them (#219), under their old names here.
-use wicket_home::{control, exitcause, images_policy, owner, program};
+use wicket_home::{control, exitcause, images_policy, owner, program, s3};
 
 mod audit_export;
 mod capacity;
@@ -55,7 +55,6 @@ mod reconcile;
 mod rootcopy;
 mod roots;
 mod run;
-mod s3;
 mod serve;
 mod session;
 mod snapstore;
