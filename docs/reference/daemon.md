@@ -57,7 +57,10 @@ caller's signals and sends its exit code; the caller and the run don't notice. O
 being started (admission, uploads) are waited for, and new ones are refused for those seconds, to
 be tried again. A restart by systemd (`deploy/install.sh`, `systemctl restart wicketd`) stops only
 the daemon (`KillMode=process`): its runs go on supervising their boxes, and only their callers'
-connections end (`wicket session <run>` opens one again). To end runs too, end them first (`wicket identity revoke <run>`, or `wicket
+connections end (`wicket session <run>` opens one again). At its start, the new `wicketd` hands
+each run whose supervisor runs another build to its own (#475): the supervisor is stopped without
+its box, and the new build's reconciler starts one that re-attaches, so no run keeps an old build's
+supervisor across an install. To end runs too, end them first (`wicket identity revoke <run>`, or `wicket
 hibernate` for a long-lived agent).
 
 ## The policy file
