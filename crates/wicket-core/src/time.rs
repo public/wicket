@@ -242,7 +242,9 @@ impl Parser<'_> {
 fn add_to(sec: u64, nsec: u64, out: &mut Duration) -> Result<(), DurationError> {
     let mut sec = sec;
     let mut nsec = u64::from(out.subsec_nanos()).checked_add(nsec).ok_or(DurationError::NumberOverflow)?;
-    if nsec > 1_000_000_000 {
+    // `>=`, not humantime's `>`: a carry of exactly one second must be added here, where its
+    // overflow is an error, not by `Duration::new`, which panics on it (#437's fuzz target).
+    if nsec >= 1_000_000_000 {
         sec = sec.checked_add(nsec / 1_000_000_000).ok_or(DurationError::NumberOverflow)?;
         nsec %= 1_000_000_000;
     }
@@ -463,6 +465,16 @@ mod tests {
     /// `--ca-ttl 24h`, `--every`, `--window`, ...), and the edges of the grammar, with what
     /// humantime 2.4 made of each: seconds and nanoseconds, or its error. Generated from humantime
     /// before it was replaced (#437); the replacement must agree byte for byte.
+    /// humantime panicked here: half-seconds that carry into seconds already at their maximum. The
+    /// one place the spellings' results differ from humantime's (it panicked; this refuses).
+    #[test]
+    fn a_carry_past_the_largest_duration_is_refused() {
+        let e = parse_duration("18446744073709551615s 500ms 500ms").unwrap_err();
+        assert_eq!(e, DurationError::NumberOverflow);
+        assert_eq!(parse_duration("1s 500ms 500ms").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_duration("18446744073709551614s 500ms 500ms").unwrap(), Duration::from_secs(u64::MAX));
+    }
+
     #[test]
     fn duration_spellings_are_humantime_s() {
         let cases: &[Case] = &[
