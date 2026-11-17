@@ -478,7 +478,7 @@ impl Node {
             last_oom,
             persist_failures,
             last_persist_failure,
-            orphaned: self.orphaned.lock().expect("orphaned").clone(),
+            orphaned: self.orphaned.lock().expect("orphaned").clone().into(),
         }
     }
 
@@ -3023,7 +3023,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let found = node.scan_orphans();
         assert_eq!(found.iter().map(|o| o.run.as_str()).collect::<Vec<_>>(), [RUN]);
         assert!(found[0].bytes >= 64 * 1024, "{found:?}");
-        assert_eq!(node.health().orphaned, found, "in its health");
+        assert_eq!(node.health().orphaned.to_vec(), found, "in its health");
         assert_eq!(node.orphaned_now(), found, "and told to a control connection");
         let alerts = crate::health::alerts("n1", &node.health(), (node.clock)());
         assert!(alerts.iter().any(|a| a.key == "n1/orphaned" && a.text.contains(RUN)), "{alerts:?}");

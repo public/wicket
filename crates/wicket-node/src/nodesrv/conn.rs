@@ -108,7 +108,7 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
         .collect();
     let feed = node.replica.lock().expect("replica").hello();
     let capacity = Some(node.capacity());
-    let orphaned = node.orphaned_now();
+    let orphaned = Some(node.orphaned_now()).filter(|o| !o.is_empty()).map(Box::new);
     let _ = tx.send(Frame::Msg(Msg::Welcome {
         node: node.name.clone(),
         build: node.build.clone(),

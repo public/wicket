@@ -662,8 +662,9 @@ pub enum Msg {
         capacity: Option<NodeCapacity>,
         /// Runs' directories it keeps with no record of their box (#449): not in `runs`, but
         /// `Forget` deletes them by their path.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        orphaned: Vec<crate::health::OrphanedRun>,
+        /// Boxed: the message enum stays small.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orphaned: Option<Box<Vec<crate::health::OrphanedRun>>>,
     },
     /// The node won't talk to this control host (protocols too far apart, wrong node name).
     Refused {
@@ -1067,7 +1068,7 @@ mod tests {
                     boxes: 1,
                     ..Default::default()
                 }),
-                orphaned: vec![crate::health::OrphanedRun { run: "run_b".into(), bytes: 4096 }],
+                orphaned: Some(Box::new(vec![crate::health::OrphanedRun { run: "run_b".into(), bytes: 4096 }])),
             }),
             Frame::Msg(Msg::ImageHave { id: 3, digest: format!("sha256:{}", "a".repeat(64)) }),
             Frame::Msg(Msg::PutImage {

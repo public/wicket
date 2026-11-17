@@ -132,7 +132,7 @@ impl Link {
             .map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
         let proto = authed.proto;
         let (capacity, runs, orphaned, build) = match authed.welcome {
-            Msg::Welcome { capacity, runs, orphaned, build, .. } => (capacity, runs, orphaned, build),
+            Msg::Welcome { capacity, runs, orphaned, build, .. } => (capacity, runs, orphaned.map(|o| *o).unwrap_or_default(), build),
             _ => (None, vec![], vec![], String::new()),
         };
         let calls = Arc::new(Calls::default());

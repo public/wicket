@@ -48,8 +48,9 @@ pub struct NodeHealth {
     /// Runs' directories the node keeps with no record of their box (#449): a box whose record went
     /// (its exit, then a restart of the node) with its work never collected. `wicket node forget
     /// <run> --force` deletes them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub orphaned: Vec<OrphanedRun>,
+    /// A boxed slice: `Msg::Health` carries this, and the message enum stays small.
+    #[serde(default, skip_serializing_if = "<[_]>::is_empty")]
+    pub orphaned: Box<[OrphanedRun]>,
 }
 
 /// A run's directory on a node with no record of its box (#449), and what it takes on disk.
