@@ -384,7 +384,7 @@ Asks the operator to update the installation to a build the agent made. It files
 ## `expose`
 
 Offers a TCP port of this box (a server on 127.0.0.1 or 0.0.0.0) to other boxes. The parent may
-connect without it; other boxes may if this zone's `accept_from` lists theirs, or an operator approves.
+connect without it; other boxes may if this zone's `accept_from` lists their principal or their zone, or an operator approves.
 
 | argument | type | default |
 |---|---|---|

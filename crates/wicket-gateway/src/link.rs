@@ -34,8 +34,8 @@ fn ledger(ctx: &RunCtx) -> std::sync::MutexGuard<'_, wicket_store::Ledger> {
     ctx.ledger.lock().expect("ledger")
 }
 
-/// `expose(port, name?)`: this box offers `port` to boxes whose zones its `accept_from` lists (and to
-/// others a human approves). Its parent doesn't need it.
+/// `expose(port, name?)`: this box offers `port` to boxes its `accept_from` lists, by zone or by
+/// principal (and to others a human approves). Its parent doesn't need it.
 pub fn expose(ctx: &RunCtx, port: u16, name: Option<&str>) -> Reply {
     if port == 0 {
         return ("`port` must be 1-65535".into(), true);
@@ -57,7 +57,10 @@ pub fn expose(ctx: &RunCtx, port: u16, name: Option<&str>) -> Reply {
     let who = if ctx.zone.accept_from.is_empty() {
         "your parent (always), and boxes an operator approves".to_string()
     } else {
-        format!("your parent, boxes in zones {} (your accept_from), and boxes an operator approves", ctx.zone.accept_from.join(", "))
+        format!(
+            "your parent, boxes your accept_from lists by zone or principal ({}), and boxes an operator approves",
+            ctx.zone.accept_from.join(", ")
+        )
     };
     (
         format!(
@@ -100,6 +103,7 @@ struct EndInfo {
     agent: String,
     parent_run: Option<String>,
     zone_name: String,
+    principal: String,
     accept_from: Vec<String>,
     zone: Option<ZoneSpec>,
 }
@@ -110,6 +114,7 @@ impl EndInfo {
             run: &self.run,
             parent_run: self.parent_run.as_deref(),
             zone_name: &self.zone_name,
+            principal: Some(&self.principal),
             accept_from: &self.accept_from,
             zone: self.zone.as_ref(),
         }
@@ -144,7 +149,15 @@ fn end_info(ctx: &RunCtx, ops: &dyn BoxOps, run: &str, port: Option<u16>) -> Res
     }
     .or_else(|| exposed.as_ref().and_then(|e| serde_json::from_str(&e.zone).ok()));
     Ok((
-        EndInfo { run: run.into(), agent: rec.agent, parent_run: rec.parent_run, zone_name: rec.zone, accept_from: rec.accept_from, zone },
+        EndInfo {
+            run: run.into(),
+            agent: rec.agent,
+            parent_run: rec.parent_run,
+            zone_name: rec.zone,
+            principal: rec.spiffe_id,
+            accept_from: rec.accept_from,
+            zone,
+        },
         exposed,
     ))
 }
@@ -819,5 +832,22 @@ mod tests {
         let mut nowhere = alice.clone();
         nowhere.boxes = None;
         assert!(connect(&nowhere, "run_bob", Some(5432)).await.0.contains("links need a box"));
+    }
+
+    /// #250, #253: an `accept_from` principal entry lets that principal connect, as it lets it send
+    /// messages; another box in the same zone still needs a human.
+    #[tokio::test]
+    async fn accept_from_may_name_one_principal() {
+        let w = World::new();
+        let alice = w.boxed(w.zone("team", &[]), "alice", "run_alice", None, &[]);
+        let eve = w.boxed(w.zone("team", &[]), "eve", "run_eve", None, &[]);
+        let alice_id = w.ledger.lock().unwrap().identity("run_alice").unwrap().unwrap().spiffe_id;
+        let dave = w.boxed(w.zone("db", &[alice_id.as_str()]), "dave", "run_dave", None, &[]);
+        let (text, err) = expose(&dave, 5432, Some("db"));
+        assert!(!err && text.contains(&alice_id), "{text}");
+        let (text, err) = connect(&alice, "run_dave", Some(5432)).await;
+        assert!(!err && text.contains("db.wicket.internal:5432") && text.contains("accept_from"), "{text}");
+        let (text, err) = connect(&eve, "run_dave", Some(5432)).await;
+        assert!(!err && text.starts_with("needs approval"), "{text}");
     }
 }
