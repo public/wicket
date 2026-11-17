@@ -1552,6 +1552,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// #422: the control host restarts with a call in flight on the node, whose `serve` restarts
+    /// too and charges that call its whole reservation (#324). The re-attached supervisor counts the
+    /// node's spend from its first report, and the slice it sends is in the node's counts: the node
+    /// completes the next call within the budget. (A slice in the supervisor's own counts was that
+    /// report short: the node held less than it had spent and refused every call.)
+    #[tokio::test]
+    async fn after_a_restart_with_a_call_in_flight_the_next_call_completes_within_the_budget() {
+        let done = [
+            sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#),
+            [
+                sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":250}}"#),
+                sse("message_stop", r#"{"type":"message_stop"}"#),
+            ]
+            .concat(),
+        ];
+        let (port, _) = sse_upstream(done.to_vec(), std::time::Duration::ZERO).await;
+        let budget = 4000;
+        // Before the restart: two calls settled at 20 tokens, and one in flight with 1000 reserved.
+        let (before, dir) = llm_to(port, budget, "restart-inflight");
+        before.count.admit_request();
+        before.count.admit_request();
+        before.count.settle(0, 10, 0, 0, 40);
+        before.count.admit_request();
+        assert_eq!(before.count.reserve_output(budget, 1000), Some(1000));
+        // What the node's journal holds, and the supervisor's last heartbeat (the agent's row).
+        let journaled = before.spent_charged();
+        let heartbeat = before.spent_total();
+        // The node's `serve` restarts: it counts the journal, the call in flight charged in full.
+        let (node, _) = llm_to(port, budget, "restart-inflight");
+        node.merge_spent(journaled);
+        assert_eq!(node.spent().output_tokens, 1040);
+        // The re-attached supervisor: the agent's spend as its prior, the node's first report its base.
+        let (control, _) = llm_to(port, budget, "restart-inflight-control");
+        control.spent_before(heartbeat.0, heartbeat.1, heartbeat.2);
+        let base = node.spent();
+        control.merge_spent(base.since(base));
+        let fraction = 0.25;
+        let next = control.next_slice(fraction).unwrap();
+        let slice = super::Slice::renewed_from(None, next, control.spent(), control.input_total(), base);
+        assert!(slice.output_tokens > node.spent().output_tokens, "{slice:?}: the node holds more than it spent");
+        node.set_slice(Some(slice));
+        assert_eq!(call(node.clone(), "restart-inflight", ASK, true).await, 200);
+        assert_eq!(output_settles(&node, 1040 + 250).await, 1040 + 250);
+        // A slice in the supervisor's own counts would have left the node nothing.
+        let unoffset = super::Slice::renewed(None, next, control.spent(), control.input_total());
+        assert!(unoffset.output_tokens <= base.output_tokens, "{unoffset:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// #366: a zone with a model list sends upstream only calls naming one of its models; any other
     /// model, or none, is refused here with a 403 naming what is allowed, and audited.
     #[tokio::test]

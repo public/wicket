@@ -280,7 +280,7 @@ async fn serve(env: Rc<Env>, st: Rc<RefCell<State>>, s: turmoil::net::TcpStream)
                         out.push((wire::KIND_FEED, f.to_line().into_bytes()));
                     }
                     for (run, r) in &s.runs {
-                        if let Some(sl) = slice_due(&r.llm, slices.get(run).copied()) {
+                        if let Some(sl) = slice_due(&r.llm, slices.get(run).copied(), r.spent_base.flatten().unwrap_or_default()) {
                             slices.insert(run.clone(), sl);
                             env.oracle.borrow_mut().note(now, format!("slice {run} {sl:?}"));
                             let m = Ctl::BudgetSlice { run: run.clone(), slice: sl };
@@ -299,9 +299,9 @@ async fn serve(env: Rc<Env>, st: Rc<RefCell<State>>, s: turmoil::net::TcpStream)
 }
 
 /// `noderun::slice_due`: the slice to send, if it differs from the one this connection sent.
-fn slice_due(l: &Llm, cur: Option<Slice>) -> Option<Slice> {
+fn slice_due(l: &Llm, cur: Option<Slice>, base: Spent) -> Option<Slice> {
     let next = l.next_slice(crate::SLICE_FRACTION)?;
-    let slice = Slice::renewed(cur, next, l.spent(), l.input_total());
+    let slice = Slice::renewed_from(cur, next, l.spent(), l.input_total(), base);
     (cur != Some(slice)).then_some(slice)
 }
 
