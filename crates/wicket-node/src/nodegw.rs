@@ -433,12 +433,19 @@ pub(super) fn push(node: &Arc<Node>, run: &str, p: wicket_agent::harness::Messag
                 Ok((text, false)) => match serde_json::from_str::<Value>(&text) {
                     Ok(v) if v.get("message_id").is_some() => {
                         let id = v["message_id"].clone();
+                        let sid = id.as_str().unwrap_or_default().to_string();
+                        // One this box has had, given again after a control-host restart (#445).
+                        if node.had_message(&run, &sid) {
+                            node.message_read(&run, &sid);
+                            continue;
+                        }
                         if tx.send(notification(&p, &v)).await.is_err() {
-                            // Taken and recorded read, but its reader left: on the record, for the
-                            // control host to see.
+                            // Taken, but its reader left: in flight on the control host (#445),
+                            // which gives it again once a supervisor takes the run over.
                             node.audit_note(&run, "node.message_push_lost", json!({ "id": id }));
                             break;
                         }
+                        node.message_read(&run, &sid);
                         node.audit_note(&run, "node.message_pushed", json!({ "id": id }));
                     }
                     // No message within the wait, or one the org policy refused: wait again.

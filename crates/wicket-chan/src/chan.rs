@@ -48,12 +48,16 @@ use wicket_proxy::llm::Slice;
 /// 13 or 14, so only the versions above 12 have a check here; the checks for features of 12 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health) went once every peer had them.
-pub const PROTOCOL: u32 = 14;
+pub const PROTOCOL: u32 = 15;
 /// The first protocol version whose nodes send the control host's tools as [`Msg::Call`] (#257).
 pub const ONE_GATEWAY: u32 = 13;
 /// The first protocol version whose node CA is renewed over the channel (#416): [`Msg::CaRenew`],
 /// [`Msg::CaCsr`], [`Msg::NodeCa`] and [`Msg::NodeCaInstalled`].
 pub const CA_RENEWAL: u32 = 14;
+/// The first protocol version whose nodes say when a box has had a message the control host gave
+/// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
+/// hands it over.
+pub const MESSAGE_READ: u32 = 15;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -649,6 +653,14 @@ pub enum Msg {
         serial: String,
         error: Option<String>,
     },
+    /// Node → control host (#445): run `run`'s box has had message `id`, which the control host's
+    /// `await_message` gave it: the reply that carried it is written to the box (or pushed to its
+    /// session). Until this, the message is in flight, and a supervisor that takes the run over
+    /// gives it again; the node drops one its box has had.
+    MessageRead {
+        run: String,
+        id: String,
+    },
     Welcome {
         node: String,
         build: String,
@@ -993,7 +1005,7 @@ mod tests {
     /// and its answer are typed messages (protocol 13).
     #[test]
     fn the_control_hosts_tools_are_typed_calls_from_protocol_13() {
-        assert_eq!((PROTOCOL, ONE_GATEWAY), (14, 13));
+        assert_eq!((PROTOCOL, ONE_GATEWAY), (15, 13));
         assert!(negotiate(12, 13).unwrap() < ONE_GATEWAY);
         assert_eq!(ControlTool::of("await_grant"), Some(ControlTool::AwaitGrant));
         assert_eq!(ControlTool::RequestCapacity.name(), "request_capacity");
@@ -1227,30 +1239,30 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build has no checks for features of protocol 12 or before (node health, #377, the
-    /// last): a peer below 13 can't connect, so every connection talks 13 or 14 (#257 slice 4b,
-    /// #416), and a check for a version at or under 12 would always pass. 13 (one gateway) keeps its
-    /// check for as long as a node at 13 can connect; so does 14 (CA renewal).
+    /// Why this build has no checks for features of protocol 13 or before (one gateway, #257 slice
+    /// 4b, the last): a peer below 14 can't connect, so every connection talks 14 or 15 (#416, #445),
+    /// and a check for a version at or under 13 would always pass. 14 (CA renewal) keeps its check
+    /// for as long as a node at 14 can connect; so does 15 (message reads).
     #[test]
-    fn no_connection_talks_below_protocol_13() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, CA_RENEWAL), (14, 1, 14));
+    fn no_connection_talks_below_protocol_14() {
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW, CA_RENEWAL, MESSAGE_READ), (15, 1, 14, 15));
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((13..=14).contains(&at) && (13..=15).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(13..=15).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((14..=15).contains(&at) && (14..=16).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(14..=16).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 14 or 15 talking to a control host at 14 from the other side.
-        assert_eq!(negotiate(15, PROTOCOL), Ok(14));
-        assert!(negotiate(13, PROTOCOL).unwrap() < CA_RENEWAL, "a node at 13 is not asked to renew its CA");
-        assert!(negotiate(PROTOCOL, 12).is_err() && negotiate(12, PROTOCOL).is_err());
+        // And a node at 15 or 16 talking to a control host at 15 from the other side.
+        assert_eq!(negotiate(16, PROTOCOL), Ok(15));
+        assert!(negotiate(14, PROTOCOL).unwrap() < MESSAGE_READ, "a node at 14 sends no MessageRead, and gets messages read as handed");
+        assert!(negotiate(PROTOCOL, 13).is_err() && negotiate(13, PROTOCOL).is_err());
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start
     /// without them reads as having none.
     #[test]
     fn a_start_carries_its_swaps_by_name() {
-        assert_eq!((PROTOCOL, ONE_GATEWAY), (14, 13));
+        assert_eq!((PROTOCOL, ONE_GATEWAY), (15, 13));
         let swaps = vec![
             wicket_proxy::CredentialSwap {
                 name: "account login".into(),

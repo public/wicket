@@ -19,10 +19,10 @@ CONSTANTS
     AuthTtl,            \* how long a box's authority lasts past its last renewal, in ticks
     MaxTime,
     MaxCrashes,
-    \* Design switches: TRUE is the pass design, FALSE the code without it (README.md says which are
-    \* the code and which still open).
+    \* Design switches: TRUE is the pass design and the code (#444, #445, #446), FALSE the code
+    \* before its fix (README.md).
     FinishInLedger,     \* the agent's finish is recorded in the ledger, not only in its supervisor (#444)
-    AckAfterHand,       \* a message is marked delivered once the box has it (and a box drops a repeat)
+    AckAfterHand,       \* a message is marked delivered once the box has it, and a box drops a repeat (#445)
     WakeAfterAuthority  \* a lapsed holder's agent is woken only once every box of it has stopped
 
 NONE == "none"

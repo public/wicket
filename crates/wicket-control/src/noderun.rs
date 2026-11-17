@@ -282,6 +282,10 @@ pub struct NodeCtl {
     proto: std::sync::atomic::AtomicU32,
     /// Why the box ended, as its node reported with its exit (#185).
     exit_cause: Mutex<Option<String>>,
+    /// Where in the box's stdin (bytes since the run's start) what this supervisor writes begins:
+    /// 0 for a box it started, its node's count for one it re-attached to, once the node said
+    /// (#445). Operator prompts are recorded by where they are in it.
+    pub stdin_base: std::sync::OnceLock<u64>,
 }
 
 impl NodeCtl {
@@ -593,6 +597,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         next: [std::sync::atomic::AtomicU64::new(s.resume_from[0]), std::sync::atomic::AtomicU64::new(s.resume_from[1])],
         proto: std::sync::atomic::AtomicU32::new(0),
         exit_cause: Mutex::new(None),
+        stdin_base: std::sync::OnceLock::new(),
     });
     let shared = Arc::new(Shared {
         node: name.clone(),
@@ -1030,6 +1035,17 @@ async fn session(
         }
         p.next[0] = p.next[0].max(r.stdout_start);
         p.next[1] = p.next[1].max(r.stderr_start);
+        // The first time this supervisor hears how far the node got (#445): a re-attached one gives
+        // again what the supervisor before it took and its box never had, before this connection
+        // answers anything.
+        if sh.ctl.stdin_base.set(p.stdin.end()).is_ok() && sh.attach {
+            let l = sh.ledger.lock().expect("ledger");
+            let messages = l.requeue_in_flight(&sh.run.0).unwrap_or(0);
+            let prompts = l.requeue_operator_messages(&sh.run.0, r.stdin_received).map(|v| v.len()).unwrap_or(0);
+            if messages + prompts > 0 {
+                say!("[wicket] giving the box again what it never had before this supervisor took over: {messages} message(s), {prompts} prompt(s)");
+            }
+        }
         say!("[wicket] node {} reconnected; resuming the box's output", sh.node);
         send(Frame::Msg(Msg::Resume { run: r.run.clone(), stdout_from: p.next[0], stderr_from: p.next[1] }));
         p.stdin.ack(r.stdin_received);
@@ -1326,6 +1342,8 @@ async fn on_frame(
             Msg::Call { id, run, tool, args } => {
                 let (gw, spawn, out) = (sh.gateway.clone(), sh.spawn.clone(), out.clone());
                 let mine = run == sh.run.0;
+                // A node that says when its box has had a message (#445) gets it in flight.
+                let read_by_node = p.proto >= wicket_chan::chan::MESSAGE_READ;
                 tokio::spawn(async move {
                     let (text, is_error) = match (mine, tool, gw.superseded()) {
                         (false, ..) => (format!("no gateway for run {run} here"), true),
@@ -1338,10 +1356,19 @@ async fn on_frame(
                                 .unwrap_or_else(|e| (format!("not started: {e}"), true)),
                             None => ("this agent may not start other boxes (max_children is 0)".into(), true),
                         },
+                        // Its node says when the box has had a message it carries (`MessageRead`).
+                        (true, ..) if read_by_node => {
+                            let (text, is_error, _in_flight) = gw.call_tool_read(&tool.name(), args).await;
+                            (text, is_error)
+                        }
                         (true, ..) => gw.call_tool(&tool.name(), args).await,
                     };
                     let _ = out.send(Frame::Msg(Msg::Called { id, text, is_error }));
                 });
+            }
+            // The box has had a message the gateway gave it (#445): read.
+            Msg::MessageRead { run, id } if run == sh.run.0 => {
+                sh.gateway.message_read(&id);
             }
             Msg::TunnelOpen { stream, run, target } => {
                 // No socket of the control host's is a tunnel target any more (#257).
