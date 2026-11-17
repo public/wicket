@@ -56,10 +56,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ci/determinator -> target
-      - name: The rules' own tests (synthetic changes, every file claimed, every out-of-crate input mapped)
-        run: cargo test --locked --manifest-path ci/determinator/Cargo.toml
-      - name: The label check's own test
-        run: ci/pr-has-label_test.sh
+          # select-tests saves this cache (its build has what `cargo run` needs).
+          shared-key: select
+          save-if: false
       - id: select
         name: Select
         # The full-ci label as the pull request has it now, from the API (#246), not as this event's
@@ -93,6 +92,27 @@ jobs:
           esac
           echo "fuzz_matrix=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${list[@]}")" >>"$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT" >>"$GITHUB_STEP_SUMMARY"
+
+  # The selection's own tests (#218), beside it rather than before it (#460): every job waits on the
+  # selection, and nothing on these. A broken rule fails this job, and so the change.
+  select-tests:
+    name: The selection's own tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ci/determinator -> target
+          # The same cache as the selection's.
+          shared-key: select
+      - name: The rules' own tests (synthetic changes, every file claimed, every out-of-crate input mapped)
+        run: cargo test --locked --manifest-path ci/determinator/Cargo.toml
+      - name: The label check's own test
+        run: ci/pr-has-label_test.sh
 
   # The repository is public: no secrets or details of real machines, in any commit.
   public:
@@ -337,28 +357,55 @@ jobs:
 
   # #321: TLC on the TLA+ models under verification/tla/, at the bounds their .cfg files state
   # (a few minutes), when they or the code they model change. A pinned, checksum-verified JRE.
-  tla:
-    name: TLA+ models (TLC)
+  # In three parts at once (#460; ci/tla.sh --shard): GrantsOnNodes's three pass_grants_* models are
+  # 250 s of its 283 s, and dealt out in turn they fall in different parts. One job says all passed.
+  tla-shard:
+    name: TLA+ models (TLC) ${{ matrix.shard }}/3
     needs: select
     if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: ci/tla.sh
+      - run: ci/tla.sh --shard "${{ matrix.shard }}/3"
+
+  tla:
+    name: TLA+ models (TLC)
+    needs: [select, tla-shard]
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every part passed
+        env:
+          SHARDS: ${{ needs.tla-shard.result }}
+        run: |
+          echo "parts: $SHARDS"
+          [ "$SHARDS" = success ]
 
   # #325: Kani proof harnesses (bounded model checking of wicket-core's decision functions, each
   # naming the Lean theorem of #322 it restates) and the budget counter's loom test, one harness at
   # a time (ci/kani.sh). Selected by ci/determinator/suites.toml's kani suite: the harnessed crate
   # (its code, its harnesses), the script.
-  kani:
-    name: Kani proofs and loom
+  # In two parts at once (#460; ci/kani.sh --shard deals out the harnesses and loom in turn: 173 s
+  # and 170 s of its 343 s on #460's run, against 193 s for the largest of three), and
+  # one job that says they all passed.
+  kani-shard:
+    name: Kani proofs and loom ${{ matrix.shard }}/2
     needs: select
     if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     env:
       KANI_VERSION: 0.68.0
     steps:
@@ -366,11 +413,29 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # One cache for the parts (Kani itself, and wicket-core built for it); the first saves it.
+          shared-key: kani
+          save-if: ${{ matrix.shard == 1 }}
       - name: Install Kani
         run: |
           cargo install --locked kani-verifier --version "$KANI_VERSION"
           cargo kani setup
-      - run: ci/kani.sh
+      - run: ci/kani.sh --shard "${{ matrix.shard }}/2"
+
+  kani:
+    name: Kani proofs and loom
+    needs: [select, kani-shard]
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every part passed
+        env:
+          SHARDS: ${{ needs.kani-shard.result }}
+        run: |
+          echo "parts: $SHARDS"
+          [ "$SHARDS" = success ]
 
   # #324: the deterministic simulation (crates/wicket-sim). A pull request runs its fixed seeds with
   # the crate's tests, whenever ci/determinator selects it. This runs a few hundred more, a different
@@ -393,48 +458,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   # One Claude Code agent in a gVisor box, end to end, driven by the scripted mock model: no model
-  # credential is used.
+  # credential is used. Then hibernation, restore and the install path. Acceptance, the longest
+  # suite, runs beside it in a job of its own (#460), each after the same setup
+  # (.github/actions/gvisor-setup).
   smoke:
     name: gVisor smoke test
     needs: select
     # Any of its suites selected (or no selection: everything).
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') || contains(needs.select.outputs.suites, ' hibernate ') || contains(needs.select.outputs.suites, ' restore ') || contains(needs.select.outputs.suites, ' acceptance ') || contains(needs.select.outputs.suites, ' daemon-uids ') || contains(needs.select.outputs.suites, ' install-test ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') || contains(needs.select.outputs.suites, ' hibernate ') || contains(needs.select.outputs.suites, ' restore ') || contains(needs.select.outputs.suites, ' daemon-uids ') || contains(needs.select.outputs.suites, ' install-test ')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Install gVisor as a Docker runtime
-        run: |
-          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
-            | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
-          # gVisor's apt repository is sometimes caught mid-sync ("File has unexpected size"): retry.
-          for i in 1 2 3 4; do
-            if sudo apt-get update -q && sudo apt-get install -y -q runsc; then break; fi
-            [ "$i" = 4 ] && exit 1
-            echo "gVisor apt install failed (attempt $i), retrying in $((i * 20)) s"; sleep $((i * 20))
-          done
-          # Keep the runner's own Docker settings; add runsc with host unix sockets (wicket's proxies).
-          cfg=/etc/docker/daemon.json
-          [ -f "$cfg" ] || echo '{}' | sudo tee "$cfg" >/dev/null
-          jq '.runtimes.runsc = {path: "/usr/bin/runsc", runtimeArgs: ["--host-uds=open"]}' "$cfg" | sudo tee "$cfg.new" >/dev/null
-          sudo mv "$cfg.new" "$cfg"
-          sudo systemctl restart docker
-          runsc --version | head -1
-          docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
-      - run: cargo build -p wicket-cli --locked
-      - name: Rust's musl target, for the smoke test's static HTTP/3 client
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          sudo apt-get install -y -q musl-tools
-          # Built here, not only by smoke.sh: acceptance uses it too, and runs without the smoke step
-          # when the selection (#218) picks acceptance alone.
-          cargo build -q --release --locked --target x86_64-unknown-linux-musl --manifest-path ci/h3get/Cargo.toml
-      - name: Build the agent image
-        run: target/debug/wicket image
+      - uses: ./.github/actions/gvisor-setup
+        with:
+          save-cache: "true"
       - name: Smoke test
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') }}
         run: WICKET=target/debug/wicket H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/smoke.sh
@@ -445,11 +485,6 @@ jobs:
       - name: Restore onto a standby
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' restore ') }}
         run: WICKET=target/debug/wicket ci/restore.sh
-      # #41: the release acceptance test's local flows (a few minutes; the multi-host and installed
-      # variants run nightly, .github/workflows/acceptance.yml).
-      - name: Acceptance
-        if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' acceptance ') }}
-        run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:poc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh
       # #12: the daemon with real, different uids (nobody as an operator, root as the break-glass).
       - name: wicketd with second uids
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' daemon-uids ') }}
@@ -458,3 +493,19 @@ jobs:
       - name: Install script in a fresh container
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' install-test ') }}
         run: ci/install-test.sh target/debug/wicket ubuntu:24.04
+
+  # #41: the release acceptance test's local flows (a few minutes; the multi-host and installed
+  # variants run nightly, .github/workflows/acceptance.yml).
+  acceptance:
+    name: gVisor acceptance
+    needs: select
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' acceptance ')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/gvisor-setup
+      - name: Acceptance
+        run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:poc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh

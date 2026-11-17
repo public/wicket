@@ -4,19 +4,28 @@
 # (and each model's own .cfg) must pass; every `fail_*.cfg` must be refused with the invariant this
 # script names for it, so a variant that stops failing (the model stopped seeing the bug) fails too.
 #
-#   ci/tla.sh [--traces] [CFG...]     (default: every .cfg under verification/tla/)
+#   ci/tla.sh [--traces] [--shard I/N] [CFG...]     (default: every .cfg under verification/tla/)
 #
 # A model that should pass and doesn't prints TLC's counterexample (the states up to the violation).
 # --traces prints each fail_* variant's counterexample too: the trace to file with a finding.
+# --shard I/N checks the Ith of N parts (1-based) of the .cfg files, dealt out in turn, so N CI jobs
+# check them all at once (#460).
 #
 # TOOLS_DIR (default target/tools) keeps the downloads; TLA_HEAP (default 1g) is TLC's heap.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-traces=0 args=()
-for a in "$@"; do
+traces=0 args=() shard=1 shards=1
+while [ $# -gt 0 ]; do
+  a=$1
+  shift
   case "$a" in
     --traces) traces=1 ;;
+    --shard)
+      [[ "${1:-}" =~ ^([0-9]+)/([0-9]+)$ ]] && [ "${BASH_REMATCH[1]}" -ge 1 ] && [ "${BASH_REMATCH[1]}" -le "${BASH_REMATCH[2]}" ] \
+        || { echo "--shard wants I/N, 1 <= I <= N" >&2; exit 2; }
+      shard=${BASH_REMATCH[1]} shards=${BASH_REMATCH[2]}
+      shift ;;
     -h | --help) sed -n '2,/^set -e/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option $a (see --help)" >&2; exit 2 ;;
     *) args+=("$a") ;;
@@ -78,8 +87,12 @@ expect_fail() {
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-if [ ${#args[@]} -gt 0 ]; then cfgs=("${args[@]}"); else mapfile -t cfgs < <(ls verification/tla/*.cfg); fi
-status=0
+if [ ${#args[@]} -gt 0 ]; then all=("${args[@]}"); else mapfile -t all < <(ls verification/tla/*.cfg); fi
+cfgs=()
+for i in "${!all[@]}"; do
+  if [ $((i % shards + 1)) = "$shard" ]; then cfgs+=("${all[$i]}"); fi
+done
+status=0 times=()
 for cfg in "${cfgs[@]}"; do
   dir=$(dirname "$cfg") name=$(basename "$cfg" .cfg)
   # A model's own .cfg is named after it; a variant names its model on a `\* model: <Name>` line
@@ -104,6 +117,7 @@ for cfg in "${cfgs[@]}"; do
   rc=$?
   set -e
   took=$(( $(date +%s) - start ))
+  times+=("$name ${took}s")
   states=$(grep -Eo '^[0-9]+ states generated, [0-9]+ distinct states found' "$log" | tail -n 1 || true)
   want=$(expect_fail "$name")
   if [ -z "$want" ]; then
@@ -129,4 +143,8 @@ for cfg in "${cfgs[@]}"; do
     status=1
   fi
 done
+# Each model's time, as an annotation on the run: what to rebalance the shards by.
+if [ -n "${GITHUB_ACTIONS:-}" ] && [ ${#times[@]} -gt 0 ]; then
+  echo "::notice title=tla shard $shard/$shards times::$(printf '%s%%0A' "${times[@]}")"
+fi
 exit $status

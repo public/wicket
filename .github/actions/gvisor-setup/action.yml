@@ -1,0 +1,49 @@
+# What the gVisor jobs in ci.yml (the smoke test and acceptance, #460) each need before their
+# suites: Rust's cache, gVisor as a Docker runtime, the debug `wicket`, the static HTTP/3 client and
+# the agent image. After actions/checkout.
+name: gVisor, wicket and the agent image
+description: Install gVisor as a Docker runtime; build wicket, the HTTP/3 client and the agent image.
+inputs:
+  save-cache:
+    description: Whether this job saves Rust's cache (one of the jobs sharing it does).
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        # The smoke job's cache, as before the split; the acceptance job reads it.
+        shared-key: smoke
+        save-if: ${{ inputs.save-cache == 'true' }}
+    - name: Install gVisor as a Docker runtime
+      shell: bash
+      run: |
+        curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+          | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+        # gVisor's apt repository is sometimes caught mid-sync ("File has unexpected size"): retry.
+        for i in 1 2 3 4; do
+          if sudo apt-get update -q && sudo apt-get install -y -q runsc; then break; fi
+          [ "$i" = 4 ] && exit 1
+          echo "gVisor apt install failed (attempt $i), retrying in $((i * 20)) s"; sleep $((i * 20))
+        done
+        # Keep the runner's own Docker settings; add runsc with host unix sockets (wicket's proxies).
+        cfg=/etc/docker/daemon.json
+        [ -f "$cfg" ] || echo '{}' | sudo tee "$cfg" >/dev/null
+        jq '.runtimes.runsc = {path: "/usr/bin/runsc", runtimeArgs: ["--host-uds=open"]}' "$cfg" | sudo tee "$cfg.new" >/dev/null
+        sudo mv "$cfg.new" "$cfg"
+        sudo systemctl restart docker
+        runsc --version | head -1
+        docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
+    - name: Build wicket
+      shell: bash
+      run: cargo build -p wicket-cli --locked
+    - name: Rust's musl target, for the static HTTP/3 client (the smoke test and acceptance)
+      shell: bash
+      run: |
+        rustup target add x86_64-unknown-linux-musl
+        sudo apt-get install -y -q musl-tools
+        cargo build -q --release --locked --target x86_64-unknown-linux-musl --manifest-path ci/h3get/Cargo.toml
+    - name: Build the agent image
+      shell: bash
+      run: target/debug/wicket image
