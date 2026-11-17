@@ -20,6 +20,7 @@ fn identity_ttl() -> i64 {
 }
 
 pub use wicket_chan::check_run_id;
+pub use wicket_node::status::egress_line;
 
 /// The run's box, on whichever node it runs: stop it, revoke it, look inside it.
 #[derive(Clone)]
@@ -2490,23 +2491,6 @@ fn check_fetched(tree: &str, here: &Path, got: &Path, skip: &[&str]) -> Result<(
         );
     }
     Ok(())
-}
-
-/// An egress decision's line, as the run log prints it (and `wicket node top` shows it). A node sends
-/// these events, and an agent chose the method, host and path: printed only stripped (#128).
-pub fn egress_line(ev: &Event) -> Option<String> {
-    let Event::Egress { method, host, path, risk, outcome, detail } = ev else { return None };
-    let tag = match outcome.as_str() {
-        "allow" => "ALLOW  ",
-        "pending" => "PENDING",
-        "denied" => "DENIED ",
-        "forwarded" => "FORWARD",
-        "spliced" => "SPLICE ",
-        "unavailable" => "STALE  ",
-        _ => "BLOCKED",
-    };
-    let clip = wicket_agent::clip;
-    Some(format!("[egress] {tag} {} {}{}  ({}; {})", clip(method, 16), clip(host, 120), clip(path, 120), clip(risk, 24), clip(detail, 240)))
 }
 
 /// A git push the run made, allowed, is its work collected (#377).

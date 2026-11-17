@@ -54,7 +54,7 @@ pub(super) fn transfer(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, stream: u6
 
 /// A run's tree on this node: `workspace`, `state`, `tmp` or `volume.<name>`.
 pub(super) fn tree_dir(paths: &NodePaths, run: &str, tree: &str) -> Result<PathBuf> {
-    crate::run::check_run_id(run)?;
+    wicket_chan::check_run_id(run)?;
     let dir = paths.runs().join(run);
     let ok = |s: &str| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c));
     match tree {
@@ -106,7 +106,7 @@ pub(super) fn listen(node: &Arc<Node>, gen: u64, run: &str, sock: &str) -> Resul
 /// hold authority on this node (unexpired, unrevoked), and the link closes, its connections with
 /// it, as soon as either doesn't (checked every 2 s), or when the control host unlinks it.
 pub(super) fn listen_direct(node: &Arc<Node>, run: &str, sock: &str, to: &str, port: u16) -> Result<()> {
-    crate::run::check_run_id(to)?;
+    wicket_chan::check_run_id(to)?;
     if port == 0 {
         bail!("port 0");
     }

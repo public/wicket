@@ -15,12 +15,16 @@ mod tests {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = vec![];
         for f in [
-            "nodesrv.rs",
+            // Moved to wicket-node (#219): node serve, its gateway, and what moved with them.
+            "../../wicket-node/src/nodesrv.rs",
+            "../../wicket-node/src/nodegw.rs",
+            "../../wicket-node/src/controlca.rs",
+            "../../wicket-node/src/childplan.rs",
+            "../../wicket-node/src/status.rs",
             // Moved to wicket-home (#219); node serve calls it.
             "../../wicket-home/src/nodeauth.rs",
             "nodeca.rs",
             "noderun.rs",
-            "nodegw.rs",
             "run.rs",
             "spawn.rs",
             "reconcile.rs",
@@ -31,7 +35,7 @@ mod tests {
         ] {
             files.push(src.join(f));
         }
-        for d in ["nodesrv", "serve"] {
+        for d in ["../../wicket-node/src/nodesrv", "serve"] {
             for e in std::fs::read_dir(src.join(d)).unwrap() {
                 let p = e.unwrap().path();
                 if p.extension().is_some_and(|x| x == "rs") {

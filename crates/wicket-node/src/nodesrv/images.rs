@@ -164,7 +164,7 @@ async fn pull_into(
     from: &crate::registry::Source,
     dir: &std::path::Path,
 ) -> Result<crate::oci::Unpacked> {
-    crate::run::check_run_id(run)?;
+    wicket_chan::check_run_id(run)?;
     if let Some(n) = name {
         if !wicket_core::image::parse(n).is_ok_and(|r| !r.name.is_empty() && r.pin.as_deref() == Some(digest)) {
             bail!("{n:?} is not a name pinned to {digest}");
@@ -274,12 +274,12 @@ sys.exit(2)
 "#;
 
     /// The control host's end of a connection: frames in go through `calls`.
-    fn pump(s: UnixStream, calls: Arc<crate::nodecall::Calls>) {
+    fn pump(s: UnixStream, calls: Arc<crate::calls::Calls>) {
         pump_with(s, calls, None)
     }
 
     /// As [`pump`], answering the node's secret fetches with `secret` (name, value), if given.
-    fn pump_with(s: UnixStream, calls: Arc<crate::nodecall::Calls>, secret: Option<(String, String)>) {
+    fn pump_with(s: UnixStream, calls: Arc<crate::calls::Calls>, secret: Option<(String, String)>) {
         let (mut rd, mut wr) = s.into_split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
         calls.set_out(Some(tx));
@@ -330,7 +330,7 @@ sys.exit(2)
         let mut node = test_node(&inst);
         Arc::get_mut(&mut node).unwrap().docker =
             Docker::with_command(vec!["env".into(), format!("FAKE_STORE={}", store.display()), fake.display().to_string()]);
-        let calls = Arc::new(crate::nodecall::Calls::default());
+        let calls = Arc::new(crate::calls::Calls::default());
         pump(connect(&node, 1, &inst).await, calls.clone());
 
         // Larger than the sender's window, so it waits on the node's acknowledgements.
@@ -377,7 +377,7 @@ sys.exit(2)
         let mut node = test_node(&inst);
         Arc::get_mut(&mut node).unwrap().docker =
             Docker::with_command(vec!["env".into(), format!("FAKE_STORE={}", store.display()), fake.display().to_string()]);
-        let calls = Arc::new(crate::nodecall::Calls::default());
+        let calls = Arc::new(crate::calls::Calls::default());
         pump_with(connect(&node, 1, &inst).await, calls.clone(), Some(("reg".into(), "u:p".into())));
 
         let img = image_with(b"a pulled layer");
@@ -446,7 +446,7 @@ sys.exit(2)
         assert!(docker.image_identity(&id).await.unwrap().is_none());
 
         let node = test_node(&inst);
-        let calls = Arc::new(crate::nodecall::Calls::default());
+        let calls = Arc::new(crate::calls::Calls::default());
         pump(connect(&node, 1, &inst).await, calls.clone());
         let name = crate::oci::import_name(&tag, &id).unwrap();
         calls.put_image(&id, Some(&name), bytes.as_slice()).await.unwrap();

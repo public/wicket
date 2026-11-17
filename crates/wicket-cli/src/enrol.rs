@@ -44,11 +44,9 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use wicket_core::TenantId;
+pub use wicket_node::NODE_DIR;
 use wicket_proxy::ca::{InstallationCa, NodeCaCert};
 use wicket_store::{Ledger, NodeCaRow, NodeRow};
-
-/// Where wicket keeps its files on a node, relative to the login's home directory.
-pub const NODE_DIR: &str = ".local/share/wicket-node";
 
 /// The control host's files for nodes.
 pub struct Paths {

@@ -16,6 +16,7 @@ wicket-store.workspace = true
 wicket-proxy.workspace = true
 wicket-chan.workspace = true
 wicket-home.workspace = true
+wicket-node.workspace = true
 wicket-sandbox.workspace = true
 wicket-agent.workspace = true
 wicket-auth.workspace = true

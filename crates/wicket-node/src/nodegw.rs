@@ -541,8 +541,8 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
     let max = parent.agent.as_ref().map_or(0, |a| a.max_children);
     let used = sp.slots_used.saturating_add(node.edge.slots_of(run));
     let org = node.replica.lock().expect("replica").org_of(run);
-    let plan = crate::spawn::plan_child(
-        &crate::spawn::PlanIn {
+    let plan = crate::childplan::plan_child(
+        &crate::childplan::PlanIn {
             parent: &parent,
             run: &wicket_core::RunId(run.into()),
             image: &own_image,
@@ -613,7 +613,7 @@ async fn start_child(
     run: &str,
     parent: &crate::chan::BoxStart,
     sp: &crate::chan::EdgeSpawn,
-    plan: crate::spawn::ChildPlan,
+    plan: crate::childplan::ChildPlan,
     deadline: i64,
 ) -> anyhow::Result<String> {
     use anyhow::Context;
@@ -836,7 +836,7 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
         true => format!("{method} {host}{}… (every path under it)", wicket_core::prefix_dir(&path)),
         false => format!("{method} {host}{path}"),
     };
-    let why = format!("{}{reason}", crate::noderun::AGENT_ASKS);
+    let why = format!("{}{reason}", crate::AGENT_ASKS);
     if connected(node, run) {
         match node.ask_control(run, &op, &why, None, prefix).await {
             Ok(Asked::Pending { request, fresh }) => {

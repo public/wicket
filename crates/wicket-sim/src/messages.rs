@@ -11,7 +11,7 @@
 //!   principal's new run by `put_identity`, an agent's wake by `claim_wake`); and identities signed
 //!   by [`wicket_identity::Issuer`].
 //! - Stand-ins:
-//!   - the node follows `wicket-cli/src/nodegw.rs`: connected, a box's `send_message` and
+//!   - the node follows `wicket-node/src/nodegw.rs`: connected, a box's `send_message` and
 //!     `await_message` are asked of its run's gateway on the control host (`call_control`); cut off,
 //!     a message to another box on the node is decided and delivered there (`send_local`, with its
 //!     receipt, refused if the recipient's `accept_from` doesn't list the sender), kept in the
