@@ -84,7 +84,7 @@ node's own `Llm`.
      host's copies of `whoami` and `request_access`, which the node always answered, are gone,
      and so are the branches for peers before protocol 5 (`EDGE_DECISIONS`), which
      `PROTOCOL_SKEW` no longer lets connect. No protocol change.
-   - **4b (done): typed calls, no relay.** Protocol 13 (`chan::ONE_GATEWAY`). The tools only the
+   - **4b (done): typed calls, no relay.** Protocol 13. The tools only the
      control host answers are a closed set, `chan::ControlTool`. The node asks them as
      `Msg::Call { id, run, tool, args }` over the run's channel and gets `Msg::Called { id, text,
      is_error }`; `noderun` answers with the run's `Gateway::call_tool` in the supervisor's
@@ -93,7 +93,8 @@ node's own `Llm`.
      `relay_rpc`, `relay_or_offline`, `gateway_offline`, the gateway's HTTP server
      (`Gateway::serve*`), `ctl/gateway.sock`, the `gateway` tunnel target (`TUNNEL_TARGETS`,
      `Node::open_tunnel`, `noderun`'s tunnel handler), and `refuse_older_node`'s per-feature
-     floors and `forwarded_host`, all below 13. A box goes only to nodes at 13 or later.
+     floors and `forwarded_host`, all below 13. A box went only to nodes at 13 or later; with
+     protocol 15 no peer talks below 14, and that check (`refuse_older_node`) is gone too.
    - **4c (done): a child's supervisor in its parent's process.** A spawn the node doesn't start
      (placement on another node, an org layer not alike, a renewed authority, beyond the zone) is a
      `ControlTool::Spawn` call that `noderun` answers itself with `spawn::tool`, and a child the

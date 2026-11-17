@@ -45,12 +45,11 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 1, a connection talks
-/// 13 or 14, so only the versions above 12 have a check here; the checks for features of 12 and
+/// 14 or 15, so only the versions above 13 have a check here; the checks for features of 13 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
-/// forwarded egress, node health) went once every peer had them.
+/// forwarded egress, node health, the control host's tools as [`Msg::Call`]) went once every peer
+/// had them.
 pub const PROTOCOL: u32 = 15;
-/// The first protocol version whose nodes send the control host's tools as [`Msg::Call`] (#257).
-pub const ONE_GATEWAY: u32 = 13;
 /// The first protocol version whose node CA is renewed over the channel (#416): [`Msg::CaRenew`],
 /// [`Msg::CaCsr`], [`Msg::NodeCa`] and [`Msg::NodeCaInstalled`].
 pub const CA_RENEWAL: u32 = 14;
@@ -115,7 +114,6 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // Every feature's first version is one this build speaks, and a peer at the oldest version it
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
-    assert!(ONE_GATEWAY <= PROTOCOL);
     assert!(CA_RENEWAL <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
@@ -1007,11 +1005,9 @@ mod tests {
     use super::*;
 
     /// #257 slice 4b: the control host's tools are a closed set, sent by their MCP names, and a call
-    /// and its answer are typed messages (protocol 13).
+    /// and its answer are typed messages (protocol 13, which every peer talks).
     #[test]
-    fn the_control_hosts_tools_are_typed_calls_from_protocol_13() {
-        assert_eq!((PROTOCOL, ONE_GATEWAY), (15, 13));
-        assert!(negotiate(12, 13).unwrap() < ONE_GATEWAY);
+    fn the_control_hosts_tools_are_typed_calls() {
         assert_eq!(ControlTool::of("await_grant"), Some(ControlTool::AwaitGrant));
         assert_eq!(ControlTool::RequestCapacity.name(), "request_capacity");
         for local in ["whoami", "request_access", "spawn_agent", "anything", ""] {
@@ -1268,7 +1264,6 @@ mod tests {
     /// without them reads as having none.
     #[test]
     fn a_start_carries_its_swaps_by_name() {
-        assert_eq!((PROTOCOL, ONE_GATEWAY), (15, 13));
         let swaps = vec![
             wicket_proxy::CredentialSwap {
                 name: "account login".into(),

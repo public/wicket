@@ -711,18 +711,11 @@ impl Node {
 
     /// One of the control host's tools for `run`'s box (#257 slice 4b), asked over the connection
     /// that owns it and answered when the tool is done: a wait as long as the tool's own
-    /// (`timeout_seconds`, at most 600) and a minute more. Err when there is no such connection,
-    /// it talks an older protocol, or it drops before the answer.
+    /// (`timeout_seconds`, at most 600) and a minute more. Err when there is no such connection, or
+    /// it drops before the answer.
     async fn call_control(&self, run: &str, tool: chan::ControlTool, args: &serde_json::Value) -> std::io::Result<(String, bool)> {
         let unreachable = || std::io::Error::new(std::io::ErrorKind::NotConnected, "the control host is unreachable");
         let gen = self.owner(run).ok_or_else(unreachable)?;
-        let proto = self.links.lock().expect("links").get(&gen).map_or(0, |l| l.proto);
-        if proto < chan::ONE_GATEWAY {
-            return Err(std::io::Error::other(format!(
-                "the control host talks protocol {proto}, and takes this box's tools as calls from protocol {}",
-                chan::ONE_GATEWAY
-            )));
-        }
         let id = self.id();
         let (tx, rx) = oneshot::channel();
         self.calls.lock().expect("calls").insert(id, (gen, tx));
