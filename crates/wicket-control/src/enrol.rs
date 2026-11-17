@@ -545,53 +545,6 @@ RestartSec=2
 WantedBy=default.target
 ";
 
-/// `wicket node install <name>`: copies this control host's current wicket binary to the node over
-/// the pinned ssh connection (as a version: see `update.rs`), checks its sha256 there, and (unless `no_service`)
-/// installs and restarts the `wicket-node` systemd user service that runs `wicket node serve`. The
-/// node's `serve` refuses a control host more than one protocol version away (`chan.rs`); `wicket self
-/// update --nodes` keeps nodes current.
-pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Result<()> {
-    use sha2::Digest;
-    let ledger = Ledger::open(&crate::ledger_path())?;
-    let row = ledger.node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
-    if row.status != "active" {
-        bail!("node {name} is {}", row.status);
-    }
-    let node = pinned_node(&Paths::installation().nodes_dir, &row, ssh_key)?;
-    let arch = node.sh("uname -m").await?;
-    if arch != std::env::consts::ARCH {
-        bail!("node {name} is {arch}, this control host's wicket is {}: install a {arch} build there yourself", std::env::consts::ARCH);
-    }
-    // The control host's current version, staged on the node as a version of its own
-    // (`<node dir>/versions/<id>/wicket`, `~/.local/bin/wicket` a link to its `current`).
-    let exe = crate::update::self_exe()?;
-    let bytes = std::fs::read(&exe)?;
-    let sha = hex::encode(Sha256::digest(&bytes));
-    let prev = crate::update::push_version(&node, &bytes, &sha).await?;
-    say!(
-        "installed wicket on node {name} ({} MB, version {}{}, sha256 {}…)",
-        bytes.len() >> 20,
-        &sha[..12],
-        prev.filter(|p| p.as_str() != &sha[..12]).map(|p| format!(", was {p}")).unwrap_or_default(),
-        &sha[..16]
-    );
-    if no_service {
-        say!("no service installed: run `~/.local/bin/wicket node serve` on the node yourself");
-        return Ok(());
-    }
-    let home = node.sh("echo $HOME").await?;
-    let unit_dir = format!("{home}/.config/systemd/user");
-    let script = format!(
-        "set -eu\nexport XDG_RUNTIME_DIR=/run/user/$(id -u)\nmkdir -p {d}\ncat > {d}/wicket-node.service <<'WICKET_UNIT_EOF'\n{NODE_UNIT}WICKET_UNIT_EOF\n\
-         systemctl --user daemon-reload\nsystemctl --user enable wicket-node >/dev/null 2>&1\nsystemctl --user restart wicket-node\n\
-         sleep 1\nsystemctl --user is-active wicket-node\n",
-        d = wicket_sandbox::shell_quote(&unit_dir)
-    );
-    let state = node.script("installing the wicket-node service (is lingering enabled for this user?)", &script).await?;
-    say!("wicket-node service on {name}: {state}");
-    Ok(())
-}
-
 /// Revokes a node: the ledger marks it (and its CA certificates) revoked, and its pinned host key is
 /// deleted, so ssh to it fails host key verification. Returns the revoked CA serials.
 pub fn revoke(ledger: &mut Ledger, nodes_dir: &Path, name: &str) -> Result<Vec<String>> {
@@ -653,7 +606,7 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
-fn pinned_node(nodes_dir: &Path, row: &NodeRow, ssh_key: Option<&Path>) -> Result<Node> {
+pub fn pinned_node(nodes_dir: &Path, row: &NodeRow, ssh_key: Option<&Path>) -> Result<Node> {
     let pin = Pin::for_node(nodes_dir, &row.name);
     if !pin.known_hosts.exists() {
         bail!("node {} is enrolled but its pinned host key ({}) is missing: refusing to connect", row.name, pin.known_hosts.display());

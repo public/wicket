@@ -2,8 +2,6 @@
 //! [`say!`] and [`say_err!`] are `println!` and `eprintln!` that follow a supervisor thread's log
 //! and never panic. main.rs imports the macros for every module here.
 
-pub use wicket_home::out::to;
-
 #[cfg(test)]
 mod tests {
     /// #422: `println!` and `eprintln!` panic when stdout or stderr is closed (a journal that went
@@ -23,14 +21,15 @@ mod tests {
             "../../wicket-node/src/status.rs",
             // Moved to wicket-home (#219); node serve calls it.
             "../../wicket-home/src/nodeauth.rs",
-            "nodeca.rs",
-            "noderun.rs",
-            "run.rs",
-            "spawn.rs",
+            // Moved to wicket-control (#219): a run's supervisor and what it needs.
+            "../../wicket-control/src/nodeca.rs",
+            "../../wicket-control/src/noderun.rs",
+            "../../wicket-control/src/run.rs",
+            "../../wicket-control/src/spawn.rs",
+            "../../wicket-control/src/localnode.rs",
+            "../../wicket-control/src/enrol.rs",
+            "../../wicket-control/src/nodecreate.rs",
             "reconcile.rs",
-            "localnode.rs",
-            "enrol.rs",
-            "nodecreate.rs",
             "daemon/mod.rs",
         ] {
             files.push(src.join(f));

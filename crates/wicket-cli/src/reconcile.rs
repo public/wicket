@@ -977,7 +977,7 @@ pub mod setup {
                 .filter(|r| r.status == "active")
                 .with_context(|| format!("static host {} is not an enrolled node: enrol it (wicket node enrol) first", node.name))?;
             if self.install {
-                crate::enrol::install(&row.name, None, false).await?;
+                crate::update::install(&row.name, None, false).await?;
             }
             Ok((row.name, row.target))
         }
@@ -1037,7 +1037,7 @@ pub mod setup {
                 &self.wait,
             )
             .await?;
-            crate::enrol::install(&name, self.ssh_key.as_deref(), false).await?;
+            crate::update::install(&name, self.ssh_key.as_deref(), false).await?;
             Ok((name, target))
         }
         fn retire(&self, ledger: &mut Ledger, lease: &LeaseRow) -> Result<()> {

@@ -831,7 +831,7 @@ struct Progress {
     /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
     remint_failed: i64,
     /// What `wicket top` reads of this run's node (`ctl/link.json`).
-    link: crate::top::LinkRecord,
+    link: wicket_node::status::LinkRecord,
 }
 
 async fn manage(
@@ -861,7 +861,7 @@ async fn manage(
         slice: None,
         fetched: std::collections::HashMap::new(),
         remint_failed: 0,
-        link: crate::top::LinkRecord { node: sh.node.clone(), ..Default::default() },
+        link: wicket_node::status::LinkRecord { node: sh.node.clone(), ..Default::default() },
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
@@ -870,7 +870,7 @@ async fn manage(
         // Cut off: since now, or since it was (a retry that fails again keeps the time).
         if p.link.connected || p.link.since_ms == 0 {
             let now = wicket_feed::now_ms();
-            p.link = crate::top::LinkRecord { connected: false, since_ms: now, updated_ms: now, ..p.link.clone() };
+            p.link = wicket_node::status::LinkRecord { connected: false, since_ms: now, updated_ms: now, ..p.link.clone() };
             p.link.save(&sh.dir);
         }
         sh.ctl.calls.set_out(None);
@@ -965,7 +965,7 @@ async fn session(
     let (feed, runs) = match authed.welcome {
         Msg::Welcome { feed, runs, proto, capacity, .. } => {
             let now = wicket_feed::now_ms();
-            p.link = crate::top::LinkRecord { connected: true, since_ms: now, updated_ms: now, capacity, ..p.link.clone() };
+            p.link = wicket_node::status::LinkRecord { connected: true, since_ms: now, updated_ms: now, capacity, ..p.link.clone() };
             p.link.save(&sh.dir);
             p.proto = proto;
             sh.ctl.proto.store(proto, Ordering::SeqCst);

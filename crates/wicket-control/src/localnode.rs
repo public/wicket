@@ -252,7 +252,7 @@ fn renew_cert(ledger: &std::sync::Mutex<Ledger>, dir: &std::path::Path) -> Resul
 /// Starts the `serve`, detached from this run (it outlives it, and serves the next).
 fn start_serve(dir: &std::path::Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let exe = crate::update::self_exe()?;
+    let exe = wicket_node::reexec::self_exe()?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("serve.log"))?;
     let idle = std::env::var("WICKET_LOCAL_NODE_IDLE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(600);
     let mut c = std::process::Command::new(exe);

@@ -12,58 +12,41 @@ mod out;
 
 // The control/node channel and the modules its messages carry: a crate of their own (#219), under
 // their old names here.
-use wicket_chan::{chan, health, nodesecrets, oci, registry};
+use wicket_chan::{chan, health, nodesecrets};
 // The installation's paths, its identity issuer and who is calling: a crate of their own (#219),
 // under their old names here.
 #[cfg(test)]
 use wicket_home::principal_from_env;
 use wicket_home::{
-    cli_principal, confirm, data_dir, identity_line, issuer, issuer_key_path, ledger_path, operator, show_request, trust_domain,
-    verified_identity,
+    confirm, data_dir, identity_line, issuer, issuer_key_path, ledger_path, operator, show_request, trust_domain, verified_identity,
 };
 
 // Modules that need only wicket-home's helpers moved with them (#219), under their old names here.
-use wicket_home::{audit_export, control, exitcause, images_policy, nodeauth, owner, program, s3, statestore};
+use wicket_home::{audit_export, control, owner, program, s3, statestore};
 // The node, `wicket node serve` and its gateway (#219), under its old name here.
 use wicket_node::nodesrv;
+// The control host's core, a run's supervisor and what it needs (#219), under their old names here.
+#[cfg(test)]
+use wicket_control::spawn;
+use wicket_control::{
+    capacity, effect, enrol, grant, hibernate, image, localnode, node, nodecall, nodecreate, noderun, operators, policy, roots, run,
+    snapstore, storegc, transcript,
+};
 
-mod capacity;
 mod ci_update;
 mod cli_reference;
 mod cmd;
 mod daemon;
 mod doctor;
-mod effect;
-mod enrol;
-mod gitguard;
-mod grant;
-mod hibernate;
-mod image;
 mod invariants;
-mod links;
-mod localnode;
 mod mock;
-mod node;
-mod nodeca;
-mod nodecall;
-mod nodecreate;
-mod noderun;
-mod operators;
 mod pin;
-mod policy;
-mod quotas;
 mod reconcile;
 mod rootcopy;
-mod roots;
-mod run;
 mod serve;
 mod session;
-mod snapstore;
-mod spawn;
 mod state;
-mod storegc;
 mod top;
-mod transcript;
 mod units;
 mod update;
 
@@ -537,4 +520,19 @@ fn serve_opts(c: Cmd) -> Option<(serve::ServeOpts, bool)> {
         },
         no_bootstrap_link,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// `wicket run --image` is parsed, and without it nothing is named: no default that would hide
+    /// the manifest's agent.image (wicket-control's `run::box_image` applies it).
+    #[test]
+    fn the_image_flag_names_no_default() {
+        let parse = |args: &[&str]| match <crate::Cli as clap::Parser>::try_parse_from(args).unwrap().cmd {
+            crate::Cmd::Run { image, .. } => image,
+            _ => unreachable!(),
+        };
+        assert_eq!(parse(&["wicket", "run", "m.yaml"]), None, "no default that would hide the manifest's");
+        assert_eq!(parse(&["wicket", "run", "--image", "img:other", "m.yaml"]).as_deref(), Some("img:other"));
+    }
 }

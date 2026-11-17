@@ -17,7 +17,6 @@
 //! isn't a terminal, frames are printed as plain text. Every line is cut to the terminal's width.
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -199,39 +198,6 @@ fn slice_left(slice: Option<&Slice>, spent: &Spent) -> String {
             format!("{} req {}", s.requests.saturating_sub(spent.requests), count(s.output_tokens.saturating_sub(spent.output_tokens)))
         }
         None => "-".into(),
-    }
-}
-
-/// What a run's supervisor on the control host last saw of its node (`ctl/link.json`).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct LinkRecord {
-    pub node: String,
-    pub connected: bool,
-    /// Since when (Unix ms) it has been connected, or cut off.
-    pub since_ms: i64,
-    /// What the node last reported the run's box has spent of its model budget.
-    #[serde(default)]
-    pub spent: Spent,
-    /// The node's size and what its boxes were given, at the last connect.
-    #[serde(default)]
-    pub capacity: Option<crate::chan::NodeCapacity>,
-    pub updated_ms: i64,
-}
-
-impl LinkRecord {
-    pub const FILE: &'static str = "link.json";
-
-    /// Written aside and renamed, in the run's `ctl/` directory.
-    pub fn save(&self, run_dir: &Path) {
-        let f = run_dir.join("ctl").join(Self::FILE);
-        let tmp = f.with_extension("tmp");
-        if std::fs::write(&tmp, serde_json::to_vec(self).unwrap_or_default()).is_ok() {
-            let _ = std::fs::rename(&tmp, &f);
-        }
-    }
-
-    pub fn load(run_dir: &Path) -> Option<LinkRecord> {
-        serde_json::from_slice(&std::fs::read(run_dir.join("ctl").join(Self::FILE)).ok()?).ok()
     }
 }
 
