@@ -103,15 +103,15 @@ fn the_cli_reference_is_checked_by_a_cli_test() {
 
 #[test]
 fn a_crate_selects_its_reverse_dependencies() {
-    let fwd = ["wicket-fwd", "wicket-proxy", "wicket-chan", "wicket-cli", "wicket-sim"];
+    let fwd = ["wicket-fwd", "wicket-proxy", "wicket-chan", "wicket-home", "wicket-cli", "wicket-sim"];
     let fuzz = ["fuzz-egress", "fuzz-gateway", "fuzz-chan"];
     check(&["crates/wicket-fwd/src/copy.rs"], &fwd, &with(CLI, &fuzz));
     let s = select(&["crates/wicket-fwd/src/copy.rs"]);
     assert_eq!(s.filter(), "rdeps(=wicket-fwd)");
-    assert_eq!(s.cargo_args(&members(head())), "-p wicket-chan -p wicket-cli -p wicket-fwd -p wicket-proxy -p wicket-sim");
-    check(&["crates/wicket-sandbox/tests/x.rs"], &["wicket-sandbox", "wicket-cli"], CLI);
+    assert_eq!(s.cargo_args(&members(head())), "-p wicket-chan -p wicket-cli -p wicket-fwd -p wicket-home -p wicket-proxy -p wicket-sim");
+    check(&["crates/wicket-sandbox/tests/x.rs"], &["wicket-sandbox", "wicket-home", "wicket-cli"], CLI);
     // A deleted file is still its crate's.
-    check(&["crates/wicket-sandbox/src/gone.rs"], &["wicket-sandbox", "wicket-cli"], CLI);
+    check(&["crates/wicket-sandbox/src/gone.rs"], &["wicket-sandbox", "wicket-home", "wicket-cli"], CLI);
     // A crate's own notes stay its crate's.
     check(&["crates/wicket-fwd/NOTES.md"], &fwd, &with(CLI, &fuzz));
 }
@@ -148,6 +148,17 @@ fn the_simulation_follows_the_run_loops() {
         assert_eq!(select(&[f]).filter(), "rdeps(=wicket-cli) | rdeps(=wicket-sim)");
     }
     check(&["crates/wicket-cli/src/cmd/run.rs"], &["wicket-cli"], CLI);
+}
+
+/// The modules that left wicket-cli for wicket-home (#219) still select wicket-cli and its suites.
+#[test]
+fn wicket_home_selects_wicket_cli() {
+    check(&["crates/wicket-home/src/statestore.rs"], &["wicket-home", "wicket-cli"], CLI);
+    let s = select(&["crates/wicket-home/src/nodeauth.rs"]);
+    assert_eq!(s.filter(), "rdeps(=wicket-home)");
+    check(&["deploy/install.sh"], &["wicket-home", "wicket-cli"], CLI);
+    let s = select(&["examples/program-repo-stats.pinned.yaml"]);
+    assert!(set(&["wicket-home", "wicket-cli"]).is_subset(&s.affected));
 }
 
 #[test]
@@ -213,7 +224,7 @@ fn inputs_from_outside_the_crates() {
     assert!(s.affected.contains("wicket-authz") && s.suites.contains("lean"));
     check(
         &["plugins/wicket/skills/wicket-box/SKILL.md"],
-        &["wicket-agent", "wicket-chan", "wicket-cli"],
+        &["wicket-agent", "wicket-chan", "wicket-home", "wicket-cli"],
         &with(CLI, &["fuzz-manifest", "fuzz-chan"]),
     );
 }
