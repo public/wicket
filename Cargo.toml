@@ -11,6 +11,7 @@ members = [
     "crates/wicket-proxy",
     "crates/wicket-sandbox",
     "crates/wicket-agent",
+    "crates/wicket-chan",
     "crates/wicket-cli",
     "crates/wicket-authz",
     "crates/wicket-feed",
@@ -73,6 +74,7 @@ wicket-store = { path = "crates/wicket-store" }
 wicket-auth = { path = "crates/wicket-auth" }
 wicket-identity = { path = "crates/wicket-identity" }
 wicket-proxy = { path = "crates/wicket-proxy" }
+wicket-chan = { path = "crates/wicket-chan" }
 wicket-sandbox = { path = "crates/wicket-sandbox" }
 wicket-agent = { path = "crates/wicket-agent" }
 wicket-feed = { path = "crates/wicket-feed" }

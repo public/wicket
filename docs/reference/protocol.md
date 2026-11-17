@@ -43,7 +43,7 @@ adds the headers `x-wicket-request-id` and `retry-after: 30`.
 Between a control-host process (a `wicket run`, or a link relay) and a node's `wicket node serve`:
 one multiplexed, length-prefixed byte stream, over ssh (`ssh <node> wicket node attach`, which joins
 the session to `serve`'s unix socket), or over that socket directly for this host's own node. The
-code is `crates/wicket-cli/src/chan.rs`.
+code is `crates/wicket-chan/src/chan.rs`.
 
 - **Frames.** A 4-byte big-endian length, then one kind byte and the body: `1` a JSON control
   message, `2` data (stream id and byte offset, each a big-endian u64, then the bytes: a box's stdio

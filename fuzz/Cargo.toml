@@ -14,8 +14,8 @@ cargo-fuzz = true
 # Its own workspace: not part of the root one.
 [workspace]
 
-# The harnesses' own unit tests would compile the CLI modules' test code (see src/lib.rs); the corpus
-# replays are integration tests (tests/corpus.rs).
+# The harnesses have no unit tests of their own: the corpus replays are integration tests
+# (tests/corpus.rs).
 [lib]
 test = false
 doctest = false
@@ -25,6 +25,7 @@ libfuzzer-sys = "0.4"
 wicket-core = { path = "../crates/wicket-core" }
 wicket-store = { path = "../crates/wicket-store" }
 wicket-proxy = { path = "../crates/wicket-proxy" }
+wicket-chan = { path = "../crates/wicket-chan" }
 wicket-agent = { path = "../crates/wicket-agent" }
 wicket-feed = { path = "../crates/wicket-feed" }
 wicket-authz = { path = "../crates/wicket-authz" }

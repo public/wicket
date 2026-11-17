@@ -272,7 +272,7 @@ def self_test():
     case("docs only", ["docs/reference/agents.md", "README.md", "experiments/x/RESULTS.md"], set(), {"docs"})
     # The CLI reference is checked by a wicket-cli unit test (cli_reference.rs).
     case("the CLI reference", ["docs/reference/cli.md"], {"wicket-cli"}, {"docs"})
-    case("wicket-fwd", ["crates/wicket-fwd/src/copy.rs"], {"wicket-fwd", "wicket-proxy", "wicket-cli", "wicket-sim"}, {"smoke"})
+    case("wicket-fwd", ["crates/wicket-fwd/src/copy.rs"], {"wicket-fwd", "wicket-proxy", "wicket-chan", "wicket-cli", "wicket-sim"}, {"smoke"})
     # Nearly everything: the crates that don't depend on wicket-core (auth, identity, fwd, placement) aren't.
     case("wicket-core", ["crates/wicket-core/src/op.rs"],
          lambda c: c != ALL and len(c) >= 10 and {"wicket-core", "wicket-cli", "wicket-proxy"} <= c and "wicket-fwd" not in c, ALL)
@@ -281,7 +281,7 @@ def self_test():
     case("hibernation", ["crates/wicket-cli/src/hibernate.rs"], {"wicket-cli", "wicket-sim"}, {"hibernate", "restore"})
     case("updates", ["crates/wicket-cli/src/update.rs"], {"wicket-cli"}, {"update"})
     # Every end-to-end suite, and the fuzz target that reads its frames (#323).
-    case("the node protocol", ["crates/wicket-cli/src/chan.rs"], {"wicket-cli"}, set(E2E) | {"fuzz-chan"})
+    case("the node protocol", ["crates/wicket-chan/src/chan.rs"], {"wicket-chan", "wicket-cli"}, set(E2E) | {"fuzz-chan"})
     case("a CLI command group", ["crates/wicket-cli/src/cmd/itself.rs"], {"wicket-cli"}, {"update"})
     # An unmapped crate file: every end-to-end suite, no fuzz target.
     case("the run commands (nearly every suite calls them)", ["crates/wicket-cli/src/cmd/run.rs"], {"wicket-cli"}, set(E2E))
@@ -330,8 +330,8 @@ def self_test():
             fails.append(f"ci/affected.map names {pat}, which doesn't exist")
     # Cargo's arguments: crates without a library get no doctest arguments, and none selected is none.
     for files, want_args, want_doc in (
-        (["crates/wicket-cli/src/chan.rs"], "-p wicket-cli", ""),
-        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-cli -p wicket-fwd -p wicket-proxy -p wicket-sim", ""),
+        (["crates/wicket-chan/src/chan.rs"], "-p wicket-chan -p wicket-cli", ""),
+        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-chan -p wicket-cli -p wicket-fwd -p wicket-proxy -p wicket-sim", ""),
         (["docs/x.md"], "", ""),
         (["Cargo.lock"], "--workspace", ""),
     ):

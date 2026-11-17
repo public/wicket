@@ -2120,6 +2120,8 @@ crates/
   wicket-agent       harness adapters (Claude Code, ACP) and their modes
   wicket-placement   providers (static hosts, Vultr), billing, the money envelope
   wicket-fwd         in-box forwarders to wicket.internal
+  wicket-chan        the control/node channel's protocol and what its messages carry (health, a
+                     node's secrets, OCI images and registries); fuzzed as it is
   wicket-cli         the `wicket` binary: CLI, daemon, console, node, reconciler
 ```
 
