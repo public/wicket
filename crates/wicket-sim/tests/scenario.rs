@@ -3,7 +3,8 @@
 //! `placement` (placed nodes' leases, the reconciler, the money envelope and release, several runs
 //! on one node) and `messages` (principals, held messages, wake and receipts).
 //!
-//! - `seeds`: every scenario for a fixed set of seeds, or `WICKET_SIM_SEEDS=<n>` seeds from
+//! - `seeds_<scenario>_<part>`: each scenario for a fixed set of seeds, in parts, or
+//!   `WICKET_SIM_SEEDS=<n>` seeds from
 //!   `WICKET_SIM_FROM` (default 0): CI runs the fixed set on pull requests and more nightly
 //!   (`ci/sim.sh`). `WICKET_SIM_SCENARIO=<name>` runs one scenario only.
 //! - `replay`: one seed, `WICKET_SIM_SEED=<seed>` (and `WICKET_SIM_SCENARIO`), with its plan and
@@ -39,8 +40,48 @@ fn scenarios() -> Vec<&'static str> {
     }
 }
 
-#[test]
-fn seeds() {
+/// The `seeds` tests, one per scenario and part: part `p` of `n` runs every `n`th seed from the
+/// `p`th, so a scenario's parts together run its seeds once, and nextest runs them at once (one
+/// test of them all was the pull requests' slowest, #460). The slower a scenario, the more parts.
+macro_rules! seeds {
+    ($($name:ident: $scenario:literal, $part:literal of $parts:literal;)*) => {
+        $(#[test]
+        fn $name() {
+            seeds($scenario, $part, $parts);
+        })*
+        /// The tests above cover every scenario, each part of it once.
+        #[test]
+        fn seeds_cover_every_scenario_and_part() {
+            let mut have: Vec<(&str, usize, usize)> = vec![$(($scenario, $part, $parts)),*];
+            have.sort();
+            for s in SCENARIOS {
+                let parts: Vec<_> = have.iter().filter(|h| h.0 == s).collect();
+                assert!(!parts.is_empty(), "no seeds test for {s}");
+                let n = parts[0].2;
+                assert_eq!(parts.iter().map(|h| (h.1, h.2)).collect::<Vec<_>>(), (0..n).map(|p| (p, n)).collect::<Vec<_>>(), "{s}");
+            }
+            assert!(have.iter().all(|h| SCENARIOS.contains(&h.0)));
+        }
+    };
+}
+
+seeds! {
+    seeds_feed_0: "feed", 0 of 2;
+    seeds_feed_1: "feed", 1 of 2;
+    seeds_placement_0: "placement", 0 of 2;
+    seeds_placement_1: "placement", 1 of 2;
+    seeds_messages_0: "messages", 0 of 4;
+    seeds_messages_1: "messages", 1 of 4;
+    seeds_messages_2: "messages", 2 of 4;
+    seeds_messages_3: "messages", 3 of 4;
+}
+
+/// Part `part` of `parts` of `scenario`'s seeds (none when `WICKET_SIM_SCENARIO` names another
+/// scenario).
+fn seeds(scenario: &'static str, part: usize, parts: usize) {
+    if !scenarios().contains(&scenario) {
+        return;
+    }
     let seeds: Vec<u64> = match env_u64("WICKET_SIM_SEEDS") {
         Some(n) => {
             let from = env_u64("WICKET_SIM_FROM").unwrap_or(0);
@@ -49,17 +90,17 @@ fn seeds() {
         None => FIXED.to_vec(),
     };
     let mut failed = vec![];
-    for scenario in scenarios() {
-        for &seed in &seeds {
-            let r = wicket_sim::run_scenario(scenario, seed, &dir().join("seeds"), false);
-            println!("seed {seed}: {scenario}: hash {:016x}{}; {}", r.hash, if r.ok() { "" } else { " FAILED" }, r.stats);
-            for k in &r.known {
-                println!("  KNOWN {k}");
-            }
-            if !r.ok() {
-                eprintln!("{r}");
-                failed.push(replay_command(scenario, seed));
-            }
+    // Each scenario names its seeds' directories (`seed-<n>`, `placement-<n>`, `messages-<n>`), so
+    // the parts share this one.
+    for &seed in seeds.iter().skip(part).step_by(parts) {
+        let r = wicket_sim::run_scenario(scenario, seed, &dir().join("seeds"), false);
+        println!("seed {seed}: {scenario}: hash {:016x}{}; {}", r.hash, if r.ok() { "" } else { " FAILED" }, r.stats);
+        for k in &r.known {
+            println!("  KNOWN {k}");
+        }
+        if !r.ok() {
+            eprintln!("{r}");
+            failed.push(replay_command(scenario, seed));
         }
     }
     assert!(
@@ -104,7 +145,7 @@ fn deterministic() {
 /// What the simulation found first (#324): a node whose spend file was written only once a second,
 /// with calls in flight not counted, restarted counting from less than its upstream had billed,
 /// and spent past the run's budget. Seed 8 crashes the node mid-call: without the journal it
-/// overspends; with it (the `seeds` test), it doesn't.
+/// overspends; with it (the `seeds_*` tests), it doesn't.
 #[test]
 fn without_the_spend_journal_a_crashed_node_overspends() {
     let r = wicket_sim::run_with(8, &dir().join("no-journal"), Options { spend_journal: false, ..Options::default() });
@@ -172,7 +213,7 @@ fn a_relayed_message_whose_answer_is_cut_off_is_still_lost() {
 /// #337's F1): the token's check is `time <= not_after` in whole seconds, and the grant was
 /// published with `not_after = expires_at`. The oracle is strict (live while `now < expires_at`,
 /// in ms): published as before, seed 1 allows by a grant past its lifetime; published with
-/// `expires_at - 1` (the `seeds` test), no seed does.
+/// `expires_at - 1` (the `seeds_*` tests), no seed does.
 #[test]
 fn published_with_not_after_at_expires_at_a_node_allows_past_the_grants_lifetime() {
     let r = wicket_sim::run_with(1, &dir().join("grant-end"), Options { grant_end_fix: false, ..Options::default() });
@@ -182,7 +223,7 @@ fn published_with_not_after_at_expires_at_a_node_allows_past_the_grants_lifetime
 
 /// #257, slice 3: the control host publishes every grant, one on a host the node's CA can't cover
 /// included, and decides nothing; the node splices such a host if the box's token allows it
-/// wholesale and refuses it otherwise. The `seeds` test checks that no such host is allowed but
+/// wholesale and refuses it otherwise. The `seeds_*` tests check that no such host is allowed but
 /// spliced. A node that decided those hosts from the feed instead (as if it could terminate them)
 /// would honour the published grant: the oracle finds it.
 #[test]
