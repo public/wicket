@@ -17,7 +17,7 @@ for every pull request.
 | core | `wicket-core`: `subset.rs` (spawned zones within their parent's), `op.rs` (risk, reach, public addresses), `canon.rs` (canonical paths), `budget.rs` (the model budget counter) | `cargo test -p wicket-core --lib` |
 | matchers | `wicket-core/src/manifest.rs`: the host, glob and model matchers (`host_matches`, `compile_glob`, `fold_case_glob`, `wildcard_for`, `names_host`, `allows_model`, `model_covers`, `check_models`) | the same |
 | authz | `wicket-authz`: `decide.rs` (loading a token and deciding), `token.rs` (minting and grants), `cost.rs` (the step estimate) | `cargo test -p wicket-authz` |
-| grant | `wicket-cli/src/grant.rs`: who may grant what (`within_authority`, `agent_terms`, `check_terms`, `bounds`, `outlasts`, `check_ttl`, `check_prefix`, `agent_renews`, `descendant_chain`) | `cargo test -p wicket-cli --bin wicket grant` |
+| grant | `wicket-control/src/grant.rs`: who may grant what (`within_authority`, `agent_terms`, `check_terms`, `bounds`, `outlasts`, `check_ttl`, `check_prefix`, `agent_renews`, `descendant_chain`) | `cargo test -p wicket-control --lib grant` |
 
 Each crate's slowest test is skipped for each mutant:
 - wicket-core's `segment_proofs_agree_with_the_matcher` takes 26 of its 28 seconds;
@@ -41,7 +41,7 @@ caught) aren't counted as missed.
 | `wicket-core/src/canon.rs` | 83 | 3 | 0 | |
 | `wicket-core/src/manifest.rs` (matchers) | 69 | 6 | 1 | a real gap: see below |
 | `wicket-authz` (`decide.rs`, `token.rs`, `cost.rs`) | 114 | 15 | 6 | equivalent or diagnostics only (accepted) |
-| `wicket-cli/src/grant.rs` (grant rules) | 32 | 1 | 0 | |
+| `wicket-control/src/grant.rs` (grant rules) | 32 | 1 | 0 | |
 | **all** | **739** | **207** | **10** | |
 
 What the 207 were, and what killed them:
