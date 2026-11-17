@@ -112,6 +112,7 @@ async function signed(body, after, extra) {
   const go = document.getElementById("confirm-go");
   document.getElementById("confirm-what").textContent = describe(begin.action);
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
+  renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   document.getElementById("confirm-state").textContent = "";
   const deny = begin.action.decision === "deny" || begin.action.action === "revoke" || begin.action.action === "delete_secret";
   go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
@@ -144,6 +145,24 @@ function renderBlast(box, b) {
   list("It would also allow, for example:", b.examples);
   box.append(el("div", "meta", "It would have covered " + b.covered + " of this run\u2019s last " + b.recent + " egress requests."));
   list("The zone already reaches this host by:", b.zone_rules);
+}
+// #465: approving an agent's update request installs its build. What, and where, before signing.
+function renderUpdate(box, u) {
+  box.replaceChildren();
+  box.hidden = !u;
+  if (!u) return;
+  if (!u.applies) {
+    box.append(el("div", "meta", "Approving accepts the build with sha256 " + strip(u.sha256).slice(0, 16) +
+      "… once, but doesn’t install it: " + strip(u.why_not || "")));
+    return;
+  }
+  const mib = (u.size / 1048576).toFixed(1);
+  box.append(el("div", "meta", "Approving installs this build now, blue/green with its health gate; a failed gate rolls back."));
+  const ul = el("ul");
+  ul.append(el("li", "", "artifact: " + strip(u.artifact) + " (" + mib + " MiB) from the run’s /workspace/out, sha256 " + strip(u.sha256).slice(0, 16) + "…"));
+  ul.append(el("li", "", "commit: " + (u.commit_said ? strip(u.commit_said) + " (as the agent says; not checked)" : "the agent didn’t say")));
+  ul.append(el("li", "", "reaches: the control host" + ((u.nodes || []).length ? ", then nodes " + u.nodes.map(strip).join(", ") + " (the first is the canary)" : ", and no nodes")));
+  box.append(ul);
 }
 function closeConfirm() {
   document.getElementById("confirm").hidden = true;
