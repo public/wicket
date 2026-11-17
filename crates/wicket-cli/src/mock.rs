@@ -24,12 +24,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-/// The text of the conversation's last message, if it is the user's words (not a tool result).
+/// The conversation's last message from the user (their words or a tool result). The messages
+/// after it are the harness's own notes, which start no turn: Claude Code adds `system` messages
+/// of its own after the user's, for example that an MCP server is still connecting when its
+/// connection to wicket's gateway dropped and came back between turns (a control-host restart).
+/// Taken as the last message, such a note looked like a new turn, and the mock ran its command
+/// twice for one prompt.
+fn last_user(v: &Value) -> Option<&Value> {
+    v.get("messages")?.as_array()?.iter().rev().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+}
+
+/// The text of the conversation's last user message, if it is the user's words (not a tool result).
 fn last_user_text(v: &Value) -> Option<String> {
-    let last = v.get("messages")?.as_array()?.last()?;
-    if last.get("role")?.as_str()? != "user" {
-        return None;
-    }
+    let last = last_user(v)?;
     let text = match last.get("content")? {
         Value::String(s) => s.clone(),
         Value::Array(c) => c
@@ -44,10 +51,10 @@ fn last_user_text(v: &Value) -> Option<String> {
 
 static REPLIES: AtomicU64 = AtomicU64::new(0);
 
-/// The tool result the conversation's last message carries, if any: (its tool_use id, its text).
-/// None: the last message is the user's words, so the turn starts with the command.
+/// The tool result the conversation's last user message carries, if any: (its tool_use id, its
+/// text). None: that message is the user's words, so the turn starts with the command.
 fn tool_result_last(v: &Value) -> Option<(String, String)> {
-    let c = v.get("messages")?.as_array()?.last()?.get("content")?.as_array()?;
+    let c = last_user(v)?.get("content")?.as_array()?;
     let r = c.iter().find(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))?;
     let id = r.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("").to_string();
     let text = match r.get("content") {
@@ -226,5 +233,28 @@ mod tests {
         let v = json!({ "messages": [{ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "toolu_mock_3", "content": [{ "type": "text", "text": "wicket-mock: stay" }] }] }] });
         assert_eq!(tool_result_last(&v), Some(("toolu_mock_3".into(), "wicket-mock: stay".into())));
         assert!(gateway_call("finish").contains(r#""name":"finish""#));
+    }
+
+    /// A `system` note Claude Code adds after the user's message is no new turn: one prompt is one
+    /// command, its result ends the turn. The requests are the ones a control-host restart's
+    /// acceptance check sent (ci/acceptance.sh, restart_flow), where the note said the wicket MCP
+    /// server was still connecting.
+    #[test]
+    fn the_harness_s_own_notes_start_no_turn() {
+        let note = json!({ "role": "system", "content": [{ "type": "text", "text": "The following MCP servers are still connecting — their tools (typically named mcp__<server>__*) are not yet available but will appear shortly:\nwicket" }] });
+        let prompt = json!({ "role": "user", "content": [{ "type": "text", "text": "Again, after the restart." }] });
+        let result = json!({ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "toolu_mock_5", "content": [{ "type": "text", "text": "wicket-mock: stay" }] }] });
+        let asked = json!({ "role": "assistant", "content": [{ "type": "tool_use", "id": "toolu_mock_5", "name": "Bash", "input": {} }] });
+        // The turn's first request: the prompt, then the note. The command runs.
+        let first = json!({ "messages": [prompt, note] });
+        assert_eq!(tool_result_last(&first), None);
+        assert_eq!(last_user_text(&first).as_deref(), Some("Again, after the restart."));
+        // Its result, then another note: the turn ends (it ran the command again before).
+        let second = json!({ "messages": [prompt, note, asked, result, note] });
+        let (id, out) = tool_result_last(&second).expect("the command's result");
+        assert_eq!(next_after(&id, &out), Next::EndTurn);
+        assert_eq!(last_user_text(&second), None);
+        // A conversation of notes only has no user message.
+        assert_eq!(last_user(&json!({ "messages": [note] })), None);
     }
 }
