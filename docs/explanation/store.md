@@ -246,8 +246,8 @@ those two.
    name that isn't UTF-8 now refuses to hibernate, with an error naming the file, and the
    hibernation fails as on any other push error. The agent stays as it was, and the operator's
    output, the agent's note and the audit (`agent.hibernate_failed`) say why. The first PR also
-   converts every version-1 head to a version-2 bundle on the control host's first reconciler pass
-   after it starts. The conversion restores each tree with the version-1 reader and pushes it as
+   converts every version-1 head to a version-2 bundle when the control host's reconciler starts
+   (`wicket reconcile`, before its first pass, and again after `wicket self update` re-executes it). The conversion restores each tree with the version-1 reader and pushes it as
    version 2. The head moves only while the agent's generation, head and seq are unchanged and it
    isn't awake (`Ledger::convert_agent_head`). Each conversion is audited
    (`agent.bundle_converted`, or `agent.bundle_not_converted` with why). Every version-1 bundle

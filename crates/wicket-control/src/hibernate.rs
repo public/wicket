@@ -230,7 +230,7 @@ pub struct Converted {
 }
 
 /// #258: converts every version-1 head to a version-2 bundle (`bundle::convert_v1`), so that the
-/// version-1 reader can go. The control host's first reconciler pass after it starts runs this.
+/// version-1 reader can go. The control host's reconciler runs this as it starts.
 /// Each conversion holds the stores as a push does, and moves the head only while nothing else
 /// moved it and the agent isn't awake (`Ledger::convert_agent_head`): an awake agent's own push
 /// is version 2. Each moved head is audited `agent.bundle_converted`, each that couldn't move
