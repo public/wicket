@@ -43,6 +43,7 @@ use wicket_core::timing::Timings;
 use wicket_core::{Op, RunId, TenantId, ZoneSpec};
 use wicket_feed::{BoxAuthority, Change, KeyCert, LiveGrant, Publisher, PublisherConfig, RevokeKind};
 use wicket_identity::node::NodeCertClaims;
+use wicket_node::AGENT_ASKS;
 use wicket_store::Ledger;
 
 /// The feed's timings for this control host: the defaults, or the test overrides.
@@ -1728,9 +1729,6 @@ fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
     out
 }
 
-/// How a node marks an ask the agent made itself (`request_access`), its reason following.
-pub(crate) const AGENT_ASKS: &str = "asked by the agent: ";
-
 /// The op a node asks about, as the control host classifies it, and why it needs a grant, as this
 /// zone decides it; refused if it isn't this run's, isn't egress, isn't canonical, is in wicket's
 /// own namespace, or doesn't need a grant (forbidden, or already allowed).
@@ -2222,5 +2220,17 @@ mod forget_tests {
         assert!(super::forget_refused(&l, crate::localnode::NAME, "run_a").is_none(), "this host's own node keeps them anyway");
         l.record_collected("run_a", "outbox").unwrap();
         assert!(super::forget_refused(&l, "n1", "run_a").is_none());
+    }
+
+    /// #257 slice 4b: a box starts only on a node talking protocol 13, where its gateway's control
+    /// tools are typed calls; an older one is refused, saying why and what to do.
+    #[test]
+    fn a_box_is_refused_by_a_node_before_protocol_13() {
+        let why = super::refuse_older_node("n1", 12).unwrap_err().to_string();
+        assert!(
+            why.contains("node n1 talks protocol 12") && why.contains("from protocol 13") && why.contains("wicket node install n1"),
+            "{why}"
+        );
+        assert!(super::refuse_older_node("n1", crate::chan::ONE_GATEWAY).is_ok());
     }
 }

@@ -4059,6 +4059,7 @@ dependencies = [
  "wicket-feed",
  "wicket-home",
  "wicket-identity",
+ "wicket-node",
  "wicket-placement",
  "wicket-policy",
  "wicket-proxy",
@@ -4152,6 +4153,44 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "wicket-node"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "ed25519-dalek",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "http",
+ "http-body-util",
+ "humantime",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "time",
+ "tokio",
+ "wicket-agent",
+ "wicket-authz",
+ "wicket-chan",
+ "wicket-core",
+ "wicket-feed",
+ "wicket-home",
+ "wicket-identity",
+ "wicket-proxy",
+ "wicket-sandbox",
+ "wicket-store",
+ "x509-parser",
 ]
 
 [[package]]

@@ -84,7 +84,7 @@ impl NodePaths {
             return PathBuf::from(d);
         }
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        home.join(crate::enrol::NODE_DIR)
+        home.join(crate::NODE_DIR)
     }
     pub fn new(root: Option<PathBuf>) -> NodePaths {
         let root = root.unwrap_or_else(NodePaths::default_root);
@@ -261,7 +261,7 @@ struct Node {
     /// Images being received (#191), by stream.
     images: images::Incoming,
     /// What `wicket node top` shows beyond the rest: boxes starting, egress decisions, connections.
-    seen: crate::top::NodeSeen,
+    seen: crate::status::NodeSeen,
     /// Boxes killed for memory, and failures to persist the node's own state (#377), for its health.
     ooms: Arc<crate::health::Counter>,
     persists: Arc<crate::health::Counter>,
@@ -282,8 +282,8 @@ struct Node {
 impl Node {
     /// What `wicket node top` shows of this node (its status socket's answer): names, deadlines,
     /// states and counts only; no secret, body or credential.
-    fn status(&self) -> crate::top::NodeStatus {
-        use crate::top::{BoxStatus, FeedStatus, NodeStatus};
+    fn status(&self) -> crate::status::NodeStatus {
+        use crate::status::{BoxStatus, FeedStatus, NodeStatus};
         let now = (self.clock)();
         let mut st = NodeStatus { node: self.name.clone(), build: self.build.clone(), now_ms: now, ..Default::default() };
         match std::fs::read_to_string(self.paths.root.join(crate::nodeauth::CERT_FILE)) {
@@ -822,7 +822,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     let listener = wicket_proxy::sockpath::bind(&ctl).with_context(|| format!("listening on {}", ctl.display()))?;
     // `wicket node top`'s status socket (read-only: one JSON document per connection), beside the
     // control socket in the same 0700 directory.
-    let status_sock = crate::top::status_socket(&ctl);
+    let status_sock = crate::status::status_socket(&ctl);
     let _ = std::fs::remove_file(&status_sock);
     let status_listener = wicket_proxy::sockpath::bind(&status_sock).with_context(|| format!("listening on {}", status_sock.display()))?;
     let clock = node_clock();
@@ -903,10 +903,10 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         let n = node.clone();
         // This host's own node runs the control host's versions; another node its own.
         let versions = match n.paths.shares_host() {
-            true => crate::update::Versions::control().root,
+            true => crate::reexec::control_root(),
             false => n.paths.root.join("versions"),
         };
-        crate::update::reexec_on_hangup(n.paths.root.join("serve.pid"), versions, move || {
+        crate::reexec::reexec_on_hangup(n.paths.root.join("serve.pid"), versions, move || {
             for b in n.boxes.lock().expect("boxes").values_mut() {
                 save_output(b);
             }
@@ -1072,7 +1072,7 @@ async fn adopt_previous(node: &Arc<Node>) {
     let runs = node.paths.runs();
     let Ok(boxes) = node.docker.boxes().await else { return };
     for b in boxes {
-        let Some(run) = b.run.as_deref().filter(|r| crate::run::check_run_id(r).is_ok() && runs.join(r).is_dir()) else { continue };
+        let Some(run) = b.run.as_deref().filter(|r| wicket_chan::check_run_id(r).is_ok() && runs.join(r).is_dir()) else { continue };
         let dir = runs.join(run);
         match BoxRecord::load(&dir).filter(|r| r.name == b.name && r.start.run == run) {
             Some(rec) => {
@@ -1111,7 +1111,7 @@ async fn adopt_previous(node: &Arc<Node>) {
     // Boxes that exited while no `serve` ran: their exit is kept for the control host.
     for (name, run) in node.docker.exited_boxes().await.unwrap_or_default() {
         let dir = runs.join(&run);
-        let Some(rec) = BoxRecord::load(&dir).filter(|r| r.name == name && crate::run::check_run_id(&run).is_ok()) else { continue };
+        let Some(rec) = BoxRecord::load(&dir).filter(|r| r.name == name && wicket_chan::check_run_id(&run).is_ok()) else { continue };
         load_derived(node, &dir, &run);
         let code = node.docker.state(&name).await.ok().flatten().map(|s| s.1).unwrap_or(-1);
         wire_exited(node, rec, dir, code).await;
@@ -1140,7 +1140,7 @@ async fn box_ctl(node: &Node, run: &str, what: &str, user: &str, arg: &str) -> R
         "status" => Ok(None),
         "usage" => {
             let d = tree_dir(&node.paths, run, arg)?;
-            Ok(Some(tokio::task::spawn_blocking(move || crate::hibernate::used_bytes(&d)).await?.to_string()))
+            Ok(Some(tokio::task::spawn_blocking(move || crate::boxfiles::used_bytes(&d)).await?.to_string()))
         }
         "pause" => node.docker.pause(&name).await.map(|()| {
             node.seen.paused(run, true);
@@ -1207,7 +1207,7 @@ fn start_box_boxed(
 /// part of `docker run` as Docker's own timestamps show it ([`runtime_spans`]).
 async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: Arc<Timings>) -> Result<String> {
     let run = bs.run.clone();
-    if crate::run::check_run_id(&run).is_ok() && !node.boxes.lock().expect("boxes").contains_key(&run) {
+    if wicket_chan::check_run_id(&run).is_ok() && !node.boxes.lock().expect("boxes").contains_key(&run) {
         node.seen.starting(&run, &bs.zone, wicket_feed::now_ms());
     }
     let r = start_box_steps(node, owner, bs, t).await;
@@ -1220,7 +1220,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     let total = t.span("total");
     let docker = node.docker.timed(t.clone());
     let checks = t.span("checks");
-    crate::run::check_run_id(&bs.run)?;
+    wicket_chan::check_run_id(&bs.run)?;
     if node.boxes.lock().expect("boxes").contains_key(&bs.run) {
         bail!("run {} is already on this node", bs.run);
     }
@@ -1236,7 +1236,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     // A placed node past its lease starts no box (#395): decided here, where the box starts, not
     // only when its run began.
     if let Some(by) = bs.start_by.filter(|by| (node.clock)() / 1000 >= *by) {
-        bail!("{}", crate::nodecreate::past_lease(&node.name, by));
+        bail!("{}", crate::past_lease(&node.name, by));
     }
     // A box whose hosts need the node CA doesn't start on an expired one (#416): every request it
     // made would be refused. The control host renews it over the channel first, if it can.
@@ -1324,7 +1324,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
         if rel.split('/').any(|p| p.is_empty() || p == "..") {
             bail!("bad state file name {rel:?}");
         }
-        crate::hibernate::write_owned(&dir.join("state"), rel, &b64.decode(body)?).with_context(|| format!("writing state file {rel}"))?;
+        crate::boxfiles::write_owned(&dir.join("state"), rel, &b64.decode(body)?).with_context(|| format!("writing state file {rel}"))?;
     }
     let mut volume_mounts = vec![];
     for (name, target) in &bs.volumes {
@@ -1486,7 +1486,7 @@ fn load_derived(node: &Node, dir: &std::path::Path, run: &str) {
 /// own manifest, adapter plan, limits and name. A fresh workspace; no volumes, binds or swaps.
 fn child_start(
     parent: &BoxStart,
-    plan: &crate::spawn::ChildPlan,
+    plan: &crate::childplan::ChildPlan,
     child: &wicket_core::RunId,
     session: &wicket_agent::AgentSession,
     who: serde_json::Value,
@@ -2065,7 +2065,7 @@ fn entry_spans(started: Option<std::time::SystemTime>, text: &str) -> Vec<wicket
 /// `t` has timed its end so far (from when Docker said it exited).
 async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: ExitTimings) {
     let dir = n.boxes.lock().expect("boxes").get(run).map(|b| b.dir.clone());
-    let result = dir.as_ref().and_then(|d| crate::hibernate::read_outbox(d, 64 * 1024)).and_then(|b| String::from_utf8(b).ok());
+    let result = dir.as_ref().and_then(|d| crate::boxfiles::read_outbox(d, 64 * 1024)).and_then(|b| String::from_utf8(b).ok());
     let output = n.boxes.lock().expect("boxes").get_mut(run).map(|b| {
         b.exited = Some((code, result.clone()));
         if let Some(f) = b.stdin.take() {
@@ -2325,7 +2325,7 @@ async fn serve_box(
         let (n, run) = (node.clone(), bs.run.clone());
         tasks.push(tokio::spawn(async move {
             while let Some(ev) = ev_rx.recv().await {
-                if let (wicket_proxy::Event::Egress { outcome, .. }, Some(line)) = (&ev, crate::run::egress_line(&ev)) {
+                if let (wicket_proxy::Event::Egress { outcome, .. }, Some(line)) = (&ev, crate::status::egress_line(&ev)) {
                     n.seen.egress(&run, outcome, line, (n.clock)());
                 }
                 if let Ok(event) = serde_json::to_value(&ev) {
@@ -2738,18 +2738,6 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(node.calls.lock().unwrap().is_empty());
     }
 
-    /// #257 slice 4b: a box starts only on a node talking protocol 13, where its gateway's control
-    /// tools are typed calls; an older one is refused, saying why and what to do.
-    #[test]
-    fn a_box_is_refused_by_a_node_before_protocol_13() {
-        let why = crate::noderun::refuse_older_node("n1", 12).unwrap_err().to_string();
-        assert!(
-            why.contains("node n1 talks protocol 12") && why.contains("from protocol 13") && why.contains("wicket node install n1"),
-            "{why}"
-        );
-        assert!(crate::noderun::refuse_older_node("n1", chan::ONE_GATEWAY).is_ok());
-    }
-
     async fn next_msg(s: &mut UnixStream) -> Frame {
         tokio::time::timeout(std::time::Duration::from_secs(5), chan::read_frame(s)).await.unwrap().unwrap().unwrap()
     }
@@ -2938,7 +2926,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 outcome: o.into(),
                 detail: "d".into(),
             };
-            crate::run::egress_line(&ev).unwrap()
+            crate::status::egress_line(&ev).unwrap()
         };
         for (i, o) in ["allow", "blocked", "spliced", "pending"].iter().enumerate() {
             node.seen.egress("run_a", o, line(o), 10 + i as i64);
@@ -2960,7 +2948,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(a.connected, "its owner's connection is up");
         // Allowed: allow and spliced; refused: blocked and twelve denials; the ask counts as neither.
         assert_eq!((a.egress_allowed, a.egress_refused), (2, 13));
-        assert_eq!(st.egress.len(), crate::top::RECENT);
+        assert_eq!(st.egress.len(), crate::status::RECENT);
         assert_eq!(st.egress[0].at_ms, 111, "newest first");
         assert_eq!(st.egress[0].line, "[egress] DENIED  GET api.example.com/x  (read; d)");
         // An expired certificate says when it expired.
@@ -3536,7 +3524,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         while asks.len() < 2 || made.is_none() {
             match next_msg(&mut c).await {
                 Frame::Msg(Msg::Ask { id, queued: Some((q, _)), prefix: p, why, .. }) => {
-                    assert!(why.starts_with(crate::noderun::AGENT_ASKS), "{why}");
+                    assert!(why.starts_with(crate::AGENT_ASKS), "{why}");
                     assert_eq!(p, q == prefix);
                     let rid = format!("r-{}", asks.len() + 1);
                     c.write_all(&Frame::Msg(Msg::Asked { id, pending: Some((rid.clone(), true)), denied: None, error: None }).encode())
@@ -3907,7 +3895,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let inst = Install::new("ca-renewal");
         let root = wicket_proxy::ca::InstallationCa::generate().unwrap();
         let (node, first) = ca_node(&inst, &root, time::Duration::minutes(6));
-        let issued = crate::nodeca::active(&inst.ledger.lock().unwrap(), "n1").unwrap().issued_at;
+        let issued = crate::controlca::active(&inst.ledger.lock().unwrap(), "n1").unwrap().issued_at;
         // A running box: its egress proxy's minter and router, as `serve_box` made them.
         let live = node.ca();
         let router = NodeRouter { ca: live.clone(), clock: node.clock.clone() };
@@ -3915,7 +3903,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         // Its run's connection, and the control host's side of the renewal (`noderun` drives the
         // same calls on its once-a-second tick).
         let mut c = connect_run(&node, 2, &inst, RUN).await;
-        let mut r = crate::nodeca::CaRenewal::default();
+        let mut r = crate::controlca::CaRenewal::default();
         assert!(r.tick(&inst.ledger, "n1", chan::PROTOCOL, issued + 179).is_none(), "not yet half its life");
         let ask = r.tick(&inst.ledger, "n1", chan::PROTOCOL, issued + 180).expect("due at half its life");
         c.write_all(&Frame::Msg(ask).encode()).await.unwrap();

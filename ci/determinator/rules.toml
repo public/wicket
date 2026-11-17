@@ -87,7 +87,7 @@ post-rule = "skip-rules"
 # gateway, `node create`, the reconciler and a run's supervisor.
 [[path-rule]]
 globs = [
-  "crates/wicket-cli/src/nodesrv.rs", "crates/wicket-cli/src/noderun.rs", "crates/wicket-cli/src/nodegw.rs",
+  "crates/wicket-node/src/nodesrv.rs", "crates/wicket-cli/src/noderun.rs", "crates/wicket-node/src/nodegw.rs",
   "crates/wicket-cli/src/nodecreate.rs", "crates/wicket-cli/src/reconcile.rs", "crates/wicket-cli/src/hibernate.rs",
 ]
 mark-changed = ["wicket-sim"]

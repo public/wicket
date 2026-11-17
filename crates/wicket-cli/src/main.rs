@@ -24,6 +24,8 @@ use wicket_home::{
 
 // Modules that need only wicket-home's helpers moved with them (#219), under their old names here.
 use wicket_home::{audit_export, control, exitcause, images_policy, nodeauth, owner, program, s3, statestore};
+// The node, `wicket node serve` and its gateway (#219), under its old name here.
+use wicket_node::nodesrv;
 
 mod capacity;
 mod ci_update;
@@ -46,7 +48,6 @@ mod nodeca;
 mod nodecall;
 mod nodecreate;
 mod noderun;
-mod nodesrv;
 mod operators;
 mod pin;
 mod policy;

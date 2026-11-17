@@ -22,6 +22,7 @@ use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 use wicket_core::TenantId;
+pub use wicket_node::past_lease;
 use wicket_placement::boot::{self, SCRUBBED_USER_DATA};
 use wicket_placement::model::Boot;
 use wicket_placement::vultr::{ApiKey, Client, VultrConfig, VultrProvider};
@@ -140,14 +141,6 @@ pub fn refuse_past_lease(ledger: &Ledger, node: &str, now: i64) -> Result<Option
         bail!("{}", past_lease(node, p.lease_until));
     }
     Ok(Some(p.lease_until))
-}
-
-/// Why a placed node takes no new run: it is past its lease, which ended at `until`.
-pub fn past_lease(node: &str, until: i64) -> String {
-    format!(
-        "node {node} is past its lease (it ended {}): it takes no new runs, and the reconciler releases it once nothing is on it. Create another node (wicket node create)",
-        fmt_time(until)
-    )
 }
 
 /// After a placed node is released: revokes its enrolment, if it is still enrolled under its name

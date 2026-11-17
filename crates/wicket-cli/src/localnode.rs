@@ -29,10 +29,8 @@
 use anyhow::{bail, Context, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+pub use wicket_node::LOCAL_NODE as NAME;
 use wicket_store::Ledger;
-
-/// The built-in node's name (reserved: `wicket node enrol` refuses it).
-pub const NAME: &str = "local";
 
 /// How long the local node's identity certificate lasts.
 const CERT_TTL: i64 = 86_400;
