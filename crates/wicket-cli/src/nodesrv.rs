@@ -3953,7 +3953,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         // Its health shows the new end, and nothing to alert on.
         let h = node.health();
         assert_eq!(h.ca_not_after, Some(row.not_after));
-        assert!(crate::health::alerts("n1", &h, (node.clock)()).is_empty());
+        // (The CA's alerts only: the host's own disk may alert where the tests run.)
+        assert!(crate::health::alerts("n1", &h, (node.clock)()).iter().all(|a| !a.key.contains("/ca-")));
     }
 
     /// #416: an expired node CA is a health alert, and a box whose hosts need it isn't started.
@@ -3965,7 +3966,9 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let (node, _) = ca_node(&inst, &root, time::Duration::seconds(-1));
         let h = node.health();
         let alerts = crate::health::alerts("n1", &h, (node.clock)());
-        assert_eq!(alerts.iter().map(|a| a.key.as_str()).collect::<Vec<_>>(), ["n1/ca-expired"]);
+        // The CA's alerts only: the host's own disk may alert where the tests run.
+        let ca: Vec<&str> = alerts.iter().map(|a| a.key.as_str()).filter(|k| k.contains("/ca-")).collect();
+        assert_eq!(ca, ["n1/ca-expired"]);
         assert!(node.status().ca_until.is_some_and(|u| u * 1000 < (node.clock)()));
         fed_box(&node, &inst, RUN, "name: z\nreach:\n  - { host: api.example.com }\n");
         node.boxes.lock().unwrap().remove(RUN);
