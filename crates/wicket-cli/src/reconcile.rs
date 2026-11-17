@@ -1407,6 +1407,31 @@ mod tests {
         assert!(d.iter().any(|x| x.kind == "refused" && x.target == "orphan"), "{d:?}");
     }
 
+    /// #409: a child whose supervisor is stuck in its parent's live process is reported each pass
+    /// (not audited, not taken over); once that process is gone it is handled like any other run.
+    #[tokio::test]
+    async fn a_stuck_child_supervisor_is_reported_until_its_process_ends() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_stuck", "alive:1");
+        started(&l, "run_stuck_dead", "dead:1");
+        started(&l, "run_fine", "alive:1");
+        l.set_run_stuck("run_stuck", NOW - 90).unwrap();
+        l.set_run_stuck("run_stuck_dead", NOW - 90).unwrap();
+        let w = World::new(Fake::default());
+        for _ in 0..2 {
+            let d = w.pass(&mut l, NOW, false).await;
+            let stuck: Vec<&Done> = d.iter().filter(|x| x.kind == "run_stuck").collect();
+            assert_eq!(stuck.len(), 1, "{d:?}");
+            assert_eq!(stuck[0].target, "run_stuck");
+            assert!(stuck[0].detail.contains("90s ago"), "{}", stuck[0].detail);
+            assert_eq!(l.run_status("run_stuck").unwrap().as_deref(), Some("running"));
+        }
+        assert_eq!(audited(&l, "reconcile.run_stuck"), 0);
+        // Its process gone (no node recorded): ended as lost, as any run.
+        assert_eq!(l.run_status("run_stuck_dead").unwrap().as_deref(), Some(LOST));
+        assert_eq!(l.run_status("run_fine").unwrap().as_deref(), Some("running"));
+    }
+
     #[tokio::test]
     async fn boxes_whose_run_ended_or_whose_process_is_gone_stop_and_unknown_ones_stay() {
         let mut l = Ledger::open_in_memory().unwrap();
