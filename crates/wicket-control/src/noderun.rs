@@ -407,7 +407,7 @@ pub struct Start {
     pub spent_counted: bool,
     /// The control host's half of the box's gateway (#257 slice 4b): it answers the node's
     /// [`Msg::Call`]s.
-    pub gateway: Arc<wicket_proxy::gateway::Gateway>,
+    pub gateway: Arc<crate::gateway::Gateway>,
     /// What answers the box's `spawn` calls (#257 slice 4c): its children's supervisors run in this
     /// process. None: it may start none.
     pub spawn: Option<Arc<crate::spawn::SpawnCtx>>,
@@ -452,7 +452,7 @@ struct Shared {
     /// What the node had counted when this supervisor took over, if that was already counted.
     spent_base: Mutex<Option<Option<wicket_proxy::llm::Spent>>>,
     /// Answers the node's [`Msg::Call`]s for the box's gateway (#257).
-    gateway: Arc<wicket_proxy::gateway::Gateway>,
+    gateway: Arc<crate::gateway::Gateway>,
     /// Answers the box's `spawn` calls (#257 slice 4c).
     spawn: Option<Arc<crate::spawn::SpawnCtx>>,
     /// The run's credential swaps, which its node makes (#257): what this host releases to it for

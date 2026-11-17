@@ -25,6 +25,8 @@ libfuzzer-sys = "0.4"
 wicket-core = { path = "../crates/wicket-core" }
 wicket-store = { path = "../crates/wicket-store" }
 wicket-proxy = { path = "../crates/wicket-proxy" }
+# The control host's gateway tools (#257), which the gateway target fuzzes.
+wicket-control = { path = "../crates/wicket-control" }
 wicket-chan = { path = "../crates/wicket-chan" }
 wicket-agent = { path = "../crates/wicket-agent" }
 wicket-feed = { path = "../crates/wicket-feed" }

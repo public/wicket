@@ -26,7 +26,7 @@ run's is a tunnel target any more (`llm` went with slice 1, `egress` with slice 
 |---|---|---|
 | `run.rs` → `Egress::new` on `ctl/egress.sock`, deciding through `decide::Central` (compiled zone + ledger: `consume_grant`, `denied_recently`, `pending_for`) | every request to a host the node forwarded instead of terminating | **removed in slice 3**: a host the node CA can't cover is spliced (if the box's token allows it wholesale) or refused on the node (`decide::route`, `Route::Uncovered`) |
 | the same egress's model gate (`Egress::set_model_gate`) | budget and filter for model calls made through egress (wrapped sessions) | **removed in slice 3**, with the forwarded path; since slice 2 the node's egress takes its own model proxy as its gate |
-| `run.rs` → `Gateway::new`, answering the node's `Msg::Call` (`wicket-proxy/src/gateway.rs`) | the `chan::ControlTool`s: `decide`, `expose`/`connect`/`link`/`unlink`/`links`, `finish`, `hibernate`; `send_message`, `await_message`, `request_capacity`, `request_update` while connected; spawns the node doesn't start itself; operator-held `await_grant`/`pending_requests`; `principals`, `receipts`, `delegations`, `continue_child` | these tools need the ledger, the other boxes' records, the placement backend or the run's supervisor; since 4b they are typed calls, not relayed JSON-RPC |
+| `run.rs` → `Gateway::new`, answering the node's `Msg::Call` (`wicket-control/src/gateway.rs`) | the `chan::ControlTool`s: `decide`, `expose`/`connect`/`link`/`unlink`/`links`, `finish`, `hibernate`; `send_message`, `await_message`, `request_capacity`, `request_update` while connected; spawns the node doesn't start itself; operator-held `await_grant`/`pending_requests`; `principals`, `receipts`, `delegations`, `continue_child` | these tools need the ledger, the other boxes' records, the placement backend or the run's supervisor; since 4b they are typed calls, not relayed JSON-RPC |
 | `run.rs` → `Llm::new` on `ctl/llm.sock` | nothing: since #152 the node's model proxy holds the credential (fetched with `SecretFetch`) and calls the model itself; `Llm::relayed`'s relay runs only when the vault isn't sourced, which never happens on a node | **removed in slice 1** |
 | `noderun::ask` / `check_node_ask` / `check_node_op` | raises a pending request for a node's ask, after checking the op belongs to the run's own tenant, run and zone | this is issuance, not a decision: it stays (a peer message only asks) |
 | `noderun::sync_grants` | turns ledger grants into Biscuit grant blocks (`LiveGrant`) on the feed, and renewals into re-minted blocks | publication, not a decision: since slice 3 it only publishes (every egress grant, whatever its host), and the ledger only records issuance. `Ledger::consume_grant` refuses an egress op; it still consumes wicket's own SPAWN and LINK grants for the control-host gateway (slice 4) |
@@ -107,12 +107,13 @@ node's own `Llm`.
      their daemon guards, `RunCtx.spawner`, the `Spawner` type and `Gateway::spawn`. A run's owner
      in the ledger is its process, so a parent and its children share one; if it dies the
      reconciler re-attaches each (`wicket attach`), as their own processes.
-   - **Left of slice 4: the tool bodies.** The control host's tool bodies stay in
-     `wicket-proxy/src/gateway.rs` as the answerers of `ControlTool`s: what needs the ledger has
-     to be answered where the ledger is. Moving them next to `noderun` would leave the gateway
-     module the handshake, but the deterministic simulation (`wicket-sim`, which depends on
-     `wicket-proxy`, not on the `wicket` binary crate) calls them through `Gateway::call_tool`, so
-     they move only with a library the simulation can use.
+   - **The tool bodies (done, after #434).** The control host's tool bodies, the answerers of
+     `ControlTool`s, are in `wicket-control/src/gateway.rs` (with the link tools in
+     `gateway/link.rs` and the delegation tools in `gateway/delegate.rs`), next to `noderun`,
+     which asks them: what needs the ledger is answered where the ledger is. wicket-proxy's
+     gateway module keeps MCP's handshake, the tool list and a spawn's arguments, which the node
+     reads. The deterministic simulation (`wicket-sim`) calls the bodies through
+     `Gateway::call_tool` from the wicket-control library.
 5. **Slice 5 (done): `run.rs` starts no proxies.** (Its gateway socket went with 4b.) With nothing
    left on `ctl/*.sock`, the run supervisor keeps the vault, the ledger, approvals and the feed. The
    control host is forward-only: it relays secrets and asks, and decides nothing per request. Its

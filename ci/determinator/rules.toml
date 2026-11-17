@@ -89,13 +89,12 @@ globs = ["crates/wicket-authz/tests/common/**"]
 mark-changed = ["wicket-feed"]
 post-rule = "skip-rules"
 
-# The simulation's stand-ins follow the node's and the control host's run loops (#324): the node's
-# gateway, `node create`, the reconciler and a run's supervisor.
+# The simulation's stand-ins follow the node's and the control host's run loops (#324). It depends
+# on wicket-control (the control host's gateway tools, #257), and through it on wicket-node, so a
+# run's supervisor, `node create` and the node select it as their reverse dependency; the
+# reconciler, in wicket-cli, needs this rule.
 [[path-rule]]
-globs = [
-  "crates/wicket-node/src/nodesrv.rs", "crates/wicket-control/src/noderun.rs", "crates/wicket-node/src/nodegw.rs",
-  "crates/wicket-control/src/nodecreate.rs", "crates/wicket-cli/src/reconcile.rs", "crates/wicket-control/src/hibernate.rs",
-]
+globs = ["crates/wicket-cli/src/reconcile.rs"]
 mark-changed = ["wicket-sim"]
 post-rule = "skip-rules"
 
