@@ -687,7 +687,6 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         }
         trees.end();
         let start = s.start;
-        refuse_older_node(&name, ctl.proto.load(Ordering::SeqCst))?;
         ca_current(&shared, ctl.proto.load(Ordering::SeqCst)).await;
         // A remote node gets a pinned image it lacks from here, verified there before it imports it
         // (#191); the control host's own node shares its runtime.
@@ -1710,19 +1709,6 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     Some(Frame::Msg(Msg::BudgetSlice { run: sh.run.0.clone(), slice }))
 }
 
-/// Why a box can't start on node `name` talking `proto` (#257 slice 4b): before protocol 13 the node
-/// would relay the box's gateway tools through a tunnel this host no longer serves. Every older
-/// feature floor (pins, budget slices, swaps, no forwarded egress) is below it.
-pub(crate) fn refuse_older_node(name: &str, proto: u32) -> Result<()> {
-    if proto < crate::chan::ONE_GATEWAY {
-        bail!(
-            "node {name} talks protocol {proto}, and this host answers a box's gateway tools only as typed calls, from protocol {}: update the node (`wicket node install {name}`)",
-            crate::chan::ONE_GATEWAY
-        );
-    }
-    Ok(())
-}
-
 /// Releases secret `name` to this run's node, on its first use there (#152): only if the run's zone
 /// (or one of its credential swaps, #257) uses it and the vault's binding covers the hosts it uses
 /// it for. Audited either way.
@@ -2300,17 +2286,5 @@ mod forget_tests {
         assert!(l.take_message_in_flight("run_a").unwrap().is_none(), "once, and never m2");
         assert!(l.message_read("run_a", &m1).unwrap());
         assert_eq!(super::requeue_on_resume(&l, "run_a", false, true, 0), (0, 0), "a reconnect with nothing in flight");
-    }
-
-    /// #257 slice 4b: a box starts only on a node talking protocol 13, where its gateway's control
-    /// tools are typed calls; an older one is refused, saying why and what to do.
-    #[test]
-    fn a_box_is_refused_by_a_node_before_protocol_13() {
-        let why = super::refuse_older_node("n1", 12).unwrap_err().to_string();
-        assert!(
-            why.contains("node n1 talks protocol 12") && why.contains("from protocol 13") && why.contains("wicket node install n1"),
-            "{why}"
-        );
-        assert!(super::refuse_older_node("n1", crate::chan::ONE_GATEWAY).is_ok());
     }
 }
