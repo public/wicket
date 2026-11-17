@@ -25,7 +25,8 @@ CONSTANTS
     FinishInLedger,     \* the agent's finish is recorded in the ledger, not only in its supervisor (#444)
     AckAfterHand,       \* a message is marked delivered once the box has it, and a box drops a repeat (#445)
     RequeueOnReconnect, \* a supervisor gives again, on every reconnect, what it gave on the link that dropped (#453)
-    WakeAfterAuthority  \* a lapsed holder's agent is woken only once every box of it has stopped
+    WakeAfterAuthority, \* a lapsed holder's agent is woken only once every box of it has stopped
+    EndAgentOnLost      \* a run ended as lost ends its agent's activation (#474)
 
 NONE == "none"
 
@@ -172,11 +173,28 @@ Adopt(r) ==
     /\ link' = [link EXCEPT ![r] = [up |-> TRUE, epoch |-> @.epoch + 1]]
     /\ UNCHANGED <<now, host, crashes, agent, box, harness, gen, authUntil, asked, finLedger, stdinOpen, msg, msgTo, handedTo, seen, takenOn, drops>>
 
-(* reconcile.rs (run_lost): no box left, so the run ends. *)
+(* A box that never starts on its node (or stops at once), and its supervisor with it (#474): *)
+(* the run is left with no box and no supervisor, for the reconciler to find.                 *)
+BoxFails(r) ==
+    /\ host = "up" /\ sup[r] = "alive" /\ box[r] = "running"
+    /\ \A m \in Msgs : msgTo[m] = r => msg[m] \notin {"taken", "handed"}
+    /\ box' = [box EXCEPT ![r] = "stopped"]
+    /\ harness' = [harness EXCEPT ![r] = "exited"]
+    /\ sup' = [sup EXCEPT ![r] = "dead"]
+    /\ link' = [link EXCEPT ![r].up = FALSE]
+    /\ UNCHANGED <<now, host, crashes, agent, gen, authUntil, asked, finLedger, finSup, stdinOpen, msg,
+                   msgTo, handedTo, seen, takenOn, drops>>
+
+(* reconcile.rs (run_lost): no box left, so the run ends; Ledger::run_lost ends its agent's     *)
+(* activation with it (#474). The agent has a head (it starts hibernated), so it is hibernated  *)
+(* again, restorable from that head; one that never hibernated would be ended.                  *)
 Lost(r) ==
     /\ host = "up" /\ sup[r] = "dead" /\ box[r] # "running"
     /\ sup' = [sup EXCEPT ![r] = "none"]
-    /\ UNCHANGED <<now, host, crashes, agent, box, harness, gen, authUntil, asked, finLedger, finSup,
+    /\ agent' = IF EndAgentOnLost /\ agent.state = "active" /\ agent.holder = r /\ agent.gen = gen[r]
+                THEN [agent EXCEPT !.state = "hibernated", !.claimUntil = 0]
+                ELSE agent
+    /\ UNCHANGED <<now, host, crashes, box, harness, gen, authUntil, asked, finLedger, finSup,
                    stdinOpen, msg, msgTo, handedTo, seen, link, takenOn, drops>>
 
 (* The agent calls wicket's finish tool: the ledger records it (gateway.rs `want` →          *)
@@ -263,7 +281,7 @@ LinkUp(r) ==
 Next ==
     \/ Tick \/ Crash \/ Restart
     \/ \E r \in Runs : LinkDrop(r) \/ LinkUp(r)
-    \/ \E r \in Runs : Wake(r) \/ Renew(r) \/ Supersede(r) \/ Adopt(r) \/ Lost(r) \/ AskFinish(r)
+    \/ \E r \in Runs : Wake(r) \/ Renew(r) \/ Supersede(r) \/ Adopt(r) \/ Lost(r) \/ BoxFails(r) \/ AskFinish(r)
                        \/ CloseSession(r) \/ HarnessExits(r)
     \/ \E m \in Msgs : Send(m) \/ Ack(m) \/ \E r \in Runs : Take(m, r) \/ Hand(m, r)
 
@@ -292,5 +310,11 @@ NoMessageTwice == \A m \in Msgs, r \in Runs : handedTo[m][r] <= 1
 (* so it closes the session: a finished run's harness never keeps running.                      *)
 FinishKnown ==
     \A r \in Runs : (host = "up" /\ sup[r] = "alive" /\ asked[r] /\ stdinOpen[r] /\ harness[r] = "running") => finSup[r]
+
+(* An active agent has a live run (a supervisor, or one the reconciler can still adopt or end), *)
+(* or a claim that hasn't lapsed (#474): never `active` with nothing behind it, where messages   *)
+(* queue for nobody and the agent shows as running.                                             *)
+ActiveHasRun ==
+    agent.state = "active" => (agent.claimUntil >= now \/ (agent.holder \in Runs /\ sup[agent.holder] # "none"))
 
 =============================================================================
