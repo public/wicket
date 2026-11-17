@@ -78,9 +78,20 @@ suites in `ci/determinator/suites.toml`. Both are reviewed like code.
   changed ones. A change to `wicket-core` affects 12 of the 16 crates. A change to `wicket-fwd`
   affects it, `wicket-proxy`, `wicket-chan`, `wicket-cli` and `wicket-sim`.
 - **Suites.** A suite runs when a path it lists changes (its script, its scenarios), or when a crate
-  it lists is affected. Every end-to-end suite lists `wicket-cli`, which nearly every crate change
-  affects. Kani lists `wicket-core`, and Lean lists `wicket-authz`. Each fuzz target lists the crates
-  its harness links.
+  it lists is affected. Each end-to-end suite lists what it exercises that the others don't:
+  - `smoke`, `acceptance`, `daemon-uids` and `update` list `wicket-cli`, which nearly every crate
+    change affects;
+  - `node-e2e` and `acceptance-nodes` list `wicket-node` and `wicket-chan`, and the control host's
+    side of the node channel (`noderun.rs`, `nodecall.rs`, `enrol.rs`, `nodeca.rs`);
+  - `hibernate` and `restore` list `wicket-store` and the hibernation and state-store paths;
+  - `install-test` lists `deploy/`, the packaging scripts and the CLI's install path (the daemon,
+    units, root copies, `wicket self`);
+  - `tla` lists only its models.
+
+  The end-to-end suites run the built binary, so a change only to tests (`[tests]` in
+  `ci/determinator/suites.toml`: `crates/*/tests/`, test modules and their data) selects none of
+  them. Kani lists `wicket-core`, and Lean lists `wicket-authz`. Each fuzz target lists the crates its
+  harness links.
 - **Docs only.** A change to Markdown, `docs/`, `experiments/` or `refs/` selects no crate and no
   suite: only the doc checks run. A change to `docs/reference/cli.md` also runs `wicket-cli`'s tests,
   one of which checks that page against every command's `--help`.

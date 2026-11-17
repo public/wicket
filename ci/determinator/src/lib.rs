@@ -31,8 +31,16 @@ pub fn graph(dir: &Utf8Path) -> Result<PackageGraph> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SuitesFile {
+    /// Files only a crate's tests read: a change to them can't change what the crate builds.
+    tests: TestsFile,
     suite: BTreeMap<String, Entry>,
     fuzz: FuzzFile,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestsFile {
+    paths: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -49,22 +57,24 @@ struct Entry {
     packages: Vec<String>,
     #[serde(default)]
     paths: Vec<String>,
+    /// The suite runs the built binaries, not the crates' tests: a change only to tests (the
+    /// `[tests]` paths) doesn't select it through its packages.
+    #[serde(default)]
+    binary: bool,
 }
 
 pub struct Suite {
     pub name: String,
     pub packages: Vec<String>,
     pub paths: Vec<String>,
+    /// It runs the built binaries (see `Entry::binary`).
+    pub binary: bool,
     globs: GlobSet,
 }
 
 impl Suite {
-    fn new(name: String, packages: Vec<String>, paths: Vec<String>) -> Result<Self> {
-        let mut b = GlobSetBuilder::new();
-        for p in &paths {
-            b.add(GlobBuilder::new(p).literal_separator(true).build().with_context(|| format!("suite {name}: {p}"))?);
-        }
-        Ok(Suite { globs: b.build()?, name, packages, paths })
+    fn new(name: String, e: Entry) -> Result<Self> {
+        Ok(Suite { globs: globs(&e.paths, &name)?, name, packages: e.packages, paths: e.paths, binary: e.binary })
     }
 
     pub fn matches(&self, path: &Utf8Path) -> bool {
@@ -72,10 +82,21 @@ impl Suite {
     }
 }
 
+fn globs(paths: &[String], what: &str) -> Result<GlobSet> {
+    let mut b = GlobSetBuilder::new();
+    for p in paths {
+        b.add(GlobBuilder::new(p).literal_separator(true).build().with_context(|| format!("{what}: {p}"))?);
+    }
+    Ok(b.build()?)
+}
+
 /// The suites, end-to-end first, then `fuzz-<target>` for each fuzz target.
 pub struct Suites {
     pub suites: Vec<Suite>,
     pub fuzz_targets: Vec<String>,
+    /// The `[tests]` paths: files only a crate's tests read.
+    pub tests: Vec<String>,
+    test_globs: GlobSet,
 }
 
 impl Suites {
@@ -83,15 +104,21 @@ impl Suites {
         let f: SuitesFile = toml::from_str(text).context("ci/determinator/suites.toml")?;
         let mut suites = Vec::new();
         for (name, e) in f.suite {
-            suites.push(Suite::new(name, e.packages, e.paths)?);
+            suites.push(Suite::new(name, e)?);
         }
         let fuzz_targets: Vec<String> = f.fuzz.target.keys().cloned().collect();
-        for (t, e) in f.fuzz.target {
+        for (t, mut e) in f.fuzz.target {
             let mut paths: Vec<String> = f.fuzz.paths.iter().map(|p| p.replace("{t}", &t)).collect();
-            paths.extend(e.paths);
-            suites.push(Suite::new(format!("fuzz-{t}"), e.packages, paths)?);
+            paths.append(&mut e.paths);
+            e.paths = paths;
+            suites.push(Suite::new(format!("fuzz-{t}"), e)?);
         }
-        Ok(Suites { suites, fuzz_targets })
+        Ok(Suites { suites, fuzz_targets, test_globs: globs(&f.tests.paths, "tests")?, tests: f.tests.paths })
+    }
+
+    /// Whether only a crate's tests read `path`.
+    pub fn is_test(&self, path: &Utf8Path) -> bool {
+        self.test_globs.is_match(path.as_std_path())
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -112,6 +139,9 @@ pub struct Selection {
     pub affected: BTreeSet<String>,
     /// The crates whose rdeps() the nextest filterset names: together they cover `affected`.
     pub roots: BTreeSet<String>,
+    /// `affected` through the changed files that aren't only tests (`Suites::is_test`), and the
+    /// simulated builds: what the suites that run the built binaries see change.
+    pub built: BTreeSet<String>,
     pub suites: BTreeSet<String>,
 }
 
@@ -145,6 +175,8 @@ impl Selection {
         det.set_rules(rules)?;
         let mut why = Vec::new();
         let mut everything = false;
+        // The crates marked by files that aren't only tests: what the built binaries see change.
+        let mut code = BTreeSet::new();
         for f in files {
             let mut marked = BTreeSet::new();
             let m = det.match_path(f, |id| {
@@ -154,10 +186,14 @@ impl Selection {
                 PathMatch::RuleMatchedAll => "everything (a rule)".to_string(),
                 PathMatch::NoMatches => "everything (no rule, in no crate)".to_string(),
                 _ if marked.is_empty() => "no crate".to_string(),
-                _ => marked.into_iter().collect::<Vec<_>>().join(" "),
+                _ => marked.iter().cloned().collect::<Vec<_>>().join(" "),
             };
             everything |= matches!(m, PathMatch::RuleMatchedAll | PathMatch::NoMatches);
-            why.push(format!("{f}: {what}"));
+            let test = suites.is_test(f);
+            if !test {
+                code.extend(marked.iter().filter(|n| !n.is_empty()).cloned());
+            }
+            why.push(format!("{f}: {what}{}", if test && !marked.is_empty() { " (its tests only)" } else { "" }));
         }
         if everything {
             return Ok(Self::everything(why));
@@ -186,13 +222,20 @@ impl Selection {
         if !rdeps(&mut roots.iter())?.is_superset(&affected) {
             roots.extend(changed.iter().cloned());
         }
+        // What the built binaries see change: the crates code marked, and those whose simulated
+        // build changed, and every crate depending on one.
+        code.extend(names(&set.summary_changed_set));
+        let built = if code.is_empty() { BTreeSet::new() } else { rdeps(&mut code.iter())? };
         let suites = suites
             .suites
             .iter()
-            .filter(|s| files.iter().any(|f| s.matches(f)) || s.packages.iter().any(|p| affected.contains(p)))
+            .filter(|s| {
+                let through = if s.binary { &built } else { &affected };
+                files.iter().any(|f| s.matches(f)) || s.packages.iter().any(|p| through.contains(p))
+            })
             .map(|s| s.name.clone())
             .collect();
-        Ok(Selection { everything: false, why, changed, affected, roots, suites })
+        Ok(Selection { everything: false, why, changed, affected, roots, built, suites })
     }
 
     /// Cargo's package arguments: `--workspace` for every crate, `-p` per crate, or none.
