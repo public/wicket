@@ -306,9 +306,10 @@ impl Ledger {
              (SELECT spiffe_id FROM identities WHERE run IN (SELECT run FROM agent_runs WHERE agent = ?1 AND run != ?2))",
             params![id, run, t - crate::MESSAGE_HOLD_SECS],
         )?;
+        // Prompts and notices not yet taken (#253), including those queued for the agent itself
+        // while it hibernated (`wicket session <agent> <prompt>`).
         tx.execute(
-            "UPDATE operator_messages SET run = ?2 WHERE consumed_at IS NULL \
-             AND (run = ?1 OR run IN (SELECT run FROM agent_runs WHERE agent = ?1 AND run != ?2))",
+            &format!("UPDATE messages SET to_run = ?2 WHERE {} AND delivered_at IS NULL AND to_run = ?1", crate::TURNS),
             params![id, run],
         )?;
         tx.commit()?;
@@ -369,17 +370,19 @@ impl Ledger {
     /// Undelivered peer messages waiting for `run`.
     pub fn waiting_messages(&self, run: &str) -> Result<i64> {
         Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE to_run = ?1 AND delivered_at IS NULL AND taken_at IS NULL",
+            &format!("SELECT COUNT(*) FROM messages WHERE to_run = ?1 AND {} AND delivered_at IS NULL AND taken_at IS NULL", crate::PEER),
             params![run],
             |r| r.get(0),
         )?)
     }
 
-    /// Operator messages queued for `run` and not yet handed to it.
-    pub fn waiting_operator_messages(&self, run: &str) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("SELECT COUNT(*) FROM operator_messages WHERE run = ?1 AND consumed_at IS NULL", params![run], |r| r.get(0))?)
+    /// Prompts and notices queued for `run` and not yet handed to it.
+    pub fn waiting_prompts(&self, run: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM messages WHERE to_run = ?1 AND {} AND delivered_at IS NULL", crate::TURNS),
+            params![run],
+            |r| r.get(0),
+        )?)
     }
 
     /// Every run of an agent, oldest first.
