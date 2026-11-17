@@ -197,6 +197,12 @@ pub struct BoxStart {
     /// The box's Docker name (`<prefix>-<run>`), if the control host names it.
     #[serde(default)]
     pub name: Option<String>,
+    /// The box's hostname (#469): the manifest's `agent.hostname`, or for a Remote Control server
+    /// its node's name, which the Claude apps show as the machine's. The node uses it only if it is
+    /// a plain name. None: Docker's (the container's id). A node before it ignores it, so it needs
+    /// no protocol version: such a box keeps Docker's hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     /// What the run (or its long-lived agent) already spent of the zone's model budget: requests,
     /// input and output tokens. The node's model proxy starts from it (#151).
     #[serde(default)]

@@ -46,6 +46,8 @@ pub struct SandboxSpec {
     pub interactive: bool,
     /// Extra labels, e.g. which run and which process own the box (`wicket reap` reads them).
     pub labels: Vec<(String, String)>,
+    /// The box's hostname (#469), a plain name; None: Docker's (the container's id).
+    pub hostname: Option<String>,
 }
 
 /// A wicket box Docker is running, as `Docker::boxes` lists it.
@@ -614,6 +616,12 @@ impl Docker {
         for (k, v) in &spec.labels {
             a.push("--label".into());
             a.push(format!("{k}={v}"));
+        }
+        // The box's hostname, if it is given one (#469), and only a plain name. Else Docker's: the
+        // container's id.
+        if let Some(h) = spec.hostname.as_deref().filter(|h| wicket_core::manifest::hostname_ok(h)) {
+            a.push("--hostname".into());
+            a.push(h.to_string());
         }
         // /tmp: a tmpfs, unless wicket mounts a host directory there (a local box's /tmp is kept with
         // the rest of its writable state, #70).

@@ -1541,6 +1541,8 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
             .filter(|w| w.starts_with('/') && node.paths.shares_host())
             .unwrap_or_else(|| wicket_agent::WORKSPACE.into()),
         interactive: false,
+        // A plain name only (#469); anything else leaves Docker's.
+        hostname: bs.hostname.clone().filter(|h| wicket_core::manifest::hostname_ok(h)),
         // Its owner: on the control host's own node, the run's process (what the reconciler there
         // judges); elsewhere this `serve` (what the next `serve` judges, `reap_previous`).
         labels: vec![
@@ -1687,6 +1689,9 @@ fn child_start(
         long_lived: false,
         durable: vec![],
         name,
+        // A name its manifest gives it (#469). Not `node`, nor a server's default: this node
+        // doesn't know its own name here (the control host does, for the boxes it starts).
+        hostname: m.agent.as_ref().and_then(|a| a.hostname.clone()).filter(|h| h != "node"),
         llm_prior: (0, 0, 0),
         // On the same node as its parent: started no later than its parent could be.
         start_by: parent.start_by,

@@ -1087,6 +1087,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // An ACP agent's own command: its runtime, for the quiet-point check (with its harness's own).
     let agent_cmd: Vec<String> = if acp_cfg.is_some() { plan.argv.iter().skip(1).cloned().collect() } else { vec![] };
     let name = crate::links::box_name(&run.0);
+    // The box's hostname (#469): the manifest's, or for a Remote Control server its node's name,
+    // the machine's in the Claude apps. The control host's own node goes by the host's name.
+    let hostname = m.agent.as_ref().and_then(|a| {
+        let node = match node_name.as_str() {
+            crate::localnode::NAME => std::fs::read_to_string("/proc/sys/kernel/hostname").map(|h| h.trim().to_string()).unwrap_or_default(),
+            n => n.to_string(),
+        };
+        a.hostname_on(if node.is_empty() { crate::localnode::NAME } else { &node })
+    });
     let spec = SandboxSpec {
         name: name.clone(),
         image: image.to_string(),
@@ -1102,6 +1111,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         workdir: wrap_cwd.as_ref().map(|c| c.display().to_string()).unwrap_or_else(|| wicket_agent::WORKSPACE.into()),
         interactive,
         labels: vec![],
+        hostname,
     };
 
     timings.since("plan", lap);
@@ -1231,6 +1241,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             owner: Some(crate::owner::owner_label()),
             long_lived: box_tmp,
             name: Some(spec.name.clone()),
+            hostname: spec.hostname.clone(),
             llm_prior: llm.spent_total(),
             start_by,
             output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),

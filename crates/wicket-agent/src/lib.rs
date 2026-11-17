@@ -335,9 +335,10 @@ pub fn claude_code_remote_control_plan(
         "remote-control",
         "--name",
         rc.name.as_str(),
-        // One session per box: the box ends with it.
+        // One session per box, which the box ends with; or a server (#469), which starts the
+        // sessions the apps ask for, in the box's directory.
         "--spawn",
-        "session",
+        rc.spawn.as_arg(),
         // The manifest's mode: `default` asks in the app before it acts, as a session on the owner's
         // own machine would; wicket's proxies decide what the box can reach whatever the mode.
         "--permission-mode",
@@ -1009,6 +1010,11 @@ mod tests {
         assert_eq!(&w.plan.argv[..5], ["wicket-entry", "claude", "remote-control", "--name", "my box"]);
         assert!(w.plan.argv.windows(2).any(|p| p == ["--spawn", "session"]));
         assert!(w.plan.stdin_task.is_none());
+        // A server (#469): the sessions the apps ask for, in the box's directory.
+        let mut server = m.clone();
+        server.agent.as_mut().unwrap().remote.as_mut().unwrap().spawn = wicket_core::RemoteSpawn::SameDir;
+        let s = harness::of(&server).unwrap().remote_plan(&server, &run, &meta).unwrap();
+        assert!(s.plan.argv.windows(2).any(|p| p == ["--spawn", "same-dir"]));
         let file = |rel: &str| -> Value { serde_json::from_slice(&w.files.iter().find(|(r, _)| r == rel).unwrap().1).unwrap() };
         let creds = file("claude/.credentials.json");
         assert_eq!(creds["claudeAiOauth"]["accessToken"], w.login_placeholder);
