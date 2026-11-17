@@ -14,6 +14,7 @@ path = "src/main.rs"
 wicket-core.workspace = true
 wicket-store.workspace = true
 wicket-proxy.workspace = true
+wicket-chan.workspace = true
 wicket-sandbox.workspace = true
 wicket-agent.workspace = true
 wicket-auth.workspace = true
@@ -42,7 +43,7 @@ reqwest.workspace = true
 # client (reqwest, already a dependency), which is also the seam the tests' mock ACME server plugs into.
 # (Its ring feature pulls rcgen 0.14 for CSRs; wicket's own certificates stay on the workspace rcgen.)
 instant-acme = { version = "0.8", default-features = false, features = ["ring"] }
-x509-parser = "0.18"
+x509-parser = { version = "0.18", features = ["verify"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hyper.workspace = true
@@ -67,6 +68,7 @@ p256 = { version = "0.14", features = ["ecdsa", "getrandom"] }
 ring = "0.17"
 
 [dev-dependencies]
+wicket-chan = { workspace = true, features = ["testkit"] }
 rusqlite.workspace = true
 ciborium = "0.2"
 wicket-placement = { workspace = true, features = ["mock"] }

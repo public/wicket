@@ -19,14 +19,7 @@ fn identity_ttl() -> i64 {
     std::env::var("WICKET_IDENTITY_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(600).max(20)
 }
 
-/// Whether `id` is a run id wicket made (`run_` and 26 lowercase letters or digits).
-pub fn check_run_id(id: &str) -> Result<()> {
-    if id.len() == 30 && id.starts_with("run_") && id[4..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
-        Ok(())
-    } else {
-        bail!("bad run id {id:?}")
-    }
-}
+pub use wicket_chan::check_run_id;
 
 /// The run's box, on whichever node it runs: stop it, revoke it, look inside it.
 #[derive(Clone)]

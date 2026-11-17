@@ -22,7 +22,7 @@ use std::path::Path;
 use tokio::io::AsyncWriteExt;
 use zeroize::Zeroizing;
 
-/// Where a node may pull an image from (#191): what [`crate::images_policy::Registry`] allows, as
+/// Where a node may pull an image from (#191): what the CLI's `images_policy::Registry` allows, as
 /// the control host sends it with a pull.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Source {
@@ -318,7 +318,7 @@ pub async fn pull(src: &Source, pin: &str, name: Option<&str>, cred: Option<&str
     tokio::task::spawn_blocking(move || crate::oci::finish(&d, &have, &pin, name.as_deref())).await?
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit {
     //! A registry for tests: serves an image's blobs by digest over HTTP on a loopback port, behind
     //! a token challenge if asked, and counts what it served.

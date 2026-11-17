@@ -102,7 +102,7 @@ crates/wicket-cli/src/noderun.rs   | -   | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/nodegw.rs    | -   | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/nodeauth.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodecall.rs  | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/nodesecrets.rs | - | node-e2e acceptance-nodes tla
+crates/wicket-chan/src/nodesecrets.rs | - | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/enrol.rs     | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodecreate.rs| -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/reconcile.rs | -   | node-e2e acceptance-nodes acceptance
@@ -127,7 +127,7 @@ crates/wicket-cli/src/cmd/node.rs    | - | hibernate restore acceptance acceptan
 crates/wicket-cli/src/cmd/operator.rs | - | install-test daemon-uids acceptance
 crates/wicket-cli/src/cmd/policy.rs  | - | restore acceptance policy
 crates/wicket-cli/src/cmd/zone.rs    | - | acceptance
-# Not listed on purpose, so they select every suite: the node protocol (chan.rs), the ledger's
+# Not listed on purpose, so they select every suite: the node protocol (wicket-chan's chan.rs), the ledger's
 # schema (wicket-store), token formats (wicket-authz, wicket-feed), wicket-core, run.rs.
 
 # ---- Kani proof harnesses and the loom test (#325) ----
@@ -201,15 +201,12 @@ fuzz/regressions/canon/**          | -   | fuzz-canon
 # ---- fuzz targets: the code each one fuzzes (tags; see the top) ----
 # Every target depends on wicket-core.
 crates/wicket-core/src/**          | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git fuzz-canon
-# The chan target compiles the CLI's channel modules, which carry proxy, feed and identity types.
+# The chan target links wicket-chan (#219), whose messages carry proxy, feed, agent and identity types.
 crates/wicket-proxy/src/**         | -   | fuzz-egress fuzz-gateway fuzz-chan
-crates/wicket-cli/src/chan.rs      | -   | fuzz-chan
-crates/wicket-cli/src/nodesecrets.rs | - | fuzz-chan
-crates/wicket-cli/src/oci.rs       | -   | fuzz-chan
-crates/wicket-cli/src/registry.rs  | -   | fuzz-chan
+crates/wicket-chan/src/**          | -   | fuzz-chan
 crates/wicket-feed/src/**          | -   | fuzz-feed fuzz-chan
 crates/wicket-authz/src/**         | -   | fuzz-feed fuzz-token fuzz-manifest fuzz-chan
-crates/wicket-agent/src/**         | -   | fuzz-manifest
+crates/wicket-agent/src/**         | -   | fuzz-manifest fuzz-chan
 crates/wicket-policy/src/**        | -   | fuzz-manifest
 crates/wicket-store/src/**         | -   | fuzz-store fuzz-egress fuzz-gateway fuzz-chan
 crates/wicket-identity/src/**      | -   | fuzz-chan

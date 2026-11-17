@@ -168,6 +168,11 @@ impl NodeCa {
         Ok(NodeCa { issuer, der, not_after, permitted, leaves: Mutex::new(HashMap::new()) })
     }
 
+    /// The certificate as issued (DER).
+    pub fn cert_der(&self) -> &[u8] {
+        &self.der
+    }
+
     /// Whether the CA may mint for `host` at `now` (Unix seconds).
     pub fn may_mint(&self, host: &str, now: i64) -> bool {
         now < self.not_after && self.permitted.iter().any(|s| crate::decide::subtree_permits(s, host))
@@ -183,8 +188,8 @@ impl Minter for NodeCa {
         if let Some(c) = self.leaves.lock().expect("lock").get(host) {
             return Ok(c.clone());
         }
-        // A leaf never outlives its CA; cached leaves are dropped with the process (the CA is renewed
-        // daily, and `node serve` reloads it).
+        // A leaf never outlives its CA; cached leaves are dropped with it (a renewed CA is a new
+        // `NodeCa`, swapped in under the node's boxes).
         let not_after = (OffsetDateTime::now_utc() + Duration::days(1)).min(OffsetDateTime::from_unix_timestamp(self.not_after)?);
         let cfg = leaf_config(host, &self.issuer, &self.der, not_after)?;
         self.leaves.lock().expect("lock").insert(host.to_string(), cfg.clone());
@@ -221,7 +226,8 @@ pub struct NodeCaCert {
     pub permitted: Vec<String>,
 }
 
-/// How long a node intermediate lives unless asked otherwise. Renewal is `wicket node renew-ca`.
+/// How long a node intermediate lives unless asked otherwise. It is renewed over the control channel at
+/// half-life (#416), or with `wicket node renew-ca`.
 pub const NODE_CA_TTL: Duration = Duration::hours(24);
 
 impl InstallationCa {

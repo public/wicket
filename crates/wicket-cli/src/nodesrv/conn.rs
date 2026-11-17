@@ -484,6 +484,30 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 };
                 node.send_to(gen, Frame::Msg(Msg::NodeCertInstalled { serial, error }));
             }
+            // The node CA's renewal (#416, protocol 14): a new key and its request, then its certificate.
+            Msg::CaRenew {} => {
+                let (csr, error) = match super::nodeca::begin(&node.ca_pending, &node.name, (node.clock)() / 1000) {
+                    Ok(csr) => (Some(csr), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+                node.send_to(gen, Frame::Msg(Msg::CaCsr { csr, error }));
+            }
+            Msg::NodeCa { pem } => {
+                let now = (node.clock)() / 1000;
+                let got = super::nodeca::install(&node.ca_pending, &node.paths.root, &node.root_pem, node.paths.shares_host(), &pem, now);
+                let (serial, error) = match got {
+                    Ok((ca, serial)) => {
+                        eprintln!("[node] node CA renewed: serial {serial} until {}; every box mints from it now", ca.not_after);
+                        node.live_ca.set(Some(ca));
+                        (serial, None)
+                    }
+                    Err(e) => {
+                        eprintln!("[node] refused a renewed node CA: {e:#}");
+                        (String::new(), Some(format!("{e:#}")))
+                    }
+                };
+                node.send_to(gen, Frame::Msg(Msg::NodeCaInstalled { serial, error }));
+            }
             other => bail!("unexpected message from the control host: {other:?}"),
         },
     }
