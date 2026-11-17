@@ -1282,25 +1282,7 @@ pub async fn prune(nodes: Option<String>, only_nodes: bool, keep: usize, dry_run
 /// without stopping their boxes and `bin`'s reconciler adopts their runs, and the console and the
 /// reconciler service re-execute themselves.
 async fn handover(bin: &Path) -> Result<()> {
-    // Supervisors: a SIGKILL ends one without its box (a SIGTERM would stop the box).
-    let mut killed = vec![];
-    {
-        let l = Ledger::open(&crate::ledger_path())?;
-        for (run, owner) in l.running_runs()? {
-            let Some(o) = owner else { continue };
-            if crate::owner::owner_alive(&o) != Some(true) {
-                continue;
-            }
-            let Some(pid) = o.split(':').nth(1).and_then(|p| p.parse::<i32>().ok()) else { continue };
-            if pid as u32 == std::process::id() {
-                continue;
-            }
-            // SAFETY: a plain syscall.
-            if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
-                killed.push(run);
-            }
-        }
-    }
+    let killed = stop_stale_supervisors(&Ledger::open(&crate::ledger_path())?, bin)?;
     // This host's own node.
     let local = crate::localnode::pidfile()?;
     if let Some(pid) = hangup(&local, "node serve") {
@@ -1318,17 +1300,65 @@ async fn handover(bin: &Path) -> Result<()> {
         }
     }
     if !killed.is_empty() {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let out = tokio::process::Command::new(bin).arg("reconcile").output().await.context("running the new build's reconcile")?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let adopted: Vec<&String> =
-            killed.iter().filter(|r| text.lines().any(|l| l.starts_with("run_adopted") && l.contains(r.as_str()))).collect();
-        say(format!("runs: {} handed over, {} adopted by the new build", killed.len(), adopted.len()));
-        if adopted.len() != killed.len() {
-            eprintln!("{text}{}", String::from_utf8_lossy(&out.stderr));
-        }
+        let bin = bin.to_path_buf();
+        say(tokio::task::spawn_blocking(move || adopt_handed(&bin, &killed)).await??);
     }
     Ok(())
+}
+
+/// Stops each run supervisor on this machine that isn't running `bin` (an older build), so the new
+/// build takes its run over (#151's path, [`adopt_handed`]). A SIGKILL ends a supervisor without its
+/// box (a SIGTERM would stop the box). Returns the runs whose supervisors were stopped, once each
+/// of those processes is gone (or after a few seconds).
+///
+/// No supervisor keeps an old build across an install or an update (#475): an old build reads a
+/// ledger whose newer rows it may not understand, so the expand/contract rule
+/// (docs/explanation/updates.md, "Migrations") only has to hold for the seconds of a handover.
+pub fn stop_stale_supervisors(ledger: &Ledger, bin: &Path) -> Result<Vec<String>> {
+    let mut killed = vec![];
+    for (run, owner) in ledger.running_runs()? {
+        let Some(o) = owner else { continue };
+        if crate::owner::owner_alive(&o) != Some(true) {
+            continue;
+        }
+        let Some(pid) = o.split(':').nth(1).and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if pid == std::process::id() || !runs_other_build(pid, bin) {
+            continue;
+        }
+        // SAFETY: a plain syscall.
+        if unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0 {
+            killed.push((run, o));
+        }
+    }
+    // Gone once reaped (by its parent, or by init for a supervisor that outlived its wicketd).
+    for _ in 0..100 {
+        if killed.iter().all(|(_, o)| crate::owner::owner_alive(o) != Some(true)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(killed.into_iter().map(|(r, _)| r).collect())
+}
+
+/// Whether process `pid` runs a binary other than `bin`. One whose binary can't be read is taken
+/// as another: handing a run over to the same build costs a re-attach, keeping an old one costs
+/// its prompts (#475).
+fn runs_other_build(pid: u32, bin: &Path) -> bool {
+    let want = std::fs::canonicalize(bin).ok();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    want.is_none() || exe != want
+}
+
+/// Runs `bin`'s reconciler, which starts a new supervisor (`wicket attach`, on `bin`) for each run
+/// in `killed` whose box still runs: what [`stop_stale_supervisors`] stopped. Says how many were.
+pub fn adopt_handed(bin: &Path, killed: &[String]) -> Result<String> {
+    let out = std::process::Command::new(bin).arg("reconcile").output().context("running the new build's reconcile")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let adopted = killed.iter().filter(|r| text.lines().any(|l| l.starts_with("run_adopted") && l.contains(r.as_str()))).count();
+    if adopted != killed.len() {
+        eprintln!("{text}{}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(format!("runs: {} handed over, {adopted} adopted by the new build", killed.len()))
 }
 
 /// Runs the health gate for `target` (`control`, or `node:<name>`) over its window: `bin`'s
@@ -1716,6 +1746,36 @@ pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #475: a supervisor on another build than the one handing over is stopped (and its run
+    /// reported, for the new build's reconciler to adopt); one on the same build, and this process,
+    /// are left alone.
+    #[test]
+    fn only_supervisors_on_another_build_are_stopped() {
+        let old = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let same = std::process::Command::new("sh").args(["-c", "sleep 30; :"]).spawn().unwrap();
+        let (old_pid, same_pid) = (old.id(), same.id());
+        let bin = std::fs::canonicalize(format!("/proc/{same_pid}/exe")).unwrap();
+        let reaper = |mut c: std::process::Child| std::thread::spawn(move || c.wait());
+        let (old_t, _same_t) = (reaper(old), reaper(same));
+        if std::fs::canonicalize(format!("/proc/{old_pid}/exe")).unwrap() == bin {
+            eprintln!("sleep and sh are one binary here: nothing to tell apart");
+            // SAFETY: plain syscalls on this test's own children.
+            unsafe { libc::kill(old_pid as i32, libc::SIGKILL) };
+            unsafe { libc::kill(same_pid as i32, libc::SIGKILL) };
+            return;
+        }
+        let l = Ledger::open_in_memory().unwrap();
+        for (run, pid) in [("run_old", old_pid), ("run_same", same_pid), ("run_here", std::process::id())] {
+            l.run_started(&TenantId::single(), &wicket_core::RunId(run.into()), "z", "claude").unwrap();
+            l.set_run_owner(run, &crate::owner::owner_label_of(pid).unwrap()).unwrap();
+        }
+        assert_eq!(stop_stale_supervisors(&l, &bin).unwrap(), vec!["run_old".to_string()]);
+        assert!(old_t.join().unwrap().is_ok(), "stopped and reaped");
+        assert_eq!(crate::owner::owner_alive(&l.run_owner("run_same").unwrap().unwrap()), Some(true));
+        // SAFETY: as above.
+        unsafe { libc::kill(same_pid as i32, libc::SIGKILL) };
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("wicket-self-{tag}-{}", std::process::id()));

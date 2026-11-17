@@ -200,7 +200,11 @@ newest that has opened it) and its **floor** (the oldest that may open it) in `s
 
 - **Expand** steps (a new table, a new column with a default, a new index) bump the version and leave the
   floor: older builds ignore what they don't know, so a rollback across them is safe. Every migration up to
-  #162 is one of these (version 1).
+  #162 is one of these (version 1). An expand step leaves what an older build *reads* alone: a step
+  that adds rows an older query would mishandle to a table it reads is not one, whatever its DDL
+  (#475: schema 17 put prompts in the `messages` an older `await_message` took peers' messages from,
+  and older supervisors dropped them). The store's `previous_build` test reads a ledger the build
+  writes with the previous build's queries.
 - **Contract** steps (dropping or rewriting anything an older build reads) raise the floor to their
   version. A build below the floor refuses to open the ledger, and `wicket self rollback` refuses to
   switch to it. A contract step ships only in a release after the one whose expand step stopped anything

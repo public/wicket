@@ -19,6 +19,8 @@ pub mod bundle;
 pub mod cas;
 mod links;
 mod node;
+#[cfg(test)]
+mod previous_build;
 mod quota;
 mod receipts;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
@@ -69,6 +71,9 @@ pub enum StoreError {
 /// The ledger's schema version (#162). Every migration bumps it, and records what kind it is:
 /// - **expand** (a new table, a new column with a default, a new index): older binaries ignore it,
 ///   so a rollback across it is safe. [`SCHEMA_FLOOR`] stays.
+///   An expand step leaves what an older binary reads alone: one that adds rows an older query
+///   would mishandle to a table it reads is not one (#475; `previous_build` reads this build's
+///   ledger with the previous build's queries).
 /// - **contract** (dropping or rewriting anything an older binary reads): [`SCHEMA_FLOOR`] is raised
 ///   to this version, and binaries below it refuse to open the ledger ([`StoreError::TooNew`]), so
 ///   `wicket self rollback` refuses to go back across it. A contract step ships only in a release
