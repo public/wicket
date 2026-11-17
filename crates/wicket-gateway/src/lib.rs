@@ -176,6 +176,13 @@ impl Gateway {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
+                // An update is nothing to retry (#465): the console applies it.
+                "granted" if req.method == "UPDATE" && req.host == "wicket.internal" => {
+                    return (
+                        format!("granted: {id} was approved. Approved in the console, wicket is installing your build now and tells you how it ended in a notice; approved with `wicket approve`, the operator runs the update on the host. Don't ask again."),
+                        false,
+                    )
+                }
                 "granted" => {
                     return (
                         format!("granted: {id} was approved. Retry the same request now ({} {}{}).", req.method, req.host, req.path),
@@ -461,6 +468,14 @@ impl Gateway {
         if reason.is_empty() || reason.len() > 1000 {
             return ("`reason` is required (at most 1000 characters): what the build is, and where its artifact is".into(), true);
         }
+        // The commit the agent says it is, for the approval card (#465): its word, shown as such.
+        let commit = match args.get("commit").and_then(|v| v.as_str()).map(str::trim) {
+            None | Some("") => String::new(),
+            Some(c) if (7..=40).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                format!(" of commit {}", c.to_ascii_lowercase())
+            }
+            Some(_) => return ("`commit` is a git commit: 7 to 40 hex digits".into(), true),
+        };
         let mut op = wicket_core::Op::egress(
             &self.ctx.tenant,
             &self.ctx.run,
@@ -475,10 +490,11 @@ impl Gateway {
             return (format!("an operator denied exactly this update ({rid}) a few minutes ago; don't ask again"), true);
         }
         // The artifact's hash is the argument the approval is for (#369), as well as its path.
-        match l.file_request(&op, Some(sha), &format!("update wicket to the build with sha256 {sha}: {reason}"), None).map(|f| f.id().to_string()) {
+        let filed = l.file_request(&op, Some(sha), &format!("update wicket to the build with sha256 {sha}{commit}: {reason}"), None);
+        match filed.map(|f| f.id().to_string()) {
             Ok(rid) => (
                 format!(
-                    "needs an operator: request {rid}. This does not update wicket, and nothing you can call does. If an operator approves it, they run `wicket self update <artifact>` on the control host, which accepts the artifact with sha256 {sha} once. Call await_grant with {rid} to wait for the decision."
+                    "needs an operator: request {rid}. This does not update wicket, and nothing you can call does. If an operator approves it in the console, wicket takes the file with sha256 {sha} from /workspace/out, updates the control host and then its nodes (rolling back on a failed health gate), and tells you how it ended in a notice; your run carries on through it. Approved with `wicket approve`, the operator runs `wicket self update <artifact>` on the host instead. Call await_grant with {rid} to wait for the decision."
                 ),
                 false,
             ),
@@ -1309,6 +1325,14 @@ mod tests {
         assert!(gw.request_update(&json!({ "sha256": "../../etc", "reason": "x" })).1);
         assert!(gw.request_update(&json!({ "sha256": sha.to_uppercase(), "reason": "x" })).1);
         assert!(gw.request_update(&json!({ "sha256": sha })).1);
+        // The commit it says it is goes on the request, for the card (#465); only a commit does.
+        let other = "1f".repeat(32);
+        let (text, err) = gw.request_update(&json!({ "sha256": other, "reason": "main", "commit": "36C92B5E" }));
+        assert!(!err && text.contains("in the console"), "{text}");
+        let pending = w.ledger.lock().unwrap().pending(&TenantId("t0".into())).unwrap();
+        let r = pending.iter().find(|r| r.path.ends_with(&other)).unwrap();
+        assert_eq!(r.reason, format!("update wicket to the build with sha256 {other} of commit 36c92b5e: main"));
+        assert!(gw.request_update(&json!({ "sha256": other, "reason": "x", "commit": "main; rm" })).1);
         assert!(wicket_proxy::gateway::tools().as_array().unwrap().iter().any(|t| t["name"] == "request_update"));
     }
 

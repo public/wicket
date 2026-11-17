@@ -150,6 +150,7 @@ pub fn route(cmd: &Cmd) -> Route {
             | SelfCmd::Rollback { .. }
             | SelfCmd::Prune { .. }
             | SelfCmd::TrustKey { .. }
+            | SelfCmd::ApplyUpdate { .. }
             | SelfCmd::Health { .. } => Forward(Privileged),
             // Touch no wicket data.
             SelfCmd::Keygen { .. } | SelfCmd::Sign { .. } | SelfCmd::Describe | SelfCmd::Units => Local,
@@ -174,7 +175,12 @@ pub fn root_only(cmd: &Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Itself {
-            cmd: SelfCmd::Update { .. } | SelfCmd::Follow | SelfCmd::Rollback { .. } | SelfCmd::Prune { .. } | SelfCmd::TrustKey { .. }
+            cmd: SelfCmd::Update { .. }
+                | SelfCmd::Follow
+                | SelfCmd::Rollback { .. }
+                | SelfCmd::Prune { .. }
+                | SelfCmd::TrustKey { .. }
+                | SelfCmd::ApplyUpdate { .. }
         }
     )
 }
@@ -370,6 +376,7 @@ mod tests {
             (&["self", "update", "/tmp/w.tar.gz"], Route::Forward(Privileged)),
             (&["self", "update", "/tmp/w", "--nodes", "all"], Route::Forward(Privileged)),
             (&["self", "rollback"], Route::Forward(Privileged)),
+            (&["self", "apply-update", "req_x"], Route::Forward(Privileged)),
             (&["self", "prune", "--dry-run"], Route::Forward(Privileged)),
             (&["self", "trust-key", "/tmp/k.pub"], Route::Forward(Privileged)),
             (&["self", "keygen", "/tmp/k"], Route::Local),

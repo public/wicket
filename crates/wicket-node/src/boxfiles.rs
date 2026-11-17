@@ -5,17 +5,16 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use wicket_store::bundle;
 
-/// Reads a box's typed output file, `<root>/workspace/out/result.json`, without trusting the box:
-/// no component under `root` is followed if it is a symlink, the file must be a regular file of
-/// at most `max` bytes, and at most `max + 1` bytes are read. Anything else is "no result".
-pub fn read_outbox(root: &Path, max: usize) -> Option<Vec<u8>> {
-    use std::io::Read;
+fn open_at(dir: libc::c_int, name: &str, flags: libc::c_int) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let c = std::ffi::CString::new(name).ok()?;
+    let fd = unsafe { libc::openat(dir, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// `<root>/workspace/out`, opened without following a symlink under `root`.
+fn open_outbox(root: &Path) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let open_at = |dir: libc::c_int, name: &str, flags: libc::c_int| -> Option<OwnedFd> {
-        let c = std::ffi::CString::new(name).ok()?;
-        let fd = unsafe { libc::openat(dir, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
-    };
     let c = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).ok()?;
     let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
     if fd < 0 {
@@ -25,17 +24,77 @@ pub fn read_outbox(root: &Path, max: usize) -> Option<Vec<u8>> {
     for d in ["workspace", "out"] {
         dir = open_at(dir.as_raw_fd(), d, libc::O_RDONLY | libc::O_DIRECTORY)?;
     }
-    // O_NONBLOCK so a FIFO can't block the open; it is then refused as not a regular file.
-    let f = open_at(dir.as_raw_fd(), "result.json", libc::O_RDONLY | libc::O_NONBLOCK)?;
-    let f = std::fs::File::from(f);
+    Some(dir)
+}
+
+/// A regular file `name` in the open directory `dir`, never followed, of at most `max` bytes.
+/// O_NONBLOCK so a FIFO can't block the open; it is then refused as not a regular file.
+fn regular_at(dir: &std::os::fd::OwnedFd, name: &str, max: u64) -> Option<(std::fs::File, u64)> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::from(open_at(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_NONBLOCK)?);
     let m = f.metadata().ok()?;
-    if !m.file_type().is_file() || m.len() > max as u64 {
-        return None;
-    }
+    (m.file_type().is_file() && m.len() <= max).then_some((f, m.len()))
+}
+
+/// Reads a box's typed output file, `<root>/workspace/out/result.json`, without trusting the box:
+/// no component under `root` is followed if it is a symlink, the file must be a regular file of
+/// at most `max` bytes, and at most `max + 1` bytes are read. Anything else is "no result".
+pub fn read_outbox(root: &Path, max: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let dir = open_outbox(root)?;
+    let (f, _) = regular_at(&dir, "result.json", max as u64)?;
     let mut b = Vec::new();
     f.take(max as u64 + 1).read_to_end(&mut b).ok()?;
     (b.len() <= max).then_some(b)
 }
+
+/// A file found in a box's outbox ([`find_in_outbox`]), open: read it through `file`, never by
+/// its name again (the box may replace what the name points to).
+#[derive(Debug)]
+pub struct OutboxFile {
+    pub name: String,
+    pub size: u64,
+    pub file: std::fs::File,
+}
+
+/// The file directly in `<root>/workspace/out` whose sha256 is `sha256` (lowercase hex), as
+/// [`read_outbox`] reads: nothing under `root` followed if it is a symlink, only regular files of
+/// at most `max` bytes, hashed through the descriptor that is returned (at its start). At most
+/// [`OUTBOX_SCAN`] entries are looked at. None if no file there has that hash, or there is no
+/// outbox.
+pub fn find_in_outbox(root: &Path, sha256: &str, max: u64) -> Result<Option<OutboxFile>> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+    let Some(dir) = open_outbox(root) else { return Ok(None) };
+    // The names, through the descriptor: the directory the walk opened, not whatever the path is now.
+    let mut names: Vec<String> = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?
+        .take(OUTBOX_SCAN)
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    for name in names {
+        let Some((mut f, size)) = regular_at(&dir, &name, max) else { continue };
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut r = std::io::Read::take(&f, max + 1);
+        let read = loop {
+            match std::io::Read::read(&mut r, &mut buf) {
+                Ok(0) => break true,
+                Ok(n) => h.update(&buf[..n]),
+                Err(_) => break false,
+            }
+        };
+        if read && hex::encode(h.finalize()) == sha256 {
+            f.seek(SeekFrom::Start(0))?;
+            return Ok(Some(OutboxFile { name, size, file: f }));
+        }
+    }
+    Ok(None)
+}
+
+/// How many entries of an outbox [`find_in_outbox`] looks at.
+pub const OUTBOX_SCAN: usize = 256;
 
 /// Writes a file wicket owns at `root/rel`, where the tree under `root` may be agent-written:
 /// every directory on the way is made a real directory (a symlink there is replaced), and the
@@ -161,6 +220,38 @@ mod outbox_tests {
         let fifo = std::ffi::CString::new(d.join("workspace/out/result.json").as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         assert_eq!(read_outbox(&d, 64), None, "fifo");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An artifact is found by its hash, read through the descriptor that was hashed, and never
+    /// through a link the box left (#465).
+    #[test]
+    fn an_artifact_is_found_by_its_sha256_and_never_through_a_link() {
+        use super::find_in_outbox;
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let d = root("find");
+        let sha = |b: &[u8]| hex::encode(Sha256::digest(b));
+        std::fs::write(d.join("workspace/out/notes.txt"), b"notes").unwrap();
+        std::fs::write(d.join("workspace/out/wicket.tar.gz"), b"an archive").unwrap();
+        std::fs::create_dir(d.join("workspace/out/sub")).unwrap();
+        let mut found = find_in_outbox(&d, &sha(b"an archive"), 1024).unwrap().expect("found");
+        assert_eq!((found.name.as_str(), found.size), ("wicket.tar.gz", 10));
+        let mut b = Vec::new();
+        found.file.read_to_end(&mut b).unwrap();
+        assert_eq!(b, b"an archive", "read from its start");
+        assert!(find_in_outbox(&d, &sha(b"an archive"), 9).unwrap().is_none(), "over the cap");
+        assert!(find_in_outbox(&d, &sha(b"other"), 1024).unwrap().is_none());
+        // A link to a file with the hash, outside the outbox, isn't followed.
+        std::fs::write(d.join("host-file"), b"host bytes").unwrap();
+        symlink("../../host-file", d.join("workspace/out/link")).unwrap();
+        assert!(find_in_outbox(&d, &sha(b"host bytes"), 1024).unwrap().is_none());
+        std::fs::remove_dir_all(d.join("workspace/out")).unwrap();
+        std::fs::create_dir(d.join("elsewhere")).unwrap();
+        std::fs::write(d.join("elsewhere/a"), b"host bytes").unwrap();
+        symlink("../elsewhere", d.join("workspace/out")).unwrap();
+        assert!(find_in_outbox(&d, &sha(b"host bytes"), 1024).unwrap().is_none(), "directory link");
+        assert!(find_in_outbox(&d.join("none"), &sha(b"x"), 1024).unwrap().is_none(), "no outbox");
         let _ = std::fs::remove_dir_all(&d);
     }
 

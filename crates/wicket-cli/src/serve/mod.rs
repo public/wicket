@@ -146,6 +146,8 @@ enum Action {
         /// The sha256 of the effect descriptor the passkey signed (#369): the decision is made
         /// only if the request is still that effect.
         effect_sha256: String,
+        /// An approved update request is applied (#465): its card said so, and the passkey signed it.
+        apply_update: bool,
     },
     Revoke {
         run: String,
@@ -213,6 +215,9 @@ struct Pending {
 
 /// Starts a console run. The real one runs `wicket run` detached; tests record instead.
 type Launcher = Box<dyn Fn(&Launch) -> Result<()> + Send + Sync>;
+/// Applies an approved update request (#465): the real one runs `wicket self apply-update`
+/// detached; tests record instead. Given the request and the log to write.
+type Updater = Box<dyn Fn(&str, &std::path::Path) -> Result<()> + Send + Sync>;
 /// The verified identity of a run's agent (crate::verified_identity; replaceable in tests, which
 /// have no issuer key).
 type IdentityCheck = fn(&Ledger, &str) -> Value;
@@ -237,6 +242,7 @@ struct State {
     data: PathBuf,
     roots: Vec<(String, PathBuf)>,
     launcher: Launcher,
+    updater: Updater,
     identity: IdentityCheck,
     challenges: Mutex<HashMap<String, Pending>>,
     limiter: Limiter,
@@ -289,6 +295,7 @@ impl State {
             data,
             roots,
             launcher,
+            updater: Box::new(|_, _| bail!("this console doesn't apply updates")),
             identity,
             challenges: Mutex::new(HashMap::new()),
             limiter: Limiter::default(),
@@ -348,6 +355,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     // their own processes, and stay).
     crate::update::reexec_on_hangup(crate::update::pidfile("console"), crate::update::Versions::control().root, || {});
     let exe = crate::update::self_exe()?;
+    let update_exe = exe.clone();
     let mut state = State::new(
         RelyingParty { rp_id: plan.rp_id.clone(), origin: plan.origin.clone() },
         ledger_path(),
@@ -356,6 +364,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         Box::new(move |l| launch_detached(&exe, l)),
         |l, run| crate::verified_identity(l, run, None),
     );
+    state.updater = Box::new(move |request, log| apply_update_detached(&update_exe, request, log));
     state.trusted = plan.trusted.clone();
     state.authority = plan.authority.clone();
     state.hsts = plan.hsts;
@@ -424,6 +433,25 @@ fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
         .process_group(0);
     let mut child = cmd.spawn().context("starting wicket run")?;
     // Reap it when it exits; the console doesn't wait for it.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Starts `wicket self apply-update <request>` (#465) as its own process group, logging to `log`:
+/// the update it runs moves this console to the new build (SIGHUP, a re-exec), and must outlive it.
+fn apply_update_detached(exe: &std::path::Path, request: &str, log: &std::path::Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let out = std::fs::File::create(log).with_context(|| format!("creating {}", log.display()))?;
+    let mut child = std::process::Command::new(exe)
+        .args(["self", "apply-update", request])
+        .stdin(std::process::Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out)
+        .process_group(0)
+        .spawn()
+        .context("starting wicket self apply-update")?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -1245,7 +1273,16 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
                 "effect": effect, "effect_sha256": effect_sha256, "blast": blast,
             });
-            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide, effect_sha256 }, v))
+            // Approving an agent's update request installs its build (#465): what it installs,
+            // and where, is shown before the passkey is asked for, and signed with the decision.
+            let mut v = v;
+            let mut apply_update = false;
+            if approve && crate::apply_update::requested_sha(&req).is_some() {
+                let p = crate::apply_update::preview(&l, &state.data, &req).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                apply_update = p.applies;
+                v["update"] = serde_json::to_value(&p).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            }
+            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide, effect_sha256, apply_update }, v))
         }
         // `say` and the console's follow-up box are gone (#198): prompts are sent in the session.
         Some("say") => Err(bad("say is gone: open the run's session and prompt there")),
@@ -1480,7 +1517,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
     let t = &state.tenant;
     let rid = |r: &str| RunId(r.to_string());
     match action {
-        Action::Decide { request, approve: true, uses, ttl_secs, prefix, zone_wide, effect_sha256 } => {
+        Action::Decide { request, approve: true, uses, ttl_secs, prefix, zone_wide, effect_sha256, apply_update } => {
             // The agent may have been revoked since the operator was shown it.
             let req = l.request(request)?;
             if !identity_approvable(&(state.identity)(&l, &req.run)) {
@@ -1501,7 +1538,20 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             let scope = under.map(|p| format!(" for every path under {}{p}", req.host)).unwrap_or_default();
             let zone = if *zone_wide { format!(", for any run in zone {}", req.zone) } else { String::new() };
             let lease = lease.map(|x| format!("; lease {x} is provisioned by the next reconcile pass")).unwrap_or_default();
-            Ok(format!("approved {request} → {grant}{scope}{zone}{lease} (signed with {})", oc.name))
+            let applying = if *apply_update {
+                drop(l);
+                let log = state.data.join("runs").join(&req.run).join(format!("update-{request}.log"));
+                match (state.updater)(request, &log) {
+                    Ok(()) => format!(
+                        "; installing it now, on the control host and then its nodes (log: runs/{}/update-{request}.log); the agent is told how it ends",
+                        req.run
+                    ),
+                    Err(e) => format!("; it could not be applied ({e:#}): run `sudo wicket self update` with the artifact on the host"),
+                }
+            } else {
+                String::new()
+            };
+            Ok(format!("approved {request} → {grant}{scope}{zone}{lease}{applying} (signed with {})", oc.name))
         }
         Action::Decide { request, approve: false, .. } => {
             let lease = match grant::decide(
@@ -2145,6 +2195,66 @@ mod tests {
         assert_eq!(t.post("/api/decide/finish", a).status, StatusCode::OK);
         assert_eq!(t.post("/api/decide/begin", json!([])).status, StatusCode::BAD_REQUEST);
         assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (3, 0), "re-verifies offline");
+    }
+
+    /// #465: approving an agent's update request shows what it installs and where, signs it, and
+    /// applies it; one whose artifact isn't in the outbox is only accepted, as before.
+    #[test]
+    fn approving_an_update_request_applies_the_build_in_its_outbox() {
+        let mut t = setup("apply-update");
+        t.running("run_u", "lead");
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let rec = applied.clone();
+        t.state.updater = Box::new(move |r, log| {
+            rec.lock().unwrap().push((r.to_string(), log.to_path_buf()));
+            Ok(())
+        });
+        let out = t.dir.join("runs/run_u/workspace/out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("wicket-0.0.1-abc-x86_64-linux.tar.gz"), b"an archive").unwrap();
+        let file = |l: Ledger, sha: &str| {
+            let mut op = wicket_core::Op::egress(
+                &TenantId::single(),
+                &RunId("run_u".into()),
+                "z",
+                "UPDATE",
+                "wicket.internal",
+                &format!("/self/{sha}"),
+            );
+            op.risk = wicket_core::RiskClass::R4ExecOrPrivilege;
+            let reason = format!("update wicket to the build with sha256 {sha} of commit 36c92b5e: main");
+            l.file_request(&op, Some(sha), &reason, None).unwrap().id().to_string()
+        };
+        let sha = hex::encode(sha2::Sha256::digest(b"an archive"));
+        let rid = file(t.ledger(), &sha);
+        let b = t.begin(json!({ "action": "decide", "id": rid, "decision": "approve" }));
+        assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+        let u = &b.body["action"]["update"];
+        assert_eq!(
+            (u["artifact"].as_str(), u["size"].as_u64(), u["commit_said"].as_str(), u["applies"].as_bool()),
+            (Some("wicket-0.0.1-abc-x86_64-linux.tar.gz"), Some(10), Some("36c92b5e"), Some(true)),
+            "{u}"
+        );
+        assert_eq!(u["nodes"], json!([]));
+        let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
+        let r = t.post("/api/action/finish", a);
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        assert!(r.body["ok"].as_str().unwrap().contains("installing it now"), "{:?}", r.body);
+        assert_eq!(t.ledger().request(&rid).unwrap().status, "granted");
+        assert_eq!(*applied.lock().unwrap(), [(rid.clone(), t.dir.join(format!("runs/run_u/update-{rid}.log")))]);
+        // Not in the outbox: the card says why, and approving only accepts the sha256.
+        let rid2 = file(t.ledger(), &"0f".repeat(32));
+        let b = t.begin(json!({ "action": "decide", "id": rid2, "decision": "approve" }));
+        assert_eq!(b.body["action"]["update"]["applies"], false);
+        assert!(b.body["action"]["update"]["why_not"].as_str().unwrap().contains("no file in run_u's outbox"));
+        let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
+        let r = t.post("/api/action/finish", a);
+        assert!(!r.body["ok"].as_str().unwrap().contains("installing"), "{:?}", r.body);
+        assert_eq!(applied.lock().unwrap().len(), 1, "not applied");
+        // A denial applies nothing and shows no update.
+        let rid3 = file(t.ledger(), &"1f".repeat(32));
+        let b = t.begin(json!({ "action": "decide", "id": rid3, "decision": "deny" }));
+        assert!(b.body["action"].get("update").is_none());
     }
 
     /// #254: the console decides through `cmd/approve`'s functions, as `wicket approve` and `deny`

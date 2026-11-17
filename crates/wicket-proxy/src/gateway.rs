@@ -51,12 +51,13 @@ fn capacity_tool() -> Value {
 fn update_tool() -> Value {
     json!({
         "name": "request_update",
-        "description": "Ask the operator to update this wicket installation to a build you made (wicket building wicket). Give the sha256 of the artifact (the release archive from ci/package.sh, or the binary) and say where it is. A human always decides; this never updates anything by itself: once approved, the operator runs `wicket self update` with the artifact, which accepts that hash once.",
+        "description": "Ask the operator to update this wicket installation to a build you made (wicket building wicket). Put the artifact (the release archive from ci/package.sh, or the binary) directly in /workspace/out, and give its sha256. A human always decides; this never updates anything by itself. If an operator approves it in the console, wicket takes that file from your outbox, checks its hash, and updates the control host and then its nodes, rolling back if the new build fails its health gate; you are told how it ended (a notice from wicket). Approved with `wicket approve`, the operator runs `wicket self update` with the artifact instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "sha256": { "type": "string", "description": "the artifact's sha256 (64 hex digits)" },
-                "reason": { "type": "string", "description": "what the build changes, and the artifact's path" }
+                "reason": { "type": "string", "description": "what the build changes, and the artifact's path" },
+                "commit": { "type": "string", "description": "the git commit the build is of (7 to 40 hex digits), shown to the operator as what you say it is" }
             },
             "required": ["sha256", "reason"],
             "additionalProperties": false

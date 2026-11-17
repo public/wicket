@@ -79,10 +79,21 @@ and stages it. It is accepted only if
 Anything else is refused, and the refusal is an audit record (`self.update_refused`). There is no switch
 that skips verification.
 
-**Who may update.** Through wicketd, `self update`, `self rollback` and `self trust-key` are root's alone
-(`sudo wicket self …`, the host break-glass); not an operator's, not a passkey's in the console, and not
-the daemon's own uid either, which runs runs' supervisors, proxies and gateways. An agent can only ask:
-`request_update` files an R4 request and returns; nothing an agent can call updates wicket.
+**Who may update.** Through wicketd, `self update`, `self rollback`, `self trust-key` and
+`self apply-update` are root's alone (`sudo wicket self …`, the host break-glass); not an operator's,
+and not the daemon's own uid either, which runs runs' supervisors, proxies and gateways. An agent can
+only ask: `request_update` files an R4 request and returns; nothing an agent can call updates wicket.
+
+The one other way is an operator's passkey-signed approval of that request in the console (#465). The
+confirmation shows the artifact (the file in the requesting run's `/workspace/out` with the requested
+sha256, found without following links), its size, the commit the agent says it is, and the nodes it
+reaches, and the passkey signs them with the decision. The console then runs `wicket self apply-update
+<request>` as its own process, as the `wicket` user: it copies the file to a private staging file and
+runs the same update as `self update <copy> --nodes all`, which hashes the copy again and accepts it
+only by that approval, used up. The requester is told the outcome as a notice from wicket. It moves the
+`wicket` user's versions only: root's copies and link stay, as root never runs what the `wicket` user
+staged (#261). A box on another node keeps its outbox there, so its update is still applied from a
+terminal.
 
 ## Builds CI signed
 

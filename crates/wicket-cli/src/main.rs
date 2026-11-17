@@ -33,6 +33,7 @@ use wicket_control::{
     snapstore, storegc, transcript,
 };
 
+mod apply_update;
 mod ci_update;
 mod cli_reference;
 mod cmd;

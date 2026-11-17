@@ -62,6 +62,7 @@ reference](manifest.md)).
   - [`wicket state restore`](#wicket-state-restore)
   - [`wicket state snapshots`](#wicket-state-snapshots)
   - [`wicket state snapshot`](#wicket-state-snapshot)
+  - [`wicket state gc`](#wicket-state-gc)
 - [`wicket keys`](#wicket-keys)
   - [`wicket keys roots-offline`](#wicket-keys-roots-offline)
   - [`wicket keys certify`](#wicket-keys-certify)
@@ -100,6 +101,7 @@ reference](manifest.md)).
   - [`wicket self sign`](#wicket-self-sign)
   - [`wicket self apply-units`](#wicket-self-apply-units)
   - [`wicket self admit`](#wicket-self-admit)
+  - [`wicket self apply-update`](#wicket-self-apply-update)
 - [`wicket daemon`](#wicket-daemon)
 
 ## `wicket`
@@ -1433,17 +1435,18 @@ Update this installation to another wicket build (#162): blue/green, with a heal
 Usage: wicket self <COMMAND>
 
 Commands:
-  status       The staged versions, which is current and previous, and the ledger's schema
-  update       Stage an artifact (a wicket binary, or a release archive from ci/package.sh), switch the control host to it, hand its processes over, and watch it; then the nodes, a canary first. Any failed health check switches back
-  follow       Update to the newest build CI signed for main, if `<data dir>/ci-builds.yaml`'s follow policy lets it now (its window, soak time, only forward along main, never across a schema contract step or a failed build). Run by the wicket-follow timer
-  rollback     Switch back to the previous version: the control host (unless --only-nodes) and these nodes
-  prune        Remove what no rollback or running box needs: versions other than current and previous that no process runs, their agent images unless a container uses them, and ledger snapshots beyond the newest few (always keeping the newest of the current and previous versions')
-  trust-key    Trust a release public key (from `wicket self keygen`) for updates
-  keygen       Make a release key pair: KEY (private, keep it offline) and KEY.pub
-  sign         Sign an artifact with a release key: writes <artifact>.sig
-  apply-units  Install this build's systemd units (#165) where they differ from the installed ones, and reload systemd; restarts nothing. Run as root with root's own copy of the version, as a refused `self update` says: `sudo /usr/local/lib/wicket/<id>/wicket self apply-units`
-  admit        Make root's own copy of the wicket build in ARTIFACT (a binary or a release archive), in /usr/local/lib/wicket/<id>/ (#261). Root runs only these: `sudo wicket self update ARTIFACT` makes one itself; this is for a build that came another way (`--from-ci`, `self follow`). /usr/local/bin/wicket moves to it if it is the current version. Refuses an artifact the wicket user could have written
-  help         Print this message or the help of the given subcommand(s)
+  status        The staged versions, which is current and previous, and the ledger's schema
+  update        Stage an artifact (a wicket binary, or a release archive from ci/package.sh), switch the control host to it, hand its processes over, and watch it; then the nodes, a canary first. Any failed health check switches back
+  follow        Update to the newest build CI signed for main, if `<data dir>/ci-builds.yaml`'s follow policy lets it now (its window, soak time, only forward along main, never across a schema contract step or a failed build). Run by the wicket-follow timer
+  rollback      Switch back to the previous version: the control host (unless --only-nodes) and these nodes
+  prune         Remove what no rollback or running box needs: versions other than current and previous that no process runs, their agent images unless a container uses them, and ledger snapshots beyond the newest few (always keeping the newest of the current and previous versions')
+  trust-key     Trust a release public key (from `wicket self keygen`) for updates
+  keygen        Make a release key pair: KEY (private, keep it offline) and KEY.pub
+  sign          Sign an artifact with a release key: writes <artifact>.sig
+  apply-units   Install this build's systemd units (#165) where they differ from the installed ones, and reload systemd; restarts nothing. Run as root with root's own copy of the version, as a refused `self update` says: `sudo /usr/local/lib/wicket/<id>/wicket self apply-units`
+  admit         Make root's own copy of the wicket build in ARTIFACT (a binary or a release archive), in /usr/local/lib/wicket/<id>/ (#261). Root runs only these: `sudo wicket self update ARTIFACT` makes one itself; this is for a build that came another way (`--from-ci`, `self follow`). /usr/local/bin/wicket moves to it if it is the current version. Refuses an artifact the wicket user could have written
+  apply-update  Apply an agent's approved update request (#465): the file in its run's outbox with the sha256 the request names, as `self update <it> --nodes all` would, then tell the agent how it ended. The console runs it when an operator approves the request
+  help          Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -1587,6 +1590,20 @@ Usage: wicket self admit <ARTIFACT>
 
 Arguments:
   <ARTIFACT>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket self apply-update`
+
+```text
+Apply an agent's approved update request (#465): the file in its run's outbox with the sha256 the request names, as `self update <it> --nodes all` would, then tell the agent how it ended. The console runs it when an operator approves the request
+
+Usage: wicket self apply-update <REQUEST>
+
+Arguments:
+  <REQUEST>  The approved request (`UPDATE wicket.internal/self/<sha256>`, from `request_update`)
 
 Options:
   -h, --help  Print help

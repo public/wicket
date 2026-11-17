@@ -702,7 +702,7 @@ fn say(s: impl AsRef<str>) {
 }
 
 /// Every node `--nodes` names, canary first.
-fn node_list(ledger: &Ledger, spec: &str) -> Result<Vec<String>> {
+pub(crate) fn node_list(ledger: &Ledger, spec: &str) -> Result<Vec<String>> {
     let active: Vec<String> =
         ledger.nodes()?.into_iter().filter(|n| n.status == "active" && !n.target.starts_with("unix:")).map(|n| n.name).collect();
     if spec == "all" {
