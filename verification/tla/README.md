@@ -8,8 +8,9 @@ it too. TLC checks it at small, explicit bounds.
 
 Run it with `ci/tla.sh`, or `ci/tla.sh verification/tla/<cfg>` for one configuration. The script
 downloads a Temurin 21 JRE and `tla2tools.jar` (TLC 2.19, release v1.7.4), pinned by URL and
-sha256. CI's `tla` job runs it when the models, `ci/tla.sh` or the node code they model change
-(`ci/determinator/suites.toml`).
+sha256. CI's `tla` job runs it when the models or `ci/tla.sh` change (`ci/determinator/suites.toml`), and
+on every push to `main` and nightly. TLC reads only the models, so a change to the code they model
+doesn't run it: review such a change against the tables below.
 
 ## What it checks
 
