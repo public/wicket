@@ -7,7 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+wicket-core.workspace = true
 wicket-store.workspace = true
+wicket-sandbox.workspace = true
 wicket-proxy.workspace = true
 wicket-agent.workspace = true
 wicket-identity.workspace = true

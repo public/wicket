@@ -5,6 +5,8 @@
 //! A library split from wicket-cli, whose modules nearly all use these, so the ones that need
 //! nothing else of the CLI's can leave it too. wicket-cli imports them under their old names.
 
+pub mod exitcause;
+
 use anyhow::Result;
 use std::path::PathBuf;
 use wicket_store::Ledger;

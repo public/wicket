@@ -20,6 +20,9 @@ use wicket_home::{
     verified_identity,
 };
 
+// Modules that need only wicket-home's helpers moved with them (#219), under their old names here.
+use wicket_home::exitcause;
+
 mod audit_export;
 mod capacity;
 mod ci_update;
@@ -30,7 +33,6 @@ mod daemon;
 mod doctor;
 mod effect;
 mod enrol;
-mod exitcause;
 mod gitguard;
 mod grant;
 mod hibernate;

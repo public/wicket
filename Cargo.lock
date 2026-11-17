@@ -4115,8 +4115,10 @@ dependencies = [
  "anyhow",
  "serde_json",
  "wicket-agent",
+ "wicket-core",
  "wicket-identity",
  "wicket-proxy",
+ "wicket-sandbox",
  "wicket-store",
 ]
 
