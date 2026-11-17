@@ -4113,10 +4113,17 @@ name = "wicket-home"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures-util",
+ "getrandom 0.4.3",
  "hex",
+ "http-body-util",
  "humantime",
+ "hyper",
+ "hyper-util",
+ "libc",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

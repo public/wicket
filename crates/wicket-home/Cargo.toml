@@ -20,7 +20,17 @@ tokio.workspace = true
 reqwest.workspace = true
 url.workspace = true
 humantime.workspace = true
+getrandom.workspace = true
 futures-util.workspace = true
 sha2.workspace = true
 hex.workspace = true
 time.workspace = true
+
+[dev-dependencies]
+# audit_export's tests: an edited ledger, and a sink's HTTP server.
+rusqlite.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+libc.workspace = true
