@@ -9,8 +9,8 @@
 #   ci/sim.sh [--seeds N] [--from S] [--file-issues]
 #
 # Pull requests don't need this script: `wicket-sim`'s tests run a fixed set of seeds whenever
-# ci/affected.py selects the crate (a change to it, to a crate it uses, or to the node code its
-# stand-ins follow, ci/affected.map). This runs N more (default 200) from S (default: a different
+# ci/determinator selects the crate (a change to it, to a crate it uses, or to the node code its
+# stand-ins follow, ci/determinator/rules.toml). This runs N more (default 200) from S (default: a different
 # block each day, so the nightly runs cover new seeds), optimised. Every failing seed's replay
 # command goes to sim-failures.txt. With --file-issues (nightly, GH_TOKEN set), each failing seed
 # without an open issue gets one, filed with its replay command and what it broke. Known findings

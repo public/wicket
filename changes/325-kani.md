@@ -12,5 +12,5 @@ type: Added
   than is left, nothing overflows). A loom test runs the run's budget counter under every
   interleaving of its node's `Spent` reports, slice leases, model calls and carve-outs.
   `ci/kani.sh` runs them one at a time (each needs under 2 GiB), and CI runs it when a change
-  touches the harnessed code (the `kani` suite in `ci/affected.map`)
+  touches the harnessed code (the `kani` suite in `ci/determinator/suites.toml`)
   ([#325](https://github.com/public/wicket/issues/325)).

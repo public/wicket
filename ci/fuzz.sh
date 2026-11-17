@@ -7,7 +7,7 @@
 #
 #   target…        the targets to run (default: all; `none` runs none, for a workflow's selection)
 #   --secs N       how long each target runs (default 60)
-#   --affected     the targets the change selects (ci/affected.py's fuzz-<target> suites), instead
+#   --affected     the targets the change selects (ci/determinator's fuzz targets), instead
 #   --base REF     with --affected: what to compare with (default origin/main)
 #   --sanitizer S  none (default: coverage only, the build that fits a 4 GiB box) or address
 #   --no-replay    skip the corpus replay (cargo test in fuzz/)
@@ -42,8 +42,8 @@ done
 case "$sanitizer" in none | address) ;; *) echo "--sanitizer: none or address" >&2; exit 2 ;; esac
 
 if [ "$affected" = 1 ]; then
-  sel=$(python3 ci/affected.py --base "$base" --worktree 2>/dev/null | sed -n 's/^fuzz: //p')
-  [ "$sel" = - ] && sel=none
+  sel=$(cargo run -q --locked --manifest-path ci/determinator/Cargo.toml -- --base "$base" --worktree 2>/dev/null |
+    sed -n 's/^fuzz=//p')
   read -r -a targets <<<"${sel:-$ALL_TARGETS}"
 fi
 [ ${#targets[@]} -eq 0 ] && read -r -a targets <<<"$ALL_TARGETS"

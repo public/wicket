@@ -30,7 +30,7 @@ cd fuzz && cargo test
 
 # A short run of some targets (the script installs cargo-fuzz if it is missing):
 ci/fuzz.sh --secs 60 egress gateway
-# The targets a change selects (ci/affected.map's fuzz-<target> suites):
+# The targets a change selects (ci/determinator/suites.toml):
 ci/fuzz.sh --affected
 ```
 
@@ -52,8 +52,8 @@ there instead of `/tmp`.
 
 ## In CI
 
-- A pull request fuzzes the targets its change selects, 60 s each (`ci.yml`'s fuzz job). The code a
-  target fuzzes is tagged with it in `ci/affected.map`.
+- A pull request fuzzes the targets its change selects, 60 s each (`ci.yml`'s fuzz job). The crates a
+  harness links are listed with it in `ci/determinator/suites.toml`.
 - Every night, every target runs for 20 minutes on its own runner (`fuzz.yml`), and a finding is
   filed as an issue.
 - A finding is minimized (`cargo fuzz tmin`) and uploaded. Keep it: add the minimized input to
