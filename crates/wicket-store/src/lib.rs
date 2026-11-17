@@ -107,12 +107,47 @@ pub enum StoreError {
 /// (expand) keeps a message a box was given in flight until the box has had it (#445):
 /// `messages.taken_at`, and `operator_messages.stdin_start` and `stdin_end` (where a prompt is in
 /// the box's stdin), so a supervisor that takes a run over after a control-host restart gives again
-/// what never arrived.
-pub const SCHEMA_VERSION: u32 = 16;
+/// what never arrived. Version 17 (expand) gives an agent one inbox (#253): operators' prompts and
+/// wicket's notices are rows of `messages` (`kind` `prompt` or `notice`, beside peers' `message`),
+/// with `text`, `label` (who it shows as) and `stdin_start`/`stdin_end`; `operator_messages` rows
+/// are copied over once, and the table stays, unread, until a contract step drops it.
+pub const SCHEMA_VERSION: u32 = 17;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
 const _: () = assert!(SCHEMA_FLOOR <= SCHEMA_VERSION);
+
+/// `messages.kind` (#253): a peer's message (pulled with `await_message`, signed by its sender),
+/// an operator's prompt, or a notice from wicket (each pushed as the agent's next turn).
+pub const KIND_MESSAGE: &str = "message";
+pub const KIND_PROMPT: &str = "prompt";
+pub const KIND_NOTICE: &str = "notice";
+/// Who a notice is from, as shown.
+pub const NOTICE_LABEL: &str = "wicket";
+/// The SQL condition for a row that is a turn (a prompt or a notice), and for a peer's message.
+pub(crate) const TURNS: &str = "kind IN ('prompt', 'notice')";
+pub(crate) const PEER: &str = "kind = 'message'";
+
+/// Schema 17's copy of `operator_messages` into `messages` (#253): what was taken stays taken, with
+/// where it is in its box's stdin, so a takeover after the upgrade gives again only what never
+/// arrived. Their senders were recorded by label only (no principal).
+const LEGACY_PROMPTS: &str = "INSERT OR IGNORE INTO messages
+   (id, tenant, from_run, to_run, envelope, created_at, delivered_at, taken_at, kind, text, label, stdin_start, stdin_end)
+ SELECT 'prompt-legacy-' || o.id,
+        COALESCE((SELECT tenant FROM runs WHERE runs.id = o.run), (SELECT tenant FROM agents WHERE agents.id = o.run), ''),
+        '', o.run, '', o.created_at, o.consumed_at, o.consumed_at,
+        CASE WHEN o.by = 'wicket' THEN 'notice' ELSE 'prompt' END, o.text, o.by, o.stdin_start, o.stdin_end
+ FROM operator_messages o ORDER BY o.id";
+
+/// A prompt or notice taken for a run: its message id, text, who it shows as, and the operator's
+/// principal id (None for a notice, and for prompts recorded before #253).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Prompt {
+    pub id: String,
+    pub text: String,
+    pub label: String,
+    pub from_principal: Option<String>,
+}
 
 /// How long a message waits for its principal to have a live run (#250): a principal that starts
 /// within it gets the message; after it, it stays undelivered on the record.
@@ -332,7 +367,7 @@ CREATE TABLE IF NOT EXISTS revocations (
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, from_run TEXT NOT NULL, to_run TEXT NOT NULL, envelope TEXT NOT NULL,
   created_at INTEGER NOT NULL, delivered_at INTEGER, to_principal TEXT, from_principal TEXT, priority TEXT, in_reply_to TEXT,
-  taken_at INTEGER
+  taken_at INTEGER, kind TEXT NOT NULL DEFAULT 'message', text TEXT, label TEXT, stdin_start INTEGER, stdin_end INTEGER
 );
 CREATE INDEX IF NOT EXISTS messages_inbox ON messages (to_run, delivered_at, created_at);
 CREATE TABLE IF NOT EXISTS node_tokens (
@@ -536,6 +571,16 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN taken_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE operator_messages ADD COLUMN stdin_start INTEGER", []);
         let _ = conn.execute("ALTER TABLE operator_messages ADD COLUMN stdin_end INTEGER", []);
+        // Ledgers created before an agent had one inbox (#253): prompts and notices move into
+        // `messages`, copied once (when `kind` is added) with what was taken and where in stdin.
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN text TEXT", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN label TEXT", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN stdin_start INTEGER", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN stdin_end INTEGER", []);
+        if conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'", []).is_ok() {
+            conn.execute(LEGACY_PROMPTS, [])?;
+        }
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_turns ON messages (to_run, kind, delivered_at)")?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -654,42 +699,67 @@ impl Ledger {
         Ok((id, true))
     }
 
-    // ---- operator messages to a running agent: session prompts and wicket's own notices ----
+    // ---- prompts and notices: an agent's turns, in its one inbox (#253) ----
 
-    /// Queues a message from the operator (a session prompt, #198) or wicket for a running agent. Operator text is trusted task text
-    /// (it comes from the principal), unlike anything an agent or a web page says.
-    pub fn add_operator_message(&self, run: &str, text: &str, by: &str) -> Result<i64> {
-        self.conn
-            .execute("INSERT INTO operator_messages (run, text, by, created_at) VALUES (?1, ?2, ?3, ?4)", params![run, text, by, now()])?;
-        Ok(self.conn.last_insert_rowid())
+    /// Queues a prompt from operator `from` (its authenticated principal id, #11) for `run` (a run,
+    /// or a hibernated agent's id until a wake moves it, #249): the agent's next turn. `label` is
+    /// who it shows as. Operator text is trusted task text (it comes from the principal), unlike
+    /// anything an agent or a web page says: so it is a turn, not a peer's message, and no
+    /// `accept_from` applies (an operator's authority is operators.yaml's). Unsigned: wicket
+    /// authenticated the operator, and the caller audits the write. Its message id.
+    pub fn add_prompt(&self, run: &str, text: &str, label: &str, from: &str) -> Result<String> {
+        self.add_turn(run, text, label, Some(from), KIND_PROMPT)
     }
 
-    /// Takes every queued message for `run`, oldest first: (text, by). Each is handed out once.
-    pub fn take_operator_messages(&mut self, run: &str) -> Result<Vec<(String, String)>> {
-        Ok(self.take_operator_messages_with_ids(run)?.into_iter().map(|(_, t, b)| (t, b)).collect())
+    /// Queues a notice from wicket itself for `run` (a box near its memory limit, #185): a turn,
+    /// like a prompt, from no operator.
+    pub fn add_notice(&self, run: &str, text: &str) -> Result<String> {
+        self.add_turn(run, text, NOTICE_LABEL, None, KIND_NOTICE)
     }
 
-    /// [`Ledger::take_operator_messages`] with each message's id (what [`Ledger::add_operator_message`]
-    /// returned), so a session that queued one can tell when the agent took it up (#327).
-    pub fn take_operator_messages_with_ids(&mut self, run: &str) -> Result<Vec<(i64, String, String)>> {
+    fn add_turn(&self, run: &str, text: &str, label: &str, from: Option<&str>, kind: &str) -> Result<String> {
+        let id = format!("prompt-{}", wicket_core::new_ulid().to_string().to_lowercase());
+        self.conn.execute(
+            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, from_principal, kind, text, label)
+             VALUES (?1, COALESCE((SELECT tenant FROM runs WHERE id = ?2), (SELECT tenant FROM agents WHERE id = ?2), ''),
+                     '', ?2, '', ?3, ?4, ?5, ?6, ?7)",
+            params![id, run, now(), from, kind, text, label],
+        )?;
+        Ok(id)
+    }
+
+    /// Takes every prompt and notice queued for `run`, oldest first. Each is handed out once: it is
+    /// taken, and counted read, until [`Ledger::requeue_prompts`] gives it again.
+    pub fn take_prompts(&mut self, run: &str) -> Result<Vec<Prompt>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows: Vec<(i64, String, String)> = {
-            let mut st = tx.prepare("SELECT id, text, by FROM operator_messages WHERE run = ?1 AND consumed_at IS NULL ORDER BY id")?;
-            let r = st.query_map(params![run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows: Vec<Prompt> = {
+            let mut st = tx.prepare(&format!(
+                "SELECT id, text, label, from_principal FROM messages WHERE to_run = ?1 AND {TURNS} AND delivered_at IS NULL
+                 ORDER BY created_at, rowid"
+            ))?;
+            let r = st.query_map(params![run], |r| {
+                Ok(Prompt {
+                    id: r.get(0)?,
+                    text: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    label: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    from_principal: r.get(3)?,
+                })
+            })?;
             r.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        for (id, _, _) in &rows {
-            tx.execute("UPDATE operator_messages SET consumed_at = ?2 WHERE id = ?1", params![id, now()])?;
+        let t = now();
+        for p in &rows {
+            tx.execute("UPDATE messages SET taken_at = ?2, delivered_at = ?2 WHERE id = ?1", params![p.id, t])?;
         }
         tx.commit()?;
         Ok(rows)
     }
 
-    /// Where operator message `id`, taken, is in its box's stdin (#445): its bytes from offset
-    /// `start` (counted from the run's start) to `end`.
-    pub fn set_operator_message_stdin(&self, id: i64, start: u64, end: u64) -> Result<()> {
+    /// Where prompt `id`, taken, is in its box's stdin (#445): its bytes from offset `start`
+    /// (counted from the run's start) to `end`.
+    pub fn set_prompt_stdin(&self, id: &str, start: u64, end: u64) -> Result<()> {
         self.conn.execute(
-            "UPDATE operator_messages SET stdin_start = ?2, stdin_end = ?3 WHERE id = ?1",
+            &format!("UPDATE messages SET stdin_start = ?2, stdin_end = ?3 WHERE id = ?1 AND {TURNS}"),
             params![id, start as i64, end as i64],
         )?;
         Ok(())
@@ -697,30 +767,34 @@ impl Ledger {
 
     /// Gives `run` again every prompt taken for it whose bytes its box's node never had: its node
     /// has `stdin_received` bytes of the box's stdin, and the prompt starts at or after that, or
-    /// was taken and never written (no offsets, #445). Called by a supervisor that takes the run over, once its node says how far it got.
-    /// A prompt the node has part of stays taken: giving it again would send its start twice.
-    /// The prompts given again.
-    pub fn requeue_operator_messages(&self, run: &str, stdin_received: u64) -> Result<Vec<i64>> {
+    /// was taken and never written (no offsets, #445). Called by a supervisor that takes the run
+    /// over, once its node says how far it got. A prompt the node has part of stays taken: giving
+    /// it again would send its start twice. The prompts given again.
+    pub fn requeue_prompts(&self, run: &str, stdin_received: u64) -> Result<Vec<String>> {
         let tx = self.conn.unchecked_transaction()?;
-        let ids: Vec<i64> = {
-            let mut st = tx.prepare(
-                "SELECT id FROM operator_messages WHERE run = ?1 AND consumed_at IS NOT NULL AND (stdin_start IS NULL OR stdin_start >= ?2) ORDER BY id",
-            )?;
+        let ids: Vec<String> = {
+            let mut st = tx.prepare(&format!(
+                "SELECT id FROM messages WHERE to_run = ?1 AND {TURNS} AND delivered_at IS NOT NULL
+                   AND (stdin_start IS NULL OR stdin_start >= ?2) ORDER BY created_at, rowid"
+            ))?;
             let r = st.query_map(params![run, stdin_received as i64], |r| r.get(0))?;
             r.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for id in &ids {
-            tx.execute("UPDATE operator_messages SET consumed_at = NULL, stdin_start = NULL, stdin_end = NULL WHERE id = ?1", params![id])?;
+            tx.execute(
+                "UPDATE messages SET delivered_at = NULL, taken_at = NULL, stdin_start = NULL, stdin_end = NULL WHERE id = ?1",
+                params![id],
+            )?;
         }
         tx.commit()?;
         Ok(ids)
     }
 
-    /// Whether operator message `id` was handed to its run yet (None: there is no such message).
-    pub fn operator_message_taken(&self, id: i64) -> Result<Option<bool>> {
+    /// Whether prompt `id` was handed to its run yet (None: there is no such prompt).
+    pub fn prompt_taken(&self, id: &str) -> Result<Option<bool>> {
         Ok(self
             .conn
-            .query_row("SELECT consumed_at IS NOT NULL FROM operator_messages WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row(&format!("SELECT delivered_at IS NOT NULL FROM messages WHERE id = ?1 AND {TURNS}"), params![id], |r| r.get(0))
             .optional()?)
     }
 
@@ -1051,7 +1125,7 @@ impl Ledger {
         let m: Option<StoredMessage> = tx
             .query_row(
                 &format!(
-                    "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND delivered_at IS NULL ORDER BY {} LIMIT 1",
+                    "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND {PEER} AND delivered_at IS NULL ORDER BY {} LIMIT 1",
                     receipts::INBOX_ORDER
                 ),
                 params![run],
@@ -1073,7 +1147,7 @@ impl Ledger {
         let m: Option<StoredMessage> = tx
             .query_row(
                 &format!(
-                    "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND delivered_at IS NULL AND taken_at IS NULL ORDER BY {} LIMIT 1",
+                    "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND {PEER} AND delivered_at IS NULL AND taken_at IS NULL ORDER BY {} LIMIT 1",
                     receipts::INBOX_ORDER
                 ),
                 params![run],
@@ -1091,7 +1165,7 @@ impl Ledger {
     /// `run` (already read, or someone else's).
     pub fn message_read(&self, run: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE messages SET delivered_at = ?3 WHERE id = ?1 AND to_run = ?2 AND delivered_at IS NULL",
+            "UPDATE messages SET delivered_at = ?3 WHERE id = ?1 AND to_run = ?2 AND kind = 'message' AND delivered_at IS NULL",
             params![id, run, now()],
         )?;
         Ok(n == 1)
@@ -1102,7 +1176,7 @@ impl Ledger {
     /// has had. How many.
     pub fn requeue_in_flight(&self, run: &str) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE messages SET taken_at = NULL WHERE to_run = ?1 AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            "UPDATE messages SET taken_at = NULL WHERE to_run = ?1 AND kind = 'message' AND delivered_at IS NULL AND taken_at IS NOT NULL",
             params![run],
         )?)
     }
@@ -1111,7 +1185,7 @@ impl Ledger {
     /// node (the link dropped first). False if it wasn't in flight for `run`.
     pub fn requeue_message(&self, run: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE messages SET taken_at = NULL WHERE id = ?1 AND to_run = ?2 AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            "UPDATE messages SET taken_at = NULL WHERE id = ?1 AND to_run = ?2 AND kind = 'message' AND delivered_at IS NULL AND taken_at IS NOT NULL",
             params![id, run],
         )?;
         Ok(n == 1)
@@ -1119,7 +1193,7 @@ impl Ledger {
 
     /// Every stored envelope (id, envelope, created_at), for offline verification.
     pub fn envelopes(&self) -> Result<Vec<(String, String, i64)>> {
-        let mut st = self.conn.prepare("SELECT id, envelope, created_at FROM messages ORDER BY created_at")?;
+        let mut st = self.conn.prepare("SELECT id, envelope, created_at FROM messages WHERE kind = 'message' ORDER BY created_at")?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -2430,40 +2504,114 @@ mod tests {
         assert!(l.take_message_in_flight("run_a").unwrap().is_none(), "the read one never");
     }
 
+    /// #253: one inbox, two deliveries. A peer's message is never taken as a turn, and a prompt
+    /// never answers `await_message`, is never read by the node's `MessageRead`, nor requeued with
+    /// peers' messages; each kind counts only its own as waiting.
+    #[test]
+    fn prompts_and_peer_messages_share_the_inbox_but_not_its_deliveries() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        l.add_message("m-1", &t, "run_peer", "run_a", "envelope").unwrap();
+        let p = l.add_prompt("run_a", "do the thing", "owner", OWNER).unwrap();
+        assert_eq!((l.waiting_messages("run_a").unwrap(), l.waiting_prompts("run_a").unwrap()), (1, 1));
+        let taken = l.take_message_in_flight("run_a").unwrap().unwrap();
+        assert_eq!(taken.id, "m-1");
+        assert!(l.take_message_in_flight("run_a").unwrap().is_none(), "the prompt isn't a peer's message");
+        assert!(!l.message_read("run_a", &p).unwrap(), "nor read as one");
+        assert_eq!(l.take_prompts("run_a").unwrap().iter().map(|p| p.id.clone()).collect::<Vec<_>>(), vec![p.clone()]);
+        assert_eq!(l.requeue_in_flight("run_a").unwrap(), 1, "only the peer's message is given again");
+        assert_eq!(l.requeue_prompts("run_a", 0).unwrap(), vec![p.clone()], "and only the prompt by the stdin count");
+        assert!(l.envelopes().unwrap().iter().all(|(id, ..)| id == "m-1"), "a prompt has no envelope to verify");
+        // The prompt has a receipt, from its operator.
+        let r = l.receipt(&p).unwrap().unwrap();
+        assert_eq!(r.from_principal.as_deref(), Some(OWNER));
+    }
+
+    /// #253: schema 17 copies every operator message into the one inbox once, keeping what was taken
+    /// and where it is in its box's stdin.
+    #[test]
+    fn schema_17_moves_operator_messages_into_the_inbox() {
+        let path = std::env::temp_dir().join(format!("wicket-opmsg-{}.db", wicket_core::new_ulid()));
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            // A schema-16 ledger: its messages have no kind, text, label or stdin offsets yet.
+            for col in ["kind", "text", "label", "stdin_start", "stdin_end"] {
+                c.execute_batch(&format!("ALTER TABLE messages DROP COLUMN {col}")).unwrap();
+            }
+            for (text, by, consumed, start) in [
+                ("had", "owner", Some(10), Some(0)),
+                ("never", "owner", Some(10), Some(100)),
+                ("queued", "owner", None, None),
+                ("low memory", "wicket", None, None),
+            ] {
+                c.execute(
+                    "INSERT INTO operator_messages (run, text, by, created_at, consumed_at, stdin_start, stdin_end) VALUES ('run_a', ?1, ?2, 5, ?3, ?4, ?4 + 50)",
+                    params![text, by, consumed, start],
+                )
+                .unwrap();
+            }
+        }
+        let mut l = Ledger::open(&path).unwrap();
+        assert_eq!(Ledger::schema_of(&path).unwrap().version, SCHEMA_VERSION);
+        assert_eq!(l.waiting_prompts("run_a").unwrap(), 2);
+        assert_eq!(l.requeue_prompts("run_a", 60).unwrap(), vec!["prompt-legacy-2".to_string()]);
+        let got: Vec<(String, String)> = l.take_prompts("run_a").unwrap().into_iter().map(|p| (p.text, p.label)).collect();
+        assert_eq!(got, [("never".into(), "owner".into()), ("queued".into(), "owner".into()), ("low memory".into(), "wicket".into())]);
+        drop(l);
+        // Opening it again copies nothing twice.
+        let mut l = Ledger::open(&path).unwrap();
+        assert!(l.take_prompts("run_a").unwrap().is_empty());
+        drop(l);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// #445: a prompt whose bytes its node never had is given again by a supervisor that takes the
     /// run over; one the node has, all or part of, isn't.
     #[test]
     fn a_prompt_its_node_never_had_is_given_again() {
         let mut l = Ledger::open_in_memory().unwrap();
         for text in ["had", "part", "never", "untaken"] {
-            l.add_operator_message("run_a", text, "owner").unwrap();
+            l.add_prompt("run_a", text, "owner", OWNER).unwrap();
         }
-        let taken = l.take_operator_messages_with_ids("run_a").unwrap();
-        let ids: Vec<i64> = taken.iter().map(|(id, _, _)| *id).collect();
-        l.set_operator_message_stdin(ids[0], 0, 100).unwrap();
-        l.set_operator_message_stdin(ids[1], 100, 200).unwrap();
-        l.set_operator_message_stdin(ids[2], 200, 300).unwrap();
+        let ids: Vec<String> = l.take_prompts("run_a").unwrap().into_iter().map(|p| p.id).collect();
+        l.set_prompt_stdin(&ids[0], 0, 100).unwrap();
+        l.set_prompt_stdin(&ids[1], 100, 200).unwrap();
+        l.set_prompt_stdin(&ids[2], 200, 300).unwrap();
         // The node had 150 bytes: the first prompt and half the second.
-        assert_eq!(l.requeue_operator_messages("run_a", 150).unwrap(), vec![ids[2], ids[3]]);
-        let again: Vec<String> = l.take_operator_messages("run_a").unwrap().into_iter().map(|(t, _)| t).collect();
+        assert_eq!(l.requeue_prompts("run_a", 150).unwrap(), vec![ids[2].clone(), ids[3].clone()]);
+        let again: Vec<String> = l.take_prompts("run_a").unwrap().into_iter().map(|p| p.text).collect();
         assert_eq!(again, ["never", "untaken"]);
-        assert_eq!(l.operator_message_taken(ids[0]).unwrap(), Some(true));
+        assert_eq!(l.prompt_taken(&ids[0]).unwrap(), Some(true));
+        // Never twice: taken again, nothing is left to take, and the node's count gives back only
+        // what it never had.
+        assert!(l.take_prompts("run_a").unwrap().is_empty());
+        l.set_prompt_stdin(&ids[2], 300, 400).unwrap();
+        l.set_prompt_stdin(&ids[3], 400, 500).unwrap();
+        assert_eq!(l.requeue_prompts("run_a", 500).unwrap(), Vec::<String>::new());
     }
 
+    const OWNER: &str = "spiffe://test.local/t/t0/op/unix/owner";
+
     #[test]
-    fn operator_follow_ups_are_taken_once() {
+    fn prompts_are_taken_once_in_order_from_their_operator() {
         let mut l = Ledger::open_in_memory().unwrap();
-        l.add_operator_message("run_a", "first", "owner").unwrap();
-        l.add_operator_message("run_a", "second", "owner").unwrap();
-        l.add_operator_message("run_b", "other run", "owner").unwrap();
-        let got = l.take_operator_messages("run_a").unwrap();
-        assert_eq!(got.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
-        assert!(l.take_operator_messages("run_a").unwrap().is_empty());
-        let id = l.add_operator_message("run_a", "third", "owner").unwrap();
-        assert_eq!(l.operator_message_taken(id).unwrap(), Some(false));
-        l.take_operator_messages("run_a").unwrap();
-        assert_eq!(l.operator_message_taken(id).unwrap(), Some(true));
-        assert_eq!(l.operator_message_taken(id + 100).unwrap(), None);
+        l.add_prompt("run_a", "first", "owner", OWNER).unwrap();
+        l.add_notice("run_a", "memory is nearly full").unwrap();
+        l.add_prompt("run_a", "second", "owner", OWNER).unwrap();
+        l.add_prompt("run_b", "other run", "owner", OWNER).unwrap();
+        let got = l.take_prompts("run_a").unwrap();
+        assert_eq!(got.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), vec!["first", "memory is nearly full", "second"]);
+        assert_eq!((got[0].label.as_str(), got[0].from_principal.as_deref()), ("owner", Some(OWNER)));
+        assert_eq!((got[1].label.as_str(), got[1].from_principal.as_deref()), (NOTICE_LABEL, None), "a notice is from wicket");
+        assert!(l.take_prompts("run_a").unwrap().is_empty());
+        let id = l.add_prompt("run_a", "third", "owner", OWNER).unwrap();
+        assert_eq!(l.prompt_taken(&id).unwrap(), Some(false));
+        assert_eq!(l.waiting_prompts("run_a").unwrap(), 1);
+        l.take_prompts("run_a").unwrap();
+        assert_eq!(l.prompt_taken(&id).unwrap(), Some(true));
+        assert_eq!(l.prompt_taken("prompt-nope").unwrap(), None);
+        assert_eq!(l.waiting_prompts("run_a").unwrap(), 0);
         // Turn cancels (#327): taken once, for their run only, stale ones dropped.
         l.request_turn_cancel("run_a", "passkey:phone").unwrap();
         l.request_turn_cancel("run_b", "passkey:laptop").unwrap();

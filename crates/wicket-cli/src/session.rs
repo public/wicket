@@ -109,8 +109,8 @@ fn reach(l: &Ledger, tenant: &TenantId, op: &Operator, who: &str, text: Option<&
                 bail!("agent {} is hibernated and can't be woken: {why}", a.id);
             }
             if let Some(t) = text {
-                let id = l.add_operator_message(&a.id, t, &op.label)?;
-                l.audit(tenant, None, "session.prompt", &prompt_audit(op, None, Some(&a.id), id, t))?;
+                let id = l.add_prompt(&a.id, t, &op.label, &op.id)?;
+                l.audit(tenant, None, "session.prompt", &prompt_audit(op, None, Some(&a.id), &id, t))?;
             }
             hibernate::trigger_wake(&a.id, &format!("wicket session by {}", op.label));
             let log = hibernate::agent_dir(&a.id).join("wake.log");
@@ -167,7 +167,7 @@ fn running(l: &Ledger, run: &str) -> Result<()> {
 }
 
 /// A `session.prompt` audit body, as the console's endpoint writes it.
-fn prompt_audit(op: &Operator, run: Option<&str>, agent: Option<&str>, id: i64, text: &str) -> Value {
+fn prompt_audit(op: &Operator, run: Option<&str>, agent: Option<&str>, id: &str, text: &str) -> Value {
     json!({ "run": run, "agent": agent, "by": op.label, "principal": op.id, "via": "terminal", "operator_message": id,
             "chars": text.chars().count(), "sha256": hex::encode(sha2::Sha256::digest(text.as_bytes())), "wakes": agent.is_some() })
 }
@@ -353,14 +353,14 @@ impl Session {
         Ok(m.as_str())
     }
 
-    fn queue(&self, text: &str) -> Result<i64> {
+    fn queue(&self, text: &str) -> Result<String> {
         if text.chars().count() > crate::serve::MAX_TEXT {
             bail!("the prompt is too long (at most {} characters)", crate::serve::MAX_TEXT);
         }
         let l = self.ledger()?;
         running(&l, &self.run)?;
-        let id = l.add_operator_message(&self.run, text, &self.op.label)?;
-        l.audit(&self.tenant, Some(&RunId(self.run.clone())), "session.prompt", &prompt_audit(&self.op, Some(&self.run), None, id, text))?;
+        let id = l.add_prompt(&self.run, text, &self.op.label, &self.op.id)?;
+        l.audit(&self.tenant, Some(&RunId(self.run.clone())), "session.prompt", &prompt_audit(&self.op, Some(&self.run), None, &id, text))?;
         Ok(id)
     }
 
@@ -376,7 +376,7 @@ impl Session {
                 return Ok(());
             }
             show(&format!("> {}: {}\n", strip(&self.op.label), lines(&t)));
-            return self.follow_turn(&mut scr, pos, id, busy).await;
+            return self.follow_turn(&mut scr, pos, &id, busy).await;
         }
         self.audit("session.attached", json!({ "run": self.run, "by": self.op.label, "principal": self.op.id, "via": "terminal" }));
         show(&format!("session {} (type a prompt and Enter; /stop interrupts the running turn; /mode MODE changes its permission mode; Ctrl-C leaves)\n", self.run));
@@ -423,14 +423,14 @@ impl Session {
         Ok(())
     }
 
-    /// Shows the transcript from `pos` until the turn of operator message `id` ends. `busy`: a turn
+    /// Shows the transcript from `pos` until the turn of prompt `id` ends. `busy`: a turn
     /// was running when it was queued, so the first turn end after the agent takes it is that one's.
-    async fn follow_turn(&self, scr: &mut Screen, mut pos: u64, id: i64, busy: bool) -> Result<()> {
+    async fn follow_turn(&self, scr: &mut Screen, mut pos: u64, id: &str, busy: bool) -> Result<()> {
         let mut taken = false;
         let mut skip = 0u32;
         let mut checked = Instant::now();
         loop {
-            if !taken && self.ledger()?.operator_message_taken(id)? == Some(true) {
+            if !taken && self.ledger()?.prompt_taken(id)? == Some(true) {
                 taken = true;
                 skip = u32::from(busy);
             }

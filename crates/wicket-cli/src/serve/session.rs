@@ -378,7 +378,7 @@ struct Waiting {
 #[derive(Debug)]
 struct Queued {
     by: String,
-    op: Option<i64>,
+    op: Option<String>,
 }
 
 /// One socket's view of a run's session. No sockets in here: it takes the browser's messages and
@@ -400,7 +400,7 @@ pub struct Bridge {
     /// wicket's `session/prompt` request ids, with who the prompt was from and its operator message.
     prompt_rpc: HashMap<String, Queued>,
     /// This socket's prompts, by operator message.
-    waiting: BTreeMap<i64, Waiting>,
+    waiting: BTreeMap<String, Waiting>,
     /// The agent's permission requests by their JSON-RPC id: their tool call id.
     permissions: HashMap<String, String>,
     /// Escalations shown (request ids), and the ones the client was asked about and hasn't answered.
@@ -560,7 +560,7 @@ impl Bridge {
         if let Err(r) = check_running(&l, &self.run) {
             return self.error_out(id, -32000, r.body["error"].as_str().unwrap_or("the run is not running"));
         }
-        let op = match l.add_operator_message(&self.run, &text, &self.who.label) {
+        let op = match l.add_prompt(&self.run, &text, &self.who.label, &self.who.principal) {
             Ok(op) => op,
             Err(_) => return self.error_out(id, -32603, "couldn't queue the prompt"),
         };
@@ -709,7 +709,7 @@ impl Bridge {
     /// One entry of what wicket said to the agent.
     fn on_wicket(&mut self, e: &Value, out: &mut Vec<Value>) {
         if let Some(q) = e.get("queued") {
-            self.queued.push_back(Queued { by: q["by"].as_str().unwrap_or("wicket").to_string(), op: q["op"].as_i64() });
+            self.queued.push_back(Queued { by: q["by"].as_str().unwrap_or("wicket").to_string(), op: q["op"].as_str().map(String::from) });
             return;
         }
         let Some(msg) = e.get("msg") else { return };
@@ -718,7 +718,7 @@ impl Bridge {
             (Some("session/prompt"), Some(id)) => {
                 let q = self.queued.pop_front().unwrap_or(Queued { by: "wicket".into(), op: None });
                 // This socket's own prompts are already on its screen; others' are shown.
-                if !q.op.is_some_and(|op| self.waiting.contains_key(&op)) {
+                if !q.op.as_ref().is_some_and(|op| self.waiting.contains_key(op)) {
                     let text: Vec<&str> = msg
                         .pointer("/params/prompt")
                         .and_then(|p| p.as_array())

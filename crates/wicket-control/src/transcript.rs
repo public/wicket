@@ -197,8 +197,8 @@ impl AcpLog {
         }
     }
 
-    /// A prompt was queued in wicket's ACP client: from `by`, for operator message `op`.
-    pub fn queued(&mut self, at: u64, by: &str, op: Option<i64>) {
+    /// A prompt was queued in wicket's ACP client: from `by`, for prompt `op` (its message id).
+    pub fn queued(&mut self, at: u64, by: &str, op: Option<&str>) {
         self.entry(serde_json::json!({ "at": at, "queued": { "by": by, "op": op } }));
     }
 }

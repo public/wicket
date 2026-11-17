@@ -1899,15 +1899,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 // run over takes no prompt before its node says (it may give some again, #445).
                 let base = if taken_over { stopper.0.stdin_base.get().copied() } else { Some(0) };
                 let msgs = match base {
-                    Some(_) => ledger.lock().ok().and_then(|mut l| l.take_operator_messages_with_ids(&run.0).ok()).unwrap_or_default(),
+                    Some(_) => ledger.lock().ok().and_then(|mut l| l.take_prompts(&run.0).ok()).unwrap_or_default(),
                     None => vec![],
                 };
-                for (op, text, by) in msgs {
+                for wicket_store::Prompt { id: op, text, label: by, .. } in msgs {
                     use tokio::io::AsyncWriteExt;
                     say!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
                     if let Some(si) = stdin.as_mut() {
                         if let Some(log) = acp_log.as_mut() {
-                            log.queued(transcript_f.offset(), &by, Some(op));
+                            log.queued(transcript_f.offset(), &by, Some(&op));
                         }
                         let input = turn_input(&mut acp, &acp_state, &text);
                         if let Some(log) = acp_log.as_mut() {
@@ -1927,7 +1927,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             _ => (0, 0),
                         };
                         if let Ok(l) = ledger.lock() {
-                            let _ = l.set_operator_message_stdin(op, at, to);
+                            let _ = l.set_prompt_stdin(&op, at, to);
                         }
                     }
                     turn_running = true;
@@ -2308,7 +2308,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     }))?;
                     status = "hibernated".into();
                     // Anything sent while it was hibernating (this run was still its address) wakes it now.
-                    let waiting = l.waiting_operator_messages(&run.0).unwrap_or(0) + l.waiting_messages(&run.0).unwrap_or(0);
+                    let waiting = l.waiting_prompts(&run.0).unwrap_or(0) + l.waiting_messages(&run.0).unwrap_or(0);
                     drop(l);
                     if waiting > 0 {
                         say!("[wicket] {waiting} message(s) arrived while it hibernated: waking it again");

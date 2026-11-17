@@ -213,7 +213,7 @@ Send(m) ==
     /\ UNCHANGED <<now, host, crashes, agent, box, harness, sup, gen, authUntil, asked, finLedger, finSup,
                    stdinOpen, handedTo, seen, link, takenOn, drops>>
 
-(* Ledger::take_message (await_message) and take_operator_messages: the supervisor takes it,  *)
+(* Ledger::take_message (await_message) and take_prompts: the supervisor takes it,            *)
 (* and today the ledger marks it delivered.                                                    *)
 Take(m, r) ==
     /\ host = "up" /\ sup[r] = "alive" /\ box[r] = "running"

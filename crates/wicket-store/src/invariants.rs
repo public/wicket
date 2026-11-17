@@ -428,7 +428,7 @@ pub fn check_end_state(l: &Ledger) -> Result<EndState> {
     }
     // Messages.
     s.messages = l.conn.query_row(
-        "SELECT (SELECT count(*) FROM messages) + (SELECT count(*) FROM message_refusals WHERE id NOT IN (SELECT id FROM messages))",
+        "SELECT (SELECT count(*) FROM messages WHERE kind = 'message') + (SELECT count(*) FROM message_refusals WHERE id NOT IN (SELECT id FROM messages))",
         [],
         |r| r.get::<_, i64>(0),
     )? as usize;
