@@ -206,3 +206,91 @@ the guards together keep every property in every interleaving of asks, decisions
 and hops, and that dropping any one guard breaks its property. Not modelled: zone-wide grants,
 prefix asks, and the ledger's transactions themselves (each action is one atomic step, as
 `file_request`, `approve_shown` and `use_effect_grant` are one transaction each).
+
+# RunLifecycle: an agent's activations across control-host restarts
+
+Model 2 of [#321](https://github.com/public/wicket/issues/321). It covers one long-lived agent
+(`#70`, `#249`) and the activations (runs) that hold it. A wake claims the agent and starts a box.
+The box's supervisor runs on the control host: it renews the claim and the box's authority, hands
+the agent its messages, and closes its session when the agent asks to finish. A control-host crash
+stops every supervisor, never a box; the box's node keeps it running until its authority ends. The
+reconciler gives a box whose supervisor is gone a new one (re-attach, `#151`). A wake may take
+over an agent whose holder let its claim lapse. Messages are a peer's (`#250`) or an operator's
+(`#198`); one held while no run holds the agent goes to its next run.
+
+| property | meaning |
+|---|---|
+| `OneHarness` | a wake never starts a second harness of the agent while another runs |
+| `NoMessageLost` | no message is counted as delivered without the agent ever having it |
+| `NoMessageTwice` | no box is given a message twice |
+| `FinishKnown` | a live supervisor of an agent that asked to finish, whose session is still open, knows it: a finished run's harness never keeps running |
+
+The switches are the opposite of `GrantsOnNodes`': here `TRUE` is a **proposed** design, and each
+`fail_lifecycle_*` variant is **today's code**, which TLC refuses. These are findings to fix, not
+past bugs:
+
+| switch (proposed value) | today | fails |
+|---|---|---|
+| `FinishInLedger = TRUE` | the agent's `finish` reaches only its supervisor (`run.rs`: `finish_asked`, from `want_rx`). A control-host restart between the call and the end of its turn loses it; the re-attached supervisor never closes the session, and the harness runs until its timeout | `fail_lifecycle_finish_lost`: `FinishKnown` |
+| `AckAfterHand = TRUE` | a message is marked delivered when it is taken (`Ledger::take_message`, `take_operator_messages_with_ids`), before the box has it. If the control host stops in between, the only copy was the dead supervisor's. The proposal acknowledges once the box has it, and a box drops a repeat by id | `fail_lifecycle_message_lost`: `NoMessageLost` |
+| `WakeAfterAuthority = TRUE` | `Ledger::claim_wake` takes over an `active` agent whose claim lapsed (`CLAIM_SECS`, 30 s). A control-host outage longer than that leaves its box running on its node, so a wake then starts a second box until the first's re-attached supervisor finds it superseded. The proposal wakes a lapsed agent only once its old box's authority has ended (its node stops it then) | `fail_lifecycle_twin_wake`: `OneHarness` |
+
+`fail_lifecycle_today` has every switch as on main. `NoMessageTwice` holds in every variant: with
+`AckAfterHand` a message is queued again after a crash, and the box's record of what it has had
+keeps the repeat out.
+
+| action | code (file, function) |
+|---|---|
+| `Wake` | `wicket-control/src/hibernate.rs` `wake` → `wicket-store/src/agents.rs` `Ledger::claim_wake` (moves undelivered and held messages, and operator messages, to the new run) |
+| `Renew`, `Supersede` | `wicket-control/src/run.rs`, the heartbeat: `Ledger::renew_agent_claim`, and `superseded` when it fails |
+| `Crash`, `Restart` | the control host's processes stopping (`ci/acceptance.sh`, `restart_flow`) |
+| `Adopt`, `Lost` | `wicket-cli/src/reconcile.rs`: `run_adopted` (a new `wicket run --attach`), `run_lost` |
+| `AskFinish`, `CloseSession`, `HarnessExits` | the gateway's `finish` tool (`wicket_proxy::Want::Finish`) → `run.rs` `finish_asked` → the session's close (`stdin = None`, `StdinClose`, recorded by the node) and `Linger::Finish` (#293) |
+| `Send` | `send_message` (the gateway) and `wicket session`'s `add_operator_message` |
+| `Take`, `Hand`, `Ack` | `Ledger::take_message` (`await_message`) and `take_operator_messages_with_ids` (`run.rs`), then the tool's reply or the stdin write; `Ack` is the proposal's |
+| `Tick` | time; a node stops a box whose authority has ended |
+
+Bounds: two activations, one message, `ClaimTtl = 1`, `AuthTtl = 3`, `MaxTime = 5`, one crash
+(`RunLifecycle.cfg`). Not modelled: hibernation's push (`commit_agent_push` checks the pusher's
+generation, so a stale twin can't commit), the wake's restore, budgets, and spawned children.
+
+# Placement: placed nodes and the runs on them
+
+Model 3 of [#321](https://github.com/public/wicket/issues/321). A node is created with a lease. A
+run is placed on a node with lease left, and carries the node's lease end as its start-by time
+(`#395`). The node admits a box into the memory its running boxes leave (`#300`), counting a box's
+limit until its container ends (`#430`). A box's container ends, its exit is recorded, and its
+files are fetched, or kept on the node when the fetch fails (`#324`). The reconciler releases a
+node past its lease once nothing on it holds it (`#294`).
+
+| property | meaning |
+|---|---|
+| `NoStartPastLease` | no box starts at or past its node's lease end |
+| `NoOvercommit` | no node runs more boxes than its memory holds |
+| `NoReleaseWithWork` | no node is released with a run's work on it: running, not yet collected, or kept |
+
+Here `TRUE` is the code on main, and each `fail_placement_*` variant is a bug it fixed:
+
+| switch (main) | the bug | fails |
+|---|---|---|
+| `StartByCheck = TRUE` | a placed node started a box that reached it past its lease (#395) | `fail_placement_no_start_by`: `NoStartPastLease` |
+| `Admission = TRUE` | two runs on one node beyond its memory (#300) | `fail_placement_no_admission`: `NoOvercommit` |
+| `ReleaseHolds = TRUE` | a node released at its lease end with a run, or a run's files, on it (#294, #324) | `fail_placement_release_running`: `NoReleaseWithWork` |
+| `FreeAtContainerEnd = TRUE` | before #430 a box's limit counted until its exit was recorded, refusing a box the memory had room for; `pass_placement_before430` checks the old rule was safe too, and `Placement.cfg` that #430's is | (none: both pass) |
+
+A box that started before its node's lease end may run past it: the reconciler keeps the node,
+billing, until the run ends (`placed_held`). The spend that costs is outside this model.
+
+| action | code (file, function) |
+|---|---|
+| `Create` | `wicket-control/src/nodecreate.rs` (`wicket node create`) |
+| `Place` | `wicket-control/src/run.rs`: the placed node and `start_by` (its lease end) in the `BoxStart` |
+| `Start`, `Refuse` | `wicket-node/src/nodesrv.rs` `start_box` (the `start_by` check) and `Node::admit` (`holds_limits`) |
+| `ContainerEnds`, `Exit` | `nodesrv.rs`: `Node::box_ended` (#430), then `finish` once the output is read |
+| `Fetch`, `FetchFails`, `FetchLater` | `run.rs`'s fetch of the box's files, `Ledger::set_run_uncollected`, and a later `wicket fetch` |
+| `Release` | `wicket-cli/src/reconcile.rs` `placed_pass` (`running_runs_on_node`, `uncollected_runs_on_node`) |
+
+Bounds: one node, two runs, `Cap = 1`, `Lease = 2`, `MaxTime = 4` (`Placement.cfg`). Not
+modelled: the spend envelope and capacity approvals, the provider's own lease, several nodes'
+choice of placement, and a node's crash.
+
