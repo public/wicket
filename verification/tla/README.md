@@ -6,7 +6,9 @@ grants through the feed, decides at the edge, and may be cut off or crash. And i
 which makes requests and model calls, and spawns children. The peers that may message them are in
 it too. TLC checks it at small, explicit bounds.
 
-Run it with `ci/tla.sh`, or `ci/tla.sh verification/tla/<cfg>` for one configuration. The script
+Run it with `ci/tla.sh`, or `ci/tla.sh verification/tla/<cfg>` for one configuration. A model
+that should pass and doesn't prints TLC's counterexample; `ci/tla.sh --traces` prints each `fail_*`
+variant's too, the trace to file with a finding. The script
 downloads a Temurin 21 JRE and `tla2tools.jar` (TLC 2.19, release v1.7.4), pinned by URL and
 sha256. CI's `tla` job runs it when the models, `ci/tla.sh` or the node code they model change
 (`ci/determinator/suites.toml`).
