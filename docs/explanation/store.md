@@ -151,15 +151,32 @@ These are what the store does, not separate features (closed #139 and #193).
 
 **Roots** are:
 
-- every ref in the store;
-- every digest the ledger holds: hibernation heads, named snapshots before their retention ends,
-  volume snapshots with a live grant, and installed versions;
-- objects written in the last hour, so a push still in progress isn't swept.
+- every ref in the store, except a bundle's (`agents/<agent>/<seq>.<generation>`) once its agent's
+  head has moved past it: that ref is dropped first;
+- every digest the ledger holds: hibernation heads today; named snapshots before their retention
+  ends, volume snapshots with a live grant and installed versions as those steps land.
 
-The reconciler marks everything reachable from the roots, then deletes the rest. It runs on the
-control host, for the state store, and on each node, where the local store is also cut down to its
-cache cap. Until that sweep exists, a user deletes only objects it alone reaches. For ledger
-snapshots, that means the blob of a snapshot no other ref points to.
+A collection marks everything reachable from the roots, then deletes the rest. It runs from the
+reconciler once an hour, on the control host, over its local store and the state store's, and as
+`wicket state gc` (`--dry-run` deletes nothing). What it deletes is audited (`store.gc`, and the
+digests in `store.deleted`).
+
+- **Pushes in flight.** A push reuses objects it finds already stored, and names what it wrote only
+  at its end, so no grace period alone keeps a sweep from deleting an old object a push has just
+  reused. The store keeps locks as objects of its own instead, `l/push/<id>` and `l/gc`, which work
+  on any backend. A push writes its lock and waits while a collection holds the store, and keeps
+  the lock until its head is committed. A collection writes its lock and gives up while a push holds
+  the store, looking again every 64 objects and stopping when one has begun. Each writes its own lock
+  before it reads the other's, so of two that overlap, at least one sees the other. A restore holds
+  the local store the same way, so the cache cap doesn't evict what it has just fetched. Locks whose
+  holder died go stale (a collection's an hour after it last renewed it, a push's after six).
+- **Order.** Negotiation trusts that a store holding a tree holds everything under it. A
+  collection keeps that true however it ends: it deletes each tree before what the tree names,
+  learning which garbage objects are trees from their first bytes (a ranged read on S3).
+- **The cache cap.** With bundles in the state store, the local store is also its cache: after a
+  complete sweep, objects the state store holds are evicted, least recently used first, a tree before
+  its children, until the store is under `local_cache:` (default 20 GiB). An object only the local
+  store holds, and anything under it, is never evicted.
 
 ## What each format becomes
 
@@ -225,7 +242,10 @@ those two.
    `agents/<agent>/<seq>.<generation>` names it in the bundles' home store (the state store with
    `bundles: s3`, else the local one). A tree with a name that isn't UTF-8 is still pushed as
    version 1. Not yet: resuming on the same host before the upload ends, and packs.
-4. **Garbage collection** in the reconciler, and the local store's cache cap.
+4. **Garbage collection** in the reconciler, and the local store's cache cap (done): mark from the
+   ledger's heads and the store's refs, sweep trees first, push and collection locks in the store,
+   `wicket state gc`. Ledger snapshots' blobs are no longer deleted by hand when their ref goes: the
+   sweep takes them. Nodes have no local store yet, so only the control host's stores are collected.
 5. **Named snapshots and forks** (#177) on bundle trees.
 6. **Transfer between nodes**: `has` and `get` on the node channel, reads falling through local, peer
    and state store; volume snapshots (#251) on it.

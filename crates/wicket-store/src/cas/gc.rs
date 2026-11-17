@@ -396,6 +396,7 @@ impl Cas {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn evict(
         &self,
         held: &mut Held,
