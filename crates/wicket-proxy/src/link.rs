@@ -1,6 +1,6 @@
 //! Links between boxes (issue #6): what a link needs of the boxes it joins ([`BoxOps`]), which the
 //! control host implements for boxes on any node. The link tools themselves (`expose`, `connect`,
-//! `link`) are the control host's: `wicket_control::gateway::link` (#257).
+//! `link`) are the control host's: `wicket_gateway::link` (#257).
 
 use std::net::Ipv4Addr;
 use std::time::Duration;

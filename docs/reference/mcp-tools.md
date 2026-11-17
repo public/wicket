@@ -3,7 +3,7 @@
 wicket's MCP gateway is the agent's only MCP server. Claude Code reaches it at
 `http://wicket.internal:8081/mcp` and sees its tools as `mcp__wicket__<tool>`. The tools are defined in
 `crates/wicket-proxy/src/gateway.rs` (`tools()`), and the control host answers its share in
-`crates/wicket-control/src/gateway.rs`; every call is an event in the run's output
+`crates/wicket-gateway/src/lib.rs`; every call is an event in the run's output
 (`[wicket-tool] <name>: …`) and the tools that decide something are audited.
 
 Every tool answers with one text block; a refusal or failure sets `isError`.
