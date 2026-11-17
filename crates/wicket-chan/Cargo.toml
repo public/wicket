@@ -11,6 +11,7 @@ publish.workspace = true
 testkit = []
 
 [dependencies]
+humantime.workspace = true
 wicket-core.workspace = true
 wicket-store.workspace = true
 wicket-proxy.workspace = true

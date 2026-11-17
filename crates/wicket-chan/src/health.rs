@@ -1,5 +1,5 @@
 //! A node's health (#377): its disk and inodes (for its data directory), memory, feed freshness,
-//! boxes killed for memory, and failures to persist its own state. The node samples it and reports
+//! boxes killed for memory, failures to persist its own state, and its CA's validity (#416). The node samples it and reports
 //! it to the control host on its channel ([`crate::chan::Msg::Health`]); the control host keeps the
 //! latest per node in the ledger, `wicket top` and the console show it, and the console pushes to
 //! operators when it crosses a threshold ([`alerts`]).
@@ -18,6 +18,9 @@ pub const REPORT_FRESH_MS: i64 = 10 * 60 * 1000;
 /// An out-of-memory kill or persistence failure older than this isn't announced (a restarted
 /// console doesn't announce last week's).
 pub const EVENT_ALERT_MS: i64 = 60 * 60 * 1000;
+/// A node CA with less than this share of its lifetime left alerts (#416): renewal over the channel
+/// is due at half, so it is late.
+pub const CA_ALERT_SHARE: f64 = 0.25;
 
 /// One sample of a node's health.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -37,6 +40,11 @@ pub struct NodeHealth {
     /// latest failure.
     pub persist_failures: u64,
     pub last_persist_failure: Option<HealthEvent>,
+    /// The node CA's validity (Unix s, #416), as the node holds it: None if it has none.
+    #[serde(default)]
+    pub ca_not_before: Option<i64>,
+    #[serde(default)]
+    pub ca_not_after: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -160,6 +168,8 @@ pub fn alerts(node: &str, h: &NodeHealth, now_ms: i64) -> Vec<Alert> {
             });
         }
     }
+    // The CA's end is a date: a stale report still says when it was (or is) due.
+    out.extend(ca_alert(node, h, now_ms));
     let events = [("oom", "a box was killed for memory", &h.last_oom), ("persist", "could not persist its state", &h.last_persist_failure)];
     for (kind, say, e) in events {
         if let Some(e) = e.as_ref().filter(|e| now_ms - e.at_ms <= EVENT_ALERT_MS) {
@@ -167,6 +177,41 @@ pub fn alerts(node: &str, h: &NodeHealth, now_ms: i64) -> Vec<Alert> {
         }
     }
     out
+}
+
+/// The node CA (#416): an alert once less than [`CA_ALERT_SHARE`] of its lifetime is left, and
+/// another (its own key, so pushed again) once it has expired.
+fn ca_alert(node: &str, h: &NodeHealth, now_ms: i64) -> Option<Alert> {
+    let end = h.ca_not_after?;
+    let now = now_ms / 1000;
+    let fix = format!("the control host renews it over the channel while a run is connected; else `wicket node renew-ca {node}`");
+    if now >= end {
+        return Some(Alert {
+            key: format!("{node}/ca-expired"),
+            text: format!(
+                "node {node}: its CA expired {} ago ({}), so boxes there can't reach their inspected hosts and none start: {fix}",
+                human_secs(now - end),
+                rfc3339(end)
+            ),
+        });
+    }
+    let life = (end - h.ca_not_before.unwrap_or(end)).max(0);
+    ((end - now) as f64 <= CA_ALERT_SHARE * life as f64).then(|| Alert {
+        key: format!("{node}/ca-expiring"),
+        text: format!("node {node}: its CA expires in {} ({}) and was not renewed: {fix}", human_secs(end - now), rfc3339(end)),
+    })
+}
+
+fn human_secs(s: i64) -> String {
+    match s {
+        s if s < 120 => format!("{s} s"),
+        s if s < 7200 => format!("{} min", s / 60),
+        s => format!("{} h", s / 3600),
+    }
+}
+
+fn rfc3339(s: i64) -> String {
+    humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s.max(0) as u64)).to_string()
 }
 
 /// The disk thresholds of `key` (a node's, or the control host's own), named `who` in the text.
@@ -194,6 +239,11 @@ pub fn summary(h: &NodeHealth, now_ms: i64) -> String {
     }
     if let Some(u) = h.feed_fresh_until_ms.filter(|u| *u < now_ms) {
         s.push_str(&format!(", feed stale {} s", (now_ms - u) / 1000));
+    }
+    match h.ca_not_after {
+        Some(end) if end * 1000 <= now_ms => s.push_str(&format!(", CA EXPIRED {}", rfc3339(end))),
+        Some(end) => s.push_str(&format!(", CA until {}", rfc3339(end))),
+        None => {}
     }
     s
 }
@@ -404,6 +454,34 @@ mod tests {
         // The feed stale for less than 5 min is not yet alerted.
         let mut h = healthy(now);
         h.feed_fresh_until_ms = Some(now - 4 * 60_000);
+        assert!(alerts("n1", &h, now).is_empty());
+    }
+
+    /// #416: a node CA in its last quarter alerts, and again (another key, so pushed again) once
+    /// expired, whether or not the report is fresh; top and the console show its end.
+    #[test]
+    fn a_node_ca_alerts_in_its_last_quarter_and_again_once_expired() {
+        let now = 10_000_000_000;
+        let mut h = healthy(now);
+        let s = now / 1000;
+        h.ca_not_before = Some(s - 3600);
+        h.ca_not_after = Some(s + 3600);
+        assert!(alerts("n1", &h, now).is_empty(), "half its life left");
+        assert!(summary(&h, now).contains("CA until "), "{}", summary(&h, now));
+        h.ca_not_after = Some(s + 1200); // 1200 of 4800 s left: a quarter
+        let a = alerts("n1", &h, now);
+        assert_eq!(a.iter().map(|a| a.key.as_str()).collect::<Vec<_>>(), ["n1/ca-expiring"]);
+        assert!(a[0].text.contains("expires in 20 min") && a[0].text.contains("wicket node renew-ca n1"), "{}", a[0].text);
+        h.ca_not_after = Some(s);
+        let a = alerts("n1", &h, now);
+        assert_eq!(a.iter().map(|a| a.key.as_str()).collect::<Vec<_>>(), ["n1/ca-expired"]);
+        assert!(a[0].text.contains("none start"), "{}", a[0].text);
+        assert!(summary(&h, now).contains("CA EXPIRED"), "{}", summary(&h, now));
+        // A stale report (the node not connected since) still says the CA is gone.
+        h.at_ms = now - REPORT_FRESH_MS - 1;
+        assert_eq!(alerts("n1", &h, now).len(), 1);
+        // A report from before CA validity was reported: nothing.
+        h.ca_not_after = None;
         assert!(alerts("n1", &h, now).is_empty());
     }
 
