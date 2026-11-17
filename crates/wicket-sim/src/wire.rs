@@ -1,6 +1,6 @@
 //! The simulated channels' wire format.
 //!
-//! **Control host ↔ node.** This follows the node channel's framing (`wicket-cli/src/chan.rs`): a
+//! **Control host ↔ node.** This follows the node channel's framing (`wicket-chan/src/chan.rs`): a
 //! 4-byte big-endian length, then a kind byte (`1` a JSON message, `3` one wicket-feed frame line),
 //! then the body. The messages are the few of `chan::Msg` the simulation needs, with the same
 //! payloads (`Slice` and `Spent` are wicket-proxy's own types). `chan.rs` lives in the CLI binary, so

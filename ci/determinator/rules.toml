@@ -34,15 +34,21 @@ mark-changed = "all"
 globs = ["examples/**"]
 mark-changed = ["wicket-core", "wicket-authz", "wicket-feed", "wicket-policy", "wicket-home", "wicket-cli"]
 
-# The console's session view (#327), embedded by crates/wicket-cli/build.rs; the agent image the
-# CLI builds; the install and unit files it writes.
+# The agent image wicket builds, embedded by wicket-control's image.rs (#219); wicket-cli depends on
+# wicket-control.
 [[path-rule]]
 globs = ["images/claude-code/wicket-entry"]
-mark-changed = ["wicket-cli", "wicket-fwd"]
+mark-changed = ["wicket-control", "wicket-fwd"]
 
 [[path-rule]]
+globs = ["images/**"]
+mark-changed = ["wicket-control"]
+
+# The console's session view (#327), embedded by crates/wicket-cli/build.rs; the install and unit
+# files the CLI writes.
+[[path-rule]]
 globs = [
-  "web/**", "images/**", "ci/session-view.sh", "ci/install-node.sh", "docs/reference/cli.md",
+  "web/**", "ci/session-view.sh", "ci/install-node.sh", "docs/reference/cli.md",
   "ci/gen-cli-reference.sh", "deploy/systemd/**", "deploy/systemd-user/**",
 ]
 mark-changed = ["wicket-cli"]
@@ -87,8 +93,8 @@ post-rule = "skip-rules"
 # gateway, `node create`, the reconciler and a run's supervisor.
 [[path-rule]]
 globs = [
-  "crates/wicket-node/src/nodesrv.rs", "crates/wicket-cli/src/noderun.rs", "crates/wicket-node/src/nodegw.rs",
-  "crates/wicket-cli/src/nodecreate.rs", "crates/wicket-cli/src/reconcile.rs", "crates/wicket-cli/src/hibernate.rs",
+  "crates/wicket-node/src/nodesrv.rs", "crates/wicket-control/src/noderun.rs", "crates/wicket-node/src/nodegw.rs",
+  "crates/wicket-control/src/nodecreate.rs", "crates/wicket-cli/src/reconcile.rs", "crates/wicket-control/src/hibernate.rs",
 ]
 mark-changed = ["wicket-sim"]
 post-rule = "skip-rules"

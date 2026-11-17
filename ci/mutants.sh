@@ -44,7 +44,7 @@ sets=(
   "core|wicket-core|-f crates/wicket-core/src/subset.rs -f crates/wicket-core/src/op.rs -f crates/wicket-core/src/canon.rs -f crates/wicket-core/src/budget.rs|core"
   "matchers|wicket-core|-f crates/wicket-core/src/manifest.rs -F host_matches|compile_glob|wildcard_for|allows_model|model_covers|names_host|covers_host|ReachRule::matches|check_models|fold_case_glob|core"
   "authz|wicket-authz|-f crates/wicket-authz/src/decide.rs -f crates/wicket-authz/src/token.rs -f crates/wicket-authz/src/cost.rs|authz"
-  "grant|wicket-cli|-f crates/wicket-cli/src/grant.rs -F within_authority|check_terms|agent_terms|outlasts|descendant_chain|agent_renews|bounds|check_ttl|check_prefix|grant"
+  "grant|wicket-control|-f crates/wicket-control/src/grant.rs -F within_authority|check_terms|agent_terms|outlasts|descendant_chain|agent_renews|bounds|check_ttl|check_prefix|grant"
 )
 survived=()
 for s in "${sets[@]}"; do
@@ -54,7 +54,7 @@ for s in "${sets[@]}"; do
   case "$tests" in
     core) targs=("${core_tests[@]}") ;;
     authz) targs=(-- -- --skip oracle3) ;;
-    grant) targs=(-- --bin wicket -- grant) ;;
+    grant) targs=(-- --lib -- grant) ;;
   esac
   # The -F regex holds `|`: split the filters on spaces only.
   read -r -a fargs <<<"$filters"

@@ -1,0 +1,44 @@
+[package]
+name = "wicket-control"
+description = "The control host's core (#219): a run's supervisor and its box on a node, spawns, hibernation, transcripts, the authority roots and feed, and what they need of nodes (enrolment, placement, leases), grants, operators and policy. Split from wicket-cli so it builds and tests without the CLI, the console and the daemon."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wicket-core.workspace = true
+wicket-store.workspace = true
+wicket-proxy.workspace = true
+wicket-chan.workspace = true
+wicket-home.workspace = true
+wicket-node.workspace = true
+wicket-sandbox.workspace = true
+wicket-agent.workspace = true
+wicket-identity.workspace = true
+wicket-placement.workspace = true
+wicket-feed.workspace = true
+wicket-policy.workspace = true
+wicket-authz.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+humantime.workspace = true
+hex.workspace = true
+sha2.workspace = true
+base64.workspace = true
+time.workspace = true
+getrandom.workspace = true
+libc = "0.2"
+reqwest.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+# `wicket node create`'s options (nodecreate.rs), flattened into the CLI's.
+clap.workspace = true
+
+[dev-dependencies]
+wicket-chan = { workspace = true, features = ["testkit"] }
+wicket-home = { workspace = true, features = ["testkit"] }
+wicket-placement = { workspace = true, features = ["mock"] }
+getrandom = { workspace = true, features = ["sys_rng"] }

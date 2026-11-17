@@ -22,7 +22,7 @@
 //!   `noderun::slice_due` uses). Each call goes through the proxy's own admit, reserve and settle
 //!   (`Llm::sim_begin`, `Llm::sim_settle`: the `sim` feature's seam).
 //!
-//! The hosts' run loops are stand-ins, written to follow `wicket-cli`'s `noderun.rs` (control
+//! The hosts' run loops are stand-ins, written to follow `wicket-control`'s `noderun.rs` (control
 //! host) and `wicket-node`'s `nodesrv.rs` (node). Those files open unix sockets and docker
 //! themselves. The stand-ins keep what those loops persist: the node's spend file, written
 //! before each model call goes upstream and every second, and its slices, written as they arrive. A box stub stands in for the box
