@@ -372,7 +372,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         }
         Some(net::TlsSource::Acme(cfg)) => {
             acme::run(cfg.clone(), resolver.clone(), acme::reqwest_http(), Duration::from_secs(12 * 3600));
-            println!("ACME ({}): certificate for {} kept in {}", cfg.directory, cfg.domain, cfg.cache.display());
+            say!("ACME ({}): certificate for {} kept in {}", cfg.directory, cfg.domain, cfg.cache.display());
             Some(tokio_rustls::TlsAcceptor::from(tls::server_config(resolver.clone(), true)?))
         }
     };
@@ -381,21 +381,21 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         (None, true) => "HTTP behind a TLS terminator",
         (None, false) => "HTTP, loopback only",
     };
-    println!("wicket console on {}/  (listening on {}, {how})", plan.origin, plan.addr);
+    say!("wicket console on {}/  (listening on {}, {how})", plan.origin, plan.addr);
     if !web::SESSION_VIEW_BUILT {
-        println!("this build has no session view (built without web/session's bundle): runs' session pages say so");
+        say!("this build has no session view (built without web/session's bundle): runs' session pages say so");
     }
     for (name, dir) in &state.roots {
-        println!("runs can be started from {name}: {}", dir.display());
+        say!("runs can be started from {name}: {}", dir.display());
     }
     if has_passkeys {
-        println!("sign in with your passkey. (Lost them all? On the host: wicket operator reset)");
+        say!("sign in with your passkey. (Lost them all? On the host: wicket operator reset)");
     } else if !bootstrap_link {
-        println!("no operator passkey yet. On the host, as root: wicket operator enrol-link --origin {}", plan.origin);
+        say!("no operator passkey yet. On the host, as root: wicket operator enrol-link --origin {}", plan.origin);
     } else {
         let token = issue_enrol_link(&state.ledger()?, &state.tenant, BOOTSTRAP_TTL, "wicket serve (no passkey yet)")?;
-        println!("no operator passkey yet. Enrol one within 10 minutes (single use):");
-        println!("  {}/enrol?t={token}", plan.origin);
+        say!("no operator passkey yet. Enrol one within 10 minutes (single use):");
+        say!("  {}/enrol?t={token}", plan.origin);
     }
     net::run(listener, acceptor, state).await
 }

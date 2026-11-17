@@ -56,7 +56,7 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
             if let Frame::Feed(bytes) = f {
                 let r = node.replica.lock().expect("replica").accept_bytes(&bytes, (node.clock)());
                 if let Err(e) = &r {
-                    eprintln!("[node] feed frame refused (observer): {} ({e})", e.kind());
+                    say_err!("[node] feed frame refused (observer): {} ({e})", e.kind());
                 }
                 wr.write_all(&node.feed_status(r.as_ref().err()).encode()).await?;
             }
@@ -110,7 +110,7 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
     let capacity = Some(node.capacity());
     let _ =
         tx.send(Frame::Msg(Msg::Welcome { node: node.name.clone(), build: node.build.clone(), proto: negotiated, feed, runs, capacity }));
-    eprintln!(
+    say_err!(
         "[node] control host connected{} (protocol {negotiated})",
         if scope.is_empty() { String::new() } else { format!(" ({scope})") }
     );
@@ -149,7 +149,7 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
                 node.send_to(g, Frame::Msg(Msg::AuditAsk {}));
             }
         }
-        eprintln!(
+        say_err!(
             "[node] control host disconnected{}; its boxes keep running on the feed held",
             if scope.is_empty() { String::new() } else { format!(" ({scope})") }
         );
@@ -173,7 +173,7 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 }
             }
             if let Err(e) = &r {
-                eprintln!("[node] feed frame refused: {} ({e})", e.kind());
+                say_err!("[node] feed frame refused: {} ({e})", e.kind());
                 let _ = node.audit.lock().expect("audit").audit(
                     &wicket_core::TenantId::single(),
                     None,
@@ -185,12 +185,7 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 if let Ok(f) = wicket_feed::Frame::parse(&bytes) {
                     if matches!(f.kind, wicket_feed::FrameKind::Delta | wicket_feed::FrameKind::Snap) {
                         let epoch = node.replica.lock().expect("replica").state().map(|s| s.epoch);
-                        eprintln!(
-                            "[node] feed {} applied, epoch {} (at {} ms)",
-                            f.kind.as_str(),
-                            epoch.unwrap_or(0),
-                            wicket_feed::now_ms()
-                        );
+                        say_err!("[node] feed {} applied, epoch {} (at {} ms)", f.kind.as_str(), epoch.unwrap_or(0), wicket_feed::now_ms());
                     }
                 }
             }
@@ -224,7 +219,7 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                         Err(e) => (None, Some(format!("{e:#}"))),
                     };
                     if let Some(e) = &error {
-                        eprintln!("[node] starting {run} failed: {e}");
+                        say_err!("[node] starting {run} failed: {e}");
                     }
                     n.send_to(gen, Frame::Msg(Msg::Started { run, error, digest, timings: t.spans() }));
                 });
@@ -311,7 +306,7 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     match &error {
                         None => node.audit_note(&child, "node.child_adopted", serde_json::json!({})),
                         Some(e) => {
-                            eprintln!("[node] {child}: the control host refused the child this node started ({e}); stopping it");
+                            say_err!("[node] {child}: the control host refused the child this node started ({e}); stopping it");
                             node.audit_note(&child, "node.child_refused", serde_json::json!({ "why": e }));
                             node.stopped.lock().expect("stopped").insert(child.clone(), format!("refused by the control host: {e}"));
                             let name = node.boxes.lock().expect("boxes").get(&child).map(|b| b.name.clone());
@@ -324,7 +319,7 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
             }
             Msg::BudgetSlice { run, slice } => {
                 if let Err(e) = node.slices.put(&run, &slice) {
-                    eprintln!("[node] {run}: keeping its budget slice: {e:#}");
+                    say_err!("[node] {run}: keeping its budget slice: {e:#}");
                 }
                 if let Some(l) = node.llms.lock().expect("llms").get(&run) {
                     l.set_slice(Some(slice));
@@ -474,11 +469,11 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 let now = (node.clock)() / 1000;
                 let (serial, error) = match node.ident.install_cert(&node.paths.root, cert.trim(), &node.name, now) {
                     Ok(c) => {
-                        eprintln!("[node] identity certificate renewed: {}… until {}", &c.jti[..12], c.exp);
+                        say_err!("[node] identity certificate renewed: {}… until {}", &c.jti[..12], c.exp);
                         (c.jti, None)
                     }
                     Err(e) => {
-                        eprintln!("[node] refused a renewed identity certificate: {e:#}");
+                        say_err!("[node] refused a renewed identity certificate: {e:#}");
                         (String::new(), Some(format!("{e:#}")))
                     }
                 };
@@ -497,12 +492,12 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 let got = super::nodeca::install(&node.ca_pending, &node.paths.root, &node.root_pem, node.paths.shares_host(), &pem, now);
                 let (serial, error) = match got {
                     Ok((ca, serial)) => {
-                        eprintln!("[node] node CA renewed: serial {serial} until {}; every box mints from it now", ca.not_after);
+                        say_err!("[node] node CA renewed: serial {serial} until {}; every box mints from it now", ca.not_after);
                         node.live_ca.set(Some(ca));
                         (serial, None)
                     }
                     Err(e) => {
-                        eprintln!("[node] refused a renewed node CA: {e:#}");
+                        say_err!("[node] refused a renewed node CA: {e:#}");
                         (String::new(), Some(format!("{e:#}")))
                     }
                 };

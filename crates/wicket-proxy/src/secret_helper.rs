@@ -183,7 +183,7 @@ pub fn serve(l: UnixListener, allowed: Vec<u32>, served: Vec<Served>) -> Result<
         let state = state.clone();
         std::thread::spawn(move || {
             if let Err(e) = serve_one(&c, &state.0, &state.1) {
-                eprintln!("wicket secret serve: {e:#}");
+                let _ = writeln!(std::io::stderr(), "wicket secret serve: {e:#}");
             }
         });
     }
@@ -207,10 +207,17 @@ pub fn serve_one(c: &UnixStream, allowed: &[u32], served: &[Served]) -> Result<(
     let a = answer(peer, allowed, served, line.trim());
     let what = serde_json::from_str::<serde_json::Value>(line.trim()).ok().and_then(|r| r.get("secret")?.as_str().map(String::from));
     match a.get("error").and_then(|e| e.as_str()) {
+        // Not eprintln!: a closed stderr mustn't panic the helper (#422).
         Some(e) => {
-            eprintln!("wicket secret serve: uid {peer}{}: refused: {e}", what.map(|w| format!(" asked for {w}")).unwrap_or_default())
+            let _ = writeln!(
+                std::io::stderr(),
+                "wicket secret serve: uid {peer}{}: refused: {e}",
+                what.map(|w| format!(" asked for {w}")).unwrap_or_default()
+            );
         }
-        None => eprintln!("wicket secret serve: served {} to uid {peer}", what.unwrap_or_default()),
+        None => {
+            let _ = writeln!(std::io::stderr(), "wicket secret serve: served {} to uid {peer}", what.unwrap_or_default());
+        }
     }
     let mut w = c;
     w.write_all(format!("{a}\n").as_bytes())?;

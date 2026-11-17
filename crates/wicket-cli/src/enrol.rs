@@ -350,8 +350,8 @@ pub fn token(name: Option<String>, ttl: Duration) -> Result<()> {
     let l = Ledger::open(&crate::ledger_path())?;
     let t = l.create_node_token(&TenantId::single(), &name, ttl.as_secs() as i64)?;
     l.audit(&TenantId::single(), None, "node.token", &serde_json::json!({ "name": name, "ttl_secs": ttl.as_secs() }))?;
-    println!("{t}");
-    eprintln!(
+    say!("{t}");
+    say_err!(
         "one-time join token for node {name}, valid for {}: wicket node enrol <ssh-target> --token <token> --hosts …",
         humantime::format_duration(ttl)
     );
@@ -406,7 +406,7 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
         let _ = std::fs::remove_dir_all(&pin_dir);
     };
     if spec.is_none() {
-        println!("pinned host key {} {} (trust on first use: check it against the node's console)", key.kind, key.fingerprint());
+        say!("pinned host key {} {} (trust on first use: check it against the node's console)", key.kind, key.fingerprint());
     }
     let node = Node::pinned(&o.target, o.ssh_key.as_deref(), &pin, &name);
     let generated = match node
@@ -464,7 +464,7 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
     node.script("installing the node files", &script).await.with_context(|| {
         format!("node {name} is recorded and its CA (serial {}) issued, but installing it on the node failed: fix that and run `wicket node renew-ca {name}`, or `wicket node revoke {name}`", cert.serial)
     })?;
-    println!(
+    say!(
         "enrolled node {name} ({}): host key {} pinned, node key {}, identity {} until {}, CA serial {} for {} until {}",
         o.target,
         row.host_key_fp,
@@ -522,7 +522,7 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration, cert_ttl
             cert.serial
         )
     })?;
-    println!(
+    say!(
         "renewed node {name}'s CA: serial {} for {} until {}; identity certificate until {}",
         cert.serial,
         cert.permitted.join(", "),
@@ -570,7 +570,7 @@ pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Re
     let bytes = std::fs::read(&exe)?;
     let sha = hex::encode(Sha256::digest(&bytes));
     let prev = crate::update::push_version(&node, &bytes, &sha).await?;
-    println!(
+    say!(
         "installed wicket on node {name} ({} MB, version {}{}, sha256 {}…)",
         bytes.len() >> 20,
         &sha[..12],
@@ -578,7 +578,7 @@ pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Re
         &sha[..16]
     );
     if no_service {
-        println!("no service installed: run `~/.local/bin/wicket node serve` on the node yourself");
+        say!("no service installed: run `~/.local/bin/wicket node serve` on the node yourself");
         return Ok(());
     }
     let home = node.sh("echo $HOME").await?;
@@ -590,7 +590,7 @@ pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Re
         d = wicket_sandbox::shell_quote(&unit_dir)
     );
     let state = node.script("installing the wicket-node service (is lingering enabled for this user?)", &script).await?;
-    println!("wicket-node service on {name}: {state}");
+    say!("wicket-node service on {name}: {state}");
     Ok(())
 }
 
@@ -617,7 +617,7 @@ pub fn list() -> Result<()> {
     let names: Vec<String> = nodes.iter().filter(|n| n.status != "revoked").map(|n| n.name.clone()).collect();
     let unenrolled = crate::nodecreate::leased_not_enrolled(&l, &names, now)?;
     if nodes.is_empty() && unenrolled.is_empty() {
-        println!("no nodes (lease one with wicket node create, or enrol your own: wicket node token, then wicket node enrol)");
+        say!("no nodes (lease one with wicket node create, or enrol your own: wicket node token, then wicket node enrol)");
     }
     for n in nodes {
         let ca = l.node_cas(&n.name)?.into_iter().find(|c| c.status == "active");
@@ -636,21 +636,21 @@ pub fn list() -> Result<()> {
             None if n.status == "active" => format!("no identity certificate (wicket node renew-ca {})", n.name),
             None => "no identity certificate".into(),
         };
-        println!("{}  {}  {}  host key {}  hosts {}  {}  {}", n.name, n.status, n.target, n.host_key_fp, n.hosts.join(","), ca, id);
+        say!("{}  {}  {}  host key {}  hosts {}  {}  {}", n.name, n.status, n.target, n.host_key_fp, n.hosts.join(","), ca, id);
         if n.status != "revoked" {
             if let Some(lease) = crate::nodecreate::lease_summary(&l, &n.name, now)? {
-                println!("  {lease}");
+                say!("  {lease}");
             }
         }
         // What it holds for this host's runs (#152, #153): authority deadlines, secrets fetched (by
         // name), budget slices.
         let now_ms = wicket_feed::now_ms();
         for (run, a, h) in crate::noderun::node_holdings(&l, &n.name)? {
-            println!("{}", crate::noderun::holdings_line(&run, a.as_ref(), &h, now_ms));
+            say!("{}", crate::noderun::holdings_line(&run, a.as_ref(), &h, now_ms));
         }
     }
     for line in unenrolled {
-        println!("{line}");
+        say!("{line}");
     }
     Ok(())
 }
@@ -679,7 +679,7 @@ pub fn resolve(ledger: &Ledger, nodes_dir: &Path, arg: &str, ssh_key: Option<&Pa
         Some(r) if r.status == "active" => pinned_node(nodes_dir, &r, ssh_key),
         Some(r) => bail!("node {} ({}) is {}: refusing to use it", r.name, r.target, r.status),
         None => {
-            eprintln!(
+            say_err!(
                 "[wicket] warning: {arg} is not an enrolled node, so its ssh host key is not pinned (trusted on first use). \
                  Enrol it: wicket node token --name <name>, then wicket node enrol {arg} --token … --host-key …"
             );

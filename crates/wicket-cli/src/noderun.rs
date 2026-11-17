@@ -710,7 +710,7 @@ async fn ca_current(sh: &Shared, proto: u32) {
     if !expired() {
         return;
     }
-    println!("[wicket] node {}'s CA has expired: renewing it before the box starts", sh.node);
+    say!("[wicket] node {}'s CA has expired: renewing it before the box starts", sh.node);
     for _ in 0..120 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         if !expired() {

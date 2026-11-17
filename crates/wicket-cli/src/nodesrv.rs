@@ -465,7 +465,7 @@ impl Node {
         let now = (self.clock)();
         self.persists.note(now, format!("feed: {why}"));
         let again = self.reserve.release().then(|| {
-            eprintln!("[node] the disk reserve is released for the node's feed");
+            say_err!("[node] the disk reserve is released for the node's feed");
             self.replica.lock().expect("replica").accept_bytes(bytes, now).map(|_| ())
         });
         if !matches!(again, Some(Ok(()))) {
@@ -485,7 +485,7 @@ impl Node {
         }
         *stalled = None;
         drop(stalled);
-        eprintln!("[node] the feed can be written again (it couldn't since {since} ms): asking for what it missed");
+        say_err!("[node] the feed can be written again (it couldn't since {since} ms): asking for what it missed");
         let _ = self.audit.lock().expect("audit").audit(
             &wicket_core::TenantId::single(),
             None,
@@ -519,7 +519,7 @@ impl Node {
         };
         let swept = volumes::sweep(&self.paths.volumes(), &self.paths.runs(), &|r| running.contains(r), &in_use, (self.clock)());
         for (dir, why) in &swept {
-            eprintln!("[node] deleted {}: {why}", dir.display());
+            say_err!("[node] deleted {}: {why}", dir.display());
             let _ = self.audit.lock().expect("audit").audit(
                 &wicket_core::TenantId::single(),
                 None,
@@ -646,7 +646,7 @@ impl Node {
             match loaded {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    eprintln!(
+                    say_err!(
                         "[node] the node CA is unusable ({e:#}); hosts are only spliced, where a box's token allows them wholesale, or refused"
                     );
                     None
@@ -788,7 +788,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(paths.root.join("serve.lock"))?;
         // SAFETY: flock on a file descriptor this function owns.
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            eprintln!("[node] another `wicket node serve` is serving {}", paths.root.display());
+            say_err!("[node] another `wicket node serve` is serving {}", paths.root.display());
             return Ok(());
         }
         f
@@ -805,7 +805,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     let replica = match Replica::open_with(&paths.feed(), &name, root_key, ReplicaConfig::default(), authz_root) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[node] the persisted feed does not verify ({e}); starting closed until the control host sends a fresh one");
+            say_err!("[node] the persisted feed does not verify ({e}); starting closed until the control host sends a fresh one");
             Replica::reset_with(&paths.feed(), &name, root_key, ReplicaConfig::default(), authz_root)?
         }
     };
@@ -833,17 +833,17 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     let secrets = crate::nodesecrets::Cache::new(clock.clone());
     match secrets.import_handover() {
         Ok(0) => {}
-        Ok(n) => eprintln!("[node] {n} cached secret(s) handed over from the previous process"),
-        Err(e) => eprintln!("[node] the secret cache handed over is refused: {e:#}"),
+        Ok(n) => say_err!("[node] {n} cached secret(s) handed over from the previous process"),
+        Err(e) => say_err!("[node] the secret cache handed over is refused: {e:#}"),
     }
     let slices = crate::nodesecrets::Slices::new(&node_root)?;
     // The disk reserve (#377): taken now if the disk has room for it, and again whenever it has.
     let reserve = crate::health::Reserve::for_node(&node_root);
     match reserve.take() {
-        Ok(true) => eprintln!("[node] disk reserve: {} MiB held for the node's own state", reserve.size >> 20),
+        Ok(true) => say_err!("[node] disk reserve: {} MiB held for the node's own state", reserve.size >> 20),
         Ok(false) if reserve.held() > 0 => {}
-        Ok(false) => eprintln!("[node] disk reserve: not held (no room for {} MiB above the floor)", reserve.size >> 20),
-        Err(e) => eprintln!("[node] disk reserve: not held ({e})"),
+        Ok(false) => say_err!("[node] disk reserve: not held (no room for {} MiB above the floor)", reserve.size >> 20),
+        Err(e) => say_err!("[node] disk reserve: not held ({e})"),
     }
     let node = Arc::new(Node {
         name: name.clone(),
@@ -892,7 +892,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         crate::audit_export::flush_on_signal(node.audit.clone(), move || n.ship_audit());
     }
     // A box start's Docker calls go to its Engine API where this process can reach it (#287).
-    eprintln!("[node] docker: {}", node.docker.backend().await);
+    say_err!("[node] docker: {}", node.docker.backend().await);
     // Image identities are reused between box starts while nothing changes the images (#287).
     tokio::spawn(node.docker.clone().watch_images(node.idents.clone()));
     adopt_previous(&node).await;
@@ -921,7 +921,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                     use std::os::fd::IntoRawFd;
                     std::env::set_var(crate::nodesecrets::HANDOVER_ENV, fd.into_raw_fd().to_string());
                 }
-                Err(e) => eprintln!("[node] the secret cache can't be handed over ({e:#}); it is fetched again"),
+                Err(e) => say_err!("[node] the secret cache can't be handed over ({e:#}); it is fetched again"),
             }
         });
     }
@@ -975,7 +975,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                 }
                 if tick5.is_multiple_of(60) && n.feed_stalled.lock().expect("stalled").is_none() {
                     if let Ok(true) = n.reserve.take() {
-                        eprintln!("[node] disk reserve: taken back ({} MiB)", n.reserve.size >> 20);
+                        say_err!("[node] disk reserve: taken back ({} MiB)", n.reserve.size >> 20);
                     }
                 }
                 // Secrets past their expiry are dropped (#152); their use already ended.
@@ -985,7 +985,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                     if !stopped.insert(run.clone()) {
                         continue;
                     }
-                    eprintln!("[node] {run}: its authority expired at {until} ms; stopping the box");
+                    say_err!("[node] {run}: its authority expired at {until} ms; stopping the box");
                     n.audit_note(&run, "node.authority_expired", serde_json::json!({ "until_ms": until }));
                     n.stopped.lock().expect("stopped").insert(run.clone(), format!("its authority expired at {until} ms"));
                     let _ = n.docker.unpause(&name).await;
@@ -1012,7 +1012,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         });
     }
     let mode = node.replica.lock().expect("replica").mode((node.clock)());
-    eprintln!("[node] {name}: serving on {} (build {}, feed {mode:?})", ctl.display(), &node.build[..12]);
+    say_err!("[node] {name}: serving on {} (build {}, feed {mode:?})", ctl.display(), &node.build[..12]);
     {
         let n = node.clone();
         tokio::spawn(async move {
@@ -1041,7 +1041,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                     idle_since = std::time::Instant::now();
                 }
                 if !root.join("node.json").exists() || idle_since.elapsed().as_secs() >= secs {
-                    eprintln!("[node] idle for {secs} s: exiting");
+                    say_err!("[node] idle for {secs} s: exiting");
                     if let Ok(l) = n.audit.lock() {
                         let _ = l.flush_audit();
                     }
@@ -1057,7 +1057,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         let n = node.clone();
         tokio::spawn(async move {
             if let Err(e) = connection(n, stream, gen).await {
-                eprintln!("[node] control connection ended: {e:#}");
+                say_err!("[node] control connection ended: {e:#}");
             }
         });
     }
@@ -1083,16 +1083,16 @@ async fn adopt_previous(node: &Arc<Node>) {
                 match zone {
                     Some(z) if z.name == rec.start.zone => match serve_box(node, &rec.start, &dir, z, None).await {
                         Ok(tasks) => {
-                            eprintln!("[node] {run}: adopted box {} from a previous serve", b.name);
+                            say_err!("[node] {run}: adopted box {} from a previous serve", b.name);
                             wire(node, None, rec, dir, tasks, ids());
                         }
                         Err(e) => {
-                            eprintln!("[node] {run}: could not adopt box {} ({e:#}); stopping it", b.name);
+                            say_err!("[node] {run}: could not adopt box {} ({e:#}); stopping it", b.name);
                             let _ = node.docker.kill(&b.name).await;
                         }
                     },
                     _ => {
-                        eprintln!("[node] {run}: box {} has no authority in this node's feed; stopping it", b.name);
+                        say_err!("[node] {run}: box {} has no authority in this node's feed; stopping it", b.name);
                         let _ = node.docker.kill(&b.name).await;
                     }
                 }
@@ -1102,7 +1102,7 @@ async fn adopt_previous(node: &Arc<Node>) {
             None if node.paths.shares_host() => {}
             None => {
                 if let crate::owner::Verdict::Orphan(why) = crate::owner::judge(&b, None) {
-                    eprintln!("[node] stopping {} ({why})", b.name);
+                    say_err!("[node] stopping {} ({why})", b.name);
                     let _ = node.docker.kill(&b.name).await;
                 }
             }
@@ -1241,7 +1241,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     // A box whose hosts need the node CA doesn't start on an expired one (#416): every request it
     // made would be refused. The control host renews it over the channel first, if it can.
     if let Some(why) = nodeca::expired_for(node.ca().get().as_deref(), &zone, &node.name, (node.clock)() / 1000) {
-        eprintln!("[node] {}: refused: {why}", bs.run);
+        say_err!("[node] {}: refused: {why}", bs.run);
         node.audit_note(&bs.run, "box.refused", serde_json::json!({ "why": why }));
         bail!("{why}");
     }
@@ -1268,7 +1268,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     // Admission (#377): the box's memory limit against what is actually free, and the disk floor.
     // Refused, nothing of it is made; the refusal names why, and placement tries another node.
     if let Err(e) = node.admit(&bs.run, bs.memory.parse::<u64>().unwrap_or(0) >> 20) {
-        eprintln!("[node] {}: refused: {e:#}", bs.run);
+        say_err!("[node] {}: refused: {e:#}", bs.run);
         node.audit_note(&bs.run, "box.refused", serde_json::json!({ "why": format!("{e:#}") }));
         return Err(e);
     }
@@ -1436,7 +1436,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     wire(node, owner, rec, dir, tasks, spec.user.clone());
     wired.end();
     total.end();
-    eprintln!("[node] box {name} started ({})", ident.id);
+    say_err!("[node] box {name} started ({})", ident.id);
     Ok(ident.id)
 }
 
@@ -1478,7 +1478,7 @@ fn load_derived(node: &Node, dir: &std::path::Path, run: &str) {
         return;
     }
     if let Err(e) = r.put_local(a) {
-        eprintln!("[node] {run}: the authority this node derived for it no longer holds ({e})");
+        say_err!("[node] {run}: the authority this node derived for it no longer holds ({e})");
     }
 }
 
@@ -1708,7 +1708,7 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
     if let Some(f) = &feed {
         match f.clone().serve(&dir.join("sock/stdin.sock")) {
             Ok(t) => tasks.push(t),
-            Err(e) => eprintln!("[node] {}: the box's stdin socket failed: {e:#}", bs.run),
+            Err(e) => say_err!("[node] {}: the box's stdin socket failed: {e:#}", bs.run),
         }
         // An image from before stdin came over a socket never asks for it, and its agent would wait
         // for ever: stopped, saying why (on the box's stderr, which the control host shows).
@@ -1720,7 +1720,7 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             }
             let why =
                 "[wicket] the box never read its stdin: its image predates wicket's stdin socket (#151); rebuild it with `wicket image`\n";
-            eprintln!("[node] {run}: {}", why.trim());
+            say_err!("[node] {run}: {}", why.trim());
             let frame = {
                 let mut boxes = n.boxes.lock().expect("boxes");
                 boxes.get_mut(&run).filter(|b| b.exited.is_none()).map(|b| {
@@ -1772,7 +1772,7 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
     let (run, done) = (bs.run.clone(), logs.done);
     readers.push(tokio::spawn(async move {
         if let Ok(Err(e)) = done.await {
-            eprintln!("[node] {run}: reading the box's output failed: {e:#}");
+            say_err!("[node] {run}: reading the box's output failed: {e:#}");
         }
     }));
     // The node enforces the run's timeout itself, connected or not, from when the box started.
@@ -1784,7 +1784,7 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
         let code = tokio::select! {
             c = n.docker.wait(&box_name) => c.unwrap_or(-1),
             _ = &mut deadline => {
-                eprintln!("[node] {run}: past its timeout; stopping the box");
+                say_err!("[node] {run}: past its timeout; stopping the box");
                 n.stopped.lock().expect("stopped").entry(run.clone()).or_insert_with(|| "past its timeout (the node's backstop)".into());
                 let _ = n.docker.unpause(&box_name).await;
                 let _ = n.docker.kill(&box_name).await;
@@ -1881,7 +1881,7 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
                     aligner = None;
                     if !lined {
                         let at = n.boxes.lock().expect("boxes").get(&run).map(|b| b.out[i].end()).unwrap_or(0);
-                        eprintln!("[node] {run}: its output's replay couldn't be lined up: resuming at offset {at}");
+                        say_err!("[node] {run}: its output's replay couldn't be lined up: resuming at offset {at}");
                         let _ = n.audit.lock().expect("audit").audit(
                             &wicket_core::TenantId::single(),
                             Some(&wicket_core::RunId(run.clone())),
@@ -1917,7 +1917,7 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
             stopped = true;
             let why =
                 format!("[wicket] the box's output passed its zone's limits.output ({cap} bytes): stopping it (on_output_full: stop)\n");
-            eprintln!("[node] {run}: {}", why.trim());
+            say_err!("[node] {run}: {}", why.trim());
             let frame = {
                 let mut boxes = n.boxes.lock().expect("boxes");
                 boxes.get_mut(&run).map(|b| {
@@ -2095,7 +2095,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     let stopped = n.stopped.lock().expect("stopped").get(run).cloned();
     let cause = crate::exitcause::describe(code, stopped.as_deref(), info.as_ref(), mem.as_ref(), limit);
     if let Some(c) = &cause {
-        eprintln!("[node] {run}: {c}");
+        say_err!("[node] {run}: {c}");
         n.audit_note(
             run,
             "box.exit_cause",
@@ -2133,7 +2133,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
         n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent(), first_request_ms: l.first_request_ms() }));
     }
     t.step("node.teardown.release");
-    eprintln!("[node] {run}: box exited ({code})");
+    say_err!("[node] {run}: box exited ({code})");
     n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason: cause, timings: t.done() }));
 }
 
@@ -2287,17 +2287,17 @@ async fn serve_box(
     }
     tasks.push(tokio::spawn(async move {
         if let Err(e) = h3.serve_on(us).await {
-            eprintln!("[node] HTTP/3 and DNS ended: {e:#}");
+            say_err!("[node] HTTP/3 and DNS ended: {e:#}");
         }
     }));
     tasks.push(tokio::spawn(async move {
         if let Err(e) = egress.serve_on(el).await {
-            eprintln!("[node] egress proxy ended: {e:#}");
+            say_err!("[node] egress proxy ended: {e:#}");
         }
     }));
     tasks.push(tokio::spawn(async move {
         if let Err(e) = llm.serve_on(ll).await {
-            eprintln!("[node] model proxy ended: {e:#}");
+            say_err!("[node] model proxy ended: {e:#}");
         }
     }));
     // The MCP gateway (#151): served here, each call relayed to the run's gateway on the control
@@ -2369,7 +2369,7 @@ async fn sample_memory(n: &Arc<Node>) {
         let (warned2, text) = crate::exitcause::pressure(&m, warned, advice.as_deref());
         n.mem.lock().expect("mem").insert(run.clone(), (Some(dir), m, warned2));
         if let Some(text) = text {
-            eprintln!("[node] {run}: memory at {} of {}", crate::exitcause::human(m.current), crate::exitcause::human(m.max.unwrap_or(0)));
+            say_err!("[node] {run}: memory at {} of {}", crate::exitcause::human(m.current), crate::exitcause::human(m.max.unwrap_or(0)));
             n.audit_note(&run, "box.memory_pressure", serde_json::json!({ "current": m.current, "max": m.max, "peak": m.peak }));
             let ev = wicket_proxy::Event::Box { what: "memory_pressure".into(), detail: text };
             if let Ok(event) = serde_json::to_value(&ev) {

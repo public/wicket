@@ -319,13 +319,13 @@ impl CapacityApprover {
             *self.request.lock().expect("request") = Some(id.clone());
             match crate::grant::decide_by_capacity_grants(&mut l, &self.tenant, &self.principal, &id, &ask)? {
                 Ok((g, _)) => {
-                    println!("approved by capacity grant {g} (request {id})");
+                    say!("approved by capacity grant {g} (request {id})");
                     return Ok(Approval::Approved);
                 }
                 Err(why) => {
-                    println!("no capacity grant covers node {}:", r.node_name);
+                    say!("no capacity grant covers node {}:", r.node_name);
                     for w in why {
-                        println!("  {w}");
+                        say!("  {w}");
                     }
                 }
             }
@@ -335,7 +335,7 @@ impl CapacityApprover {
             Ledger::open(&self.ledger)?.deny(&id, "wicket:no-wait")?;
             return Ok(Approval::Denied(format!("no capacity grant covers it, and --wait 0 (request {id} withdrawn)")));
         }
-        println!(
+        say!(
             "waiting up to {} for an operator to decide request {id} (wicket approve {id}, or the console)",
             humantime::format_duration(self.wait)
         );
@@ -381,7 +381,7 @@ pub async fn plans(common: Common, region: String, plan_type: String) -> Result<
     let mut plans: Vec<_> = p.client().list_plans(&plan_type).await?.into_iter().filter(|p| p.locations.contains(&region)).collect();
     plans.sort_by_key(|p| (p.hourly_rate(), p.id.clone()));
     for p in plans {
-        println!("{:<24} {:>2} vCPU {:>6} MB  {}/h  (${}/month)", p.id, p.vcpu_count, p.ram, p.hourly_rate(), p.monthly_cost);
+        say!("{:<24} {:>2} vCPU {:>6} MB  {}/h  (${}/month)", p.id, p.vcpu_count, p.ram, p.hourly_rate(), p.monthly_cost);
     }
     Ok(())
 }
@@ -402,7 +402,7 @@ pub async fn list_provider(common: &Common) -> Result<()> {
     for n in &nodes {
         let placed = ledger.placed_node(&n.id.0)?;
         let capacity = ledger.leases(wicket_store::LIVE_LEASES)?.iter().any(|l| l.node_id.as_deref() == Some(n.id.0.as_str()));
-        println!(
+        say!(
             "{}  {:<16} {:<14} {:<4} {:?}  {}  {}/h  created {}  lease until {}  next paid hour {}",
             n.id,
             n.name,
@@ -417,10 +417,10 @@ pub async fn list_provider(common: &Common) -> Result<()> {
         );
         let note = lease_note(n, placed.as_ref(), capacity, now);
         if !note.is_empty() {
-            println!("  ! {note}");
+            say!("  ! {note}");
         }
     }
-    println!("{} node(s) tagged {}", nodes.len(), o.tag());
+    say!("{} node(s) tagged {}", nodes.len(), o.tag());
     Ok(())
 }
 
@@ -517,7 +517,7 @@ pub async fn create(args: CreateArgs) -> Result<()> {
         detail: None,
         hourly: Some(n.billing.hourly_rate().0 as i64),
     })?;
-    println!("created {} ({}), {}/h, lease until {}", n.id, name, n.billing.hourly_rate(), n.lease_until.map(fmt_time).unwrap_or_default());
+    say!("created {} ({}), {}/h, lease until {}", n.id, name, n.billing.hourly_rate(), n.lease_until.map(fmt_time).unwrap_or_default());
     if n.host_key.as_deref() != Some(pinned.as_str()) {
         bail!(
             "{} already existed for this idempotency key and its pinned host key isn't known here: enrol it with `wicket node enrol` and a key from elsewhere, or release it",
@@ -538,9 +538,9 @@ pub async fn create(args: CreateArgs) -> Result<()> {
         bring_up_or_release::<_, boot::SshProbe>(&placer, &crate::ledger_path(), &n, &name, &pinned, ssh_key, hosts, ca_ttl, &wait, None)
             .await?;
     if let Some(next) = placer.next_paid_hour_at(&ready) {
-        println!("next paid hour starts {}; release before then: wicket node release {}", fmt_time(next), n.id);
+        say!("next paid hour starts {}; release before then: wicket node release {}", fmt_time(next), n.id);
     }
-    println!("the reconciler (wicket reconcile --every) releases it at {} unless a run is still placed on it", fmt_time(lease_until));
+    say!("the reconciler (wicket reconcile --every) releases it at {} unless a run is still placed on it", fmt_time(lease_until));
     Ok(())
 }
 
@@ -563,8 +563,8 @@ pub async fn release(common: Common, id: String) -> Result<()> {
     let id = NodeId(instance_id(&Ledger::open(&crate::ledger_path())?, &id)?);
     let node = p.get(&id).await?;
     match p.release(&id, ReleaseMode::Now).await? {
-        Released::AlreadyGone => println!("{id} is already gone"),
-        r => println!("{id}: {r:?}"),
+        Released::AlreadyGone => say!("{id} is already gone"),
+        r => say!("{id}: {r:?}"),
     }
     let mut ledger = Ledger::open(&crate::ledger_path())?;
     ledger.placed_node_ended(&id.0, "released", "released by wicket node release")?;
@@ -572,7 +572,7 @@ pub async fn release(common: Common, id: String) -> Result<()> {
         // Files of runs a fetch didn't bring back went with it (#300): a human chose that.
         let lost = ledger.forget_uncollected_on_node(&n.name)?;
         if lost > 0 {
-            println!("{} run(s)' uncollected files went with it", lost);
+            say!("{} run(s)' uncollected files went with it", lost);
         }
         ledger.audit(
             &TenantId::single(),
@@ -581,7 +581,7 @@ pub async fn release(common: Common, id: String) -> Result<()> {
             &serde_json::json!({ "id": id.0, "name": n.name, "uncollected_runs_lost": lost }),
         )?;
         if retire_enrolment(&mut ledger, &n)? {
-            println!("revoked node {}", n.name);
+            say!("revoked node {}", n.name);
         }
     }
     Ok(())
@@ -624,7 +624,7 @@ async fn bring_up_with<Q: boot::Probe>(
         Err(e) => return Err(e.context(format!("{id} is still billing: `wicket node release {id}`"))),
     };
     let target = ready.ssh_target.clone().context("no address")?;
-    println!(
+    say!(
         "{id} is active at {target}; waiting for node setup (host key pinned: {pinned}; giving up after {} without any answer on port {})",
         humantime::format_duration(wait.silent_limit),
         wait.port
@@ -664,7 +664,7 @@ async fn bring_up_with<Q: boot::Probe>(
     }
     // The private host key no longer needs to be in the metadata service.
     if let Err(e) = p.client().set_user_data(&id.0, SCRUBBED_USER_DATA).await {
-        eprintln!("warning: could not replace {id}'s user data (it still holds the boot host key): {e:#}");
+        say_err!("warning: could not replace {id}'s user data (it still holds the boot host key): {e:#}");
     }
     Ok((ready, target))
 }
@@ -693,11 +693,11 @@ pub async fn give_up_unreachable<A: envelope::SpendApprover>(
                              "reason": why.to_string() }),
     );
     if let Err(e) = audited {
-        eprintln!("warning: could not audit giving up on {id}: {e:#}");
+        say_err!("warning: could not audit giving up on {id}: {e:#}");
     }
     if released.is_ok() {
         if let Err(e) = ledger.placed_node_ended(&id.0, "released", &format!("released by wicket node create: {why}")) {
-            eprintln!("warning: could not record {id} as released: {e:#}");
+            say_err!("warning: could not record {id} as released: {e:#}");
         }
     }
     match released {

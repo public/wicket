@@ -846,7 +846,7 @@ pub async fn node_runs(ledger: &Ledger, dry_run: bool) -> Result<HashMap<String,
         if n == crate::localnode::NAME && !dry_run {
             // This host's own node: started if it isn't serving (it adopts its boxes as it starts).
             if let Err(e) = crate::localnode::ensure(&shared).await {
-                eprintln!("[wicket] this host's own node did not start: {e:#}");
+                say_err!("[wicket] this host's own node did not start: {e:#}");
             }
         }
         let scope = format!("reconcile:{}", std::process::id());
@@ -916,13 +916,13 @@ async fn machines_pass(
 
 pub fn print(done: &[Done], dry_run: bool) {
     for d in done {
-        println!("{:<15} {}  {}", d.kind, d.target, d.detail);
+        say!("{:<15} {}  {}", d.kind, d.target, d.detail);
     }
     let changed = done
         .iter()
         .filter(|d| !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held" | "store_gc"))
         .count();
-    println!("reconcile: {changed} change(s){}", if dry_run { " (dry run: nothing changed)" } else { "" });
+    say!("reconcile: {changed} change(s){}", if dry_run { " (dry run: nothing changed)" } else { "" });
 }
 
 /// `wicket reconcile [--dry-run] [--every <interval>]`.
@@ -934,7 +934,7 @@ pub async fn command(dry_run: bool, every: Option<std::time::Duration>) -> Resul
     loop {
         match pass(dry_run).await {
             Ok(d) => print(&d, dry_run),
-            Err(e) if every.is_some() => eprintln!("reconcile pass failed: {e:#}"),
+            Err(e) if every.is_some() => say_err!("reconcile pass failed: {e:#}"),
             Err(e) => return Err(e),
         }
         match every {
