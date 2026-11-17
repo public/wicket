@@ -122,9 +122,11 @@ not a permanent decision.
   node-started child once the control host adopts it. Revoking a parent's block doesn't by itself revoke
   those; revoking the parent's run does ([concepts](concepts.md#authority-biscuit-tokens-and-the-feed)).
 - **What is proved, and what is tested.** The Lean spec (`verification/lean`, #322) proves properties of
-  the Rust it restates: `subset::check` and `reach_within`, `grant::within_authority` and
-  `operators::may_decide`, `CompiledZone::evaluate`, the glob, host and path matchers and
-  `canonical_path`; an oracle test checks wicket-core's decisions against it. It doesn't cover the
+  the Rust it restates: `subset::check` and `reach_within` (model allowlists and `accept_from`
+  included), `grant::within_authority` and `operators::may_decide`, `CompiledZone::evaluate`, the
+  glob, host and path matchers, `canonical_path`, and a node's spawn: an appended spawn block never
+  widens its parent's token. An oracle test checks wicket-core's decisions against it, and
+  wicket-authz's token decisions against its model of a token's blocks. It doesn't cover the
   Biscuit evaluator that decides on nodes, the Cedar compiler, the proxies' parsing or anything else.
   The evaluator is tested, not proved: token decisions against `CompiledZone::evaluate`, and the fork's
   compiled evaluator against the fork's own generic engine and its unpatched `AuthorizerBuilder` path
