@@ -33,6 +33,7 @@ use wicket_control::{
     snapstore, storegc, transcript,
 };
 
+mod apply_update;
 mod ci_update;
 mod cli_reference;
 mod cmd;
@@ -49,7 +50,6 @@ mod state;
 mod top;
 mod units;
 mod update;
-mod apply_update;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};

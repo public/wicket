@@ -74,7 +74,8 @@ pub struct Preview {
 pub fn preview(l: &Ledger, data: &Path, req: &Request) -> Result<Preview> {
     let sha = requested_sha(req).context("not an update request")?.to_string();
     let nodes = crate::update::node_list(l, "all")?;
-    let mut p = Preview { sha256: sha.clone(), artifact: None, size: None, commit_said: commit_said(req), nodes, applies: false, why_not: None };
+    let mut p =
+        Preview { sha256: sha.clone(), artifact: None, size: None, commit_said: commit_said(req), nodes, applies: false, why_not: None };
     match find(l, data, req, &sha) {
         Ok(f) => {
             p.artifact = Some(f.name);
@@ -90,7 +91,10 @@ pub fn preview(l: &Ledger, data: &Path, req: &Request) -> Result<Preview> {
 fn find(l: &Ledger, data: &Path, req: &Request, sha: &str) -> Result<wicket_node::boxfiles::OutboxFile> {
     let root = run_root(data, &req.run)?;
     if let Some(node) = l.run_node(&req.run).ok().flatten().filter(|n| n != crate::localnode::NAME) {
-        bail!("{} runs on node {node}, and its outbox is there: copy the artifact out and run `sudo wicket self update` on the control host", req.run);
+        bail!(
+            "{} runs on node {node}, and its outbox is there: copy the artifact out and run `sudo wicket self update` on the control host",
+            req.run
+        );
     }
     wicket_node::boxfiles::find_in_outbox(&root, sha, MAX_ARTIFACT)?.with_context(|| {
         format!("no file in {}'s outbox (/workspace/out) has sha256 {sha} (regular files of at most 1 GiB, not links)", req.run)
@@ -144,9 +148,11 @@ pub async fn apply(request: &str) -> Result<()> {
     let data = crate::data_dir();
     let l = Ledger::open(&crate::ledger_path())?;
     let req = l.request(request)?;
-    let sha = requested_sha(&req).with_context(|| format!("{request} is not an update request (UPDATE wicket.internal/self/<sha256>)"))?.to_string();
-    if req.status != "approved" {
-        bail!("{request} is {}, not approved", req.status);
+    let sha = requested_sha(&req)
+        .with_context(|| format!("{request} is not an update request (UPDATE wicket.internal/self/<sha256>)"))?
+        .to_string();
+    if req.status != "granted" {
+        bail!("{request} is {}, not approved (granted)", req.status);
     }
     let told = |l: &Ledger, text: &str| {
         if let Err(e) = l.add_notice(&req.run, text) {
@@ -168,7 +174,12 @@ pub async fn apply(request: &str) -> Result<()> {
         Ok(x) => x,
         Err(e) => {
             let r = Err(e);
-            audit(&l, &req.run, "self.apply_failed", serde_json::json!({ "request": request, "artifact_sha256": sha, "why": format!("{:#}", r.as_ref().unwrap_err()) }));
+            audit(
+                &l,
+                &req.run,
+                "self.apply_failed",
+                serde_json::json!({ "request": request, "artifact_sha256": sha, "why": format!("{:#}", r.as_ref().unwrap_err()) }),
+            );
             told(&l, &notice(request, &sha, Outcome::Failed, &r));
             return r;
         }
@@ -262,7 +273,8 @@ mod tests {
     #[test]
     fn a_failed_gate_is_a_rollback() {
         assert_eq!(outcome(&Ok(())), Outcome::Done);
-        let rolled: Result<()> = Err(anyhow::anyhow!("the update to b failed its health gate on the control host and was rolled back to a: x"));
+        let rolled: Result<()> =
+            Err(anyhow::anyhow!("the update to b failed its health gate on the control host and was rolled back to a: x"));
         assert_eq!(outcome(&rolled), Outcome::RolledBack);
         assert!(notice("req_1", "ab", Outcome::RolledBack, &rolled).starts_with("update req_1 rolled back"));
         let failed: Result<()> = Err(anyhow::anyhow!("refused: not approved"));
@@ -281,7 +293,10 @@ mod tests {
         let sha = hex::encode(sha2::Sha256::digest(b"archive"));
         let l = Ledger::open(&d.join("ledger.db")).unwrap();
         let p = preview(&l, &d, &req("UPDATE", &format!("/self/{sha}"), &format!("sha256 {sha} of commit abcdef1: x"))).unwrap();
-        assert_eq!((p.artifact.as_deref(), p.size, p.applies, p.commit_said.as_deref()), (Some("wicket.tar.gz"), Some(7), true, Some("abcdef1")));
+        assert_eq!(
+            (p.artifact.as_deref(), p.size, p.applies, p.commit_said.as_deref()),
+            (Some("wicket.tar.gz"), Some(7), true, Some("abcdef1"))
+        );
         let other = "0f".repeat(32);
         let p = preview(&l, &d, &req("UPDATE", &format!("/self/{other}"), "x")).unwrap();
         assert!(!p.applies && p.why_not.unwrap().contains("no file in run_a's outbox"));
