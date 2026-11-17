@@ -25,12 +25,9 @@ const FWD_SOURCES: &[(&str, &str)] = &[
     ("src/entry.rs", include_str!("../../wicket-fwd/src/entry.rs")),
 ];
 
-/// The image directory (`images/claude-code`), path relative to it and contents. A test checks the
-/// list is complete.
-const IMAGE_SOURCES: &[(&str, &str)] = &[
-    ("Dockerfile", include_str!("../../../images/claude-code/Dockerfile")),
-    ("wicket-entry", include_str!("../../../images/claude-code/wicket-entry")),
-];
+/// The image directory (`images/claude-code`), path relative to it and contents: the Claude
+/// adapter's (a test checks the list is complete).
+const IMAGE_SOURCES: &[(&str, &str)] = wicket_agent::claude::IMAGE_FILES;
 
 /// The agent image's repository, and the tag a box gets when nothing names another: the Claude
 /// adapter's (the only harness with an image of wicket's).
