@@ -3554,6 +3554,43 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(matches!(next_msg(&mut c).await, Frame::Msg(Msg::TunnelOpened { error: None, .. })));
     }
 
+    /// #465: a box's outbox alone is sent, read only, and never through a link the box made.
+    #[tokio::test]
+    async fn the_outbox_tree_is_read_only_and_never_a_link() {
+        let inst = Install::new("nodesrv-outbox");
+        let node = test_node(&inst);
+        let run = "run_00000000000000000000000001";
+        let dir = inst.dir.join("runs").join(run);
+        let mut c = connect_run(&node, 1, &inst, run).await;
+        let stream = TUNNEL_BIT | chan::CONTROL_TUNNEL_BIT | 9;
+        let ask = |s: u64, tree: &str, put: bool| {
+            let m = if put {
+                Msg::PutTree { stream: s, run: run.into(), tree: tree.into() }
+            } else {
+                Msg::GetTree { stream: s, run: run.into(), tree: tree.into() }
+            };
+            Frame::Msg(m).encode()
+        };
+        let refused = |f: Frame| match f {
+            Frame::Msg(Msg::TunnelOpened { error: Some(e), .. }) => e,
+            f => panic!("expected a refusal, got {f:?}"),
+        };
+        c.write_all(&ask(stream, "outbox", false)).await.unwrap();
+        assert!(refused(next_msg(&mut c).await).contains("has no outbox"));
+        // The box made its outbox a link to a node directory: refused.
+        std::fs::create_dir_all(dir.join("workspace")).unwrap();
+        std::fs::create_dir_all(inst.dir.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(inst.dir.join("elsewhere"), dir.join("workspace/out")).unwrap();
+        c.write_all(&ask(stream + 1, "outbox", false)).await.unwrap();
+        assert!(refused(next_msg(&mut c).await).contains("not a directory"));
+        std::fs::remove_file(dir.join("workspace/out")).unwrap();
+        std::fs::create_dir(dir.join("workspace/out")).unwrap();
+        c.write_all(&ask(stream + 2, "outbox", true)).await.unwrap();
+        assert!(refused(next_msg(&mut c).await).contains("only read"));
+        c.write_all(&ask(stream + 3, "outbox", false)).await.unwrap();
+        assert!(matches!(next_msg(&mut c).await, Frame::Msg(Msg::TunnelOpened { error: None, .. })));
+    }
+
     /// A box on this node whose token the replica holds: `zone` (YAML), minted for `run` until an
     /// hour from now, with the node's #164 edge start.
     fn fed_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {
