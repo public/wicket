@@ -1481,7 +1481,8 @@ pub struct AuthorityRecord {
 }
 
 /// How far past a box's authority a wake still waits: clock skew between this host and the node.
-pub const WAKE_SKEW_MS: i64 = 30_000;
+/// The ledger's fence on a lapsed claim allows the same (#446).
+pub const WAKE_SKEW_MS: i64 = wicket_store::WAKE_SKEW_SECS * 1000;
 
 fn authority_file(run_dir: &Path) -> PathBuf {
     run_dir.join("ctl").join("authority.json")

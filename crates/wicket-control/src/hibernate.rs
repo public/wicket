@@ -480,6 +480,24 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
             )?;
             bail!("agent {} can't be woken yet: {why}", a.id);
         }
+        // The same fence in the ledger (#446), which `claim_wake` keeps: a run of the agent still
+        // recorded running, its authority not ended. It holds where this host's run files don't,
+        // as on a standby restored from the state store (#154).
+        if a.state != "hibernated" {
+            if let Some((r, until)) = l.agent_fenced_until(&a.id, wicket_store::now())? {
+                let why = format!(
+                    "its activation (run {r}) may still be running on its node, recorded running with authority until {}: it can be woken from then, or once the reconciler finds the box gone",
+                    crate::noderun::fmt_ms(until.saturating_mul(1000))
+                );
+                l.audit(
+                    &TenantId(a.tenant.clone()),
+                    None,
+                    "agent.wake_refused",
+                    &serde_json::json!({ "agent": a.id, "by": by, "why": why, "until_ms": until.saturating_mul(1000) }),
+                )?;
+                bail!("agent {} can't be woken yet: {why}", a.id);
+            }
+        }
         // Where it last ran (its run before this wake): only a tie-break when placing it.
         let last_node = l.run_node(&a.run)?;
         for (r, _) in l.agent_runs(&a.id)? {
