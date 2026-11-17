@@ -6,6 +6,7 @@
 //! nothing else of the CLI's can leave it too. wicket-cli imports them under their old names.
 
 pub mod exitcause;
+pub mod owner;
 
 use anyhow::Result;
 use std::path::PathBuf;
