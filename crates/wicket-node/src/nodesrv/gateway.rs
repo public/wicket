@@ -124,6 +124,7 @@ async fn gateway_rpc(
             a
         }
         None => match chan::ControlTool::of(&name) {
+            Some(chan::ControlTool::AwaitMessage) => await_control_message(node, run, &args).await,
             Some(tool) => call_or_offline(node, run, tool, &args).await,
             None => (format!("unknown tool {name}"), true),
         },
@@ -134,6 +135,36 @@ async fn gateway_rpc(
         "content": [{ "type": "text", "text": answer.0 }], "isError": answer.1,
     } }),
     )
+}
+
+/// `await_message`, answered by the control host (#445). A message this box has had, given again by
+/// a supervisor that took the run over after a control-host restart, is dropped (and the control
+/// host told it was read), and the wait goes on; one it hasn't had is kept as read, and the control
+/// host told, as its reply goes to the box.
+async fn await_control_message(node: &Arc<Node>, run: &str, args: &serde_json::Value) -> (String, bool) {
+    let wait = std::time::Duration::from_secs(args.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(300).clamp(1, 600));
+    let until = std::time::Instant::now() + wait;
+    loop {
+        let (text, is_error) = call_or_offline(node, run, chan::ControlTool::AwaitMessage, args).await;
+        match message_id(&text).filter(|_| !is_error) {
+            Some(id) if node.had_message(run, &id) => {
+                node.message_read(run, &id);
+                if std::time::Instant::now() >= until {
+                    return (format!("no message after {}s. You may call await_message again.", wait.as_secs()), false);
+                }
+            }
+            Some(id) => {
+                node.message_read(run, &id);
+                return (text, is_error);
+            }
+            None => return (text, is_error),
+        }
+    }
+}
+
+/// The id of the message an `await_message` answer gives, if it gives one.
+pub(super) fn message_id(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text).ok()?.get("message_id")?.as_str().map(String::from)
 }
 
 /// One of the control host's tools, asked of it; while it can't be reached, a clear refusal.

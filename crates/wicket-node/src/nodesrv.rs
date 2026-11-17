@@ -224,8 +224,15 @@ struct Link {
 /// answer (the tool's text, and whether it is an error) goes.
 type PendingCall = (u64, oneshot::Sender<(String, bool)>);
 
+/// How many of a box's read message ids its node keeps (#445).
+const READ_KEPT: usize = 256;
+
 struct Node {
     name: String,
+    /// The control host's messages each box here has had (#445), newest last, at most
+    /// [`READ_KEPT`] per box: one given again after a control-host restart is dropped. Kept while
+    /// this `serve` runs.
+    read: Mutex<HashMap<String, std::collections::VecDeque<String>>>,
     paths: NodePaths,
     ident: crate::nodeauth::NodeIdentity,
     build: String,
@@ -738,6 +745,31 @@ impl Node {
         self.owner(run).is_some_and(|g| self.send_to(g, f))
     }
 
+    /// Whether `run`'s box has had the control host's message `id` (#445).
+    fn had_message(&self, run: &str, id: &str) -> bool {
+        self.read.lock().expect("read").get(run).is_some_and(|ids| ids.iter().any(|i| i == id))
+    }
+
+    /// `run`'s box has had the control host's message `id` (#445): kept, so a repeat is dropped,
+    /// and told to the control host (`Msg::MessageRead`) if its connection takes it.
+    fn message_read(&self, run: &str, id: &str) {
+        {
+            let mut read = self.read.lock().expect("read");
+            let ids = read.entry(run.to_string()).or_default();
+            if !ids.iter().any(|i| i == id) {
+                ids.push_back(id.to_string());
+                while ids.len() > READ_KEPT {
+                    ids.pop_front();
+                }
+            }
+        }
+        let Some(g) = self.owner(run) else { return };
+        let proto = self.links.lock().expect("links").get(&g).map_or(0, |l| l.proto);
+        if proto >= chan::MESSAGE_READ {
+            self.send_to(g, Frame::Msg(Msg::MessageRead { run: run.into(), id: id.into() }));
+        }
+    }
+
     #[cfg(test)]
     fn connected(&self) -> bool {
         !self.links.lock().expect("links").is_empty()
@@ -967,6 +999,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         root_pem,
         docker: Docker::from_env(),
         idents: Default::default(),
+        read: Default::default(),
         links: Mutex::new(HashMap::new()),
         boxes: Mutex::new(HashMap::new()),
         asks: Mutex::new(HashMap::new()),
@@ -2697,6 +2730,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             root_pem: std::fs::read_to_string(i.dir.join("root.pem")).unwrap_or_default(),
             docker: Docker::from_env(),
             idents: Default::default(),
+            read: Default::default(),
             links: Mutex::new(HashMap::new()),
             boxes: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
@@ -3037,6 +3071,26 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert_eq!((body["orphaned"].as_bool(), body["bytes"].as_u64().is_some_and(|b| b >= 64 * 1024)), (Some(true), true), "{body}");
         // A run it has no directory for: nothing to do.
         node.forget("run_n0thing0000000000000000000");
+    }
+
+    /// #445: the node keeps which of the control host's messages each box has had, so one given
+    /// again after a control-host restart is dropped; the most recent `READ_KEPT` per box, each box
+    /// its own.
+    #[tokio::test]
+    async fn a_node_knows_which_messages_its_box_has_had() {
+        let inst = Install::new("nodesrv-read");
+        let node = test_node(&inst);
+        assert!(!node.had_message("run_a", "m1"));
+        node.message_read("run_a", "m1");
+        node.message_read("run_a", "m1");
+        assert!(node.had_message("run_a", "m1"));
+        assert!(!node.had_message("run_b", "m1"), "each box its own");
+        for i in 0..READ_KEPT {
+            node.message_read("run_a", &format!("n{i}"));
+        }
+        assert!(!node.had_message("run_a", "m1"), "the oldest goes past READ_KEPT");
+        assert!(node.had_message("run_a", &format!("n{}", READ_KEPT - 1)));
+        assert_eq!(node.read.lock().unwrap()["run_a"].len(), READ_KEPT);
     }
 
     /// A box of most of the room there is, started the moment its predecessor of the same size

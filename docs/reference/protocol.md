@@ -92,13 +92,14 @@ exchanged, for the logs and for the health gate.
 | 13 | One gateway, on the node (#257 slice 4b): the tools a box's node doesn't answer itself reach the control host as `Call` (one of `ControlTool`, the control host's tools by name, with the box's arguments), answered with `Called`, instead of JSON-RPC relayed through a `gateway` tunnel (gone, with the run's `ctl/gateway.sock`). A box starts only on a node talking 13. |
 
 | 14 | Node CA renewal over the channel (#416): `CaRenew` (make a new CA key), `CaCsr` (its signing request, or why not), `NodeCa` (its certificate) and `NodeCaInstalled` (installed for every box, or why not), sent at half the CA's life. A node talking 13 is renewed with `wicket node renew-ca` over ssh, as before. Node health reports carry the CA's validity (`ca_not_before`, `ca_not_after`, defaulted fields). |
+| 15 | Messages in flight until the box has had them (#445): `MessageRead` (node to control host) once a message the control host's `await_message` gave reaches the box, or is pushed to its session. Until then the message is in flight, and a supervisor that takes the run over gives it again; the node drops one its box has had. With a node talking 14, the control host counts a message read as it hands it over, as before. |
 
-wicket speaks version 14, so it talks only to peers at 13 and 14. What the rows above say happens
+wicket speaks version 15, so it talks only to peers at 14 and 15. What the rows above say happens
 with an older peer (a node relaying every gateway tool before 5, a box refused by a node before 6,
-9, 10 or 11, an image not sent to a node before 7) is history: no connection can negotiate below 13,
-and the code for it is gone. Every connection has 12's health reports, so they have no check
-either; each version above 12 that a build still talks to keeps its check (13's one gateway, 14's CA
-renewal).
+9, 10 or 11, an image not sent to a node before 7, a box on a node before 13) is history: no
+connection can negotiate below 14. Every connection has 12's health reports and 13's one gateway;
+each version above 13 that a build still talks to keeps its check (14's CA renewal, 15's message
+reads).
 
 ## Ledger schema
 

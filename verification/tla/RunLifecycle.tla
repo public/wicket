@@ -19,9 +19,10 @@ CONSTANTS
     AuthTtl,            \* how long a box's authority lasts past its last renewal, in ticks
     MaxTime,
     MaxCrashes,
-    \* Design switches: TRUE is the proposed design, FALSE today's code.
-    FinishInLedger,     \* the agent's finish is recorded in the ledger, not only in its supervisor
-    AckAfterHand,       \* a message is marked delivered once the box has it (and a box drops a repeat)
+    \* Design switches: TRUE is the pass design and the code (#444, #445, #446), FALSE the code
+    \* before its fix (README.md).
+    FinishInLedger,     \* the agent's finish is recorded in the ledger, not only in its supervisor (#444)
+    AckAfterHand,       \* a message is marked delivered once the box has it, and a box drops a repeat (#445)
     WakeAfterAuthority  \* a lapsed holder's agent is woken only once every box of it has stopped
 
 NONE == "none"
@@ -166,8 +167,8 @@ Lost(r) ==
     /\ UNCHANGED <<now, host, crashes, agent, box, harness, gen, authUntil, asked, finLedger, finSup,
                    stdinOpen, msg, msgTo, handedTo, seen>>
 
-(* The agent calls wicket's finish tool: its supervisor is told (want_rx), and in the proposed *)
-(* design the ledger too.                                                                      *)
+(* The agent calls wicket's finish tool: the ledger records it (gateway.rs `want` →          *)
+(* Ledger::record_run_want, #444), and its supervisor is told (want_rx).                       *)
 AskFinish(r) ==
     /\ host = "up" /\ sup[r] = "alive" /\ harness[r] = "running" /\ ~asked[r]
     /\ asked' = [asked EXCEPT ![r] = TRUE]

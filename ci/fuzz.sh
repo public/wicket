@@ -4,6 +4,7 @@
 # the script fails.
 #
 #   ci/fuzz.sh [--secs N] [--affected [--base REF]] [--sanitizer none|address] [--no-replay] [target…]
+#   ci/fuzz.sh --list   every target's name, one per line (CI's matrix of them)
 #
 #   target…        the targets to run (default: all; `none` runs none, for a workflow's selection)
 #   --secs N       how long each target runs (default 60)
@@ -33,6 +34,7 @@ while [ $# -gt 0 ]; do
     --base) base=$2; shift ;;
     --sanitizer) sanitizer=$2; shift ;;
     --no-replay) replay=0 ;;
+    --list) printf '%s\n' $ALL_TARGETS; exit 0 ;;
     -h | --help) sed -n '2,/^set -E/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option $1 (see --help)" >&2; exit 2 ;;
     *) targets+=("$1") ;;

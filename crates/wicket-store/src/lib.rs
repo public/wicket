@@ -101,8 +101,14 @@ pub enum StoreError {
 /// table: when and how a run's work was collected, which a cleanup checks before it deletes the
 /// run's workspace (#377). Version 14 (expand) adds `runs.stuck_at`: when the parent of a child run
 /// whose supervisor runs in its process found it still running after asking it to stop, so the
-/// reconciler and `wicket top` show it as stuck (#409).
-pub const SCHEMA_VERSION: u32 = 14;
+/// reconciler and `wicket top` show it as stuck (#409). Version 15 (expand) adds `runs.want`: what
+/// the agent asked of its own run, `finish` or `hibernate` (#249), recorded when it asks, so a
+/// supervisor that re-attaches after a control-host restart still acts on it (#444). Version 16
+/// (expand) keeps a message a box was given in flight until the box has had it (#445):
+/// `messages.taken_at`, and `operator_messages.stdin_start` and `stdin_end` (where a prompt is in
+/// the box's stdin), so a supervisor that takes a run over after a control-host restart gives again
+/// what never arrived.
+pub const SCHEMA_VERSION: u32 = 16;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
@@ -279,7 +285,7 @@ CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
   status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT, policy TEXT,
   authority_until INTEGER, authority_cap INTEGER, activity TEXT, activity_at INTEGER, uncollected TEXT,
-  stuck_at INTEGER
+  stuck_at INTEGER, want TEXT
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -306,7 +312,7 @@ CREATE TABLE IF NOT EXISTS identities (
 );
 CREATE TABLE IF NOT EXISTS operator_messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, text TEXT NOT NULL, by TEXT NOT NULL,
-  created_at INTEGER NOT NULL, consumed_at INTEGER
+  created_at INTEGER NOT NULL, consumed_at INTEGER, stdin_start INTEGER, stdin_end INTEGER
 );
 CREATE TABLE IF NOT EXISTS turn_cancels (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, by TEXT NOT NULL,
@@ -325,7 +331,8 @@ CREATE TABLE IF NOT EXISTS revocations (
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, from_run TEXT NOT NULL, to_run TEXT NOT NULL, envelope TEXT NOT NULL,
-  created_at INTEGER NOT NULL, delivered_at INTEGER, to_principal TEXT, from_principal TEXT, priority TEXT, in_reply_to TEXT
+  created_at INTEGER NOT NULL, delivered_at INTEGER, to_principal TEXT, from_principal TEXT, priority TEXT, in_reply_to TEXT,
+  taken_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS messages_inbox ON messages (to_run, delivered_at, created_at);
 CREATE TABLE IF NOT EXISTS node_tokens (
@@ -523,6 +530,12 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN uncollected TEXT", []);
         // Ledgers created before a child's stuck supervisor was recorded (#409).
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN stuck_at INTEGER", []);
+        // Ledgers created before an agent's finish or hibernate was recorded for its run (#444).
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN want TEXT", []);
+        // Ledgers created before a message was in flight until its box had it (#445).
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN taken_at INTEGER", []);
+        let _ = conn.execute("ALTER TABLE operator_messages ADD COLUMN stdin_start INTEGER", []);
+        let _ = conn.execute("ALTER TABLE operator_messages ADD COLUMN stdin_end INTEGER", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -670,6 +683,37 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(rows)
+    }
+
+    /// Where operator message `id`, taken, is in its box's stdin (#445): its bytes from offset
+    /// `start` (counted from the run's start) to `end`.
+    pub fn set_operator_message_stdin(&self, id: i64, start: u64, end: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE operator_messages SET stdin_start = ?2, stdin_end = ?3 WHERE id = ?1",
+            params![id, start as i64, end as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Gives `run` again every prompt taken for it whose bytes its box's node never had: its node
+    /// has `stdin_received` bytes of the box's stdin, and the prompt starts at or after that, or
+    /// was taken and never written (no offsets, #445). Called by a supervisor that takes the run over, once its node says how far it got.
+    /// A prompt the node has part of stays taken: giving it again would send its start twice.
+    /// The prompts given again.
+    pub fn requeue_operator_messages(&self, run: &str, stdin_received: u64) -> Result<Vec<i64>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let ids: Vec<i64> = {
+            let mut st = tx.prepare(
+                "SELECT id FROM operator_messages WHERE run = ?1 AND consumed_at IS NOT NULL AND (stdin_start IS NULL OR stdin_start >= ?2) ORDER BY id",
+            )?;
+            let r = st.query_map(params![run, stdin_received as i64], |r| r.get(0))?;
+            r.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in &ids {
+            tx.execute("UPDATE operator_messages SET consumed_at = NULL, stdin_start = NULL, stdin_end = NULL WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(ids)
     }
 
     /// Whether operator message `id` was handed to its run yet (None: there is no such message).
@@ -1019,6 +1063,48 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(m)
+    }
+
+    /// Takes the next message for `run` as [`Ledger::take_message`] does, but in flight (#445): not
+    /// read until its box has had it ([`Ledger::message_read`]). It isn't taken again meanwhile, and
+    /// a supervisor that takes the run over gives it again ([`Ledger::requeue_in_flight`]).
+    pub fn take_message_in_flight(&mut self, run: &str) -> Result<Option<StoredMessage>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let m: Option<StoredMessage> = tx
+            .query_row(
+                &format!(
+                    "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND delivered_at IS NULL AND taken_at IS NULL ORDER BY {} LIMIT 1",
+                    receipts::INBOX_ORDER
+                ),
+                params![run],
+                |r| Ok(StoredMessage { id: r.get(0)?, from_run: r.get(1)?, envelope: r.get(2)?, created_at: r.get(3)? }),
+            )
+            .optional()?;
+        if let Some(StoredMessage { id, .. }) = &m {
+            tx.execute("UPDATE messages SET taken_at = ?2 WHERE id = ?1", params![id, now()])?;
+        }
+        tx.commit()?;
+        Ok(m)
+    }
+
+    /// `run`'s box has had message `id` (#445): it is read. False: no such message in flight for
+    /// `run` (already read, or someone else's).
+    pub fn message_read(&self, run: &str, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE messages SET delivered_at = ?3 WHERE id = ?1 AND to_run = ?2 AND delivered_at IS NULL",
+            params![id, run, now()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Gives `run` again every message taken for it and never read (#445): called by a supervisor
+    /// as it takes the run over, when whoever took them is gone. The box's node drops one its box
+    /// has had. How many.
+    pub fn requeue_in_flight(&self, run: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE messages SET taken_at = NULL WHERE to_run = ?1 AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            params![run],
+        )?)
     }
 
     /// Every stored envelope (id, envelope, created_at), for offline verification.
@@ -2292,6 +2378,49 @@ mod tests {
         l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
         let later = Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "GET", "news.example.org", "/item");
         assert!(l.grant_covering(&later).unwrap().is_some(), "every path under the prefix");
+    }
+
+    /// #445: a message taken in flight isn't taken again, isn't read until its box has had it, and
+    /// is given again when the supervisor that took it goes; a read one never is.
+    #[test]
+    fn a_message_in_flight_is_given_again_until_its_box_has_had_it() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId("t".into());
+        l.add_message("m1", &t, "run_p", "run_a", "{}").unwrap();
+        l.add_message("m2", &t, "run_p", "run_a", "{}").unwrap();
+        let first = l.take_message_in_flight("run_a").unwrap().unwrap();
+        let second = l.take_message_in_flight("run_a").unwrap().unwrap();
+        assert_ne!(first.id, second.id, "one in flight isn't taken again");
+        assert!(l.take_message_in_flight("run_a").unwrap().is_none());
+        assert_eq!(l.waiting_messages("run_a").unwrap(), 0, "in flight isn't waiting");
+        // The box has had the first; the supervisor goes before it had the second.
+        assert!(l.message_read("run_a", &first.id).unwrap());
+        assert!(!l.message_read("run_a", &first.id).unwrap(), "read once");
+        assert!(!l.message_read("run_b", &second.id).unwrap(), "only its own run's");
+        assert_eq!(l.requeue_in_flight("run_a").unwrap(), 1);
+        let again = l.take_message_in_flight("run_a").unwrap().unwrap();
+        assert_eq!(again.id, second.id, "given again");
+        assert!(l.take_message_in_flight("run_a").unwrap().is_none(), "the read one never");
+    }
+
+    /// #445: a prompt whose bytes its node never had is given again by a supervisor that takes the
+    /// run over; one the node has, all or part of, isn't.
+    #[test]
+    fn a_prompt_its_node_never_had_is_given_again() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        for text in ["had", "part", "never", "untaken"] {
+            l.add_operator_message("run_a", text, "owner").unwrap();
+        }
+        let taken = l.take_operator_messages_with_ids("run_a").unwrap();
+        let ids: Vec<i64> = taken.iter().map(|(id, _, _)| *id).collect();
+        l.set_operator_message_stdin(ids[0], 0, 100).unwrap();
+        l.set_operator_message_stdin(ids[1], 100, 200).unwrap();
+        l.set_operator_message_stdin(ids[2], 200, 300).unwrap();
+        // The node had 150 bytes: the first prompt and half the second.
+        assert_eq!(l.requeue_operator_messages("run_a", 150).unwrap(), vec![ids[2], ids[3]]);
+        let again: Vec<String> = l.take_operator_messages("run_a").unwrap().into_iter().map(|(t, _)| t).collect();
+        assert_eq!(again, ["never", "untaken"]);
+        assert_eq!(l.operator_message_taken(ids[0]).unwrap(), Some(true));
     }
 
     #[test]
