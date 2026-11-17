@@ -245,8 +245,20 @@ impl Gateway {
             Ok(r) => r,
             Err(e) => return (e.to_string(), true),
         };
+        let trust_domain = wicket_identity::Principal::parse(&me.claims.sub).map(|p| p.trust_domain().to_string()).unwrap_or_default();
         let mut out = vec![];
-        for r in rows.into_iter().filter(|r| r.spiffe_id != me.claims.sub) {
+        let mut operators = vec![];
+        for r in rows {
+            let r = match r {
+                wicket_store::Principal::Agent(r) => r,
+                wicket_store::Principal::Operator { via, name } => {
+                    operators.push(wicket_identity::operator_id(&trust_domain, &self.tenant(), &via, &name));
+                    continue;
+                }
+            };
+            if r.spiffe_id == me.claims.sub {
+                continue;
+            }
             let relation = if parent.as_deref() == Some(r.spiffe_id.as_str()) {
                 "parent"
             } else if r.parent_run.as_deref().is_some_and(|p| mine.iter().any(|m| m == p)) {
@@ -266,14 +278,19 @@ impl Gateway {
                 "may_send_to": may_send, "may_hear_from": may_receive,
             }));
         }
-        // Operators your accept_from names (#11): they reach you through the CLI and console.
+        // Operators your accept_from names (#11): they reach you through the CLI and console. The
+        // ledger's record has those enrolled with a passkey; a CLI operator (a unix user) has no
+        // record yet, so one your accept_from names is listed from it.
         for a in &self.ctx.zone.accept_from {
-            if let Some(wicket_identity::Principal::Operator { .. }) = wicket_identity::Principal::parse(a) {
-                out.push(json!({
-                    "id": a, "kind": "operator", "relation": "operator", "state": "offline",
-                    "may_send_to": false, "may_hear_from": true,
-                }));
+            if matches!(wicket_identity::Principal::parse(a), Some(wicket_identity::Principal::Operator { .. })) && !operators.contains(a) {
+                operators.push(a.clone());
             }
+        }
+        for id in operators.into_iter().filter(|id| wicket_core::manifest::accepts(&self.ctx.zone.accept_from, "", Some(id))) {
+            out.push(json!({
+                "id": id, "kind": "operator", "relation": "operator", "state": "offline",
+                "may_send_to": false, "may_hear_from": true,
+            }));
         }
         let v = json!({
             "you": me.claims.sub,
@@ -1010,7 +1027,20 @@ mod tests {
     #[tokio::test]
     async fn principals_lists_who_a_run_may_talk_to_with_presence() {
         let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
-        let lead = w.agent("t0", "research", "lead", "run_lead", None, &["audit", "spiffe://test.local/t/t0/op/unix/alice"]);
+        let lead = w.agent(
+            "t0",
+            "research",
+            "lead",
+            "run_lead",
+            None,
+            &["audit", "spiffe://test.local/t/t0/op/unix/alice", "spiffe://test.local/t/t0/op/passkey/laptop"],
+        );
+        // Operators enrolled with a passkey are in the ledger's record (#253): one it names, one not.
+        for name in ["laptop", "phone"] {
+            let c =
+                wicket_store::OperatorCredential { id: format!("cred-{name}"), name: name.into(), x: [1; 32], y: [2; 32], sign_count: 0 };
+            w.ledger.lock().unwrap().add_operator_credential(&TenantId("t0".into()), &c).unwrap();
+        }
         let child = w.agent("t0", "research", "fetcher", "run_child", Some("run_lead"), &[]);
         let ops = w.agent("t0", "ops", "deployer", "run_ops", None, &["research"]);
         let _audit = w.agent("t0", "audit", "auditor", "run_audit", None, &[]);
@@ -1037,6 +1067,13 @@ mod tests {
         );
         let h = by("spiffe://test.local/t/t0/op/unix/alice").expect("an operator its accept_from names");
         assert_eq!(h["kind"], "operator");
+        let ops: Vec<&Value> = v["principals"].as_array().unwrap().iter().filter(|p| p["kind"] == "operator").collect();
+        assert_eq!(
+            ops.iter().filter(|p| p["id"] == "spiffe://test.local/t/t0/op/passkey/laptop").count(),
+            1,
+            "a passkey operator in the record and in accept_from, once: {text}"
+        );
+        assert!(by("spiffe://test.local/t/t0/op/passkey/phone").is_none(), "one accept_from doesn't name isn't listed: {text}");
         assert!(by("spiffe://test.local/t/t0/z/elsewhere/a/stranger").is_none(), "{text}");
         assert!(!text.contains("/t/t1/"), "another tenant's principals are never listed: {text}");
         assert!(by(&id_of(&lead)).is_none(), "not itself");

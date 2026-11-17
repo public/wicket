@@ -23,7 +23,26 @@ CREATE TABLE IF NOT EXISTS message_refusals (
   why TEXT NOT NULL, created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS message_refusals_from ON message_refusals (from_principal, created_at);
+-- Every principal the ledger knows (#11, #253 primitive 3): one record, read-only, over the tables
+-- each kind is enrolled in. An agent is its latest identity; an operator its console passkey (a CLI
+-- operator, known by its unix user alone, has no record yet). No writes go through it.
+CREATE VIEW IF NOT EXISTS principals AS
+  SELECT 'agent' AS kind, i.tenant AS tenant, i.spiffe_id AS id, NULL AS via, i.agent AS name, i.run AS run
+    FROM identities i
+   WHERE i.rowid = (SELECT rowid FROM identities j WHERE j.tenant = i.tenant AND j.spiffe_id = i.spiffe_id
+                    ORDER BY issued_at DESC, rowid DESC LIMIT 1)
+  UNION ALL
+  SELECT DISTINCT 'operator', tenant, NULL, 'passkey', name, NULL FROM operator_credentials WHERE revoked = 0;
 "#;
+
+/// One principal in the ledger's record ([`Ledger::principals`]).
+#[derive(Clone, Debug)]
+pub enum Principal {
+    /// An agent: its latest identity.
+    Agent(IdentityRow),
+    /// An operator, enrolled as `via/name` (the id is the trust domain's: `wicket_identity::operator_id`).
+    Operator { via: String, name: String },
+}
 
 /// How soon a sender wants a message read (#252), where the recipient's harness can act on it:
 /// `now` interrupts the running turn, `next` joins it (the default), `later` waits for it to end.
@@ -289,16 +308,26 @@ impl Ledger {
         Ok(self.conn.query_row("SELECT activity FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?.flatten())
     }
 
-    /// The latest identity of every principal that has run in `tenant`: one row each.
-    pub fn principals(&self, tenant: &str) -> Result<Vec<IdentityRow>> {
-        let mut st = self.conn.prepare(
-            "SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities i
-             WHERE tenant = ?1 AND rowid = (SELECT rowid FROM identities j WHERE j.tenant = i.tenant AND j.spiffe_id = i.spiffe_id
-                                            ORDER BY issued_at DESC, rowid DESC LIMIT 1)
-             ORDER BY spiffe_id",
-        )?;
-        let rows = st.query_map(params![tenant], crate::row_to_identity)?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    /// Every principal `tenant` has (the `principals` view): each agent that has run, by its latest
+    /// identity, and each operator enrolled with a passkey. Agents first, each kind in id order.
+    pub fn principals(&self, tenant: &str) -> Result<Vec<Principal>> {
+        let mut st = self.conn.prepare("SELECT kind, run, via, name FROM principals WHERE tenant = ?1 ORDER BY kind, id, via, name")?;
+        let rows = st.query_map(params![tenant], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?))
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            match row? {
+                (k, Some(run), _, _) if k == "agent" => {
+                    if let Some(i) = self.identity(&run)? {
+                        out.push(Principal::Agent(i));
+                    }
+                }
+                (_, _, Some(via), name) => out.push(Principal::Operator { via, name }),
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 
     /// Principal `spiffe_id`'s presence in `tenant` (#252), from what the ledger knows: with a live
@@ -424,6 +453,32 @@ mod tests {
         l.put_identity(&row(&t, "run_3", "spiffe://x/t/default/z/z/a/other")).unwrap();
         let all = l.principals(&t.0).unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(all.iter().find(|r| r.spiffe_id == p).unwrap().run, "run_2", "its latest run");
+        let agent = |id: &str| {
+            all.iter().find_map(|r| match r {
+                Principal::Agent(i) if i.spiffe_id == id => Some(i.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(agent(p).unwrap().run, "run_2", "its latest run");
+        // Operators enrolled with a passkey are principals too (#253): once each, not once revoked.
+        for (id, name) in [("c1", "laptop"), ("c2", "laptop"), ("c3", "phone")] {
+            let c = crate::OperatorCredential { id: id.into(), name: name.into(), x: [1; 32], y: [2; 32], sign_count: 0 };
+            l.add_operator_credential(&t, &c).unwrap();
+        }
+        let ops = |l: &Ledger| -> Vec<String> {
+            l.principals(&t.0)
+                .unwrap()
+                .into_iter()
+                .filter_map(|r| match r {
+                    Principal::Operator { via, name } => Some(format!("{via}/{name}")),
+                    Principal::Agent(_) => None,
+                })
+                .collect()
+        };
+        assert_eq!(ops(&l), ["passkey/laptop", "passkey/phone"]);
+        assert_eq!(l.principals("another").unwrap().len(), 0, "another tenant's none");
+        l.reset_operator_credentials(&t).unwrap();
+        assert!(ops(&l).is_empty(), "revoked: no longer a principal");
+        assert_eq!(l.principals(&t.0).unwrap().len(), 2, "the agents stay");
     }
 }
