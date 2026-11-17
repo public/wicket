@@ -528,7 +528,6 @@ mod tests {
             escalate: true,
             attribute: None,
             identity: None,
-            spawner: None,
             swaps,
             boxes: None,
             capacity: None,

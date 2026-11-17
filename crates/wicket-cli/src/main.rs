@@ -5,9 +5,15 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+#[macro_use]
+mod out;
+
+// The control/node channel and the modules its messages carry: a crate of their own (#219), under
+// their old names here.
+use wicket_chan::{chan, health, nodesecrets, oci, registry};
+
 mod audit_export;
 mod capacity;
-mod chan;
 mod ci_update;
 mod cli_reference;
 mod cmd;
@@ -19,7 +25,6 @@ mod enrol;
 mod exitcause;
 mod gitguard;
 mod grant;
-mod health;
 mod hibernate;
 mod image;
 mod images_policy;
@@ -29,12 +34,11 @@ mod localnode;
 mod mock;
 mod node;
 mod nodeauth;
+mod nodeca;
 mod nodecall;
 mod nodecreate;
 mod noderun;
-mod nodesecrets;
 mod nodesrv;
-mod oci;
 mod operators;
 mod owner;
 mod pin;
@@ -42,7 +46,6 @@ mod policy;
 mod program;
 mod quotas;
 mod reconcile;
-mod registry;
 mod rootcopy;
 mod roots;
 mod run;
@@ -117,18 +120,9 @@ enum Cmd {
         /// ssh identity for --node (default: the one it was enrolled with).
         #[arg(long)]
         ssh_key: Option<PathBuf>,
-        /// Internal: the run id to use (set by a parent starting a child agent).
+        /// Internal: the run id to use (set by the console starting a run).
         #[arg(long, hide = true)]
         run_id: Option<String>,
-        /// Internal: the run that started this one (`spawn`).
-        #[arg(long, hide = true)]
-        parent_run: Option<String>,
-        /// Internal: the capacity lease this run is placed on (`spawn` with `placement: {lease}`).
-        #[arg(long, hide = true)]
-        lease: Option<String>,
-        /// Internal: take over a child its node started (#164): `<started ms>:<session id>`.
-        #[arg(long, hide = true)]
-        adopt: Option<String>,
     },
     /// Open a running agent's session in this terminal, as its operator: what it says and does, live.
     /// An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's

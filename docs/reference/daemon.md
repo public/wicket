@@ -45,8 +45,9 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 | `program digest`, `zone`, `node serve`, `self keygen\|sign`, `dev …` | local |
 | `serve`, `daemon`, `state replicate` | refused: the `wicket-console`, `wicketd` and `wicket-state` units run them |
 
-Arguments only wicket itself passes are refused from any caller: `run --run-id`, `--parent-run`,
-`--lease` and `--ssh-key`, and `wake --by`. Manifests and `--workdir` are sent to the daemon as
+Arguments only wicket itself passes are refused from any caller: `run --run-id` and `--ssh-key`,
+and `wake --by`. (A child run's parent, lease and takeover are no arguments: its supervisor runs
+in its parent's process.) Manifests and `--workdir` are sent to the daemon as
 content; mounting a directory in place (`run --workspace-dir`, and `wrap`, which mounts its
 launcher's directory) is root's only. Restarting `wicketd` stops the runs started through it.
 

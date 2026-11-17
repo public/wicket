@@ -19,8 +19,8 @@ pub struct SpawnCtx {
     /// The boxes this run may start, its children's included (#256): the amount of its `children`
     /// quota grant, less its own box, read when the run starts. What `slots` is checked against.
     pub max_children: u32,
-    /// The `wicket` binary children run as (`None`: this one). Tests point it elsewhere.
-    pub exe: Option<PathBuf>,
+    /// Starts a child's supervisor ([`supervise`]; tests start a stand-in).
+    pub supervise: Supervise,
     pub run: RunId,
     pub dir: PathBuf,
     pub image: String,
@@ -30,7 +30,7 @@ pub struct SpawnCtx {
     pub node: Option<String>,
     pub ssh_key: Option<PathBuf>,
     pub ledger: Arc<Mutex<Ledger>>,
-    pub children: Arc<Mutex<Vec<(String, std::process::Child)>>>,
+    pub children: Arc<Mutex<Vec<(String, Supervisor)>>>,
     pub llm: Arc<OnceLock<Arc<Llm>>>,
     pub deadline: Instant,
     /// The parent's org layer (#51): what spawns the org policy allows it, whatever it is approved.
@@ -68,8 +68,83 @@ pub fn reserved_slots(dir: &std::path::Path, max: u32) -> u32 {
     used.min(max)
 }
 
-pub fn spawner(c: Arc<SpawnCtx>) -> wicket_proxy::Spawner {
-    Arc::new(move |req| spawn(&c, req))
+/// The `spawn` tool for this run's box (#257 slice 4c): answered here, on the control host, when its
+/// node doesn't start the child itself. Blocks while the child's supervisor starts (up to 10 s).
+pub fn tool(c: &SpawnCtx, args: &serde_json::Value) -> (String, bool) {
+    let req = match wicket_proxy::gateway::spawn_request(args) {
+        Ok(r) => r,
+        Err(e) => return (e, true),
+    };
+    match spawn(c, req) {
+        Ok(msg) => (msg, false),
+        Err(e) => (format!("not started: {e}"), true),
+    }
+}
+
+/// What a child's supervisor is started with: `wicket run`'s options for a child, owned.
+pub struct ChildOpts {
+    /// Its manifest, in the parent's `children/`.
+    pub manifest: PathBuf,
+    pub run_id: String,
+    pub parent_run: String,
+    pub image: String,
+    pub node: Option<String>,
+    pub ssh_key: Option<PathBuf>,
+    pub lease: Option<String>,
+    pub adopt: Option<(i64, String)>,
+    /// What it prints goes here (`children/<run>.log`).
+    pub log: std::fs::File,
+    /// Its parent asks it to stop its box and end.
+    pub stop: Arc<tokio::sync::Notify>,
+}
+
+/// A child's supervisor, running in its parent's process.
+pub struct Supervisor {
+    pub stop: Arc<tokio::sync::Notify>,
+    pub thread: std::thread::JoinHandle<()>,
+}
+
+/// Starts a child's supervisor.
+pub type Supervise = fn(ChildOpts) -> std::io::Result<std::thread::JoinHandle<()>>;
+
+/// Starts child run `o.run_id`'s supervisor in this process (#257 slice 4c): [`crate::run::run`],
+/// on a thread of its own with its own runtime, so everything it runs (and prints, to its log)
+/// is its own, as it was when it was a `wicket run` of its own. It ends when its run does.
+pub fn supervise(o: ChildOpts) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name(format!("supervise {}", o.run_id)).spawn(move || {
+        let ChildOpts { manifest, run_id, parent_run, image, node, ssh_key, lease, adopt, log, stop } = o;
+        let id = run_id.clone();
+        crate::out::to(log);
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return say!("[wicket] run {run_id}'s supervisor has no runtime: {e}"),
+        };
+        // A panic ends this run's supervisor, not its parent's.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(crate::run::run(crate::run::RunOpts {
+                manifest: &manifest,
+                workdir: None,
+                workspace_dir: None,
+                task: None,
+                image: Some(&image),
+                node: node.as_deref(),
+                ssh_key: ssh_key.as_deref(),
+                run_id: Some(run_id),
+                parent_run: Some(parent_run),
+                lease,
+                wrap: None,
+                wake: None,
+                attach: false,
+                adopt,
+                stop: Some(stop),
+            }))
+        }));
+        match r {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => say!("Error: {e:?}"),
+            Err(_) => say!("[wicket] run {id}'s supervisor panicked"),
+        }
+    })
 }
 
 /// Takes over the children this run's node starts for its box (#164).
@@ -80,7 +155,7 @@ pub fn adopter(c: Arc<SpawnCtx>) -> crate::noderun::Adopter {
 /// Takes over a child the parent's node started for it while deciding its spawn (#164): checked
 /// again here, as of when it started (its zone within the parent's, what no human may approve,
 /// the org policy, the parent's slots), its slots and model budget reserved as `spawn` does, and
-/// recorded and supervised as a run of its own (`wicket run --adopt`), which publishes its token
+/// recorded and supervised as a run of its own (its supervisor adopting it), which publishes its token
 /// and takes over its box without starting another. The budget was checked on the node against
 /// the slice it was sent; here it is carved from the parent's. Idempotent: a resend is taken once.
 fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
@@ -213,7 +288,7 @@ fn unrecord_quotas(c: &SpawnCtx, ids: &[String]) {
     }
 }
 
-/// A child its node started (#164), to take over: `wicket run --adopt`.
+/// A child its node started (#164), to take over: its supervisor adopts its box.
 pub struct Adopt {
     pub started_ms: i64,
     pub session: String,
@@ -708,10 +783,9 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
     )
 }
 
-/// Starts the child: another `wicket run`, with its own box, sockets, proxies and identity. Returns
-/// its run id once it has recorded its identity (or exited, or 10 s passed).
-/// Starts the supervisor of child `child` (`wicket run --parent-run`), or (`adopt`) of a child its
-/// node started already.
+/// Starts the supervisor of child `child`, or (`adopt`) of a child its node started already, in
+/// this process (#257 slice 4c): its own box, identity and records, as a run of its own. Returns
+/// its run id once it has recorded its identity (or ended, or 10 s passed).
 fn launch_as(
     c: &SpawnCtx,
     child: &RunId,
@@ -725,44 +799,27 @@ fn launch_as(
     let yaml_path = cdir.join(format!("{}.yaml", child.0));
     std::fs::write(&yaml_path, yaml).map_err(|e| e.to_string())?;
     let log = std::fs::File::create(cdir.join(format!("{}.log", child.0))).map_err(|e| e.to_string())?;
-    let exe = match &c.exe {
-        Some(e) => e.clone(),
-        None => crate::update::self_exe().map_err(|e| e.to_string())?,
+    // Placed on a lease: that lease's node, reached with the key it was enrolled with. Otherwise
+    // the parent's own node (named, or the node the hint named), reached as the parent reaches it.
+    let (node, lease) = match placed {
+        Some(p) => (Some(p.node.clone()), p.lease.clone()),
+        None => (c.node.clone(), None),
     };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(["run", "--run-id", &child.0, "--parent-run", &c.run.0, "--image", image]);
-    if let Some(a) = adopt {
-        cmd.arg("--adopt").arg(format!("{}:{}", a.started_ms, a.session));
-    }
-    match placed {
-        Some(p) => {
-            cmd.args(["--node", &p.node]);
-            match &p.lease {
-                Some(lease) => {
-                    cmd.args(["--lease", lease]);
-                }
-                // The parent's own node: reached the way the parent reaches it. A lease's node
-                // carries the key it was enrolled with.
-                None => {
-                    if let Some(k) = &c.ssh_key {
-                        cmd.arg("--ssh-key").arg(k);
-                    }
-                }
-            }
-        }
-        None => {
-            if let Some(n) = &c.node {
-                cmd.args(["--node", n]);
-            }
-            if let Some(k) = &c.ssh_key {
-                cmd.arg("--ssh-key").arg(k);
-            }
-        }
-    }
-    let log2 = log.try_clone().map_err(|e| e.to_string())?;
-    cmd.arg(&yaml_path).stdin(std::process::Stdio::null()).stdout(log2).stderr(log);
-    let mut proc = match cmd.spawn() {
-        Ok(p) => p,
+    let ssh_key = if lease.is_some() { None } else { c.ssh_key.clone() };
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let thread = match (c.supervise)(ChildOpts {
+        manifest: yaml_path.clone(),
+        run_id: child.0.clone(),
+        parent_run: c.run.0.clone(),
+        image: image.to_string(),
+        node,
+        ssh_key,
+        lease,
+        adopt: adopt.map(|a| (a.started_ms, a.session.clone())),
+        log,
+        stop: stop.clone(),
+    }) {
+        Ok(t) => t,
         Err(e) => {
             // Never started: no spawn record, so a re-attach doesn't count it (`reserved_slots`).
             let _ = std::fs::remove_file(&yaml_path);
@@ -771,7 +828,7 @@ fn launch_as(
     };
     // The child records its identity before its box starts; wait for it so the parent can message it.
     for _ in 0..100 {
-        if matches!(proc.try_wait(), Ok(Some(_))) {
+        if thread.is_finished() {
             break;
         }
         if c.ledger.lock().ok().and_then(|l| l.identity(&child.0).ok().flatten()).is_some() {
@@ -779,14 +836,14 @@ fn launch_as(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    c.children.lock().map_err(|_| "children lock")?.push((child.0.clone(), proc));
+    c.children.lock().map_err(|_| "children lock")?.push((child.0.clone(), Supervisor { stop, thread }));
     Ok(child.0.clone())
 }
 
 /// Where a child runs, from `spawn`'s placement hint.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Placed {
-    /// The enrolled node (`wicket run --node`).
+    /// The enrolled node it runs on.
     pub node: String,
     /// The lease it is placed on: the reconciler stops it when the lease ends.
     pub lease: Option<String>,
@@ -990,6 +1047,11 @@ mod tests {
         }
     }
 
+    /// A child's supervisor that ends at once (as `/bin/true` did, when a child was a process).
+    fn ended(_: ChildOpts) -> std::io::Result<std::thread::JoinHandle<()>> {
+        Ok(std::thread::spawn(|| {}))
+    }
+
     fn parent(max: u32, zone: &str) -> Parent {
         let dir = std::env::temp_dir().join(format!("wicket-spawn-test-{}-{}", std::process::id(), wicket_core::new_request_id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -998,7 +1060,7 @@ mod tests {
             parent: m,
             slots: Default::default(),
             max_children: max,
-            exe: Some("/bin/true".into()),
+            supervise: ended,
             run: RunId("run_01parent".into()),
             dir: dir.clone(),
             image: "img:a".into(),
@@ -1076,7 +1138,7 @@ mod tests {
     #[test]
     fn a_spawn_records_its_carve_out_as_quota_grants() {
         let mut p = parent(4, ZONE);
-        Arc::get_mut(&mut p.ctx).unwrap().exe = Some("/nonexistent/wicket".into());
+        Arc::get_mut(&mut p.ctx).unwrap().supervise = |_| Err(std::io::Error::other("no supervisor"));
         assert!(spawn(&p.ctx, program("a")).is_err());
         {
             let l = p.ctx.ledger.lock().unwrap();
@@ -1084,7 +1146,7 @@ mod tests {
             let all = l.grants(&wicket_core::TenantId::single(), true, 100).unwrap();
             assert!(all.iter().all(|g| g.grant.revoked), "recorded before the launch, revoked when it failed");
         }
-        Arc::get_mut(&mut p.ctx).unwrap().exe = Some("/bin/true".into());
+        Arc::get_mut(&mut p.ctx).unwrap().supervise = ended;
         let agent =
             SpawnRequest { kind: "agent".into(), task: Some("work".into()), command: vec![], zone: None, max_children: 1, ..program("a") };
         let out = spawn(&p.ctx, agent).unwrap();
@@ -1120,10 +1182,10 @@ mod tests {
     #[test]
     fn a_failed_launch_releases_its_slot() {
         let mut p = parent(1, ZONE);
-        Arc::get_mut(&mut p.ctx).unwrap().exe = Some("/nonexistent/wicket".into());
+        Arc::get_mut(&mut p.ctx).unwrap().supervise = |_| Err(std::io::Error::other("no supervisor"));
         assert!(spawn(&p.ctx, program("a")).unwrap_err().contains("starting the box"));
         assert_eq!(*p.ctx.slots.lock().unwrap(), 0);
-        Arc::get_mut(&mut p.ctx).unwrap().exe = Some("/bin/true".into());
+        Arc::get_mut(&mut p.ctx).unwrap().supervise = ended;
         assert!(spawn(&p.ctx, program("a")).unwrap().starts_with("started"));
     }
 
@@ -1144,7 +1206,7 @@ mod tests {
             parent: p.ctx.parent.clone(),
             slots: Arc::new(Mutex::new(reserved)),
             max_children: 3,
-            exe: Some("/bin/true".into()),
+            supervise: ended,
             run: p.ctx.run.clone(),
             dir: p.dir.clone(),
             image: "img:a".into(),
@@ -1161,9 +1223,35 @@ mod tests {
         assert!(e.contains("at most 3 boxes (theirs included), and has used 3"), "{e}");
         // A launch that never started leaves no record behind.
         let mut q = parent(1, ZONE);
-        Arc::get_mut(&mut q.ctx).unwrap().exe = Some("/nonexistent/wicket".into());
+        Arc::get_mut(&mut q.ctx).unwrap().supervise = |_| Err(std::io::Error::other("no supervisor"));
         assert!(spawn(&q.ctx, program("a")).is_err());
         assert_eq!(reserved_slots(&q.dir, 1), 0);
+    }
+
+    /// #257 slice 4c: a child's supervisor is `run::run` on a thread of this process, and what it
+    /// prints goes to its log in the parent's `children/`, not to the parent's output.
+    #[test]
+    fn a_childs_supervisor_runs_in_process_and_prints_to_its_log() {
+        let p = parent(1, ZONE);
+        let log_path = p.dir.join("child.log");
+        let t = supervise(ChildOpts {
+            manifest: p.dir.join("children/run_01child.yaml"),
+            run_id: "run_01child".into(),
+            parent_run: "run_01parent".into(),
+            image: "img:a".into(),
+            node: None,
+            ssh_key: None,
+            lease: None,
+            adopt: None,
+            log: std::fs::File::create(&log_path).unwrap(),
+            stop: Default::default(),
+        })
+        .unwrap();
+        assert!(t.thread().name().is_some_and(|n| n.ends_with("run_01child")));
+        t.join().unwrap();
+        // No manifest there: the run fails before it starts anything, and says why in its log.
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(log.starts_with("Error: reading ") && log.contains("run_01child.yaml"), "{log}");
     }
 
     /// #127: a spawned zone's name carries the parent run, so no other run can make it.

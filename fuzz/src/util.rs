@@ -43,7 +43,6 @@ pub fn ctx(zone: &str, vault: PathBuf) -> (wicket_proxy::RunCtx, tokio::sync::mp
         escalate: false,
         attribute: None,
         identity: None,
-        spawner: None,
         swaps: vec![],
         boxes: None,
         capacity: None,

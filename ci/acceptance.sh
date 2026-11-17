@@ -78,6 +78,7 @@ chmod 755 "$work"
 if [ ${#work} -gt 24 ]; then echo "$work: too long a path for the runs' sockets (ACC_TMP=/tmp)" >&2; rm -rf "$work"; exit 2; fi
 pids=()
 our_runs=()
+restart_runs=()
 built_image=
 pin_images=()
 
@@ -606,6 +607,7 @@ restart_flow() {
   r=$(restart_start local); runs+=("$r"); labels+=(local)
   if [ "$nodes" = local ]; then r=$(restart_start node --node "$NODE"); runs+=("$r"); labels+=("$NODE"); fi
   for r in "${runs[@]}"; do boxes+=("$(box_of "$r")"); done
+  restart_runs=("${runs[@]}")
   echo "   runs: ${runs[*]}; boxes: ${boxes[*]}"
   local killed=0 p
   for p in $(pgrep -f "$W" 2>/dev/null); do
@@ -747,6 +749,20 @@ echo "$n_ok ok, $n_fail failed"
 if [ "$fail" != 0 ]; then
   echo "== mock model log (tail)"; tail -20 "$work/mock.log"
   for f in lead hib1 hib2 acp1 acp2 linger orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
+  # The restart check's supervisors (#151): the first, each one reconcile started, and the local
+  # node's serve. In GitHub Actions, also as annotations: readable from the API without the log.
+  shown() {   # $1: title, $2: file, $3: lines
+    echo "== $1 (tail)"; tail -"$3" "$2"
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+      echo "::error title=acceptance: $1::$(tail -"$3" "$2" | cut -c1-300 | sed 's/%/%25/g; s/\r/%0D/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+    fi
+  }
+  for f in "$work"/restart-*.log; do [ -f "$f" ] && shown "$(basename "$f")" "$f" 25; done
+  for r in "${restart_runs[@]}"; do
+    [ -n "$r" ] && data "runs/$r/ctl/attach.log" >"$work/attach-$r.log" 2>/dev/null && shown "$r attach.log" "$work/attach-$r.log" 40
+  done
+  data "local-node/serve/serve.log" >"$work/local-serve.log" 2>/dev/null && shown "local node serve.log" "$work/local-serve.log" 40
+  df -h "$work" / 2>/dev/null | sed 's/^/   /'
   exit 1
 fi
 echo "acceptance passed"

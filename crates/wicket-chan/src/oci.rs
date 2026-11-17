@@ -288,7 +288,7 @@ impl<F: FnMut(u64)> Read for ChunkReader<F> {
 }
 
 /// Image archives for tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit {
     use super::*;
 

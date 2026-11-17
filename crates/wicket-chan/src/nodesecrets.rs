@@ -461,7 +461,7 @@ impl Slices {
     }
 
     fn file(&self, run: &str) -> Result<PathBuf> {
-        crate::run::check_run_id(run)?;
+        crate::check_run_id(run)?;
         Ok(self.dir.join(format!("{run}.json")))
     }
 
@@ -480,7 +480,7 @@ impl Slices {
     }
 }
 
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");

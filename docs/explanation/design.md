@@ -437,7 +437,7 @@ is the only member of the `docker` group. Other users reach wicket only through 
   (`<name>.hosts` in the vault, set by root with `secret set/link/hosts --hosts`; `claude-oauth` defaults to
   `api.anthropic.com`, any other unbound secret goes nowhere). Runs whose manifest sends a secret elsewhere are
   refused, and the egress proxy, credential swaps and the model proxy check the binding again on every send.
-  Internal arguments (`--run-id`, `--parent-run`, `--lease`) are
+  Internal arguments (`--run-id`, `--ssh-key`) are
   refused, and refusals are audited.
 
 Without the daemon, the CLI keeps the single-user behaviour (development mode, labelled insecure by `wicket
@@ -1245,7 +1245,7 @@ Decided on the node (since protocol 5):
   the parent's, its secrets shared from what the parent holds there. Its identity until adoption is the
   parent's box path plus the child (provisional, node-attested, signing nothing). The node reports it
   (`Spawned`); the control host checks it again (`subset`, the org policy, slots), records it and
-  supervises it (`wicket run --adopt`), whose token then comes from the feed. Where the org policy reads
+  supervises it (a supervisor that adopts its box, in the parent's process), whose token then comes from the feed. Where the org policy reads
   the spawn depth, the zone or its groups, a node can't fold it for the child: those spawns are the
   control host's;
 - messages and links between two boxes on one node: decided from both tokens (`accept_from`, the
@@ -2120,6 +2120,8 @@ crates/
   wicket-agent       harness adapters (Claude Code, ACP) and their modes
   wicket-placement   providers (static hosts, Vultr), billing, the money envelope
   wicket-fwd         in-box forwarders to wicket.internal
+  wicket-chan        the control/node channel's protocol and what its messages carry (health, a
+                     node's secrets, OCI images and registries); fuzzed as it is
   wicket-cli         the `wicket` binary: CLI, daemon, console, node, reconciler
 ```
 

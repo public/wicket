@@ -356,7 +356,6 @@ pub fn run_ctx(run: &str, zone: &ZoneSpec) -> wicket_proxy::RunCtx {
         escalate: true,
         attribute: None,
         identity: None,
-        spawner: None,
         swaps: vec![],
         boxes: None,
         capacity: None,

@@ -1840,6 +1840,36 @@ impl Ledger {
         Ok(())
     }
 
+    /// Records a CA certificate that replaced an active node's CA on the node itself (#416, renewed
+    /// over the channel: the old key is gone from the node). Earlier active ones still unexpired
+    /// were replaced early, so they are revoked (for the feed's revocation list); expired ones are
+    /// superseded. Returns the serials revoked.
+    pub fn replace_node_ca(&mut self, ca: &NodeCaRow) -> Result<Vec<String>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: Option<String> = tx.query_row("SELECT status FROM nodes WHERE name = ?1", params![ca.node], |r| r.get(0)).optional()?;
+        match status.as_deref() {
+            None => return Err(StoreError::Node(ca.node.clone(), "is not enrolled")),
+            Some("active") => {}
+            Some(_) => return Err(StoreError::Node(ca.node.clone(), "is revoked")),
+        }
+        let t = now();
+        let serials = {
+            let mut st = tx.prepare(
+                "SELECT serial FROM node_cas WHERE node = ?1 AND status = 'active' AND not_after > ?2 ORDER BY issued_at, rowid",
+            )?;
+            let rows = st.query_map(params![ca.node, t], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for s in &serials {
+            tx.execute("UPDATE node_cas SET status = 'revoked', revoked_at = ?2 WHERE serial = ?1", params![s, t])?;
+        }
+        tx.execute("UPDATE node_cas SET status = 'superseded' WHERE node = ?1 AND status = 'active'", params![ca.node])?;
+        insert_node_ca(&tx, ca)?;
+        tx.execute("UPDATE nodes SET hosts = ?2 WHERE name = ?1", params![ca.node, serde_json::Value::from(ca.hosts.clone()).to_string()])?;
+        tx.commit()?;
+        Ok(serials)
+    }
+
     /// Marks a node revoked, and its unexpired CA certificates with it. Returns their serials (for the
     /// feed's revocation list). Revoking twice is refused.
     pub fn revoke_node(&mut self, name: &str) -> Result<Vec<String>> {
@@ -2008,6 +2038,23 @@ mod node_tests {
         assert!(l.node("n1").unwrap().is_none());
     }
 
+    /// #416: a CA replaced on the node before its end goes on the revocation list; one replaced
+    /// after its end just drops out.
+    #[test]
+    fn a_ca_replaced_early_is_revoked() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0a")).unwrap();
+        assert_eq!(l.replace_node_ca(&ca("n1", "0b")).unwrap(), vec!["0a"]);
+        let mut expired = ca("n1", "0c");
+        expired.not_after = now() - 1;
+        l.replace_node_ca(&expired).unwrap();
+        assert_eq!(l.replace_node_ca(&ca("n1", "0d")).unwrap(), vec![] as Vec<String>, "0c had ended");
+        let st = |s: &str| l.node_cas("n1").unwrap().into_iter().find(|c| c.serial == s).unwrap().status;
+        assert_eq!((st("0a"), st("0b"), st("0c"), st("0d")), ("revoked".into(), "revoked".into(), "superseded".into(), "active".into()));
+        assert_eq!(l.revoked_node_cas(now()).unwrap().iter().map(|c| c.serial.as_str()).collect::<Vec<_>>(), ["0a", "0b"]);
+    }
+
     #[test]
     fn nodes_are_recorded_renewed_and_revoked_with_their_ca_serials() {
         let mut l = Ledger::open_in_memory().unwrap();
@@ -2032,6 +2079,7 @@ mod node_tests {
         assert!(l.revoked_node_cas(now() + 90_000).unwrap().is_empty(), "expired ones drop off the list");
         assert!(l.revoke_node("n1").is_err());
         assert!(l.renew_node_ca(&ca("n1", "0c")).is_err(), "no new CA for a revoked node");
+        assert!(l.replace_node_ca(&ca("n1", "0c")).is_err(), "nor a replacement");
         // Re-enrolling a revoked name takes a fresh token, and keeps the old serials revoked.
         let t2 = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
         l.enrol_node(&t2, &node("n1"), &ca("n1", "0d")).unwrap();

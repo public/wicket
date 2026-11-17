@@ -361,6 +361,10 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return Ok(*r),
         };
+        // From here the reservation is held by `held`: a box that gives up on the call (its client
+        // times out while the credential is fetched, #422) drops this future, and the drop gives
+        // the reservation back instead of leaving it counted for good.
+        let held = Reservation::new(self, reserved);
         self.journal();
         // On a node (#152), the credential comes from the node's cache (fetched from the control host
         // on first use) and the call goes from here; the control host isn't asked per call. Without
@@ -368,32 +372,42 @@ impl Llm {
         // Only the node runs a model proxy for a box (#257): nothing relays a call to another one.
         if self.ctx.vault.is_sourced() {
             if let Err(e) = self.ctx.vault.ensure(&spec.secret).await {
-                self.settle(reserved, Usage::default(), true);
+                drop(held);
                 self.event(model, 503, Usage::default(), "credential unavailable on this node");
                 return Ok(problem(503, "credential", "Model credential unavailable on this node", &format!("{e:#}"), None));
             }
         }
-        let up = self.send_once_more_if_relogged(spec, &parts, body, model.as_deref(), &mut note).await.map(|r| {
-            let (status, headers) = (r.status().as_u16(), r.headers().clone());
-            let stream = r.bytes_stream().map(|c| c.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)).boxed();
-            (status, headers, stream)
+        // Sent upstream on a task of its own: once the call may reach the provider it is settled by
+        // what the provider answers (`account`, which reads the answer to its end), whether or not
+        // the box still waits for it.
+        let me = self.clone();
+        let call = tokio::spawn(async move {
+            let reserved = held.take();
+            let spec = me.ctx.zone.llm.as_ref().expect("checked: a model route");
+            let up = me.send_once_more_if_relogged(spec, &parts, body, model.as_deref(), &mut note).await.map(|r| {
+                let (status, headers) = (r.status().as_u16(), r.headers().clone());
+                let stream = r.bytes_stream().map(|c| c.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)).boxed();
+                (status, headers, stream)
+            });
+            let (status, headers, stream) = match up {
+                Ok(r) => r,
+                Err(e) => {
+                    me.settle(reserved, Usage::default(), true);
+                    return Err(e);
+                }
+            };
+            let mut out = Response::builder().status(StatusCode::from_u16(status)?);
+            for (name, value) in headers.iter() {
+                if !STRIP_RESPONSE.contains(&name.as_str()) {
+                    out = out.header(name.as_str(), value.as_bytes());
+                }
+            }
+            let sse =
+                headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
+            let body = me.account(model, status, sse, stream, reserved, note);
+            Ok(out.body(body)?)
         });
-        let (status, headers, stream) = match up {
-            Ok(r) => r,
-            Err(e) => {
-                self.settle(reserved, Usage::default(), true);
-                return Err(e);
-            }
-        };
-        let mut out = Response::builder().status(StatusCode::from_u16(status)?);
-        for (name, value) in headers.iter() {
-            if !STRIP_RESPONSE.contains(&name.as_str()) {
-                out = out.header(name.as_str(), value.as_bytes());
-            }
-        }
-        let sse = headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
-        let body = self.account(model, status, sse, stream, reserved, note);
-        Ok(out.body(body)?)
+        call.await.map_err(|e| anyhow::anyhow!("the model call's task: {e}"))?
     }
 
     /// Sends a call upstream with the model secret's current value; if the upstream refuses that
@@ -665,8 +679,10 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return *r,
         };
+        // Held until the call goes upstream, given back if the box gives up first (#422); from
+        // there it is settled on a task of its own, as `forward`'s.
+        let mut held = Reservation::new(self, f.reserved);
         self.journal();
-        let reserved = f.reserved;
         let mut parts = parts;
         // The body may have been rewritten (fields stripped, max_tokens lowered): its own length goes
         // up, not the one the box declared. And the response is asked for unencoded, as the model
@@ -675,7 +691,12 @@ impl Llm {
         parts.headers.insert(http::header::CONTENT_LENGTH, f.body.len().into());
         parts.headers.insert(http::header::ACCEPT_ENCODING, http::HeaderValue::from_static("identity"));
         let req = Request::from_parts(parts, http_body_util::Full::new(f.body));
-        match egress.forward(req, host, "https", pq, via).await {
+        // Sent: a box that gives up on it now leaves it charged its reservation, as a call whose
+        // final usage wasn't seen (the provider may bill it).
+        held.sent();
+        let sent = egress.forward(req, host, "https", pq, via).await;
+        let reserved = held.take();
+        match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let sse = resp
@@ -772,6 +793,43 @@ impl Llm {
         });
         let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
         BodyExt::boxed(StreamBody::new(stream))
+    }
+}
+
+/// A call's output reservation (#113) while its call is being made: settled by whoever takes it
+/// ([`Reservation::take`]). Dropped untaken, the call was given up on (the box's client went away,
+/// #422): a call not yet sent gives its reservation back, uncharged; one sent is charged it in full,
+/// as a call whose final usage wasn't seen.
+struct Reservation {
+    llm: Arc<Llm>,
+    tokens: u64,
+    sent: bool,
+}
+
+impl Reservation {
+    fn new(llm: &Arc<Llm>, tokens: u64) -> Reservation {
+        Reservation { llm: llm.clone(), tokens, sent: false }
+    }
+
+    /// The call is going upstream: the provider may bill it from here.
+    fn sent(&mut self) {
+        self.sent = true;
+    }
+
+    /// Hands the reservation to the caller, who settles it.
+    fn take(mut self) -> u64 {
+        std::mem::take(&mut self.tokens)
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.tokens == 0 {
+            return;
+        }
+        let charged = if self.sent { self.tokens } else { 0 };
+        self.llm.count.settle(self.tokens, 0, 0, 0, charged);
+        self.llm.journal();
     }
 }
 
@@ -1012,7 +1070,6 @@ mod tests {
             escalate: true,
             attribute: None,
             identity: None,
-            spawner: None,
             swaps: vec![],
             boxes: None,
             capacity: None,
@@ -1386,6 +1443,162 @@ mod tests {
         let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
         c.vault = vault;
         (super::Llm::new(c).unwrap(), dir)
+    }
+
+    /// A node's secret cache whose first fetch waits for `go` (#422): the control host a restarted
+    /// node fetches the model credential from is still reconnecting.
+    struct SlowFetch {
+        dir: crate::vault::Vault,
+        held: std::sync::atomic::AtomicBool,
+        go: tokio::sync::Notify,
+    }
+
+    impl crate::vault::SecretSource for SlowFetch {
+        fn get(&self, name: &str) -> anyhow::Result<String> {
+            self.dir.get(name)
+        }
+        fn hosts(&self, name: &str) -> Vec<String> {
+            self.dir.hosts(name)
+        }
+        fn has(&self, _: &str) -> bool {
+            self.held.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn fetch<'a>(&'a self, _: &'a str) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.go.notified().await;
+                self.held.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// #422: a call the box gives up on while its node fetches the credential (its client timed
+    /// out) gives its output reservation back. It used to stay reserved for good, and the node
+    /// refused every later call with "Model token budget exhausted" though nothing was spent.
+    #[tokio::test]
+    async fn a_call_given_up_before_it_is_sent_gives_its_reservation_back() {
+        use http_body_util::BodyExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        let done = [
+            sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#),
+            [
+                sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":250}}"#),
+                sse("message_stop", r#"{"type":"message_stop"}"#),
+            ]
+            .concat(),
+        ];
+        let (port, seen) = sse_upstream(done.to_vec(), std::time::Duration::ZERO).await;
+        // A budget of one call's max_tokens: a reservation left behind leaves nothing.
+        let (direct, dir) = llm_to(port, 300, "given-up");
+        let source = std::sync::Arc::new(SlowFetch { dir: direct.ctx.vault.clone(), held: false.into(), go: tokio::sync::Notify::new() });
+        let mut c = direct.ctx.clone();
+        c.vault = crate::vault::Vault::from_source(source.clone());
+        let llm = super::Llm::new(c).unwrap();
+        let sock = dir.join("llm.sock");
+        let server = tokio::spawn({
+            let (llm, sock) = (llm.clone(), sock.clone());
+            async move { llm.serve(&sock).await }
+        });
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The first call waits for the credential with its output reserved; its client gives up.
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+        let conn = tokio::spawn(conn);
+        let req = http::Request::post("/v1/messages")
+            .header("host", "wicket.internal")
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(ASK)))
+            .unwrap();
+        let pending = tokio::spawn(async move { send.send_request(req).await.map(|r| r.status().as_u16()) });
+        for _ in 0..300 {
+            if llm.count.inflight_output_tokens.load(SeqCst) == 300 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(llm.count.inflight_output_tokens.load(SeqCst), 300, "the call holds its reservation while it waits");
+        pending.abort();
+        conn.abort();
+        for _ in 0..300 {
+            if llm.count.inflight_output_tokens.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(llm.count.inflight_output_tokens.load(SeqCst), 0, "given up before it was sent: its reservation is back");
+        assert_eq!(llm.count.output_tokens.load(SeqCst), 0, "and nothing is charged for it");
+        assert!(seen.lock().await.is_empty(), "it never reached the upstream");
+        // The credential arrives: the next call gets the whole budget and completes within it.
+        source.go.notify_one();
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+        let conn = tokio::spawn(conn);
+        let req = http::Request::post("/v1/messages")
+            .header("host", "wicket.internal")
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(ASK)))
+            .unwrap();
+        let resp = send.send_request(req).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let _ = resp.into_body().collect().await;
+        assert_eq!(output_settles(&llm, 250).await, 250);
+        conn.abort();
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #422: the control host restarts with a call in flight on the node, whose `serve` restarts
+    /// too and charges that call its whole reservation (#324). The re-attached supervisor counts the
+    /// node's spend from its first report, and the slice it sends is in the node's counts: the node
+    /// completes the next call within the budget. (A slice in the supervisor's own counts was that
+    /// report short: the node held less than it had spent and refused every call.)
+    #[tokio::test]
+    async fn after_a_restart_with_a_call_in_flight_the_next_call_completes_within_the_budget() {
+        let done = [
+            sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#),
+            [
+                sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":250}}"#),
+                sse("message_stop", r#"{"type":"message_stop"}"#),
+            ]
+            .concat(),
+        ];
+        let (port, _) = sse_upstream(done.to_vec(), std::time::Duration::ZERO).await;
+        let budget = 4000;
+        // Before the restart: two calls settled at 20 tokens, and one in flight with 1000 reserved.
+        let (before, dir) = llm_to(port, budget, "restart-inflight");
+        before.count.admit_request();
+        before.count.admit_request();
+        before.count.settle(0, 10, 0, 0, 40);
+        before.count.admit_request();
+        assert_eq!(before.count.reserve_output(budget, 1000), Some(1000));
+        // What the node's journal holds, and the supervisor's last heartbeat (the agent's row).
+        let journaled = before.spent_charged();
+        let heartbeat = before.spent_total();
+        // The node's `serve` restarts: it counts the journal, the call in flight charged in full.
+        let (node, _) = llm_to(port, budget, "restart-inflight");
+        node.merge_spent(journaled);
+        assert_eq!(node.spent().output_tokens, 1040);
+        // The re-attached supervisor: the agent's spend as its prior, the node's first report its base.
+        let (control, _) = llm_to(port, budget, "restart-inflight-control");
+        control.spent_before(heartbeat.0, heartbeat.1, heartbeat.2);
+        let base = node.spent();
+        control.merge_spent(base.since(base));
+        let fraction = 0.25;
+        let next = control.next_slice(fraction).unwrap();
+        let slice = super::Slice::renewed_from(None, next, control.spent(), control.input_total(), base);
+        assert!(slice.output_tokens > node.spent().output_tokens, "{slice:?}: the node holds more than it spent");
+        node.set_slice(Some(slice));
+        assert_eq!(call(node.clone(), "restart-inflight", ASK, true).await, 200);
+        assert_eq!(output_settles(&node, 1040 + 250).await, 1040 + 250);
+        // A slice in the supervisor's own counts would have left the node nothing.
+        let unoffset = super::Slice::renewed(None, next, control.spent(), control.input_total());
+        assert!(unoffset.output_tokens <= base.output_tokens, "{unoffset:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// #366: a zone with a model list sends upstream only calls naming one of its models; any other
