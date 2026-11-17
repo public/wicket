@@ -68,3 +68,55 @@ pub fn ends_by(now: i64, end: Option<i64>, until: i64) -> Result<(), Outlasts> {
 #[cfg(kani)]
 #[path = "proofs/authority.rs"]
 mod proofs;
+
+/// The rules at their boundaries, as the Kani proofs state them for every value (#326: the proofs
+/// don't run under `cargo test`, so mutation testing needs these).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parent links over numbers: `i`'s parent is `i + 1`, up to `top` (which has none).
+    fn line(top: u32) -> impl FnMut(&u32) -> Result<Option<u32>, String> {
+        move |r: &u32| Ok((*r < top).then_some(r + 1))
+    }
+
+    #[test]
+    fn a_chain_runs_from_the_run_up_to_its_ancestor() {
+        assert_eq!(descendant_chain(line(10), &1, &0), Ok(Some(vec![0, 1])), "a child");
+        assert_eq!(descendant_chain(line(10), &3, &0), Ok(Some(vec![0, 1, 2, 3])), "a grandchild's grandchild");
+        assert_eq!(descendant_chain(line(10), &0, &0), Ok(None), "never the target itself");
+        assert_eq!(descendant_chain(line(10), &0, &3), Ok(None), "an ancestor is no descendant");
+        assert_eq!(descendant_chain(line(10), &20, &0), Ok(None), "the chain ends without the target");
+        // Errors from the parent lookup are the caller's.
+        let failing = |_: &u32| -> Result<Option<u32>, String> { Err("ledger".into()) };
+        assert_eq!(descendant_chain(failing, &1, &0), Err("ledger".into()));
+    }
+
+    #[test]
+    fn a_chain_is_at_most_max_chain_runs_below_its_target_and_never_loops() {
+        let max = MAX_CHAIN as u32;
+        let found = descendant_chain(line(1000), &max, &0).unwrap().expect("MAX_CHAIN runs below");
+        assert_eq!(found.len(), MAX_CHAIN + 1);
+        assert_eq!(descendant_chain(line(1000), &(max + 1), &0), Ok(None), "one more is too far");
+        // A cycle of parent links (0 → 1 → 2 → 0) that doesn't pass the target ends.
+        let cycle = |r: &u32| -> Result<Option<u32>, String> { Ok(Some((r + 1) % 3)) };
+        assert_eq!(descendant_chain(cycle, &7, &0), Ok(None));
+        assert_eq!(descendant_chain(cycle, &2, &0), Ok(Some(vec![0, 1, 2])));
+    }
+
+    #[test]
+    fn an_end_is_within_an_authority_up_to_its_last_second() {
+        assert_eq!(end_of(10, 5), Some(15));
+        assert_eq!(end_of(-10, 5), Some(-5));
+        assert_eq!(end_of(i64::MAX - 1, 2), None, "past i64::MAX");
+        assert_eq!(end_of(i64::MAX, 0), Some(i64::MAX));
+        assert_eq!(ends_within(100, 50, 150), Ok(()), "ending exactly with the authority");
+        assert_eq!(ends_within(100, 51, 150), Err(Outlasts::Later));
+        assert_eq!(ends_within(100, 1, 100), Err(Outlasts::Ended), "an authority ending now has ended");
+        assert_eq!(ends_within(100, 0, 99), Err(Outlasts::Ended));
+        assert_eq!(ends_within(100, u64::MAX, i64::MAX), Err(Outlasts::Later), "an end past i64::MAX outlasts all");
+        assert_eq!(ends_by(100, Some(120), 150), Ok(()));
+        assert_eq!(ends_by(100, None, 150), Err(Outlasts::Later));
+        assert_eq!(ends_by(100, Some(120), 101), Err(Outlasts::Later));
+    }
+}

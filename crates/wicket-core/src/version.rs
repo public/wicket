@@ -31,3 +31,42 @@ pub fn schema_recorded((at, at_floor): (u32, u32), (version, floor): (u32, u32))
 #[cfg(kani)]
 #[path = "proofs/version.rs"]
 mod proofs;
+
+/// The rules at their boundaries, as the Kani proofs state them for every value (#326: the proofs
+/// don't run under `cargo test`, so mutation testing needs these).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peers_talk_at_the_lower_version_within_the_skew() {
+        assert_eq!(talk_at(15, 14, 1), Some(14));
+        assert_eq!(talk_at(15, 16, 1), Some(15));
+        assert_eq!(talk_at(15, 15, 1), Some(15));
+        assert_eq!(talk_at(15, 13, 1), None, "two apart");
+        assert_eq!(talk_at(15, 17, 1), None);
+        assert_eq!(talk_at(1, 0, 1), None, "a peer from before protocol versions, even within the skew");
+        assert_eq!(talk_at(3, 5, 2), Some(3));
+    }
+
+    #[test]
+    fn a_jump_is_more_than_the_skew_either_way() {
+        assert!(!is_jump(15, 15, 1));
+        assert!(!is_jump(15, 16, 1) && !is_jump(16, 15, 1), "exactly the skew apart is no jump");
+        assert!(is_jump(15, 17, 1) && is_jump(17, 15, 1));
+        assert!(is_jump(1, 1 + 3, 2) && !is_jump(1, 1, 0));
+    }
+
+    #[test]
+    fn a_build_opens_a_ledger_up_to_its_own_version_as_floor() {
+        assert!(schema_opens(17, 1) && schema_opens(17, 17));
+        assert!(!schema_opens(16, 17), "a contract step past the build");
+    }
+
+    #[test]
+    fn what_a_ledger_records_never_goes_down() {
+        assert_eq!(schema_recorded((16, 1), (17, 1)), (17, 1), "a newer build raises the version");
+        assert_eq!(schema_recorded((17, 3), (16, 2)), (17, 3), "an older one lowers neither");
+        assert_eq!(schema_recorded((17, 2), (17, 5)), (17, 5), "a contract step raises the floor");
+    }
+}
