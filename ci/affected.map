@@ -60,7 +60,7 @@ ci/changelog.py                    | -   | docs
 ci/changelog_test.py               | -   | docs
 
 # ---- inputs the crates read from outside their directories (the self-test checks this list) ----
-examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-cli | lean
+examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-home wicket-cli | lean
 examples/policy/**                 | wicket-policy | policy
 images/**                          | wicket-cli | smoke acceptance
 # The console's session view (#327): embedded by crates/wicket-cli/build.rs, checked by its job.
@@ -70,7 +70,7 @@ ci/install-node.sh                 | wicket-cli | -
 images/claude-code/wicket-entry    | wicket-fwd | -
 # The wicket-box skill: the Claude adapter installs it in every box (crates/wicket-agent/src/lib.rs).
 plugins/wicket/skills/wicket-box/SKILL.md | wicket-agent | -
-deploy/install.sh                  | wicket-cli | install-test daemon-uids
+deploy/install.sh                  | wicket-home | install-test daemon-uids
 deploy/systemd/**                  | wicket-cli | install-test update
 deploy/systemd-user/**             | wicket-cli | -
 deploy/vultr/node-setup.sh         | wicket-placement | -
@@ -128,7 +128,8 @@ crates/wicket-cli/src/cmd/operator.rs | - | install-test daemon-uids acceptance
 crates/wicket-cli/src/cmd/policy.rs  | - | restore acceptance policy
 crates/wicket-cli/src/cmd/zone.rs    | - | acceptance
 # Not listed on purpose, so they select every suite: the node protocol (wicket-chan's chan.rs), the ledger's
-# schema (wicket-store), token formats (wicket-authz, wicket-feed), wicket-core, run.rs.
+# schema (wicket-store), token formats (wicket-authz, wicket-feed), wicket-core, run.rs, and wicket-home's
+# lib.rs (the installation's paths, issuer and caller, which nearly every module uses, #219).
 
 # ---- Kani proof harnesses and the loom test (#325) ----
 # The functions they check are wicket-core's (manifest, subset, canon, op, version, budget,

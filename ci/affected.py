@@ -272,16 +272,18 @@ def self_test():
     case("docs only", ["docs/reference/agents.md", "README.md", "experiments/x/RESULTS.md"], set(), {"docs"})
     # The CLI reference is checked by a wicket-cli unit test (cli_reference.rs).
     case("the CLI reference", ["docs/reference/cli.md"], {"wicket-cli"}, {"docs"})
-    case("wicket-fwd", ["crates/wicket-fwd/src/copy.rs"], {"wicket-fwd", "wicket-proxy", "wicket-chan", "wicket-cli", "wicket-sim"}, {"smoke"})
+    case("wicket-fwd", ["crates/wicket-fwd/src/copy.rs"], {"wicket-fwd", "wicket-proxy", "wicket-chan", "wicket-home", "wicket-cli", "wicket-sim"}, {"smoke"})
     # Nearly everything: the crates that don't depend on wicket-core (auth, identity, fwd, placement) aren't.
     case("wicket-core", ["crates/wicket-core/src/op.rs"],
          lambda c: c != ALL and len(c) >= 10 and {"wicket-core", "wicket-cli", "wicket-proxy"} <= c and "wicket-fwd" not in c, ALL)
-    case("a crate's own tests", ["crates/wicket-sandbox/tests/x.rs"], {"wicket-sandbox", "wicket-cli"}, set())
+    case("a crate's own tests", ["crates/wicket-sandbox/tests/x.rs"], {"wicket-sandbox", "wicket-home", "wicket-cli"}, set())
     case("policy code", ["crates/wicket-policy/tests/cedar.rs"], {"wicket-policy", "wicket-policy-diff", "wicket-cli"}, {"policy"})
     case("hibernation", ["crates/wicket-cli/src/hibernate.rs"], {"wicket-cli", "wicket-sim"}, {"hibernate", "restore"})
     case("updates", ["crates/wicket-cli/src/update.rs"], {"wicket-cli"}, {"update"})
+    # A module that left wicket-cli for wicket-home (#219) keeps its suites, and still selects wicket-cli.
+    case("the state store", ["crates/wicket-home/src/statestore.rs"], {"wicket-home", "wicket-cli"}, {"hibernate", "restore"})
     # Every end-to-end suite, and the fuzz target that reads its frames (#323).
-    case("the node protocol", ["crates/wicket-chan/src/chan.rs"], {"wicket-chan", "wicket-cli"}, set(E2E) | {"fuzz-chan"})
+    case("the node protocol", ["crates/wicket-chan/src/chan.rs"], {"wicket-chan", "wicket-home", "wicket-cli"}, set(E2E) | {"fuzz-chan"})
     case("a CLI command group", ["crates/wicket-cli/src/cmd/itself.rs"], {"wicket-cli"}, {"update"})
     # An unmapped crate file: every end-to-end suite, no fuzz target.
     case("the run commands (nearly every suite calls them)", ["crates/wicket-cli/src/cmd/run.rs"], {"wicket-cli"}, set(E2E))
@@ -292,7 +294,7 @@ def self_test():
     case("a workflow", [".github/workflows/ci.yml"], ALL, ALL)
     case("an unmapped file", ["somewhere/new.txt"], ALL, ALL)
     case("nothing changed", [], ALL, ALL)
-    case("a deleted crate file", ["crates/wicket-sandbox/src/gone.rs"], {"wicket-sandbox", "wicket-cli"}, set(E2E))
+    case("a deleted crate file", ["crates/wicket-sandbox/src/gone.rs"], {"wicket-sandbox", "wicket-home", "wicket-cli"}, set(E2E))
     # Fuzz targets (#323): the code a target fuzzes adds it without narrowing anything; a harness, its
     # corpus or a past finding selects that target alone; the shared harness code, every target.
     case("egress code", ["crates/wicket-proxy/src/egress/mod.rs"], lambda c: c != ALL and "wicket-proxy" in c,
@@ -330,8 +332,8 @@ def self_test():
             fails.append(f"ci/affected.map names {pat}, which doesn't exist")
     # Cargo's arguments: crates without a library get no doctest arguments, and none selected is none.
     for files, want_args, want_doc in (
-        (["crates/wicket-chan/src/chan.rs"], "-p wicket-chan -p wicket-cli", ""),
-        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-chan -p wicket-cli -p wicket-fwd -p wicket-proxy -p wicket-sim", ""),
+        (["crates/wicket-chan/src/chan.rs"], "-p wicket-chan -p wicket-cli -p wicket-home", ""),
+        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-chan -p wicket-cli -p wicket-fwd -p wicket-home -p wicket-proxy -p wicket-sim", ""),
         (["docs/x.md"], "", ""),
         (["Cargo.lock"], "--workspace", ""),
     ):
