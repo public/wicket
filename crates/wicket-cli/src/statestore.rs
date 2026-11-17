@@ -11,6 +11,7 @@
 //!   access_key_id: AKIA…
 //!   secret: s3-wicket                   # vault secret: the secret access key, bound to the endpoint
 //! bundles: s3                           # hibernated agents' bundles: s3 or local (default local)
+//! local_cache: 20g                      # with bundles: s3, the most <data dir>/store keeps (default 20g)
 //! ledger:                               # stream the ledger to the store (Litestream)
 //!   sync_interval: 1s
 //!   retention: 72h
@@ -39,8 +40,28 @@ pub struct StateStore {
     pub s3: Option<S3Config>,
     #[serde(default)]
     pub bundles: Where,
+    /// With bundles in the store, the local store is also its cache, cut down to this (`20g`,
+    /// `512m`) by the store's collection (#258), objects the store holds going first, least
+    /// recently used first. Default [`DEFAULT_LOCAL_CACHE`].
+    #[serde(default)]
+    pub local_cache: Option<String>,
     #[serde(default)]
     pub ledger: Option<LedgerStream>,
+}
+
+/// The local store's cache cap with bundles in the state store, when `local_cache` doesn't say.
+pub const DEFAULT_LOCAL_CACHE: u64 = 20 << 30;
+
+impl StateStore {
+    /// The local store's cache cap, in bytes (with bundles in the state store).
+    pub fn local_cache(&self) -> Result<u64> {
+        match &self.local_cache {
+            None => Ok(DEFAULT_LOCAL_CACHE),
+            Some(s) => {
+                wicket_core::subset::parse_bytes(s).with_context(|| format!("state-store.yaml: local_cache {s:?} isn't a size (20g, 512m)"))
+            }
+        }
+    }
 }
 
 /// The ledger streamed to the store, with point-in-time restore.

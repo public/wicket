@@ -179,7 +179,7 @@ pub fn left_running(procs: &[(u32, u32, String)]) -> Vec<String> {
 
 /// Pushes an activation's trees as the agent's next bundle and commits it in the ledger. Returns the
 /// manifest, or None if this activation was superseded (its push is refused; the objects it wrote
-/// are orphans for GC).
+/// are left for the store's collection, `crate::storegc`).
 pub fn push(
     ledger: &std::sync::Mutex<Ledger>,
     agent: &AgentRow,
@@ -194,6 +194,9 @@ pub fn push(
     let to = bundle::PushTo { agent: &agent.id, generation, seq, session_id: &agent.session_id };
     let (local, written) = local_store()?;
     let shared = shared_store()?;
+    // Held until the head is committed: no collection deletes what this push writes or reuses (#258).
+    let by = format!("the push of agent {}", agent.id);
+    let _held = (local.writing(&by)?, shared.as_ref().map(|s| s.writing(&by)).transpose()?);
     let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: Some(&written) };
     // The ledger's bundle size: a version-2 bundle's is what it restores to (its objects are shared
     // with other bundles), a version-1 bundle's what it stores.
@@ -416,6 +419,8 @@ pub fn restore(m: &StateManifest, name: &str, dest: &Path) -> Result<()> {
     }
     let (local, _) = local_store()?;
     let shared = shared_store()?;
+    // Held while it fetches and reads: the cache cap doesn't evict what it has just fetched (#258).
+    let _held = local.writing(&format!("the restore of agent {}", m.agent))?;
     let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: None };
     bundle::restore(stores, &store()?, m, name, dest).with_context(|| format!("restoring {name}"))?;
     Ok(())

@@ -55,6 +55,7 @@ mod snapstore;
 mod spawn;
 mod state;
 mod statestore;
+mod storegc;
 mod top;
 mod transcript;
 mod units;

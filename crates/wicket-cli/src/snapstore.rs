@@ -44,6 +44,8 @@ pub fn push(st: &Cas, snap: &Path) -> Result<(String, Digest)> {
     if let Some(d) = st.get_ref(&key)? {
         return Ok((key, d));
     }
+    // Held until the ref names the blob: no collection deletes it meanwhile (#258).
+    let _held = st.writing(&format!("the push of {key}"))?;
     let d = st.put_file(snap).with_context(|| format!("pushing {key} to the state store"))?;
     if !st.set_ref(&key, &d).with_context(|| format!("naming {key} in the state store"))? {
         // Pushed by another update in the meantime: that one stands.
@@ -64,27 +66,14 @@ pub fn list(st: &Cas) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Deletes snapshot `name` from the store: its ref, its blob unless another ref names it too, and a
-/// copy pushed before #258.
+/// Deletes snapshot `name` from the store: its ref, and a copy pushed before #258. Its blob goes
+/// with the store's next collection (`crate::storegc`), unless something else still names it.
 pub fn remove(st: &Cas, name: &str) -> Result<()> {
     if !valid_name(name) {
         bail!("not a snapshot's name: {name}");
     }
     let key = format!("{PREFIX}{name}");
-    if let Some(d) = st.get_ref(&key)? {
-        st.delete_ref(&key)?;
-        // Until the store's sweep (store.md), a blob goes only when no ref reaches it.
-        let mut shared = false;
-        for r in st.refs("")? {
-            if st.get_ref(&r)? == Some(d) {
-                shared = true;
-                break;
-            }
-        }
-        if !shared {
-            st.delete(&d)?;
-        }
-    }
+    st.delete_ref(&key)?;
     st.backend().delete(&key)?;
     Ok(())
 }
@@ -206,8 +195,18 @@ mod tests {
         assert!(st.has(&digest).unwrap());
         assert_eq!(list(&st).unwrap(), ["1800000000-bbbbbbbbbbbb.db"]);
         remove(&st, "1800000000-bbbbbbbbbbbb.db").unwrap();
-        assert!(!st.has(&digest).unwrap());
         assert!(list(&st).unwrap().is_empty());
+        // The blob, now named by nothing, goes with the store's next collection (#258).
+        let plan = wicket_store::cas::GcPlan {
+            roots: &|| Ok(vec![]),
+            drop_ref: &|_, _| false,
+            dry_run: false,
+            by: "test",
+            cap: None,
+            now: &wicket_store::now,
+        };
+        assert_eq!(st.collect(&plan).unwrap().deleted, vec![digest]);
+        assert!(!st.has(&digest).unwrap());
         let _ = std::fs::remove_dir_all(&d);
     }
 

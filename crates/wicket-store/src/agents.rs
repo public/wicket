@@ -169,6 +169,14 @@ impl Ledger {
         Ok(r.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Every agent's head, of every tenant: (agent, head, head's sequence number). What the
+    /// content-addressed store's collection keeps (#258).
+    pub fn agent_heads(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut st = self.conn.prepare("SELECT id, head, head_seq FROM agents WHERE head IS NOT NULL ORDER BY id")?;
+        let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(r.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// The agent a run was an activation of, and that activation's generation.
     pub fn agent_of_run(&self, run: &str) -> Result<Option<(String, i64)>> {
         Ok(self

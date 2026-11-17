@@ -343,6 +343,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A backend that reads only the range asked for (as S3's ranged GET does).
+    struct Ranged(DirStore);
+    impl ObjectStore for Ranged {
+        fn put_if_absent(&self, key: &str, data: &mut dyn Read) -> io::Result<bool> {
+            self.0.put_if_absent(key, data)
+        }
+        fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
+            self.0.get(key)
+        }
+        fn get_head(&self, key: &str, n: u64) -> io::Result<Option<Box<dyn Read + Send>>> {
+            let Some(r) = self.0.get(key)? else { return Ok(None) };
+            let mut v = vec![];
+            r.take(n).read_to_end(&mut v)?;
+            Ok(Some(Box::new(io::Cursor::new(v))))
+        }
+        fn delete(&self, key: &str) -> io::Result<()> {
+            self.0.delete(key)
+        }
+        fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
+            self.0.list_prefix(prefix)
+        }
+    }
+
+    #[test]
+    fn the_head_of_an_object_is_read_from_its_first_chunks_alone() {
+        let d = std::env::temp_dir().join(format!("wicket-sealed-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let s = SealedStore::sealed_only(Ranged(DirStore::new(&d)), &[7u8; 32]);
+        let data: Vec<u8> = (0..3 * CHUNK + 5).map(|i| (i % 251) as u8).collect();
+        s.put_if_absent("o/big", &mut &data[..]).unwrap();
+        let mut head = vec![];
+        s.get_head("o/big", 10).unwrap().unwrap().read_to_end(&mut head).unwrap();
+        assert_eq!(head, data[..CHUNK], "the first chunk, authenticated, and no more");
+        let mut two = vec![];
+        s.get_head("o/big", CHUNK as u64 + 1).unwrap().unwrap().read_to_end(&mut two).unwrap();
+        assert_eq!(two, data[..2 * CHUNK]);
+        // A whole read of the same backend still refuses an object cut at a chunk's boundary.
+        let mut all = vec![];
+        s.get("o/big").unwrap().unwrap().read_to_end(&mut all).unwrap();
+        assert_eq!(all, data);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn tampered_swapped_cut_or_foreign_objects_are_refused() {
         let (s, d) = store("tamper");

@@ -130,8 +130,9 @@ impl Cas {
 
 /// What a collection does.
 pub struct Plan<'a> {
-    /// The digests the ledger holds (every agent's head that is a digest).
-    pub roots: Vec<Digest>,
+    /// The digests the ledger holds (every agent's head that is a digest), read once the store is
+    /// held, so a push committed just before is seen.
+    pub roots: &'a dyn Fn() -> io::Result<Vec<Digest>>,
     /// Refs to delete before marking, by name and target: what nothing names any more.
     pub drop_ref: &'a dyn Fn(&str, &Digest) -> bool,
     /// Find and report, delete nothing (and take no lock).
@@ -279,7 +280,7 @@ impl Cas {
             }
         };
         // Refs: drop what nothing names, keep the rest as roots.
-        let mut roots: Vec<Digest> = plan.roots.clone();
+        let mut roots: Vec<Digest> = (plan.roots)()?;
         for name in self.refs("")? {
             let target = match self.get_ref(&name) {
                 Ok(Some(d)) => d,
@@ -477,4 +478,430 @@ fn parents_first(trees: &BTreeMap<Digest, Vec<Digest>>) -> Vec<Digest> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! Property tests (#258): a collection runs with pushes interleaved at every operation it makes
+    //! on its backend, in an order drawn from a seed. Checked at each step: everything a committed
+    //! head, a kept ref or a push in flight reaches is still stored, and every tree stored has
+    //! everything under it.
+    use super::*;
+    use crate::cas::Entry;
+    use crate::objects::{DirStore, ObjectStore, Stat};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn root(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wicket-gc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    type Hook = Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
+    /// A directory store that runs a hook before each operation: the pushes' turn.
+    struct Hooked {
+        inner: DirStore,
+        hook: Hook,
+        running: Arc<AtomicBool>,
+    }
+
+    impl Hooked {
+        fn turn(&self) {
+            if self.running.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let mut h = self.hook.lock().unwrap().take();
+            if let Some(f) = h.as_mut() {
+                f();
+            }
+            *self.hook.lock().unwrap() = h;
+            self.running.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl ObjectStore for Hooked {
+        fn put_if_absent(&self, key: &str, data: &mut dyn Read) -> io::Result<bool> {
+            self.turn();
+            self.inner.put_if_absent(key, data)
+        }
+        fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
+            self.turn();
+            self.inner.get(key)
+        }
+        fn has(&self, key: &str) -> io::Result<bool> {
+            self.turn();
+            self.inner.has(key)
+        }
+        fn delete(&self, key: &str) -> io::Result<()> {
+            self.turn();
+            self.inner.delete(key)
+        }
+        fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
+            self.turn();
+            self.inner.list_prefix(prefix)
+        }
+        fn stat(&self, key: &str) -> io::Result<Option<Stat>> {
+            self.inner.stat(key)
+        }
+    }
+
+    /// A push in flight, as `bundle::push_tree` and `hibernate::push` make one: its lock, the
+    /// subtrees, the bundle tree, its ref, then the ledger's head, then the lock let go.
+    struct Push {
+        agent: String,
+        seq: i64,
+        stage: u8,
+        lock: Option<Writing<'static>>,
+        written: Vec<Digest>,
+        bundle: Option<Digest>,
+    }
+
+    struct World {
+        rng: Rng,
+        now: i64,
+        heads: BTreeMap<String, (i64, Digest)>,
+        pushes: Vec<Push>,
+        violations: Vec<String>,
+        /// Pushes that don't wait for a collection (to show the check finds what that breaks).
+        careless: bool,
+        turns: u64,
+    }
+
+    const CONTENTS: [&[u8]; 6] = [b"a", b"bb", b"ccc", b"dddd", b"eeeee", b"ffffff"];
+
+    fn file(cas: &Cas, rng: &mut Rng, name: &str) -> Entry {
+        let b = CONTENTS[rng.below(CONTENTS.len() as u64) as usize];
+        let digest = cas.put_bytes(b).unwrap();
+        Entry { name: name.into(), kind: Kind::File, mode: 0o644, mtime: 0, size: b.len() as u64, digest }
+    }
+
+    fn dir(cas: &Cas, rng: &mut Rng, depth: u32) -> Digest {
+        let mut es = vec![];
+        for i in 0..1 + rng.below(3) {
+            es.push(file(cas, rng, &format!("f{i}")));
+        }
+        if depth > 0 {
+            for i in 0..rng.below(3) {
+                let digest = dir(cas, rng, depth - 1);
+                es.push(Entry { name: format!("d{i}"), kind: Kind::Dir, mode: 0o755, mtime: 0, size: 0, digest });
+            }
+        }
+        cas.put_tree(&Tree::new(es).unwrap()).unwrap()
+    }
+
+    /// Whether everything `d` reaches is stored (`tree`: what it is, if known).
+    fn whole(cas: &Cas, d: &Digest, tree: bool) -> bool {
+        if !tree {
+            return cas.inner.has(&d.key()).unwrap();
+        }
+        match cas.get_tree(d) {
+            Ok(Some(t)) => t.entries().iter().all(|e| whole(cas, &e.digest, e.kind == Kind::Dir)),
+            _ => false,
+        }
+    }
+
+    impl World {
+        /// One step of one push, maybe a new push first.
+        fn step(&mut self, cas: &'static Cas) {
+            self.now += 1;
+            if self.pushes.len() < 2 && self.rng.below(3) == 0 {
+                let agent = ["a", "b", "c"][self.rng.below(3) as usize].to_string();
+                if !self.pushes.iter().any(|p| p.agent == agent) {
+                    let seq = self.heads.get(&agent).map_or(1, |h| h.0 + 1);
+                    self.pushes.push(Push { agent, seq, stage: 0, lock: None, written: vec![], bundle: None });
+                }
+            }
+            if self.pushes.is_empty() {
+                return;
+            }
+            let i = self.rng.below(self.pushes.len() as u64) as usize;
+            let now = self.now;
+            let careless = self.careless;
+            let p = &mut self.pushes[i];
+            match p.stage {
+                0 => {
+                    p.lock = Some(cas.begin_writing(&format!("push {}", p.agent), now).unwrap());
+                    p.stage = 1;
+                }
+                1 => {
+                    if careless || p.lock.as_ref().unwrap().ready(now).unwrap() {
+                        p.stage = 2;
+                    }
+                }
+                2 => {
+                    let d = dir(cas, &mut self.rng, 2);
+                    p.written.push(d);
+                    if self.rng.below(2) == 0 {
+                        p.stage = 3;
+                    }
+                }
+                3 => {
+                    let es = p
+                        .written
+                        .iter()
+                        .enumerate()
+                        .map(|(k, d)| Entry { name: format!("t{k}"), kind: Kind::Dir, mode: 0o755, mtime: 0, size: 0, digest: *d })
+                        .collect();
+                    p.bundle = Some(cas.put_tree(&Tree::new(es).unwrap()).unwrap());
+                    p.stage = 4;
+                }
+                4 => {
+                    cas.set_ref(&format!("agents/{}/{}.1", p.agent, p.seq), p.bundle.as_ref().unwrap()).unwrap();
+                    p.stage = 5;
+                }
+                5 => {
+                    self.heads.insert(p.agent.clone(), (p.seq, p.bundle.unwrap()));
+                    p.stage = 6;
+                }
+                _ => {
+                    self.pushes.remove(i);
+                }
+            }
+        }
+
+        /// `full`: also every tree the store holds (slow).
+        fn check(&mut self, cas: &Cas, when: &str, full: bool) {
+            for (a, (_, h)) in &self.heads {
+                if !whole(cas, h, true) {
+                    self.violations.push(format!("{when}: agent {a}'s head {h} lost an object"));
+                }
+            }
+            for p in &self.pushes {
+                for d in p.written.iter().chain(p.bundle.iter()) {
+                    if !whole(cas, d, true) {
+                        self.violations.push(format!("{when}: agent {a}'s push in flight lost an object of {d}", a = p.agent));
+                    }
+                }
+            }
+            for d in cas.objects().unwrap().into_iter().filter(|_| full) {
+                if is_tree(cas, &d).unwrap() == Some(true) && !whole(cas, &d, true) {
+                    self.violations.push(format!("{when}: tree {d} is stored without all it names"));
+                }
+            }
+        }
+    }
+
+    /// Runs `rounds` collections of one store, with pushes interleaved from `seed`; returns the
+    /// violations, and what the collections deleted.
+    fn run(seed: u64, careless: bool, rounds: usize) -> (Vec<String>, usize) {
+        let dirp = root(&format!("prop-{seed}-{careless}"));
+        let hook: Hook = Arc::default();
+        let gc_cas = Cas::new(Hooked { inner: DirStore::new(&dirp), hook: hook.clone(), running: Arc::default() });
+        let push_cas: &'static Cas = Box::leak(Box::new(Cas::new(DirStore::new(&dirp))));
+        let world = Arc::new(Mutex::new(World {
+            rng: Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1),
+            now: 1_000_000,
+            heads: BTreeMap::new(),
+            pushes: vec![],
+            violations: vec![],
+            careless,
+            turns: 0,
+        }));
+        {
+            let w = world.clone();
+            *hook.lock().unwrap() = Some(Box::new(move || {
+                let mut w = w.lock().unwrap();
+                for _ in 0..w.rng.below(3) {
+                    w.step(push_cas);
+                }
+                w.turns += 1;
+                let full = w.turns.is_multiple_of(8);
+                w.check(push_cas, "during a collection", full);
+            }));
+        }
+        let mut deleted = 0;
+        for _ in 0..rounds {
+            let n = world.lock().unwrap().rng.below(20);
+            for _ in 0..n {
+                world.lock().unwrap().step(push_cas);
+            }
+            let w2 = world.clone();
+            let roots = move || Ok(w2.lock().unwrap().heads.values().map(|h| h.1).collect());
+            let w3 = world.clone();
+            let drop_ref = move |name: &str, target: &Digest| {
+                let w = w3.lock().unwrap();
+                let Some((agent, rest)) = name.strip_prefix("agents/").and_then(|r| r.split_once('/')) else { return false };
+                let seq: i64 = rest.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(i64::MAX);
+                w.heads.get(agent).is_some_and(|(hs, hd)| hd != target && seq <= *hs)
+            };
+            let w4 = world.clone();
+            let now = move || w4.lock().unwrap().now;
+            let plan = Plan { roots: &roots, drop_ref: &drop_ref, dry_run: false, by: "test", cap: None, now: &now };
+            let rep = gc_cas.collect(&plan).unwrap();
+            deleted += rep.deleted.len();
+            world.lock().unwrap().check(push_cas, "after a collection", true);
+        }
+        *hook.lock().unwrap() = None;
+        let v = world.lock().unwrap().violations.clone();
+        let _ = std::fs::remove_dir_all(&dirp);
+        (v, deleted)
+    }
+
+    /// Seeds per test (more with `WICKET_GC_SEEDS`).
+    fn seeds() -> u64 {
+        std::env::var("WICKET_GC_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(30)
+    }
+
+    #[test]
+    fn no_reachable_object_is_deleted_whatever_the_pushes_do() {
+        let mut deleted = 0;
+        for seed in 1..=seeds() {
+            let (v, d) = run(seed, false, 5);
+            assert!(v.is_empty(), "seed {seed}: {v:#?}");
+            deleted += d;
+        }
+        assert!(deleted > seeds() as usize, "the collections deleted only {deleted} objects: the property isn't exercised");
+    }
+
+    /// The same, with pushes that don't wait for a collection under way: the check finds what that
+    /// breaks, so the property above means something.
+    #[test]
+    fn a_push_that_ignores_the_collection_loses_objects() {
+        let broken = (1..=seeds()).filter(|s| !run(*s, true, 5).0.is_empty()).count();
+        assert!(broken > 0, "no seed lost an object without the push lock");
+    }
+
+    fn plan_for<'a>(
+        roots: &'a dyn Fn() -> io::Result<Vec<Digest>>,
+        drop: &'a dyn Fn(&str, &Digest) -> bool,
+        now: &'a dyn Fn() -> i64,
+    ) -> Plan<'a> {
+        Plan { roots, drop_ref: drop, dry_run: false, by: "test", cap: None, now }
+    }
+
+    #[test]
+    fn a_collection_keeps_roots_and_refs_and_a_dry_run_deletes_nothing() {
+        let d = root("basic");
+        let cas = Cas::new(DirStore::new(&d));
+        let mut rng = Rng(7);
+        let head = dir(&cas, &mut rng, 2);
+        let snap = cas.put_bytes(b"ledger snapshot").unwrap();
+        cas.set_ref("ledger-snapshots/x.db", &snap).unwrap();
+        let old = cas.put_bytes(b"an old bundle's file").unwrap();
+        let old_tree = cas
+            .put_tree(&Tree::new(vec![Entry { name: "f".into(), kind: Kind::File, mode: 0o644, mtime: 0, size: 20, digest: old }]).unwrap())
+            .unwrap();
+        cas.set_ref("agents/a/1.1", &old_tree).unwrap();
+        let orphan = cas.put_bytes(b"a crashed push's file").unwrap();
+        let roots = || Ok(vec![head]);
+        let drop = |n: &str, _: &Digest| n == "agents/a/1.1";
+        let now = || 1;
+        let dry = Plan { dry_run: true, ..plan_for(&roots, &drop, &now) };
+        let r = cas.collect(&dry).unwrap();
+        assert_eq!(r.refs_dropped, vec!["agents/a/1.1".to_string()]);
+        let mut got: Vec<Digest> = r.deleted.clone();
+        got.sort();
+        let mut want = vec![old, old_tree, orphan];
+        want.sort();
+        assert_eq!(got, want);
+        assert!(
+            r.deleted.iter().position(|x| *x == old_tree) < r.deleted.iter().position(|x| *x == old),
+            "a tree goes before what it names"
+        );
+        assert!(cas.has(&orphan).unwrap() && cas.get_ref("agents/a/1.1").unwrap().is_some(), "a dry run deletes nothing");
+        let r = cas.collect(&plan_for(&roots, &drop, &now)).unwrap();
+        assert_eq!(r.deleted.len(), 3);
+        assert!(!cas.has(&orphan).unwrap() && !cas.has(&old).unwrap() && cas.get_ref("agents/a/1.1").unwrap().is_none());
+        assert!(whole(&cas, &head, true) && cas.has(&snap).unwrap());
+        assert_eq!(cas.collect(&plan_for(&roots, &drop, &now)).unwrap().deleted.len(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_collection_waits_for_a_push_and_a_push_for_a_collection() {
+        let d = root("locks");
+        let cas = Cas::new(DirStore::new(&d));
+        cas.put_bytes(b"garbage").unwrap();
+        let roots = || Ok(vec![]);
+        let drop = |_: &str, _: &Digest| false;
+        let t = std::cell::Cell::new(1000);
+        let now = || t.get();
+        let w = cas.begin_writing("push a", 1000).unwrap();
+        let r = cas.collect(&plan_for(&roots, &drop, &now)).unwrap();
+        assert_eq!(r.busy.as_deref(), Some("a push by push a is under way"));
+        assert_eq!(cas.objects().unwrap().len(), 1);
+        // A push's lock that outlived its push is stale after six hours.
+        t.set(1000 + PUSH_STALE_SECS);
+        std::mem::forget(w);
+        let r = cas.collect(&plan_for(&roots, &drop, &now)).unwrap();
+        assert!(r.busy.is_none(), "{r:?}");
+        assert_eq!(r.deleted.len(), 1);
+        assert!(cas.backend().list_prefix(PUSH_LOCKS).unwrap().is_empty(), "the stale lock is removed");
+        // A collection's lock holds pushes back until it is let go, or goes stale.
+        assert!(put_lock(&cas, GC_LOCK, "gc", 5000).unwrap());
+        let w = cas.begin_writing("push b", 5000).unwrap();
+        assert!(!w.ready(5000).unwrap());
+        assert!(w.ready(5000 + GC_STALE_SECS).unwrap());
+        assert_eq!(cas.collect(&plan_for(&roots, &drop, &|| 5001)).unwrap().busy.as_deref(), Some("a collection by gc is under way"));
+        drop_lock(&cas);
+        assert!(w.ready(5001).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn drop_lock(cas: &Cas) {
+        cas.backend().delete(GC_LOCK).unwrap();
+    }
+
+    #[test]
+    fn the_cap_evicts_only_what_the_shared_store_holds_least_recently_used_first() {
+        let (dl, ds) = (root("cap-local"), root("cap-shared"));
+        let local = Cas::new(DirStore::new(&dl));
+        let shared = Cas::new(DirStore::new(&ds));
+        let big = |b: u8| vec![b; 4096];
+        let f = |cas: &Cas, b: u8, name: &str| {
+            let bytes = big(b);
+            Entry { name: name.into(), kind: Kind::File, mode: 0o644, mtime: 0, size: 4096, digest: cas.put_bytes(&bytes).unwrap() }
+        };
+        // Two bundles, both in the shared store; a third only here.
+        let t1 = local.put_tree(&Tree::new(vec![f(&local, 1, "x"), f(&local, 2, "y")]).unwrap()).unwrap();
+        let t2 = local.put_tree(&Tree::new(vec![f(&local, 3, "x")]).unwrap()).unwrap();
+        local.send_tree(&shared, &t1).unwrap();
+        local.send_tree(&shared, &t2).unwrap();
+        let t3 = local.put_tree(&Tree::new(vec![f(&local, 4, "x")]).unwrap()).unwrap();
+        // t2 used most recently.
+        let age = |d: &Digest, at: i64| {
+            let p = dl.join(d.key());
+            let f = std::fs::File::options().write(true).open(p).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(at as u64)).unwrap();
+        };
+        for d in local.objects().unwrap() {
+            age(&d, 100);
+        }
+        age(&t2, 200);
+        let roots = || Ok(vec![t1, t2, t3]);
+        let drop = |_: &str, _: &Digest| false;
+        let now = || 1;
+        let plan = Plan { cap: Some((&shared, 1)), ..plan_for(&roots, &drop, &now) };
+        let r = local.collect(&plan).unwrap();
+        assert!(r.deleted.is_empty());
+        // Everything the shared store holds goes; t3 and its file stay (only here), and t1 went before t2.
+        assert!(local.has(&t3).unwrap() && whole(&local, &t3, true));
+        assert!(!local.has(&t1).unwrap() && !local.has(&t2).unwrap());
+        assert!(r.over_cap);
+        let pos = |d: &Digest| r.evicted.iter().position(|x| x == d).unwrap();
+        assert!(pos(&t1) < pos(&t2), "least recently used first: {:?}", r.evicted);
+        for d in local.objects().unwrap() {
+            if is_tree(&local, &d).unwrap() == Some(true) {
+                assert!(whole(&local, &d, true), "a tree kept keeps all under it");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dl);
+        let _ = std::fs::remove_dir_all(&ds);
+    }
 }

@@ -29,6 +29,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 StateCmd::Restore { kit, at, force } => state::restore(&kit, at.as_deref(), force),
                 StateCmd::Snapshots => snapstore::print_list(),
                 StateCmd::Snapshot { name, out } => snapstore::get(&name, &out),
+                StateCmd::Gc { dry_run } => crate::storegc::command(dry_run),
             })
             .join()
             .map_err(|_| anyhow::anyhow!("wicket state panicked"))?
@@ -118,6 +119,14 @@ pub enum StateCmd {
         name: String,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Collect the content-addressed stores (#258): delete what no agent's head and no ref reaches,
+    /// in this host's store and the state store's, and cut this host's down to its cache cap
+    /// (`local_cache:`, with bundles in the state store). The reconciler does this hourly.
+    Gc {
+        /// Say what would be deleted, and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
