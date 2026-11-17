@@ -99,7 +99,10 @@ node's own `Llm`.
      `ControlTool::Spawn` call that `noderun` answers itself with `spawn::tool`, and a child the
      node started is adopted as before; either way the child's supervisor (`run::run`) runs on a
      thread of the parent's process with its own runtime, printing to `children/<run>.log`, and
-     its parent stops it through a `Notify` instead of a SIGINT. Gone: `launch_as`'s
+     its parent stops it through a `Notify` instead of a SIGINT. A thread can't be killed, so a
+     supervisor that hasn't ended 30 s after its stop (`spawn::stop_children`, #409) is recorded
+     as stuck: a line in the parent's log, `run.child_stuck`, and `runs.stuck_at` (schema 14),
+     which the reconciler reports and `wicket top` shows until a new supervisor takes the run. Gone: `launch_as`'s
      `wicket run --parent-run` re-exec, `Cmd::Run`'s `--parent-run`, `--lease` and `--adopt` and
      their daemon guards, `RunCtx.spawner`, the `Spawner` type and `Gateway::spawn`. A run's owner
      in the ledger is its process, so a parent and its children share one; if it dies the

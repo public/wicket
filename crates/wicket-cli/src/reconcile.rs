@@ -8,7 +8,9 @@
 //!   its box untouched. If the node says the box is gone, the run is ended as `lost`; if the node
 //!   can't be reached, the run is left for the next pass. A run with no node recorded (its process
 //!   died before it reached one) is ended as `lost`. A run supervised on another machine is left alone: only that machine can
-//!   tell.
+//!   tell. A run whose owner is alive but whose supervisor is stuck (a child's, in its parent's
+//!   process, that didn't end when its parent stopped it, #409) is reported as `run_stuck` each pass
+//!   and taken over once that process ends.
 //! - *Leases* (`wicket_store::LeaseRow`): a pending lease whose request a human granted becomes
 //!   `approved`, one denied or withdrawn ends. An approved or active lease ends when its holder run has
 //!   ended or (active) when `not_after` has passed; runs placed on it are stopped first.
@@ -222,6 +224,15 @@ where
         for (run, owner) in self.ledger.running_runs()? {
             let Some(o) = owner else { continue };
             if (self.owner_alive)(&o) != Some(false) {
+                // A child's supervisor, in its parent's live process, that didn't end when its parent
+                // stopped it (#409): reported each pass, and left for when that process ends.
+                if let Some(at) = self.ledger.run_stuck(&run)? {
+                    let detail = format!(
+                        "stuck: its supervisor, in process {o}, hasn't ended since its parent asked it to stop ({}s ago); it is taken over once that process ends",
+                        (self.now - at).max(0)
+                    );
+                    self.note("run_stuck", &run, &detail);
+                }
                 continue;
             }
             let Some(node) = self.ledger.run_node(&run)? else {
@@ -1394,6 +1405,31 @@ mod tests {
         let d = w.pass(&mut l, NOW, false).await;
         assert!(fake.destroyed.lock().unwrap().is_empty());
         assert!(d.iter().any(|x| x.kind == "refused" && x.target == "orphan"), "{d:?}");
+    }
+
+    /// #409: a child whose supervisor is stuck in its parent's live process is reported each pass
+    /// (not audited, not taken over); once that process is gone it is handled like any other run.
+    #[tokio::test]
+    async fn a_stuck_child_supervisor_is_reported_until_its_process_ends() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_stuck", "alive:1");
+        started(&l, "run_stuck_dead", "dead:1");
+        started(&l, "run_fine", "alive:1");
+        l.set_run_stuck("run_stuck", NOW - 90).unwrap();
+        l.set_run_stuck("run_stuck_dead", NOW - 90).unwrap();
+        let w = World::new(Fake::default());
+        for _ in 0..2 {
+            let d = w.pass(&mut l, NOW, false).await;
+            let stuck: Vec<&Done> = d.iter().filter(|x| x.kind == "run_stuck").collect();
+            assert_eq!(stuck.len(), 1, "{d:?}");
+            assert_eq!(stuck[0].target, "run_stuck");
+            assert!(stuck[0].detail.contains("90s ago"), "{}", stuck[0].detail);
+            assert_eq!(l.run_status("run_stuck").unwrap().as_deref(), Some("running"));
+        }
+        assert_eq!(audited(&l, "reconcile.run_stuck"), 0);
+        // Its process gone (no node recorded): ended as lost, as any run.
+        assert_eq!(l.run_status("run_stuck_dead").unwrap().as_deref(), Some(LOST));
+        assert_eq!(l.run_status("run_fine").unwrap().as_deref(), Some("running"));
     }
 
     #[tokio::test]
