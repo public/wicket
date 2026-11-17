@@ -146,6 +146,8 @@ enum Action {
         /// The sha256 of the effect descriptor the passkey signed (#369): the decision is made
         /// only if the request is still that effect.
         effect_sha256: String,
+        /// An approved update request is applied (#465): its card said so, and the passkey signed it.
+        apply_update: bool,
     },
     Revoke {
         run: String,
@@ -213,6 +215,9 @@ struct Pending {
 
 /// Starts a console run. The real one runs `wicket run` detached; tests record instead.
 type Launcher = Box<dyn Fn(&Launch) -> Result<()> + Send + Sync>;
+/// Applies an approved update request (#465): the real one runs `wicket self apply-update`
+/// detached; tests record instead. Given the request and the log to write.
+type Updater = Box<dyn Fn(&str, &std::path::Path) -> Result<()> + Send + Sync>;
 /// The verified identity of a run's agent (crate::verified_identity; replaceable in tests, which
 /// have no issuer key).
 type IdentityCheck = fn(&Ledger, &str) -> Value;
@@ -237,6 +242,7 @@ struct State {
     data: PathBuf,
     roots: Vec<(String, PathBuf)>,
     launcher: Launcher,
+    updater: Updater,
     identity: IdentityCheck,
     challenges: Mutex<HashMap<String, Pending>>,
     limiter: Limiter,
@@ -289,6 +295,7 @@ impl State {
             data,
             roots,
             launcher,
+            updater: Box::new(|_, _| bail!("this console doesn't apply updates")),
             identity,
             challenges: Mutex::new(HashMap::new()),
             limiter: Limiter::default(),
@@ -348,6 +355,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     // their own processes, and stay).
     crate::update::reexec_on_hangup(crate::update::pidfile("console"), crate::update::Versions::control().root, || {});
     let exe = crate::update::self_exe()?;
+    let update_exe = exe.clone();
     let mut state = State::new(
         RelyingParty { rp_id: plan.rp_id.clone(), origin: plan.origin.clone() },
         ledger_path(),
@@ -356,6 +364,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         Box::new(move |l| launch_detached(&exe, l)),
         |l, run| crate::verified_identity(l, run, None),
     );
+    state.updater = Box::new(move |request, log| apply_update_detached(&update_exe, request, log));
     state.trusted = plan.trusted.clone();
     state.authority = plan.authority.clone();
     state.hsts = plan.hsts;
@@ -424,6 +433,25 @@ fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
         .process_group(0);
     let mut child = cmd.spawn().context("starting wicket run")?;
     // Reap it when it exits; the console doesn't wait for it.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Starts `wicket self apply-update <request>` (#465) as its own process group, logging to `log`:
+/// the update it runs moves this console to the new build (SIGHUP, a re-exec), and must outlive it.
+fn apply_update_detached(exe: &std::path::Path, request: &str, log: &std::path::Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let out = std::fs::File::create(log).with_context(|| format!("creating {}", log.display()))?;
+    let mut child = std::process::Command::new(exe)
+        .args(["self", "apply-update", request])
+        .stdin(std::process::Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out)
+        .process_group(0)
+        .spawn()
+        .context("starting wicket self apply-update")?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -1245,7 +1273,16 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
                 "effect": effect, "effect_sha256": effect_sha256, "blast": blast,
             });
-            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide, effect_sha256 }, v))
+            // Approving an agent's update request installs its build (#465): what it installs,
+            // and where, is shown before the passkey is asked for, and signed with the decision.
+            let mut v = v;
+            let mut apply_update = false;
+            if approve && crate::apply_update::requested_sha(&req).is_some() {
+                let p = crate::apply_update::preview(&l, &state.data, &req).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                apply_update = p.applies;
+                v["update"] = serde_json::to_value(&p).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            }
+            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide, effect_sha256, apply_update }, v))
         }
         // `say` and the console's follow-up box are gone (#198): prompts are sent in the session.
         Some("say") => Err(bad("say is gone: open the run's session and prompt there")),
@@ -1480,7 +1517,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
     let t = &state.tenant;
     let rid = |r: &str| RunId(r.to_string());
     match action {
-        Action::Decide { request, approve: true, uses, ttl_secs, prefix, zone_wide, effect_sha256 } => {
+        Action::Decide { request, approve: true, uses, ttl_secs, prefix, zone_wide, effect_sha256, apply_update } => {
             // The agent may have been revoked since the operator was shown it.
             let req = l.request(request)?;
             if !identity_approvable(&(state.identity)(&l, &req.run)) {
@@ -1501,7 +1538,20 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             let scope = under.map(|p| format!(" for every path under {}{p}", req.host)).unwrap_or_default();
             let zone = if *zone_wide { format!(", for any run in zone {}", req.zone) } else { String::new() };
             let lease = lease.map(|x| format!("; lease {x} is provisioned by the next reconcile pass")).unwrap_or_default();
-            Ok(format!("approved {request} → {grant}{scope}{zone}{lease} (signed with {})", oc.name))
+            let applying = if *apply_update {
+                drop(l);
+                let log = state.data.join("runs").join(&req.run).join(format!("update-{request}.log"));
+                match (state.updater)(request, &log) {
+                    Ok(()) => format!(
+                        "; installing it now, on the control host and then its nodes (log: runs/{}/update-{request}.log); the agent is told how it ends",
+                        req.run
+                    ),
+                    Err(e) => format!("; it could not be applied ({e:#}): run `sudo wicket self update` with the artifact on the host"),
+                }
+            } else {
+                String::new()
+            };
+            Ok(format!("approved {request} → {grant}{scope}{zone}{lease}{applying} (signed with {})", oc.name))
         }
         Action::Decide { request, approve: false, .. } => {
             let lease = match grant::decide(

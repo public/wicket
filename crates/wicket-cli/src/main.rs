@@ -49,6 +49,7 @@ mod state;
 mod top;
 mod units;
 mod update;
+mod apply_update;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
