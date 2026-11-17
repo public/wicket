@@ -15,6 +15,8 @@ runs:
         # The smoke job's cache, as before the split; the acceptance job reads it.
         shared-key: smoke
         save-if: ${{ inputs.save-cache == 'true' }}
+        # The static HTTP/3 client as last built, with a stamp of what it was built from (below).
+        cache-directories: ~/.cache/wicket-h3get
     - name: Install gVisor as a Docker runtime
       shell: bash
       run: |
@@ -38,12 +40,29 @@ runs:
     - name: Build wicket
       shell: bash
       run: cargo build -p wicket-cli --locked
-    - name: Rust's musl target, for the static HTTP/3 client (the smoke test and acceptance)
+    # The static HTTP/3 client (the smoke test and acceptance): Rust's musl target, musl-tools and a
+    # release build, 27-45 s, unless the cache holds the binary built from the same sources and
+    # toolchain (its stamp: rustc's version and every file under ci/h3get but its target dir). Rust's
+    # cache key doesn't cover ci/h3get, so the stamp decides; a mismatch builds it again.
+    - name: The static HTTP/3 client (h3get, for musl)
       shell: bash
       run: |
-        rustup target add x86_64-unknown-linux-musl
-        sudo apt-get install -y -q musl-tools
-        cargo build -q --release --locked --target x86_64-unknown-linux-musl --manifest-path ci/h3get/Cargo.toml
+        out=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get
+        kept=$HOME/.cache/wicket-h3get
+        stamp=$({ rustc -vV; find ci/h3get -path ci/h3get/target -prune -o -type f -print | LC_ALL=C sort | xargs sha256sum; } | sha256sum | cut -d' ' -f1)
+        if [ -x "$kept/h3get" ] && [ "$(cat "$kept/stamp" 2>/dev/null)" = "$stamp" ]; then
+          echo "h3get: from the cache, built from these sources ($stamp)"
+          mkdir -p "$(dirname "$out")"
+          cp "$kept/h3get" "$out"
+        else
+          echo "h3get: building ($stamp)"
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y -q musl-tools
+          cargo build -q --release --locked --target x86_64-unknown-linux-musl --manifest-path ci/h3get/Cargo.toml
+          mkdir -p "$kept"
+          cp "$out" "$kept/h3get"
+          echo "$stamp" >"$kept/stamp"
+        fi
     - name: Build the agent image
       shell: bash
       run: target/debug/wicket image
