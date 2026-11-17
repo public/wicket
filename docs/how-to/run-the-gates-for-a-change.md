@@ -1,5 +1,41 @@
 # Run the gates for a change
 
+## Before you push: `ci/preflight.sh`
+
+`ci/preflight.sh` runs the cheap checks CI runs, so a pull request doesn't fail in CI on something
+you could have caught before pushing. It takes about two minutes with a warm build directory, most of
+it clippy.
+
+```sh
+ci/preflight.sh                 # the cheap checks and clippy over the affected crates
+ci/preflight.sh --full          # and the affected crates' tests
+ci/preflight.sh --base REF      # compare with REF instead of origin/main
+ci/preflight.sh --all           # clippy (and tests) over the whole workspace, with no selection
+```
+
+It runs, in order:
+
+- `cargo fmt --all -- --check`;
+- `ci/check-public.py` (tokens, home-directory paths, public IP addresses) over tracked files and the
+  untracked ones git doesn't ignore, so a new file is checked before its commit. Use documentation
+  addresses (`203.0.113.0/24`) and `/home/you/` in examples and tests;
+- `ci/check-terms.sh`, `ci/check-doc-links.sh` and `ci/check-plugin.py`;
+- `ci/changelog.py check --base origin/main`: a change to more than docs and CI adds a fragment in
+  `changes/`;
+- both lockfiles, with `cargo metadata --locked`: the workspace's and the fuzz workspace's
+  (`fuzz/Cargo.lock`, which a dependency change in a crate the fuzz targets link can leave stale);
+- gitleaks over the commits since the merge base, when `gitleaks` is on `PATH`, with the repository's
+  `.gitleaks.toml`. Without it the step is skipped with a note; CI runs it over every commit. A
+  published test vector that looks like a key needs an allowlist entry in `.gitleaks.toml`;
+- `cargo clippy --all-targets --locked -- -D warnings` over the crates the change affects (the
+  selection below, uncommitted and untracked files included), or the workspace if the selection fails.
+
+Every check runs. It ends with a summary of what passed, failed or was skipped, and exits 1 if
+anything failed. It can't catch a test that passes here and fails on CI's runners, such as one that
+reads the host's own disk: keep tests to the files they make.
+
+## All the gates: `ci/gates.sh`
+
 `ci/gates.sh` runs the checks a change must pass. With `--affected`, it runs only what the change can
 affect, which is what CI runs for a pull request.
 
@@ -55,7 +91,7 @@ suites in `ci/determinator/suites.toml`. Both are reviewed like code.
   - a file outside the crates that no rule claims;
   - an empty change, or an error in the selection.
 
-rustfmt, `check-public.py` and the Markdown link check always run.
+`ci/preflight.sh` always runs, with the selection's crates for clippy.
 
 ## Tests with cargo-nextest
 
