@@ -225,6 +225,7 @@ over an agent whose holder let its claim lapse. Messages are a peer's (`#250`) o
 |---|---|
 | `OneHarness` | a wake never starts a second harness of the agent while another runs |
 | `NoMessageLost` | no message is counted as delivered without the agent ever having it |
+| `NoMessageStuck` | a message in flight on a live supervisor's open link was taken on that link: one taken on a link that dropped is given again, not left in flight until a later supervisor |
 | `NoMessageTwice` | no box is given a message twice |
 | `FinishKnown` | a live supervisor of an agent that asked to finish, whose session is still open, knows it: a finished run's harness never keeps running |
 
@@ -236,8 +237,9 @@ fix, which TLC refuses:
 | `FinishInLedger = TRUE` (the code, #444) | before #444, the agent's `finish` reached only its supervisor (`run.rs`: `finish_asked`, from `want_rx`). A control-host restart between the call and the end of its turn lost it; the re-attached supervisor never closed the session, and the harness ran until its timeout. Now the gateway records it (`Ledger::record_run_want`, `runs.want`) before the tool answers, and a re-attached supervisor reads it (`run.rs` `asked_of`) | `fail_lifecycle_finish_lost`: `FinishKnown` |
 | `AckAfterHand = TRUE` (done, #445) | before #445, a message was marked delivered when it was taken (`Ledger::take_message`, `take_operator_messages_with_ids`), before the box had it. If the control host stopped in between, the only copy was the dead supervisor's. Now a message is in flight (`take_message_in_flight`, `messages.taken_at`) until the box's node says the box has had it (`Msg::MessageRead`, protocol 15); a prompt is recorded by where it is in the box's stdin (`stdin_start`, `stdin_end`). A supervisor that takes the run over gives again what never arrived (`requeue_in_flight`, `requeue_operator_messages` against the node's `stdin_received`), and the node drops a message its box has had (`Node::had_message`) | `fail_lifecycle_message_lost`: `NoMessageLost` |
 | `WakeAfterAuthority = TRUE` (done, #446) | before #446, `Ledger::claim_wake` took over an `active` agent whose claim lapsed (`CLAIM_SECS`, 30 s). A control-host outage longer than that left its box running on its node, so a wake then started a second box until the first's re-attached supervisor found it superseded. Now `claim_wake` takes over a lapsed agent only once no run of it is recorded running with authority left (its box's authority end, recorded in the ledger at its start and each renewal, plus 30 s): its node stops the box then, or the reconciler ends the run once its node says the box is gone | `fail_lifecycle_twin_wake`: `OneHarness` |
+| `RequeueOnReconnect = TRUE` (done, #453) | after #451 (and before #453), a supervisor gave again its in-flight messages only on its first resume of a run it took over. If the link to the box's node dropped after `await_message` answered and before `MessageRead` arrived, while the supervisor lived on, the message stayed in flight, neither waiting nor read, until a later supervisor. Now every reconnect gives again what was given on the link that dropped (`noderun.rs` `requeue_on_resume`), and an answer that can't be sent gives its message back (`Ledger::requeue_message`); the node drops a repeat its box has had | `fail_lifecycle_reconnect_stuck`: `NoMessageStuck` |
 
-Every switch is now the code (#444, #445, #446), so `RunLifecycle.cfg` is main, and each
+Every switch is now the code (#444, #445, #446, #453), so `RunLifecycle.cfg` is main, and each
 `fail_lifecycle_*` variant is the code before one fix. `NoMessageTwice` holds in every variant: with
 `AckAfterHand` a message is queued again after a crash, and the box's record of what it has had
 keeps the repeat out.
@@ -251,10 +253,11 @@ keeps the repeat out.
 | `AskFinish`, `CloseSession`, `HarnessExits` | the gateway's `finish` tool (`wicket_proxy::Want::Finish`) → `run.rs` `finish_asked` → the session's close (`stdin = None`, `StdinClose`, recorded by the node) and `Linger::Finish` (#293) |
 | `Send` | `send_message` (the gateway) and `wicket session`'s `add_operator_message` |
 | `Take`, `Hand`, `Ack` | `Ledger::take_message` (`await_message`) and `take_operator_messages_with_ids` (`run.rs`), then the tool's reply or the stdin write; `Ack` is the proposal's |
+| `LinkDrop`, `LinkUp` | the link between a live supervisor and its box's node dropping and coming back (`noderun.rs` `session`, reconnecting; `requeue_on_resume`, #453) |
 | `Tick` | time; a node stops a box whose authority has ended |
 
 Bounds: two activations, one message, `ClaimTtl = 1`, `AuthTtl = 3`, `MaxTime = 5`, one crash
-(`RunLifecycle.cfg`). Not modelled: hibernation's push (`commit_agent_push` checks the pusher's
+and one link drop (`RunLifecycle.cfg`; the older `fail_lifecycle_*` variants allow no link drop). Not modelled: hibernation's push (`commit_agent_push` checks the pusher's
 generation, so a stale twin can't commit), the wake's restore, budgets, and spawned children.
 
 # Placement: placed nodes and the runs on them
