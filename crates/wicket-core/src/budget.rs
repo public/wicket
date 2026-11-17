@@ -441,6 +441,43 @@ mod tests {
         inflight_output_tokens: 40,
     };
 
+    const S: Spent = Spent { requests: 5, input_tokens: 100, cache_read_tokens: 20, cache_creation_tokens: 3, output_tokens: 50 };
+    const B: Spent = Spent { requests: 2, input_tokens: 40, cache_read_tokens: 30, cache_creation_tokens: 1, output_tokens: 10 };
+
+    /// #152, #422: what a node reports, added to and taken from a base, saturating.
+    #[test]
+    fn spent_adds_and_subtracts_field_by_field_saturating() {
+        assert_eq!(S.input_total(), 123, "cached tokens included");
+        assert_eq!(Spent { input_tokens: u64::MAX, cache_read_tokens: 1, ..S }.input_total(), u64::MAX);
+        assert_eq!(S.plus(B), Spent { requests: 7, input_tokens: 140, cache_read_tokens: 50, cache_creation_tokens: 4, output_tokens: 60 });
+        assert_eq!(S.since(B), Spent { requests: 3, input_tokens: 60, cache_read_tokens: 0, cache_creation_tokens: 2, output_tokens: 40 });
+        assert_eq!(S.plus(B).since(B), Spent { cache_read_tokens: 20, ..S });
+        assert_eq!(Spent { output_tokens: u64::MAX, ..S }.plus(B).output_tokens, u64::MAX);
+    }
+
+    /// #152: a node keeps its slice until less than half of it is left, takes a lower one at once,
+    /// and gets the first one as it is; in the node's counts when the control host counts from a
+    /// base (#422).
+    #[test]
+    fn a_slice_is_renewed_at_half_and_lowered_at_once() {
+        let next = Slice { requests: 10, output_tokens: 100, input_tokens: Some(1000) };
+        let cur = Slice { requests: 8, output_tokens: 80, input_tokens: Some(800) };
+        let spent = |r, o| Spent { requests: r, output_tokens: o, ..Spent::default() };
+        assert_eq!(Slice::renewed(None, next, spent(0, 0), 0), next, "the first slice");
+        assert_eq!(Slice::renewed(Some(cur), next, spent(4, 40), 400), cur, "half of what is left or more: kept");
+        assert_eq!(Slice::renewed(Some(cur), next, spent(7, 40), 400), next, "requests running low");
+        assert_eq!(Slice::renewed(Some(cur), next, spent(4, 70), 400), next, "output running low");
+        assert_eq!(Slice::renewed(Some(cur), next, spent(4, 40), 700), next, "input running low");
+        let lower = Slice { requests: 6, ..next };
+        assert_eq!(Slice::renewed(Some(cur), lower, spent(0, 0), 0), lower, "a lower slice at once");
+        // From a base: the node counted `base` before the control host's count began.
+        let base = Spent { requests: 100, input_tokens: 1000, output_tokens: 1000, ..Spent::default() };
+        let held = cur.offset(base);
+        assert_eq!(held, Slice { requests: 108, output_tokens: 1080, input_tokens: Some(1800) });
+        assert_eq!(Slice::renewed_from(Some(held), next, spent(4, 40), 400, base), held, "kept, in the node's counts");
+        assert_eq!(Slice::renewed_from(Some(held), next, spent(7, 40), 400, base), next.offset(base));
+    }
+
     #[test]
     fn a_zones_quota_is_its_llm_limits() {
         let l: crate::manifest::LlmSpec =

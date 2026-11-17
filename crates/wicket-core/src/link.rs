@@ -252,6 +252,12 @@ mod tests {
         assert_eq!(connect(&lead, &accepting_id, true).unwrap().basis, None);
         assert_eq!(connect(&lead_p, &accepting, true).unwrap().basis, Some(Basis::Accepted));
 
+        // The basis as audited and shown to the agent.
+        assert_eq!(
+            [Basis::Child, Basis::Accepted, Basis::Controller].map(Basis::as_str),
+            ["child", "accept_from", "both ends are the caller's"]
+        );
+
         // A child connecting to its parent is not the parent's child: it needs the parent's consent.
         assert!(connect(&child, &lead, false).is_err());
         assert!(connect(&lead, &lead, false).unwrap_err().contains("itself"));
@@ -310,6 +316,10 @@ mod tests {
         assert_eq!(allocate(&used, "run_1", "other").unwrap(), ("chrome-box".to_string(), POOL_START));
         let (n2, a2) = allocate(&used, "run_2", "chrome-box").unwrap();
         assert_eq!((n2.as_str(), a2), ("chrome-box-2", Ipv4Addr::new(198, 18, 1, 2)));
+        // And a third target with that name, `-3` (the suffix counts up past each one taken).
+        let mut three = used.clone();
+        three.push(Named { name: n2.clone(), addr: a2, to_run: "run_2".into() });
+        assert_eq!(allocate(&three, "run_3", "chrome-box").unwrap(), ("chrome-box-3".to_string(), Ipv4Addr::new(198, 18, 1, 3)));
         assert!(in_pool(a2) && !in_pool(Ipv4Addr::new(198, 18, 0, 1)));
         // The pool is finite.
         let full: Vec<Named> = (0..POOL_SIZE)
