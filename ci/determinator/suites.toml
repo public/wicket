@@ -68,7 +68,7 @@ paths = [
 
 [fuzz.target]
 egress = { packages = ["wicket-proxy", "wicket-store"], paths = ["fuzz/src/util.rs"] }
-gateway = { packages = ["wicket-proxy", "wicket-store"], paths = ["fuzz/src/util.rs"] }
+gateway = { packages = ["wicket-control", "wicket-proxy", "wicket-store"], paths = ["fuzz/src/util.rs"] }
 chan = { packages = ["wicket-chan"], paths = ["fuzz/src/node_chan.rs"] }
 feed = { packages = ["wicket-feed"] }
 token = { packages = ["wicket-authz"] }

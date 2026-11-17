@@ -338,30 +338,6 @@ impl From<&str> for SendError {
     }
 }
 
-/// While a run waits (`await_message`, `await_grant`), its presence is `waiting` (#252); then what
-/// it was, unless its supervisor has said something newer meanwhile (a node's push stream waits
-/// between turns, not in one).
-pub(crate) struct Waiting<'a>(&'a RunCtx, Option<String>);
-
-impl<'a> Waiting<'a> {
-    pub(crate) fn start(ctx: &'a RunCtx) -> Waiting<'a> {
-        let before = ctx.ledger.lock().ok().and_then(|l| {
-            let before = l.run_activity(&ctx.run.0).ok().flatten();
-            let _ = l.set_run_activity(&ctx.run.0, Some("waiting"));
-            before
-        });
-        Waiting(ctx, before.filter(|b| b != "waiting"))
-    }
-}
-
-impl Drop for Waiting<'_> {
-    fn drop(&mut self) {
-        if let Ok(l) = self.0.ledger.lock() {
-            let _ = l.restore_run_activity(&self.0.run.0, "waiting", self.1.as_deref());
-        }
-    }
-}
-
 impl RunCtx {
     /// Why this activation may no longer act, if a newer one has superseded it (or its agent is
     /// gone). Checked by every proxy on every request.
@@ -533,7 +509,7 @@ impl RunCtx {
     /// Records an event in the audit log and sends it to the console. A failure to record is
     /// dropped: for events that must be on disk before their request goes ahead, use
     /// [`record`](Self::record), which fails closed.
-    pub(crate) fn emit(&self, ev: Event) {
+    pub fn emit(&self, ev: Event) {
         let _ = self.record(ev);
     }
 
@@ -713,7 +689,7 @@ pub(crate) const STRIP_RESPONSE: &[&str] = &["connection", "keep-alive", "transf
 #[cfg(test)]
 mod fence_tests {
     //! #70: an activation superseded by a newer wake is refused at every enforcement point (the LLM
-    //! proxy's test is in llm.rs).
+    //! proxy's test is in llm.rs, the control host's gateway's in wicket-control's gateway.rs).
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -802,14 +778,5 @@ mod fence_tests {
         assert!(r.starts_with("HTTP/1.1 403") && r.contains("stale"), "{r}");
         server.abort();
         let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[tokio::test]
-    async fn the_gateway_refuses_a_stale_generation() {
-        let gw = gateway::Gateway::new(stale_ctx());
-        for tool in ["links", "await_grant", "send_message"] {
-            let (text, is_error) = gw.call_tool(tool, serde_json::json!({})).await;
-            assert!(is_error && text.contains("stale"), "{tool}: {text}");
-        }
     }
 }

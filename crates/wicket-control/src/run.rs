@@ -1,5 +1,6 @@
 //! `wicket run`: one agent, one zone, one sandbox.
 
+use crate::gateway::Gateway;
 use crate::node::Node;
 use crate::{data_dir, ledger_path};
 use anyhow::{bail, Context, Result};
@@ -9,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
-use wicket_proxy::{gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
+use wicket_proxy::{llm::Llm, vault::Vault, Event, RunCtx};
 use wicket_sandbox::SandboxSpec;
 use wicket_store::Ledger;
 

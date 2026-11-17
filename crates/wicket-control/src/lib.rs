@@ -24,6 +24,7 @@ use wicket_node::nodesrv;
 pub mod capacity;
 pub mod effect;
 pub mod enrol;
+pub mod gateway;
 pub mod gitguard;
 pub mod grant;
 pub mod hibernate;
