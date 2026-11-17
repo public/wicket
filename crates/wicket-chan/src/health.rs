@@ -45,6 +45,20 @@ pub struct NodeHealth {
     pub ca_not_before: Option<i64>,
     #[serde(default)]
     pub ca_not_after: Option<i64>,
+    /// Runs' directories the node keeps with no record of their box (#449): a box whose record went
+    /// (its exit, then a restart of the node) with its work never collected. `wicket node forget
+    /// <run> --force` deletes them.
+    /// A boxed slice: `Msg::Health` carries this, and the message enum stays small.
+    #[serde(default, skip_serializing_if = "<[_]>::is_empty")]
+    pub orphaned: Box<[OrphanedRun]>,
+}
+
+/// A run's directory on a node with no record of its box (#449), and what it takes on disk.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanedRun {
+    pub run: String,
+    /// Allocated bytes (0 until the node has measured it).
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -170,6 +184,19 @@ pub fn alerts(node: &str, h: &NodeHealth, now_ms: i64) -> Vec<Alert> {
     }
     // The CA's end is a date: a stale report still says when it was (or is) due.
     out.extend(ca_alert(node, h, now_ms));
+    // Files nothing records (#449): only wicket node forget --force removes them.
+    if !h.orphaned.is_empty() {
+        let bytes: u64 = h.orphaned.iter().map(|o| o.bytes).sum();
+        let first = &h.orphaned[0].run;
+        out.push(Alert {
+            key: format!("{node}/orphaned"),
+            text: format!(
+                "node {node}: keeps {} run directories it has no box record for ({} MiB), their work never collected: `wicket node forget {first} --force` deletes one",
+                h.orphaned.len(),
+                bytes >> 20
+            ),
+        });
+    }
     let events = [("oom", "a box was killed for memory", &h.last_oom), ("persist", "could not persist its state", &h.last_persist_failure)];
     for (kind, say, e) in events {
         if let Some(e) = e.as_ref().filter(|e| now_ms - e.at_ms <= EVENT_ALERT_MS) {

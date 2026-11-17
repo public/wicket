@@ -2225,9 +2225,15 @@ pub async fn forget_command(run: &str, force: bool, by: &str) -> anyhow::Result<
         (None, _) => {}
     }
     let link = crate::nodecall::Link::connect(&node, &format!("forget:{}", std::process::id()), &ledger).await?;
-    if !link.runs.iter().any(|r| r.run == run) {
+    // A run the node has no box record for may still have its directory there (#449): the node
+    // finds it by its path, and deletes it the same way.
+    let orphan = link.orphaned.iter().find(|o| o.run == run);
+    if !link.runs.iter().any(|r| r.run == run) && orphan.is_none() {
         say!("node {node} has no files for run {run}");
         return Ok(());
+    }
+    if let Some(o) = orphan {
+        say!("node {node} has no box record for run {run}, but keeps its directory ({} MiB)", o.bytes >> 20);
     }
     link.calls.forget(run);
     // A round trip after it: the node has handled the forget once this is answered.
