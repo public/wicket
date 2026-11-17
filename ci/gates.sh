@@ -12,7 +12,8 @@
 #   --only-e2e     the end-to-end suites only (a build of wicket-cli first)
 #   --suites "…"   these suites instead of the selected ones
 #
-# Always: rustfmt, ci/check-public.py, the Markdown link check and the term check. Rust: clippy and the tests of the
+# Always: ci/preflight.sh (rustfmt, ci/check-public.py, the term, link, plugin and changelog checks,
+# the lockfiles, gitleaks when installed, clippy of the selected crates). Rust: the tests of the
 # selected crates, with cargo-nextest when it is installed (a retried test that then passed is
 # reported as flaky, never hidden), else cargo test. End-to-end suites run against
 # target/debug/wicket; they need what each script says (Docker with runsc, the agent image, sudo).
@@ -70,17 +71,15 @@ read -r -a pkgs <<<"$args"
 read -r -a doc_pkgs <<<"$doc_args"
 
 # ---- always ----
+# ci/preflight.sh: rustfmt, the public, terms, link and plugin checks, the changelog fragment, the
+# lockfiles, gitleaks when installed, and clippy over the selected crates. Its heavy steps go through
+# $GATES_SLOT too.
 if [ "$rust" = 1 ]; then
-  step "rustfmt" cargo fmt --all -- --check
-  step "no secrets or machine details" python3 ci/check-public.py
-  step "Markdown links" ci/check-doc-links.sh
-  step "terms" ci/check-terms.sh
-  step "plugin and skills" python3 -I ci/check-plugin.py
+  step "preflight (ci/preflight.sh)" ci/preflight.sh --base "$base" --packages "$args"
 fi
 
 # ---- Rust ----
 if [ "$rust" = 1 ] && [ ${#pkgs[@]} -gt 0 ]; then
-  hstep "clippy (${crates})" cargo clippy "${pkgs[@]}" --all-targets --locked -- -D warnings
   if cargo nextest --version >/dev/null 2>&1; then
     hstep "tests ($filter, nextest)" cargo nextest run "${pkgs[@]}" -E "$filter" --locked --profile ci
     # nextest doesn't run doctests. They run over the tests' own crates (ci/determinator), so cargo
