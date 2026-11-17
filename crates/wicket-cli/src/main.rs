@@ -21,7 +21,7 @@ use wicket_home::{
 };
 
 // Modules that need only wicket-home's helpers moved with them (#219), under their old names here.
-use wicket_home::{exitcause, owner, program};
+use wicket_home::{exitcause, images_policy, owner, program};
 
 mod audit_export;
 mod capacity;
@@ -37,7 +37,6 @@ mod gitguard;
 mod grant;
 mod hibernate;
 mod image;
-mod images_policy;
 mod invariants;
 mod links;
 mod localnode;

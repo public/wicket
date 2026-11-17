@@ -6,6 +6,7 @@
 //! nothing else of the CLI's can leave it too. wicket-cli imports them under their old names.
 
 pub mod exitcause;
+pub mod images_policy;
 pub mod owner;
 pub mod program;
 
