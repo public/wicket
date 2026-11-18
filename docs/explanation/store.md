@@ -232,7 +232,7 @@ check (`images_policy::require_pinned`): a policy, not a trust path.
 
 ## Order of the work
 
-1. **The store API and ledger snapshots** (this PR). `wicket_store::cas`: `put`, `get` (verified)
+1. **The store API and ledger snapshots** (done). `wicket_store::cas`: `put`, `get` (verified)
    and `has` by digest; trees (the format, `put_tree`, `get_tree`); write-once refs; `has` on
    `ObjectStore` (a HEAD on S3); a sealed store that reads no plain object. `snapstore` moves onto it. Snapshots
    that earlier builds pushed stay readable and are pruned the same way.
@@ -265,12 +265,14 @@ check (`images_policy::require_pinned`): a policy, not a trust path.
    ledger's heads and the store's refs, sweep trees first, push and collection locks in the store,
    `wicket state gc`. Ledger snapshots' blobs are no longer deleted by hand when their ref goes: the
    sweep takes them. Nodes have no local store yet, so only the control host's stores are collected.
-5. **Named snapshots and forks** (#177) on bundle trees.
+5. **Named snapshots and forks** (#177) on bundle trees. Not started.
 6. **Transfer between nodes**: `has` and `get` on the node channel, reads falling through local, peer
-   and state store; volume snapshots (#251) on it.
-7. **Packs and ranged reads**, for remote backends.
-8. **Installed versions** as blobs and trees fetched by nodes; then `may_use` over #256's grants for
-   updates, programs and images.
+   and state store; volume snapshots (#251) on it. Not started: nodes have no local store yet.
+7. **Packs and ranged reads**, for remote backends. Not started.
+8. **`may_use` over #256's grants for updates, programs and images** (done, 2026-11-18: #483, #486,
+   #488, #491, #492, #511; see the status above). **Installed versions as blobs and trees fetched by
+   nodes**: not started. Nodes still get a new build pushed over their pinned ssh
+   (`update::push_version`).
 
 ## Open questions
 
