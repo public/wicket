@@ -22,22 +22,50 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-/// `wicket serve`'s options, as given on the command line.
-#[derive(Clone, Debug, Default)]
+/// `wicket serve`'s options, as given on the command line (flattened into `Cmd::Serve`).
+#[derive(Clone, Debug, Default, clap::Args)]
 pub struct ServeOpts {
+    #[arg(long, default_value = "127.0.0.1:8787")]
     pub listen: String,
+    /// Browser origin for WebAuthn (default: http://localhost:PORT; https://DOMAIN with ACME).
+    #[arg(long)]
     pub origin: Option<String>,
+    /// WebAuthn relying-party id (default: the origin's host).
+    #[arg(long)]
     pub rp_id: Option<String>,
+    /// Serve HTTPS with this certificate chain (PEM; re-read when it changes).
+    #[arg(long, requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
+    /// The certificate's private key (PEM).
+    #[arg(long, requires = "tls_cert")]
     pub tls_key: Option<PathBuf>,
+    /// Serve HTTPS with a certificate from an ACME CA (Let's Encrypt) for this name, validated
+    /// with TLS-ALPN-01 on this listener (so listen on :443).
+    #[arg(long)]
     pub acme_domain: Option<String>,
-    pub acme_contact: Vec<String>,
-    pub acme_directory: Option<String>,
-    pub acme_staging: bool,
+    /// Accept the ACME CA's terms of service (required with --acme-domain).
+    #[arg(long)]
     pub acme_agree_tos: bool,
+    /// Contact for the ACME account (mailto:...; repeatable).
+    #[arg(long)]
+    pub acme_contact: Vec<String>,
+    /// Use Let's Encrypt's staging CA (untrusted certificates; for trying the setup).
+    #[arg(long)]
+    pub acme_staging: bool,
+    /// Another ACME directory URL.
+    #[arg(long)]
+    pub acme_directory: Option<String>,
+    /// Where the ACME account and certificate are kept (default $WICKET_HOME/acme).
+    #[arg(long)]
     pub acme_cache: Option<PathBuf>,
+    /// A TLS-terminating proxy in front serves the console's https:// --origin; listen in plain HTTP.
+    #[arg(long)]
     pub behind_tls_terminator: bool,
+    /// The proxy's address or range (repeatable): its X-Forwarded-For names the client.
+    #[arg(long)]
     pub trusted_proxy: Vec<String>,
+    /// Most simultaneous connections.
+    #[arg(long, default_value_t = 256)]
     pub max_connections: usize,
 }
 

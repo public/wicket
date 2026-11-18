@@ -8,10 +8,7 @@ use crate::*;
 /// Runs one of this group's commands.
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
-        c @ Cmd::Serve { .. } => {
-            let (opts, no_bootstrap_link) = serve_opts(c).expect("a serve command");
-            serve::serve(opts, !no_bootstrap_link).await
-        }
+        Cmd::Serve { opts, no_bootstrap_link } => serve::serve(opts, !no_bootstrap_link).await,
         Cmd::Program { cmd: ProgramCmd::Digest { dir } } => {
             println!("{}", program::digest_dir(&dir)?);
             Ok(())
