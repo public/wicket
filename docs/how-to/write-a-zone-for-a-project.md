@@ -142,5 +142,5 @@ doesn't have that image. `wicket image` prints the digest of what it built.
 [Image pins](../reference/manifest.md#image-pins) has the rules.
 
 A pinned image is accepted by a grant on its digest (#258): running the manifest records yours,
-for the zone, and `wicket grant list` shows it. A tag is not accepted by a grant: it runs as the
-manifest's own statement, as before. (`images.yaml`'s `require_digests` is read and ignored.)
+for the zone, and `wicket grant list` shows it. To refuse tags on the installation, put
+`require_digests: true` in `<data dir>/images.yaml`.

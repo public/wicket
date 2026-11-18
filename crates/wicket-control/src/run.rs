@@ -480,6 +480,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
     let image_name = image.to_string();
     if record.is_none() && wake.is_none() {
+        // The operator's policy first (`images.yaml`'s `require_digests`): a tag is refused before
+        // anything is asked of a grant.
+        crate::images_policy::require_pinned(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
         // The one "may this digest run" check (#258): a pinned image is accepted by a grant on its
         // digest, which the operator running the manifest records. A child's image is pinned to
         // its parent's, as its parent's zone allows (decided where it is spawned): not regranted.

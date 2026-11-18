@@ -1,7 +1,8 @@
-//! The installation's image registries (`<data dir>/images.yaml`, #191): the registries its nodes
-//! may pull images from.
+//! The installation's image policy (`<data dir>/images.yaml`, #192, #191): whether a run may
+//! start a tag image, and the registries its nodes may pull images from.
 //!
 //! ```yaml
+//! require_digests: true
 //! registries:
 //!   - host: registry.example.com      # host[:port], as image names give it
 //!     secret: registry-login          # optional: a vault secret bound to the host, `user:password` or a token
@@ -9,18 +10,20 @@
 //!     blob_hosts: [cdn.example.com]   # where it redirects blob downloads, if elsewhere
 //! ```
 //!
-//! Whether an image may run is no longer this file's (#258): a pinned image is accepted by a grant
-//! on its digest, the one "may this digest run" check (`wicket_control::digest`). The old
-//! `require_digests` is still read, so a file that sets it opens, and ignored.
+//! `require_digests` is the operator's policy, not a trust path: with it, a run is refused unless
+//! its own image and every entry of its zone's `images` are pinned (`name@sha256:…`; `wicket zone
+//! pin MANIFEST` rewrites tags to their current digests), checked just before a pinned image is
+//! accepted by a grant on its digest, the one "may this digest run" check (#258,
+//! `wicket_control::digest`). The installation's own agent image (built by this wicket from the
+//! sources it embeds) is exempt.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImagesPolicy {
-    /// Ignored since #258 (a pinned image is accepted by a grant on its digest); read so an older
-    /// file still opens.
+    /// Refuse a run whose image, or any of its zone's `images`, is a tag ([`require_pinned`]).
     #[serde(default)]
     pub require_digests: bool,
     /// Registries a node may pull a pinned image from, host-side (#191). None: images reach nodes
@@ -85,15 +88,51 @@ pub fn load() -> Result<ImagesPolicy> {
     }
 }
 
+/// The operator's `require_digests` policy, for a run of `m` starting `image`: refused, naming the
+/// tags, if the installation requires pins and the run's image (other than `default_image`, the
+/// installation's own) or any of its zone's `images` is a tag.
+pub fn require_pinned(m: &wicket_core::Manifest, image: &str, default_image: &str) -> Result<()> {
+    require_pinned_with(&load()?, m, image, default_image)
+}
+
+pub fn require_pinned_with(p: &ImagesPolicy, m: &wicket_core::Manifest, image: &str, default_image: &str) -> Result<()> {
+    if !p.require_digests {
+        return Ok(());
+    }
+    let mut tags: Vec<&str> = m.zone.images.iter().map(String::as_str).filter(|i| !wicket_core::image::is_pinned(i)).collect();
+    if image != default_image && !wicket_core::image::is_pinned(image) {
+        tags.insert(0, image);
+    }
+    if !tags.is_empty() {
+        bail!(
+            "this installation requires images pinned by digest ({}), and these are tags: {}. Pin them: wicket zone pin <manifest>",
+            path().display(),
+            tags.join(", ")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// #258: a file from before still opens; `require_digests` is read and ignored.
     #[test]
-    fn an_older_file_with_require_digests_still_opens() {
-        let p: ImagesPolicy = wicket_core::yaml::from_str("require_digests: true\nregistries: []\n").unwrap();
-        assert!(p.require_digests && p.registries.is_empty());
+    fn required_digests_refuse_tags_but_not_the_installation_s_own_image() {
+        let pin = format!("img@sha256:{}", "a".repeat(64));
+        let m = |images: &str| {
+            wicket_agent::load(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {{secret: m}}, images: [{images}]}}")).unwrap()
+        };
+        let on = ImagesPolicy { require_digests: true, ..Default::default() };
+        assert!(require_pinned_with(&ImagesPolicy::default(), &m("img:tag"), "img:tag", "dflt").is_ok(), "off by default");
+        assert!(require_pinned_with(&on, &m(&pin), &pin, "dflt").is_ok());
+        assert!(require_pinned_with(&on, &m(&pin), "dflt", "dflt").is_ok(), "the installation's own image");
+        let e = require_pinned_with(&on, &m(&format!("{pin}, img:tag")), &pin, "dflt").unwrap_err().to_string();
+        assert!(
+            e.starts_with("this installation requires images pinned by digest") && e.contains("img:tag") && e.contains("wicket zone pin"),
+            "{e}"
+        );
+        assert!(require_pinned_with(&on, &m(&pin), "img:tag", "dflt").is_err(), "its own image a tag");
     }
 
     #[test]

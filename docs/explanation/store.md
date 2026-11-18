@@ -223,11 +223,12 @@ Done for #258, an update, a program and an image are all accepted through `may_u
   digest, which running the manifest records (#486, #488).
 
 The separate paths are gone: a key file in `release-keys/` only keeps its principal's grant
-renewed, `images_policy::check` and the program pin gate are deleted (a source that isn't what was
-pinned has no grant, and the one check refuses it), and `use_update_approval` is internal. The
-node still checks that a box's image is its pin: that is integrity, not trust. A tag image and an
-unpinned (development) program aren't accepted by a grant: they run as the manifest's own
-statement, as before.
+renewed, the program pin gate is deleted (a source that isn't what was pinned has no grant, and
+the one check refuses it), and `use_update_approval` is internal. The node still checks that a
+box's image is its pin: that is integrity, not trust. A tag image and an unpinned (development)
+program aren't accepted by a grant: they run as the manifest's own statement, as before, unless
+the operator's `images.yaml` says `require_digests`, which refuses a tag image just before the
+check (`images_policy::require_pinned`): a policy, not a trust path.
 
 ## Order of the work
 
