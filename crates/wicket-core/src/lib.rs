@@ -14,6 +14,7 @@ pub mod image;
 pub mod link;
 pub mod manifest;
 pub mod op;
+pub mod quota;
 pub mod splice;
 pub mod subset;
 pub mod text;

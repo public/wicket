@@ -255,10 +255,16 @@ impl Ledger {
         let Some((grant, uses, decided_by, held)) = covering(&tx, tenant, digest, action, scope)? else {
             return Ok(None);
         };
-        // Conditional, so two uses racing for a grant's last use can't both take it.
-        if uses.is_some() && tx.execute("UPDATE grants SET uses_left = uses_left - 1 WHERE id = ?1 AND uses_left > 0", params![grant])? != 1
-        {
+        // One use taken ([`wicket_core::quota::take_use`], which Kani checks: never below zero,
+        // never at zero). Conditional on the count read, so two uses racing for a grant's last
+        // use can't both take it.
+        let Some(left) = wicket_core::quota::take_use(uses) else {
             return Ok(None);
+        };
+        if let (Some(read), Some(left)) = (uses, left) {
+            if tx.execute("UPDATE grants SET uses_left = ?2 WHERE id = ?1 AND uses_left = ?3", params![grant, left, read])? != 1 {
+                return Ok(None);
+            }
         }
         let used = DigestUse { grant, decided_by, scope: held };
         let body = serde_json::json!({

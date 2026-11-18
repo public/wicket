@@ -107,13 +107,18 @@ pub(crate) fn check(
     record_limit(conn, tenant, budget)?;
     let max = limit(conn, tenant)?.unwrap_or(budget);
     let (h, r) = reserved(conn, tenant)?;
-    if h + hourly > max.max_hourly {
-        return Ok(Err(BudgetRefusal::Hourly { reserved: h, new: hourly, max: max.max_hourly }));
-    }
-    if r + reserved_new > max.max_total {
-        return Ok(Err(BudgetRefusal::Total { reserved: r, new: reserved_new, max: max.max_total }));
-    }
-    Ok(Ok(()))
+    // The sums in `i128` (Kani checks it, #325): one that would overflow is refused, not wrapped.
+    use wicket_core::quota::{money_fits, Money, MoneyOver};
+    let fits = money_fits(
+        Money { hourly: h, total: r },
+        Money { hourly, total: reserved_new },
+        Money { hourly: max.max_hourly, total: max.max_total },
+    );
+    Ok(match fits {
+        Ok(()) => Ok(()),
+        Err(MoneyOver::Hourly) => Err(BudgetRefusal::Hourly { reserved: h, new: hourly, max: max.max_hourly }),
+        Err(MoneyOver::Total) => Err(BudgetRefusal::Total { reserved: r, new: reserved_new, max: max.max_total }),
+    })
 }
 
 impl Ledger {

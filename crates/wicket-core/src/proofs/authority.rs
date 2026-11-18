@@ -1,6 +1,6 @@
 //! An agent's authority (`authority`): Wicket/Grant.lean's `descendantChain` and `agentTerms`.
 
-use super::{descendant_chain, ends_within, MAX_CHAIN};
+use super::{agent_term_refusal, descendant_chain, ends_within, GrantRules, GrantShape, TermRefusal, MAX_CHAIN};
 
 /// Runs, as small ids: four of them, with any parent links (cycles and self-parents included).
 const RUNS: u8 = 4;
@@ -69,5 +69,44 @@ fn an_agents_grant_ends_within_its_authority() {
     // Complete too: an end that is within it is allowed.
     if now < until && i128::from(now) + i128::from(ttl) <= i128::from(until) {
         assert!(ends_within(now, ttl, until).is_ok());
+    }
+}
+
+fn any_rules() -> GrantRules {
+    GrantRules { prefix: kani::any(), zone_wide: kani::any(), git_push: kani::any(), unbounded: kani::any() }
+}
+
+fn any_shape() -> GrantShape {
+    GrantShape { zone_wide: kani::any(), prefix: kani::any(), unbounded: kani::any(), git_push: kani::any() }
+}
+
+/// `agentTerms`' refusals under the policy's `agents:` rules (#256; the Lean spec has the
+/// default only): a default `AgentRules` refuses every refusal-shaped grant `agent_terms` refused
+/// before the rules existed (a whole zone, a prefix, no number of uses, a git push), and nothing
+/// else.
+#[kani::proof]
+fn default_agent_rules_refuse_what_agent_terms_did() {
+    let shape = any_shape();
+    let refused = agent_term_refusal(GrantRules::default(), shape).is_some();
+    assert_eq!(refused, shape.zone_wide || shape.prefix || shape.unbounded || shape.git_push);
+}
+
+/// And each rule lifts exactly its own refusal: for any rules and shape, a grant is refused
+/// exactly when it has a refusal-shaped term whose rule is off, and the refusal named is one of
+/// those. So turning one rule on accepts only grants whose sole such term is its own.
+#[kani::proof]
+fn each_agent_rule_lifts_only_its_refusal() {
+    let (r, s) = (any_rules(), any_shape());
+    let zone = s.zone_wide && !r.zone_wide;
+    let prefix = s.prefix && !r.prefix;
+    let unbounded = s.unbounded && !r.unbounded;
+    let push = s.git_push && !r.git_push;
+    match agent_term_refusal(r, s) {
+        None => assert!(!zone && !prefix && !unbounded && !push),
+        // The first in `agent_terms`' order.
+        Some(TermRefusal::ZoneWide) => assert!(zone),
+        Some(TermRefusal::Prefix) => assert!(prefix && !zone),
+        Some(TermRefusal::Unbounded) => assert!(unbounded && !zone && !prefix),
+        Some(TermRefusal::GitPush) => assert!(push && !zone && !prefix && !unbounded),
     }
 }
