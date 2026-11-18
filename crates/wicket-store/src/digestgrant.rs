@@ -118,15 +118,18 @@ fn path_of(digest: &str) -> String {
     format!("/digest/{digest}")
 }
 
+/// A grant [`covering`] found: (id, uses left, decided by, its scope).
+type Covering = (String, Option<i64>, String, DigestScope);
+
 /// The oldest live grant on `digest` for `action` whose scope covers `scope` (an installation-wide
-/// grant covers every zone and node), with a use left: (id, uses left, decided by, its scope).
+/// grant covers every zone and node), with a use left.
 fn covering(
     conn: &rusqlite::Connection,
     tenant: &TenantId,
     digest: &str,
     action: DigestAction,
     scope: &DigestScope,
-) -> Result<Option<(String, Option<i64>, String, DigestScope)>> {
+) -> Result<Option<Covering>> {
     let mut st = conn.prepare(
         "SELECT id, uses_left, decided_by, terms FROM grants
          WHERE tenant = ?1 AND method = ?2 AND host = ?3 AND path = ?4 AND revoked = 0 AND expires_at > ?5
