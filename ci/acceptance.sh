@@ -712,6 +712,53 @@ daemon_flow() {
 }
 if [ "$mode" = installed ]; then daemon_flow; else skip "wicketd moving and restarting under a run" "installed only (wicketd)"; fi
 
+# ---- 5d. a self update over a run on the older build (#487) ----
+# Installed only: a long-lived run started through wicketd, its supervisor on the installed build.
+# `sudo wicket self update` to another build (this one with bytes appended: a new build id, the
+# same code, signed with a release key root trusts) moves the control host's processes and hands
+# the run over; wicketd re-executes last. Then the CLI must answer through wicketd within seconds
+# (#487: wicketd once hung in that handover and refused every command until restarted), the
+# run's next turn is on the same box, and the update says every handed run was adopted. The same
+# again for the rollback.
+update_flow() {
+  log "a self update and a rollback over a run on the older build: the CLI answers within seconds (#487)"
+  local r b d id t0
+  r=$(restart_start update)
+  b=$(box_of "$r")
+  check "  the run started through wicketd took its first turn" '[ "$(restart_result "$r" | jq -r .turn 2>/dev/null)" = 1 ]'
+  # Root's own directory, so root's copy is made from it (#261).
+  d=$(sudo -n mktemp -d /root/acc-update.XXXXXX)
+  sudo -n sh -c "cp '$(readlink -f "$W")' '$d/wicket' && printf 'build b' >>'$d/wicket' && chmod 755 '$d/wicket'"
+  wroot self keygen "$d/rk" >/dev/null && wroot self trust-key "$d/rk.pub" >/dev/null && wroot self sign --key "$d/rk" "$d/wicket" >/dev/null
+  id=$(sudo -n sha256sum "$d/wicket" | cut -c1-12)
+  # The new build's agent image is the one under test, so the update builds none.
+  $DOCKER tag "$IMAGE_TAG" "wicket/claude-code:$id" >/dev/null
+  wroot self update "$d/wicket" --window 5s --interval 5s --no-prune >"$work/update.log" 2>&1 || true
+  check "  the update went through" 'grep -q "done: the control host run $id" "$work/update.log"'
+  t0=$(date +%s)
+  wait_for 20 'wt 5 pending >/dev/null 2>&1' || true
+  check "  then the CLI answered through wicketd within seconds" \
+    'wt 5 pending >/dev/null 2>&1 && [ $(( $(date +%s) - t0 )) -lt 20 ] && grep -q "handing [0-9]* running command(s) to the new build" /tmp/wicketd.log'
+  # `runs: <handed> handed over, <adopted> adopted by the new build`: at least the one run, all adopted.
+  check "  every run handed over was adopted" \
+    'grep -oE "runs: [0-9]+ handed over, [0-9]+ adopted" "$work/update.log" | awk "{ n++; if (\$2 < 1 || \$2 != \$5) bad=1 } END { exit (bad || !n) }"'
+  w session --no-wait "$r" "Again, after the update." >/dev/null 2>&1 || true
+  wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 2 ]' || true
+  check "  its next turn was in the same run, on the same box" '[ "$(restart_result "$r" | jq -r .turn)" = 2 ] && [ "$(box_of "$r")" = "$b" ]'
+  wroot self rollback >"$work/rollback.log" 2>&1 || true
+  t0=$(date +%s)
+  wait_for 20 'wt 5 pending >/dev/null 2>&1' || true
+  check "  after the rollback too, the CLI answered within seconds" 'wt 5 pending >/dev/null 2>&1 && [ $(( $(date +%s) - t0 )) -lt 20 ]'
+  w session --no-wait "$r" "Again, after the rollback." >/dev/null 2>&1 || true
+  wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 3 ]' || true
+  check "  and its next turn was in the same run, on the same box" '[ "$(restart_result "$r" | jq -r .turn)" = 3 ] && [ "$(box_of "$r")" = "$b" ]'
+  wroot identity revoke "$r" --reason "acceptance: update check done" >/dev/null 2>&1 || true
+  wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true
+  sudo -n rm -f "$d/wicket" "$d/wicket.sig" "$d/rk" "$d/rk.pub"
+  sudo -n rmdir "$d" 2>/dev/null || true
+}
+if [ "$mode" = installed ]; then update_flow; else skip "a self update over a run on the older build" "installed only (wicketd)"; fi
+
 # ---- 3c. an org policy in Cedar (#51) ----
 # The installation's org policy forbids one path the zone allows: the box's token, compiled at mint,
 # refuses it at the edge. A new version revokes the runs minted under the old one. Development mode
