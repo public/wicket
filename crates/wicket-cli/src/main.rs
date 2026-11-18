@@ -50,6 +50,7 @@ mod state;
 mod top;
 mod units;
 mod update;
+mod webauthn;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};

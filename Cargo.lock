@@ -3952,19 +3952,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wicket-auth"
-version = "0.0.1"
-dependencies = [
- "base64 0.22.1",
- "ciborium",
- "p256",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
-]
-
-[[package]]
 name = "wicket-authz"
 version = "0.0.1"
 dependencies = [
@@ -4029,14 +4016,12 @@ dependencies = [
  "reqwest",
  "ring",
  "rpassword",
- "rusqlite",
  "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tar",
  "thiserror",
- "time",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -4044,7 +4029,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "wicket-agent",
- "wicket-auth",
  "wicket-authz",
  "wicket-chan",
  "wicket-control",

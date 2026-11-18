@@ -21,6 +21,7 @@
 //! The crypto is `p256` (ECDH and ES256, already used for passkeys) and `ring` (HKDF-SHA-256 and
 //! AES-128-GCM, already in the tree through rustls), so Web Push adds no new crate.
 
+use crate::webauthn::{b64u, unb64u};
 use anyhow::{anyhow, bail, Context, Result};
 use p256::ecdsa::signature::Signer;
 use p256::elliptic_curve::sec1::ToSec1Point;
@@ -32,7 +33,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use wicket_auth::{b64u, unb64u};
 
 /// How long a push service keeps a push it couldn't deliver yet (seconds).
 pub const TTL_SECS: u32 = 3600;

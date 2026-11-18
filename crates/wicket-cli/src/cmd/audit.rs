@@ -188,7 +188,7 @@ pub(crate) fn verify_identities_and_messages(l: &Ledger) -> Result<(usize, usize
 /// Re-verifies every passkey-signed record in the audit log (decisions and the console's other
 /// actions) from the stored public keys alone: the signature must cover exactly what was recorded.
 pub(crate) fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
-    use wicket_auth::{decision_challenge, unb64u, Credential, RelyingParty};
+    use crate::webauthn::{decision_challenge, unb64u, Credential, RelyingParty};
     let keys = l.operator_credentials_all(&TenantId::single())?;
     let (mut ok, mut bad) = (0, 0);
     for (seq, _, kind, run, body) in l.audit_tail(usize::MAX >> 1)? {

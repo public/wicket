@@ -131,7 +131,7 @@ fn wicket_core_is_nearly_everything_but_not_everything() {
     assert!(!s.everything);
     assert_eq!(s.roots, set(&["wicket-core"]));
     assert_eq!(s.filter(), "rdeps(=wicket-core)");
-    for c in ["wicket-auth", "wicket-identity", "wicket-fwd", "wicket-placement"] {
+    for c in ["wicket-identity", "wicket-fwd", "wicket-placement"] {
         assert!(!s.affected.contains(c), "{c}");
     }
     assert!(s.affected.len() >= 10);

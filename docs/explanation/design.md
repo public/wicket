@@ -2126,7 +2126,6 @@ crates/
   wicket-authz       vendored, patched biscuit-auth and wicket's token vocabulary (§2.1)
   wicket-feed        the signed snapshot-and-delta feed and its replica on a node
   wicket-identity    issuer, agent and node identities, one compact-JWS module
-  wicket-auth        passkeys (WebAuthn)
   wicket-store       ledger, audit chain, leases, links, bundles, object and content-addressed store
   wicket-proxy       egress proxy, model proxy and MCP gateway
   wicket-sandbox     box backends (Docker with runsc)
@@ -2144,7 +2143,7 @@ crates/
   wicket-control     the control host's core: a run's supervisor and its box on a node, spawns,
                      hibernation, transcripts, the authority roots and feed, and what a run needs
                      of nodes (enrolment, placement, leases), grants, operators and policy
-  wicket-cli         the `wicket` binary: CLI, daemon, console, reconciler, self update
+  wicket-cli         the `wicket` binary: CLI, daemon, console and its passkeys (WebAuthn), reconciler, self update
 ```
 
 Dependency rule: `wicket-core` depends on nothing internal. Nothing that decides depends on

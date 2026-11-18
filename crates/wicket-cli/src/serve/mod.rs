@@ -69,6 +69,7 @@ mod web;
 
 pub use net::ServeOpts;
 
+use crate::webauthn::{b64u, decision_challenge, unb64u, Credential, RelyingParty};
 use crate::{data_dir, grant, ledger_path};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -84,7 +85,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use wicket_auth::{b64u, decision_challenge, unb64u, Credential, RelyingParty};
 use wicket_core::{RunId, TenantId};
 use wicket_store::{ConsoleSession, Ledger, OperatorCredential};
 
