@@ -90,15 +90,18 @@ mark-changed = ["wicket-feed"]
 post-rule = "skip-rules"
 
 # The simulation's stand-ins follow the node's and the control host's run loops (#324): a run's
-# supervisor, `node create`, the node, the node channel's framing and the reconciler. It depends on
-# wicket-gateway (the control host's gateway tools, #257), not on wicket-control, wicket-node or
-# wicket-chan, so the files it follows in them need this rule; the rest of those crates leave it out.
+# supervisor, `node create`, the node, the node channel's framing, the reconciler, and wicketd and
+# the updates' handover. It depends on wicket-gateway (the control host's gateway tools, #257), not
+# on wicket-control, wicket-node, wicket-chan or wicket-cli, so the files it follows in them need
+# this rule; the rest of those crates leave it out.
 [[path-rule]]
 globs = [
   "crates/wicket-control/src/run.rs", "crates/wicket-control/src/noderun.rs",
   "crates/wicket-control/src/hibernate.rs", "crates/wicket-control/src/nodecreate.rs",
   "crates/wicket-node/src/nodesrv.rs", "crates/wicket-node/src/nodegw.rs",
   "crates/wicket-chan/src/chan.rs", "crates/wicket-cli/src/reconcile.rs",
+  # The update scenario's: wicketd's start, drain and handoff, and the updates' handover (#324).
+  "crates/wicket-cli/src/daemon/mod.rs", "crates/wicket-cli/src/daemon/handoff.rs", "crates/wicket-cli/src/update.rs",
 ]
 mark-changed = ["wicket-sim"]
 post-rule = "skip-rules"

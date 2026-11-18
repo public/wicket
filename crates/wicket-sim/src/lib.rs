@@ -43,6 +43,7 @@ pub mod oracle;
 pub mod placement;
 pub mod rng;
 pub mod trace;
+pub mod update;
 pub mod wire;
 
 use oracle::Oracle;
@@ -527,7 +528,7 @@ enum Action {
 }
 
 /// Runs `scenario` (one of [`trace::SCENARIOS`]) for `seed`: the first slice's feed and budget
-/// scenario ([`run_with`]), [`placement`] or [`messages`].
+/// scenario ([`run_with`]), [`placement`], [`messages`] or [`update`].
 pub fn run_scenario(scenario: &str, seed: u64, dir: &Path, keep_trace: bool) -> trace::Report {
     match scenario {
         "feed" => {
@@ -545,6 +546,7 @@ pub fn run_scenario(scenario: &str, seed: u64, dir: &Path, keep_trace: bool) -> 
         }
         "placement" => placement::run(seed, dir, placement::Options { keep_trace, ..placement::Options::default() }),
         "messages" => messages::run(seed, dir, messages::Options { keep_trace, ..messages::Options::default() }),
+        "update" => update::run(seed, dir, update::Options { keep_trace, ..update::Options::default() }),
         other => panic!("no scenario {other:?}: one of {:?}", trace::SCENARIOS),
     }
 }
