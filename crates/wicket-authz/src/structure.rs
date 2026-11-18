@@ -269,7 +269,9 @@ fn query(q: &Rule, p: &Policy, trusted: &mut Vec<PublicKeyData>, regexes: &mut u
 /// A check that reads `policy` is the org layer's (#51): hard, whatever else it reads.
 fn classify(queries: &[Rule], kind: &CheckKind) -> CheckClass {
     let reads = |n: &str| queries.iter().any(|q| q.body.iter().any(|pr| pr.name == n));
-    if *kind == CheckKind::One && !reads("policy") && (reads("host") || reads("risk") || reads("approved")) {
+    // The rule is wicket-core's (Kani checks it, #325): never the org policy.
+    if wicket_core::escalation::check_escalatable(*kind == CheckKind::One, reads("policy"), reads("host"), reads("risk"), reads("approved"))
+    {
         CheckClass::Escalatable
     } else {
         CheckClass::Hard
