@@ -12,19 +12,18 @@
 //!   destroys whatever was created, since nothing desires it any more).
 //!
 //! **Money.** Each lease reserves `reserved`, the worst case at its own price cap (`hourly_cap` per
-//! started hour for its whole duration), from the moment it is asked for. [`Ledger::create_lease`]
-//! refuses, atomically, a lease that would take the reservations of every `pending`, `approved` or
-//! `active` lease over the installation's limits. Only `ended`, `denied`, `withdrawn` and `failed`
-//! leases give their reservation back. A lease's money is also recorded as two quota grants bound
+//! started hour for its whole duration), from the moment it is asked for, as two quota grants bound
 //! to the run that asked (#256): `QUOTA wicket.internal /quota/money.hourly/<lease>` (its
-//! `hourly_cap`) and `/quota/money.reserved/<lease>` (its `reserved`), made by
-//! [`LEASE_QUOTA_BY`] in the same transaction, revoked when the lease ends. They are the record;
-//! the check stays the installation's limits over the live leases' reservations, here.
+//! `hourly_cap`) and `/quota/money.reserved/<lease>` (its `reserved`), made by [`LEASE_QUOTA_BY`],
+//! revoked when the lease ends (`ended`, `denied`, `withdrawn`, `failed`). [`Ledger::create_lease`]
+//! records them only if the one spend check ([`crate::money`]) lets them, in the same transaction:
+//! the tenant's live money quota grants plus these, against its money limit grant.
 //!
 //! **Placed nodes** ([`PlacedNodeRow`], #294) are the other kind of owned node: made by `wicket node
-//! create` for the installation rather than asked for by a run. They have no reservation here (the
-//! placer's money envelope covered them); the reconciler releases one at its `lease_until` unless a
-//! run still placed on it (by its enrolled name) holds it, which it records in `held_by`.
+//! create` for the installation rather than asked for by a run. Their money is reserved by the same
+//! check ([`Ledger::reserve_money`], keyed `node-<name>`) before the node is made; the reconciler
+//! releases one at its `lease_until` unless a run still placed on it (by its enrolled name) holds
+//! it, which it records in `held_by`.
 
 use crate::{now, Ledger, Result, StoreError};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -141,25 +140,18 @@ fn live_in() -> String {
 }
 
 impl Ledger {
-    /// Records a `pending` lease, reserving `reserved` and `hourly_cap`, unless that would take the
-    /// live leases' reservations over `budget` (checked and inserted in one transaction, so two asks
-    /// racing can't both fit). The caller fills in `id`, `tenant`, `run`, `provider`, `spec`,
-    /// `hourly_cap`, `reserved` and `duration_secs`; the rest is set here.
+    /// Records a `pending` lease, reserving `reserved` and `hourly_cap`, unless the one spend check
+    /// refuses it (#256, [`crate::money`]): the tenant's live money quota grants (every live lease's
+    /// and every node `wicket node create` made) plus this one, against `budget` recorded as the
+    /// tenant's money limit grant. Checked and inserted in one transaction, so two asks racing
+    /// can't both fit. The caller fills in `id`, `tenant`, `run`, `provider`, `spec`, `hourly_cap`,
+    /// `reserved` and `duration_secs`; the rest is set here.
     pub fn create_lease(&mut self, l: &LeaseRow, budget: LeaseBudget) -> Result<std::result::Result<(), BudgetRefusal>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (hourly, total): (i64, i64) = tx.query_row(
-            &format!(
-                "SELECT COALESCE(SUM(hourly_cap), 0), COALESCE(SUM(reserved), 0) FROM leases WHERE tenant = ?1 AND status IN ({})",
-                live_in()
-            ),
-            params![l.tenant],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if hourly + l.hourly_cap > budget.max_hourly {
-            return Ok(Err(BudgetRefusal::Hourly { reserved: hourly, new: l.hourly_cap, max: budget.max_hourly }));
-        }
-        if total + l.reserved > budget.max_total {
-            return Ok(Err(BudgetRefusal::Total { reserved: total, new: l.reserved, max: budget.max_total }));
+        if let Err(r) = crate::money::check(&tx, &l.tenant, budget, l.hourly_cap, l.reserved)? {
+            // The limit grant as configured is kept; no lease is recorded.
+            tx.commit()?;
+            return Ok(Err(r));
         }
         tx.execute(
             &format!("INSERT INTO leases ({LEASE_COLS}) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'pending', NULL, NULL, NULL, NULL, NULL, NULL, NULL)"),
@@ -440,10 +432,17 @@ impl Ledger {
     /// Ends an active placed node: `released` (destroyed, or found gone) or `left` (the provider
     /// refused: no longer owned, or protected). False if it had already ended.
     pub fn placed_node_ended(&self, id: &str, status: &str, detail: &str) -> Result<bool> {
-        let n = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let n = tx.execute(
             "UPDATE placed_nodes SET status = ?2, detail = ?3, held_by = NULL, ended_at = ?4 WHERE id = ?1 AND status = 'active'",
             params![id, status, detail, now()],
         )?;
+        // Its money goes back with it (#256).
+        let name: Option<String> = tx.query_row("SELECT name FROM placed_nodes WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+        if let (1, Some(name)) = (n, name) {
+            crate::quota::revoke_lease_quotas(&tx, &crate::money::node_money_key(&name))?;
+        }
+        tx.commit()?;
         Ok(n == 1)
     }
 }
