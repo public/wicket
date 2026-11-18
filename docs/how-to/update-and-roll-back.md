@@ -129,6 +129,10 @@ A rollback is a switch to `previous`, so a second rollback goes forward again. I
 below the ledger's schema floor: after a contract step, restore the snapshot instead (below). Root's
 `/usr/local/bin/wicket` moves to root's copy of the build rolled back to, if it has one.
 
+A build upgrades a ledger from schema 17 on (`wicket self status` shows the schema). An installation
+whose ledger is older is refused, with a message naming a build that upgrades it: update to that build
+first (main at `a3135ea`), then to this one.
+
 ## Prune
 
 ```sh
