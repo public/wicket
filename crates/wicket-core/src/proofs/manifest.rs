@@ -1,40 +1,61 @@
 //! A zone's consent and model lists (`manifest`): `accept_from` (#250, #411) and
 //! `zone.llm.models` (#366). #322's Lean spec has no counterpart. Short strings: list entries and
-//! senders chosen from a few concrete names of five bytes each (zones `zonea` and `zoneb`,
+//! senders chosen from a few names of five bytes, held by value (zones `zonea` and `zoneb`,
 //! principals `x://a` and `x://b`, and a principal id `zonea` spelt like a zone); model names and
 //! patterns over `a`, `b` and `*`.
 
 use super::{accepts, is_principal_entry, model_covers};
 use crate::proofs::AnyStr;
 
-// Every name is five bytes, so comparing two is a fixed-length compare: zones `zonea` and `zoneb`,
-// principals `x://a` and `x://b`. (With names of different lengths, chosen symbolically, the
-// accept_from harnesses took up to 294 s.) Unwound 7: a five-byte compare, and lists of three.
-const ZONES: [&str; 2] = ["zonea", "zoneb"];
-const PRINCIPALS: [&str; 2] = ["x://a", "x://b"];
+/// A name of five bytes, held by value: zones `zonea` and `zoneb`, principals `x://a` and `x://b`.
+/// By value, not as a `&'static str` chosen among several, so no read goes through a pointer
+/// that could be any of them. (Chosen as `&str`s, of five bytes or of mixed lengths, the
+/// accept_from harnesses took 49-294 s.)
+#[derive(Clone, Copy)]
+struct Name([u8; 5]);
 
-fn any_zone() -> &'static str {
-    ZONES[usize::from(kani::any::<bool>())]
+impl AsRef<str> for Name {
+    fn as_ref(&self) -> &str {
+        // SAFETY: every byte is one of the ASCII names' below.
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
 }
 
-/// A sender's principal id, if known: one of the principals, or `zonea`, an id spelt like a zone.
-fn any_principal() -> Option<&'static str> {
-    [None, Some("x://a"), Some("x://b"), Some("zonea")][kani::any_where(|&i: &usize| i < 4)]
+const ZONEA: [u8; 5] = *b"zonea";
+const ZONEB: [u8; 5] = *b"zoneb";
+const PA: [u8; 5] = *b"x://a";
+const PB: [u8; 5] = *b"x://b";
+
+fn any_of(names: &[[u8; 5]]) -> Name {
+    Name(names[kani::any_where(|&i: &usize| i < names.len())])
+}
+
+fn any_zone() -> Name {
+    any_of(&[ZONEA, ZONEB])
 }
 
 /// Any entry: a zone or a principal.
-fn any_entry() -> &'static str {
+fn any_entry() -> Name {
+    any_of(&[ZONEA, ZONEB, PA, PB])
+}
+
+/// A sender's principal id, if known: one of the principals, or `zonea`, an id spelt like a zone.
+fn any_principal() -> Option<Name> {
     if kani::any() {
-        any_zone()
+        Some(any_of(&[PA, PB, ZONEA]))
     } else {
-        PRINCIPALS[usize::from(kani::any::<bool>())]
+        None
     }
+}
+
+fn id(p: &Option<Name>) -> Option<&str> {
+    p.as_ref().map(AsRef::as_ref)
 }
 
 /// `accepts`: an `accept_from` list (up to two entries of either kind) lets a sender in exactly
 /// when one entry names it, a zone entry by the sender's zone and a principal entry by its
 /// principal id; an empty list refuses everyone, and an entry added never refuses a sender let in
-/// before.
+/// before. (Unwound 7: a five-byte compare, and lists of three.)
 #[kani::proof]
 #[kani::unwind(7)]
 fn accept_from_lets_in_exactly_whom_it_names() {
@@ -42,11 +63,11 @@ fn accept_from_lets_in_exactly_whom_it_names() {
     let len: usize = kani::any_where(|&l| l <= 2);
     let (list, more) = (&entries[..len], &entries[..len + 1]);
     let (zone, principal) = (any_zone(), any_principal());
-    let got = accepts(list, zone, principal);
-    let named = list.iter().any(|e| if is_principal_entry(e) { principal == Some(*e) } else { *e == zone });
+    let got = accepts(list, zone.as_ref(), id(&principal));
+    let named = list.iter().any(|e| if is_principal_entry(e.as_ref()) { principal.is_some_and(|p| p.0 == e.0) } else { e.0 == zone.0 });
     assert_eq!(got, named);
     assert!(!list.is_empty() || !got);
-    assert!(!got || accepts(more, zone, principal));
+    assert!(!got || accepts(more, zone.as_ref(), id(&principal)));
 }
 
 /// The two kinds never cross (#250), one: a list of principal entries ignores the sender's zone,
@@ -54,11 +75,11 @@ fn accept_from_lets_in_exactly_whom_it_names() {
 #[kani::proof]
 #[kani::unwind(7)]
 fn a_principal_list_ignores_the_senders_zone() {
-    let entries = [PRINCIPALS[usize::from(kani::any::<bool>())], PRINCIPALS[usize::from(kani::any::<bool>())]];
+    let entries = [any_of(&[PA, PB]), any_of(&[PA, PB])];
     let list = &entries[..kani::any_where(|&l: &usize| l <= 2)];
     let principal = any_principal();
-    assert_eq!(accepts(list, ZONES[0], principal), accepts(list, ZONES[1], principal));
-    assert!(!accepts(list, any_zone(), None));
+    assert_eq!(accepts(list, "zonea", id(&principal)), accepts(list, "zoneb", id(&principal)));
+    assert!(!accepts(list, any_zone().as_ref(), None));
 }
 
 /// And two: a list of zone entries ignores the sender's principal, known or not.
@@ -67,8 +88,8 @@ fn a_principal_list_ignores_the_senders_zone() {
 fn a_zone_list_ignores_the_senders_principal() {
     let entries = [any_zone(), any_zone()];
     let list = &entries[..kani::any_where(|&l: &usize| l <= 2)];
-    let zone = any_zone();
-    assert_eq!(accepts(list, zone, any_principal()), accepts(list, zone, None));
+    let (zone, principal) = (any_zone(), any_principal());
+    assert_eq!(accepts(list, zone.as_ref(), id(&principal)), accepts(list, zone.as_ref(), None));
 }
 
 /// Whether a model pattern is one `check_models` lets a zone list: not empty, and a `*` only as
