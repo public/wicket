@@ -88,15 +88,13 @@ impl Vault {
     /// When a reference's current value expires upstream (Unix ms), if its file says so (e.g. the
     /// linked login's access token): a node holding a copy drops it then (#152).
     pub fn expires_at(&self, name: &str) -> Option<i64> {
-        let r = self.path(name).ok()?.with_extension("ref");
-        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
-        if let Some(h) = spec.get("helper").filter(|h| !h.is_null()) {
-            let h: crate::secret_helper::HelperRef = serde_json::from_value(h.clone()).ok()?;
+        let spec = self.read_ref(name).ok()?;
+        if let Some(h) = &spec.helper {
             return h.fetch(name).ok()?.expires_at;
         }
-        let (file, ep) = (spec.get("file")?.as_str()?, spec.get("expires_pointer")?.as_str()?);
+        let (file, ep) = (spec.file?, spec.expires_pointer?);
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
-        doc.pointer(ep)?.as_i64()
+        doc.pointer(&ep)?.as_i64()
     }
 
     pub fn default_dir() -> PathBuf {
@@ -116,9 +114,8 @@ impl Vault {
             return s.get(name);
         }
         let p = self.path(name)?;
-        let r = p.with_extension("ref");
-        if r.exists() {
-            return self.get_ref(name, &r);
+        if p.with_extension("ref").exists() {
+            return self.get_ref(name);
         }
         let meta = std::fs::metadata(&p).with_context(|| format!("secret {name:?} is not set (run: wicket secret set {name})"))?;
         if let Err(why) = check_private(&p, &meta) {
@@ -132,28 +129,43 @@ impl Vault {
         Ok(v)
     }
 
-    fn get_ref(&self, name: &str, r: &std::path::Path) -> Result<String> {
-        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r)?)?;
-        if let Some(h) = spec.get("helper").filter(|h| !h.is_null()) {
-            let h: crate::secret_helper::HelperRef =
-                serde_json::from_value(h.clone()).with_context(|| format!("{name}.ref has a malformed \"helper\""))?;
+    fn get_ref(&self, name: &str) -> Result<String> {
+        let spec = self.read_ref(name)?;
+        if let Some(h) = &spec.helper {
             return Ok(h.fetch(name)?.value);
         }
-        let file = spec.get("file").and_then(|v| v.as_str()).with_context(|| format!("{name}.ref needs \"file\""))?;
+        let file = spec.file.as_deref().with_context(|| format!("{name}.ref needs \"file\""))?;
         // No pointer: the whole file is the secret (e.g. an API key file).
-        let pointer = spec.get("pointer").and_then(|v| v.as_str());
-        let expires_pointer = spec.get("expires_pointer").and_then(|v| v.as_str());
-        read_linked(name, file, pointer, expires_pointer).map(|(v, _)| v).map_err(|e| unreadable_hint(name, file, e))
+        read_linked(name, file, spec.pointer.as_deref(), spec.expires_pointer.as_deref())
+            .map(|(v, _)| v)
+            .map_err(|e| unreadable_hint(name, file, e))
+    }
+
+    /// `name`'s link (`<name>.ref`), as written by [`Vault::link`] or [`Vault::link_via_helper`].
+    fn read_ref(&self, name: &str) -> Result<RefFile> {
+        let r = self.path(name)?.with_extension("ref");
+        serde_json::from_str(&std::fs::read_to_string(&r)?).with_context(|| format!("{name}.ref is malformed"))
+    }
+
+    /// Writes `name`'s link (private, in a private directory) in place of any stored value, and
+    /// checks it by reading the secret through it once.
+    fn write_ref(&self, name: &str, spec: &RefFile) -> Result<()> {
+        let p = self.path(name)?;
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+        let r = p.with_extension("ref");
+        std::fs::write(&r, serde_json::to_vec_pretty(spec)?)?;
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o600))?;
+        let _ = std::fs::remove_file(&p);
+        self.get(name).map(|_| ())
     }
 
     /// For a secret linked to a JSON field, the object that holds it, as the file has it now (e.g.
     /// a harness login's object, for its non-secret fields: scopes, plan).
     /// None for a stored secret or a whole-file link.
     pub fn linked_object(&self, name: &str) -> Option<serde_json::Value> {
-        let r = self.path(name).ok()?.with_extension("ref");
-        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
-        let file = spec.get("file")?.as_str()?;
-        let pointer = spec.get("pointer")?.as_str()?;
+        let spec = self.read_ref(name).ok()?;
+        let (file, pointer) = (spec.file?, spec.pointer?);
         let parent = &pointer[..pointer.rfind('/')?];
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
         doc.pointer(parent).filter(|v| v.is_object()).cloned()
@@ -162,9 +174,7 @@ impl Vault {
     /// What the linker stored with a linked secret (see [`Vault::link`]); None for a stored secret,
     /// or a link made without any.
     pub fn link_meta(&self, name: &str) -> Option<serde_json::Value> {
-        let r = self.path(name).ok()?.with_extension("ref");
-        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
-        spec.get("meta").filter(|m| !m.is_null()).cloned()
+        self.read_ref(name).ok()?.meta
     }
 
     /// Makes `name` a reference to another file (never copied into the vault): a JSON field in it,
@@ -182,18 +192,14 @@ impl Vault {
         if pointer.is_none() && expires_pointer.is_some() {
             bail!("an expiry pointer needs a JSON pointer: a whole-file reference has no fields");
         }
-        let p = self.path(name)?;
-        std::fs::create_dir_all(&self.dir)?;
-        std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
-        let mut spec = serde_json::json!({ "file": file, "pointer": pointer, "expires_pointer": expires_pointer });
-        if let Some(m) = meta {
-            spec["meta"] = m.clone();
-        }
-        let r = p.with_extension("ref");
-        std::fs::write(&r, serde_json::to_vec_pretty(&spec)?)?;
-        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o600))?;
-        let _ = std::fs::remove_file(&p);
-        self.get(name).map(|_| ())
+        let spec = RefFile {
+            file: Some(file.into()),
+            pointer: pointer.map(String::from),
+            expires_pointer: expires_pointer.map(String::from),
+            helper: None,
+            meta: meta.cloned(),
+        };
+        self.write_ref(name, &spec)
     }
 
     /// Makes `name` a reference to a value `wicket secret serve` holds, running as the linked file's
@@ -207,25 +213,19 @@ impl Vault {
         file: Option<&str>,
         meta: Option<&serde_json::Value>,
     ) -> Result<()> {
-        let p = self.path(name)?;
-        std::fs::create_dir_all(&self.dir)?;
-        std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
-        let mut spec = serde_json::json!({ "file": file, "helper": helper });
-        if let Some(m) = meta {
-            spec["meta"] = m.clone();
-        }
-        let r = p.with_extension("ref");
-        std::fs::write(&r, serde_json::to_vec_pretty(&spec)?)?;
-        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o600))?;
-        let _ = std::fs::remove_file(&p);
-        self.get(name).map(|_| ())
+        let spec = RefFile {
+            file: file.map(String::from),
+            pointer: None,
+            expires_pointer: None,
+            helper: Some(helper.clone()),
+            meta: meta.cloned(),
+        };
+        self.write_ref(name, &spec)
     }
 
     /// The helper a linked secret is read through (#350), if it is linked that way.
     pub fn helper_of(&self, name: &str) -> Option<crate::secret_helper::HelperRef> {
-        let r = self.path(name).ok()?.with_extension("ref");
-        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
-        serde_json::from_value(spec.get("helper")?.clone()).ok()
+        self.read_ref(name).ok()?.helper
     }
 
     /// [`Vault::get_for`], for a request about to go upstream (#350): a value that can't be read is
@@ -336,9 +336,8 @@ impl Vault {
         let r = p.with_extension("ref");
         let (reference, meta) = match std::fs::symlink_metadata(&r) {
             Ok(m) => {
-                let spec: serde_json::Value = std::fs::read(&r).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-                let s = |k: &str| spec.get(k).and_then(|v| v.as_str()).map(String::from);
-                (Some(Reference { file: s("file").unwrap_or_default(), pointer: s("pointer") }), m)
+                let spec = self.read_ref(name).unwrap_or_default();
+                (Some(Reference { file: spec.file.unwrap_or_default(), pointer: spec.pointer }), m)
             }
             Err(_) => (None, std::fs::symlink_metadata(&p).ok()?),
         };
@@ -370,6 +369,24 @@ impl Vault {
         v.sort();
         v
     }
+}
+
+/// A linked secret's `<name>.ref`: what it refers to, never the value. A file (its JSON field at
+/// `pointer`, or all of it), with where its expiry is; or a helper that serves it (#350). `meta` is
+/// the linker's, opaque here. Read leniently (a `null` is an absent field), so links any build wrote
+/// read alike.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RefFile {
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pointer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_pointer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    helper: Option<crate::secret_helper::HelperRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Value>,
 }
 
 /// A secret as [`Vault::info`] describes it: never its value.
@@ -716,6 +733,34 @@ mod tests {
         assert_eq!(v.link_meta("api"), None, "a re-link replaces what the last one kept");
         v.set("stored", "x").unwrap();
         assert_eq!(v.link_meta("stored"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Links as earlier builds wrote them (every field present, `null` for none) read as they did.
+    #[test]
+    fn links_written_by_earlier_builds_still_read() {
+        let dir = std::env::temp_dir().join(format!("wicket-vault-oldref-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("vault")).unwrap();
+        let login = dir.join("login.json");
+        std::fs::write(&login, r#"{"acct": {"token": "tok-1", "expires": 4102444800000, "plan": "max"}}"#).unwrap();
+        std::fs::set_permissions(&login, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let v = Vault::new(dir.join("vault"));
+        let old = serde_json::json!({ "file": login, "pointer": "/acct/token", "expires_pointer": "/acct/expires", "meta": null });
+        std::fs::write(dir.join("vault/claude.ref"), serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+        assert_eq!(v.get("claude").unwrap(), "tok-1");
+        assert_eq!(v.expires_at("claude"), Some(4_102_444_800_000));
+        assert_eq!(v.linked_object("claude").unwrap()["plan"], "max");
+        assert_eq!((v.link_meta("claude"), v.helper_of("claude")), (None, None));
+        assert_eq!(v.info("claude").unwrap().reference.unwrap().pointer.as_deref(), Some("/acct/token"));
+        // A whole-file link: no pointer at all, and `null` for the expiry.
+        let key = dir.join("key");
+        std::fs::write(&key, "k\n").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let old = serde_json::json!({ "file": key, "pointer": null, "expires_pointer": null });
+        std::fs::write(dir.join("vault/api.ref"), serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+        assert_eq!(v.get("api").unwrap(), "k");
+        assert_eq!(v.expires_at("api"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
