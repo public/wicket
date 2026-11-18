@@ -54,8 +54,12 @@ pub fn op_for(tenant: &crate::TenantId, run: &crate::RunId, zone: &str, method: 
 }
 
 /// Whether an op (method and path) is a push's: what a grant for it covers for a window.
+/// (Compared as bytes, without allocating, for Kani: `RECEIVE_PACK` is lowercase ASCII.)
 pub fn is_push(method: &str, path: &str) -> bool {
-    method.eq_ignore_ascii_case("POST") && path.to_ascii_lowercase().ends_with(RECEIVE_PACK) && path.len() > RECEIVE_PACK.len() + 1
+    let p = path.as_bytes();
+    method.eq_ignore_ascii_case("POST")
+        && p.len() > RECEIVE_PACK.len() + 1
+        && p[p.len() - RECEIVE_PACK.len()..].eq_ignore_ascii_case(RECEIVE_PACK.as_bytes())
 }
 
 /// The uses and lifetime (seconds) a grant for `method path` is made with, given what the approver
@@ -117,4 +121,33 @@ mod tests {
         assert_eq!(grant_terms("POST", "/acme/app.git/git-receive-pack", Some(1), 60), (None, 60));
         assert_eq!(grant_terms("POST", "/acme/app/issues", Some(1), 3600), (Some(1), 3600));
     }
+
+    /// `is_push` compares bytes now (for Kani); it decides as the lowercasing form did.
+    #[test]
+    fn is_push_decides_as_lowercasing_did() {
+        let old = |m: &str, p: &str| {
+            m.eq_ignore_ascii_case("POST") && p.to_ascii_lowercase().ends_with(RECEIVE_PACK) && p.len() > RECEIVE_PACK.len() + 1
+        };
+        for m in ["POST", "post", "PoSt", "GET", "", "POSTS"] {
+            for p in [
+                "/a/git-receive-pack",
+                "/A/GIT-RECEIVE-PACK",
+                "a/git-receive-pack",
+                "//git-receive-pack",
+                "/git-receive-pack",
+                "x/git-receive-pack",
+                "/é/git-receive-pack",
+                "/a/git-receive-packé",
+                "/a/git-receive-pac",
+                "é",
+                "",
+            ] {
+                assert_eq!(is_push(m, p), old(m, p), "{m} {p}");
+            }
+        }
+    }
 }
+
+#[cfg(kani)]
+#[path = "proofs/git.rs"]
+mod proofs;

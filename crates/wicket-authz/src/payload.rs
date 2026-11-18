@@ -403,8 +403,11 @@ impl Grant {
     /// an older node (within `PROTOCOL_SKEW`) reads the same block, vets it, and agrees with the
     /// ledger too: a strict `$t < not_after` would be a new rule shape such a node's structure
     /// check refuses, and its inclusive reading of an unchanged `expires_at` is the bug itself.
+    ///
+    /// The arithmetic is `wicket_core::quota::not_after_for`, which Kani checks against the
+    /// ledger's half-open end at every millisecond (#325).
     pub fn not_after_for(expires_at: i64) -> u64 {
-        u64::try_from(expires_at.saturating_sub(1)).unwrap_or(0)
+        wicket_core::quota::not_after_for(expires_at)
     }
 }
 

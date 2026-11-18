@@ -387,6 +387,14 @@ pub(crate) fn decide(forbidden: impl FnOnce() -> bool, risk: RiskClass, reach: i
 #[path = "proofs/decide.rs"]
 mod decide_proofs;
 
+#[cfg(any(kani, test))]
+#[path = "proofs/ip_blocks.rs"]
+mod ip_blocks;
+
+#[cfg(kani)]
+#[path = "proofs/ip.rs"]
+mod ip_proofs;
+
 impl std::ops::Deref for CompiledZone {
     type Target = ZoneSpec;
     fn deref(&self) -> &ZoneSpec {
@@ -451,6 +459,49 @@ pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
 mod tests {
     use super::*;
     use crate::Manifest;
+
+    /// #325: `is_public_ip` against the table of never-public blocks Kani checks it against over
+    /// every address (proofs/ip.rs): here at each block's edges and a million samples, so a typo
+    /// in the table shows without Kani.
+    #[test]
+    fn is_public_ip_agrees_with_the_block_table_kani_checks() {
+        use super::ip_blocks::{in_v4, in_v6, V4_BLOCKS, V6_BLOCKS};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let v4 = |a: u32| {
+            assert_eq!(is_public_ip(&IpAddr::V4(Ipv4Addr::from(a))), !V4_BLOCKS.iter().any(|b| in_v4(a, *b)), "{}", Ipv4Addr::from(a))
+        };
+        let v6 = |a: u128| {
+            assert_eq!(is_public_ip(&IpAddr::V6(Ipv6Addr::from(a))), !V6_BLOCKS.iter().any(|b| in_v6(a, *b)), "{}", Ipv6Addr::from(a))
+        };
+        // Each block's edges and the addresses just outside them.
+        for &(net, len) in V4_BLOCKS {
+            let last = net | (u32::MAX >> len.min(31) >> u32::from(len == 32));
+            for a in [net, last, net.wrapping_sub(1), last.wrapping_add(1)] {
+                v4(a);
+            }
+        }
+        for &(net, len) in V6_BLOCKS {
+            let last = net | (u128::MAX >> len);
+            for a in [net, last, net.wrapping_sub(1), last.wrapping_add(1)] {
+                v6(a);
+            }
+        }
+        // And a million addresses of each family, from a fixed xorshift.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..1_000_000 {
+            v4(next() as u32);
+            let hi = next();
+            v6((u128::from(hi) << 64) | u128::from(next()));
+            // Under the blocks' own prefixes too, where a random address rarely lands.
+            v6(u128::from(hi >> 32) << 96 | u128::from(next() as u32));
+        }
+    }
 
     /// #326: every range `is_public_ip` refuses, by an address inside it and a public neighbour just
     /// outside, so each clause alone decides some address (mutation testing found none of them
