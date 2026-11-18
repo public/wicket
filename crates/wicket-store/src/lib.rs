@@ -12,6 +12,8 @@ mod agents;
 mod capgrant;
 pub use capgrant::{covers as capacity_covers, CapacityAsk, CapacityGrant, CapacityTerms, CapacityUsed, CAPACITY_GRANT_PATH};
 mod delegations;
+mod digestgrant;
+pub use digestgrant::{valid_digest, DigestAction, DigestGrantRow, DigestScope, DigestUse, NewDigestGrant, DIGEST_METHOD};
 mod effect;
 pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
 pub use effect::{descriptor, requesters, DecisionTerms, EffectUse, EgressSeen, Filed};
