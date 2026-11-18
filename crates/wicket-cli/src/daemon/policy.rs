@@ -369,7 +369,7 @@ mod tests {
             (&["node", "plans"], Route::Forward(Privileged)),
             (&["node", "release", "i-1"], Route::Forward(Privileged)),
             (
-                &["node", "create", "--name", "n1", "--hosts", "example.com", "--max-hourly", "1", "--max-total", "1", "--ssh-key-id", "k"],
+                &["node", "create", "--name", "n1", "--hosts", "example.com", "--ssh-key-id", "k"],
                 Route::Forward(Privileged),
             ),
             (&["self", "status"], Route::Forward(Read)),
