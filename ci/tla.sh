@@ -82,6 +82,11 @@ expect_fail() {
     fail_placement_no_start_by) echo 'NoStartPastLease' ;;
     fail_placement_no_admission) echo 'NoOvercommit' ;;
     fail_placement_release_running) echo 'NoReleaseWithWork' ;;
+    # #321's update path (Update.tla): #475's, #487's and #529's bugs, and why the expand rule stays.
+    fail_update_old_supervisor_drops_prompts | fail_update_handover_without_expand) echo 'NoPromptLost' ;;
+    fail_update_old_build_lingers) echo 'OldBuildBounded' ;;
+    fail_update_drain_hangs) echo 'DaemonTakesCommands' ;;
+    fail_update_local_serve_left_old | fail_update_serve_after_stop) echo 'BoxesKept' ;;
     *) echo "" ;;
   esac
 }
