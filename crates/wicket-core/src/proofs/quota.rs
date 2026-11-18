@@ -2,7 +2,7 @@
 //! #322's Lean spec has no counterpart yet. Over every `i64`, not bounded inputs: there are no
 //! loops but the uses harness's, bounded by its `#[kani::unwind]`.
 
-use super::{money_fits, take_use, Money, MoneyOver};
+use super::{money_fits, not_after_for, take_use, token_allows, Money, MoneyOver};
 
 fn any_money() -> Money {
     Money { hourly: kani::any(), total: kani::any() }
@@ -52,4 +52,16 @@ fn a_grant_of_k_uses_is_accepted_k_times() {
     }
     assert_eq!(accepted, k);
     assert_eq!(left, Some(0));
+}
+
+/// #342: a node's token and the ledger end a grant at the same millisecond. For every grant end
+/// `expires_at` (`>= 1`: every grant's, which ends after the epoch) and every clock reading of the
+/// node's, the token's `not_after_for(expires_at)` allows a request exactly while the ledger's
+/// half-open grant is live (`now_ms < expires_at * 1000`, exact in `i128`).
+#[kani::proof]
+fn a_token_ends_at_the_ledgers_millisecond() {
+    let (expires_at, now_ms): (i64, i64) = kani::any();
+    kani::assume(expires_at >= 1);
+    let live = i128::from(now_ms) < i128::from(expires_at) * 1000;
+    assert_eq!(token_allows(not_after_for(expires_at), now_ms), live);
 }

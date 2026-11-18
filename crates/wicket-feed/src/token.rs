@@ -193,7 +193,7 @@ impl Policy for BoxAuthority {
 /// so `inject` is always empty.
 fn request(spec: &BoxAuthority, op: &Op, now_ms: i64) -> authz::Request {
     authz::Request {
-        time: u64::try_from(now_ms.div_euclid(1000)).unwrap_or(0),
+        time: wicket_core::quota::token_secs(now_ms),
         tenant: op.tenant.0.clone(),
         box_id: spec.box_path.clone(),
         epoch: spec.epoch,
@@ -492,7 +492,7 @@ impl Replica<BoxAuthority> {
             return Err("the authority issuing key that minted this box's token is no longer certified".into());
         }
         let req = authz::Request {
-            time: u64::try_from(now.div_euclid(1000)).unwrap_or(0),
+            time: wicket_core::quota::token_secs(now),
             tenant: tenant.into(),
             box_id: z.spec.box_path.clone(),
             epoch: z.spec.epoch,

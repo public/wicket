@@ -32,6 +32,26 @@ pub fn money_fits(reserved: Money, new: Money, max: Money) -> Result<(), MoneyOv
     Ok(())
 }
 
+/// The `not_after` a grant the ledger ends at `expires_at` (Unix seconds) is published with in a
+/// node's token (#342; `wicket-authz`'s `Grant::not_after_for`). The ledger's grant is live while
+/// `now_ms < expires_at * 1000` (#337: half-open); the token's check is
+/// `floor(now_ms / 1000) <= not_after`. So `expires_at - 1`: the two agree at every millisecond
+/// (Kani checks it, `proofs/quota.rs`). An `expires_at` of 0 or less, which no grant has, gives 0.
+pub fn not_after_for(expires_at: i64) -> u64 {
+    u64::try_from(expires_at.saturating_sub(1)).unwrap_or(0)
+}
+
+/// A request's time in a node's token (Unix seconds), from the node's clock in ms: floored, and 0
+/// before the epoch (`wicket-feed`'s `authz::Request`).
+pub fn token_secs(now_ms: i64) -> u64 {
+    u64::try_from(now_ms.div_euclid(1000)).unwrap_or(0)
+}
+
+/// Whether a token's `not_after` allows a request at `now_ms`: its check, `time <= not_after`.
+pub fn token_allows(not_after: u64, now_ms: i64) -> bool {
+    token_secs(now_ms) <= not_after
+}
+
 /// One use of a grant with `uses_left` (None: not counted). `Some(left)`: accepted, with `left`
 /// uses left after it (None again for a grant that isn't counted). None: refused, for a counted
 /// grant with no use left (zero, or a count below it that no grant should hold).
@@ -60,6 +80,25 @@ mod tests {
         // Exact below too: a sum under i64::MIN is within a limit of i64::MIN.
         assert_eq!(money_fits(m(i64::MIN, i64::MIN), m(-1, -1), m(i64::MIN, i64::MIN)), Ok(()));
         assert_eq!(money_fits(m(i64::MAX, i64::MAX), m(i64::MIN, i64::MIN), m(-1, -1)), Ok(()));
+    }
+
+    /// #342 (Kani checks every value, proofs/quota.rs): the token allows through the last
+    /// millisecond before the ledger's end, never at it.
+    #[test]
+    fn a_token_ends_at_the_ledgers_millisecond() {
+        for e in [1i64, 2, 1_700_000_000, i64::MAX / 1000, i64::MAX] {
+            let na = not_after_for(e);
+            let ms = i128::from(e) * 1000;
+            for now in [ms - 1001, ms - 1000, ms - 1, ms, ms + 1, 0, -1, i128::from(i64::MIN), i128::from(i64::MAX)] {
+                let Ok(now) = i64::try_from(now) else { continue };
+                assert_eq!(token_allows(na, now), i128::from(now) < ms, "expires_at {e}, now_ms {now}");
+            }
+        }
+        // No grant ends at or before the epoch; such an end gives 0, which allows the first second.
+        assert_eq!(not_after_for(0), 0);
+        assert_eq!(not_after_for(i64::MIN), 0);
+        assert_eq!(token_secs(-1), 0);
+        assert_eq!(token_secs(1999), 1);
     }
 
     #[test]
