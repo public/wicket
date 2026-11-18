@@ -6,9 +6,6 @@
 //! survives losing the control host: a standby restored from the recovery kit (which holds
 //! `state.key`) and the store fetches it with `wicket state snapshot`, verified by its digest.
 //!
-//! Snapshots that builds before #258 pushed (sealed objects `ledger-snapshots/<name>`, no digest) are
-//! still listed, fetched and pruned.
-//!
 //! Pruning (`wicket self prune`, and after each update) applies the local rule to the store's copies
 //! too: the newest few, and always the newest of the current and previous versions'.
 
@@ -17,7 +14,7 @@ use std::path::Path;
 use wicket_store::cas::{Cas, Digest};
 use wicket_store::sealed::SealedStore;
 
-/// The refs' prefix in the store (and the objects' prefix before #258).
+/// The refs' prefix in the store.
 pub const PREFIX: &str = "ledger-snapshots/";
 
 /// The installation's store for snapshots, sealed; None without a state store.
@@ -57,16 +54,14 @@ pub fn push(st: &Cas, snap: &Path) -> Result<(String, Digest)> {
 
 /// The snapshots in the store, oldest first (by name: `<seconds>-<id>.db`).
 pub fn list(st: &Cas) -> Result<Vec<String>> {
-    let refs = st.refs(PREFIX)?;
-    let legacy = st.backend().list_prefix(PREFIX)?;
     let mut names: Vec<String> =
-        refs.into_iter().chain(legacy).filter_map(|k| k.strip_prefix(PREFIX).map(String::from)).filter(|n| valid_name(n)).collect();
+        st.refs(PREFIX)?.into_iter().filter_map(|k| k.strip_prefix(PREFIX).map(String::from)).filter(|n| valid_name(n)).collect();
     names.sort_by_key(|n| (n.split('-').next().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0), n.clone()));
     names.dedup();
     Ok(names)
 }
 
-/// Deletes snapshot `name` from the store: its ref, and a copy pushed before #258. Its blob goes
+/// Deletes snapshot `name` from the store: its ref. Its blob goes
 /// with the store's next collection (`crate::storegc`), unless something else still names it.
 pub fn remove(st: &Cas, name: &str) -> Result<()> {
     if !valid_name(name) {
@@ -74,7 +69,6 @@ pub fn remove(st: &Cas, name: &str) -> Result<()> {
     }
     let key = format!("{PREFIX}{name}");
     st.delete_ref(&key)?;
-    st.backend().delete(&key)?;
     Ok(())
 }
 
@@ -86,10 +80,8 @@ pub fn fetch(st: &Cas, name: &str, out: &Path) -> Result<()> {
         bail!("not a snapshot's name: {name} (`wicket state snapshots` lists them)");
     }
     let key = format!("{PREFIX}{name}");
-    let mut r = match st.get_ref(&key)? {
-        Some(d) => st.get(&d)?.with_context(|| format!("snapshot {name} names {d}, which isn't in the state store"))?,
-        None => st.backend().get(&key)?.with_context(|| format!("no snapshot {name} in the state store"))?,
-    };
+    let d = st.get_ref(&key)?.with_context(|| format!("no snapshot {name} in the state store"))?;
+    let mut r = st.get(&d)?.with_context(|| format!("snapshot {name} names {d}, which isn't in the state store"))?;
     let tmp = out.with_file_name(format!(".{}.part", out.file_name().and_then(|n| n.to_str()).unwrap_or("snapshot")));
     let _ = std::fs::remove_file(&tmp);
     let mut f =
@@ -142,7 +134,7 @@ pub fn get(name: &str, out: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wicket_store::objects::{DirStore, ObjectStore};
+    use wicket_store::objects::DirStore;
 
     fn files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -209,26 +201,6 @@ mod tests {
         };
         assert_eq!(st.collect(&plan).unwrap().deleted, vec![digest]);
         assert!(!st.has(&digest).unwrap());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_snapshot_pushed_before_the_store_is_still_read_and_pruned() {
-        let d = std::env::temp_dir().join(format!("wicket-snapstore-legacy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let snap = d.join("ledger.db");
-        wicket_store::Ledger::open(&d.join("l.db")).unwrap().snapshot(&snap).unwrap();
-        // As #167 pushed it: the file sealed as an object of its own name.
-        let old = SealedStore::new(DirStore::new(d.join("store")), &[7u8; 32]);
-        let name = "1600000000-cccccccccccc.db";
-        old.put_if_absent(&format!("{PREFIX}{name}"), &mut std::fs::File::open(&snap).unwrap()).unwrap();
-        let st = Cas::new(SealedStore::new(DirStore::new(d.join("store")), &[7u8; 32]));
-        assert_eq!(list(&st).unwrap(), [name]);
-        fetch(&st, name, &d.join("back.db")).unwrap();
-        assert_eq!(std::fs::read(d.join("back.db")).unwrap(), std::fs::read(&snap).unwrap());
-        remove(&st, name).unwrap();
-        assert!(list(&st).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 }
