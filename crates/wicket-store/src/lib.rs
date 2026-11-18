@@ -26,6 +26,8 @@ pub mod money;
 mod node;
 #[cfg(test)]
 mod previous_build;
+#[cfg(test)]
+mod props;
 mod quota;
 mod receipts;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};

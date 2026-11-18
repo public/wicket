@@ -3,15 +3,17 @@
 # (wicket-core subset.rs, op.rs), path canonicalisation (canon.rs), the host and glob matchers
 # (manifest.rs), the model budget (budget.rs), what an agent may decide (authority.rs), version
 # skew (version.rs), who may link (link.rs), token loading and cost (wicket-authz), grant
-# bounds (wicket-control grant.rs), and the egress proxy's host judging, request preparation,
-# node decisions and dial-time address checks (wicket-proxy). Each mutant is a small change to the code (`>` for `>=`, a
+# bounds (wicket-control grant.rs), the digest grants and the money check (wicket-store
+# digestgrant.rs, money.rs, #258, #256), digest acceptance (wicket-control digest.rs), and the
+# egress proxy's host judging, request preparation, node decisions and dial-time address checks
+# (wicket-proxy). Each mutant is a small change to the code (`>` for `>=`, a
 # function returning a constant, a deleted match arm); one the tests still pass on is a test gap.
 # Kani's proofs (authority, version) don't run under `cargo test`: unit tests at the boundaries
 # stand in for them here.
 #
 #   ci/mutants.sh [--jobs N] [--only <name>] [--list]
 #
-#   --only   one set: core, authority, matchers, authz, grant or proxy
+#   --only   one set: core, authority, matchers, authz, grant, digest, accept or proxy
 #   --list   print the mutants each set would test, and test none
 #
 # A surviving mutant fails the run unless ci/mutants.accepted lists it (equivalent mutants: ones no
@@ -50,6 +52,8 @@ sets=(
   "matchers|wicket-core|-f crates/wicket-core/src/manifest.rs -F host_matches|compile_glob|wildcard_for|allows_model|model_covers|names_host|covers_host|ReachRule::matches|check_models|fold_case_glob|core"
   "authz|wicket-authz|-f crates/wicket-authz/src/decide.rs -f crates/wicket-authz/src/token.rs -f crates/wicket-authz/src/cost.rs|authz"
   "grant|wicket-control|-f crates/wicket-control/src/grant.rs -F within_authority|check_terms|agent_terms|outlasts|descendant_chain|agent_renews|bounds|check_ttl|check_prefix|grant"
+  "digest|wicket-store|-f crates/wicket-store/src/digestgrant.rs -f crates/wicket-store/src/money.rs|store"
+  "accept|wicket-control|-f crates/wicket-control/src/digest.rs|accept"
   "proxy|wicket-proxy|-f crates/wicket-proxy/src/decide.rs -f crates/wicket-proxy/src/egress/hosts.rs -f crates/wicket-proxy/src/egress/outgoing.rs -f crates/wicket-proxy/src/egress/connect.rs -f crates/wicket-proxy/src/dial.rs|proxy"
 )
 survived=()
@@ -61,6 +65,8 @@ for s in "${sets[@]}"; do
     core) targs=("${core_tests[@]}") ;;
     authz) targs=(-- -- --skip oracle3) ;;
     grant) targs=(-- --lib -- grant) ;;
+    store) targs=(-- --lib -- digestgrant money props approved_update lease) ;;
+    accept) targs=(-- --lib -- digest) ;;
     proxy) targs=() ;;
   esac
   # The -F regex holds `|`: split the filters on spaces only.
