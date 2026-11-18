@@ -6,6 +6,16 @@
 //! (`noderun.rs`), as this host's own boxes do through the built-in local node (`localnode.rs`, #146);
 //! a target that isn't enrolled is reached only to enrol it (trust on first use, with a warning).
 //!
+//! **One connection per node** (#287). An enrolled node's ssh shares one connection: the first
+//! command to it opens a master (`ControlMaster=auto`), whose socket is in [`master_dir`] (the
+//! wicket user's, 0700), and every later command for 10 minutes after the last one
+//! (`ControlPersist`) is a session over it: no new TCP connection, key exchange or authentication
+//! (a start on a node over ssh measured 0.39 s cold, 0.05 s over a master). The master was opened
+//! with the pinned host key, as every connection is. Revoking or releasing a node closes it
+//! ([`Node::close_master`]): a master would otherwise let commands through to a node whose pinned
+//! key is gone. Keepalives end a master whose connection died within 30 s; a channel that gets no
+//! answer through one closes it and dials again, fresh (`noderun.rs`).
+//!
 //! **Test hook.** `WICKET_NODE_SSH` replaces `ssh <options> <target>` for every command sent to a node
 //! with the command it names (split on spaces; it gets the remote command as one argument, as ssh
 //! does), e.g. `env HOME=/tmp/node sh -c` to treat a directory on this machine as the node. Everything
@@ -59,10 +69,17 @@ impl Node {
             base.push("-i".into());
             base.push(k.display().to_string());
         }
-        let common = ["BatchMode=yes", "ConnectTimeout=15", "ServerAliveInterval=30"].map(String::from);
+        let common = ["BatchMode=yes", "ConnectTimeout=15", "ServerAliveInterval=10", "ServerAliveCountMax=3"].map(String::from);
         for o in host_key_opts.iter().chain(common.iter()) {
             base.push("-o".into());
             base.push(o.clone());
+        }
+        // An enrolled node's connection is shared (a target reached to enrol it isn't: its key isn't pinned yet).
+        if name.is_some() {
+            for o in master_options(&master_dir()) {
+                base.push("-o".into());
+                base.push(o);
+            }
         }
         let hook = std::env::var("WICKET_NODE_SSH")
             .ok()
@@ -79,6 +96,26 @@ impl Node {
         let mut v = self.base.clone();
         v.push(self.target.clone());
         v
+    }
+
+    /// Closes this node's shared connection, if one is open (`ssh -O exit`): after a revocation or a
+    /// release, so nothing more reaches the node over it. Best effort: no master is not an error.
+    /// It only talks to the local control socket, so it returns at once.
+    pub fn close_master(&self) {
+        let Some(argv) = self.close_master_argv() else { return };
+        let _ =
+            std::process::Command::new(&argv[0]).args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+
+    /// The command [`Node::close_master`] runs: this node's ssh options (so the same control
+    /// socket), then `-O exit` and the target. None for a node whose connection isn't shared.
+    pub fn close_master_argv(&self) -> Option<Vec<String>> {
+        if self.hook.is_some() || self.name.is_none() {
+            return None;
+        }
+        let mut v = self.base.clone();
+        v.extend(["-O".to_string(), "exit".to_string(), self.target.clone()]);
+        Some(v)
     }
 
     fn cmd(&self) -> Command {
@@ -115,6 +152,22 @@ impl Node {
         }
         Ok(())
     }
+}
+
+/// Where the shared connections' control sockets are: `<data dir>/ssh`, made 0700 (the wicket user's).
+pub fn master_dir() -> PathBuf {
+    let d = crate::data_dir().join("ssh");
+    if std::fs::create_dir_all(&d).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700));
+    }
+    d
+}
+
+/// ssh options that share one connection per node through a socket in `dir` (#287): `%C` is a hash
+/// of the local host, the remote host, port and user, short enough for a socket's path.
+pub fn master_options(dir: &Path) -> Vec<String> {
+    vec!["ControlMaster=auto".into(), format!("ControlPath=\"{}/cm-%C\"", dir.display()), "ControlPersist=10m".into()]
 }
 
 /// ssh options that accept only the pinned key: no global known_hosts, no learning or updating keys.

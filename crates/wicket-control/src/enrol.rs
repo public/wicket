@@ -550,6 +550,8 @@ WantedBy=default.target
 pub fn revoke(ledger: &mut Ledger, nodes_dir: &Path, name: &str) -> Result<Vec<String>> {
     let serials = ledger.revoke_node(name)?;
     let pin = Pin::for_node(nodes_dir, name);
+    // Its shared connection first (#287): one would carry commands to it without the host key.
+    close_master_of(ledger, nodes_dir, name);
     match std::fs::remove_file(&pin.known_hosts) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -557,6 +559,13 @@ pub fn revoke(ledger: &mut Ledger, nodes_dir: &Path, name: &str) -> Result<Vec<S
     }
     ledger.audit(&TenantId::single(), None, "node.revoked", &serde_json::json!({ "name": name, "ca_serials": serials }))?;
     Ok(serials)
+}
+
+/// Closes the shared ssh connection to enrolled node `name`, if one is open (#287).
+pub fn close_master_of(ledger: &Ledger, nodes_dir: &Path, name: &str) {
+    let Ok(Some(row)) = ledger.node(name) else { return };
+    let pin = Pin::for_node(nodes_dir, name);
+    Node::pinned(&row.target, None, &pin, name).close_master();
 }
 
 /// `wicket node list`: every enrolled node, with its lease, provider and cost if it has a lease, then
@@ -715,6 +724,48 @@ mod tests {
         assert_eq!(p.last().unwrap(), "wicket@203.0.113.7");
         let tofu = Node::new("wicket@203.0.113.7", None).ssh_prefix();
         assert!(tofu.iter().any(|o| o == "StrictHostKeyChecking=accept-new"));
+        // #287: an enrolled node's connection is shared, through a socket in the wicket user's 0700
+        // directory; a node reached to enrol it (its key not pinned yet) isn't.
+        let dir = crate::node::master_dir();
+        let path = format!("ControlPath=\"{}/cm-%C\"", dir.display());
+        for want in ["ControlMaster=auto", path.as_str(), "ControlPersist=10m", "ServerAliveCountMax=3"] {
+            assert!(opts.contains(&want), "{want} missing from {opts:?}");
+        }
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(!tofu.iter().any(|o| o.starts_with("ControlMaster") || o.starts_with("ControlPath")));
+        // Closing it is the same options, then `-O exit` and the target; nothing for a TOFU node.
+        let close = Node::pinned("wicket@203.0.113.7", None, &pin, "n1").close_master_argv().unwrap();
+        assert!(close.contains(&path));
+        assert_eq!(close[close.len() - 3..], ["-O", "exit", "wicket@203.0.113.7"]);
+        assert!(Node::new("wicket@203.0.113.7", None).close_master_argv().is_none());
+    }
+
+    /// #287: revoking a node closes its shared connection, before its pinned key goes: one left open
+    /// would carry commands to the node without checking any host key.
+    #[test]
+    fn revoking_a_node_closes_its_shared_connection() {
+        let d = std::env::temp_dir().join(format!("wicket-cm-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let bin = d.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = d.join("ssh-calls");
+        let fake = bin.join("ssh");
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // This test's own process (nextest runs each test in one): ssh is the fake first on PATH.
+        let path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{path}", bin.display()));
+        let nodes = d.join("nodes");
+        let mut l = Ledger::open_in_memory().unwrap();
+        enrol_row(&mut l, &nodes, "n1");
+        let target = l.node("n1").unwrap().unwrap().target;
+        revoke(&mut l, &nodes, "n1").unwrap();
+        std::env::set_var("PATH", path);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(calls.lines().any(|c| c.ends_with(&format!("-O exit {target}")) && c.contains("ControlPath=")), "{calls:?}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     fn enrol_row(l: &mut Ledger, nodes: &Path, name: &str) {
