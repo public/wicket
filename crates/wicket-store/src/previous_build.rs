@@ -7,7 +7,7 @@
 //! its DDL.
 //!
 //! [`PREVIOUS`] is the previous build's queries over the tables whose rows have more than one
-//! meaning, copied from its source (schema 17, before 8e1a9af), each with the kinds of row it can
+//! meaning, copied from its source (schema 18: the same as schema 17's, the floor since schema 19), each with the kinds of row it can
 //! handle. When a change gives one of those tables a new kind of row, or a release moves the floor,
 //! copy the queries of the build before it here first, then make the change: this test then says
 //! whether the old queries still see only what they understand.
@@ -21,7 +21,8 @@ struct Query {
     handles: &'static [&'static str],
 }
 
-/// Schema 17's readers of `messages` (`?1` a run; `?2`, where it is used, a stdin offset).
+/// Schema 18's readers of `messages`, unchanged since 17 (`?1` a run; `?2`, where it is used, a
+/// stdin offset). None reads `operator_messages`, which schema 19 drops.
 const PREVIOUS: &[Query] = &[
     Query {
         what: "take_prompts",
