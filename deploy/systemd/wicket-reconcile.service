@@ -17,6 +17,11 @@ NoNewPrivileges=yes
 ProtectSystem=full
 Restart=on-failure
 RestartSec=10
+# What a pass starts outlives it: the supervisors (`wicket attach`) of runs it adopts, and this
+# host's own node's serve. A restart (deploy/install.sh restarts this unit right after wicketd)
+# stops only the reconciler: with the default, it would SIGTERM those, and a supervisor ends its
+# box on SIGTERM (#529).
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target

@@ -759,6 +759,58 @@ update_flow() {
 }
 if [ "$mode" = installed ]; then update_flow; else skip "a self update over a run on the older build" "installed only (wicketd)"; fi
 
+# ---- 5e. deploy/install.sh over a run on this host's own node (#529) ----
+# Installed only: a long-lived run started through wicketd, its box on this host's own node. Then
+# deploy/install.sh installs another build (bytes appended, as in 5d) and wicketd restarts (by
+# systemd where there is one; here, as KillMode=process does it). The restarted wicketd must move
+# the local node's serve, which its restart leaves running on the old build, to the new build
+# before it hands the run over (#529: a run re-attached to the old serve had its box stopped), and
+# the run's next turn must be in the same run, on the same box.
+install_flow() {
+  log "deploy/install.sh over a run on this host's own node: the serve moves to the new build (#529)"
+  local r b d id p sh before attach0 serve
+  sh=${ACC_INSTALL_SH:-$(ls /opt/pkg/wicket-*/deploy/install.sh 2>/dev/null | head -1)}
+  if [ -z "$sh" ] || [ ! -x "$sh" ]; then
+    skip "install.sh over a run on this host's own node" "no deploy/install.sh from the release archive (set ACC_INSTALL_SH)"
+    return
+  fi
+  r=$(restart_start install)
+  b=$(box_of "$r")
+  check "  the run started through wicketd took its first turn" '[ "$(restart_result "$r" | jq -r .turn 2>/dev/null)" = 1 ]'
+  d=$(sudo -n mktemp -d /root/acc-install.XXXXXX)
+  sudo -n sh -c "cp '$(readlink -f "$W")' '$d/wicket' && printf 'build c' >>'$d/wicket' && chmod 755 '$d/wicket'"
+  id=$(sudo -n sha256sum "$d/wicket" | cut -c1-12)
+  $DOCKER tag "$IMAGE_TAG" "wicket/claude-code:$id" >/dev/null
+  p=$(data pids/daemon.pid 2>/dev/null | head -1)
+  starts() { grep -c "wicketd: /run/wicket/wicketd.sock as" /tmp/wicketd.log 2>/dev/null || true; }
+  before=$(starts)
+  attach0=$(data "runs/$r/ctl/attach.log" 2>/dev/null | wc -l)
+  sudo -n "$sh" --binary "$d/wicket" --operator "$(id -un)" --skip-gvisor --skip-image --trust-domain acc.wicket.test >"$work/install.log" 2>&1 || true
+  check "  install.sh installed the new build" '[ "$(basename "$(readlink /var/lib/wicket-versions/current)")" = "$id" ]'
+  if [ ! -d /run/systemd/system ]; then
+    sudo -n kill -TERM "$p"
+    wait_for 20 '! sudo -n kill -0 '"$p"' 2>/dev/null' || true
+    sudo -n sh -c 'cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /var/lib/wicket-versions/current/wicket daemon >>/tmp/wicketd.log 2>&1 &'
+  fi
+  wait_for 30 '[ "$(starts)" -gt "$before" ]' || true
+  wait_for 40 'grep -qE "runs: [0-9]+ handed over" /tmp/wicketd.log' || true
+  check "  the new wicketd moved this host's node's serve to the new build" \
+    'grep -q "wicketd: this host'"'"'s node: serve (pid [0-9]*) re-executed as the new build" /tmp/wicketd.log'
+  serve=$(data local-node/serve/serve.exe 2>/dev/null | sed -n 2p)
+  check "  and the serve runs it" '[ "$serve" = "$(readlink -f /var/lib/wicket-versions/current/wicket)" ]'
+  check "  and handed the run over, adopted by the new build" \
+    'grep -oE "runs: [0-9]+ handed over, [0-9]+ adopted" /tmp/wicketd.log | tail -1 | awk "{ exit !(\$2 >= 1 && \$2 == \$5) }"'
+  w session --no-wait "$r" "Again, after install.sh." >/dev/null 2>&1 || true
+  wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 2 ]' || true
+  check "  its next turn was in the same run, on the same box" '[ "$(restart_result "$r" | jq -r .turn)" = 2 ] && [ "$(box_of "$r")" = "$b" ]'
+  check "  and the re-attach didn't end its box" '! data "runs/$r/ctl/attach.log" 2>/dev/null | tail -n +"$((attach0 + 1))" | grep -q "the box ended"'
+  wroot identity revoke "$r" --reason "acceptance: install check done" >/dev/null 2>&1 || true
+  wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true
+  sudo -n rm -f "$d/wicket"
+  sudo -n rmdir "$d" 2>/dev/null || true
+}
+if [ "$mode" = installed ]; then install_flow; else skip "install.sh over a run on this host's own node" "installed only (wicketd)"; fi
+
 # ---- 3c. an org policy in Cedar (#51) ----
 # The installation's org policy forbids one path the zone allows: the box's token, compiled at mint,
 # refuses it at the edge. A new version revokes the runs minted under the old one. Development mode

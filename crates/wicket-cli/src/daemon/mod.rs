@@ -134,7 +134,13 @@ fn drain(handoff_path: &Path, draining: &'static AtomicBool, in_flight: &std::sy
 
 /// Hands each run whose supervisor runs another build than `exe` over to `exe` (#475): the
 /// supervisor is stopped without its box, and `exe`'s reconciler starts a new one that re-attaches.
+///
+/// This host's own node's serve moves to `exe` first (#529): a restart of wicketd leaves it, its
+/// child, on the build it started on, and the new supervisors re-attach to it.
 fn hand_over_runs(exe: &Path) {
+    if let Some(line) = crate::update::reexec_local_node(exe) {
+        say_err!("wicketd: {line}");
+    }
     let killed =
         match Ledger::open(&crate::ledger_path()).map_err(anyhow::Error::from).and_then(|l| crate::update::stop_stale_supervisors(&l, exe))
         {
