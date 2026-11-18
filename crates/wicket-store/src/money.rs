@@ -141,6 +141,10 @@ impl Ledger {
             |r| r.get(0),
         )?;
         if held > 0 {
+            // Kept as it is; the limit grant still follows the limits it was asked under (#326's
+            // property test found it left stale here).
+            record_limit(&tx, tenant, budget)?;
+            tx.commit()?;
             return Ok(Ok(()));
         }
         if let Err(r) = check(&tx, tenant, budget, hourly, reserved)? {
