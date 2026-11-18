@@ -1,0 +1,14 @@
+default: anything
+operators:
+  unix/alice: anything
+  passkey/laptop:
+    kinds: [http]
+    hosts: ["*.example.com"]
+    max_risk: R2
+  unix/auditor: nothing
+agents:
+  kinds: [http]
+  prefix: false
+  zone_wide: false
+  git_push: false
+  unbounded: false

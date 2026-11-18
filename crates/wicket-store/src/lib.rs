@@ -14,7 +14,8 @@ pub use capgrant::{covers as capacity_covers, CapacityAsk, CapacityGrant, Capaci
 mod delegations;
 mod digestgrant;
 pub use digestgrant::{
-    signer_principal, valid_digest, DigestAction, DigestScope, DigestUse, NewDigestGrant, Signer, DIGEST_METHOD, SIGNER_GRANT_SECS,
+    digest_terms_text, parse_digest_terms, signer_principal, valid_digest, DigestAction, DigestGrantPath, DigestScope, DigestUse,
+    NewDigestGrant, Signer, DIGEST_METHOD, SIGNER_GRANT_SECS,
 };
 mod effect;
 pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};

@@ -133,3 +133,6 @@ store = { packages = ["wicket-store"] }
 git = { packages = ["wicket-core"] }
 canon = { packages = ["wicket-core"] }
 time = { packages = ["wicket-core"] }
+vault_ref = { packages = ["wicket-proxy"] }
+digest_grant = { packages = ["wicket-store"] }
+agent_rules = { packages = ["wicket-control"] }

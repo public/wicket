@@ -1,0 +1,5 @@
+{
+  "file": "/home/you/.claude/.credentials.json",
+  "pointer": "/claudeAiOauth/accessToken",
+  "expires_pointer": "/claudeAiOauth/expiresAt"
+}
