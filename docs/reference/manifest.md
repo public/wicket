@@ -265,6 +265,11 @@ hex>`, or `sha256:<64 hex>` alone. Anything with `@` must be a valid pin, or the
   parent's box started as.
 - **Recorded:** every box's digest, in its run's record (`ctl/run.json`'s `image_digest`) and the
   audit (`run.image`).
+- **Accepted by a grant (#258):** a run an operator starts with a pinned image is accepted by a
+  grant on that digest (`run`, in the run's zone), the one "may this digest run" check. Running
+  the manifest records the operator's grant for a day if none is live (`digest.granted`), and each
+  run is accepted by one (`digest.accepted`, naming it). A child's image, pinned to its parent's,
+  is decided where it is spawned and isn't granted again.
 - **Requiring pins:** an installation can require every image to be pinned (`images.yaml`,
   [files](files.md)). `wicket zone pin MANIFEST` rewrites a manifest's tags to their current digests, and
   `wicket image digest REF…` prints them.
