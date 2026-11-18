@@ -98,6 +98,14 @@ debug = 1
 debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
+# Dependencies (never wicket's own crates, which stay unoptimized and quick to rebuild) at level 1:
+# the tests spend most of their time in them (tokio, turmoil, rusqlite's SQLite, serde, the
+# crypto), and CI builds them only when its cache misses. Measured: the workspace's tests 182 s ->
+# 149 s, the simulation, store and Cedar tests 131 s -> 103 s; a cold build of the dependencies
+# 148 s at -j4; a rebuild after a change to wicket-core 39 s -> 31 s. #51's Cedar differential
+# (wicket-policy's tests/cedar.rs) had its two crates at 1 for this reason (#219, at 2 they were
+# the longest part of a clean build of wicket-cli).
+opt-level = 1
 
 # The authz tests run the Biscuit fork's generic engine on 100k requests (and verify many Ed25519
 # signatures); unoptimized, that takes minutes. Optimizing these dependencies keeps `cargo test` fast
@@ -120,12 +128,3 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.globset]
 opt-level = 2
-# #51's differential test (wicket-policy's tests/cedar.rs) runs Cedar's parser, validator and
-# authorizer on thousands of generated policies and requests: unoptimized, minutes. Level 1, not 2:
-# at 2 the two crates are the longest part of a clean build of wicket-cli, on its critical path
-# (#219, experiments/build-times: build 82 s at 2, 58 s at 1, 18 s at 0; that test 55 s, 64 s and
-# 100 s).
-[profile.dev.package.cedar-policy]
-opt-level = 1
-[profile.dev.package.cedar-policy-core]
-opt-level = 1
