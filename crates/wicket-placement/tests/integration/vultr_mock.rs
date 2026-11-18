@@ -121,12 +121,7 @@ async fn acquire_creates_a_tagged_instance_with_cloud_init_and_waits_for_it() {
     use base64::Engine;
     let (base, st) = serve().await;
     let asked = Arc::new(Mutex::new(vec![]));
-    let p = Placer::new(
-        VultrProvider::new(client(&base), config()),
-        Yes(asked.clone()),
-        Owner::new("example"),
-        MoneyEnvelope { max_hourly: MicroUsd::parse_dollars("0.05").unwrap(), max_total: MicroUsd::parse_dollars("1").unwrap() },
-    );
+    let p = Placer::new(VultrProvider::new(client(&base), config()), Yes(asked.clone()), Owner::new("example"));
     let n = p.acquire(&request("task-1")).await.unwrap();
     assert_eq!(n.state, NodeState::Pending);
     assert_eq!(n.ssh_target, None); // no address yet
@@ -164,12 +159,7 @@ async fn acquire_creates_a_tagged_instance_with_cloud_init_and_waits_for_it() {
     assert_eq!(p.next_paid_hour_at(&ready).unwrap() - ready.created_at, 3600 * (1 + (now() - ready.created_at).max(0) / 3600));
 
     // Same key again, from a fresh placer (a restart): found by tag, nothing created.
-    let p2 = Placer::new(
-        VultrProvider::new(client(&base), config()),
-        Yes(asked.clone()),
-        Owner::new("example"),
-        MoneyEnvelope { max_hourly: MicroUsd::parse_dollars("0.05").unwrap(), max_total: MicroUsd::parse_dollars("1").unwrap() },
-    );
+    let p2 = Placer::new(VultrProvider::new(client(&base), config()), Yes(asked.clone()), Owner::new("example"));
     assert_eq!(p2.acquire(&request("task-1")).await.unwrap().id, n.id);
     assert_eq!(st.lock().unwrap().seen.iter().filter(|s| s.method == "POST").count(), 1);
     assert_eq!(asked.lock().unwrap().len(), 1);
@@ -206,12 +196,7 @@ async fn listing_is_by_owner_tag_across_pages_and_never_includes_others() {
                 "tags": if i == 4 { json!(["control-host"]) } else { json!(["wicket-owner-example", "wicket-until-1794394200"]) }}));
         }
     }
-    let p = Placer::new(
-        VultrProvider::new(client(&base).with_per_page(2), config()),
-        Yes(Arc::default()),
-        Owner::new("example"),
-        MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
-    );
+    let p = Placer::new(VultrProvider::new(client(&base).with_per_page(2), config()), Yes(Arc::default()), Owner::new("example"));
     let owned = p.list().await.unwrap();
     assert_eq!(owned.len(), 4);
     assert!(owned.iter().all(|n| n.state == NodeState::Active && n.lease_until == Some(1_794_394_200)));
@@ -221,20 +206,12 @@ async fn listing_is_by_owner_tag_across_pages_and_never_includes_others() {
     assert!(p.get(&ctl).await.unwrap().is_none());
     assert!(matches!(p.release(&ctl, ReleaseMode::Now).await.unwrap_err(), PlacementError::NotOwned(_)));
     assert!(st.lock().unwrap().seen.iter().all(|s| s.method != "DELETE"));
-    // The envelope (zero here) refuses a new node, with four nodes already counted.
-    let e = p.acquire(&request("new")).await.unwrap_err();
-    assert!(matches!(e, PlacementError::Envelope(_)), "{e}");
 }
 
 #[tokio::test]
 async fn a_vm_zone_gets_no_vultr_offer() {
     let (base, _st) = serve().await;
-    let p = Placer::new(
-        VultrProvider::new(client(&base), config()),
-        Yes(Arc::default()),
-        Owner::new("example"),
-        MoneyEnvelope { max_hourly: MicroUsd::parse_dollars("1").unwrap(), max_total: MicroUsd::parse_dollars("10").unwrap() },
-    );
+    let p = Placer::new(VultrProvider::new(client(&base), config()), Yes(Arc::default()), Owner::new("example"));
     let mut r = request("vm");
     r.min_isolation = IsolationTier::Vm;
     assert!(matches!(p.acquire(&r).await.unwrap_err(), PlacementError::NoCapacity(_)));

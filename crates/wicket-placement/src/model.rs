@@ -2,7 +2,6 @@
 //! calls).
 
 use crate::billing::BillingModel;
-use crate::envelope::EnvelopeRefusal;
 use crate::money::MicroUsd;
 use sha2::{Digest, Sha256};
 use std::future::Future;
@@ -209,8 +208,6 @@ impl Owner {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlacementError {
-    #[error("refused by the money envelope: {0}")]
-    Envelope(EnvelopeRefusal),
     #[error("spend not approved: {0}")]
     NotApproved(String),
     #[error("no capacity: {0}")]
@@ -256,8 +253,8 @@ pub enum Released {
 /// The interface the rest of wicket uses. One implementation, [`Placer`](crate::Placer), over any
 /// [`Provider`].
 pub trait Placement: Send + Sync {
-    /// A node for `req`: an existing one for the same idempotency key, a warm pooled one, or a new one
-    /// inside the money envelope and approved by a human.
+    /// A node for `req`: an existing one for the same idempotency key, or a warm pooled one or a new
+    /// one, either approved by the spend approver (which checks its money, #256).
     fn acquire(&self, req: &CapacityRequest) -> impl Future<Output = Result<NodeHandle>> + Send;
     /// An owned node.
     fn get(&self, id: &NodeId) -> impl Future<Output = Result<Option<NodeHandle>>> + Send;

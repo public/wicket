@@ -19,14 +19,14 @@
 //!   `wicket-idem-<sha256(key)[..16]>`. Vultr has no server-side idempotency token, so two *processes*
 //!   racing on one key can still both create (design §8.4: "tag-then-list-before-create"); one
 //!   process serialises its own acquires, and the reconciler destroys the duplicate.
-//! - **The money envelope** ([`MoneyEnvelope`]): a maximum hourly rate summed over every owned node,
-//!   and a maximum total (every owned node's billed cost through its lease end, plus the new node's
-//!   worst case). A request beyond either is refused outright: no approval can widen it. A request's own
-//!   `max_hourly` bounds the plans considered.
-//! - **Spend is approved.** Any node with a non-zero worst-case cost is created only after the
-//!   [`SpendApprover`] says yes, with the plan, rate and worst case on the request. wicket's approver
-//!   files a CAPACITY request, decided by the operator's standing capacity grants or, beyond them, by
-//!   an operator (#256); this crate supplies no UI.
+//! - **Money is wicket's.** This crate holds no limits: the one spend check is the ledger's (#256, a
+//!   tenant money quota grant and the live money quota grants against it), made by the
+//!   [`SpendApprover`]. A request's own `max_hourly` bounds the plans considered.
+//! - **Spend is approved.** Any node with a non-zero worst-case cost is created, and any warm node
+//!   claimed from the pool, only after the [`SpendApprover`] says yes, with the plan, rate and worst
+//!   case on the request. wicket's approvers check the money; `wicket node create`'s also files a
+//!   CAPACITY request, decided by the operator's standing capacity grants or, beyond them, by an
+//!   operator; this crate supplies no UI.
 //! - **Worst case, reserved first.** The worst case is what the provider bills for the requested
 //!   lifetime under its [`BillingModel`], every partial unit rounded up.
 //!
@@ -76,7 +76,7 @@ pub mod static_hosts;
 pub mod vultr;
 
 pub use billing::{BillingModel, PoolRules, ReleaseDecision};
-pub use envelope::{Approval, MoneyEnvelope, SpendApprover, SpendRequest};
+pub use envelope::{Approval, SpendApprover, SpendRequest};
 pub use model::{
     CapacityRequest, CreateSpec, IsolationTier, NodeHandle, NodeId, NodeState, Offer, Owner, Placement, PlacementError, Provider, Released,
     Resources, Timestamp,

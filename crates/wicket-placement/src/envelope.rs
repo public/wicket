@@ -1,60 +1,13 @@
-//! The money envelope (design §8.5) and the human approval hook.
+//! Spend approval: the hook every node with a money effect goes through before it is used.
+//!
+//! The money check itself is wicket's, in the ledger (#256: one tenant money quota grant, and the
+//! live money quota grants against it, `wicket_store::money`), made by the [`SpendApprover`] in the
+//! transaction that records the node's money. This crate holds no limits of its own.
 
-use crate::model::{NodeHandle, Timestamp};
 use crate::money::MicroUsd;
 use std::future::Future;
 
-/// The limits no approval can widen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MoneyEnvelope {
-    /// The most every owned node together may cost per hour.
-    pub max_hourly: MicroUsd,
-    /// The most every owned node together may cost over its lease, the new node at its worst case.
-    pub max_total: MicroUsd,
-}
-
-/// Why the envelope refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EnvelopeRefusal {
-    Hourly { committed: MicroUsd, new: MicroUsd, max: MicroUsd },
-    Total { committed: MicroUsd, new: MicroUsd, max: MicroUsd },
-}
-
-impl std::fmt::Display for EnvelopeRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EnvelopeRefusal::Hourly { committed, new, max } => {
-                write!(f, "{committed}/h already running + {new}/h for this node is over the {max}/h limit")
-            }
-            EnvelopeRefusal::Total { committed, new, max } => {
-                write!(f, "{committed} committed + {new} worst case for this node is over the {max} total limit")
-            }
-        }
-    }
-}
-
-/// What owned nodes already commit: their summed hourly rate, and their cost through their lease end
-/// (or through the current hour, for a node without a lease tag).
-pub fn committed(nodes: &[NodeHandle], now: Timestamp) -> (MicroUsd, MicroUsd) {
-    let hourly = nodes.iter().map(|n| n.billing.hourly_rate()).sum();
-    let total = nodes.iter().map(|n| n.billed_through(n.lease_until.unwrap_or(now).max(now))).sum();
-    (hourly, total)
-}
-
-impl MoneyEnvelope {
-    pub fn check(&self, committed: (MicroUsd, MicroUsd), hourly: MicroUsd, worst_case: MicroUsd) -> Result<(), EnvelopeRefusal> {
-        let (c_hourly, c_total) = committed;
-        if c_hourly + hourly > self.max_hourly {
-            return Err(EnvelopeRefusal::Hourly { committed: c_hourly, new: hourly, max: self.max_hourly });
-        }
-        if c_total + worst_case > self.max_total {
-            return Err(EnvelopeRefusal::Total { committed: c_total, new: worst_case, max: self.max_total });
-        }
-        Ok(())
-    }
-}
-
-/// What a human is asked to approve: everything on the approval card.
+/// What is asked before a node is used: everything on the approval card.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SpendRequest {
     pub backend: String,
@@ -64,12 +17,10 @@ pub struct SpendRequest {
     pub purpose: String,
     pub hourly: MicroUsd,
     pub lifetime_secs: i64,
-    /// Reserved before creating: the most this node can cost over `lifetime_secs`.
+    /// Reserved before using it: the most this node can cost over `lifetime_secs`.
     pub worst_case: MicroUsd,
-    pub committed_hourly: MicroUsd,
-    pub committed_total: MicroUsd,
-    pub max_hourly: MicroUsd,
-    pub max_total: MicroUsd,
+    /// A warm node from the pool (already made, its current hour paid for), not a new one.
+    pub warm: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,9 +29,11 @@ pub enum Approval {
     Denied(String),
 }
 
-/// Who decides anything with a money effect: `wicket node create`'s CAPACITY request, decided by
-/// the operator's standing capacity grants or, beyond them, by an operator (#256). Called only for
-/// requests already inside the envelope.
+/// Who decides anything with a money effect, and checks its money (#256): a capacity lease's
+/// approver (its money was reserved when it was asked for), and `wicket node create`'s, which
+/// reserves the node's money and files a CAPACITY request decided by the operator's standing
+/// capacity grants or, beyond them, by an operator. Called for every paid offer and every warm
+/// node claimed from the pool.
 pub trait SpendApprover: Send + Sync {
     fn approve(&self, req: &SpendRequest) -> impl Future<Output = Approval> + Send;
 }
