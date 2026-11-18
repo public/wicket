@@ -6,6 +6,7 @@
 //! as it is (`fuzz/`): it depends on no module of the CLI's.
 
 pub mod chan;
+pub mod files;
 pub mod health;
 pub mod nodesecrets;
 pub mod oci;

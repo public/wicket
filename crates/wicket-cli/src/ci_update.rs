@@ -324,7 +324,7 @@ fn load_state() -> FollowState {
 }
 
 fn save_state(s: &FollowState) {
-    let _ = crate::nodesecrets::write_atomic(&state_path(), &serde_json::to_vec(s).unwrap_or_default());
+    let _ = wicket_chan::files::write_atomic(&state_path(), &serde_json::to_vec(s).unwrap_or_default());
 }
 
 /// Whether `minute` (minutes past midnight, UTC) is in `window` (`HH:MM-HH:MM`, may wrap).

@@ -1613,10 +1613,7 @@ fn save_holdings(sh: &Shared, p: &Progress) {
     secrets.sort();
     let h = Holdings { secrets, slice: p.slice, updated_ms: wicket_feed::now_ms() };
     let f = sh.dir.join("ctl").join("holdings.json");
-    let tmp = f.with_extension("tmp");
-    if std::fs::write(&tmp, serde_json::to_vec(&h).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, &f);
-    }
+    let _ = wicket_chan::files::replace(&f, "tmp", &serde_json::to_vec(&h).unwrap_or_default());
 }
 
 pub fn read_holdings(run_dir: &Path) -> Option<Holdings> {

@@ -12,7 +12,7 @@ mod out;
 
 // The control/node channel and the modules its messages carry: a crate of their own (#219), under
 // their old names here.
-use wicket_chan::{chan, health, nodesecrets};
+use wicket_chan::{chan, health};
 // The installation's paths, its identity issuer and who is calling: a crate of their own (#219),
 // under their old names here.
 #[cfg(test)]

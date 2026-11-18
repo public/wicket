@@ -262,10 +262,7 @@ impl LinkRecord {
     /// Written aside and renamed, in the run's `ctl/` directory.
     pub fn save(&self, run_dir: &Path) {
         let f = run_dir.join("ctl").join(Self::FILE);
-        let tmp = f.with_extension("tmp");
-        if std::fs::write(&tmp, serde_json::to_vec(self).unwrap_or_default()).is_ok() {
-            let _ = std::fs::rename(&tmp, &f);
-        }
+        let _ = wicket_chan::files::replace(&f, "tmp", &serde_json::to_vec(self).unwrap_or_default());
     }
 
     pub fn load(run_dir: &Path) -> Option<LinkRecord> {

@@ -132,7 +132,7 @@ impl EdgeQueue {
     }
 
     fn save(&self, held: &Held) {
-        let _ = crate::nodesecrets::write_atomic(&self.file, &serde_json::to_vec(held).unwrap_or_default());
+        let _ = wicket_chan::files::write_atomic(&self.file, &serde_json::to_vec(held).unwrap_or_default());
     }
 
     /// Queues a call (or finds the same one queued already): its id, and whether it is new.

@@ -210,10 +210,7 @@ pub fn show() -> Result<()> {
 }
 
 fn write_replace(p: &Path, body: &str) -> Result<()> {
-    let tmp = p.with_extension("new");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, p)?;
-    Ok(())
+    Ok(wicket_chan::files::replace(p, "new", body.as_bytes())?)
 }
 
 /// `wicket policy apply FILE [--entities F] [--keep-runs]`.
