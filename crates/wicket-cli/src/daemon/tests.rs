@@ -286,3 +286,145 @@ fn moving_to_a_new_build_with_running_commands_does_not_hang() {
     drop(client);
     assert_eq!(follower.join().unwrap(), 128 + libc::SIGTERM);
 }
+
+/// #487's deadlock class, over orders (#326): a handover with N followed commands that exit in any
+/// order and at any time (before the drain, while the handoff holds the registry, after it), and
+/// with commands still being started. In every round the drain returns within a bound, the daemon
+/// takes commands again once the handoff is dropped (an exec that failed), and every follower ends
+/// with its child's own exit code. Each wait is guarded by a timeout, so a deadlock fails the test
+/// instead of hanging it.
+#[test]
+fn a_handover_ends_within_a_bound_whatever_order_the_commands_exit_in() {
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    let mut below = move |n: u64| {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s % n
+    };
+    let within = |what: &str, limit: Duration, mut done: Box<dyn FnMut() -> bool>| {
+        let t0 = Instant::now();
+        while !done() {
+            assert!(t0.elapsed() < limit, "{what}: not within {limit:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    for round in 0..12u64 {
+        let draining: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let in_flight: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let t = tmp();
+        let path = t.0.join(handoff::FILE);
+        let mut followers = vec![];
+        let mut clients = vec![];
+        for i in 0..(1 + round % 5) {
+            let (ms, code) = (below(500), 10 + i as i32);
+            let script = format!("sleep {}.{:03}; exit {code}", ms / 1000, ms % 1000);
+            let pid = std::process::Command::new("sh").args(["-c", &script]).process_group(0).spawn().unwrap().id() as i32;
+            let (daemon, client) = UnixStream::pair().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let f = std::thread::spawn(move || handoff::follow(pid, &daemon, None, move || tx.send(()).unwrap()).unwrap());
+            rx.recv_timeout(Duration::from_secs(5)).expect("followed");
+            followers.push((code, f));
+            clients.push(client);
+        }
+        // Commands still being started, each done at its own time.
+        for _ in 0..below(3) {
+            in_flight.fetch_add(1, Ordering::SeqCst);
+            let ms = below(300);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(ms));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        std::thread::sleep(Duration::from_millis(below(300)));
+        let (dtx, drx) = std::sync::mpsc::channel();
+        let (p, hold) = (path.clone(), 100 + below(300));
+        std::thread::spawn(move || {
+            let held = drain(&p, draining, in_flight);
+            dtx.send(held.0.as_ref().map(|h| h.handed())).unwrap();
+            // Held as across an exec, then dropped: the exec failed.
+            std::thread::sleep(Duration::from_millis(hold));
+            drop(held);
+        });
+        let handed = drx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| panic!("round {round}: the drain hung"));
+        assert!(handed.is_some(), "round {round}: the handoff is written");
+        assert!(draining.load(Ordering::SeqCst), "round {round}: new commands are refused while it is held");
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0, "round {round}: it waited for the commands being started");
+        within(&format!("round {round}: commands are taken again"), Duration::from_secs(5), Box::new(|| !draining.load(Ordering::SeqCst)));
+        for (code, f) in followers {
+            let t0 = Instant::now();
+            while !f.is_finished() {
+                assert!(t0.elapsed() < Duration::from_secs(10), "round {round}: a follower didn't end");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(f.join().unwrap(), code, "round {round}: its child's exit code");
+        }
+        drop(clients);
+    }
+}
+
+/// #477 within #487's handover (#326): supervisors the daemon is following, on another build, are
+/// stopped (`stop_stale_supervisors`, SIGKILL) while a handover holds the registry. Stopping them
+/// returns within its bound with every run, the drain returns, and each follower ends with the
+/// kill's code once the handoff is dropped.
+#[test]
+fn stopping_followed_supervisors_during_a_handover_ends_within_a_bound() {
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+    for n in 1..=4u32 {
+        let draining: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let in_flight: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let t = tmp();
+        let ledger = wicket_store::Ledger::open(&t.0.join("ledger.db")).unwrap();
+        let mut followers = vec![];
+        let mut clients = vec![];
+        let mut runs = vec![];
+        for i in 0..n {
+            let pid = std::process::Command::new("sh").args(["-c", "sleep 30"]).process_group(0).spawn().unwrap().id();
+            let run = format!("run_{n}_{i}");
+            ledger.run_started(&wicket_core::TenantId::single(), &wicket_core::RunId(run.clone()), "z", "a").unwrap();
+            ledger.set_run_owner(&run, &crate::owner::owner_label_of(pid).unwrap()).unwrap();
+            runs.push(run);
+            let (daemon, client) = UnixStream::pair().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let f = std::thread::spawn(move || handoff::follow(pid as i32, &daemon, None, move || tx.send(()).unwrap()).unwrap());
+            rx.recv_timeout(Duration::from_secs(5)).expect("followed");
+            followers.push(f);
+            clients.push(client);
+        }
+        // The handover holds the registry for a while (as across an exec).
+        let (dtx, drx) = std::sync::mpsc::channel();
+        let p = t.0.join(handoff::FILE);
+        std::thread::spawn(move || {
+            let held = drain(&p, draining, in_flight);
+            dtx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            drop(held);
+        });
+        drx.recv_timeout(Duration::from_secs(10)).expect("the drain hung");
+        // Meanwhile the new build stops the old supervisors (`sh` is another binary than this one).
+        let t0 = Instant::now();
+        let mut stopped = crate::update::stop_stale_supervisors(&ledger, &std::env::current_exe().unwrap()).unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(10), "n {n}: stopping took {:?}", t0.elapsed());
+        stopped.sort();
+        assert_eq!(stopped, runs, "n {n}: every stale supervisor is stopped");
+        for f in followers {
+            let t0 = Instant::now();
+            while !f.is_finished() {
+                assert!(t0.elapsed() < Duration::from_secs(10), "n {n}: a follower didn't end");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(f.join().unwrap(), 128 + libc::SIGKILL, "n {n}: ended by the kill");
+        }
+        let t0 = Instant::now();
+        while draining.load(Ordering::SeqCst) {
+            assert!(t0.elapsed() < Duration::from_secs(5), "n {n}: commands are taken again");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(clients);
+    }
+}
