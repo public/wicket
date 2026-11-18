@@ -50,7 +50,7 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
    ```
 
    `deploy/install.sh` pulls that pinned image (the digest is `LITESTREAM_IMAGE` in
-   `crates/wicket-cli/src/statestore.rs`; a test keeps the two equal), so the `wicket-state` unit needs
+   `crates/wicket-home/src/statestore.rs`; a test keeps the two equal), so the `wicket-state` unit needs
    nothing more. With `--skip-image`, or if the pull fails, the unit pulls it when it first starts.
 
 3. **The audit sink**, in `audit-sinks.yaml`:
