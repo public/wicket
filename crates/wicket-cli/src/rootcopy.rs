@@ -272,6 +272,44 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Root's link (`/usr/local/bin/wicket`, what operators and `sudo wicket` run) and the versions
+/// root's `current` (what wicket's services run), when they are different builds: (root's link's
+/// build, if it names one, and `current`'s). After an update applied from the console (#465), or
+/// a CI build followed, root's link stays on the build root last copied until root copies the new
+/// one.
+pub fn skew(l: &Layout) -> Option<(Option<String>, String)> {
+    if !l.copies.is_dir() {
+        return None;
+    }
+    let current = l.versions_pointer("current")?;
+    let linked = l.linked();
+    (linked.as_deref() != Some(current.as_str())).then_some((linked, current))
+}
+
+/// What to say about a [`skew`]: one line, with how to catch up.
+pub fn skew_line(link: &Path, linked: Option<&str>, current: &str) -> String {
+    format!(
+        "wicket: {} runs build {}, but wicket's services run {current}. To make root's copy of {current} and move the link to it: \
+         sudo wicket self update <its artifact> (it is installed already: this only copies it), or deploy/install.sh from its release archive",
+        link.display(),
+        linked.unwrap_or("(not one of root's copies)")
+    )
+}
+
+/// On stderr, once per command, when this process is root's link's build and wicket's services run
+/// another ([`skew`]). Only from root's own copies: a command wicketd runs for its caller is the
+/// services' build, and saying it twice would be noise.
+pub fn warn_if_skewed() {
+    let l = Layout::installed();
+    let Ok(exe) = std::env::current_exe() else { return };
+    if !exe.starts_with(&l.copies) {
+        return;
+    }
+    if let Some((linked, current)) = skew(&l) {
+        eprintln!("{}", skew_line(&l.link, linked.as_deref(), &current));
+    }
+}
+
 /// Root never runs a binary the `wicket` user could have replaced: as root, this build refuses to
 /// run from such a path (a replaced binary wouldn't check, which is why nothing documented runs
 /// one; this catches running an honest one by hand, as #165's message once said to).
@@ -426,6 +464,30 @@ mod tests {
         std::os::unix::fs::symlink(&id, &tmp).unwrap();
         std::fs::rename(&tmp, l.versions.join("current")).unwrap();
         id
+    }
+
+    /// Root's link behind the services' build is found, and the line says how to catch up; in step,
+    /// or on a host without root's copies (development mode), nothing is said.
+    #[test]
+    fn roots_link_behind_the_services_build_is_found() {
+        let (d, _c) = tmp("skew");
+        let l = layout(&d, None);
+        let a = stage(&l, b"build a");
+        assert_eq!(skew(&l), None, "no root's copies: not an installed host");
+        std::fs::create_dir_all(l.copies.join(&a)).unwrap();
+        std::fs::write(l.copy(&a), b"build a").unwrap();
+        l.link_to(&a).unwrap();
+        assert_eq!(skew(&l), None, "in step");
+        let b = stage(&l, b"build b");
+        assert_eq!(skew(&l), Some((Some(a.clone()), b.clone())));
+        let line = skew_line(&l.link, Some(&a), &b);
+        assert!(
+            line.contains(&format!("runs build {a}, but wicket's services run {b}")) && line.contains("sudo wicket self update"),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "one line");
+        std::fs::remove_file(&l.link).unwrap();
+        assert_eq!(skew(&l), Some((None, b)), "no link: still behind");
     }
 
     #[test]

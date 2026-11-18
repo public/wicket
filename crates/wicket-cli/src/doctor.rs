@@ -64,6 +64,15 @@ pub async fn doctor(image: &str) -> Result<()> {
     if system {
         r.good(format!("mode: system install, as {user} (uid {me})"));
         system_checks(&mut r, me, &socket);
+        let layout = crate::rootcopy::Layout::installed();
+        match crate::rootcopy::skew(&layout) {
+            Some((linked, current)) => r.good(format!(
+                "warning: {}",
+                crate::rootcopy::skew_line(&layout.link, linked.as_deref(), &current).trim_start_matches("wicket: ")
+            )),
+            None if layout.copies.is_dir() => r.good(format!("root's link: {} runs the services' build", layout.link.display())),
+            None => {}
+        }
     } else {
         r.good(format!(
             "mode: development (one user, no wicketd): INSECURE. Anything running as {user} can connect to run sockets and pass as a run, \

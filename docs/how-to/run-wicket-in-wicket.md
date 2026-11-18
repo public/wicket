@@ -77,8 +77,11 @@ request, and run `sudo wicket self update /tmp/wicket-…tar.gz --nodes all`; or
 
 An update applied from the console moves the `wicket` user's versions (`/var/lib/wicket-versions`)
 and the services that run from them; root's own copy and `/usr/local/bin/wicket` (#261) stay where
-they were, as root never runs what the `wicket` user staged. `sudo wicket self admit <artifact>`
-moves root's link.
+they were, as root never runs what the `wicket` user staged. Until root's copy catches up, every
+command run through `/usr/local/bin/wicket` prints one line on stderr saying which build it runs and
+which the services run, and `wicket doctor` says so too. To catch up, run `sudo wicket self update
+<artifact>` with the build's artifact (it is installed already: this makes root's copy and moves the
+link), `sudo wicket self admit <artifact>`, or `deploy/install.sh` from its release archive.
 
 What isn't covered: wicket's own end-to-end tests need Docker in the box, which a box doesn't have
 ([design](../explanation/design.md) §21).
