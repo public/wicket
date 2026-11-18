@@ -13,9 +13,9 @@
 //! - **It decides egress.** Each box gets its own egress proxy on a unix socket, deciding from the
 //!   node's verified feed replica (`wicket_proxy::decide::NodeDecider`) and terminating TLS with the
 //!   node's name-constrained CA. It injects the zone's secrets and makes the box's credential swaps
-//!   itself, each secret fetched on first use (#152, #257). Hosts it can't terminate (outside the
-//!   CA's constraints, an expired CA, or swapped by a control host before protocol 10) are tunnelled
-//!   to the control host's egress proxy for the run.
+//!   itself, each secret fetched on first use (#152, #257). A host it can't terminate (outside the
+//!   CA's constraints, or an expired CA) is spliced if the box's token allows it wholesale, and
+//!   refused otherwise (#257: the control host forwards no egress).
 //! - **It runs the box's model proxy and MCP gateway** (#151). The model proxy is the box's only
 //!   one (#257): it checks each call and makes it itself, with the credential fetched from the
 //!   control host on first use (#152). The gateway decides the tools it can from the box's token
@@ -669,8 +669,7 @@ impl Node {
         found.first().map(|(r, _)| r.to_string())
     }
 
-    /// What this node decides `run`'s gateway tools from (#164): its start's edge. (A control host
-    /// that started a box without one, before protocol 5, is past `PROTOCOL_SKEW`.)
+    /// What this node decides `run`'s gateway tools from (#164): its start's edge.
     fn edge_start(&self, run: &str) -> Option<chan::EdgeStart> {
         self.boxes.lock().expect("boxes").get(run).and_then(|b| b.record.start.edge.clone()).map(|e| *e)
     }

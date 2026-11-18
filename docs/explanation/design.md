@@ -1750,7 +1750,7 @@ pub enum OperatorAction {
 }
 ```
 
-Adapters declare whether their agent has a native remote UI (`AgentCaps::native_remote`). The Claude Code
+Adapters say whether their agent has a native remote UI (`Adapter::remote_plan`). The Claude Code
 T1 adapter has one. ACP agents can be driven from an ACP client such as Zed. T3 agents only get wicket's
 own channels.
 

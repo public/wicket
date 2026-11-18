@@ -323,7 +323,6 @@ impl Session {
         Ok(())
     }
 
-    /// Queues a prompt for a run that isn't ACP's, audited as the endpoint's are.
     /// `/stop` for a stream-json run (#363): its supervisor interrupts the running turn.
     fn cancel(&self) -> Result<()> {
         let l = self.ledger()?;

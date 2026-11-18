@@ -65,7 +65,7 @@ fn update_tool() -> Value {
     })
 }
 
-/// The request a `spawn` call makes, read the same way by the control host's gateway and a node's.
+/// The request a `spawn` call makes, as a box's node reads it (`nodegw.rs`).
 pub fn spawn_request(args: &Value) -> Result<crate::SpawnRequest, String> {
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).map(String::from);
     Ok(crate::SpawnRequest {

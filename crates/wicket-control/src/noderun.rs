@@ -839,7 +839,7 @@ struct Progress {
     renew_after: i64,
     /// The node CA's renewal on this connection (#416).
     ca: crate::nodeca::CaRenewal,
-    /// The protocol version this connection talks (#162): version-2 messages go only at 2 or later.
+    /// The protocol version this connection talks (#162); 0 until it has negotiated one.
     proto: u32,
     /// Whether a budget slice went on this connection, and the last one sent (#152).
     slice_sent: bool,
