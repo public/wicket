@@ -202,3 +202,7 @@ mod tests {
         assert_eq!(kind_of("SPAWN"), "spawn");
     }
 }
+
+#[cfg(kani)]
+#[path = "proofs/effect.rs"]
+mod proofs;

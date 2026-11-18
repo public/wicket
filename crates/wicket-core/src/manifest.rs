@@ -1138,6 +1138,27 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
 
+    /// #325: why Kani's `a_covered_model_pattern_lets_in_nothing_more` holds only for the patterns
+    /// `check_models` accepts: with a `*` inside one, covering isn't transitive, and a child's list
+    /// a parent's covers could let in more. `check_models` refuses such a pattern.
+    #[test]
+    fn model_covering_is_transitive_only_for_valid_patterns() {
+        use super::{model_covers, LlmSpec};
+        assert!(model_covers("a**", "a*") && model_covers("a*", "ab") && !model_covers("a**", "ab"));
+        let spec = |m: &str| LlmSpec {
+            provider: String::new(),
+            secret: String::new(),
+            upstream: String::new(),
+            max_requests: 1,
+            max_output_tokens: 1,
+            max_input_tokens: None,
+            allow_server_tools: false,
+            models: Some(vec![m.to_string()]),
+        };
+        assert!(spec("a**").check_models().is_err());
+        assert!(spec("a*").check_models().is_ok() && spec("ab").check_models().is_ok());
+    }
+
     /// #250: accept_from names zones (every agent in one) or principals (one agent, or an operator).
     #[test]
     fn accept_from_names_a_zone_or_a_principal() {
@@ -1510,3 +1531,7 @@ zone:
         assert!(crate::yaml::to_string(&m).unwrap().contains("drive: true"));
     }
 }
+
+#[cfg(kani)]
+#[path = "proofs/manifest.rs"]
+mod proofs;
