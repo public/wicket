@@ -121,6 +121,6 @@ globs = [
   "ci/smoke.sh", "ci/smoke.yaml", "ci/h3get/**", "ci/hibernate.sh", "ci/hibernate.yaml", "ci/restore.sh",
   "ci/acceptance.sh", "ci/acceptance/**", "ci/install-acceptance.sh", "ci/install-test.sh", "ci/daemon-uids.sh",
   "ci/node-e2e.sh", "ci/node-e2e/**", "ci/update.sh", "ci/update/**", "ci/policy-diff.sh", "ci/kani.sh",
-  "ci/lean.sh", "ci/tla.sh", "ci/fuzz.sh", "fuzz/**", "verification/**", "deploy/**", "programs/**",
+  "ci/lean.sh", "ci/tla.sh", "ci/shard.awk", "ci/fuzz.sh", "fuzz/**", "verification/**", "deploy/**", "programs/**",
 ]
 mark-changed = []
