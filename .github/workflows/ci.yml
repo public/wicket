@@ -434,9 +434,8 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: ${{ hashFiles('Cargo.toml') }}
           # One cache for the parts (Kani itself, and wicket-core built for it); the first saves it.
-          shared-key: kani
+          shared-key: kani-${{ hashFiles('Cargo.toml') }}
           save-if: ${{ matrix.shard == 1 }}
       - name: Install Kani
         run: |

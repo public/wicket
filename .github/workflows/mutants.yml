@@ -35,8 +35,7 @@ jobs:
       # so every run restored the old build, rebuilt all of it, and never saved (an exact hit).
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: ${{ hashFiles('Cargo.toml') }}
-          shared-key: mutants
+          shared-key: mutants-${{ hashFiles('Cargo.toml') }}
       - name: cargo-mutants (from crates.io, its locked dependencies checksum-verified)
         run: cargo mutants --version 2>/dev/null | grep -q " $CARGO_MUTANTS_VERSION" || cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION"
       - name: Mutants
