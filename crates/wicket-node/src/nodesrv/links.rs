@@ -11,6 +11,9 @@ pub(super) fn transfer(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, stream: u6
     let out = node.links.lock().expect("links").get(&gen).map(|l| l.out.clone());
     let Some(out) = out else { return };
     let spawned = tree_dir(&node.paths, run, tree).and_then(|d| {
+        if put && tree == "outbox" {
+            bail!("the outbox tree is only read");
+        }
         if put {
             std::fs::create_dir_all(&d)?;
         } else if !d.is_dir() {
@@ -59,6 +62,18 @@ pub(super) fn tree_dir(paths: &NodePaths, run: &str, tree: &str) -> Result<PathB
     let ok = |s: &str| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c));
     match tree {
         "workspace" | "state" | "tmp" => Ok(dir.join(tree)),
+        // The box's `/workspace/out` alone (#465: an artifact it asks wicket to install), read only:
+        // never through a link the box made of either directory.
+        "outbox" => {
+            for d in [dir.join("workspace"), dir.join("workspace/out")] {
+                match std::fs::symlink_metadata(&d) {
+                    Ok(m) if m.is_dir() => {}
+                    Ok(_) => bail!("run {run}'s {} is not a directory", d.strip_prefix(&dir).unwrap_or(&d).display()),
+                    Err(_) => return Ok(d),
+                }
+            }
+            Ok(dir.join("workspace/out"))
+        }
         t => match t.strip_prefix("volume.") {
             Some(v) if ok(v) => Ok(dir.join("volumes").join(v)),
             _ => bail!("no tree {t:?}"),

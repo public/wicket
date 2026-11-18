@@ -68,14 +68,30 @@ pub struct Preview {
     /// `sudo wicket self update` on the host, as before).
     pub applies: bool,
     pub why_not: Option<String>,
+    /// The node the run's box is on, when it isn't this host's own: its outbox is there, and the
+    /// artifact is fetched from it (and only then found and hashed) once the request is approved.
+    pub node: Option<String>,
 }
 
 /// The preview of approving `req` (an update request, [`requested_sha`]), with `data` the data dir.
 pub fn preview(l: &Ledger, data: &Path, req: &Request) -> Result<Preview> {
     let sha = requested_sha(req).context("not an update request")?.to_string();
     let nodes = crate::update::node_list(l, "all")?;
-    let mut p =
-        Preview { sha256: sha.clone(), artifact: None, size: None, commit_said: commit_said(req), nodes, applies: false, why_not: None };
+    let mut p = Preview {
+        sha256: sha.clone(),
+        artifact: None,
+        size: None,
+        commit_said: commit_said(req),
+        nodes,
+        applies: false,
+        why_not: None,
+        node: remote_node(l, &req.run),
+    };
+    if p.node.is_some() {
+        // Not fetched to be shown: a fetch is the whole outbox, over the node's connection.
+        p.applies = run_root(data, &req.run).is_ok();
+        return Ok(p);
+    }
     match find(l, data, req, &sha) {
         Ok(f) => {
             p.artifact = Some(f.name);
@@ -87,18 +103,53 @@ pub fn preview(l: &Ledger, data: &Path, req: &Request) -> Result<Preview> {
     Ok(p)
 }
 
-/// The artifact in `req`'s run's outbox, or why there is none.
+/// The node `run`'s box is on, if it isn't this host's own.
+fn remote_node(l: &Ledger, run: &str) -> Option<String> {
+    l.run_node(run).ok().flatten().filter(|n| n != crate::localnode::NAME)
+}
+
+/// The artifact in `req`'s run's outbox on this host, or why there is none.
 fn find(l: &Ledger, data: &Path, req: &Request, sha: &str) -> Result<wicket_node::boxfiles::OutboxFile> {
     let root = run_root(data, &req.run)?;
-    if let Some(node) = l.run_node(&req.run).ok().flatten().filter(|n| n != crate::localnode::NAME) {
-        bail!(
-            "{} runs on node {node}, and its outbox is there: copy the artifact out and run `sudo wicket self update` on the control host",
-            req.run
-        );
+    if let Some(node) = remote_node(l, &req.run) {
+        bail!("{} runs on node {node}, and its outbox is there", req.run);
     }
-    wicket_node::boxfiles::find_in_outbox(&root, sha, MAX_ARTIFACT)?.with_context(|| {
-        format!("no file in {}'s outbox (/workspace/out) has sha256 {sha} (regular files of at most 1 GiB, not links)", req.run)
-    })
+    found(wicket_node::boxfiles::find_in_outbox(&root, sha, MAX_ARTIFACT)?, &req.run, sha)
+}
+
+fn found(f: Option<wicket_node::boxfiles::OutboxFile>, run: &str, sha: &str) -> Result<wicket_node::boxfiles::OutboxFile> {
+    f.with_context(|| format!("no file in {run}'s outbox (/workspace/out) has sha256 {sha} (regular files of at most 1 GiB, not links)"))
+}
+
+/// How long fetching a remote outbox may take.
+const FETCH_WAIT: Duration = Duration::from_secs(600);
+
+/// The artifact in the outbox of `run`'s box on node `node`: the outbox fetched over a control
+/// connection of this process's own ([`crate::nodecall::Link`]) into `into` (private), then found
+/// there as on this host, never following what the box put there. A node from before the
+/// `outbox` tree sends the whole workspace instead.
+async fn fetch_remote(node: &str, run: &str, sha: &str, into: &Path) -> Result<wicket_node::boxfiles::OutboxFile> {
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&crate::ledger_path())?));
+    let link = crate::nodecall::Link::connect(node, &format!("apply-update:{}", std::process::id()), &ledger)
+        .await
+        .with_context(|| format!("reaching node {node}"))?;
+    let get = |tree: &'static str, dest: PathBuf| {
+        let calls = link.calls.clone();
+        async move {
+            tokio::time::timeout(FETCH_WAIT, calls.get_tree(run, tree, &dest))
+                .await
+                .map_err(|_| anyhow::anyhow!("fetching {run}'s {tree} from node {node} took over {FETCH_WAIT:?}"))?
+        }
+    };
+    match get("outbox", into.join("workspace/out")).await {
+        Ok(()) => {}
+        Err(e) if format!("{e:#}").contains("no tree") => {
+            let _ = std::fs::remove_dir_all(into.join("workspace"));
+            get("workspace", into.join("workspace")).await?
+        }
+        Err(e) => return Err(e.context(format!("fetching {run}'s outbox from node {node}"))),
+    }
+    found(wicket_node::boxfiles::find_in_outbox(into, sha, MAX_ARTIFACT)?, run, sha)
 }
 
 /// How an applied update ended, as the requester is told.
@@ -162,9 +213,18 @@ pub async fn apply(request: &str) -> Result<()> {
     // Into a private copy first: the update reads (and hashes again) only that.
     let stage = data.join(format!("self-apply-{}", std::process::id()));
     let _clean = RemoveDir(stage.clone());
-    let copied = find(&l, &data, &req, &sha).and_then(|mut f| {
-        std::fs::create_dir_all(&stage)?;
-        std::fs::set_permissions(&stage, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    let made = std::fs::create_dir_all(&stage)
+        .and_then(|()| std::fs::set_permissions(&stage, std::os::unix::fs::PermissionsExt::from_mode(0o700)))
+        .map_err(anyhow::Error::from);
+    let located = match (made, remote_node(&l, &req.run)) {
+        (Err(e), _) => Err(e),
+        (Ok(()), Some(node)) => {
+            say!("fetching {}'s outbox from node {node}", req.run);
+            fetch_remote(&node, &req.run, &sha, &stage.join("fetched")).await
+        }
+        (Ok(()), None) => find(&l, &data, &req, &sha),
+    };
+    let copied = located.and_then(|mut f| {
         let to = stage.join("artifact");
         let mut out = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&to)?;
         std::io::copy(&mut std::io::Read::take(&mut f.file, MAX_ARTIFACT), &mut out)?;
@@ -303,6 +363,13 @@ mod tests {
         let mut r = req("UPDATE", &format!("/self/{sha}"), "x");
         r.run = "../x".into();
         assert!(!preview(&l, &d, &r).unwrap().applies);
+        // A box on another node: its outbox is fetched from there once approved, not to be shown.
+        l.run_started(&TenantId::single(), &wicket_core::RunId("run_n".into()), "z", "lead").unwrap();
+        l.set_run_node("run_n", "far").unwrap();
+        let mut r = req("UPDATE", &format!("/self/{sha}"), "x");
+        r.run = "run_n".into();
+        let p = preview(&l, &d, &r).unwrap();
+        assert_eq!((p.node.as_deref(), p.applies, p.artifact, p.why_not), (Some("far"), true, None, None));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -65,9 +65,12 @@ The approval is used up by the update that accepts it, whatever uses the grant h
 update to the same artifact needs a second approval. Like every grant made for an agent's request, it
 lapses if the agent's identity is revoked first, so update before ending the agent.
 
-**From a terminal instead.** Only a box on the control host's own node has its outbox on the control
-host; for a box on another node, the card says so and approving only accepts the sha256. Then, or
-if you approve with `sudo wicket approve <request>`, copy the archive out of the run's workspace
+**A box on another node** keeps its outbox there. The card says so, and approving fetches the run's
+`/workspace/out` from the node over a control connection of its own, as `self update` reaches nodes.
+The file is then found in that copy by its sha256, as on the control host, and installed the same
+way. A node older than this build sends the run's whole workspace instead.
+
+**From a terminal instead.** If you approve with `sudo wicket approve <request>`, copy the archive out of the run's workspace
 (`<data dir>/runs/<run>/workspace/out/`, or the node's run directory), check its sha256 against the
 request, and run `sudo wicket self update /tmp/wicket-…tar.gz --nodes all`; or
 `sudo wicket self apply-update <request>`, which takes it from the outbox as the console does.

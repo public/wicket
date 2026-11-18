@@ -92,8 +92,11 @@ reaches, and the passkey signs them with the decision. The console then runs `wi
 runs the same update as `self update <copy> --nodes all`, which hashes the copy again and accepts it
 only by that approval, used up. The requester is told the outcome as a notice from wicket. It moves the
 `wicket` user's versions only: root's copies and link stay, as root never runs what the `wicket` user
-staged (#261). A box on another node keeps its outbox there, so its update is still applied from a
-terminal.
+staged (#261). A box on another node keeps its outbox there. `apply-update` fetches it as the node's
+read-only `outbox` tree (the run's `workspace/out`, refused if the box made either directory a
+link), over a control connection of its own, into a private directory. It then finds the file by
+its sha256 with the same no-follow walk. A node from before the `outbox` tree sends the run's
+whole `workspace` instead.
 
 ## Builds CI signed
 

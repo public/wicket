@@ -189,6 +189,10 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(ids["confirm-what"].textContent.startsWith("Deny"), ids["confirm-what"].textContent);
   assert.strictEqual(ids["confirm-blast"].hidden, true, "a denial widens nothing");
   assert.strictEqual(ids["confirm-update"].hidden, true, "and installs nothing");
+  // A box on another node: the artifact is fetched from its outbox there, once approved.
+  await run('renderUpdate(document.getElementById("confirm-update"), { sha256: "ab".repeat(32), node: "far", applies: true, nodes: [], commit_said: null })');
+  assert.ok(ids["confirm-update"].textContent.includes("on node far, fetched from there when you approve"), ids["confirm-update"].textContent);
+  await run('renderUpdate(document.getElementById("confirm-update"), null)');
   ids["confirm-cancel"].listeners.click(); await flush();
   assert.strictEqual(ids.confirm.hidden, true);
   assert.strictEqual(ceremonies, 1);
