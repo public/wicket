@@ -4,8 +4,8 @@
 //! spec has no counterpart (protocol skew, budget arithmetic) the harness says so.
 //!
 //! The harnesses live next to the code they check (`#[path]` child modules of `manifest`,
-//! `subset`, `canon`, `op`, `git`, `effect`, `version`, `budget`, `authority` and `quota`, so they
-//! reach private functions); this module holds what they share.
+//! `subset`, `canon`, `op`, `git`, `effect`, `time`, `version`, `budget`, `authority` and `quota`, so
+//! they reach private functions); this module holds what they share.
 //!
 //! Bounds. CBMC unrolls every loop, so inputs are short strings over a few characters chosen to
 //! reach every branch, and the checked functions avoid `format!` and allocation on the paths the
