@@ -163,3 +163,58 @@ pub fn check(tok: &Biscuit) -> Result<Estimate, String> {
     }
     Ok(e)
 }
+
+/// The estimate's edges, on hand-built tokens (the mutants #466's run left: each assertion below
+/// fails if one comparison or condition is turned around).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(code: &str) -> Biscuit {
+        Biscuit::builder().code(code).unwrap().build(&biscuit_auth::PrivateKey::new()).unwrap()
+    }
+
+    /// A path glob of `n` pattern bytes.
+    fn glob(n: usize) -> String {
+        format!("^/{}$", "a".repeat(n - 3))
+    }
+
+    /// A token costing exactly the budget passes; one pattern byte more is refused.
+    #[test]
+    fn a_token_costing_exactly_the_budget_passes() {
+        let n = ((STEP_BUDGET - BASE_STEPS) / STEPS_PER_PATTERN_BYTE) as usize;
+        let at = token(&format!(r#"check if host("h"), path($p), $p.matches("{}");"#, glob(n)));
+        let e = check(&at).unwrap();
+        assert_eq!((e.pattern_bytes, e.steps()), (n as u64, STEP_BUDGET));
+        let over = token(&format!(r#"check if host("h"), path($p), $p.matches("{}");"#, glob(n + 1)));
+        assert!(check(&over).unwrap_err().starts_with("host h:"));
+    }
+
+    /// The host a query binds is its `host` predicate's, whatever one-term predicate comes before it.
+    #[test]
+    fn the_host_is_the_host_predicates_not_the_first_ones() {
+        let t = token(r#"check if method("GET"), host("h.example"), path($p), $p.matches("^/a$");"#);
+        assert_eq!(estimate(&t).unwrap(), Estimate { host: "h.example".into(), pattern_bytes: 4, patterns: 1 });
+    }
+
+    /// Of two hosts that cost the same, the first (in key order) is named.
+    #[test]
+    fn a_tie_names_the_first_host() {
+        let t = token(
+            r#"check if host("a.example"), path($p), $p.matches("^/x$");
+               check if host("b.example"), path($p), $p.matches("^/y$");"#,
+        );
+        assert_eq!(estimate(&t).unwrap().host, "a.example");
+    }
+
+    /// A query with no path glob counts for nothing, not even as a host: a wildcard's globs are
+    /// named by the wildcard, not by an exact host under it that has none of its own.
+    #[test]
+    fn a_host_without_globs_is_no_candidate() {
+        let t = token(
+            r#"check if host("h.example.com");
+               check if host($h), $h.ends_with(".example.com"), path($p), $p.matches("^/abc$");"#,
+        );
+        assert_eq!(estimate(&t).unwrap(), Estimate { host: "*.example.com".into(), pattern_bytes: 6, patterns: 1 });
+    }
+}
