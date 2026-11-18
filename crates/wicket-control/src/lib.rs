@@ -22,6 +22,7 @@ use wicket_home::{cli_principal, data_dir, issuer, issuer_key_path, ledger_path,
 use wicket_node::nodesrv;
 
 pub mod capacity;
+pub mod digest;
 pub mod effect;
 pub mod enrol;
 // The control host's gateway tools (#257), a crate of their own: what the simulation calls.

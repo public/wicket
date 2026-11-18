@@ -43,7 +43,11 @@ wicket program digest programs/repo-stats       # prints sha256:…
 
 Put it in the manifest as `program.digest: sha256:…` (as in
 `examples/program-repo-stats.pinned.yaml`). From then on a run refuses any other source, and the
-digest is recorded in the run's `run.start` audit record.
+digest is recorded in the run's `run.start` audit record. The source is accepted the way every
+digest is (#258): by a grant on it. Running the pinned manifest records your grant (`run` on the
+digest, in the run's zone, for a day; `digest.granted`), and each run is accepted by it
+(`digest.accepted`, naming the grant). `wicket grant list` shows it, and `wicket grant revoke`
+ends it: the next run of the pinned manifest records a new one.
 
 The digest is the source's tree in wicket's content-addressed store
 ([store.md](../explanation/store.md)): every file's content, name and executable bit, and nothing

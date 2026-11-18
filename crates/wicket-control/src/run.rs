@@ -444,16 +444,27 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 Some(s) => Some(crate::program::digest_dir(s)?),
                 None => None,
             };
-            match (&p.digest, &digest, &src) {
+            let pinned = match (&p.digest, &digest, &src) {
                 (Some(want), Some(got), Some(s)) if want != got => match crate::program::check_pin(s, got, want)? {
                     crate::program::Pinned::Legacy => {
-                        say!("[wicket] program {} is pinned by its old digest {want}; `wicket zone pin` rewrites it to {got}", p.name)
+                        say!("[wicket] program {} is pinned by its old digest {want}; `wicket zone pin` rewrites it to {got}", p.name);
+                        true
                     }
                     _ => bail!("program {} source digest is {got}, but the approved digest is {want}: re-approve the change", p.name),
                 },
                 (Some(_), None, _) => bail!("program {} pins a digest but has no source", p.name),
-                (None, Some(got), _) => say!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name),
-                _ => {}
+                (None, Some(got), _) => {
+                    say!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name);
+                    false
+                }
+                (Some(_), Some(_), _) => true,
+                _ => false,
+            };
+            // The one "may this digest run" check (#258): a grant on the pinned source's digest.
+            if let (true, Some(got)) = (pinned, &digest) {
+                let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
+                let u = crate::digest::accept_program(&Ledger::open(&ledger_path())?, &m.tenant, &m.zone.name, &p.name, got, &by)?;
+                say!("[wicket] program {} ({got}) accepted by grant {} from {}", p.name, u.grant, u.decided_by);
             }
             src.map(|s| (s, digest.unwrap_or_default()))
         }
