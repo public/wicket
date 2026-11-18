@@ -63,8 +63,11 @@ pub fn is_pinned(s: &str) -> bool {
 /// The repository of a name: without its tag (`wicket-self:dev` → `wicket-self`;
 /// `registry:5000/x:1` → `registry:5000/x`).
 pub fn repository(name: &str) -> &str {
-    match name.rfind(':') {
-        Some(i) if !name[i + 1..].contains('/') => &name[..i],
+    // Over bytes (`:` and `/` are ASCII, so the same places as a char search): str's char search
+    // made the Kani harness of `entry_allows` take 28 minutes (#325).
+    let b = name.as_bytes();
+    match b.iter().rposition(|&c| c == b':') {
+        Some(i) if !b[i + 1..].contains(&b'/') => &name[..i],
         _ => name,
     }
 }
@@ -119,6 +122,20 @@ mod tests {
 
     fn d(c: char) -> String {
         format!("sha256:{}", std::iter::repeat_n(c, 64).collect::<String>())
+    }
+
+    /// `repository` searches bytes now (for Kani); it gives what the char search did.
+    #[test]
+    fn repository_is_the_name_without_its_tag() {
+        let old = |name: &str| -> String {
+            match name.rfind(':') {
+                Some(i) if !name[i + 1..].contains('/') => name[..i].to_string(),
+                _ => name.to_string(),
+            }
+        };
+        for n in ["", ":", "a", "a:b", "a:b:c", "registry:5000/x", "registry:5000/x:1", "é:é", "a/é:1", "x:/", "/:", "wicket-self:dev"] {
+            assert_eq!(repository(n), old(n), "{n}");
+        }
     }
 
     #[test]
