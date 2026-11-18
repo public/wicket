@@ -380,14 +380,7 @@ pub fn trigger_wake(agent: &str, by: &str) {
         c.stdout(l2);
     }
     c.stderr(log);
-    use std::os::unix::process::CommandExt;
-    // SAFETY: setsid in the child before exec; no allocation.
-    unsafe {
-        c.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    wicket_node::reexec::detach(&mut c);
     match c.spawn() {
         Ok(_) => {}
         Err(e) => say_err!("[wicket] can't wake {agent}: {e}"),
