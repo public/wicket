@@ -69,6 +69,13 @@ wicket node revoke n1
   ssh call uses a wicket-managed known_hosts (`<data dir>/nodes/<name>/known_hosts`) with
   `StrictHostKeyChecking=yes`, so a node with any other key is refused. A `--node` target that isn't enrolled
   is refused: boxes run only through an enrolled node's `serve`. A revoked node is refused.
+- **One connection per node** (#287). An enrolled node's ssh calls share one connection: the first opens a
+  master (`ControlMaster=auto`), with its control socket in `<data dir>/ssh/` (the wicket user's, 0700), and
+  each later call for 10 minutes after the last (`ControlPersist=10m`) is a session over it. A run's channel,
+  link relays, health checks, `self update` and `renew-ca` all use it. So a box start after the first skips
+  ssh's connect, key exchange and authentication: about 0.39 s to 0.05 s on pc5800. The master is opened with
+  the pinned host key like every connection. Keepalives (every 10 s, 3 missed) end a master whose connection
+  died; a channel that gets no answer over one closes it (`ssh -O exit`) and dials once more, fresh.
 - **Join token.** It's single-use, expires, and names the node. The operator redeems it on the control host
   with `enrol`. It shows that whoever minted it meant that name to join, and it never goes to the node. Passed as `--token`,
   it shows up in `ps` and shell history, which is acceptable only because it's single-use and short-lived.
@@ -106,7 +113,8 @@ wicket node revoke n1
   `*.example.org` permits every name under `example.org` but not `example.org` itself. X.509 can't express
   "exactly this host". The reach rules stay the exact gate, and the constraint bounds what a stolen node CA can
   do until it expires.
-- **Revoking** deletes the pinned key, revokes the node's identity certificates (a run connected to the node
+- **Revoking** closes the node's shared ssh connection (it would carry commands without checking a host
+  key), deletes the pinned key, revokes the node's identity certificates (a run connected to the node
   stops its box there and drops it within a second, and nothing reconnects), and records the node CA's serials
   for the feed's revocation list (not distributed yet), as a renewal over the channel does for the CA it replaces.
 

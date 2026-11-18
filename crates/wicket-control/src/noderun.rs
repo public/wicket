@@ -926,50 +926,64 @@ async fn session(
     // Only the first connection's steps are part of the box's start (#287).
     let first = ready.is_some() && !sh.timings.has("node.dial");
     let dialing = std::time::Instant::now();
-    let d = match sh.via.dial().await {
-        Ok(d) => d,
-        // This host's own node's `serve` is gone (killed, or exited): start it again, and it adopts
-        // its boxes, this run's among them (#151).
-        Err(e) if sh.node == crate::localnode::NAME => {
-            crate::localnode::ensure(&sh.ledger).await.map_err(|e2| e.context(format!("restarting this host's node: {e2:#}")))?;
-            sh.via.dial().await?
-        }
-        Err(e) => return Err(e),
-    };
-    let (mut from, mut to, mut child, errlog) = (d.rd, d.wr, d.child, d.errlog);
-    let shaking = std::time::Instant::now();
-    if first {
-        sh.timings.record("node.dial", dialing, shaking);
-    }
-    let build = crate::nodesrv::build_id()?;
-    let hello = |nonce| Msg::Hello {
-        node: sh.node.clone(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        build,
-        proto: crate::chan::PROTOCOL,
-        observer: false,
-        nonce,
-        scope: sh.run.0.clone(),
-    };
-    let authed = match crate::nodeauth::control(&mut from, &mut to, &sh.node, &sh.ledger, &sh.issuer, hello).await {
-        Ok(a) => a,
-        Err(HsError::NoAnswer) => {
-            if let Some(c) = child.as_mut() {
-                let _ = c.start_kill();
+    let mut fresh = false;
+    let (mut from, mut to, mut child, authed, shaking) = loop {
+        let d = match sh.via.dial().await {
+            Ok(d) => d,
+            // This host's own node's `serve` is gone (killed, or exited): start it again, and it adopts
+            // its boxes, this run's among them (#151).
+            Err(e) if sh.node == crate::localnode::NAME => {
+                crate::localnode::ensure(&sh.ledger).await.map_err(|e2| e.context(format!("restarting this host's node: {e2:#}")))?;
+                sh.via.dial().await?
             }
-            let err = match errlog {
-                Some(e) => e.await.unwrap_or_default(),
-                None => String::new(),
-            };
-            let err = err.trim().lines().last().unwrap_or("no error output").to_string();
-            bail!("no answer from `wicket node serve` ({err}): is it installed and running? (`wicket node install {}`)", sh.node);
+            Err(e) => return Err(e),
+        };
+        let (mut from, mut to, mut child, errlog) = (d.rd, d.wr, d.child, d.errlog);
+        let shaking = std::time::Instant::now();
+        if first {
+            sh.timings.record("node.dial", dialing, shaking);
         }
-        Err(e @ HsError::Timeout(_)) => return Err(e.into()),
-        Err(HsError::Refused(why)) => {
-            // Refused either way (identity, revocation, protocol): not worth retrying.
-            p.ever = false;
-            bail!("{why}")
-        }
+        let build = crate::nodesrv::build_id()?;
+        let hello = |nonce| Msg::Hello {
+            node: sh.node.clone(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            build,
+            proto: crate::chan::PROTOCOL,
+            observer: false,
+            nonce,
+            scope: sh.run.0.clone(),
+        };
+        let authed = match crate::nodeauth::control(&mut from, &mut to, &sh.node, &sh.ledger, &sh.issuer, hello).await {
+            Ok(a) => a,
+            // Over a shared ssh connection that has gone stale (a network change, #287): close it and
+            // dial again, once, over a fresh one, before counting this as no answer.
+            Err(HsError::NoAnswer | HsError::Timeout(_)) if !fresh && matches!(sh.via, crate::nodecall::Via::Ssh(_)) => {
+                if let Some(c) = child.as_mut() {
+                    let _ = c.start_kill();
+                }
+                crate::enrol::close_master_of(&sh.ledger.lock().expect("ledger"), &crate::enrol::Paths::installation().nodes_dir, &sh.node);
+                fresh = true;
+                continue;
+            }
+            Err(HsError::NoAnswer) => {
+                if let Some(c) = child.as_mut() {
+                    let _ = c.start_kill();
+                }
+                let err = match errlog {
+                    Some(e) => e.await.unwrap_or_default(),
+                    None => String::new(),
+                };
+                let err = err.trim().lines().last().unwrap_or("no error output").to_string();
+                bail!("no answer from `wicket node serve` ({err}): is it installed and running? (`wicket node install {}`)", sh.node);
+            }
+            Err(e @ HsError::Timeout(_)) => return Err(e.into()),
+            Err(HsError::Refused(why)) => {
+                // Refused either way (identity, revocation, protocol): not worth retrying.
+                p.ever = false;
+                bail!("{why}")
+            }
+        };
+        break (from, to, child, authed, shaking);
     };
     let (feed, runs) = match authed.welcome {
         Msg::Welcome { feed, runs, proto, capacity, .. } => {

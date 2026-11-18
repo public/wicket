@@ -50,6 +50,11 @@ including the agent's own settings and any subagents it runs there. The goals ar
   access away from untrusted reads.
 - Risk is judged from method, host and path, with a short pattern list for GitHub only.
 - The Biscuit fork nodes decide with has had no external audit.
+- **A node's shared ssh connection** (#287). The control host keeps one ssh connection to each enrolled node
+  open for 10 minutes after its last use, through a control socket in the wicket user's 0700 `<data dir>/ssh/`.
+  Whoever holds the wicket uid can open sessions to the node over it without the ssh key, which that uid can
+  read anyway. A session over it checks no host key: the master did, when it opened. So revoking or releasing
+  a node closes its master before its pinned key goes.
 
 Everything else is in [limits](limits.md), with the design section or issue for each. The 0.0.1
 security review is [security-review-0.0.1](security-review-0.0.1.md).
