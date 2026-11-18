@@ -1008,7 +1008,9 @@ pub fn update_lock() -> Result<std::fs::File> {
     Ok(f)
 }
 
-struct RemoveOnDrop(PathBuf);
+/// A directory removed, with what is in it, when this is dropped: a private staging directory's
+/// lifetime (wicket-cli's one such guard).
+pub(crate) struct RemoveOnDrop(pub(crate) PathBuf);
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
