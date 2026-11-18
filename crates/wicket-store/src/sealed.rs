@@ -6,10 +6,9 @@
 //!   its ciphertext with the tag. Chunk `i`'s nonce is the prefix and `i`; its associated data is the
 //!   object's key, `i` and whether it is the last chunk. So an object can't be read under another
 //!   key, nor its chunks reordered, dropped or cut short, without the read failing.
-//! - **Keys.** Sealed objects are stored under `sealed/<key>`. Objects written before sealing (plain,
-//!   under `<key>`) are still read, so agents hibernated before can wake; anything written from now on
-//!   is sealed, and the next hibernation writes the agent's trees sealed again (content-addressed
-//!   blobs are re-written under the sealed name, not deduplicated against plain ones).
+//! - **Keys.** Objects are stored under `sealed/<key>`, and only those exist: nothing plain under a
+//!   key is read, listed or counted. Anyone who can write the backend could otherwise plant a plain
+//!   object that is read as if wicket had written it.
 //! - **What isn't hidden.** Object keys (content hashes, agent ids, sequence numbers) and sizes.
 //! - **Another store.** A store that already encrypts at rest itself (S3 with server-side
 //!   encryption, say) can be used without this layer; sealing here also keeps the data from whoever
@@ -30,8 +29,6 @@ pub struct SealedStore<S> {
     inner: S,
     raw: [u8; 32],
     kid: [u8; 8],
-    /// Whether objects written before sealing (plain, under their own key) are read.
-    plain: bool,
 }
 
 fn kid(key: &[u8; 32]) -> [u8; 8] {
@@ -82,10 +79,7 @@ impl<S: ObjectStore> SealedStore<S> {
             Some(n) => self.inner.get_head(&name, 20 + n.div_ceil(CHUNK as u64).max(1) * (4 + CHUNK + TAG) as u64)?,
             None => self.inner.get(&name)?,
         };
-        let Some(mut r) = got else {
-            // Written before objects were sealed.
-            return if self.plain { self.inner.get(key) } else { Ok(None) };
-        };
+        let Some(mut r) = got else { return Ok(None) };
         let mut head = [0u8; 20];
         if fill(&mut *r, &mut head)? != 20 || &head[..4] != MAGIC {
             return Err(bad("not a sealed object"));
@@ -98,16 +92,9 @@ impl<S: ObjectStore> SealedStore<S> {
         Ok(Some(Box::new(Opener { inner: r, key: key2, object: key.into(), prefix, i: 0, buf: vec![], pos: 0, done: false, partial })))
     }
 
+    /// `inner`, its objects sealed under `key`.
     pub fn new(inner: S, key: &[u8; 32]) -> SealedStore<S> {
-        SealedStore { inner, raw: *key, kid: kid(key), plain: true }
-    }
-
-    /// Like [`SealedStore::new`], but only sealed objects exist: nothing plain under a key is read,
-    /// listed or counted. Anyone who can write the backend could otherwise plant a plain object
-    /// that is read as if wicket had written it. The content-addressed store ([`crate::cas`]) uses
-    /// this.
-    pub fn sealed_only(inner: S, key: &[u8; 32]) -> SealedStore<S> {
-        SealedStore { plain: false, ..SealedStore::new(inner, key) }
+        SealedStore { inner, raw: *key, kid: kid(key) }
     }
 
     /// `data`, sealed for object `object`, as it is read.
@@ -276,25 +263,17 @@ impl<S: ObjectStore> ObjectStore for SealedStore<S> {
     }
 
     fn has(&self, key: &str) -> io::Result<bool> {
-        Ok(self.inner.has(&format!("{PREFIX}{key}"))? || (self.plain && self.inner.has(key)?))
+        self.inner.has(&format!("{PREFIX}{key}"))
     }
 
     fn delete(&self, key: &str) -> io::Result<()> {
-        self.inner.delete(&format!("{PREFIX}{key}"))?;
-        if self.plain {
-            self.inner.delete(key)?;
-        }
-        Ok(())
+        self.inner.delete(&format!("{PREFIX}{key}"))
     }
 
     fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
         let mut out: Vec<String> =
             self.inner.list_prefix(&format!("{PREFIX}{prefix}"))?.into_iter().map(|k| k[PREFIX.len()..].to_string()).collect();
-        if self.plain {
-            out.extend(self.inner.list_prefix(prefix)?.into_iter().filter(|k| !k.starts_with(PREFIX)));
-        }
         out.sort();
-        out.dedup();
         Ok(out)
     }
 }
@@ -370,7 +349,7 @@ mod tests {
     fn the_head_of_an_object_is_read_from_its_first_chunks_alone() {
         let d = std::env::temp_dir().join(format!("wicket-sealed-head-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        let s = SealedStore::sealed_only(Ranged(DirStore::new(&d)), &[7u8; 32]);
+        let s = SealedStore::new(Ranged(DirStore::new(&d)), &[7u8; 32]);
         let data: Vec<u8> = (0..3 * CHUNK + 5).map(|i| (i % 251) as u8).collect();
         s.put_if_absent("o/big", &mut &data[..]).unwrap();
         let mut head = vec![];
@@ -415,21 +394,8 @@ mod tests {
     }
 
     #[test]
-    fn objects_written_before_sealing_are_still_read() {
-        let (s, d) = store("legacy");
-        DirStore::new(&d).put_if_absent("old/blob", &mut &b"plain"[..]).unwrap();
-        assert_eq!(read(&s, "old/blob").unwrap(), b"plain");
-        assert_eq!(s.list_prefix("old/").unwrap(), ["old/blob"]);
-        // Written again from now on: sealed, under its sealed name.
-        assert!(s.put_if_absent("old/blob", &mut &b"plain"[..]).unwrap());
-        assert!(std::fs::read(d.join("sealed/old/blob")).unwrap().starts_with(MAGIC));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_sealed_only_store_never_reads_a_plain_object() {
-        let (_, d) = store("strict");
-        let s = SealedStore::sealed_only(DirStore::new(&d), &[7u8; 32]);
+    fn a_plain_object_is_never_read() {
+        let (s, d) = store("strict");
         DirStore::new(&d).put_if_absent("r/planted", &mut &b"plain"[..]).unwrap();
         assert!(s.get("r/planted").unwrap().is_none());
         assert!(!s.has("r/planted").unwrap());

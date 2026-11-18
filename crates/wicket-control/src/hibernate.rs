@@ -51,7 +51,7 @@ pub const BUSY_CLAIM_SECS: i64 = 900;
 /// plain reads, and the count of what its backend writes.
 pub fn local_store() -> Result<(wicket_store::cas::Cas, std::sync::Arc<std::sync::atomic::AtomicU64>)> {
     let (dir, written) = wicket_store::objects::Counting::new(DirStore::new(data_dir().join("store")));
-    Ok((wicket_store::cas::Cas::new(SealedStore::sealed_only(dir, &state_key()?)), written))
+    Ok((wicket_store::cas::Cas::new(SealedStore::new(dir, &state_key()?)), written))
 }
 
 /// The shared content-addressed store bundles must reach before a head moves: the state store's, if
@@ -60,7 +60,7 @@ pub fn local_store() -> Result<(wicket_store::cas::Cas, std::sync::Arc<std::sync
 pub fn shared_store() -> Result<Option<wicket_store::cas::Cas>> {
     Ok(match crate::statestore::StateStore::load()? {
         Some(s) if s.bundles == crate::statestore::Where::S3 => {
-            Some(wicket_store::cas::Cas::new(SealedStore::sealed_only(s.open_s3()?, &state_key()?)))
+            Some(wicket_store::cas::Cas::new(SealedStore::new(s.open_s3()?, &state_key()?)))
         }
         _ => None,
     })
