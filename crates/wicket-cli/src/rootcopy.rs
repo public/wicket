@@ -24,6 +24,7 @@ use anyhow::{bail, Context, Result};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use wicket_node::reexec::valid_id;
 
 /// Root's copies.
 pub const COPIES: &str = "/usr/local/lib/wicket";
@@ -117,10 +118,6 @@ pub struct Layout {
     pub versions: PathBuf,
     /// The account root must not trust (None: there is none, nothing is checked).
     pub untrusted: Option<Account>,
-}
-
-fn valid_id(id: &str) -> bool {
-    id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl Layout {

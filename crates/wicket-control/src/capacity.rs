@@ -350,14 +350,10 @@ pub fn status(l: &Ledger, run: &RunId, id: &str) -> Result<CapacityState> {
         "active" => CapacityState::Settled(format!(
             "ready: lease {id} is node {} until {}. Start boxes there with spawn and placement {{\"lease\": \"{id}\"}}. They stop when the lease ends.",
             lease.node_name.as_deref().unwrap_or("?"),
-            lease.not_after.map(fmt_time).unwrap_or_else(|| "?".into())
+            lease.not_after.map(wicket_core::time::unix_rfc3339).unwrap_or_else(|| "?".into())
         )),
         s => CapacityState::Settled(format!("lease {id} is {s}: {}", lease.detail.unwrap_or_default())),
     })
-}
-
-pub fn fmt_time(t: i64) -> String {
-    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
 }
 
 /// Whether a request is a capacity ask, and for which lease.
@@ -388,7 +384,7 @@ pub fn list() -> Result<()> {
             x.provider,
             x.node_name.as_deref().or(x.node_id.as_deref()).unwrap_or("-"),
             usd(x.reserved),
-            x.not_after.map(fmt_time).unwrap_or_else(|| "-".into()),
+            x.not_after.map(wicket_core::time::unix_rfc3339).unwrap_or_else(|| "-".into()),
             x.billed.map(|b| format!("billed {}  ", usd(b))).unwrap_or_default(),
             x.detail.unwrap_or_default()
         );

@@ -481,9 +481,11 @@ where
         for a in actions {
             match a {
                 plan::Action::Ignore { node, reason } => self.note("ignored", &node.0, &format!("{reason:?}: never touched")),
-                plan::Action::Pool { node, until } => {
-                    self.note("kept_warm", &node.0, &format!("no lease; paid until {}, destroyed then", capacity::fmt_time(until)))
-                }
+                plan::Action::Pool { node, until } => self.note(
+                    "kept_warm",
+                    &node.0,
+                    &format!("no lease; paid until {}, destroyed then", wicket_core::time::unix_rfc3339(until)),
+                ),
                 plan::Action::Destroy { node, reason: plan::DestroyReason::NoLease } if young(&node).is_some() => {
                     // Nothing records it, and it is new: its creator (`wicket node create`) may not
                     // have recorded it yet (#324).
@@ -491,7 +493,10 @@ where
                     self.note(
                         "young",
                         &node.0,
-                        &format!("nothing records it, and it was just created: left for its creator until {}", capacity::fmt_time(until)),
+                        &format!(
+                            "nothing records it, and it was just created: left for its creator until {}",
+                            wicket_core::time::unix_rfc3339(until)
+                        ),
                     )
                 }
                 plan::Action::Destroy { node, reason } => self.destroy(&node, &format!("{reason:?}")).await?,
@@ -581,7 +586,7 @@ where
                 lease.id,
                 n.plan.as_deref().unwrap_or("?"),
                 n.billing.hourly_rate(),
-                n.lease_until.map(capacity::fmt_time).unwrap_or_default()
+                n.lease_until.map(wicket_core::time::unix_rfc3339).unwrap_or_default()
             ),
             Some(&lease.run),
         );
@@ -607,7 +612,7 @@ where
                 self.did(
                     "lease_active",
                     &lease.id,
-                    &format!("node {name} ({target}) until {}", capacity::fmt_time(until)),
+                    &format!("node {name} ({target}) until {}", wicket_core::time::unix_rfc3339(until)),
                     Some(&lease.run),
                 );
             }
@@ -703,7 +708,7 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
         if row.lease_until > now {
             continue;
         }
-        let ended = capacity::fmt_time(row.lease_until);
+        let ended = wicket_core::time::unix_rfc3339(row.lease_until);
         let mut record = |ledger: &mut Ledger, kind: &'static str, detail: String, audit: bool| {
             if audit && !dry_run {
                 let _ = ledger.audit(

@@ -25,8 +25,6 @@ pub mod nodesrv;
 pub mod reexec;
 pub mod status;
 
-use std::time::Duration;
-
 /// Where wicket keeps its files on a node, relative to the login's home directory.
 pub const NODE_DIR: &str = ".local/share/wicket-node";
 
@@ -40,10 +38,6 @@ pub const AGENT_ASKS: &str = "asked by the agent: ";
 pub fn past_lease(node: &str, until: i64) -> String {
     format!(
         "node {node} is past its lease (it ended {}): it takes no new runs, and the reconciler releases it once nothing is on it. Create another node (wicket node create)",
-        fmt_time(until)
+        wicket_core::time::unix_rfc3339(until)
     )
-}
-
-fn fmt_time(t: i64) -> String {
-    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
 }
