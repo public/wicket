@@ -14,11 +14,11 @@
 //! 4. then the ledger records it, revoking the CA it replaced early (`node.ca_renewed`).
 //!
 //! A node that was unreachable until its CA expired is renewed the same way once a run connects to
-//! it; a box start waits for that (a box on an expired CA is refused by the node). A node on
-//! protocol 13 isn't asked: `wicket node renew-ca` renews it over ssh, as before. The control host's
-//! own node renews its CA itself (`localnode.rs`).
+//! it; a box start waits for that (a box on an expired CA is refused by the node). `wicket node
+//! renew-ca` renews it over ssh instead, for a node unreachable meanwhile. The control host's own
+//! node renews its CA itself (`localnode.rs`).
 
-use crate::chan::{Msg, CA_RENEWAL};
+use crate::chan::Msg;
 use anyhow::Context;
 use std::sync::Mutex;
 use wicket_core::TenantId;
@@ -58,7 +58,8 @@ impl CaRenewal {
 
     /// Checked every second: the request to send, if a renewal is due and none is under way.
     pub fn tick(&mut self, ledger: &Mutex<Ledger>, node: &str, proto: u32, now: i64) -> Option<Msg> {
-        if proto < CA_RENEWAL || node == crate::LOCAL_NODE {
+        // 0: the connection hasn't negotiated a version yet. Every version it can talk renews.
+        if proto == 0 || node == crate::LOCAL_NODE {
             return None;
         }
         match &self.step {
@@ -186,15 +187,15 @@ mod tests {
         i.ledger.lock().unwrap().renew_node_ca(&enrolled).unwrap();
         let c = ca_of(&i.ledger);
         let now = c.issued_at;
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, now + 1799).is_none());
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL - 1, now + 1800).is_none(), "a node at 13 isn't asked");
-        assert!(r.tick(&i.ledger, crate::LOCAL_NODE, CA_RENEWAL, now + 7200).is_none(), "the local node renews itself");
-        assert_eq!(r.tick(&i.ledger, "n1", CA_RENEWAL, now + 1800), Some(Msg::CaRenew {}));
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, now + 1801).is_none(), "one at a time");
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, now + 1799).is_none());
+        assert!(r.tick(&i.ledger, "n1", 0, now + 1800).is_none(), "not asked before the connection talks a version");
+        assert!(r.tick(&i.ledger, crate::LOCAL_NODE, crate::chan::PROTOCOL, now + 7200).is_none(), "the local node renews itself");
+        assert_eq!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL - 1, now + 1800), Some(Msg::CaRenew {}), "a node at 14 is asked too");
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, now + 1801).is_none(), "one at a time");
         // The node refused (another renewal under way): retried a minute later.
         assert!(r.on_csr(&i.ledger, Some(&root), "n1", None, Some("busy".into()), now + 1802).is_none());
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, now + 1803).is_none());
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, now + 1802 + STEP_SECS).is_some());
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, now + 1803).is_none());
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, now + 1802 + STEP_SECS).is_some());
         let t = now + 1900;
         let key = rcgen::KeyPair::generate().unwrap();
         let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
@@ -204,14 +205,14 @@ mod tests {
         assert!(r.on_installed(&i.ledger, "n1", "", Some("no".into()), t).is_none());
         assert_eq!(ca_of(&i.ledger).serial, c.serial);
         // Again, and taken.
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, t + STEP_SECS).is_some());
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, t + STEP_SECS).is_some());
         let key = rcgen::KeyPair::generate().unwrap();
         let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
         let Some(Msg::NodeCa { pem }) = r.on_csr(&i.ledger, Some(&root), "n1", Some(csr), None, t + STEP_SECS) else { panic!() };
         let (_, p) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap();
         let serial = hex::encode(p.parse_x509().unwrap().raw_serial());
         assert!(r.on_installed(&i.ledger, "n1", "someone-else", None, t + STEP_SECS).is_none(), "not the one sent");
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, t + 2 * STEP_SECS).is_some());
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, t + 2 * STEP_SECS).is_some());
         let key = rcgen::KeyPair::generate().unwrap();
         let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
         let Some(Msg::NodeCa { pem }) = r.on_csr(&i.ledger, Some(&root), "n1", Some(csr), None, t + 2 * STEP_SECS) else { panic!() };
@@ -227,7 +228,7 @@ mod tests {
         let l = i.ledger.lock().unwrap();
         assert_eq!(l.revoked_node_cas(t).unwrap().iter().map(|c| c.serial.clone()).collect::<Vec<_>>(), std::slice::from_ref(&c.serial));
         drop(l);
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, t + 3 * STEP_SECS).is_none(), "renewed: not due");
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, t + 3 * STEP_SECS).is_none(), "renewed: not due");
     }
 
     #[test]
@@ -235,12 +236,12 @@ mod tests {
         let i = Install::new("ca-renew-lost");
         let mut r = CaRenewal::default();
         let now = ca_of(&i.ledger).not_after; // expired: due at once (a node back after its CA's end)
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, now).is_some());
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, now + STEP_SECS - 1).is_none());
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, now + STEP_SECS).is_some());
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, now).is_some());
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, now + STEP_SECS - 1).is_none());
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, now + STEP_SECS).is_some());
         // A reconnect forgets what was asked on the old connection.
         r.reset();
-        assert!(r.tick(&i.ledger, "n1", CA_RENEWAL, now + STEP_SECS + 1).is_some());
+        assert!(r.tick(&i.ledger, "n1", crate::chan::PROTOCOL, now + STEP_SECS + 1).is_some());
         // An answer nothing asked for is ignored.
         let mut fresh = CaRenewal::default();
         assert!(fresh.on_csr(&i.ledger, None, "n1", Some("x".into()), None, now).is_none());

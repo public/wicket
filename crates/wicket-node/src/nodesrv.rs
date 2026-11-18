@@ -1448,22 +1448,9 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
         std::fs::create_dir_all(dir.join("state").join(d))?;
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::write(dir.join("ca/ca.pem"), format!("{}{}", node.root_pem, bs.ca_pem))?;
+    std::fs::write(dir.join("ca/ca.pem"), &node.root_pem)?;
     std::fs::write(dir.join("hosts"), wicket_core::link::hosts_file(&[]))?;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let tar = b64.decode(&bs.workspace_tar).context("workspace archive")?;
-    if !tar.is_empty() {
-        let mut c = tokio::process::Command::new("tar")
-            .arg("-C")
-            .arg(dir.join("workspace"))
-            .args(["--no-same-owner", "-xf", "-"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        c.stdin.take().expect("stdin").write_all(&tar).await?;
-        if !c.wait().await?.success() {
-            bail!("unpacking the workspace failed");
-        }
-    }
     // The state tree may be the agent's own (restored from its bundle), so a name in it may be a
     // symlink it planted: every directory on the way is made a real one and each file is created
     // new, never followed.
@@ -1675,7 +1662,7 @@ fn child_start(
         interactive: launch.stdin_task.is_some(),
         timeout_secs: timeout.min(left),
         escalate: m.zone.escalation.request,
-        ca_pem: parent.ca_pem.clone(),
+        ca_pem: String::new(),
         workspace_tar: String::new(),
         state_files,
         state_dirs,
