@@ -12,6 +12,8 @@ mod agents;
 mod capgrant;
 pub use capgrant::{covers as capacity_covers, CapacityAsk, CapacityGrant, CapacityTerms, CapacityUsed, CAPACITY_GRANT_PATH};
 mod delegations;
+mod digestgrant;
+pub use digestgrant::{valid_digest, DigestAction, DigestGrantRow, DigestScope, DigestUse, NewDigestGrant, DIGEST_METHOD};
 mod effect;
 pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
 pub use effect::{descriptor, requesters, DecisionTerms, EffectUse, EgressSeen, Filed};
@@ -19,6 +21,8 @@ pub mod bundle;
 pub mod cas;
 mod links;
 mod node;
+#[cfg(test)]
+mod previous_build;
 mod quota;
 mod receipts;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
@@ -69,6 +73,9 @@ pub enum StoreError {
 /// The ledger's schema version (#162). Every migration bumps it, and records what kind it is:
 /// - **expand** (a new table, a new column with a default, a new index): older binaries ignore it,
 ///   so a rollback across it is safe. [`SCHEMA_FLOOR`] stays.
+///   An expand step leaves what an older binary reads alone: one that adds rows an older query
+///   would mishandle to a table it reads is not one (#475; `previous_build` reads this build's
+///   ledger with the previous build's queries).
 /// - **contract** (dropping or rewriting anything an older binary reads): [`SCHEMA_FLOOR`] is raised
 ///   to this version, and binaries below it refuse to open the ledger ([`StoreError::TooNew`]), so
 ///   `wicket self rollback` refuses to go back across it. A contract step ships only in a release
@@ -113,9 +120,13 @@ pub enum StoreError {
 /// are copied over once, and the table stays, unread, until a contract step drops it.
 /// Version 18 (expand) adds the read-only `principals` view (#11, #253): every agent's latest identity
 /// and every passkey operator, one record (`Ledger::principals`).
-pub const SCHEMA_VERSION: u32 = 18;
+/// Version 19 (contract) drops `operator_messages` (#463), once a ledger from before version 17 has
+/// had its rows copied into `messages`. Builds of schema 17 and 18 never read it (version 17 was the
+/// expand step that stopped them), so the floor is 17, not 19: a rollback to them stays safe, and only
+/// builds from before one inbox, which read prompts from that table, can no longer open the ledger.
+pub const SCHEMA_VERSION: u32 = 19;
 /// The oldest schema whose binaries may open a ledger this build has opened.
-pub const SCHEMA_FLOOR: u32 = 1;
+pub const SCHEMA_FLOOR: u32 = 17;
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
 const _: () = assert!(SCHEMA_FLOOR <= SCHEMA_VERSION);
 
@@ -346,10 +357,6 @@ CREATE TABLE IF NOT EXISTS operator_credentials (
 CREATE TABLE IF NOT EXISTS identities (
   run TEXT PRIMARY KEY, tenant TEXT NOT NULL, spiffe_id TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
   parent_run TEXT, accept_from TEXT NOT NULL DEFAULT '[]', jws TEXT NOT NULL, issued_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS operator_messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, text TEXT NOT NULL, by TEXT NOT NULL,
-  created_at INTEGER NOT NULL, consumed_at INTEGER, stdin_start INTEGER, stdin_end INTEGER
 );
 CREATE TABLE IF NOT EXISTS turn_cancels (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, by TEXT NOT NULL,
@@ -582,6 +589,9 @@ impl Ledger {
         if conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'", []).is_ok() {
             conn.execute(LEGACY_PROMPTS, [])?;
         }
+        // Schema 19 (contract, #463): the old table goes, its rows copied above if they never were.
+        // A build of schema 17 or 18 that opens the ledger again creates it empty, and never reads it.
+        conn.execute_batch("DROP TABLE IF EXISTS operator_messages")?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_turns ON messages (to_run, kind, delivered_at)")?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
@@ -2554,6 +2564,13 @@ mod tests {
             for col in ["kind", "text", "label", "stdin_start", "stdin_end"] {
                 c.execute_batch(&format!("ALTER TABLE messages DROP COLUMN {col}")).unwrap();
             }
+            // ...and its prompts are in their own table, as they were until schema 17.
+            c.execute_batch(
+                "CREATE TABLE operator_messages (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, text TEXT NOT NULL, by TEXT NOT NULL,
+                   created_at INTEGER NOT NULL, consumed_at INTEGER, stdin_start INTEGER, stdin_end INTEGER)",
+            )
+            .unwrap();
             for (text, by, consumed, start) in [
                 ("had", "owner", Some(10), Some(0)),
                 ("never", "owner", Some(10), Some(100)),
@@ -2573,6 +2590,12 @@ mod tests {
         assert_eq!(l.requeue_prompts("run_a", 60).unwrap(), vec!["prompt-legacy-2".to_string()]);
         let got: Vec<(String, String)> = l.take_prompts("run_a").unwrap().into_iter().map(|p| (p.text, p.label)).collect();
         assert_eq!(got, [("never".into(), "owner".into()), ("queued".into(), "owner".into()), ("low memory".into(), "wicket".into())]);
+        // Schema 19 (contract, #463): the old table is gone once copied, and builds from before
+        // one inbox, which read it, can no longer open the ledger.
+        let old: i64 = l.conn.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'operator_messages'", [], |r| r.get(0)).unwrap();
+        assert_eq!(old, 0);
+        assert_eq!(Ledger::schema_of(&path).unwrap(), Schema { version: SCHEMA_VERSION, floor: 17 });
+        assert!(!wicket_core::version::schema_opens(16, SCHEMA_FLOOR) && wicket_core::version::schema_opens(17, SCHEMA_FLOOR));
         drop(l);
         // Opening it again copies nothing twice.
         let mut l = Ledger::open(&path).unwrap();

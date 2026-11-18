@@ -208,7 +208,13 @@ where
 
     fn end_run(&mut self, run: &str, why: &str) -> Result<()> {
         if !self.dry_run && self.ledger.run_status(run)?.as_deref() == Some("running") {
-            self.ledger.run_ended(&RunId(run.to_string()), LOST, why)?;
+            // Its agent too, if it was the agent's activation (#474): nothing re-attaches a lost run.
+            if let Some(state) = self.ledger.run_lost(run, why)? {
+                if let Some((agent, _)) = self.ledger.agent_of_run(run)? {
+                    let detail = format!("its run {run} was lost: it is {state}");
+                    self.did("agent_ended", &agent, &detail, Some(run));
+                }
+            }
         }
         self.runs_ended.insert(run.to_string());
         Ok(())
@@ -1372,6 +1378,43 @@ mod tests {
         assert_eq!(audited(&l, "reconcile.run_adopted"), 1);
         pass_at(&w, &mut l, &asked, false, NOW + 61).await;
         assert_eq!(l.run_status("run_fenced").unwrap().as_deref(), Some(LOST));
+    }
+
+    /// #474: a long-lived agent's first box never starts on its node, so its run is lost straight
+    /// away: the agent ends with it, instead of staying `active` with nobody behind it.
+    #[tokio::test]
+    async fn a_lost_run_ends_its_long_lived_agent() {
+        let w = World::new(Fake::default());
+        let mut l = Ledger::open_in_memory().unwrap();
+        l.run_started(&TenantId::single(), &RunId("run_a".into()), "z", "a").unwrap();
+        l.set_run_owner("run_a", "dead:1:1").unwrap();
+        l.set_run_node("run_a", "pc").unwrap();
+        l.create_agent(&wicket_store::NewAgent {
+            id: "agt_a",
+            tenant: "t0",
+            zone: "z",
+            name: "worker",
+            run: "run_a",
+            session_id: "s",
+            manifest: "m",
+            image: "img",
+            workspace: None,
+            claim_until: NOW + 30,
+        })
+        .unwrap();
+        let asked = HashMap::from([("pc".to_string(), Some(vec![]))]);
+        let nodes = w.nodes.clone();
+        let m = Machines { placer: &w.placer, approver: &w.approver, setup: &w.setup, warm_pool: false };
+        let mut p = Pass::new(&mut l, Some(m), &w.local, move |n: &str| nodes.get(n).cloned(), NOW, false).with_node_runs(asked);
+        p.owner_alive = alive;
+        p.adopt = adopt;
+        let d = p.run().await.unwrap();
+        assert_eq!(l.run_status("run_a").unwrap().as_deref(), Some(LOST));
+        let a = l.agent("agt_a").unwrap().unwrap();
+        assert_eq!(a.state, "ended");
+        assert!(a.note.unwrap().contains("node pc has no box for it"));
+        assert!(d.iter().any(|x| x.kind == "agent_ended" && x.target == "agt_a"), "{d:?}");
+        assert_eq!(audited(&l, "reconcile.agent_ended"), 1);
     }
 
     #[tokio::test]

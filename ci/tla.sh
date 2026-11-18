@@ -77,6 +77,7 @@ expect_fail() {
     fail_lifecycle_message_lost) echo 'NoMessageLost' ;;
     fail_lifecycle_twin_wake) echo 'OneHarness' ;;
     fail_lifecycle_reconnect_stuck) echo 'NoMessageStuck' ;;
+    fail_lifecycle_agent_left_active) echo 'ActiveHasRun' ;;
     # #321's placement (Placement.tla): the bugs its switches fixed.
     fail_placement_no_start_by) echo 'NoStartPastLease' ;;
     fail_placement_no_admission) echo 'NoOvercommit' ;;

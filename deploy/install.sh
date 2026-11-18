@@ -267,7 +267,8 @@ if [ "$systemd" = 1 ]; then
         # Root's copies of updates applied from the console (#261): it acts only on approvals signed
         # by a passkey root trusts (sudo wicket self trust-operator <name>), so on with none trusted.
         systemctl enable --now wicket-admit.path >/dev/null 2>&1 || true
-        # Restarting wicketd stops the runs started through it: only when something changed.
+        # Restarting wicketd leaves the runs started through it running (#468); at its start, the new
+        # wicketd moves their supervisors to the installed build (#475). Only when something changed.
         if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q wicketd; then
             systemctl restart wicketd
         fi

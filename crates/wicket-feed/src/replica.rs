@@ -94,9 +94,6 @@ impl Default for ReplicaConfig {
 /// What a decision allowed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Allowed {
-    /// By the zone's reach rule `n`. No decision of this crate's returns it (tokens allow by
-    /// [`Allowed::Ceiling`]); kept for callers that match on it.
-    Reach(usize),
     /// By the ceilings of the box's token (every block's reach), without a grant.
     Ceiling,
     /// By a live grant (one use consumed).

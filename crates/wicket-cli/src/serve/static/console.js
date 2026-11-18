@@ -156,10 +156,16 @@ function renderUpdate(box, u) {
       "… once, but doesn’t install it: " + strip(u.why_not || "")));
     return;
   }
-  const mib = (u.size / 1048576).toFixed(1);
   box.append(el("div", "meta", "Approving installs this build now, blue/green with its health gate; a failed gate rolls back."));
   const ul = el("ul");
-  ul.append(el("li", "", "artifact: " + strip(u.artifact) + " (" + mib + " MiB) from the run’s /workspace/out, sha256 " + strip(u.sha256).slice(0, 16) + "…"));
+  const sha = strip(u.sha256).slice(0, 16) + "…";
+  if (u.node) {
+    ul.append(el("li", "", "artifact: the file with sha256 " + sha + " in the run’s /workspace/out on node " + strip(u.node) +
+      ", fetched from there when you approve (not installed if it isn’t there)"));
+  } else {
+    const mib = (u.size / 1048576).toFixed(1);
+    ul.append(el("li", "", "artifact: " + strip(u.artifact) + " (" + mib + " MiB) from the run’s /workspace/out, sha256 " + sha));
+  }
   ul.append(el("li", "", "commit: " + (u.commit_said ? strip(u.commit_said) + " (as the agent says; not checked)" : "the agent didn’t say")));
   ul.append(el("li", "", "reaches: the control host" + ((u.nodes || []).length ? ", then nodes " + u.nodes.map(strip).join(", ") + " (the first is the canary)" : ", and no nodes")));
   box.append(ul);

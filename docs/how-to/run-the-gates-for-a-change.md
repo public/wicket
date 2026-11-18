@@ -149,3 +149,15 @@ the workspace. They also check that every tracked file is in a crate or claimed 
 every path the rules name exists. Last, they find every file a crate reads from outside its own
 directory (`include_str!`, paths such as `../../examples`), and check that a change to it selects
 that crate. When you add such a file, add a rule to `ci/determinator/rules.toml`.
+
+## A change to the ledger's schema
+
+Each migration is an expand step or a contract step ([Migrations](../explanation/updates.md#migrations)).
+An older build can be reading the ledger your build writes: after a rollback, and for the seconds
+of a handover, when a run's supervisor still runs the build it started on. So an expand step leaves
+what an older build reads alone. A step that adds rows an older query would mishandle to a table it
+reads is not one, whatever its DDL (#475).
+
+Before such a change, copy the previous build's queries over the tables it touches into
+`crates/wicket-store/src/previous_build.rs`, with the kinds of row each handles. Its test then reads
+a ledger your build writes with them.

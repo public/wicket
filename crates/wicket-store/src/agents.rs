@@ -361,6 +361,31 @@ impl Ledger {
         Ok(w)
     }
 
+    /// Ends `run` as lost (its supervisor gone, and no box of it left to take over), and with it
+    /// the agent whose current activation it was (#474): nothing renews that agent's claim again, so
+    /// left `active` it would show as running, and messages to it would queue for nobody. An agent
+    /// that has hibernated before goes back to `hibernated`, restorable from its last head (what a
+    /// takeover of its lapsed claim would have woken it from); one that never did is `ended`. Its
+    /// new state, or None when `run` wasn't an agent's current activation.
+    pub fn run_lost(&self, run: &str, why: &str) -> Result<Option<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.run_ended(&wicket_core::RunId(run.to_string()), "lost", why)?;
+        let note = format!("its run {run} was lost: {why}");
+        let n = tx.execute(
+            "UPDATE agents SET state = CASE WHEN head IS NULL THEN 'ended' ELSE 'hibernated' END, claim_until = NULL, lease_until = NULL, \
+             want = NULL, note = ?2, updated_at = ?3 \
+             WHERE run = ?1 AND state IN ('active', 'waking', 'hibernating') \
+             AND generation = (SELECT generation FROM agent_runs WHERE agent_runs.run = ?1 AND agent_runs.agent = agents.id)",
+            params![run, note, now()],
+        )?;
+        let state = match n {
+            0 => None,
+            _ => tx.query_row("SELECT state FROM agents WHERE run = ?1", params![run], |r| r.get(0)).optional()?,
+        };
+        tx.commit()?;
+        Ok(state)
+    }
+
     /// Revocation covers sleeping agents: a revoked agent is never woken again.
     pub fn agent_not_restorable(&self, id: &str, why: &str) -> Result<()> {
         self.conn.execute("UPDATE agents SET restorable = 0, note = ?2, updated_at = ?3 WHERE id = ?1", params![id, why, now()])?;
@@ -411,6 +436,33 @@ mod tests {
             claim_until: now() + 30,
         })
         .unwrap();
+    }
+
+    /// #474: a lost run ends its agent's activation: `ended` if the agent never hibernated (its box
+    /// never started, say), back to `hibernated` and wakeable if it has a head. A run that is no
+    /// longer the agent's activation leaves the agent alone.
+    #[test]
+    fn a_lost_run_ends_its_agent_or_leaves_it_restorable() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        agent(&mut l, "agt_a");
+        l.run_started(&wicket_core::TenantId::single(), &wicket_core::RunId("run_1".into()), "z", "a").unwrap();
+        assert_eq!(l.run_lost("run_1", "node pc has no box for it").unwrap().as_deref(), Some("ended"));
+        let a = l.agent("agt_a").unwrap().unwrap();
+        assert_eq!((a.state.as_str(), a.claim_until), ("ended", None));
+        assert!(a.note.unwrap().contains("its run run_1 was lost: node pc has no box for it"));
+        assert_eq!(l.run_status("run_1").unwrap().as_deref(), Some("lost"));
+        assert_eq!(l.run_lost("run_1", "again").unwrap(), None, "once");
+
+        // One that hibernated, then was woken into a run that is lost: restorable.
+        let mut l = Ledger::open_in_memory().unwrap();
+        agent(&mut l, "agt_b");
+        assert!(l.commit_agent_push("agt_b", 1, 0, 1, "head-1", 10).unwrap());
+        let g = l.claim_wake("agt_b", "run_2", now() + 30).unwrap().unwrap();
+        l.set_agent_state("agt_b", g, "active", None).unwrap();
+        assert_eq!(l.run_lost("run_1", "stale").unwrap(), None, "an earlier activation's");
+        assert_eq!(l.agent("agt_b").unwrap().unwrap().state, "active");
+        assert_eq!(l.run_lost("run_2", "its box never started").unwrap().as_deref(), Some("hibernated"));
+        assert!(l.claim_wake("agt_b", "run_3", now() + 30).unwrap().is_some(), "woken again from its head");
     }
 
     #[test]

@@ -91,7 +91,10 @@ reaches, and the passkey signs them with the decision. The console then runs `wi
 <request>` as its own process, as the `wicket` user: it copies the file to a private staging file and
 runs the same update as `self update <copy> --nodes all`, which hashes the copy again and accepts it
 only by that approval, used up. The requester is told the outcome as a notice from wicket. A box on
-another node keeps its outbox there, so its update is still applied from a terminal.
+another node keeps its outbox there. `apply-update` fetches it as the node's read-only `outbox` tree
+(the run's `workspace/out`, refused if the box made either directory a link), over a control
+connection of its own, into a private directory. It then finds the file by its sha256 with the
+same no-follow walk. A node from before the `outbox` tree sends the run's whole `workspace` instead.
 
 **Root's link after a console update.** The update moves the `wicket` user's versions. Root's copy
 follows through one narrow root step that trusts neither the `wicket` user nor the ledger, which
@@ -236,7 +239,11 @@ newest that has opened it) and its **floor** (the oldest that may open it) in `s
 
 - **Expand** steps (a new table, a new column with a default, a new index) bump the version and leave the
   floor: older builds ignore what they don't know, so a rollback across them is safe. Every migration up to
-  #162 is one of these (version 1).
+  #162 is one of these (version 1). An expand step leaves what an older build *reads* alone: a step
+  that adds rows an older query would mishandle to a table it reads is not one, whatever its DDL
+  (#475: schema 17 put prompts in the `messages` an older `await_message` took peers' messages from,
+  and older supervisors dropped them). The store's `previous_build` test reads a ledger the build
+  writes with the previous build's queries.
 - **Contract** steps (dropping or rewriting anything an older build reads) raise the floor to their
   version. A build below the floor refuses to open the ledger, and `wicket self rollback` refuses to
   switch to it. A contract step ships only in a release after the one whose expand step stopped anything

@@ -58,8 +58,10 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   sha256, its size, the commit the agent says it is, and the nodes it reaches after the control
   host. Approving runs `wicket self apply-update <request>` (log:
   `<data dir>/runs/<run>/update-<request>.log`): the blue/green update with its health gate and
-  rollback, then the nodes; the agent is told how it ended. If the file isn't there (or the box is
-  on another node), the confirmation says why, and approving only accepts the sha256 for a
+  rollback, then the nodes; the agent is told how it ended. For a box on another node, the
+  confirmation says the outbox is fetched from that node once you approve, and the file is found
+  in it by its sha256 then. If the file isn't there, the confirmation says why, and approving only
+  accepts the sha256 for a
   `sudo wicket self update` on the host ([run wicket in wicket](../how-to/run-wicket-in-wicket.md)).
 - **register a device for notifications, and show the request on one** (`push_subscribe`,
   `push_details`): see [notifications](#notifications). Removing a device and hiding the request
