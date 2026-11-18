@@ -261,7 +261,7 @@ async fn console(r: &mut Report, l: &Ledger, system: bool) {
     };
     use clap::Parser;
     let parsed = crate::Cli::try_parse_from(["wicket".to_string(), "serve".into()].into_iter().chain(args.iter().cloned()));
-    let Some((opts, _)) = parsed.ok().and_then(|c| crate::serve_opts(c.cmd)) else {
+    let Ok(crate::Cli { cmd: crate::Cmd::Serve { opts, .. }, .. }) = parsed else {
         r.bad(format!("console: NOT OK: bad arguments in {CONSOLE_ENV}: {}", args.join(" ")));
         return;
     };
