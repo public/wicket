@@ -1,0 +1,25 @@
+The control host's audit records of 2026-11-18's updates, scrubbed for the public repository, as
+`ci/tla-trail.py` printed them from the audit export. Run ids are r1 (the run on this host's own
+node) and r2 (a run on a remote node); node names other than `local` are `remote`; owners, trust
+domains, identities and tasks are left out. Times are UTC.
+
+The export runs from 11:00:06 to 18:48:58. Between its updates it holds only each run's identity
+rotations, every 300 s, which show the supervisors alive. It doesn't reach the 10:04 self update
+(#487), so that update has no trail here.
+
+Neither update's other steps are audited: wicketd's restart, the local serve's re-exec, the old
+supervisors being stopped, prompts. UpdateTrace.tla lets the model take them between the trail's
+steps.
+
+update at 1759 UTC (unix 1795024742): 2 re-attach(es)
+  the 17:58 install (#529)
+  +0s reconcile.run_adopted, run.attach r1 on node local
+  +2s run.exit_cause r1: stopped by wicket: its control host stopped it (exit 137)
+  +0s reconcile.run_adopted, run.attach r2 on node remote
+Trail1759 == << [action |-> "Reattach", run |-> "r1", box |-> "stopped"], [action |-> "Reattach", run |-> "r2", box |-> "running"] >>
+
+update at 1848 UTC (unix 1795027738): 2 re-attach(es)
+  the 18:48 install, with #531; r1 is the local run started at 18:00:30, after 17:58's ended
+  +0s reconcile.run_adopted, run.attach r2 on node remote
+  +0s reconcile.run_adopted, run.attach r1 on node local
+Trail1848 == << [action |-> "Reattach", run |-> "r2", box |-> "running"], [action |-> "Reattach", run |-> "r1", box |-> "running"] >>
