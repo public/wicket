@@ -368,10 +368,7 @@ mod tests {
             (&["node", "list", "--provider"], Route::Forward(Privileged)),
             (&["node", "plans"], Route::Forward(Privileged)),
             (&["node", "release", "i-1"], Route::Forward(Privileged)),
-            (
-                &["node", "create", "--name", "n1", "--hosts", "example.com", "--ssh-key-id", "k"],
-                Route::Forward(Privileged),
-            ),
+            (&["node", "create", "--name", "n1", "--hosts", "example.com", "--ssh-key-id", "k"], Route::Forward(Privileged)),
             (&["self", "status"], Route::Forward(Read)),
             (&["self", "update", "/tmp/w.tar.gz"], Route::Forward(Privileged)),
             (&["self", "update", "/tmp/w", "--nodes", "all"], Route::Forward(Privileged)),
