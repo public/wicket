@@ -66,14 +66,26 @@ macro_rules! seeds {
 }
 
 seeds! {
-    seeds_feed_0: "feed", 0 of 2;
-    seeds_feed_1: "feed", 1 of 2;
-    seeds_placement_0: "placement", 0 of 2;
-    seeds_placement_1: "placement", 1 of 2;
-    seeds_messages_0: "messages", 0 of 4;
-    seeds_messages_1: "messages", 1 of 4;
-    seeds_messages_2: "messages", 2 of 4;
-    seeds_messages_3: "messages", 3 of 4;
+    seeds_feed_0: "feed", 0 of 3;
+    seeds_feed_1: "feed", 1 of 3;
+    seeds_feed_2: "feed", 2 of 3;
+    seeds_placement_0: "placement", 0 of 6;
+    seeds_placement_1: "placement", 1 of 6;
+    seeds_placement_2: "placement", 2 of 6;
+    seeds_placement_3: "placement", 3 of 6;
+    seeds_placement_4: "placement", 4 of 6;
+    seeds_placement_5: "placement", 5 of 6;
+    seeds_messages_0: "messages", 0 of 11;
+    seeds_messages_1: "messages", 1 of 11;
+    seeds_messages_2: "messages", 2 of 11;
+    seeds_messages_3: "messages", 3 of 11;
+    seeds_messages_4: "messages", 4 of 11;
+    seeds_messages_5: "messages", 5 of 11;
+    seeds_messages_6: "messages", 6 of 11;
+    seeds_messages_7: "messages", 7 of 11;
+    seeds_messages_8: "messages", 8 of 11;
+    seeds_messages_9: "messages", 9 of 11;
+    seeds_messages_10: "messages", 10 of 11;
 }
 
 /// Part `part` of `parts` of `scenario`'s seeds (none when `WICKET_SIM_SCENARIO` names another
@@ -128,18 +140,46 @@ fn replay() {
     assert!(ok, "seed {seed} broke an invariant");
 }
 
-#[test]
-fn deterministic() {
-    for scenario in scenarios() {
-        let a = wicket_sim::run_scenario(scenario, 7, &dir().join("a"), true);
-        let b = wicket_sim::run_scenario(scenario, 7, &dir().join("b"), true);
-        if a.hash != b.hash {
-            let at = a.trace.iter().zip(&b.trace).position(|(x, y)| x != y).unwrap_or(a.trace.len().min(b.trace.len()));
-            panic!("{scenario}: seed 7 ran differently twice, from trace line {at}:\n  {:?}\n  {:?}", a.trace.get(at), b.trace.get(at));
-        }
+/// Seed 7 of `scenario`, run twice, gives the same trace (none when `WICKET_SIM_SCENARIO` names
+/// another scenario). One test per scenario, so nextest runs them at once (#460's reason).
+fn deterministic(scenario: &'static str) {
+    if !scenarios().contains(&scenario) {
+        return;
     }
+    // The two runs at once, each on a thread of its own: nothing is shared between them, so a
+    // difference is the scenario's own (and one test of them in turn was a slow one).
+    let (a, b) = std::thread::scope(|s| {
+        let b = s.spawn(|| wicket_sim::run_scenario(scenario, 7, &dir().join("b"), true));
+        let a = wicket_sim::run_scenario(scenario, 7, &dir().join("a"), true);
+        (a, b.join().expect("the second run"))
+    });
+    if a.hash != b.hash {
+        let at = a.trace.iter().zip(&b.trace).position(|(x, y)| x != y).unwrap_or(a.trace.len().min(b.trace.len()));
+        panic!("{scenario}: seed 7 ran differently twice, from trace line {at}:\n  {:?}\n  {:?}", a.trace.get(at), b.trace.get(at));
+    }
+}
+
+#[test]
+fn deterministic_feed() {
+    deterministic("feed");
     let a = wicket_sim::run_with(7, &dir().join("stats"), Options { keep_trace: true, ..Options::default() });
     assert!(a.stats.allowed_grant > 0 && a.stats.model_ok > 0, "the scenario exercised grants and the budget: {:?}", a.stats);
+}
+
+#[test]
+fn deterministic_placement() {
+    deterministic("placement");
+}
+
+#[test]
+fn deterministic_messages() {
+    deterministic("messages");
+}
+
+/// The `deterministic_*` tests cover every scenario.
+#[test]
+fn deterministic_covers_every_scenario() {
+    assert_eq!(SCENARIOS, ["feed", "placement", "messages"], "add a deterministic_<scenario> test for each new scenario");
 }
 
 /// What the simulation found first (#324): a node whose spend file was written only once a second,
