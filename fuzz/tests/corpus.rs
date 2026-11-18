@@ -61,6 +61,18 @@ fn canon() {
 fn time() {
     replay("time", wicket_fuzz::time::run);
 }
+#[test]
+fn vault_ref() {
+    replay("vault_ref", wicket_fuzz::vault_ref::run);
+}
+#[test]
+fn digest_grant() {
+    replay("digest_grant", wicket_fuzz::digest_grant::run);
+}
+#[test]
+fn agent_rules() {
+    replay("agent_rules", wicket_fuzz::agent_rules::run);
+}
 
 /// The egress oracle is only as good as its view of the origins: allowed requests get there.
 #[test]

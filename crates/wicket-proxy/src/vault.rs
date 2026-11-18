@@ -389,6 +389,15 @@ struct RefFile {
     meta: Option<serde_json::Value>,
 }
 
+/// A link file's text as [`Vault`] reads it (`read_ref`), written back as it writes one
+/// (`write_ref`): None if it doesn't read. For the fuzz target (#326), whose oracle is that what
+/// reads writes as what reads back the same.
+#[doc(hidden)]
+pub fn ref_file_round_trip(text: &str) -> Option<String> {
+    let r: RefFile = serde_json::from_str(text).ok()?;
+    Some(String::from_utf8(serde_json::to_vec_pretty(&r).ok()?).expect("JSON is UTF-8"))
+}
+
 /// A secret as [`Vault::info`] describes it: never its value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretInfo {

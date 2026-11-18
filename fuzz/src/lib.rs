@@ -13,6 +13,10 @@ pub mod node_chan;
 pub mod store;
 pub mod time;
 pub mod token;
+// The parsers added for #258, #472 and #499 (#326).
+pub mod agent_rules;
+pub mod digest_grant;
+pub mod vault_ref;
 
 pub(crate) mod util;
 

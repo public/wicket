@@ -111,7 +111,7 @@ fn the_cli_reference_is_checked_by_a_cli_test() {
 #[test]
 fn a_crate_selects_its_reverse_dependencies() {
     let fwd = ["wicket-fwd", "wicket-proxy", "wicket-gateway", "wicket-chan", "wicket-home", "wicket-node", "wicket-control", "wicket-cli", "wicket-sim"];
-    let fuzz = ["fuzz-egress", "fuzz-gateway", "fuzz-chan"];
+    let fuzz = ["fuzz-egress", "fuzz-gateway", "fuzz-chan", "fuzz-vault_ref"];
     check(&["crates/wicket-fwd/src/copy.rs"], &fwd, &with3(CLI, NODES, &fuzz));
     let s = select(&["crates/wicket-fwd/src/copy.rs"]);
     assert_eq!(s.filter(), "rdeps(=wicket-fwd)");
@@ -136,10 +136,11 @@ fn wicket_core_is_nearly_everything_but_not_everything() {
     }
     assert!(s.affected.len() >= 10);
     assert_eq!(nextest_selects(&s.filter()), s.affected);
-    // Every suite but tla (its models only) and install-test (its install path only): kani and lean
-    // through wicket-core and wicket-authz, every fuzz target.
-    let all: BTreeSet<String> =
-        Suites::parse(SUITES).unwrap().names().filter(|n| !["tla", "install-test"].contains(n)).map(String::from).collect();
+    // Every suite but tla (its models only), install-test (its install path only) and the
+    // agent_rules fuzz target (operators.rs and the YAML reader only): kani and lean through
+    // wicket-core and wicket-authz, every other fuzz target.
+    let skip = ["tla", "install-test", "fuzz-agent_rules"];
+    let all: BTreeSet<String> = Suites::parse(SUITES).unwrap().names().filter(|n| !skip.contains(n)).map(String::from).collect();
     assert_eq!(s.suites, all);
 }
 
@@ -230,7 +231,7 @@ fn each_suite_is_selected_by_what_it_exercises() {
     let suites = |f: &str| select(&[f]).suites;
     // A change to the CLI's tests only: its tests run, no end-to-end suite.
     check(&["crates/wicket-cli/src/serve/tests/http.rs"], &["wicket-cli"], &[]);
-    check(&["crates/wicket-proxy/tests/integration/h3.rs"], &["wicket-proxy", "wicket-gateway", "wicket-chan", "wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &["fuzz-egress", "fuzz-gateway", "fuzz-chan"]);
+    check(&["crates/wicket-proxy/tests/integration/h3.rs"], &["wicket-proxy", "wicket-gateway", "wicket-chan", "wicket-home", "wicket-node", "wicket-control", "wicket-sim", "wicket-cli"], &["fuzz-egress", "fuzz-gateway", "fuzz-chan", "fuzz-vault_ref"]);
     // The node suites: the node, its channel, and the control host's side of it; not a store change.
     for f in ["crates/wicket-node/src/nodesrv.rs", "crates/wicket-chan/src/chan.rs", "crates/wicket-control/src/nodecall.rs"] {
         assert!(suites(f).contains("node-e2e") && suites(f).contains("acceptance-nodes"), "{f}");

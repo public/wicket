@@ -107,7 +107,7 @@ fn risk_rank(r: &str) -> Option<i64> {
 
 /// What agents may decide and grant for their descendants (#256, #50): rules of the policy, each
 /// defaulting to what agents could do before it was one (an operator decides the rest).
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AgentRules {
     /// The request kinds an agent may decide: only `http` so far (`spawn`, `link`, `capacity`,
@@ -139,6 +139,13 @@ impl AgentRules {
             bail!("agents.kinds: {k:?} can't be decided by an agent (only {} so far)", AGENT_KINDS.join(", "));
         }
         Ok(())
+    }
+
+    /// The rules as `operators.yaml`'s `agents:` section (JSON, which YAML reads): what
+    /// [`Policy::parse`] reads back as these rules. For the fuzz target (#326).
+    #[doc(hidden)]
+    pub fn as_policy_yaml(&self) -> String {
+        format!("agents: {}\n", serde_json::to_string(self).expect("rules serialise"))
     }
 
     /// Whether an agent may decide a request of this method at all.

@@ -118,6 +118,44 @@ fn path_of(digest: &str) -> String {
     format!("/digest/{digest}")
 }
 
+/// A digest grant's terms as `grants.terms` holds them: its action and scope, or None if they don't
+/// read (such a grant covers nothing). The one reader, [`Ledger::may_use`]'s and the listing's.
+pub fn parse_digest_terms(text: &str) -> Option<(DigestAction, DigestScope)> {
+    let t: Terms = serde_json::from_str(text).ok()?;
+    Some((t.action, t.scope))
+}
+
+/// What [`parse_digest_terms`] reads, as a grant records it.
+pub fn digest_terms_text(action: DigestAction, scope: &DigestScope) -> String {
+    serde_json::to_string(&Terms { action, scope: scope.clone() }).expect("terms serialise")
+}
+
+/// What a `DIGEST` grant's path names: a digest (`/digest/<digest>`) or a CI principal's standing
+/// grant (`/signer/<key id>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DigestGrantPath {
+    Digest(String),
+    Signer(String),
+}
+
+impl DigestGrantPath {
+    /// None for any other path, a digest that isn't one ([`valid_digest`]), or an empty key id.
+    pub fn parse(path: &str) -> Option<DigestGrantPath> {
+        if let Some(d) = path.strip_prefix("/digest/") {
+            return valid_digest(d).then(|| DigestGrantPath::Digest(d.to_string()));
+        }
+        let id = path.strip_prefix("/signer/")?;
+        (!id.is_empty() && !id.contains('/')).then(|| DigestGrantPath::Signer(id.to_string()))
+    }
+
+    pub fn path(&self) -> String {
+        match self {
+            DigestGrantPath::Digest(d) => path_of(d),
+            DigestGrantPath::Signer(id) => signer_path(id),
+        }
+    }
+}
+
 /// A grant [`covering`] found: (id, uses left, decided by, its scope).
 type Covering = (String, Option<i64>, String, DigestScope);
 
@@ -146,9 +184,9 @@ fn covering(
     })?;
     for row in rows {
         let (id, uses, decided_by, terms) = row?;
-        if let Ok(t) = serde_json::from_str::<Terms>(&terms) {
-            if t.action == action && (t.scope == DigestScope::Installation || &t.scope == scope) {
-                return Ok(Some((id, uses, decided_by, t.scope)));
+        if let Some((a, s)) = parse_digest_terms(&terms) {
+            if a == action && (s == DigestScope::Installation || &s == scope) {
+                return Ok(Some((id, uses, decided_by, s)));
             }
         }
     }
@@ -165,7 +203,7 @@ impl Ledger {
         if g.expires_at <= now() {
             return Err(StoreError::Refused("a digest grant needs a lifetime that hasn't ended".into()));
         }
-        let terms = serde_json::to_string(&Terms { action: g.action, scope: g.scope.clone() }).expect("terms serialise");
+        let terms = digest_terms_text(g.action, &g.scope);
         let zone = match &g.scope {
             DigestScope::Zone(z) => z.as_str(),
             _ => "",
@@ -298,8 +336,8 @@ impl Ledger {
         for row in r {
             let (grant, path, terms) = row?;
             let key = serde_json::from_str::<serde_json::Value>(&terms).ok().and_then(|v| v["key"].as_str().map(String::from));
-            if let (Some(key_id), Some(key)) = (path.strip_prefix("/signer/"), key) {
-                out.push(Signer { grant, key_id: key_id.to_string(), key });
+            if let (Some(DigestGrantPath::Signer(key_id)), Some(key)) = (DigestGrantPath::parse(&path), key) {
+                out.push(Signer { grant, key_id, key });
             }
         }
         Ok(out)

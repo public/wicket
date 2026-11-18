@@ -133,3 +133,8 @@ store = { packages = ["wicket-store"] }
 git = { packages = ["wicket-core"] }
 canon = { packages = ["wicket-core"] }
 time = { packages = ["wicket-core"] }
+vault_ref = { packages = ["wicket-proxy"] }
+digest_grant = { packages = ["wicket-store"] }
+# Its harness links wicket-control for `Policy::parse` alone: only the parser selects it, not every
+# change to wicket-control and the crates under it (its optimized build is the longest of all).
+agent_rules = { packages = [], paths = ["crates/wicket-control/src/operators.rs", "crates/wicket-core/src/yaml.rs"] }

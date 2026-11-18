@@ -32,6 +32,8 @@ wicket-agent = { path = "../crates/wicket-agent" }
 wicket-feed = { path = "../crates/wicket-feed" }
 wicket-authz = { path = "../crates/wicket-authz" }
 wicket-policy = { path = "../crates/wicket-policy" }
+# operators.yaml and the agents' grant rules (#472), which the agent_rules target fuzzes.
+wicket-control = { path = "../crates/wicket-control" }
 wicket-identity = { path = "../crates/wicket-identity" }
 biscuit-auth = { path = "../third_party/biscuit-auth" }
 anyhow = "1"
@@ -133,6 +135,27 @@ bench = false
 [[bin]]
 name = "time"
 path = "fuzz_targets/time.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_ref"
+path = "fuzz_targets/vault_ref.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "digest_grant"
+path = "fuzz_targets/digest_grant.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_rules"
+path = "fuzz_targets/agent_rules.rs"
 test = false
 doc = false
 bench = false
