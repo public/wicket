@@ -443,9 +443,41 @@ fn kind(d: &Decision) -> u8 {
     }
 }
 
-/// The example zones, a small spawn-capable one, and random org policies: Cedar and the token agree.
+/// How many parts the random org policies are checked in, [`ROUNDS`] each: nextest runs the parts
+/// at once (one test of all 160 rounds was the tests job's slowest). Part 0's seed is the one the
+/// single test had, so its rounds are that test's first 40.
+const PARTS: u64 = 4;
+const ROUNDS: usize = 40;
+
 #[test]
-fn cedar_and_the_compiled_token_agree() {
+fn cedar_and_the_compiled_token_agree_0() {
+    cedar_and_the_compiled_token_agree(0);
+}
+
+#[test]
+fn cedar_and_the_compiled_token_agree_1() {
+    cedar_and_the_compiled_token_agree(1);
+}
+
+#[test]
+fn cedar_and_the_compiled_token_agree_2() {
+    cedar_and_the_compiled_token_agree(2);
+}
+
+#[test]
+fn cedar_and_the_compiled_token_agree_3() {
+    cedar_and_the_compiled_token_agree(3);
+}
+
+/// The tests above are every part, once.
+#[test]
+fn cedar_parts_are_all_tested() {
+    assert_eq!(PARTS, 4, "add a cedar_and_the_compiled_token_agree_<part> test for each part");
+}
+
+/// The example zones, a small spawn-capable one, and random org policies (part `part` of
+/// [`PARTS`], from its own seed): Cedar and the token agree.
+fn cedar_and_the_compiled_token_agree(part: u64) {
     let keys = Keys::new(0);
     let ents = r#"[
       {"uid": {"type": "Zone", "id": "dev-api"}, "attrs": {}, "parents": [{"type": "Group", "id": "dev"}]},
@@ -459,9 +491,9 @@ fn cedar_and_the_compiled_token_agree() {
         )
         .unwrap(),
     );
-    let mut rng = Rng(51);
+    let mut rng = Rng(51 + part);
     let (mut checked, mut kinds, mut refused, mut granted) = (0usize, [0usize; 3], 0usize, 0usize);
-    for round in 0..160 {
+    for round in 0..ROUNDS {
         let text = random_org(&mut rng);
         let org = OrgPolicy::parse(&text, ents).unwrap_or_else(|e| panic!("round {round}: {e}\n{text}"));
         // A policy outside the fragment (a negated path, say) is refused at compile: never minted.
@@ -566,10 +598,10 @@ fn cedar_and_the_compiled_token_agree() {
         "{checked} decisions agree: {} allow, {} forbidden, {} needs-grant; {refused} policies refused at compile",
         kinds[0], kinds[1], kinds[2]
     );
-    assert!(refused < 40, "most generated policies compile ({refused} refused)");
+    assert!(refused < ROUNDS / 4, "most generated policies compile ({refused} refused)");
     eprintln!("{granted} granted requests checked");
-    assert!(kinds.iter().all(|&k| k > 400), "every outcome well exercised: {kinds:?}");
-    assert!(granted > 200, "grants exercised: {granted}");
+    assert!(kinds.iter().all(|&k| k > 100), "every outcome well exercised: {kinds:?}");
+    assert!(granted > 50, "grants exercised: {granted}");
 }
 
 /// #411: an `accept_from`'s zone and principal entries read alike everywhere: the gateway's
