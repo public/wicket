@@ -33,67 +33,67 @@ harnesses() {
 }
 
 # Each harness's (and loom's) seconds on a CI runner, as the run's "kani shard I/N times"
-# annotations print them (these from main's run for #534), so they can be pasted in as they are.
-# Only the split depends on them: a stale or missing time can slow a part, never skip an item.
+# annotations print them (these from #542's run, with #540's and #541's harnesses), so they can be
+# pasted in as they are. Only the split depends on them: a stale or missing time can slow a part,
+# never skip an item.
 ci_times() {
   cat <<'EOF'
-a_token_ends_at_the_ledgers_millisecond 244 s
-a_push_is_a_post_to_a_repositorys_receive_pack 96 s
-a_grant_is_made_as_picked_or_as_a_push_window 86 s
+a_grant_is_made_as_picked_or_as_a_push_window 93 s
+a_push_is_a_post_to_a_repositorys_receive_pack 88 s
+a_token_ends_with_its_grant_through_2106 82 s
 check_plain_is_plain_ok 71 s
-upstream_reads_the_same_segments 59 s
-children_never_exceed_the_parent 55 s
-loom 47 s
-a_chain_is_a_strict_ancestry 40 s
-a_descendant_is_found 24 s
+children_never_exceed_the_parent 57 s
+upstream_reads_the_same_segments 52 s
+a_pin_is_allowed_only_by_its_own_digest 37 s
+a_wicket_host_is_refused_to_agents 33 s
+pattern_overlap_is_symmetric 32 s
+a_reserved_method_is_refused_to_agents 29 s
+patterns_that_share_a_host_overlap 29 s
 host_covers_sound 24 s
-a_carve_out_keeps_the_run_within_its_budget 19 s
-matching_ignores_case_and_trailing_dots 16 s
-a_slice_never_exceeds_what_is_left 9 s
-check_escapes_is_escapes_ok 9 s
+a_carve_out_keeps_the_run_within_its_budget 22 s
+overlap_with_a_host_is_matching_it 21 s
+a_chain_is_a_strict_ancestry 18 s
+accept_from_lets_in_exactly_whom_it_names 17 s
+a_principal_list_ignores_the_senders_zone 15 s
+matching_ignores_case_and_trailing_dots 14 s
+loom 11 s
+a_slice_never_exceeds_what_is_left 10 s
+a_zone_list_ignores_the_senders_principal 10 s
+check_escapes_is_escapes_ok 8 s
 evaluate_reach_set 8 s
-wildcard_never_matches_its_apex 8 s
+a_covered_model_pattern_lets_in_nothing_more 7 s
+a_descendant_is_found 7 s
+wildcard_never_matches_its_apex 7 s
 allow_iff 5 s
-allow_lower_risk 4 s
-an_ipv4_address_is_public_exactly_outside_the_special_blocks 4 s
 an_ipv6_address_is_public_exactly_outside_the_special_blocks 4 s
-an_agents_grant_ends_within_its_authority 3 s
+default_agent_rules_refuse_what_agent_terms_did 4 s
+a_refusal_needs_a_grant_only_if_every_failure_is_escalatable 3 s
+allow_lower_risk 3 s
+an_ipv4_address_is_public_exactly_outside_the_special_blocks 3 s
+each_agent_rule_lifts_only_its_refusal 3 s
 forbid_wins 3 s
+a_carried_second_is_added_exactly_or_refused 2 s
+a_grant_of_k_uses_is_accepted_k_times 2 s
 a_renewed_slice_is_the_next_or_no_more_than_it 2 s
+a_spawn_ceiling_admits_what_is_within_it_and_tighter_admits_less 2 s
 a_use_never_takes_a_grant_below_zero 2 s
+an_approval_widens_unless_it_is_one_use_for_an_hour_for_the_run 2 s
 merging_spent_only_raises_the_counts 2 s
+negotiation_is_symmetric_and_a_jump_is_what_cant_talk 2 s
 peers_talk_within_the_skew_at_the_lower_version 2 s
 the_schema_floor_only_rises 2 s
 a_feature_is_used_only_if_both_peers_have_it 1 s
-a_grant_of_k_uses_is_accepted_k_times 1 s
-default_agent_rules_refuse_what_agent_terms_did 1 s
-each_agent_rule_lifts_only_its_refusal 1 s
+a_token_allows_a_reading_before_the_epoch 1 s
+an_agents_grant_ends_within_its_authority 1 s
+an_org_policy_check_is_never_escalatable 1 s
 money_is_accepted_exactly_within_the_limits 1 s
-negotiation_is_symmetric_and_a_jump_is_what_cant_talk 1 s
 EOF
 }
 default_time=30
 
-# item<TAB>part<TAB>seconds for the items on stdin (one name a line, in order) split into $1 parts:
-# longest first (ties in input order), each to the part with the least so far (ties to the lowest).
-plan() {
-  awk -v n="$1" -v dflt="$default_time" '
-    FNR == NR { t[$1] = $2; next }
-    { name[m++] = $0 }
-    END {
-      for (i = 0; i < m; i++) { o[i] = i; s[i] = (name[i] in t) ? t[name[i]] : dflt }
-      # Insertion sort, longest first; a stable sort keeps ties in input order.
-      for (i = 1; i < m; i++)
-        for (j = i; j > 0 && s[o[j]] > s[o[j - 1]]; j--) { x = o[j]; o[j] = o[j - 1]; o[j - 1] = x }
-      for (p = 1; p <= n; p++) load[p] = 0
-      for (k = 0; k < m; k++) {
-        i = o[k]; best = 1
-        for (p = 2; p <= n; p++) if (load[p] < load[best]) best = p
-        part[i] = best; load[best] += s[i]
-      }
-      for (i = 0; i < m; i++) printf "%s\t%d\t%d\n", name[i], part[i], s[i]
-    }' <(ci_times) -
-}
+# item<TAB>part<TAB>seconds for the items on stdin (one name a line, in order), split into $1 parts
+# by ci/shard.awk.
+plan() { awk -v n="$1" -v dflt="$default_time" -f ci/shard.awk <(ci_times) -; }
 
 if [ "${1:-}" = --list ]; then
   harnesses
@@ -101,11 +101,7 @@ if [ "${1:-}" = --list ]; then
 fi
 if [ "${1:-}" = --plan ]; then
   [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || { echo "--plan wants a number of parts" >&2; exit 2; }
-  split=$( { harnesses | cut -f2; echo loom; } | plan "$2")
-  for ((p = 1; p <= $2; p++)); do
-    awk -F'\t' -v p="$p" '$2 == p { n++; s += $3; l = l "  " $1 " " $3 " s\n" }
-      END { printf "part %d: %d s, %d items\n%s", p, s, n, l }' <<<"$split"
-  done
+  { harnesses | cut -f2; echo loom; } | awk -v n="$2" -v dflt="$default_time" -v summary=1 -f ci/shard.awk <(ci_times) -
   exit 0
 fi
 loom=1 shard=1 shards=1

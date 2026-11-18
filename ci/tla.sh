@@ -8,14 +8,16 @@
 #
 # A model that should pass and doesn't prints TLC's counterexample (the states up to the violation).
 # --traces prints each fail_* variant's counterexample too: the trace to file with a finding.
-# --shard I/N checks the Ith of N parts (1-based) of the .cfg files, dealt out in turn, so N CI jobs
-# check them all at once (#460).
+# --shard I/N checks the Ith of N parts (1-based) of the .cfg files, so N CI jobs check them all at
+# once (#460). The parts are balanced by each model's time in CI (`ci_times` below), by ci/shard.awk:
+# longest first, each to the part with the least so far; every .cfg is in exactly one part.
+# --plan N prints that split into N parts, each with its expected seconds, and checks nothing.
 #
 # TOOLS_DIR (default target/tools) keeps the downloads; TLA_HEAP (default 1g) is TLC's heap.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-traces=0 args=() shard=1 shards=1
+traces=0 args=() shard=1 shards=1 plan=
 while [ $# -gt 0 ]; do
   a=$1
   shift
@@ -26,11 +28,41 @@ while [ $# -gt 0 ]; do
         || { echo "--shard wants I/N, 1 <= I <= N" >&2; exit 2; }
       shard=${BASH_REMATCH[1]} shards=${BASH_REMATCH[2]}
       shift ;;
+    --plan)
+      [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || { echo "--plan wants a number of parts" >&2; exit 2; }
+      plan=$1
+      shift ;;
     -h | --help) sed -n '2,/^set -e/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option $a (see --help)" >&2; exit 2 ;;
     *) args+=("$a") ;;
   esac
 done
+
+# The .cfg files that take more than a second or two on a CI runner, as the run's "tla shard I/N
+# times" annotations print them (these from main's run for #537), so they can be pasted in as they
+# are. Any other counts as 1 s: list a new model that takes longer. Only the split depends on them.
+ci_times() {
+  cat <<'EOF'
+pass_grants_slice3 110s
+pass_grants_end 108s
+pass_grants_today 55s
+RunLifecycle 9s
+GrantsOnNodes 9s
+pass_budget_today 2s
+pass_budget_end 2s
+EOF
+}
+if [ ${#args[@]} -gt 0 ]; then all=("${args[@]}"); else mapfile -t all < <(ls verification/tla/*.cfg); fi
+# The .cfg files' parts by ci/shard.awk: name<TAB>part<TAB>seconds in their order (or, with a second
+# argument, each part's summary).
+split_cfgs() {
+  for c in "${all[@]}"; do basename "$c" .cfg; done |
+    awk -v n="$1" -v dflt=1 -v summary="${2:-}" -f ci/shard.awk <(ci_times) -
+}
+if [ -n "$plan" ]; then
+  split_cfgs "$plan" 1
+  exit 0
+fi
 
 # TLC's counterexample in a log: from its first `Error:` line to the statistics after the trace,
 # without progress lines. Empty when TLC printed none (a parse error, say).
@@ -93,10 +125,10 @@ expect_fail() {
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-if [ ${#args[@]} -gt 0 ]; then all=("${args[@]}"); else mapfile -t all < <(ls verification/tla/*.cfg); fi
+mapfile -t parts < <(split_cfgs "$shards" | cut -f2)
 cfgs=()
 for i in "${!all[@]}"; do
-  if [ $((i % shards + 1)) = "$shard" ]; then cfgs+=("${all[$i]}"); fi
+  if [ "${parts[$i]}" = "$shard" ]; then cfgs+=("${all[$i]}"); fi
 done
 status=0 times=()
 for cfg in "${cfgs[@]}"; do

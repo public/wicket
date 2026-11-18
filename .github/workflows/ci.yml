@@ -377,10 +377,12 @@ jobs:
 
   # #321: TLC on the TLA+ models under verification/tla/, at the bounds their .cfg files state
   # (a few minutes), when they or the code they model change. A pinned, checksum-verified JRE.
-  # In three parts at once (#460; ci/tla.sh --shard): GrantsOnNodes's three pass_grants_* models are
-  # 250 s of its 283 s, and dealt out in turn they fall in different parts. One job says all passed.
+  # In two parts at once (#460; ci/tla.sh --shard splits the models by their CI times, longest
+  # first): GrantsOnNodes's three pass_grants_* models are 273 s of 327 s, so two parts are 164 and
+  # 163 s by `ci/tla.sh --plan 2` and end well before the gVisor jobs. Three parts only gave Kani's
+  # fourth a runner to wait for. One job says all passed.
   tla-shard:
-    name: TLA+ models (TLC) ${{ matrix.shard }}/3
+    name: TLA+ models (TLC) ${{ matrix.shard }}/2
     needs: select
     if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) }}
     runs-on: ubuntu-24.04
@@ -388,12 +390,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: ci/tla.sh --shard "${{ matrix.shard }}/3"
+      - run: ci/tla.sh --shard "${{ matrix.shard }}/2"
 
   tla:
     name: TLA+ models (TLC)
@@ -413,11 +415,11 @@ jobs:
   # naming the Lean theorem of #322 it restates) and the budget counter's loom test, one harness at
   # a time (ci/kani.sh). Selected by ci/determinator/suites.toml's kani suite: the harnessed crate
   # (its code, its harnesses), the script.
-  # In three parts at once (#460; ci/kani.sh --shard splits the harnesses and loom by their CI
-  # times, longest first: 285, 285 and 284 s of 854 s by `ci/kani.sh --plan 3`, its longest harness
-  # 244 s; in two they were 427 s each), and one job that says they all passed.
+  # In four parts at once (#460; ci/kani.sh --shard splits the harnesses and loom by their CI
+  # times, longest first: 264, 263, 264 and 264 s of 1055 s by `ci/kani.sh --plan 4`; in three
+  # they were 353 s each), and one job that says they all passed.
   kani-shard:
-    name: Kani proofs and loom ${{ matrix.shard }}/3
+    name: Kani proofs and loom ${{ matrix.shard }}/4
     needs: select
     if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) }}
     runs-on: ubuntu-24.04
@@ -425,7 +427,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     env:
       KANI_VERSION: 0.68.0
     steps:
@@ -441,7 +443,7 @@ jobs:
         run: |
           cargo install --locked kani-verifier --version "$KANI_VERSION"
           cargo kani setup
-      - run: ci/kani.sh --shard "${{ matrix.shard }}/3"
+      - run: ci/kani.sh --shard "${{ matrix.shard }}/4"
 
   kani:
     name: Kani proofs and loom

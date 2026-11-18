@@ -338,6 +338,9 @@ fn end_to_end_scripts_select_their_suites() {
     check(&["ci/smoke.sh"], &[], &["smoke"]);
     check(&["ci/h3get/src/main.rs"], &[], &["smoke", "acceptance"]);
     check(&["ci/kani.sh"], &[], &["kani"]);
+    check(&["ci/tla.sh"], &[], &["tla"]);
+    // Both scripts split their CI parts with it.
+    check(&["ci/shard.awk"], &[], &["kani", "tla"]);
     check(&["ci/update/x"], &[], &["update"]);
 }
 

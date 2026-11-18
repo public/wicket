@@ -30,13 +30,13 @@ paths = ["ci/lean.sh"]
 
 [suite.kani]
 packages = ["wicket-core"]
-paths = ["ci/kani.sh"]
+paths = ["ci/kani.sh", "ci/shard.awk"]
 
 # TLC reads only the models (ci/tla.sh): no crate's code reaches it, so only its own paths select it.
 # Each README maps the models' actions to the code; a change to that code is reviewed against them,
 # but rerunning TLC can't catch a drift.
 [suite.tla]
-paths = ["verification/tla/**", "ci/tla.sh"]
+paths = ["verification/tla/**", "ci/tla.sh", "ci/shard.awk"]
 
 [suite.smoke]
 binary = true
