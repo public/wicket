@@ -656,8 +656,8 @@ pub fn is_principal_entry(entry: &str) -> bool {
 
 /// Whether an `accept_from` list lets a sender in: it names the sender's zone, or (#250) the
 /// sender's principal id, when the caller knows it.
-pub fn accepts(accept_from: &[String], zone: &str, principal: Option<&str>) -> bool {
-    accept_from.iter().any(|a| if is_principal_entry(a) { principal == Some(a.as_str()) } else { a == zone })
+pub fn accepts<S: AsRef<str>>(accept_from: &[S], zone: &str, principal: Option<&str>) -> bool {
+    accept_from.iter().map(AsRef::as_ref).any(|a| if is_principal_entry(a) { principal == Some(a) } else { a == zone })
 }
 
 /// Whether model pattern `pattern` (a name, or a prefix ending in `*`) covers `other`: a model
@@ -1176,7 +1176,7 @@ mod tests {
         assert!(accepts(&list, "audit", Some("spiffe://w.test/t/t0/z/audit/a/auditor")), "one listed principal");
         assert!(!accepts(&list, "audit", Some("spiffe://w.test/t/t0/z/audit/a/other")), "not its zone-mates");
         assert!(!accepts(&list, "audit", None), "a principal entry needs the sender's id");
-        assert!(!accepts(&[], "ops", Some("x")));
+        assert!(!accepts::<String>(&[], "ops", Some("x")));
         // #411: the kinds never cross: a zone entry isn't an id, a principal entry isn't a zone.
         assert!(!accepts(&list, "audit", Some("ops")), "a zone entry matches the sender's zone only");
         assert!(!accepts(&list, "spiffe://w.test/t/t0/z/audit/a/auditor", None), "a principal entry matches the sender's id only");

@@ -1,55 +1,64 @@
 //! A zone's consent and model lists (`manifest`): `accept_from` (#250, #411) and
 //! `zone.llm.models` (#366). #322's Lean spec has no counterpart. Short strings: list entries and
-//! senders chosen from a few concrete names, so a zone and a principal can look alike; model
-//! names and patterns over `a`, `b` and `*`.
+//! senders chosen from a few concrete names (zones `a` and `b`, principals `x://a` and `x://b`,
+//! and a principal id `a` like a zone's name); model names and patterns over `a`, `b` and `*`.
 
 use super::{accepts, is_principal_entry, model_covers};
 use crate::proofs::AnyStr;
 
-/// Zones, principals and things like both: an entry or a sender is one of these.
-const NAMES: [&str; 4] = ["a", "b", "x://a", "x://b"];
-
-fn any_name() -> &'static str {
-    NAMES[kani::any_where(|&i: &usize| i < NAMES.len())]
-}
-
-/// Lists are windows of [`POOL`], built once: its windows of two hold two zones, two principals,
-/// and each mix. (Built from symbolic choices instead, this harness or `Effect::widens`' ran a
-/// CI shard past its hour.)
+/// Lists are windows of [`POOL`]: its windows of two hold two zones, two principals, and each mix.
+/// Plain `&str`s, no heap: with `String`s (symbolically chosen, then a fixed pool of them) its
+/// shard first ran past its hour, then was stopped after 11 minutes (exit 143).
 const POOL: [&str; 6] = ["x://a", "x://b", "a", "b", "x://a", "a"];
 
-/// `accepts`: an `accept_from` list lets a sender in exactly when one entry names it, a zone entry
-/// by the sender's zone and a principal entry by its principal id, the two kinds never crossing
-/// (#250): a list of principal entries ignores the sender's zone and refuses a sender whose
-/// principal isn't known; a list of zone entries ignores the principal. An empty list refuses
-/// everyone, and an entry added never refuses a sender let in before. (Unwound 9: the substring
-/// search of `is_principal_entry` over a name of five bytes, and lists of up to three.)
-#[kani::proof]
-#[kani::unwind(9)]
-fn accept_from_names_a_zone_or_a_principal_never_crossing() {
-    let pool: [String; 6] = POOL.map(String::from);
+/// A window of [`POOL`] of up to two entries, and the same window with the pool's next entry.
+fn any_list() -> (&'static [&'static str], &'static [&'static str]) {
     let start: usize = kani::any_where(|&s| s < POOL.len());
     let len: usize = kani::any_where(|&l| l <= 2 && start + l < POOL.len());
-    let (list, more) = (&pool[start..start + len], &pool[start..start + len + 1]);
-    let (zone, other_zone) = (any_name(), any_name());
-    kani::assume(!is_principal_entry(zone) && !is_principal_entry(other_zone));
-    let principal: Option<&str> = if kani::any() { Some(any_name()) } else { None };
-    let other_principal: Option<&str> = if kani::any() { Some(any_name()) } else { None };
-    let got = accepts(list, zone, principal);
-    let named = list.iter().any(|e| if is_principal_entry(e) { principal == Some(e.as_str()) } else { e == zone });
-    assert_eq!(got, named);
-    if list.is_empty() {
-        assert!(!got);
+    (&POOL[start..start + len], &POOL[start..start + len + 1])
+}
+
+fn any_zone() -> &'static str {
+    if kani::any() {
+        "a"
+    } else {
+        "b"
     }
+}
+
+fn any_principal() -> Option<&'static str> {
+    [None, Some("a"), Some("x://a"), Some("x://b")][kani::any_where(|&i: &usize| i < 4)]
+}
+
+/// `accepts`: an `accept_from` list lets a sender in exactly when one entry names it, a zone entry
+/// by the sender's zone and a principal entry by its principal id; an empty list refuses everyone,
+/// and an entry added never refuses a sender let in before.
+#[kani::proof]
+#[kani::unwind(6)]
+fn accept_from_lets_in_exactly_whom_it_names() {
+    let (list, more) = any_list();
+    let (zone, principal) = (any_zone(), any_principal());
+    let got = accepts(list, zone, principal);
+    let named = list.iter().any(|e| if is_principal_entry(e) { principal == Some(*e) } else { *e == zone });
+    assert_eq!(got, named);
+    assert!(!list.is_empty() || !got);
+    assert!(!got || accepts(more, zone, principal));
+}
+
+/// The two kinds never cross (#250): a list of principal entries ignores the sender's zone and
+/// refuses a sender whose principal isn't known; a list of zone entries ignores the principal.
+#[kani::proof]
+#[kani::unwind(6)]
+fn accept_from_never_crosses_zones_and_principals() {
+    let (list, _) = any_list();
+    let (zone, other_zone) = (any_zone(), any_zone());
+    let (principal, other_principal) = (any_principal(), any_principal());
     if list.iter().all(|e| is_principal_entry(e)) {
-        assert_eq!(got, accepts(list, other_zone, principal));
+        assert_eq!(accepts(list, zone, principal), accepts(list, other_zone, principal));
         assert!(!accepts(list, zone, None));
     }
     if list.iter().all(|e| !is_principal_entry(e)) {
-        assert_eq!(got, accepts(list, zone, other_principal));
-    }
-    if got {
-        assert!(accepts(more, zone, principal));
+        assert_eq!(accepts(list, zone, principal), accepts(list, zone, other_principal));
     }
 }
 
