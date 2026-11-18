@@ -303,3 +303,48 @@ Bounds: one node, two runs, `Cap = 1`, `Lease = 2`, `MaxTime = 4` (`Placement.cf
 modelled: the spend envelope and capacity approvals, the provider's own lease, several nodes'
 choice of placement, and a node's crash.
 
+# Update: the control host moving to a new build under long-lived runs
+
+Model 4 of [#321](https://github.com/public/wicket/issues/321). A new build arrives two ways:
+
+- An install (`deploy/install.sh`) restarts wicketd. `KillMode=process` leaves the runs'
+  supervisors running as orphans, on the build they started on (#468).
+- `wicket self update` stops the runs' old supervisors itself, then sends wicketd SIGHUP. The daemon
+  drains: it refuses new commands and writes the handoff of its running ones, then re-executes as
+  the new build (#455).
+
+The new build writes operators' prompts in its schema. A supervisor still on the old build reads
+them.
+
+| property | meaning |
+|---|---|
+| `NoPromptLost` | no operator's prompt is lost across an update |
+| `OldBuildBounded` | after an update, no supervisor runs the old build for longer than the handover's bound |
+| `DaemonTakesCommands` | the daemon refuses commands for no longer than its drain's bound: it always takes them again |
+
+The bounds are what the code's timeouts keep. They are written as obligations on time: time
+doesn't pass a handover's bound while the handover can still act, nor a drain's while the drain
+can still return. A bug that stops either from acting lets time pass, and breaks its property.
+
+| switch (pass value) | the code without it | fails |
+|---|---|---|
+| `ExpandSafe = TRUE` and `HandOverOnStart = TRUE` | #475: schema 17 wasn't expand-safe for older readers. After an install's restart (#468), the old-build supervisors' `await_message` took the new build's prompts as peers' messages and dropped them | `fail_update_old_supervisor_drops_prompts`: `NoPromptLost` |
+| `HandOverOnStart = TRUE` (#477) | an install's restart left every run on its old supervisor for as long as the run lived | `fail_update_old_build_lingers`: `OldBuildBounded` |
+| `DrainReturns = TRUE` (#489) | #487: the SIGHUP drain asked the registry it held how many commands it handed over, deadlocked, and the daemon refused every command until it was restarted | `fail_update_drain_hangs`: `DaemonTakesCommands` |
+| `ExpandSafe = TRUE` alone | the handover narrows #475's window but doesn't close it. A prompt sent in the seconds before an old supervisor is stopped is still dropped if the schema step isn't expand-safe. The expand rule, which the store's `previous_build` test checks (#477), is what closes it | `fail_update_handover_without_expand`: `NoPromptLost` |
+
+| action | code (file, function) |
+|---|---|
+| `Install`, `DaemonStart` | `deploy/install.sh` (`systemctl restart wicketd`); `wicket-cli/src/daemon/mod.rs` `serve`, which hands over on a thread (`hand_over_runs`) while it takes commands |
+| `HandOver`, `Reattach` | `wicket-cli/src/update.rs` `stop_stale_supervisors` (SIGKILL, the box left running), then the reconciler's `run_adopted` (`wicket attach` on the new build) |
+| `SelfUpdate`, `DrainDone` | `update.rs` `handover`, then SIGHUP: `daemon/mod.rs` `drain` and `handoff::prepare`, held across the exec (#489) |
+| `Send`, `Take` | `Ledger::add_prompt` (#463), and a supervisor's `take_prompts` or `await_message` on its build |
+
+Bounds: two runs, two prompts, `MaxTime = 4`, `HandoverMax = 1`, `DrainMax = 1` (`Update.cfg`).
+
+Not modelled:
+- a supervisor stopped holding a prompt in flight (RunLifecycle covers that: it is given again on the re-attach, #445);
+- several updates in a row;
+- a rollback;
+- nodes' own builds.
+
