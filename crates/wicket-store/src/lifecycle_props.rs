@@ -54,6 +54,24 @@ fn active_has_run(l: &Ledger) -> std::result::Result<(), String> {
     }
 }
 
+/// Run `run` is lost: it ends as `lost`, and if it was the active agent's current activation the
+/// agent ends with it (hibernated when it has a head, else ended), which `run_lost` returns; an
+/// earlier activation's run leaves the agent as it was.
+fn lose(l: &Ledger, run: &str, seed: u64, step: usize) {
+    let before = l.agent(AGENT).unwrap().unwrap();
+    let got = l.run_lost(run, "prop: lost").unwrap();
+    let after = l.agent(AGENT).unwrap().unwrap();
+    assert_eq!(l.run_status(run).unwrap().as_deref(), Some("lost"), "seed {seed} step {step}: {run} ends as lost");
+    if before.state == "active" && before.run == run {
+        let want = if before.head.is_some() { "hibernated" } else { "ended" };
+        assert_eq!((got.as_deref(), after.state.as_str()), (Some(want), want), "seed {seed} step {step}: its agent ends with it");
+        assert!(after.claim_until.is_none(), "seed {seed} step {step}: and its claim with it");
+    } else {
+        assert_eq!(got, None, "seed {seed} step {step}: not the active agent's activation");
+        assert_eq!(after.state, before.state, "seed {seed} step {step}: the agent is left alone");
+    }
+}
+
 /// #474: whatever happens to an agent's runs, an active agent always has a live run or claim.
 #[test]
 fn no_agent_is_active_without_a_live_run_or_claim() {
@@ -99,14 +117,12 @@ fn no_agent_is_active_without_a_live_run_or_claim() {
                     }
                 }
                 // The current activation's run is lost: by the reconciler, or a re-attach failing.
-                (1, Some(a)) => {
-                    let _ = l.run_lost(&a.run.clone(), "prop: lost").unwrap();
-                }
+                (1, Some(a)) => lose(&l, &a.run.clone(), seed, step),
                 // An earlier activation's run is lost.
                 (2, Some(_)) if !runs.is_empty() => {
                     let r = runs[rng.below(runs.len() as u64) as usize].clone();
                     if l.run_status(&r).unwrap().as_deref() == Some("running") {
-                        let _ = l.run_lost(&r, "prop: an old run lost").unwrap();
+                        lose(&l, &r, seed, step);
                     }
                 }
                 // The holder's claim lapses (its supervisor stopped renewing).
