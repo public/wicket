@@ -81,6 +81,28 @@ pub fn reexec_on_hangup<G: 'static>(pidfile: PathBuf, versions: PathBuf, before:
     });
 }
 
+/// Makes `c` start detached from this process: in a session of its own, so a ^C or SIGHUP to this
+/// process's terminal doesn't reach it, and with none of this process's descriptors but the stdio
+/// `c` is given (a wrapped agent's launcher, say, would otherwise never see its stdout close).
+/// How wicket starts what must outlive it: the local node's `serve`, a run's `attach`, a `wake`.
+pub fn detach(c: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: async-signal-safe calls only, in the child before exec.
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            let max = match libc::sysconf(libc::_SC_OPEN_MAX) {
+                n if n > 0 => n.min(65_536) as libc::c_int,
+                _ => 1024,
+            };
+            for fd in 3..max {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+}
+
 /// The control host's versions root: the one the running binary is in (an installed host's
 /// `/usr/local/bin/wicket` links into it), else `$WICKET_VERSIONS`, else `<data dir>/versions`.
 pub fn control_root() -> PathBuf {

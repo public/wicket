@@ -2607,28 +2607,13 @@ pub fn attach_failed(run: &str, e: &anyhow::Error) {
 /// `<run dir>/ctl/attach.log`: what the reconciler does for a run whose supervisor is gone but whose
 /// box still runs on its node (#151).
 pub fn spawn_attach(run: &str) -> Result<()> {
-    use std::os::unix::process::CommandExt;
     check_run_id(run)?;
     let dir = data_dir().join("runs").join(run).join("ctl");
     std::fs::create_dir_all(&dir)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("attach.log"))?;
     let mut c = std::process::Command::new(wicket_node::reexec::self_exe()?);
     c.args(["attach", run]).current_dir(&dir).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
-    // SAFETY: async-signal-safe calls only, in the child before exec: its own session, and no
-    // descriptor of the reconciler's but stdio.
-    unsafe {
-        c.pre_exec(|| {
-            libc::setsid();
-            let max = match libc::sysconf(libc::_SC_OPEN_MAX) {
-                n if n > 0 => n.min(65_536) as libc::c_int,
-                _ => 1024,
-            };
-            for fd in 3..max {
-                libc::close(fd);
-            }
-            Ok(())
-        });
-    }
+    wicket_node::reexec::detach(&mut c);
     c.spawn().context("starting `wicket attach`")?;
     Ok(())
 }
