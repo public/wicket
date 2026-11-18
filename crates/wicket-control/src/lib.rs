@@ -2,7 +2,7 @@
 //! ([`noderun`], [`nodecall`], [`links`]), spawns ([`spawn`], [`quotas`]), hibernation and its
 //! stores ([`hibernate`], [`snapstore`], [`storegc`], [`gitguard`]), transcripts ([`transcript`]),
 //! the authority roots and the feed ([`roots`]), and what a run needs of the rest: nodes'
-//! enrolment, placement and leases ([`enrol`], [`localnode`], [`node`], [`nodeca`],
+//! enrolment, placement and leases ([`enrol`], [`localnode`], [`node`],
 //! [`nodecreate`], [`capacity`]), grants and their effects ([`grant`], [`effect`]), operators
 //! ([`operators`]), policy ([`policy`]) and images ([`image`]).
 //!
@@ -34,7 +34,6 @@ pub mod image;
 pub mod links;
 pub mod localnode;
 pub mod node;
-pub mod nodeca;
 pub mod nodecall;
 pub mod nodecreate;
 pub mod noderun;

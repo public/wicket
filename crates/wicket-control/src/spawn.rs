@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use wicket_core::{subset, Manifest, Op, RunId};
-pub use wicket_node::childplan::{plan_child, ChildPlan, PlanIn};
+use wicket_node::childplan::{plan_child, ChildPlan, PlanIn};
 use wicket_proxy::{llm::Llm, SpawnRequest};
 use wicket_store::{EffectUse, Filed, Ledger};
 

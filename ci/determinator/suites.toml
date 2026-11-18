@@ -96,7 +96,7 @@ packages = ["wicket-node", "wicket-chan"]
 paths = [
   "ci/node-e2e.sh", "ci/node-e2e/**",
   "crates/wicket-control/src/noderun.rs", "crates/wicket-control/src/nodecall.rs",
-  "crates/wicket-control/src/enrol.rs", "crates/wicket-control/src/nodeca.rs",
+  "crates/wicket-control/src/enrol.rs",
 ]
 
 [suite.acceptance-nodes]
@@ -105,7 +105,7 @@ packages = ["wicket-node", "wicket-chan"]
 paths = [
   "ci/acceptance.sh", "ci/acceptance/**",
   "crates/wicket-control/src/noderun.rs", "crates/wicket-control/src/nodecall.rs",
-  "crates/wicket-control/src/enrol.rs", "crates/wicket-control/src/nodeca.rs",
+  "crates/wicket-control/src/enrol.rs",
 ]
 
 [suite.update]

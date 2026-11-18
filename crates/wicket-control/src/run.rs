@@ -21,7 +21,7 @@ fn identity_ttl() -> i64 {
 }
 
 pub use wicket_chan::check_run_id;
-pub use wicket_node::status::egress_line;
+use wicket_node::status::egress_line;
 
 /// The run's box, on whichever node it runs: stop it, revoke it, look inside it.
 #[derive(Clone)]
