@@ -470,7 +470,10 @@ fn trusted_signers(l: &Ledger) -> Result<Vec<([u8; 32], wicket_store::Signer)>> 
     Ok(v)
 }
 
-fn trusted_keys() -> Result<Vec<[u8; 32]>> {
+/// The keys of the CI principals with a live standing grant: the only keys a signature is checked
+/// against (#258). A key file in `release-keys/` is no acceptance path of its own: it only keeps
+/// its principal's grant renewed (and is imported once, if it never had one).
+fn signer_keys() -> Result<Vec<[u8; 32]>> {
     Ok(trusted_signers(&Ledger::open(&crate::ledger_path())?)?.into_iter().map(|(k, _)| k).collect())
 }
 
@@ -567,8 +570,7 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
     }
     let mut why_not_signed = format!("no signature ({} doesn't exist)", sig_path.display());
     if let Ok(bytes) = std::fs::read(&sig_path) {
-        match serde_json::from_slice::<Signature>(&bytes).map_err(anyhow::Error::from).and_then(|s| verify_sig(&s, &sha, &trusted_keys()?))
-        {
+        match serde_json::from_slice::<Signature>(&bytes).map_err(anyhow::Error::from).and_then(|s| verify_sig(&s, &sha, &signer_keys()?)) {
             Ok(key) => {
                 // A CI signature given by hand: its claims are recorded too.
                 let claims = serde_json::from_slice::<Signature>(&bytes)
@@ -621,7 +623,7 @@ pub fn verify_ci_files(archive: &Path, sig: &Path, e: &CiExpect) -> Result<(Stri
 fn ci_signed(sha: &str, sig: &Path, e: &CiExpect) -> Result<(String, CiClaims)> {
     let bytes = std::fs::read(sig).with_context(|| format!("no signature ({})", sig.display()))?;
     let s: Signature = serde_json::from_slice(&bytes)?;
-    let (key, c) = verify_ci_sig(&s, sha, &trusted_keys()?)?;
+    let (key, c) = verify_ci_sig(&s, sha, &signer_keys()?)?;
     check_claims(&c, e, wicket_store::now())?;
     Ok((key, c))
 }

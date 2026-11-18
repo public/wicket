@@ -141,5 +141,6 @@ starts as that digest on its node, whatever the tag points to later, and the nod
 doesn't have that image. `wicket image` prints the digest of what it built.
 [Image pins](../reference/manifest.md#image-pins) has the rules.
 
-To require pins for every run on the installation, put `require_digests: true` in
-`<data dir>/images.yaml`.
+A pinned image is accepted by a grant on its digest (#258): running the manifest records yours,
+for the zone, and `wicket grant list` shows it. To refuse tags on the installation, put
+`require_digests: true` in `<data dir>/images.yaml`.

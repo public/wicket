@@ -118,6 +118,43 @@ fn path_of(digest: &str) -> String {
     format!("/digest/{digest}")
 }
 
+/// A grant [`covering`] found: (id, uses left, decided by, its scope).
+type Covering = (String, Option<i64>, String, DigestScope);
+
+/// The oldest live grant on `digest` for `action` whose scope covers `scope` (an installation-wide
+/// grant covers every zone and node), with a use left.
+fn covering(
+    conn: &rusqlite::Connection,
+    tenant: &TenantId,
+    digest: &str,
+    action: DigestAction,
+    scope: &DigestScope,
+) -> Result<Option<Covering>> {
+    let mut st = conn.prepare(
+        "SELECT id, uses_left, decided_by, terms FROM grants
+         WHERE tenant = ?1 AND method = ?2 AND host = ?3 AND path = ?4 AND revoked = 0 AND expires_at > ?5
+           AND amount IS NULL AND (uses_left IS NULL OR uses_left > 0)
+         ORDER BY created_at, rowid",
+    )?;
+    let rows = st.query_map(params![tenant.0, DIGEST_METHOD, crate::QUOTA_HOST, path_of(digest), now()], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        ))
+    })?;
+    for row in rows {
+        let (id, uses, decided_by, terms) = row?;
+        if let Ok(t) = serde_json::from_str::<Terms>(&terms) {
+            if t.action == action && (t.scope == DigestScope::Installation || &t.scope == scope) {
+                return Ok(Some((id, uses, decided_by, t.scope)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 impl Ledger {
     /// Records a grant on `g.digest`: its grant id. The caller has checked that whoever makes it
     /// may (only operators make these, #258).
@@ -154,6 +191,12 @@ impl Ledger {
         Ok(id)
     }
 
+    /// Whether a live grant on `digest` lets it do `action` in `scope`, without using or auditing
+    /// anything: what a run checks before it records the grant its pin stands for (#258).
+    pub fn digest_granted(&self, tenant: &TenantId, digest: &str, action: DigestAction, scope: &DigestScope) -> Result<bool> {
+        Ok(valid_digest(digest) && covering(&self.conn, tenant, digest, action, scope)?.is_some())
+    }
+
     /// May `digest` do `action` in `scope`? The one check (#258): the oldest live grant on the
     /// digest for that action whose scope covers `scope` (an installation-wide grant covers every
     /// zone and node), one of its uses taken if it is counted, and the acceptance audited
@@ -171,24 +214,7 @@ impl Ledger {
             return Ok(None);
         }
         let tx = self.conn.unchecked_transaction()?;
-        let rows: Vec<(String, Option<i64>, String, String)> = {
-            let mut st = tx.prepare(
-                "SELECT id, uses_left, decided_by, terms FROM grants
-                 WHERE tenant = ?1 AND method = ?2 AND host = ?3 AND path = ?4 AND revoked = 0 AND expires_at > ?5
-                   AND amount IS NULL AND (uses_left IS NULL OR uses_left > 0)
-                 ORDER BY created_at, rowid",
-            )?;
-            let r = st.query_map(params![tenant.0, DIGEST_METHOD, crate::QUOTA_HOST, path_of(digest), now()], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<String>>(3)?.unwrap_or_default()))
-            })?;
-            r.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        let found = rows.into_iter().find_map(|(id, uses, decided_by, terms)| {
-            let t: Terms = serde_json::from_str(&terms).ok()?;
-            let covers = t.action == action && (t.scope == DigestScope::Installation || &t.scope == scope);
-            covers.then_some((id, uses, decided_by, t.scope))
-        });
-        let Some((grant, uses, decided_by, held)) = found else {
+        let Some((grant, uses, decided_by, held)) = covering(&tx, tenant, digest, action, scope)? else {
             return Ok(None);
         };
         // Conditional, so two uses racing for a grant's last use can't both take it.
