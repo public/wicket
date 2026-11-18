@@ -1,6 +1,6 @@
 # Create nodes on Vultr
 
-Have wicket create nodes on Vultr inside a money envelope, by hand (`wicket node create`) or for agents
+Have wicket create nodes on Vultr within the money limits in `placement.yaml`, by hand (`wicket node create`) or for agents
 that ask (`request_capacity` and leases). [Nodes](../reference/nodes.md#creating-nodes-wicket-node-create)
 has the rules; this page is the recipe. On an installed control host, run these commands with
 `sudo`.
@@ -30,21 +30,26 @@ below).
 
 ## 2. Create a node by hand
 
+`wicket node create` reads its money limits from `placement.yaml` (`max_hourly_usd`,
+`max_total_usd`; [step 3](#3-leases-for-agents) sets it up), and refuses to run without it.
+
 ```sh
 wicket node plans --region lhr                     # plans and their hourly price
 wicket node create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
-    --max-hourly 0.05 --max-total 0.50 --ssh-key-id <id> --ssh-key /var/lib/wicket/ssh/placement \
+    --ssh-key-id <id> --ssh-key /var/lib/wicket/ssh/placement \
     --hosts 'api.example.com'
 ```
 
-- `--max-hourly` and `--max-total` are the envelope: every owned node's hourly rate together, and
-  every owned node's cost through its lease plus the new node's worst case. Anything beyond it is
-  refused before anything is asked.
-- Inside the envelope, the node is a request, `CAPACITY wicket.internal /capacity/node/n2`, with the
-  plan, region, rate and worst case. If one of your live capacity grants covers it, it is approved
-  at once and audited against that grant. Otherwise it waits for an operator: on the console, which
-  sends a notification, or `wicket approve <id>`. That wait lasts up to `--wait` (default `15m`);
-  if nobody decides by then, the request is denied and nothing is created.
+- Its money is reserved first, against the same budget as agents' leases (#256): the new node's
+  hourly rate and worst case, plus what every live lease and created node has reserved, must fit
+  `max_hourly_usd` and `max_total_usd`. Anything beyond them is refused before anything is asked.
+- Within them, the node is a request, `CAPACITY wicket.internal /capacity/node/n2`, with the
+  plan, region, rate and worst case, and what is reserved with it against the limits. If one of
+  your live capacity grants covers it, it is approved at once and audited against that grant.
+  Otherwise it waits for an operator: on the console, which sends a notification, or `wicket
+  approve <id>`. That wait lasts up to `--wait` (default `15m`);
+  if nobody decides by then, the request is denied, nothing is created and its reservation is given
+  back.
 - To skip the wait, have an operator give you a capacity grant on the console's Capacity card: the
   plans, regions, hourly and daily money, how many nodes at once, and for how long (at most 24h,
   renewable). See [capacity grants](../reference/console.md#capacity-grants).
@@ -57,7 +62,7 @@ wicket node create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime
   (setup may still be running), and wicket waits up to 15 minutes for setup. If every connect times
   out or is unreachable for `--give-up-silent` (default `4m`), wicket releases the instance (it
   checks the owner tag first), records a `placement.node_unreachable` audit record with the reason,
-  and says so. Its cost leaves the envelope with it, so you can run `create` again, perhaps in
+  and says so. Its reservation is given back with it, so you can run `create` again, perhaps in
   another `--region`. A node that answers but doesn't finish setup within 15 minutes is still left
   running, with the `wicket node release` command to run.
 - A retried `create` with the same `--idempotency-key` (default: derived from `--name`) finds the
@@ -87,7 +92,7 @@ An agent can ask for a machine of its own with the `request_capacity` tool. It g
 cloud credential.
 
 1. Copy `examples/placement/placement.yaml` to `<data dir>/placement.yaml` (`/var/lib/wicket/` on an
-   installed host) and set `backend: vultr`, the envelope (`max_hourly_usd`, `max_total_usd`), and
+   installed host) and set `backend: vultr`, the money limits (`max_hourly_usd`, `max_total_usd`), and
    the `vultr:` section (`region`, `ssh_key_ids`, `ssh_key`). `backend: static` uses your own
    enrolled machines instead. Every field is in [configuration](../reference/configuration.md#placementyaml).
 2. Run the reconciler. Installed, the `wicket-reconcile` unit already runs `wicket reconcile --every
@@ -95,7 +100,8 @@ cloud credential.
 3. Check it: `wicket doctor` reports the placement backend and whether the API key is set.
 
 When an agent asks, the ask becomes a pending lease with its worst case reserved against the
-envelope (an ask over budget is refused before you see it):
+money limits, which it shares with nodes made by `wicket node create` (an ask over budget is refused
+before you see it):
 
 ```sh
 wicket pending                     # CAPACITY wicket.internal/capacity/l-…

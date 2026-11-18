@@ -1,11 +1,11 @@
-//! The placement rules, on a fake backend: the money envelope, approval, idempotency, owner tags,
-//! release before the next paid hour, and the static-host backend.
+//! The placement rules, on a fake backend: approval of every paid node and warm claim, idempotency,
+//! owner tags, release before the next paid hour, and the static-host backend.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use wicket_placement::billing::BillingModel;
-use wicket_placement::envelope::{DenyAll, EnvelopeRefusal};
+use wicket_placement::envelope::DenyAll;
 use wicket_placement::model::PROTECTED_TAG;
 use wicket_placement::static_hosts::{StaticHost, StaticHosts};
 use wicket_placement::*;
@@ -140,10 +140,6 @@ impl SpendApprover for Human {
     }
 }
 
-fn envelope(hourly: &str, total: &str) -> MoneyEnvelope {
-    MoneyEnvelope { max_hourly: MicroUsd::parse_dollars(hourly).unwrap(), max_total: MicroUsd::parse_dollars(total).unwrap() }
-}
-
 fn req(key: &str, lifetime: i64) -> CapacityRequest {
     CapacityRequest {
         resources: Resources { vcpus: 1, memory_mib: 1024 },
@@ -159,16 +155,16 @@ fn req(key: &str, lifetime: i64) -> CapacityRequest {
     }
 }
 
-fn placer(f: &Fake, human: &Human, env: MoneyEnvelope) -> Placer<Fake, Human> {
+fn placer(f: &Fake, human: &Human) -> Placer<Fake, Human> {
     let c = f.clock.clone();
-    Placer::new(f.clone(), human.clone(), Owner::new("example"), env).with_clock(Arc::new(move || c.load(Ordering::SeqCst)))
+    Placer::new(f.clone(), human.clone(), Owner::new("example")).with_clock(Arc::new(move || c.load(Ordering::SeqCst)))
 }
 
 #[tokio::test]
 async fn a_paid_node_needs_a_human_and_carries_the_owner_idempotency_and_lease_tags() {
     let f = Fake::new(vec![offer("big", 4, 8192, 60_000), offer("small", 1, 1024, 14_000)]);
     let human = Human::new(true);
-    let p = placer(&f, &human, envelope("0.10", "1.00"));
+    let p = placer(&f, &human);
     let n = p.acquire(&req("task-1", 30 * 60)).await.unwrap();
     // Cheapest offer that fits.
     assert_eq!(n.plan.as_deref(), Some("small"));
@@ -189,61 +185,41 @@ async fn a_paid_node_needs_a_human_and_carries_the_owner_idempotency_and_lease_t
 async fn a_denied_request_creates_nothing() {
     let f = Fake::new(vec![offer("small", 1, 1024, 14_000)]);
     let human = Human::new(false);
-    let e = placer(&f, &human, envelope("0.10", "1.00")).acquire(&req("k", H)).await.unwrap_err();
+    let e = placer(&f, &human).acquire(&req("k", H)).await.unwrap_err();
     assert!(matches!(e, PlacementError::NotApproved(_)), "{e}");
     assert_eq!(f.creates(), 0);
     // With no approver configured, nothing paid is ever created.
-    let e = Placer::new(f.clone(), DenyAll, Owner::new("example"), envelope("0.10", "1.00")).acquire(&req("k", H)).await.unwrap_err();
+    let e = Placer::new(f.clone(), DenyAll, Owner::new("example")).acquire(&req("k", H)).await.unwrap_err();
     assert!(matches!(e, PlacementError::NotApproved(_)));
     assert_eq!(f.creates(), 0);
 }
 
+/// #256: the placer holds no money limits of its own; the approver (wicket's, which makes the one
+/// spend check in the ledger) is asked for every paid node, with its worst case, and its no is final.
 #[tokio::test]
-async fn the_envelope_refuses_before_any_human_is_asked() {
+async fn the_approver_alone_decides_a_paid_node_with_its_worst_case() {
     let f = Fake::new(vec![offer("small", 1, 1024, 14_000)]);
     let human = Human::new(true);
-    // Hourly: $0.014/h against a $0.01/h cap.
-    let e = placer(&f, &human, envelope("0.01", "100")).acquire(&req("a", H)).await.unwrap_err();
-    assert!(matches!(e, PlacementError::Envelope(EnvelopeRefusal::Hourly { .. })), "{e}");
-    // Total: 11 hours at $0.014 is $0.154, billed $0.16, over $0.15 (10 hours, $0.14, would fit).
-    let e = placer(&f, &human, envelope("1", "0.15")).acquire(&req("b", 11 * H)).await.unwrap_err();
-    assert!(matches!(e, PlacementError::Envelope(EnvelopeRefusal::Total { .. })), "{e}");
-    assert!(human.asked().is_empty());
-    assert_eq!(f.creates(), 0);
-}
-
-#[tokio::test]
-async fn the_envelope_counts_nodes_already_running() {
-    let f = Fake::new(vec![offer("small", 1, 1024, 14_000)]);
-    let human = Human::new(true);
-    let owner = Owner::new("example");
-    // Two owned nodes at $0.01/h, leased for 3 hours: $0.02/h and 2 × $0.03 committed.
-    f.insert("old-1", vec![owner.tag(), Owner::lease_tag(3 * H - 600)], 0);
-    f.insert("old-2", vec![owner.tag(), Owner::lease_tag(3 * H - 600)], 0);
-    // Someone else's node doesn't count (and isn't listed).
-    f.insert("theirs", vec![Owner::new("other").tag()], 0);
-    let e = placer(&f, &human, envelope("0.03", "10")).acquire(&req("a", H)).await.unwrap_err();
-    assert!(matches!(e, PlacementError::Envelope(EnvelopeRefusal::Hourly { .. })), "{e}");
-    let e = placer(&f, &human, envelope("1", "0.07")).acquire(&req("a", H)).await.unwrap_err();
-    assert!(matches!(e, PlacementError::Envelope(EnvelopeRefusal::Total { .. })), "{e}");
-    let p = placer(&f, &human, envelope("0.04", "0.09"));
-    p.acquire(&req("a", 30 * 60)).await.unwrap();
-    assert_eq!(human.asked()[0].committed_hourly, MicroUsd::from_cents(2));
-    assert_eq!(human.asked()[0].committed_total, MicroUsd::from_cents(6));
-    assert_eq!(p.list().await.unwrap().len(), 3);
+    // 11 hours at $0.014 is $0.154, billed $0.16: asked as such, however much is already owned.
+    f.insert("old-1", vec![Owner::new("example").tag(), Owner::lease_tag(3 * H - 600)], 0);
+    let p = placer(&f, &human);
+    p.acquire(&req("b", 11 * H)).await.unwrap();
+    let asked = human.asked();
+    assert_eq!((asked[0].hourly, asked[0].worst_case, asked[0].warm), (MicroUsd(14_000), MicroUsd::from_cents(16), false));
+    assert_eq!(p.list().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
 async fn the_same_idempotency_key_returns_the_same_node_even_after_a_restart() {
     let f = Fake::new(vec![offer("small", 1, 1024, 14_000)]);
     let human = Human::new(true);
-    let p = placer(&f, &human, envelope("1", "10"));
+    let p = placer(&f, &human);
     let a = p.acquire(&req("task-7", H)).await.unwrap();
     let b = p.acquire(&req("task-7", H)).await.unwrap();
     assert_eq!(a.id, b.id);
     assert_eq!(f.creates(), 1);
     // A new process (empty memory) finds it at the provider by its tag, without asking again.
-    let p2 = placer(&f, &human, envelope("1", "10"));
+    let p2 = placer(&f, &human);
     assert_eq!(p2.acquire(&req("task-7", H)).await.unwrap().id, a.id);
     assert_eq!(f.creates(), 1);
     assert_eq!(human.asked().len(), 1);
@@ -256,7 +232,7 @@ async fn the_same_idempotency_key_returns_the_same_node_even_after_a_restart() {
 async fn concurrent_acquires_with_one_key_create_once() {
     let f = Fake::new(vec![offer("small", 1, 1024, 14_000)]);
     let human = Human::new(true);
-    let p = Arc::new(placer(&f, &human, envelope("1", "10")));
+    let p = Arc::new(placer(&f, &human));
     let (r1, r2) = (req("k", H), req("k", H));
     let (a, b) = tokio::join!(p.acquire(&r1), p.acquire(&r2));
     assert_eq!(a.unwrap().id, b.unwrap().id);
@@ -271,7 +247,7 @@ async fn release_refuses_unowned_and_protected_nodes() {
     f.insert("control-host", vec![], 0);
     f.insert("theirs", vec![Owner::new("other").tag()], 0);
     f.insert("broker", vec![owner.tag(), PROTECTED_TAG.into()], 0);
-    let p = placer(&f, &human, envelope("1", "10"));
+    let p = placer(&f, &human);
     for (id, protected) in [("control-host", false), ("theirs", false), ("broker", true)] {
         let e = p.release(&NodeId(id.into()), ReleaseMode::Now).await.unwrap_err();
         match e {
@@ -290,18 +266,20 @@ async fn release_refuses_unowned_and_protected_nodes() {
 async fn release_keeps_a_node_warm_within_its_paid_hour_and_reuses_it() {
     let f = Fake::new(vec![offer("small", 1, 1024, 14_000)]);
     let human = Human::new(true);
-    let p = placer(&f, &human, envelope("1", "10"));
+    let p = placer(&f, &human);
     let n = p.acquire(&req("first", 10 * 60)).await.unwrap();
     assert_eq!(p.next_paid_hour_at(&n), Some(H));
     // Done after 15 minutes, more work may come: kept until minute 50, already paid for.
     f.clock.store(15 * 60, Ordering::SeqCst);
     assert_eq!(p.release(&n.id, ReleaseMode::Billing { more_work_expected: true }).await.unwrap(), Released::Pooled { until: 50 * 60 });
-    // The next request takes it: no create, no approval.
+    // The next request takes it: no create, but its money is checked as a new node's is (#256).
     f.clock.store(20 * 60, Ordering::SeqCst);
     let m = p.acquire(&req("second", 15 * 60)).await.unwrap();
     assert_eq!(m.id, n.id);
     assert_eq!(f.creates(), 1);
-    assert_eq!(human.asked().len(), 1);
+    let asked = human.asked();
+    assert_eq!((asked.len(), asked[1].warm, asked[1].node_name.as_str()), (2, true, "n1"));
+    assert_eq!(asked[1].worst_case, MicroUsd::from_cents(2));
     // Released again with too little paid time left to be worth keeping: destroyed.
     f.clock.store(52 * 60, Ordering::SeqCst);
     assert_eq!(p.release(&m.id, ReleaseMode::Billing { more_work_expected: true }).await.unwrap(), Released::Destroyed);
@@ -312,7 +290,7 @@ async fn release_keeps_a_node_warm_within_its_paid_hour_and_reuses_it() {
 async fn a_pooled_node_is_destroyed_before_its_next_paid_hour_and_not_claimed_late() {
     let f = Fake::new(vec![offer("small", 1, 1024, 14_000)]);
     let human = Human::new(true);
-    let p = placer(&f, &human, envelope("1", "10"));
+    let p = placer(&f, &human);
     let n = p.acquire(&req("first", 10 * 60)).await.unwrap();
     f.clock.store(5 * 60, Ordering::SeqCst);
     p.release(&n.id, ReleaseMode::Billing { more_work_expected: true }).await.unwrap();
@@ -347,7 +325,7 @@ async fn offers_are_filtered_by_size_isolation_price_and_ranked_by_preference() 
     ams.region = Some("ams".into());
     let f = Fake::new(vec![offer("small", 1, 1024, 14_000), offer("big", 4, 8192, 60_000), vm, ams]);
     let human = Human::new(true);
-    let p = placer(&f, &human, envelope("10", "100"));
+    let p = placer(&f, &human);
     // Region preference beats price.
     assert_eq!(p.acquire(&req("a", H)).await.unwrap().plan.as_deref(), Some("small"));
     // A plan hint beats both.
@@ -389,7 +367,7 @@ async fn static_hosts_place_by_free_capacity_without_spending() {
         },
     ];
     // DenyAll: the static backend never spends, so it never asks.
-    let p = Placer::new(StaticHosts::new(hosts), DenyAll, Owner::new("example"), envelope("0", "0"));
+    let p = Placer::new(StaticHosts::new(hosts), DenyAll, Owner::new("example"));
     let mut r = req("a", H);
     r.region_hint = None;
     r.resources = Resources { vcpus: 2, memory_mib: 2048 };

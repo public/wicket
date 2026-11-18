@@ -3,7 +3,7 @@
 # simulated network and clock, with faults from each seed, checked against #321's invariants:
 # `feed` (no egress allow without a live grant; model spend within the run's budget), `placement`
 # (no node used past its lease; no two runs colliding on one node; no node released while a run's
-# box or uncollected work is on it; the money envelope) and `messages` (no message lost or delivered
+# box or uncollected work is on it; the money limit, #256) and `messages` (no message lost or delivered
 # twice; a refused message's receipt says so).
 #
 #   ci/sim.sh [--seeds N] [--from S] [--file-issues]

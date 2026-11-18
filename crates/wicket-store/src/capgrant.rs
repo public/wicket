@@ -17,8 +17,9 @@
 //!   after the approval while the node is being created;
 //! - **daily** (its worst case) for a day from the approval, unless the create failed.
 //!
-//! The installation's money envelope (`wicket node create --max-hourly/--max-total`) is still checked
-//! before anything is created: a grant is a decision, not a budget of its own.
+//! The one spend check (#256, [`crate::money`]: the node's money reserved against the tenant's
+//! money limit grant, `placement.yaml`'s limits) still comes first: a grant is a decision, not a
+//! budget of its own.
 
 use crate::{now, Ledger, Result};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};

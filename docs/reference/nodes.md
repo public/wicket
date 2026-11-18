@@ -380,17 +380,22 @@ nodes. Backends are the operator's own machines (static hosts) and Vultr. `wicke
 wicket secret set vultr-api-key                     # read from the terminal; only ever sent as the API's bearer token
 wicket node plans --region lhr                     # plans and their hourly price
 wicket node create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
-  --max-hourly 0.05 --max-total 0.50 --ssh-key-id <id of a key in the Vultr account> --ssh-key <its private key> \
+  --ssh-key-id <id of a key in the Vultr account> --ssh-key <its private key> \
   --hosts 'api.example.com'
 wicket node list                                   # every node, a leased one with its lease end, provider and cost
 wicket node list --provider                        # and the provider's owned instances, next paid hour
 wicket node release n2                             # destroy now (by name or instance id), revoke the enrolment
 ```
 
-- **Money.** `--max-hourly` and `--max-total` are the envelope: every owned node's hourly rate together, and
-  every owned node's cost through its lease plus the new node's worst case. Anything beyond it is refused.
-  Inside it, the node is a `CAPACITY wicket.internal /capacity/node/<name>` request from the operator who runs
-  `create`: approved at once by a live [capacity grant](console.md#capacity-grants) of theirs that covers it
+- **Money.** `create` needs `placement.yaml`: its `max_hourly_usd` and `max_total_usd` are the limits, shared
+  with capacity leases (#256). Before anything is asked, the node's hourly rate and worst case are reserved in the
+  ledger as a pair of money quota grants, `QUOTA wicket.internal /quota/money.hourly/node-<name>` and
+  `/quota/money.reserved/node-<name>`, made by `wicket:node-create`, in the same transaction as the one spend
+  check (see [capacity leases](#capacity-leases-and-the-reconciler)); over the limits, it is refused. The
+  reconciler renews the pair while the node bills; it is given back when the node is released, or when the
+  create is denied or fails. `--max-node-hourly` caps this one node's price. Within the limits, the node is a
+  `CAPACITY wicket.internal /capacity/node/<name>` request from the operator who runs `create`, its reason
+  saying what is reserved with it (`Reserved with it: $X/h, $Y (limit $A/h, $B total)`): approved at once by a live [capacity grant](console.md#capacity-grants) of theirs that covers it
   (plans, regions, hourly and daily money, nodes at once), otherwise pending for an operator for up to `--wait`. Vultr
   bills per started hour, each line rounded up to the cent, with a 672 h monthly cap, so a node's lease ends at
   minute 50 of its last hour and `list --provider` shows when the next paid hour starts.
@@ -410,13 +415,17 @@ An agent asks for a machine of its own with the gateway's `request_capacity` too
 region, duration, an hourly price cap, a reason). Capacity is a **lease**, never a cloud credential:
 
 1. The ask becomes a pending lease in the ledger with its worst case reserved (every started hour at the
-   agent's own cap), atomically against `max_hourly_usd`/`max_total_usd` in `placement.yaml`
-   (`examples/placement/placement.yaml`; without it the tool is off). Over budget is refused before an operator sees it.
-   Its money is also recorded, in the same transaction, as two quota grants bound to the asking run (#256):
+   agent's own cap) as two money quota grants bound to the asking run (#256):
    `QUOTA wicket.internal /quota/money.hourly/<lease>` (the hourly cap) and `/quota/money.reserved/<lease>` (the
    worst case), micro-USD, made by `wicket:lease-budget`, lasting the lease's duration plus an hour (at most 24h,
-   renewable), and revoked when the lease ends. `wicket grant list` shows them; they decide nothing and never go to a
-   node. The check stays the budget over the live leases' reservations.
+   renewable), and revoked when the lease ends. `wicket grant list` shows them; they never go to a node.
+   The money quota grants are the only spend check (#256): `max_hourly_usd` and `max_total_usd` in
+   `placement.yaml` (`examples/placement/placement.yaml`; without it the tool is off) are recorded as one
+   tenant grant, `QUOTA wicket.internal /quota/money.limit` made by `wicket:placement.yaml`, renewed (or
+   replaced, if the limits changed) at every check. In the transaction that records the new pair, the sums of
+   every live pair (every lease's and every node `wicket node create` made), plus the new one, must fit it.
+   Over budget is refused before an operator sees it. A claim from the warm pool goes through the same check.
+   An owner-tagged machine the ledger doesn't know isn't counted: it is the reconciler's to destroy or adopt.
 2. An operator decides it like any request (`wicket pending`, `wicket approve`/`deny`, or the console). The
    approval is bound to that lease: the placer may spend only on its node, and only up to its reservation.
 3. The reconciler acquires the node (a static host, or a fresh Vultr node with its host key pinned before it

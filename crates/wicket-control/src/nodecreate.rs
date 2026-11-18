@@ -1,7 +1,8 @@
 //! `wicket node create`, `release` and `plans`: nodes leased from a provider, through the placement
 //! interface (`wicket-placement`, #37), and the provider half of `wicket node list`.
 //!
-//! `create` runs the whole path for one Vultr node: the money envelope and a CAPACITY request
+//! `create` runs the whole path for one Vultr node: the one spend check (#256: its money reserved
+//! against `placement.yaml`'s limits, with every lease's and node's) and a CAPACITY request
 //! ([`CapacityApprover`]: approved by a capacity grant that covers it, else by an operator), a
 //! tagged instance whose cloud-init runs `deploy/vultr/node-setup.sh` with an ssh host key generated
 //! here and pinned before boot, the wait for it to be active and set up, and `wicket node enrol` with
@@ -68,12 +69,6 @@ pub struct CreateArgs {
     /// Most this node may cost per hour, in dollars.
     #[arg(long)]
     max_node_hourly: Option<String>,
-    /// Envelope: most all owned nodes together may cost per hour, in dollars.
-    #[arg(long)]
-    max_hourly: String,
-    /// Envelope: most all owned nodes together may cost through their leases, in dollars.
-    #[arg(long)]
-    max_total: String,
     /// Id of an ssh key already in the Vultr account (installed for root, copied to `wicket`).
     #[arg(long = "ssh-key-id", required = true)]
     ssh_key_ids: Vec<String>,
@@ -122,12 +117,7 @@ fn vultr_with_secret(secret: &str, config: VultrConfig) -> Result<VultrProvider>
 /// A placer that can only read and release (it approves no spend), for placed nodes made under
 /// `owner` with the API key in `secret`: what the reconciler releases them with.
 pub fn release_placer(owner: &str, secret: &str) -> Result<Placer<VultrProvider, envelope::DenyAll>> {
-    Ok(Placer::new(
-        vultr_with_secret(secret, VultrConfig::default())?,
-        envelope::DenyAll,
-        Owner::new(owner),
-        MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
-    ))
+    Ok(Placer::new(vultr_with_secret(secret, VultrConfig::default())?, envelope::DenyAll, Owner::new(owner)))
 }
 
 /// Refuses a new run on a placed node past its lease (#294, #324): one started there would hold
@@ -241,7 +231,9 @@ fn fmt_time(t: i64) -> String {
 /// principal's that covers the node approves it at once, through [`crate::grant::decide`], and the
 /// decision is audited against the grant. Otherwise it waits, pending, for an operator (`wicket
 /// approve`, or the console, which notifies) for up to `wait`, and is denied when nobody decides.
-/// The placer calls it only for a node already inside the money envelope.
+/// First, the one spend check (#256): the node's money is reserved as money quota grants
+/// (`node-<name>`) against the tenant's money limit grant (`placement.yaml`'s limits), or the node
+/// is refused before anyone is asked. A request that isn't approved gives the money back.
 pub struct CapacityApprover {
     pub ledger: PathBuf,
     pub tenant: TenantId,
@@ -249,13 +241,39 @@ pub struct CapacityApprover {
     pub principal: String,
     pub wait: Duration,
     pub poll: Duration,
+    /// The installation's limits (`placement.yaml`), recorded as the tenant's money limit grant.
+    pub budget: wicket_store::LeaseBudget,
     /// The request filed, once it is.
     pub request: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// How much longer than its lifetime a node's money quotas last before the reconciler renews them:
+/// the wait for an operator and for the node first.
+const NODE_MONEY_SLACK_SECS: i64 = 3600;
+
 impl CapacityApprover {
-    pub fn new(ledger: PathBuf, tenant: TenantId, principal: String, wait: Duration) -> CapacityApprover {
-        CapacityApprover { ledger, tenant, principal, wait, poll: Duration::from_secs(2), request: Default::default() }
+    pub fn new(
+        ledger: PathBuf,
+        tenant: TenantId,
+        principal: String,
+        wait: Duration,
+        budget: wicket_store::LeaseBudget,
+    ) -> CapacityApprover {
+        CapacityApprover { ledger, tenant, principal, wait, poll: Duration::from_secs(2), budget, request: Default::default() }
+    }
+
+    /// Reserves the node's money: the one spend check.
+    fn reserve(&self, r: &SpendRequest) -> Result<std::result::Result<(), wicket_store::BudgetRefusal>> {
+        let a = Self::ask(r);
+        Ok(Ledger::open(&self.ledger)?.reserve_money(
+            &self.tenant.0,
+            &wicket_store::money::node_money_key(&r.node_name),
+            a.hourly,
+            a.worst,
+            r.lifetime_secs.saturating_add(NODE_MONEY_SLACK_SECS),
+            self.budget,
+            wicket_store::money::NODE_MONEY_BY,
+        )?)
     }
 
     fn ask(r: &SpendRequest) -> wicket_store::CapacityAsk {
@@ -278,8 +296,10 @@ impl CapacityApprover {
             crate::capacity::HOST,
             &crate::grant::node_request_path(&r.node_name),
         );
+        let (h, t) = l.money_reserved(&self.tenant.0)?;
+        let usd = |m: i64| MicroUsd(u64::try_from(m).unwrap_or(0));
         let reason = format!(
-            "node {} on {}: plan {} in {}, {}/h for {} (worst case {}), for {}. Already committed: {}/h, {} (envelope {}/h, {} total)",
+            "node {} on {}: plan {} in {}, {}/h for {} (worst case {}), for {}. Reserved with it: {}/h, {} (limit {}/h, {} total)",
             r.node_name,
             r.backend,
             r.plan,
@@ -288,10 +308,10 @@ impl CapacityApprover {
             wicket_core::time::format_duration(Duration::from_secs(r.lifetime_secs.max(0) as u64)),
             r.worst_case,
             r.purpose,
-            r.committed_hourly,
-            r.committed_total,
-            r.max_hourly,
-            r.max_total
+            usd(h),
+            usd(t),
+            usd(self.budget.max_hourly),
+            usd(self.budget.max_total)
         );
         let (id, _) = l.pending_for(&op, &reason, None)?;
         l.audit(
@@ -364,10 +384,21 @@ pub const OPERATOR_ZONE: &str = "operator";
 
 impl SpendApprover for CapacityApprover {
     async fn approve(&self, r: &SpendRequest) -> Approval {
-        match self.decide(r).await {
+        match self.reserve(r) {
+            Ok(Ok(())) => {}
+            Ok(Err(refused)) => return Approval::Denied(format!("over this installation's money limit: {refused}")),
+            Err(e) => return Approval::Denied(format!("reserving its money failed: {e:#}")),
+        }
+        let a = match self.decide(r).await {
             Ok(a) => a,
             Err(e) => Approval::Denied(format!("the capacity request failed: {e:#}")),
+        };
+        if a != Approval::Approved {
+            if let Ok(l) = Ledger::open(&self.ledger) {
+                let _ = l.release_money(&wicket_store::money::node_money_key(&r.node_name));
+            }
         }
+        a
     }
 }
 
@@ -386,12 +417,7 @@ pub async fn plans(common: Common, region: String, plan_type: String) -> Result<
 /// as the provider sees them, with their cost, lease and next paid hour.
 pub async fn list_provider(common: &Common) -> Result<()> {
     let o = owner(common);
-    let p = Placer::new(
-        provider(common, VultrConfig::default())?,
-        envelope::DenyAll,
-        o.clone(),
-        MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
-    );
+    let p = Placer::new(provider(common, VultrConfig::default())?, envelope::DenyAll, o.clone());
     let nodes = p.list().await?;
     let ledger = Ledger::open(&crate::ledger_path())?;
     let now = wicket_store::now();
@@ -432,8 +458,6 @@ pub async fn create(args: CreateArgs) -> Result<()> {
         memory_mib,
         lifetime,
         max_node_hourly,
-        max_hourly,
-        max_total,
         ssh_key_ids,
         ssh_key,
         os_id,
@@ -463,11 +487,21 @@ pub async fn create(args: CreateArgs) -> Result<()> {
     let owner_name = owner_name(&common);
     let o = Owner::new(&owner_name);
     let config = VultrConfig { os_id, sshkey_ids: ssh_key_ids, default_region: region.clone(), ..VultrConfig::default() };
-    let envelope = MoneyEnvelope { max_hourly: dollars(&max_hourly)?, max_total: dollars(&max_total)? };
+    // The installation's money limits (#256): placement.yaml's, recorded as the tenant's money limit
+    // grant, which every node and lease is checked against together.
+    let budget = crate::capacity::PlacementConfig::load()?
+        .with_context(|| {
+            format!(
+                "no {}: wicket node create checks a node's money against its max_hourly_usd and max_total_usd (docs/reference/configuration.md)",
+                crate::capacity::PlacementConfig::path().display()
+            )
+        })?
+        .budget()?;
     let principal = crate::operators::Operator::cli(&TenantId::single().0)?.id;
-    let approver = CapacityApprover::new(crate::ledger_path(), TenantId::single(), principal, wicket_core::time::parse_duration(&wait)?);
+    let approver =
+        CapacityApprover::new(crate::ledger_path(), TenantId::single(), principal, wicket_core::time::parse_duration(&wait)?, budget);
     let filed = approver.request.clone();
-    let placer = Placer::new(provider(&common, config)?, approver, o.clone(), envelope);
+    let placer = Placer::new(provider(&common, config)?, approver, o.clone());
 
     let host_key = boot::generate_host_key(&format!("wicket-node-{name}")).await?;
     let user_data = boot::cloud_config(boot::NODE_SETUP, &host_key)?;
@@ -495,6 +529,10 @@ pub async fn create(args: CreateArgs) -> Result<()> {
             Ok(n) => l.capacity_use_created(&rid, &n.id.0)?,
             Err(e) => l.capacity_use_failed(&rid, &format!("{e}"))?,
         };
+    }
+    if acquired.is_err() {
+        // Nothing was made: its money goes back.
+        Ledger::open(&crate::ledger_path())?.release_money(&wicket_store::money::node_money_key(&name))?;
     }
     let n = acquired?;
     // Recorded at once, so the reconciler releases it at its lease end whatever happens next.
@@ -550,12 +588,7 @@ fn instance_id(l: &Ledger, arg: &str) -> Result<String> {
 /// it), refusing anything without the owner tag, and revokes its enrolment.
 pub async fn release(common: Common, id: String) -> Result<()> {
     let o = owner(&common);
-    let p = Placer::new(
-        provider(&common, VultrConfig::default())?,
-        envelope::DenyAll,
-        o,
-        MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
-    );
+    let p = Placer::new(provider(&common, VultrConfig::default())?, envelope::DenyAll, o);
     let id = NodeId(instance_id(&Ledger::open(&crate::ledger_path())?, &id)?);
     let node = p.get(&id).await?;
     match p.release(&id, ReleaseMode::Now).await? {
@@ -695,6 +728,10 @@ pub async fn give_up_unreachable<A: envelope::SpendApprover>(
         if let Err(e) = ledger.placed_node_ended(&id.0, "released", &format!("released by wicket node create: {why}")) {
             say_err!("warning: could not record {id} as released: {e:#}");
         }
+        // Its money goes back, recorded or not yet (#256).
+        if let Err(e) = ledger.release_money(&wicket_store::money::node_money_key(&node.name)) {
+            say_err!("warning: could not give back {id}'s money: {e:#}");
+        }
     }
     match released {
         Ok(_) => anyhow::anyhow!("{why}: released {id} ({}) rather than leave it billing", node.name),
@@ -775,6 +812,21 @@ mod tests {
         }
     }
 
+    /// Approves what the one spend check lets through (#256), against the ledger at `.0`: what
+    /// [`CapacityApprover`] does before it files its request.
+    struct Budget(PathBuf, wicket_store::LeaseBudget);
+
+    impl SpendApprover for Budget {
+        async fn approve(&self, r: &SpendRequest) -> Approval {
+            let mut l = Ledger::open(&self.0).unwrap();
+            let key = wicket_store::money::node_money_key(&r.node_name);
+            match l.reserve_money("t0", &key, r.hourly.0 as i64, r.worst_case.0 as i64, 3600, self.1, "test").unwrap() {
+                Ok(()) => Approval::Approved,
+                Err(e) => Approval::Denied(e.to_string()),
+            }
+        }
+    }
+
     /// A node whose ssh port first answers after `answers_after` (never if None) and whose setup is
     /// done `ready_after` from the start.
     struct Node {
@@ -816,17 +868,19 @@ mod tests {
         }
     }
 
-    /// Room in the envelope for one node at a time ($0.014/h, worst case $0.02 each).
     fn placer(base: &str) -> Placer<VultrProvider, Yes> {
+        placer_with(base, Yes)
+    }
+
+    fn placer_with<A: SpendApprover>(base: &str, a: A) -> Placer<VultrProvider, A> {
         let client = Client::with_base(base, ApiKey::new(KEY)).unwrap();
         let config = VultrConfig { sshkey_ids: vec!["k1".into()], ..VultrConfig::default() };
-        Placer::new(
-            VultrProvider::new(client, config),
-            Yes,
-            Owner::new("example"),
-            MoneyEnvelope { max_hourly: MicroUsd::parse_dollars("0.05").unwrap(), max_total: MicroUsd::parse_dollars("0.03").unwrap() },
-        )
-        .with_clock(std::sync::Arc::new(|| CREATED + 60))
+        Placer::new(VultrProvider::new(client, config), a, Owner::new("example")).with_clock(std::sync::Arc::new(|| CREATED + 60))
+    }
+
+    /// Room for one node at a time ($0.014/h, worst case $0.02 each), in the ledger at `path`.
+    fn one_node_budget(path: &std::path::Path) -> Budget {
+        Budget(path.to_path_buf(), wicket_store::LeaseBudget { max_hourly: 50_000, max_total: 30_000 })
     }
 
     fn request(name: &str) -> CapacityRequest {
@@ -857,12 +911,13 @@ mod tests {
     #[tokio::test]
     async fn a_node_that_never_answers_is_released_early_audited_and_its_money_freed() {
         let (base, st) = serve().await;
-        let p = placer(&base);
-        let n = p.acquire(&request("n1")).await.unwrap();
-        // The envelope holds one node: a second is refused while the first is billing.
-        assert!(matches!(p.acquire(&request("n2")).await, Err(PlacementError::Envelope(_))));
-
         let path = ledger_path("silent");
+        let p = placer_with(&base, one_node_budget(&path));
+        let n = p.acquire(&request("n1")).await.unwrap();
+        // The limit holds one node: a second is refused while the first is billing (#256).
+        let e = p.acquire(&request("n2")).await.unwrap_err();
+        assert!(matches!(&e, PlacementError::NotApproved(why) if why.contains("over the")), "{e}");
+
         let probe = node(None, 0);
         let t0 = tokio::time::Instant::now();
         let e = bring_up_or_release(&p, &path, &n, "n1", PINNED, None, None, Duration::from_secs(60), &wait(), Some(&probe))
@@ -885,7 +940,8 @@ mod tests {
         assert_eq!(body["port"], 22);
         assert!(body["reason"].as_str().unwrap().contains("never answered"), "{body}");
 
-        // Its committed money left the envelope with it: the next node fits.
+        // Its money went back with it: the next node fits.
+        assert_eq!(Ledger::open(&path).unwrap().money_reserved("t0").unwrap(), (0, 0));
         let n2 = p.acquire(&request("n2")).await.unwrap();
         assert_ne!(n2.id, n.id);
     }
@@ -1036,15 +1092,10 @@ mod tests {
     fn granted_placer(base: &str, path: &std::path::Path, wait: Duration) -> Placer<VultrProvider, CapacityApprover> {
         let client = Client::with_base(base, ApiKey::new(KEY)).unwrap();
         let config = VultrConfig { sshkey_ids: vec!["k1".into()], ..VultrConfig::default() };
-        let mut a = CapacityApprover::new(path.to_path_buf(), TenantId::single(), ALEX.into(), wait);
+        let budget = wicket_store::LeaseBudget { max_hourly: 50_000, max_total: 100_000 };
+        let mut a = CapacityApprover::new(path.to_path_buf(), TenantId::single(), ALEX.into(), wait, budget);
         a.poll = Duration::from_millis(20);
-        Placer::new(
-            VultrProvider::new(client, config),
-            a,
-            Owner::new("example"),
-            MoneyEnvelope { max_hourly: MicroUsd::parse_dollars("0.05").unwrap(), max_total: MicroUsd::parse_dollars("0.10").unwrap() },
-        )
-        .with_clock(std::sync::Arc::new(|| CREATED + 60))
+        Placer::new(VultrProvider::new(client, config), a, Owner::new("example")).with_clock(std::sync::Arc::new(|| CREATED + 60))
     }
 
     fn issue(path: &std::path::Path, nodes: u32) -> String {
@@ -1100,6 +1151,13 @@ mod tests {
         assert_eq!(st.lock().unwrap().instances.len(), 1);
         let r2 = requests(&path).into_iter().find(|r| r.path == "/capacity/node/n2").unwrap();
         assert_eq!(r2.status, "denied");
+        // #256: n1's money is reserved against the tenant's money limit grant; n2's, denied, went back.
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(l.money_reserved(&TenantId::single().0).unwrap(), (14_000, 20_000));
+        assert_eq!(
+            l.money_limit(&TenantId::single().0).unwrap(),
+            Some(wicket_store::LeaseBudget { max_hourly: 50_000, max_total: 100_000 })
+        );
     }
 
     #[tokio::test]

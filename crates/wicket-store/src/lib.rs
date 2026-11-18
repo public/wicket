@@ -20,6 +20,7 @@ pub use effect::{descriptor, requesters, DecisionTerms, EffectUse, EgressSeen, F
 pub mod bundle;
 pub mod cas;
 mod links;
+pub mod money;
 mod node;
 #[cfg(test)]
 mod previous_build;

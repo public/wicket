@@ -2,7 +2,7 @@
 //! the rules it enforces.
 
 use crate::billing::{self, PoolRules, ReleaseDecision};
-use crate::envelope::{self, Approval, MoneyEnvelope, SpendApprover, SpendRequest};
+use crate::envelope::{Approval, SpendApprover, SpendRequest};
 use crate::model::*;
 use crate::money::MicroUsd;
 use std::collections::HashMap;
@@ -33,15 +33,14 @@ pub struct Placer<P, A> {
     provider: P,
     approver: A,
     owner: Owner,
-    envelope: MoneyEnvelope,
     rules: PoolRules,
     clock: Clock,
     state: Mutex<State>,
 }
 
 impl<P: Provider, A: SpendApprover> Placer<P, A> {
-    pub fn new(provider: P, approver: A, owner: Owner, envelope: MoneyEnvelope) -> Placer<P, A> {
-        Placer { provider, approver, owner, envelope, rules: PoolRules::default(), clock: Arc::new(now), state: Mutex::default() }
+    pub fn new(provider: P, approver: A, owner: Owner) -> Placer<P, A> {
+        Placer { provider, approver, owner, rules: PoolRules::default(), clock: Arc::new(now), state: Mutex::default() }
     }
 
     pub fn with_clock(mut self, clock: Clock) -> Self {
@@ -132,7 +131,26 @@ impl<P: Provider, A: SpendApprover> Placement for Placer<P, A> {
                 && billing::claimable(&n.billing, n.created_at, now, &self.rules)
                 && n.billing.next_paid_hour_at(n.created_at, now).is_none_or(|next| now + req.lifetime_secs <= next - self.rules.margin)
         };
+        // A warm claim's money is checked as a new node's is (#256): the approver reserves it.
         if let Some(i) = st.pool.iter().position(|(n, _)| fits(n)) {
+            let n = &st.pool[i].0;
+            let hourly = n.billing.hourly_rate();
+            let ask = SpendRequest {
+                backend: self.provider.id().to_string(),
+                plan: n.plan.clone().unwrap_or_default(),
+                region: n.region.clone(),
+                node_name: req.name.clone(),
+                purpose: req.purpose.clone(),
+                hourly,
+                lifetime_secs: req.lifetime_secs,
+                worst_case: n.billing.worst_case(req.lifetime_secs),
+                warm: true,
+            };
+            if hourly > MicroUsd::ZERO || ask.worst_case > MicroUsd::ZERO {
+                if let Approval::Denied(why) = self.approver.approve(&ask).await {
+                    return Err(PlacementError::NotApproved(why));
+                }
+            }
             let (n, _) = st.pool.remove(i);
             st.by_key.insert(req.idempotency_key.clone(), n.clone());
             return Ok(n);
@@ -152,9 +170,6 @@ impl<P: Provider, A: SpendApprover> Placement for Placer<P, A> {
         let hourly = offer.billing.hourly_rate();
         let worst = offer.billing.worst_case(req.lifetime_secs);
         if worst > MicroUsd::ZERO || hourly > MicroUsd::ZERO {
-            let owned = self.owned().await?;
-            let committed = envelope::committed(&owned, now);
-            self.envelope.check(committed, hourly, worst).map_err(PlacementError::Envelope)?;
             let ask = SpendRequest {
                 backend: self.provider.id().to_string(),
                 plan: offer.plan.clone(),
@@ -164,10 +179,7 @@ impl<P: Provider, A: SpendApprover> Placement for Placer<P, A> {
                 hourly,
                 lifetime_secs: req.lifetime_secs,
                 worst_case: worst,
-                committed_hourly: committed.0,
-                committed_total: committed.1,
-                max_hourly: self.envelope.max_hourly,
-                max_total: self.envelope.max_total,
+                warm: false,
             };
             if let Approval::Denied(why) = self.approver.approve(&ask).await {
                 return Err(PlacementError::NotApproved(why));

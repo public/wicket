@@ -1139,7 +1139,7 @@ Commands:
   token     Print a one-time join token for a node (stored hashed; single use)
   enrol     Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
   list      List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a node from `wicket node create` or a capacity lease), with any leased node not enrolled
-  create    Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Inside a money envelope, its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
+  create    Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Its money is reserved first against placement.yaml's limits (with every lease's); then its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
   release   Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
   plans     List a provider's (Vultr's) plans in a region, with their hourly price
   revoke    Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
@@ -1210,9 +1210,9 @@ Options:
 ### `wicket node create`
 
 ```text
-Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Inside a money envelope, its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
+Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Its money is reserved first against placement.yaml's limits (with every lease's); then its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
 
-Usage: wicket node create [OPTIONS] --name <NAME> --max-hourly <MAX_HOURLY> --max-total <MAX_TOTAL> --ssh-key-id <SSH_KEY_IDS>
+Usage: wicket node create [OPTIONS] --name <NAME> --ssh-key-id <SSH_KEY_IDS>
 
 Options:
       --api-key-secret <API_KEY_SECRET>
@@ -1235,10 +1235,6 @@ Options:
           How long the node is needed: its worst-case cost is reserved for this long, and its lease ends at minute 50 of the last hour [default: 1h]
       --max-node-hourly <MAX_NODE_HOURLY>
           Most this node may cost per hour, in dollars
-      --max-hourly <MAX_HOURLY>
-          Envelope: most all owned nodes together may cost per hour, in dollars
-      --max-total <MAX_TOTAL>
-          Envelope: most all owned nodes together may cost through their leases, in dollars
       --ssh-key-id <SSH_KEY_IDS>
           Id of an ssh key already in the Vultr account (installed for root, copied to `wicket`)
       --ssh-key <SSH_KEY>

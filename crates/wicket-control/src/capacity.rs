@@ -6,11 +6,12 @@
 //! ask, and the reconciler only looks after runs and boxes. See `examples/placement/placement.yaml`.
 //!
 //! **Money.** A lease reserves its worst case *at the agent's own price cap* (`max_hourly_usd` for
-//! every started hour of its duration) the moment it is asked for, in the ledger, atomically against
-//! `max_hourly_usd`/`max_total_usd` here ([`wicket_store::Ledger::create_lease`]). The node the
-//! placer then picks is no dearer than that cap, so the real worst case is never above what was
-//! reserved; the placer's own money envelope (the same limits, over the provider's owner-tagged nodes)
-//! is checked again before anything is created. Static hosts cost nothing and reserve nothing.
+//! every started hour of its duration) the moment it is asked for, in the ledger, by the one spend
+//! check (#256, [`wicket_store::Ledger::create_lease`]): its money quota grants, with every live
+//! lease's and every node `wicket node create` made, against `max_hourly_usd`/`max_total_usd` here,
+//! recorded as the tenant's money limit grant. The node the placer then picks (new, or warm from the
+//! pool) is no dearer than that cap, so the real worst case is never above what was reserved, which
+//! [`LeaseApprover`] checks. Static hosts cost nothing and reserve nothing.
 //!
 //! **The human.** The ask becomes an ordinary pending request (`CAPACITY wicket.internal
 //! /capacity/<lease>`), whose reason states the resources, duration, price cap and worst case: it shows
@@ -152,10 +153,6 @@ impl PlacementConfig {
 
     pub fn budget(&self) -> Result<LeaseBudget> {
         Ok(LeaseBudget { max_hourly: dollars(&self.max_hourly_usd)?.0 as i64, max_total: dollars(&self.max_total_usd)?.0 as i64 })
-    }
-
-    pub fn envelope(&self) -> Result<MoneyEnvelope> {
-        Ok(MoneyEnvelope { max_hourly: dollars(&self.max_hourly_usd)?, max_total: dollars(&self.max_total_usd)? })
     }
 
     pub fn owner(&self) -> Owner {
@@ -402,6 +399,59 @@ pub fn list() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lease(id: &str, hourly_cap: i64, reserved: i64) -> LeaseRow {
+        LeaseRow {
+            id: id.into(),
+            tenant: TenantId::single().0,
+            run: "run_a".into(),
+            request_id: None,
+            provider: "vultr".into(),
+            spec: serde_json::json!({}),
+            hourly_cap,
+            reserved,
+            duration_secs: 3600,
+            created_at: 0,
+            not_after: None,
+            status: String::new(),
+            node_id: None,
+            node_name: None,
+            ssh_target: None,
+            host_key: None,
+            billed: None,
+            ended_at: None,
+            detail: None,
+        }
+    }
+
+    /// #256: today's limits stay the same. `placement.yaml`'s `max_hourly_usd` and `max_total_usd`
+    /// (here `examples/placement/placement.yaml`'s, $0.10/h and $1.00) become the tenant's money
+    /// limit grant, and leases and `wicket node create`'s nodes are checked against it together, to
+    /// the micro-dollar.
+    #[test]
+    fn todays_limits_are_the_money_limit_grant_for_leases_and_nodes_together() {
+        let cfg = PlacementConfig::parse(
+            "owner: wicket.example.com\nbackend: static\nmax_hourly_usd: '0.10'\nmax_total_usd: '1.00'\nstatic_hosts:\n  - name: n1\n    ssh_target: wicket@203.0.113.7\n    capacity: { vcpus: 4, memory_mib: 8192 }\n    isolation: gvisor\n",
+        )
+        .unwrap();
+        let b = cfg.budget().unwrap();
+        assert_eq!(b, LeaseBudget { max_hourly: 100_000, max_total: 1_000_000 });
+        let t = TenantId::single().0;
+        let mut l = Ledger::open_in_memory().unwrap();
+        // A node takes $0.06/h and $0.60; a lease the rest, exactly.
+        let node = wicket_store::money::node_money_key("n1");
+        l.reserve_money(&t, &node, 60_000, 600_000, 3600, b, wicket_store::money::NODE_MONEY_BY).unwrap().unwrap();
+        l.create_lease(&lease("l-1", 40_000, 400_000), b).unwrap().unwrap();
+        assert_eq!(l.money_limit(&t).unwrap(), Some(b));
+        assert_eq!(l.money_reserved(&t).unwrap(), (100_000, 1_000_000));
+        // Not a micro-dollar more, of either.
+        assert!(matches!(l.create_lease(&lease("l-2", 1, 0), b).unwrap(), Err(wicket_store::BudgetRefusal::Hourly { .. })));
+        assert!(matches!(l.create_lease(&lease("l-2", 0, 1), b).unwrap(), Err(wicket_store::BudgetRefusal::Total { .. })));
+        assert!(l.reserve_money(&t, "node-n2", 0, 1, 3600, b, wicket_store::money::NODE_MONEY_BY).unwrap().is_err());
+        // The node is released: its money is the lease's to take.
+        l.release_money(&node).unwrap();
+        l.create_lease(&lease("l-2", 60_000, 600_000), b).unwrap().unwrap();
+    }
 
     /// #117: a deny ends the lease that recorded the request, not whatever lease its path names.
     #[test]

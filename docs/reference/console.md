@@ -99,8 +99,9 @@ request waits in **Waiting for you**, with a notification on your devices, for u
 Each row of the card shows what the grant covers, what its nodes use and leave, and when it ends.
 **Renew** is a signed decision that gives it a new end, from now (the form's hours, at most 24).
 **Revoke** ends it at once: nothing more is approved under it, and the nodes made under it keep
-their own leases. The money envelope (`create --max-hourly`, `--max-total`) is still checked before
-anything is created. An operator whose authority in [`operators.yaml`](configuration.md#operatorsyaml)
+their own leases. Whatever the grant, the node's money is reserved first against the limits in
+[`placement.yaml`](configuration.md#placementyaml), which leases share (#256), before anything is
+asked or created. An operator whose authority in [`operators.yaml`](configuration.md#operatorsyaml)
 doesn't include `capacity` may not issue or renew one.
 
 ## Sessions

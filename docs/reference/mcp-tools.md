@@ -351,8 +351,9 @@ The caller's delegations, newest first (at most 50): each one's `delegation` id,
 ## `request_capacity`
 
 Asks an operator for a machine of the agent's own for a while: more CPU or memory, another isolation
-tier, a region. It costs money, so an operator always decides, within the budget in `placement.yaml`;
-an ask over budget is refused before an operator sees it. Without `placement.yaml` the tool is off.
+tier, a region. It costs money, so an operator always decides, within the budget in `placement.yaml`,
+which leases share with nodes made by `wicket node create` (#256); an ask over budget, counting what
+every live lease and created node has reserved, is refused before an operator sees it. Without `placement.yaml` the tool is off.
 Returns a lease id; calling again with `{lease}` waits until its node is ready. Then `spawn` with
 `placement: {"lease": …}` places boxes there. The node is destroyed when the lease ends, and what
 runs on it stops.
