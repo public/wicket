@@ -267,10 +267,12 @@ async fn the_push_window_expires() {
     let w = World::new().await;
     assert_eq!(w.discover(REPO).await.0, 403);
     let rid = w.pending()[0].id.clone();
-    w.approve(&rid, Duration::from_secs(2));
+    // A window long enough for the push under a loaded test run (it once ran out at 2 s), and a
+    // wait past it.
+    w.approve(&rid, Duration::from_secs(5));
     assert_eq!(w.discover(REPO).await.0, 200);
     assert_eq!(w.upload(REPO, &["refs/heads/feat"]).await.0, 200);
-    tokio::time::sleep(Duration::from_millis(3100)).await;
+    tokio::time::sleep(Duration::from_millis(5100)).await;
     // The window has passed: the next push is a new request for a human.
     let (st, body) = w.discover(REPO).await;
     assert_eq!(st, 403, "{body}");
