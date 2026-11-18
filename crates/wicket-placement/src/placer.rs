@@ -48,11 +48,6 @@ impl<P: Provider, A: SpendApprover> Placer<P, A> {
         self
     }
 
-    pub fn with_rules(mut self, rules: PoolRules) -> Self {
-        self.rules = rules;
-        self
-    }
-
     pub fn provider(&self) -> &P {
         &self.provider
     }

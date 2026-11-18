@@ -87,16 +87,6 @@ pub struct DigestUse {
     pub scope: DigestScope,
 }
 
-/// A live digest grant, as [`Ledger::digest_grants`] lists it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct DigestGrantRow {
-    pub id: String,
-    pub action: DigestAction,
-    pub scope: DigestScope,
-    /// None: any number of uses while it lasts.
-    pub uses_left: Option<i64>,
-}
-
 /// Whether `d` is a digest a grant can name: `sha256:` and 64 lowercase hex digits.
 pub fn valid_digest(d: &str) -> bool {
     d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
@@ -194,25 +184,6 @@ impl Ledger {
         tx.commit()?;
         Ok(Some(used))
     }
-
-    /// The live digest grants on `digest`, oldest first.
-    pub fn digest_grants(&self, tenant: &TenantId, digest: &str) -> Result<Vec<DigestGrantRow>> {
-        let mut st = self.conn.prepare(
-            "SELECT id, terms, uses_left FROM grants WHERE tenant = ?1 AND method = ?2 AND host = ?3 AND path = ?4
-               AND revoked = 0 AND expires_at > ?5 ORDER BY created_at, rowid",
-        )?;
-        let r = st.query_map(params![tenant.0, DIGEST_METHOD, crate::QUOTA_HOST, path_of(digest), now()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, Option<i64>>(2)?))
-        })?;
-        let mut out = vec![];
-        for row in r {
-            let (id, terms, uses) = row?;
-            if let Ok(t) = serde_json::from_str::<Terms>(&terms) {
-                out.push(DigestGrantRow { id, action: t.action, scope: t.scope, uses_left: uses });
-            }
-        }
-        Ok(out)
-    }
 }
 
 #[cfg(test)]
@@ -267,7 +238,15 @@ mod tests {
         // Revoked: no longer.
         l.revoke_grant(&all).unwrap();
         assert_eq!(l.may_use(&t, D, DigestAction::Install, &DigestScope::Installation, "self update").unwrap(), None);
-        assert_eq!(l.digest_grants(&t, D).unwrap().len(), 1, "the used-up run grant is still listed until it expires");
+        let listed: i64 = l
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM grants WHERE method = ?1 AND path = ?2 AND revoked = 0",
+                params![DIGEST_METHOD, path_of(D)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(listed, 1, "the used-up run grant is still there until it expires");
     }
 
     /// A digest grant names a digest, has a lifetime, and decides no request or op.

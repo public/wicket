@@ -56,11 +56,6 @@ impl std::fmt::Debug for Answer {
 }
 
 impl HelperRef {
-    /// The helper for `uid` at its default socket.
-    pub fn for_uid(uid: u32) -> HelperRef {
-        HelperRef { uid, socket: default_socket(uid) }
-    }
-
     /// Asks the helper for `name`'s current value. Refused unless the helper runs as `self.uid`, or
     /// if the value it gives has expired.
     pub fn fetch(&self, name: &str) -> Result<Answer> {

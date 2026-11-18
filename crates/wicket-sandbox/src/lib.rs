@@ -329,13 +329,6 @@ impl Docker {
         Docker { cmd, quote: false, timings: None, api: None }
     }
 
-    /// The Docker whose Engine API is at `sock` (the CLI given `-H unix://sock` where it's needed).
-    pub fn engine_at(sock: impl Into<PathBuf>) -> Docker {
-        let sock = sock.into();
-        let cmd = vec!["docker".into(), "-H".into(), format!("unix://{}", sock.display())];
-        Docker { cmd, quote: false, timings: None, api: Some(Api::new(sock)) }
-    }
-
     /// Docker on a remote node, reached with the given ssh command (ending in the target).
     pub fn over_ssh(mut ssh: Vec<String>) -> Docker {
         ssh.push("docker".into());
@@ -654,34 +647,6 @@ impl Docker {
     /// As [`Docker::exec_args`], as a command to spawn.
     pub fn exec(&self, container: &str, user: &str, flags: &[&str], argv: &[String]) -> Command {
         self.command_with(self.exec_args(container, user, flags, argv))
-    }
-
-    /// As [`Docker::exec`], for blocking callers.
-    pub fn exec_blocking(&self, container: &str, user: &str, flags: &[&str], argv: &[String]) -> std::process::Command {
-        let mut c = std::process::Command::new(&self.cmd[0]);
-        c.args(&self.cmd[1..]);
-        for a in self.exec_args(container, user, flags, argv) {
-            c.arg(if self.quote { shell_quote(&a) } else { a });
-        }
-        c
-    }
-
-    /// Starts the box with the given stdin and stdout (e.g. inherited from whoever launched wicket,
-    /// when wicket wraps an agent another program drives) and stderr piped.
-    pub fn spawn_with(&self, spec: &SandboxSpec, stdin: Stdio, stdout: Stdio) -> Result<Child> {
-        let mut c = self.command_with(self.build_args(spec));
-        c.stdin(stdin).stdout(stdout).stderr(Stdio::piped()).kill_on_drop(true);
-        c.spawn().context("starting docker run")
-    }
-
-    /// Starts the box with stdout and stderr piped.
-    pub fn spawn(&self, spec: &SandboxSpec) -> Result<Child> {
-        let mut c = self.command_with(self.build_args(spec));
-        c.stdin(if spec.interactive { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        c.spawn().context("starting docker run")
     }
 
     /// Starts the box detached (`docker run -d`, kept after it exits so its exit code can be read):

@@ -13,7 +13,7 @@ mod capgrant;
 pub use capgrant::{covers as capacity_covers, CapacityAsk, CapacityGrant, CapacityTerms, CapacityUsed, CAPACITY_GRANT_PATH};
 mod delegations;
 mod digestgrant;
-pub use digestgrant::{valid_digest, DigestAction, DigestGrantRow, DigestScope, DigestUse, NewDigestGrant, DIGEST_METHOD};
+pub use digestgrant::{valid_digest, DigestAction, DigestScope, DigestUse, NewDigestGrant, DIGEST_METHOD};
 mod effect;
 pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
 pub use effect::{descriptor, requesters, DecisionTerms, EffectUse, EgressSeen, Filed};
@@ -1251,16 +1251,6 @@ impl Ledger {
         Ok((id, true))
     }
 
-    /// The request a grant was made for, if any.
-    pub fn request_for_grant(&self, grant: &str) -> Result<Option<Request>> {
-        let rid: Option<Option<String>> =
-            self.conn.query_row("SELECT request_id FROM grants WHERE id = ?1", params![grant], |r| r.get(0)).optional()?;
-        match rid.flatten() {
-            Some(rid) => Ok(Some(self.request(&rid)?)),
-            None => Ok(None),
-        }
-    }
-
     pub fn request(&self, id: &str) -> Result<Request> {
         self.conn
             .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests WHERE id = ?1", params![id], row_to_request)
@@ -1302,22 +1292,17 @@ impl Ledger {
     /// (exact path unless a narrower-or-equal prefix of the asked path is given).
     ///
     /// The grant is bound to the run that asked: no other run (another box in the same zone, a later
-    /// run of it) can use it, and it ends with the run (#127). [`Ledger::approve_zone_wide`] is the
-    /// wider scope, when the human picks it.
+    /// run of it) can use it, and it ends with the run (#127). [`Ledger::approve_shown`] with
+    /// `zone_wide` is the wider scope, when the human picks it.
     pub fn approve(&mut self, id: &str, a: &Approval) -> Result<String> {
         Ok(self.approve_scoped(id, a, false, None)?.0)
     }
 
-    /// As [`Ledger::approve`] (or [`Ledger::approve_zone_wide`]), only if the request's effect
+    /// As [`Ledger::approve`] (or zone-wide), only if the request's effect
     /// descriptor with these terms is `shown` (#369), checked in the transaction that makes the
     /// grant ([`StoreError::EffectChanged`] otherwise). Returns the grant and the descriptor's hash.
     pub fn approve_shown(&mut self, id: &str, a: &Approval, zone_wide: bool, shown: Option<&str>) -> Result<(String, String)> {
         self.approve_scoped(id, a, zone_wide, shown)
-    }
-
-    /// As [`Ledger::approve`], usable by any run in the request's zone until it expires.
-    pub fn approve_zone_wide(&mut self, id: &str, a: &Approval) -> Result<String> {
-        Ok(self.approve_scoped(id, a, true, None)?.0)
     }
 
     fn approve_scoped(&mut self, id: &str, a: &Approval, zone_wide: bool, shown: Option<&str>) -> Result<(String, String)> {
@@ -2459,7 +2444,7 @@ mod tests {
         assert!(l.grant_covering(&op("run_a")).unwrap().is_none(), "the grant outlived its run");
         // Zone-wide, when the human picks it: any run in the zone, after the asker ends too.
         let (c, _) = l.pending_for(&op("run_c"), "c", None).unwrap();
-        l.approve_zone_wide(&c, &once).unwrap();
+        l.approve_shown(&c, &once, true, None).unwrap();
         l.run_started(&t, &RunId("run_c".into()), "z", "c").unwrap();
         l.run_ended(&RunId("run_c".into()), "succeeded", "").unwrap();
         assert!(l.grant_covering(&op("run_d")).unwrap().is_some());
@@ -2760,7 +2745,8 @@ mod tests {
         let gid = l
             .approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() })
             .unwrap();
-        assert_eq!(l.request_for_grant(&gid).unwrap().unwrap().id, id);
+        let rid: String = l.conn.query_row("SELECT request_id FROM grants WHERE id = ?1", params![gid], |r| r.get(0)).unwrap();
+        assert_eq!(rid, id);
     }
 
     /// #56: a live grant is renewed to a new end with its uses kept; a revoked or expired one isn't.
