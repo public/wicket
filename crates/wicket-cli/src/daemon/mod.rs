@@ -90,24 +90,7 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
     // ([`handoff`]). Only commands not yet started (admission, uploads: seconds) are waited for;
     // new ones are refused meanwhile, to be tried again.
     crate::update::reexec_on_hangup(crate::update::pidfile("daemon"), crate::update::Versions::control().root, move || {
-        DRAINING.store(true, Ordering::SeqCst);
-        let mut waited = 0u64;
-        while IN_FLIGHT.load(Ordering::SeqCst) > 0 {
-            if waited.is_multiple_of(10) {
-                say_err!(
-                    "wicketd: waiting for {} command(s) being started before moving to the new build",
-                    IN_FLIGHT.load(Ordering::SeqCst)
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            waited += 1;
-        }
-        let held = handoff::prepare(&handoff_path);
-        match &held {
-            Ok(_) => say_err!("wicketd: handing {} running command(s) to the new build", handoff::followed()),
-            Err(e) => say_err!("wicketd: no handoff ({e:#}): its running commands lose their callers' connections"),
-        }
-        Draining(held.ok())
+        drain(&handoff_path, &DRAINING, &IN_FLIGHT)
     });
     say_err!("wicketd: {} as {} (uid {uid}), data {}, policy {}", socket.display(), d.user, d.data_dir.display(), d.policy_path.display());
     for conn in listener.incoming() {
@@ -126,6 +109,27 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// What wicketd does on SIGHUP before it re-executes: refuses new commands, waits for the ones
+/// being started, and writes the handoff of the running ones ([`handoff::prepare`]), held across
+/// the exec. Returns at once whatever the running commands do (#487: it once deadlocked here).
+fn drain(handoff_path: &Path, draining: &'static AtomicBool, in_flight: &std::sync::atomic::AtomicUsize) -> Draining {
+    draining.store(true, Ordering::SeqCst);
+    let mut waited = 0u64;
+    while in_flight.load(Ordering::SeqCst) > 0 {
+        if waited.is_multiple_of(10) {
+            say_err!("wicketd: waiting for {} command(s) being started before moving to the new build", in_flight.load(Ordering::SeqCst));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        waited += 1;
+    }
+    let held = handoff::prepare(handoff_path);
+    match &held {
+        Ok(p) => say_err!("wicketd: handing {} running command(s) to the new build", p.handed()),
+        Err(e) => say_err!("wicketd: no handoff ({e:#}): its running commands lose their callers' connections"),
+    }
+    Draining(held.ok(), draining)
 }
 
 /// Hands each run whose supervisor runs another build than `exe` over to `exe` (#475): the
@@ -157,10 +161,10 @@ static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 static DRAINING: AtomicBool = AtomicBool::new(false);
 
 /// Held across the exec; if the exec fails, the daemon takes commands again.
-struct Draining(#[allow(dead_code)] Option<handoff::Prepared>);
+struct Draining(#[allow(dead_code)] Option<handoff::Prepared>, &'static AtomicBool);
 impl Drop for Draining {
     fn drop(&mut self) {
-        DRAINING.store(false, Ordering::SeqCst);
+        self.1.store(false, Ordering::SeqCst);
     }
 }
 

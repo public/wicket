@@ -251,3 +251,38 @@ async fn an_operator_manifest_cannot_send_a_secret_anywhere_root_did_not_bind_it
     let refused = l.audit_tail(50).unwrap().into_iter().filter(|r| r.2 == "daemon.refused").count();
     assert_eq!(refused, 4);
 }
+
+/// #487: on SIGHUP, with commands running (long-lived runs), the daemon writes their handoff and
+/// moves on at once. It once deadlocked here, asking the registry it held how many it handed over,
+/// and refused every command until it was restarted.
+#[test]
+fn moving_to_a_new_build_with_running_commands_does_not_hang() {
+    use std::os::unix::process::CommandExt;
+    static DRAINING_HERE: AtomicBool = AtomicBool::new(false);
+    static IN_FLIGHT_HERE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let t = tmp();
+    let path = t.0.join(handoff::FILE);
+    let pid = std::process::Command::new("sh").args(["-c", "sleep 30"]).process_group(0).spawn().unwrap().id() as i32;
+    let (daemon, client) = UnixStream::pair().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let follower = std::thread::spawn(move || handoff::follow(pid, &daemon, None, move || tx.send(()).unwrap()).unwrap());
+    rx.recv().unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let p = path.clone();
+    std::thread::spawn(move || {
+        let held = drain(&p, &DRAINING_HERE, &IN_FLIGHT_HERE);
+        done_tx.send(held.0.as_ref().map(|h| h.handed())).unwrap();
+        // Held until the test has looked (as across an exec), then dropped: the exec failed.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+    });
+    let handed = done_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the handoff is written at once, not hung");
+    assert!(handed.is_some_and(|n| n >= 1), "{handed:?}");
+    assert!(DRAINING_HERE.load(Ordering::SeqCst), "new commands are refused meanwhile");
+    let h: handoff::Handoff = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(h.children.iter().any(|c| c.pid == pid));
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    assert!(!DRAINING_HERE.load(Ordering::SeqCst), "a failed exec takes commands again");
+    drop(client);
+    assert_eq!(follower.join().unwrap(), 128 + libc::SIGTERM);
+}
