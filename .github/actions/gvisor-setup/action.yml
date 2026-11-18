@@ -18,11 +18,13 @@ runs:
       run: |
         stamp=$({ rustc -vV; find ci/h3get -path ci/h3get/target -prune -o -type f -print | LC_ALL=C sort | xargs sha256sum; } | sha256sum | cut -d' ' -f1)
         echo "stamp=$stamp" >>"$GITHUB_OUTPUT"
+    # Keyed on Cargo.toml too: rust-cache's own key stayed the same through #524's [profile] change,
+    # so every run restored the old build, rebuilt all of it, and never saved (an exact hit).
     - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         # The smoke job's cache, as before the split; the acceptance job reads it.
         shared-key: smoke
-        key: h3get-${{ steps.h3get.outputs.stamp }}
+        key: h3get-${{ steps.h3get.outputs.stamp }}-${{ hashFiles('Cargo.toml') }}
         save-if: ${{ inputs.save-cache == 'true' }}
         # The static HTTP/3 client as last built, with its stamp (below).
         cache-directories: ~/.cache/wicket-h3get

@@ -188,7 +188,11 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup show active-toolchain
+      # Keyed on Cargo.toml too: rust-cache's own key stayed the same through #524's [profile] change,
+      # so every run restored the old build, rebuilt all of it, and never saved (an exact hit).
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
       - name: Selected crates
         id: pkgs
         env:
@@ -328,6 +332,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
       - name: Node (pinned)
         run: ci/install-node.sh
       - name: Build, reproduce, embed and test
@@ -345,6 +351,8 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
       - run: ci/policy-diff.sh "origin/$BASE"
         env:
           BASE: ${{ github.base_ref || 'main' }}
@@ -363,6 +371,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
       - run: ci/lean.sh
 
   # #321: TLC on the TLA+ models under verification/tla/, at the bounds their .cfg files state
@@ -424,6 +434,7 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: ${{ hashFiles('Cargo.toml') }}
           # One cache for the parts (Kani itself, and wicket-core built for it); the first saves it.
           shared-key: kani
           save-if: ${{ matrix.shard == 1 }}
@@ -463,6 +474,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
       - run: ci/sim.sh --seeds 300 --file-issues
         env:
           GH_TOKEN: ${{ github.token }}
