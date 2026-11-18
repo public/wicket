@@ -22,7 +22,6 @@ mod tests {
             // Moved to wicket-home (#219); node serve calls it.
             "../../wicket-home/src/nodeauth.rs",
             // Moved to wicket-control (#219): a run's supervisor and what it needs.
-            "../../wicket-control/src/nodeca.rs",
             "../../wicket-control/src/noderun.rs",
             "../../wicket-control/src/run.rs",
             "../../wicket-control/src/spawn.rs",

@@ -626,7 +626,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         cfg,
         issuer,
         token_issuer: Mutex::new(token_issuer),
-        installation_ca: crate::nodeca::installation_ca().map(Arc::new),
+        installation_ca: installation_ca().map(Arc::new),
         approver,
         image: s.start.image.clone(),
         org: s.org.clone(),
@@ -724,7 +724,7 @@ async fn ca_current(sh: &Shared, proto: u32) {
         return;
     }
     let expired =
-        || crate::nodeca::active(&sh.ledger.lock().expect("ledger"), &sh.node).is_some_and(|c| c.not_after <= wicket_store::now());
+        || wicket_node::controlca::active(&sh.ledger.lock().expect("ledger"), &sh.node).is_some_and(|c| c.not_after <= wicket_store::now());
     if !expired() {
         return;
     }
@@ -837,7 +837,7 @@ struct Progress {
     /// No renewal attempt before this (after a failed one).
     renew_after: i64,
     /// The node CA's renewal on this connection (#416).
-    ca: crate::nodeca::CaRenewal,
+    ca: wicket_node::controlca::CaRenewal,
     /// The protocol version this connection talks (#162): version-2 messages go only at 2 or later.
     proto: u32,
     /// Whether a budget slice went on this connection, and the last one sent (#152).
@@ -2052,6 +2052,15 @@ fn live_grant(tenant: &TenantId, run: &RunId, zone: &str, issuer: &wicket_feed::
         },
         uses: g.uses_left.map(|u| u.clamp(0, i64::from(u32::MAX)) as u32),
     }
+}
+
+/// The installation CA, for renewing nodes' CAs over their channels (#416, wicket-node's
+/// `controlca`), if this control host has one (never created here).
+fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
+    let key = crate::enrol::Paths::installation().ca_key;
+    key.exists()
+        .then(|| wicket_proxy::ca::InstallationCa::load_or_create(&key))
+        .and_then(|r| r.map_err(|e| say_err!("[wicket] installation CA: {e:#}")).ok())
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 use wicket_core::TenantId;
-pub use wicket_node::past_lease;
+use wicket_node::past_lease;
 use wicket_placement::boot::{self, SCRUBBED_USER_DATA};
 use wicket_placement::model::Boot;
 use wicket_placement::vultr::{ApiKey, Client, VultrConfig, VultrProvider};
