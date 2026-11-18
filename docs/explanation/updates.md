@@ -79,7 +79,9 @@ and stages it. It is accepted only if
   revoked grant is not brought back by the reconciler (`wicket self trust-key` records a new one); or
 - a **human approved its sha256** for one update: an agent's `request_update` (below), approved with
   `wicket approve` or in the console like any R4 request. The approval is used up by the update that
-  accepts it, whatever uses the grant had left.
+  accepts it, whatever uses the grant had left: it becomes the operator's one-use `install` grant on
+  the build's digest (`digest.granted`, `under` the approval), accepted by the same one check as a
+  signature (`digest.accepted`, #258).
 
 Anything else is refused, and the refusal is an audit record (`self.update_refused`). There is no switch
 that skips verification.

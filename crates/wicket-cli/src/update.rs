@@ -599,9 +599,19 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
         }
     }
     // Bound first: the ledger's lock must be released before `refuse` takes it again.
-    let approval = ledger.lock().expect("ledger").use_update_approval(&sha)?;
+    // An operator's approval is their one-use grant on the build's digest, accepted by the one
+    // check (#258).
+    let approval = ledger.lock().expect("ledger").accept_update_approval(
+        &TenantId::single(),
+        &sha,
+        &format!("self update by {}", crate::operator()),
+    )?;
     match approval {
-        Some((request, grant)) => Ok(Accepted { copy, sha256: sha, source: serde_json::json!({ "approved": { "request": request, "grant": grant } }) }),
+        Some((request, u)) => Ok(Accepted {
+            copy,
+            sha256: sha,
+            source: serde_json::json!({ "approved": { "request": request, "grant": u.grant, "by": u.decided_by } }),
+        }),
         None => Err(refuse(format!(
             "the artifact (sha256 {sha}) is not signed by a release key this installation trusts: {why_not_signed}; and no operator has approved an update to it (an agent's request_update, approved with `wicket approve`)"
         ))),
