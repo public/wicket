@@ -1238,7 +1238,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             timeout_secs: m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs()
                 + if long_lived { 120 } else { 0 },
             escalate,
-            // Nothing more than the root (#257 slice 5); a node at 13 still reads the field.
+            // Unused (#257 slice 5, #146): sent empty for nodes from before they were defaulted.
             ca_pem: String::new(),
             workspace_tar: String::new(),
             state_files: state_files.clone(),

@@ -720,7 +720,8 @@ pub async fn start(s: Start) -> Result<NodeBox> {
 /// hosts need the CA while it is expired. Not renewed by then, the start goes ahead and the node
 /// says why it refuses.
 async fn ca_current(sh: &Shared, proto: u32) {
-    if proto < crate::chan::CA_RENEWAL || sh.node == crate::localnode::NAME {
+    // 0: not negotiated yet. Every version a connection can talk renews (#416).
+    if proto == 0 || sh.node == crate::localnode::NAME {
         return;
     }
     let expired =

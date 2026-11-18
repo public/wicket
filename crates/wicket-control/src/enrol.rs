@@ -28,8 +28,8 @@
 //!   the one secret a dedicated node holds (design §8, #57): stolen, it can only mint certificates for
 //!   the hosts that node's boxes could reach anyway, until it expires.
 //!   It is renewed over the channel at half-life, with a new key and the same constraints
-//!   (`nodeca.rs`, #416, protocol 14); `renew-ca` renews it over ssh, for a node at protocol 13, one
-//!   unreachable meanwhile, or new `--hosts`.
+//!   (`nodeca.rs`, #416); `renew-ca` renews it over ssh, for a node unreachable meanwhile, or new
+//!   `--hosts`.
 //! - **Feed and issuer keys.** The node gets the feed root's public key (created on the control host,
 //!   next to the issuer key, on first use) and the issuer's public JWK, to verify the feed and agent
 //!   identities offline.
