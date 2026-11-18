@@ -10,6 +10,10 @@ slow-timeout = { period = "60s" }
 # JUnit report: never silently passing. Two retries at most.
 retries = 2
 fail-fast = false
+# Twice CI's 4 vCPUs: the slow tests (the simulation's seeds, the CAS collection's) spend much of
+# their time waiting on the filesystem, so more of them at once finish sooner. Measured: the whole
+# workspace's tests in 218 s at 8, 310 s at 4; at most 0.7 GiB of memory.
+test-threads = 8
 slow-timeout = { period = "60s", terminate-after = 10 }
 status-level = "slow"
 final-status-level = "flaky"
