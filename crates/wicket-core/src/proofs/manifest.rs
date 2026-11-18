@@ -13,6 +13,11 @@ fn any_name() -> &'static str {
     NAMES[kani::any_where(|&i: &usize| i < NAMES.len())]
 }
 
+/// Lists are windows of [`POOL`], built once: its windows of two hold two zones, two principals,
+/// and each mix. (Built from symbolic choices instead, this harness or `Effect::widens`' ran a
+/// CI shard past its hour.)
+const POOL: [&str; 6] = ["x://a", "x://b", "a", "b", "x://a", "a"];
+
 /// `accepts`: an `accept_from` list lets a sender in exactly when one entry names it, a zone entry
 /// by the sender's zone and a principal entry by its principal id, the two kinds never crossing
 /// (#250): a list of principal entries ignores the sender's zone and refuses a sender whose
@@ -22,29 +27,29 @@ fn any_name() -> &'static str {
 #[kani::proof]
 #[kani::unwind(9)]
 fn accept_from_names_a_zone_or_a_principal_never_crossing() {
-    let len: usize = kani::any_where(|&l| l <= 2);
-    let list: Vec<String> = (0..len).map(|_| any_name().to_string()).collect();
+    let pool: [String; 6] = POOL.map(String::from);
+    let start: usize = kani::any_where(|&s| s < POOL.len());
+    let len: usize = kani::any_where(|&l| l <= 2 && start + l < POOL.len());
+    let (list, more) = (&pool[start..start + len], &pool[start..start + len + 1]);
     let (zone, other_zone) = (any_name(), any_name());
     kani::assume(!is_principal_entry(zone) && !is_principal_entry(other_zone));
     let principal: Option<&str> = if kani::any() { Some(any_name()) } else { None };
     let other_principal: Option<&str> = if kani::any() { Some(any_name()) } else { None };
-    let got = accepts(&list, zone, principal);
+    let got = accepts(list, zone, principal);
     let named = list.iter().any(|e| if is_principal_entry(e) { principal == Some(e.as_str()) } else { e == zone });
     assert_eq!(got, named);
     if list.is_empty() {
         assert!(!got);
     }
     if list.iter().all(|e| is_principal_entry(e)) {
-        assert_eq!(got, accepts(&list, other_zone, principal));
-        assert!(!accepts(&list, zone, None));
+        assert_eq!(got, accepts(list, other_zone, principal));
+        assert!(!accepts(list, zone, None));
     }
     if list.iter().all(|e| !is_principal_entry(e)) {
-        assert_eq!(got, accepts(&list, zone, other_principal));
+        assert_eq!(got, accepts(list, zone, other_principal));
     }
-    let mut more = list.clone();
-    more.push(any_name().to_string());
     if got {
-        assert!(accepts(&more, zone, principal));
+        assert!(accepts(more, zone, principal));
     }
 }
 

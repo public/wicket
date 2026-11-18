@@ -650,7 +650,8 @@ impl LlmSpec {
 /// a principal entry only its id, so a list's two kinds never cross (and wicket-policy's Cedar,
 /// which reads the zone as the message's resource and the id as `context.sender`, says the same, #411).
 pub fn is_principal_entry(entry: &str) -> bool {
-    entry.contains("://")
+    // `contains("://")`, as a plain scan: str's substring search costs Kani far more (#325).
+    entry.as_bytes().windows(3).any(|w| w == b"://")
 }
 
 /// Whether an `accept_from` list lets a sender in: it names the sender's zone, or (#250) the
@@ -1137,6 +1138,14 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// #325: `is_principal_entry` scans bytes now (for Kani); it decides as `contains("://")` did.
+    #[test]
+    fn a_principal_entry_is_one_with_a_scheme_separator() {
+        for e in ["", ":", "://", "a://", "://b", "spiffe://t/z/a", ":/", "a:/b", "é://", "a:/:/", "zone", "a::///"] {
+            assert_eq!(super::is_principal_entry(e), e.contains("://"), "{e}");
+        }
+    }
 
     /// #325: why Kani's `a_covered_model_pattern_lets_in_nothing_more` holds only for the patterns
     /// `check_models` accepts: with a `*` inside one, covering isn't transitive, and a child's list

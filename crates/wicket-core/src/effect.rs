@@ -66,8 +66,14 @@ impl Effect {
     /// Whether these terms widen what was asked for (#369's blast radius): a prefix, more than
     /// one use (or unlimited), a lifetime over an hour, or every run in the zone.
     pub fn widens(&self) -> bool {
-        self.prefix || self.terms.as_ref().is_some_and(|t| t.uses != Some(1) || t.ttl_secs > WIDE_TTL_SECS || t.scope == "zone")
+        terms_widen(self.prefix, self.terms.as_ref().map(|t| (t.uses, t.ttl_secs, t.scope == "zone")))
     }
+}
+
+/// [`Effect::widens`] on the parts it reads: a prefix, and its terms' uses, lifetime and whether
+/// they are zone-wide (Kani checks it, `proofs/effect.rs`).
+pub fn terms_widen(prefix: bool, terms: Option<(Option<u32>, u64, bool)>) -> bool {
+    prefix || terms.is_some_and(|(uses, ttl, zone)| uses != Some(1) || ttl > WIDE_TTL_SECS || zone)
 }
 
 /// A lifetime longer than this widens a grant (#369).
