@@ -549,6 +549,85 @@ mod tests {
         e.prepare(b.body(http_body_util::Full::new(bytes::Bytes::new())).unwrap(), host, "https", "/x", true).await
     }
 
+    fn egress(c: crate::RunCtx) -> std::sync::Arc<super::Egress> {
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap()
+    }
+
+    /// The same blocked request a third time is told to stop; a run blocked ten times is told to
+    /// ask, and its operator hears the agent may be stuck at ten and every ten after (#130).
+    #[tokio::test]
+    async fn repeated_blocks_are_counted_and_said() {
+        let (mut c, _) = ctx("reach: []", vec![], "strike");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        c.events = tx;
+        let e = egress(c);
+        assert_eq!(e.strike("a"), "");
+        assert_eq!(e.strike("a"), "");
+        assert!(e.strike("a").contains("blocked 3 times"), "the same request, a third time");
+        for i in 4..10 {
+            let note = e.strike(&format!("other {i}"));
+            assert!(!note.contains("blocked") && !note.contains("hit the box's limits"), "{i}: {note}");
+        }
+        let stuck = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::Event>| {
+            let mut n = vec![];
+            while let Ok(ev) = rx.try_recv() {
+                if let crate::Event::Tool { detail, .. } = ev {
+                    n.push(detail);
+                }
+            }
+            n
+        };
+        assert!(stuck(&mut rx).is_empty(), "not before ten");
+        assert!(e.strike("tenth").contains("hit the box's limits 10 times"));
+        assert_eq!(stuck(&mut rx), ["agent may be stuck: 10 blocked requests in this run"]);
+        for i in 11..20 {
+            e.strike(&format!("more {i}"));
+        }
+        assert!(stuck(&mut rx).is_empty(), "nothing between ten and twenty");
+        e.strike("twentieth");
+        assert_eq!(stuck(&mut rx), ["agent may be stuck: 20 blocked requests in this run"]);
+    }
+
+    /// A host is judged before any request to it: never-reachable ones are refused as such, ones a
+    /// hiding zone doesn't name look as if they don't exist, and the rest go on to be decided.
+    #[tokio::test]
+    async fn a_host_is_judged_before_any_request_to_it() {
+        use http_body_util::BodyExt;
+        let body = |r: http::Response<super::BoxBody>| async move {
+            String::from_utf8(r.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+        };
+        let (c, _) = ctx("reach: [{host: api.example.com}]", vec![], "judge");
+        let e = egress(c);
+        let r = e.judge_host("169.254.169.254", "GET").expect("refused");
+        assert_eq!(r.status(), 403);
+        assert!(body(r).await.contains("no approval can change that"));
+        assert!(e.judge_host("api.example.com", "GET").is_none(), "a reachable host goes on");
+        let (c, _) = ctx("unlisted_hosts: hide, reach: [{host: api.example.com}]", vec![], "judge-hide");
+        let e = egress(c);
+        let r = e.judge_host("news.example.org", "GET").expect("hidden");
+        assert_eq!(r.status(), 502);
+        assert!(body(r).await.contains("does not exist as far as this box is concerned"));
+        assert!(e.judge_host("api.example.com", "GET").is_none());
+    }
+
+    /// A streamed request body's declared length may be the limit, not more.
+    #[tokio::test]
+    async fn a_streamed_body_may_be_the_limit_and_no_more() {
+        let (c, _) = ctx("reach: [{host: api.example.com, methods: [PUT]}]", vec![], "limit");
+        let e = egress(c);
+        let put = |n: u64| {
+            http::Request::put("/x")
+                .header("host", "api.example.com")
+                .header("content-length", n.to_string())
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .unwrap()
+        };
+        assert!(e.prepare(put(super::MAX_STREAMED_BODY), "api.example.com", "https", "/x", true).await.is_ok());
+        let err = e.prepare(put(super::MAX_STREAMED_BODY + 1), "api.example.com", "https", "/x", true).await.err().expect("refused");
+        assert!(err.to_string().contains("request body (the limit is"), "{err}");
+    }
+
     /// Whatever a zone says, the proxy never attaches a secret to a host it isn't bound to.
     #[tokio::test]
     async fn a_secret_is_injected_only_into_its_bound_hosts() {

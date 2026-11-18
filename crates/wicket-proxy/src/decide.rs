@@ -259,6 +259,8 @@ mod tests {
             (".example.org", "example.org"),
             ("api.example.com", "api.example.com.evil.example.net"),
             ("api.example.com", "xapi.example.com"),
+            // A leading-dot subtree names what is under it: not a name that is only the dot and it.
+            (".example.org", ".example.org"),
         ] {
             assert!(!subtree_permits(st, host), "{st} {host}");
         }

@@ -154,8 +154,11 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
         assert!(e.to_string().contains("an address of this node itself"), "{e}");
         assert!(resolve_public(&l, "public.example", 443).await.is_ok());
+        // Both families are read: 127.0.0.1 always, and an IPv6 address wherever the host has one.
         let own = own_addresses().unwrap();
-        assert!(own.iter().any(|a| a.is_loopback()), "the interfaces are read: {own:?}");
+        assert!(own.iter().any(|a| a.is_ipv4() && a.is_loopback()), "the interfaces are read: {own:?}");
+        let has_v6 = std::fs::read_to_string("/proc/net/if_inet6").is_ok_and(|s| !s.trim().is_empty());
+        assert_eq!(own.iter().any(|a| a.is_ipv6()), has_v6, "{own:?}");
     }
 
     /// #366: cloud metadata services at addresses outside the special-purpose ranges.
