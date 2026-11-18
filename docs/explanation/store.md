@@ -102,8 +102,8 @@ header and the object's key (`o/<hex>`, `r/<name>`) in each chunk's associated d
 - **No plain fallback.** `SealedStore` still reads unsealed objects written before #146. Over the
   content-addressed store that is a hole: anyone who can write the bucket could plant a plain ref
   pointing at a plain object, and it would be read as if wicket had written it. The store opens
-  its backend with plain reads off (`SealedStore::sealed_only`). Old prefixes keep the fallback until
-  their users move.
+  its backend with plain reads off, and since every user has moved onto it, `SealedStore` reads
+  no plain object at all.
 - **One key per store, not per agent.** Forks (#177) and shared volume snapshots (#251) only share
   storage if their objects are sealed under the same key. That key is `state.key` today: one
   installation, one tenant. E5 recommended per-agent repositories, for crypto-shredding; with one
@@ -229,7 +229,7 @@ those two.
 
 1. **The store API and ledger snapshots** (this PR). `wicket_store::cas`: `put`, `get` (verified)
    and `has` by digest; trees (the format, `put_tree`, `get_tree`); write-once refs; `has` on
-   `ObjectStore` (a HEAD on S3); `SealedStore::sealed_only`. `snapstore` moves onto it. Snapshots
+   `ObjectStore` (a HEAD on S3); a sealed store that reads no plain object. `snapstore` moves onto it. Snapshots
    that earlier builds pushed stay readable and are pruned the same way.
 2. **Trees from directories** (done): `put_dir` and `checkout`, with bundle restore's checks, and the
    program digest as a tree digest. A program's tree is a *plain* tree (`DirOpts::plain`): plain

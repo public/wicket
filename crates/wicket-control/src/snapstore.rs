@@ -26,7 +26,7 @@ pub fn store() -> Result<Option<Cas>> {
     if s.s3.is_none() {
         return Ok(None);
     }
-    Ok(Some(Cas::new(SealedStore::sealed_only(s.open_s3()?, &crate::hibernate::state_key()?))))
+    Ok(Some(Cas::new(SealedStore::new(s.open_s3()?, &crate::hibernate::state_key()?))))
 }
 
 fn valid_name(name: &str) -> bool {
@@ -159,7 +159,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("wicket-snapstore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("local")).unwrap();
-        let st = Cas::new(SealedStore::sealed_only(DirStore::new(d.join("store")), &[7u8; 32]));
+        let st = Cas::new(SealedStore::new(DirStore::new(d.join("store")), &[7u8; 32]));
         let snap = d.join("local/1700000000-aaaaaaaaaaaa.db");
         let ledger = wicket_store::Ledger::open(&d.join("local/ledger.db")).unwrap();
         ledger.snapshot(&snap).unwrap();
@@ -189,7 +189,7 @@ mod tests {
         assert!(fetch(&st, "1-cccccccccccc.db", &d.join("none.db")).is_err());
         assert!(fetch(&st, "../x.db", &d.join("bad.db")).is_err());
         // Another state.key can't read it, and leaves nothing behind.
-        let other = Cas::new(SealedStore::sealed_only(DirStore::new(d.join("store")), &[8u8; 32]));
+        let other = Cas::new(SealedStore::new(DirStore::new(d.join("store")), &[8u8; 32]));
         assert!(fetch(&other, "1700000000-aaaaaaaaaaaa.db", &d.join("other.db")).is_err());
         assert!(!d.join("other.db").exists() && !d.join(".other.db.part").exists());
         // The two share one blob: removing one keeps it for the other.
@@ -223,7 +223,7 @@ mod tests {
         let old = SealedStore::new(DirStore::new(d.join("store")), &[7u8; 32]);
         let name = "1600000000-cccccccccccc.db";
         old.put_if_absent(&format!("{PREFIX}{name}"), &mut std::fs::File::open(&snap).unwrap()).unwrap();
-        let st = Cas::new(SealedStore::sealed_only(DirStore::new(d.join("store")), &[7u8; 32]));
+        let st = Cas::new(SealedStore::new(DirStore::new(d.join("store")), &[7u8; 32]));
         assert_eq!(list(&st).unwrap(), [name]);
         fetch(&st, name, &d.join("back.db")).unwrap();
         assert_eq!(std::fs::read(d.join("back.db")).unwrap(), std::fs::read(&snap).unwrap());

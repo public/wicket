@@ -245,7 +245,7 @@ mod tests {
         let d = tmp("round");
         let src = d.join("src");
         sample(&src);
-        let cas = Cas::new(SealedStore::sealed_only(DirStore::new(d.join("store")), &[5u8; 32]));
+        let cas = Cas::new(SealedStore::new(DirStore::new(d.join("store")), &[5u8; 32]));
         let opts = DirOpts::default();
         let t = cas.put_dir(&src, &opts).unwrap();
         assert_eq!(t, dir_digest(&src, &opts).unwrap(), "named the same whether stored or not");

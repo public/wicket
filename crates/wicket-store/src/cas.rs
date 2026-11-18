@@ -10,7 +10,7 @@
 //! - **Refs** (`r/<name>`) hold `sha256:<hex>\n`, put-if-absent like everything else: a ref is
 //!   never rewritten. They name what must outlive the ledger (pre-update ledger snapshots, #167);
 //!   everything else is named by a digest the ledger holds.
-//! - **Sealing.** Open the store over [`crate::sealed::SealedStore::sealed_only`]: each object is
+//! - **Sealing.** Open the store over [`crate::sealed::SealedStore`]: each object is
 //!   sealed under its own key (`o/<hex>`, `r/<name>`), and nothing plain is read.
 //! - **Directories** become trees with [`Cas::put_dir`] and come back with [`Cas::checkout`].
 
@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn refs_are_write_once_and_checked() {
         let d = root("refs");
-        let cas = Cas::new(SealedStore::sealed_only(DirStore::new(&d), &[9u8; 32]));
+        let cas = Cas::new(SealedStore::new(DirStore::new(&d), &[9u8; 32]));
         let a = cas.put_bytes(b"one").unwrap();
         let b = cas.put_bytes(b"two").unwrap();
         assert!(cas.set_ref("snaps/x.db", &a).unwrap());
