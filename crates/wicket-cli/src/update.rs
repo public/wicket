@@ -1361,19 +1361,16 @@ pub async fn prune(nodes: Option<String>, only_nodes: bool, keep: usize, dry_run
 /// node's `serve` re-executes itself (adopting its boxes), runs' supervisors here are stopped
 /// without stopping their boxes and `bin`'s reconciler adopts their runs, and the console and the
 /// reconciler service re-execute themselves.
+///
+/// The serve moves first (#529): once a supervisor is stopped, the reconciler service may re-attach
+/// its run at once, and a new build's supervisor must find the new build's serve.
 async fn handover(bin: &Path) -> Result<()> {
-    let killed = stop_stale_supervisors(&Ledger::open(&crate::ledger_path())?, bin)?;
     // This host's own node.
-    let local = crate::localnode::pidfile()?;
-    if let Some(pid) = hangup(&local, "node serve") {
-        for _ in 0..200 {
-            if runs(pid, bin, &local) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        say(format!("this host's node: serve (pid {pid}) re-executed as {}", if runs(pid, bin, &local) { "the new build" } else { "?" }));
+    let b = bin.to_path_buf();
+    if let Some(line) = tokio::task::spawn_blocking(move || reexec_local_node(&b)).await? {
+        say(line);
     }
+    let killed = stop_stale_supervisors(&Ledger::open(&crate::ledger_path())?, bin)?;
     for role in ["console", "reconcile"] {
         if let Some(pid) = hangup(&pidfile(role), role) {
             say(format!("{role} (pid {pid}): re-executing"));
@@ -1384,6 +1381,34 @@ async fn handover(bin: &Path) -> Result<()> {
         say(tokio::task::spawn_blocking(move || adopt_handed(&bin, &killed)).await??);
     }
     Ok(())
+}
+
+/// Re-executes this host's own node's `serve` as `bin` (SIGHUP: same pid, its boxes adopted) when it
+/// runs another build, and waits up to ten seconds for it to. Says what it did, or `None` when no
+/// serve runs here or it already runs `bin`.
+///
+/// Both ways a new build arrives need it before runs are handed over: `wicket self update`
+/// ([`handover`]), and wicketd's start after `deploy/install.sh` (#529), which restarts wicketd
+/// but leaves its child, the serve (`KillMode=process`), on the old build. A new build's
+/// supervisor re-attached to an old build's serve lost its run's box.
+pub fn reexec_local_node(bin: &Path) -> Option<String> {
+    reexec_serve(&crate::localnode::pidfile().ok()?, bin)
+}
+
+/// [`reexec_local_node`] for the serve whose pid file is `local`.
+fn reexec_serve(local: &Path, bin: &Path) -> Option<String> {
+    let pid: u32 = std::fs::read_to_string(local).ok()?.trim().parse().ok()?;
+    if runs(pid, bin, local) {
+        return None;
+    }
+    let pid = hangup(local, "node serve")?;
+    for _ in 0..200 {
+        if runs(pid, bin, local) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Some(format!("this host's node: serve (pid {pid}) re-executed as {}", if runs(pid, bin, local) { "the new build" } else { "?" }))
 }
 
 /// Stops each run supervisor on this machine that isn't running `bin` (an older build), so the new
@@ -1862,6 +1887,51 @@ mod tests {
         l.run_ended(&wicket_core::RunId("run_d".into()), "lost", "gone").unwrap();
         let handed: Vec<String> = ["run_a", "run_b", "run_c", "run_d", "run_gone"].map(String::from).to_vec();
         assert_eq!(adopted_count(&l, &handed, |o| o == "alive").unwrap(), 1, "only run_a: running, with a live supervisor");
+    }
+
+    /// #529: this host's node's serve is re-executed (SIGHUP) when it runs another build than the
+    /// one handing over, and waited for; left alone when it runs that build already.
+    #[test]
+    fn the_local_serve_moves_to_the_new_build() {
+        let (sh, sleep) = (which("sh"), which("sleep"));
+        if sh == sleep {
+            eprintln!("sh and sleep are one binary here: nothing to tell apart");
+            return;
+        }
+        // A stand-in serve: `sh` (the old build) until SIGHUP, then `sleep` (the new one), same pid.
+        let dir = std::env::temp_dir().join(format!("wicket-local-serve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pidfile, ready) = (dir.join("serve.pid"), dir.join("ready"));
+        // It says it is ready once its trap is set: a SIGHUP before would end it.
+        let script = format!("trap 'exec {} 30' HUP; : >'{}'; while :; do sleep 0.05; done", sleep.display(), ready.display());
+        let mut serve = std::process::Command::new(&sh).args(["-c", &script, "wicket", "node", "serve"]).spawn().unwrap();
+        let pid = serve.id();
+        std::fs::write(&pidfile, format!("{pid}\n")).unwrap();
+        for _ in 0..250 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(reexec_serve(&pidfile, &sh), None, "on the build already: left alone");
+        let said = reexec_serve(&pidfile, &sleep);
+        assert_eq!(said, Some(format!("this host's node: serve (pid {pid}) re-executed as the new build")));
+        assert_eq!(std::fs::canonicalize(format!("/proc/{pid}/exe")).unwrap(), sleep);
+        let _ = serve.kill();
+        let _ = serve.wait();
+        assert_eq!(reexec_serve(&dir.join("none.pid"), &sleep), None, "no serve here");
+        let _ = std::fs::remove_file(&pidfile);
+        let _ = std::fs::remove_file(&ready);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    fn which(name: &str) -> PathBuf {
+        ["/usr/bin", "/bin"]
+            .iter()
+            .map(|d| Path::new(d).join(name))
+            .find(|p| p.exists())
+            .map(|p| std::fs::canonicalize(p).unwrap())
+            .unwrap()
     }
 
     /// #475: a supervisor on another build than the one handing over is stopped (and its run
