@@ -21,6 +21,8 @@ pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
 pub use effect::{descriptor, requesters, DecisionTerms, EffectUse, EgressSeen, Filed};
 pub mod bundle;
 pub mod cas;
+#[cfg(test)]
+mod lifecycle_props;
 mod links;
 pub mod money;
 mod node;
