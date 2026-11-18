@@ -194,7 +194,7 @@ impl Ledger {
 mod tests {
     use super::*;
 
-    /// Today's limits (`examples/placement/placement.yaml`): $2/h and $20 in all.
+    /// Limits of $2/h and $20 in all (wicket-control's capacity tests pin today's configured ones).
     const TODAY: LeaseBudget = LeaseBudget { max_hourly: 2_000_000, max_total: 20_000_000 };
 
     /// #256: the limit is one tenant grant; leases and nodes reserve against it together; what
