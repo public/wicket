@@ -54,16 +54,31 @@ fn a_grant_of_k_uses_is_accepted_k_times() {
     assert_eq!(left, Some(0));
 }
 
-/// #342: a node's token and the ledger end a grant at the same millisecond. For every grant end
-/// `expires_at` (`>= 1`: every grant's, which ends after the epoch) and every clock reading of the
-/// node's, the token's `not_after_for(expires_at)` allows a request exactly while the ledger's
-/// half-open grant is live (`now_ms < expires_at * 1000`, exact in `i128`).
+/// #342: a node's token and the ledger end a grant at the same millisecond, for every grant end
+/// `expires_at` from 1 to `u32::MAX` (through year 2106) and every clock reading of the node's
+/// from the epoch to 2^42 ms (year 2109, past every such end). The token's
+/// `not_after_for(expires_at)` allows a request exactly while the ledger's half-open grant is live
+/// (`now_ms < expires_at * 1000`).
+///
+/// Built from narrower types, so their high bits are known to be zero: over every `i64` (#534's
+/// first form), proving the clock's `div_euclid(1000)` against `expires_at * 1000` took 244-343 s.
+/// Ends past 2106 and readings past 2109 are the unit test's (`quota::tests`, at `i64::MAX`).
 #[kani::proof]
-fn a_token_ends_at_the_ledgers_millisecond() {
-    let (expires_at, now_ms): (i64, i64) = kani::any();
-    kani::assume(expires_at >= 1);
-    let live = i128::from(now_ms) < i128::from(expires_at) * 1000;
+fn a_token_ends_with_its_grant_through_2106() {
+    let expires_at = i64::from(kani::any_where(|&e: &u32| e >= 1));
+    let now_ms = (kani::any::<u64>() >> 22) as i64;
+    let live = now_ms < expires_at * 1000;
     assert_eq!(token_allows(not_after_for(expires_at), now_ms), live);
+}
+
+/// And a clock reading before the epoch (from 2^32 ms before it: a node's clock set back, which
+/// the token reads as second 0) is allowed by every grant's token, as the ledger's grant, ending
+/// after the epoch, is live.
+#[kani::proof]
+fn a_token_allows_a_reading_before_the_epoch() {
+    let expires_at: i64 = kani::any_where(|&e: &i64| e >= 1);
+    let now_ms = -1 - i64::from(kani::any::<u32>());
+    assert!(token_allows(not_after_for(expires_at), now_ms));
 }
 
 fn any_ask() -> SpawnAsk {
