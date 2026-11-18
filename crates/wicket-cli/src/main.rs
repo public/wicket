@@ -435,6 +435,11 @@ async fn main() -> Result<()> {
     // Root runs only its own copies of wicket (#261).
     rootcopy::refuse_untrusted_exe()?;
     let cli = Cli::parse();
+    // Root's link behind the build wicket's services run: one line, on stderr (not for
+    // `self update`, `self admit` and `self rollback`, which are how it catches up).
+    if !matches!(&cli.cmd, Cmd::Itself { cmd: SelfCmd::Update { .. } | SelfCmd::Admit { .. } | SelfCmd::Rollback { .. } }) {
+        rootcopy::warn_if_skewed();
+    }
     // With wicketd installed, this user can't read wicket's data: the daemon runs the command.
     let route = daemon::policy::route(&cli.cmd);
     match daemon::client::mode() {

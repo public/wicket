@@ -179,5 +179,18 @@ out=$(cd / && wicket self update /tmp/wicket-b 2>&1) || true
 case "$out" in *"units differ"*) fail "still refused over units: $out" ;; *"building wicket/claude-code:$b with $b"*) ;; *) fail "the update after apply-units: $out" ;; esac
 [ "$(readlink /usr/local/bin/wicket)" = "/usr/local/lib/wicket/$a/wicket" ] || fail "root'"'"'s link moved after a failed update"
 echo "ok: an update to other systemd units waits for root'"'"'s apply-units, from root'"'"'s copy, then goes on"
+
+# Root'"'"'s link behind the services'"'"' build (as after an update applied from the console, #465): every
+# command root'"'"'s link runs says so on stderr, once, with how to catch up; in step, nothing is said.
+out=$(cd / && wicket self units 2>&1 >/dev/null)
+[ -z "$out" ] || fail "in step, a command said: $out"
+runuser -u wicket -- ln -sfn "$b" $vroot/current.new && runuser -u wicket -- mv -T $vroot/current.new $vroot/current
+out=$(cd / && wicket self units 2>&1 >/dev/null)
+case "$out" in "wicket: /usr/local/bin/wicket runs build $a, but wicket'"'"'s services run $b."*"sudo wicket self update"*) ;; *) fail "root'"'"'s link behind: $out" ;; esac
+[ "$(printf "%s\n" "$out" | wc -l)" = 1 ] || fail "more than one line: $out"
+runuser -u wicket -- ln -sfn "$a" $vroot/current.new && runuser -u wicket -- mv -T $vroot/current.new $vroot/current
+out=$(cd / && wicket self units 2>&1 >/dev/null)
+[ -z "$out" ] || fail "back in step, a command said: $out"
+echo "ok: root'"'"'s link behind the services'"'"' build is said on stderr, with how to catch up"
 echo "install-test: all checks passed"
 '
