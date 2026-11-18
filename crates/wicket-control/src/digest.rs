@@ -31,7 +31,7 @@ pub fn accept_image(l: &Ledger, tenant: &TenantId, zone: &str, name: &str, diges
 fn accept(l: &Ledger, tenant: &TenantId, zone: &str, using: &str, digest: &str, by: &str) -> Result<DigestUse> {
     let scope = DigestScope::Zone(zone.to_string());
     let name = using;
-    if let Some(u) = l.may_use(tenant, digest, DigestAction::Run, &scope, &using)? {
+    if let Some(u) = l.may_use(tenant, digest, DigestAction::Run, &scope, using)? {
         return Ok(u);
     }
     let grant = l.grant_digest(&NewDigestGrant {
@@ -50,7 +50,7 @@ fn accept(l: &Ledger, tenant: &TenantId, zone: &str, using: &str, digest: &str, 
         &serde_json::json!({ "digest": digest, "action": "run", "scope": scope, "grant": grant, "by": by,
                              "why": format!("{name} is pinned to it in the manifest {by} ran") }),
     )?;
-    match l.may_use(tenant, digest, DigestAction::Run, &scope, &using)? {
+    match l.may_use(tenant, digest, DigestAction::Run, &scope, using)? {
         Some(u) => Ok(u),
         None => bail!("{name}: the grant just recorded on {digest} ({grant}) doesn't cover zone {zone}"),
     }
