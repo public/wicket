@@ -1284,8 +1284,6 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             }
             Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide, effect_sha256, apply_update }, v))
         }
-        // `say` and the console's follow-up box are gone (#198): prompts are sent in the session.
-        Some("say") => Err(bad("say is gone: open the run's session and prompt there")),
         Some("open_session") => {
             let Some(run) = str_field(body, "run") else { return Err(bad("run required")) };
             check_running(&l, run)?;
@@ -1443,8 +1441,7 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
     else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "too many passkey ceremonies in progress; try again shortly");
     };
-    // `decision` is the older name the page used for the signed JSON.
-    ok(json!({ "action": v, "decision": v, "publicKey": assertion_options(state, &key) }))
+    ok(json!({ "action": v, "publicKey": assertion_options(state, &key) }))
 }
 
 fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Value) -> Reply {
@@ -2067,14 +2064,10 @@ mod tests {
     }
 
     #[test]
-    fn say_is_gone_and_says_where_prompts_go() {
+    fn an_unknown_action_is_refused_and_queues_nothing() {
         let t = setup("say");
         t.running("run_a", "lead");
-        assert_refused(
-            &t.begin(json!({ "action": "say", "run": "run_a", "text": "hi" })),
-            StatusCode::BAD_REQUEST,
-            "open the run's session",
-        );
+        assert_refused(&t.begin(json!({ "action": "say", "run": "run_a", "text": "hi" })), StatusCode::BAD_REQUEST, "action must be");
         assert!(t.ledger().take_prompts("run_a").unwrap().is_empty());
     }
 
