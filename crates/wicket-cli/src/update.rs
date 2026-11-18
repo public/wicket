@@ -1361,13 +1361,16 @@ pub async fn prune(nodes: Option<String>, only_nodes: bool, keep: usize, dry_run
 /// node's `serve` re-executes itself (adopting its boxes), runs' supervisors here are stopped
 /// without stopping their boxes and `bin`'s reconciler adopts their runs, and the console and the
 /// reconciler service re-execute themselves.
+///
+/// The serve moves first (#529): once a supervisor is stopped, the reconciler service may re-attach
+/// its run at once, and a new build's supervisor must find the new build's serve.
 async fn handover(bin: &Path) -> Result<()> {
-    let killed = stop_stale_supervisors(&Ledger::open(&crate::ledger_path())?, bin)?;
     // This host's own node.
     let b = bin.to_path_buf();
     if let Some(line) = tokio::task::spawn_blocking(move || reexec_local_node(&b)).await? {
         say(line);
     }
+    let killed = stop_stale_supervisors(&Ledger::open(&crate::ledger_path())?, bin)?;
     for role in ["console", "reconcile"] {
         if let Some(pid) = hangup(&pidfile(role), role) {
             say(format!("{role} (pid {pid}): re-executing"));
