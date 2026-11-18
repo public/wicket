@@ -164,7 +164,7 @@ pub(super) fn apply_renew(
         json!({ "action": "capacity_renew", "via": "console", "signed": signed }),
     )? {
         grant::Decided::Renewed { until, .. } => {
-            Ok(format!("renewed capacity grant {id} until {} (signed with {})", crate::capacity::fmt_time(until), oc.name))
+            Ok(format!("renewed capacity grant {id} until {} (signed with {})", wicket_core::time::unix_rfc3339(until), oc.name))
         }
         _ => unreachable!("a renewal renews"),
     }

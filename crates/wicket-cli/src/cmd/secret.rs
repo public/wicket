@@ -5,6 +5,17 @@
 
 use crate::*;
 
+/// A secret's value for `wicket secret set <name>`: typed at the terminal (not echoed), or read
+/// from stdin. Read where the terminal is: in the caller's process, also when wicketd stores it.
+pub fn read_value(name: &str) -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        return Ok(rpassword::prompt_password(format!("value for {name} (not echoed): "))?);
+    }
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s)?;
+    Ok(s)
+}
+
 /// Runs one of this group's commands.
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
@@ -12,13 +23,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             let v = Vault::new(Vault::default_dir());
             match cmd {
                 SecretCmd::Set { name, hosts } => {
-                    let value = if std::io::stdin().is_terminal() {
-                        rpassword::prompt_password(format!("value for {name} (not echoed): "))?
-                    } else {
-                        let mut s = String::new();
-                        std::io::stdin().read_to_string(&mut s)?;
-                        s
-                    };
+                    let value = read_value(&name)?;
                     if value.trim().is_empty() {
                         bail!("empty value");
                     }

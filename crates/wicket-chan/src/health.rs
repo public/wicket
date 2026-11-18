@@ -218,14 +218,18 @@ fn ca_alert(node: &str, h: &NodeHealth, now_ms: i64) -> Option<Alert> {
             text: format!(
                 "node {node}: its CA expired {} ago ({}), so boxes there can't reach their inspected hosts and none start: {fix}",
                 human_secs(now - end),
-                rfc3339(end)
+                wicket_core::time::unix_rfc3339(end)
             ),
         });
     }
     let life = (end - h.ca_not_before.unwrap_or(end)).max(0);
     ((end - now) as f64 <= CA_ALERT_SHARE * life as f64).then(|| Alert {
         key: format!("{node}/ca-expiring"),
-        text: format!("node {node}: its CA expires in {} ({}) and was not renewed: {fix}", human_secs(end - now), rfc3339(end)),
+        text: format!(
+            "node {node}: its CA expires in {} ({}) and was not renewed: {fix}",
+            human_secs(end - now),
+            wicket_core::time::unix_rfc3339(end)
+        ),
     })
 }
 
@@ -235,10 +239,6 @@ fn human_secs(s: i64) -> String {
         s if s < 7200 => format!("{} min", s / 60),
         s => format!("{} h", s / 3600),
     }
-}
-
-fn rfc3339(s: i64) -> String {
-    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s.max(0) as u64)).to_string()
 }
 
 /// The disk thresholds of `key` (a node's, or the control host's own), named `who` in the text.
@@ -268,8 +268,8 @@ pub fn summary(h: &NodeHealth, now_ms: i64) -> String {
         s.push_str(&format!(", feed stale {} s", (now_ms - u) / 1000));
     }
     match h.ca_not_after {
-        Some(end) if end * 1000 <= now_ms => s.push_str(&format!(", CA EXPIRED {}", rfc3339(end))),
-        Some(end) => s.push_str(&format!(", CA until {}", rfc3339(end))),
+        Some(end) if end * 1000 <= now_ms => s.push_str(&format!(", CA EXPIRED {}", wicket_core::time::unix_rfc3339(end))),
+        Some(end) => s.push_str(&format!(", CA until {}", wicket_core::time::unix_rfc3339(end))),
         None => {}
     }
     s

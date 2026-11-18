@@ -911,7 +911,7 @@ fn units_installed(ledger: &Mutex<Ledger>, v: &Versions, green: &str, artifact_s
         Some(u) if !u.is_empty() => u,
         _ => return Ok(()),
     };
-    let e = crate::units::UnitsPending { version: green.into(), units, dir, root_copy: crate::units::root_copy(green) };
+    let e = crate::units::UnitsPending { version: green.into(), units, dir, root_copy: crate::rootcopy::Layout::installed().copy(green) };
     audit(
         ledger,
         "self.update_refused",
@@ -930,7 +930,7 @@ fn warn_units(v: &Versions, to: &str) {
                 "warning: {to}'s systemd units differ from those installed in {} ({}): to have its own, {}",
                 dir.display(),
                 u.join(", "),
-                crate::units::apply_hint(to, &crate::units::root_copy(to))
+                crate::units::apply_hint(to, &crate::rootcopy::Layout::installed().copy(to))
             ));
         }
     }

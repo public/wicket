@@ -338,6 +338,12 @@ pub fn format_rfc3339_seconds(t: SystemTime) -> Rfc3339Timestamp {
     Rfc3339Timestamp(t)
 }
 
+/// Unix seconds as `2026-11-12T19:05:05Z`: what the ledger and the channel keep times as, shown to
+/// people. A time before 1970 shows as 1970.
+pub fn unix_rfc3339(secs: i64) -> String {
+    format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs.max(0) as u64)).to_string()
+}
+
 /// The civil date of a day since 1970-01-01 (Howard Hinnant's `civil_from_days`).
 fn civil(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;

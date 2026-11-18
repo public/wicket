@@ -89,11 +89,6 @@ pub struct UnitsPending {
     pub root_copy: PathBuf,
 }
 
-/// Where root's own copy of version `id` is (`rootcopy`).
-pub fn root_copy(id: &str) -> PathBuf {
-    Path::new(crate::rootcopy::COPIES).join(id).join("wicket")
-}
-
 /// What root runs to apply version `id`'s units: its own copy of the build, never the versions
 /// root's (the wicket user's); first made from the artifact if root has none yet.
 pub fn apply_hint(id: &str, root_copy: &Path) -> String {
