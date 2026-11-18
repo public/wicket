@@ -316,6 +316,36 @@ impl Ledger {
         self.may_use(tenant, digest, DigestAction::Install, &DigestScope::Installation, by)
     }
 
+    /// An operator's approval of an update to the build with sha256 `sha` (an agent's
+    /// `request_update`, approved: [`Ledger::use_update_approval`], used up here) as what it is
+    /// (#258): that operator's grant on the build's digest, `install`, one use, then the one check,
+    /// [`Ledger::may_use`]. Returns the request and the acceptance; None: no live approval.
+    pub fn accept_update_approval(&mut self, tenant: &TenantId, sha: &str, by: &str) -> Result<Option<(String, DigestUse)>> {
+        let Some((request, approval)) = self.use_update_approval(sha)? else { return Ok(None) };
+        let decided_by: String = self
+            .conn
+            .query_row("SELECT decided_by FROM grants WHERE id = ?1", params![approval], |r| r.get(0))
+            .unwrap_or_else(|_| "operator".into());
+        let digest = format!("sha256:{sha}");
+        let grant = self.grant_digest(&NewDigestGrant {
+            tenant,
+            digest: &digest,
+            action: DigestAction::Install,
+            scope: DigestScope::Installation,
+            uses: Some(1),
+            expires_at: now() + 600,
+            decided_by: &decided_by,
+        })?;
+        self.audit(
+            tenant,
+            None,
+            "digest.granted",
+            &serde_json::json!({ "digest": digest, "action": "install", "scope": DigestScope::Installation, "grant": grant,
+                                 "by": decided_by, "under": approval, "request": request, "why": "an operator approved the update" }),
+        )?;
+        Ok(self.may_use(tenant, &digest, DigestAction::Install, &DigestScope::Installation, by)?.map(|u| (request, u)))
+    }
+
     /// The live digest grants on `digest`, oldest first.
     pub fn digest_grants(&self, tenant: &TenantId, digest: &str) -> Result<Vec<DigestGrantRow>> {
         let mut st = self.conn.prepare(
