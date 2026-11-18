@@ -13,7 +13,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `/etc/docker/daemon.json` | Docker | gVisor registered as `runsc` with `--host-uds=open`. | [install](../how-to/install-on-a-host.md) |
 | `<data dir>/audit-sinks.yaml` (or `$WICKET_AUDIT_SINKS`) | `wicket run`, `wicket serve`, `wicket audit export` | Where audit records are exported, and how often checkpoints are signed. | [audit](audit.md#the-sinks-file) |
 | `<data dir>/state-store.yaml` | `wicket state …`, hibernation, `type: store` sinks | The S3-compatible state store, where bundles go, the ledger's stream. | [state off the host](../how-to/state-off-host-and-restore.md) |
-| `<data dir>/placement.yaml` (or `$WICKET_PLACEMENT`) | the gateway (`request_capacity`), `wicket reconcile` | The placement backend (static hosts or Vultr) and the money envelope for leases. Without it `request_capacity` is off. | [create nodes on Vultr](../how-to/create-nodes-on-vultr.md#3-leases-for-agents) |
+| `<data dir>/placement.yaml` (or `$WICKET_PLACEMENT`) | the gateway (`request_capacity`), `wicket reconcile`, `wicket node create` | The placement backend (static hosts or Vultr) and the money limits that leases and `wicket node create`'s nodes share. Without it `request_capacity` is off and `wicket node create` refuses. | [create nodes on Vultr](../how-to/create-nodes-on-vultr.md#3-leases-for-agents) |
 | `<data dir>/operators.yaml` | `wicket approve`, `deny`, `grant renew`, the console | Each operator's authority: what it may decide. Without it every operator may decide anything. | [below](#operatorsyaml) |
 | `<data dir>/manifests/*.yaml` | `wicket serve` | Manifests the console may start, besides `examples/` of the directory `wicket serve` started in. | [console](console.md#actions) |
 | `<data dir>/release-keys/*.pub` | `wicket self update` | Release keys whose signatures an update accepts. | [update and roll back](../how-to/update-and-roll-back.md) |
@@ -34,8 +34,8 @@ Unknown keys are errors, so a misspelt setting can't silently stay at its defaul
 |---|---|---|---|
 | `owner` | string | the trust domain | The installation's name in the owner tag, `wicket-owner-<owner>`. Keep it stable: only instances with this tag are listed or destroyed. |
 | `backend` | `static` or `vultr` | required | The operator's own enrolled machines, or fresh Vultr nodes. |
-| `max_hourly_usd` | decimal string | required | Every lease together, worst case, per hour. |
-| `max_total_usd` | decimal string | required | Every lease together, worst case, in total. |
+| `max_hourly_usd` | decimal string | required | Every lease and every node `wicket node create` made together, worst case, per hour. Recorded with `max_total_usd` as the money limit grant, `QUOTA wicket.internal /quota/money.limit` (#256). |
+| `max_total_usd` | decimal string | required | Every lease and every node `wicket node create` made together, worst case, in total. |
 | `static_hosts` | list | `[]` | For `static`: `name` (the enrolled node's name), `ssh_target`, `capacity: {vcpus, memory_mib}`, `isolation`, `region`. |
 | `install_static` | boolean | `false` | Run `wicket node install` on a static host when a lease binds it. |
 | `vultr` | object | none | For `vultr`: `region`, `ssh_key_ids` (keys in the Vultr account), `ssh_key` (the private half's path on this host), `give_up_silent` (default `4m`: a new node that gives no answer of any kind on port 22 for this long fails its lease and is destroyed; once the port answers, setup is waited for up to 15 minutes). The API key is the vault secret `vultr-api-key`. |

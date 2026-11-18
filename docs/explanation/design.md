@@ -1055,7 +1055,8 @@ See `examples/links/`.
 Placement (`wicket-placement`) chooses the node a box runs on. Its backends are `Provider`s: the
 operator's own static hosts, reached over SSH, and Vultr. `Placer` enforces the same rules over any of
 them: owner tags (nothing untagged, or tagged `wicket-protected`, is ever listed or destroyed),
-idempotent creates, the money envelope and worst-case reservation (§8.5). A node runs boxes itself, by
+idempotent creates, and the spend approval it asks before any paid node, a warm one included, which
+holds it to the money limit and worst-case reservation (§8.5). A node runs boxes itself, by
 direct launch (§7.1), and decides their requests at the edge (§9.2.1).
 
 Kubernetes placement, a `kube-rs` operator and reservation pods are deferred (#45, §22). Kubernetes would
@@ -1090,9 +1091,18 @@ Only Vultr and static hosts are built. A `HostProvider` across six clouds, grade
 - **Money is reserved at the worst case.** A provisioning `Op` reserves `BillingModel::worst_case(rate,
   lifetime)` in the ledger before creating anything. A pool's `max × rate × 672 h` must fit the budget.
   A daily reconcile matches the ledger against `charges_since` from every provider, to the cent.
-- **The money envelope** (`placement.yaml`: a maximum hourly rate over every owned node, and a maximum
-  total) is a hard limit. A request beyond it is refused, and no approval widens it. Inside it, every
-  paid node needs a human's approval, with the plan, rate and worst case shown.
+- **The money limit** (`placement.yaml`: `max_hourly_usd` and `max_total_usd`) is a hard limit, and
+  the money quota grants are the only spend check (#256). The limits are recorded as one tenant quota
+  grant, `QUOTA wicket.internal /quota/money.limit` (made by `wicket:placement.yaml`, renewed or
+  replaced at every check). What is reserved is the live pairs of money quota grants,
+  `/quota/money.hourly/<key>` and `/quota/money.reserved/<key>`: one per capacity lease (made by
+  `wicket:lease-budget`, bound to the run that asked) and one per node `wicket node create` makes
+  (`node-<name>`, made by `wicket:node-create`, renewed while the node bills). One check, in the
+  transaction that records a new pair: the live pairs' sums plus the new pair must fit the limit
+  grant. Leases, created nodes and warm-pool claims all go through it, so they share one budget. A
+  request beyond it is refused, and no approval widens it. Inside it, every paid node needs a human's
+  approval (or a capacity grant's), with the plan, rate, worst case and what is reserved with it
+  shown.
 - **Agents can ask for capacity, never for credentials.** A cloud key would be an egress bypass,
   persistence and money all at once. `request_capacity` is a typed request. A **lease** is a grant of
   capacity (#253): a node for a time, its worst case reserved, held by the requesting run.
@@ -1271,7 +1281,7 @@ What a node still sends the control host, and why:
 ### 9.3 LLM proxy (`wicket-llm`)
 - Holds the model credential (the owner's Claude subscription token, never an API key) and routes per
   zone, with a budget of requests and tokens (`max_requests`, `max_output_tokens`, `max_input_tokens`).
-  It has no money budget: the only money limits are placement's envelope and capacity grants (§8.5). A
+  It has no money budget: the only money limits are placement's money limit and capacity grants (§8.5). A
   per-zone model allowlist is #366.
 - Wire APIs: Anthropic Messages, OpenAI Responses, Google, Chat (§6). `codex responses-api-proxy` is
   differential prior art.
@@ -2121,7 +2131,7 @@ crates/
   wicket-proxy       egress proxy, model proxy and MCP gateway
   wicket-sandbox     box backends (Docker with runsc)
   wicket-agent       harness adapters (Claude Code, ACP) and their modes
-  wicket-placement   providers (static hosts, Vultr), billing, the money envelope
+  wicket-placement   providers (static hosts, Vultr), billing, the spend approval
   wicket-fwd         in-box forwarders to wicket.internal
   wicket-chan        the control/node channel's protocol and what its messages carry (health, a
                      node's secrets, OCI images and registries); fuzzed as it is
@@ -2158,7 +2168,7 @@ is the #253 simplification with the features that stand on it. Where the v0.2 mi
 | M6 | `wicket explain`, the zone view, the timeline | not built |
 | M7 | lifecycle | hibernate and wake by rebuild built; the timer ladder replaced by #249 |
 | M9 | ACP adapter, `spawn` | built |
-| M10 | Vultr placement, `request_capacity`, the money envelope | built; other clouds deferred (§22) |
+| M10 | Vultr placement, `request_capacity`, the money limit | built; other clouds deferred (§22) |
 | M11 | mandates | deferred (§22) |
 | M12 | programs | built as agents without a model (§17); registry and promotion deferred |
 

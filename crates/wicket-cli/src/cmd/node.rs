@@ -131,8 +131,9 @@ pub enum NodeCmd {
         common: nodecreate::Common,
     },
     /// Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and
-    /// pinned at creation. Inside a money envelope, its spend is a CAPACITY request from you: approved
-    /// at once by a capacity grant of yours that covers it, otherwise waiting for an operator.
+    /// pinned at creation. Its money is reserved first against placement.yaml's limits (with every
+    /// lease's); then its spend is a CAPACITY request from you: approved at once by a capacity grant
+    /// of yours that covers it, otherwise waiting for an operator.
     Create(Box<nodecreate::CreateArgs>),
     /// Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and
     /// revoke its enrolment.

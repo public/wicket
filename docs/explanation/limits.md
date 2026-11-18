@@ -270,8 +270,12 @@ not a permanent decision.
 
 - **Model budgets count requests and tokens, not money.** A zone's `llm` budget is `max_requests`,
   `max_output_tokens` and `max_input_tokens`; nothing converts them to a price or caps a run's spend in
-  currency. The only money limits are placement's: the envelope in `placement.yaml` and the capacity
-  grants for nodes ([`placement.yaml`](../reference/configuration.md#placementyaml)).
+  currency. The only money limits are placement's: the limits in `placement.yaml`, which leases and
+  `wicket node create`'s nodes share, and the capacity grants for nodes
+  ([`placement.yaml`](../reference/configuration.md#placementyaml)).
+- **The spend check counts what the ledger reserved, not what the provider runs.** It sums the live
+  money quota grants (#256). An owner-tagged machine the ledger doesn't know (a crash between create
+  and record) isn't counted until the reconciler destroys or adopts it.
 
 - **Charges aren't reconciled against the provider.** Leases record what they billed by wicket's own
   arithmetic. Nothing compares that with Vultr's invoices yet (design §8.5,
