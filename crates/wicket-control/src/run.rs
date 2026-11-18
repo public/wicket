@@ -483,6 +483,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let image_name = image.to_string();
     if record.is_none() && wake.is_none() {
         crate::images_policy::check(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
+        // The one "may this digest run" check (#258): a pinned image is accepted by a grant on its
+        // digest, which the operator running the manifest records. A child's image is pinned to
+        // its parent's, as its parent's zone allows (decided where it is spawned): not regranted.
+        if let (Some(pin), None) = (&image_pin, &parent_run) {
+            let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
+            let u = crate::digest::accept_image(&Ledger::open(&ledger_path())?, &m.tenant, &m.zone.name, image, pin, &by)?;
+            say!("[wicket] image {image} accepted by grant {} from {}", u.grant, u.decided_by);
+        }
     }
     // The workload's name, and what runs it: an agent's harness, or a program's command.
     let (workload, workload_runs) = match (&m.agent, &m.program) {

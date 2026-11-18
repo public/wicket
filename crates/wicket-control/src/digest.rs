@@ -1,11 +1,12 @@
-//! "May this digest run" (#258): programs. A program's source is accepted by the one check,
-//! [`wicket_store::Ledger::may_use`], on a grant on its digest (`run`, scoped to the run's zone).
+//! "May this digest run" (#258): programs and images. A program's source and a box's pinned image
+//! are accepted by the one check, [`wicket_store::Ledger::may_use`], on a grant on their digest
+//! (`run`, scoped to the run's zone).
 //!
-//! The grant is an operator's: running a manifest that pins the program's digest (the operator's
-//! approval of that source, as before) records it, made by the operator running it, for a day,
-//! and a later run of the same source in the same zone is accepted by it. A pin that doesn't match
-//! the source refuses the run before any grant is looked at; an unpinned program is a development
-//! run, warned about and not accepted by a grant (as before).
+//! The grant is an operator's: running a manifest that pins the digest (the operator's approval
+//! of that source or image, as before) records it, made by the operator running it, for a day,
+//! and a later run of the same digest in the same zone is accepted by it. A program pin that
+//! doesn't match the source refuses the run before any grant is looked at; an unpinned program
+//! or image is accepted as before (a development run, or `images.yaml`'s rule), not by a grant.
 
 use anyhow::{bail, Result};
 use wicket_core::TenantId;
@@ -18,9 +19,19 @@ pub const PROGRAM_GRANT_SECS: i64 = 24 * 3600;
 /// operator `by`: a live grant on the digest if there is one, else the one this pinned run
 /// records. Every acceptance is one `digest.accepted` audit record naming the grant.
 pub fn accept_program(l: &Ledger, tenant: &TenantId, zone: &str, name: &str, digest: &str, by: &str) -> Result<DigestUse> {
+    accept(l, tenant, zone, &format!("program {name}"), digest, by)
+}
+
+/// Accepts the image `name`, pinned to `digest`, as a box's image in `zone`, started by operator
+/// `by`: as [`accept_program`] does a program's source.
+pub fn accept_image(l: &Ledger, tenant: &TenantId, zone: &str, name: &str, digest: &str, by: &str) -> Result<DigestUse> {
+    accept(l, tenant, zone, &format!("image {name}"), digest, by)
+}
+
+fn accept(l: &Ledger, tenant: &TenantId, zone: &str, using: &str, digest: &str, by: &str) -> Result<DigestUse> {
     let scope = DigestScope::Zone(zone.to_string());
-    let using = format!("program {name}");
-    if let Some(u) = l.may_use(tenant, digest, DigestAction::Run, &scope, &using)? {
+    let name = using;
+    if let Some(u) = l.may_use(tenant, digest, DigestAction::Run, &scope, using)? {
         return Ok(u);
     }
     let grant = l.grant_digest(&NewDigestGrant {
@@ -37,11 +48,11 @@ pub fn accept_program(l: &Ledger, tenant: &TenantId, zone: &str, name: &str, dig
         None,
         "digest.granted",
         &serde_json::json!({ "digest": digest, "action": "run", "scope": scope, "grant": grant, "by": by,
-                             "why": format!("program {name} is pinned to it in the manifest {by} ran") }),
+                             "why": format!("{name} is pinned to it in the manifest {by} ran") }),
     )?;
-    match l.may_use(tenant, digest, DigestAction::Run, &scope, &using)? {
+    match l.may_use(tenant, digest, DigestAction::Run, &scope, using)? {
         Some(u) => Ok(u),
-        None => bail!("program {name}: the grant just recorded on {digest} ({grant}) doesn't cover zone {zone}"),
+        None => bail!("{name}: the grant just recorded on {digest} ({grant}) doesn't cover zone {zone}"),
     }
 }
 
@@ -74,5 +85,20 @@ mod tests {
         assert_ne!(accept_program(&l, &t, "research", "build", D, "operator:alex").unwrap().grant, first.grant);
         // Not a digest: refused.
         assert!(accept_program(&l, &t, "research", "build", "latest", "operator:alex").is_err());
+    }
+
+    /// #258: a pinned image is accepted the same way, by the same kind of grant on its digest (an
+    /// image and a program of one digest share it: a digest is what is granted, not a name).
+    #[test]
+    fn a_pinned_image_is_accepted_by_a_grant_on_its_digest() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let image = format!("registry.example.com/agent@{D}");
+        let u = accept_image(&l, &t, "research", &image, D, "operator:alex").unwrap();
+        assert_eq!(accept_image(&l, &t, "research", &image, D, "operator:sam").unwrap().grant, u.grant);
+        let rec = l.audit_tail(100).unwrap().into_iter().rfind(|r| r.2 == "digest.accepted").unwrap();
+        let body: serde_json::Value = serde_json::from_str(&rec.4).unwrap();
+        assert_eq!((body["by"].as_str(), body["grant"].as_str()), (Some(format!("image {image}").as_str()), Some(u.grant.as_str())));
+        assert_eq!(kinds(&l, "digest.granted"), 1);
     }
 }
