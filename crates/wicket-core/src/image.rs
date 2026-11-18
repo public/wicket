@@ -92,17 +92,25 @@ pub fn matching(wanted: &str, allowed: &[String]) -> Option<(String, Option<Stri
     }
     for e in allowed {
         let Ok(a) = parse(e) else { continue };
-        match (&w.pin, &a.pin) {
-            (Some(wp), Some(ap)) if wp == ap && (w.name.is_empty() || a.name.is_empty() || repository(&w.name) == repository(&a.name)) => {
-                return Some((e.clone(), Some(ap.clone())));
-            }
-            (None, Some(ap)) if !a.name.is_empty() && repository(&w.name) == repository(&a.name) => {
-                return Some((e.clone(), Some(ap.clone())))
-            }
-            _ => {}
+        if let Some(digest) = entry_allows(&w.name, w.pin.as_deref(), &a.name, a.pin.as_deref()) {
+            return Some((e.clone(), Some(digest.to_string())));
         }
     }
     None
+}
+
+/// [`matching`]'s rule for an allowed entry `a` that isn't `wanted` itself, on their parsed names
+/// and pins: the digest the box must then have, or None. Only a pinned entry allows anything here:
+/// a pin by the same digest (no name on either side, or the same repository), a tag by a pin for
+/// its repository. (Kani checks it, `proofs/image.rs`.)
+pub(crate) fn entry_allows<'a>(w_name: &str, w_pin: Option<&str>, a_name: &str, a_pin: Option<&'a str>) -> Option<&'a str> {
+    match (w_pin, a_pin) {
+        (Some(wp), Some(ap)) if wp == ap && (w_name.is_empty() || a_name.is_empty() || repository(w_name) == repository(a_name)) => {
+            Some(ap)
+        }
+        (None, Some(ap)) if !a_name.is_empty() && repository(w_name) == repository(a_name) => Some(ap),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -158,3 +166,7 @@ mod tests {
         assert_eq!(matching("bad image", &allowed), None);
     }
 }
+
+#[cfg(kani)]
+#[path = "proofs/image.rs"]
+mod proofs;

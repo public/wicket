@@ -18,7 +18,7 @@
 //! shared CDN can be used to reach other sites behind the same CDN (domain fronting), which is why
 //! the zone view says which hosts are spliced.
 
-use crate::manifest::{host_matches, ZoneSpec};
+use crate::manifest::{host_matches, label_under, ZoneSpec};
 use crate::op::{never_reachable, HTTP_METHODS};
 
 /// Hosts (and host patterns) for which the dangerous-pattern list (`op::classify`) can rate a
@@ -45,14 +45,20 @@ impl Inspection {
 /// Whether some host matches both patterns (`*.example.com`, or an exact name). For an exact
 /// `b`, this is [`host_matches`]`(a, b)`.
 pub fn patterns_overlap(a: &str, b: &str) -> bool {
-    let a = a.trim_end_matches('.').to_ascii_lowercase();
-    let b = b.trim_end_matches('.').to_ascii_lowercase();
-    match (a.strip_prefix("*."), b.strip_prefix("*.")) {
-        (None, None) => a == b,
-        (Some(_), None) => host_matches(&a, &b),
-        (None, Some(_)) => host_matches(&b, &a),
+    // Over bytes, ignoring ASCII case and trailing dots, without allocating (Kani checks it, #325).
+    fn trim(mut x: &[u8]) -> &[u8] {
+        while let [rest @ .., b'.'] = x {
+            x = rest;
+        }
+        x
+    }
+    let (a, b) = (trim(a.as_bytes()), trim(b.as_bytes()));
+    match (a.strip_prefix(b"*."), b.strip_prefix(b"*.")) {
+        (None, None) => a.eq_ignore_ascii_case(b),
+        (Some(s), None) => b.len() > s.len() + 1 && label_under(b, s),
+        (None, Some(t)) => a.len() > t.len() + 1 && label_under(a, t),
         // Two wildcards share names when one suffix is the other or lies under it.
-        (Some(s), Some(t)) => s == t || s.ends_with(&format!(".{t}")) || t.ends_with(&format!(".{s}")),
+        (Some(s), Some(t)) => s.eq_ignore_ascii_case(t) || label_under(s, t) || label_under(t, s),
     }
 }
 
@@ -134,6 +140,52 @@ mod tests {
     use super::*;
     use crate::op::{CompiledZone, Op, Verdict};
     use crate::{Manifest, RiskClass, RunId, TenantId};
+
+    /// #325: `patterns_overlap` works on bytes now (for Kani); it decides as the lowercasing form did.
+    #[test]
+    fn patterns_overlap_decides_as_lowercasing_did() {
+        let old = |a: &str, b: &str| {
+            let a = a.trim_end_matches('.').to_ascii_lowercase();
+            let b = b.trim_end_matches('.').to_ascii_lowercase();
+            match (a.strip_prefix("*."), b.strip_prefix("*.")) {
+                (None, None) => a == b,
+                (Some(_), None) => host_matches(&a, &b),
+                (None, Some(_)) => host_matches(&b, &a),
+                (Some(s), Some(t)) => s == t || s.ends_with(&format!(".{t}")) || t.ends_with(&format!(".{s}")),
+            }
+        };
+        let names = [
+            "",
+            ".",
+            "*.",
+            "*.*",
+            "*",
+            "a",
+            "A.",
+            "a.b",
+            "A.B..",
+            "*.a",
+            "*.A.",
+            "*.b",
+            "*.a.b",
+            "*.b.a",
+            "x.a.b",
+            "*.x.a.b",
+            "github.com",
+            "*.github.com",
+            "API.GitHub.com.",
+            "é.a",
+            "*.é.a",
+            "ab",
+            "*.ab",
+            "b.ab",
+        ];
+        for a in names {
+            for b in names {
+                assert_eq!(patterns_overlap(a, b), old(a, b), "{a:?} {b:?}");
+            }
+        }
+    }
 
     fn zone(body: &str) -> ZoneSpec {
         Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone:\n  name: z\n  llm: {{}}\n{body}")).unwrap().zone
@@ -359,3 +411,7 @@ mod tests {
         assert!(matches!(&v[1].1, Inspection::Inspected(why) if why.contains("forbid")), "{v:?}");
     }
 }
+
+#[cfg(kani)]
+#[path = "proofs/splice.rs"]
+mod proofs;
