@@ -129,9 +129,11 @@ fn row_to_lease(r: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseRow> {
     })
 }
 
+/// A new lease id, `l-` and 12 random hex digits. Without the OS's random source there is none to
+/// give: it panics rather than hand out the same id twice (it once gave `l-000000000000`).
 pub fn new_lease_id() -> String {
     let mut b = [0u8; 6];
-    let _ = getrandom::fill(&mut b);
+    getrandom::fill(&mut b).expect("the OS random source");
     format!("l-{}", hex::encode(b))
 }
 
