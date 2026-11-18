@@ -282,8 +282,9 @@ jobs:
           key: fuzz-none
           save-if: ${{ contains(matrix.targets, 'egress') }}
       - name: Fuzz ${{ matrix.targets }}
-        # Word-split on purpose: the group's targets, one after another.
-        run: ci/fuzz.sh --no-replay --secs 60 $TARGETS
+        # Word-split on purpose: the group's targets, fuzzed at once (one core each; a runner has
+        # four), each for its full 60 s: the group takes one target's time, not three.
+        run: ci/fuzz.sh --no-replay --secs 60 --jobs 3 $TARGETS
       - name: Findings (minimized) and logs
         if: ${{ failure() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
