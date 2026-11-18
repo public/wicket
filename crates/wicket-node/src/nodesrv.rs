@@ -1247,7 +1247,7 @@ async fn adopt_previous(node: &Arc<Node>) {
             // a box without its record isn't its to judge (it is another node's, or the reconciler's).
             None if node.paths.shares_host() => {}
             None => {
-                if let crate::owner::Verdict::Orphan(why) = crate::owner::judge(&b, None) {
+                if let crate::owner::Verdict::Orphan(why) = crate::owner::judge(&b) {
                     say_err!("[node] stopping {} ({why})", b.name);
                     let _ = node.docker.kill(&b.name).await;
                 }

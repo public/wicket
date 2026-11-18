@@ -59,18 +59,14 @@ pub enum Verdict {
     Unknown(String),
 }
 
-/// What to do with one box. `run_status` is the ledger's status for its run, if any.
-pub fn judge(b: &BoxInfo, run_status: Option<&str>) -> Verdict {
+/// What to do with one box, by its owner label: a box without one is left alone (a node has no
+/// ledger to ask about its run).
+pub fn judge(b: &BoxInfo) -> Verdict {
     match b.owner.as_deref().map(owner_alive) {
         Some(Some(true)) => Verdict::Live,
         Some(Some(false)) => Verdict::Orphan("its wicket process has exited".into()),
         Some(None) => Verdict::Unknown("owned by a process on another machine, or an unreadable owner label".into()),
-        // Boxes started before owner labels: only the ledger can say, and only an ended run is certain.
-        None => match run_status {
-            Some(s) if s != "running" => Verdict::Orphan(format!("its run has ended ({s})")),
-            Some(_) => Verdict::Unknown("no owner label, and its run is recorded as still running".into()),
-            None => Verdict::Unknown("no owner label and no run in this ledger".into()),
-        },
+        None => Verdict::Unknown("no owner label".into()),
     }
 }
 
@@ -84,7 +80,7 @@ mod tests {
 
     #[test]
     fn a_box_whose_owner_runs_is_live() {
-        assert_eq!(judge(&boxed(Some(owner_label())), Some("running")), Verdict::Live);
+        assert_eq!(judge(&boxed(Some(owner_label()))), Verdict::Live);
     }
 
     #[test]
@@ -94,18 +90,16 @@ mod tests {
         let start = start_time(pid).unwrap_or(1);
         child.wait().unwrap();
         let gone = format!("{}:{pid}:{start}", machine_id());
-        assert!(matches!(judge(&boxed(Some(gone)), Some("running")), Verdict::Orphan(_)));
+        assert!(matches!(judge(&boxed(Some(gone))), Verdict::Orphan(_)));
         // Same pid as a live process, different start time: a reused pid, not the owner.
         let reused = format!("{}:{}:1", machine_id(), std::process::id());
-        assert!(matches!(judge(&boxed(Some(reused)), Some("running")), Verdict::Orphan(_)));
+        assert!(matches!(judge(&boxed(Some(reused))), Verdict::Orphan(_)));
     }
 
     #[test]
-    fn other_machines_and_unlabelled_boxes_are_left_alone_unless_their_run_ended() {
-        assert!(matches!(judge(&boxed(Some("another-host:1:1".into())), None), Verdict::Unknown(_)));
-        assert!(matches!(judge(&boxed(Some("garbage".into())), None), Verdict::Unknown(_)));
-        assert!(matches!(judge(&boxed(None), Some("running")), Verdict::Unknown(_)));
-        assert!(matches!(judge(&boxed(None), None), Verdict::Unknown(_)));
-        assert!(matches!(judge(&boxed(None), Some("succeeded")), Verdict::Orphan(_)));
+    fn other_machines_and_unlabelled_boxes_are_left_alone() {
+        assert!(matches!(judge(&boxed(Some("another-host:1:1".into()))), Verdict::Unknown(_)));
+        assert!(matches!(judge(&boxed(Some("garbage".into()))), Verdict::Unknown(_)));
+        assert!(matches!(judge(&boxed(None)), Verdict::Unknown(_)));
     }
 }
