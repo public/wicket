@@ -65,6 +65,60 @@ pub fn ends_by(now: i64, end: Option<i64>, until: i64) -> Result<(), Outlasts> {
     }
 }
 
+/// What the policy's `agents:` rules (`wicket-control`'s `AgentRules`, #256) let an agent grant
+/// beyond the narrowest terms. Each lifts exactly one refusal of [`agent_term_refusal`]; the
+/// default lifts none, which is what `agent_terms` refused before they were rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GrantRules {
+    /// A grant of every path under a prefix.
+    pub prefix: bool,
+    /// A grant to the asking run's whole zone.
+    pub zone_wide: bool,
+    /// A git push's grant (a window, #26).
+    pub git_push: bool,
+    /// A grant with no number of uses.
+    pub unbounded: bool,
+}
+
+/// The shape of what an agent would grant: which of the refusal-shaped terms it has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GrantShape {
+    pub zone_wide: bool,
+    pub prefix: bool,
+    /// No number of uses.
+    pub unbounded: bool,
+    /// A git push's grant: its terms are a window (`git::grant_terms` changes them).
+    pub git_push: bool,
+}
+
+/// Why an agent may not grant terms of a shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermRefusal {
+    ZoneWide,
+    Prefix,
+    Unbounded,
+    GitPush,
+}
+
+/// The first of `shape`'s refusal-shaped terms that `rules` don't lift, in `agent_terms`' order:
+/// a whole zone, a prefix, no number of uses, a git push. None: an agent may grant it (its
+/// lifetime is checked apart, [`ends_within`]).
+pub fn agent_term_refusal(rules: GrantRules, shape: GrantShape) -> Option<TermRefusal> {
+    if shape.zone_wide && !rules.zone_wide {
+        return Some(TermRefusal::ZoneWide);
+    }
+    if shape.prefix && !rules.prefix {
+        return Some(TermRefusal::Prefix);
+    }
+    if shape.unbounded && !rules.unbounded {
+        return Some(TermRefusal::Unbounded);
+    }
+    if shape.git_push && !rules.git_push {
+        return Some(TermRefusal::GitPush);
+    }
+    None
+}
+
 #[cfg(kani)]
 #[path = "proofs/authority.rs"]
 mod proofs;
@@ -118,5 +172,26 @@ mod tests {
         assert_eq!(ends_by(100, Some(120), 150), Ok(()));
         assert_eq!(ends_by(100, None, 150), Err(Outlasts::Later));
         assert_eq!(ends_by(100, Some(120), 101), Err(Outlasts::Later));
+    }
+
+    /// Every rule and shape (Kani states the same, proofs/authority.rs).
+    #[test]
+    fn each_agent_rule_lifts_exactly_its_own_refusal() {
+        let of = |b: u8| (b & 1 != 0, b & 2 != 0, b & 4 != 0, b & 8 != 0);
+        for rb in 0..16u8 {
+            for sb in 0..16u8 {
+                let (rz, rp, ru, rg) = of(rb);
+                let (sz, sp, su, sg) = of(sb);
+                let rules = GrantRules { zone_wide: rz, prefix: rp, unbounded: ru, git_push: rg };
+                let shape = GrantShape { zone_wide: sz, prefix: sp, unbounded: su, git_push: sg };
+                let want = (sz && !rz) || (sp && !rp) || (su && !ru) || (sg && !rg);
+                assert_eq!(agent_term_refusal(rules, shape).is_some(), want, "{rules:?} {shape:?}");
+                if rb == 0 {
+                    assert_eq!(agent_term_refusal(GrantRules::default(), shape).is_some(), sb != 0);
+                }
+            }
+        }
+        let all = GrantShape { zone_wide: true, prefix: true, unbounded: true, git_push: true };
+        assert_eq!(agent_term_refusal(GrantRules::default(), all), Some(TermRefusal::ZoneWide), "agent_terms' order");
     }
 }

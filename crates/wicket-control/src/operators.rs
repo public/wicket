@@ -148,6 +148,17 @@ impl AgentRules {
         format!("agents: {}\n", serde_json::to_string(self).expect("rules serialise"))
     }
 
+    /// The rules on what an agent may grant, for [`wicket_core::authority::agent_term_refusal`]
+    /// (which Kani checks, #325). The default rules lift no refusal.
+    pub fn grant_rules(&self) -> wicket_core::authority::GrantRules {
+        wicket_core::authority::GrantRules {
+            prefix: self.prefix,
+            zone_wide: self.zone_wide,
+            git_push: self.git_push,
+            unbounded: self.unbounded,
+        }
+    }
+
     /// Whether an agent may decide a request of this method at all.
     pub fn decides(&self, method: &str) -> bool {
         let kind = Asked::of_op(method, "", None).kind;
@@ -349,6 +360,24 @@ pub fn with_identity(mut p: serde_json::Value, tenant: &str) -> serde_json::Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default rules are the ones Kani's harnesses call the default (#325): they lift no
+    /// refusal, and each field maps to its own rule.
+    #[test]
+    fn agent_rules_map_to_the_grant_rules_kani_checks() {
+        use wicket_core::authority::GrantRules;
+        assert_eq!(AgentRules::default().grant_rules(), GrantRules::default());
+        assert_eq!(Policy::parse("").unwrap().agents.grant_rules(), GrantRules::default(), "no agents: section");
+        let one = |f: fn(&mut AgentRules)| {
+            let mut r = AgentRules::default();
+            f(&mut r);
+            r.grant_rules()
+        };
+        assert_eq!(one(|r| r.prefix = true), GrantRules { prefix: true, ..GrantRules::default() });
+        assert_eq!(one(|r| r.zone_wide = true), GrantRules { zone_wide: true, ..GrantRules::default() });
+        assert_eq!(one(|r| r.git_push = true), GrantRules { git_push: true, ..GrantRules::default() });
+        assert_eq!(one(|r| r.unbounded = true), GrantRules { unbounded: true, ..GrantRules::default() });
+    }
 
     fn op(policy: &str, via: &str, name: &str) -> Operator {
         Operator::new("default", via, name, format!("{name}@test"), &Policy::parse(policy).unwrap())

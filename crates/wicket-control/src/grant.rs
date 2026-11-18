@@ -133,19 +133,21 @@ fn descendant_chain(l: &Ledger, a: &AgentAuthority, run: &str) -> Result<Vec<Str
 /// What an agent may grant within what it may decide: exactly the asked path, to the asking run
 /// only, for a bounded number of uses, ending no later than its own authority.
 fn agent_terms(a: &AgentAuthority, req: &Request, t: &Terms) -> Result<()> {
-    let r = &a.rules;
-    if t.zone_wide && !r.zone_wide {
-        bail!("an agent grants to the asking run only, not its whole zone");
-    }
-    if t.prefix.is_some() && !r.prefix {
-        bail!("an agent grants exactly the asked path, not a prefix");
-    }
-    if t.uses.is_none() && !r.unbounded {
-        bail!("an agent's grant needs a number of uses");
-    }
-    // A push's grant is a window, not a number of uses (#26): a human's, unless the rules say.
-    if !r.git_push && wicket_core::git::grant_terms(&req.method, &req.path, t.uses, t.ttl.as_secs()) != (t.uses, t.ttl.as_secs()) {
-        bail!("a git push is decided by an operator");
+    use wicket_core::authority::{agent_term_refusal, GrantShape, TermRefusal};
+    let shape = GrantShape {
+        zone_wide: t.zone_wide,
+        prefix: t.prefix.is_some(),
+        unbounded: t.uses.is_none(),
+        // A push's grant is a window, not a number of uses (#26): a human's, unless the rules say.
+        git_push: wicket_core::git::grant_terms(&req.method, &req.path, t.uses, t.ttl.as_secs()) != (t.uses, t.ttl.as_secs()),
+    };
+    // Each rule lifts exactly its own refusal (Kani checks it, #325).
+    match agent_term_refusal(a.rules.grant_rules(), shape) {
+        Some(TermRefusal::ZoneWide) => bail!("an agent grants to the asking run only, not its whole zone"),
+        Some(TermRefusal::Prefix) => bail!("an agent grants exactly the asked path, not a prefix"),
+        Some(TermRefusal::Unbounded) => bail!("an agent's grant needs a number of uses"),
+        Some(TermRefusal::GitPush) => bail!("a git push is decided by an operator"),
+        None => {}
     }
     let now = wicket_store::now();
     outlasts(a, now, wicket_core::authority::end_of(now, t.ttl.as_secs()), "grant")
@@ -573,18 +575,19 @@ fn renew(l: &mut Ledger, by: &Granter, id: &str, ttl: Duration, extra: serde_jso
 /// could grant now: a grant to the asking run only, for exactly the asked path, with a number of
 /// uses, not a push's window, ending no later than its own authority.
 fn agent_renews(a: &AgentAuthority, g: &wicket_store::GrantRow, req: &Request, until: i64) -> Result<()> {
-    let r = &a.rules;
-    if g.run.as_deref() != Some(req.run.as_str()) && !r.zone_wide {
-        bail!("an agent renews a grant to the asking run only, not its whole zone");
-    }
-    if g.prefix && !r.prefix {
-        bail!("an agent renews a grant for exactly the asked path, not a prefix");
-    }
-    if g.uses_left.is_none() && !r.unbounded {
-        bail!("an agent renews only a grant with a number of uses");
-    }
-    if !r.git_push && wicket_core::git::grant_terms(&g.method, &g.path, Some(1), 60) != (Some(1), 60) {
-        bail!("a git push is decided by an operator");
+    use wicket_core::authority::{agent_term_refusal, GrantShape, TermRefusal};
+    let shape = GrantShape {
+        zone_wide: g.run.as_deref() != Some(req.run.as_str()),
+        prefix: g.prefix,
+        unbounded: g.uses_left.is_none(),
+        git_push: wicket_core::git::grant_terms(&g.method, &g.path, Some(1), 60) != (Some(1), 60),
+    };
+    match agent_term_refusal(a.rules.grant_rules(), shape) {
+        Some(TermRefusal::ZoneWide) => bail!("an agent renews a grant to the asking run only, not its whole zone"),
+        Some(TermRefusal::Prefix) => bail!("an agent renews a grant for exactly the asked path, not a prefix"),
+        Some(TermRefusal::Unbounded) => bail!("an agent renews only a grant with a number of uses"),
+        Some(TermRefusal::GitPush) => bail!("a git push is decided by an operator"),
+        None => {}
     }
     outlasts(a, wicket_store::now(), Some(until), "grant")
 }
