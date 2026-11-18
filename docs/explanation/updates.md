@@ -71,7 +71,12 @@ and stages it. It is accepted only if
 
 - it is **signed by a release key** this installation trusts: a detached `<artifact>.sig` (Ed25519 over a
   domain-separated sha256 of the artifact) by a key in `<data dir>/release-keys/` (`wicket self trust-key`,
-  or `install.sh --release-key`); or
+  or `install.sh --release-key`). A trusted key is a **CI principal** (`release-key:<key id>`) holding a
+  standing grant to install what it signs (#258), `DIGEST wicket.internal /signer/<key id>`, for a day, renewed by the reconciler each pass while the key file is still there, and revoked once
+  it isn't. A verified signature is that principal's one-use `install` grant on the artifact's digest,
+  accepted by the one "may this digest run" check (`digest.accepted`, naming the grant). Revoking the
+  standing grant (`wicket grant revoke`), or removing the key file, so stops a key within a day; a
+  revoked grant is not brought back by the reconciler (`wicket self trust-key` records a new one); or
 - a **human approved its sha256** for one update: an agent's `request_update` (below), approved with
   `wicket approve` or in the console like any R4 request. The approval is used up by the update that
   accepts it, whatever uses the grant had left.
