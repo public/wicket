@@ -30,7 +30,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Keyed on Cargo.toml too: rust-cache's own key stayed the same through #524's [profile] change,
+      # so every run restored the old build, rebuilt all of it, and never saved (an exact hit).
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
       - name: Install gVisor as a Docker runtime
         run: |
           curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
