@@ -7,11 +7,9 @@
 crates/wicket-core/src/op.rs: replace > with >= in classify   # raising to an equal risk leaves it as it was
 # 0.0.0.0, 255.255.255.255 and :: are also refused by `o[0] == 0`, `o[0] >= 240` and `s[..6] == [0; 6]`.
 crates/wicket-core/src/op.rs: replace || with && in is_public_ip   # the broadcast and unspecified clauses are redundant
-# The cost estimate (#183) is an upper bound checked when a token is made: these move its ties and
-# exact boundary (a token costing exactly STEP_BUDGET, an empty pattern set), never a decision.
-crates/wicket-authz/src/cost.rs: replace || with && in host_of   # a host predicate always has one term
-crates/wicket-authz/src/cost.rs: replace > with >= in estimate   # a check with no patterns adds nothing; a tie changes the host named
-crates/wicket-authz/src/cost.rs: replace > with >= in check   # a token costing exactly the budget: no fixture builds one
-# Diagnostics only: nothing outside tests reads them.
-crates/wicket-authz/src/decide.rs: replace Loaded::is_compiled -> bool with true   # every fixture token compiles
-crates/wicket-authz/src/decide.rs: replace Loaded::last_fell_back -> bool with false   # no fixture falls back
+# Diagnostics only: nothing outside tests reads them, and no token a node loads can tell them apart.
+# The structural check (structure.rs) admits only the block shapes the compiled evaluator handles,
+# and a request's facts are always the types those checks compare, so every loadable token compiles
+# and no request falls back (the oracle tests assert both, on every shape they build).
+crates/wicket-authz/src/decide.rs: replace Loaded::is_compiled -> bool with true   # every loadable token compiles
+crates/wicket-authz/src/decide.rs: replace Loaded::last_fell_back -> bool with false   # no request on a loadable token falls back

@@ -1410,6 +1410,52 @@ mod tests {
         }
     }
 
+    /// #466's survivors: an agent renews neither a human's prefix grant nor a git push's window
+    /// unless its rules say, and decides no request at all when its rules name no kind.
+    #[test]
+    fn an_agent_renews_no_prefix_or_push_grant_and_decides_no_kind_unless_its_rules_say() {
+        use crate::operators::AgentRules;
+        let t = Tree::new();
+        let zone = "name: p\nreach:\n  - { host: api.example.com, methods: [GET, POST], paths: [\"/v1/**\", \"/acme/app.git/**\"], allow_dangerous: true }\n";
+        let hook = t.hook(zone);
+        let a = hook.authority();
+        let by = human("alice@cli");
+        let approve = |id: &str, t2: Terms| {
+            let mut l = t.ledger.lock().unwrap();
+            match decide(&mut l, &by, id, &Verdict::Approve(t2), serde_json::json!({})).unwrap() {
+                Decided::Approved { grant, .. } => grant,
+                d => panic!("{d:?}"),
+            }
+        };
+        let rules = |f: fn(&mut AgentRules)| {
+            let mut r = AgentRules::default();
+            f(&mut r);
+            Granter::Agent(AgentAuthority { rules: r, ..a.clone() })
+        };
+        // A prefix grant: refused by default, renewed with the rule.
+        let prefix = approve(&t.ask("run_c", "GET", "/v1/items"), Terms { prefix: Some("/v1/".into()), ..terms(60) });
+        let e = format!("{:#}", renewed(&mut t.ledger.lock().unwrap(), &Granter::Agent(a.clone()), &prefix, 120).unwrap_err());
+        assert!(e.contains("exactly the asked path"), "{e}");
+        assert!(renewed(&mut t.ledger.lock().unwrap(), &rules(|r| r.prefix = true), &prefix, 120).is_ok());
+        // A push's window (no number of uses): refused even when unbounded grants are allowed, unless
+        // pushes are too.
+        let push = approve(&t.ask("run_c", "POST", "/acme/app.git/git-receive-pack"), Terms { uses: None, ..terms(60) });
+        let e = format!("{:#}", renewed(&mut t.ledger.lock().unwrap(), &rules(|r| r.unbounded = true), &push, 120).unwrap_err());
+        assert!(e.contains("git push is decided by an operator"), "{e}");
+        let both = rules(|r| {
+            r.unbounded = true;
+            r.git_push = true;
+        });
+        assert!(renewed(&mut t.ledger.lock().unwrap(), &both, &push, 120).is_ok());
+        // Rules that name no kind decide nothing, an HTTP request included.
+        let get = t.ask("run_c", "GET", "/v1/other");
+        let req = t.ledger.lock().unwrap().request(&get).unwrap();
+        let none = AgentAuthority { rules: AgentRules { kinds: vec![], ..AgentRules::default() }, ..a.clone() };
+        let e = format!("{:#}", within_authority(&t.ledger.lock().unwrap(), &none, &req).unwrap_err());
+        assert!(e.contains("decided by an operator"), "{e}");
+        assert!(within_authority(&t.ledger.lock().unwrap(), &a, &req).is_ok(), "the default rules decide it");
+    }
+
     #[test]
     fn a_running_boxs_authority_is_renewed_by_who_may_grant_it_never_past_its_timeout() {
         let t = Tree::new();
