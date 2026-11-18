@@ -23,12 +23,10 @@ pub const SOCK_DIR: &str = "/wicket/sock";
 pub const CA_DIR: &str = "/wicket/ca";
 pub const STATE_DIR: &str = "/wicket/state";
 pub const WORKSPACE: &str = "/workspace";
-pub const OUTBOX: &str = "/workspace/out/result.json";
 
 /// wicket's services inside the box: their own name and address (set up by wicket-entry), so the
 /// agent keeps all of localhost. 198.18.0.0/15 is reserved for benchmarking and never routed.
 pub const WICKET_HOST: &str = "wicket.internal";
-pub const WICKET_ADDR: &str = "198.18.0.1";
 const PROXY_URL: &str = "http://wicket.internal:3128";
 const LLM_URL: &str = "http://wicket.internal:8080";
 const NO_PROXY: &str = "localhost,127.0.0.1,::1,wicket.internal";

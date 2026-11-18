@@ -1895,7 +1895,8 @@ mod tests {
         }
         assert_eq!(stop_stale_supervisors(&l, &bin).unwrap(), vec!["run_old".to_string()]);
         assert!(old_t.join().unwrap().is_ok(), "stopped and reaped");
-        assert_eq!(crate::owner::owner_alive(&l.run_owner("run_same").unwrap().unwrap()), Some(true));
+        let owner = l.running_runs().unwrap().into_iter().find(|(r, _)| r == "run_same").and_then(|(_, o)| o).unwrap();
+        assert_eq!(crate::owner::owner_alive(&owner), Some(true));
         // SAFETY: as above.
         unsafe { libc::kill(same_pid as i32, libc::SIGKILL) };
     }
