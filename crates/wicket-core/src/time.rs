@@ -683,3 +683,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+#[path = "proofs/time.rs"]
+mod proofs;

@@ -196,17 +196,12 @@ impl OrgLayer {
         }
     }
 
-    /// Whether it allows a spawn.
+    /// Whether it allows a spawn: some alternative lists its image (or any) and admits what it
+    /// asks for ([`wicket_core::quota::SpawnLimits::admits`]).
     pub fn allows_spawn(&self, image: &str, isolation: i64, mem: i64, cpus_milli: i64, pids: i64, timeout_s: i64) -> bool {
         self.spawn.as_ref().is_none_or(|alts| {
-            alts.iter().any(|a| {
-                a.images.as_ref().is_none_or(|i| i.iter().any(|x| x == image))
-                    && a.min_isolation.is_none_or(|n| isolation >= n)
-                    && a.max_mem_bytes.is_none_or(|n| mem <= n)
-                    && a.max_cpus_milli.is_none_or(|n| cpus_milli <= n)
-                    && a.max_pids.is_none_or(|n| pids <= n)
-                    && a.max_timeout_s.is_none_or(|n| timeout_s <= n)
-            })
+            let ask = wicket_core::quota::SpawnAsk { isolation, mem_bytes: mem, cpus_milli, pids, timeout_s };
+            alts.iter().any(|a| a.images.as_ref().is_none_or(|i| i.iter().any(|x| x == image)) && a.limits().admits(ask))
         })
     }
 
@@ -278,6 +273,20 @@ pub struct SpawnMatch {
     pub max_cpus_milli: Option<i64>,
     pub max_pids: Option<i64>,
     pub max_timeout_s: Option<i64>,
+}
+
+impl SpawnMatch {
+    /// Its isolation floor and resource caps, for [`wicket_core::quota::SpawnLimits::admits`]
+    /// (which Kani checks, #325).
+    pub fn limits(&self) -> wicket_core::quota::SpawnLimits {
+        wicket_core::quota::SpawnLimits {
+            min_isolation: self.min_isolation,
+            max_mem_bytes: self.max_mem_bytes,
+            max_cpus_milli: self.max_cpus_milli,
+            max_pids: self.max_pids,
+            max_timeout_s: self.max_timeout_s,
+        }
+    }
 }
 
 /// wicket's isolation strength as an integer (higher is stronger).
