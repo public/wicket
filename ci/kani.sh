@@ -33,47 +33,53 @@ harnesses() {
 }
 
 # Each harness's (and loom's) seconds on a CI runner, as the run's "kani shard I/N times"
-# annotations print them (these from main's run for #537), so they can be pasted in as they are.
+# annotations print them (these from #539's run, on main with #535 and #538), so they can be pasted in as they are.
 # Only the split depends on them: a stale or missing time can slow a part, never skip an item.
 ci_times() {
   cat <<'EOF'
-a_token_ends_at_the_ledgers_millisecond 245 s
-a_push_is_a_post_to_a_repositorys_receive_pack 105 s
-a_grant_is_made_as_picked_or_as_a_push_window 89 s
-check_plain_is_plain_ok 73 s
-upstream_reads_the_same_segments 66 s
-children_never_exceed_the_parent 64 s
-a_wicket_host_is_refused_to_agents 38 s
-a_reserved_method_is_refused_to_agents 38 s
-host_covers_sound 25 s
-a_carve_out_keeps_the_run_within_its_budget 22 s
-a_chain_is_a_strict_ancestry 20 s
-matching_ignores_case_and_trailing_dots 14 s
-a_slice_never_exceeds_what_is_left 12 s
-loom 11 s
-a_descendant_is_found 10 s
-evaluate_reach_set 10 s
-check_escapes_is_escapes_ok 9 s
-wildcard_never_matches_its_apex 7 s
-allow_iff 5 s
+accept_from_lets_in_exactly_whom_it_names 146 s
+a_principal_list_ignores_the_senders_zone 113 s
+a_grant_is_made_as_picked_or_as_a_push_window 102 s
+check_plain_is_plain_ok 85 s
+a_token_ends_with_its_grant_through_2106 83 s
+a_push_is_a_post_to_a_repositorys_receive_pack 82 s
+upstream_reads_the_same_segments 64 s
+children_never_exceed_the_parent 56 s
+a_zone_list_ignores_the_senders_principal 54 s
+a_wicket_host_is_refused_to_agents 41 s
+a_reserved_method_is_refused_to_agents 27 s
+host_covers_sound 27 s
+a_carve_out_keeps_the_run_within_its_budget 21 s
+a_chain_is_a_strict_ancestry 21 s
+matching_ignores_case_and_trailing_dots 17 s
+a_slice_never_exceeds_what_is_left 11 s
+loom 10 s
+evaluate_reach_set 9 s
+wildcard_never_matches_its_apex 9 s
+a_descendant_is_found 8 s
+a_covered_model_pattern_lets_in_nothing_more 7 s
+check_escapes_is_escapes_ok 7 s
+allow_iff 6 s
 allow_lower_risk 4 s
-an_ipv6_address_is_public_exactly_outside_the_special_blocks 4 s
-an_ipv4_address_is_public_exactly_outside_the_special_blocks 3 s
+an_ipv4_address_is_public_exactly_outside_the_special_blocks 4 s
+each_agent_rule_lifts_only_its_refusal 4 s
+an_ipv6_address_is_public_exactly_outside_the_special_blocks 3 s
+default_agent_rules_refuse_what_agent_terms_did 3 s
 forbid_wins 3 s
-the_schema_floor_only_rises 3 s
 a_carried_second_is_added_exactly_or_refused 2 s
 a_feature_is_used_only_if_both_peers_have_it 2 s
+a_grant_of_k_uses_is_accepted_k_times 2 s
 a_renewed_slice_is_the_next_or_no_more_than_it 2 s
 a_spawn_ceiling_admits_what_is_within_it_and_tighter_admits_less 2 s
+a_token_allows_a_reading_before_the_epoch 2 s
 a_use_never_takes_a_grant_below_zero 2 s
 an_agents_grant_ends_within_its_authority 2 s
-each_agent_rule_lifts_only_its_refusal 2 s
+an_approval_widens_unless_it_is_one_use_for_an_hour_for_the_run 2 s
 merging_spent_only_raises_the_counts 2 s
 money_is_accepted_exactly_within_the_limits 2 s
 negotiation_is_symmetric_and_a_jump_is_what_cant_talk 2 s
 peers_talk_within_the_skew_at_the_lower_version 2 s
-a_grant_of_k_uses_is_accepted_k_times 1 s
-default_agent_rules_refuse_what_agent_terms_did 1 s
+the_schema_floor_only_rises 2 s
 EOF
 }
 default_time=30
