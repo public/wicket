@@ -2,8 +2,7 @@
 //! has no counterpart. Over every number of uses and lifetime, either scope, and with or without a
 //! prefix. On `terms_widen`, the decision `Effect::widens` makes on those parts (it reads the
 //! scope as `scope == "zone"`), not on a whole `Effect` with its strings: this harness or
-//! `accept_from`'s ran a CI shard past its hour when they were first written (it was
-//! `accept_from`'s, which then still stopped its shard).
+//! `accept_from`'s ran a CI shard past its hour when they were first written.
 
 use super::{terms_widen, WIDE_TTL_SECS};
 
