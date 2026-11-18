@@ -804,9 +804,10 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
     for (i, n) in nodes.iter().enumerate().filter(|_| !jump) {
         node_update(&ledger, &v, n, &green, &o.gate, i == 0).await?;
     }
-    // wicketd re-executes itself last, once the commands it is running (this one) have ended.
+    // wicketd re-executes itself last, at once, handing its running commands (this one, and runs) to
+    // the new image (#455, #468).
     if let Some(pid) = hangup(&pidfile("daemon"), "daemon") {
-        say(format!("wicketd (pid {pid}) moves to {green} when its running commands end"));
+        say(format!("wicketd (pid {pid}) moves to {green} now, handing its running commands over"));
     }
     say(format!(
         "done: the control host{} run {green}; `wicket self rollback` goes back to {blue}",
@@ -1351,14 +1352,35 @@ fn runs_other_build(pid: u32, bin: &Path) -> bool {
 
 /// Runs `bin`'s reconciler, which starts a new supervisor (`wicket attach`, on `bin`) for each run
 /// in `killed` whose box still runs: what [`stop_stale_supervisors`] stopped. Says how many were.
+///
+/// Counted from the ledger (#487), not from this reconcile's output: the reconciler service may
+/// adopt a run first, and then this pass has nothing to say about it. A run is adopted once it is
+/// still running with a live supervisor (the stopped one is dead); new supervisors take a moment
+/// to record themselves, so this waits up to [`ADOPT_WAIT`] for them.
 pub fn adopt_handed(bin: &Path, killed: &[String]) -> Result<String> {
     let out = std::process::Command::new(bin).arg("reconcile").output().context("running the new build's reconcile")?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let adopted = killed.iter().filter(|r| text.lines().any(|l| l.starts_with("run_adopted") && l.contains(r.as_str()))).count();
+    let ledger = Ledger::open(&crate::ledger_path())?;
+    let deadline = std::time::Instant::now() + ADOPT_WAIT;
+    let adopted = loop {
+        let n = adopted_count(&ledger, killed, |o| crate::owner::owner_alive(o) == Some(true))?;
+        if n == killed.len() || std::time::Instant::now() >= deadline {
+            break n;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
     if adopted != killed.len() {
-        eprintln!("{text}{}", String::from_utf8_lossy(&out.stderr));
+        eprintln!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     }
     Ok(format!("runs: {} handed over, {adopted} adopted by the new build", killed.len()))
+}
+
+/// How long [`adopt_handed`] waits for the handed runs' new supervisors.
+const ADOPT_WAIT: Duration = Duration::from_secs(20);
+
+/// How many of `runs` are running with a supervisor `alive` says is alive.
+fn adopted_count(ledger: &Ledger, runs: &[String], alive: impl Fn(&str) -> bool) -> Result<usize> {
+    let now = ledger.running_runs()?;
+    Ok(runs.iter().filter(|r| now.iter().any(|(id, owner)| id == *r && owner.as_deref().is_some_and(&alive))).count())
 }
 
 /// Runs the health gate for `target` (`control`, or `node:<name>`) over its window: `bin`'s
@@ -1650,7 +1672,7 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
     }
     if !only_nodes {
         if let Some(pid) = hangup(&pidfile("daemon"), "daemon") {
-            say(format!("wicketd (pid {pid}) moves back when its running commands end"));
+            say(format!("wicketd (pid {pid}) moves back now, handing its running commands over"));
         }
     }
     Ok(())
@@ -1746,6 +1768,22 @@ pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #487: a handed run counts as adopted when it runs under a live supervisor, whoever started
+    /// it (the reconciler service, often, before the update's own pass): not by what that pass says.
+    #[test]
+    fn a_handed_run_is_adopted_when_a_live_supervisor_has_it() {
+        let l = Ledger::open_in_memory().unwrap();
+        for (run, owner) in [("run_a", Some("alive")), ("run_b", Some("dead")), ("run_c", None), ("run_d", Some("alive"))] {
+            l.run_started(&TenantId::single(), &wicket_core::RunId(run.into()), "z", "claude").unwrap();
+            if let Some(o) = owner {
+                l.set_run_owner(run, o).unwrap();
+            }
+        }
+        l.run_ended(&wicket_core::RunId("run_d".into()), "lost", "gone").unwrap();
+        let handed: Vec<String> = ["run_a", "run_b", "run_c", "run_d", "run_gone"].map(String::from).to_vec();
+        assert_eq!(adopted_count(&l, &handed, |o| o == "alive").unwrap(), 1, "only run_a: running, with a live supervisor");
+    }
 
     /// #475: a supervisor on another build than the one handing over is stopped (and its run
     /// reported, for the new build's reconciler to adopt); one on the same build, and this process,

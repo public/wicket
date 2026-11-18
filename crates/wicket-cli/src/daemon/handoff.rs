@@ -67,11 +67,6 @@ pub struct Handed {
     pub stage: Option<PathBuf>,
 }
 
-/// How many children are being followed.
-pub fn followed() -> usize {
-    lock().len()
-}
-
 /// Follows child `pid`, whose caller is on `conn`, until it exits: the caller's signals go to the
 /// child's process group (its going away is a SIGTERM), and the result is the child's exit code
 /// (128 + the signal, for one a signal ended). `stage` is removed after it exits, if this image
@@ -155,10 +150,21 @@ pub fn exit_code(status: i32) -> i32 {
 
 /// Held from the handoff's writing through the exec. If the exec fails, dropping it gives the
 /// connections back their close-on-exec flag and removes the handoff.
+///
+/// It holds the registry's lock: nothing on this thread may take it again while it is held (#487:
+/// asking the registry how many children it hands over, here, deadlocked wicketd mid-handover).
+/// How many it hands over is [`Prepared::handed`].
 pub struct Prepared {
     _registry: MutexGuard<'static, BTreeMap<i32, Entry>>,
     fds: Vec<i32>,
     path: PathBuf,
+}
+
+impl Prepared {
+    /// How many children the handoff carries.
+    pub fn handed(&self) -> usize {
+        self.fds.len()
+    }
 }
 
 impl Drop for Prepared {
@@ -298,6 +304,7 @@ mod tests {
             let c = h.children.iter().find(|c| c.pid == pid).expect("handed");
             assert_eq!((h.daemon, c.stage.as_deref()), (std::process::id(), Some(stage.as_path())));
             assert!(!cloexec(c.conn), "kept open across the exec");
+            assert!(held.handed() >= 1 && held.handed() == h.children.len());
             let fd = c.conn;
             drop(held);
             assert!(cloexec(fd), "an exec that failed: closed on exec again");
