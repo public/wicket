@@ -239,23 +239,26 @@ impl Loaded {
         };
         let mut hard = Vec::new();
         let mut soft = Vec::new();
+        use wicket_core::escalation::{needs_grant, Failed};
         for c in &checks {
-            match c {
-                FailedCheck::Authorizer(a) => hard.push(format!("node: {}", a.rule)),
+            let (failed, text) = match c {
+                FailedCheck::Authorizer(a) => (Failed::Node, format!("node: {}", a.rule)),
                 FailedCheck::Block(b) => {
                     let class = self.vetted.classes.get(b.block_id as usize).and_then(|v| v.get(b.check_id as usize));
-                    let text = format!("block {}: {}", b.block_id, b.rule);
-                    match class {
-                        Some(CheckClass::Escalatable) => soft.push(text),
-                        _ => hard.push(text),
-                    }
+                    (Failed::Block(class.map(|c| *c == CheckClass::Escalatable)), format!("block {}: {}", b.block_id, b.rule))
                 }
+            };
+            if failed.soft() {
+                soft.push(text);
+            } else {
+                hard.push(text);
             }
         }
-        if !hard.is_empty() || soft.is_empty() {
-            Decision::Forbidden(hard.join("; "))
-        } else {
+        // Fail-closed (wicket-core's rule, which Kani checks, #325).
+        if needs_grant(hard.len(), soft.len()) {
             Decision::NeedsGrant(soft.join("; "))
+        } else {
+            Decision::Forbidden(hard.join("; "))
         }
     }
 }
