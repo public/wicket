@@ -1,7 +1,8 @@
 //! The simulated scenarios (#324), each with faults from a seed, checked against #321's invariants:
 //! `feed` (the first slice: a control host, one node and two box stubs; grants and model budgets),
 //! `placement` (placed nodes' leases, the reconciler, the money limit and release, several runs
-//! on one node) and `messages` (principals, held messages, wake and receipts).
+//! on one node), `messages` (principals, held messages, wake and receipts) and `update` (an
+//! install's restart and a self update's re-exec under long-lived runs).
 //!
 //! - `seeds_<scenario>_<part>`: each scenario for a fixed set of seeds, in parts, or
 //!   `WICKET_SIM_SEEDS=<n>` seeds from
@@ -86,6 +87,7 @@ seeds! {
     seeds_messages_8: "messages", 8 of 11;
     seeds_messages_9: "messages", 9 of 11;
     seeds_messages_10: "messages", 10 of 11;
+    seeds_update_0: "update", 0 of 1;
 }
 
 /// Part `part` of `parts` of `scenario`'s seeds (none when `WICKET_SIM_SCENARIO` names another
@@ -176,10 +178,61 @@ fn deterministic_messages() {
     deterministic("messages");
 }
 
+#[test]
+fn deterministic_update() {
+    deterministic("update");
+}
+
 /// The `deterministic_*` tests cover every scenario.
 #[test]
 fn deterministic_covers_every_scenario() {
-    assert_eq!(SCENARIOS, ["feed", "placement", "messages"], "add a deterministic_<scenario> test for each new scenario");
+    assert_eq!(SCENARIOS, ["feed", "placement", "messages", "update"], "add a deterministic_<scenario> test for each new scenario");
+}
+
+/// The update scenario's bugs (#475, #487, #529), each found again with its fix turned off: the
+/// seed breaks the invariant the fix protects, and nothing else.
+fn update_without(seed: u64, options: wicket_sim::update::Options, expect: &str) {
+    let r = wicket_sim::update::run(seed, &dir().join("update-without"), options);
+    assert!(!r.ok() && r.violations.iter().all(|v| v.contains(expect)), "update seed {seed}: expected only {expect:?}: {r}");
+}
+
+/// #475: without the expand rule, and with an install leaving supervisors on the old build (no
+/// #477 handover), an old supervisor takes the new build's prompts as something else and drops them.
+#[test]
+fn without_the_expand_rule_and_the_handover_an_old_supervisor_drops_prompts() {
+    let o = wicket_sim::update::Options { expand_safe: false, hand_over_on_start: false, ..Default::default() };
+    update_without(0, o, "an old build's supervisor dropped a new-schema prompt");
+}
+
+/// #487: a SIGHUP drain that never returns leaves the daemon refusing every command.
+#[test]
+fn without_a_drain_that_returns_the_cli_is_never_answered() {
+    let o = wicket_sim::update::Options { drain_returns: false, ..Default::default() };
+    update_without(1, o, "the CLI got no answer within");
+}
+
+/// #529: an install's restarted wicketd hands the local run over while the local serve is still the
+/// old build, and the new supervisor's re-attach loses the box.
+#[test]
+fn without_the_serve_moved_first_an_install_stops_the_local_box() {
+    let o = wicket_sim::update::Options { serve_first_on_start: false, ..Default::default() };
+    update_without(0, o, "re-attached to the local node's serve on the old build");
+}
+
+/// #529, in a self update: the old order (stop the supervisors, then re-exec the serve) lets the
+/// reconciler service re-attach in between. A race: seed 19 is one of 8 of seeds 0-199.
+#[test]
+fn without_the_serve_moved_first_a_self_update_can_stop_the_local_box() {
+    let o = wicket_sim::update::Options { serve_first_on_update: false, ..Default::default() };
+    update_without(19, o, "re-attached to the local node's serve on the old build");
+}
+
+/// #529: without `KillMode=process` on the reconciler unit, install.sh's restart of it SIGTERMs
+/// the supervisors its passes started, and each ends its box.
+#[test]
+fn without_killmode_process_the_reconcilers_restart_stops_boxes() {
+    let o = wicket_sim::update::Options { reconcile_keeps_children: false, ..Default::default() };
+    update_without(10, o, "SIGTERMed by the unit's restart");
 }
 
 /// What the simulation found first (#324): a node whose spend file was written only once a second,
