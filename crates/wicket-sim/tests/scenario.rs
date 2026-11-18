@@ -1,6 +1,6 @@
 //! The simulated scenarios (#324), each with faults from a seed, checked against #321's invariants:
 //! `feed` (the first slice: a control host, one node and two box stubs; grants and model budgets),
-//! `placement` (placed nodes' leases, the reconciler, the money envelope and release, several runs
+//! `placement` (placed nodes' leases, the reconciler, the money limit and release, several runs
 //! on one node) and `messages` (principals, held messages, wake and receipts).
 //!
 //! - `seeds_<scenario>_<part>`: each scenario for a fixed set of seeds, in parts, or
@@ -190,11 +190,12 @@ fn the_ledger_check_finds_a_node_released_with_a_runs_files() {
 }
 
 /// A reconciler pass listed a node `place create` had just made, before it was recorded, and
-/// destroyed it as having no lease.
+/// destroyed it as having no lease. (Seed 20 found it; since #256 an acquire no longer lists the
+/// provider's nodes before it creates, which moved the race, and seed 4 is the first that finds it.)
 #[test]
 fn without_the_grace_the_reconciler_destroys_a_node_just_placed() {
     let o = wicket_sim::placement::Options { young_grace: false, ..Default::default() };
-    placement_without("grace", 20, o, "before its lease ends");
+    placement_without("grace", 4, o, "before its lease ends");
 }
 
 /// The known loss the messages scenario found (#324, see `wicket_sim::messages::run`): a relayed
