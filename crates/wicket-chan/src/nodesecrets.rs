@@ -466,7 +466,7 @@ impl Slices {
     }
 
     pub fn put(&self, run: &str, s: &Slice) -> Result<()> {
-        write_atomic(&self.file(run)?, &serde_json::to_vec(s)?)
+        crate::files::write_atomic(&self.file(run)?, &serde_json::to_vec(s)?)
     }
 
     pub fn get(&self, run: &str) -> Option<Slice> {
@@ -478,17 +478,6 @@ impl Slices {
             let _ = std::fs::remove_file(f);
         }
     }
-}
-
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 /// Asks raised on a node while its control host was unreachable (#153), kept until it answers.
@@ -522,7 +511,7 @@ impl Asks {
     }
 
     fn save(&self, held: &BTreeMap<String, QueuedAsk>) {
-        let _ = write_atomic(&self.file, &serde_json::to_vec(held).unwrap_or_default());
+        let _ = crate::files::write_atomic(&self.file, &serde_json::to_vec(held).unwrap_or_default());
     }
 
     /// Queues an ask (or finds the one already queued for the same run and op): its id, and

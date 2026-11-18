@@ -1597,7 +1597,7 @@ fn runtime_spans(t: &Timings, run: (std::time::SystemTime, Instant), end: (std::
 const DERIVED_FILE: &str = "derived.json";
 
 fn save_derived(dir: &std::path::Path, a: &BoxAuthority) -> Result<()> {
-    crate::nodesecrets::write_atomic(&dir.join(DERIVED_FILE), &serde_json::to_vec(a)?)
+    wicket_chan::files::write_atomic(&dir.join(DERIVED_FILE), &serde_json::to_vec(a)?)
 }
 
 /// Holds a child's derived authority again (a restarted `serve`), unless the feed holds its own.
@@ -2524,9 +2524,7 @@ fn ca_validity(pem: &[u8]) -> Option<(i64, i64)> {
 /// mid-write must not leave a short file, which a restarted `serve` would read as nothing spent.
 /// Called under the model proxy's journal lock only ([`wicket_proxy::llm::Llm::journal`]).
 fn write_spend(path: &std::path::Path, s: &wicket_proxy::llm::Spent) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(s).unwrap_or_default())?;
-    std::fs::rename(&tmp, path)
+    wicket_chan::files::replace(path, "json.tmp", &serde_json::to_vec(s).unwrap_or_default())
 }
 
 /// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).

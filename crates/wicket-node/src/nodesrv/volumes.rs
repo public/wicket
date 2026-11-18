@@ -34,10 +34,7 @@ fn read(p: &Path) -> Option<Life> {
 }
 
 fn write(p: &Path, l: &Life) {
-    let tmp = p.with_extension("tmp");
-    if std::fs::write(&tmp, serde_json::to_vec(l).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, p);
-    }
+    let _ = wicket_chan::files::replace(p, "tmp", &serde_json::to_vec(l).unwrap_or_default());
 }
 
 fn life_of<'a>(bs: &'a BoxStart, name: &str) -> Option<&'a VolumeLife> {
