@@ -650,13 +650,14 @@ impl LlmSpec {
 /// a principal entry only its id, so a list's two kinds never cross (and wicket-policy's Cedar,
 /// which reads the zone as the message's resource and the id as `context.sender`, says the same, #411).
 pub fn is_principal_entry(entry: &str) -> bool {
-    entry.contains("://")
+    // `contains("://")`, as a plain scan: str's substring search costs Kani far more (#325).
+    entry.as_bytes().windows(3).any(|w| w == b"://")
 }
 
 /// Whether an `accept_from` list lets a sender in: it names the sender's zone, or (#250) the
 /// sender's principal id, when the caller knows it.
-pub fn accepts(accept_from: &[String], zone: &str, principal: Option<&str>) -> bool {
-    accept_from.iter().any(|a| if is_principal_entry(a) { principal == Some(a.as_str()) } else { a == zone })
+pub fn accepts<S: AsRef<str>>(accept_from: &[S], zone: &str, principal: Option<&str>) -> bool {
+    accept_from.iter().map(AsRef::as_ref).any(|a| if is_principal_entry(a) { principal == Some(a) } else { a == zone })
 }
 
 /// Whether model pattern `pattern` (a name, or a prefix ending in `*`) covers `other`: a model
@@ -1138,6 +1139,35 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
 
+    /// #325: `is_principal_entry` scans bytes now (for Kani); it decides as `contains("://")` did.
+    #[test]
+    fn a_principal_entry_is_one_with_a_scheme_separator() {
+        for e in ["", ":", "://", "a://", "://b", "spiffe://t/z/a", ":/", "a:/b", "é://", "a:/:/", "zone", "a::///"] {
+            assert_eq!(super::is_principal_entry(e), e.contains("://"), "{e}");
+        }
+    }
+
+    /// #325: why Kani's `a_covered_model_pattern_lets_in_nothing_more` holds only for the patterns
+    /// `check_models` accepts: with a `*` inside one, covering isn't transitive, and a child's list
+    /// a parent's covers could let in more. `check_models` refuses such a pattern.
+    #[test]
+    fn model_covering_is_transitive_only_for_valid_patterns() {
+        use super::{model_covers, LlmSpec};
+        assert!(model_covers("a**", "a*") && model_covers("a*", "ab") && !model_covers("a**", "ab"));
+        let spec = |m: &str| LlmSpec {
+            provider: String::new(),
+            secret: String::new(),
+            upstream: String::new(),
+            max_requests: 1,
+            max_output_tokens: 1,
+            max_input_tokens: None,
+            allow_server_tools: false,
+            models: Some(vec![m.to_string()]),
+        };
+        assert!(spec("a**").check_models().is_err());
+        assert!(spec("a*").check_models().is_ok() && spec("ab").check_models().is_ok());
+    }
+
     /// #250: accept_from names zones (every agent in one) or principals (one agent, or an operator).
     #[test]
     fn accept_from_names_a_zone_or_a_principal() {
@@ -1146,7 +1176,7 @@ mod tests {
         assert!(accepts(&list, "audit", Some("spiffe://w.test/t/t0/z/audit/a/auditor")), "one listed principal");
         assert!(!accepts(&list, "audit", Some("spiffe://w.test/t/t0/z/audit/a/other")), "not its zone-mates");
         assert!(!accepts(&list, "audit", None), "a principal entry needs the sender's id");
-        assert!(!accepts(&[], "ops", Some("x")));
+        assert!(!accepts::<String>(&[], "ops", Some("x")));
         // #411: the kinds never cross: a zone entry isn't an id, a principal entry isn't a zone.
         assert!(!accepts(&list, "audit", Some("ops")), "a zone entry matches the sender's zone only");
         assert!(!accepts(&list, "spiffe://w.test/t/t0/z/audit/a/auditor", None), "a principal entry matches the sender's id only");
@@ -1510,3 +1540,7 @@ zone:
         assert!(crate::yaml::to_string(&m).unwrap().contains("drive: true"));
     }
 }
+
+#[cfg(kani)]
+#[path = "proofs/manifest.rs"]
+mod proofs;
