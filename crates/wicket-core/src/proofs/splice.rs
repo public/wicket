@@ -11,8 +11,10 @@ const PAT: &[u8] = b"ab.*";
 const HOST: &[u8] = b"ab.";
 
 /// Sound, as `inspection` needs it: if some host matches both patterns, they overlap, so a host a
-/// forbid rule could name is never spliced; and the relation is symmetric. For an exact pattern it
-/// is exactly matching.
+/// forbid rule could name is never spliced; and the relation is symmetric. Against an exact host
+/// it is exactly matching for a pattern without a trailing dot, and wider for one with one: the
+/// overlap trims a pattern's trailing dots, matching doesn't (so `a.` overlaps `a`, which it
+/// doesn't match; the safe side, inspecting more).
 #[kani::proof]
 #[kani::unwind(7)]
 fn patterns_that_share_a_host_overlap() {
@@ -23,7 +25,11 @@ fn patterns_that_share_a_host_overlap() {
         assert!(overlap);
     }
     assert_eq!(overlap, patterns_overlap(b.as_str(), a.as_str()));
-    if !host.bytes().is_empty() {
-        assert_eq!(patterns_overlap(a.as_str(), host.as_str()), host_matches(a.as_str(), host.as_str()));
+    let matches = host_matches(a.as_str(), host.as_str());
+    let with_host = patterns_overlap(a.as_str(), host.as_str());
+    if a.bytes().last() != Some(&b'.') {
+        assert_eq!(with_host, matches);
+    } else {
+        assert!(with_host || !matches);
     }
 }

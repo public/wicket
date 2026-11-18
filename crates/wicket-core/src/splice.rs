@@ -43,7 +43,8 @@ impl Inspection {
 }
 
 /// Whether some host matches both patterns (`*.example.com`, or an exact name). For an exact
-/// `b`, this is [`host_matches`]`(a, b)`.
+/// `b`, this is [`host_matches`]`(a, b)` when `a` has no trailing dot; with one it is wider (the
+/// overlap trims a pattern's trailing dots, matching doesn't), which only inspects more.
 pub fn patterns_overlap(a: &str, b: &str) -> bool {
     // Over bytes, ignoring ASCII case and trailing dots, without allocating (Kani checks it, #325).
     fn trim(mut x: &[u8]) -> &[u8] {
@@ -140,6 +141,39 @@ mod tests {
     use super::*;
     use crate::op::{CompiledZone, Op, Verdict};
     use crate::{Manifest, RiskClass, RunId, TenantId};
+
+    /// #325: what Kani's `patterns_that_share_a_host_overlap` states, exhaustively over every pattern
+    /// of up to four bytes of `ab.*` and every host of up to four of `ab.` (Kani goes to five).
+    #[test]
+    fn patterns_that_share_a_host_overlap_exhaustively() {
+        fn all(alphabet: &[u8], n: usize) -> Vec<String> {
+            let mut out = vec![String::new()];
+            let mut last = vec![String::new()];
+            for _ in 0..n {
+                last = last.iter().flat_map(|s| alphabet.iter().map(move |c| format!("{s}{}", *c as char))).collect();
+                out.extend(last.iter().cloned());
+            }
+            out
+        }
+        let (pats, hosts) = (all(b"ab.*", 4), all(b"ab.", 4));
+        for a in &pats {
+            for h in &hosts {
+                let (m, o) = (host_matches(a, h), patterns_overlap(a, h));
+                if a.ends_with('.') {
+                    assert!(o || !m, "{a:?} {h:?}");
+                } else {
+                    assert_eq!(o, m, "{a:?} {h:?}");
+                }
+            }
+            for b in &pats {
+                let o = patterns_overlap(a, b);
+                assert_eq!(o, patterns_overlap(b, a), "{a:?} {b:?}");
+                if !o {
+                    assert!(!hosts.iter().any(|h| host_matches(a, h) && host_matches(b, h)), "{a:?} {b:?}");
+                }
+            }
+        }
+    }
 
     /// #325: `patterns_overlap` works on bytes now (for Kani); it decides as the lowercasing form did.
     #[test]
