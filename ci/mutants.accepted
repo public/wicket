@@ -13,3 +13,26 @@ crates/wicket-core/src/op.rs: replace || with && in is_public_ip   # the broadca
 # and no request falls back (the oracle tests assert both, on every shape they build).
 crates/wicket-authz/src/decide.rs: replace Loaded::is_compiled -> bool with true   # every loadable token compiles
 crates/wicket-authz/src/decide.rs: replace Loaded::last_fell_back -> bool with false   # no request on a loadable token falls back
+
+# wicket-proxy (the proxy set). Trait defaults that every production implementation overrides (the
+# node's NodeDecider and its control link, nodesrv.rs's Control): only test doubles reach them.
+crates/wicket-proxy/src/decide.rs: replace Decider::splice -> Option<usize> with Some(0)   # NodeDecider overrides it
+crates/wicket-proxy/src/decide.rs: replace Decider::splice -> Option<usize> with Some(1)   # NodeDecider overrides it
+crates/wicket-proxy/src/decide.rs: replace Decider::splice_lost -> String with String::new()   # NodeDecider overrides it; a text only
+crates/wicket-proxy/src/decide.rs: replace Decider::splice_lost -> String with "xyzzy".into()   # NodeDecider overrides it; a text only
+crates/wicket-proxy/src/decide.rs: replace Decider::splice_note -> &'static str with "xyzzy"   # NodeDecider overrides it; an audit note only
+crates/wicket-proxy/src/decide.rs: replace ControlLink::queue -> Result<String, String> with Ok(String::new())   # the node's Control overrides it
+crates/wicket-proxy/src/decide.rs: replace ControlLink::queue -> Result<String, String> with Ok("xyzzy".into())   # the node's Control overrides it
+# `total == 10 || (total > 10 && total % 10 == 0)`: at ten the first clause holds already.
+crates/wicket-proxy/src/egress/hosts.rs: replace > with >= in Egress::strike   # ten is the first clause
+# Only on a node does vault.ensure fetch, and so fail; elsewhere it is Ok, and the branch never runs.
+crates/wicket-proxy/src/egress/outgoing.rs: delete ! in Egress::prepare   # ensure fails only on a node with its control host away
+# After vault.check has passed, the secret is there: vault.get fails only if it is removed in between.
+crates/wicket-proxy/src/egress/outgoing.rs: replace match guard rule.optional with true in Egress::prepare   # get after check: only a racing removal
+crates/wicket-proxy/src/egress/outgoing.rs: replace match guard rule.optional with false in Egress::prepare   # get after check: only a racing removal
+# The domain-existence cache's bound (1024 entries): one more cached, never a different answer.
+crates/wicket-proxy/src/egress/hosts.rs: replace < with <= in Egress::domain_exists   # cache size only
+# Which words a tripwire refusal uses for another run's placeholder: the refusal is the same.
+crates/wicket-proxy/src/egress/outgoing.rs: replace match guard seen.contains(&tag) with false in Egress::tripwire   # the message only
+# HEAD, 204 and 304 carry no body: `||` refuses one of those that says it is encoded, which has none to check.
+crates/wicket-proxy/src/egress/outgoing.rs: replace && with || in Egress::clean   # bodiless responses only

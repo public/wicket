@@ -401,6 +401,11 @@ async fn an_unknown_bearer_on_a_placeholder_host_is_dropped_and_audited() {
     }
     assert!(!w.seen(HOST).contains("stale-or-forged-token") && !w.seen(HOST).contains("authorization"), "{}", w.seen(HOST));
     assert_eq!(w.audits("placeholder.unknown").len(), 1, "once per host per run");
+    // A host that has no placeholder: the box's bearer is dropped too, but there is no placeholder
+    // it could have meant, so nothing is audited as one.
+    let (head, _) = w.call(OTHER, "GET", "/echo", &bearer("someone-elses-token"), "").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(w.audits("placeholder.unknown").len(), 1, "not counted for a host with no placeholder");
 }
 
 #[derive(Debug)]
