@@ -324,7 +324,7 @@ pub fn keygen(out: &Path) -> Result<()> {
     getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
     let key = wicket_identity::SigningKey::from_bytes(&seed);
     let public = key.verifying_key().to_bytes();
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode_0600().open(out)?;
+    let mut f = std::os::unix::fs::OpenOptionsExt::mode(std::fs::OpenOptions::new().write(true).create_new(true), 0o600).open(out)?;
     use std::io::Write;
     writeln!(f, "{}", serde_json::json!({ "alg": "ed25519", "secret": B64.encode(seed) }))?;
     let pubpath = PathBuf::from(format!("{}.pub", out.display()));
@@ -336,16 +336,6 @@ pub fn keygen(out: &Path) -> Result<()> {
         pubpath.display()
     );
     Ok(())
-}
-
-trait Mode0600 {
-    fn mode_0600(&mut self) -> &mut Self;
-}
-impl Mode0600 for std::fs::OpenOptions {
-    fn mode_0600(&mut self) -> &mut Self {
-        use std::os::unix::fs::OpenOptionsExt;
-        self.mode(0o600)
-    }
 }
 
 fn read_secret(key: &Path) -> Result<wicket_identity::SigningKey> {
@@ -921,7 +911,7 @@ fn units_installed(ledger: &Mutex<Ledger>, v: &Versions, green: &str, artifact_s
         Some(u) if !u.is_empty() => u,
         _ => return Ok(()),
     };
-    let e = crate::units::UnitsPending { version: green.into(), units, dir, root_copy: crate::units::root_copy(green) };
+    let e = crate::units::UnitsPending { version: green.into(), units, dir, root_copy: crate::rootcopy::Layout::installed().copy(green) };
     audit(
         ledger,
         "self.update_refused",
@@ -940,7 +930,7 @@ fn warn_units(v: &Versions, to: &str) {
                 "warning: {to}'s systemd units differ from those installed in {} ({}): to have its own, {}",
                 dir.display(),
                 u.join(", "),
-                crate::units::apply_hint(to, &crate::units::root_copy(to))
+                crate::units::apply_hint(to, &crate::rootcopy::Layout::installed().copy(to))
             ));
         }
     }
@@ -1008,7 +998,9 @@ pub fn update_lock() -> Result<std::fs::File> {
     Ok(f)
 }
 
-struct RemoveOnDrop(PathBuf);
+/// A directory removed, with what is in it, when this is dropped: a private staging directory's
+/// lifetime (wicket-cli's one such guard).
+pub(crate) struct RemoveOnDrop(pub(crate) PathBuf);
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -1895,7 +1887,8 @@ mod tests {
         }
         assert_eq!(stop_stale_supervisors(&l, &bin).unwrap(), vec!["run_old".to_string()]);
         assert!(old_t.join().unwrap().is_ok(), "stopped and reaped");
-        assert_eq!(crate::owner::owner_alive(&l.run_owner("run_same").unwrap().unwrap()), Some(true));
+        let owner = l.running_runs().unwrap().into_iter().find(|(r, _)| r == "run_same").and_then(|(_, o)| o).unwrap();
+        assert_eq!(crate::owner::owner_alive(&owner), Some(true));
         // SAFETY: as above.
         unsafe { libc::kill(same_pid as i32, libc::SIGKILL) };
     }

@@ -265,48 +265,8 @@ enum Cmd {
     /// HTTP on loopback by default; any other address needs HTTPS (--acme-domain, or --tls-cert and
     /// --tls-key) or --behind-tls-terminator.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:8787")]
-        listen: String,
-        /// Browser origin for WebAuthn (default: http://localhost:PORT; https://DOMAIN with ACME).
-        #[arg(long)]
-        origin: Option<String>,
-        /// WebAuthn relying-party id (default: the origin's host).
-        #[arg(long)]
-        rp_id: Option<String>,
-        /// Serve HTTPS with this certificate chain (PEM; re-read when it changes).
-        #[arg(long, requires = "tls_key")]
-        tls_cert: Option<PathBuf>,
-        /// The certificate's private key (PEM).
-        #[arg(long, requires = "tls_cert")]
-        tls_key: Option<PathBuf>,
-        /// Serve HTTPS with a certificate from an ACME CA (Let's Encrypt) for this name, validated
-        /// with TLS-ALPN-01 on this listener (so listen on :443).
-        #[arg(long)]
-        acme_domain: Option<String>,
-        /// Accept the ACME CA's terms of service (required with --acme-domain).
-        #[arg(long)]
-        acme_agree_tos: bool,
-        /// Contact for the ACME account (mailto:...; repeatable).
-        #[arg(long)]
-        acme_contact: Vec<String>,
-        /// Use Let's Encrypt's staging CA (untrusted certificates; for trying the setup).
-        #[arg(long)]
-        acme_staging: bool,
-        /// Another ACME directory URL.
-        #[arg(long)]
-        acme_directory: Option<String>,
-        /// Where the ACME account and certificate are kept (default $WICKET_HOME/acme).
-        #[arg(long)]
-        acme_cache: Option<PathBuf>,
-        /// A TLS-terminating proxy in front serves the console's https:// --origin; listen in plain HTTP.
-        #[arg(long)]
-        behind_tls_terminator: bool,
-        /// The proxy's address or range (repeatable): its X-Forwarded-For names the client.
-        #[arg(long)]
-        trusted_proxy: Vec<String>,
-        /// Most simultaneous connections.
-        #[arg(long, default_value_t = 256)]
-        max_connections: usize,
+        #[command(flatten)]
+        opts: serve::ServeOpts,
         /// Don't print a passkey enrolment link at start when no passkey is enrolled (a system
         /// install's log may be readable by operators; root prints one with `operator enrol-link`).
         #[arg(long)]
@@ -483,49 +443,6 @@ async fn main() -> Result<()> {
         c @ (Cmd::Serve { .. } | Cmd::Operator { .. } | Cmd::Program { .. }) => cmd::operator::dispatch(c).await,
         c @ Cmd::Dev { .. } => cmd::dev::dispatch(c).await,
     }
-}
-
-/// A `serve` command's options, and whether it prints no enrolment link at start.
-fn serve_opts(c: Cmd) -> Option<(serve::ServeOpts, bool)> {
-    let Cmd::Serve {
-        listen,
-        origin,
-        rp_id,
-        tls_cert,
-        tls_key,
-        acme_domain,
-        acme_agree_tos,
-        acme_contact,
-        acme_staging,
-        acme_directory,
-        acme_cache,
-        behind_tls_terminator,
-        trusted_proxy,
-        max_connections,
-        no_bootstrap_link,
-    } = c
-    else {
-        return None;
-    };
-    Some((
-        serve::ServeOpts {
-            listen,
-            origin,
-            rp_id,
-            tls_cert,
-            tls_key,
-            acme_domain,
-            acme_contact,
-            acme_directory,
-            acme_staging,
-            acme_agree_tos,
-            acme_cache,
-            behind_tls_terminator,
-            trusted_proxy,
-            max_connections,
-        },
-        no_bootstrap_link,
-    ))
 }
 
 #[cfg(test)]

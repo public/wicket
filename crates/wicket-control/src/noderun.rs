@@ -97,7 +97,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
             let mut seed = [0u8; 32];
             getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path)?;
-            f.write_all_sync(hex::encode(seed).as_bytes())?;
+            std::io::Write::write_all(&mut f, hex::encode(seed).as_bytes())?;
             wicket_identity::SigningKey::from_bytes(&seed)
         }
         Err(e) => return Err(e.into()),
@@ -138,15 +138,6 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
     };
     let authz_root = crate::roots::authz_root_public()?;
     Ok(Publisher::open_with(&dir, name, &crate::roots::feed_root_public()?, key, &cert_jws, cfg.clone(), authz_root)?)
-}
-
-trait WriteSync {
-    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()>;
-}
-impl WriteSync for std::fs::File {
-    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()> {
-        std::io::Write::write_all(self, b)
-    }
 }
 
 /// A node's feed, shared by every process that publishes to it (each run on the node, and each
@@ -720,7 +711,8 @@ pub async fn start(s: Start) -> Result<NodeBox> {
 /// hosts need the CA while it is expired. Not renewed by then, the start goes ahead and the node
 /// says why it refuses.
 async fn ca_current(sh: &Shared, proto: u32) {
-    if proto < crate::chan::CA_RENEWAL || sh.node == crate::localnode::NAME {
+    // 0: not negotiated yet. Every version a connection can talk renews (#416).
+    if proto == 0 || sh.node == crate::localnode::NAME {
         return;
     }
     let expired =
@@ -838,7 +830,7 @@ struct Progress {
     renew_after: i64,
     /// The node CA's renewal on this connection (#416).
     ca: wicket_node::controlca::CaRenewal,
-    /// The protocol version this connection talks (#162): version-2 messages go only at 2 or later.
+    /// The protocol version this connection talks (#162); 0 until it has negotiated one.
     proto: u32,
     /// Whether a budget slice went on this connection, and the last one sent (#152).
     slice_sent: bool,

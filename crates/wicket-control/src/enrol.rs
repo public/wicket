@@ -28,8 +28,8 @@
 //!   the one secret a dedicated node holds (design §8, #57): stolen, it can only mint certificates for
 //!   the hosts that node's boxes could reach anyway, until it expires.
 //!   It is renewed over the channel at half-life, with a new key and the same constraints
-//!   (`nodeca.rs`, #416, protocol 14); `renew-ca` renews it over ssh, for a node at protocol 13, one
-//!   unreachable meanwhile, or new `--hosts`.
+//!   (`nodeca.rs`, #416); `renew-ca` renews it over ssh, for a node unreachable meanwhile, or new
+//!   `--hosts`.
 //! - **Feed and issuer keys.** The node gets the feed root's public key (created on the control host,
 //!   next to the issuer key, on first use) and the issuer's public JWK, to verify the feed and agent
 //!   identities offline.
@@ -468,10 +468,10 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
         row.host_key_fp,
         &row.node_key[..16],
         nc.sub,
-        fmt_time(nc.exp),
+        wicket_core::time::unix_rfc3339(nc.exp),
         cert.serial,
         cert.permitted.join(", "),
-        fmt_time(cert.not_after)
+        wicket_core::time::unix_rfc3339(cert.not_after)
     );
     Ok(())
 }
@@ -524,8 +524,8 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration, cert_ttl
         "renewed node {name}'s CA: serial {} for {} until {}; identity certificate until {}",
         cert.serial,
         cert.permitted.join(", "),
-        fmt_time(cert.not_after),
-        fmt_time(nc.exp)
+        wicket_core::time::unix_rfc3339(cert.not_after),
+        wicket_core::time::unix_rfc3339(nc.exp)
     );
     Ok(())
 }
@@ -574,16 +574,21 @@ pub fn list() -> Result<()> {
         let ca = l.node_cas(&n.name)?.into_iter().find(|c| c.status == "active");
         let ca = match ca {
             Some(c) if c.not_after > wicket_store::now() => {
-                format!("CA {} until {}", &c.serial[..12.min(c.serial.len())], fmt_time(c.not_after))
+                format!("CA {} until {}", &c.serial[..12.min(c.serial.len())], wicket_core::time::unix_rfc3339(c.not_after))
             }
             Some(c) => {
-                format!("CA {} EXPIRED {} (wicket node renew-ca {})", &c.serial[..12.min(c.serial.len())], fmt_time(c.not_after), n.name)
+                format!(
+                    "CA {} EXPIRED {} (wicket node renew-ca {})",
+                    &c.serial[..12.min(c.serial.len())],
+                    wicket_core::time::unix_rfc3339(c.not_after),
+                    n.name
+                )
             }
             None => "no CA".into(),
         };
         let id = match l.node_certs(&n.name)?.into_iter().find(|c| c.status == "active") {
-            Some(c) if c.not_after > now => format!("identity until {}", fmt_time(c.not_after)),
-            Some(c) => format!("identity EXPIRED {} (wicket node renew-ca {})", fmt_time(c.not_after), n.name),
+            Some(c) if c.not_after > now => format!("identity until {}", wicket_core::time::unix_rfc3339(c.not_after)),
+            Some(c) => format!("identity EXPIRED {} (wicket node renew-ca {})", wicket_core::time::unix_rfc3339(c.not_after), n.name),
             None if n.status == "active" => format!("no identity certificate (wicket node renew-ca {})", n.name),
             None => "no identity certificate".into(),
         };
@@ -643,10 +648,6 @@ pub fn resolve(ledger: &Ledger, nodes_dir: &Path, arg: &str, ssh_key: Option<&Pa
 pub fn resolve_installed(arg: &str, ssh_key: Option<&Path>) -> Result<Node> {
     let l = Ledger::open(&crate::ledger_path())?;
     resolve(&l, &Paths::installation().nodes_dir, arg, ssh_key)
-}
-
-fn fmt_time(t: i64) -> String {
-    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
 }
 
 #[cfg(test)]

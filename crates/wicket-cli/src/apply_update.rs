@@ -212,7 +212,7 @@ pub async fn apply(request: &str) -> Result<()> {
     };
     // Into a private copy first: the update reads (and hashes again) only that.
     let stage = data.join(format!("self-apply-{}", std::process::id()));
-    let _clean = RemoveDir(stage.clone());
+    let _clean = crate::update::RemoveOnDrop(stage.clone());
     let made = std::fs::create_dir_all(&stage)
         .and_then(|()| std::fs::set_permissions(&stage, std::os::unix::fs::PermissionsExt::from_mode(0o700)))
         .map_err(anyhow::Error::from);
@@ -279,13 +279,6 @@ pub async fn apply(request: &str) -> Result<()> {
     );
     told(&l, &notice(request, &sha, o, &r));
     r
-}
-
-struct RemoveDir(PathBuf);
-impl Drop for RemoveDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 #[cfg(test)]

@@ -89,11 +89,6 @@ pub struct UnitsPending {
     pub root_copy: PathBuf,
 }
 
-/// Where root's own copy of version `id` is (`rootcopy`).
-pub fn root_copy(id: &str) -> PathBuf {
-    Path::new(crate::rootcopy::COPIES).join(id).join("wicket")
-}
-
 /// What root runs to apply version `id`'s units: its own copy of the build, never the versions
 /// root's (the wicket user's); first made from the artifact if root has none yet.
 pub fn apply_hint(id: &str, root_copy: &Path) -> String {
@@ -239,7 +234,7 @@ mod tests {
     fn differing_units_are_found_and_applied() {
         let d = std::env::temp_dir().join(format!("wicket-units-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        let _clean = Remove(d.clone());
+        let _clean = crate::update::RemoveOnDrop(d.clone());
         let d = Dir(d);
         // A versions root, and the path the units run (as /var/lib/wicket-versions/current/wicket is).
         let (units, root) = (d.path().join("units"), d.path().join("versions"));
@@ -278,12 +273,6 @@ mod tests {
     impl Dir {
         fn path(&self) -> &Path {
             &self.0
-        }
-    }
-    struct Remove(PathBuf);
-    impl Drop for Remove {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }

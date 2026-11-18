@@ -15,7 +15,6 @@ use hyper_util::rt::TokioIo;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
 
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 /// How long a response is still read to its end after the agent stopped reading it, so its final
@@ -43,7 +42,6 @@ pub struct Llm {
     /// quota grants ([`Llm::with_quota`]); on a node, the zone its token carries, its slices
     /// bounding it. None: the zone has no model route.
     quota: Option<ModelQuota>,
-    last_activity: std::sync::Mutex<Instant>,
     /// When the box's first request reached this proxy (Unix ms, #287).
     first_request_ms: std::sync::OnceLock<i64>,
     /// Told [`Llm::spent_charged`] as each call is sent upstream ([`Llm::set_journal`]).
@@ -112,7 +110,6 @@ impl Llm {
             count: Counter::default(),
             slice: std::sync::Mutex::new(None),
             quota,
-            last_activity: std::sync::Mutex::new(Instant::now()),
             first_request_ms: std::sync::OnceLock::new(),
             journal: std::sync::Mutex::new(None),
         }))
@@ -193,11 +190,6 @@ impl Llm {
         }
     }
 
-    /// Seconds since the agent last called the model: the liveness signal.
-    pub fn idle_secs(&self) -> u64 {
-        self.last_activity.lock().map(|t| t.elapsed().as_secs()).unwrap_or(0)
-    }
-
     pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
         let listener = crate::sockpath::listen(socket)?;
         self.serve_on(listener).await
@@ -246,9 +238,6 @@ impl Llm {
     async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<BoxBody> {
         self.first_request_ms
             .get_or_init(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0));
-        if let Ok(mut t) = self.last_activity.lock() {
-            *t = Instant::now();
-        }
         let Some(spec) = self.ctx.zone.llm.as_ref() else {
             return problem(404, "no-model", "No model", "this zone has no model route", None);
         };
@@ -663,9 +652,6 @@ impl Llm {
         B: hyper::body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        if let Ok(mut t) = self.last_activity.lock() {
-            *t = Instant::now();
-        }
         let spec = self.ctx.zone.llm.as_ref();
         if let Some(r) = self.admit(spec) {
             return r;

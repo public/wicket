@@ -393,7 +393,7 @@ mod tests {
         let mut l = Ledger::open_in_memory().unwrap();
         let o = |run: &str| op(run, "SPAWN", "/zones/child/worker");
         let rid = l.file_request(&o("run_b"), Some("aaaa"), "spawn", None).unwrap().id().to_string();
-        l.approve_zone_wide(&rid, &once("op")).unwrap();
+        l.approve_shown(&rid, &once("op"), true, None).unwrap();
         assert_eq!(l.use_effect_grant(&o("run_a"), Some("bbbb")).unwrap(), EffectUse::None, "run_b's arguments, not run_a's");
         // A legacy grant (no arguments recorded) for run_a's target doesn't refuse run_a either.
         let legacy = l.pending_for_unheld(&o("run_a"), None, "old", None).unwrap().0;

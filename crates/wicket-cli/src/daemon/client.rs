@@ -5,7 +5,7 @@ use super::proto::{self, kind, Hello, Welcome};
 use super::{policy, upload, SOCKET_PATH};
 use crate::{Cmd, SecretCmd};
 use anyhow::{bail, Context, Result};
-use std::io::{IsTerminal, Read, Write};
+use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -64,13 +64,7 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
     // stdin: a secret is read here, where the terminal is, and handed over through a pipe.
     let mut stdin_pipe: Option<OwnedFd> = None;
     if let Cmd::Secret { cmd: SecretCmd::Set { name, .. } } = cmd {
-        let value = if std::io::stdin().is_terminal() {
-            rpassword::prompt_password(format!("value for {name} (not echoed): "))?
-        } else {
-            let mut v = String::new();
-            std::io::stdin().read_to_string(&mut v)?;
-            v
-        };
+        let value = crate::cmd::secret::read_value(name)?;
         let (r, mut w) = std::io::pipe()?;
         // Written from a thread: a value larger than the pipe's buffer would block until read.
         std::thread::spawn(move || {

@@ -24,6 +24,7 @@ use anyhow::{bail, Context, Result};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use wicket_node::reexec::valid_id;
 
 /// Root's copies.
 pub const COPIES: &str = "/usr/local/lib/wicket";
@@ -119,10 +120,6 @@ pub struct Layout {
     pub untrusted: Option<Account>,
 }
 
-fn valid_id(id: &str) -> bool {
-    id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
 impl Layout {
     /// An installed host's.
     pub fn installed() -> Layout {
@@ -180,7 +177,7 @@ impl Layout {
         let _ = std::fs::remove_dir_all(&stage);
         std::fs::create_dir(&stage)?;
         std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700))?;
-        let _clean = Remove(stage.clone());
+        let _clean = crate::update::RemoveOnDrop(stage.clone());
         let copy = stage.join("artifact");
         {
             let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&copy)?;
@@ -257,13 +254,6 @@ impl Layout {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
-    }
-}
-
-struct Remove(PathBuf);
-impl Drop for Remove {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -406,11 +396,11 @@ mod tests {
         Account { uid: u32::MAX - 1, groups: vec![u32::MAX - 1] }
     }
 
-    fn tmp(name: &str) -> (PathBuf, Remove) {
+    fn tmp(name: &str) -> (PathBuf, crate::update::RemoveOnDrop) {
         let d = std::env::temp_dir().join(format!("wicket-rootcopy-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        (d.clone(), Remove(d))
+        (d.clone(), crate::update::RemoveOnDrop(d))
     }
 
     /// A root-owned file outside any directory this test's user owns, to admit.

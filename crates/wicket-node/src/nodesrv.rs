@@ -13,9 +13,9 @@
 //! - **It decides egress.** Each box gets its own egress proxy on a unix socket, deciding from the
 //!   node's verified feed replica (`wicket_proxy::decide::NodeDecider`) and terminating TLS with the
 //!   node's name-constrained CA. It injects the zone's secrets and makes the box's credential swaps
-//!   itself, each secret fetched on first use (#152, #257). Hosts it can't terminate (outside the
-//!   CA's constraints, an expired CA, or swapped by a control host before protocol 10) are tunnelled
-//!   to the control host's egress proxy for the run.
+//!   itself, each secret fetched on first use (#152, #257). A host it can't terminate (outside the
+//!   CA's constraints, or an expired CA) is spliced if the box's token allows it wholesale, and
+//!   refused otherwise (#257: the control host forwards no egress).
 //! - **It runs the box's model proxy and MCP gateway** (#151). The model proxy is the box's only
 //!   one (#257): it checks each call and makes it itself, with the credential fetched from the
 //!   control host on first use (#152). The gateway decides the tools it can from the box's token
@@ -669,8 +669,7 @@ impl Node {
         found.first().map(|(r, _)| r.to_string())
     }
 
-    /// What this node decides `run`'s gateway tools from (#164): its start's edge. (A control host
-    /// that started a box without one, before protocol 5, is past `PROTOCOL_SKEW`.)
+    /// What this node decides `run`'s gateway tools from (#164): its start's edge.
     fn edge_start(&self, run: &str) -> Option<chan::EdgeStart> {
         self.boxes.lock().expect("boxes").get(run).and_then(|b| b.record.start.edge.clone()).map(|e| *e)
     }
@@ -1248,7 +1247,7 @@ async fn adopt_previous(node: &Arc<Node>) {
             // a box without its record isn't its to judge (it is another node's, or the reconciler's).
             None if node.paths.shares_host() => {}
             None => {
-                if let crate::owner::Verdict::Orphan(why) = crate::owner::judge(&b, None) {
+                if let crate::owner::Verdict::Orphan(why) = crate::owner::judge(&b) {
                     say_err!("[node] stopping {} ({why})", b.name);
                     let _ = node.docker.kill(&b.name).await;
                 }
@@ -1448,22 +1447,9 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
         std::fs::create_dir_all(dir.join("state").join(d))?;
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::write(dir.join("ca/ca.pem"), format!("{}{}", node.root_pem, bs.ca_pem))?;
+    std::fs::write(dir.join("ca/ca.pem"), &node.root_pem)?;
     std::fs::write(dir.join("hosts"), wicket_core::link::hosts_file(&[]))?;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let tar = b64.decode(&bs.workspace_tar).context("workspace archive")?;
-    if !tar.is_empty() {
-        let mut c = tokio::process::Command::new("tar")
-            .arg("-C")
-            .arg(dir.join("workspace"))
-            .args(["--no-same-owner", "-xf", "-"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        c.stdin.take().expect("stdin").write_all(&tar).await?;
-        if !c.wait().await?.success() {
-            bail!("unpacking the workspace failed");
-        }
-    }
     // The state tree may be the agent's own (restored from its bundle), so a name in it may be a
     // symlink it planted: every directory on the way is made a real one and each file is created
     // new, never followed.
@@ -1675,7 +1661,7 @@ fn child_start(
         interactive: launch.stdin_task.is_some(),
         timeout_secs: timeout.min(left),
         escalate: m.zone.escalation.request,
-        ca_pem: parent.ca_pem.clone(),
+        ca_pem: String::new(),
         workspace_tar: String::new(),
         state_files,
         state_dirs,
@@ -1750,7 +1736,7 @@ impl BoxRecord {
         use std::os::unix::fs::OpenOptionsExt;
         let tmp = dir.join(format!("{}.new", Self::FILE));
         let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all_sync(&serde_json::to_vec(self)?)?;
+        std::io::Write::write_all(&mut f, &serde_json::to_vec(self)?)?;
         std::fs::rename(&tmp, dir.join(Self::FILE))?;
         Ok(())
     }
@@ -1830,15 +1816,6 @@ impl StdinFeed {
             }
             more.await;
         }
-    }
-}
-
-trait WriteSync {
-    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()>;
-}
-impl WriteSync for std::fs::File {
-    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()> {
-        std::io::Write::write_all(self, b)
     }
 }
 

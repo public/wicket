@@ -26,7 +26,7 @@ pub const OPERATORS_GROUP: &str = "wicket-operators";
 pub enum Class {
     /// Reads state: pending requests, links, audit, identities, leases, nodes, secret names.
     Read,
-    /// Starts or steers runs: `run`, `wrap`, `say`.
+    /// Starts or steers runs: `run`, `wrap`, `session`.
     Run,
     /// Takes authority away: revoke an identity or a grant, cut a link, end a lease.
     Revoke,
@@ -76,9 +76,9 @@ pub fn route(cmd: &Cmd) -> Route {
             SecretCmd::List => Forward(Read),
             // The helper runs as the caller, the owner of the files it serves (#350): never as wicket.
             SecretCmd::Serve { .. } => Local,
-            // Setting a secret changes what the proxies present upstream; linking one makes the
-            // wicket user read a file the caller names.
-            // and binding one to hosts decides where it may go.
+            // Setting a secret changes what the proxies present upstream, linking one makes the
+            // wicket user read a file the caller names, and binding one to hosts decides where it
+            // may go.
             SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } | SecretCmd::Rm { .. } => Forward(Privileged),
         },
         // Reads a directory the caller names, as the wicket user.

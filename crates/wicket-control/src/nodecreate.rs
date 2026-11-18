@@ -163,17 +163,22 @@ fn placed_summary(p: &wicket_store::PlacedNodeRow, now: i64) -> String {
     let cost = p.hourly.map(|h| format!("{}/h", usd(h))).unwrap_or_else(|| "cost not recorded".into());
     let end = if p.lease_until <= now {
         match &p.held_by {
-            Some(runs) => format!("PAST ITS LEASE (ended {}): held by run {runs}, billing until released", fmt_time(p.lease_until)),
-            None => format!("PAST ITS LEASE (ended {}): released at the reconciler's next pass", fmt_time(p.lease_until)),
+            Some(runs) => format!(
+                "PAST ITS LEASE (ended {}): held by run {runs}, billing until released",
+                wicket_core::time::unix_rfc3339(p.lease_until)
+            ),
+            None => {
+                format!("PAST ITS LEASE (ended {}): released at the reconciler's next pass", wicket_core::time::unix_rfc3339(p.lease_until))
+            }
         }
     } else {
-        format!("lease until {}", fmt_time(p.lease_until))
+        format!("lease until {}", wicket_core::time::unix_rfc3339(p.lease_until))
     };
     format!("{end}; provider {} instance {}, {cost}; release with: wicket node release {}", p.backend, p.id, p.name)
 }
 
 fn lease_row_summary(x: &wicket_store::LeaseRow) -> String {
-    let end = x.not_after.map(|t| format!("until {}", fmt_time(t))).unwrap_or_else(|| x.status.clone());
+    let end = x.not_after.map(|t| format!("until {}", wicket_core::time::unix_rfc3339(t))).unwrap_or_else(|| x.status.clone());
     let cost =
         if x.reserved == 0 { "no cost".to_string() } else { format!("at most {}/h, {} reserved", usd(x.hourly_cap), usd(x.reserved)) };
     let instance = x.node_id.as_deref().map(|i| format!(" instance {i}")).unwrap_or_default();
@@ -204,7 +209,7 @@ fn lease_note(n: &NodeHandle, placed: Option<&wicket_store::PlacedNodeRow>, capa
     if until > now {
         return String::new();
     }
-    let ended = format!("PAST ITS LEASE (ended {})", fmt_time(until));
+    let ended = format!("PAST ITS LEASE (ended {})", wicket_core::time::unix_rfc3339(until));
     match placed.filter(|p| p.status == "active") {
         Some(p) => match &p.held_by {
             Some(runs) => format!(
@@ -220,10 +225,6 @@ fn lease_note(n: &NodeHandle, placed: Option<&wicket_store::PlacedNodeRow>, capa
 
 fn dollars(s: &str) -> Result<MicroUsd> {
     MicroUsd::parse_dollars(s).with_context(|| format!("{s:?} is not a dollar amount"))
-}
-
-fn fmt_time(t: i64) -> String {
-    wicket_core::time::format_rfc3339_seconds(std::time::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64)).to_string()
 }
 
 /// Decides a node's spend as a CAPACITY request (#256): `CAPACITY wicket.internal
@@ -433,9 +434,9 @@ pub async fn list_provider(common: &Common) -> Result<()> {
             n.state,
             n.ssh_target.as_deref().unwrap_or("-"),
             n.billing.hourly_rate(),
-            fmt_time(n.created_at),
-            n.lease_until.map(fmt_time).unwrap_or_else(|| "-".into()),
-            p.next_paid_hour_at(n).map(fmt_time).unwrap_or_else(|| "-".into()),
+            wicket_core::time::unix_rfc3339(n.created_at),
+            n.lease_until.map(wicket_core::time::unix_rfc3339).unwrap_or_else(|| "-".into()),
+            p.next_paid_hour_at(n).map(wicket_core::time::unix_rfc3339).unwrap_or_else(|| "-".into()),
         );
         let note = lease_note(n, placed.as_ref(), capacity, now);
         if !note.is_empty() {
@@ -551,7 +552,13 @@ pub async fn create(args: CreateArgs) -> Result<()> {
         detail: None,
         hourly: Some(n.billing.hourly_rate().0 as i64),
     })?;
-    say!("created {} ({}), {}/h, lease until {}", n.id, name, n.billing.hourly_rate(), n.lease_until.map(fmt_time).unwrap_or_default());
+    say!(
+        "created {} ({}), {}/h, lease until {}",
+        n.id,
+        name,
+        n.billing.hourly_rate(),
+        n.lease_until.map(wicket_core::time::unix_rfc3339).unwrap_or_default()
+    );
     if n.host_key.as_deref() != Some(pinned.as_str()) {
         bail!(
             "{} already existed for this idempotency key and its pinned host key isn't known here: enrol it with `wicket node enrol` and a key from elsewhere, or release it",
@@ -572,9 +579,12 @@ pub async fn create(args: CreateArgs) -> Result<()> {
         bring_up_or_release::<_, boot::SshProbe>(&placer, &crate::ledger_path(), &n, &name, &pinned, ssh_key, hosts, ca_ttl, &wait, None)
             .await?;
     if let Some(next) = placer.next_paid_hour_at(&ready) {
-        say!("next paid hour starts {}; release before then: wicket node release {}", fmt_time(next), n.id);
+        say!("next paid hour starts {}; release before then: wicket node release {}", wicket_core::time::unix_rfc3339(next), n.id);
     }
-    say!("the reconciler (wicket reconcile --every) releases it at {} unless a run is still placed on it", fmt_time(lease_until));
+    say!(
+        "the reconciler (wicket reconcile --every) releases it at {} unless a run is still placed on it",
+        wicket_core::time::unix_rfc3339(lease_until)
+    );
     Ok(())
 }
 

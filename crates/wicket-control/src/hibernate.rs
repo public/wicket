@@ -19,8 +19,9 @@
 //!   (`wicket_store::bundle`, version 2): the control host's local store (`<data dir>/store`)
 //!   writes only files that changed since an earlier hibernation, and with `bundles: s3` the state
 //!   store is sent only what it lacks, before the ledger's head moves. A wake fetches what the local
-//!   store lacks. Heads pushed before #365 (version 1) are still read; an agent whose files have
-//!   names the tree format can't hold (not UTF-8) is kept as a version-1 bundle, and says so.
+//!   store lacks. A ledger whose head is still a version-1 bundle (from before #365) is refused at
+//!   start ([`refuse_v1_heads`], #470); an agent whose files have names the tree format can't hold
+//!   (not UTF-8) isn't hibernated, and the error names the file.
 //! - **Fencing.** Waking is a compare-and-set claim in the ledger that bumps the agent's generation;
 //!   the proxies refuse a stale generation and a push commits only under the current one
 //!   (`wicket_store::agents`).

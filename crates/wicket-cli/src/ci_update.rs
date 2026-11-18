@@ -296,17 +296,10 @@ pub async fn update_from_ci(target: &str, nodes: Option<String>, only_nodes: boo
 
 async fn take(gh: &Gh, c: &CiConfig, b: &Build, nodes: Option<String>, only_nodes: bool, gate: Gate, prune: bool) -> Result<()> {
     let dir = crate::data_dir().join(format!("ci-download-{}", std::process::id()));
-    let _clean = Remove(dir.clone());
+    let _clean = crate::update::RemoveOnDrop(dir.clone());
     let (archive, sig) = fetch(gh, b, &dir).await?;
     let ci = CiExpect { repo: c.repo.clone(), workflow: c.workflow.clone(), commit: b.commit.clone() };
     update::update(update::UpdateOpts { artifact: archive, sig: Some(sig), nodes, only_nodes, gate, prune, ci: Some(ci) }).await
-}
-
-struct Remove(PathBuf);
-impl Drop for Remove {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 // ---- following main ----
@@ -421,7 +414,7 @@ pub async fn follow() -> Result<()> {
         );
     }
     let dir = crate::data_dir().join(format!("ci-download-{}", std::process::id()));
-    let _clean = Remove(dir.clone());
+    let _clean = crate::update::RemoveOnDrop(dir.clone());
     let (archive, sig) = fetch(&gh, &b, &dir).await?;
     let ci = CiExpect { repo: c.repo.clone(), workflow: c.workflow.clone(), commit: b.commit.clone() };
     let claims: CiClaims = match update::verify_ci_files(&archive, &sig, &ci) {

@@ -50,9 +50,6 @@ use wicket_proxy::llm::Slice;
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`]) went once every peer
 /// had them.
 pub const PROTOCOL: u32 = 15;
-/// The first protocol version whose node CA is renewed over the channel (#416): [`Msg::CaRenew`],
-/// [`Msg::CaCsr`], [`Msg::NodeCa`] and [`Msg::NodeCaInstalled`].
-pub const CA_RENEWAL: u32 = 14;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -114,7 +111,7 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // Every feature's first version is one this build speaks, and a peer at the oldest version it
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
-    assert!(CA_RENEWAL <= PROTOCOL);
+    assert!(MESSAGE_READ <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -159,11 +156,13 @@ pub struct BoxStart {
     pub timeout_secs: u64,
     /// The zone's `escalation.request` (false by default for a program, #255).
     pub escalate: bool,
-    /// More of the box's CA bundle, after the installation root (which signs its node CA's leaves).
-    /// Empty: the control host terminates no TLS, so it has no CA of the run's to add (#257 slice 5).
-    /// Still sent, for nodes at 13 that read it.
+    /// Unused, always empty: the box's CA bundle is the installation root alone (#257 slice 5).
+    /// Still sent, for nodes from before it was defaulted; to go once none can connect.
+    #[serde(default)]
     pub ca_pem: String,
-    /// The workspace, as a tar archive (base64).
+    /// Unused, always empty: a box's workspace is laid out by its node, never sent (#146). Still
+    /// sent, for nodes from before it was defaulted; to go once none can connect.
+    #[serde(default)]
     pub workspace_tar: String,
     /// Extra files under the run's state directory: (relative path, base64 contents).
     pub state_files: Vec<(String, String)>,
@@ -1241,13 +1240,13 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build has no checks for features of protocol 13 or before (one gateway, #257 slice
-    /// 4b, the last): a peer below 14 can't connect, so every connection talks 14 or 15 (#416, #445),
-    /// and a check for a version at or under 13 would always pass. 14 (CA renewal) keeps its check
-    /// for as long as a node at 14 can connect; so does 15 (message reads).
+    /// Why this build has no checks for features of protocol 14 or before (CA renewal, #416, the
+    /// last): a peer below 14 can't connect, so every connection talks 14 or 15, and a check for a
+    /// feature of version N matters only while a peer at N - 1 can connect. 15 (message reads,
+    /// #445) keeps its check for as long as a node at 14 can connect.
     #[test]
     fn no_connection_talks_below_protocol_14() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, CA_RENEWAL, MESSAGE_READ), (15, 1, 14, 15));
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ), (15, 1, 15));
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
                 Ok(at) => assert!((14..=15).contains(&at) && (14..=16).contains(&theirs), "{theirs} -> {at}"),
