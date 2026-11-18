@@ -103,6 +103,15 @@ mod tests {
 
     /// #258: a pinned image is accepted the same way, by the same kind of grant on its digest (an
     /// image and a program of one digest share it: a digest is what is granted, not a name).
+    /// The grant a pinned run records lasts a day, as every grant may at most (#326's mutants).
+    #[test]
+    fn the_grant_a_pin_records_lasts_a_day() {
+        let l = Ledger::open_in_memory().unwrap();
+        let u = accept_image(&l, &TenantId::single(), "research", "img", D, "operator:alex").unwrap();
+        let left = l.grant(&u.grant).unwrap().unwrap().expires_at - wicket_store::now();
+        assert!(PROGRAM_GRANT_SECS == 86_400 && (left - PROGRAM_GRANT_SECS).abs() <= 2, "{left}");
+    }
+
     #[test]
     fn a_pinned_image_is_accepted_by_a_grant_on_its_digest() {
         let l = Ledger::open_in_memory().unwrap();

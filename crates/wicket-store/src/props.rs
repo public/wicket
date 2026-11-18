@@ -268,3 +268,114 @@ fn money_reservations_never_exceed_the_limit_they_were_checked_against() {
         }
     }
 }
+
+// ---- What the mutants of digestgrant.rs and money.rs left: the records' exact fields ----
+
+fn grant_row(l: &Ledger, id: &str) -> (String, Option<String>, i64) {
+    l.conn
+        .query_row("SELECT zone, principal, expires_at FROM grants WHERE id = ?1", rusqlite::params![id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+}
+
+/// A digest is `sha256:` and exactly 64 lowercase hex digits; `digest_granted` says whether a live
+/// grant covers one, without using it, and is false for anything that isn't a digest.
+#[test]
+fn a_digest_is_exactly_a_sha256_and_digest_granted_only_answers() {
+    let d = digests()[0].clone();
+    assert!(valid_digest(&d));
+    for bad in [
+        format!("sha256:{}", "a".repeat(63)),
+        format!("sha256:{}", "a".repeat(65)),
+        format!("sha256:{}", "g".repeat(64)),
+        format!("sha256:{}", "A".repeat(64)),
+        format!("sha512:{}", "a".repeat(64)),
+        "a".repeat(64),
+    ] {
+        assert!(!valid_digest(&bad), "{bad}");
+    }
+    let l = Ledger::open_in_memory().unwrap();
+    let t = TenantId::single();
+    let z = DigestScope::Zone("a".into());
+    assert!(!l.digest_granted(&t, &d, DigestAction::Run, &z).unwrap(), "no grant");
+    let g = l
+        .grant_digest(&NewDigestGrant {
+            tenant: &t,
+            digest: &d,
+            action: DigestAction::Run,
+            scope: z.clone(),
+            uses: Some(1),
+            expires_at: now() + 60,
+            decided_by: "operator:test",
+        })
+        .unwrap();
+    assert!(l.digest_granted(&t, &d, DigestAction::Run, &z).unwrap());
+    assert!(!l.digest_granted(&t, &d, DigestAction::Install, &z).unwrap(), "another action");
+    assert!(!l.digest_granted(&t, "latest", DigestAction::Run, &z).unwrap(), "not a digest");
+    assert!(l.digest_granted(&t, &d, DigestAction::Run, &z).unwrap(), "asking used nothing");
+    // A zone's grant is recorded in that zone (`wicket grant list` shows it there).
+    assert_eq!(grant_row(&l, &g).0, "a");
+    // The acceptance's audit record names the action by its name.
+    l.may_use(&t, &d, DigestAction::Run, &z, "prop").unwrap().unwrap();
+    let rec = l.audit_of_kind("digest.accepted").unwrap();
+    let body: serde_json::Value = serde_json::from_str(&rec[0].body).unwrap();
+    assert_eq!((body["action"].as_str(), body["by"].as_str()), (Some("run"), Some("prop")));
+    for (a, s) in [(DigestAction::Run, "run"), (DigestAction::Install, "install"), (DigestAction::Mount, "mount")] {
+        assert_eq!(a.as_str(), s);
+    }
+}
+
+/// A CI principal's standing grant is held by `release-key:<id>` for a day; the one-use grants a
+/// signature and an approval become last ten minutes.
+#[test]
+fn the_grants_lifetimes_and_principals_are_what_they_say() {
+    let mut l = Ledger::open_in_memory().unwrap();
+    let t = TenantId::single();
+    assert_eq!(signer_principal("k1"), "release-key:k1");
+    let g = l.trust_signer(&t, "k1", "KEY", "operator:test").unwrap();
+    let (_, principal, until) = grant_row(&l, &g);
+    assert_eq!(principal.as_deref(), Some("release-key:k1"));
+    assert!((until - now() - SIGNER_GRANT_SECS).abs() <= 2 && SIGNER_GRANT_SECS == 86_400, "{until}");
+    let s = l.signers(&t).unwrap().remove(0);
+    let d = digests()[1].clone();
+    let u = l.accept_signed(&t, &d, &s, "prop").unwrap().unwrap();
+    assert_eq!(u.decided_by, "release-key:k1");
+    let left = grant_row(&l, &u.grant).2 - now();
+    assert!((598..=600).contains(&left), "{left}");
+    // An approved update's grant, the same.
+    let sha = "ab".repeat(32);
+    let mut op =
+        wicket_core::Op::egress(&t, &wicket_core::RunId("run_t".into()), "z", "UPDATE", "wicket.internal", &format!("/self/{sha}"));
+    op.risk = wicket_core::RiskClass::R4ExecOrPrivilege;
+    let (rid, _) = l.pending_for(&op, "a build", None).unwrap();
+    let a = Approval { uses: None, ttl: std::time::Duration::from_secs(600), path_prefix: None, decided_by: "op".into() };
+    l.approve(&rid, &a).unwrap();
+    let (_, u) = l.accept_update_approval(&t, &sha, "prop").unwrap().unwrap();
+    let left = grant_row(&l, &u.grant).2 - now();
+    assert!((598..=600).contains(&left), "{left}");
+}
+
+/// A reservation's part of 0 records no grant (a lease with no price cap, say); `renew_money`
+/// keeps both live parts live until it says, and renews nothing once they are released.
+#[test]
+fn a_zero_part_records_nothing_and_renewing_says_what_it_renewed() {
+    let mut l = Ledger::open_in_memory().unwrap();
+    let b = LeaseBudget { max_hourly: 100, max_total: 1_000 };
+    l.reserve_money("t", "node-a", 0, 50, 60, b, "prop").unwrap().unwrap();
+    let rows = |l: &Ledger| -> i64 {
+        l.conn.query_row("SELECT COUNT(*) FROM grants WHERE path LIKE '/quota/money.%/node-a'", [], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(rows(&l), 1, "only the part that isn't 0");
+    l.reserve_money("t", "node-b", 10, 50, 60, b, "prop").unwrap().unwrap();
+    let until = now() + 7200;
+    assert_eq!(l.renew_money("node-b", until).unwrap(), 2);
+    let ends: Vec<i64> = {
+        let mut st = l.conn.prepare("SELECT expires_at FROM grants WHERE path LIKE '/quota/money.%/node-b'").unwrap();
+        st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+    };
+    assert_eq!(ends, vec![until, until]);
+    assert_eq!(l.renew_money("node-b", until).unwrap(), 0, "already that long");
+    l.release_money("node-b").unwrap();
+    assert_eq!(l.renew_money("node-b", until + 60).unwrap(), 0, "released: nothing brought back");
+}
