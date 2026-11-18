@@ -94,8 +94,8 @@ pub enum StoreError {
 /// and `runs.activity` (busy, idle, waiting) for presence. Version 6 (expand) adds the
 /// `delegations` table: what a parent delegated to the children it spawned, and where it is (#252).
 /// Version 7 (expand) adds `agents.claim_until`, the wake claim's end, which `agents.lease_until`
-/// held before (#349: a claim, not a lease). It is copied over once, and both are written until a
-/// contract step drops `lease_until`, so a build from before it still sees every claim.
+/// held before (#349: a claim, not a lease). It is copied over once; `lease_until` was written too
+/// while a build before schema 7 could open the ledger, and isn't since the floor passed it.
 /// Version 8 (expand) adds `placed_nodes.hourly`: what a node from `wicket node create` costs per
 /// hour, for `wicket node list` (#358).
 /// Version 9 (expand) adds standing capacity grants (#256): `grants.principal`, `grants.terms` and
