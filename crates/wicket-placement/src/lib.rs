@@ -5,9 +5,8 @@
 //!   nodes carrying an owner tag. Implementations: [`static_hosts::StaticHosts`] (the operator's own
 //!   machines, reached over ssh) and [`vultr::VultrProvider`] (Vultr API v2). A Kubernetes backend (#45)
 //!   is a third `Provider`.
-//! - [`Placement`]: what the rest of wicket calls (`acquire`, `get`, `list`, `release`,
-//!   `next_paid_hour_at`). [`Placer`] implements it once, over any `Provider`, so the rules below hold
-//!   for every backend.
+//! - [`Placer`]: what the rest of wicket calls (`acquire`, `get`, `list`, `release`,
+//!   `next_paid_hour_at`), over any `Provider`, so the rules below hold for every backend.
 //!
 //! **Rules [`Placer`] enforces.**
 //! - **Owner tags.** Every node it creates carries `wicket-owner-<installation>`, and the idempotency
@@ -78,8 +77,8 @@ pub mod vultr;
 pub use billing::{BillingModel, PoolRules, ReleaseDecision};
 pub use envelope::{Approval, SpendApprover, SpendRequest};
 pub use model::{
-    CapacityRequest, CreateSpec, IsolationTier, NodeHandle, NodeId, NodeState, Offer, Owner, Placement, PlacementError, Provider, Released,
-    Resources, Timestamp,
+    CapacityRequest, CreateSpec, IsolationTier, NodeHandle, NodeId, NodeState, Offer, Owner, PlacementError, Provider, Released, Resources,
+    Timestamp,
 };
 pub use money::MicroUsd;
 pub use placer::{Placer, ReleaseMode};

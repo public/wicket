@@ -97,7 +97,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
             let mut seed = [0u8; 32];
             getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path)?;
-            f.write_all_sync(hex::encode(seed).as_bytes())?;
+            std::io::Write::write_all(&mut f, hex::encode(seed).as_bytes())?;
             wicket_identity::SigningKey::from_bytes(&seed)
         }
         Err(e) => return Err(e.into()),
@@ -138,15 +138,6 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
     };
     let authz_root = crate::roots::authz_root_public()?;
     Ok(Publisher::open_with(&dir, name, &crate::roots::feed_root_public()?, key, &cert_jws, cfg.clone(), authz_root)?)
-}
-
-trait WriteSync {
-    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()>;
-}
-impl WriteSync for std::fs::File {
-    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()> {
-        std::io::Write::write_all(self, b)
-    }
 }
 
 /// A node's feed, shared by every process that publishes to it (each run on the node, and each

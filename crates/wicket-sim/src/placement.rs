@@ -61,8 +61,8 @@ use wicket_placement::billing::PoolRules;
 use wicket_placement::model::{NodeState, PROTECTED_TAG};
 use wicket_placement::reconcile as plan;
 use wicket_placement::{
-    Approval, BillingModel, CapacityRequest, CreateSpec, IsolationTier, MicroUsd, NodeHandle, NodeId, Offer, Owner, Placement,
-    PlacementError, Placer, Provider, ReleaseMode, Released, Resources, SpendApprover, SpendRequest,
+    Approval, BillingModel, CapacityRequest, CreateSpec, IsolationTier, MicroUsd, NodeHandle, NodeId, Offer, Owner, PlacementError, Placer,
+    Provider, ReleaseMode, Released, Resources, SpendApprover, SpendRequest,
 };
 use wicket_store::{Ledger, PlacedNodeRow};
 

@@ -1737,7 +1737,7 @@ impl BoxRecord {
         use std::os::unix::fs::OpenOptionsExt;
         let tmp = dir.join(format!("{}.new", Self::FILE));
         let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all_sync(&serde_json::to_vec(self)?)?;
+        std::io::Write::write_all(&mut f, &serde_json::to_vec(self)?)?;
         std::fs::rename(&tmp, dir.join(Self::FILE))?;
         Ok(())
     }
@@ -1817,15 +1817,6 @@ impl StdinFeed {
             }
             more.await;
         }
-    }
-}
-
-trait WriteSync {
-    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()>;
-}
-impl WriteSync for std::fs::File {
-    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()> {
-        std::io::Write::write_all(self, b)
     }
 }
 
