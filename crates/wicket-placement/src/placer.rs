@@ -1,4 +1,4 @@
-//! [`Placer`]: the one [`Placement`] implementation, over any [`Provider`]. See the crate docs for
+//! [`Placer`]: what the rest of wicket calls to place nodes, over any [`Provider`]. See the crate docs for
 //! the rules it enforces.
 
 use crate::billing::{self, PoolRules, ReleaseDecision};
@@ -104,8 +104,11 @@ impl<P: Provider, A: SpendApprover> Placer<P, A> {
     }
 }
 
-impl<P: Provider, A: SpendApprover> Placement for Placer<P, A> {
-    async fn acquire(&self, req: &CapacityRequest) -> Result<NodeHandle> {
+/// What the rest of wicket calls (it was the `Placement` trait, of which this was the only impl).
+impl<P: Provider, A: SpendApprover> Placer<P, A> {
+    /// A node for `req`: an existing one for the same idempotency key, or a warm pooled one or a new
+    /// one, either approved by the spend approver (which checks its money, #256).
+    pub async fn acquire(&self, req: &CapacityRequest) -> Result<NodeHandle> {
         // One acquire at a time: the in-process half of idempotency.
         let mut st = self.state.lock().await;
         if let Some(n) = st.by_key.get(&req.idempotency_key) {
@@ -195,15 +198,17 @@ impl<P: Provider, A: SpendApprover> Placement for Placer<P, A> {
         Ok(n)
     }
 
-    async fn get(&self, id: &NodeId) -> Result<Option<NodeHandle>> {
+    /// An owned node.
+    pub async fn get(&self, id: &NodeId) -> Result<Option<NodeHandle>> {
         Ok(self.provider.get(id).await?.filter(|n| self.owner.owns(n)))
     }
 
-    async fn list(&self) -> Result<Vec<NodeHandle>> {
+    /// Every owned node (for the reconciler).
+    pub async fn list(&self) -> Result<Vec<NodeHandle>> {
         self.owned().await
     }
 
-    async fn release(&self, id: &NodeId, mode: ReleaseMode) -> Result<Released> {
+    pub async fn release(&self, id: &NodeId, mode: ReleaseMode) -> Result<Released> {
         let Some(n) = self.provider.get(id).await? else {
             self.forget(id).await;
             return Ok(Released::AlreadyGone);
@@ -232,7 +237,8 @@ impl<P: Provider, A: SpendApprover> Placement for Placer<P, A> {
         }
     }
 
-    fn next_paid_hour_at(&self, node: &NodeHandle) -> Option<Timestamp> {
+    /// When the node's next billing unit starts (`None`: no stepped billing).
+    pub fn next_paid_hour_at(&self, node: &NodeHandle) -> Option<Timestamp> {
         node.billing.next_paid_hour_at(node.created_at, (self.clock)())
     }
 }

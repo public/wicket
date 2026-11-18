@@ -249,18 +249,3 @@ pub enum Released {
     },
     AlreadyGone,
 }
-
-/// The interface the rest of wicket uses. One implementation, [`Placer`](crate::Placer), over any
-/// [`Provider`].
-pub trait Placement: Send + Sync {
-    /// A node for `req`: an existing one for the same idempotency key, or a warm pooled one or a new
-    /// one, either approved by the spend approver (which checks its money, #256).
-    fn acquire(&self, req: &CapacityRequest) -> impl Future<Output = Result<NodeHandle>> + Send;
-    /// An owned node.
-    fn get(&self, id: &NodeId) -> impl Future<Output = Result<Option<NodeHandle>>> + Send;
-    /// Every owned node (for the reconciler).
-    fn list(&self) -> impl Future<Output = Result<Vec<NodeHandle>>> + Send;
-    fn release(&self, id: &NodeId, mode: crate::ReleaseMode) -> impl Future<Output = Result<Released>> + Send;
-    /// When the node's next billing unit starts (`None`: no stepped billing).
-    fn next_paid_hour_at(&self, node: &NodeHandle) -> Option<Timestamp>;
-}

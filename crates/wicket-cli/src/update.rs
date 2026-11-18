@@ -324,7 +324,7 @@ pub fn keygen(out: &Path) -> Result<()> {
     getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
     let key = wicket_identity::SigningKey::from_bytes(&seed);
     let public = key.verifying_key().to_bytes();
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode_0600().open(out)?;
+    let mut f = std::os::unix::fs::OpenOptionsExt::mode(std::fs::OpenOptions::new().write(true).create_new(true), 0o600).open(out)?;
     use std::io::Write;
     writeln!(f, "{}", serde_json::json!({ "alg": "ed25519", "secret": B64.encode(seed) }))?;
     let pubpath = PathBuf::from(format!("{}.pub", out.display()));
@@ -336,16 +336,6 @@ pub fn keygen(out: &Path) -> Result<()> {
         pubpath.display()
     );
     Ok(())
-}
-
-trait Mode0600 {
-    fn mode_0600(&mut self) -> &mut Self;
-}
-impl Mode0600 for std::fs::OpenOptions {
-    fn mode_0600(&mut self) -> &mut Self {
-        use std::os::unix::fs::OpenOptionsExt;
-        self.mode(0o600)
-    }
 }
 
 fn read_secret(key: &Path) -> Result<wicket_identity::SigningKey> {
