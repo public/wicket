@@ -180,7 +180,7 @@ impl Layout {
         let _ = std::fs::remove_dir_all(&stage);
         std::fs::create_dir(&stage)?;
         std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700))?;
-        let _clean = Remove(stage.clone());
+        let _clean = crate::update::RemoveOnDrop(stage.clone());
         let copy = stage.join("artifact");
         {
             let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&copy)?;
@@ -257,13 +257,6 @@ impl Layout {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
-    }
-}
-
-struct Remove(PathBuf);
-impl Drop for Remove {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -406,11 +399,11 @@ mod tests {
         Account { uid: u32::MAX - 1, groups: vec![u32::MAX - 1] }
     }
 
-    fn tmp(name: &str) -> (PathBuf, Remove) {
+    fn tmp(name: &str) -> (PathBuf, crate::update::RemoveOnDrop) {
         let d = std::env::temp_dir().join(format!("wicket-rootcopy-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        (d.clone(), Remove(d))
+        (d.clone(), crate::update::RemoveOnDrop(d))
     }
 
     /// A root-owned file outside any directory this test's user owns, to admit.

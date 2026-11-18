@@ -239,7 +239,7 @@ mod tests {
     fn differing_units_are_found_and_applied() {
         let d = std::env::temp_dir().join(format!("wicket-units-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        let _clean = Remove(d.clone());
+        let _clean = crate::update::RemoveOnDrop(d.clone());
         let d = Dir(d);
         // A versions root, and the path the units run (as /var/lib/wicket-versions/current/wicket is).
         let (units, root) = (d.path().join("units"), d.path().join("versions"));
@@ -278,12 +278,6 @@ mod tests {
     impl Dir {
         fn path(&self) -> &Path {
             &self.0
-        }
-    }
-    struct Remove(PathBuf);
-    impl Drop for Remove {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }
