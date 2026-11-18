@@ -465,35 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn a_ledger_from_before_schema_7_keeps_its_claims_and_both_columns_are_written() {
-        let dir = std::env::temp_dir().join(format!("wicket-store-claim-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("ledger.db");
-        let id = new_agent_id();
-        let until = now() + 600;
-        {
-            // The agents table as schema 6 made it: the claim's end in `lease_until`.
-            let c = rusqlite::Connection::open(&path).unwrap();
-            c.execute_batch(&SCHEMA.replace(", claim_until INTEGER\n", "\n")).unwrap();
-            c.execute(
-                "INSERT INTO agents (id, tenant, zone, name, state, generation, run, session_id, manifest, image, head, lease_until, \
-                 created_at, updated_at) VALUES (?1, 't0', 'z', 'a', 'active', 1, 'run_1', 's', 'm', 'img', 'h', ?2, 0, 0)",
-                params![id, until],
-            )
-            .unwrap();
-        }
-        let mut l = Ledger::open(&path).unwrap();
-        assert_eq!(l.agent(&id).unwrap().unwrap().claim_until, Some(until), "copied over");
-        assert_eq!(l.claim_wake(&id, "run_2", now() + 30).unwrap(), None, "its holder's claim is still live");
-        assert!(l.renew_agent_claim(&id, 1, until + 60).unwrap());
-        l.conn.execute("UPDATE agents SET lease_until = 1 WHERE id = ?1", params![id]).unwrap();
-        drop(l);
-        assert_eq!(Ledger::open(&path).unwrap().agent(&id).unwrap().unwrap().claim_until, Some(until + 60), "copied only once");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn a_hibernated_agent_wakes_once_and_a_stale_push_is_refused() {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = new_agent_id();

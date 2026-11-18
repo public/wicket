@@ -71,6 +71,8 @@ pub enum StoreError {
     EgressGrant(String),
     #[error("this ledger was migrated by a newer wicket (schema {version}), past a step this build (schema {SCHEMA_VERSION}) can't read: roll forward, or restore the snapshot taken before that update")]
     TooNew { version: u32, floor: u32 },
+    #[error("this ledger is schema {version}, older than schema {UPGRADES_FROM}, the oldest this build upgrades: open it once with a wicket build that still upgrades it (main at {STEP_THROUGH}), then with this one")]
+    TooOld { version: u32 },
 }
 
 /// The ledger's schema version (#162). Every migration bumps it, and records what kind it is:
@@ -130,6 +132,12 @@ pub enum StoreError {
 pub const SCHEMA_VERSION: u32 = 19;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
+/// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
+/// refused ([`StoreError::TooOld`]) and names [`STEP_THROUGH`], a build that upgrades it; the
+/// steps for older ledgers are gone, as every column they added is in a ledger of schema 17.
+pub const UPGRADES_FROM: u32 = 17;
+/// A build that upgrades a ledger of any schema (main just before the upgrade steps went).
+pub const STEP_THROUGH: &str = "a3135ea";
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
 const _: () = assert!(SCHEMA_FLOOR <= SCHEMA_VERSION);
 
@@ -143,17 +151,6 @@ pub const NOTICE_LABEL: &str = "wicket";
 /// The SQL condition for a row that is a turn (a prompt or a notice), and for a peer's message.
 pub(crate) const TURNS: &str = "kind IN ('prompt', 'notice')";
 pub(crate) const PEER: &str = "kind = 'message'";
-
-/// Schema 17's copy of `operator_messages` into `messages` (#253): what was taken stays taken, with
-/// where it is in its box's stdin, so a takeover after the upgrade gives again only what never
-/// arrived. Their senders were recorded by label only (no principal).
-const LEGACY_PROMPTS: &str = "INSERT OR IGNORE INTO messages
-   (id, tenant, from_run, to_run, envelope, created_at, delivered_at, taken_at, kind, text, label, stdin_start, stdin_end)
- SELECT 'prompt-legacy-' || o.id,
-        COALESCE((SELECT tenant FROM runs WHERE runs.id = o.run), (SELECT tenant FROM agents WHERE agents.id = o.run), ''),
-        '', o.run, '', o.created_at, o.consumed_at, o.consumed_at,
-        CASE WHEN o.by = 'wicket' THEN 'notice' ELSE 'prompt' END, o.text, o.by, o.stdin_start, o.stdin_end
- FROM operator_messages o ORDER BY o.id";
 
 /// A prompt or notice taken for a run: its message id, text, who it shows as, and the operator's
 /// principal id (None for a notice, and for prompts recorded before #253).
@@ -193,6 +190,13 @@ fn check_schema(conn: &Connection) -> Result<()> {
     let s = read_schema(conn)?;
     if !wicket_core::version::schema_opens(SCHEMA_VERSION, s.floor) {
         return Err(StoreError::TooNew { version: s.version, floor: s.floor });
+    }
+    // A new ledger has nothing but `schema_meta` yet; an old one (version 0 is one from before #162
+    // recorded a schema) has its tables.
+    let tables: i64 =
+        conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name != 'schema_meta'", [], |r| r.get(0))?;
+    if s.version < UPGRADES_FROM && tables > 0 {
+        return Err(StoreError::TooOld { version: s.version });
     }
     if s.version < SCHEMA_VERSION || s.floor < SCHEMA_FLOOR {
         conn.execute(
@@ -521,78 +525,14 @@ impl Ledger {
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
-        // Ledgers created before passkey revocation existed.
-        let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
-        // Ledgers created before requests recorded who asked.
-        let _ = conn.execute("ALTER TABLE requests ADD COLUMN attribution TEXT NOT NULL DEFAULT '[]'", []);
-        let _ = conn.execute("ALTER TABLE requests ADD COLUMN scope_prefix INTEGER NOT NULL DEFAULT 0", []);
-        // Ledgers created before grants could be handed to a node.
-        let _ = conn.execute("ALTER TABLE grants ADD COLUMN node TEXT", []);
-        // Ledgers created before grants carried a risk bound (#119). Their grants have none, which
-        // counts as the lowest: they cover no request (every request is at least R1).
-        let _ = conn.execute("ALTER TABLE grants ADD COLUMN max_risk INTEGER", []);
-        // The run a grant is bound to (#127); NULL is zone-wide, as every grant was before.
-        let _ = conn.execute("ALTER TABLE grants ADD COLUMN run TEXT", []);
-        // The feed epoch that carries a grant handed to a node, until the node reports it applied.
-        let _ = conn.execute("ALTER TABLE grants ADD COLUMN node_epoch INTEGER", []);
-        // Ledgers created before quotas were grants (#256): NULL for every other grant.
-        let _ = conn.execute("ALTER TABLE grants ADD COLUMN amount INTEGER", []);
-        // Ledgers created before runs recorded their supervising process.
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
-        // The org policy version a run's token was minted under (#51).
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN policy TEXT", []);
-        // Ledgers created before runs recorded the node they were placed on (#120).
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN node TEXT", []);
-        // Ledgers created before a running box's authority could be renewed (#56).
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN authority_until INTEGER", []);
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN authority_cap INTEGER", []);
-        // Ledgers created before messages were addressed to principals (#250).
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN to_principal TEXT", []);
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at)")?;
-        // Ledgers created before the agent-to-agent protocol's receipts and presence (#252).
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN from_principal TEXT", []);
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN priority TEXT", []);
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN in_reply_to TEXT", []);
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN activity TEXT", []);
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN activity_at INTEGER", []);
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_sent ON messages (from_principal, created_at)")?;
-        // Ledgers created before the wake claim had its own name (#349): its end was `lease_until`.
-        if conn.execute("ALTER TABLE agents ADD COLUMN claim_until INTEGER", []).is_ok() {
-            conn.execute("UPDATE agents SET claim_until = lease_until", [])?;
-        }
-        // Ledgers created before placed nodes recorded their hourly price (#358).
-        let _ = conn.execute("ALTER TABLE placed_nodes ADD COLUMN hourly INTEGER", []);
-        // Ledgers created before capacity grants (#256): the principal a grant is to, and its terms.
-        let _ = conn.execute("ALTER TABLE grants ADD COLUMN principal TEXT", []);
-        let _ = conn.execute("ALTER TABLE grants ADD COLUMN terms TEXT", []);
-        // Ledgers created before approvals were bound to their effect (#369).
-        let _ = conn.execute("ALTER TABLE requests ADD COLUMN args_sha256 TEXT", []);
-        let _ = conn.execute("ALTER TABLE grants ADD COLUMN args_sha256 TEXT", []);
-        let _ = conn.execute("ALTER TABLE grants ADD COLUMN effect_sha256 TEXT", []);
+        // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS audit_run ON audit (run, seq); CREATE INDEX IF NOT EXISTS requests_run ON requests (run, status)",
+            "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
+             CREATE INDEX IF NOT EXISTS messages_sent ON messages (from_principal, created_at);
+             CREATE INDEX IF NOT EXISTS audit_run ON audit (run, seq);
+             CREATE INDEX IF NOT EXISTS requests_run ON requests (run, status)",
         )?;
-        // Ledgers created before a run's uncollected files held its node (#300, #324).
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN uncollected TEXT", []);
-        // Ledgers created before a child's stuck supervisor was recorded (#409).
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN stuck_at INTEGER", []);
-        // Ledgers created before an agent's finish or hibernate was recorded for its run (#444).
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN want TEXT", []);
-        // Ledgers created before a message was in flight until its box had it (#445).
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN taken_at INTEGER", []);
-        let _ = conn.execute("ALTER TABLE operator_messages ADD COLUMN stdin_start INTEGER", []);
-        let _ = conn.execute("ALTER TABLE operator_messages ADD COLUMN stdin_end INTEGER", []);
-        // Ledgers created before an agent had one inbox (#253): prompts and notices move into
-        // `messages`, copied once (when `kind` is added) with what was taken and where in stdin.
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN text TEXT", []);
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN label TEXT", []);
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN stdin_start INTEGER", []);
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN stdin_end INTEGER", []);
-        if conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'", []).is_ok() {
-            conn.execute(LEGACY_PROMPTS, [])?;
-        }
-        // Schema 19 (contract, #463): the old table goes, its rows copied above if they never were.
+        // Schema 19 (contract, #463): the old table goes (schema 17 copied its rows into `messages`).
         // A build of schema 17 or 18 that opens the ledger again creates it empty, and never reads it.
         conn.execute_batch("DROP TABLE IF EXISTS operator_messages")?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_turns ON messages (to_run, kind, delivered_at)")?;
@@ -2340,9 +2280,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ledger.db");
-        // A ledger from before #162: no schema recorded.
-        Connection::open(&path).unwrap().execute_batch(SCHEMA).unwrap();
-        assert_eq!(Ledger::schema_of(&path).unwrap(), Schema { version: 0, floor: 0 });
+        // A ledger from before #162 (no schema recorded), or of any schema before 17: refused, naming
+        // a build that upgrades it, and left as it was.
+        let old = dir.join("old.db");
+        Connection::open(&old).unwrap().execute_batch(SCHEMA).unwrap();
+        assert_eq!(Ledger::schema_of(&old).unwrap(), Schema { version: 0, floor: 0 });
+        let e = Ledger::open(&old).err().expect("refused");
+        assert!(matches!(e, StoreError::TooOld { version: 0 }) && e.to_string().contains(STEP_THROUGH), "{e}");
+        assert_eq!(Ledger::schema_of(&old).unwrap(), Schema { version: 0, floor: 0 }, "untouched");
+        Connection::open(&old).unwrap().execute("INSERT INTO schema_meta (key, value) VALUES ('version', 16), ('floor', 0)", []).unwrap();
+        assert!(matches!(Ledger::open(&old), Err(StoreError::TooOld { version: 16 })));
+        // A new ledger, and one of schema 17: opened.
         let l = Ledger::open(&path).unwrap();
         assert_eq!(Ledger::schema_of(&path).unwrap(), Schema { version: SCHEMA_VERSION, floor: SCHEMA_FLOOR });
         // A snapshot is a whole ledger, with the same schema and records.
@@ -2549,54 +2497,23 @@ mod tests {
         assert_eq!(r.from_principal.as_deref(), Some(OWNER));
     }
 
-    /// #253: schema 17 copies every operator message into the one inbox once, keeping what was taken
-    /// and where it is in its box's stdin.
+    /// #463: a ledger of schema 17 or 18 still has the old `operator_messages` table (empty: schema
+    /// 17 copied it into the inbox); this build drops it, and builds from before one inbox can no
+    /// longer open the ledger.
     #[test]
-    fn schema_17_moves_operator_messages_into_the_inbox() {
+    fn schema_19_drops_the_old_operator_messages_table() {
         let path = std::env::temp_dir().join(format!("wicket-opmsg-{}.db", wicket_core::new_ulid()));
+        drop(Ledger::open(&path).unwrap());
         {
             let c = Connection::open(&path).unwrap();
-            c.execute_batch(SCHEMA).unwrap();
-            // A schema-16 ledger: its messages have no kind, text, label or stdin offsets yet.
-            for col in ["kind", "text", "label", "stdin_start", "stdin_end"] {
-                c.execute_batch(&format!("ALTER TABLE messages DROP COLUMN {col}")).unwrap();
-            }
-            // ...and its prompts are in their own table, as they were until schema 17.
-            c.execute_batch(
-                "CREATE TABLE operator_messages (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, text TEXT NOT NULL, by TEXT NOT NULL,
-                   created_at INTEGER NOT NULL, consumed_at INTEGER, stdin_start INTEGER, stdin_end INTEGER)",
-            )
-            .unwrap();
-            for (text, by, consumed, start) in [
-                ("had", "owner", Some(10), Some(0)),
-                ("never", "owner", Some(10), Some(100)),
-                ("queued", "owner", None, None),
-                ("low memory", "wicket", None, None),
-            ] {
-                c.execute(
-                    "INSERT INTO operator_messages (run, text, by, created_at, consumed_at, stdin_start, stdin_end) VALUES ('run_a', ?1, ?2, 5, ?3, ?4, ?4 + 50)",
-                    params![text, by, consumed, start],
-                )
-                .unwrap();
-            }
+            c.execute("UPDATE schema_meta SET value = 17 WHERE key = 'version'", []).unwrap();
+            c.execute_batch("CREATE TABLE operator_messages (id INTEGER PRIMARY KEY, run TEXT NOT NULL)").unwrap();
         }
-        let mut l = Ledger::open(&path).unwrap();
-        assert_eq!(Ledger::schema_of(&path).unwrap().version, SCHEMA_VERSION);
-        assert_eq!(l.waiting_prompts("run_a").unwrap(), 2);
-        assert_eq!(l.requeue_prompts("run_a", 60).unwrap(), vec!["prompt-legacy-2".to_string()]);
-        let got: Vec<(String, String)> = l.take_prompts("run_a").unwrap().into_iter().map(|p| (p.text, p.label)).collect();
-        assert_eq!(got, [("never".into(), "owner".into()), ("queued".into(), "owner".into()), ("low memory".into(), "wicket".into())]);
-        // Schema 19 (contract, #463): the old table is gone once copied, and builds from before
-        // one inbox, which read it, can no longer open the ledger.
+        let l = Ledger::open(&path).unwrap();
         let old: i64 = l.conn.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'operator_messages'", [], |r| r.get(0)).unwrap();
         assert_eq!(old, 0);
         assert_eq!(Ledger::schema_of(&path).unwrap(), Schema { version: SCHEMA_VERSION, floor: 17 });
         assert!(!wicket_core::version::schema_opens(16, SCHEMA_FLOOR) && wicket_core::version::schema_opens(17, SCHEMA_FLOOR));
-        drop(l);
-        // Opening it again copies nothing twice.
-        let mut l = Ledger::open(&path).unwrap();
-        assert!(l.take_prompts("run_a").unwrap().is_empty());
         drop(l);
         let _ = std::fs::remove_file(&path);
     }
