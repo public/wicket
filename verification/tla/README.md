@@ -308,19 +308,22 @@ choice of placement, and a node's crash.
 Model 4 of [#321](https://github.com/public/wicket/issues/321). A new build arrives two ways:
 
 - An install (`deploy/install.sh`) restarts wicketd. `KillMode=process` leaves the runs'
-  supervisors running as orphans, on the build they started on (#468).
-- `wicket self update` stops the runs' old supervisors itself, then sends wicketd SIGHUP. The daemon
-  drains: it refuses new commands and writes the handoff of its running ones, then re-executes as
-  the new build (#455).
+  supervisors running as orphans, on the build they started on (#468), and wicketd's child too:
+  this host's own node's `serve` (#529).
+- `wicket self update` re-executes the local serve, stops the runs' old supervisors itself, then
+  sends wicketd SIGHUP. The daemon drains: it refuses new commands and writes the handoff of its
+  running ones, then re-executes as the new build (#455).
 
 The new build writes operators' prompts in its schema. A supervisor still on the old build reads
-them.
+them. A run's box on the local node (`LocalRuns`) is served by the local serve. When a new build's
+supervisor re-attached to an old build's serve, the box was lost (#529).
 
 | property | meaning |
 |---|---|
 | `NoPromptLost` | no operator's prompt is lost across an update |
 | `OldBuildBounded` | after an update, no supervisor runs the old build for longer than the handover's bound |
 | `DaemonTakesCommands` | the daemon refuses commands for no longer than its drain's bound: it always takes them again |
+| `BoxesKept` | an update keeps every run's box: a re-attach never ends the box it means to keep |
 
 The bounds are what the code's timeouts keep. They are written as obligations on time: time
 doesn't pass a handover's bound while the handover can still act, nor a drain's while the drain
@@ -331,20 +334,27 @@ can still return. A bug that stops either from acting lets time pass, and breaks
 | `ExpandSafe = TRUE` and `HandOverOnStart = TRUE` | #475: schema 17 wasn't expand-safe for older readers. After an install's restart (#468), the old-build supervisors' `await_message` took the new build's prompts as peers' messages and dropped them | `fail_update_old_supervisor_drops_prompts`: `NoPromptLost` |
 | `HandOverOnStart = TRUE` (#477) | an install's restart left every run on its old supervisor for as long as the run lived | `fail_update_old_build_lingers`: `OldBuildBounded` |
 | `DrainReturns = TRUE` (#489) | #487: the SIGHUP drain asked the registry it held how many commands it handed over, deadlocked, and the daemon refused every command until it was restarted | `fail_update_drain_hangs`: `DaemonTakesCommands` |
+| `ServeFirstOnStart = TRUE` (#529) | `deploy/install.sh`'s restart of wicketd left the local serve on the old build. The new wicketd handed the local run over, and its new-build supervisor, re-attached to the old serve, lost the box ("stopped by wicket: its control host stopped it") | `fail_update_local_serve_left_old`: `BoxesKept` |
+| `ServeFirstOnUpdate = TRUE` (#529) | `wicket self update`'s `handover` stopped the old supervisors before it re-executed the serve. The reconciler service could re-attach a local run in between, to the old serve | `fail_update_serve_after_stop`: `BoxesKept` |
 | `ExpandSafe = TRUE` alone | the handover narrows #475's window but doesn't close it. A prompt sent in the seconds before an old supervisor is stopped is still dropped if the schema step isn't expand-safe. The expand rule, which the store's `previous_build` test checks (#477), is what closes it | `fail_update_handover_without_expand`: `NoPromptLost` |
 
 | action | code (file, function) |
 |---|---|
 | `Install`, `DaemonStart` | `deploy/install.sh` (`systemctl restart wicketd`); `wicket-cli/src/daemon/mod.rs` `serve`, which hands over on a thread (`hand_over_runs`) while it takes commands |
-| `HandOver`, `Reattach` | `wicket-cli/src/update.rs` `stop_stale_supervisors` (SIGKILL, the box left running), then the reconciler's `run_adopted` (`wicket attach` on the new build) |
+| `ServeReexec` | `update.rs` `reexec_local_node`: SIGHUP to the local serve, which re-executes as the current build with the same pid and adopts its boxes; the caller waits for it. First in `hand_over_runs` and in `handover` |
+| `HandOver`, `Reattach` | `wicket-cli/src/update.rs` `stop_stale_supervisors` (SIGKILL, the box left running), then a reconciler's `run_adopted` (`wicket attach` on the new build): the handover's own pass (`adopt_handed`) or the reconciler service's, whichever comes first |
 | `SelfUpdate`, `DrainDone` | `update.rs` `handover`, then SIGHUP: `daemon/mod.rs` `drain` and `handoff::prepare`, held across the exec (#489) |
 | `Send`, `Take` | `Ledger::add_prompt` (#463), and a supervisor's `take_prompts` or `await_message` on its build |
 
-Bounds: two runs, two prompts, `MaxTime = 4`, `HandoverMax = 1`, `DrainMax = 1` (`Update.cfg`).
+Bounds: two runs, one of them on the local node, two prompts, `MaxTime = 4`, `HandoverMax = 1`,
+`DrainMax = 1` (`Update.cfg`).
 
 Not modelled:
 - a supervisor stopped holding a prompt in flight (RunLifecycle covers that: it is given again on the re-attach, #445);
 - several updates in a row;
 - a rollback;
-- nodes' own builds.
+- nodes' own builds (a remote node's serve moves by `wicket self update --nodes`);
+- why an old serve under a new supervisor loses the box. The model takes #529's outcome as given;
+- the reconciler service's own restart: `wicket-reconcile.service` has `KillMode=process`, so its
+  restart leaves the supervisors its passes started running (#529).
 
