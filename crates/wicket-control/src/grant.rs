@@ -1238,6 +1238,53 @@ mod tests {
     /// #256, #50: who may grant is policy. The default rules are the refusals agents always had,
     /// each pinned here; a rule that allows one lifts that refusal alone, and no rule lifts the
     /// agent's own bounds (its authority's end, its descendants, its reach).
+    /// #472, #326: the default rules lift nothing, whatever the request. They decide HTTP requests
+    /// only (every reserved kind stays an operator's), no prefix request, and grant only the plain
+    /// shape: a number of uses, exactly the asked path, to the asking run, and no git push's window.
+    #[test]
+    fn default_agent_rules_lift_nothing_whatever_the_request() {
+        use crate::operators::AgentRules;
+        let rules = AgentRules::default();
+        for m in wicket_core::op::HTTP_METHODS {
+            assert!(rules.decides(m), "{m}");
+        }
+        for m in wicket_core::op::RESERVED_METHODS {
+            assert!(!rules.decides(m), "{m} is an operator's");
+        }
+        let t = Tree::new();
+        let hook = t.hook(
+            "name: p\nreach:\n  - { host: api.example.com, methods: [GET, POST], paths: [\"/v1/**\", \"/acme/app.git/**\"], allow_dangerous: true }\n",
+        );
+        let a = AgentAuthority { rules: rules.clone(), ..hook.authority() };
+        let req = |method: &str, path: &str| {
+            let id = t.ask("run_c", method, path);
+            t.ledger.lock().unwrap().request(&id).unwrap()
+        };
+        let plain = req("GET", "/v1/items");
+        let push = req("POST", "/acme/app.git/git-receive-pack");
+        for (r, is_push) in [(&plain, false), (&push, true)] {
+            for uses in [Some(1), None] {
+                for prefix in [None, Some("/".to_string())] {
+                    for zone_wide in [false, true] {
+                        let terms = Terms { uses, ttl: Duration::from_secs(60), prefix: prefix.clone(), zone_wide };
+                        let plain_shape = uses.is_some() && prefix.is_none() && !zone_wide && !is_push;
+                        let got = agent_terms(&a, r, &terms);
+                        assert_eq!(got.is_ok(), plain_shape, "{} {} {terms:?}: {got:?}", r.method, r.path);
+                        // Nor through the bounds, for a grant with no number of uses.
+                        if uses.is_none() {
+                            assert!(bounds(&Granter::Agent(a.clone()), &Verdict::Approve(terms.clone())).is_err(), "{terms:?}");
+                        }
+                    }
+                }
+            }
+        }
+        let mut whole = req("GET", "/v1/");
+        whole.scope_prefix = true;
+        let e = format!("{:#}", within_authority(&t.ledger.lock().unwrap(), &a, &whole).unwrap_err());
+        assert!(e.contains("decided by an operator"), "{e}");
+        assert!(within_authority(&t.ledger.lock().unwrap(), &a, &plain).is_ok(), "the plain request is the agent's to decide");
+    }
+
     #[test]
     fn the_agents_rules_decide_what_an_agent_may_grant() {
         use crate::operators::AgentRules;
