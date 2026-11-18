@@ -13,7 +13,9 @@ mod capgrant;
 pub use capgrant::{covers as capacity_covers, CapacityAsk, CapacityGrant, CapacityTerms, CapacityUsed, CAPACITY_GRANT_PATH};
 mod delegations;
 mod digestgrant;
-pub use digestgrant::{valid_digest, DigestAction, DigestScope, DigestUse, NewDigestGrant, DIGEST_METHOD};
+pub use digestgrant::{
+    signer_principal, valid_digest, DigestAction, DigestScope, DigestUse, NewDigestGrant, Signer, DIGEST_METHOD, SIGNER_GRANT_SECS,
+};
 mod effect;
 pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
 pub use effect::{descriptor, requesters, DecisionTerms, EffectUse, EgressSeen, Filed};
@@ -2308,6 +2310,26 @@ mod tests {
         assert_eq!(l.use_update_approval(&"cd".repeat(32)).unwrap(), None, "another hash");
         assert_eq!(l.use_update_approval(&sha).unwrap(), Some((rid, gid)));
         assert_eq!(l.use_update_approval(&sha).unwrap(), None, "used up, even with uses left");
+    }
+
+    /// #258: an approval is accepted as what it is, the operator's one-use `install` grant on the
+    /// build's digest, by the one check; used up, as before.
+    #[test]
+    fn an_approved_update_is_accepted_as_the_operators_grant_on_its_digest() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let sha = "ab".repeat(32);
+        let mut op = Op::egress(&t, &RunId("run_t".into()), "z", "UPDATE", "wicket.internal", &format!("/self/{sha}"));
+        op.risk = wicket_core::RiskClass::R4ExecOrPrivilege;
+        let (rid, _) = l.pending_for(&op, "an agent's build", None).unwrap();
+        assert!(l.accept_update_approval(&t, &sha, "self update").unwrap().is_none(), "asked, not approved");
+        let a = Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "operator:alex".into() };
+        l.approve(&rid, &a).unwrap();
+        let (req, u) = l.accept_update_approval(&t, &sha, "self update").unwrap().unwrap();
+        assert_eq!((req, u.decided_by.as_str(), u.scope), (rid, "operator:alex", DigestScope::Installation));
+        assert!(l.accept_update_approval(&t, &sha, "self update").unwrap().is_none(), "used up");
+        let digest = format!("sha256:{sha}");
+        assert_eq!(l.may_use(&t, &digest, DigestAction::Install, &DigestScope::Installation, "again").unwrap(), None);
     }
 
     #[test]

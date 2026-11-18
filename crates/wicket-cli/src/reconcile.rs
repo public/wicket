@@ -890,6 +890,14 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     let now = wicket_store::now();
     let mut done = machines_pass(&mut ledger, asked, &local, now, dry_run).await?;
     done.extend(placed_nodes(&mut ledger, now, dry_run).await?);
+    // The CI principals' standing grants (#258): renewed while their release key is trusted,
+    // revoked once it isn't.
+    if !dry_run {
+        match crate::update::renew_signers(&ledger) {
+            Ok(changes) => done.extend(changes.into_iter().map(|(kind, key, detail)| Done { kind, target: key, detail })),
+            Err(e) => done.push(Done { kind: "error", target: "release keys".into(), detail: format!("renewing their grants: {e:#}") }),
+        }
+    }
     if !dry_run && crate::storegc::due() {
         // The store clients block: off the async runtime.
         let passes = tokio::task::spawn_blocking(|| crate::storegc::run(&Ledger::open(&crate::ledger_path())?, false)).await?;

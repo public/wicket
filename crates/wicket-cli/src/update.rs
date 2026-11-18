@@ -443,7 +443,8 @@ fn verify_ci_sig(sig: &Signature, sha: &str, trusted: &[[u8; 32]]) -> Result<(St
     Ok((key_id(&public), claims))
 }
 
-fn trusted_keys() -> Result<Vec<[u8; 32]>> {
+/// The release keys in `<data dir>/release-keys/`: what the installation's operators trust.
+fn key_files() -> Result<Vec<[u8; 32]>> {
     let mut v = vec![];
     if let Ok(rd) = std::fs::read_dir(release_keys_dir()) {
         for e in rd.flatten() {
@@ -455,7 +456,60 @@ fn trusted_keys() -> Result<Vec<[u8; 32]>> {
     Ok(v)
 }
 
-/// `wicket self trust-key`: adds a release public key.
+/// Who a key file from before #258 is imported as trusted by.
+const IMPORTED_BY: &str = "wicket:release-keys";
+
+/// The release keys a signature is checked against (#258): each CI principal's, while its standing
+/// grant is live. A key file never recorded as one (trusted before #258) is imported once, so an
+/// installed host moves over by itself; a grant revoked or lapsed is not brought back.
+fn trusted_signers(l: &Ledger) -> Result<Vec<([u8; 32], wicket_store::Signer)>> {
+    let t = TenantId::single();
+    for k in key_files()? {
+        let id = key_id(&k);
+        if !l.signer_recorded(&t, &id)? {
+            let g = l.trust_signer(&t, &id, &B64.encode(k), IMPORTED_BY)?;
+            l.audit(&t, None, "self.key_trusted", &serde_json::json!({ "key": id, "grant": g, "by": IMPORTED_BY }))?;
+        }
+    }
+    let mut v = vec![];
+    for s in l.signers(&t)? {
+        if let Some(k) = B64.decode(&s.key).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+            v.push((k, s));
+        }
+    }
+    Ok(v)
+}
+
+fn trusted_keys() -> Result<Vec<[u8; 32]>> {
+    Ok(trusted_signers(&Ledger::open(&crate::ledger_path())?)?.into_iter().map(|(k, _)| k).collect())
+}
+
+/// The reconciler's daily care of the CI principals' standing grants (#258): each is renewed for a
+/// day while its key file is still in `release-keys/`, and revoked once it isn't. Revoking the
+/// grant (`wicket grant revoke`), or removing the key file, so stops a key within a day. Returns
+/// what changed: (kind, key, detail).
+pub fn renew_signers(l: &Ledger) -> Result<Vec<(&'static str, String, String)>> {
+    let t = TenantId::single();
+    let files: Vec<String> = key_files()?.iter().map(key_id).collect();
+    let mut done = vec![];
+    for (_, s) in trusted_signers(l)? {
+        if files.contains(&s.key_id) {
+            l.renew_signer(&t, &s.key_id)?;
+        } else {
+            l.revoke_grant(&s.grant)?;
+            l.audit(
+                &t,
+                None,
+                "self.key_untrusted",
+                &serde_json::json!({ "key": s.key_id, "grant": s.grant, "why": "its key file is gone" }),
+            )?;
+            done.push(("key_untrusted", s.key_id.clone(), format!("its key file is gone: grant {} revoked", s.grant)));
+        }
+    }
+    Ok(done)
+}
+
+/// `wicket self trust-key`: adds a release public key, and its CI principal's standing grant.
 pub fn trust_key(public: &Path) -> Result<()> {
     let k = read_public(public)?;
     wicket_identity::VerifyingKey::from_bytes(&k).context("not an Ed25519 key")?;
@@ -463,8 +517,12 @@ pub fn trust_key(public: &Path) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let id = key_id(&k);
     std::fs::write(dir.join(format!("{id}.pub")), format!("{}\n", serde_json::json!({ "alg": "ed25519", "key": B64.encode(k) })))?;
-    Ledger::open(&crate::ledger_path())?.audit(&TenantId::single(), None, "self.key_trusted", &serde_json::json!({ "key": id }))?;
-    println!("trusting release key {id}");
+    let l = Ledger::open(&crate::ledger_path())?;
+    let t = TenantId::single();
+    // Trusted again after a revocation: a new grant (a live one is kept).
+    let g = l.trust_signer(&t, &id, &B64.encode(k), &crate::operator())?;
+    l.audit(&t, None, "self.key_trusted", &serde_json::json!({ "key": id, "grant": g, "by": crate::operator() }))?;
+    println!("trusting release key {id} (its standing grant {g}, renewed daily while the key is trusted)");
     Ok(())
 }
 
@@ -497,9 +555,23 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
     let sig_path = sig.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(format!("{}.sig", artifact.display())));
     // A CI build (#190): only a CI signature whose claims are what was asked for. No other
     // signature, and no human approval of its sha256, stands in for it.
+    // A signature verified against a CI principal's key is that principal's grant on this one
+    // digest, accepted by the one check (#258); it is audited as every acceptance is.
+    let by_grant = |key: &str| -> Result<Option<wicket_store::DigestUse>> {
+        let l = ledger.lock().expect("ledger");
+        let Some((_, s)) = trusted_signers(&l)?.into_iter().find(|(_, s)| s.key_id == key) else { return Ok(None) };
+        Ok(l.accept_signed(&TenantId::single(), &format!("sha256:{sha}"), &s, &format!("self update by {}", crate::operator()))?)
+    };
+    let with_grant = |mut source: serde_json::Value, u: &wicket_store::DigestUse| {
+        source["grant"] = serde_json::json!(u.grant);
+        source
+    };
     if let Some(e) = ci {
         return match ci_signed(&sha, &sig_path, e) {
-            Ok((key, c)) => Ok(Accepted { copy, sha256: sha, source: ci_source(&key, &c) }),
+            Ok((key, c)) => match by_grant(&key)? {
+                Some(u) => Ok(Accepted { copy, sha256: sha.clone(), source: with_grant(ci_source(&key, &c), &u) }),
+                None => Err(refuse(format!("release key {key} has no live standing grant"))),
+            },
             Err(e) => Err(refuse(format!("the CI build isn't signed as asked: {e:#}"))),
         };
     }
@@ -518,15 +590,28 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
                     Some(c) => ci_source(&key, &c),
                     None => serde_json::json!({ "signed": key }),
                 };
-                return Ok(Accepted { copy, sha256: sha, source });
+                match by_grant(&key)? {
+                    Some(u) => return Ok(Accepted { copy, sha256: sha.clone(), source: with_grant(source, &u) }),
+                    None => why_not_signed = format!("{}: release key {key} has no live standing grant", sig_path.display()),
+                }
             }
             Err(e) => why_not_signed = format!("{} ({e:#})", sig_path.display()),
         }
     }
     // Bound first: the ledger's lock must be released before `refuse` takes it again.
-    let approval = ledger.lock().expect("ledger").use_update_approval(&sha)?;
+    // An operator's approval is their one-use grant on the build's digest, accepted by the one
+    // check (#258).
+    let approval = ledger.lock().expect("ledger").accept_update_approval(
+        &TenantId::single(),
+        &sha,
+        &format!("self update by {}", crate::operator()),
+    )?;
     match approval {
-        Some((request, grant)) => Ok(Accepted { copy, sha256: sha, source: serde_json::json!({ "approved": { "request": request, "grant": grant } }) }),
+        Some((request, u)) => Ok(Accepted {
+            copy,
+            sha256: sha,
+            source: serde_json::json!({ "approved": { "request": request, "grant": u.grant, "by": u.decided_by } }),
+        }),
         None => Err(refuse(format!(
             "the artifact (sha256 {sha}) is not signed by a release key this installation trusts: {why_not_signed}; and no operator has approved an update to it (an agent's request_update, approved with `wicket approve`)"
         ))),

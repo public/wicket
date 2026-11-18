@@ -87,6 +87,28 @@ pub struct DigestUse {
     pub scope: DigestScope,
 }
 
+/// How long a CI principal's standing grant lasts before the reconciler renews it: a day, the cap
+/// every grant has. Revoking the grant, or no longer trusting its key, stops it within a day.
+pub const SIGNER_GRANT_SECS: i64 = 24 * 3600;
+
+/// The CI principal of release key `key_id`.
+pub fn signer_principal(key_id: &str) -> String {
+    format!("release-key:{key_id}")
+}
+
+fn signer_path(key_id: &str) -> String {
+    format!("/signer/{key_id}")
+}
+
+/// A CI principal with a live standing grant: the grant, its release key's id, and the public key
+/// (base64url, as the key file holds it).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Signer {
+    pub grant: String,
+    pub key_id: String,
+    pub key: String,
+}
+
 /// Whether `d` is a digest a grant can name: `sha256:` and 64 lowercase hex digits.
 pub fn valid_digest(d: &str) -> bool {
     d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
@@ -184,6 +206,135 @@ impl Ledger {
         tx.commit()?;
         Ok(Some(used))
     }
+
+    /// Records that the CI principal of release key `key_id` (`key`, its public key, base64) holds
+    /// a standing grant to install what it signs (#258): a grant held by
+    /// [`signer_principal`]`(key_id)`, at `/signer/<key id>`, for [`SIGNER_GRANT_SECS`], renewed
+    /// by the reconciler while the key stays trusted ([`Ledger::renew_signer`]). A live one is kept
+    /// (its id returned). Only operators trust keys (`wicket self trust-key`).
+    pub fn trust_signer(&self, tenant: &TenantId, key_id: &str, key: &str, decided_by: &str) -> Result<String> {
+        if let Some(s) = self.signers(tenant)?.into_iter().find(|s| s.key_id == key_id) {
+            return Ok(s.grant);
+        }
+        let terms = serde_json::json!({ "action": "install", "scope": DigestScope::Installation, "key": key }).to_string();
+        let id = new_grant_id();
+        self.conn.execute(
+            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, principal, terms)
+             VALUES (?1, ?2, '', ?3, ?4, ?5, 0, NULL, ?6, NULL, ?7, ?8, ?9, ?10)",
+            params![
+                id,
+                tenant.0,
+                DIGEST_METHOD,
+                crate::QUOTA_HOST,
+                signer_path(key_id),
+                now() + SIGNER_GRANT_SECS,
+                decided_by,
+                now(),
+                signer_principal(key_id),
+                terms
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Whether release key `key_id` has ever had a standing grant, live or not (a key file imported
+    /// once stays as its grant left it: revoked or lapsed is not brought back).
+    pub fn signer_recorded(&self, tenant: &TenantId, key_id: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM grants WHERE tenant = ?1 AND method = ?2 AND host = ?3 AND path = ?4",
+            params![tenant.0, DIGEST_METHOD, crate::QUOTA_HOST, signer_path(key_id)],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Keeps release key `key_id`'s live standing grant live for another [`SIGNER_GRANT_SECS`]
+    /// (the reconciler, daily, while the key is still trusted). False: there is none live (revoked
+    /// or lapsed), and nothing is brought back.
+    pub fn renew_signer(&self, tenant: &TenantId, key_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE grants SET expires_at = ?5 WHERE tenant = ?1 AND method = ?2 AND host = ?3 AND path = ?4 AND revoked = 0 AND expires_at > ?6",
+            params![tenant.0, DIGEST_METHOD, crate::QUOTA_HOST, signer_path(key_id), now() + SIGNER_GRANT_SECS, now()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The CI principals holding a live standing grant: each release key this installation trusts now.
+    pub fn signers(&self, tenant: &TenantId) -> Result<Vec<Signer>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, path, terms FROM grants WHERE tenant = ?1 AND method = ?2 AND host = ?3 AND substr(path, 1, 8) = '/signer/'
+               AND revoked = 0 AND expires_at > ?4 ORDER BY created_at, rowid",
+        )?;
+        let r = st.query_map(params![tenant.0, DIGEST_METHOD, crate::QUOTA_HOST, now()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?.unwrap_or_default()))
+        })?;
+        let mut out = vec![];
+        for row in r {
+            let (grant, path, terms) = row?;
+            let key = serde_json::from_str::<serde_json::Value>(&terms).ok().and_then(|v| v["key"].as_str().map(String::from));
+            if let (Some(key_id), Some(key)) = (path.strip_prefix("/signer/"), key) {
+                out.push(Signer { grant, key_id: key_id.to_string(), key });
+            }
+        }
+        Ok(out)
+    }
+
+    /// A build `digest` signed by `signer` (its signature verified by the caller, against the key
+    /// of the signer's live standing grant): the signer's grant on that one digest (`install`,
+    /// installation-wide, one use, minutes), within its standing authority, then the one check,
+    /// [`Ledger::may_use`], audited as every acceptance is.
+    pub fn accept_signed(&self, tenant: &TenantId, digest: &str, signer: &Signer, by: &str) -> Result<Option<DigestUse>> {
+        if !self.signers(tenant)?.iter().any(|s| s.grant == signer.grant) {
+            return Ok(None);
+        }
+        let grant = self.grant_digest(&NewDigestGrant {
+            tenant,
+            digest,
+            action: DigestAction::Install,
+            scope: DigestScope::Installation,
+            uses: Some(1),
+            expires_at: now() + 600,
+            decided_by: &signer_principal(&signer.key_id),
+        })?;
+        self.audit(
+            tenant,
+            None,
+            "digest.granted",
+            &serde_json::json!({ "digest": digest, "action": "install", "scope": DigestScope::Installation, "grant": grant,
+                                 "by": signer_principal(&signer.key_id), "under": signer.grant, "why": "signed by its release key" }),
+        )?;
+        self.may_use(tenant, digest, DigestAction::Install, &DigestScope::Installation, by)
+    }
+
+    /// An operator's approval of an update to the build with sha256 `sha` (an agent's
+    /// `request_update`, approved: [`Ledger::use_update_approval`], used up here) as what it is
+    /// (#258): that operator's grant on the build's digest, `install`, one use, then the one check,
+    /// [`Ledger::may_use`]. Returns the request and the acceptance; None: no live approval.
+    pub fn accept_update_approval(&mut self, tenant: &TenantId, sha: &str, by: &str) -> Result<Option<(String, DigestUse)>> {
+        let Some((request, approval)) = self.use_update_approval(sha)? else { return Ok(None) };
+        let decided_by: String = self
+            .conn
+            .query_row("SELECT decided_by FROM grants WHERE id = ?1", params![approval], |r| r.get(0))
+            .unwrap_or_else(|_| "operator".into());
+        let digest = format!("sha256:{sha}");
+        let grant = self.grant_digest(&NewDigestGrant {
+            tenant,
+            digest: &digest,
+            action: DigestAction::Install,
+            scope: DigestScope::Installation,
+            uses: Some(1),
+            expires_at: now() + 600,
+            decided_by: &decided_by,
+        })?;
+        self.audit(
+            tenant,
+            None,
+            "digest.granted",
+            &serde_json::json!({ "digest": digest, "action": "install", "scope": DigestScope::Installation, "grant": grant,
+                                 "by": decided_by, "under": approval, "request": request, "why": "an operator approved the update" }),
+        )?;
+        Ok(self.may_use(tenant, &digest, DigestAction::Install, &DigestScope::Installation, by)?.map(|u| (request, u)))
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +398,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(listed, 1, "the used-up run grant is still there until it expires");
+    }
+
+    /// #258: a release key is a CI principal with a standing grant: renewed while trusted, never
+    /// brought back once revoked; what it signs is its one-use grant on that digest, accepted by
+    /// the one check.
+    #[test]
+    fn a_release_key_is_a_ci_principal_with_a_standing_grant() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        assert!(!l.signer_recorded(&t, "k1").unwrap());
+        let g = l.trust_signer(&t, "k1", "KEY", "operator:alex").unwrap();
+        assert_eq!(l.trust_signer(&t, "k1", "KEY", "operator:alex").unwrap(), g, "kept, not repeated");
+        let s = l.signers(&t).unwrap();
+        assert_eq!(s, vec![Signer { grant: g.clone(), key_id: "k1".into(), key: "KEY".into() }]);
+        assert!(l.renew_signer(&t, "k1").unwrap());
+        // What it signs: accepted, once, by its grant on the digest.
+        let u = l.accept_signed(&t, D, &s[0], "self update").unwrap().unwrap();
+        assert_eq!(u.decided_by, signer_principal("k1"));
+        assert_eq!(l.may_use(&t, D, DigestAction::Install, &DigestScope::Installation, "again").unwrap(), None, "one use");
+        // Revoked: it signs nothing more, and renewing doesn't bring it back.
+        l.revoke_grant(&g).unwrap();
+        assert!(!l.renew_signer(&t, "k1").unwrap());
+        assert!(l.signers(&t).unwrap().is_empty());
+        assert_eq!(l.accept_signed(&t, D, &s[0], "self update").unwrap(), None);
+        assert!(l.signer_recorded(&t, "k1").unwrap(), "recorded: a key file isn't imported again");
     }
 
     /// A digest grant names a digest, has a lifetime, and decides no request or op.
