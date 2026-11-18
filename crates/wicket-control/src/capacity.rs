@@ -6,11 +6,12 @@
 //! ask, and the reconciler only looks after runs and boxes. See `examples/placement/placement.yaml`.
 //!
 //! **Money.** A lease reserves its worst case *at the agent's own price cap* (`max_hourly_usd` for
-//! every started hour of its duration) the moment it is asked for, in the ledger, atomically against
-//! `max_hourly_usd`/`max_total_usd` here ([`wicket_store::Ledger::create_lease`]). The node the
-//! placer then picks is no dearer than that cap, so the real worst case is never above what was
-//! reserved; the placer's own money envelope (the same limits, over the provider's owner-tagged nodes)
-//! is checked again before anything is created. Static hosts cost nothing and reserve nothing.
+//! every started hour of its duration) the moment it is asked for, in the ledger, by the one spend
+//! check (#256, [`wicket_store::Ledger::create_lease`]): its money quota grants, with every live
+//! lease's and every node `wicket node create` made, against `max_hourly_usd`/`max_total_usd` here,
+//! recorded as the tenant's money limit grant. The node the placer then picks (new, or warm from the
+//! pool) is no dearer than that cap, so the real worst case is never above what was reserved, which
+//! [`LeaseApprover`] checks. Static hosts cost nothing and reserve nothing.
 //!
 //! **The human.** The ask becomes an ordinary pending request (`CAPACITY wicket.internal
 //! /capacity/<lease>`), whose reason states the resources, duration, price cap and worst case: it shows
@@ -152,10 +153,6 @@ impl PlacementConfig {
 
     pub fn budget(&self) -> Result<LeaseBudget> {
         Ok(LeaseBudget { max_hourly: dollars(&self.max_hourly_usd)?.0 as i64, max_total: dollars(&self.max_total_usd)?.0 as i64 })
-    }
-
-    pub fn envelope(&self) -> Result<MoneyEnvelope> {
-        Ok(MoneyEnvelope { max_hourly: dollars(&self.max_hourly_usd)?, max_total: dollars(&self.max_total_usd)? })
     }
 
     pub fn owner(&self) -> Owner {

@@ -696,6 +696,10 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
     let mut done = vec![];
     let rows = ledger.placed_nodes(&["active"])?;
     for row in rows.into_iter().filter(|r| Owner::new(&r.owner) == *placer.owner() && r.backend == placer.provider().id()) {
+        // Its money stays reserved while it bills (#256): renewed a day at a time, until it ends.
+        if !dry_run {
+            let _ = ledger.renew_money(&wicket_store::money::node_money_key(&row.name), wicket_store::now() + 24 * 3600);
+        }
         if row.lease_until > now {
             continue;
         }
@@ -915,7 +919,7 @@ async fn machines_pass(
     match cfg.backend {
         capacity::Backend::Static => {
             let provider = static_hosts::StaticHosts::persistent(cfg.static_hosts.clone(), crate::data_dir().join("placement-static.json"));
-            let placer = Placer::new(provider, approver.clone(), cfg.owner(), cfg.envelope()?);
+            let placer = Placer::new(provider, approver.clone(), cfg.owner());
             let s = setup::Static { install: cfg.install_static };
             let m = Machines { placer: &placer, approver: &approver, setup: &s, warm_pool: cfg.warm_pool };
             Pass::new(ledger, Some(m), local, node_docker, now, dry_run).with_node_runs(asked.clone()).run().await
@@ -923,7 +927,7 @@ async fn machines_pass(
         capacity::Backend::Vultr => {
             let v = cfg.vultr.clone().context("vultr settings")?;
             let provider = setup::vultr_provider(&v)?;
-            let placer = Placer::new(provider, approver.clone(), cfg.owner(), cfg.envelope()?);
+            let placer = Placer::new(provider, approver.clone(), cfg.owner());
             let s = setup::Vultr { ssh_key: v.ssh_key.clone(), hosts: cfg.node_hosts.clone(), wait: v.ready_wait()? };
             let m = Machines { placer: &placer, approver: &approver, setup: &s, warm_pool: cfg.warm_pool };
             Pass::new(ledger, Some(m), local, node_docker, now, dry_run).with_node_runs(asked.clone()).run().await
@@ -1260,13 +1264,7 @@ mod tests {
     impl<P: Provider> World<P> {
         fn new(provider: P) -> World<P> {
             let approver = LeaseApprover::default();
-            let placer = Placer::new(
-                provider,
-                approver.clone(),
-                Owner::new("example"),
-                MoneyEnvelope { max_hourly: MicroUsd(1_000_000), max_total: MicroUsd(10_000_000) },
-            )
-            .with_clock(Arc::new(|| NOW));
+            let placer = Placer::new(provider, approver.clone(), Owner::new("example")).with_clock(Arc::new(|| NOW));
             World { placer, approver, setup: FakeSetup::default(), local: FakeBoxes::default(), nodes: BTreeMap::new() }
         }
 
@@ -1627,10 +1625,7 @@ mod tests {
             hourly: MicroUsd(20_000),
             lifetime_secs: 1800,
             worst_case: MicroUsd(worst),
-            committed_hourly: MicroUsd::ZERO,
-            committed_total: MicroUsd::ZERO,
-            max_hourly: MicroUsd::ZERO,
-            max_total: MicroUsd::ZERO,
+            warm: false,
         };
         assert_eq!(a.approve(&ask("cap-x", 20_000)).await, Approval::Approved);
         assert!(matches!(a.approve(&ask("cap-x", 30_000)).await, Approval::Denied(_)));

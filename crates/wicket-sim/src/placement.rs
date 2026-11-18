@@ -1,9 +1,10 @@
-//! Placement (#324, second slice): placed nodes' leases, the reconciler, the money envelope and
+//! Placement (#324, second slice): placed nodes' leases, the reconciler, the money limit and
 //! release, with several runs on one node, on turmoil's simulated network and clock.
 //!
 //! **What is real and what stands in.**
-//! - Real: [`wicket_placement::Placer`] (idempotent `acquire` by tag, the money envelope, the spend
-//!   approval, `get` and `release` with their owner and `wicket-protected` checks), the reconciler's
+//! - Real: [`wicket_placement::Placer`] (idempotent `acquire` by tag, the spend approval, `get` and
+//!   `release` with their owner and `wicket-protected` checks), the one spend check (#256: the
+//!   ledger's money quota grants against its money limit grant), the reconciler's
 //!   decision [`wicket_placement::reconcile::reconcile`], the billing rules
 //!   ([`wicket_placement::BillingModel::vultr`]: per started hour, leases end at minute 50), the
 //!   ledger ([`wicket_store::Ledger`] on the control host's disk: runs, their nodes, placed nodes,
@@ -39,7 +40,9 @@
 //!   refused as a replay, rollback or fork), and each run's fetch brings back its own whole
 //!   workspace;
 //! - a node isn't released while a run's box runs on it or a run's work on it is uncollected;
-//! - the money envelope holds: owned nodes never bill more per hour than its hourly limit.
+//! - the money limit holds: owned nodes never bill more per hour than its hourly limit, or commit
+//!   more than its total; the ledger's live money quota grants cover what a new node bills and stay
+//!   within the tenant's money limit grant, which holds `placement.yaml`'s limits (#256).
 
 use crate::rng::Rng;
 use crate::trace::{Report, Trace};
@@ -58,8 +61,8 @@ use wicket_placement::billing::PoolRules;
 use wicket_placement::model::{NodeState, PROTECTED_TAG};
 use wicket_placement::reconcile as plan;
 use wicket_placement::{
-    Approval, BillingModel, CapacityRequest, CreateSpec, IsolationTier, MicroUsd, MoneyEnvelope, NodeHandle, NodeId, Offer, Owner,
-    Placement, PlacementError, Placer, Provider, ReleaseMode, Released, Resources, SpendApprover, SpendRequest,
+    Approval, BillingModel, CapacityRequest, CreateSpec, IsolationTier, MicroUsd, NodeHandle, NodeId, Offer, Owner, Placement,
+    PlacementError, Placer, Provider, ReleaseMode, Released, Resources, SpendApprover, SpendRequest,
 };
 use wicket_store::{Ledger, PlacedNodeRow};
 
@@ -77,7 +80,7 @@ pub const PASS_S: i64 = 30;
 pub const GRACE_S: i64 = 2 * PASS_S + 120;
 /// The machines the provider has.
 pub const MACHINES: usize = 4;
-/// A node's hourly rate (Vultr's vc2-1c-2gb), and the envelope's hourly limit: three at once.
+/// A node's hourly rate (Vultr's vc2-1c-2gb), and the money limit's hourly limit: three at once.
 pub const RATE: MicroUsd = MicroUsd(14_000);
 pub const MAX_HOURLY: MicroUsd = MicroUsd(3 * 14_000);
 pub const PORT: u16 = 9000;
@@ -155,7 +158,7 @@ pub struct Plan {
     pub max_latency_s: u64,
     /// The provider's API answers in 1..= this many seconds.
     pub cloud_latency_s: u64,
-    /// The envelope's total limit.
+    /// The money limit's total.
     pub max_total: MicroUsd,
     pub creates: Vec<Create>,
     pub runs: Vec<RunPlan>,
@@ -206,7 +209,7 @@ impl fmt::Display for Plan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "placement seed {}: link latency 1..={} s, provider latency 1..={} s, envelope {} per hour, {} total",
+            "placement seed {}: link latency 1..={} s, provider latency 1..={} s, money limit {} per hour, {} total",
             self.seed, self.max_latency_s, self.cloud_latency_s, MAX_HOURLY, self.max_total
         )?;
         for c in &self.creates {
@@ -315,11 +318,11 @@ impl World {
         );
         let hourly: MicroUsd = self.live().map(|n| n.billing.hourly_rate()).sum();
         if hourly > MAX_HOURLY {
-            self.trace.violate(now, format!("owned nodes bill {hourly} per hour, over the envelope's {MAX_HOURLY}"));
+            self.trace.violate(now, format!("owned nodes bill {hourly} per hour, over the money limit's {MAX_HOURLY}"));
         }
         let total: MicroUsd = self.live().map(|n| n.billed_through(n.lease_until.unwrap_or(now).max(now))).sum();
         if total > self.max_total {
-            self.trace.violate(now, format!("owned nodes are committed to {total}, over the envelope's {}", self.max_total));
+            self.trace.violate(now, format!("owned nodes are committed to {total}, over the money limit's {}", self.max_total));
         }
     }
 
@@ -505,14 +508,37 @@ impl Provider for Cloud {
     }
 }
 
-/// The decision on `wicket node create`'s CAPACITY request (`nodecreate::CapacityApprover`), as planned.
-struct PlanApprover(bool);
+/// `wicket node create`'s approver (`nodecreate::CapacityApprover`): the one spend check (#256),
+/// the node's money reserved against the tenant's money limit grant in the control host's ledger,
+/// then the decision on its CAPACITY request, as planned (a no gives the money back).
+struct PlanApprover {
+    yes: bool,
+    ledger: PathBuf,
+    budget: wicket_store::LeaseBudget,
+}
 
 impl SpendApprover for PlanApprover {
-    async fn approve(&self, _req: &SpendRequest) -> Approval {
-        if self.0 {
+    async fn approve(&self, r: &SpendRequest) -> Approval {
+        let mut l = Ledger::open(&self.ledger).expect("the control host's ledger");
+        let key = wicket_store::money::node_money_key(&r.node_name);
+        let reserved = l
+            .reserve_money(
+                &TenantId::single().0,
+                &key,
+                r.hourly.0 as i64,
+                r.worst_case.0 as i64,
+                r.lifetime_secs + 3600,
+                self.budget,
+                wicket_store::money::NODE_MONEY_BY,
+            )
+            .expect("reserve");
+        if let Err(refused) = reserved {
+            return Approval::Denied(format!("over this installation's money limit: {refused}"));
+        }
+        if self.yes {
             Approval::Approved
         } else {
+            let _ = l.release_money(&key);
             Approval::Denied("the operator said no".into())
         }
     }
@@ -596,8 +622,9 @@ impl Env {
     fn ledger(&self) -> Ledger {
         Ledger::open(&self.dir.join("control").join("ledger.db")).expect("the control host's ledger")
     }
-    fn envelope(&self) -> MoneyEnvelope {
-        MoneyEnvelope { max_hourly: MAX_HOURLY, max_total: self.plan.max_total }
+    /// The installation's limits (`placement.yaml`), recorded as the tenant's money limit grant.
+    fn budget(&self) -> wicket_store::LeaseBudget {
+        wicket_store::LeaseBudget { max_hourly: MAX_HOURLY.0 as i64, max_total: self.plan.max_total.0 as i64 }
     }
     fn cloud(&self) -> Cloud {
         Cloud(self.world.clone())
@@ -743,7 +770,8 @@ async fn creates(env: Rc<Env>) {
 /// `nodecreate.rs`'s `create`: acquire, record at once, enrol.
 async fn place_create(env: &Rc<Env>, i: usize) {
     let c = env.plan.creates[i].clone();
-    let placer = Placer::new(env.cloud(), PlanApprover(c.approve), Owner::new(OWNER), env.envelope()).with_clock(clock());
+    let approver = PlanApprover { yes: c.approve, ledger: env.dir.join("control").join("ledger.db"), budget: env.budget() };
+    let placer = Placer::new(env.cloud(), approver, Owner::new(OWNER)).with_clock(clock());
     let req = CapacityRequest {
         resources: Resources { vcpus: 1, memory_mib: 2048 },
         min_isolation: IsolationTier::Gvisor,
@@ -759,11 +787,30 @@ async fn place_create(env: &Rc<Env>, i: usize) {
     let n = match placer.acquire(&req).await {
         Ok(n) => n,
         Err(e) => {
+            // Nothing was made: its money goes back (`nodecreate::create`).
+            let _ = env.ledger().release_money(&wicket_store::money::node_money_key(&c.name));
             env.stat(|s| s.creates_refused += 1);
             env.note(format!("place create {} refused: {e}", c.name));
             return;
         }
     };
+    // The money invariant reads the grants (#256): what the ledger reserves covers what the new
+    // node bills, and stays within the tenant's money limit grant.
+    {
+        let l = env.ledger();
+        let t = TenantId::single();
+        let (hourly, total) = l.money_reserved(&t.0).expect("reserved");
+        let limit = l.money_limit(&t.0).expect("limit");
+        if limit != Some(env.budget()) {
+            env.violate(format!("the tenant's money limit grant is {limit:?}, not placement.yaml's {:?}", env.budget()));
+        }
+        if hourly > MAX_HOURLY.0 as i64 || total > env.plan.max_total.0 as i64 {
+            env.violate(format!("live money quota grants reserve {hourly}/h and {total}, over the limit grant"));
+        }
+        if hourly < n.billing.hourly_rate().0 as i64 {
+            env.violate(format!("{} bills {}/h, but only {hourly}/h is reserved", n.id, n.billing.hourly_rate()));
+        }
+    }
     // Recorded at once, so the reconciler releases it at its lease end whatever happens next.
     let lease_until = n.lease_until.unwrap_or(n.created_at + req.lifetime_secs);
     let ledger = env.ledger();
@@ -1098,7 +1145,7 @@ async fn reconcile_pass(env: &Rc<Env>) {
     let mut ledger = env.ledger();
     let owner = Owner::new(OWNER);
     // `place::release_placer`: no spend is approved on this path.
-    let placer = Placer::new(env.cloud(), wicket_placement::envelope::DenyAll, owner.clone(), env.envelope()).with_clock(clock());
+    let placer = Placer::new(env.cloud(), wicket_placement::envelope::DenyAll, owner.clone()).with_clock(clock());
 
     // `reconcile_machines`, with no capacity leases: owned nodes no placed node records go.
     let observed = match placer.list().await {
