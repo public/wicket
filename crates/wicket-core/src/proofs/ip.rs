@@ -19,8 +19,9 @@ fn an_ipv4_address_is_public_exactly_outside_the_special_blocks() {
 
 /// An IPv6 address is public exactly when no never-public block holds it: so no form that carries
 /// or translates to an IPv4 address is, whatever that address.
+// 17: the table's 11 blocks, and the 12-byte compare of `is_public_ip`'s `s[..6] == [0; 6]`.
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(17)]
 fn an_ipv6_address_is_public_exactly_outside_the_special_blocks() {
     let a: u128 = kani::any();
     let special = V6_BLOCKS.iter().any(|b| in_v6(a, *b));
