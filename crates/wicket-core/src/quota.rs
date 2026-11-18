@@ -43,8 +43,11 @@ pub fn not_after_for(expires_at: i64) -> u64 {
 
 /// A request's time in a node's token (Unix seconds), from the node's clock in ms: floored, and 0
 /// before the epoch (`wicket-feed`'s `authz::Request`).
+///
+/// (`u64::try_from(now_ms.div_euclid(1000)).unwrap_or(0)`, as an unsigned division of a reading
+/// at or after the epoch: one divider for Kani, not a signed one and its Euclidean fix-up, #325.)
 pub fn token_secs(now_ms: i64) -> u64 {
-    u64::try_from(now_ms.div_euclid(1000)).unwrap_or(0)
+    u64::try_from(now_ms).map_or(0, |ms| ms / 1000)
 }
 
 /// Whether a token's `not_after` allows a request at `now_ms`: its check, `time <= not_after`.
@@ -143,6 +146,9 @@ mod tests {
         assert_eq!(not_after_for(0), 0);
         assert_eq!(not_after_for(i64::MIN), 0);
         assert_eq!(token_secs(-1), 0);
+        for ms in [i64::MIN, -1001, -1000, -999, -1, 0, 1, 999, 1000, 1001, 1_700_000_000_123, i64::MAX - 1, i64::MAX] {
+            assert_eq!(token_secs(ms), u64::try_from(ms.div_euclid(1000)).unwrap_or(0), "{ms}");
+        }
         assert_eq!(token_secs(1999), 1);
     }
 
