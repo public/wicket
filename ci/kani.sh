@@ -33,8 +33,9 @@ harnesses() {
 }
 
 # Each harness's (and loom's) seconds on a CI runner, as the run's "kani shard I/N times"
-# annotations print them (these from #542's run, with #540's and #541's harnesses), so they can be pasted in as they are.
-# Only the split depends on them: a stale or missing time can slow a part, never skip an item.
+# annotations print them (these from #542's run, with #540's and #541's harnesses), so they can be
+# pasted in as they are. Only the split depends on them: a stale or missing time can slow a part,
+# never skip an item.
 ci_times() {
   cat <<'EOF'
 a_grant_is_made_as_picked_or_as_a_push_window 93 s
