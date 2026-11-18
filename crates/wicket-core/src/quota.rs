@@ -52,6 +52,51 @@ pub fn token_allows(not_after: u64, now_ms: i64) -> bool {
     token_secs(now_ms) <= not_after
 }
 
+/// What a spawn asks for, as the org policy reads it (`wicket-authz`'s `OrgLayer::allows_spawn`):
+/// its isolation strength (higher is stronger) and its resources.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpawnAsk {
+    pub isolation: i64,
+    pub mem_bytes: i64,
+    pub cpus_milli: i64,
+    pub pids: i64,
+    pub timeout_s: i64,
+}
+
+/// One alternative of an org policy's spawn ceiling: a floor on isolation, caps on the rest. A
+/// limit that is None doesn't constrain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpawnLimits {
+    pub min_isolation: Option<i64>,
+    pub max_mem_bytes: Option<i64>,
+    pub max_cpus_milli: Option<i64>,
+    pub max_pids: Option<i64>,
+    pub max_timeout_s: Option<i64>,
+}
+
+impl SpawnLimits {
+    /// Whether a spawn asking for `a` is within these limits (Kani checks it, `proofs/quota.rs`).
+    pub fn admits(&self, a: SpawnAsk) -> bool {
+        self.min_isolation.is_none_or(|n| a.isolation >= n)
+            && self.max_mem_bytes.is_none_or(|n| a.mem_bytes <= n)
+            && self.max_cpus_milli.is_none_or(|n| a.cpus_milli <= n)
+            && self.max_pids.is_none_or(|n| a.pids <= n)
+            && self.max_timeout_s.is_none_or(|n| a.timeout_s <= n)
+    }
+}
+
+impl SpawnAsk {
+    /// Whether `self` asks for no more than `other`: isolation at least as strong, and no more of
+    /// any resource.
+    pub fn within(&self, other: &SpawnAsk) -> bool {
+        self.isolation >= other.isolation
+            && self.mem_bytes <= other.mem_bytes
+            && self.cpus_milli <= other.cpus_milli
+            && self.pids <= other.pids
+            && self.timeout_s <= other.timeout_s
+    }
+}
+
 /// One use of a grant with `uses_left` (None: not counted). `Some(left)`: accepted, with `left`
 /// uses left after it (None again for a grant that isn't counted). None: refused, for a counted
 /// grant with no use left (zero, or a count below it that no grant should hold).
@@ -99,6 +144,19 @@ mod tests {
         assert_eq!(not_after_for(i64::MIN), 0);
         assert_eq!(token_secs(-1), 0);
         assert_eq!(token_secs(1999), 1);
+    }
+
+    #[test]
+    fn a_spawn_ceiling_floors_isolation_and_caps_the_rest() {
+        let ask = SpawnAsk { isolation: 2, mem_bytes: 512, cpus_milli: 1000, pids: 64, timeout_s: 600 };
+        assert!(SpawnLimits::default().admits(ask));
+        let l = SpawnLimits { min_isolation: Some(2), max_mem_bytes: Some(512), ..Default::default() };
+        assert!(l.admits(ask), "at the limits");
+        assert!(!l.admits(SpawnAsk { isolation: 1, ..ask }), "weaker isolation");
+        assert!(!l.admits(SpawnAsk { mem_bytes: 513, ..ask }), "more memory");
+        let caps = SpawnLimits { max_cpus_milli: Some(999), ..Default::default() };
+        assert!(!caps.admits(ask));
+        assert!(SpawnAsk { cpus_milli: 999, ..ask }.within(&ask) && !ask.within(&SpawnAsk { pids: 63, ..ask }));
     }
 
     #[test]

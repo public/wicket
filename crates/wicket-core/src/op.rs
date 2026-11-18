@@ -240,28 +240,55 @@ pub const HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PA
 
 /// `wicket.internal` and every name under it (the in-box address of wicket's services and the link
 /// names of other boxes).
+/// (Compared as bytes, without allocating, for Kani: `DOMAIN` is lowercase ASCII.)
 pub fn is_wicket_host(host: &str) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == crate::link::DOMAIN || h.ends_with(&format!(".{}", crate::link::DOMAIN))
+    let h = host.trim_end_matches('.').as_bytes();
+    let d = crate::link::DOMAIN.as_bytes();
+    h.len() >= d.len() && h[h.len() - d.len()..].eq_ignore_ascii_case(d) && (h.len() == d.len() || h[h.len() - d.len() - 1] == b'.')
+}
+
+/// Whether `method` is one of [`RESERVED_METHODS`], in any case.
+pub fn is_reserved_method(method: &str) -> bool {
+    RESERVED_METHODS.iter().any(|m| m.eq_ignore_ascii_case(method))
+}
+
+/// Why an agent or a node may not raise a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentOpRefusal {
+    /// A reserved method, or a wicket host: wicket's own approval namespace (#117).
+    Reserved,
+    /// A method that isn't one of [`HTTP_METHODS`] (exactly, in upper case).
+    NotHttp,
+}
+
+/// Why an agent or a node may not raise a request for `method` on `host`, if it may not: the
+/// decision [`Op::refused_for_agents`] words (Kani checks it, `proofs/reserved.rs`).
+pub fn agent_op_refusal(method: &str, host: &str) -> Option<AgentOpRefusal> {
+    if is_wicket_host(host) || is_reserved_method(method) {
+        return Some(AgentOpRefusal::Reserved);
+    }
+    if !HTTP_METHODS.contains(&method) {
+        return Some(AgentOpRefusal::NotHttp);
+    }
+    None
 }
 
 impl Op {
     /// Whether this op is in wicket's own approval namespace (#117): a reserved method, or a wicket
     /// host. Only wicket raises such requests; an agent or a node never may.
     pub fn is_reserved(&self) -> bool {
-        is_wicket_host(&self.host) || RESERVED_METHODS.contains(&self.method.to_ascii_uppercase().as_str())
+        is_wicket_host(&self.host) || is_reserved_method(&self.method)
     }
 
     /// Why an agent or a node may not raise a request for this op, if it may not: a reserved op, or
     /// a method that isn't one of [`HTTP_METHODS`].
     pub fn refused_for_agents(&self) -> Option<String> {
-        if self.is_reserved() {
-            return Some(format!("{} {} is wicket's own approval namespace: only wicket asks for it", self.method, self.host));
+        match agent_op_refusal(&self.method, &self.host)? {
+            AgentOpRefusal::Reserved => {
+                Some(format!("{} {} is wicket's own approval namespace: only wicket asks for it", self.method, self.host))
+            }
+            AgentOpRefusal::NotHttp => Some(format!("method {:?} is not one of {}", self.method, HTTP_METHODS.join(", "))),
         }
-        if !HTTP_METHODS.contains(&self.method.as_str()) {
-            return Some(format!("method {:?} is not one of {}", self.method, HTTP_METHODS.join(", ")));
-        }
-        None
     }
 }
 
@@ -392,6 +419,10 @@ mod decide_proofs;
 mod ip_blocks;
 
 #[cfg(kani)]
+#[path = "proofs/reserved.rs"]
+mod reserved_proofs;
+
+#[cfg(kani)]
 #[path = "proofs/ip.rs"]
 mod ip_proofs;
 
@@ -459,6 +490,40 @@ pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
 mod tests {
     use super::*;
     use crate::Manifest;
+
+    /// #325: `is_wicket_host` and `is_reserved_method` compare bytes now (for Kani); they decide
+    /// as the lowercasing forms did.
+    #[test]
+    fn the_reserved_namespace_decides_as_lowercasing_did() {
+        let old_host = |host: &str| {
+            let h = host.trim_end_matches('.').to_ascii_lowercase();
+            h == crate::link::DOMAIN || h.ends_with(&format!(".{}", crate::link::DOMAIN))
+        };
+        let old_method = |m: &str| RESERVED_METHODS.contains(&m.to_ascii_uppercase().as_str());
+        for h in [
+            "wicket.internal",
+            "WICKET.Internal",
+            "wicket.internal.",
+            "wicket.internal..",
+            "a.wicket.internal",
+            ".wicket.internal",
+            "awicket.internal",
+            "wicket.internal.x",
+            "icket.internal",
+            "é.wicket.internal",
+            "wicket.internalé",
+            "",
+            ".",
+            "x",
+            "example.com",
+            "wİcket.internal",
+        ] {
+            assert_eq!(is_wicket_host(h), old_host(h), "{h}");
+        }
+        for m in ["SPAWN", "spawn", "Link", "digest", "TOOLS", "TOO", "GET", "", "capacity", "ſpawn"] {
+            assert_eq!(is_reserved_method(m), old_method(m), "{m}");
+        }
+    }
 
     /// #325: `is_public_ip` against the table of never-public blocks Kani checks it against over
     /// every address (proofs/ip.rs): here at each block's edges and a million samples, so a typo

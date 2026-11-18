@@ -2,7 +2,7 @@
 //! #322's Lean spec has no counterpart yet. Over every `i64`, not bounded inputs: there are no
 //! loops but the uses harness's, bounded by its `#[kani::unwind]`.
 
-use super::{money_fits, not_after_for, take_use, token_allows, Money, MoneyOver};
+use super::{money_fits, not_after_for, take_use, token_allows, Money, MoneyOver, SpawnAsk, SpawnLimits};
 
 fn any_money() -> Money {
     Money { hourly: kani::any(), total: kani::any() }
@@ -79,4 +79,47 @@ fn a_token_allows_a_reading_before_the_epoch() {
     let expires_at: i64 = kani::any_where(|&e: &i64| e >= 1);
     let now_ms = -1 - i64::from(kani::any::<u32>());
     assert!(token_allows(not_after_for(expires_at), now_ms));
+}
+
+fn any_ask() -> SpawnAsk {
+    SpawnAsk { isolation: kani::any(), mem_bytes: kani::any(), cpus_milli: kani::any(), pids: kani::any(), timeout_s: kani::any() }
+}
+
+fn any_limits() -> SpawnLimits {
+    SpawnLimits {
+        min_isolation: kani::any(),
+        max_mem_bytes: kani::any(),
+        max_cpus_milli: kani::any(),
+        max_pids: kani::any(),
+        max_timeout_s: kani::any(),
+    }
+}
+
+/// Whether limits `t` are no looser than `l`: a floor at least as high where `l` has one, a cap
+/// at most as high where `l` has one.
+fn no_looser(t: &SpawnLimits, l: &SpawnLimits) -> bool {
+    let floor = |t: Option<i64>, l: Option<i64>| l.is_none_or(|l| t.is_some_and(|t| t >= l));
+    let cap = |t: Option<i64>, l: Option<i64>| l.is_none_or(|l| t.is_some_and(|t| t <= l));
+    floor(t.min_isolation, l.min_isolation)
+        && cap(t.max_mem_bytes, l.max_mem_bytes)
+        && cap(t.max_cpus_milli, l.max_cpus_milli)
+        && cap(t.max_pids, l.max_pids)
+        && cap(t.max_timeout_s, l.max_timeout_s)
+}
+
+/// `OrgLayer::allows_spawn`'s ceiling (`SpawnLimits::admits`), for every ask and limits: no limits
+/// admit everything; a spawn that asks for no more than an admitted one (isolation at least as
+/// strong, no more of any resource) is admitted too; and limits no looser than others admit
+/// nothing those refuse. So a child zone's tighter ceiling never lets through what its parent's
+/// refuses.
+#[kani::proof]
+fn a_spawn_ceiling_admits_what_is_within_it_and_tighter_admits_less() {
+    let (l, t, a, b) = (any_limits(), any_limits(), any_ask(), any_ask());
+    assert!(SpawnLimits::default().admits(a));
+    if l.admits(a) && b.within(&a) {
+        assert!(l.admits(b));
+    }
+    if no_looser(&t, &l) && t.admits(a) {
+        assert!(l.admits(a));
+    }
 }
