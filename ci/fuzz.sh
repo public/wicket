@@ -3,11 +3,14 @@
 # of each target selected. A finding is minimized and left under $FUZZ_WORK/artifacts/<target>/, and
 # the script fails.
 #
-#   ci/fuzz.sh [--secs N] [--affected [--base REF]] [--sanitizer none|address] [--no-replay] [target…]
+#   ci/fuzz.sh [--secs N] [--jobs N] [--affected [--base REF]] [--sanitizer none|address] [--no-replay] [target…]
 #   ci/fuzz.sh --list   every target's name, one per line (CI's matrix of them)
 #
 #   target…        the targets to run (default: all; `none` runs none, for a workflow's selection)
 #   --secs N       how long each target runs (default 60)
+#   --jobs N       how many targets fuzz at once (default 1): each still runs its --secs, on a core
+#                  of its own (libFuzzer is one thread), so N targets take one target's time. Each
+#                  may use up to 2 GiB (-rss_limit_mb), so leave N at 1 in a 4 GiB box
 #   --affected     the targets the change selects (ci/determinator's fuzz targets), instead
 #   --base REF     with --affected: what to compare with (default origin/main)
 #   --sanitizer S  none (default: coverage only, the build that fits a 4 GiB box) or address
@@ -26,10 +29,11 @@ cd "$(dirname "$0")/.."
 
 CARGO_FUZZ_VERSION=0.13.2
 ALL_TARGETS="egress gateway chan feed token manifest store git canon time"
-secs=60 affected=0 base=origin/main sanitizer=none replay=1 targets=()
+secs=60 jobs=1 affected=0 base=origin/main sanitizer=none replay=1 targets=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --secs) secs=$2; shift ;;
+    --jobs) jobs=$2; shift ;;
     --affected) affected=1 ;;
     --base) base=$2; shift ;;
     --sanitizer) sanitizer=$2; shift ;;
@@ -80,16 +84,42 @@ fi
 
 flags=(-O -s "$sanitizer" --codegen-units 16 --target-dir "$target_dir")
 failed=() summary=()
+# Built first, one after another (one library: the first build serves the rest), so the runs below
+# only start their fuzzer.
 for t in "${targets[@]}"; do
-  log "fuzz $t (${secs} s, sanitizer $sanitizer)"
+  log "build $t (sanitizer $sanitizer)"
   (cd fuzz && cargo fuzz build "${flags[@]}" "$t")
+done
+# One target's run, its exit code in $work/$t.rc.
+fuzz_one() {
+  local t=$1 rc=0 dirs
+  rm -f "$work/$t.rc"
   mkdir -p "$work/corpus/$t" "$work/artifacts/$t"
   dirs=("$work/corpus/$t" "corpus/$t")
   [ -d "fuzz/regressions/$t" ] && dirs+=("regressions/$t")
-  rc=0
   (cd fuzz && cargo fuzz run "${flags[@]}" "$t" "${dirs[@]}" -- \
     -max_total_time="$secs" -rss_limit_mb=2048 -timeout=25 -print_final_stats=1 \
     -artifact_prefix="$work/artifacts/$t/") >"$work/$t.log" 2>&1 || rc=$?
+  echo "$rc" >"$work/$t.rc"
+}
+log "fuzz ${targets[*]} (${secs} s each, $jobs at a time)"
+running=0
+for t in "${targets[@]}"; do
+  if [ "$jobs" -le 1 ]; then
+    fuzz_one "$t"
+    continue
+  fi
+  fuzz_one "$t" &
+  running=$((running + 1))
+  if [ "$running" -ge "$jobs" ]; then
+    wait -n || true
+    running=$((running - 1))
+  fi
+done
+wait
+for t in "${targets[@]}"; do
+  rc=$(cat "$work/$t.rc" 2>/dev/null || echo 1)
+  log "fuzz $t"
   grep -E '^(#[0-9]+ +(INITED|DONE)|Done |==[0-9]+==|SUMMARY|thread .* panicked)' -A1 "$work/$t.log" | head -40 || true
   runs=$(sed -n 's/^stat::number_of_executed_units: *//p' "$work/$t.log" | tail -1)
   if [ "$rc" = 0 ]; then
