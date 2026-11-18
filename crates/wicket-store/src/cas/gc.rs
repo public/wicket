@@ -759,23 +759,43 @@ mod tests {
         std::env::var("WICKET_GC_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(30)
     }
 
-    #[test]
-    fn no_reachable_object_is_deleted_whatever_the_pushes_do() {
-        let mut deleted = 0;
-        for seed in 1..=seeds() {
+    /// Part `part` of [`PARTS`] of the seeds: every `PARTS`th from `part + 1`, so the parts
+    /// together run each seed once, and nextest runs them at once (one test of them all was among
+    /// the tests job's slowest).
+    fn no_reachable_object_is_deleted(part: u64) {
+        let (mut deleted, mut ran) = (0, 0);
+        for seed in (1..=seeds()).filter(|s| (s - 1) % PARTS == part) {
             let (v, d) = run(seed, false, 5);
             assert!(v.is_empty(), "seed {seed}: {v:#?}");
             deleted += d;
+            ran += 1;
         }
-        assert!(deleted > seeds() as usize, "the collections deleted only {deleted} objects: the property isn't exercised");
+        assert!(deleted > ran, "the collections deleted only {deleted} objects: the property isn't exercised");
+    }
+
+    const PARTS: u64 = 3;
+
+    #[test]
+    fn no_reachable_object_is_deleted_whatever_the_pushes_do_0() {
+        no_reachable_object_is_deleted(0);
+    }
+
+    #[test]
+    fn no_reachable_object_is_deleted_whatever_the_pushes_do_1() {
+        no_reachable_object_is_deleted(1);
+    }
+
+    #[test]
+    fn no_reachable_object_is_deleted_whatever_the_pushes_do_2() {
+        no_reachable_object_is_deleted(2);
     }
 
     /// The same, with pushes that don't wait for a collection under way: the check finds what that
-    /// breaks, so the property above means something.
+    /// breaks, so the property above means something. One seed that breaks is the proof: the
+    /// seeds after it aren't run.
     #[test]
     fn a_push_that_ignores_the_collection_loses_objects() {
-        let broken = (1..=seeds()).filter(|s| !run(*s, true, 5).0.is_empty()).count();
-        assert!(broken > 0, "no seed lost an object without the push lock");
+        assert!((1..=seeds()).any(|s| !run(s, true, 5).0.is_empty()), "no seed lost an object without the push lock");
     }
 
     fn plan_for<'a>(
