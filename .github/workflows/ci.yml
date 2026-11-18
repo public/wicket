@@ -413,11 +413,11 @@ jobs:
   # naming the Lean theorem of #322 it restates) and the budget counter's loom test, one harness at
   # a time (ci/kani.sh). Selected by ci/determinator/suites.toml's kani suite: the harnessed crate
   # (its code, its harnesses), the script.
-  # In two parts at once (#460; ci/kani.sh --shard deals out the harnesses and loom in turn: 173 s
-  # and 170 s of its 343 s on #460's run, against 193 s for the largest of three), and
-  # one job that says they all passed.
+  # In three parts at once (#460; ci/kani.sh --shard splits the harnesses and loom by their CI
+  # times, longest first: 285, 285 and 284 s of 854 s by `ci/kani.sh --plan 3`, its longest harness
+  # 244 s; in two they were 427 s each), and one job that says they all passed.
   kani-shard:
-    name: Kani proofs and loom ${{ matrix.shard }}/2
+    name: Kani proofs and loom ${{ matrix.shard }}/3
     needs: select
     if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) }}
     runs-on: ubuntu-24.04
@@ -425,7 +425,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
     env:
       KANI_VERSION: 0.68.0
     steps:
@@ -441,7 +441,7 @@ jobs:
         run: |
           cargo install --locked kani-verifier --version "$KANI_VERSION"
           cargo kani setup
-      - run: ci/kani.sh --shard "${{ matrix.shard }}/2"
+      - run: ci/kani.sh --shard "${{ matrix.shard }}/3"
 
   kani:
     name: Kani proofs and loom
