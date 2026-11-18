@@ -103,7 +103,17 @@ impl Llm {
     /// zone with a model route and no quota is given none to spend.
     pub fn with_quota(ctx: RunCtx, quota: Option<ModelQuota>) -> Result<Arc<Llm>> {
         let quota = ctx.zone.llm.as_ref().map(|_| quota.unwrap_or_default());
-        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
+        // As the egress proxy's (#116): the model route's host is resolved by wicket and dialled
+        // only at checked, public addresses, and a connection that doesn't come up in 15 s fails.
+        // An address the zone names itself (`http://127.0.0.1:…`, the tests' local models) is the
+        // operator's choice and isn't resolved, so isn't checked.
+        let lookup = crate::dial::Lookup { fixed: Arc::default(), own: None };
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .dns_resolver(Arc::new(crate::dial::PublicResolver(lookup)))
+            .build()?;
         Ok(Arc::new(Llm {
             ctx,
             client,
@@ -1167,6 +1177,45 @@ mod tests {
         let (status, _) = post(super::Llm::new(c).unwrap(), "bound").await;
         assert_eq!(status, 200);
         assert!(seen.lock().await.iter().any(|r| r.to_ascii_lowercase().contains("authorization: bearer the-model-token")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As egress (#116): a model route's host is resolved by wicket and dialled only at public
+    /// addresses, so a name that resolves to loopback is refused before anything is sent; an
+    /// address the zone names itself is the operator's choice, and is dialled.
+    #[tokio::test]
+    async fn a_model_route_by_name_reaches_only_public_addresses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                seen2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = vec![0u8; 8192];
+                let _ = c.read(&mut buf).await;
+                let _ = c
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                    .await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("wicket-llm-public-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = crate::vault::Vault::new(dir.clone());
+        vault.set("model", "the-model-token").unwrap();
+        vault.set_hosts("model", &["localhost".into(), "127.0.0.1".into()]).unwrap();
+        let named = format!("{{secret: model, upstream: 'http://localhost:{port}'}}");
+        let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &named);
+        c.vault = vault.clone();
+        let (status, _) = post(super::Llm::new(c).unwrap(), "public-named").await;
+        assert!(status >= 500, "{status}");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing was dialled");
+        let literal = format!("{{secret: model, upstream: 'http://127.0.0.1:{port}'}}");
+        let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &literal);
+        c.vault = vault;
+        let (status, _) = post(super::Llm::new(c).unwrap(), "public-literal").await;
+        assert_eq!(status, 200);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

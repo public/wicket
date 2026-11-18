@@ -136,6 +136,8 @@ that carry an IPv4 address, such as NAT64 and 6to4). A host is parsed as a URL p
 `2852039166` or `0xa9fea9fe` is 169.254.169.254, and IP addresses aren't proxied at all. wicket resolves
 every upstream name itself and connects only to addresses it has checked; a name with any non-public
 address is refused, and the checked address is the one dialled, so DNS rebinding can't move a connection.
+The model proxy dials its zone's model route the same way; a route the zone names by address (a local
+model on `127.0.0.1`, say) is the operator's choice, and is dialled as named.
 
 A request goes upstream as it was decided. Only allow-listed request headers are forwarded (content
 negotiation, caching, conditional requests, the body's type and encoding, `git-protocol`, and a
