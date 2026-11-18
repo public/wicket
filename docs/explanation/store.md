@@ -215,15 +215,19 @@ one audit record that names the grant.
 Done for #258, an update, a program and an image are all accepted through `may_use`. That needs
 #256's grant record, so it lands after it.
 
-**Status (2026-11-16).** #256's grant record has landed, but it holds only one of these answers: the
-human-approved update (an UPDATE grant, `Ledger::use_update_approval`). The others need what
-doesn't exist yet. A **CI principal** with a standing grant (today, release and CI keys are files
-in `<data dir>/release-keys/` and a signature is checked against them, `update::accept`). And a
-**grant recorded on a manifest's pinned digests** when it is run or approved, covering the children
-that inherit them (today, an image or program pin is the manifest's own statement:
-`images_policy::check`, `program::check_pin`, and the node checking an image is its pin). With
-only the update approval to find, `may_use` would add a function and delete none, so it waits for
-those two.
+**Status (2026-11-18): done.** `Ledger::may_use` is the only acceptance:
+- a release or CI signature is its CI principal's one-use grant, under the principal's standing
+  grant, which the reconciler renews daily while the key is trusted (#491);
+- an approved update is the operator's one-use grant (#492);
+- a pinned program's source and a run's pinned image are accepted by the zone's grant on their
+  digest, which running the manifest records (#486, #488).
+
+The separate paths are gone: a key file in `release-keys/` only keeps its principal's grant
+renewed, `images_policy::check` and the program pin gate are deleted (a source that isn't what was
+pinned has no grant, and the one check refuses it), and `use_update_approval` is internal. The
+node still checks that a box's image is its pin: that is integrity, not trust. A tag image and an
+unpinned (development) program aren't accepted by a grant: they run as the manifest's own
+statement, as before.
 
 ## Order of the work
 

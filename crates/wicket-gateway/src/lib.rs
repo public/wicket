@@ -1320,7 +1320,7 @@ mod tests {
         // Asking again is the same request; nothing is approved by asking.
         let (again, _) = gw.request_update(&json!({ "sha256": sha, "reason": "a build of main, at /workspace/out/wicket.tar.gz" }));
         assert!(again.contains(&r.id));
-        assert_eq!(w.ledger.lock().unwrap().use_update_approval(&sha).unwrap(), None);
+        assert!(w.ledger.lock().unwrap().accept_update_approval(&wicket_core::TenantId::single(), &sha, "self update").unwrap().is_none());
         // A hash is a hash; a reason is required.
         assert!(gw.request_update(&json!({ "sha256": "../../etc", "reason": "x" })).1);
         assert!(gw.request_update(&json!({ "sha256": sha.to_uppercase(), "reason": "x" })).1);

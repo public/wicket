@@ -444,27 +444,25 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 Some(s) => Some(crate::program::digest_dir(s)?),
                 None => None,
             };
-            let pinned = match (&p.digest, &digest, &src) {
-                (Some(want), Some(got), Some(s)) if want != got => match crate::program::check_pin(s, got, want)? {
-                    crate::program::Pinned::Legacy => {
-                        say!("[wicket] program {} is pinned by its old digest {want}; `wicket zone pin` rewrites it to {got}", p.name);
-                        true
-                    }
-                    _ => bail!("program {} source digest is {got}, but the approved digest is {want}: re-approve the change", p.name),
-                },
+            match (&p.digest, &digest, &src) {
                 (Some(_), None, _) => bail!("program {} pins a digest but has no source", p.name),
-                (None, Some(got), _) => {
-                    say!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name);
-                    false
+                (None, Some(got), _) => say!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name),
+                // The one "may this digest run" check (#258): the pin records a grant on the pinned
+                // digest, and the source's own digest must be granted. A pin by the digest from
+                // before #258 pins the same source.
+                (Some(want), Some(got), Some(s)) => {
+                    let pinned = if want != got && *want == crate::program::legacy_digest_dir(s)? {
+                        say!("[wicket] program {} is pinned by its old digest {want}; `wicket zone pin` rewrites it to {got}", p.name);
+                        got.clone()
+                    } else {
+                        want.clone()
+                    };
+                    let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
+                    let l = Ledger::open(&ledger_path())?;
+                    let u = crate::digest::accept_program(&l, &m.tenant, &m.zone.name, &p.name, &pinned, got, &by)?;
+                    say!("[wicket] program {} ({got}) accepted by grant {} from {}", p.name, u.grant, u.decided_by);
                 }
-                (Some(_), Some(_), _) => true,
-                _ => false,
-            };
-            // The one "may this digest run" check (#258): a grant on the pinned source's digest.
-            if let (true, Some(got)) = (pinned, &digest) {
-                let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
-                let u = crate::digest::accept_program(&Ledger::open(&ledger_path())?, &m.tenant, &m.zone.name, &p.name, got, &by)?;
-                say!("[wicket] program {} ({got}) accepted by grant {} from {}", p.name, u.grant, u.decided_by);
+                _ => {}
             }
             src.map(|s| (s, digest.unwrap_or_default()))
         }
@@ -482,7 +480,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
     let image_name = image.to_string();
     if record.is_none() && wake.is_none() {
-        crate::images_policy::check(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
         // The one "may this digest run" check (#258): a pinned image is accepted by a grant on its
         // digest, which the operator running the manifest records. A child's image is pinned to
         // its parent's, as its parent's zone allows (decided where it is spawned): not regranted.

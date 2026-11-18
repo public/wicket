@@ -1410,8 +1410,10 @@ impl Ledger {
     /// (#162): a live grant made for such a request, found by the same lookup as every other
     /// request kind's ([`Ledger::consume_grant`]), for exactly `UPDATE wicket.internal
     /// /self/<sha256>`, from any run. It is used up here (revoked, whatever uses it had left), so
-    /// one approval accepts one update. Returns (request id, grant id).
-    pub fn use_update_approval(&mut self, sha256: &str) -> Result<Option<(String, String)>> {
+    /// one approval accepts one update. Returns (request id, grant id). Not an acceptance of its
+    /// own (#258): only [`Ledger::accept_update_approval`] calls it, which makes the approval the
+    /// operator's grant on the build's digest and asks the one check.
+    pub(crate) fn use_update_approval(&mut self, sha256: &str) -> Result<Option<(String, String)>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let path = format!("/self/{sha256}");
         let found = live_grant(
