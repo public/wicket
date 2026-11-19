@@ -637,6 +637,7 @@ impl Ledger {
     /// A fresh run's start, as one transaction (#582 step 2): its row, its supervisor (`owner`), the
     /// lease it is placed on, and for a new long-lived agent its agent row. One write lock and one
     /// sync instead of one each; a start that fails leaves none of them.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_run_start(
         &self,
         tenant: &TenantId,
