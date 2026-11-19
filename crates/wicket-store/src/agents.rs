@@ -412,6 +412,17 @@ impl Ledger {
     }
 }
 
+/// An agent's row and its first activation's, in whatever transaction `conn` is in.
+pub(crate) fn insert_agent(conn: &rusqlite::Connection, a: &NewAgent) -> Result<()> {
+    let t = now();
+    conn.execute(
+        &format!("INSERT INTO agents ({COLS}) VALUES (?1, ?2, ?3, ?4, 'active', 1, ?5, ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, 1, NULL, NULL, ?11, ?11, 0, 0, 0, 0)"),
+        params![a.id, a.tenant, a.zone, a.name, a.run, a.session_id, a.manifest, a.image, a.workspace, a.claim_until, t],
+    )?;
+    conn.execute("INSERT INTO agent_runs (run, agent, generation, started_at) VALUES (?1, ?2, 1, ?3)", params![a.run, a.id, t])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,15 +606,4 @@ mod tests {
         assert!(l.commit_agent_push(&id, 1, 0, 1, "h", 1).unwrap());
         assert!(!l.want_agent(&id, "hibernate").unwrap(), "nothing holds it");
     }
-}
-
-/// An agent's row and its first activation's, in whatever transaction `conn` is in.
-pub(crate) fn insert_agent(conn: &rusqlite::Connection, a: &NewAgent) -> Result<()> {
-    let t = now();
-    conn.execute(
-        &format!("INSERT INTO agents ({COLS}) VALUES (?1, ?2, ?3, ?4, 'active', 1, ?5, ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, 1, NULL, NULL, ?11, ?11, 0, 0, 0, 0)"),
-        params![a.id, a.tenant, a.zone, a.name, a.run, a.session_id, a.manifest, a.image, a.workspace, a.claim_until, t],
-    )?;
-    conn.execute("INSERT INTO agent_runs (run, agent, generation, started_at) VALUES (?1, ?2, 1, ?3)", params![a.run, a.id, t])?;
-    Ok(())
 }
