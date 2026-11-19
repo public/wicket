@@ -29,7 +29,10 @@ run's is a tunnel target any more (`llm` went with slice 1, `egress` with slice 
 | `run.rs` → `Gateway::new`, answering the node's `Msg::Call` (`wicket-gateway/src/lib.rs`) | the `chan::ControlTool`s: `decide`, `expose`/`connect`/`link`/`unlink`/`links`, `finish`, `hibernate`; `send_message`, `await_message`, `request_capacity`, `request_update` while connected; spawns the node doesn't start itself; operator-held `await_grant`/`pending_requests`; `principals`, `receipts`, `delegations`, `continue_child` | these tools need the ledger, the other boxes' records, the placement backend or the run's supervisor; since 4b they are typed calls, not relayed JSON-RPC |
 | `run.rs` → `Llm::new` on `ctl/llm.sock` | nothing: since #152 the node's model proxy holds the credential (fetched with `SecretFetch`) and calls the model itself; `Llm::relayed`'s relay runs only when the vault isn't sourced, which never happens on a node | **removed in slice 1** |
 | `noderun::ask` / `check_node_ask` / `check_node_op` | raises a pending request for a node's ask, after checking the op belongs to the run's own tenant, run and zone | this is issuance, not a decision: it stays (a peer message only asks) |
-| `noderun::sync_grants` | turns ledger grants into Biscuit grant blocks (`LiveGrant`) on the feed, and renewals into re-minted blocks | publication, not a decision: since slice 3 it only publishes (every egress grant, whatever its host), and the ledger only records issuance. `Ledger::consume_grant` refuses an egress op; it still consumes wicket's own SPAWN and LINK grants for the control-host gateway (slice 4) |
+| `noderun::sync_grants` | turns ledger grants into Biscuit grant blocks (`LiveGrant`) on the feed, and renewals into re-minted blocks | publication, not a decision: since slice 3 it only publishes (every egress grant, whatever its host), and the ledger only records issuance. `Ledger::consume_grant` refuses an egress op. wicket's own SPAWN and LINK grants are used where the spawn or link is made, on the control host, by `Ledger::use_effect_grant` with #369's binding to the call's arguments (`spawn.rs`, `wicket-gateway/src/link.rs`) |
+| `run.rs` → `control::Supervised`, `wicket-home/src/control.rs` `Prompts` (#363) | a driven harness's tool-permission prompts: `Ledger::consume_grant` on `TOOL wicket.internal /tools/<tool>/<digest>`, `denied_recently`, then `pending_for` | **per tool call, on the control host**: the last per-request decision there, and `consume_grant`'s last caller outside tests. While the control host is unreachable a prompt waits. Step 4 below |
+| `wicket-gateway` `send_message` (connected) and `nodegw::send_local` (cut off) | who may message whom: parent or child, the receiver's `accept_from`, its org layer | **decided twice**, by the control host from identities and records, and by the node from both boxes' tokens. Step 3 below |
+| `run.rs` → `Llm::with_quota` | the run's model budget: its total, its children's carve-outs, the slices it leases its node, the node's `Spent` merged in | quota issuance, not a per-call decision; but it builds the whole model proxy (`wicket_proxy::llm::Llm`) to use its counter. Step 2 below |
 | `nodesrv.rs` `shares_host` branches | transport only: where the box is laid out, the run's sockets reached directly, host directories mounted, the CA loaded unconstrained (`NodeCa::load_any`) | the built-in node shares the host's filesystem; none of these is a decision |
 
 The node side, for comparison: `NodeDecider` (egress, from the replica), `nodegw.rs` (`whoami`,
@@ -122,6 +125,34 @@ node's own `Llm`.
    mounted, which boxes are its to reap); no branch on it decides. The run's own CA went too: the
    control host terminates no TLS, so a box trusts the installation root alone (`BoxStart.ca_pem`
    is sent empty, for nodes at 13 that read it).
+
+## What's left (2026-11-19)
+
+Slices 1-5 removed every per-request path #257 named. Read again on main, the control host still:
+
+- **decides a driven harness's tool prompts** per call (`wicket-home`'s `Prompts`, #363);
+- **decides message delivery twice**, once on the control host while the box's node is connected,
+  once on the node while cut off;
+- **builds the model proxy for a budget counter**: the run's `Llm` counts, carves, leases slices
+  and merges `Spent`, and calls no model since slice 1.
+
+What stays on the control host is issuance and lifecycle, as #253 keeps them: spawns it places
+(and its check of a node-started child it adopts), links (both boxes' records, made there), an
+agent's `decide`, capacity and update requests (the money check, #256), `finish` and
+`hibernate`, the ledger reads (`principals`, `receipts`, `delegations`, a human's decision for
+`await_grant` and `pending_requests`), and the model budget's total. The `shares_host` branches
+are transport. The steps:
+
+6. **The run's budget without the model proxy.** `run.rs` keeps the counter, carve-outs, slices
+   and `Spent` merges in a budget type of their own, and no longer builds `Llm`. No protocol.
+7. **One message decision, at the receiver's node.** It decides delivery from the receiver's
+   token (its `accept_from`, its org layer) and the sender's principal as the control host routes
+   it; the control host stores, routes and gives receipts. A protocol bump.
+8. **Tool prompts on the node.** TOOL grants published by `sync_grants` like egress ones; the node
+   answers a prompt from its replica and asks by `Msg::Ask`, queued while cut off. `run.rs`'s
+   `Supervised` keeps interrupts and mode changes, which are commands. Then `consume_grant` and
+   `denied_recently` have no production caller. A protocol bump, and a design point first: how the
+   node reads the harness's control lines.
 
 Each slice has to pass the node e2e flow (`ci/node-e2e.sh`, also run by `ci/acceptance.sh --nodes local`) and the acceptance
 suite unchanged.
