@@ -61,6 +61,7 @@ fn c(s: &str) -> String {
 fn state(t: &wicket_store::Trigger, now: i64) -> String {
     match (t.status.as_str(), t.approval.as_str(), t.until) {
         ("paused", _, _) => "paused".into(),
+        ("done", _, _) => "done (its timer has fired)".into(),
         (_, "pending", _) => "waiting for approval".into(),
         (_, _, Some(u)) if u <= now => format!("lapsed {}", when(u)),
         (_, _, Some(u)) => format!("active, until {}", when(u)),
