@@ -18,6 +18,8 @@ class Node {
   get textContent() { return this._text + this.children.map(c => c.textContent).join(""); }
   addEventListener(k, f) { this.listeners[k] = f; }
   focus() {}
+  setAttribute(k, v) { this.attrs = { ...(this.attrs || {}), [k]: String(v) }; }
+  getAttribute(k) { return (this.attrs || {})[k] ?? null; }
   scrollIntoView() {}
   click() { if (!this.disabled && this.onclick) return this.onclick({ preventDefault() {} }); }
   all(pred, out = []) { for (const c of this.children) { if (pred(c)) out.push(c); if (c.all) c.all(pred, out); } return out; }
@@ -218,8 +220,38 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     path: "/acme/app.git/git-receive-pack", risk: "R4ExecOrPrivilege", request: "r-p", run: "run_a",
     effect: { terms: { uses: null, ttl_secs: 300, scope: "run" } } });
   const said = run("describe(" + push + ")");
-  assert.ok(said.startsWith("Allow any number of uses for 5 min: POST github.com/acme/app.git/git-receive-pack"), said);
+  assert.ok(said.startsWith("Approve any number of uses for 5 min: POST github.com/acme/app.git/git-receive-pack"), said);
+  // A whole hour reads as one, as on the card (#574).
+  assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", method: "GET", host: "h", path: "/p", effect: { terms: { uses: null, ttl_secs: 3600 } } }) + ")").startsWith("Approve any number of uses for 1 hour"));
+  // Risk said as what it means, code first.
+  assert.strictEqual(run("riskLabel('R4ExecOrPrivilege')"), "R4 \u00b7 push, deploy or privilege");
+  // A cancelled passkey is said as such, as an error that stays; a reply with no text is "Done.".
+  run("toastError({ name: 'NotAllowedError', message: 'The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/' }, null, true)");
+  assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Passkey cancelled. Nothing was signed.", "error"]);
+  assert.strictEqual(ids.msg.getAttribute("role"), "alert", "an error is announced");
+  // A NotAllowedError away from a passkey (a refused notification permission) is said as it is.
+  run("toastError({ name: 'NotAllowedError', message: 'Permission denied' }, 'Notifications')");
+  assert.strictEqual(ids.msg.textContent, "Notifications: Permission denied");
+  run("toast(undefined)");
+  assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Done.", ""]);
   assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "GET", host: "h", path: "/p", effect: { terms: { uses: 1, ttl_secs: 600 } } }) + ")").startsWith("Approve once for 10 min"));
+  // A push's card says the window it is granted as, from the server's terms (#574 review).
+  const pushReq = { id: "q-push", risk: "R4ExecOrPrivilege", method: "POST", host: "github.com", path: "/acme/app.git/git-receive-pack", scope_prefix: false,
+    reason: "push", identity: { verified: true, agent: "a", zone: "z", acting_for: [], id: "spiffe://x/a/a" }, attribution: [], zone: "z", run: "run_a",
+    created_at: 1, once_terms: { uses: null, ttl_secs: 300 } };
+  const pc = run("(r => pendingCard({ now: 2 }, r))")(pushReq);
+  const pt = pc.textContent;
+  assert.ok(pt.includes("Approve this push (any number of uses for 5 min)") && pt.includes("approved as one window") && !pt.includes("one use at a time"), pt);
+  // A push to another host is R2, but granted as the same window: no hour button (#597 re-review).
+  const r2 = run("(r => pendingCard({ now: 2 }, r))")({ ...pushReq, id: "q-push2", risk: "R2WriteReversible", host: "git.example" }).textContent;
+  assert.ok(r2.includes("Approve this push (any number of uses for 5 min)") && !r2.includes("1 hour"), r2);
+  // An error that stays is gone once a sheet opens: it would sit above it.
+  run("toastError({ name: 'Error', message: 'earlier' })");
+  assert.strictEqual(ids.msg.hidden, false);
+  await advance(1000);
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  assert.strictEqual(ids.msg.hidden, true, "the error toast goes when the sheet opens");
+  ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an

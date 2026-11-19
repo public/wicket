@@ -1898,6 +1898,10 @@ fn dashboard(state: &State) -> Result<Value> {
         "pending": l.pending(t)?.into_iter().map(|r| {
             let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);
             v["identity"] = (state.identity)(&l, &r.run);
+            // What the card's first button would grant, as the grant is made (#574 review): a git
+            // push is a window, any number of uses for 5 minutes (#26), whatever is picked.
+            let (uses, ttl_secs) = wicket_core::git::grant_terms(&r.method, &r.path, Some(1), 600);
+            v["once_terms"] = json!({ "uses": uses, "ttl_secs": ttl_secs });
             v
         }).collect::<Vec<_>>(),
         "decided": l.decided(t, 15)?,
@@ -2438,6 +2442,23 @@ mod tests {
             assert_eq!(crate::principal_from_env(Some(bad)), None, "{bad}");
         }
         assert_eq!(crate::principal_from_env(None), None);
+    }
+
+    /// #574 review: each pending row says what its first button would grant. A push to any host is
+    /// the window (any number of uses for 5 minutes); anything else is one use for 10 minutes.
+    #[test]
+    fn a_pending_row_carries_the_terms_its_first_button_grants() {
+        let t = setup("once-terms");
+        t.running("run_o", "lead");
+        let run = RunId("run_o".into());
+        let push = wicket_core::Op::egress(&TenantId::single(), &run, "z", "POST", "git.example", "/acme/app.git/git-receive-pack");
+        let (pid, _) = t.ledger().pending_for(&push, "push", None).unwrap();
+        let get = wicket_core::Op::egress(&TenantId::single(), &run, "z", "GET", "a.example", "/x");
+        let (gid, _) = t.ledger().pending_for(&get, "x", None).unwrap();
+        let view = dashboard(&t.state).unwrap();
+        let row = |id: &str| view["pending"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap()["once_terms"].clone();
+        assert_eq!(row(&pid), json!({ "uses": null, "ttl_secs": wicket_core::git::PUSH_WINDOW_SECS }));
+        assert_eq!(row(&gid), json!({ "uses": 1, "ttl_secs": 600 }));
     }
 
     /// #369: the passkey signs the request's effect descriptor, and the blast radius of an approval
