@@ -39,9 +39,14 @@ mod props;
 mod quota;
 mod receipts;
 mod scale;
+mod standing;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
+pub use standing::{
+    new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
+    Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
+};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
@@ -151,6 +156,9 @@ pub enum StoreError {
 /// archived run's grants sees none), so the floor stays 17.
 /// Version 22 (expand, after #582's 21) adds `node_labels` and `node_taints` (#579): what placement
 /// filters nodes by. Older builds don't read them; the floor stays 17.
+/// Version 23 (expand, after #587's 22) adds the `standing` table: standing reach (#572), a reach
+/// rule an agent asks for once and a human approves for its principal or zone. Older builds don't
+/// read it, so the floor stays 17.
 /// Version 24 (expand, after #576's 23) adds `placements` (#579 step 2): the node room reserved for
 /// boxes being started. Older builds don't read it; the floor stays 17.
 pub const SCHEMA_VERSION: u32 = 24;
@@ -551,6 +559,7 @@ impl Ledger {
         conn.execute_batch(capgrant::SCHEMA)?;
         conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(nodelabels::SCHEMA)?;
+        conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
@@ -600,6 +609,7 @@ impl Ledger {
         conn.execute_batch(capgrant::SCHEMA)?;
         conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(nodelabels::SCHEMA)?;
+        conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
         scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
