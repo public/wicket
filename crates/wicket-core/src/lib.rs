@@ -16,6 +16,7 @@ pub mod link;
 pub mod manifest;
 pub mod message;
 pub mod op;
+pub mod placement;
 pub mod quota;
 pub mod splice;
 pub mod subset;

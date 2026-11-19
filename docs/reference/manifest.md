@@ -35,8 +35,20 @@ zone:
 | `agent` | [agent](#agent) | none | An agent, run by its [harness](#harness-modes). |
 | `program` | [program](#program) | none | A deterministic workload with no model. |
 | `zone` | [zone](#zone) | required | Where the workload runs, and what it may reach. |
+| `placement` | [placement](#placement) | none | What the box asks of the node it goes on. |
 
 Exactly one of `agent` and `program` must be given.
+
+## `placement`
+
+What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. Today it decides where a woken agent goes ([nodes](nodes.md#placement)); `wicket run --node` and a spawn's placement hint name the node themselves.
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `node_selector` | map of string to string | none | Labels the node must have, each with this value (`gpu: a100`). |
+| `tolerations` | list of strings | none | Node taints the box may go on despite: `key` (any value) or `key=value`. A node's taint keeps off every box that doesn't tolerate it. |
+
+Keys are lowercase letters and digits with `.`, `_`, `-` or `/` inside, at most 63; values are letters, digits, `.`, `_` and `-`, at most 63. A manifest without `placement` reads the same to a node that doesn't know it; one with it needs its node on this release or later when it spawns there.
 
 ## `agent`
 

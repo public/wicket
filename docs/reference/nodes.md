@@ -335,9 +335,9 @@ wicket node revoke n1
   margin of 5% of memory, at least 256 MiB. Limits are never overcommitted against what is actually
   free. The disk must have at least 5% (at least 1 GiB) free, and 1% of its inodes. The refusal
   (`no room on this node for the box: …`) is audited as `box.refused` on the node, and `wicket run`
-  reports it. A node's `Welcome` carries the room it has now (`room_mib`) and whether it starts
-  no box at all (`full`). Placing a waking agent uses both, and refuses the wake when no node has
-  room, rather than overcommitting one.
+  reports it. A node's `Welcome`, and since #579 its health report, carry its size and use, the room
+  it has now (`room_mib`) and whether it starts no box at all (`full`). Placing a waking agent uses
+  them, and refuses the wake when no node has room, rather than overcommitting one.
 - **Reserve.** A node holds a disk reserve, `reserve` in its directory: preallocated space box
   volumes can't use, 2% of the disk (at least 256 MiB, at most 2 GiB), or `WICKET_NODE_RESERVE_MIB`
   (0 for none). When a feed frame can't be persisted, the node releases the reserve and tries the
@@ -358,6 +358,52 @@ wicket node revoke n1
   forgotten at the run's end. Instead the refusal is printed and audited as `run.cleanup_refused`,
   and the node keeps the files until `wicket node forget <run> --force` (audited as
   `run.cleanup_forced`). The node audits the deletion as `run.files_deleted`.
+
+## Placement
+
+Where a box goes ([#579](https://github.com/public/wicket/issues/579)): `wicket run --node` or a spawn's
+placement hint names a node; otherwise a run goes on this host's own node. A woken agent is placed by the
+scheduler, `wicket-placement::schedule`, a pure function of what the control host knows when it decides:
+
+- **Capacity, from the ledger.** Each node's latest health report (every 30 s, on every connection to it;
+  stored once per node at most every 20 s) carries its capacity, and a wake reads it there. A node with no
+  report under 90 s old, or one from a node before #579, is asked over its control channel instead (within
+  10 s): an idle node, with no run connected to it, reports nothing. A report may still count a box that
+  ended since it (one that just hibernated), so before a wake is refused for room, the nodes read from
+  reports are asked too.
+- **Reservations.** Choosing a node and reserving what the box asks for there are one ledger transaction
+  (`placements`), so two starts never count the same room: a node's room is its report less what boxes
+  chosen since hold on it. A reservation counts until the node reports the box (after it starts), or is
+  given back when the start fails or the run ends; one never confirmed stops counting after 2 minutes.
+  A node named for the box (`wicket run --node`, a lease's node) passes the same filters when its last
+  report is fresh: the start is refused, saying why, for a label, taint or CA it fails; for room, the
+  node's own admission decides, since the report may count a box that has ended.
+- **The queue.** A wake that no node may take now waits instead of failing: `queued: no node may take agent
+  … now (n1: …; n2: …)`, then it tries again every 2 s, asking the nodes with no fresh report every 30 s,
+  for up to `wicket wake --wait` (default 30 minutes; `--wait 0` fails at once, as before). Waiting wakes
+  are served first come, first served (`placement_waits`): one is placed only when no wake waiting longer
+  fits a node now, so a wake that fits nowhere doesn't hold up the ones behind it. A waiting wake keeps its
+  claim on the agent, and holds its place only while its process is alive. The queue never creates
+  capacity: `request_capacity` and `wicket node create` stay the only ways.
+
+- **Labels and taints.** `wicket node set <node> --label gpu=a100 --taint dedicated=ci` records them in the
+  ledger (`key-` removes one; audited `node.labels`). A box goes on a node only if the node has every label
+  its manifest's [`placement.node_selector`](manifest.md#placement) names, with that value, and the box
+  tolerates every taint the node has (`placement.tolerations`: `key` for any value, or `key=value`). A
+  taint keeps a node for the boxes that say they belong there.
+- **Filter.** Out are: a node that starts no box (`full`); one without the vCPUs and memory the box's limits
+  ask for, by its report and its admission's room ([above](#health-admission-and-disk-377)); a label or
+  taint mismatch; and a node whose CA doesn't cover the box's inspected hosts and whose policy keeps them
+  out ([#573](https://github.com/public/wicket/issues/573); a node it may be widened to is in).
+- **Score.** Of the nodes left, bin-pack: the one left with the least memory, then the fewest vCPUs, once
+  the box is on it. Where the agent ran before breaks a tie, then the name, so the same inputs always give
+  the same node. A spread strategy exists in the function for later.
+- **Refusal.** With no node left the wake is refused, naming every node and every reason it was out
+  (`n1 (tainted dedicated=ci, not tolerated), n2 (0.5 vCPU, 512 MiB free)`). The node's own admission
+  stays the last word: it may still refuse the box it was given.
+
+A queue, reservations for starts in flight, and placing new runs (not only wakes) come next, on #582's
+cached capacity index.
 
 ## Images on nodes
 

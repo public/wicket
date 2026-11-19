@@ -76,9 +76,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             session::open(session::Opts { run, text, wait: !no_wait, timeout: timeout.map(std::time::Duration::from_secs) }).await
         }
         Cmd::Hibernate { run, wait } => hibernate::hibernate(&run, wait).await,
-        Cmd::Wake { agent, text, by } => {
+        Cmd::Wake { agent, text, by, wait } => {
             let text = text.join(" ");
-            hibernate::wake(&agent, (!text.trim().is_empty()).then_some(text), by).await
+            let wait = wicket_core::time::parse_duration(&wait).context("bad --wait")?;
+            hibernate::wake(&agent, (!text.trim().is_empty()).then_some(text), by, wait).await
         }
         Cmd::Agents { json } => hibernate::list(json),
         _ => unreachable!("dispatched to the wrong command group"),

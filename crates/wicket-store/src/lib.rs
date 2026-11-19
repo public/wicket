@@ -26,7 +26,10 @@ pub mod cas;
 mod lifecycle_props;
 mod links;
 mod nodeca;
+mod nodelabels;
+mod placements;
 pub use nodeca::{CaHosts, CaWant};
+pub use placements::{Placement, RESERVE_SECS, WAIT_SEEN_MS};
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -36,9 +39,14 @@ mod props;
 mod quota;
 mod receipts;
 mod scale;
+mod standing;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
+pub use standing::{
+    new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
+    Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
+};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
@@ -146,7 +154,15 @@ pub enum StoreError {
 /// trigger on `audit`, which an older build fires too), and `grants_archive` and `requests_archive`
 /// for the settled rows of runs long ended. Older builds don't read the new tables (one reading an
 /// archived run's grants sees none), so the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 21;
+/// Version 22 (expand, after #582's 21) adds `node_labels` and `node_taints` (#579): what placement
+/// filters nodes by. Older builds don't read them; the floor stays 17.
+/// Version 23 (expand, after #587's 22) adds the `standing` table: standing reach (#572), a reach
+/// rule an agent asks for once and a human approves for its principal or zone. Older builds don't
+/// read it, so the floor stays 17.
+/// Version 24 (expand, after #576's 23) adds `placements` and `placement_waits` (#579 step 2): the
+/// node room reserved for boxes being started, and the runs waiting for a node. Older builds don't
+/// read them; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 24;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -543,6 +559,9 @@ impl Ledger {
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
         conn.execute_batch(nodeca::SCHEMA)?;
+        conn.execute_batch(nodelabels::SCHEMA)?;
+        conn.execute_batch(standing::SCHEMA)?;
+        conn.execute_batch(placements::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -590,6 +609,9 @@ impl Ledger {
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
         conn.execute_batch(nodeca::SCHEMA)?;
+        conn.execute_batch(nodelabels::SCHEMA)?;
+        conn.execute_batch(standing::SCHEMA)?;
+        conn.execute_batch(placements::SCHEMA)?;
         scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
@@ -617,6 +639,9 @@ impl Ledger {
         self.conn.execute("UPDATE grants SET revoked = 1 WHERE run = ?1 AND revoked = 0", params![run.0])?;
         // And what it wanted of its node's CA (#573), on every way a run ends.
         self.drop_node_ca_wants(&run.0)?;
+        // And the room it reserved on a node (#579).
+        self.placement_released(&run.0)?;
+        self.stop_waiting(&run.0)?;
         self.close_links_of(&run.0)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(

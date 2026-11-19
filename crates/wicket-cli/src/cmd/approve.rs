@@ -17,9 +17,17 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             for r in p {
                 print!("{}", show_request(&l, &r));
             }
+            // Standing asks (#572), decided with `wicket standing approve|deny`.
+            let now = wicket_store::now();
+            for s in l.standing_with_status(&TenantId::single(), "pending")? {
+                println!("{}\n  decide: wicket standing show {id}; wicket standing approve {id} [--narrow] [--for zone]; wicket standing deny {id}", crate::cmd::standing::line(&s, now), id = s.id);
+            }
             Ok(())
         }
         Cmd::Approve { id, uses, unlimited, ttl, prefix, yes, zone_wide } => {
+            if id.starts_with("s-") {
+                bail!("{id} is a standing ask: wicket standing show {id}, then wicket standing approve {id}");
+            }
             let ttl = wicket_core::time::parse_duration(&ttl).context("bad --ttl")?;
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
@@ -111,6 +119,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Deny { id } => {
+            if id.starts_with("s-") {
+                bail!("{id} is a standing ask: wicket standing deny {id}");
+            }
             let mut l = Ledger::open(&ledger_path())?;
             if let grant::Decided::Denied { lease: Some(lease) } = grant::decide(
                 &mut l,
