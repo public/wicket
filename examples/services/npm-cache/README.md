@@ -10,8 +10,10 @@ from the internet once per node and tenant, not once per box.
 wicket service add examples/services/npm-cache/manifest.yaml
 ```
 
-Its manifest is read from here at each start, so keep the directory. `wicket reconcile` (its
-service runs it every 30 s) starts an instance on a node once a box there uses it.
+wicket copies the manifest and this directory into its own data directory, pins their digest, and
+runs that copy: changing these files changes nothing until you add it again. `wicket reconcile` (its
+service runs it every 30 s) starts an instance on a node once a box there uses it, and stops it
+once no box there has used it for 10 minutes.
 
 ## Use it
 
@@ -29,7 +31,7 @@ zone:
 - Once the instance on its node runs, the box is linked to it. The box's output says
   `npm-cache on node …: linked …`.
 - `npm config get registry` in the box shows it. The cache's log, in
-  `services/npm-cache/<run>.log` under wicket's data directory, shows each package it fetched, and
+  `services/npm-cache/logs/<run>.log` under wicket's data directory, shows each package it fetched, and
   each one it served from its storage.
 
 ## Why the box needs the cache's reach

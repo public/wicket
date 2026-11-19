@@ -13,7 +13,7 @@ program:
   command:
     - sh
     - -c
-    - npm install --global --prefix /tmp/verdaccio verdaccio@6 && exec /tmp/verdaccio/bin/verdaccio --config /workspace/config.yaml --listen 0.0.0.0:4873
+    - npm install --global --prefix /tmp/verdaccio --no-audit --no-fund verdaccio@6.1.6 && exec /tmp/verdaccio/bin/verdaccio --config /workspace/config.yaml --listen 0.0.0.0:4873
   source: .
 service:
   port: 4873

@@ -75,8 +75,11 @@ export function describe(a: Record<string, any>): string {
   const s = strip;
   if (a.action === 'open_session') return `Open ${s(a.run)}'s session as ${s(a.principal?.id)}${a.agent ? ` · agent ${s(a.agent)}` : ''}`;
   if (a.action === 'decide') {
-    const verb = a.decision === 'deny' ? 'Deny' : a.uses === 1 ? 'Approve once' : `Allow${a.uses ? ` ${a.uses} uses` : ''}`;
-    const how = a.decision === 'deny' ? '' : ` for ${Math.round((a.ttl_secs || 0) / 60)} min`;
+    // The terms are the effect's (what the passkey signs and the grant is made with), not the
+    // page's ask: a git push's grant is a window, unlimited uses for 5 minutes (#26, #574).
+    const t = a.effect?.terms ?? { uses: a.uses, ttl_secs: a.ttl_secs };
+    const verb = a.decision === 'deny' ? 'Deny' : t.uses === 1 ? 'Approve once' : `Allow${t.uses ? ` ${t.uses} uses` : ' any number of uses'}`;
+    const how = a.decision === 'deny' ? '' : ` for ${Math.round((t.ttl_secs || 0) / 60)} min`;
     const what = a.path_prefix ? s(a.method + ' ' + a.host + a.path_prefix) : s(a.method + ' ' + a.host + a.path);
     return (
       `${verb}${how}: ${what}${a.prefix ? '… (every path under it)' : ''}` +

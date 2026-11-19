@@ -720,7 +720,10 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
             }
             done.push(Done { kind, target: row.id.clone(), detail });
         };
-        let running = ledger.running_runs_on_node(&row.name)?;
+        // A per-node service's instance (#579) never holds a node by itself: it serves the boxes
+        // there, and stops when they are gone.
+        let instances: Vec<String> = ledger.live_service_instances()?.into_iter().map(|i| i.run).collect();
+        let running: Vec<String> = ledger.running_runs_on_node(&row.name)?.into_iter().filter(|r| !instances.contains(r)).collect();
         // A run whose files a fetch didn't bring back holds the node too (#300, #324): releasing
         // it would destroy them.
         let uncollected: Vec<String> = ledger.uncollected_runs_on_node(&row.name)?.into_iter().filter(|r| !running.contains(r)).collect();
@@ -912,11 +915,19 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     }
     // Per-node services (#579): an instance on each node whose boxes use one, started if missing.
     match wicket_control::services::pass(&ledger, dry_run) {
-        Ok(started) => done.extend(started.into_iter().map(|(s, run)| Done {
-            kind: "service_started",
-            target: format!("{} on {}", s.service, s.node),
-            detail: if dry_run { format!("for {} (dry run)", s.tenant) } else { format!("for {}: run {run}", s.tenant) },
-        })),
+        Ok(p) => {
+            done.extend(p.started.into_iter().map(|(s, run)| Done {
+                kind: "service_started",
+                target: format!("{} on {}", s.service, s.node),
+                detail: if dry_run { format!("for {} (dry run)", s.tenant) } else { format!("for {}: run {run}", s.tenant) },
+            }));
+            done.extend(p.stopped.into_iter().map(|(run, why)| Done { kind: "service_stopped", target: run, detail: why }));
+            done.extend(p.failed.into_iter().map(|(s, e)| Done {
+                kind: "error",
+                target: format!("service {} on {}", s.service, s.node),
+                detail: e,
+            }));
+        }
         Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
     }
     // The ledger's own upkeep (#582): settled rows of runs long ended to the archive, planner

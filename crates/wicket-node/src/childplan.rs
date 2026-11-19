@@ -149,6 +149,8 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
     // The child manifest.
     let mut cm = p.clone();
     cm.zone = z;
+    // A spawned box is never a per-node service (#579): only an operator installs one.
+    cm.service = None;
     if is_agent {
         let task = req.task.clone().filter(|t| !t.trim().is_empty()).ok_or("an agent needs a task")?;
         cm.task = task;

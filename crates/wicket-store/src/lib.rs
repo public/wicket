@@ -29,7 +29,9 @@ mod services;
 pub use services::{Instance, ServiceRow, SHARED_TENANT};
 mod nodeca;
 mod nodelabels;
+mod placements;
 pub use nodeca::{CaHosts, CaWant};
+pub use placements::{Placement, RESERVE_SECS, WAIT_SEEN_MS};
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -159,6 +161,9 @@ pub enum StoreError {
 /// Version 23 (expand, after #587's 22) adds the `standing` table: standing reach (#572), a reach
 /// rule an agent asks for once and a human approves for its principal or zone. Older builds don't
 /// read it, so the floor stays 17.
+/// Version 24 (expand, after #576's 23) adds `placements` and `placement_waits` (#579 step 2): the
+/// node room reserved for boxes being started, and the runs waiting for a node. Older builds don't
+/// read them; the floor stays 17.
 /// Version 25 (expand, after #579 step 2's 24) adds `services`, `service_wants` and
 /// `service_instances` (#579 step 3): the per-node services installed, which runs use them on which
 /// node, and the instances kept for them. Older builds don't read them; the floor stays 17.
@@ -561,6 +566,7 @@ impl Ledger {
         conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
+        conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
@@ -611,6 +617,7 @@ impl Ledger {
         conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
+        conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
         scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
@@ -639,6 +646,9 @@ impl Ledger {
         self.conn.execute("UPDATE grants SET revoked = 1 WHERE run = ?1 AND revoked = 0", params![run.0])?;
         // And what it wanted of its node's CA (#573), on every way a run ends.
         self.drop_node_ca_wants(&run.0)?;
+        // And the room it reserved on a node (#579).
+        self.placement_released(&run.0)?;
+        self.stop_waiting(&run.0)?;
         // And what it used of per-node services (#579).
         self.drop_service_wants(&run.0)?;
         self.close_links_of(&run.0)?;

@@ -64,7 +64,11 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 }
                 return Ok(());
             }
-            for (seq, ts, kind, run, body) in l.audit_tail(tail)? {
+            let rows = l.audit_tail(tail)?;
+            if rows.is_empty() {
+                println!("no audit records yet");
+            }
+            for (seq, ts, kind, run, body) in rows {
                 println!("{seq:>6} {ts} {kind:<9} {} {body}", run.unwrap_or_else(|| "-".into()));
             }
             Ok(())

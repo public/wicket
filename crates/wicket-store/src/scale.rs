@@ -89,7 +89,7 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
 pub struct Maintained {
     pub archived_grants: usize,
     pub archived_requests: usize,
-    /// Cancel and mode-change rows taken or stale, deleted.
+    /// Cancel and mode-change rows taken or stale, and reservations settled a day ago (#579), deleted.
     pub dropped_asks: usize,
     /// WAL frames checkpointed, and the WAL's frames (both -1 for a ledger not in WAL mode).
     pub checkpointed: i64,
@@ -163,7 +163,7 @@ impl Ledger {
     /// One maintenance pass (see the module's doc).
     pub fn maintain(&self, now: i64) -> Result<Maintained> {
         let (archived_grants, archived_requests) = self.archive_ended(now)?;
-        let dropped_asks = self.drop_spent_asks(now)?;
+        let dropped_asks = self.drop_spent_asks(now)? + self.drop_settled_placements(now)?;
         // Statistics for the planner, limited so a large table costs milliseconds (SQLite's advice
         // for long-lived connections; it only analyses tables whose size moved a lot).
         self.conn.execute_batch("PRAGMA analysis_limit = 400; PRAGMA optimize;")?;
@@ -216,6 +216,7 @@ pub(crate) mod tests {
         "identities",
         "identity_history",
         "node_ca_wants",
+        "placements",
         "grants_archive",
         "requests_archive",
     ];

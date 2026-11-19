@@ -53,7 +53,7 @@ sed -i "s|^program:|program:\n  image: $image|" "$work/npm-cache/manifest.yaml"
 # A box that uses the cache: it waits for its link, then installs left-pad through it.
 user() { # name, reach (yes|no)
   local reach='reach: [{ host: registry.npmjs.org, methods: [GET, HEAD], paths: ["/**"] }]' wait_for=240
-  [ "$2" = yes ] || { reach='reach: []'; wait_for=20; }
+  [ "$2" = yes ] || { reach='reach: []'; wait_for=90; }
   cat >"$work/$1.yaml" <<EOF
 task: install left-pad through the node's npm cache
 program:
@@ -89,7 +89,7 @@ grep -q installed-left-pad "$work/a.log" || { cat "$work/a.log"; fail "box A's n
 grep -q "service_started .*npm-cache on local" "$work/reconcile.log" || { cat "$work/reconcile.log"; fail "the reconciler didn't start the cache"; }
 ok "box A got the cache's registry, was linked to it, and installed left-pad through it"
 
-slog=$(ls "$WICKET_HOME"/services/npm-cache/*.log | head -1)
+slog=$(ls "$WICKET_HOME"/services/npm-cache/logs/*.log | head -1)
 fetched() { grep -c "registry.npmjs.org/left-pad" "$slog" || true; }
 n1=$(fetched)
 [ "$n1" -ge 1 ] || { cat "$slog"; fail "the cache never fetched left-pad"; }
@@ -108,8 +108,16 @@ ok "the boxes made no request to registry.npmjs.org: the cache did"
 
 # Using a service is having its reach: a box that doesn't reach what the cache does isn't linked.
 user offline no
-W run "$work/offline.yaml" >"$work/o.log" 2>&1 || true
+W run "$work/offline.yaml" >"$work/o.log" 2>&1 &
+off_pid=$!
+# While the box runs: its link is a pending request (a run that ends withdraws its requests).
+pending_link=
+for _ in $(seq 60); do
+  if W pending | grep -q "LINK"; then pending_link=1; break; fi
+  sleep 1
+done
+wait "$off_pid" || true
+[ -n "$pending_link" ] || { cat "$work/o.log"; fail "the link's request was never pending"; }
 grep -q "npm-cache on node local: needs approval" "$work/o.log" || { cat "$work/o.log"; fail "a box without the cache's reach was linked, or not asked for"; }
-W pending | grep -q "LINK" || fail "the link's request is not pending"
 ok "a box without the cache's reach needs a human to be linked to it"
 echo "service-e2e.sh: all checks passed"
