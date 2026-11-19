@@ -842,8 +842,9 @@ struct Progress {
     remint_failed: i64,
     /// What `wicket top` reads of this run's node (`ctl/link.json`).
     link: wicket_node::status::LinkRecord,
-    /// The standing rules (#572) the box's token carries now, by id.
-    standing: HashSet<String>,
+    /// The standing rules (#572) the box's token carries now, by id, with the end each was
+    /// published with.
+    standing: std::collections::HashMap<String, u64>,
 }
 
 async fn manage(
@@ -874,7 +875,7 @@ async fn manage(
         fetched: std::collections::HashMap::new(),
         remint_failed: 0,
         link: wicket_node::status::LinkRecord { node: sh.node.clone(), ..Default::default() },
-        standing: HashSet::new(),
+        standing: std::collections::HashMap::new(),
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
@@ -2050,48 +2051,24 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         rebuild = true;
     }
     // Standing reach (#572): the live standing rules bound to this run's agent or zone, as blocks of
-    // its token, on a node at protocol 17 or later and for a top-level box only (a spawned child's
-    // token is narrowed by its parent's ceilings, and it has no principal of its own). One revoked
-    // or lapsed since is revoked on the node, as a grant is.
-    if p.proto >= wicket_chan::chan::STANDING && issuer.box_path == sh.run.0 {
-        let standing = sh.ledger.lock().expect("ledger").standing_for_run(&sh.tenant, &sh.run, &sh.zone.name).unwrap_or_default();
-        let ids: HashSet<String> = standing.iter().map(|s| s.id.clone()).collect();
-        for id in p.standing.iter().filter(|id| !ids.contains(*id)).cloned().collect::<Vec<_>>() {
-            let until = now_s.saturating_add(366 * 24 * 3600).saturating_mul(1000);
-            changes.push(Change::Revoke { kind: RevokeKind::Grant, id: id.clone(), until });
-            p.live.retain(|l| l.grant.gid != id);
-            p.standing.remove(&id);
-            rebuild = true;
-        }
-        let fresh: Vec<&wicket_store::Standing> = standing.iter().filter(|s| !p.standing.contains(&s.id)).collect();
-        for s in fresh {
-            if p.live.len() >= wicket_feed::token::MAX_GRANTS {
-                if p.waiting.insert(s.id.clone()) {
-                    say!(
-                        "[wicket] node {} holds {} live grants for {}: standing rule {} waits until one ends",
-                        sh.node,
-                        p.live.len(),
-                        sh.run,
-                        s.id
-                    );
-                }
-                continue;
-            }
-            let live = standing_live(&issuer, s);
-            let mut trial = p.live.clone();
-            trial.push(live.clone());
-            if let Err(e) = loads(&trial) {
-                if p.waiting.insert(s.id.clone()) {
-                    say!("[wicket] standing rule {} can't go in {}'s token ({e}): it isn't published", s.id, sh.run);
-                }
-                continue;
-            }
-            say!("[wicket] standing rule {} published to node {} for {}", s.id, sh.node, sh.run);
-            p.live.push(live);
-            p.standing.insert(s.id.clone());
-            rebuild = true;
-        }
-    }
+    // its token ([`sync_standing`]).
+    let top_level = issuer.box_path == sh.run.0;
+    let rules = match p.proto >= wicket_chan::chan::STANDING && top_level {
+        true => sh
+            .ledger
+            .lock()
+            .expect("ledger")
+            .standing_for_run(&sh.tenant, &sh.run, &sh.zone.name, &wicket_store::zone_digest(&sh.zone))
+            .map_err(|e| e.to_string()),
+        false => Ok(vec![]),
+    };
+    let (node, run) = (sh.node.clone(), sh.run.0.clone());
+    let (more, changed) =
+        sync_standing(&mut p.standing, &mut p.live, &mut p.waiting, rules, p.proto, top_level, now_s, &issuer, &loads, &mut |m| {
+            say!("[wicket] {run} on node {node}: {m}")
+        });
+    changes.extend(more);
+    rebuild |= changed;
     if !rebuild {
         return vec![];
     }
@@ -2256,6 +2233,94 @@ fn standing_live(issuer: &wicket_feed::Issuer, s: &wicket_store::Standing) -> Li
     }
 }
 
+/// The standing part of a token sync (#572), apart from the ledger and the feed so it can be
+/// tested: `rules` are the live standing rules the ledger binds to the run now (or why they
+/// couldn't be read), `published` what the box's token carries (by id, with the end each was
+/// published with). The feed changes to make, and whether the token must be rebuilt.
+///
+/// - On a node below protocol 17, or for a spawned child's box, none is published; any published
+///   before (a node rolled back to 16) come out of the token, which that node couldn't load with
+///   them (#572 review, L6).
+/// - Rules that can't be read this tick change nothing: a read error isn't "no rules", which would
+///   revoke every published one on the node for a year (M4).
+/// - One no longer live (revoked, lapsed, unbound) is revoked on the node, as a grant is.
+/// - One whose end changed (renewed, or shortened) is published again with its new end (M3).
+/// - A new one goes in if the token has room and loads with it.
+#[allow(clippy::too_many_arguments)]
+fn sync_standing(
+    published: &mut std::collections::HashMap<String, u64>,
+    live: &mut Vec<LiveGrant>,
+    waiting: &mut HashSet<String>,
+    rules: std::result::Result<Vec<wicket_store::Standing>, String>,
+    proto: u32,
+    top_level: bool,
+    now_s: i64,
+    issuer: &wicket_feed::Issuer,
+    loads: &dyn Fn(&[LiveGrant]) -> std::result::Result<(), String>,
+    log: &mut dyn FnMut(String),
+) -> (Vec<Change<BoxAuthority>>, bool) {
+    let mut changes = vec![];
+    let mut rebuild = false;
+    if proto < wicket_chan::chan::STANDING || !top_level {
+        if !published.is_empty() {
+            live.retain(|l| !published.contains_key(&l.grant.gid));
+            published.clear();
+            rebuild = true;
+        }
+        return (changes, rebuild);
+    }
+    let rules = match rules {
+        Ok(r) => r,
+        Err(e) => {
+            log(format!("could not read its standing rules ({e}); its token keeps the ones it has until the next sync"));
+            return (changes, false);
+        }
+    };
+    let ids: HashSet<&str> = rules.iter().map(|s| s.id.as_str()).collect();
+    for id in published.keys().filter(|id| !ids.contains(id.as_str())).cloned().collect::<Vec<_>>() {
+        let until = now_s.saturating_add(366 * 24 * 3600).saturating_mul(1000);
+        changes.push(Change::Revoke { kind: RevokeKind::Grant, id: id.clone(), until });
+        live.retain(|l| l.grant.gid != id);
+        published.remove(&id);
+        rebuild = true;
+    }
+    for s in &rules {
+        let block = standing_live(issuer, s);
+        match published.get(&s.id) {
+            Some(end) if *end == block.grant.not_after => continue,
+            // Renewed or shortened: the same block with its new end.
+            Some(_) => {
+                for l in live.iter_mut().filter(|l| l.grant.gid == s.id) {
+                    l.grant.not_after = block.grant.not_after;
+                }
+                published.insert(s.id.clone(), block.grant.not_after);
+                rebuild = true;
+                continue;
+            }
+            None => {}
+        }
+        if live.len() >= wicket_feed::token::MAX_GRANTS {
+            if waiting.insert(s.id.clone()) {
+                log(format!("standing rule {} waits for room in the token ({} live grants)", s.id, live.len()));
+            }
+            continue;
+        }
+        let mut trial = live.clone();
+        trial.push(block.clone());
+        if let Err(e) = loads(&trial) {
+            if waiting.insert(s.id.clone()) {
+                log(format!("standing rule {} can't go in the token ({e}): it isn't published", s.id));
+            }
+            continue;
+        }
+        log(format!("standing rule {} published", s.id));
+        published.insert(s.id.clone(), block.grant.not_after);
+        live.push(block);
+        rebuild = true;
+    }
+    (changes, rebuild)
+}
+
 /// The installation CA, for renewing nodes' CAs over their channels (#416, wicket-node's
 /// `controlca`), if this control host has one (never created here).
 fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
@@ -2282,7 +2347,7 @@ mod tests {
         let rule: wicket_core::manifest::ReachRule =
             wicket_core::yaml::from_str("{ host: CI.example, methods: [GET], paths: ['/jobs/*/logs'] }").unwrap();
         let rule = wicket_core::manifest::ReachRule { host: "ci.example".into(), ..rule };
-        let (id, _) = l.ask_standing(&tenant, &run, "z", "spiffe://w/t/t0/z/z/a/a", &rule, "logs").unwrap();
+        let (id, _) = l.ask_standing(&tenant, &run, "z", "d", "spiffe://w/t/t0/z/z/a/a", &rule, "logs").unwrap();
         let terms = wicket_store::StandingTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: None };
         l.approve_standing(&id, &rule, &terms, "ann", None).unwrap();
         let s = l.standing(&id).unwrap();
@@ -2294,6 +2359,68 @@ mod tests {
         // With a lapse, the block ends as a grant's does.
         let lapsing = wicket_store::Standing { expires_at: Some(1_900_000_000), ..s };
         assert_eq!(standing_live(&issuer, &lapsing).grant.not_after, 1_899_999_999);
+    }
+
+    /// #572 review (M3, M4, L6, and the branch's own tests): what a sync does with standing rules.
+    /// A new one is published; an unchanged sync changes nothing; a renewal or a shortening is
+    /// published again with its new end; a revoked (or lapsed, or unbound) one is revoked on the
+    /// node; a read error changes nothing; a child's box, or a node below protocol 17, gets none,
+    /// and loses any it had.
+    #[test]
+    fn a_sync_publishes_renews_and_revokes_standing_rules() {
+        let tenant = TenantId::single();
+        let run = RunId("run_s".into());
+        let zone: ZoneSpec = wicket_core::yaml::from_str("name: z\nreach: []\n").unwrap();
+        let key = wicket_authz::SigningKey::generate();
+        let issuer = wicket_feed::Issuer::root(&key, &tenant.0, "run:run_s", &run.0, 0, &zone, &[], 2_000_000_000, vec![]).unwrap();
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        let rule: wicket_core::manifest::ReachRule =
+            wicket_core::yaml::from_str("{ host: ci.example, methods: [GET], paths: ['/jobs/*/logs'] }").unwrap();
+        let (id, _) = l.ask_standing(&tenant, &run, "z", "d", "spiffe://w/t/t0/z/z/a/a", &rule, "logs").unwrap();
+        let terms = wicket_store::StandingTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: Some(3600) };
+        l.approve_standing(&id, &rule, &terms, "ann", None).unwrap();
+        let rule_row = l.standing(&id).unwrap();
+        let (mut published, mut live, mut waiting) = (std::collections::HashMap::new(), vec![], HashSet::new());
+        let ok = |_: &[LiveGrant]| Ok(());
+        let mut logs = vec![];
+        let mut sync = |published: &mut std::collections::HashMap<String, u64>,
+                        live: &mut Vec<LiveGrant>,
+                        rules: std::result::Result<Vec<wicket_store::Standing>, String>,
+                        proto: u32,
+                        top: bool| {
+            sync_standing(published, live, &mut waiting, rules, proto, top, 1_000, &issuer, &ok, &mut |m| logs.push(m))
+        };
+        let p17 = wicket_chan::chan::STANDING;
+        // Published.
+        let (c, r) = sync(&mut published, &mut live, Ok(vec![rule_row.clone()]), p17, true);
+        assert!(c.is_empty() && r && live.len() == 1 && published.contains_key(&id));
+        // Unchanged: nothing.
+        let (c, r) = sync(&mut published, &mut live, Ok(vec![rule_row.clone()]), p17, true);
+        assert!(c.is_empty() && !r);
+        // Renewed, then shortened: published again with its new end, both ways.
+        for end in [rule_row.expires_at.unwrap() + 86_400, rule_row.expires_at.unwrap() - 600] {
+            let moved = wicket_store::Standing { expires_at: Some(end), ..rule_row.clone() };
+            let (c, r) = sync(&mut published, &mut live, Ok(vec![moved]), p17, true);
+            assert!(c.is_empty() && r, "{end}");
+            assert_eq!(live[0].grant.not_after, wicket_authz::Grant::not_after_for(end));
+            assert_eq!(published[&id], wicket_authz::Grant::not_after_for(end));
+        }
+        // A read error: nothing changes (not "no rules", which would revoke it on the node).
+        let (c, r) = sync(&mut published, &mut live, Err("database is locked".into()), p17, true);
+        assert!(c.is_empty() && !r && live.len() == 1);
+        // Gone from the ledger's live rules: revoked on the node, and out of the token.
+        let (c, r) = sync(&mut published, &mut live, Ok(vec![]), p17, true);
+        assert!(r && live.is_empty() && published.is_empty());
+        assert!(matches!(&c[..], [Change::Revoke { kind: RevokeKind::Grant, id: g, .. }] if *g == id));
+        // A child's box gets none; a node that drops to 16 loses what it had, with no revocation.
+        let (c, r) = sync(&mut published, &mut live, Ok(vec![rule_row.clone()]), p17, false);
+        assert!(c.is_empty() && !r && live.is_empty());
+        sync(&mut published, &mut live, Ok(vec![rule_row.clone()]), p17, true);
+        assert_eq!(live.len(), 1);
+        let (c, r) = sync(&mut published, &mut live, Ok(vec![rule_row.clone()]), p17 - 1, true);
+        assert!(c.is_empty() && r && live.is_empty() && published.is_empty());
+        drop(sync);
+        assert!(logs.iter().any(|m| m.contains("could not read")), "{logs:?}");
     }
 
     /// #56: a renewed grant the box's token carries is published with its new end; one the token
