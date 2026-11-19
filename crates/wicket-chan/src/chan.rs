@@ -322,6 +322,11 @@ pub struct EdgeStart {
     /// its adapter says. None: the agent reads them with `await_message`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push: Option<wicket_agent::harness::MessagePush>,
+    /// How the control host may widen this node's CA (#573), as its operator had set it when the
+    /// box started: the node asks for an https host its CA doesn't cover only if this lets the CA be
+    /// widened to it. None (a control host from before it) is `fixed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_widen: Option<wicket_store::CaHosts>,
 }
 
 /// What a node decides a box's spawns from (#164): a child within the box's authority starts on

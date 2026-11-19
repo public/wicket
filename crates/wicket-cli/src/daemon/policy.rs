@@ -112,9 +112,12 @@ pub fn route(cmd: &Cmd) -> Route {
             NodeCmd::List { provider: true, .. } | NodeCmd::Plans { .. } => Forward(Privileged),
             // Spends money (a CAPACITY request decided by a grant or an operator), or destroys a machine.
             NodeCmd::Create(_) | NodeCmd::Release { .. } => Forward(Privileged),
-            NodeCmd::Token { .. } | NodeCmd::Enrol { .. } | NodeCmd::Revoke { .. } | NodeCmd::RenewCa { .. } | NodeCmd::Install { .. } => {
-                Forward(Privileged)
-            }
+            NodeCmd::Token { .. }
+            | NodeCmd::Enrol { .. }
+            | NodeCmd::Revoke { .. }
+            | NodeCmd::RenewCa { .. }
+            | NodeCmd::Set { .. }
+            | NodeCmd::Install { .. } => Forward(Privileged),
             // Deletes a run's files on its node, perhaps uncollected work.
             NodeCmd::Forget { .. } => Forward(Privileged),
             NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } => Local,

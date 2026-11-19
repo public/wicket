@@ -1686,7 +1686,7 @@ fn child_start(
         output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
         output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
         swaps: vec![],
-        edge: Some(Box::new(chan::EdgeStart { who, spawn: None, push: None })),
+        edge: Some(Box::new(chan::EdgeStart { who, spawn: None, push: None, ca_widen: None })),
         image_pin: plan.image_pin.clone(),
         timings: parent.timings,
         memory_advice: m.zone.limits.memory_advice().map(str::to_string),
@@ -3190,8 +3190,12 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
 
         let mut rec = fake_record("run_a");
         rec.started_ms = 1000;
-        rec.start.edge =
-            Some(Box::new(chan::EdgeStart { who: serde_json::json!({ "agent": "coder", "id": "x" }), spawn: None, push: None }));
+        rec.start.edge = Some(Box::new(chan::EdgeStart {
+            who: serde_json::json!({ "agent": "coder", "id": "x" }),
+            spawn: None,
+            push: None,
+            ca_widen: None,
+        }));
         node.boxes.lock().unwrap().insert(
             "run_a".into(),
             BoxState {
@@ -3673,15 +3677,31 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let (t, err) = ask("https://storage.example/gvisor/releases/release/", "prefix").await;
         assert!(!err && t.starts_with("not requested: storage.example isn't served by this box's node, n1"), "{t}");
         assert!(t.contains("name constraints") && t.contains("No approval can change that"), "{t}");
+        assert!(t.contains("wicket node set n1 --ca-hosts auto"), "{t}");
         assert!(t.contains("wicket node renew-ca n1 --hosts storage.example"), "{t}");
         assert!(node.queue.of(RUN).is_empty(), "nothing asked");
+        // #573: under a policy that lets the CA be widened to the host, it is asked for (the grant
+        // widens the CA); a list that leaves it out refuses as `fixed` does.
+        let set_policy = |p: wicket_store::CaHosts| {
+            node.boxes.lock().unwrap().get_mut(RUN).unwrap().record.start.edge.as_mut().unwrap().ca_widen = Some(p);
+        };
+        set_policy(wicket_store::CaHosts::Allowed(vec!["*.example.org".into()]));
+        let (t, _) = ask("https://storage.example/x", "exact").await;
+        assert!(t.starts_with("not requested: storage.example"), "outside the list: {t}");
+        set_policy(wicket_store::CaHosts::Allowed(vec!["storage.example".into()]));
+        let (t, _) = ask("https://storage.example/w", "exact").await;
+        assert!(t.starts_with("queued: q-"), "within the list: {t}");
+        set_policy(wicket_store::CaHosts::Auto);
+        let (t, _) = ask("https://storage.example/y", "exact").await;
+        assert!(t.starts_with("queued: q-"), "auto: {t}");
+        set_policy(wicket_store::CaHosts::Fixed);
         let (t, _) = ask("https://covered.test/x", "exact").await;
         assert!(t.starts_with("queued: q-"), "a covered host is asked for: {t}");
         let (t, _) = ask("http://storage.example/x", "exact").await;
         assert!(t.starts_with("queued: q-"), "plain http needs no CA: {t}");
         let (t, _) = ask("https://whole.test/x", "exact").await;
         assert!(t.contains("already allowed"), "uncovered, but spliced: {t}");
-        assert_eq!(node.queue.of(RUN).len(), 2);
+        assert_eq!(node.queue.of(RUN).len(), 4, "two under the widening policies, two here");
     }
 
     /// [`fed_box`] for several boxes on this node.
@@ -3724,6 +3744,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             who: serde_json::json!({ "id": format!("spiffe://wicket.test/t/t0/z/{}/a/{run}", z.name), "run": run, "zone": z.name }),
             spawn: None,
             push: None,
+            ca_widen: None,
         }));
         let st = BoxState {
             streams: [1, 2, 3],
