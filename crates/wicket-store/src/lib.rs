@@ -25,6 +25,8 @@ pub mod cas;
 #[cfg(test)]
 mod lifecycle_props;
 mod links;
+mod nodeca;
+pub use nodeca::{CaHosts, CaWant};
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -33,9 +35,11 @@ mod previous_build;
 mod props;
 mod quota;
 mod receipts;
+mod scale;
 mod standing;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
+pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
 pub use standing::{
     new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
     Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
@@ -139,9 +143,18 @@ pub enum StoreError {
 /// had its rows copied into `messages`. Builds of schema 17 and 18 never read it (version 17 was the
 /// expand step that stopped them), so the floor is 17, not 19: a rollback to them stays safe, and only
 /// builds from before one inbox, which read prompts from that table, can no longer open the ledger.
-/// Version 20 (expand) adds the `standing` table: standing reach (#572), a reach rule an agent asks
-/// for once and a human approves for its principal or zone.
-pub const SCHEMA_VERSION: u32 = 20;
+/// Version 20 (expand) adds `node_ca_policy` and `node_ca_wants` (#573): how a
+/// node's CA may be widened at runtime, and the hosts its boxes want of it. Older builds don't read
+/// them, so the floor stays 17.
+/// Version 21 (expand, after #581's 20) is #582's first step: indexes on what every run's supervisor
+/// and node feed status look up, `node_audit_heads` (each node's last shipped record, kept by a
+/// trigger on `audit`, which an older build fires too), and `grants_archive` and `requests_archive`
+/// for the settled rows of runs long ended. Older builds don't read the new tables (one reading an
+/// archived run's grants sees none), so the floor stays 17.
+/// Version 23 (expand, after #587's 22) adds the `standing` table: standing reach (#572), a reach
+/// rule an agent asks for once and a human approves for its principal or zone. Older builds don't
+/// read it, so the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 23;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -537,6 +550,7 @@ impl Ledger {
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
+        conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
@@ -549,6 +563,7 @@ impl Ledger {
         // A build of schema 17 or 18 that opens the ledger again creates it empty, and never reads it.
         conn.execute_batch("DROP TABLE IF EXISTS operator_messages")?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_turns ON messages (to_run, kind, delivered_at)")?;
+        scale::migrate(&conn)?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -583,7 +598,9 @@ impl Ledger {
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
+        conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
+        scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
@@ -608,6 +625,8 @@ impl Ledger {
         )?;
         // So are the grants bound to it: nothing else may use them (#127).
         self.conn.execute("UPDATE grants SET revoked = 1 WHERE run = ?1 AND revoked = 0", params![run.0])?;
+        // And what it wanted of its node's CA (#573), on every way a run ends.
+        self.drop_node_ca_wants(&run.0)?;
         self.close_links_of(&run.0)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
@@ -778,6 +797,10 @@ impl Ledger {
     /// Takes `run`'s cancel requests: who asked, oldest first, of those made within the last
     /// `fresh_secs` (older ones are dropped: a supervisor that was away mustn't cancel a later turn).
     pub fn take_turn_cancels(&mut self, run: &str, fresh_secs: i64) -> Result<Vec<String>> {
+        // Asked several times a second by every supervisor: the write lock only when there is one.
+        if !self.untaken("turn_cancels", run)? {
+            return Ok(vec![]);
+        }
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let t = now();
         let by: Vec<String> = {
@@ -791,6 +814,16 @@ impl Ledger {
         Ok(by)
     }
 
+    /// Whether `run` has an ask in `table` (`turn_cancels` or `mode_changes`) not yet taken: a read,
+    /// so a supervisor with nothing to take doesn't take the write lock (#582).
+    fn untaken(&self, table: &str, run: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE run = ?1 AND consumed_at IS NULL)"),
+            params![run],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Asks `run`'s supervisor to change its driven session's permission mode while it runs (#363),
     /// to `mode` as the manifest spells it. Taken within a second or so, like a turn cancel.
     pub fn request_mode_change(&self, run: &str, mode: &str, by: &str) -> Result<i64> {
@@ -801,6 +834,9 @@ impl Ledger {
     /// Takes `run`'s mode changes: (mode, who asked), oldest first, of those made within the last
     /// `fresh_secs` (older ones are dropped, as stale cancels are).
     pub fn take_mode_changes(&mut self, run: &str, fresh_secs: i64) -> Result<Vec<(String, String)>> {
+        if !self.untaken("mode_changes", run)? {
+            return Ok(vec![]);
+        }
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let t = now();
         let asked: Vec<(String, String)> = {
@@ -1207,11 +1243,18 @@ impl Ledger {
         Ok((id, true))
     }
 
+    /// A request of a run ended long ago is read from the archive (#582).
     pub fn request(&self, id: &str) -> Result<Request> {
-        self.conn
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests WHERE id = ?1", params![id], row_to_request)
-            .optional()?
-            .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))
+        for table in ["requests", "requests_archive"] {
+            let found = self
+                .conn
+                .query_row(&format!("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM {table} WHERE id = ?1"), params![id], row_to_request)
+                .optional()?;
+            if let Some(r) = found {
+                return Ok(r);
+            }
+        }
+        Err(StoreError::NoSuchRequest(id.to_string()))
     }
 
     /// The most recent runs, newest first.
@@ -1924,6 +1967,8 @@ impl Ledger {
                 node.enrolled_at
             ],
         )?;
+        // A machine enrolled under a name starts with no CA policy or wants (#573).
+        nodeca::forget_node_ca(&tx, &node.name)?;
         insert_node_ca(&tx, ca)?;
         tx.commit()?;
         Ok(())
@@ -1996,7 +2041,8 @@ impl Ledger {
         }
         tx.execute("UPDATE node_cas SET status = 'superseded' WHERE node = ?1 AND status = 'active'", params![ca.node])?;
         insert_node_ca(&tx, ca)?;
-        tx.execute("UPDATE nodes SET hosts = ?2 WHERE name = ?1", params![ca.node, serde_json::Value::from(ca.hosts.clone()).to_string()])?;
+        // `nodes.hosts` stays what the operator set (enrolment, renew-ca): a CA widened at runtime
+        // (#573) adds its boxes' wants to it, which a later renewal prunes.
         tx.commit()?;
         Ok(serials)
     }
@@ -2022,6 +2068,7 @@ impl Ledger {
             tx.execute("UPDATE node_cas SET status = 'revoked', revoked_at = ?2 WHERE serial = ?1", params![s, t])?;
         }
         tx.execute("UPDATE node_certs SET status = 'revoked', revoked_at = ?2 WHERE node = ?1 AND status != 'revoked'", params![name, t])?;
+        nodeca::forget_node_ca(&tx, name)?;
         tx.commit()?;
         Ok(serials)
     }
@@ -2156,6 +2203,29 @@ mod node_tests {
         assert!(l.enrol_node(&t2, &node("n1"), &ca("n1", "02")).is_err(), "n1 is enrolled already");
         assert!(l.enrol_node(&t, &node("n1"), &ca("n1", "03")).is_err(), "second use");
         assert!(matches!(l.check_node_token("wkt_nope", now()), Err(StoreError::Token("unknown"))));
+    }
+
+    /// #573's review, 4 and 7: a node's CA policy is set and audited together, with who set it;
+    /// revoking a node, or enrolling a machine under its name again, starts with no policy and no
+    /// wants (not another machine's `auto`).
+    #[test]
+    fn a_nodes_ca_policy_goes_with_it_and_is_audited_with_its_setter() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        assert!(l.set_node_ca_policy_audited("n1", &CaHosts::Auto, "alex").is_err(), "not enrolled");
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0a")).unwrap();
+        l.set_node_ca_policy_audited("n1", &CaHosts::Auto, "alex").unwrap();
+        let a = l.audit_tail(1).unwrap();
+        assert!(a[0].2 == "node.ca_policy" && a[0].4.contains("\"by\":\"alex\""), "{a:?}");
+        l.run_started(&TenantId::single(), &RunId("run_a".into()), "z", "a").unwrap();
+        l.want_node_ca_hosts("n1", &["x.example.com".into()], "run_a", "reach", 1).unwrap();
+        l.revoke_node("n1").unwrap();
+        assert_eq!(l.node_ca_policy("n1").unwrap(), CaHosts::Fixed);
+        assert!(l.node_ca_wants("n1").unwrap().is_empty());
+        l.set_node_ca_policy("n1", &CaHosts::Auto).unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0b")).unwrap();
+        assert_eq!(l.node_ca_policy("n1").unwrap(), CaHosts::Fixed, "a new machine under the name");
     }
 
     #[test]
