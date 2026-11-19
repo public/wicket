@@ -36,6 +36,10 @@ pub struct Manifest {
     /// What the box asks of the node it goes on (#579): labels to match, taints it tolerates.
     #[serde(default)]
     pub placement: crate::placement::PlacementSpec,
+    /// What makes this program a per-node service (#579 step 3), which other boxes use through
+    /// `zone.uses`. Installed by an operator (`wicket service add`), never spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<crate::service::ServiceSpec>,
 }
 
 /// As derived, except that a program's zone always writes its `escalation`: a program's default is
@@ -52,6 +56,8 @@ impl Serialize for Manifest {
             zone: ZoneOut<'a>,
             #[serde(skip_serializing_if = "crate::placement::PlacementSpec::is_default")]
             placement: &'a crate::placement::PlacementSpec,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            service: &'a Option<crate::service::ServiceSpec>,
         }
         #[derive(Serialize)]
         struct ZoneOut<'a> {
@@ -68,6 +74,7 @@ impl Serialize for Manifest {
             program: &self.program,
             zone: ZoneOut { zone: &self.zone, escalation },
             placement: &self.placement,
+            service: &self.service,
         }
         .serialize(s)
     }
@@ -331,6 +338,12 @@ pub struct ZoneSpec {
     /// default, so a zone that doesn't use it reads the same to a node that doesn't know it.
     #[serde(default, skip_serializing_if = "Escalation::is_default")]
     pub escalation: Escalation,
+    /// Per-node services the zone's boxes use (#579 step 3): each reached at
+    /// `<name>.wicket.internal`, the instance on the box's own node, through a link. Using a service
+    /// is having its reach: the link opens without a human only if this zone's reach covers the
+    /// service's ([`crate::service`]). Written out only when set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "crate::yaml::null_as_default")]
+    pub uses: Vec<String>,
 }
 
 /// Who may escalate (#50): ask for more, and grant others what this zone may do.
@@ -877,6 +890,15 @@ impl Manifest {
         self.zone.limits.exit_grace()?;
         self.zone.check_wildcards()?;
         self.placement.check().map_err(ManifestError::Invalid)?;
+        for u in &self.zone.uses {
+            crate::service::check_name(u).map_err(|e| ManifestError::Invalid(format!("zone.uses: {e}")))?;
+        }
+        if let Some(s) = &self.service {
+            s.check().map_err(ManifestError::Invalid)?;
+            if self.program.is_none() {
+                return Err(ManifestError::Invalid("service: a service is a program (an agent can't be one)".into()));
+            }
+        }
         self.zone.llm.as_ref().map_or(Ok(()), LlmSpec::check_models)?;
         // Every image named, by tag or pinned by digest (#192): a pin is strict, never a tag.
         let named = self.zone.images.iter().map(|i| ("zone.images", i.as_str()));
@@ -1145,6 +1167,30 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// #579 step 3: a service is a program with `service:`, its users name it in `zone.uses`, and
+    /// both are written out only when set.
+    #[test]
+    fn a_service_and_its_users() {
+        let svc = super::Manifest::from_yaml(concat!(
+            "task: cache\nprogram: { name: npm-cache, command: [verdaccio] }\n",
+            "service: { port: 4873, env: { npm_config_registry: 'http://{host}:{port}/' } }\n",
+            "zone: { name: npm-cache, reach: [{ host: registry.npmjs.org, methods: [GET, HEAD], paths: ['/**'] }] }\n"
+        ))
+        .unwrap();
+        assert_eq!(svc.service.as_ref().unwrap().port, 4873);
+        let again = super::Manifest::from_yaml(&crate::yaml::to_string(&svc).unwrap()).unwrap();
+        assert_eq!(again.service, svc.service);
+        let agent_svc = "task: t\nagent: { name: a }\nservice: { port: 1 }\nzone: { name: z, llm: {} }\n";
+        assert!(super::Manifest::from_yaml(agent_svc).unwrap_err().to_string().contains("a service is a program"));
+        let user =
+            super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, uses: [npm-cache] }\n").unwrap();
+        assert_eq!(user.zone.uses, ["npm-cache"]);
+        assert!(super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, uses: [Npm] }\n").is_err());
+        let plain = super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z }\n").unwrap();
+        let y = crate::yaml::to_string(&plain).unwrap();
+        assert!(!y.contains("uses") && !y.contains("service"), "{y}");
+    }
 
     /// #325: `is_principal_entry` scans bytes now (for Kani); it decides as `contains("://")` did.
     #[test]
