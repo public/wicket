@@ -30,24 +30,41 @@ pub struct Approve {
     pub ttl: Option<Duration>,
 }
 
-/// The rule narrowed to what the evidence used: its methods, and its exact paths, where the ask's
-/// rule covers them. None if the evidence is empty (nothing to narrow to).
+/// The rule narrowed to what the evidence shows a human let through: the method and path pairs
+/// its blocked requests were granted for, exactly, and nothing else (#572 review, M2). One rule is
+/// every method × every path, so where the granted methods were on different paths only the most
+/// granted method (and any others granted on exactly its paths) is kept: never a pair the evidence
+/// lacks. No `allow_dangerous` (the evidence says nothing of risk: the operator adds it by editing).
+/// At most [`wicket_core::op::STANDING_PAIRS`] pairs, the most granted paths first. None if nothing
+/// it covers was granted.
 pub fn narrowed(s: &Standing) -> Option<ReachRule> {
-    if s.evidence.ops.is_empty() {
-        return None;
-    }
-    let mut methods: Vec<String> = vec![];
-    let mut paths: Vec<String> = vec![];
-    for (m, p, _) in &s.evidence.ops {
-        if !methods.contains(m) {
-            methods.push(m.clone());
-        }
-        let p = glob_literal(p);
-        if !paths.contains(&p) {
-            paths.push(p);
+    use std::collections::BTreeMap;
+    let mut by: BTreeMap<&str, (u64, Vec<String>)> = BTreeMap::new();
+    for o in s.evidence.ops.iter().filter(|o| o.granted > 0) {
+        let e = by.entry(o.method.as_str()).or_default();
+        e.0 += o.granted;
+        let p = glob_literal(&o.path);
+        if !e.1.contains(&p) {
+            e.1.push(p);
         }
     }
-    Some(ReachRule { host: s.rule.host.clone(), methods, paths, allow_dangerous: s.rule.allow_dangerous })
+    let (top, (_, paths)) = by.iter().max_by_key(|(m, (n, _))| (*n, std::cmp::Reverse(**m)))?;
+    let mut sorted = paths.clone();
+    sorted.sort();
+    let methods: Vec<String> = by
+        .iter()
+        .filter(|(m, (_, p))| {
+            m == &top || {
+                let mut q = p.clone();
+                q.sort();
+                q == sorted
+            }
+        })
+        .map(|(m, _)| m.to_string())
+        .collect();
+    let keep = (wicket_core::op::STANDING_PAIRS / methods.len()).max(1);
+    let paths: Vec<String> = paths.iter().take(keep).cloned().collect();
+    Some(ReachRule { host: s.rule.host.clone(), methods, paths, allow_dangerous: false }.canonical())
 }
 
 /// `path` as a glob that matches only itself.
@@ -55,21 +72,37 @@ fn glob_literal(path: &str) -> String {
     path.chars().map(|c| if "*?[]{}\\".contains(c) { format!("[{c}]") } else { c.to_string() }).collect()
 }
 
-/// What the rule allows beyond what the evidence used, in words, for the card: methods it never
-/// used, and whether its paths cover more than the paths it asked for.
+/// What `rule` allows beyond the evidence, in words, for the card: each method and path pair of it
+/// that no blocked request asked for, globs that cover paths none asked for, and `allow_dangerous`
+/// (#572 review, M2: a narrowed rule's pairs are checked too, not assumed).
 pub fn beyond(s: &Standing, rule: &ReachRule) -> Vec<String> {
     let mut out = vec![];
-    let used: Vec<&str> = s.evidence.ops.iter().map(|(m, _, _)| m.as_str()).collect();
-    let unused: Vec<&str> = rule.methods.iter().map(String::as_str).filter(|m| !used.contains(m)).collect();
-    if !unused.is_empty() {
-        out.push(format!("methods never asked for: {}", unused.join(", ")));
+    if s.evidence.ops.is_empty() {
+        out.push("no blocked request it covers in the last 14 days: all of it is beyond the evidence".into());
     }
-    if let Some(n) = narrowed(s) {
-        if n.paths != rule.paths {
-            out.push(format!("paths: {} where the evidence needs only {}", rule.paths.join(", "), n.paths.join(", ")));
+    for m in &rule.methods {
+        for p in &rule.paths {
+            let one = ReachRule { host: rule.host.clone(), methods: vec![m.clone()], paths: vec![p.clone()], allow_dangerous: true };
+            let asked = s.evidence.ops.iter().any(|o| {
+                o.method.eq_ignore_ascii_case(m)
+                    && one
+                        .allows(&wicket_core::Op::egress(
+                            &wicket_core::TenantId::single(),
+                            &wicket_core::RunId(String::new()),
+                            "",
+                            m,
+                            &rule.host,
+                            &o.path,
+                        ))
+                        .unwrap_or(false)
+            });
+            if !asked && !s.evidence.ops.is_empty() {
+                out.push(format!("{m} {p}: no request asked for it"));
+            }
         }
-    } else {
-        out.push("no request it covers was asked for in the last 14 days: all of it is beyond the evidence".into());
+    }
+    for p in rule.paths.iter().filter(|p| p.contains(['*', '?', '[', '{'])) {
+        out.push(format!("{p} is a glob: it covers paths no request asked for too"));
     }
     if rule.allow_dangerous {
         out.push("allow_dangerous: R3 and R4 requests (irreversible, external) are allowed too".into());
@@ -175,12 +208,17 @@ pub fn renew(l: &Ledger, by: &Granter, id: &str, ttl: Option<Duration>) -> Resul
     }
     let until = ttl.map(|t| wicket_store::now().saturating_add(t.as_secs() as i64));
     l.renew_standing(id, until).context("renewing")?;
-    l.audit(
+    // Recorded, or undone: a renewal is a decision (#572 review, L3).
+    let recorded = l.audit(
         &TenantId::single(),
         None,
         "decision",
         &serde_json::json!({ "decision": "renew", "standing": id, "by": by.label(), "until": until, "previous_until": s.expires_at }),
-    )?;
+    );
+    if let Err(e) = recorded {
+        let _ = l.renew_standing(id, s.expires_at);
+        return Err(anyhow::Error::from(e).context("the renewal could not be recorded in the audit log, so it was undone"));
+    }
     Ok(until)
 }
 
@@ -194,8 +232,8 @@ mod tests {
         Granter::Human(crate::operators::Operator::new("t0", "unix", "ann", "ann".into(), &p))
     }
 
-    /// An ask with evidence (two job-log reads in one run), as an agent's `request_access` files it.
-    fn asked(l: &Ledger) -> String {
+    /// A run of the worker agent, with its identity.
+    fn worker(l: &Ledger) -> RunId {
         let t = TenantId::single();
         let r = RunId("run_w".into());
         l.run_started(&t, &r, "work", "worker").unwrap();
@@ -211,29 +249,52 @@ mod tests {
             issued_at: 1,
         })
         .unwrap();
-        for job in [1, 2, 2] {
-            let op = wicket_core::Op::egress(&t, &r, "work", "GET", "api.github.com", &format!("/repos/o/r/actions/jobs/{job}/logs"));
-            l.ask(&op, "logs", false, None).unwrap();
-        }
-        let rule: ReachRule =
-            wicket_core::yaml::from_str("{ host: api.github.com, methods: [GET, POST], paths: ['/repos/o/r/**'] }").unwrap();
-        l.ask_standing(&t, &r, "work", "spiffe://w.test/t/t0/z/work/a/worker", &rule, "CI logs").unwrap().0
+        r
     }
 
-    /// #572: the card's "beyond what was asked" names the unused method and the wider paths;
-    /// narrowed, the rule is the evidence's ops exactly; approved narrowed, that is what is
-    /// recorded and audited.
+    /// Blocked requests of the worker's (`granted`: approved), then its ask for `rule`.
+    fn asked_with(l: &mut Ledger, blocked: &[(&str, &str, bool)], rule: &str) -> String {
+        let t = TenantId::single();
+        let r = worker(l);
+        for (m, p, granted) in blocked {
+            let op = wicket_core::Op::egress(&t, &r, "work", m, "api.github.com", p);
+            let (rid, _) = l.pending_for(&op, "blocked", None).unwrap();
+            if *granted {
+                // A grant, as `wicket approve` makes it.
+                let a = wicket_store::Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "op".into() };
+                l.approve(&rid, &a).unwrap();
+            }
+        }
+        let rule: ReachRule = wicket_core::yaml::from_str(rule).unwrap();
+        l.ask_standing(&t, &r, "work", "digest", "spiffe://w.test/t/t0/z/work/a/worker", &rule, "CI logs").unwrap().0
+    }
+
+    /// An ask with evidence: job-log reads granted twice and once, in one run.
+    fn asked(l: &mut Ledger) -> String {
+        let logs = |j: u32| format!("/repos/o/r/actions/jobs/{j}/logs");
+        let (a, b) = (logs(1), logs(2));
+        asked_with(
+            l,
+            &[("GET", &a, true), ("GET", &b, true), ("GET", &b, true)],
+            "{ host: api.github.com, methods: [GET, POST], paths: ['/repos/o/r/**'] }",
+        )
+    }
+
+    /// #572: the card's "wider than the evidence" names each method and path pair no request asked
+    /// for, and the glob; narrowed, the rule is the granted ops exactly, with nothing beyond it;
+    /// approved narrowed, that is what is recorded and audited.
     #[test]
     fn an_operator_approves_a_standing_ask_narrowed_to_its_evidence() {
-        let l = Ledger::open_in_memory().unwrap();
-        let id = asked(&l);
+        let mut l = Ledger::open_in_memory().unwrap();
+        let id = asked(&mut l);
         let s = l.standing(&id).unwrap();
         let b = beyond(&s, &s.rule);
-        assert!(b.iter().any(|x| x == "methods never asked for: POST"), "{b:?}");
-        assert!(b.iter().any(|x| x.starts_with("paths: /repos/o/r/** where the evidence needs only")), "{b:?}");
+        assert!(b.iter().any(|x| x == "POST /repos/o/r/**: no request asked for it"), "{b:?}");
+        assert!(b.iter().any(|x| x.starts_with("/repos/o/r/** is a glob")), "{b:?}");
         let n = narrowed(&s).unwrap();
         assert_eq!(n.methods, ["GET"]);
         assert_eq!(n.paths, ["/repos/o/r/actions/jobs/1/logs", "/repos/o/r/actions/jobs/2/logs"]);
+        assert!(!n.allow_dangerous);
         assert!(beyond(&s, &n).is_empty(), "{:?}", beyond(&s, &n));
         let a = Approve { rule: Some(n.clone()), bound: StandingBound::Agent, ttl: Some(DEFAULT_STANDING_TTL) };
         let (rule, effect) = approve(&l, &human(), &id, &a, None).unwrap();
@@ -248,12 +309,41 @@ mod tests {
         assert!(l.audit_tail(10).unwrap().iter().any(|r| r.2 == "standing.revoked"));
     }
 
+    /// #572 review, M2: narrowing never makes a pair the evidence lacks (GET /a and DELETE /b
+    /// granted isn't GET and DELETE on both), drops allow_dangerous, ignores what wasn't granted,
+    /// and stays within a token block's pairs.
+    #[test]
+    fn narrowing_keeps_only_granted_pairs() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let id = asked_with(
+            &mut l,
+            &[("GET", "/a", true), ("GET", "/a", true), ("DELETE", "/b", true), ("POST", "/c", false)],
+            "{ host: api.github.com, methods: [GET, DELETE, POST], paths: ['/**'], allow_dangerous: true }",
+        );
+        let n = narrowed(&l.standing(&id).unwrap()).unwrap();
+        assert_eq!((n.methods.clone(), n.paths.clone(), n.allow_dangerous), (vec!["GET".to_string()], vec!["/a".to_string()], false));
+        let op = |m: &str, p: &str| wicket_core::Op::egress(&TenantId::single(), &RunId("run_w".into()), "work", m, "api.github.com", p);
+        assert!(n.allows(&op("GET", "/a")).unwrap() && !n.allows(&op("DELETE", "/a")).unwrap() && !n.allows(&op("GET", "/b")).unwrap());
+        // Methods granted on exactly the same paths stay together.
+        let mut l = Ledger::open_in_memory().unwrap();
+        let id = asked_with(
+            &mut l,
+            &[("GET", "/a", true), ("HEAD", "/a", true)],
+            "{ host: api.github.com, methods: [GET, HEAD], paths: ['/**'] }",
+        );
+        assert_eq!(narrowed(&l.standing(&id).unwrap()).unwrap().methods, ["GET", "HEAD"]);
+        // Nothing granted: nothing to narrow to.
+        let mut l = Ledger::open_in_memory().unwrap();
+        let id = asked_with(&mut l, &[("GET", "/a", false)], "{ host: api.github.com }");
+        assert!(narrowed(&l.standing(&id).unwrap()).is_none());
+    }
+
     /// Only a human decides; a lifetime past the cap is refused unless it is "until revoked"; an
     /// approval on another effect than the one shown is refused; each refusal is audited.
     #[test]
     fn standing_reach_is_a_humans_to_give_within_its_bounds() {
-        let l = Ledger::open_in_memory().unwrap();
-        let id = asked(&l);
+        let mut l = Ledger::open_in_memory().unwrap();
+        let id = asked(&mut l);
         let ask = wicket_store::CapacityAsk { node: "n".into(), plan: "p".into(), region: "r".into(), hourly: 0, worst: 0 };
         let agent = Granter::Capacity { grant: "g-x".into(), ask };
         let a = Approve { rule: None, bound: StandingBound::Agent, ttl: Some(DEFAULT_STANDING_TTL) };
