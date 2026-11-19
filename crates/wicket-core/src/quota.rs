@@ -160,6 +160,12 @@ mod tests {
         assert!(l.admits(ask), "at the limits");
         assert!(!l.admits(SpawnAsk { isolation: 1, ..ask }), "weaker isolation");
         assert!(!l.admits(SpawnAsk { mem_bytes: 513, ..ask }), "more memory");
+        // Each cap at its value and one past it (mutation testing, #326: the pids and timeout caps'
+        // `<=` for `>` survived).
+        let at = SpawnLimits { max_pids: Some(64), max_timeout_s: Some(600), max_cpus_milli: Some(1000), ..Default::default() };
+        assert!(at.admits(ask), "at the pids, timeout and cpu caps");
+        assert!(!at.admits(SpawnAsk { pids: 65, ..ask }), "one process more");
+        assert!(!at.admits(SpawnAsk { timeout_s: 601, ..ask }), "one second more");
         let caps = SpawnLimits { max_cpus_milli: Some(999), ..Default::default() };
         assert!(!caps.admits(ask));
         assert!(SpawnAsk { cpus_milli: 999, ..ask }.within(&ask) && !ask.within(&SpawnAsk { pids: 63, ..ask }));

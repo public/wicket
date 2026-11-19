@@ -42,6 +42,9 @@ mod tests {
     #[test]
     fn only_known_escalatable_failures_need_a_grant() {
         assert!(check_escalatable(true, false, true, false, false));
+        // Any one of reach or risk is enough (mutation testing, #326: `||` for `&&` survived).
+        assert!(check_escalatable(true, false, false, true, false), "risk alone");
+        assert!(check_escalatable(true, false, false, false, true), "approved alone");
         assert!(!check_escalatable(true, true, true, true, true), "the org policy is hard");
         assert!(!check_escalatable(false, false, true, false, false), "an all-alternatives check is hard");
         assert!(!check_escalatable(true, false, false, false, false), "nothing escalatable read");
