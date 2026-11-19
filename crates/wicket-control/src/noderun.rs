@@ -225,11 +225,18 @@ impl SharedFeed {
     /// Node `name`'s feed for this process: the one its other runs on the node use, or opened now.
     pub fn open(name: &str, cfg: PublisherConfig) -> Result<Arc<SharedFeed>> {
         let dir = crate::data_dir().join("nodes").join(name);
-        let mut feeds = FEEDS.lock().expect("feeds");
-        if let Some(f) = feeds.get(&dir).and_then(std::sync::Weak::upgrade) {
+        // The map only holds handles, each insert or removal whole: one a panic left poisoned is
+        // still sound. It isn't held while a feed opens (the node's lock, the log read), so nodes
+        // open in parallel; two runs opening the same node at once keep the first one in.
+        let feeds = || FEEDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(f) = feeds().get(&dir).and_then(std::sync::Weak::upgrade) {
             return Ok(f);
         }
         let f = Arc::new(SharedFeed::open_new(name, cfg)?);
+        let mut feeds = feeds();
+        if let Some(first) = feeds.get(&dir).and_then(std::sync::Weak::upgrade) {
+            return Ok(first);
+        }
         feeds.retain(|_, w| w.strong_count() > 0);
         feeds.insert(dir, Arc::downgrade(&f));
         Ok(f)
@@ -259,30 +266,43 @@ impl SharedFeed {
     /// The feed, locked and current.
     pub fn lock(&self) -> Result<FeedGuard<'_>> {
         let lock = feed_lock(&self.dir)?;
-        // A run that panicked holding the feed may have left the publisher half-updated: it is
-        // opened again from the files, and the other runs on the node carry on.
+        // A run that panicked holding the feed may have left the publisher half-updated (a commit
+        // that wrote its delta but didn't apply it): it is opened again from the files, and the
+        // other runs on the node carry on. The poison is cleared only once that worked, so a
+        // reopen that fails leaves it for the next lock to try again, never trusting the old one.
         let (mut g, poisoned) = match self.inner.lock() {
             Ok(g) => (g, false),
-            Err(e) => {
-                self.inner.clear_poison();
-                (e.into_inner(), true)
-            }
+            Err(e) => (e.into_inner(), true),
         };
-        let now = wicket_feed::now_ms();
-        // Another process (or `wicket keys certify`) renewed the certificate, or it nears its end
-        // (`open_feed` renews it, with the roots at hand; checked hourly, as without them it can't).
-        let on_disk = std::fs::read_to_string(self.dir.join("feed/cert.jws")).ok();
-        let mut cert_due = on_disk.as_deref() != Some(g.0.key_frame().jws.as_str());
-        if now >= g.1.saturating_add(CERT_CHECK_MS) {
-            g.1 = now;
-            // The same window `open_feed` renews in, so the reopen does renew it.
-            cert_due |= renew_margin().is_some_and(|m| g.0.cert().not_after <= now + m);
-        }
-        let current = !poisoned && !cert_due && matches!(g.0.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_)));
-        if !current {
+        let reopen = |g: &mut (Publisher<BoxAuthority>, i64)| -> Result<()> {
             let issued = g.0.last_issued();
             g.0 = open_feed(&self.name, self.cfg.clone())?;
             g.0.note_issued(issued);
+            Ok(())
+        };
+        // What other processes appended first: a publisher that can't follow the log must be
+        // opened again, or nothing may be published.
+        if poisoned || !matches!(g.0.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_))) {
+            reopen(&mut g)?;
+            self.inner.clear_poison();
+        } else {
+            let now = wicket_feed::now_ms();
+            // Another process (or `wicket keys certify`) renewed the certificate, or it nears its
+            // end (`open_feed` renews it in the same window, with the roots at hand; checked
+            // hourly, as without them it can't).
+            let on_disk = std::fs::read_to_string(self.dir.join("feed/cert.jws")).ok();
+            let mut cert_due = on_disk.as_deref() != Some(g.0.key_frame().jws.as_str());
+            if now >= g.1.saturating_add(CERT_CHECK_MS) {
+                g.1 = now;
+                cert_due |= renew_margin().is_some_and(|m| g.0.cert().not_after <= now + m);
+            }
+            // A renewal that fails keeps the publisher as it is, current and still certified:
+            // the commit or revocation this lock is for still goes out.
+            if cert_due {
+                if let Err(e) = reopen(&mut g) {
+                    say_err!("[wicket] could not renew node {}'s feed certificate ({e:#}); publishing with the current one", self.name);
+                }
+            }
         }
         g.0.note_issued(last_issued(&self.dir.join("feed")));
         let issued = g.0.last_issued();
