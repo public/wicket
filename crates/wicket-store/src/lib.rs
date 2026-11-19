@@ -32,6 +32,7 @@ mod nodelabels;
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
 pub use placements::{Placement, RESERVE_SECS, WAIT_SEEN_MS};
+mod changes;
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -41,7 +42,9 @@ mod props;
 mod quota;
 mod receipts;
 mod scale;
+pub use changes::{ChangeWatch, Topic};
 mod standing;
+mod triggers;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
@@ -49,6 +52,7 @@ pub use standing::{
     new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
     Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
 };
+pub use triggers::{Firing as TriggerFiring, Trigger, TriggerEvent, FIRING_STATES as TRIGGER_FIRING_STATES};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
@@ -168,7 +172,13 @@ pub enum StoreError {
 /// Version 25 (expand, after #579 step 2's 24) adds `services`, `service_wants` and
 /// `service_instances` (#579 step 3): the per-node services installed, which runs use them on which
 /// node, and the instances kept for them. Older builds don't read them; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 25;
+/// Version 26 (expand, after 25) adds triggers (#578): `triggers`, `trigger_events`,
+/// `trigger_firings` and `work_claims`. Older builds don't read them; the floor stays 17.
+/// Version 27 (expand, after #579 step 3's 25 and 26) adds `ledger_changes` and its triggers (#582
+/// step 2): a counter per topic (grants, asks, revocations, node CAs) that every write to its tables
+/// moves, so a supervisor reads its rows only when they changed. Older builds don't read it, and its
+/// triggers fire under them too; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 27;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -569,6 +579,7 @@ impl Ledger {
         conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
+        conn.execute_batch(triggers::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -581,6 +592,7 @@ impl Ledger {
         conn.execute_batch("DROP TABLE IF EXISTS operator_messages")?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_turns ON messages (to_run, kind, delivered_at)")?;
         scale::migrate(&conn)?;
+        changes::migrate(&conn)?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -620,7 +632,9 @@ impl Ledger {
         conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
+        conn.execute_batch(triggers::SCHEMA)?;
         scale::migrate(&conn)?;
+        changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
@@ -632,6 +646,33 @@ impl Ledger {
             params![run.0, tenant.0, zone, agent, now()],
         )?;
         Ok(())
+    }
+
+    /// A fresh run's start, as one transaction (#582 step 2): its row, its supervisor (`owner`), the
+    /// lease it is placed on, and for a new long-lived agent its agent row. One write lock and one
+    /// sync instead of one each; a start that fails leaves none of them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_run_start(
+        &self,
+        tenant: &TenantId,
+        run: &RunId,
+        zone: &str,
+        workload: &str,
+        owner: &str,
+        lease: Option<&str>,
+        agent: Option<&NewAgent<'_>>,
+    ) -> Result<()> {
+        self.immediate::<_, StoreError>(|l| {
+            l.run_started(tenant, run, zone, workload)?;
+            l.set_run_owner(&run.0, owner)?;
+            if let Some(lease) = lease {
+                l.set_run_lease(&run.0, lease)?;
+            }
+            if let Some(a) = agent {
+                agents::insert_agent(&l.conn, a)?;
+            }
+            Ok(())
+        })
     }
 
     /// Ends a run. Its still-pending requests are withdrawn: a request belongs to the work that
@@ -2251,6 +2292,33 @@ mod node_tests {
         let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
         l.enrol_node(&t, &node("n1"), &ca("n1", "0b")).unwrap();
         assert_eq!(l.node_ca_policy("n1").unwrap(), CaHosts::Fixed, "a new machine under the name");
+    }
+
+    /// #582 step 2: a run's start rows are one transaction: all of them, or (a refused start) none.
+    #[test]
+    fn a_runs_start_is_one_transaction() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let a = NewAgent {
+            id: "agt_x",
+            tenant: "t0",
+            zone: "z",
+            name: "a",
+            run: "run_a",
+            session_id: "s",
+            manifest: "m",
+            image: "i",
+            workspace: None,
+            claim_until: now() + 60,
+        };
+        l.record_run_start(&t, &RunId("run_a".into()), "z", "a", "pid:1", Some("l-1"), Some(&a)).unwrap();
+        assert_eq!(l.run_status("run_a").unwrap().as_deref(), Some("running"));
+        assert_eq!(l.runs_on_lease("l-1").unwrap().len(), 1);
+        assert!(l.agent("agt_x").unwrap().is_some());
+        // The same run again (its row exists): refused, and the second agent isn't left behind.
+        let b = NewAgent { id: "agt_y", ..a };
+        assert!(l.record_run_start(&t, &RunId("run_a".into()), "z", "a", "pid:2", None, Some(&b)).is_err());
+        assert!(l.agent("agt_y").unwrap().is_none(), "rolled back with the run");
     }
 
     #[test]

@@ -29,6 +29,8 @@ Input: `{"zones": [zone…], "cases": [case…]}`. A case is one of
 - `{"kind": "take_use", "uses_left": n|null}` → `take_use` (`refused`, `uncounted`, or the uses left);
 - `{"kind": "money", "rh", "rt", "nh", "nt", "mh", "mt"}` → `money_fits` (`fits`, `hourly`, `total`);
 - `{"kind": "spawn", limits (or null), ask}` → `SpawnLimits::admits`.
+- `{"kind": "relation", "to_child", "to_parent", "accept_from", "zone", "principal", "reply"}` →
+  `message::relation` (#565): `child`, `parent`, `peer`, `reply` or `none`;
 - `{"kind": "subtree_permits", "subtree": s, "host": h}` → `splice::subtree_permits` (#573);
 - `{"kind": "covered", "permitted": [s…], "need": n}` → whether `uncovered(permitted, [n])` is empty;
 - `{"kind": "widen", "base": [s…], "wants": [[run, s]…], "max": n}` → `splice::widen`, as
@@ -241,6 +243,20 @@ def decideCase (zs : Array Zone) (c : Json) : Except String String := do
     let g : String → Except String Int := fun k => c.getObjValAs? Int k
     return toString (spawnAdmits (← oi "min_isolation") (← oi "max_mem") (← oi "max_cpus") (← oi "max_pids") (← oi "max_timeout")
       (← g "isolation") (← g "mem") (← g "cpus") (← g "pids") (← g "timeout"))
+  | "relation" =>
+    let pr ← match c.getObjVal? "principal" with
+      | .ok .null => pure none
+      | .ok v => pure (some (bytesOf (← v.getStr?)))
+      | .error _ => pure none
+    let f : Facts := { toChild := ← jBool c "to_child", toParent := ← jBool c "to_parent",
+                       acceptFrom := ← jStrs c "accept_from", senderZone := ← jStr c "zone", sender := pr,
+                       reply := ← jBool c "reply" }
+    return match relation f with
+      | none => "none"
+      | some .child => "child"
+      | some .parent => "parent"
+      | some .peer => "peer"
+      | some .reply => "reply"
   | "subtree_permits" => return toString (subtreePermits (← jStr c "subtree") (← jStr c "host"))
   | "covered" => return toString (coveredBy (← jStrs c "permitted") (← jStr c "need"))
   | "widen" =>

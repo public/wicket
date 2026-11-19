@@ -1,5 +1,7 @@
-//! What a box asks of the node it goes on (#579): node labels it must match, and the node taints it
-//! tolerates. The scheduler that uses them is `wicket-placement::schedule`.
+//! What a box asks of the node it goes on (#579): node labels it must match, the node taints it
+//! tolerates, what it wants near it or away from it (affinity), and how it ranks against other boxes
+//! for room (priority, and whether it may be stopped for a higher one). The scheduler that uses them
+//! is `wicket-placement::schedule`.
 //!
 //! A node's operator labels it (`wicket node set <node> --label gpu=a100`) and taints it
 //! (`--taint dedicated=ci`). A box goes on a node only if the node has every label its
@@ -24,6 +26,128 @@ pub struct PlacementSpec {
     /// Node taints the box may go on despite: `key` (any value) or `key=value`.
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "crate::yaml::null_as_default")]
     pub tolerations: Vec<String>,
+    /// Where it waits for a node, and which boxes it may displace: higher first. A child's is at
+    /// most its parent's ([`within`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub priority: i32,
+    /// It may be stopped to make room for a box of higher priority.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub preemptible: bool,
+    /// What it wants on its node: a service its zone uses, or a volume it holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "crate::yaml::null_as_default")]
+    pub affinity: Vec<Affinity>,
+    /// What it wants off its node: another zone's boxes, or one principal's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "crate::yaml::null_as_default")]
+    pub anti_affinity: Vec<AntiAffinity>,
+}
+
+fn is_zero(n: &i32) -> bool {
+    *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The highest priority, and minus it the lowest.
+pub const MAX_PRIORITY: i32 = 1000;
+
+/// One thing a box wants on its node: `{service: npm-cache}` or `{volume: data}`. Preferred (a node
+/// with it ranks first) unless `required` (a node without it is out).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Affinity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+}
+
+/// What an affinity term names.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Near {
+    /// A per-node service whose instance runs on the node.
+    Service(String),
+    /// A volume the node holds.
+    Volume(String),
+}
+
+impl Affinity {
+    /// What it names (None: not exactly one of `service` and `volume`; [`PlacementSpec::check`]
+    /// refuses it).
+    pub fn near(&self) -> Option<Near> {
+        match (&self.service, &self.volume) {
+            (Some(s), None) => Some(Near::Service(s.clone())),
+            (None, Some(v)) => Some(Near::Volume(v.clone())),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Near {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Near::Service(s) => write!(f, "service {s}"),
+            Near::Volume(v) => write!(f, "volume {v}"),
+        }
+    }
+}
+
+/// One thing a box wants off its node: `{zone: research}` (any box of that zone) or `{principal:
+/// spiffe://…/a/<agent>}` (that agent's boxes). Preferred unless `required`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AntiAffinity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+}
+
+/// What an anti-affinity term names.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Away {
+    Zone(String),
+    Principal(String),
+}
+
+impl AntiAffinity {
+    /// What it names (None: not exactly one of `zone` and `principal`).
+    pub fn away(&self) -> Option<Away> {
+        match (&self.zone, &self.principal) {
+            (Some(z), None) => Some(Away::Zone(z.clone())),
+            (None, Some(p)) => Some(Away::Principal(p.clone())),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Away {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Away::Zone(z) => write!(f, "zone {z}"),
+            Away::Principal(p) => write!(f, "principal {p}"),
+        }
+    }
+}
+
+/// Where a child's placement asks for more than its parent's may (#579 step 4): a higher priority,
+/// or not preemptible when its parent is. Each is a reason; none: it's within.
+pub fn within(child: &PlacementSpec, parent: &PlacementSpec) -> Vec<String> {
+    let mut v = vec![];
+    if child.priority > parent.priority {
+        v.push(format!("placement.priority {}: above this zone's {}", child.priority, parent.priority));
+    }
+    if parent.preemptible && !child.preemptible {
+        v.push("placement.preemptible false: this zone's boxes may be stopped for higher priorities, so its children's may".into());
+    }
+    v
 }
 
 impl PlacementSpec {
@@ -39,6 +163,31 @@ impl PlacementSpec {
         }
         for t in &self.tolerations {
             Taint::parse(t).map_err(|e| format!("placement.tolerations: {e}"))?;
+        }
+        if !(-MAX_PRIORITY..=MAX_PRIORITY).contains(&self.priority) {
+            return Err(format!("placement.priority {}: from -{MAX_PRIORITY} to {MAX_PRIORITY}", self.priority));
+        }
+        for a in &self.affinity {
+            match a.near() {
+                None => return Err("placement.affinity: each names one service or one volume".into()),
+                Some(Near::Service(s)) => crate::service::check_name(&s).map_err(|e| format!("placement.affinity: {e}"))?,
+                Some(Near::Volume(v)) => check_volume(&v).map_err(|e| format!("placement.affinity: {e}"))?,
+            }
+        }
+        for a in &self.anti_affinity {
+            match a.away() {
+                None => return Err("placement.anti_affinity: each names one zone or one principal".into()),
+                Some(Away::Zone(z)) => {
+                    if z.is_empty() || z.len() > 128 || crate::manifest::is_principal_entry(&z) || z.chars().any(char::is_whitespace) {
+                        return Err(format!("placement.anti_affinity: {z:?} is not a zone name"));
+                    }
+                }
+                Some(Away::Principal(p)) => {
+                    if !p.starts_with("spiffe://") || p.len() > 512 || p.chars().any(char::is_whitespace) {
+                        return Err(format!("placement.anti_affinity: {p:?} is not a principal id (spiffe://…)"));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -84,6 +233,15 @@ impl fmt::Display for Taint {
             Some(v) => write!(f, "{}={v}", self.key),
             None => f.write_str(&self.key),
         }
+    }
+}
+
+/// A volume's name, as `zone.volumes` names it: `[a-z0-9-]+`.
+fn check_volume(v: &str) -> Result<(), String> {
+    if !v.is_empty() && v.len() <= 63 && v.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        Ok(())
+    } else {
+        Err(format!("{v:?} is not a volume name: [a-z0-9-]+"))
     }
 }
 
@@ -142,5 +300,54 @@ mod tests {
         assert_eq!(p.tolerations(), vec![Taint { key: "dedicated".into(), value: Some("ci".into()) }]);
         p.node_selector.insert("Bad".into(), "x".into());
         assert!(p.check().unwrap_err().contains("node_selector"));
+    }
+
+    #[test]
+    fn priorities_and_affinity_are_checked() {
+        let y = |s: &str| crate::yaml::from_str::<PlacementSpec>(s);
+        let p = y("priority: 10\npreemptible: true\naffinity: [{service: npm-cache}, {volume: data, required: true}]\n\
+                   anti_affinity: [{zone: research}, {principal: 'spiffe://w.test/t/t0/z/x/a/b', required: true}]")
+        .unwrap();
+        assert!(p.check().is_ok(), "{:?}", p.check());
+        assert_eq!(p.affinity[0].near(), Some(Near::Service("npm-cache".into())));
+        assert_eq!(p.affinity[1].near(), Some(Near::Volume("data".into())));
+        assert!(p.affinity[1].required && !p.affinity[0].required);
+        assert_eq!(p.anti_affinity[1].away(), Some(Away::Principal("spiffe://w.test/t/t0/z/x/a/b".into())));
+        // Unset, they aren't written: a manifest that doesn't use them reads the same as before.
+        assert!(PlacementSpec::default().is_default());
+        assert_eq!(crate::yaml::to_string(&PlacementSpec { priority: 0, ..Default::default() }).unwrap().trim(), "{}");
+
+        for bad in [
+            "priority: 1001",
+            "priority: -1001",
+            "affinity: [{}]",
+            "affinity: [{service: a, volume: b}]",
+            "affinity: [{service: Bad}]",
+            "affinity: [{volume: 'a b'}]",
+            "anti_affinity: [{}]",
+            "anti_affinity: [{zone: z, principal: 'spiffe://x'}]",
+            "anti_affinity: [{principal: research}]",
+            "anti_affinity: [{zone: 'spiffe://x/y'}]",
+        ] {
+            assert!(y(bad).map_err(|e| e.to_string()).and_then(|p| p.check()).is_err(), "{bad}");
+        }
+        assert!(y("affinity: [{node: x}]").is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn a_child_never_ranks_above_its_parent() {
+        let spec = |priority, preemptible| PlacementSpec { priority, preemptible, ..Default::default() };
+        assert!(within(&spec(5, false), &spec(5, false)).is_empty());
+        assert!(within(&spec(-3, true), &spec(5, false)).is_empty(), "lower, and preemptible: narrower");
+        assert_eq!(within(&spec(6, false), &spec(5, false)), ["placement.priority 6: above this zone's 5"]);
+        assert_eq!(within(&spec(5, false), &spec(5, true)).len(), 1, "not preemptible under a preemptible parent");
+        assert_eq!(within(&spec(9, false), &spec(5, true)).len(), 2, "every reason");
+        // Exhaustively over a small range: within() holds exactly when both hold.
+        for (cp, pp) in (-3..=3).flat_map(|a| (-3..=3).map(move |b| (a, b))) {
+            for (ce, pe) in [(false, false), (false, true), (true, false), (true, true)] {
+                let ok = within(&spec(cp, ce), &spec(pp, pe)).is_empty();
+                assert_eq!(ok, cp <= pp && (ce || !pe), "{cp} {ce} under {pp} {pe}");
+            }
+        }
     }
 }

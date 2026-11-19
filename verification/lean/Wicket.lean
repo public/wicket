@@ -6,4 +6,5 @@ import Wicket.Canon
 import Wicket.Grant
 import Wicket.Spawn
 import Wicket.Decisions
+import Wicket.Message
 import Wicket.NodeCa

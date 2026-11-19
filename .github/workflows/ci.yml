@@ -491,7 +491,7 @@ jobs:
     name: gVisor smoke test
     needs: select
     # Any of its suites selected (or no selection: everything).
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') || contains(needs.select.outputs.suites, ' hibernate ') || contains(needs.select.outputs.suites, ' restore ') || contains(needs.select.outputs.suites, ' daemon-uids ') || contains(needs.select.outputs.suites, ' install-test ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') || contains(needs.select.outputs.suites, ' hibernate ') || contains(needs.select.outputs.suites, ' restore ') || contains(needs.select.outputs.suites, ' services ') || contains(needs.select.outputs.suites, ' daemon-uids ') || contains(needs.select.outputs.suites, ' install-test ')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -513,6 +513,10 @@ jobs:
       - name: Restore onto a standby
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' restore ') }}
         run: WICKET=target/debug/wicket ci/restore.sh
+      # #579 step 3: the npm cache installed as a per-node service, and boxes using it.
+      - name: Per-node services
+        if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' services ') }}
+        run: WICKET=target/debug/wicket ci/service-e2e.sh
       # #12: the daemon with real, different uids (nobody as an operator, root as the break-glass).
       - name: wicketd with second uids
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' daemon-uids ') }}
