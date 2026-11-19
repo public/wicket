@@ -478,23 +478,28 @@ impl Ledger {
     /// bind. Each name it held, as it is now.
     pub fn release_run_names(&self, run: &RunId) -> Result<Vec<NameRow>> {
         let held = self.names_held_by(run)?;
-        let tx = self.conn.unchecked_transaction()?;
+        // `run_ended` calls this, sometimes inside its caller's transaction: then that one holds
+        // these writes, and a nested one would be refused.
+        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let c = &self.conn;
         let t = now();
         // Its run-scoped asks nobody decided go with it, as its requests do.
-        tx.execute(
+        c.execute(
             "UPDATE names SET status = 'withdrawn', decided_at = ?2, decided_by = 'wicket:run-ended' WHERE asked_run = ?1 AND status = 'pending' AND scope = 'run'",
             params![run.0, t],
         )?;
         for n in &held {
             match n.scope {
-                NameScope::Run => tx.execute(
+                NameScope::Run => c.execute(
                     "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = 'wicket', end_reason = 'run ended' WHERE id = ?1",
                     params![n.id, t],
                 )?,
-                NameScope::Standing => tx.execute("UPDATE names SET holder = NULL WHERE id = ?1", params![n.id])?,
+                NameScope::Standing => c.execute("UPDATE names SET holder = NULL WHERE id = ?1", params![n.id])?,
             };
         }
-        tx.commit()?;
+        if let Some(own) = own {
+            own.commit()?;
+        }
         held.iter().map(|n| self.name(&n.id)).collect()
     }
 
@@ -809,6 +814,19 @@ mod tests {
         let r = l.revoke_name(&id, "alice").unwrap();
         assert_eq!((r.status.as_str(), r.end_reason.as_deref(), r.holder), ("ended", Some("revoked"), None));
         assert!(l.ask_public(&ask(&t, &r2, P2, "demo", NameScope::Run)).unwrap().1);
+    }
+
+    /// `run_ended` releases names, and some callers end a run inside their own transaction.
+    #[test]
+    fn names_are_released_inside_a_callers_transaction() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r = RunId("run-1".into());
+        let n = l.register_internal(&ask(&t, &r, P1, "api", NameScope::Run), 5, 3600).unwrap();
+        l.conn.execute_batch("BEGIN").unwrap();
+        l.run_ended(&r, "succeeded", "").unwrap();
+        l.conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(l.name(&n.id).unwrap().end_reason.as_deref(), Some("run ended"));
     }
 
     #[test]
