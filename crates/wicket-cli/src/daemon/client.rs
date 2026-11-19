@@ -136,7 +136,8 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
     proto::write_json(&mut w, kind::HELLO, &hello)?;
     let welcome: Welcome = match proto::read_frame(&mut r)? {
         Some((kind::WELCOME, p)) => serde_json::from_slice(&p)?,
-        Some((kind::ERROR, p)) => bail!("wicketd: {}", String::from_utf8_lossy(&p)),
+        // The daemon sends an error only to refuse the command (`refuse`).
+        Some((kind::ERROR, p)) => return Err(wicket_home::exit::refused(format!("wicketd: {}", String::from_utf8_lossy(&p)))),
         _ => bail!("wicketd closed the connection"),
     };
     let mut client_ok = true;
@@ -155,7 +156,8 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
             loop {
                 match proto::read_frame(&mut r)? {
                     Some((kind::EXIT, p)) if p.len() == 4 => return Ok(i32::from_be_bytes(p[..4].try_into().expect("4 bytes"))),
-                    Some((kind::ERROR, p)) => bail!("wicketd: {}", String::from_utf8_lossy(&p)),
+                    // The daemon sends an error only to refuse the command (`refuse`).
+                    Some((kind::ERROR, p)) => return Err(wicket_home::exit::refused(format!("wicketd: {}", String::from_utf8_lossy(&p)))),
                     Some(_) => {}
                     // A restart by the service manager (#455): the command itself goes on.
                     None => bail!(

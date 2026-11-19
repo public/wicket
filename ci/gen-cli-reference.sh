@@ -72,6 +72,23 @@ EOF
     for sub in $("$WICKET" --help | subcommands); do
         section 2 "$sub"
     done
+    cat <<'EOF'
+## Exit codes
+
+Every command exits with one of these, through the daemon too, so a script can tell what happened
+without reading the message (which goes to stderr, after `Error: `).
+
+| Code | Means | For example |
+| --- | --- | --- |
+| 0 | Done. | |
+| 1 | Failed, for any reason the others don't name. | The ledger can't be opened; a node doesn't answer. |
+| 2 | A usage error: the command line is wrong. Nothing was changed. | An unknown flag; `--ttl 5q`; `wicket approve s-…` (a standing ask: `wicket standing approve`). |
+| 3 | Refused: wicket won't do it as asked. | The daemon's policy doesn't allow this caller the command; a decision outside the decider's authority; deciding a request that is already decided; terms wider than the request; a lease that is already ended; a session on a run that isn't running. |
+| 4 | Not found: what the command names doesn't exist. | `no such request r-…`; no grant, link, lease, run, agent, node, service or identity by that name; no placement decision for the run. |
+| 5 | An approval it needed wasn't given. | Answering no at `approve`'s or `standing approve`'s confirmation; `wicket node create` whose spend no capacity grant covers and no operator approved within `--wait` (or that was denied, or over the installation's money limit). |
+
+`wicket wake`, which wicket runs itself, exits 3 when the agent is already being woken or is running.
+EOF
 }
 
 if [ "$check" = 1 ]; then

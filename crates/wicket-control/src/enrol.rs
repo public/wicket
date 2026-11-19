@@ -481,7 +481,7 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration, cert_ttl
     let ttl = to_time(ca_ttl)?;
     let cert_ttl = crate::nodeauth::cert_ttl(cert_ttl)?;
     let mut ledger = Ledger::open(&crate::ledger_path())?;
-    let row = ledger.node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    let row = ledger.node(name)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {name} is not enrolled")))?;
     if row.status != "active" {
         bail!("node {name} is {}", row.status);
     }

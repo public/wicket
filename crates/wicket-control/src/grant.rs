@@ -461,8 +461,9 @@ fn refused(l: &Ledger, by: &Granter, id: &str, v: &Verdict, why: anyhow::Error) 
         "why": format!("{why:#}"),
     });
     match l.audit(&TenantId::single(), None, "decision.refused", &record) {
-        Ok(_) => why.context("refused (the refusal is on the audit record)"),
-        Err(e) => why.context(format!("refused (the refusal could not be recorded: {e})")),
+        // Exit code 3 (#574), unless what it names wasn't there (4: the cause says so).
+        Ok(_) => why.context(wicket_home::exit::Exit::refused("refused (the refusal is on the audit record)")),
+        Err(e) => why.context(wicket_home::exit::Exit::refused(format!("refused (the refusal could not be recorded: {e})"))),
     }
 }
 
@@ -486,14 +487,14 @@ enum Target {
 
 fn target(l: &Ledger, id: &str) -> Result<Target> {
     if id.starts_with("g-") {
-        return Ok(Target::Grant(Box::new(l.grant(id)?.ok_or_else(|| anyhow::anyhow!("no grant {id}"))?)));
+        return Ok(Target::Grant(Box::new(l.grant(id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no grant {id}")))?)));
     }
     if id.starts_with("r-") {
         return Ok(Target::Grant(Box::new(l.grant_for_request(id)?.ok_or_else(|| anyhow::anyhow!("request {id} has no live grant"))?)));
     }
     match l.run_authority(id)? {
         Some((until, cap)) => Ok(Target::Authority { run: id.to_string(), until, cap }),
-        None => bail!("no grant, request or box authority {id}"),
+        None => Err(wicket_home::exit::not_found(format!("no grant, request or box authority {id}"))),
     }
 }
 

@@ -26,13 +26,16 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Approve { id, uses, unlimited, ttl, prefix, yes, zone_wide } => {
             if id.starts_with("s-") {
-                bail!("{id} is a standing ask: wicket standing show {id}, then wicket standing approve {id}");
+                return Err(wicket_home::exit::usage(format!(
+                    "{id} is a standing ask: wicket standing show {id}, then wicket standing approve {id}"
+                )));
             }
-            let ttl = wicket_core::time::parse_duration(&ttl).context("bad --ttl")?;
+            let ttl = wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
             let t = grant::Terms { uses: if unlimited { None } else { Some(uses) }, ttl, prefix: prefix.clone(), zone_wide };
-            grant::check_terms(&req, &t)?;
+            // Terms the request doesn't allow are refused (exit 3, #574).
+            grant::check_terms(&req, &t).map_err(|e| wicket_home::exit::refused(format!("{e:#}")))?;
             // What is approved is what wicket recorded, shown before the grant exists: a hint printed
             // from a node's or an agent's text can name the wrong request (#121).
             print!("{}", show_request(&l, &req));
@@ -45,7 +48,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 print!("{}", crate::effect::render(&b));
             }
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
-                bail!("not approved");
+                return Err(wicket_home::exit::needs_approval("not approved"));
             }
             let grant::Decided::Approved { grant: gid, lease, uses: made_uses, ttl } = grant::decide(
                 &mut l,
@@ -104,7 +107,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Unlink { id } => {
             let l = Ledger::open(&ledger_path())?;
-            let r = l.link(&id)?.with_context(|| format!("no link {id}"))?;
+            let r = l.link(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no link {id}")))?;
             if l.close_link(&id, &operator(), "cut by the operator")? {
                 l.audit(
                     &TenantId::single(),
@@ -120,7 +123,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Deny { id } => {
             if id.starts_with("s-") {
-                bail!("{id} is a standing ask: wicket standing deny {id}");
+                return Err(wicket_home::exit::usage(format!("{id} is a standing ask: wicket standing deny {id}")));
             }
             let mut l = Ledger::open(&ledger_path())?;
             if let grant::Decided::Denied { lease: Some(lease) } = grant::decide(
@@ -149,7 +152,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Grant { cmd: GrantCmd::Revoke { id } } => {
             let l = Ledger::open(&ledger_path())?;
-            let g = l.grant(&id)?.with_context(|| format!("no grant {id}"))?;
+            let g = l.grant(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no grant {id}")))?;
             l.revoke_grant(&id)?;
             l.audit(&TenantId::single(), None, "grant.revoked", &serde_json::json!({ "grant": id, "by": operator(), "node": g.node }))?;
             match &g.node {
@@ -159,7 +162,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Grant { cmd: GrantCmd::Renew { id, ttl } } => {
-            let ttl = wicket_core::time::parse_duration(&ttl).context("bad --ttl")?;
+            let ttl = wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
             let mut l = Ledger::open(&ledger_path())?;
             let grant::Decided::Renewed { what, until } = grant::decide(
                 &mut l,

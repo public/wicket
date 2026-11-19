@@ -443,7 +443,40 @@ enum Cmd {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        // As a `main` returning the error would print it, then the code for its kind (#574).
+        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("Error: {e:?}\n"));
+        std::process::exit(exit_code(&e));
+    }
+}
+
+/// The exit code for `e` (#574; docs/reference/cli.md lists them): what a command said, else what
+/// the store's and placement's errors are, else 1.
+fn exit_code(e: &anyhow::Error) -> i32 {
+    use wicket_home::exit::Code;
+    use wicket_store::StoreError as S;
+    let code = wicket_home::exit::code_of(e).or_else(|| {
+        e.chain().find_map(|c| {
+            if let Some(s) = c.downcast_ref::<S>() {
+                return match s {
+                    S::NoSuchRequest(_) => Some(Code::NotFound),
+                    S::NotPending(..) | S::Refused(_) | S::EffectChanged(..) | S::EgressGrant(_) => Some(Code::Refused),
+                    _ => None,
+                };
+            }
+            match c.downcast_ref::<wicket_placement::PlacementError>()? {
+                wicket_placement::PlacementError::NotApproved(_) => Some(Code::NeedsApproval),
+                wicket_placement::PlacementError::NotFound(_) => Some(Code::NotFound),
+                wicket_placement::PlacementError::NotOwned(_) | wicket_placement::PlacementError::Protected(_) => Some(Code::Refused),
+                _ => None,
+            }
+        })
+    });
+    code.unwrap_or(Code::Failed) as i32
+}
+
+async fn run() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("WICKET_LOG").unwrap_or_else(|_| "warn".into()))
@@ -470,7 +503,7 @@ async fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            daemon::policy::Route::Refuse(why) => bail!("{why}"),
+            daemon::policy::Route::Refuse(why) => return Err(wicket_home::exit::refused(why)),
             daemon::policy::Route::Local => {}
         },
         daemon::client::Mode::Missing(why) if matches!(route, daemon::policy::Route::Forward(_)) => bail!("{why}"),
@@ -507,6 +540,23 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// #574: each kind of failure has its code, whichever crate it comes from.
+    #[test]
+    fn errors_exit_with_the_code_for_their_kind() {
+        use wicket_home::exit;
+        let code = |e: anyhow::Error| crate::exit_code(&e);
+        assert_eq!(code(anyhow::anyhow!("anything")), 1);
+        assert_eq!(code(exit::usage("x")), 2);
+        assert_eq!(code(exit::refused("x")), 3);
+        assert_eq!(code(exit::not_found("x")), 4);
+        assert_eq!(code(exit::needs_approval("not approved")), 5);
+        assert_eq!(code(wicket_store::StoreError::NoSuchRequest("r-1".into()).into()), 4);
+        assert_eq!(code(anyhow::Error::from(wicket_store::StoreError::NotPending("r-1".into(), "denied".into())).context("deciding")), 3);
+        assert_eq!(code(wicket_store::StoreError::Refused("x".into()).into()), 3);
+        assert_eq!(code(wicket_placement::PlacementError::NotApproved("nobody decided".into()).into()), 5);
+        assert_eq!(code(wicket_placement::PlacementError::NoCapacity("none".into()).into()), 1);
+    }
+
     /// `wicket run --image` is parsed, and without it nothing is named: no default that would hide
     /// the manifest's agent.image (wicket-control's `run::box_image` applies it).
     #[test]

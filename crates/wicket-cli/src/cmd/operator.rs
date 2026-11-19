@@ -22,7 +22,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     }
                 }
                 OperatorCmd::EnrolLink { ttl, origin } => {
-                    let ttl = wicket_core::time::parse_duration(&ttl).context("bad --ttl")?;
+                    let ttl =
+                        wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
                     if ttl.is_zero() || ttl > Duration::from_secs(3600) {
                         bail!("--ttl must be more than 0 and at most 1h");
                     }

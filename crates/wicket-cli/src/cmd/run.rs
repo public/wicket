@@ -71,7 +71,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             let text = text.join(" ");
             let text = (!text.trim().is_empty()).then_some(text);
             if no_wait && text.is_none() {
-                bail!("--no-wait needs a prompt to send");
+                return Err(wicket_home::exit::usage("--no-wait needs a prompt to send"));
             }
             session::open(session::Opts { run, text, wait: !no_wait, timeout: timeout.map(std::time::Duration::from_secs) }).await
         }
