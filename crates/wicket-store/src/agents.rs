@@ -342,6 +342,12 @@ impl Ledger {
         Ok(n == 1)
     }
 
+    /// Withdraws a request `want` made of agent `id` that its supervisor hasn't taken yet (#579 step
+    /// 4: a preemption given up on). True if it was still pending.
+    pub fn withdraw_agent_want(&self, id: &str, want: &str) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE agents SET want = NULL WHERE id = ?1 AND want = ?2", params![id, want])? > 0)
+    }
+
     /// Takes what an operator asked of this activation, once.
     pub fn take_agent_want(&self, id: &str, generation: i64) -> Result<Option<String>> {
         let w: Option<String> = self

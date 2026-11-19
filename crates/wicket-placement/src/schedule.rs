@@ -23,9 +23,9 @@
 //! tenants; within a tenant, its own runs fill its places in line by priority, highest first.
 //!
 //! **Preemption** ([`preempt`]): when no node may take a box, which boxes to stop to make room: only
-//! those whose manifest marks them preemptible and whose priority is below the box's, the fewest on
-//! one node, of the lowest priority. It decides; stopping them is the caller's, through the normal
-//! stop, and the node's admission still decides the start that follows.
+//! those whose manifest marks them preemptible and whose priority is below the box's, on one node,
+//! each one needed (none can be kept), the lowest priorities first. It decides; stopping them is the
+//! caller's, through the normal stop, and the node's admission still decides the start that follows.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};

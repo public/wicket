@@ -184,7 +184,10 @@ impl Ledger {
     /// priority, and whether it may be preempted. Recorded for every box at its start.
     pub fn record_run_terms(&self, run: &str, vcpus: f32, memory_mib: u64, priority: i32, preemptible: bool, now_ms: i64) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO run_terms (run, vcpus, memory_mib, priority, preemptible, at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            // A re-attach records them again; when preemption last asked the box to stop stays.
+            "INSERT INTO run_terms (run, vcpus, memory_mib, priority, preemptible, at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run) DO UPDATE SET vcpus = excluded.vcpus, memory_mib = excluded.memory_mib,
+               priority = excluded.priority, preemptible = excluded.preemptible, at_ms = excluded.at_ms",
             params![run, vcpus as f64, memory_mib as i64, priority, preemptible, now_ms],
         )?;
         Ok(())
