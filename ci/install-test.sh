@@ -58,8 +58,11 @@ fail() { echo "FAIL: $*"; exit 1; }
 # apt over IPv4 only: with --network host the container has the network of the runner, which may have no
 # IPv6 route, and apt does not fall back from an unreachable address (#219).
 echo "Acquire::ForceIPv4 \"true\";" >/etc/apt/apt.conf.d/99wicket-ipv4
-# Every stanza (the archive and security) from the mirror of the host, whatever its URIs said.
-[ -z "$MIRROR" ] || [ ! -f /etc/apt/sources.list.d/ubuntu.sources ] || sed -i "s|^URIs:.*|URIs: $MIRROR|" /etc/apt/sources.list.d/ubuntu.sources
+# A mirror answering 503 for a while (the EC2 mirror of a runner has, #219): each fetch is tried again.
+echo "Acquire::Retries \"5\";" >/etc/apt/apt.conf.d/99wicket-retries
+# Every stanza (the archive and security) from the mirror of the host first, and its own Ubuntu host
+# after it: apt fetches a file that fails from one from the next source that has it.
+[ -z "$MIRROR" ] || [ ! -f /etc/apt/sources.list.d/ubuntu.sources ] || sed -i "s|^URIs:[[:space:]]*\(.*\)|URIs: $MIRROR \1|" /etc/apt/sources.list.d/ubuntu.sources
 echo "packages from: $(sed -n "s/^URIs: //p" /etc/apt/sources.list.d/ubuntu.sources | tr "\n" " ")"
 useradd --create-home alex
 groupadd --system docker
