@@ -81,13 +81,14 @@ function describe(a) {
     const what = a.path_prefix ? s(a.method + " " + a.host + a.path_prefix) : s(a.method + " " + a.host + a.path);
     // In lines (#574, item 1): the decision and its target first, as the passkey signs them; then
     // the risk, who it is for, and the ids last and apart.
+    // Who it is for, from the signed fields: the agent's name with its zone (the same name in two
+    // zones mustn't read the same), its full id with the ids; who in the box asked, as reported.
     const agent = a.agent ? String(a.agent).split("/a/").pop() : "";
-    const lines = [verb + how + ": " + what + (a.prefix ? "\u2026 (every path under it)" : ""),
-      "Risk: " + riskLabel(a.risk) + (a.scope === "zone" ? " \u00b7 for any run in zone " + s(a.zone) : "")];
-    if (agent || (a.requested_by || []).length) {
-      lines.push((agent ? "For " + s(agent) : "For run " + s(a.run)) + ((a.requested_by || []).length ? " \u00b7 asked by " + a.requested_by.map(s).join(", ") : ""));
-    }
-    lines.push("Request " + s(a.request) + " \u00b7 run " + s(a.run) + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : ""));
+    const lines = [verb + how + ": " + what + (a.prefix ? "\u2026 (every path under it)" : "") + (a.scope === "zone" ? " \u00b7 for any run in zone " + s(a.zone) : ""),
+      "Risk: " + riskLabel(a.risk)];
+    lines.push((agent ? "For " + s(agent) : "For run " + s(a.run)) + " (zone " + s(a.zone) + ")" +
+      ((a.requested_by || []).length ? " \u00b7 asked by " + a.requested_by.map(s).join(", ") + " (as reported)" : ""));
+    lines.push("Request " + s(a.request) + " \u00b7 run " + s(a.run) + (a.agent ? " \u00b7 agent " + s(a.agent) : "") + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : ""));
     return lines.join("\n");
   }
   if (a.action === "revoke") return "Revoke " + s(a.run) + " (" + s(a.agent) + "): " + s(a.reason);
