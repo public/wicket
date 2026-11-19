@@ -93,14 +93,15 @@ exchanged, for the logs and for the health gate.
 | 14 | Node CA renewal over the channel (#416): `CaRenew` (make a new CA key), `CaCsr` (its signing request, or why not), `NodeCa` (its certificate) and `NodeCaInstalled` (installed for every box, or why not), sent at half the CA's life. A node talking 13 is renewed with `wicket node renew-ca` over ssh, as before. Node health reports carry the CA's validity (`ca_not_before`, `ca_not_after`, defaulted fields). |
 | 15 | Messages in flight until the box has had them (#445): `MessageRead` (node to control host) once a message the control host's `await_message` gave reaches the box, or is pushed to its session. Until then the message is in flight, and a supervisor that takes the run over gives it again; the node drops one its box has had. With a node talking 14, the control host counts a message read as it hands it over, as before. |
 | 16 | Path-prefix grants on nodes (#257 4a): a prefix grant ("every path under `/repos/acme/app/`") goes in a box's token as the prefix it is, a block `approved(gid, host, method, $p) <- path($p), $p.starts_with(prefix), …` the node's structural check admits only with a canonical prefix ending in `/`, so it covers the directory and every path under it, whole segments only, as the ledger does. To a node talking 15 the control host sends it for its own path exactly, as before (that node's check would refuse the whole token). |
+| 17 | Standing reach (#572): `AskStanding` (node to control host), a box's `request_access` with scope `standing`, answered with `Asked` (which also carries `hint`, for an agent asking for the same thing again: an optional field, which an older node ignores). The control host publishes an approved standing rule to a node at 17 as a block of the box's token. A node at 15 or 16 neither asks for nor honours one: the box is told its control host or node must be updated, and asks as before. |
 
-wicket speaks version 16, so it talks only to peers at 15 and 16. What the rows above say happens
+wicket speaks version 17 with a skew of 2 (#572 followed #568's 16 within a release, so a control host can go from 15 to 17 while its nodes still talk 15): it talks only to peers at 15, 16 and 17. What the rows above say happens
 with an older peer (a node relaying every gateway tool before 5, a box refused by a node before 6,
 9, 10 or 11, an image not sent to a node before 7, a box on a node before 13) is history: no
-connection can negotiate below 15. Every connection has 12's health reports, 13's one gateway,
-14's CA renewal and 15's message reads (whose check can go). A check for a version's feature
-matters only while a peer one version older can connect: 16's prefix grants keep theirs while a
-node at 15 can. `BoxStart`'s `ca_pem` and
+connection can negotiate below 15. Every connection has 12's health reports, 13's one gateway and
+14's CA renewal. A check for a version's feature matters only while a peer below it can connect:
+15's message reads, 16's prefix grants and 17's standing reach keep theirs while a node at 15 or 16
+can. `BoxStart`'s `ca_pem` and
 `workspace_tar` are always empty and no node reads them; they are defaulted, and go once no peer
 from before that can connect.
 

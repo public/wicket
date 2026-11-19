@@ -13,7 +13,7 @@
 use super::Peer;
 use crate::{
     Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd, ServiceCmd,
-    StateCmd,
+    StandingCmd, StateCmd,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -73,6 +73,9 @@ pub fn route(cmd: &Cmd) -> Route {
         // Renewing a grant or a box's authority grants more time: a decision, as approving is.
         Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { cmd: GrantCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Unlink { .. } | Cmd::Grant { cmd: GrantCmd::Revoke { .. } } => Forward(Revoke),
+        Cmd::Standing { cmd: StandingCmd::List { .. } | StandingCmd::Show { .. } } => Forward(Read),
+        Cmd::Standing { cmd: StandingCmd::Approve { .. } | StandingCmd::Deny { .. } | StandingCmd::Renew { .. } } => Forward(Privileged),
+        Cmd::Standing { cmd: StandingCmd::Revoke { .. } } => Forward(Revoke),
         Cmd::Secret { cmd } => match cmd {
             SecretCmd::List => Forward(Read),
             // The helper runs as the caller, the owner of the files it serves (#350): never as wicket.
@@ -347,6 +350,12 @@ mod tests {
             (&["deny", "R1"], Route::Forward(Privileged)),
             (&["unlink", "L1"], Route::Forward(Revoke)),
             (&["grant", "revoke", "G1"], Route::Forward(Revoke)),
+            (&["standing", "list"], Route::Forward(Read)),
+            (&["standing", "show", "s-1"], Route::Forward(Read)),
+            (&["standing", "approve", "s-1", "--narrow"], Route::Forward(Privileged)),
+            (&["standing", "deny", "s-1"], Route::Forward(Privileged)),
+            (&["standing", "renew", "s-1"], Route::Forward(Privileged)),
+            (&["standing", "revoke", "s-1"], Route::Forward(Revoke)),
             (&["secret", "list"], Route::Forward(Read)),
             (&["secret", "set", "claude-oauth"], Route::Forward(Privileged)),
             (&["secret", "set", "gh", "--hosts", "api.github.com"], Route::Forward(Privileged)),

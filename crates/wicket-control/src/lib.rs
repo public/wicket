@@ -45,5 +45,6 @@ pub mod run;
 pub mod services;
 pub mod snapstore;
 pub mod spawn;
+pub mod standing;
 pub mod storegc;
 pub mod transcript;
