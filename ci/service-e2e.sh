@@ -74,6 +74,8 @@ zone:
 EOF
 }
 
+# A fresh data directory: its identity issuer first, as every suite's.
+W identity init --trust-domain ci.wicket.test >/dev/null
 W service add "$work/npm-cache/manifest.yaml" | grep -q "service npm-cache installed" || fail "service add"
 W service list | grep -q '^npm-cache ' || fail "service list"
 ok "wicket service add installed npm-cache"
