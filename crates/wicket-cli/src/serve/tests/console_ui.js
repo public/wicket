@@ -25,7 +25,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
@@ -374,6 +374,33 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(ids["confirm-what"].textContent.startsWith("Grant spiffe://x/t/t0/op/unix/alex 2 node(s) at once"), ids["confirm-what"].textContent);
   ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console capacity: ok");
+
+  // Standing reach (#572): an ask shows its evidence and what it allows beyond it; approving it
+  // narrowed is signed from a confirmation that names the narrowed rule; a rule is revoked with
+  // the session only.
+  const ask = { id: "s-1", principal: "spiffe://x/t/t0/z/work/a/worker", zone: "work", run: "run_w", reason: "CI <b>logs</b>",
+    rule: { host: "ci.example", methods: ["GET", "POST"], paths: ["/jobs/**"], allow_dangerous: false },
+    evidence: { requests: 3, granted: 2, denied: 1, ops: [["GET", "/jobs/1/logs", 2]] }, beyond: ["methods never asked for: POST"],
+    narrowed: { host: "ci.example", methods: ["GET"], paths: ["/jobs/1/logs"], allow_dangerous: false }, created_at: 1700000000 };
+  const rule = { id: "s-2", principal: ask.principal, zone: "work", rule: ask.narrowed, for: "agent", expires_at: null, live: true, decided_by: "passkey:laptop" };
+  state = { ...base, pending: [], standing: { asks: [ask], rules: [rule] } };
+  await run("refresh()"); await flush();
+  const sa = ids["standing-asks"].textContent;
+  for (const want of ["standing reach: { host: ci.example", "3 request(s) it covers", "beyond what was asked: methods never asked for: POST", "narrowed to the evidence"]) assert.ok(sa.includes(want), want + " in " + sa);
+  assert.strictEqual(ids["standing-asks"].all(n => n.tagName === "b").length, 0, "an agent's reason stays text");
+  await advance(1000);
+  nextAction = { v: 1, action: "standing_approve", standing: "s-1", principal: ask.principal, zone: "work", rule: ask.narrowed, for: "agent", ttl_secs: 2592000, narrowed: true, effect_sha256: "ab".repeat(32) };
+  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Approve narrowed")[0].click(); await flush();
+  const stb = began().pop().body;
+  assert.deepStrictEqual([stb.action, stb.id, stb.for, stb.narrow], ["standing_approve", "s-1", "agent", true]);
+  assert.ok(ids["confirm-what"].textContent.startsWith("Approve standing reach s-1 narrowed to its evidence: { host: ci.example, methods: [GET], paths: ['/jobs/1/logs'] }"), ids["confirm-what"].textContent);
+  assert.ok(ids["confirm-what"].textContent.includes("for 30 days"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  const sr = ids["standing-rules"];
+  assert.ok(sr.textContent.includes("until revoked") && sr.textContent.includes("by passkey:laptop"), sr.textContent);
+  await sr.all(n => n.tagName === "button" && n.textContent === "Revoke")[0].click(); await flush();
+  assert.deepStrictEqual(calls.filter(c => c.path === "/api/standing/revoke").map(c => c.body), [{ id: "s-2" }]);
+  console.log("console standing reach: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open
   // console is told, and one notification says so; tapping it opens the console's notifications.

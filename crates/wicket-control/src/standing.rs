@@ -109,9 +109,25 @@ fn refused(l: &Ledger, by: &Granter, id: &str, decision: &str, why: anyhow::Erro
     }
 }
 
-/// Approves standing ask `id` as `by`, on the effect `shown` (if the decider was shown one). The
-/// rule approved and its effect.
-pub fn approve(l: &Ledger, by: &Granter, id: &str, a: &Approve, shown: Option<&str>) -> Result<(ReachRule, String)> {
+/// `extra`'s fields, merged into an audit record (the console's: how it was decided, and the
+/// signed action).
+fn merged(mut record: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    if let (Some(r), serde_json::Value::Object(x)) = (record.as_object_mut(), extra) {
+        r.extend(x);
+    }
+    record
+}
+
+/// Approves standing ask `id` as `by`, on the effect `shown` (if the decider was shown one).
+/// `extra` goes on the decision's audit record. The rule approved and its effect.
+pub fn approve(
+    l: &Ledger,
+    by: &Granter,
+    id: &str,
+    a: &Approve,
+    shown: Option<&str>,
+    extra: serde_json::Value,
+) -> Result<(ReachRule, String)> {
     let s = l.standing(id)?;
     let rule = a.rule.clone().unwrap_or_else(|| s.rule.clone());
     let o = match may_decide(by, &rule).and_then(|o| check_ttl(a.ttl).map(|_| o)) {
@@ -130,6 +146,7 @@ pub fn approve(l: &Ledger, by: &Granter, id: &str, a: &Approve, shown: Option<&s
         "bound": a.bound.as_str(), "ttl_secs": terms.ttl_secs, "effect_sha256": effect,
         "evidence": { "requests": s.evidence.requests, "granted": s.evidence.granted },
     });
+    let record = merged(record, extra);
     if let Err(e) = l.audit(&TenantId::single(), Some(&wicket_core::RunId(s.run.clone())), "decision", &record) {
         let _ = l.revoke_standing(id, "wicket:audit-failed");
         return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so it was undone"));
@@ -137,8 +154,8 @@ pub fn approve(l: &Ledger, by: &Granter, id: &str, a: &Approve, shown: Option<&s
     Ok((rule, effect))
 }
 
-/// Denies standing ask `id` as `by`.
-pub fn deny(l: &Ledger, by: &Granter, id: &str) -> Result<()> {
+/// Denies standing ask `id` as `by`; `extra` goes on the audit record.
+pub fn deny(l: &Ledger, by: &Granter, id: &str, extra: serde_json::Value) -> Result<()> {
     let s = l.standing(id)?;
     let Granter::Human(o) = by else {
         return Err(refused(l, by, id, "deny", anyhow::anyhow!("standing reach is decided by a human operator")));
@@ -148,7 +165,10 @@ pub fn deny(l: &Ledger, by: &Granter, id: &str) -> Result<()> {
         &TenantId::single(),
         Some(&wicket_core::RunId(s.run.clone())),
         "decision",
-        &serde_json::json!({ "decision": "deny", "standing": id, "by": o.label, "granter": "human", "granter_identity": o.id }),
+        &merged(
+            serde_json::json!({ "decision": "deny", "standing": id, "by": o.label, "granter": "human", "granter_identity": o.id }),
+            extra,
+        ),
     )?;
     Ok(())
 }
@@ -167,8 +187,9 @@ pub fn revoke(l: &Ledger, by: &str, id: &str) -> Result<Standing> {
     Ok(s)
 }
 
-/// Moves approved rule `id`'s lapse to `ttl` from now (None: until revoked).
-pub fn renew(l: &Ledger, by: &Granter, id: &str, ttl: Option<Duration>) -> Result<Option<i64>> {
+/// Moves approved rule `id`'s lapse to `ttl` from now (None: until revoked); `extra` goes on the
+/// audit record.
+pub fn renew(l: &Ledger, by: &Granter, id: &str, ttl: Option<Duration>, extra: serde_json::Value) -> Result<Option<i64>> {
     let s = l.standing(id)?;
     if let Err(why) = may_decide(by, &s.rule).and_then(|_| check_ttl(ttl)) {
         return Err(refused(l, by, id, "renew", why));
@@ -179,7 +200,10 @@ pub fn renew(l: &Ledger, by: &Granter, id: &str, ttl: Option<Duration>) -> Resul
         &TenantId::single(),
         None,
         "decision",
-        &serde_json::json!({ "decision": "renew", "standing": id, "by": by.label(), "until": until, "previous_until": s.expires_at }),
+        &merged(
+            serde_json::json!({ "decision": "renew", "standing": id, "by": by.label(), "until": until, "previous_until": s.expires_at }),
+            extra,
+        ),
     )?;
     Ok(until)
 }
@@ -236,14 +260,14 @@ mod tests {
         assert_eq!(n.paths, ["/repos/o/r/actions/jobs/1/logs", "/repos/o/r/actions/jobs/2/logs"]);
         assert!(beyond(&s, &n).is_empty(), "{:?}", beyond(&s, &n));
         let a = Approve { rule: Some(n.clone()), bound: StandingBound::Agent, ttl: Some(DEFAULT_STANDING_TTL) };
-        let (rule, effect) = approve(&l, &human(), &id, &a, None).unwrap();
+        let (rule, effect) = approve(&l, &human(), &id, &a, None, serde_json::json!({})).unwrap();
         assert_eq!(rule.paths, n.paths);
         let s = l.standing(&id).unwrap();
         assert_eq!((s.status.as_str(), s.effect_sha256.as_deref()), ("approved", Some(effect.as_str())));
         let audited = l.audit_tail(10).unwrap().into_iter().find(|r| r.2 == "decision").unwrap();
         assert!(audited.4.contains(&format!("\"standing\":\"{id}\"")) && audited.4.contains("\"bound\":\"agent\""), "{}", audited.4);
         // Renewed until revoked, then revoked.
-        assert_eq!(renew(&l, &human(), &id, None).unwrap(), None);
+        assert_eq!(renew(&l, &human(), &id, None, serde_json::json!({})).unwrap(), None);
         revoke(&l, "ann", &id).unwrap();
         assert!(l.audit_tail(10).unwrap().iter().any(|r| r.2 == "standing.revoked"));
     }
@@ -257,14 +281,14 @@ mod tests {
         let ask = wicket_store::CapacityAsk { node: "n".into(), plan: "p".into(), region: "r".into(), hourly: 0, worst: 0 };
         let agent = Granter::Capacity { grant: "g-x".into(), ask };
         let a = Approve { rule: None, bound: StandingBound::Agent, ttl: Some(DEFAULT_STANDING_TTL) };
-        assert!(format!("{:#}", approve(&l, &agent, &id, &a, None).unwrap_err()).contains("human"));
+        assert!(format!("{:#}", approve(&l, &agent, &id, &a, None, serde_json::json!({})).unwrap_err()).contains("human"));
         let long = Approve { ttl: Some(MAX_STANDING_TTL * 2), ..a.clone() };
-        assert!(format!("{:#}", approve(&l, &human(), &id, &long, None).unwrap_err()).contains("at most"));
-        assert!(approve(&l, &human(), &id, &a, Some("not-the-effect")).is_err());
+        assert!(format!("{:#}", approve(&l, &human(), &id, &long, None, serde_json::json!({})).unwrap_err()).contains("at most"));
+        assert!(approve(&l, &human(), &id, &a, Some("not-the-effect"), serde_json::json!({})).is_err());
         let refusals = l.audit_tail(20).unwrap().into_iter().filter(|r| r.2 == "decision.refused").count();
         assert_eq!(refusals, 3);
         let forever = Approve { ttl: None, ..a };
-        approve(&l, &human(), &id, &forever, None).unwrap();
+        approve(&l, &human(), &id, &forever, None, serde_json::json!({})).unwrap();
         assert_eq!(l.standing(&id).unwrap().expires_at, None);
     }
 }

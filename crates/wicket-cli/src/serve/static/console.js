@@ -86,6 +86,14 @@ function describe(a) {
     return (a.action === "capacity_grant" ? "Grant " + s(a.principal) + " " + what + ", for " + hours + " h"
       : "Renew capacity grant " + s(a.grant) + " (" + s(a.principal) + ": " + what + ") for " + hours + " h from now");
   }
+  if (a.action === "standing_approve" || a.action === "standing_renew") {
+    const days = a.ttl_secs ? "for " + Math.round(a.ttl_secs / 86400) + " days" : "until revoked";
+    if (a.action === "standing_renew") return "Renew standing reach " + s(a.standing) + " (" + ruleText(a.rule) + ") " + (a.ttl_secs ? days + " from now" : days);
+    const to = a.for === "zone" ? "every agent of zone " + s(a.zone) : s(a.principal) + " (each later run of it)";
+    return "Approve standing reach " + s(a.standing) + (a.narrowed ? " narrowed to its evidence" : "") + ": " + ruleText(a.rule) +
+      " \u00b7 for " + to + " \u00b7 " + days + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
+  }
+  if (a.action === "standing_deny") return "Deny standing reach " + s(a.standing) + ": " + ruleText(a.rule);
   if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
@@ -340,6 +348,55 @@ function capacityRow(g) {
   revoke.onclick = async () => { try { toast((await post("/api/capacity/revoke", { id: g.id })).ok); } catch (e) { toast(e.message); } refresh(); };
   b.append(renew, revoke);
   d.append(head, what, use, b);
+  return d;
+}
+// Standing reach (#572). A rule as a manifest would carry it.
+function ruleText(r) {
+  r = r || {};
+  return "{ host: " + strip(r.host) + ", methods: [" + (r.methods || []).map(strip).join(", ") + "], paths: [" +
+    (r.paths || []).map(p => "'" + strip(p) + "'").join(", ") + "]" + (r.allow_dangerous ? ", allow_dangerous: true" : "") + " }";
+}
+// An agent's ask: the rule, who asked and why, the ledger's evidence, and what it allows beyond it.
+// Approved once (signed): as asked or narrowed to the evidence, for the agent or its zone, 30 days.
+function standingAskRow(a) {
+  const d = el("div", "card req");
+  const e = a.evidence || {};
+  d.append(el("div", "what", "standing reach: " + ruleText(a.rule)));
+  d.append(el("div", "why", strip(a.reason)));
+  d.append(el("div", "meta", "asked by " + strip(a.principal) + " (run " + strip(a.run) + ", zone " + strip(a.zone) + ")"));
+  d.append(el("div", "meta", "evidence: " + e.requests + " request(s) it covers in 14 days (" + e.granted + " granted, " + e.denied + " denied)"));
+  for (const o of (e.ops || [])) d.append(el("div", "meta mono", "  " + o[2] + " × " + strip(o[0]) + " " + strip(o[1])));
+  for (const b of (a.beyond || [])) d.append(el("div", "blocked", "beyond what was asked: " + strip(b)));
+  if (a.narrowed) d.append(el("div", "meta", "narrowed to the evidence: " + ruleText(a.narrowed)));
+  const b = el("div", "buttons");
+  const asAsked = el("button", "approve", "Approve for the agent (30 days)");
+  asAsked.onclick = () => signed({ action: "standing_approve", id: a.id, for: "agent" });
+  const narrow = el("button", "", "Approve narrowed");
+  narrow.onclick = () => signed({ action: "standing_approve", id: a.id, for: "agent", narrow: true });
+  narrow.disabled = !a.narrowed;
+  const zone = el("button", "", "Approve for zone " + strip(a.zone));
+  zone.onclick = () => signed({ action: "standing_approve", id: a.id, for: "zone" });
+  const deny = el("button", "deny", "Deny");
+  deny.onclick = () => signed({ action: "standing_deny", id: a.id });
+  b.append(asAsked, narrow, zone, deny);
+  d.append(el("div", "meta", strip(a.id) + " · " + when(a.created_at)), b);
+  return d;
+}
+// An approved rule: who it is for, when it lapses; renewed (signed, 30 days) or revoked (session).
+function standingRuleRow(r) {
+  const d = el("div", "row cap");
+  const head = el("div");
+  head.append(el("span", "mono", strip(r.id) + " "), el("span", "", ruleText(r.rule)));
+  const to = r.for === "zone" ? "every agent of zone " + strip(r.zone) : strip(r.principal);
+  const until = r.expires_at ? (r.live ? "until " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
+  const b = el("div", "buttons");
+  const renew = el("button", "approve", "Renew (30 days)");
+  renew.onclick = () => signed({ action: "standing_renew", id: r.id });
+  renew.disabled = !r.live;
+  const revoke = el("button", "deny", "Revoke");
+  revoke.onclick = async () => { try { toast((await post("/api/standing/revoke", { id: r.id })).ok); } catch (e) { toast(e.message); } refresh(); };
+  b.append(renew, revoke);
+  d.append(head, el("div", "meta", "for " + to + " · " + until + " · by " + strip(r.decided_by)), b);
   return d;
 }
 // The form's inputs, by name; built once, so what the operator types survives the poll.
@@ -985,6 +1042,9 @@ async function refresh() {
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
+    const st = s.standing || {};
+    renderRows("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
+    renderRows("standing-rules", st.rules || [], standingRuleRow, "No standing rules: every one-off ask waits for a decision.");
     renderStart(s);
     renderManifests(s);
     renderSecrets(s);
