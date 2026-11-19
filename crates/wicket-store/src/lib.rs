@@ -26,6 +26,7 @@ pub mod cas;
 mod lifecycle_props;
 mod links;
 mod nodeca;
+mod nodelabels;
 pub use nodeca::{CaHosts, CaWant};
 pub mod money;
 mod node;
@@ -151,6 +152,8 @@ pub enum StoreError {
 /// trigger on `audit`, which an older build fires too), and `grants_archive` and `requests_archive`
 /// for the settled rows of runs long ended. Older builds don't read the new tables (one reading an
 /// archived run's grants sees none), so the floor stays 17.
+/// Version 22 (expand, after #582's 21) adds `node_labels` and `node_taints` (#579): what placement
+/// filters nodes by. Older builds don't read them; the floor stays 17.
 /// Version 23 (expand, after #587's 22) adds the `standing` table: standing reach (#572), a reach
 /// rule an agent asks for once and a human approves for its principal or zone. Older builds don't
 /// read it, so the floor stays 17.
@@ -551,6 +554,7 @@ impl Ledger {
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
         conn.execute_batch(nodeca::SCHEMA)?;
+        conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
@@ -599,6 +603,7 @@ impl Ledger {
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
         conn.execute_batch(nodeca::SCHEMA)?;
+        conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
         scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
