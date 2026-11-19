@@ -25,7 +25,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
@@ -46,11 +46,16 @@ const fakeSub = { endpoint: "https://fcm.googleapis.com/fcm/send/dev1", options:
 const swReg = { pushManager: { getSubscription: async () => subscribed,
   subscribe: async o => { assert.strictEqual(o.userVisibleOnly, true); assert.deepStrictEqual(Array.from(o.applicationServerKey), [4, 1, 2]); fakeSub.options.applicationServerKey = o.applicationServerKey.buffer; subscribed = fakeSub; return fakeSub; } } };
 const devId = ep => require("crypto").createHash("sha256").update(ep).digest("hex").slice(0, 16);
+let stateFail = null;
 const reply = (body, ok = true) => ({ ok, status: ok ? 200 : 400, json: async () => body });
 const fetch = async (path, opts) => {
   calls.push({ path, body: opts && opts.body ? JSON.parse(opts.body) : null });
   if (path === "/api/me") return reply({ who: { state: "operator" } });
-  if (path === "/api/state") return reply(state);
+  if (path === "/api/state") {
+    if (stateFail === "network") throw new TypeError("Failed to fetch");
+    if (stateFail) return { ok: false, status: stateFail, json: async () => ({}) };
+    return reply(state);
+  }
   if (path === "/api/action/begin") {
     const b = JSON.parse(opts.body);
     // Push actions: the server's signed JSON, as the fake server sees the device.
@@ -196,6 +201,17 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-cancel"].listeners.click(); await flush();
   assert.strictEqual(ids.confirm.hidden, true);
   assert.strictEqual(ceremonies, 1);
+  // #574 (B4, item 8): a server that can't answer for a moment is said to be so, and the page stays
+  // up and goes on polling; only a 401 signs it out.
+  for (const fail of [502, "network"]) {
+    stateFail = fail;
+    await run("refresh()"); await flush();
+    assert.strictEqual(ids.console.hidden, false, "still signed in after " + fail);
+    assert.ok(!ids.stale.hidden && ids.stale.textContent.startsWith("Can't reach wicket (" + (fail === 502 ? "HTTP 502" : "no answer") + ")"), ids.stale.textContent);
+  }
+  stateFail = null;
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.stale.hidden, true, "heard from again");
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
