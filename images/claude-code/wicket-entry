@@ -120,6 +120,16 @@ read -r -t 5 -u "$FWD_OUT" said || :
 fd=${FWD[0]:-}; [ -z "$fd" ] || exec {fd}<&-
 exec {FWD_OUT}<&-
 
+# A box whose zone uses per-node services (#579) starts its program once their links are up: each
+# name in WICKET_WAIT_LINKS is in /etc/hosts (which opening a link rewrites), or after
+# WICKET_WAIT_LINKS_SECS (default 150), whichever comes first. Its output says what became of each.
+if [ -n "${WICKET_WAIT_LINKS:-}" ]; then
+  until_s=$((SECONDS + ${WICKET_WAIT_LINKS_SECS:-150}))
+  for name in ${WICKET_WAIT_LINKS//,/ }; do
+    while ! grep -qE "[[:space:]]${name//./\\.}\$" /etc/hosts && [ "$SECONDS" -lt "$until_s" ]; do sleep 0.5; done
+  done
+fi
+
 # An interactive box's stdin comes from wicket's node over a socket (#151), so it outlives the node
 # process writing it: the forwarder runs the agent and feeds it.
 if [ -n "${WICKET_STDIN_SOCK:-}" ]; then set -- wicket-fwd --stdin-from "$WICKET_STDIN_SOCK" -- "$@"; fi

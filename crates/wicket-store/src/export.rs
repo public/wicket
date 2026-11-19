@@ -101,9 +101,38 @@ impl Ledger {
         )?)
     }
 
+    /// `sink`'s position, read only: a sink with no row yet is at 0 (status views read this on
+    /// every poll and shouldn't write).
+    pub fn peek_export_cursor(&self, sink: &str) -> Result<ExportCursor> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sink, seq, checkpoint_at, holder, lease_until, error FROM audit_export WHERE sink = ?1",
+                params![sink],
+                |r| {
+                    Ok(ExportCursor {
+                        sink: r.get(0)?,
+                        seq: r.get(1)?,
+                        checkpoint_at: r.get(2)?,
+                        holder: r.get(3)?,
+                        lease_until: r.get(4)?,
+                        error: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or(ExportCursor { sink: sink.into(), seq: 0, checkpoint_at: 0, holder: None, lease_until: 0, error: None }))
+    }
+
     /// The newest record: (seq, hash).
     pub fn audit_head(&self) -> Result<Option<(i64, String)>> {
         Ok(self.conn.query_row("SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
+    }
+
+    /// When the first record after `seq` was written (Unix seconds), if there is one: how long a
+    /// sink at cursor `seq` has been behind.
+    pub fn audit_ts_after(&self, seq: i64) -> Result<Option<i64>> {
+        Ok(self.conn.query_row("SELECT ts FROM audit WHERE seq > ?1 ORDER BY seq LIMIT 1", params![seq], |r| r.get(0)).optional()?)
     }
 
     /// The record at `seq`, with its chain fields, if there is one.
@@ -207,5 +236,28 @@ mod tests {
         assert_eq!(l.export_cursor("s").unwrap().error.as_deref(), Some("connection refused"));
         l.advance_export("s", 11).unwrap();
         assert_eq!(l.export_cursor("s").unwrap().error, None);
+    }
+
+    #[test]
+    fn a_peek_writes_nothing() {
+        let l = Ledger::open_in_memory().unwrap();
+        assert_eq!(l.peek_export_cursor("new").unwrap().seq, 0);
+        let rows: i64 = l.conn.query_row("SELECT COUNT(*) FROM audit_export", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0, "no row made");
+        l.advance_export("new", 4).unwrap();
+        assert_eq!(l.peek_export_cursor("new").unwrap(), l.export_cursor("new").unwrap());
+    }
+
+    #[test]
+    fn how_long_a_cursor_has_been_behind() {
+        let l = Ledger::open_in_memory().unwrap();
+        assert_eq!(l.audit_ts_after(0).unwrap(), None, "no records: nothing behind");
+        let t = crate::TenantId::default();
+        l.audit(&t, None, "a", &serde_json::json!({})).unwrap();
+        l.audit(&t, None, "b", &serde_json::json!({})).unwrap();
+        let (head, _) = l.audit_head().unwrap().unwrap();
+        let first = l.audit_record_at(head - 1).unwrap().unwrap();
+        assert_eq!(l.audit_ts_after(head - 2).unwrap(), Some(first.ts));
+        assert_eq!(l.audit_ts_after(head).unwrap(), None, "caught up");
     }
 }

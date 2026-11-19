@@ -324,7 +324,8 @@ wicket node revoke n1
   node's status socket show the same report. The console shows it under Nodes.
 - **Alerts.** The console pushes to every registered device when a node's disk or inodes pass 85%
   used, its feed has been stale for more than 5 min, a box was killed for memory, or it couldn't persist
-  its state. The control host's own disk past 85% alerts too. Each condition is pushed once when it
+  its state. The control host's own disk past 85% alerts too, and so does a state store or audit sink that
+  lags ([console](console.md#the-state-store-and-the-audit-export)). Each condition is pushed once when it
   appears, and again only after it has cleared, under its own notification tag (`wicket-health`).
   A device registered without details is told how many alerts there are, not what they say. A report
   older than 10 min raises no disk or feed alert, and nothing is reported by a node with no

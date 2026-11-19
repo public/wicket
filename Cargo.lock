@@ -4056,6 +4056,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "jiff",
  "libc",
  "reqwest",
  "serde",
@@ -4128,6 +4129,7 @@ dependencies = [
  "tracing",
  "wicket-core",
  "wicket-identity",
+ "wicket-names",
  "wicket-proxy",
  "wicket-store",
 ]
@@ -4175,6 +4177,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "wicket-names"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -4353,7 +4364,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tokio",
  "wicket-core",
+ "wicket-names",
  "zstd",
 ]
 

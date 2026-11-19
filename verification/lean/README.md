@@ -10,9 +10,11 @@ definitions as an oracle that wicket-core's decisions are checked against.
 | `Wicket/Host.lean` | `manifest::host_matches`, `subset::host_covers` | `hostCovers_sound` |
 | `Wicket/Zone.lean` | `CompiledZone::evaluate` | `forbid_wins`: a matching forbid rule forbids, whatever the reach rules say; `forbid_any_case`; `evaluate_reach_set`: reach rules are a set; `allow_lower_risk` |
 | `Wicket/Subset.lean` | `subset::check`, `reach_within`, `path_covered`, `segments_cover`, `segment_covers` | `pathCovered_sound`; `reach_sound` and `forbidden_sound`: an admitted child is allowed by reach nothing its parent isn't, and forbids all it forbids; `check_within`: an admitted child is `Within` its parent (reach, forbid, escalation, isolation, hidden hosts, wildcards, injections, model route, memory, cpus, output, pids, authority); `within_trans` and `grandchild_within`: narrowing composes |
-| `Wicket/Canon.lean` | `canon::canonical_path` | `upstream_eq`: an upstream that percent-decodes and resolves dot segments, in either order, names the canonical path's segments; `decode_eq_unreserved`: no escape spells an unreserved character; `reach_no_escape`, `forbid_no_escape`: a canonical path can't get out from under a rule `Q/**` |
+| `Wicket/Canon.lean` | `canon::canonical_path`, `prefix_covers` | `upstream_eq`: an upstream that percent-decodes and resolves dot segments, in either order, names the canonical path's segments; `decode_eq_unreserved`: no escape spells an unreserved character; `reach_no_escape`, `forbid_no_escape`: a canonical path can't get out from under a rule `Q/**`; `prefixCovers_iff`: a prefix grant (#568) covers its directory and paths continuing it with `/`, never a sibling; `prefix_covers_segments`, `prefix_grant_is_globstar`: no wider than its directory and the rule `Q/**`; `prefix_no_escape`: a covered canonical path keeps the directory's segments as an upstream reads it |
 | `Wicket/Spawn.lean` | `manifest::model_covers`, `LlmSpec::allows_model`, `subset::model_violations`, `manifest::accepts`, `Token::attenuate`, a node's spawn (`nodegw::spawn`: `plan_child`, `peek_spawn`, `derive_child`) | `check_models`: an admitted child calls no model its parent may not (for well-formed patterns, as manifests require); `accept_narrow`, `check_accepts`: it hears only from its parent's zone or a sender its parent hears from; `attenuate_allow`, `attenuate_forbid`, `attenuate_live`, `attenuate_spawns`: an appended spawn block never widens a token; `node_spawn_within`: a child its node starts is within its parent, and its token allows, outlives and starts nothing its parent's doesn't |
 | `Wicket/Grant.lean` | `grant::within_authority`, `check_terms`, `agent_terms`, `outlasts`, `operators::may_decide` | `agent_grant_within`: every use an agent's grant permits is one the agent's own zone allows by reach, by a strict descendant, before the agent's authority ends, for one or more uses; `grant_within_ancestor`: and within every zone the agent's is within; `agent_renewal_within`; `operator_within` (#320) |
+| `Wicket/Message.lean` | `message::relation` (#565), decided by the control host and by a node cut off from it | `peer_iff`: a message goes to a peer exactly when its receiver's `accept_from` names the sender's zone (a zone entry) or principal (a principal entry); `refused_iff`; `no_peer_without_accept_from`; `less_known_allows_no_more` and `less_known_same_relation`: a side that doesn't know the sender's principal refuses whatever one that knows it refuses, and otherwise decides the same relation (or sees an answer where the other sees a named peer) |
+| `Wicket/NodeCa.lean` | `splice::subtree_permits`, `subtree_covers`, `merge_subtrees`, `widen` (what `controlca::target` signs a node CA for, #573) | `covers_sound`: an entry that covers another permits every name it does; `merge_permits`: merging drops no name; `widen_keeps_base`: every name an operator's host permits, the widened CA permits; `widen_keeps_wants`; `widen_from_inputs` and `widen_no_star`: it signs only the operator's hosts and the wants, so never `*` for a remote node when neither has one; `widen_within_cap` |
 
 ## What it doesn't cover
 
@@ -32,6 +34,9 @@ wicket-core decides as the spec does on its fixtures and generated cases. They d
   That the Biscuit evaluator decides as `chainVerdict` is tested (the oracle's `chain` cases mint
   tokens and append spawn blocks), not proved. What each block allows a box to start (`peek_spawn`'s
   facts) is a predicate of the block.
+- **`ca_subtree`** (IDNA and URL host parsing): that no host gives a subtree with `*`, which
+  `widen_no_star` takes of the wants, is tested exhaustively on short names (`splice.rs`), not
+  proved; so is the policy that filters wants (`CaHosts::allows`).
 - Everything else: the proxies, parsing, the ledger, the feed's signatures and the node's replica.
 
 ## What the spec takes as given
@@ -92,7 +97,10 @@ blocks, minted and attenuated by wicket-authz and decided by its evaluator (`cha
 test adds the pure decisions above: generated IPv4 and IPv6 addresses (biased to the special blocks
 and the IPv4 forms), grant ends and clock readings around the boundary, every combination of
 agents' rules and escalation classes, lists of failed checks, counted uses, money amounts at the
-edges of `i64`, and spawn limits and asks.
+edges of `i64`, and spawn limits and asks. Section 10 adds the message rule (#565):
+`message::relation` on generated family, reply, `accept_from` and senders. Section 11 adds a node
+CA's name constraints (#573):
+`subtree_permits`, coverage, and `widen` on generated operator's hosts and wants.
 
 In GitHub Actions, `ci/lean.sh` also turns the build's errors and the oracle's divergences into
 annotations on the run, so they show in the pull request without its log.
