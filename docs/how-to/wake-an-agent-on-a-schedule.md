@@ -2,8 +2,10 @@
 
 A trigger is your standing intent, kept in the ledger: "when this happens, do that". This page
 covers the triggers that tell time: a schedule (cron, in a time zone) or a one-off timer that wakes
-a long-lived agent or gives it a message. Webhooks, GitHub events and wicket's own events come in
-later steps of [#578](https://github.com/public/wicket/issues/578); this version refuses them.
+a long-lived agent or gives it a message. It also covers triggers on wicket's own events (a run
+ending, an agent waking, a decision): see [on wicket's own events](#on-wickets-own-events).
+Webhooks and GitHub events come in later steps of
+[#578](https://github.com/public/wicket/issues/578); this version refuses them.
 
 Triggers fire from the reconciler, so run it on a timer (`wicket reconcile --every 1m`, as the
 install sets up). Each pass looks at the minutes a schedule matched since the last one it fired
@@ -41,6 +43,43 @@ limits: { per_hour: 6 }            # the default; at most 60
   `missed` (how many earlier minutes it stands for).
 - **Limits.** `per_hour` and `queue` are enforced. `concurrency` and `debounce` aren't yet, so
   leave them out (they're refused).
+
+## On wicket's own events
+
+A `wicket` source listens to the records wicket writes in its audit chain:
+
+```yaml
+trigger: failed-runs
+source:
+  wicket: { kinds: [run.end, run.lost] }
+filter: { status: "!ok" }          # equals, one of a list, a glob; a leading ! is "not"
+action:
+  wake: release-captain
+  message:
+    body: "Run {{ event.run }} ended {{ event.status }}: look at why."
+```
+
+| kind | what it is | fields besides the common ones |
+|---|---|---|
+| `run.end` | a run ended | `status`, `cause`, `seconds`, `result`, token counts |
+| `run.lost` | the reconciler found a run's process or box gone | `target`, `detail` |
+| `box.exited` | a box ended with a cause (out of memory, killed, a non-zero exit) | `node`, `code`, `cause` |
+| `box.memory_pressure` | a node saw a box near its memory limit | `node`, `current`, `max`, `peak` |
+| `agent.wake`, `agent.hibernate` | a long-lived agent woke or hibernated | `agent`, `by` (a wake's cause) |
+| `message.refused` | a message to an agent was refused | `from`, `to`, `why` |
+| `decision` | an approval, denial, renewal or revocation | `decision`, `request` or `grant`, `by` |
+
+Every event also has `kind`, `record` (the audit kind it came from), `seq`, `run` and `at`. Filters
+can name nested fields with dots (`pr.number`).
+
+- **When it fires.** Each reconcile pass reads the records written since the last pass, and fires
+  each trigger once per record its filter passes. A trigger hears only records written while it
+  was live (since it was made, approved or resumed). A new installation starts at the chain's
+  newest record.
+- **No loops.** A trigger never fires on the `agent.wake` its own firing caused.
+- **Quoted input.** What these records hold can include an agent's own words (a run's `result`).
+  So for these triggers every text field filled into the message is quoted, `«…»`, and the turn
+  ends by saying the quoted text is the event's data, not instructions.
 
 ## Keep it
 
