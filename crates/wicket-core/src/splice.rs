@@ -167,10 +167,58 @@ fn subtree_covers(p: &str, need: &str) -> bool {
     }
 }
 
+/// The name-constraint subtree a node CA could be widened to for `host` (#573): `h` for a host
+/// name, `.d` for `*.d`, canonical (lowercase, IDNA to punycode, no trailing dot). None for what no
+/// remote node CA may be constrained to: `*` or any other wildcard but a leading `*.`, an IP
+/// literal, a single label (`intranet`, or `*.com`'s `com`), a label that isn't letters, digits,
+/// `-` and `_` within 63, a name over 253, or a host wicket never reaches. Every want passes here
+/// before it is recorded, and again before a CA is signed for it.
+pub fn ca_subtree(host: &str) -> Option<String> {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let (wild, base) = match h.strip_prefix("*.") {
+        Some(rest) => (true, rest),
+        None => (false, h.as_str()),
+    };
+    if base.is_empty() || base.contains('*') {
+        return None;
+    }
+    let d = match url::Host::parse(base).ok()? {
+        url::Host::Domain(d) => d.trim_end_matches('.').to_ascii_lowercase(),
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => return None,
+    };
+    let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+    if d.len() > 253 || d.split('.').count() < 2 || !d.split('.').all(label_ok) || d.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    if never_reachable(&d).is_some() {
+        return None;
+    }
+    Some(if wild { format!(".{d}") } else { d })
+}
+
+/// Whether `entry` (a subtree as [`ca_subtree`] gives them) is one a node CA may carry.
+pub fn issuable_subtree(entry: &str) -> bool {
+    let as_host = match entry.strip_prefix('.') {
+        Some(d) => format!("*.{d}"),
+        None => entry.to_string(),
+    };
+    ca_subtree(&as_host).as_deref() == Some(entry)
+}
+
+/// The subtree `host` needs of the node CA of a box in `zone` (#573): none if the zone splices it
+/// (no certificate is made for it) or no node CA may carry it ([`ca_subtree`]).
+pub fn ca_need(zone: &ZoneSpec, host: &str) -> Option<String> {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if inspection(zone, &h).is_spliced() {
+        return None;
+    }
+    ca_subtree(&h)
+}
+
 /// The name constraints a box's node CA needs for it (#573): every inspected host its zone reaches,
 /// injects into or calls as its model host, and `extra` (the hosts of its credential swaps and of
 /// the grants published for it), as subtrees (`h`, or `.d` for `*.d`). Spliced hosts need no
-/// certificate, and hosts wicket never reaches are left out. Entries another entry covers are
+/// certificate, and hosts no node CA may carry ([`ca_subtree`]) are left out. Entries another entry covers are
 /// dropped, and the list is sorted.
 pub fn ca_hosts(zone: &ZoneSpec, extra: &[String]) -> Vec<String> {
     let mut want: Vec<String> = vec![];
@@ -182,15 +230,7 @@ pub fn ca_hosts(zone: &ZoneSpec, extra: &[String]) -> Vec<String> {
         .chain(model_hosts(zone))
         .chain(extra.iter().cloned());
     for h in candidates {
-        let h = h.trim_end_matches('.').to_ascii_lowercase();
-        let concrete = h.strip_prefix("*.").unwrap_or(&h).to_string();
-        if concrete.is_empty() || never_reachable(&concrete).is_some() || inspection(zone, &h).is_spliced() {
-            continue;
-        }
-        let entry = match h.strip_prefix("*.") {
-            Some(d) => format!(".{d}"),
-            None => h,
-        };
+        let Some(entry) = ca_need(zone, &h) else { continue };
         if !want.contains(&entry) {
             want.push(entry);
         }
@@ -528,6 +568,49 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], ("static.example".into(), Inspection::Spliced { rule: 0 }));
         assert!(matches!(&v[1].1, Inspection::Inspected(why) if why.contains("forbid")), "{v:?}");
+    }
+
+    /// #573's review: only what a remote node CA may be constrained to is ever wanted of one.
+    /// `*` would sign an unconstrained intermediate; the rest would fail every renewal.
+    #[test]
+    fn only_issuable_subtrees_are_wanted_of_a_node_ca() {
+        assert_eq!(ca_subtree("API.Example.com."), Some("api.example.com".into()));
+        assert_eq!(ca_subtree("*.example.org"), Some(".example.org".into()));
+        assert_eq!(ca_subtree("bücher.example.com"), Some("xn--bcher-kva.example.com".into()), "punycode");
+        assert_eq!(ca_subtree("_svc.example.com"), Some("_svc.example.com".into()));
+        let long = format!("{}.example.com", "a".repeat(64));
+        for bad in [
+            "*",
+            "*.*",
+            "*.com",
+            "intranet",
+            "8.8.8.8",
+            "[2001:db8::1]",
+            "2001:db8::1",
+            "*.*.example.com",
+            "a*.example.com",
+            "localhost",
+            "x.localhost",
+            "",
+            ".",
+            long.as_str(),
+        ] {
+            assert_eq!(ca_subtree(bad), None, "{bad:?}");
+        }
+        assert!(issuable_subtree(".example.org") && issuable_subtree("api.example.com"));
+        assert!(
+            !issuable_subtree("*") && !issuable_subtree(".com") && !issuable_subtree("Api.example.com") && !issuable_subtree("8.8.8.8")
+        );
+        let z: ZoneSpec = crate::yaml::from_str(concat!(
+            "name: z\n",
+            "reach:\n",
+            "  - { host: '*', methods: [GET], paths: ['/x'] }\n",
+            "  - { host: 'bücher.example.com', methods: [GET], paths: ['/x'] }\n",
+            "  - { host: 8.8.8.8, methods: [GET], paths: ['/x'] }\n",
+            "  - { host: intranet, methods: [GET], paths: ['/x'] }\n",
+        ))
+        .unwrap();
+        assert_eq!(ca_hosts(&z, &["*.com".into(), "*.*.example.com".into()]), vec!["xn--bcher-kva.example.com".to_string()]);
     }
 
     /// #573: what a box needs of its node's CA: its inspected hosts only, wildcards as subtrees,

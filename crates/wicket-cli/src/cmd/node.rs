@@ -128,8 +128,7 @@ fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String])
     anyhow::ensure!(l.node(name)?.is_some(), "node {name} is not enrolled");
     let tenant = wicket_core::TenantId::single();
     if let Some(policy) = policy {
-        l.set_node_ca_policy(name, &policy)?;
-        l.audit(&tenant, None, "node.ca_policy", &serde_json::json!({ "name": name, "ca_hosts": policy }))?;
+        l.set_node_ca_policy_audited(name, &policy, &operator())?;
         println!(
             "node {name}: its CA is widened at runtime {}",
             match &policy {
@@ -152,7 +151,8 @@ fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String])
     }
     let (labels, taints) = (l.node_labels(name)?, l.node_taints(name)?);
     if changed {
-        l.audit(&tenant, None, "node.labels", &serde_json::json!({ "name": name, "labels": labels, "taints": taints }))?;
+        let body = serde_json::json!({ "name": name, "labels": labels, "taints": taints, "by": operator() });
+        l.audit(&tenant, None, "node.labels", &body)?;
     }
     let show = |xs: Vec<String>| if xs.is_empty() { "none".to_string() } else { xs.join(", ") };
     println!(

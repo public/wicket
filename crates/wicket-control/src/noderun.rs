@@ -708,9 +708,10 @@ pub async fn start(s: Start) -> Result<NodeBox> {
 }
 
 /// A node back after its CA expired (#416) has it renewed by the connection (`nodeca.rs`) as soon
-/// as it is up: the box's start waits for that (up to 30 s), since the node refuses a box whose
-/// hosts need the CA while it is expired. Not renewed by then, the start goes ahead and the node
-/// says why it refuses.
+/// as it is up, and a CA that doesn't cover what the box needs is widened if its policy allows
+/// (#573): the box's start waits for either (up to 60 s, one renewal step), since the node refuses
+/// a box whose hosts need the CA while it is expired. Not renewed by then, the start goes ahead and
+/// the node says why it refuses.
 async fn ca_current(sh: &Shared, proto: u32) {
     // 0: not negotiated yet. Every version a connection can talk renews (#416).
     if proto == 0 || sh.node == crate::localnode::NAME {
@@ -745,46 +746,89 @@ async fn ca_current(sh: &Shared, proto: u32) {
     }
 }
 
-/// A grant's host, wanted of the node's CA if it doesn't cover it and the policy allows (#573): the
-/// grant holds from when it is published, and takes effect once the CA covers its host.
+/// What became of a grant's host as a want of its node's CA (#573).
+#[derive(Debug, PartialEq, Eq)]
+enum GrantWant {
+    /// Nothing needed: spliced, not something a node CA carries, or the operator's hosts cover it.
+    Needless,
+    Wanted(String),
+    /// The node's CA policy keeps it out: the approval can't be used on the node.
+    Refused(String),
+}
+
+/// A grant's host, wanted of the node's CA when the operator's hosts don't cover it and the policy
+/// allows (#573): the grant holds from when it is published, and takes effect once the CA covers
+/// its host. A host the box's zone splices, or no node CA may carry, needs nothing. A host the
+/// policy keeps out (it may have changed since the box started, when the node asked under the old
+/// one) is audited, since the approval can't be used on this node.
+fn want_grant_host_in(l: &Ledger, node: &str, tenant: &TenantId, run: &RunId, zone: &ZoneSpec, g: &wicket_store::GrantRow) -> GrantWant {
+    let Some(need) = wicket_core::splice::ca_need(zone, &g.host) else { return GrantWant::Needless };
+    let base = l.node(node).ok().flatten().map(|n| n.hosts).unwrap_or_default();
+    if wicket_core::splice::uncovered(&base, std::slice::from_ref(&need)).is_empty() {
+        return GrantWant::Needless;
+    }
+    if !l.node_ca_policy(node).unwrap_or(wicket_store::CaHosts::Fixed).allows(&need) {
+        let body = serde_json::json!({ "name": node, "host": need, "grant": g.id });
+        let _ = l.audit(tenant, Some(run), "node.ca_want_refused", &body);
+        return GrantWant::Refused(need);
+    }
+    let _ = l.want_node_ca_hosts(node, std::slice::from_ref(&need), &run.0, &format!("grant {}", g.id), wicket_store::now());
+    GrantWant::Wanted(need)
+}
+
 fn want_grant_host(sh: &Shared, g: &wicket_store::GrantRow) {
     if sh.node == crate::localnode::NAME {
         return;
     }
-    let l = sh.ledger.lock().expect("ledger");
-    let host = vec![g.host.to_ascii_lowercase()];
-    let covered = wicket_node::controlca::active(&l, &sh.node).is_none_or(|c| wicket_core::splice::uncovered(&c.hosts, &host).is_empty());
-    if covered || !l.node_ca_policy(&sh.node).is_ok_and(|p| p.allows(&host[0])) {
-        return;
-    }
-    let _ = l.want_node_ca_hosts(&sh.node, &host, &sh.run.0, &format!("grant {}", g.id), wicket_store::now());
-}
-
-/// The inspected hosts the box needs of its node's CA that the CA doesn't cover (#573): recorded as
-/// wants (by this run) if the node's CA policy allows them, so the next renewal over the channel
-/// widens the CA. Returns the ones wanted; says which the policy keeps out.
-fn want_ca_hosts(sh: &Shared) -> Vec<String> {
-    let l = sh.ledger.lock().expect("ledger");
-    let policy = l.node_ca_policy(&sh.node).unwrap_or(wicket_store::CaHosts::Fixed);
-    let Some(ca) = wicket_node::controlca::active(&l, &sh.node) else { return vec![] };
-    let swaps: Vec<String> = sh.swaps.iter().map(|s| s.host.clone()).collect();
-    let missing = wicket_core::splice::uncovered(&ca.hosts, &wicket_core::splice::ca_hosts(&sh.zone, &swaps));
-    let (allowed, kept_out): (Vec<String>, Vec<String>) = missing.into_iter().partition(|h| policy.allows(h));
-    if !kept_out.is_empty() {
+    let w = want_grant_host_in(&sh.ledger.lock().expect("ledger"), &sh.node, &sh.tenant, &sh.run, &sh.zone, g);
+    if let GrantWant::Refused(h) = w {
         say!(
-            "[wicket] node {}'s CA doesn't cover {}, and its CA policy keeps them out (wicket node set {} --ca-hosts …)",
+            "[wicket] grant {} is for {h}, which node {}'s CA doesn't cover and its CA policy keeps out: it can't be used there (wicket node set {} --ca-hosts …)",
+            g.id,
             sh.node,
-            kept_out.join(", "),
             sh.node
         );
     }
+}
+
+/// What a box needs of its node's CA beyond the operator's hosts (#573): its zone's inspected
+/// hosts, its credential swaps' (`swaps`) and its live grants' (so a box restarted or woken wants
+/// them again). Recorded as wants by `run` when the node's CA policy allows them, whether or not
+/// the CA covers them now: another run may have widened it, and its wants end with it. Returns
+/// (wanted, kept out by the policy).
+fn want_ca_hosts_in(l: &Ledger, node: &str, run: &RunId, zone: &ZoneSpec, swaps: &[String]) -> (Vec<String>, Vec<String>) {
+    let Some(n) = l.node(node).ok().flatten() else { return (vec![], vec![]) };
+    let policy = l.node_ca_policy(node).unwrap_or(wicket_store::CaHosts::Fixed);
+    let now = wicket_store::now();
+    let grants = l.grants_for_run(&run.0).unwrap_or_default().into_iter().filter(|g| !g.revoked && g.expires_at > now).map(|g| g.host);
+    let extra: Vec<String> = swaps.iter().cloned().chain(grants).collect();
+    let missing = wicket_core::splice::uncovered(&n.hosts, &wicket_core::splice::ca_hosts(zone, &extra));
+    let (allowed, kept_out): (Vec<String>, Vec<String>) = missing.into_iter().partition(|h| policy.allows(h));
     if !allowed.is_empty() {
-        if let Err(e) = l.want_node_ca_hosts(&sh.node, &allowed, &sh.run.0, "the box's reach", wicket_store::now()) {
-            say!("[wicket] could not record what {} needs of node {}'s CA: {e}", sh.run, sh.node);
-            return vec![];
+        if let Err(e) = l.want_node_ca_hosts(node, &allowed, &run.0, "the box's reach", now) {
+            say!("[wicket] could not record what {run} needs of node {node}'s CA: {e}");
+            return (vec![], kept_out);
         }
     }
-    allowed
+    (allowed, kept_out)
+}
+
+fn want_ca_hosts(sh: &Shared) -> Vec<String> {
+    let l = sh.ledger.lock().expect("ledger");
+    let swaps: Vec<String> = sh.swaps.iter().map(|s| s.host.clone()).collect();
+    let (wanted, kept_out) = want_ca_hosts_in(&l, &sh.node, &sh.run, &sh.zone, &swaps);
+    // Said only if the CA doesn't cover them now either (an operator's renew-ca may have).
+    let uncovered =
+        wicket_node::controlca::active(&l, &sh.node).map(|c| wicket_core::splice::uncovered(&c.hosts, &kept_out)).unwrap_or_default();
+    if !uncovered.is_empty() {
+        say!(
+            "[wicket] node {}'s CA doesn't cover {}, and its CA policy keeps them out (wicket node set {} --ca-hosts …)",
+            sh.node,
+            uncovered.join(", "),
+            sh.node
+        );
+    }
+    wanted
 }
 
 /// Makes sure node `node` has image `pin` (#191): if it hasn't, this host's runtime exports it as an
@@ -2156,6 +2200,119 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ledger with node n1 enrolled for `api.example.com`, under `policy`.
+    fn enrolled(policy: wicket_store::CaHosts) -> Ledger {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        let now = wicket_store::now();
+        let node = wicket_store::NodeRow {
+            name: "n1".into(),
+            tenant: "t0".into(),
+            target: "wicket@203.0.113.7".into(),
+            host_key: "ssh-ed25519 AAAA".into(),
+            host_key_fp: "SHA256:x".into(),
+            node_key: "00".repeat(32),
+            ssh_key: None,
+            hosts: vec!["api.example.com".into()],
+            enrolled_at: now,
+            status: "active".into(),
+            revoked_at: None,
+        };
+        let ca = wicket_store::NodeCaRow {
+            serial: "01".into(),
+            node: "n1".into(),
+            issued_at: now,
+            not_after: now + 3600,
+            hosts: vec!["api.example.com".into()],
+            status: "active".into(),
+        };
+        l.enrol_node(&t, &node, &ca).unwrap();
+        l.set_node_ca_policy("n1", &policy).unwrap();
+        l
+    }
+
+    fn zone(reach: &[&str]) -> ZoneSpec {
+        let rules: String = reach.iter().map(|h| format!("  - {{ host: '{h}', methods: [GET], paths: ['/x'] }}\n")).collect();
+        wicket_core::yaml::from_str(&format!("name: z\nreach:\n{rules}")).unwrap()
+    }
+
+    /// #573's review, 2 and 5: a box wants every host it needs beyond the operator's, even one the
+    /// CA covers now (another run widened it, and that run's wants end with it); its live grants'
+    /// hosts are wanted at its start too (a restarted or woken box), and not what can't be signed.
+    #[test]
+    fn a_box_wants_what_the_operators_hosts_leave_out_and_its_grants() {
+        let mut l = enrolled(wicket_store::CaHosts::Auto);
+        let z = zone(&["api.example.com", "x.example.com", "*", "8.8.8.8"]);
+        for r in ["run_a", "run_b"] {
+            l.run_started(&TenantId::single(), &RunId(r.into()), "z", "a").unwrap();
+        }
+        let (a, _) = want_ca_hosts_in(&l, "n1", &RunId("run_a".into()), &z, &[]);
+        assert_eq!(a, ["x.example.com"]);
+        // run_a's renewal covers x now; run_b needs it all the same.
+        l.replace_node_ca(&wicket_store::NodeCaRow {
+            serial: "02".into(),
+            node: "n1".into(),
+            issued_at: wicket_store::now(),
+            not_after: wicket_store::now() + 3600,
+            hosts: vec!["api.example.com".into(), "x.example.com".into()],
+            status: "active".into(),
+        })
+        .unwrap();
+        let (b, _) = want_ca_hosts_in(&l, "n1", &RunId("run_b".into()), &z, &["swap.example.com".into()]);
+        assert_eq!(b, ["swap.example.com", "x.example.com"]);
+        l.run_ended(&RunId("run_a".into()), "done", "").unwrap();
+        let wants: Vec<_> = l.node_ca_wants("n1").unwrap().into_iter().map(|w| (w.host, w.run)).collect();
+        assert!(wants.contains(&("x.example.com".into(), "run_b".into())), "{wants:?}");
+        // A live grant of the run: wanted at its (re)start.
+        let op = wicket_core::Op::egress(&TenantId::single(), &RunId("run_b".into()), "z", "GET", "granted.example.com", "/y");
+        let (rid, _) = l.pending_for(&op, "out of reach", None).unwrap();
+        let a = wicket_store::Approval { uses: None, ttl: std::time::Duration::from_secs(600), path_prefix: None, decided_by: "t".into() };
+        l.approve(&rid, &a).unwrap();
+        let (b, _) = want_ca_hosts_in(&l, "n1", &RunId("run_b".into()), &z, &[]);
+        assert!(b.contains(&"granted.example.com".to_string()), "{b:?}");
+        // Under fixed, nothing is wanted: kept out.
+        l.set_node_ca_policy("n1", &wicket_store::CaHosts::Fixed).unwrap();
+        let (b, out) = want_ca_hosts_in(&l, "n1", &RunId("run_b".into()), &z, &[]);
+        assert!(b.is_empty() && out.contains(&"x.example.com".to_string()), "{b:?} {out:?}");
+    }
+
+    /// #573's review, 5 and 7: a grant's host is wanted only if a node CA must and may serve it; one
+    /// the policy keeps out is audited, as the approval can't be used on the node.
+    #[test]
+    fn a_grants_host_is_wanted_only_if_it_needs_and_may_have_the_ca() {
+        let l = enrolled(wicket_store::CaHosts::parse("*.example.org").unwrap());
+        let (t, run) = (TenantId::single(), RunId("run_a".into()));
+        l.run_started(&t, &run, "z", "a").unwrap();
+        let whole = "{ host: whole.example.org, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE], paths: ['/**'] }";
+        let z: ZoneSpec = wicket_core::yaml::from_str(&format!("name: z\nreach: [{whole}]\n")).unwrap();
+        let g = |host: &str| wicket_store::GrantRow {
+            id: format!("g-{host}"),
+            tenant: "t0".into(),
+            zone: "z".into(),
+            method: "GET".into(),
+            host: host.into(),
+            path: "/".into(),
+            prefix: false,
+            uses_left: None,
+            expires_at: wicket_store::now() + 60,
+            request_id: None,
+            revoked: false,
+            node: Some("n1".into()),
+            max_risk: None,
+            run: None,
+            amount: None,
+        };
+        let w = |host: &str| want_grant_host_in(&l, "n1", &t, &run, &z, &g(host));
+        assert_eq!(w("api.example.com"), GrantWant::Needless, "the operator's hosts cover it");
+        assert_eq!(w("whole.example.org"), GrantWant::Needless, "spliced: no certificate");
+        assert_eq!(w("*"), GrantWant::Needless, "never signed");
+        assert_eq!(w("8.8.8.8"), GrantWant::Needless);
+        assert_eq!(w("a.example.org"), GrantWant::Wanted("a.example.org".into()));
+        assert_eq!(w("other.test"), GrantWant::Refused("other.test".into()));
+        assert!(l.audit_tail(5).unwrap().iter().any(|a| a.2 == "node.ca_want_refused" && a.4.contains("other.test")));
+        assert_eq!(l.node_ca_wants("n1").unwrap().iter().map(|w| w.host.as_str()).collect::<Vec<_>>(), ["a.example.org"]);
+    }
 
     /// #56: a renewed grant the box's token carries is published with its new end; one the token
     /// doesn't carry (not handed to this node, revoked or expired) changes nothing.
