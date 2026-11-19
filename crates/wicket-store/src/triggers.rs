@@ -82,8 +82,9 @@ pub struct Trigger {
     /// When it lapses (None: until deleted).
     pub until: Option<i64>,
     pub decided_by: Option<String>,
-    /// When it last changed: made, approved, paused, resumed or renewed. A schedule fires only for
-    /// minutes after it, so a trigger resumed or approved isn't caught up on the time before.
+    /// When it last changed state: made, approved, paused, resumed or done (not renewed). A
+    /// schedule fires only for minutes after it, so a trigger resumed or approved isn't caught up
+    /// on the time before.
     pub updated_at: i64,
 }
 
@@ -242,11 +243,11 @@ impl Ledger {
         )? == 1)
     }
 
-    /// Moves a live trigger's lapse to `until` (None: until removed).
+    /// Moves a live trigger's lapse to `until` (None: until removed). Not a change to when it
+    /// fires: `updated_at` (the floor a schedule fires after) stays.
     pub fn renew_trigger(&self, id: &str, until: Option<i64>) -> Result<()> {
-        let n = self
-            .conn
-            .execute("UPDATE triggers SET until = ?2, updated_at = ?3 WHERE id = ?1 AND status != 'deleted'", params![id, until, now()])?;
+        let n =
+            self.conn.execute("UPDATE triggers SET until = ?2 WHERE id = ?1 AND status NOT IN ('deleted', 'done')", params![id, until])?;
         if n != 1 {
             return Err(StoreError::Refused(format!("no trigger {id}, or it is deleted")));
         }
