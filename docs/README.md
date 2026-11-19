@@ -71,6 +71,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Approvals bound to their effect](explanation/approvals-bound-to-effects.md): what an approval signs, its blast radius, and holding until decided
 - [Why gVisor](explanation/why-gvisor.md)
 - [Performance of the network path](explanation/performance.md)
+- [One feed publisher per node](explanation/feed-publisher.md)
 - [How updates work](explanation/updates.md)
 - The design and the research behind it:
   - [Design](explanation/design.md) (v0.2; much of it not built yet)
