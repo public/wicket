@@ -42,6 +42,8 @@ pub mod policy;
 pub mod quotas;
 pub mod roots;
 pub mod run;
+pub mod services;
+pub mod serviceuse;
 pub mod snapstore;
 pub mod spawn;
 pub mod standing;

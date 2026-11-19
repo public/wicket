@@ -81,6 +81,10 @@ reference](manifest.md)).
   - [`wicket lease release`](#wicket-lease-release)
 - [`wicket zone`](#wicket-zone)
   - [`wicket zone pin`](#wicket-zone-pin)
+- [`wicket service`](#wicket-service)
+  - [`wicket service add`](#wicket-service-add)
+  - [`wicket service remove`](#wicket-service-remove)
+  - [`wicket service list`](#wicket-service-list)
 - [`wicket doctor`](#wicket-doctor)
 - [`wicket node`](#wicket-node)
   - [`wicket node token`](#wicket-node-token)
@@ -148,6 +152,7 @@ Commands:
   reconcile  Make what exists agree with the ledger: runs, leases, machines and boxes
   lease      Capacity leases: the nodes agents asked for
   zone       How a manifest's zone treats each host it reaches: inspected or spliced, and why
+  service    Per-node services (#579): programs kept running on every node whose boxes use them
   doctor     Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes
   node       Nodes, the machines that run boxes: leased from a provider, or your own
   dev        Development helpers
@@ -1333,6 +1338,62 @@ Arguments:
 Options:
       --dry-run  Say what would change; write nothing
   -h, --help     Print help
+```
+
+## `wicket service`
+
+```text
+Per-node services (#579): programs kept running on every node whose boxes use them
+
+Usage: wicket service <COMMAND>
+
+Commands:
+  add     Install a per-node service: a program manifest with a `service:` section. Its manifest and source are copied into wicket's data directory and pinned: what was there when it was added is what runs. Adding again replaces it (audited)
+  remove  Uninstall one: its instances stop, and no new one starts
+  list    The installed services
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket service add`
+
+```text
+Install a per-node service: a program manifest with a `service:` section. Its manifest and source are copied into wicket's data directory and pinned: what was there when it was added is what runs. Adding again replaces it (audited)
+
+Usage: wicket service add <MANIFEST>
+
+Arguments:
+  <MANIFEST>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket service remove`
+
+```text
+Uninstall one: its instances stop, and no new one starts
+
+Usage: wicket service remove <NAME>
+
+Arguments:
+  <NAME>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket service list`
+
+```text
+The installed services
+
+Usage: wicket service list
+
+Options:
+  -h, --help  Print help
 ```
 
 ## `wicket doctor`

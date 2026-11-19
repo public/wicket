@@ -12,8 +12,8 @@
 
 use super::Peer;
 use crate::{
-    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd, StandingCmd,
-    StateCmd,
+    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd, ServiceCmd,
+    StandingCmd, StateCmd,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -94,6 +94,9 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Program { cmd: ProgramCmd::Digest { .. } } => Local,
         // Reads a manifest the caller names, in the caller's own process.
         Cmd::Zone { .. } => Local,
+        // Installing a service decides what runs on every node, under its reach (#579).
+        Cmd::Service { cmd: ServiceCmd::List } => Forward(Read),
+        Cmd::Service { .. } => Forward(Privileged),
         Cmd::Operator { cmd } => match cmd {
             OperatorCmd::List | OperatorCmd::Sessions => Forward(Read),
             // A passkey enrolled by the operator's uid could approve in the console.

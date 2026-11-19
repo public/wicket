@@ -95,24 +95,29 @@ impl ServiceSpec {
     }
 }
 
-/// Variables wicket sets itself in a box: proxies, its CA, its own addresses and credentials.
+/// Variables a service may not set for its users: every one a manifest's `agent.env` may not
+/// (`manifest::RESERVED_ENV_PREFIXES`: wicket's, the model's, proxies, TLS and CA bundles, Node's
+/// and curl's, MCP's, git's TLS), and the loader's, the CA bundles other tools read, and the
+/// account's own. Compared ignoring case.
 fn reserved_env(k: &str) -> bool {
     let k = k.to_ascii_uppercase();
-    k.ends_with("_PROXY")
-        || k.starts_with("WICKET")
-        || k.starts_with("SSL_")
-        || k.starts_with("NODE_EXTRA_CA")
-        || k.starts_with("REQUESTS_CA")
-        || k.starts_with("CURL_CA")
-        || k.starts_with("ANTHROPIC")
-        || k == "PATH"
-        || k == "HOME"
+    crate::manifest::RESERVED_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
+        || k.ends_with("_PROXY")
+        || k.starts_with("LD_")
+        || k.contains("CA_BUNDLE")
+        || k.contains("CA_CERT")
+        || k.ends_with("_CERT")
+        || k.ends_with("_CERTS")
+        || k.starts_with("PYTHON")
+        || k.starts_with("CARGO_HTTP")
+        || ["HOME", "PATH", "USER", "SHELL", "LOGNAME", "TMPDIR", "BASH_ENV", "ENV"].contains(&k.as_str())
 }
 
 /// A service's name, as `zone.uses` names it and its users' host name (`<name>.wicket.internal`)
 /// carries it: lowercase letters, digits and `-`, at most 40.
 pub fn check_name(n: &str) -> Result<(), String> {
     let ok = !n.is_empty()
+        && n != "wicket"
         && n.len() <= 40
         && n.starts_with(|c: char| c.is_ascii_lowercase())
         && !n.ends_with('-')
@@ -142,7 +147,26 @@ mod tests {
         assert_eq!(spec("port: 4873\ntenancy: shared\npublic_only: true").unwrap().tenancy, Tenancy::Shared);
         assert!(spec("port: 0").is_err());
         assert!(spec("port: 1\nper_node: false").is_err());
-        for bad in ["HTTPS_PROXY", "https_proxy", "WICKET_X", "SSL_CERT_FILE", "PATH", "1X", "A-B"] {
+        for bad in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "WICKET_X",
+            "SSL_CERT_FILE",
+            "PATH",
+            "1X",
+            "A-B",
+            "NODE_OPTIONS",
+            "node_tls_reject_unauthorized",
+            "CLAUDE_X",
+            "MCP_X",
+            "GIT_SSL_NO_VERIFY",
+            "CURL_CA_BUNDLE",
+            "USER",
+            "LD_PRELOAD",
+            "REQUESTS_CA_BUNDLE",
+            "PIP_CERT",
+            "PYTHONPATH",
+        ] {
             assert!(spec(&format!("port: 1\nenv: {{ {bad}: x }}")).is_err(), "{bad}");
         }
         assert!(spec("port: 1\nnode_selector: { Bad: x }").is_err());
@@ -154,7 +178,7 @@ mod tests {
         for ok in ["npm-cache", "oci-mirror", "a", "crates2"] {
             assert!(check_name(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "Npm", "-a", "a-", "a.b", "a_b", "1a", &"a".repeat(41)] {
+        for bad in ["", "Npm", "-a", "a-", "a.b", "a_b", "1a", "wicket", &"a".repeat(41)] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
     }

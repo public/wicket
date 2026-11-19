@@ -49,6 +49,9 @@ pub enum Basis {
     Accepted,
     /// `link`: the caller controls both ends (itself or its own children).
     Controller,
+    /// The target is the instance, on the caller's node and for its tenant, of a per-node service
+    /// the caller's zone `uses` (#579 step 3): wicket started it, and checked that it is.
+    Uses,
 }
 
 impl Basis {
@@ -57,6 +60,7 @@ impl Basis {
             Basis::Child => "child",
             Basis::Accepted => "accept_from",
             Basis::Controller => "both ends are the caller's",
+            Basis::Uses => "a service its zone uses",
         }
     }
 }
@@ -109,6 +113,19 @@ pub fn connect(caller: &End<'_>, target: &End<'_>, exposed: bool) -> Result<Deci
     };
     containment(caller, target, &mut needs);
     Ok(Decision { basis, needs_human: needs })
+}
+
+/// A link from `caller` to the instance of a service its zone `uses` (#579 step 3), which the
+/// caller (wicket, at the box's start) has checked is that service's instance on the caller's node.
+/// The use is the basis, but **using a service is having its reach**: the service's reach must be
+/// within the caller's, as any link's is, or a human approves exactly this link.
+pub fn connect_service(caller: &End<'_>, target: &End<'_>) -> Result<Decision, String> {
+    if caller.run == target.run {
+        return Err("a box can't link to itself: use localhost".into());
+    }
+    let mut needs = Vec::new();
+    containment(caller, target, &mut needs);
+    Ok(Decision { basis: Some(Basis::Uses), needs_human: needs })
 }
 
 /// `link(from, to, port)` by `caller`, which must control both ends: each is the caller or one of
@@ -205,6 +222,24 @@ mod tests {
 
     fn end<'a>(run: &'a str, parent: Option<&'a str>, zone_name: &'a str, accept: &'a [String], z: Option<&'a ZoneSpec>) -> End<'a> {
         End { run, parent_run: parent, zone_name, principal: None, accept_from: accept, zone: z }
+    }
+
+    /// #579 step 3: using a service is having its reach. A box whose reach covers the cache's opens
+    /// the link on its use alone; one whose reach doesn't needs a human, for exactly that link.
+    #[test]
+    fn using_a_service_needs_the_services_reach() {
+        let cache = zone("{ name: npm-cache, reach: [{ host: registry.npmjs.org, methods: [GET, HEAD], paths: ['/**'] }] }");
+        let builder =
+            zone("{ name: build, uses: [npm-cache], reach: [{ host: registry.npmjs.org, methods: [GET, HEAD], paths: ['/**'] }] }");
+        let offline = zone("{ name: offline, uses: [npm-cache] }");
+        let none: Vec<String> = vec![];
+        let svc = end("run_svc", None, "npm-cache", &none, Some(&cache));
+        let d = connect_service(&end("run_b", None, "build", &none, Some(&builder)), &svc).unwrap();
+        assert_eq!((d.basis, d.allowed()), (Some(Basis::Uses), true), "{d:?}");
+        let d = connect_service(&end("run_o", None, "offline", &none, Some(&offline)), &svc).unwrap();
+        assert_eq!(d.basis, Some(Basis::Uses));
+        assert!(!d.allowed() && d.needs_human[0].contains("zone npm-cache reaches beyond zone offline"), "{d:?}");
+        assert!(connect_service(&svc, &svc).is_err());
     }
 
     #[test]

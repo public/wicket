@@ -720,7 +720,10 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
             }
             done.push(Done { kind, target: row.id.clone(), detail });
         };
-        let running = ledger.running_runs_on_node(&row.name)?;
+        // A per-node service's instance (#579) never holds a node by itself: it serves the boxes
+        // there, and stops when they are gone.
+        let instances: Vec<String> = ledger.live_service_instances()?.into_iter().map(|i| i.run).collect();
+        let running: Vec<String> = ledger.running_runs_on_node(&row.name)?.into_iter().filter(|r| !instances.contains(r)).collect();
         // A run whose files a fetch didn't bring back holds the node too (#300, #324): releasing
         // it would destroy them.
         let uncollected: Vec<String> = ledger.uncollected_runs_on_node(&row.name)?.into_iter().filter(|r| !running.contains(r)).collect();
@@ -762,6 +765,15 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
                 continue;
             }
         };
+        // Drained first (#579): the per-node service instances on it, which hold no node by
+        // themselves, are stopped, audited, before the node goes with their volumes.
+        for i in ledger.live_service_instances()?.into_iter().filter(|i| i.node == row.name) {
+            let why = format!("its node {} is being released", row.name);
+            match wicket_control::services::stop(ledger, &i, &why) {
+                Ok(()) => record(ledger, "service_stopped", format!("service {} instance {}: {why}", i.service, i.run), true),
+                Err(e) => record(ledger, "error", format!("stopping service {} instance {}: {e:#}", i.service, i.run), false),
+            }
+        }
         match placer.release(&NodeId(row.id.clone()), ReleaseMode::Now).await {
             Ok(r) => {
                 let gone = r == Released::AlreadyGone || node.is_none();
@@ -909,6 +921,23 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
             Ok(changes) => done.extend(changes.into_iter().map(|(kind, key, detail)| Done { kind, target: key, detail })),
             Err(e) => done.push(Done { kind: "error", target: "release keys".into(), detail: format!("renewing their grants: {e:#}") }),
         }
+    }
+    // Per-node services (#579): an instance on each node whose boxes use one, started if missing.
+    match wicket_control::services::pass(&ledger, dry_run) {
+        Ok(p) => {
+            done.extend(p.started.into_iter().map(|(s, run)| Done {
+                kind: "service_started",
+                target: format!("{} on {}", s.service, s.node),
+                detail: if dry_run { format!("for {} (dry run)", s.tenant) } else { format!("for {}: run {run}", s.tenant) },
+            }));
+            done.extend(p.stopped.into_iter().map(|(run, why)| Done { kind: "service_stopped", target: run, detail: why }));
+            done.extend(p.failed.into_iter().map(|(s, e)| Done {
+                kind: "error",
+                target: format!("service {} on {}", s.service, s.node),
+                detail: e,
+            }));
+        }
+        Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
     }
     // The ledger's own upkeep (#582): settled rows of runs long ended to the archive, planner
     // statistics, and a WAL checkpoint.
@@ -2131,6 +2160,47 @@ mod tests {
         let d = full_pass(&w, &mut l, end + 180, false).await;
         assert_eq!(deletes(&st), vec!["placed-busy"], "{d:?}");
         assert_eq!(l.placed_node("placed-busy").unwrap().unwrap().status, "released");
+    }
+
+    /// #579's review, 3: a per-node service's instance neither holds nor bills a node past its
+    /// lease, and is drained (stopped, audited) before the node goes.
+    #[tokio::test]
+    async fn a_service_instance_holds_no_node_and_is_drained_before_release() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-svc", "svc-node", end);
+        started(&l, "run_cache", "alive:1");
+        l.set_run_node("run_cache", "svc-node").unwrap();
+        l.record_service_instance("run_cache", "npm-cache", "svc-node", "t0", "aa", wicket_store::now()).unwrap();
+        let w = World::new(vultr(&base));
+        let d = placed_pass(&mut l, &w.placer, retire, end + 1, false).await.unwrap();
+        assert!(!d.iter().any(|x| x.kind == "placed_held"), "an instance alone holds nothing: {d:?}");
+        assert!(d.iter().any(|x| x.kind == "service_stopped" && x.detail.contains("run_cache")), "{d:?}");
+        assert_eq!(deletes(&st), vec!["placed-svc"], "released, as with no run on it");
+        assert!(l.revoked_in_chain("run_cache").unwrap().is_some(), "the instance's run is revoked");
+        assert_eq!(audited(&l, "service.instance_stopped"), 1);
+    }
+
+    /// #579's review, 3: a node past its lease with a user's box on it is held for that box, its
+    /// service instance beside it or not (it's the box that holds it).
+    #[tokio::test]
+    async fn a_node_with_a_user_box_is_held_whatever_service_instance_is_on_it() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-both", "both-node", end);
+        for (run, owner) in [("run_user", "alive:1"), ("run_cache2", "alive:2")] {
+            started(&l, run, owner);
+            l.set_run_node(run, "both-node").unwrap();
+        }
+        l.record_service_instance("run_cache2", "npm-cache", "both-node", "t0", "aa", wicket_store::now()).unwrap();
+        let w = World::new(vultr(&base));
+        let d = placed_pass(&mut l, &w.placer, retire, end + 1, false).await.unwrap();
+        let held = d.iter().find(|x| x.kind == "placed_held").expect("held");
+        assert!(held.detail.contains("run_user") && !held.detail.contains("run_cache2"), "{}", held.detail);
+        assert!(deletes(&st).is_empty());
+        assert!(l.revoked_in_chain("run_cache2").unwrap().is_none(), "not drained while the node stays");
     }
 
     #[tokio::test]
