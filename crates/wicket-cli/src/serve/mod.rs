@@ -1840,52 +1840,12 @@ fn health_view(state: &State, now_ms: i64) -> Result<(Value, Vec<crate::health::
     }
     let disk = crate::health::disk(&state.data);
     alerts.extend(crate::health::disk_alerts("control", "the control host", &disk));
-    let store =
-        state_store_view(&l, &state.ledger, crate::statestore::StateStore::load(), crate::audit_export::SinksConfig::load(), now_ms);
+    let store = crate::statesync::installed_progress(&l, &state.ledger, now_ms).map_or(Value::Null, |p| json!(p));
     Ok((
         json!({ "nodes": nodes, "control_disk_pct": disk.used_pct().round(), "state_store": store,
                 "alerts": alerts.iter().map(|a| a.text.clone()).collect::<Vec<_>>() }),
         alerts,
     ))
-}
-
-/// The state store's sync and the audit export's progress (#635), as `wicket state check` and
-/// `wicket audit export --status` compute them: the ledger stream (null without a `ledger:`
-/// section), each audit sink against the chain head, and what couldn't be read. Null with neither
-/// a state store nor audit sinks.
-pub(crate) fn state_store_view(
-    l: &Ledger,
-    ledger: &std::path::Path,
-    store: Result<Option<crate::statestore::StateStore>>,
-    sinks: Result<Option<crate::audit_export::SinksConfig>>,
-    now_ms: i64,
-) -> Value {
-    let mut errors = Vec::new();
-    let stream = match store {
-        Ok(Some(s)) if s.ledger.is_some() => {
-            crate::statesync::status_of(&s, ledger, now_ms).map_err(|e| errors.push(format!("the ledger stream: {e:#}"))).ok()
-        }
-        Ok(_) => None,
-        Err(e) => {
-            errors.push(format!("state-store.yaml: {e:#}"));
-            None
-        }
-    };
-    let audit = match sinks {
-        Ok(Some(c)) => crate::audit_export::status(l, &c, now_ms / 1000).unwrap_or_else(|e| {
-            errors.push(format!("the audit export: {e:#}"));
-            vec![]
-        }),
-        Ok(None) => vec![],
-        Err(e) => {
-            errors.push(format!("audit-sinks.yaml: {e:#}"));
-            vec![]
-        }
-    };
-    if stream.is_none() && audit.is_empty() && errors.is_empty() {
-        return Value::Null;
-    }
-    json!({ "stream": stream, "audit": audit, "errors": errors })
 }
 
 /// Pushes node health alerts as they appear (#377), to devices of passkeys still enrolled.
@@ -2152,20 +2112,20 @@ mod tests {
         let t = setup("statestore");
         let l = t.ledger();
         let now_ms = wicket_feed::now_ms();
-        assert_eq!(state_store_view(&l, &t.state.ledger, Ok(None), Ok(None), now_ms), Value::Null, "neither set up: nothing shown");
+        assert_eq!(crate::statesync::progress(&l, &t.state.ledger, Ok(None), Ok(None), now_ms), None, "neither set up: nothing shown");
         let store = crate::statestore::StateStore::parse(
             "s3: { endpoint: 'https://s3.example.com', bucket: b-1, access_key_id: k, secret: s3 }\nledger: {}\n",
         )
         .unwrap();
         let sinks = crate::audit_export::SinksConfig::parse("sinks:\n  - {name: store, type: store}\n").unwrap();
         l.audit(&TenantId::single(), None, "op", &json!({})).unwrap();
-        let v = state_store_view(&l, &t.state.ledger, Ok(Some(store)), Ok(Some(sinks)), now_ms);
+        let v = json!(crate::statesync::progress(&l, &t.state.ledger, Ok(Some(store)), Ok(Some(sinks)), now_ms));
         assert_eq!(v["stream"]["state"], "stopped", "no Litestream here: {v}");
         assert_eq!((v["stream"]["endpoint"].as_str(), v["stream"]["bucket"].as_str()), (Some("https://s3.example.com"), Some("b-1")));
         let a = &v["audit"][0];
         assert_eq!((a["sink"].as_str(), a["kind"].as_str(), a["seq"].as_i64()), (Some("store"), Some("store"), Some(0)));
         assert!(a["behind"].as_i64().unwrap() >= 1 && a["behind"] == a["head"], "{a}");
-        let v = state_store_view(&l, &t.state.ledger, Err(anyhow::anyhow!("bad yaml")), Ok(None), now_ms);
+        let v = json!(crate::statesync::progress(&l, &t.state.ledger, Err(anyhow::anyhow!("bad yaml")), Ok(None), now_ms));
         assert_eq!(v["errors"], json!(["state-store.yaml: bad yaml"]));
     }
 

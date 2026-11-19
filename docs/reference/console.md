@@ -300,6 +300,22 @@ your passkey. It is read-only without a passkey signature.
 - The console writes the vault of the user it runs as (installed: the `wicket` user's,
   `/var/lib/wicket/.config/wicket/secrets/`), the vault the proxies read.
 
+## The state store and the audit export
+
+The *Health* section starts with the state store's rows ([#635](https://github.com/public/wicket/issues/635)),
+when `state-store.yaml` or `audit-sinks.yaml` exists. `wicket top` shows the same lines.
+
+- **State store**: the endpoint and bucket, and the ledger stream's state, as Litestream reports it
+  on its control socket: `streaming`, `starting`, `lagging` or `stopped`. Then when the store was
+  last brought up to date and Litestream's last error, the same as `wicket state check`. The row is
+  marked once the stream is lagging or stopped.
+- **Audit export**, one row per sink, the same as `wicket audit export --status`: how many records
+  the sink is behind the chain head and how long the oldest of them has waited, where its cursor
+  is, how long ago its last signed checkpoint was, and its last error.
+- A config that can't be read is a line of its own. It doesn't stop the rest of the page.
+
+The data is under `health.state_store` in `/api/state`: `stream`, `audit` and `errors`.
+
 ## Notifications
 
 The console can notify your devices when a request is waiting for you (Web Push: RFC 8030, with
