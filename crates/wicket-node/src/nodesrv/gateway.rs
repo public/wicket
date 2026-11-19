@@ -155,6 +155,9 @@ async fn await_control_message(node: &Arc<Node>, run: &str, args: &serde_json::V
             }
             Some(id) => {
                 node.message_read(run, &id);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    gw::note_heard(node, run, &v);
+                }
                 return (text, is_error);
             }
             None => return (text, is_error),

@@ -53,8 +53,12 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-say() { printf '==> %s\n' "$*"; }
+# Each step's start time (UTC), so a slow fetch shows which step it was in.
+say() { printf '==> %s %s\n' "$(date -u +%T)" "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
+# A mirror or repository that stops answering fails the fetch, rather than holding the install for
+# as long as it stalls: each connection is given up after 30 s without an answer, and retried.
+apt_net=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
 [ "$(id -u)" = 0 ] || die "run as root (sudo $0)"
 
 # shellcheck source=/dev/null
@@ -82,20 +86,20 @@ for p in docker.io ca-certificates curl gnupg python3 openssh-client; do
     dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || need+=("$p")
 done
 if [ ${#need[@]} -gt 0 ]; then
-    apt-get update -q
-    apt-get install -y -q "${need[@]}" >/dev/null
+    apt-get "${apt_net[@]}" update -q
+    apt-get "${apt_net[@]}" install -y -q "${need[@]}" >/dev/null
 fi
 
 if [ "$skip_gvisor" = 0 ]; then
     say "gVisor"
     if ! command -v runsc >/dev/null; then
         arch=$(dpkg --print-architecture)
-        curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+        curl -fsSL --max-time 60 --retry 3 https://gvisor.dev/archive.key | gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
         echo "deb [arch=$arch signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
             >/etc/apt/sources.list.d/gvisor.list
         # gVisor's repository is sometimes caught mid-sync ("File has unexpected size"): retry.
         for i in 1 2 3 4; do
-            if apt-get update -q && apt-get install -y -q runsc >/dev/null; then break; fi
+            if apt-get "${apt_net[@]}" update -q && apt-get "${apt_net[@]}" install -y -q runsc >/dev/null; then break; fi
             [ "$i" = 4 ] && die "installing gVisor failed"
             say "installing gVisor failed (attempt $i), retrying in $((i * 20)) s"
             sleep $((i * 20))
