@@ -647,17 +647,22 @@ pub fn scheduled_node(l: &Ledger, c: &Candidate, need: &[String]) -> wicket_plac
 #[derive(Default)]
 pub struct OnNodes {
     instances: Vec<wicket_store::Instance>,
+    /// Running boxes, and those being started (reserved, their run not on its node yet).
     boxes: Vec<wicket_store::RunningBox>,
+    now_ms: i64,
 }
 
 impl OnNodes {
-    pub fn read(l: &Ledger) -> Result<OnNodes> {
-        Ok(OnNodes { instances: l.live_service_instances()?, boxes: l.running_boxes()? })
+    pub fn read(l: &Ledger, now_ms: i64) -> Result<OnNodes> {
+        let mut boxes = l.running_boxes()?;
+        boxes.extend(l.boxes_in_flight(now_ms)?);
+        Ok(OnNodes { instances: l.live_service_instances()?, boxes, now_ms })
     }
 
     /// Fills `n`'s services, zones, principals and volumes as `ask` sees them, of its own tenant
     /// only (a shared service's instance too): a box never learns, or is placed by, where another
-    /// tenant's boxes run. A node holds `ask`'s kept volumes if it ran a box of `ask`'s zone.
+    /// tenant's boxes run. A node holds one of `ask`'s kept volumes if a box of `ask`'s zone runs
+    /// there, or ran there within the volume's retention.
     pub fn fill(&self, l: &Ledger, n: &mut wicket_placement::schedule::Node, ask: &Waiting) {
         let mine = |t: &str| !ask.tenant.is_empty() && t == ask.tenant;
         n.services = self
@@ -671,8 +676,21 @@ impl OnNodes {
             n.principals.extend(b.principal.clone());
         }
         let volumes: Vec<String> = ask.req.affinity.iter().filter_map(|a| a.volume.clone()).collect();
-        if !volumes.is_empty() && mine(&ask.tenant) && l.nodes_that_ran(&ask.tenant, &ask.zone).unwrap_or_default().contains(&n.name) {
-            n.volumes = volumes.into_iter().collect();
+        if volumes.is_empty() || !mine(&ask.tenant) {
+            return;
+        }
+        let ran = l.nodes_that_ran(&ask.tenant, &ask.zone).unwrap_or_default();
+        let Some((_, running, last_s)) = ran.into_iter().find(|(node, ..)| node == &n.name) else { return };
+        let now_s = self.now_ms / 1000;
+        for v in volumes {
+            // Unknown retention (a manifest from before it was recorded): kept forever, as #377's default.
+            let kept = match ask.volume_retention.get(&v).copied().flatten() {
+                None => true,
+                Some(secs) => running || last_s.saturating_add(secs as i64) > now_s,
+            };
+            if kept {
+                n.volumes.insert(v);
+            }
         }
     }
 }
@@ -696,7 +714,7 @@ pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: O
         for c in cands {
             held.push(l.held_on(&c.name, c.at_ms, now_ms)?);
         }
-        let on = OnNodes::read(l)?;
+        let on = OnNodes::read(l, now_ms)?;
         let nodes = |w: &Waiting| -> Vec<wicket_placement::schedule::Node> {
             cands
                 .iter()
@@ -713,20 +731,22 @@ pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: O
         };
         if fifo {
             let mut waiting: Vec<(Waiter, Waiting)> = vec![];
-            let mut me = Waiter { run: run.0.clone(), priority: req.priority, at_ms: now_ms };
+            let mut me = Waiter { run: run.0.clone(), tenant: ask.tenant.clone(), priority: req.priority, at_ms: now_ms };
             for (r, at_ms, json) in l.live_waiters(now_ms)? {
                 if r == run.0 {
                     me.at_ms = at_ms;
                     continue;
                 }
                 let Ok(w) = serde_json::from_str::<Waiting>(&json) else { continue };
-                waiting.push((Waiter { run: r, priority: w.req.priority, at_ms }, w));
+                waiting.push((Waiter { run: r, tenant: w.tenant.clone(), priority: w.req.priority, at_ms }, w));
             }
             let queue: Vec<Waiter> = waiting.iter().map(|(q, _)| q.clone()).collect();
             for older in ahead(&me, &queue) {
                 let Some((_, w)) = waiting.iter().find(|(q, _)| q.run == older.run) else { continue };
                 if schedule(&w.req, &nodes(w), Strategy::BinPack, None).node.is_some() {
-                    let b = Bound { decision: Default::default(), behind: Some(older.run.clone()) };
+                    // Another tenant's run isn't named: only that one waited ahead.
+                    let who = if w.tenant == ask.tenant { older.run.clone() } else { ANOTHER_TENANT.to_string() };
+                    let b = Bound { decision: Default::default(), behind: Some(who) };
                     l.record_placement_decision(&run.0, &decision_record(ask, &b, cands.len()), now_ms)?;
                     return Ok(b);
                 }
@@ -735,12 +755,16 @@ pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: O
         let d = schedule(req, &nodes(ask), Strategy::BinPack, last);
         if let Some(node) = &d.node {
             l.reserve_placement(&run.0, node, req.vcpus, req.memory_mib, now_ms)?;
+            l.record_placement_owner(&run.0, &ask.tenant, &ask.zone, ask.principal.as_deref())?;
         }
         let b = Bound { decision: d, behind: None };
         l.record_placement_decision(&run.0, &decision_record(ask, &b, cands.len()), now_ms)?;
         Ok(b)
     })
 }
+
+/// What a wake says it waits behind when that run is another tenant's: it isn't named.
+pub const ANOTHER_TENANT: &str = "a run of another tenant";
 
 /// The most nodes a decision record names, ranked and refused each: enough to say why, bounded so
 /// a large installation's records stay small (#582).
@@ -785,6 +809,13 @@ pub struct Waiting {
     pub tenant: String,
     #[serde(default)]
     pub zone: String,
+    /// Its principal, if known (a woken agent's, from its last identity): what another box's
+    /// anti-affinity names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// Its kept volumes' retention (s; None: kept forever), for volume affinity.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub volume_retention: std::collections::BTreeMap<String, Option<u64>>,
 }
 
 impl Waiting {
@@ -795,6 +826,14 @@ impl Waiting {
             need: wicket_core::splice::ca_hosts(&m.zone, &[]),
             tenant: m.tenant.0.clone(),
             zone: m.zone.name.clone(),
+            principal: None,
+            volume_retention: m
+                .zone
+                .volumes
+                .iter()
+                .filter(|v| v.keep)
+                .map(|v| (v.name.clone(), v.retention().ok().flatten().map(|d| d.as_secs())))
+                .collect(),
         }
     }
 }
@@ -826,7 +865,9 @@ pub fn from_index(names: &[String], health: &[(String, i64, String)], now_ms: i6
 /// coverage, then bin-packed (`wicket_placement::schedule`).
 async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str>, wait: std::time::Duration) -> Result<Option<String>> {
     let m = wicket_agent::load(&agent.manifest)?;
-    let me = Waiting::of(&m);
+    let mut me = Waiting::of(&m);
+    // The agent is the same principal across its runs: its last run's identity names it.
+    me.principal = Ledger::open(&ledger_path())?.identity(&agent.run)?.map(|i| i.spiffe_id);
     let req = me.req.clone();
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
     crate::localnode::ensure(&ledger).await?;
@@ -898,7 +939,7 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
             return Ok(Some(n.clone()));
         }
         let why = match &b.behind {
-            Some(r) => format!("waiting behind {r}, which goes first (a higher priority, or it waited longer) and fits"),
+            Some(r) => format!("waiting behind {r}, which goes first (it took an earlier place in line, or it is one of this tenant's of a higher priority) and fits"),
             None => b.decision.why_not(),
         };
         if started.elapsed() >= wait {
@@ -1241,6 +1282,84 @@ mod tests {
         assert_eq!(bind(&l, &RunId("run_peer".into()), &ask(5), &[n1], None, now, true).unwrap().behind.as_deref(), Some("run_high"));
     }
 
+    /// #579 step 4 (review): priority counts within a tenant only. Another tenant's run at 1000
+    /// doesn't pass this tenant's older one, and a run that waits behind another tenant's isn't told
+    /// which run it is.
+    #[test]
+    fn a_tenants_priority_never_jumps_another_tenants_wait() {
+        use wicket_placement::schedule::Request;
+        let l = Ledger::open_in_memory().unwrap();
+        let now = 81_000_000;
+        let mut n1 = cand("n1", 4.0, 4096, 0.0, 2048);
+        n1.at_ms = now - 1_000;
+        let ask = |tenant: &str, priority| Waiting {
+            req: Request { vcpus: 1.0, memory_mib: 1024, priority, ..Request::default() },
+            tenant: tenant.into(),
+            ..Default::default()
+        };
+        l.wait_for_placement("run_t0", &serde_json::to_string(&ask("t0", 0)).unwrap(), now - 9_000).unwrap();
+        l.wait_for_placement("run_t1", &serde_json::to_string(&ask("t1", 1000)).unwrap(), now - 1_000).unwrap();
+        // t1's run, though at 1000, waited later: it yields to t0's, and isn't told its id.
+        let b = bind(&l, &RunId("run_t1".into()), &ask("t1", 1000), &[n1.clone()], None, now, true).unwrap();
+        assert_eq!(b.behind.as_deref(), Some(ANOTHER_TENANT));
+        let rec = l.placement_decision("run_t1").unwrap().unwrap().1;
+        assert!(!rec.contains("run_t0"), "{rec}");
+        // t0's goes first.
+        let b = bind(&l, &RunId("run_t0".into()), &ask("t0", 0), &[n1.clone()], None, now, true).unwrap();
+        assert_eq!((b.decision.node.as_deref(), b.behind), (Some("n1"), None));
+        l.placement_released("run_t0").unwrap();
+        // Within t0, a later run of a higher priority goes ahead of its own older one, and is named.
+        assert_eq!(
+            bind(&l, &RunId("run_t0b".into()), &ask("t0", 0), &[n1.clone()], None, now, true).unwrap().behind.as_deref(),
+            Some("run_t0")
+        );
+        let b = bind(&l, &RunId("run_t0c".into()), &ask("t0", 5), &[n1], None, now, true).unwrap();
+        assert_eq!(b.behind, None, "t0's at 5 takes t0's first place");
+    }
+
+    /// #579 step 4 (review): two starts in flight see each other. A box reserved on a node, its run
+    /// not on the node yet, keeps a box that must be away from its zone off that node.
+    #[test]
+    fn a_box_being_started_counts_for_anti_affinity() {
+        use wicket_core::placement::AntiAffinity;
+        use wicket_placement::schedule::Request;
+        let l = Ledger::open_in_memory().unwrap();
+        let now = 92_000_000;
+        let cands: Vec<Candidate> = ["n1", "n2"]
+            .iter()
+            .map(|n| {
+                let mut c = cand(n, 4.0, 8192, 0.0, 0);
+                c.at_ms = now - 1_000;
+                c
+            })
+            .collect();
+        let research = Waiting {
+            req: Request { vcpus: 1.0, memory_mib: 1024, ..Request::default() },
+            tenant: "t0".into(),
+            zone: "research".into(),
+            ..Default::default()
+        };
+        let a = bind(&l, &RunId("run_a".into()), &research, &cands, None, now, false).unwrap().decision;
+        assert_eq!(a.node.as_deref(), Some("n1"));
+        let away = Waiting {
+            req: Request {
+                vcpus: 1.0,
+                memory_mib: 1024,
+                anti_affinity: vec![AntiAffinity { zone: Some("research".into()), required: true, ..Default::default() }],
+                ..Request::default()
+            },
+            tenant: "t0".into(),
+            zone: "z".into(),
+            ..Default::default()
+        };
+        let b = bind(&l, &RunId("run_b".into()), &away, &cands, None, now + 1, false).unwrap().decision;
+        assert_eq!(b.ranked, ["n2"], "run_a is being started on n1: {}", b.why_not());
+        // Once run_a's start fails, n1 is no reason.
+        l.placement_released("run_a").unwrap();
+        l.placement_released("run_b").unwrap();
+        assert_eq!(bind(&l, &RunId("run_c".into()), &away, &cands, None, now + 2, false).unwrap().decision.ranked, ["n1", "n2"]);
+    }
+
     /// #579 step 4: a node is seen with its own tenant's boxes and service instances, and the kept
     /// volumes of the zones it ran; affinity places by them.
     #[test]
@@ -1291,6 +1410,22 @@ mod tests {
         assert_eq!(place("run_b", near).ranked, ["n2"]);
         let vol = Request { affinity: vec![Affinity { volume: Some("data".into()), ..Default::default() }], ..base.clone() };
         assert_eq!(place("run_c", vol.clone()).node.as_deref(), Some("n3"), "preferred: where the zone ran");
+        // With a retention shorter than the time since the zone last ran there, the volume is gone.
+        let short = Waiting {
+            req: vol.clone(),
+            tenant: "t0".into(),
+            zone: "z".into(),
+            volume_retention: [("data".to_string(), Some(60))].into_iter().collect(),
+            ..Default::default()
+        };
+        let ended = l.nodes_that_ran("t0", "z").unwrap()[0].2;
+        let later = (ended + 3600) * 1000;
+        let d = bind(&l, &RunId("run_cr".into()), &short, &cands, None, later, false).unwrap().decision;
+        assert_ne!(d.node.as_deref(), Some("n3"), "its retention deleted it: {:?}", d.ranked);
+        l.placement_released("run_cr").unwrap();
+        let long = Waiting { volume_retention: [("data".to_string(), Some(86_400))].into_iter().collect(), ..short };
+        assert_eq!(bind(&l, &RunId("run_cl".into()), &long, &cands, None, later, false).unwrap().decision.node.as_deref(), Some("n3"));
+        l.placement_released("run_cl").unwrap();
         // Another tenant's box of the same zone name is no reason, nor holds its volumes.
         let other = Waiting { req: vol, tenant: "t1".into(), zone: "z".into(), ..Default::default() };
         assert_eq!(bind(&l, &RunId("run_d".into()), &other, &cands, None, now, false).unwrap().decision.node.as_deref(), Some("n1"));

@@ -42,7 +42,7 @@ pub fn explain(run: &str, at_ms: i64, record: &str, now_ms: i64) -> Result<Strin
             v["candidates"].as_u64().unwrap_or(0)
         )),
         (None, Some(b)) => out.push_str(&format!(
-            "{run}: waiting behind {b}, which goes first (a higher priority, or it waited longer) and fits a node now ({ago} s ago)\n"
+            "{run}: waiting behind {b}, which goes first (it took an earlier place in line, or it is one of this tenant's of a higher priority) and fits a node now ({ago} s ago)\n"
         )),
         (None, None) => out.push_str(&format!(
             "{run}: no node may take it (of {} candidates), decided {ago} s ago\n",

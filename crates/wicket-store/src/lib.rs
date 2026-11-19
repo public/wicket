@@ -178,7 +178,10 @@ pub enum StoreError {
 /// step 2): a counter per topic (grants, asks, revocations, node CAs) that every write to its tables
 /// moves, so a supervisor reads its rows only when they changed. Older builds don't read it, and its
 /// triggers fire under them too; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 27;
+/// Version 30 (expand, after #582 step 2's 27) adds `placement_owners` (#579 step 4): whose box each
+/// reservation is for, so affinity counts a box being started. Older builds don't read it; the floor
+/// stays 17.
+pub const SCHEMA_VERSION: u32 = 30;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
