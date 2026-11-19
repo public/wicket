@@ -132,9 +132,11 @@ not a permanent decision.
   compiled evaluator against the fork's own generic engine and its unpatched `AuthorizerBuilder` path
   (oracles 1–3 in `crates/wicket-authz/tests/integration/oracles.rs`). Nothing compares it with the
   upstream crate itself. Kani harnesses (#325) check some of the same Rust functions on bounded inputs.
-- **At most 10 live grants per box on a node,** and a used-up grant holds its slot until it expires.
-  A path-prefix grant is honoured on a node for the asked path only
+- **At most 10 live grants per box on a node,** and a used-up grant holds its slot until it expires
   ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102)).
+  A path-prefix grant covers its directory and every path under it on a node at protocol 16 or
+  later, as on the control host; a node still at 15 honours it for the asked path only
+  ([#257](https://github.com/public/wicket/issues/257)).
 - **Spawn refuses what it can't prove.** Path globs that `subset::check` can't prove contained are
   refused, even when they are narrower ([#30](https://github.com/public/wicket/pull/30),
   [#79](https://github.com/public/wicket/pull/79)).

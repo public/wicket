@@ -8,7 +8,7 @@
 //! The Lean definitions are restated here over bytes, as Rust checks them, and Kani checks the Rust
 //! against them.
 
-use super::{escape_fault, plain_fault};
+use super::{escape_fault, plain_fault, prefix_covers};
 use crate::proofs::AnyStr;
 
 /// Segments: `/`, `.`, a letter, `;`, `\`, `{` (which a URL parser would escape), and the escape
@@ -18,6 +18,11 @@ const PATH: &[u8] = b"/.%2Ea;\\{";
 
 /// Longest path checked.
 const N: usize = 6;
+
+/// The prefix harness's alphabet: what canonical paths' segments are made of. Escapes and dot
+/// segments are `check_plain`'s to refuse (`check_plain_is_plain_ok`), and no escape makes a `/` or a
+/// dot segment (`upstream_reads_the_same_segments`), so here `/`, a letter and `.` (in `.a`, `a.`).
+const SEGS: &[u8] = b"/a.";
 
 /// Escapes: hex digits of both cases, so `%2E` (a dot), `%2f` (lower case), `%4A` (unreserved
 /// `J`), `%24` (`$`, which may be escaped) and `%AA` (a non-ASCII byte) are all spelled; and a
@@ -162,5 +167,56 @@ fn upstream_reads_the_same_segments() {
             start = j + 1;
         }
         j += 1;
+    }
+}
+
+/// The segments of a canonical path: between its `/`s, a trailing `/` making no empty segment.
+fn segments_end(b: &[u8], seg: usize) -> Option<(usize, usize)> {
+    // The `seg`th segment's bounds in `b` (starting after the leading `/`), if there is one.
+    let body_end = if b.len() > 1 && b[b.len() - 1] == b'/' { b.len() - 1 } else { b.len() };
+    let (mut k, mut start, mut i) = (0, 1, 1);
+    if body_end <= 1 {
+        return None;
+    }
+    while i <= body_end {
+        if i == body_end || b[i] == b'/' {
+            if k == seg {
+                return Some((start, i));
+            }
+            k += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A path-prefix grant (#257 4a: honoured on nodes too) covers only paths under it: for two
+/// canonical paths, if the grant for `P` covers `Q` then `Q`'s segments begin with all of `P`'s.
+/// No escape, dot segment, doubled `/` or separator in a segment takes a covered path outside its
+/// prefix, since `canonical_path` admits none of them. With `upstream_reads_the_same_segments`, an
+/// upstream that decodes and resolves the path names the same segments.
+#[kani::proof]
+#[kani::unwind(10)]
+fn a_prefix_grant_covers_only_paths_under_it() {
+    // Two paths over [`SEGS`], one byte shorter than the single-path harnesses (531 s over a
+    // six-symbol alphabet): `/../`, `//` and `/.a/` still fit.
+    let pre = AnyStr::<{ N - 1 }>::new(SEGS);
+    let path = AnyStr::<{ N - 1 }>::new(SEGS);
+    let (p, q) = (pre.bytes(), path.bytes());
+    kani::assume(p.first() == Some(&b'/') && q.first() == Some(&b'/'));
+    // Canonical, over [`SEGS`]: `check_plain_is_plain_ok` proves `plain_fault` is Lean's `plainOk`, which
+    // on these bytes (no escape, no `;`, `\\` or byte a parser would encode) is `segs_ok` alone. Using
+    // that here keeps CBMC off `plain_fault` for two symbolic paths (401 s with it).
+    kani::assume(segs_ok(p) && segs_ok(q));
+    let (Ok(ps), Ok(qs)) = (std::str::from_utf8(p), std::str::from_utf8(q)) else { return };
+    if !prefix_covers(ps, qs) {
+        return;
+    }
+    let mut seg = 0;
+    while let Some((a, b)) = segments_end(p, seg) {
+        let Some((c, d)) = segments_end(q, seg) else { panic!("the path has fewer segments than its prefix") };
+        assert!(p[a..b] == q[c..d], "segment {seg} differs");
+        seg += 1;
     }
 }

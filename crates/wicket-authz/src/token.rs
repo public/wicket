@@ -153,3 +153,13 @@ pub fn grant(token: &Token, approver: &SigningKey, g: &Grant) -> Result<Token, A
     let signed = sign_grant(token.grant_request()?, approver, g)?;
     token.add_grant(&approver.public(), signed)
 }
+
+/// [`grant`] for a path-prefix grant (#257 4a): `g.path` is the prefix, canonical and ending in
+/// `/`; the grant covers the directory itself and every path under it, as the ledger's does. A node
+/// before protocol 16 refuses a token with such a block (its structural check doesn't admit it), so
+/// only nodes at 16 or later are sent one.
+pub fn grant_prefix(token: &Token, approver: &SigningKey, g: &Grant) -> Result<Token, AuthzError> {
+    let block = crate::generator::grant_prefix_code(g)?.block()?;
+    let signed = token.grant_request()?.0.create_block(&approver.0, block).map(SignedGrant).map_err(enc)?;
+    token.add_grant(&approver.public(), signed)
+}

@@ -6,4 +6,5 @@ mod common;
 mod hostile;
 mod oracles;
 mod org;
+mod prefix;
 mod properties;
