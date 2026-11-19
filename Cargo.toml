@@ -66,6 +66,8 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
+# Time zones for triggers' schedules (#578), from the host's zoneinfo: no bundled database.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 getrandom = "0.4"
 base64 = "0.22"
 # HTTP/3 (#92). ring everywhere, as rustls above; quinn's default provider would be aws-lc-rs.

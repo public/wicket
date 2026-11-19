@@ -91,6 +91,8 @@ pub struct Maintained {
     pub archived_requests: usize,
     /// Cancel and mode-change rows taken or stale, and reservations settled a day ago (#579), deleted.
     pub dropped_asks: usize,
+    /// Triggers' settled firings and spent events older than [`crate::TRIGGER_RETENTION_SECS`] (#578), deleted.
+    pub pruned_triggers: usize,
     /// WAL frames checkpointed, and the WAL's frames (both -1 for a ledger not in WAL mode).
     pub checkpointed: i64,
     pub wal_frames: i64,
@@ -164,13 +166,14 @@ impl Ledger {
     pub fn maintain(&self, now: i64) -> Result<Maintained> {
         let (archived_grants, archived_requests) = self.archive_ended(now)?;
         let dropped_asks = self.drop_spent_asks(now)? + self.drop_settled_placements(now)?;
+        let pruned_triggers = self.prune_triggers(now - crate::triggers::TRIGGER_RETENTION_SECS)?;
         // Statistics for the planner, limited so a large table costs milliseconds (SQLite's advice
         // for long-lived connections; it only analyses tables whose size moved a lot).
         self.conn.execute_batch("PRAGMA analysis_limit = 400; PRAGMA optimize;")?;
         let (busy, wal_frames, checkpointed): (i64, i64, i64) =
             self.conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         let _ = busy;
-        Ok(Maintained { archived_grants, archived_requests, dropped_asks, checkpointed, wal_frames })
+        Ok(Maintained { archived_grants, archived_requests, dropped_asks, pruned_triggers, checkpointed, wal_frames })
     }
 }
 

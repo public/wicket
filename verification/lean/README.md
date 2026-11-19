@@ -58,7 +58,12 @@ wicket-core decides as the spec does on its fixtures and generated cases. They d
   or an escape is outside it, and the oracle answers `unsupported` rather than guess (the Rust check
   treats those conservatively: only the same text covers them). Two of globset's readings are part
   of the spec: it matches bytes (`?` is one byte of UTF-8), and a glob made only of `**` segments
-  (`**/`, `**/**/`) matches everything.
+  (`**/`, `**/**/`) matches everything. A manifest's reach and forbid path globs start with `/`
+  (`Manifest::validate` refuses others). The subset theorems (`reach_sound`) are about absolute
+  request paths (`AbsPath`): a glob without the leading `/` may match none (`repos/**`, which the
+  manifest fuzzer's probe of a relative path then fell outside) or some (`**/merge`, as `globParse`
+  reads it too). The oracle's generated zones still take any glob, and `subset::check` decides
+  those as the spec does.
 - **Canonical paths.** The theorems that need them take an absolute path (`AbsPath`), as
   `canonical_path` guarantees. `canonicalPath` refuses what `check_plain` refuses, over UTF-8 bytes:
   besides backslashes, control characters, `;`, bad escapes and dot or empty segments, anything a

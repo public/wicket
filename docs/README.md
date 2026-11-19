@@ -26,6 +26,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Add a remote node](how-to/add-a-remote-node.md)
 - [Create nodes on Vultr](how-to/create-nodes-on-vultr.md), and leases for agents
 - [Hibernate and wake an agent](how-to/hibernate-and-wake-an-agent.md)
+- [Wake an agent on a schedule](how-to/wake-an-agent-on-a-schedule.md)
 - [Drive a box from the Claude apps](how-to/drive-a-box-from-the-claude-apps.md)
 - [Run a program instead of an agent](how-to/run-a-program.md)
 - [Run an ACP agent](how-to/run-an-acp-agent.md)
@@ -70,6 +71,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Approvals bound to their effect](explanation/approvals-bound-to-effects.md): what an approval signs, its blast radius, and holding until decided
 - [Why gVisor](explanation/why-gvisor.md)
 - [Performance of the network path](explanation/performance.md)
+- [One feed publisher per node](explanation/feed-publisher.md)
 - [How updates work](explanation/updates.md)
 - The design and the research behind it:
   - [Design](explanation/design.md) (v0.2; much of it not built yet)
