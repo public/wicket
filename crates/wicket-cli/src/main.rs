@@ -451,28 +451,32 @@ async fn main() {
     }
 }
 
-/// The exit code for `e` (#574; docs/reference/cli.md lists them): what a command said, else what
-/// the store's and placement's errors are, else 1.
+/// The exit code for `e` (#574; docs/reference/cli.md lists them): the innermost error in its
+/// chain that says one (what a command tagged, or the store's and placement's own errors), else a
+/// code added as `e`'s context (a refusal over a cause that says none), else 1.
 fn exit_code(e: &anyhow::Error) -> i32 {
-    use wicket_home::exit::Code;
+    use wicket_home::exit::{Code, Exit};
+    use wicket_placement::PlacementError as P;
     use wicket_store::StoreError as S;
-    let code = wicket_home::exit::code_of(e).or_else(|| {
-        e.chain().find_map(|c| {
-            if let Some(s) = c.downcast_ref::<S>() {
-                return match s {
-                    S::NoSuchRequest(_) => Some(Code::NotFound),
-                    S::NotPending(..) | S::Refused(_) | S::EffectChanged(..) | S::EgressGrant(_) => Some(Code::Refused),
-                    _ => None,
-                };
-            }
-            match c.downcast_ref::<wicket_placement::PlacementError>()? {
-                wicket_placement::PlacementError::NotApproved(_) => Some(Code::NeedsApproval),
-                wicket_placement::PlacementError::NotFound(_) => Some(Code::NotFound),
-                wicket_placement::PlacementError::NotOwned(_) | wicket_placement::PlacementError::Protected(_) => Some(Code::Refused),
+    let says = |c: &(dyn std::error::Error + 'static)| -> Option<Code> {
+        if let Some(x) = c.downcast_ref::<Exit>() {
+            return Some(x.code);
+        }
+        if let Some(s) = c.downcast_ref::<S>() {
+            return match s {
+                S::NoSuchRequest(_) => Some(Code::NotFound),
+                S::NotPending(..) | S::Refused(_) | S::EffectChanged(..) | S::EgressGrant(_) => Some(Code::Refused),
                 _ => None,
-            }
-        })
-    });
+            };
+        }
+        match c.downcast_ref::<P>()? {
+            P::Undecided(_) => Some(Code::NeedsApproval),
+            P::NotApproved(_) | P::NotOwned(_) | P::Protected(_) => Some(Code::Refused),
+            P::NotFound(_) => Some(Code::NotFound),
+            _ => None,
+        }
+    };
+    let code = e.chain().filter_map(says).last().or_else(|| e.downcast_ref::<Exit>().map(|x| x.code));
     code.unwrap_or(Code::Failed) as i32
 }
 
@@ -549,11 +553,20 @@ mod tests {
         assert_eq!(code(exit::usage("x")), 2);
         assert_eq!(code(exit::refused("x")), 3);
         assert_eq!(code(exit::not_found("x")), 4);
-        assert_eq!(code(exit::needs_approval("not approved")), 5);
+        assert_eq!(code(exit::needs_approval("x")), 5);
         assert_eq!(code(wicket_store::StoreError::NoSuchRequest("r-1".into()).into()), 4);
         assert_eq!(code(anyhow::Error::from(wicket_store::StoreError::NotPending("r-1".into(), "denied".into())).context("deciding")), 3);
         assert_eq!(code(wicket_store::StoreError::Refused("x".into()).into()), 3);
-        assert_eq!(code(wicket_placement::PlacementError::NotApproved("nobody decided".into()).into()), 5);
+        assert_eq!(code(wicket_placement::PlacementError::Undecided("nobody decided".into()).into()), 5);
+        assert_eq!(code(wicket_placement::PlacementError::NotApproved("request r-1 is denied".into()).into()), 3);
+        assert_eq!(code(wicket_placement::PlacementError::ApprovalFailed("the ledger".into()).into()), 1);
+        // The innermost says: a decision refused (3) because there was no such request (4) is 4.
+        let refused_unknown = anyhow::Error::from(wicket_store::StoreError::NoSuchRequest("r-nope".into()))
+            .context(exit::Exit::refused("refused (the refusal is on the audit record)"));
+        assert_eq!(code(refused_unknown), 4);
+        assert_eq!(code(anyhow::anyhow!("outside its authority").context(exit::Exit::refused("refused"))), 3);
+        // A tag over a store error that says otherwise: the store's, innermost.
+        assert_eq!(code(anyhow::Error::from(wicket_store::StoreError::NoSuchRequest("r-1".into())).context("x")), 4);
         assert_eq!(code(wicket_placement::PlacementError::NoCapacity("none".into()).into()), 1);
     }
 

@@ -490,7 +490,9 @@ fn target(l: &Ledger, id: &str) -> Result<Target> {
         return Ok(Target::Grant(Box::new(l.grant(id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no grant {id}")))?)));
     }
     if id.starts_with("r-") {
-        return Ok(Target::Grant(Box::new(l.grant_for_request(id)?.ok_or_else(|| anyhow::anyhow!("request {id} has no live grant"))?)));
+        return Ok(Target::Grant(Box::new(
+            l.grant_for_request(id)?.ok_or_else(|| wicket_home::exit::not_found(format!("request {id} has no live grant")))?,
+        )));
     }
     match l.run_authority(id)? {
         Some((until, cap)) => Ok(Target::Authority { run: id.to_string(), until, cap }),

@@ -48,7 +48,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 print!("{}", crate::effect::render(&b));
             }
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
-                return Err(wicket_home::exit::needs_approval("not approved"));
+                return Err(wicket_home::exit::refused("not approved: declined at the confirmation"));
             }
             let grant::Decided::Approved { grant: gid, lease, uses: made_uses, ttl } = grant::decide(
                 &mut l,

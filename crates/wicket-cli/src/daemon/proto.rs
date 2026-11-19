@@ -290,6 +290,11 @@ pub fn group_id(name: &str) -> Option<u32> {
     (r == 0 && !out.is_null()).then_some(gr.gr_gid)
 }
 
+/// What an `ERROR` frame's text starts with when the daemon refuses the command for its policy (the
+/// caller exits 3, #574); without it, the command failed otherwise (1). A client before it shows
+/// the text as it is.
+pub const REFUSED: &str = "refused: ";
+
 #[cfg(test)]
 mod tests {
     use super::*;

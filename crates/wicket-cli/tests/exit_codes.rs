@@ -1,5 +1,5 @@
 //! #574: `wicket`'s exit codes, from the binary, as docs/reference/cli.md lists them: 0 done, 1
-//! failed, 2 a usage error, 3 refused, 4 not found, 5 an approval not given (the last is checked in
+//! failed, 2 a usage error, 3 refused, 4 not found, 5 an approval nobody has given yet (the last is checked in
 //! main.rs's unit test: it needs a terminal or a provider).
 
 use std::process::Command;
@@ -53,6 +53,8 @@ fn every_kind_of_outcome_has_its_code() {
         (&["deny", "r-nope"], 4),
         (&["grant", "revoke", "g-nope"], 4),
         (&["grant", "renew", "g-nope"], 4),
+        (&["grant", "renew", "r-nope"], 4),
+        (&["operator", "enrol-link", "--ttl", "2h"], 2),
         (&["unlink", "lk-nope"], 4),
         (&["lease", "release", "lease_nope"], 4),
         (&["standing", "show", "s-nope"], 4),

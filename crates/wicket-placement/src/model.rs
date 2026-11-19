@@ -210,6 +210,10 @@ impl Owner {
 pub enum PlacementError {
     #[error("spend not approved: {0}")]
     NotApproved(String),
+    #[error("spend not approved: {0}")]
+    Undecided(String),
+    #[error("spend approval failed: {0}")]
+    ApprovalFailed(String),
     #[error("no capacity: {0}")]
     NoCapacity(String),
     #[error("node {0} does not carry this installation's owner tag: refusing to touch it")]

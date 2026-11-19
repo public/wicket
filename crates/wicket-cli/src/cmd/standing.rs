@@ -197,7 +197,7 @@ pub async fn dispatch(c: StandingCmd) -> Result<()> {
                 a.ttl.map(|t| wicket_core::time::format_duration(t).to_string()).unwrap_or_else(|| "until revoked".into())
             );
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
-                return Err(wicket_home::exit::needs_approval("not approved"));
+                return Err(wicket_home::exit::refused("not approved: declined at the confirmation"));
             }
             st::approve(&l, &human()?, &id, &a, Some(&shown), serde_json::json!({ "via": "cli" }))?;
             println!("approved {id}: the agent's later runs are allowed {} without asking", rule_text(&shown_rule));

@@ -15,14 +15,14 @@ pub enum Code {
     Failed = 1,
     /// The command line is wrong (clap's code, kept for every usage error).
     Usage = 2,
-    /// wicket won't do it: the daemon's policy for this caller, the org policy, or the state of
-    /// what it names (a request already decided, terms wider than the request). Trying again as is
-    /// won't help.
+    /// wicket won't do it: the daemon's policy for this caller, the org policy, an operator's no
+    /// (at the confirmation, or to a spend), or the state of what it names (a request already
+    /// decided, terms wider than the request).
     Refused = 3,
     /// What it names doesn't exist: a request, grant, link, lease, run, agent, node, service.
     NotFound = 4,
-    /// An approval it needed wasn't given: declined at the confirmation prompt, or a spend no
-    /// capacity grant covered and no operator approved within --wait.
+    /// It needs an approval nobody has given yet: a spend no capacity grant covers and no operator
+    /// decided within --wait, an update no trusted key signed and no operator approved.
     NeedsApproval = 5,
 }
 

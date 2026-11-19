@@ -4,6 +4,7 @@ type: Changed
 ---
 - `wicket` exits with one code per kind of outcome, the same for every command and through the
   daemon, as part of the CLI polish pass ([#574](https://github.com/public/wicket/issues/574)): 0
-  done, 1 failed, 2 a usage error, 3 refused, 4 not found, 5 an approval it needed wasn't given.
+  done, 1 failed, 2 a usage error, 3 refused, 4 not found, 5 it needs an approval nobody has given
+  yet.
   Before, everything but clap's usage errors exited 1. docs/reference/cli.md lists them with
   examples. `wicket wake` (internal) exits 3, not 2, when the agent is already being woken.

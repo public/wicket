@@ -136,8 +136,8 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
     proto::write_json(&mut w, kind::HELLO, &hello)?;
     let welcome: Welcome = match proto::read_frame(&mut r)? {
         Some((kind::WELCOME, p)) => serde_json::from_slice(&p)?,
-        // The daemon sends an error only to refuse the command (`refuse`).
-        Some((kind::ERROR, p)) => return Err(wicket_home::exit::refused(format!("wicketd: {}", String::from_utf8_lossy(&p)))),
+        // Its policy refused the command (exit 3), or it failed otherwise (1).
+        Some((kind::ERROR, p)) => return Err(daemon_error(&p)),
         _ => bail!("wicketd closed the connection"),
     };
     let mut client_ok = true;
@@ -156,8 +156,8 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
             loop {
                 match proto::read_frame(&mut r)? {
                     Some((kind::EXIT, p)) if p.len() == 4 => return Ok(i32::from_be_bytes(p[..4].try_into().expect("4 bytes"))),
-                    // The daemon sends an error only to refuse the command (`refuse`).
-                    Some((kind::ERROR, p)) => return Err(wicket_home::exit::refused(format!("wicketd: {}", String::from_utf8_lossy(&p)))),
+                    // Its policy refused the command (exit 3), or it failed otherwise (1).
+                    Some((kind::ERROR, p)) => return Err(daemon_error(&p)),
                     Some(_) => {}
                     // A restart by the service manager (#455): the command itself goes on.
                     None => bail!(
@@ -237,4 +237,29 @@ fn doctor(sock: &Path, w: &Welcome) -> bool {
         println!("docker: not reachable by you (good)");
     }
     ok
+}
+
+/// The daemon's `ERROR` frame as this command's error: its policy's refusal exits 3, anything
+/// else 1 (#574).
+fn daemon_error(p: &[u8]) -> anyhow::Error {
+    let text = String::from_utf8_lossy(p);
+    match text.starts_with(proto::REFUSED) {
+        true => wicket_home::exit::refused(format!("wicketd: {text}")),
+        false => anyhow::anyhow!("wicketd: {text}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// #574: the daemon's policy refusal exits 3; its other errors (moving to a new build, fds or
+    /// uploads that didn't arrive) exit 1.
+    #[test]
+    fn only_the_policys_refusal_is_refused() {
+        use wicket_home::exit::{code_of, Code};
+        let refused = super::daemon_error(format!("{}needs root, or a passkey in the console", super::proto::REFUSED).as_bytes());
+        assert_eq!(code_of(&refused), Some(Code::Refused));
+        assert!(refused.to_string().contains("needs root"), "{refused}");
+        let moving = super::daemon_error(b"wicketd is moving to a new build: try again in a few seconds");
+        assert_eq!(code_of(&moving), None);
+    }
 }

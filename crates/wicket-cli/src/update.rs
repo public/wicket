@@ -553,15 +553,17 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
     let copy = stage.join("artifact");
     std::fs::copy(artifact, &copy).with_context(|| format!("reading {}", artifact.display()))?;
     let sha = sha256_file(&copy)?;
-    let refuse = |why: String| -> anyhow::Error {
+    // Audited, and exit 3 (#574), or 5 where only an operator's approval is missing.
+    let refuse_as = |code: wicket_home::exit::Code, why: String| -> anyhow::Error {
         let _ = ledger.lock().expect("ledger").audit(
             &TenantId::single(),
             None,
             "self.update_refused",
             &serde_json::json!({ "artifact_sha256": sha, "why": why, "by": crate::operator() }),
         );
-        anyhow::anyhow!("refused: {why}")
+        wicket_home::exit::Exit { code, msg: format!("refused: {why}") }.into()
     };
+    let refuse = |why: String| refuse_as(wicket_home::exit::Code::Refused, why);
     let sig_path = sig.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(format!("{}.sig", artifact.display())));
     // A CI build (#190): only a CI signature whose claims are what was asked for. No other
     // signature, and no human approval of its sha256, stands in for it.
@@ -621,9 +623,12 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
             sha256: sha,
             source: serde_json::json!({ "approved": { "request": request, "grant": u.grant, "by": u.decided_by } }),
         }),
-        None => Err(refuse(format!(
-            "the artifact (sha256 {sha}) is not signed by a release key this installation trusts: {why_not_signed}; and no operator has approved an update to it (an agent's request_update, approved with `wicket approve`)"
-        ))),
+        None => Err(refuse_as(
+            wicket_home::exit::Code::NeedsApproval,
+            format!(
+                "the artifact (sha256 {sha}) is not signed by a release key this installation trusts: {why_not_signed}; and no operator has approved an update to it (an agent's request_update, approved with `wicket approve`)"
+            ),
+        )),
     }
 }
 
