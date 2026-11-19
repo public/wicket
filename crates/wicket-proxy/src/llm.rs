@@ -446,20 +446,9 @@ impl Llm {
         // Read again until the value changes, for up to RELOGIN_WAIT (#552): the refresh that revoked
         // this token may not have written the new one yet. A value that stays the same is a real
         // revocation, and its 401 goes to the box.
-        let deadline = tokio::time::Instant::now() + RELOGIN_WAIT;
-        let fresh = loop {
-            let read = match self.ctx.vault.refetch(&spec.secret).await {
-                Ok(()) => self.ctx.vault.get_for_patiently(&spec.secret, &up_host, SECRET_PATIENCE).await,
-                Err(e) => Err(e),
-            };
-            match read {
-                Ok(f) if f == token && tokio::time::Instant::now() < deadline => tokio::time::sleep(RELOGIN_POLL).await,
-                other => break other,
-            }
-        };
-        let fresh = match fresh {
-            Ok(f) if f != token => f,
-            Ok(_) => {
+        let fresh = match Self::changed_secret(&self.ctx.vault, &spec.secret, &up_host, &token).await {
+            Ok(Some(f)) => f,
+            Ok(None) => {
                 note.push_str(&format!(
                     "; upstream refused the credential (401); secret {:?} read again for {}s is unchanged: not retried",
                     spec.secret,
@@ -487,6 +476,24 @@ impl Llm {
         );
         note.push_str(&format!("; retried once after a 401 with the new value of secret {:?}", spec.secret));
         self.send_upstream(spec, parts, body, &fresh).await
+    }
+
+    /// Reads secret `name` again from its source until its value is no longer `old`, for up to
+    /// [`RELOGIN_WAIT`] (#552: a login refresh revokes the old token before its owner writes the new
+    /// one). `Ok(Some(new))` if it changed, `Ok(None)` if it stayed `old` (a real revocation).
+    async fn changed_secret(vault: &crate::vault::Vault, name: &str, host: &str, old: &str) -> Result<Option<String>> {
+        let deadline = tokio::time::Instant::now() + RELOGIN_WAIT;
+        loop {
+            vault.refetch(name).await?;
+            let now = vault.get_for_patiently(name, host, SECRET_PATIENCE).await?;
+            if now != old {
+                return Ok(Some(now));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(RELOGIN_POLL).await;
+        }
     }
 
     async fn send_upstream(
@@ -710,12 +717,67 @@ impl Llm {
         // `Accept-Encoding` would get a compressed stream that the usage scanner can't read.
         parts.headers.insert(http::header::CONTENT_LENGTH, f.body.len().into());
         parts.headers.insert(http::header::ACCEPT_ENCODING, http::HeaderValue::from_static("identity"));
+        // What a retry after a 401 needs (#552): the request again, and the secret the egress proxy
+        // puts on it with the value it puts on now.
+        let again = (parts.method.clone(), parts.uri.clone(), parts.version, parts.headers.clone(), f.body.clone());
+        let secret = egress.credential_secret(host, &parts.headers);
+        let before = match &secret {
+            Some(name) => match egress.ctx.vault.ensure(name).await {
+                Ok(()) => egress.ctx.vault.get_for(name, host).ok(),
+                Err(_) => None,
+            },
+            None => None,
+        };
         let req = Request::from_parts(parts, http_body_util::Full::new(f.body));
         // Sent: a box that gives up on it now leaves it charged its reservation, as a call whose
         // final usage wasn't seen (the provider may bill it).
         held.sent();
         let sent = egress.forward(req, host, "https", pq, via).await;
         let reserved = held.take();
+        // The upstream refused the credential (401): a login refreshed by its owner while the call
+        // was out revokes the old token (#360, #552). Wait for the secret to change and send the
+        // call once more with the new value; an unchanged one is a real revocation, passed on. The
+        // box has seen nothing of the first answer yet. Either way the call's note says so.
+        let mut relogin = String::new();
+        let sent = match (sent, &secret, &before) {
+            (Ok(resp), Some(name), Some(old)) if resp.status() == StatusCode::UNAUTHORIZED => {
+                match Self::changed_secret(&egress.ctx.vault, name, host, old).await {
+                    Ok(Some(_)) => {
+                        drop(resp);
+                        self.event(
+                            f.model.clone(),
+                            401,
+                            Usage::default(),
+                            &format!("upstream refused the credential (401); secret {name:?} has changed since it was read: retrying once with its new value"),
+                        );
+                        relogin = format!("; retried once after a 401 with the new value of secret {name:?}");
+                        let (method, uri, version, headers, body) = again;
+                        let mut b = Request::builder().method(method).uri(uri).version(version);
+                        if let Some(h) = b.headers_mut() {
+                            *h = headers;
+                        }
+                        match b.body(http_body_util::Full::new(body)) {
+                            Ok(req) => egress.forward(req, host, "https", pq, via).await,
+                            Err(e) => Err(anyhow::Error::from(e)),
+                        }
+                    }
+                    Ok(None) => {
+                        relogin = format!(
+                            "; upstream refused the credential (401); secret {name:?} read again for {}s is unchanged: not retried",
+                            RELOGIN_WAIT.as_secs()
+                        );
+                        Ok(resp)
+                    }
+                    Err(e) => {
+                        relogin = format!(
+                            "; upstream refused the credential (401); secret {name:?} could not be read again ({e:#}): not retried"
+                        );
+                        Ok(resp)
+                    }
+                }
+            }
+            (sent, ..) => sent,
+        };
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -725,6 +787,7 @@ impl Llm {
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|v| v.starts_with("text/event-stream"));
                 let mut note = f.note;
+                note.push_str(&relogin);
                 // An upstream that encodes anyway: its usage can't be read, so say why it is charged.
                 if let Some(enc) =
                     resp.headers().get(http::header::CONTENT_ENCODING).filter(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))

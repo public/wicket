@@ -231,6 +231,23 @@ impl Egress {
     /// Strips the box's credentials and headers, injects the zone's, and readies the body: streamed
     /// if `stream` (keeping the request's `content-length`), else read whole (bounded). GET and HEAD
     /// are always read, and refused if they carry a body.
+    /// The vault secret whose value [`Egress::prepare`] puts on a request to `host` with these
+    /// headers: the first inject rule for the host, else the run's swap for the placeholder the box
+    /// presented. None for a literal swap, or no credential. For a model call's retry after a 401
+    /// (#552).
+    pub(crate) fn credential_secret(&self, host: &str, headers: &http::HeaderMap) -> Option<String> {
+        if let Some(rule) = self.ctx.zone.inject.iter().find(|r| host_matches(&r.host, host)) {
+            return Some(rule.secret.clone());
+        }
+        let auth = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
+        let presented = auth.strip_prefix("Bearer ").unwrap_or("");
+        let sw = self.ctx.swaps.iter().find(|s| host_matches(&s.host, host) && !presented.is_empty() && s.placeholder == presented)?;
+        match &sw.real {
+            crate::SwapSource::Vault(name) => Some(name.clone()),
+            crate::SwapSource::Value(_) => None,
+        }
+    }
+
     pub(super) async fn prepare<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, stream: bool) -> Result<Outgoing>
     where
         B: Body<Data = Bytes> + Send + 'static,
