@@ -19,3 +19,7 @@ getrandom.workspace = true
 ring = "0.17"
 # The content-addressed store's objects: zstd at rest.
 zstd = "0.13"
+
+[dev-dependencies]
+# The query-plan guard (#582) watches every statement the hot paths run.
+rusqlite = { workspace = true, features = ["trace"] }
