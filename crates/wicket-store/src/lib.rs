@@ -161,9 +161,10 @@ pub enum StoreError {
 /// Version 23 (expand, after #587's 22) adds the `standing` table: standing reach (#572), a reach
 /// rule an agent asks for once and a human approves for its principal or zone. Older builds don't
 /// read it, so the floor stays 17.
-/// Version 24 (expand, after #576's 23) adds `placements` and `placement_waits` (#579 step 2): the
-/// node room reserved for boxes being started, and the runs waiting for a node. Older builds don't
-/// read them; the floor stays 17.
+/// Version 24 (expand, after #576's 23) adds `placements`, `placement_waits` and
+/// `placement_decisions` (#579 step 2): the node room reserved for boxes being started, the runs
+/// waiting for a node, and why each run went where it did. Older builds don't read them; the floor
+/// stays 17.
 /// Version 25 (expand, after #579 step 2's 24) adds `services`, `service_wants` and
 /// `service_instances` (#579 step 3): the per-node services installed, which runs use them on which
 /// node, and the instances kept for them. Older builds don't read them; the floor stays 17.

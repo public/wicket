@@ -43,24 +43,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         ServiceCmd::Remove { name } => {
-            let row = l.services()?.into_iter().find(|s| s.name == name).with_context(|| format!("no service {name} is installed"))?;
-            // Its instances stop now (their runs are revoked), then the row goes, audited.
-            let live: Vec<_> = l.live_service_instances()?.into_iter().filter(|i| i.service == name).collect();
-            for i in &live {
-                wicket_control::services::stop(&l, i, "its service was removed")?;
-            }
-            let tenant = wicket_core::TenantId(row.tenant.clone());
-            l.immediate::<_, anyhow::Error>(|l| {
-                l.remove_service(&name)?;
-                l.audit(
-                    &tenant,
-                    None,
-                    "service.removed",
-                    &serde_json::json!({ "name": name, "sha256": row.sha256, "stopped": live.iter().map(|i| &i.run).collect::<Vec<_>>(), "by": operator() }),
-                )?;
-                Ok(())
-            })?;
-            println!("service {name} removed: {} instance(s) stopped, and no new one starts", live.len());
+            let n = wicket_control::services::remove(&l, &name, &operator())?;
+            println!("service {name} removed: {n} instance(s) stopped, and no new one starts");
             Ok(())
         }
         ServiceCmd::List => {

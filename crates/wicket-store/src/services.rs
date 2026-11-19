@@ -62,10 +62,11 @@ pub struct Instance {
     pub live: bool,
 }
 
-const INSTANCE_COLS: &str = "i.run, i.service, i.node, i.tenant, i.started_at, i.sha256, i.wanted_at, r.id IS NOT NULL, r.ended_at IS NULL";
+const INSTANCE_COLS: &str =
+    "i.run, i.service, i.node, i.tenant, i.started_at, i.sha256, i.wanted_at, r.id IS NOT NULL, r.ended_at IS NULL, v.run IS NOT NULL";
 
 fn instance(r: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
-    let (has_run, running): (bool, bool) = (r.get(7)?, r.get(8)?);
+    let (has_run, running, revoked): (bool, bool, bool) = (r.get(7)?, r.get(8)?, r.get(9)?);
     let started_at: i64 = r.get(4)?;
     Ok(Instance {
         run: r.get(0)?,
@@ -75,7 +76,8 @@ fn instance(r: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
         started_at,
         sha256: r.get(5)?,
         wanted_at: r.get(6)?,
-        live: if has_run { running } else { started_at > crate::now() - START_GRACE_SECS },
+        // A revoked instance (stopped, its box going) isn't live, though its run hasn't ended yet.
+        live: !revoked && if has_run { running } else { started_at > crate::now() - START_GRACE_SECS },
     })
 }
 
@@ -156,7 +158,7 @@ impl Ledger {
     /// The instances started for `service` on `node` for `tenant`, newest first.
     pub fn service_instances(&self, service: &str, node: &str, tenant: &str) -> Result<Vec<Instance>> {
         let mut st = self.conn.prepare(&format!(
-            "SELECT {INSTANCE_COLS} FROM service_instances i LEFT JOIN runs r ON r.id = i.run
+            "SELECT {INSTANCE_COLS} FROM service_instances i LEFT JOIN runs r ON r.id = i.run LEFT JOIN revocations v ON v.run = i.run
              WHERE i.service = ?1 AND i.node = ?2 AND i.tenant = ?3 ORDER BY i.started_at DESC, i.run"
         ))?;
         let rows = st.query_map(params![service, node, tenant], instance)?;
@@ -166,7 +168,7 @@ impl Ledger {
     /// Every live instance (of any service): the idle stop's candidates, and what holds no node.
     pub fn live_service_instances(&self) -> Result<Vec<Instance>> {
         let mut st = self.conn.prepare(&format!(
-            "SELECT {INSTANCE_COLS} FROM service_instances i LEFT JOIN runs r ON r.id = i.run
+            "SELECT {INSTANCE_COLS} FROM service_instances i LEFT JOIN runs r ON r.id = i.run LEFT JOIN revocations v ON v.run = i.run
              ORDER BY i.service, i.node, i.tenant, i.started_at DESC"
         ))?;
         let rows = st.query_map([], instance)?;
@@ -177,7 +179,7 @@ impl Ledger {
     pub fn service_instance_of(&self, run: &str) -> Result<Option<Instance>> {
         let mut st = self
             .conn
-            .prepare(&format!("SELECT {INSTANCE_COLS} FROM service_instances i LEFT JOIN runs r ON r.id = i.run WHERE i.run = ?1"))?;
+            .prepare(&format!("SELECT {INSTANCE_COLS} FROM service_instances i LEFT JOIN runs r ON r.id = i.run LEFT JOIN revocations v ON v.run = i.run WHERE i.run = ?1"))?;
         Ok(st.query_row(params![run], instance).optional()?)
     }
 

@@ -208,6 +208,28 @@ pub fn pass(l: &Ledger, dry_run: bool) -> Result<Passed> {
     Ok(done)
 }
 
+/// `wicket service remove`: the service's live instances stop (their runs are revoked), then its
+/// row goes, audited under its tenant with what was stopped. Returns how many were stopped.
+pub fn remove(l: &Ledger, name: &str, by: &str) -> Result<usize> {
+    let row = l.services()?.into_iter().find(|s| s.name == name).with_context(|| format!("no service {name} is installed"))?;
+    let live: Vec<_> = l.live_service_instances()?.into_iter().filter(|i| i.service == name).collect();
+    for i in &live {
+        stop(l, i, "its service was removed")?;
+    }
+    let tenant = wicket_core::TenantId(row.tenant.clone());
+    l.immediate::<_, anyhow::Error>(|l| {
+        l.remove_service(name)?;
+        l.audit(
+            &tenant,
+            None,
+            "service.removed",
+            &serde_json::json!({ "name": name, "sha256": row.sha256, "stopped": live.iter().map(|i| &i.run).collect::<Vec<_>>(), "by": by }),
+        )?;
+        Ok(())
+    })?;
+    Ok(live.len())
+}
+
 /// Stops an instance: its run is revoked (its supervisor stops its box), audited.
 pub fn stop(l: &Ledger, i: &wicket_store::Instance, why: &str) -> Result<()> {
     l.revoke(&i.run, BY, why)?;
@@ -257,6 +279,9 @@ pub fn snapshot(manifest: &Path, root: &Path) -> Result<Snapshot> {
     let path = std::fs::canonicalize(manifest).with_context(|| format!("reading {}", manifest.display()))?;
     let mut m = wicket_core::Manifest::from_yaml(&std::fs::read_to_string(&path)?)?;
     let svc = m.service.clone().context("this manifest has no service: section: it is not a per-node service")?;
+    if svc.drain == wicket_core::service::Drain::Keep {
+        bail!("service.drain: keep isn't supported yet: an instance's volumes go with its node when the node is released (drain: drop)");
+    }
     if m.zone.escalation.request {
         bail!("a service's zone may not ask for more (escalation.request: true): it would ask on behalf of every box that uses it");
     }
@@ -414,6 +439,48 @@ mod tests {
         let three = |_: &str, _: &str, _: &str| vec![inst(now - 200, false), inst(now - 400, false), inst(now - 500, false)];
         assert!(plan(&services, &demand, &nodes, &three, now).is_empty(), "three in a row: 240 s");
         assert_eq!((restart_delay(1), restart_delay(3), restart_delay(20)), (60, 240, 3600));
+    }
+
+    /// #579's review, 3 and 9: an instance no box has used for IDLE_SECS is stopped by a pass, and
+    /// removing its service stops its instances; both are audited.
+    #[test]
+    fn idle_instances_stop_and_removing_a_service_stops_its_instances() {
+        let root = std::env::temp_dir().join(format!("wicket-svc-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("m.yaml");
+        std::fs::write(&path, "task: c\nprogram: { name: npm-cache, command: [x] }\nservice: { port: 4873 }\nzone: { name: npm-cache }\n")
+            .unwrap();
+        let snap = snapshot(&path, &root.join("data")).unwrap();
+        let l = Ledger::open_in_memory().unwrap();
+        l.add_service("npm-cache", &snap.path.display().to_string(), &snap.sha256, "t0", "alex").unwrap();
+        let t = wicket_core::TenantId::single();
+        let now = wicket_store::now();
+        for run in ["run_idle", "run_busy"] {
+            l.run_started(&t, &wicket_core::RunId(run.into()), "npm-cache", "npm-cache").unwrap();
+        }
+        l.record_service_instance("run_idle", "npm-cache", "n1", "t0", &snap.sha256, now - IDLE_SECS - 5).unwrap();
+        l.record_service_instance("run_busy", "npm-cache", "n2", "t0", &snap.sha256, now - IDLE_SECS - 5).unwrap();
+        // A live user on n2 keeps its instance wanted.
+        l.run_started(&t, &wicket_core::RunId("run_user".into()), "build", "build").unwrap();
+        l.want_service("npm-cache", "n2", "t0", "run_user").unwrap();
+        let p = pass(&l, false).unwrap();
+        assert_eq!(p.stopped.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), ["run_idle"], "{p:?}");
+        assert!(l.revoked_in_chain("run_idle").unwrap().is_some() && l.revoked_in_chain("run_busy").unwrap().is_none());
+        assert_eq!(remove(&l, "npm-cache", "alex").unwrap(), 1, "run_busy");
+        assert!(l.revoked_in_chain("run_busy").unwrap().is_some());
+        assert!(l.services().unwrap().is_empty());
+        let kinds: Vec<String> = l.audit_tail(20).unwrap().into_iter().map(|a| a.2).collect();
+        assert!(kinds.iter().filter(|k| *k == "service.instance_stopped").count() == 2 && kinds.contains(&"service.removed".to_string()));
+        assert!(remove(&l, "npm-cache", "alex").is_err(), "no such service");
+        // drain: keep isn't there yet: refused at add.
+        std::fs::write(
+            &path,
+            "task: c\nprogram: { name: npm-cache, command: [x] }\nservice: { port: 4873, drain: keep }\nzone: { name: npm-cache }\n",
+        )
+        .unwrap();
+        assert!(snapshot(&path, &root.join("data")).unwrap_err().to_string().contains("drain: keep"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -22,6 +22,19 @@ pub fn user_env(l: &Ledger, uses: &[String]) -> Vec<(String, String)> {
     uses.iter().filter_map(|u| all.get(u).map(|s| s.spec.user_env(u))).flat_map(|e| e.into_iter()).collect()
 }
 
+/// Whether `run`, whose zone is `zone`, may run in it (#579): an installed service's zone is its
+/// instances' alone, since any other run in it would share the service's kept volumes (a cache's
+/// storage) and could rewrite what it serves. Err says whose zone it is.
+pub fn check_zone(l: &Ledger, zone: &str, run: &str) -> anyhow::Result<()> {
+    for (name, svc) in installed(l)? {
+        let ours = l.service_instance_of(run)?.is_some_and(|i| i.service == name);
+        if svc.zone == zone && !ours {
+            anyhow::bail!("zone {zone} is service {name}'s: only the instances wicket starts for it run in it");
+        }
+    }
+    Ok(())
+}
+
 fn service_ref<'a>(name: &'a str, s: &'a Installed, zone: &'a str, program: &'a str) -> ServiceRef<'a> {
     ServiceRef { name, port: s.spec.port, shared: s.spec.tenancy == wicket_core::service::Tenancy::Shared, zone, program }
 }
@@ -103,6 +116,25 @@ pub fn after_start(ctx: &wicket_proxy::RunCtx, m: &wicket_core::Manifest, node: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_services_zone_is_its_instances_alone() {
+        let root = std::env::temp_dir().join(format!("wicket-svc-zone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("m.yaml");
+        std::fs::write(&path, "task: c\nprogram: { name: npm-cache, command: [x] }\nservice: { port: 4873 }\nzone: { name: npm-cache }\n")
+            .unwrap();
+        let snap = crate::services::snapshot(&path, &root.join("data")).unwrap();
+        let l = Ledger::open_in_memory().unwrap();
+        assert!(check_zone(&l, "npm-cache", "run_x").is_ok(), "nothing installed yet");
+        l.add_service("npm-cache", &snap.path.display().to_string(), &snap.sha256, "t0", "alex").unwrap();
+        assert!(check_zone(&l, "npm-cache", "run_x").unwrap_err().to_string().contains("is service npm-cache's"));
+        assert!(check_zone(&l, "build", "run_x").is_ok(), "another zone");
+        l.record_service_instance("run_svc", "npm-cache", "n1", "t0", &snap.sha256, wicket_store::now()).unwrap();
+        assert!(check_zone(&l, "npm-cache", "run_svc").is_ok(), "the instance wicket started");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_box_gets_the_environment_of_the_installed_services_it_uses() {

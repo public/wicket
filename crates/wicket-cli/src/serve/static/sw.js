@@ -55,7 +55,7 @@ self.addEventListener("notificationclick", e => {
     const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     for (const c of wins) {
       if (new URL(c.url).origin !== self.location.origin) continue;
-      c.postMessage(resub ? { resubscribe: true } : { open: id });
+      c.postMessage(resub ? { resubscribe: true } : health ? { health: true } : { open: id });
       return c.focus();
     }
     return self.clients.openWindow(url);

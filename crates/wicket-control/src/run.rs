@@ -627,16 +627,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         l.set_run_owner(&run.0, &crate::owner::owner_label())?;
         l.audit(&m.tenant, Some(&run), "run.attach", &serde_json::json!({ "owner": crate::owner::owner_label(), "node": node_name }))?;
     }
-    // An installed service's zone is its instances' alone (#579): a run that names it would share
-    // its kept volumes (its cache's storage) and could rewrite what the service serves.
+    // An installed service's zone is its instances' alone (#579).
     if record.is_none() {
-        let l = ledger.lock().expect("ledger");
-        for (name, svc) in crate::services::installed(&l)? {
-            let ours = l.service_instance_of(&run.0)?.is_some_and(|i| i.service == name);
-            if svc.zone == m.zone.name && !ours {
-                bail!("zone {} is service {name}'s: only the instances wicket starts for it run in it", m.zone.name);
-            }
-        }
+        crate::serviceuse::check_zone(&ledger.lock().expect("ledger"), &m.zone.name, &run.0)?;
     }
     if record.is_none() {
         let l = ledger.lock().expect("ledger");

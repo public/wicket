@@ -109,7 +109,8 @@ fn reserved_env(k: &str) -> bool {
         || k.ends_with("_CERT")
         || k.ends_with("_CERTS")
         || k.starts_with("PYTHON")
-        || ["HOME", "PATH", "USER", "SHELL", "LOGNAME", "TMPDIR"].contains(&k.as_str())
+        || k.starts_with("CARGO_HTTP")
+        || ["HOME", "PATH", "USER", "SHELL", "LOGNAME", "TMPDIR", "BASH_ENV", "ENV"].contains(&k.as_str())
 }
 
 /// A service's name, as `zone.uses` names it and its users' host name (`<name>.wicket.internal`)
