@@ -1342,8 +1342,9 @@ impl Ledger {
     }
 
     /// The live grant that covers `op`, by the lookup [`Ledger::consume_grant`] uses, without
-    /// using it: for what an issued grant covers (the console, tests). A grant already handed to a
-    /// node isn't found: its uses are counted there.
+    /// using it: what an issued grant covers, egress grants included (which `consume_grant`
+    /// refuses). Tests across the crates read issuance with it; nothing in production decides by
+    /// it (#257). A grant already handed to a node isn't found: its uses are counted there.
     pub fn grant_covering(&self, op: &Op) -> Result<Option<String>> {
         let tx = self.conn.unchecked_transaction()?;
         let found = live_grant(&tx, &GrantMatch::for_op(op))?;
