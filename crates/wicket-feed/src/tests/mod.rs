@@ -8,6 +8,7 @@
 //! delta.
 
 mod attacks;
+mod checkpoints;
 mod fuzz;
 mod modes;
 mod persistence;
