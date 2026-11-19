@@ -282,6 +282,9 @@ struct State {
     sockets: Arc<Mutex<session::Sockets>>,
     /// Web Push to the operators' devices ([`push`]); None if its state couldn't be opened.
     push: Option<push::Push>,
+    /// The state store's sync and the audit export's progress (#635), as [`spawn_progress`] last
+    /// read them.
+    progress: Mutex<Option<crate::statesync::Progress>>,
 }
 
 impl State {
@@ -327,6 +330,7 @@ impl State {
             tickets: Mutex::new(HashMap::new()),
             sockets: Arc::new(Mutex::new(session::Sockets::default())),
             push,
+            progress: Mutex::new(None),
         }
     }
 }
@@ -388,6 +392,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     state.hsts = plan.hsts;
     state.limits.max_connections = plan.max_connections;
     let state = Arc::new(state);
+    spawn_progress(state.clone());
     spawn_notifier(state.clone());
     let listener = TcpListener::bind(plan.addr).await.with_context(|| format!("listening on {}", plan.addr))?;
     let resolver = Arc::new(tls::CertResolver::default());
@@ -1783,6 +1788,33 @@ fn waiting(state: &State) -> Result<Vec<push::Waiting>> {
 /// How often the notifier looks at the ledger for new requests.
 const NOTIFY_EVERY: Duration = Duration::from_secs(3);
 
+/// How often the state store's progress is read.
+const PROGRESS_EVERY: Duration = Duration::from_secs(3);
+
+/// Reads the state store's sync and the audit export's progress (#635) every [`PROGRESS_EVERY`], off
+/// the request path (configs, Litestream's socket, the ledger's cursors), for [`health_view`].
+fn spawn_progress(state: Arc<State>) {
+    tokio::spawn(async move {
+        loop {
+            let s = state.clone();
+            let _ = tokio::task::spawn_blocking(move || refresh_progress(&s, wicket_feed::now_ms())).await;
+            tokio::time::sleep(PROGRESS_EVERY).await;
+        }
+    });
+}
+
+/// One read of the progress into the cache.
+fn refresh_progress(state: &State, now_ms: i64) {
+    let p = match state.ledger() {
+        Ok(l) => crate::statesync::installed_progress(&l, &state.ledger, now_ms),
+        Err(e) => {
+            tracing::warn!("state store progress: reading the ledger: {e:#}");
+            return;
+        }
+    };
+    *state.progress.lock().unwrap_or_else(|e| e.into_inner()) = p;
+}
+
 /// Watches the ledger and pushes to subscribed devices when a new request is waiting. Pushes go
 /// only to devices of passkeys still enrolled.
 fn spawn_notifier(state: Arc<State>) {
@@ -1840,7 +1872,8 @@ fn health_view(state: &State, now_ms: i64) -> Result<(Value, Vec<crate::health::
     }
     let disk = crate::health::disk(&state.data);
     alerts.extend(crate::health::disk_alerts("control", "the control host", &disk));
-    let store = crate::statesync::installed_progress(&l, &state.ledger, now_ms).map_or(Value::Null, |p| json!(p));
+    // Read in the background ([`spawn_progress`]): a request never waits on Litestream's socket.
+    let store = state.progress.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(Value::Null, |p| json!(p));
     Ok((
         json!({ "nodes": nodes, "control_disk_pct": disk.used_pct().round(), "state_store": store,
                 "alerts": alerts.iter().map(|a| a.text.clone()).collect::<Vec<_>>() }),
@@ -2125,8 +2158,15 @@ mod tests {
         let a = &v["audit"][0];
         assert_eq!((a["sink"].as_str(), a["kind"].as_str(), a["seq"].as_i64()), (Some("store"), Some("store"), Some(0)));
         assert!(a["behind"].as_i64().unwrap() >= 1 && a["behind"] == a["head"], "{a}");
-        let v = json!(crate::statesync::progress(&l, &t.state.ledger, Err(anyhow::anyhow!("bad yaml")), Ok(None), now_ms));
-        assert_eq!(v["errors"], json!(["state-store.yaml: bad yaml"]));
+        let v = json!(crate::statesync::progress(&l, &t.state.ledger, Err(anyhow::anyhow!("token: s3cr3t")), Ok(None), now_ms));
+        assert_eq!(v["errors"], json!(["state-store.yaml can't be read: `wicket state check` says why"]), "no value quoted");
+        // The dashboard serves what the background read last cached.
+        assert_eq!(dashboard(&t.state).unwrap()["health"]["state_store"], Value::Null, "nothing read yet");
+        *t.state.progress.lock().unwrap() = crate::statesync::progress(&l, &t.state.ledger, Ok(None), Err(anyhow::anyhow!("x")), now_ms);
+        assert_eq!(
+            dashboard(&t.state).unwrap()["health"]["state_store"]["errors"][0],
+            "audit-sinks.yaml can't be read: `wicket audit export --status` says why"
+        );
     }
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {

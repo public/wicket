@@ -573,6 +573,31 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(hs[2].children.length, 1, "no error, no line");
   assert.strictEqual(hs[3].textContent, "! audit-sinks.yaml: bad");
   assert.strictEqual(hs[4].className, "empty", "then the nodes");
+  // Streaming: no mark, and an error from before the last sync isn't shown; one since is.
+  const streaming = (error_ms) => ({ ...base, now: nowS, pending: [], health: { nodes: [], state_store: {
+    stream: { endpoint: "https://s3.example.com", bucket: "b-1", state: "streaming", last_sync_ms: (nowS - 2) * 1000, behind_secs: 2, error: "old trouble", error_ms },
+    audit: [], errors: [] } } });
+  state = streaming((nowS - 600) * 1000);
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
+  assert.ok(ids.health.children[0].children[0].textContent.endsWith("ledger streaming \u00b7 last sync 2 s ago"));
+  assert.strictEqual(ids.health.children[0].children.length, 1, "an error recovered from isn't shown");
+  state = streaming((nowS - 1) * 1000);
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.health.children[0].children[1].textContent, "! last error 1 s ago: old trouble", "one after the last sync is");
+  // Starting: pending, saying how long it has had no sync.
+  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: {
+    stream: { endpoint: "https://s3.example.com", bucket: "b-1", state: "starting", last_sync_ms: null, behind_secs: 12, error: null, error_ms: null }, audit: [], errors: [] } } };
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.health.children[0].children[0].children[1].className, "pend");
+  assert.ok(ids.health.children[0].children[0].textContent.endsWith("ledger starting \u00b7 no sync yet in 12 s"));
+  // Sinks only (no state store): a row per sink and no state store row; a manual sink behind isn't marked.
+  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, errors: [],
+    audit: [{ sink: "stdout", kind: "jsonl", seq: 3, head: 9, behind: 6, behind_secs: 4000, checkpoint_at: 0, error: null, manual: true }] } } };
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.health.children.length, 2, "the sink's row, then the nodes");
+  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Audit export stdout (jsonl)6 records behind (oldest 66 min) (manual: fed only by `wicket audit export`)"), ids.health.children[0].textContent);
+  assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
   // One poll at a time (B9): a second asked for while one is in flight runs after it, not beside it.
   let inFlight = 0, most = 0;
   const realFetch = sandbox.fetch;

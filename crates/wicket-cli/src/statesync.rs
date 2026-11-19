@@ -64,7 +64,7 @@ impl StreamLog {
     /// Records `error` at `at_ms`, keeping the rest.
     pub fn record_error(db: &Path, error: &str, at_ms: i64) {
         let mut l = StreamLog::read(db);
-        l.error = Some(wicket_core::text::clip(error, 500));
+        l.error = Some(wicket_core::text::clip(&wicket_core::text::redact_urls(error), 500));
         l.error_ms = at_ms;
         if let Err(e) = l.write(db) {
             eprintln!("[wicket] recording the stream's error: {e:#}");
@@ -176,7 +176,7 @@ pub fn status_of(s: &StateStore, db: &Path, now_ms: i64) -> Result<StreamStatus>
     let lag_secs = LAG_SECS.max(10 * interval);
     let log = StreamLog::read(db);
     let mut st = StreamStatus {
-        endpoint: c.endpoint.clone(),
+        endpoint: c.shown_endpoint(),
         bucket: c.bucket.clone(),
         lineage: log.lineage.clone(),
         state: StreamState::Stopped,
@@ -264,7 +264,8 @@ pub struct Progress {
     pub stream: Option<StreamStatus>,
     /// Every audit sink against the chain head.
     pub audit: Vec<crate::audit_export::SinkStatus>,
-    /// What couldn't be read (a config that doesn't parse, say).
+    /// What couldn't be read. These name the file and the command that says more, never the
+    /// file's values (an error can quote one, and these reach the console and its pushes).
     pub errors: Vec<String>,
 }
 
@@ -279,23 +280,23 @@ pub fn progress(
 ) -> Option<Progress> {
     let mut errors = Vec::new();
     let stream = match store {
-        Ok(Some(s)) if s.ledger.is_some() => {
-            status_of(&s, ledger, now_ms).map_err(|e| errors.push(format!("the ledger stream: {e:#}"))).ok()
-        }
+        Ok(Some(s)) if s.ledger.is_some() => status_of(&s, ledger, now_ms)
+            .map_err(|_| errors.push("the ledger stream can't be read: `wicket state check` says why".into()))
+            .ok(),
         Ok(_) => None,
-        Err(e) => {
-            errors.push(format!("state-store.yaml: {e:#}"));
+        Err(_) => {
+            errors.push("state-store.yaml can't be read: `wicket state check` says why".into());
             None
         }
     };
     let audit = match sinks {
-        Ok(Some(c)) => crate::audit_export::status(l, &c, now_ms / 1000).unwrap_or_else(|e| {
-            errors.push(format!("the audit export: {e:#}"));
+        Ok(Some(c)) => crate::audit_export::status(l, &c, now_ms / 1000).unwrap_or_else(|_| {
+            errors.push("the audit export's cursors can't be read: `wicket audit export --status` says why".into());
             vec![]
         }),
         Ok(None) => vec![],
-        Err(e) => {
-            errors.push(format!("audit-sinks.yaml: {e:#}"));
+        Err(_) => {
+            errors.push("audit-sinks.yaml can't be read: `wicket audit export --status` says why".into());
             vec![]
         }
     };

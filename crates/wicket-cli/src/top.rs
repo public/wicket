@@ -440,7 +440,7 @@ fn progress_lines(p: &crate::statesync::Progress, now_ms: i64) -> Vec<String> {
         let state =
             if st.state == crate::statesync::StreamState::Streaming { "streaming".into() } else { st.state.as_str().to_uppercase() };
         out.push(format!("ledger stream   {state}{at}"));
-        if st.state != crate::statesync::StreamState::Streaming {
+        if st.state != crate::statesync::StreamState::Streaming || st.error_ms > st.last_sync_ms {
             if let Some(e) = &st.error {
                 errs.push(format!("ledger stream: {}", clean(e, 300)));
             }
@@ -455,6 +455,7 @@ fn progress_lines(p: &crate::statesync::Progress, now_ms: i64) -> Vec<String> {
             0 => "never".to_string(),
             t => format!("{} ago", ago(t * 1000)),
         };
+        let behind = if s.manual { format!("{behind} (manual)") } else { behind };
         out.push(format!("audit {:<9} {behind}, checkpoint {cp}", cut(&clean(&s.sink, 64), 9)));
         if let Some(e) = &s.error {
             errs.push(format!("audit sink {}: {}", clean(&s.sink, 64), clean(e, 300)));
@@ -979,6 +980,7 @@ mod tests {
                     checkpoint_at: NOW / 1000 - 900,
                     holder: None,
                     error: Some("PUT: connection refused".into()),
+                    manual: false,
                 },
                 crate::audit_export::SinkStatus {
                     sink: "collector".into(),
@@ -990,6 +992,7 @@ mod tests {
                     checkpoint_at: NOW / 1000 - 120,
                     holder: Some("serve".into()),
                     error: None,
+                    manual: false,
                 },
             ],
             errors: vec![],

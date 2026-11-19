@@ -473,13 +473,18 @@ function stateStoreRows(p, nowMs) {
     if (st.last_sync_ms) text += " \u00b7 last sync " + secs((nowMs - st.last_sync_ms) / 1000) + " ago";
     else if (st.behind_secs !== null && st.behind_secs !== undefined) text += " \u00b7 no sync yet in " + secs(st.behind_secs);
     const cls = st.state === "streaming" ? "" : st.state === "starting" ? "pend" : "blocked";
-    const err = st.error ? "last error" + (st.error_ms ? " " + secs((nowMs - st.error_ms) / 1000) + " ago" : "") + ": " + strip(st.error) : null;
+    // An error is shown while the stream isn't streaming, or if it came after the last sync: an
+    // old one, recovered from, isn't news.
+    const live = st.error && (st.state !== "streaming" || (st.error_ms || 0) > (st.last_sync_ms || 0));
+    const err = live ? "last error" + (st.error_ms ? " " + secs((nowMs - st.error_ms) / 1000) + " ago" : "") + ": " + strip(st.error) : null;
     out.push(row("State store", cls, text, err));
   }
   for (const a of p.audit || []) {
     let text = a.behind ? a.behind + " record" + (a.behind === 1 ? "" : "s") + " behind (oldest " + secs(a.behind_secs) + ")" : "caught up";
+    // A jsonl sink to stdout is fed only by `wicket audit export` in the foreground: behind is expected.
+    if (a.manual) text += " (manual: fed only by `wicket audit export`)";
     text += " at " + a.seq + " of " + a.head + " \u00b7 last checkpoint " + (a.checkpoint_at ? secs(nowMs / 1000 - a.checkpoint_at) + " ago" : "never");
-    out.push(row("Audit export " + strip(a.sink) + " (" + strip(a.kind) + ")", a.error ? "blocked" : a.behind ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
+    out.push(row("Audit export " + strip(a.sink) + " (" + strip(a.kind) + ")", a.error ? "blocked" : a.behind && !a.manual ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
   }
   for (const e of p.errors || []) out.push(el("div", "blocked", "! " + strip(e)));
   return out;

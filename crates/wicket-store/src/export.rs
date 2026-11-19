@@ -101,6 +101,29 @@ impl Ledger {
         )?)
     }
 
+    /// `sink`'s position, read only: a sink with no row yet is at 0 (status views read this on
+    /// every poll and shouldn't write).
+    pub fn peek_export_cursor(&self, sink: &str) -> Result<ExportCursor> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sink, seq, checkpoint_at, holder, lease_until, error FROM audit_export WHERE sink = ?1",
+                params![sink],
+                |r| {
+                    Ok(ExportCursor {
+                        sink: r.get(0)?,
+                        seq: r.get(1)?,
+                        checkpoint_at: r.get(2)?,
+                        holder: r.get(3)?,
+                        lease_until: r.get(4)?,
+                        error: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or(ExportCursor { sink: sink.into(), seq: 0, checkpoint_at: 0, holder: None, lease_until: 0, error: None }))
+    }
+
     /// The newest record: (seq, hash).
     pub fn audit_head(&self) -> Result<Option<(i64, String)>> {
         Ok(self.conn.query_row("SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
@@ -213,6 +236,16 @@ mod tests {
         assert_eq!(l.export_cursor("s").unwrap().error.as_deref(), Some("connection refused"));
         l.advance_export("s", 11).unwrap();
         assert_eq!(l.export_cursor("s").unwrap().error, None);
+    }
+
+    #[test]
+    fn a_peek_writes_nothing() {
+        let l = Ledger::open_in_memory().unwrap();
+        assert_eq!(l.peek_export_cursor("new").unwrap().seq, 0);
+        let rows: i64 = l.conn.query_row("SELECT COUNT(*) FROM audit_export", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0, "no row made");
+        l.advance_export("new", 4).unwrap();
+        assert_eq!(l.peek_export_cursor("new").unwrap(), l.export_cursor("new").unwrap());
     }
 
     #[test]
