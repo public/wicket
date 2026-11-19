@@ -47,6 +47,7 @@ mod rootcopy;
 mod serve;
 mod session;
 mod state;
+mod statesync;
 mod top;
 mod units;
 mod update;
