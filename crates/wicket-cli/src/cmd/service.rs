@@ -12,28 +12,55 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     match cmd {
         ServiceCmd::Add { manifest } => {
-            let path = std::fs::canonicalize(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
-            let m = wicket_core::Manifest::from_yaml(&std::fs::read_to_string(&path)?)?;
-            let s = m.service.as_ref().context("this manifest has no service: section: it is not a per-node service")?;
-            let name = &m.program.as_ref().context("a service is a program")?.name;
-            wicket_core::service::check_name(name).map_err(anyhow::Error::msg)?;
-            l.add_service(name, &path.display().to_string(), &operator())?;
-            l.audit(
-                &m.tenant,
-                None,
-                "service.added",
-                &serde_json::json!({ "name": name, "manifest": path.display().to_string(), "tenancy": s.tenancy, "port": s.port, "by": operator() }),
-            )?;
+            // A snapshot wicket owns: what starts from now on, whatever happens to `manifest`.
+            let snap = wicket_control::services::snapshot(&manifest, &data_dir())?;
+            let m = &snap.manifest;
+            let s = m.service.as_ref().expect("a snapshot is a service");
+            let name = &m.program.as_ref().expect("a service is a program").name;
+            let by = operator();
+            // The row and its audit record in one transaction: both, or neither.
+            l.immediate::<_, anyhow::Error>(|l| {
+                let replaced = l.add_service(name, &snap.path.display().to_string(), &snap.sha256, &m.tenant.0, &by)?;
+                l.audit(
+                    &m.tenant,
+                    None,
+                    "service.added",
+                    &serde_json::json!({
+                        "name": name, "from": manifest.display().to_string(), "snapshot": snap.path.display().to_string(),
+                        "sha256": snap.sha256, "replaced": replaced, "tenancy": s.tenancy, "public_only": s.public_only,
+                        "port": s.port, "reach": m.zone.reach, "env": s.env, "by": by,
+                    }),
+                )?;
+                Ok(())
+            })?;
             println!(
-                "service {name} installed: one instance {} on each node whose boxes use it (zone.uses: [{name}]), started by wicket reconcile",
+                "service {name} installed from a snapshot ({}, sha256 {}): one instance {} on each node whose boxes use it \
+                 (zone.uses: [{name}]), started by wicket reconcile. Changing it takes another wicket service add.",
+                snap.path.display(),
+                &snap.sha256[..12],
                 if s.tenancy == wicket_core::service::Tenancy::Shared { "shared by every tenant" } else { "per tenant" }
             );
             Ok(())
         }
         ServiceCmd::Remove { name } => {
-            anyhow::ensure!(l.remove_service(&name)?, "no service {name} is installed");
-            l.audit(&wicket_core::TenantId::single(), None, "service.removed", &serde_json::json!({ "name": name, "by": operator() }))?;
-            println!("service {name} removed: no new instance starts; running ones end with their runs");
+            let row = l.services()?.into_iter().find(|s| s.name == name).with_context(|| format!("no service {name} is installed"))?;
+            // Its instances stop now (their runs are revoked), then the row goes, audited.
+            let live: Vec<_> = l.live_service_instances()?.into_iter().filter(|i| i.service == name).collect();
+            for i in &live {
+                wicket_control::services::stop(&l, i, "its service was removed")?;
+            }
+            let tenant = wicket_core::TenantId(row.tenant.clone());
+            l.immediate::<_, anyhow::Error>(|l| {
+                l.remove_service(&name)?;
+                l.audit(
+                    &tenant,
+                    None,
+                    "service.removed",
+                    &serde_json::json!({ "name": name, "sha256": row.sha256, "stopped": live.iter().map(|i| &i.run).collect::<Vec<_>>(), "by": operator() }),
+                )?;
+                Ok(())
+            })?;
+            println!("service {name} removed: {} instance(s) stopped, and no new one starts", live.len());
             Ok(())
         }
         ServiceCmd::List => {
@@ -42,7 +69,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 println!("no services installed (wicket service add <manifest>)");
             }
             for s in services {
-                println!("{}  {}  (added by {})", s.name, s.manifest, s.added_by);
+                println!("{}  sha256 {}  {}  (added by {})", s.name, &s.sha256[..s.sha256.len().min(12)], s.manifest, s.added_by);
             }
             Ok(())
         }
@@ -51,10 +78,11 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
 
 #[derive(Subcommand)]
 pub enum ServiceCmd {
-    /// Install a per-node service: a program manifest with a `service:` section. Its manifest is
-    /// read where it is, at each start: keep it there.
+    /// Install a per-node service: a program manifest with a `service:` section. Its manifest and
+    /// source are copied into wicket's data directory and pinned: what was there when it was added
+    /// is what runs. Adding again replaces it (audited).
     Add { manifest: PathBuf },
-    /// Uninstall one: no new instance starts.
+    /// Uninstall one: its instances stop, and no new one starts.
     Remove { name: String },
     /// The installed services.
     List,

@@ -188,44 +188,104 @@ async fn connect_inner(ctx: &RunCtx, target: &str, port: Option<u64>) -> Result<
     open(ctx, ops, &me, &t, port, d, &wanted).await
 }
 
-/// A box's `uses: [service]` (#579 step 3): it reaches the service's instance on its own node at
-/// `<service>.wicket.internal:<port>`. Not a tool: wicket opens it for the box once it has started.
-/// The target is the instance wicket started for that service on this box's node, for its tenant
-/// (or the shared one), found in the ledger, never by a name a box exposed. Using a service is
-/// having its reach: the link needs a human unless this zone's reach covers the service's.
-pub async fn use_service(ctx: &RunCtx, service: &str, port: u16) -> Reply {
-    match use_service_inner(ctx, service, port).await {
-        Ok(s) => (s, false),
-        Err(e) => (format!("not linked: {e}"), true),
+/// What became of a box's use of a service (#579 step 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UseOutcome {
+    /// Linked (or already): what the box reaches, as `connect` says it.
+    Linked(String),
+    /// Not yet: no instance runs on the box's node, or it hasn't registered or exposed its port.
+    /// Worth trying again shortly.
+    Waiting(String),
+    /// The link needs a human: request `request` is filed (or pending). Try again once it's
+    /// granted.
+    Approval { request: String, text: String },
+    /// Never, as things are: said why.
+    Refused(String),
+}
+
+/// What `use_service` needs to know of the service, from its installed snapshot.
+#[derive(Clone, Debug)]
+pub struct ServiceRef<'a> {
+    pub name: &'a str,
+    pub port: u16,
+    pub shared: bool,
+    /// The snapshot's zone and program: the instance's identity must say these.
+    pub zone: &'a str,
+    pub program: &'a str,
+}
+
+/// The run of `svc`'s live instance on `node` for `tenant` (or the shared one, only for a shared
+/// service), as wicket recorded starting it, and checked to be that service's: its identity's zone
+/// and agent are the snapshot's. Ok(None): none yet.
+pub fn instance_for(l: &wicket_store::Ledger, svc: &ServiceRef<'_>, node: &str, tenant: &str) -> Result<Option<String>, String> {
+    let tenant = if svc.shared { wicket_store::SHARED_TENANT } else { tenant };
+    let live = l.service_instances(svc.name, node, tenant).map_err(|e| e.to_string())?.into_iter().find(|i| i.live);
+    let Some(i) = live else { return Ok(None) };
+    match l.identity(&i.run).map_err(|e| e.to_string())? {
+        // Started, not registered yet: wait for it.
+        None => Ok(None),
+        Some(id) if id.zone == svc.zone && id.agent == svc.program => Ok(Some(i.run)),
+        Some(id) => Err(format!(
+            "the run recorded as {}'s instance ({}) is zone {} / {}, not the service's {} / {}",
+            svc.name, i.run, id.zone, id.agent, svc.zone, svc.program
+        )),
     }
 }
 
-async fn use_service_inner(ctx: &RunCtx, service: &str, port: u16) -> Result<String, String> {
-    if !ctx.zone.uses.iter().any(|u| u == service) {
-        return Err(format!("zone {} doesn't use {service}", ctx.zone.name));
+/// A box's `uses: [service]` (#579 step 3): it reaches the service's instance on its own node at
+/// `<service>.wicket.internal:<port>`. Not a tool: wicket opens it for the box once it has started.
+/// The target is the instance wicket started for that service on this box's node, for its tenant
+/// (or the shared one, for a shared service), found in the ledger and checked against the service's
+/// snapshot, never by a name a box exposed. Using a service is having its reach: the link needs a
+/// human unless this zone's reach covers the service's.
+pub async fn use_service(ctx: &RunCtx, svc: &ServiceRef<'_>) -> UseOutcome {
+    if !ctx.zone.uses.iter().any(|u| u == svc.name) {
+        return UseOutcome::Refused(format!("zone {} doesn't use {}", ctx.zone.name, svc.name));
     }
-    let ops = ctx.boxes.clone().ok_or("links need a box wicket runs on a node (this one can't link)")?;
-    let (node, instance) = {
+    let Some(ops) = ctx.boxes.clone() else { return UseOutcome::Refused("links need a box wicket runs on a node".into()) };
+    let (node, to) = {
         let l = ledger(ctx);
-        let node = l.run_node(&ctx.run.0).map_err(|e| e.to_string())?.unwrap_or_else(|| "local".into());
-        let mut found = None;
-        for tenant in [ctx.tenant.0.as_str(), wicket_store::SHARED_TENANT] {
-            let live = l.service_instances(service, &node, tenant).map_err(|e| e.to_string())?.into_iter().find(|i| i.live);
-            if let Some(i) = live {
-                found = Some(i.run);
-                break;
-            }
+        let node = match l.run_node(&ctx.run.0) {
+            Ok(n) => n.unwrap_or_else(|| "local".into()),
+            Err(e) => return UseOutcome::Waiting(e.to_string()),
+        };
+        match instance_for(&l, svc, &node, &ctx.tenant.0) {
+            Ok(Some(run)) => (node, run),
+            Ok(None) => return UseOutcome::Waiting(format!("no instance of {} runs on node {node} yet", svc.name)),
+            Err(e) => return UseOutcome::Refused(e),
         }
-        (node, found)
     };
-    let to = instance.ok_or_else(|| format!("no instance of {service} runs on node {node} yet"))?;
-    let (me, _) = end_info(ctx, &*ops, &ctx.run.0, None)?;
-    let (t, exposed) = end_info(ctx, &*ops, &to, Some(port))?;
+    let me = match end_info(ctx, &*ops, &ctx.run.0, None) {
+        Ok((me, _)) => me,
+        Err(e) => return UseOutcome::Waiting(e),
+    };
+    let (t, exposed) = match end_info(ctx, &*ops, &to, Some(svc.port)) {
+        Ok(x) => x,
+        // Registered but not running yet, or in between: not a reason to give up.
+        Err(e) => return UseOutcome::Waiting(e),
+    };
     if exposed.is_none() {
-        return Err(format!("{service}'s instance {to} on node {node} hasn't exposed port {port} yet"));
+        return UseOutcome::Waiting(format!("{}'s instance {to} on node {node} hasn't exposed port {} yet", svc.name, svc.port));
     }
-    let d = policy::connect_service(&me.end(), &t.end())?;
-    open(ctx, ops, &me, &t, port, d, service).await
+    let d = match policy::connect_service(&me.end(), &t.end()) {
+        Ok(d) => d,
+        Err(e) => return UseOutcome::Refused(e),
+    };
+    let needs_human = !d.allowed();
+    match open(ctx, ops, &me, &t, svc.port, d, svc.name).await {
+        Err(e) => UseOutcome::Refused(e),
+        Ok(text) => match text.split_whitespace().skip_while(|w| *w != "request").nth(1) {
+            Some(r) if needs_human && !text.starts_with("linked") && !text.starts_with("already linked") => {
+                UseOutcome::Approval { request: r.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-').to_string(), text }
+            }
+            // The name a link gets is unique per box: one other than the service's would leave its
+            // users' environment pointing at nothing.
+            _ if !text.contains(&format!("{}.{}", svc.name, policy::DOMAIN)) => {
+                UseOutcome::Refused(format!("linked under another name than {}: {text}", svc.name))
+            }
+            _ => UseOutcome::Linked(text),
+        },
+    }
 }
 
 /// `link(from, to, port)`: the caller, controlling both ends, lets `from` reach `port` of `to`.
@@ -564,6 +624,47 @@ async fn pipe(s: Stream, st: Stream) {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// #579's review: a box is linked only to the instance wicket started for the service, on the
+    /// box's node, for its tenant (the shared one only for a shared service), and only once the
+    /// instance's identity says it is the service (its snapshot's zone and program).
+    #[test]
+    fn a_service_instance_is_found_by_the_ledger_and_checked_to_be_the_service() {
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        let svc = ServiceRef { name: "npm-cache", port: 4873, shared: false, zone: "npm-cache", program: "npm-cache" };
+        let t = wicket_core::TenantId::single();
+        let id = |run: &str, zone: &str, agent: &str| wicket_store::IdentityRow {
+            run: run.into(),
+            tenant: "t0".into(),
+            spiffe_id: format!("spiffe://x/{run}"),
+            zone: zone.into(),
+            agent: agent.into(),
+            parent_run: None,
+            accept_from: vec![],
+            jws: "x".into(),
+            issued_at: 1,
+        };
+        assert_eq!(instance_for(&l, &svc, "n1", "t0"), Ok(None), "no instance");
+        l.record_service_instance("run_svc", "npm-cache", "n1", "t0", "aa", wicket_store::now()).unwrap();
+        assert_eq!(instance_for(&l, &svc, "n1", "t0"), Ok(None), "recorded, not registered yet: wait");
+        l.run_started(&t, &wicket_core::RunId("run_svc".into()), "npm-cache", "npm-cache").unwrap();
+        l.put_identity(&id("run_svc", "npm-cache", "npm-cache")).unwrap();
+        assert_eq!(instance_for(&l, &svc, "n1", "t0"), Ok(Some("run_svc".into())));
+        assert_eq!(instance_for(&l, &svc, "n2", "t0"), Ok(None), "another node's box");
+        assert_eq!(instance_for(&l, &svc, "n1", "t1"), Ok(None), "another tenant's box");
+        // A shared instance serves only a shared service.
+        l.record_service_instance("run_shared", "npm-cache", "n2", wicket_store::SHARED_TENANT, "aa", wicket_store::now()).unwrap();
+        l.run_started(&t, &wicket_core::RunId("run_shared".into()), "npm-cache", "npm-cache").unwrap();
+        l.put_identity(&id("run_shared", "npm-cache", "npm-cache")).unwrap();
+        assert_eq!(instance_for(&l, &svc, "n2", "t0"), Ok(None), "per tenant: the shared one isn't it");
+        let shared = ServiceRef { shared: true, ..svc.clone() };
+        assert_eq!(instance_for(&l, &shared, "n2", "t0"), Ok(Some("run_shared".into())));
+        // A recorded instance whose identity is another zone's isn't the service.
+        l.record_service_instance("run_odd", "npm-cache", "n3", "t0", "aa", wicket_store::now()).unwrap();
+        l.run_started(&t, &wicket_core::RunId("run_odd".into()), "build", "build").unwrap();
+        l.put_identity(&id("run_odd", "build", "build")).unwrap();
+        assert!(instance_for(&l, &svc, "n3", "t0").unwrap_err().contains("not the service's"));
+    }
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::Duration;

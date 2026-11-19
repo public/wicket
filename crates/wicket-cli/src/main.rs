@@ -117,6 +117,8 @@ enum Cmd {
         #[arg(long, hide = true)]
         run_id: Option<String>,
     },
+    /// Open a running agent's session in this terminal: watch it, and send it prompts.
+    ///
     /// Open a running agent's session in this terminal, as its operator: what it says and does, live.
     /// An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's
     /// messages, tool calls and turn ends. Each line typed is a prompt, the agent's next turn; `/stop`
@@ -134,6 +136,8 @@ enum Cmd {
         #[arg(long)]
         timeout: Option<u64>,
     },
+    /// Hibernate a long-lived agent at its next quiet point.
+    ///
     /// Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended
     /// and nothing but the agent runs in its box. What else runs is stopped after the zone's
     /// limits.exit_grace.
@@ -154,7 +158,12 @@ enum Cmd {
         /// What woke it (recorded and told to the agent).
         #[arg(long, hide = true)]
         by: Option<String>,
+        /// How long to wait in the queue when no node may take it now (#579); 0: fail at once.
+        #[arg(long, default_value = "30m")]
+        wait: String,
     },
+    /// A live view of nodes, runs, pending requests and leases (read-only).
+    ///
     /// A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes,
     /// what their boxes are given), runs (node, agent, status, uptime, model usage), pending
     /// requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`.
@@ -172,6 +181,8 @@ enum Cmd {
     /// still running on its node.
     #[command(hide = true)]
     Attach { run: String },
+    /// Run an agent command line that another program launches, inside a wicket box.
+    ///
     /// Run an agent command line that another program launches, inside a wicket box: the harness's
     /// wrapped mode (e.g. its Remote Control sessions' process wrapper). Its stdin and stdout stay connected to the
     /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
@@ -185,6 +196,8 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
+    /// List pending requests: what boxes asked for, waiting for a decision.
+    ///
     /// List pending requests: what boxes asked for that their zones don't allow, waiting for a grant
     /// or a denial.
     Pending,
@@ -253,6 +266,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
+    /// Build the agent image.
+    ///
     /// Build the agent image (the image directory plus the in-box forwarder's source, compiled in the
     /// build). Without --dir, from the copy embedded in this binary, so the image matches it.
     #[command(args_conflicts_with_subcommands = true)]
@@ -269,6 +284,8 @@ enum Cmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Serve the operator console.
+    ///
     /// Serve the operator console (runs, approvals, activity; start, steer and revoke runs). Plain
     /// HTTP on loopback by default; any other address needs HTTPS (--acme-domain, or --tls-cert and
     /// --tls-key) or --behind-tls-terminator.
@@ -290,28 +307,38 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OperatorCmd,
     },
+    /// Agent identities: the issuer's public key, and verified identity documents.
+    ///
     /// Agent identities (design §3.2): the issuer's public key, and verified identity documents.
     Identity {
         #[command(subcommand)]
         cmd: IdentityCmd,
     },
+    /// The installation's org policy (Cedar): a ceiling and forbids over every zone.
+    ///
     /// The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled
     /// into each box's token when it is minted.
     Policy {
         #[command(subcommand)]
         cmd: PolicyCmd,
     },
+    /// Control-plane state off this host: the state store, the recovery kit, a restore.
+    ///
     /// Control-plane state off this host (#154): the state store, the ledger's stream, the recovery
     /// kit and a restore onto a standby.
     State {
         #[command(subcommand)]
         cmd: StateCmd,
     },
+    /// The installation's root keys.
+    ///
     /// The installation's root keys (#154).
     Keys {
         #[command(subcommand)]
         cmd: KeysCmd,
     },
+    /// Make what exists agree with the ledger: runs, leases, machines and boxes.
+    ///
     /// Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past
     /// their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again
     /// right before each destroy), adopt or create the ones leases need, and stop boxes whose run has
@@ -324,12 +351,16 @@ enum Cmd {
         #[arg(long)]
         every: Option<String>,
     },
+    /// Capacity leases: the nodes agents asked for.
+    ///
     /// Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the
     /// request with `wicket approve`/`deny` (see `wicket pending`).
     Lease {
         #[command(subcommand)]
         cmd: LeaseCmd,
     },
+    /// How a manifest's zone treats each host it reaches: inspected or spliced, and why.
+    ///
     /// The zone view of a manifest: for each host its reach names, whether the egress proxy inspects
     /// it (terminates TLS and decides every request) or splices it through (decides on the hostname,
     /// relays the encrypted bytes), and why (#62).
@@ -364,6 +395,8 @@ enum Cmd {
         #[arg(long, default_value_t = 600, requires = "invariants")]
         lease_grace: i64,
     },
+    /// Nodes, the machines that run boxes: leased from a provider, or your own.
+    ///
     /// Nodes (#16, #37), machines that run boxes: leased from a provider (create, release, plans) or
     /// your own (one-time join tokens, enrolment with a pinned ssh host key, a node key and a
     /// name-constrained node CA); listing with leases and cost, revoking, renewing the CA.
@@ -376,6 +409,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DevCmd,
     },
+    /// Update this installation to another wicket build, with a health gate and rollback.
+    ///
     /// Update this installation to another wicket build (#162): blue/green, with a health gate and
     /// automatic rollback, on the control host and then its nodes. Only artifacts signed by a
     /// release key this installation trusts, or whose sha256 an operator approved (an agent's
@@ -385,6 +420,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SelfCmd,
     },
+    /// wicketd: serve other users' commands over a unix socket, as the policy allows.
+    ///
     /// wicketd (#12): run as the wicket system user and serve other users' commands over a unix
     /// socket, letting each caller do what the policy grants its uid (from SO_PEERCRED). Approving,
     /// denying and other privileged commands need root over the socket, or a passkey in the console.

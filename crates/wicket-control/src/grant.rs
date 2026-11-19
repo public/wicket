@@ -207,6 +207,11 @@ pub enum Decided {
 /// refused, and the refusal is on the audit record (`decision.refused`) with who tried and why.
 pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_json::Value) -> Result<Decided> {
     let mut extra = if extra.is_null() { serde_json::json!({}) } else { extra };
+    // A decision on a request that doesn't exist (a mistyped id) is no decision: said as such, and
+    // nothing is audited. Only a decision someone may not make is a refusal (#574).
+    if !matches!(v, Verdict::Renew(_)) {
+        l.request(id)?;
+    }
     if let Err(why) = bounds(by, v) {
         return Err(refused(l, by, id, v, why));
     }
@@ -871,6 +876,19 @@ mod tests {
 
     fn decisions(l: &Ledger) -> Vec<serde_json::Value> {
         l.audit_tail(50).unwrap().into_iter().filter(|r| r.2 == "decision").map(|r| serde_json::from_str(&r.4).unwrap()).collect()
+    }
+
+    /// #574: approving or denying a request that doesn't exist (a mistyped id) says so, and is no
+    /// refusal: nothing is audited.
+    #[test]
+    fn a_decision_on_an_unknown_request_says_so_and_audits_nothing() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let by = human("alice@cli");
+        for v in [Verdict::Deny, Verdict::Approve(terms(600))] {
+            let e = decide(&mut l, &by, "r-nope", &v, serde_json::json!({})).unwrap_err();
+            assert_eq!(format!("{e:#}"), "no such request r-nope");
+        }
+        assert!(refusals(&l).is_empty(), "{:?}", refusals(&l));
     }
 
     /// #369: a decision is made on the effect the decider was shown: its descriptor is on the grant

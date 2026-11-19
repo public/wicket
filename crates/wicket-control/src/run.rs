@@ -627,6 +627,17 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         l.set_run_owner(&run.0, &crate::owner::owner_label())?;
         l.audit(&m.tenant, Some(&run), "run.attach", &serde_json::json!({ "owner": crate::owner::owner_label(), "node": node_name }))?;
     }
+    // An installed service's zone is its instances' alone (#579): a run that names it would share
+    // its kept volumes (its cache's storage) and could rewrite what the service serves.
+    if record.is_none() {
+        let l = ledger.lock().expect("ledger");
+        for (name, svc) in crate::services::installed(&l)? {
+            let ours = l.service_instance_of(&run.0)?.is_some_and(|i| i.service == name);
+            if svc.zone == m.zone.name && !ours {
+                bail!("zone {} is service {name}'s: only the instances wicket starts for it run in it", m.zone.name);
+            }
+        }
+    }
     if record.is_none() {
         let l = ledger.lock().expect("ledger");
         l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
@@ -1111,7 +1122,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         image: image.to_string(),
         isolation: m.zone.isolation,
         mounts: vec![],
-        env: plan.env.into_iter().chain(crate::services::user_env(&ledger.lock().expect("ledger"), &m.zone.uses)).collect(),
+        env: plan.env.into_iter().chain(crate::serviceuse::user_env(&ledger.lock().expect("ledger"), &m.zone.uses)).collect(),
         argv: plan.argv,
         // In bytes, as the subset check read it, so Docker can't read the limit differently (#126).
         memory: m.zone.limits.memory_bytes().context("limits.memory is unreadable")?.to_string(),
@@ -1299,6 +1310,31 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             memory_advice: m.zone.limits.memory_advice().map(str::to_string),
             volume_life: Some(crate::chan::VolumeLife::of(&m)),
         };
+        // #579: a node named for the box (`--node`, a lease's) passes placement's filters too, and
+        // its room is reserved, when its last report says what room it has. A wake has reserved
+        // already; a re-attach has its box.
+        if node.is_some() && record.is_none() {
+            let l = ledger.lock().expect("ledger");
+            if l.placement(&run.0)?.is_none() {
+                let now = wicket_feed::now_ms();
+                let (found, _) = crate::hibernate::from_index(std::slice::from_ref(&node_name), &l.node_health()?, now);
+                if !found.is_empty() {
+                    let req = wicket_placement::schedule::Request::of(&m);
+                    let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
+                    let d = crate::hibernate::bind(&l, &run, &crate::hibernate::Waiting { req, need }, &found, None, now, false)?.decision;
+                    // Refused for room only, the node's own admission decides: its report may
+                    // still count a box that has ended.
+                    let room_only = d.refused.iter().all(|(_, why)| {
+                        why.iter().all(|r| {
+                            matches!(r, wicket_placement::schedule::Refusal::NoRoom { .. } | wicket_placement::schedule::Refusal::Full)
+                        })
+                    });
+                    if d.node.is_none() && !room_only {
+                        bail!("node {node_name} may not take this box: {}", d.why_not());
+                    }
+                }
+            }
+        }
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
             None => {
@@ -1340,11 +1376,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             adopt: adopter.clone(),
             timings: timings.clone(),
         })
-        .await?;
+        .await;
+        // The room it reserved (#579): counted until the node reports the box, or given back.
+        {
+            let l = ledger.lock().expect("ledger");
+            let _ = match &nb {
+                Ok(_) => l.placement_bound(&run.0, wicket_feed::now_ms()),
+                Err(_) => l.placement_released(&run.0),
+            };
+        }
+        let nb = nb?;
         timings.since("box_start", box_lap);
         // #579 step 3: a per-node service offers its port, under its name, to the boxes that use it;
         // a box that uses services is linked to their instances on its node once they run.
-        crate::services::after_start(&ctx, &m, &node_name);
+        crate::serviceuse::after_start(&ctx, &m, &node_name);
         timings.mark("started");
         // The image's digest as its node started it (#192), or (re-attached, taken over) as pinned
         // or recorded: in the run's record and the audit, the parent's pin for children that name
