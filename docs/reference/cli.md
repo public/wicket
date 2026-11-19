@@ -114,12 +114,12 @@ Usage: wicket <COMMAND>
 
 Commands:
   run        Run a task manifest: one workload (an agent, or a program) in one zone
-  session    Open a running agent's session in this terminal, as its operator: what it says and does, live. An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's messages, tool calls and turn ends. Each line typed is a prompt, the agent's next turn; `/stop` cancels an ACP agent's running turn; Ctrl-C or the end of input leaves, and the agent goes on. With TEXT, sends it as one prompt and exits when that turn ends. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
-  hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
-  top        A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes, what their boxes are given), runs (node, agent, status, uptime, model usage), pending requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`
+  session    Open a running agent's session in this terminal: watch it, and send it prompts
+  hibernate  Hibernate a long-lived agent at its next quiet point
+  top        A live view of nodes, runs, pending requests and leases (read-only)
   agents     Long-lived agents: state, generation, current run and bundle size
-  wrap       Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its Remote Control sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
-  pending    List pending requests: what boxes asked for that their zones don't allow, waiting for a grant or a denial
+  wrap       Run an agent command line that another program launches, inside a wicket box
+  pending    List pending requests: what boxes asked for, waiting for a decision
   approve    Approve a pending request. The grant is never wider than the request
   deny       Deny a pending request
   links      Links between boxes (expose/connect/link), newest first
@@ -127,22 +127,22 @@ Commands:
   grant      Grants made by approvals
   audit      Show or verify the hash-chained audit log, or export it to the configured sinks
   secret     Manage vault secrets (values are read from the terminal, never from arguments)
-  image      Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build). Without --dir, from the copy embedded in this binary, so the image matches it
-  serve      Serve the operator console (runs, approvals, activity; start, steer and revoke runs). Plain HTTP on loopback by default; any other address needs HTTPS (--acme-domain, or --tls-cert and --tls-key) or --behind-tls-terminator
+  image      Build the agent image
+  serve      Serve the operator console
   program    Programs: deterministic workloads that run without an agent
   operator   Operator passkeys
-  identity   Agent identities (design §3.2): the issuer's public key, and verified identity documents
-  policy     The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled into each box's token when it is minted
-  state      Control-plane state off this host (#154): the state store, the ledger's stream, the recovery kit and a restore onto a standby
-  keys       The installation's root keys (#154)
-  reconcile  Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Records every change in the audit log
-  lease      Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the request with `wicket approve`/`deny` (see `wicket pending`)
-  zone       The zone view of a manifest: for each host its reach names, whether the egress proxy inspects it (terminates TLS and decides every request) or splices it through (decides on the hostname, relays the encrypted bytes), and why (#62)
+  identity   Agent identities: the issuer's public key, and verified identity documents
+  policy     The installation's org policy (Cedar): a ceiling and forbids over every zone
+  state      Control-plane state off this host: the state store, the recovery kit, a restore
+  keys       The installation's root keys
+  reconcile  Make what exists agree with the ledger: runs, leases, machines and boxes
+  lease      Capacity leases: the nodes agents asked for
+  zone       How a manifest's zone treats each host it reaches: inspected or spliced, and why
   doctor     Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes
-  node       Nodes (#16, #37), machines that run boxes: leased from a provider (create, release, plans) or your own (one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA); listing with leases and cost, revoking, renewing the CA
+  node       Nodes, the machines that run boxes: leased from a provider, or your own
   dev        Development helpers
-  self       Update this installation to another wicket build (#162): blue/green, with a health gate and automatic rollback, on the control host and then its nodes. Only artifacts signed by a release key this installation trusts, or whose sha256 an operator approved (an agent's `request_update`), are accepted. See docs/explanation/updates.md
-  daemon     wicketd (#12): run as the wicket system user and serve other users' commands over a unix socket, letting each caller do what the policy grants its uid (from SO_PEERCRED). Approving, denying and other privileged commands need root over the socket, or a passkey in the console. Installed and started by deploy/install.sh
+  self       Update this installation to another wicket build, with a health gate and rollback
+  daemon     wicketd: serve other users' commands over a unix socket, as the policy allows
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -173,45 +173,68 @@ Options:
 ## `wicket session`
 
 ```text
-Open a running agent's session in this terminal, as its operator: what it says and does, live. An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's messages, tool calls and turn ends. Each line typed is a prompt, the agent's next turn; `/stop` cancels an ACP agent's running turn; Ctrl-C or the end of input leaves, and the agent goes on. With TEXT, sends it as one prompt and exits when that turn ends. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
+Open a running agent's session in this terminal: watch it, and send it prompts.
+
+Open a running agent's session in this terminal, as its operator: what it says and does, live. An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's messages, tool calls and turn ends. Each line typed is a prompt, the agent's next turn; `/stop` cancels an ACP agent's running turn; Ctrl-C or the end of input leaves, and the agent goes on. With TEXT, sends it as one prompt and exits when that turn ends. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken.
 
 Usage: wicket session [OPTIONS] <RUN> [TEXT]...
 
 Arguments:
-  <RUN>      
-  [TEXT]...  A prompt to send; then only its turn shows
+  <RUN>
+          
+
+  [TEXT]...
+          A prompt to send; then only its turn shows
 
 Options:
-      --no-wait            With TEXT: queue it and exit at once
-      --timeout <TIMEOUT>  With TEXT: stop following its turn after this many seconds (it stays queued)
-  -h, --help               Print help
+      --no-wait
+          With TEXT: queue it and exit at once
+
+      --timeout <TIMEOUT>
+          With TEXT: stop following its turn after this many seconds (it stays queued)
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## `wicket hibernate`
 
 ```text
-Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
+Hibernate a long-lived agent at its next quiet point.
+
+Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace.
 
 Usage: wicket hibernate [OPTIONS] <RUN>
 
 Arguments:
-  <RUN>  
+  <RUN>
+          
 
 Options:
-      --wait <WAIT>  How long to wait for the outcome (seconds) [default: 120]
-  -h, --help         Print help
+      --wait <WAIT>
+          How long to wait for the outcome (seconds)
+          
+          [default: 120]
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## `wicket top`
 
 ```text
-A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes, what their boxes are given), runs (node, agent, status, uptime, model usage), pending requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`
+A live view of nodes, runs, pending requests and leases (read-only).
+
+A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes, what their boxes are given), runs (node, agent, status, uptime, model usage), pending requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`.
 
 Usage: wicket top [OPTIONS]
 
 Options:
-      --once  Print one frame and exit (also what a stdout that isn't a terminal gets, every 2 s, without it)
-  -h, --help  Print help
+      --once
+          Print one frame and exit (also what a stdout that isn't a terminal gets, every 2 s, without it)
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## `wicket agents`
@@ -229,28 +252,39 @@ Options:
 ## `wicket wrap`
 
 ```text
-Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its Remote Control sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
+Run an agent command line that another program launches, inside a wicket box.
+
+Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its Remote Control sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
 
 Usage: wicket wrap [OPTIONS] --manifest <MANIFEST> <ARGV>...
 
 Arguments:
-  <ARGV>...  The agent command line, after `--`
+  <ARGV>...
+          The agent command line, after `--`
 
 Options:
-      --manifest <MANIFEST>  
-      --image <IMAGE>        Agent image, overriding the manifest's agent.image
-  -h, --help                 Print help
+      --manifest <MANIFEST>
+          
+
+      --image <IMAGE>
+          Agent image, overriding the manifest's agent.image
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## `wicket pending`
 
 ```text
-List pending requests: what boxes asked for that their zones don't allow, waiting for a grant or a denial
+List pending requests: what boxes asked for, waiting for a decision.
+
+List pending requests: what boxes asked for that their zones don't allow, waiting for a grant or a denial.
 
 Usage: wicket pending
 
 Options:
-  -h, --help  Print help
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## `wicket approve`
@@ -526,7 +560,9 @@ Options:
 ## `wicket image`
 
 ```text
-Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build). Without --dir, from the copy embedded in this binary, so the image matches it
+Build the agent image.
+
+Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build). Without --dir, from the copy embedded in this binary, so the image matches it.
 
 Usage: wicket image [OPTIONS]
        wicket image <COMMAND>
@@ -536,9 +572,14 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-      --tag <TAG>  The tag to build, kept as given [default: this installation's own image: the default harness's image repository, tagged with the build id on an installed version, else its default tag]
-      --dir <DIR>  An image directory to build instead (e.g. one under images/, while changing it). If its Dockerfile declares `ARG BASE`, BASE is this installation's own agent image
-  -h, --help       Print help
+      --tag <TAG>
+          The tag to build, kept as given [default: this installation's own image: the default harness's image repository, tagged with the build id on an installed version, else its default tag]
+
+      --dir <DIR>
+          An image directory to build instead (e.g. one under images/, while changing it). If its Dockerfile declares `ARG BASE`, BASE is this installation's own agent image
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `wicket image digest`
@@ -558,43 +599,62 @@ Options:
 ## `wicket serve`
 
 ```text
-Serve the operator console (runs, approvals, activity; start, steer and revoke runs). Plain HTTP on loopback by default; any other address needs HTTPS (--acme-domain, or --tls-cert and --tls-key) or --behind-tls-terminator
+Serve the operator console.
+
+Serve the operator console (runs, approvals, activity; start, steer and revoke runs). Plain HTTP on loopback by default; any other address needs HTTPS (--acme-domain, or --tls-cert and --tls-key) or --behind-tls-terminator.
 
 Usage: wicket serve [OPTIONS]
 
 Options:
       --listen <LISTEN>
           [default: 127.0.0.1:8787]
+
       --origin <ORIGIN>
           Browser origin for WebAuthn (default: http://localhost:PORT; https://DOMAIN with ACME)
+
       --rp-id <RP_ID>
           WebAuthn relying-party id (default: the origin's host)
+
       --tls-cert <TLS_CERT>
           Serve HTTPS with this certificate chain (PEM; re-read when it changes)
+
       --tls-key <TLS_KEY>
           The certificate's private key (PEM)
+
       --acme-domain <ACME_DOMAIN>
           Serve HTTPS with a certificate from an ACME CA (Let's Encrypt) for this name, validated with TLS-ALPN-01 on this listener (so listen on :443)
+
       --acme-agree-tos
           Accept the ACME CA's terms of service (required with --acme-domain)
+
       --acme-contact <ACME_CONTACT>
           Contact for the ACME account (mailto:...; repeatable)
+
       --acme-staging
           Use Let's Encrypt's staging CA (untrusted certificates; for trying the setup)
+
       --acme-directory <ACME_DIRECTORY>
           Another ACME directory URL
+
       --acme-cache <ACME_CACHE>
           Where the ACME account and certificate are kept (default $WICKET_HOME/acme)
+
       --behind-tls-terminator
           A TLS-terminating proxy in front serves the console's https:// --origin; listen in plain HTTP
+
       --trusted-proxy <TRUSTED_PROXY>
           The proxy's address or range (repeatable): its X-Forwarded-For names the client
+
       --max-connections <MAX_CONNECTIONS>
-          Most simultaneous connections [default: 256]
+          Most simultaneous connections
+          
+          [default: 256]
+
       --no-bootstrap-link
           Don't print a passkey enrolment link at start when no passkey is enrolled (a system install's log may be readable by operators; root prints one with `operator enrol-link`)
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## `wicket program`
@@ -709,7 +769,9 @@ Options:
 ## `wicket identity`
 
 ```text
-Agent identities (design §3.2): the issuer's public key, and verified identity documents
+Agent identities: the issuer's public key, and verified identity documents.
+
+Agent identities (design §3.2): the issuer's public key, and verified identity documents.
 
 Usage: wicket identity <COMMAND>
 
@@ -722,7 +784,8 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `wicket identity init`
@@ -791,7 +854,9 @@ Options:
 ## `wicket policy`
 
 ```text
-The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled into each box's token when it is minted
+The installation's org policy (Cedar): a ceiling and forbids over every zone.
+
+The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled into each box's token when it is minted.
 
 Usage: wicket policy <COMMAND>
 
@@ -803,7 +868,8 @@ Commands:
   help   Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `wicket policy show`
@@ -865,7 +931,9 @@ Options:
 ## `wicket state`
 
 ```text
-Control-plane state off this host (#154): the state store, the ledger's stream, the recovery kit and a restore onto a standby
+Control-plane state off this host: the state store, the recovery kit, a restore.
+
+Control-plane state off this host (#154): the state store, the ledger's stream, the recovery kit and a restore onto a standby.
 
 Usage: wicket state <COMMAND>
 
@@ -880,7 +948,8 @@ Commands:
   help       Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `wicket state check`
@@ -975,7 +1044,9 @@ Options:
 ## `wicket keys`
 
 ```text
-The installation's root keys (#154)
+The installation's root keys.
+
+The installation's root keys (#154).
 
 Usage: wicket keys <COMMAND>
 
@@ -986,7 +1057,8 @@ Commands:
   help           Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `wicket keys roots-offline`
@@ -1029,20 +1101,29 @@ Options:
 ## `wicket reconcile`
 
 ```text
-Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Records every change in the audit log
+Make what exists agree with the ledger: runs, leases, machines and boxes.
+
+Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Records every change in the audit log.
 
 Usage: wicket reconcile [OPTIONS]
 
 Options:
-      --dry-run        Only report what would change
-      --every <EVERY>  Keep running, one pass per interval (e.g. 30s)
-  -h, --help           Print help
+      --dry-run
+          Only report what would change
+
+      --every <EVERY>
+          Keep running, one pass per interval (e.g. 30s)
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## `wicket lease`
 
 ```text
-Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the request with `wicket approve`/`deny` (see `wicket pending`)
+Capacity leases: the nodes agents asked for.
+
+Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the request with `wicket approve`/`deny` (see `wicket pending`).
 
 Usage: wicket lease <COMMAND>
 
@@ -1052,7 +1133,8 @@ Commands:
   help     Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `wicket lease list`
@@ -1083,7 +1165,9 @@ Options:
 ## `wicket zone`
 
 ```text
-The zone view of a manifest: for each host its reach names, whether the egress proxy inspects it (terminates TLS and decides every request) or splices it through (decides on the hostname, relays the encrypted bytes), and why (#62)
+How a manifest's zone treats each host it reaches: inspected or spliced, and why.
+
+The zone view of a manifest: for each host its reach names, whether the egress proxy inspects it (terminates TLS and decides every request) or splices it through (decides on the hostname, relays the encrypted bytes), and why (#62).
 
 Usage: wicket zone [OPTIONS] [MANIFEST]
        wicket zone <COMMAND>
@@ -1093,11 +1177,15 @@ Commands:
   help  Print this message or the help of the given subcommand(s)
 
 Arguments:
-  [MANIFEST]  The manifest (YAML)
+  [MANIFEST]
+          The manifest (YAML)
 
 Options:
-      --json  JSON instead of text
-  -h, --help  Print help
+      --json
+          JSON instead of text
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `wicket zone pin`
@@ -1132,7 +1220,9 @@ Options:
 ## `wicket node`
 
 ```text
-Nodes (#16, #37), machines that run boxes: leased from a provider (create, release, plans) or your own (one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA); listing with leases and cost, revoking, renewing the CA
+Nodes, the machines that run boxes: leased from a provider, or your own.
+
+Nodes (#16, #37), machines that run boxes: leased from a provider (create, release, plans) or your own (one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA); listing with leases and cost, revoking, renewing the CA.
 
 Usage: wicket node <COMMAND>
 
@@ -1153,7 +1243,8 @@ Commands:
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `wicket node token`
@@ -1443,7 +1534,9 @@ Options:
 ## `wicket self`
 
 ```text
-Update this installation to another wicket build (#162): blue/green, with a health gate and automatic rollback, on the control host and then its nodes. Only artifacts signed by a release key this installation trusts, or whose sha256 an operator approved (an agent's `request_update`), are accepted. See docs/explanation/updates.md
+Update this installation to another wicket build, with a health gate and rollback.
+
+Update this installation to another wicket build (#162): blue/green, with a health gate and automatic rollback, on the control host and then its nodes. Only artifacts signed by a release key this installation trusts, or whose sha256 an operator approved (an agent's `request_update`), are accepted. See docs/explanation/updates.md.
 
 Usage: wicket self <COMMAND>
 
@@ -1462,7 +1555,8 @@ Commands:
   help          Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `wicket self status`
@@ -1625,12 +1719,21 @@ Options:
 ## `wicket daemon`
 
 ```text
-wicketd (#12): run as the wicket system user and serve other users' commands over a unix socket, letting each caller do what the policy grants its uid (from SO_PEERCRED). Approving, denying and other privileged commands need root over the socket, or a passkey in the console. Installed and started by deploy/install.sh
+wicketd: serve other users' commands over a unix socket, as the policy allows.
+
+wicketd (#12): run as the wicket system user and serve other users' commands over a unix socket, letting each caller do what the policy grants its uid (from SO_PEERCRED). Approving, denying and other privileged commands need root over the socket, or a passkey in the console. Installed and started by deploy/install.sh.
 
 Usage: wicket daemon [OPTIONS]
 
 Options:
-      --socket <SOCKET>  [default: /run/wicket/wicketd.sock]
-      --policy <POLICY>  Who may read, run and revoke (YAML; default: the wicket-operators group) [default: /etc/wicket/wicketd.yaml]
-  -h, --help             Print help
+      --socket <SOCKET>
+          [default: /run/wicket/wicketd.sock]
+
+      --policy <POLICY>
+          Who may read, run and revoke (YAML; default: the wicket-operators group)
+          
+          [default: /etc/wicket/wicketd.yaml]
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
