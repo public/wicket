@@ -193,6 +193,7 @@ fn apply(env: &Env, st: &mut State, run_i: usize, action: Option<(usize, &str, &
                 },
                 uses: None,
                 prefix: false,
+                standing: None,
             }
         })
         .collect();
