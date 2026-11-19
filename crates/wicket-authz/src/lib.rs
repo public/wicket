@@ -37,7 +37,7 @@ pub use payload::{
     PublicKey, Reach, Request, SpawnLimits, SpawnMatch, MAX_REACH_RISK,
 };
 pub use structure::Policy;
-pub use token::{grant, mint, sign_grant, GrantRequest, SignedGrant, SigningKey, Token};
+pub use token::{grant, grant_prefix, mint, sign_grant, GrantRequest, SignedGrant, SigningKey, Token};
 
 /// Re-exported for tests and tools that need the token format itself.
 #[doc(hidden)]

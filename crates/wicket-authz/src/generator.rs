@@ -360,6 +360,36 @@ pub(crate) fn grant_code(g: &Grant) -> Code {
     c
 }
 
+/// The Datalog for one path-prefix grant (#257 4a): `g.path` is the prefix, canonical and ending
+/// in `/` (wicket-core `prefix_dir`). It covers what the control host's ledger covers
+/// (`wicket_core::prefix_covers`): the directory itself, as an exact rule, and every path under
+/// it, as `approved(gid, host, method, $p) <- path($p), $p.starts_with(prefix), …` with the same
+/// expiry, box, epoch and uses bounds. The request's path is canonical when a node decides it
+/// (`canonical_path`), so a covered path's segments begin with the prefix's: no escape, dot
+/// segment or doubled `/` reaches outside it (Kani: `a_prefix_grant_covers_only_paths_under_it`).
+pub(crate) fn grant_prefix_code(g: &Grant) -> Result<Code, AuthzError> {
+    match wicket_core::canonical_path(&g.path) {
+        Ok(p) if p == g.path && g.path.ends_with('/') => {}
+        _ => return Err(AuthzError::Structure(format!("a prefix grant's path must be canonical and end in '/', not {:?}", g.path))),
+    }
+    let mut c = Code::default();
+    let gid = c.s(&g.gid);
+    let (h, m) = (c.s(&g.host.to_ascii_lowercase()), c.s(&g.method.to_ascii_uppercase()));
+    let pre = c.s(&path_term(&g.path));
+    let exp = c.p(Term::Date(g.not_after));
+    let (b, e, zero) = (c.s(&g.box_id), c.i(g.epoch), c.i(0));
+    let (a, d) = (c.s(&g.approver), c.p(Term::Bytes(g.digest.clone())));
+    let bounds = format!("time($t), $t <= {exp}, box({b}), epoch({e}), uses_left({gid}, $n), $n > {zero}");
+    // The directory itself (`/repos/acme/app` for `/repos/acme/app/`), unless the prefix is `/`.
+    let dir = g.path.trim_end_matches('/');
+    if !dir.is_empty() {
+        let p = c.s(&path_term(dir));
+        c.push(&format!("approved({gid}, {h}, {m}, {p}) <- {bounds};\n"));
+    }
+    c.push(&format!("approved({gid}, {h}, {m}, $p) <- path($p), $p.starts_with({pre}), {bounds};\napproval({gid}, {a}, {d});\n"));
+    Ok(c)
+}
+
 /// The node's ambient facts for one request. Built from typed terms, never parsed.
 pub fn request_facts(r: &Request) -> Vec<Fact> {
     let s = |v: &str| Term::Str(v.to_string());

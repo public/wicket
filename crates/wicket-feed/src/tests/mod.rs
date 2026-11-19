@@ -112,6 +112,7 @@ pub(crate) fn token_grant(id: &str, o: &Op, not_after: i64, uses: Option<u32>) -
             digest: o.digest().into_bytes(),
         },
         uses,
+        prefix: false,
     }
 }
 

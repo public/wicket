@@ -398,4 +398,13 @@ theorem forbid_no_escape {p q : Str} (hp : plainOk p = true) (hq : ∀ c ∈ q, 
   rw [← hB, hb]
   rfl
 
+/-- `prefix_dir(prefix)`: a grant's path prefix, ending in `/` so it covers whole segments (#119). -/
+def prefixDir (p : Str) : Str :=
+  if p.getLast? = some '/' then p else p ++ ['/']
+
+/-- `prefix_covers(prefix, path)`: what a path-prefix grant covers, on the control host's ledger and
+(#257 4a) on a node: the directory itself, or any path under it. -/
+def prefixCovers (pre path : Str) : Bool :=
+  (prefixDir pre).isPrefixOf path || (path ++ ['/']) == prefixDir pre
+
 end Wicket

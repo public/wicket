@@ -42,10 +42,11 @@ pub fn prefix_dir(prefix: &str) -> String {
     }
 }
 
-/// Whether a path-prefix grant for `prefix` covers `path` (see [`prefix_dir`]).
+/// Whether a path-prefix grant for `prefix` covers `path` (see [`prefix_dir`]): the directory itself,
+/// or a path under it. Without allocating (a node decides it per request, and Kani checks it).
 pub fn prefix_covers(prefix: &str, path: &str) -> bool {
-    let dir = prefix_dir(prefix);
-    path.starts_with(&dir) || format!("{path}/") == dir
+    let dir = prefix.strip_suffix('/').unwrap_or(prefix);
+    path == dir || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The host a request names, lowercased and without a trailing dot, if that is how a URL parser
@@ -353,6 +354,62 @@ mod tests {
             assert!(!prefix_covers(p, "/repos/acme/ap"));
         }
         assert!(prefix_covers("/", "/anything/at/all"));
+        // As prefix_dir has it: with or without the trailing `/`, and `/` (or nothing) is everything.
+        for (pre, path) in [("/a", "/a"), ("/a/", "/a"), ("/a", "/a/"), ("/a/", "/a/b"), ("", "/x"), ("/", "/")] {
+            assert!(
+                prefix_covers(pre, path) && (path.starts_with(&prefix_dir(pre)) || format!("{path}/") == prefix_dir(pre)),
+                "{pre} {path}"
+            );
+        }
+        for (pre, path) in [("/a", "/ab"), ("/a/", "/"), ("/a/b", "/a"), ("/a", "")] {
+            assert!(!prefix_covers(pre, path), "{pre} {path}");
+        }
+    }
+
+    /// #257 4a: a prefix grant, now also honoured on nodes, never covers a path outside it. Every
+    /// path of up to 6 bytes over `/`, two letters, `.`, `%2E` and `%2e` (dot segments, encoded
+    /// dots, doubled `/`, case) that `canonical_path` accepts is checked against every other as a
+    /// prefix: if the grant covers it, its segments begin with all of the prefix's. (The Kani
+    /// harness `a_prefix_grant_covers_only_paths_under_it` proves it for its alphabet too.)
+    #[test]
+    fn a_prefix_grant_covers_only_paths_under_it() {
+        let alphabet = ["/", "a", "b", ".", "%2E", "%2e"];
+        let mut raw = vec![String::new()];
+        let mut all = vec![];
+        for _ in 0..6 {
+            raw = raw.iter().flat_map(|s| alphabet.iter().map(move |a| format!("{s}{a}"))).filter(|s| s.len() <= 6).collect();
+            all.extend(raw.iter().cloned());
+        }
+        all.sort();
+        all.dedup();
+        // The allocation-free form means what `prefix_dir`'s did, on every pair, canonical or not.
+        let old = |pre: &str, path: &str| path.starts_with(&prefix_dir(pre)) || format!("{path}/") == prefix_dir(pre);
+        for pre in all.iter().take(400) {
+            for path in &all {
+                assert_eq!(prefix_covers(pre, path), old(pre, path), "{pre} {path}");
+            }
+        }
+        let canonical: Vec<String> = all.iter().filter_map(|s| canonical_path(s).ok().map(|p| p.into_owned())).collect();
+        let segs = |p: &str| -> Vec<String> {
+            p.trim_start_matches('/').trim_end_matches('/').split('/').filter(|s| !s.is_empty()).map(String::from).collect()
+        };
+        // What a canonical path can't hold: a doubled `/`, an encoded dot, a `.` or `..` segment.
+        assert!(canonical.len() > 20);
+        assert!(
+            canonical.iter().all(|p| !p.contains("//") && !p.contains("%2") && segs(p).iter().all(|s| s != "." && s != "..")),
+            "{canonical:?}"
+        );
+        let mut covered = 0;
+        for pre in &canonical {
+            for path in &canonical {
+                if prefix_covers(pre, path) {
+                    covered += 1;
+                    let (ps, qs) = (segs(pre), segs(path));
+                    assert!(qs.len() >= ps.len() && qs[..ps.len()] == ps[..], "{pre} covers {path}");
+                }
+            }
+        }
+        assert!(covered > canonical.len(), "the check saw prefixes that cover other paths");
     }
 
     /// #116: hosts are decided in one spelling, and IP addresses in none.
