@@ -19,8 +19,10 @@ const PATH: &[u8] = b"/.%2Ea;\\{";
 /// Longest path checked.
 const N: usize = 6;
 
-/// The prefix harness's alphabet: what makes and changes segments.
-const SEGS: &[u8] = b"/.%2Ea";
+/// The prefix harness's alphabet: what canonical paths' segments are made of. Escapes and dot
+/// segments are `check_plain`'s to refuse (`check_plain_is_plain_ok`), and no escape makes a `/` or a
+/// dot segment (`upstream_reads_the_same_segments`), so here `/`, a letter and `.` (in `.a`, `a.`).
+const SEGS: &[u8] = b"/a.";
 
 /// Escapes: hex digits of both cases, so `%2E` (a dot), `%2f` (lower case), `%4A` (unreserved
 /// `J`), `%24` (`$`, which may be escaped) and `%AA` (a non-ASCII byte) are all spelled; and a
@@ -197,9 +199,8 @@ fn segments_end(b: &[u8], seg: usize) -> Option<(usize, usize)> {
 #[kani::proof]
 #[kani::unwind(10)]
 fn a_prefix_grant_covers_only_paths_under_it() {
-    // Two paths, so a smaller alphabet than the single-path harnesses and one byte shorter: what
-    // changes segments (`/`, `.`, the escape `%2E`, a letter) and no more; `;`, `\` and `{` only make
-    // paths `check_plain` refuses. `/../`, `/%2E/` and `//` still fit.
+    // Two paths over [`SEGS`], one byte shorter than the single-path harnesses (531 s over a
+    // six-symbol alphabet): `/../`, `//` and `/.a/` still fit.
     let pre = AnyStr::<{ N - 1 }>::new(SEGS);
     let path = AnyStr::<{ N - 1 }>::new(SEGS);
     let (p, q) = (pre.bytes(), path.bytes());
