@@ -64,6 +64,7 @@ mod net;
 mod push;
 mod secrets;
 pub mod session;
+mod standing;
 mod tls;
 mod web;
 
@@ -192,6 +193,23 @@ enum Action {
     CapacityRenew {
         grant: String,
         ttl_secs: u64,
+    },
+    /// Approve an agent's standing ask (#572): `rule`, for the agent or its zone, for `ttl_secs`
+    /// (None: until revoked), on the effect the passkey signed.
+    StandingApprove {
+        id: String,
+        rule: Box<wicket_core::manifest::ReachRule>,
+        bound: wicket_store::StandingBound,
+        ttl_secs: Option<u64>,
+        effect: String,
+    },
+    StandingDeny {
+        id: String,
+    },
+    /// Move an approved standing rule's lapse to `ttl_secs` from now (None: until revoked).
+    StandingRenew {
+        id: String,
+        ttl_secs: Option<u64>,
     },
 }
 
@@ -963,6 +981,13 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
             Some((_, SessionKind::Operator { cred })) => secrets::unsigned(state, cred, p, body),
             _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
         },
+        "/api/standing/revoke" => match &sess {
+            Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
+                Some(oc) => standing::revoke(state, &oc, body),
+                None => err(StatusCode::UNAUTHORIZED, "the passkey you signed in with is no longer enrolled"),
+            },
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
         "/api/capacity/revoke" => match &sess {
             Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
                 Some(oc) => capacity::revoke(state, &oc, body),
@@ -1392,8 +1417,11 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         }
         Some("capacity_grant") => capacity::build_grant(state, body),
         Some("capacity_renew") => capacity::build_renew(state, &l, body),
+        Some("standing_approve") => standing::build_approve(state, &l, body),
+        Some("standing_deny") => standing::build_deny(state, &l, body),
+        Some("standing_renew") => standing::build_renew(state, &l, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant or capacity_renew",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny or standing_renew",
         )),
     }
 }
@@ -1660,6 +1688,11 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             capacity::apply_grant(state, &mut l, oc, principal, terms, *ttl_secs, signed)
         }
         Action::CapacityRenew { grant, ttl_secs } => capacity::apply_renew(state, &mut l, oc, grant, *ttl_secs, signed),
+        Action::StandingApprove { id, rule, bound, ttl_secs, effect } => {
+            standing::apply_approve(state, &l, oc, id, rule, *bound, *ttl_secs, effect, signed)
+        }
+        Action::StandingDeny { id } => standing::apply_deny(state, &l, oc, id, signed),
+        Action::StandingRenew { id, ttl_secs } => standing::apply_renew(state, &l, oc, id, *ttl_secs, signed),
     }
 }
 
@@ -1729,17 +1762,23 @@ fn push_post(state: &State, cred: &str, path: &str, body: &Value) -> Reply {
 }
 
 /// What is waiting for a decision, for the notifier: every pending request (egress asks, and
-/// wicket's own capacity, update, spawn and link asks), oldest first.
+/// wicket's own capacity, update, spawn and link asks), oldest first, then standing asks (#572).
 fn waiting(state: &State) -> Result<Vec<push::Waiting>> {
     let l = state.ledger()?;
-    Ok(l.pending(&state.tenant)?
+    let mut out: Vec<push::Waiting> = l
+        .pending(&state.tenant)?
         .into_iter()
         .map(|r| {
             let agent = l.identity(&r.run).ok().flatten().map(|i| i.agent).unwrap_or_else(|| r.run.clone());
             let ask = format!("{} {}{}{}", r.method, r.host, r.path, if r.scope_prefix { "…" } else { "" });
             push::Waiting { id: r.id, summary: format!("{agent} asks {ask}") }
         })
-        .collect())
+        .collect();
+    for s in l.standing_with_status(&state.tenant, "pending")? {
+        let agent = s.principal.rsplit("/a/").next().unwrap_or(&s.principal).to_string();
+        out.push(push::Waiting { id: s.id, summary: format!("{agent} asks for standing reach on {}", s.rule.host) });
+    }
+    Ok(out)
 }
 
 /// How often the notifier looks at the ledger for new requests.
@@ -1877,6 +1916,7 @@ fn dashboard(state: &State) -> Result<Value> {
         "placed": placed_view(&l, wicket_store::now())?,
         "health": health_view(state, wicket_feed::now_ms())?.0,
         "capacity": capacity::view(&l, &t.0)?,
+        "standing": standing::view(&l, &t.0)?,
         "audit": audit,
     }))
 }
@@ -2618,6 +2658,71 @@ mod tests {
         // With the header, the same request reaches the action (and fails on its merits: no such run).
         let out = send(true).await;
         assert!(out.starts_with("HTTP/1.1 404") && out.contains("no identity was issued for run_x"), "{out}");
+    }
+
+    /// #572: the Standing reach card shows an agent's ask with the ledger's evidence; approving it
+    /// (as asked or narrowed, for the agent or its zone) and renewing it are passkey-signed on the
+    /// effect shown; revoking needs the session only.
+    #[test]
+    fn a_standing_ask_is_approved_signed_renewed_and_revoked_from_the_card() {
+        let mut t = setup("standing");
+        let id = {
+            let mut l = t.ledger();
+            let tenant = TenantId::single();
+            let run = wicket_core::RunId("run_w".into());
+            l.run_started(&tenant, &run, "work", "worker").unwrap();
+            l.put_identity(&wicket_store::IdentityRow {
+                run: run.0.clone(),
+                tenant: tenant.0.clone(),
+                spiffe_id: "spiffe://w.test/t/t0/z/work/a/worker".into(),
+                zone: "work".into(),
+                agent: "worker".into(),
+                parent_run: None,
+                accept_from: vec![],
+                jws: "j".into(),
+                issued_at: 1,
+            })
+            .unwrap();
+            // A blocked request, granted: the evidence (an agent's own asks aren't).
+            let op = wicket_core::Op::egress(&tenant, &run, "work", "GET", "ci.example", "/jobs/1/logs");
+            let (rid, _) = l.pending_for(&op, "blocked", None).unwrap();
+            let a = wicket_store::Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "op".into() };
+            l.approve(&rid, &a).unwrap();
+            let rule: wicket_core::manifest::ReachRule =
+                wicket_core::yaml::from_str("{ host: ci.example, methods: [GET, POST], paths: ['/jobs/**'] }").unwrap();
+            l.ask_standing(&tenant, &run, "work", "zone-digest", "spiffe://w.test/t/t0/z/work/a/worker", &rule, "CI logs").unwrap().0
+        };
+        let view = standing::view(&t.ledger(), &TenantId::single().0).unwrap();
+        let ask = &view["asks"][0];
+        assert_eq!((ask["id"].as_str(), ask["evidence"]["requests"].as_u64()), (Some(id.as_str()), Some(1)), "{view}");
+        assert!(ask["beyond"].to_string().contains("POST"), "{view}");
+        // Refused before the passkey: a bad binding or lifetime.
+        assert_eq!(t.begin(json!({ "action": "standing_approve", "id": id, "for": "everyone" })).status, StatusCode::BAD_REQUEST);
+        assert_eq!(t.begin(json!({ "action": "standing_approve", "id": id, "ttl_secs": 0 })).status, StatusCode::BAD_REQUEST);
+        // What the passkey signs: the narrowed rule, for the agent, 30 days, and the effect.
+        let b = t.begin(json!({ "action": "standing_approve", "id": id, "narrow": true }));
+        let a = &b.body["action"];
+        assert_eq!((a["rule"]["paths"][0].as_str(), a["for"].as_str()), (Some("/jobs/1/logs"), Some("agent")), "{a}");
+        assert_eq!(a["ttl_secs"].as_u64(), Some(30 * 24 * 3600));
+        assert!(a["effect_sha256"].as_str().is_some_and(|e| e.len() == 64), "{a}");
+        let r = t.act(json!({ "action": "standing_approve", "id": id, "narrow": true }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        let l = t.ledger();
+        let s = l.standing(&id).unwrap();
+        assert_eq!((s.status.as_str(), s.rule.paths.clone()), ("approved", vec!["/jobs/1/logs".to_string()]));
+        let rec = l.audit_tail(20).unwrap().into_iter().rev().find(|r| r.2 == "decision").unwrap().4;
+        assert!(rec.contains("\"via\":\"console\"") && rec.contains("standing_approve"), "{rec}");
+        drop(l);
+        assert_eq!(t.begin(json!({ "action": "standing_approve", "id": id })).status, StatusCode::CONFLICT, "decided");
+        // Renewed (signed), then revoked with the session only.
+        let r = t.act(json!({ "action": "standing_renew", "id": id, "forever": true }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        assert_eq!(t.ledger().standing(&id).unwrap().expires_at, None);
+        assert_eq!(post(&t.state, "/api/standing/revoke", &anon(), &json!({ "id": id })).unwrap().status, StatusCode::UNAUTHORIZED);
+        let r = t.post("/api/standing/revoke", json!({ "id": id }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        assert_eq!(t.ledger().standing(&id).unwrap().status, "revoked");
+        assert_eq!(t.begin(json!({ "action": "standing_renew", "id": id })).status, StatusCode::CONFLICT);
     }
 
     /// #256: the Capacity card issues and renews a standing capacity grant with signed actions,

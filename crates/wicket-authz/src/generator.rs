@@ -390,6 +390,44 @@ pub(crate) fn grant_prefix_code(g: &Grant) -> Result<Code, AuthzError> {
     Ok(c)
 }
 
+/// The Datalog for one standing grant (#572): a reach rule above the box's ceiling, on `g.host`
+/// exactly. One rule per method and path glob,
+/// `approved(gid, host, method, $p) <- path($p), $p.matches(<the glob's regex>)[, risk($r), $r <= 2], …`,
+/// with a grant's expiry, box, epoch and uses bounds (the node gives a standing grant all the uses
+/// it asks for). The regex is the one a reach rule's glob compiles to (`path_regex`), so the paths
+/// it covers are exactly a manifest's. Without `allow_dangerous` it allows no request riskier than a
+/// reach rule would, since the grant escape lifts the ceiling's risk check too.
+pub(crate) fn grant_standing_code(g: &Grant, rule: &StandingRule) -> Result<Code, AuthzError> {
+    let rules = rule.methods.len() * rule.paths.len();
+    let cap = crate::structure::Policy::default().max_grant_rules;
+    if rules == 0 || rules > cap {
+        return Err(AuthzError::Structure(format!("a standing grant has {rules} method and path pairs (1 to {cap})")));
+    }
+    if g.host.starts_with("*.") {
+        return Err(AuthzError::Structure(format!("a standing grant names its host exactly, not {}", g.host)));
+    }
+    let mut c = Code::default();
+    let gid = c.s(&g.gid);
+    let h = c.s(&g.host.to_ascii_lowercase());
+    let exp = c.p(Term::Date(g.not_after));
+    let (b, e, zero) = (c.s(&g.box_id), c.i(g.epoch), c.i(0));
+    let (a, d) = (c.s(&g.approver), c.p(Term::Bytes(g.digest.clone())));
+    let bounds = format!("time($t), $t <= {exp}, box({b}), epoch({e}), uses_left({gid}, $n), $n > {zero}");
+    let risk = match rule.allow_dangerous {
+        true => String::new(),
+        false => format!(", risk($r), $r <= {}", c.i(MAX_REACH_RISK)),
+    };
+    for m in &rule.methods {
+        let m = c.s(&m.to_ascii_uppercase());
+        for glob in &rule.paths {
+            let re = c.s(&path_regex(glob)?);
+            c.push(&format!("approved({gid}, {h}, {m}, $p) <- path($p), $p.matches({re}){risk}, {bounds};\n"));
+        }
+    }
+    c.push(&format!("approval({gid}, {a}, {d});\n"));
+    Ok(c)
+}
+
 /// The node's ambient facts for one request. Built from typed terms, never parsed.
 pub fn request_facts(r: &Request) -> Vec<Fact> {
     let s = |v: &str| Term::Str(v.to_string());

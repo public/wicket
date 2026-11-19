@@ -1291,12 +1291,39 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 },
                 // Push delivery of messages (#252), if the harness takes it in a box.
                 push: harness.and_then(|h| h.message_push(&m)),
+                // What the node may ask for beyond its CA (#573).
+                ca_widen: ledger.lock().ok().and_then(|l| l.node_ca_policy(&node_name).ok()),
             })),
             image_pin: image_pin.clone(),
             timings: wicket_core::timing::enabled(),
             memory_advice: m.zone.limits.memory_advice().map(str::to_string),
             volume_life: Some(crate::chan::VolumeLife::of(&m)),
         };
+        // #579: a node named for the box (`--node`, a lease's) passes placement's filters too, and
+        // its room is reserved, when its last report says what room it has. A wake has reserved
+        // already; a re-attach has its box.
+        if node.is_some() && record.is_none() {
+            let l = ledger.lock().expect("ledger");
+            if l.placement(&run.0)?.is_none() {
+                let now = wicket_feed::now_ms();
+                let (found, _) = crate::hibernate::from_index(std::slice::from_ref(&node_name), &l.node_health()?, now);
+                if !found.is_empty() {
+                    let req = wicket_placement::schedule::Request::of(&m);
+                    let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
+                    let d = crate::hibernate::bind(&l, &run, &crate::hibernate::Waiting { req, need }, &found, None, now, false)?.decision;
+                    // Refused for room only, the node's own admission decides: its report may
+                    // still count a box that has ended.
+                    let room_only = d.refused.iter().all(|(_, why)| {
+                        why.iter().all(|r| {
+                            matches!(r, wicket_placement::schedule::Refusal::NoRoom { .. } | wicket_placement::schedule::Refusal::Full)
+                        })
+                    });
+                    if d.node.is_none() && !room_only {
+                        bail!("node {node_name} may not take this box: {}", d.why_not());
+                    }
+                }
+            }
+        }
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
             None => {
@@ -1338,7 +1365,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             adopt: adopter.clone(),
             timings: timings.clone(),
         })
-        .await?;
+        .await;
+        // The room it reserved (#579): counted until the node reports the box, or given back.
+        {
+            let l = ledger.lock().expect("ledger");
+            let _ = match &nb {
+                Ok(_) => l.placement_bound(&run.0, wicket_feed::now_ms()),
+                Err(_) => l.placement_released(&run.0),
+            };
+        }
+        let nb = nb?;
         timings.since("box_start", box_lap);
         timings.mark("started");
         // The image's digest as its node started it (#192), or (re-attached, taken over) as pinned

@@ -44,5 +44,6 @@ pub mod roots;
 pub mod run;
 pub mod snapstore;
 pub mod spawn;
+pub mod standing;
 pub mod storegc;
 pub mod transcript;
