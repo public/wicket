@@ -26,9 +26,9 @@ use http_body_util::BodyExt;
 
 /// Access tokens as long as real ones: the egress proxy masks only credentials long enough to tell
 /// apart from ordinary text (`canary::MIN_FORM`).
-const T1: &str = "sk-ant-oat01-first-token-0123456789abcdef";
-const T2: &str = "sk-ant-oat01-refreshed-token-0123456789abcdef";
-const TNEVER: &str = "sk-ant-oat01-a-token-never-given-0123456789";
+const T1: &str = "test-access-token-first-0123456789abcdef";
+const T2: &str = "test-access-token-refreshed-0123456789abcdef";
+const TNEVER: &str = "test-access-token-never-given-0123456789";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
