@@ -265,6 +265,11 @@ pub(crate) mod tests {
     /// The statements `l` runs while `f` does, each once: (SQL as written, with its values).
     /// The statements `l` runs while `f` does, each once: (SQL as written, with its values, and
     /// the most rows any run of it stepped through in a full scan).
+    /// The SQL of each statement `l` runs while `f` does, each once.
+    pub(crate) fn traced_sql(l: &mut Ledger, f: impl FnOnce(&Ledger)) -> Vec<String> {
+        traced(l, |l| f(l)).into_iter().map(|(s, _, _)| s).collect()
+    }
+
     fn traced(l: &mut Ledger, f: impl FnOnce(&mut Ledger)) -> Vec<(String, String, i32)> {
         let seen: Arc<Mutex<Vec<(String, String, i32)>>> = Arc::default();
         let into = seen.clone();

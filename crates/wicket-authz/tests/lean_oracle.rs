@@ -569,6 +569,10 @@ fn rust_decides_as_the_lean_spec() {
     let standing_from = c.cases.len();
     standing(&mut c, &mut rng);
     let standing = c.cases.len() - standing_from;
+    // 10. Who may send whom a message (#565): `message::relation` on generated facts.
+    let relations_from = c.cases.len();
+    relations(&mut c, &mut rng);
+    let relations = c.cases.len() - relations_from;
 
     let file = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lean-oracle-cases.json");
     std::fs::write(&file, serde_json::to_vec(&json!({ "zones": c.zones, "cases": c.cases })).unwrap()).unwrap();
@@ -597,6 +601,7 @@ fn rust_decides_as_the_lean_spec() {
     assert!(routes_admitted > 50 && routes_admitted < 550, "route children admitted: {routes_admitted} of 600");
     assert!(chains > 100, "too few token chains ({chains})");
     println!("lean oracle: {standing} cases of standing reach (narrowing to evidence, a rule's decisions)");
+    println!("lean oracle: {relations} cases of the message rule");
     println!("lean oracle: {decisions} cases of wicket-core's pure decisions (is_public_ip, the token's end, agents' terms, escalation, uses, money, spawn)");
     assert!(
         divergent.is_empty(),
@@ -803,4 +808,30 @@ fn standing(c: &mut Cases, rng: &mut Rng) {
         }
     }
     assert!(narrowed > 1000, "too few asks narrowed ({narrowed} of 2000)");
+}
+
+/// The cases of section 10: `message::relation` on every combination of family and reply, generated
+/// `accept_from` lists, and senders whose zone and principal (known or not) are listed or not.
+fn relations(c: &mut Cases, rng: &mut Rng) {
+    use wicket_core::message::{relation, Facts};
+    let zones = ["g", "ops", "dev", "other"];
+    let principals = [None, Some("spiffe://acc.test/t/t0/z/ops/a/x"), Some("spiffe://acc.test/t/t0/z/dev/a/y"), Some("ops")];
+    let mut peers = 0;
+    for i in 0..3000 {
+        let accept_from = gen_accept(rng);
+        let (zone, principal) = (*rng.pick(&zones), *rng.pick(&principals));
+        let (to_child, to_parent, reply) = (i & 1 != 0 && rng.chance(50), i & 2 != 0 && rng.chance(50), rng.chance(40));
+        let f = Facts { to_child, to_parent, accept_from: &accept_from, sender_zone: zone, sender: principal, reply };
+        let got = relation(&f);
+        peers += usize::from(got == Some(wicket_core::message::Relation::Peer));
+        let rust = got.map_or("none", |r| r.as_str()).to_string();
+        let case = json!({ "kind": "relation", "to_child": to_child, "to_parent": to_parent, "accept_from": accept_from,
+            "zone": zone, "principal": principal, "reply": reply });
+        c.push(
+            case,
+            rust,
+            format!("relation(child {to_child}, parent {to_parent}, {accept_from:?}, {zone}, {principal:?}, reply {reply})"),
+        );
+    }
+    assert!(peers > 300, "too few peers accepted ({peers} of 3000)");
 }

@@ -32,7 +32,9 @@ Input: `{"zones": [zone…], "cases": [case…]}`. A case is one of
 - `{"kind": "narrow", "host": h, "ops": [[method, path, granted]…]}` → `standing::narrow` (#572):
   `none`, or `[host, methods, paths, allow_dangerous]` as compact JSON;
 - `{"kind": "rule_allows", "rule": {host, methods, paths, dangerous}, "op": {…}}` →
-  `ReachRule::allows`, what a standing rule decides: `true`/`false`.
+  `ReachRule::allows`, what a standing rule decides: `true`/`false`;
+- `{"kind": "relation", "to_child", "to_parent", "accept_from", "zone", "principal", "reply"}` →
+  `message::relation` (#565): `child`, `parent`, `peer`, `reply` or `none`.
 
 Every string is read as its UTF-8 bytes (`bytesOf`): the spec is over any alphabet, and wicket's
 matchers and checks work on bytes.
@@ -256,6 +258,20 @@ def decideCase (zs : Array Zone) (c : Json) : Except String String := do
     let r ← parseReach (← c.getObjVal? "rule")
     if !(r.paths.all Wicket.supported) then return "unsupported"
     return toString (r.allows (← parseOp (← c.getObjVal? "op")))
+  | "relation" =>
+    let pr ← match c.getObjVal? "principal" with
+      | .ok .null => pure none
+      | .ok v => pure (some (bytesOf (← v.getStr?)))
+      | .error _ => pure none
+    let f : Facts := { toChild := ← jBool c "to_child", toParent := ← jBool c "to_parent",
+                       acceptFrom := ← jStrs c "accept_from", senderZone := ← jStr c "zone", sender := pr,
+                       reply := ← jBool c "reply" }
+    return match relation f with
+      | none => "none"
+      | some .child => "child"
+      | some .parent => "parent"
+      | some .peer => "peer"
+      | some .reply => "reply"
   | k => throw s!"unknown case kind {k}"
 
 def main (args : List String) : IO UInt32 := do

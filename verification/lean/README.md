@@ -14,6 +14,7 @@ definitions as an oracle that wicket-core's decisions are checked against.
 | `Wicket/Spawn.lean` | `manifest::model_covers`, `LlmSpec::allows_model`, `subset::model_violations`, `manifest::accepts`, `Token::attenuate`, a node's spawn (`nodegw::spawn`: `plan_child`, `peek_spawn`, `derive_child`) | `check_models`: an admitted child calls no model its parent may not (for well-formed patterns, as manifests require); `accept_narrow`, `check_accepts`: it hears only from its parent's zone or a sender its parent hears from; `attenuate_allow`, `attenuate_forbid`, `attenuate_live`, `attenuate_spawns`: an appended spawn block never widens a token; `node_spawn_within`: a child its node starts is within its parent, and its token allows, outlives and starts nothing its parent's doesn't |
 | `Wicket/Grant.lean` | `grant::within_authority`, `check_terms`, `agent_terms`, `outlasts`, `operators::may_decide` | `agent_grant_within`: every use an agent's grant permits is one the agent's own zone allows by reach, by a strict descendant, before the agent's authority ends, for one or more uses; `grant_within_ancestor`: and within every zone the agent's is within; `agent_renewal_within`; `operator_within` (#320) |
 | `Wicket/Standing.lean` | `standing::narrow`, `glob_literal`, `ReachRule::allows`, `wicket_store::Standing::binds`, `zone_digest` (#572) | `narrow_pairs_granted`: every method and path pair of an ask narrowed to its evidence is one a human granted; `narrow_not_dangerous`; `narrow_allows_only_evidence`: for evidence paths without glob metacharacters, the narrowed rule allows only a granted method and path, to the asked host; `rule_allows_within_globs`: a rule allows only a path one of its globs matches; `binds_digest` and `digest_decides_alike`: a rule binds only to its principal or zone under the zone definition it was approved under, and (for a digest without collisions) every zone it binds to decides every request as that one did |
+| `Wicket/Message.lean` | `message::relation` (#565), decided by the control host and by a node cut off from it | `peer_iff`: a message goes to a peer exactly when its receiver's `accept_from` names the sender's zone (a zone entry) or principal (a principal entry); `refused_iff`; `no_peer_without_accept_from`; `less_known_allows_no_more` and `less_known_same_relation`: a side that doesn't know the sender's principal refuses whatever one that knows it refuses, and otherwise decides the same relation (or sees an answer where the other sees a named peer) |
 
 ## What it doesn't cover
 
@@ -100,6 +101,8 @@ and the IPv4 forms), grant ends and clock readings around the boundary, every co
 agents' rules and escalation classes, lists of failed checks, counted uses, money amounts at the
 edges of `i64`, and spawn limits and asks. Section 9 adds standing reach (#572): asks narrowed to
 generated evidence (`narrow`), and what narrowed and generated rules decide (`rule_allows`).
+Section 10 adds the message rule (#565): `message::relation` on generated family, reply,
+`accept_from` and senders.
 
 In GitHub Actions, `ci/lean.sh` also turns the build's errors and the oracle's divergences into
 annotations on the run, so they show in the pull request without its log.
