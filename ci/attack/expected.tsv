@@ -1,0 +1,225 @@
+# The attack matrix's expected outcomes (ci/attack-matrix.sh, #215, #326): one line per attempt in
+# ci/attack/attack.sh, `<attempt>\t<outcome>`, compared exactly. GOT (an escape) is never expected.
+# A change in what wicket allows shows up here, in review. Outcomes: ci/attack/attack.sh's header.
+
+# controls: what the zone allows works (a control that fails is a FAIL, not an escape)
+control-reach	ok
+control-echo	ok
+control-dns	ok
+control-gateway	ok
+
+# through the proxy, outside the zone: other hosts, methods, request shapes, the host's own addresses,
+# loopback in its spellings, cloud metadata, IP literals, wicket's own ports, names whose DNS answers
+# are internal (*.nip.io and localtest.me are in reach: the dial check refuses them), other ports
+other-host	refused
+other-host-https	refused
+other-path	refused
+other-method	refused
+other-method-put	refused
+trace-method	refused
+host-header	refused
+absolute-uri	refused
+method-override	refused
+url-rewrite	refused
+trailing-dot	refused
+upper-host	refused
+userinfo-host	refused
+connect-other-host	refused
+connect-ip	refused
+host-canary	refused
+host-canary-tunnel	refused
+loopback-canary	refused
+loopback-decimal	refused
+loopback-hex	refused
+loopback-v6	refused
+loopback-mapped	refused
+localhost-name	refused
+cloud-metadata	refused
+cloud-metadata-v6	refused
+gcp-metadata	refused
+azure-wireserver	refused
+ip-literal-public	refused
+ip-literal-v6	refused
+proxy-loop	refused
+proxy-to-gateway	refused
+proxy-to-198	refused
+rebind-loopback	refused
+rebind-loopback-https	refused
+rebind-private	refused
+rebind-host	refused
+rebind-metadata	refused
+rebind-localtest	refused
+doh-cloudflare	refused
+doh-google	refused
+doh-ip	refused
+other-port	refused
+other-port-canary	refused
+
+# path tricks against the reach rules (the echo host shows the path the upstream saw: contained means
+# within the rule, as the upstream reads it)
+control-echo-rule	contained
+path-dotdot	refused
+path-dot-escaped	refused
+path-dot-mixed	refused
+path-slash-escaped	refused
+path-slash-escaped-lower	refused
+path-backslash	refused
+path-double-slash	refused
+path-semicolon	refused
+path-double-escape	refused
+path-null	refused
+path-case	refused
+path-sibling	refused
+path-forbidden	refused
+path-forbidden-case	refused
+path-forbidden-escaped	refused
+path-forbidden-dot	refused
+path-get-dotdot	refused
+path-get-suffix	refused
+path-fragment	contained
+path-query	contained
+method-on-echo	refused
+echo-plain-http	refused
+
+# the injected credential reflected (#362): contained here; the host checks each body for the canary,
+# raw, base64 and hex
+reflect-encoding-gzip	contained
+reflect-encoding-br	contained
+reflect-encoding-deflate	contained
+reflect-range	contained
+reflect-range-multi	contained
+reflect-http1	contained
+reflect-h2	contained
+reflect-own-auth	contained
+
+# around the proxy: no proxy, raw TCP and UDP, the forwarder's ports, the synthetic addresses' other
+# ports, DNS (wicket's resolver answers only from its synthetic range), raw and packet sockets, frames
+# written straight to the forwarder's UDP relay, the host's unix and abstract sockets
+no-proxy	refused
+no-proxy-https	refused
+raw-tcp-public	refused
+raw-tcp-dns	refused
+raw-tcp-host	refused
+raw-tcp-v6	refused
+raw-tcp-gateway-ip	refused
+forwarder-port-22	refused
+forwarder-port-80	refused
+forwarder-port-443	refused
+forwarder-port-2375	refused
+forwarder-port-2376	refused
+forwarder-port-3129	refused
+forwarder-port-5000	refused
+forwarder-port-8000	refused
+forwarder-port-8082	refused
+forwarder-port-9000	refused
+forwarder-port-9999	refused
+forwarder-port-canary	refused
+synthetic-port-22	refused
+synthetic-port-80	refused
+synthetic-port-8080	refused
+synthetic-port-canary	refused
+udp-dns-public	refused
+udp-dns-public-2	refused
+dns-exfil-label	refused
+dns-exfil-deep	refused
+dns-exfil-unregistered	refused
+dns-txt	refused
+dns-any	refused
+dns-ptr	refused
+dns-metadata-name	refused
+dns-tcp	refused
+dns-axfr	refused
+raw-icmp	refused
+raw-ip	refused
+packet-socket	refused
+ping-socket	refused
+udp-relay-public-dns	refused
+udp-relay-quic-ip	refused
+udp-relay-wicket-dns-exfil	refused
+udp-relay-quic-synthetic-unreached	refused
+host-unix-socket	refused
+host-abstract-socket	refused
+docker-socket	refused
+containerd-socket	refused
+
+# the forwarder's host sockets spoken to directly, and the model proxy (a program has no model route)
+egress-sock-direct	refused
+llm-sock	refused
+model-proxy	refused
+model-proxy-profile	refused
+
+# the gateway's tools: asking files a request for a human (asked) and grants nothing; deciding,
+# renewing, spawning, linking, connecting, capacity, updates and messages; prefix and standing asks
+ask-other-host	asked
+ask-metadata	refused
+ask-gateway	refused
+ask-standing-wide	asked
+ask-standing-wildcard	refused
+ask-standing-ip	refused
+ask-standing-wicket	refused
+ask-standing-other-host-paths	refused
+after-asking	refused
+after-asking-standing	refused
+self-decide	refused
+self-renew	refused
+peer-decide	refused
+peer-await	refused
+spawn-child	refused
+spawn-service-zone	refused
+connect-peer	asked
+connect-service	refused
+link-peer	refused
+link-parent	refused
+capacity	refused
+update	asked
+message-peer-grant	refused
+message-parent-grant	refused
+expose-as-service	info
+after-messages	refused
+
+# a prefix grant an operator made (ci/attack-matrix.sh approves it): within it is contained, any way out
+# of it refused
+prefix-granted	info
+prefix-exact	contained
+prefix-below	contained
+prefix-dotdot	refused
+prefix-escaped-dots	refused
+prefix-escaped-slash	refused
+prefix-sibling	refused
+prefix-case	refused
+prefix-method	refused
+prefix-other-host	refused
+
+# files outside the box's volumes: the host's, wicket's data directory, the run directories, the vault;
+# symlinks to host paths left where the host reads (the host checks they weren't followed); read-only
+# mounts; user namespaces; host processes
+host-file	refused
+data-dir-file	refused
+host-file-dotdot	refused
+host-file-proc-root	refused
+host-file-proc-self	refused
+run-dir-ctl	refused
+peer-run-dir	refused
+vault	refused
+shadow	refused
+list-/wicket/sock	refused
+list-/wicket/state	refused
+list-/wicket/ca	refused
+list-/volumes/scratch	refused
+list-/workspace	refused
+symlink-entry-times	info
+symlink-outbox	info
+write-/wicket/ca/x	refused
+write-/etc/hosts	refused
+write-/etc/resolv.conf	refused
+write-/usr/local/bin/wicket-fwd	refused
+write-/usr/x	refused
+userns-remount	refused
+userns-net	refused
+host-processes	refused
+
+# the per-node service the zone uses (#579), whose reach is wider than the zone's: its link waits for a
+# human, who never comes
+connect-service-run	asked
+link-service-run	refused
+svc-link	refused

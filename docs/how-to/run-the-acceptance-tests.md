@@ -48,6 +48,7 @@ wicket run examples/mock-github.yaml
 | script | checks |
 |---|---|
 | `ci/smoke.sh` | one agent in a gVisor box, end to end, with the mock model (CI runs it) |
+| `ci/attack-matrix.sh` | a program box told to get out of its reach: planted canaries (an injected secret, host files, another box's port, the host's sockets, a service it may not use) and about 190 attempts to get them or anything else out, each compared with `ci/attack/expected.tsv`; fails naming any attempt that got through (CI runs it in the smoke job) |
 | `ci/hibernate.sh [--node]` | hibernate and wake, on this host or an enrolled node |
 | `ci/node-e2e.sh --local\|<node>` | a box working on its grants while its node is cut off |
 | `ci/update.sh` | `wicket self update`, its health gate and automatic rollback |
