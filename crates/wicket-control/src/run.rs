@@ -1111,7 +1111,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         image: image.to_string(),
         isolation: m.zone.isolation,
         mounts: vec![],
-        env: plan.env,
+        env: plan.env.into_iter().chain(crate::services::user_env(&ledger.lock().expect("ledger"), &m.zone.uses)).collect(),
         argv: plan.argv,
         // In bytes, as the subset check read it, so Docker can't read the limit differently (#126).
         memory: m.zone.limits.memory_bytes().context("limits.memory is unreadable")?.to_string(),
@@ -1342,6 +1342,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         })
         .await?;
         timings.since("box_start", box_lap);
+        // #579 step 3: a per-node service offers its port, under its name, to the boxes that use it;
+        // a box that uses services is linked to their instances on its node once they run.
+        crate::services::after_start(&ctx, &m, &node_name);
         timings.mark("started");
         // The image's digest as its node started it (#192), or (re-attached, taken over) as pinned
         // or recorded: in the run's record and the audit, the parent's pin for children that name

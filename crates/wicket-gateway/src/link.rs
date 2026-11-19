@@ -188,6 +188,46 @@ async fn connect_inner(ctx: &RunCtx, target: &str, port: Option<u64>) -> Result<
     open(ctx, ops, &me, &t, port, d, &wanted).await
 }
 
+/// A box's `uses: [service]` (#579 step 3): it reaches the service's instance on its own node at
+/// `<service>.wicket.internal:<port>`. Not a tool: wicket opens it for the box once it has started.
+/// The target is the instance wicket started for that service on this box's node, for its tenant
+/// (or the shared one), found in the ledger, never by a name a box exposed. Using a service is
+/// having its reach: the link needs a human unless this zone's reach covers the service's.
+pub async fn use_service(ctx: &RunCtx, service: &str, port: u16) -> Reply {
+    match use_service_inner(ctx, service, port).await {
+        Ok(s) => (s, false),
+        Err(e) => (format!("not linked: {e}"), true),
+    }
+}
+
+async fn use_service_inner(ctx: &RunCtx, service: &str, port: u16) -> Result<String, String> {
+    if !ctx.zone.uses.iter().any(|u| u == service) {
+        return Err(format!("zone {} doesn't use {service}", ctx.zone.name));
+    }
+    let ops = ctx.boxes.clone().ok_or("links need a box wicket runs on a node (this one can't link)")?;
+    let (node, instance) = {
+        let l = ledger(ctx);
+        let node = l.run_node(&ctx.run.0).map_err(|e| e.to_string())?.unwrap_or_else(|| "local".into());
+        let mut found = None;
+        for tenant in [ctx.tenant.0.as_str(), wicket_store::SHARED_TENANT] {
+            let live = l.service_instances(service, &node, tenant).map_err(|e| e.to_string())?.into_iter().find(|i| i.live);
+            if let Some(i) = live {
+                found = Some(i.run);
+                break;
+            }
+        }
+        (node, found)
+    };
+    let to = instance.ok_or_else(|| format!("no instance of {service} runs on node {node} yet"))?;
+    let (me, _) = end_info(ctx, &*ops, &ctx.run.0, None)?;
+    let (t, exposed) = end_info(ctx, &*ops, &to, Some(port))?;
+    if exposed.is_none() {
+        return Err(format!("{service}'s instance {to} on node {node} hasn't exposed port {port} yet"));
+    }
+    let d = policy::connect_service(&me.end(), &t.end())?;
+    open(ctx, ops, &me, &t, port, d, service).await
+}
+
 /// `link(from, to, port)`: the caller, controlling both ends, lets `from` reach `port` of `to`.
 pub async fn link(ctx: &RunCtx, from: &str, to: &str, port: Option<u64>) -> Reply {
     let r = async {

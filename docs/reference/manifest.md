@@ -56,6 +56,8 @@ What makes a program a per-node service ([#579](https://github.com/public/wicket
 
 `wicket service add <manifest>` installs one (audited `service.added`; `wicket service list`, `wicket service remove`). Each `wicket reconcile` pass then keeps one instance of it on every active node its `node_selector` matches where a live box's zone `uses` it, per tenant unless `tenancy: shared`. An instance is an ordinary run of the program on that node (`services/<name>/<run>.log` in the data directory has its output). One that exits is started again, at most once a minute. Its manifest is read where it was installed from, at each start.
 
+An instance offers its `port` under the service's name once its box starts. A box whose zone `uses` the service gets the service's `env` at its start, and once the instance on its node runs (up to 2 minutes), a link to it: `<name>.wicket.internal:<port>`. The link's target is the instance wicket started for that service on the box's node and tenant, found in the ledger, never a box that merely exposed a port under that name. It opens without a human only if the box's zone reaches everything the service's does; otherwise its request is filed for exactly that link, as any link's is. The box's output says what became of each.
+
 ## `placement`
 
 What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. Today it decides where a woken agent goes ([nodes](nodes.md#placement)); `wicket run --node` and a spawn's placement hint name the node themselves.

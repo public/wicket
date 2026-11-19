@@ -112,6 +112,68 @@ fn start(manifest: &str, s: &Start, run: &str) -> Result<()> {
     Ok(())
 }
 
+/// The installed service named `name`, its manifest loaded.
+fn installed(l: &Ledger, name: &str) -> Option<ServiceSpec> {
+    let row = l.services().ok()?.into_iter().find(|s| s.name == name)?;
+    wicket_core::Manifest::from_yaml(&std::fs::read_to_string(&row.manifest).ok()?).ok()?.service
+}
+
+/// The environment a box whose zone uses `uses` gets from them (each service's `env`, `{host}` and
+/// `{port}` filled in), at its start. A service not installed gives nothing (its link says why).
+pub fn user_env(l: &Ledger, uses: &[String]) -> Vec<(String, String)> {
+    uses.iter().filter_map(|u| installed(l, u).map(|s| s.user_env(u))).flat_map(|e| e.into_iter()).collect()
+}
+
+/// How long a box that uses a service waits for its node's instance to run and link (a reconcile
+/// pass starts it within 30 s, and its start takes a few more).
+pub const LINK_WAIT_SECS: u64 = 120;
+
+/// After a box started (#579 step 3):
+/// - a per-node service's instance exposes its port, under its name, to the boxes that use it;
+/// - a box whose zone uses services records that (so the reconciler keeps an instance on its node)
+///   and is linked to each one's instance there once it runs, as `<name>.wicket.internal`.
+pub fn after_start(ctx: &wicket_proxy::RunCtx, m: &wicket_core::Manifest, node: &str) {
+    if let (Some(s), Some(p)) = (&m.service, &m.program) {
+        let l = ctx.ledger.lock().expect("ledger");
+        let zone = serde_json::to_string(&m.zone).unwrap_or_default();
+        let exposed = l.expose(&ctx.tenant, &ctx.run.0, s.port, Some(&p.name), &zone).and_then(|_| {
+            l.audit(&ctx.tenant, Some(&ctx.run), "link.expose", &serde_json::json!({ "port": s.port, "name": p.name, "service": true }))
+        });
+        match exposed {
+            Ok(_) => say!("[wicket] service {} offers port {} on node {node} to the boxes there that use it", p.name, s.port),
+            Err(e) => say_err!("[wicket] service {}: could not expose port {}: {e}", p.name, s.port),
+        }
+    }
+    if m.zone.uses.is_empty() {
+        return;
+    }
+    let tenant = ctx.tenant.0.clone();
+    for u in &m.zone.uses {
+        let l = ctx.ledger.lock().expect("ledger");
+        if let Err(e) = l.want_service(u, node, &tenant, &ctx.run.0) {
+            say_err!("[wicket] could not record that this box uses {u}: {e}");
+        }
+        let Some(spec) = installed(&l, u) else {
+            say!("[wicket] this box's zone uses {u}, which isn't installed (wicket service add): not linked");
+            continue;
+        };
+        drop(l);
+        let (ctx, u, node) = (ctx.clone(), u.clone(), node.to_string());
+        tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            loop {
+                let (text, err) = wicket_gateway::link::use_service(&ctx, &u, spec.port).await;
+                let waiting = err && (text.contains("no instance") || text.contains("hasn't exposed") || text.contains("not running"));
+                if !waiting || t0.elapsed().as_secs() >= LINK_WAIT_SECS {
+                    say!("[wicket] {u} on node {node}: {text}");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +185,30 @@ mod tests {
 
     fn inst(started_at: i64, live: bool) -> Instance {
         Instance { run: "run_i".into(), service: "s".into(), node: "n".into(), tenant: "t".into(), started_at, live }
+    }
+
+    #[test]
+    fn a_box_gets_the_environment_of_the_installed_services_it_uses() {
+        let dir = std::env::temp_dir().join(format!("wicket-svc-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("npm-cache.yaml");
+        std::fs::write(
+            &path,
+            concat!(
+                "task: cache\nprogram: { name: npm-cache, command: [verdaccio] }\n",
+                "service: { port: 4873, env: { npm_config_registry: 'http://{host}:{port}/' } }\n",
+                "zone: { name: npm-cache }\n"
+            ),
+        )
+        .unwrap();
+        let l = Ledger::open_in_memory().unwrap();
+        l.add_service("npm-cache", &path.display().to_string(), "alex").unwrap();
+        let uses = vec!["npm-cache".to_string(), "not-installed".to_string()];
+        assert_eq!(user_env(&l, &uses), vec![("npm_config_registry".to_string(), "http://npm-cache.wicket.internal:4873/".to_string())]);
+        assert!(user_env(&l, &[]).is_empty());
+        std::fs::remove_file(&path).unwrap();
+        assert!(user_env(&l, &uses).is_empty(), "a manifest gone: nothing");
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
