@@ -37,7 +37,8 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 | [`request_capacity`](#request_capacity) | Ask for a machine of its own (a lease) | `placement.yaml` |
 | [`request_update`](#request_update) | Ask the operator to update wicket to a build | |
 | [`expose`](#expose) | Offer a TCP port to other boxes | |
-| [`connect`](#connect) | Reach another box's port | |
+| [`request_name`](#request_name) | Give a port a stable internal name | protocol 18 |
+| [`connect`](#connect) | Reach another box's port, by box or by internal name | |
 | [`link`](#link) | Wire two boxes the caller controls | |
 | [`unlink`](#unlink) | Close a link | |
 | [`links`](#links) | The caller's links | |
@@ -396,18 +397,56 @@ connect without it; other boxes may if this zone's `accept_from` lists their pri
 | `port` | integer, 1–65535, required | |
 | `name` | string | the agent's name: connectors see `<name>.wicket.internal` |
 
+## `request_name`
+
+Gives a TCP port of this box a stable internal name, `<name>.<zone>.wicket.internal`, that other
+boxes of the tenant reach it by with `connect(name: "<name>.<zone>")`
+([#575](https://github.com/public/wicket/issues/575); [names for boxes](../explanation/box-dns.md)).
+The name grants nothing: it is `expose` under a name unique in the zone, and whoever connects is
+decided as `connect` decides (the parent, boxes the zone's `accept_from` lists, or an operator). So
+it needs no approval:
+
+- the name must be one DNS label (`a-z`, `0-9`, `-`, at most 63 characters, not starting or ending
+  with `-`, no `xn--`);
+- it must not be held by another agent in the zone;
+- an agent holds at most 3 internal names at once.
+
+The zone part is the zone's name in DNS form: lower case, with `_` as `-` (zone `Build` gives
+`<name>.build`, a spawned zone `lead.fetcher.run_01J…` gives `<name>.lead.fetcher.run-01j…`); a zone
+whose name can't be put in that form can't hold names. The answer says the name in full.
+
+It is held by the run that asked, and ends with it (audited as `name.released`). Asking again from
+the same run moves the name to another port, and the old port is no longer offered under it. Audited
+as `name.registered`.
+
+Public names, on the internet, aren't available yet: `kind: public` is refused. The tool needs a
+control host and node at protocol 18; with an older control host the node refuses it.
+
+| argument | type | default |
+|---|---|---|
+| `name` | string, required | |
+| `port` | integer, 1–65535, required | |
+| `kind` | `internal` | `internal` |
+| `reason` | string: what it serves, for the record (at most 200 characters) | |
+
 ## `connect`
 
 Reaches a TCP port of another box: one of the caller's children (by name or run id; no `expose`
-needed), its parent, or a box that exposed the port. Returns the address to use in the caller's box,
+needed), its parent, a box that exposed the port, or the box holding an internal name
+([`request_name`](#request_name)), given as `name` instead of `box`. A name's link is named after it,
+so the caller's box resolves `<name>.<zone>.wicket.internal` too, and the port defaults to the
+name's. A by-name link is always named exactly after the name: if the box still has an open link
+under it to an earlier holder, or already links to the holder under another name, it is refused until
+that link is closed. Returns the address to use in the caller's box,
 `<name>.wicket.internal:<port>`, relayed by wicket. Connecting lends the caller the target's
 authority, so a target whose reach isn't within the caller's needs an operator: the answer is then a
 request id for `await_grant`, after which the caller calls `connect` again.
 
 | argument | type | |
 |---|---|---|
-| `box` | string, required | a child's name, a run id, or `"parent"` |
-| `port` | integer, 1–65535, required | |
+| `box` | string | a child's name, a run id, or `"parent"` |
+| `name` | string, instead of `box` | an internal name: `<name>.<zone>`, with or without `.wicket.internal` |
+| `port` | integer, 1–65535 | required with `box`; with `name`, the name's port (another is refused) |
 
 ## `link`
 

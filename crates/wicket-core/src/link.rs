@@ -193,6 +193,33 @@ pub fn allocate(used: &[Named], to_run: &str, wanted: &str) -> Result<(String, I
     Ok((name, addr))
 }
 
+/// A by-name link's name and address (#575): exactly `name`, an internal name already in its DNS
+/// form (`<label>.<zone part>`), never suffixed, so the name a box connected by always reaches the
+/// name's holder. `open` holds only this box's open links: closed ones don't keep a name. Its
+/// address avoids every address in `used` (all of this box's links, open or closed), as
+/// [`allocate`]'s do, since `allocate` gives a target back the address it had. Refused if an open
+/// link of this box uses the name for another box (a holder that ended, whose link is still
+/// closing), or links to `to_run` under another name.
+pub fn allocate_exact(open: &[Named], used: &[Named], to_run: &str, name: &str) -> Result<(String, Ipv4Addr), String> {
+    if let Some(n) = open.iter().find(|n| n.name == name) {
+        return match n.to_run == to_run {
+            true => Ok((n.name.clone(), n.addr)),
+            false => {
+                Err(format!("this box has an open link named {name} to another box ({}): unlink it, or try again once it closes", n.to_run))
+            }
+        };
+    }
+    if let Some(n) = open.iter().find(|n| n.to_run == to_run) {
+        return Err(format!("this box already links to that box as {}.{DOMAIN}: unlink it to link it by name", n.name));
+    }
+    let start = u32::from(POOL_START);
+    let addr = (start..start + POOL_SIZE)
+        .map(Ipv4Addr::from)
+        .find(|a| used.iter().chain(open).all(|n| n.addr != *a))
+        .ok_or_else(|| format!("this box already links to {POOL_SIZE} boxes, the most it can"))?;
+    Ok((name.to_string(), addr))
+}
+
 /// Whether `a` is one of the link pool's addresses.
 pub fn in_pool(a: Ipv4Addr) -> bool {
     let (s, x) = (u32::from(POOL_START), u32::from(a));
@@ -214,6 +241,31 @@ pub fn hosts_file(names: &[(String, Ipv4Addr)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #575 review, M1: a by-name link is named exactly after the name, never suffixed; a closed
+    /// link doesn't keep the name, but an open one to another box refuses it.
+    #[test]
+    fn by_name_links_keep_their_exact_name() {
+        let n = |name: &str, last: u8, to: &str| Named { name: name.into(), addr: Ipv4Addr::new(198, 18, 1, last), to_run: to.into() };
+        let closed = n("api.build", 1, "run_a");
+        // The old holder's link is closed: the new holder gets the same name, at a fresh address.
+        let (name, addr) = allocate_exact(&[], std::slice::from_ref(&closed), "run_b", "api.build").unwrap();
+        assert_eq!((name.as_str(), addr), ("api.build", Ipv4Addr::new(198, 18, 1, 2)));
+        // Still open to the old holder: refused, not api.build-2.
+        assert!(allocate_exact(std::slice::from_ref(&closed), std::slice::from_ref(&closed), "run_b", "api.build")
+            .unwrap_err()
+            .contains("open link named api.build"));
+        // Already linked to that box under another name: refused.
+        let other = n("api", 3, "run_b");
+        assert!(allocate_exact(std::slice::from_ref(&other), std::slice::from_ref(&other), "run_b", "api.build")
+            .unwrap_err()
+            .contains("as api.wicket.internal"));
+        // The same name to the same box: kept.
+        let same = n("api.build", 4, "run_b");
+        assert_eq!(allocate_exact(std::slice::from_ref(&same), &[], "run_b", "api.build").unwrap().1, Ipv4Addr::new(198, 18, 1, 4));
+        // And connect(box) still labels a dotted wanted name (#575 review, M2).
+        assert_eq!(allocate(&[], "run_c", "api.build").unwrap().0, "api-build");
+    }
     use crate::manifest::Manifest;
 
     fn zone(yaml: &str) -> ZoneSpec {

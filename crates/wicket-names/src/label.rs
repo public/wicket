@@ -56,8 +56,26 @@ impl fmt::Display for LabelError {
 
 impl std::error::Error for LabelError {}
 
-/// Checks `label` against the rules.
+/// Checks `label` against the rules: its shape ([`check_shape`]), then the reserved labels and
+/// their lookalikes. For public names.
 pub fn check_label(label: &str, rules: &Rules) -> Result<(), LabelError> {
+    check_shape(label, rules.allow_idn)?;
+    let s = skeleton(label);
+    let reserved = RESERVED.iter().map(|r| r.to_string()).chain(rules.reserved.iter().map(|r| r.to_ascii_lowercase()));
+    for r in reserved {
+        if r == label {
+            return Err(LabelError::Reserved(String::new()));
+        }
+        if !r.is_empty() && skeleton(&r) == s {
+            return Err(LabelError::Reserved(r));
+        }
+    }
+    Ok(())
+}
+
+/// Checks only that `label` is one DNS label wicket accepts (no reserved names): for internal
+/// names, which live under their zone's name, where no lookalike of the console's can be.
+pub fn check_shape(label: &str, allow_idn: bool) -> Result<(), LabelError> {
     if label.is_empty() {
         return Err(LabelError::Empty);
     }
@@ -70,20 +88,30 @@ pub fn check_label(label: &str, rules: &Rules) -> Result<(), LabelError> {
     if label.starts_with('-') || label.ends_with('-') {
         return Err(LabelError::Hyphen);
     }
-    if label.starts_with("xn--") && !rules.allow_idn {
+    if label.starts_with("xn--") && !allow_idn {
         return Err(LabelError::Idn);
     }
-    let s = skeleton(label);
-    let reserved = RESERVED.iter().map(|r| r.to_string()).chain(rules.reserved.iter().map(|r| r.to_ascii_lowercase()));
-    for r in reserved {
-        if r == label {
-            return Err(LabelError::Reserved(String::new()));
-        }
-        if !r.is_empty() && skeleton(&r) == s {
-            return Err(LabelError::Reserved(r));
-        }
-    }
     Ok(())
+}
+
+/// The longest zone part of an internal name: with a 63-character label, a dot and
+/// `.wicket.internal`, the whole name stays within DNS's 253.
+pub const MAX_ZONE_PART: usize = 170;
+
+/// A zone's name as it appears in internal names (`<label>.<zone part>.wicket.internal`, #575):
+/// lower case, `_` as `-`, each dot-separated part one label ([`check_shape`]). Zone names allow
+/// upper case and `_`, and spawned zones are dotted (`<parent>.<agent>.<run>`): this is the one
+/// form a name is registered, looked up and linked under. A zone name it can't make DNS-safe is
+/// refused.
+pub fn zone_part(zone: &str) -> Result<String, LabelError> {
+    let z = zone.to_ascii_lowercase().replace('_', "-");
+    if z.len() > MAX_ZONE_PART {
+        return Err(LabelError::TooLong(z.len()));
+    }
+    for part in z.split('.') {
+        check_shape(part, false)?;
+    }
+    Ok(z)
 }
 
 /// The label with lookalikes folded: `0`→`o`, `1` and `i`→`l`, `5`→`s`, `rn`→`m`, `vv`→`w`, and
@@ -142,5 +170,24 @@ mod tests {
         assert!(check_label("5tatus", &rules).is_err());
         assert!(check_label("0ps", &rules).is_err());
         assert_eq!(check_label("demo", &rules), Ok(()));
+    }
+
+    #[test]
+    fn zone_parts_are_dns_safe() {
+        assert_eq!(zone_part("Build").unwrap(), "build");
+        assert_eq!(zone_part("web_api").unwrap(), "web-api");
+        assert_eq!(zone_part("lead.fetcher.run_01JABCD").unwrap(), "lead.fetcher.run-01jabcd");
+        assert!(zone_part("a..b").is_err());
+        assert!(zone_part("-x").is_err());
+        assert!(zone_part("caf\u{e9}").is_err());
+        assert!(zone_part(&"a.".repeat(100)).is_err());
+    }
+
+    #[test]
+    fn shapes_alone_allow_reserved_labels() {
+        assert_eq!(check_shape("api", false), Ok(()));
+        assert_eq!(check_shape("console", false), Ok(()));
+        assert_eq!(check_shape("a.b", false), Err(LabelError::Character('.')));
+        assert_eq!(check_shape("xn--bcher-kva", false), Err(LabelError::Idn));
     }
 }
