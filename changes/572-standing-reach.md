@@ -17,7 +17,9 @@ type: Added
     The operator may `--narrow` it to the evidence, and approves it for the agent (each later run
     of it) or `--for zone` (every agent of its zone), for 30 days by default (`--lasts`), or
     `forever` (until revoked). `wicket standing list`, `renew` and `revoke` manage approved rules.
-    Only a human approves standing reach.
+    The console's **Standing reach** card does the same: approve as asked or narrowed, for the
+    agent or its zone (passkey-signed), and renew or revoke approved rules. Only a human approves
+    standing reach.
   - **An agent that asks for the same method on a host a third time in a week** is told, with its
     answer, that standing reach would save it asking again.
   - **Needs protocol 17:** the control host and the box's node must both be on this release. A

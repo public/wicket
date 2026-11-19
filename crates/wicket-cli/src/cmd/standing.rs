@@ -194,19 +194,19 @@ pub async fn dispatch(c: StandingCmd) -> Result<()> {
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
                 bail!("not approved");
             }
-            st::approve(&l, &human()?, &id, &a, Some(&shown))?;
+            st::approve(&l, &human()?, &id, &a, Some(&shown), serde_json::json!({ "via": "cli" }))?;
             println!("approved {id}: the agent's later runs are allowed {} without asking", rule_text(&shown_rule));
             Ok(())
         }
         StandingCmd::Deny { id } => {
             let l = Ledger::open(&ledger_path())?;
-            st::deny(&l, &human()?, &id)?;
+            st::deny(&l, &human()?, &id, serde_json::json!({ "via": "cli" }))?;
             println!("denied {id}");
             Ok(())
         }
         StandingCmd::Renew { id, lasts: d } => {
             let l = Ledger::open(&ledger_path())?;
-            match st::renew(&l, &human()?, &id, lasts(&d)?)? {
+            match st::renew(&l, &human()?, &id, lasts(&d)?, serde_json::json!({ "via": "cli" }))? {
                 Some(u) => println!("renewed {id}: until {}", when(u)),
                 None => println!("renewed {id}: until revoked"),
             }
