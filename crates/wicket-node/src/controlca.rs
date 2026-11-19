@@ -129,6 +129,11 @@ pub struct CaRenewal {
 }
 
 impl CaRenewal {
+    /// Whether a renewal is under way on this connection (its steps time out on the tick).
+    pub fn busy(&self) -> bool {
+        self.step.is_some()
+    }
+
     /// A new connection: nothing under way on it.
     pub fn reset(&mut self) {
         self.step = None;

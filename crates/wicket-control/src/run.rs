@@ -1607,6 +1607,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         None => true,
     };
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut asks_watch = wicket_store::ChangeWatch::new();
     // A wrapped agent's stdout goes straight to its launcher; otherwise wicket reads it.
     let mut lines = stdout.map(|o| BufReader::new(o).lines());
     let mut wrapped_exit: Option<std::process::ExitStatus> = None;
@@ -1996,7 +1997,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
                 // A `session/cancel` from the console's session view (#327): the running turn, if any.
                 // Prompts still queued behind it stay queued.
-                let cancels = ledger.lock().ok().and_then(|mut l| l.take_turn_cancels(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
+                // Asks are read only when the ledger says some changed (#582 step 2).
+                let asks = ledger.lock().map(|l| asks_watch.changed(&l, wicket_store::Topic::Asks).unwrap_or(true)).unwrap_or(true);
+                let cancels = if asks {
+                    ledger.lock().ok().and_then(|mut l| l.take_turn_cancels(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default()
+                } else {
+                    vec![]
+                };
                 if let Some(by) = cancels.last() {
                     use tokio::io::AsyncWriteExt;
                     let out = match (acp.as_mut(), control.as_mut()) {
@@ -2038,7 +2045,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
                     write_lines(&mut stdin, &out.write).await;
                 }
-                let modes = ledger.lock().ok().and_then(|mut l| l.take_mode_changes(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
+                let modes = if asks {
+                    ledger.lock().ok().and_then(|mut l| l.take_mode_changes(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default()
+                } else {
+                    vec![]
+                };
                 if let Some((want, by)) = modes.last() {
                     let outcome = match (crate::control::parse_mode(want), control.as_mut()) {
                         (Some(mode), Some(c)) => {
