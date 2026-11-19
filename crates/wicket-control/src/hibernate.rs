@@ -697,31 +697,9 @@ pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: O
             held.push(l.held_on(&c.name, c.at_ms, now_ms)?);
         }
         let on = OnNodes::read(l)?;
-        let nodes = |w: &Waiting| -> Vec<wicket_placement::schedule::Node> {
-            cands
-                .iter()
-                .zip(&held)
-                .map(|(c, (cpu, mib))| {
-                    let mut n = scheduled_node(l, c, &w.need);
-                    on.fill(l, &mut n, w);
-                    n.used_vcpus += cpu;
-                    n.used_memory_mib += mib;
-                    n.room_mib = n.room_mib.map(|r| r.saturating_sub(*mib));
-                    n
-                })
-                .collect()
-        };
+        let nodes = |w: &Waiting| seen(l, cands, &held, &on, w);
         if fifo {
-            let mut waiting: Vec<(Waiter, Waiting)> = vec![];
-            let mut me = Waiter { run: run.0.clone(), priority: req.priority, at_ms: now_ms };
-            for (r, at_ms, json) in l.live_waiters(now_ms)? {
-                if r == run.0 {
-                    me.at_ms = at_ms;
-                    continue;
-                }
-                let Ok(w) = serde_json::from_str::<Waiting>(&json) else { continue };
-                waiting.push((Waiter { run: r, priority: w.req.priority, at_ms }, w));
-            }
+            let (me, waiting) = queue(l, run, req.priority, now_ms)?;
             let queue: Vec<Waiter> = waiting.iter().map(|(q, _)| q.clone()).collect();
             for older in ahead(&me, &queue) {
                 let Some((_, w)) = waiting.iter().find(|(q, _)| q.run == older.run) else { continue };
@@ -739,6 +717,115 @@ pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: O
         let b = Bound { decision: d, behind: None };
         l.record_placement_decision(&run.0, &decision_record(ask, &b, cands.len()), now_ms)?;
         Ok(b)
+    })
+}
+
+/// The candidates as `w` sees them: each one's room less what reservations hold on it (`held`, one
+/// per candidate), and what runs on it ([`OnNodes`]).
+fn seen(l: &Ledger, cands: &[Candidate], held: &[(f32, u64)], on: &OnNodes, w: &Waiting) -> Vec<wicket_placement::schedule::Node> {
+    cands
+        .iter()
+        .zip(held)
+        .map(|(c, (cpu, mib))| {
+            let mut n = scheduled_node(l, c, &w.need);
+            on.fill(l, &mut n, w);
+            n.used_vcpus += cpu;
+            n.used_memory_mib += mib;
+            n.room_mib = n.room_mib.map(|r| r.saturating_sub(*mib));
+            n
+        })
+        .collect()
+}
+
+/// `run` (asking `priority`) in the queue, and the other live waiters with what they ask.
+fn queue(
+    l: &Ledger,
+    run: &RunId,
+    priority: i32,
+    now_ms: i64,
+) -> Result<(wicket_placement::schedule::Waiter, Vec<(wicket_placement::schedule::Waiter, Waiting)>)> {
+    use wicket_placement::schedule::Waiter;
+    let mut me = Waiter { run: run.0.clone(), priority, at_ms: now_ms };
+    let mut waiting = vec![];
+    for (r, at_ms, json) in l.live_waiters(now_ms)? {
+        if r == run.0 {
+            me.at_ms = at_ms;
+            continue;
+        }
+        let Ok(w) = serde_json::from_str::<Waiting>(&json) else { continue };
+        waiting.push((Waiter { run: r, priority: w.req.priority, at_ms }, w));
+    }
+    Ok((me, waiting))
+}
+
+/// Who preemption's revocations are by.
+pub const PREEMPT_BY: &str = "wicket:preempt";
+
+/// When no node may take `run`'s box and no run waits ahead of it, stops boxes to make room (#579
+/// step 4), in one transaction under the ledger's write lock: those the scheduler chooses
+/// (`wicket_placement::schedule::preempt`: only boxes whose manifest marks them preemptible, of a
+/// lower priority, of `ask`'s own tenant, as few as it can on one node). Each is stopped the normal
+/// way, its run revoked (its supervisor stops its box), and audited as `placement.preempted`.
+///
+/// A box already revoked counts as gone, so a retry stops nothing more for the same room. The start
+/// that follows is placed as any other: by [`bind`], once the node's report has the room, and the
+/// node's admission still decides. A box with no terms recorded (started by an older build) is
+/// never stopped.
+pub fn preempt_for(
+    l: &Ledger,
+    run: &RunId,
+    ask: &Waiting,
+    cands: &[Candidate],
+    now_ms: i64,
+) -> Result<Option<wicket_placement::schedule::Preemption>> {
+    use wicket_placement::schedule::{ahead, preempt, Running, Strategy};
+    if ask.tenant.is_empty() {
+        return Ok(None);
+    }
+    l.immediate(|l| {
+        let (me, waiting) = queue(l, run, ask.req.priority, now_ms)?;
+        let others: Vec<_> = waiting.into_iter().map(|(q, _)| q).collect();
+        if !ahead(&me, &others).is_empty() {
+            return Ok(None);
+        }
+        let mut held = vec![];
+        for c in cands {
+            held.push(l.held_on(&c.name, c.at_ms, now_ms)?);
+        }
+        let terms = l.preemption_view()?;
+        let mut nodes = seen(l, cands, &held, &OnNodes::read(l)?, ask);
+        for n in nodes.iter_mut() {
+            for b in terms.iter().filter(|b| b.revoked && b.node == n.name) {
+                n.used_vcpus = (n.used_vcpus - b.vcpus).max(0.0);
+                n.used_memory_mib = n.used_memory_mib.saturating_sub(b.memory_mib);
+                n.room_mib = n.room_mib.map(|r| r.saturating_add(b.memory_mib));
+            }
+        }
+        let mut running: std::collections::BTreeMap<String, Vec<Running>> = Default::default();
+        for b in terms.iter().filter(|b| !b.revoked && b.tenant == ask.tenant && b.run != run.0) {
+            running.entry(b.node.clone()).or_default().push(Running {
+                run: b.run.clone(),
+                vcpus: b.vcpus,
+                memory_mib: b.memory_mib,
+                priority: b.priority,
+                preemptible: b.preemptible,
+            });
+        }
+        let Some(p) = preempt(&ask.req, &nodes, &running, Strategy::BinPack) else { return Ok(None) };
+        let tenant = wicket_core::TenantId(ask.tenant.clone());
+        for v in &p.victims {
+            let prio = terms.iter().find(|b| &b.run == v).map(|b| b.priority).unwrap_or_default();
+            l.revoke(v, PREEMPT_BY, &format!("preempted on node {} for {} (priority {} over {prio})", p.node, run.0, ask.req.priority))?;
+            l.audit(
+                &tenant,
+                Some(&RunId(v.clone())),
+                "placement.preempted",
+                &serde_json::json!({
+                    "run": v, "node": p.node, "priority": prio, "for": run.0, "for_priority": ask.req.priority, "by": PREEMPT_BY,
+                }),
+            )?;
+        }
+        Ok(Some(p))
     })
 }
 
@@ -885,6 +972,9 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
         b = decide(&cands)?;
     }
     let mut told = false;
+    // When this wake last stopped boxes for room: it waits for their room to show in the nodes'
+    // reports before it stops any more.
+    let mut preempted_at: Option<std::time::Instant> = None;
     loop {
         if let Some(n) = &b.decision.node {
             let _ = ledger.lock().expect("ledger").stop_waiting(&run.0);
@@ -916,6 +1006,21 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
             let l = ledger.lock().expect("ledger");
             l.wait_for_placement(&run.0, &waiting, wicket_feed::now_ms())?;
             l.renew_agent_claim(&agent.id, generation, wicket_store::now() + BUSY_CLAIM_SECS)?;
+            // #579 step 4: first in the queue and nothing fits, it may stop boxes that yield to it.
+            let settled = preempted_at.is_none_or(|t| t.elapsed() >= PREEMPT_SETTLE);
+            if b.behind.is_none() && settled {
+                if let Some(p) = preempt_for(&l, run, &me, &cands, wicket_feed::now_ms())? {
+                    say!(
+                        "[wicket] preempting {} on node {n} for agent {} (priority {} over at most {}): stopped as revoked, audited",
+                        p.victims.join(", "),
+                        agent.id,
+                        req.priority,
+                        p.max_priority,
+                        n = p.node,
+                    );
+                    preempted_at = Some(std::time::Instant::now());
+                }
+            }
         }
         if !told {
             say!(
@@ -939,6 +1044,10 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
 /// How often a waiting wake tries again, and how often it asks the nodes with no fresh report.
 const QUEUE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 const QUEUE_REPROBE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a wake that stopped boxes for room waits before it stops any more: long enough for
+/// the nodes' reports (every 30 s, trusted for 90 s) to show the room they gave back.
+const PREEMPT_SETTLE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How long a wake waits for a node by default (`wicket wake --wait`).
 pub const QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(1800);
@@ -1294,6 +1403,67 @@ mod tests {
         // Another tenant's box of the same zone name is no reason, nor holds its volumes.
         let other = Waiting { req: vol, tenant: "t1".into(), zone: "z".into(), ..Default::default() };
         assert_eq!(bind(&l, &RunId("run_d".into()), &other, &cands, None, now, false).unwrap().decision.node.as_deref(), Some("n1"));
+    }
+
+    /// #579 step 4: first in the queue with no node for it, a wake stops the boxes that yield to it
+    /// (preemptible, lower priority, its own tenant's, as few as it can), each revoked and audited;
+    /// a retry stops nothing more; a run waiting ahead of it, or a box without terms, isn't touched.
+    #[test]
+    fn preemption_stops_only_what_yields_through_revocation_audited() {
+        use wicket_placement::schedule::Request;
+        let l = Ledger::open_in_memory().unwrap();
+        let now = 95_000_000;
+        // n1 is full: 4 vCPUs, 4096 MiB, all held by its boxes.
+        let mut n1 = cand("n1", 4.0, 4096, 4.0, 4096);
+        n1.at_ms = now - 1_000;
+        let (t0, t1) = (wicket_core::TenantId("t0".into()), wicket_core::TenantId("t1".into()));
+        let boxed = |t: &wicket_core::TenantId, run: &str, mib: u64, priority: i32, preemptible: Option<bool>| {
+            l.run_started(t, &RunId(run.into()), "z", "a").unwrap();
+            l.set_run_node(run, "n1").unwrap();
+            if let Some(p) = preemptible {
+                l.record_run_terms(run, 1.0, mib, priority, p, now).unwrap();
+            }
+        };
+        boxed(&t0, "run_batch", 1024, 0, Some(true));
+        boxed(&t0, "run_kept", 1024, 0, Some(false));
+        boxed(&t1, "run_theirs", 1024, -5, Some(true));
+        boxed(&t0, "run_old", 1024, -5, None);
+        let ask = |priority| Waiting {
+            req: Request { vcpus: 1.0, memory_mib: 1024, priority, ..Request::default() },
+            tenant: "t0".into(),
+            zone: "z".into(),
+            ..Default::default()
+        };
+        assert!(
+            preempt_for(&l, &RunId("run_low".into()), &ask(0), &[n1.clone()], now).unwrap().is_none(),
+            "an equal priority stops nothing"
+        );
+
+        // A run waiting ahead of it (a higher priority) goes first: it stops nothing.
+        l.wait_for_placement("run_vip", &serde_json::to_string(&ask(9)).unwrap(), now).unwrap();
+        assert!(preempt_for(&l, &RunId("run_new".into()), &ask(5), &[n1.clone()], now).unwrap().is_none());
+        l.stop_waiting("run_vip").unwrap();
+
+        let p = preempt_for(&l, &RunId("run_new".into()), &ask(5), &[n1.clone()], now).unwrap().unwrap();
+        assert_eq!((p.node.as_str(), p.victims.clone()), ("n1", vec!["run_batch".to_string()]), "not kept, theirs or old");
+        let (_, by, why) = l.revoked("run_batch").unwrap().unwrap();
+        assert_eq!(by, PREEMPT_BY);
+        assert!(why.contains("for run_new (priority 5 over 0)"), "{why}");
+        for r in ["run_kept", "run_theirs", "run_old"] {
+            assert!(l.revoked(r).unwrap().is_none(), "{r}");
+        }
+        let audit: Vec<_> = l.audit_records_after(0, 100).unwrap().into_iter().filter(|a| a.kind == "placement.preempted").collect();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].run.as_deref(), Some("run_batch"));
+        let body: serde_json::Value = serde_json::from_str(&audit[0].body).unwrap();
+        assert_eq!((body["for"].as_str(), body["for_priority"].as_i64(), body["priority"].as_i64()), (Some("run_new"), Some(5), Some(0)));
+
+        // Its box is being stopped: its room counts as given back, so a retry stops nothing more.
+        assert!(preempt_for(&l, &RunId("run_new".into()), &ask(5), &[n1.clone()], now + 2_000).unwrap().is_none());
+        // Bigger asks stop no box that doesn't yield, however high the priority.
+        let mut big = ask(1000);
+        big.req.memory_mib = 3072;
+        assert!(preempt_for(&l, &RunId("run_big".into()), &big, &[n1], now).unwrap().is_none(), "kept and old stay; theirs isn't ours");
     }
 
     #[test]

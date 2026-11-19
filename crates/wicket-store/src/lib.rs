@@ -31,7 +31,7 @@ mod nodeca;
 mod nodelabels;
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
-pub use placements::{Placement, RunningBox, RESERVE_SECS, WAIT_SEEN_MS};
+pub use placements::{BoxTerms, Placement, RunningBox, RESERVE_SECS, WAIT_SEEN_MS};
 mod changes;
 pub mod money;
 mod node;
@@ -174,7 +174,11 @@ pub enum StoreError {
 /// step 2): a counter per topic (grants, asks, revocations, node CAs) that every write to its tables
 /// moves, so a supervisor reads its rows only when they changed. Older builds don't read it, and its
 /// triggers fire under them too; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 27;
+/// Version 30 (expand, after #582 step 2's 27) adds `run_terms` (#579 step 4): each box's limits,
+/// priority and whether it may be preempted, recorded at its start, which preemption chooses from.
+/// Older builds don't read it (a box they start has no terms, and is never preempted); the floor
+/// stays 17.
+pub const SCHEMA_VERSION: u32 = 30;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is

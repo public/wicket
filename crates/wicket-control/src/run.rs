@@ -1378,6 +1378,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 Ok(_) => l.placement_bound(&run.0, wicket_feed::now_ms()),
                 Err(_) => l.placement_released(&run.0),
             };
+            // What preemption may choose from (#579 step 4): every box's terms, from its start.
+            if nb.is_ok() {
+                let r = wicket_placement::schedule::Request::of(&m);
+                let _ = l.record_run_terms(&run.0, r.vcpus, r.memory_mib, r.priority, r.preemptible, wicket_feed::now_ms());
+            }
         }
         let nb = nb?;
         timings.since("box_start", box_lap);

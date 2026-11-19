@@ -25,6 +25,10 @@ CREATE TABLE IF NOT EXISTS placement_decisions (run TEXT PRIMARY KEY, at_ms INTE
 CREATE TABLE IF NOT EXISTS placement_waits (
   run TEXT PRIMARY KEY, at_ms INTEGER NOT NULL, seen_ms INTEGER NOT NULL, request TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS run_terms (
+  run TEXT PRIMARY KEY, vcpus REAL NOT NULL, memory_mib INTEGER NOT NULL, priority INTEGER NOT NULL,
+  preemptible INTEGER NOT NULL, at_ms INTEGER NOT NULL
+);
 "#;
 
 /// A waiter not seen for this long (ms) has gone (its process ended): it no longer holds its place.
@@ -42,6 +46,21 @@ pub struct RunningBox {
     pub zone: String,
     /// Its principal's id, if it has an identity.
     pub principal: Option<String>,
+}
+
+/// A running box's placement terms, for preemption (#579 step 4): what it holds, where, and
+/// whether a box of higher priority may stop it ([`Ledger::preemption_view`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxTerms {
+    pub run: String,
+    pub node: String,
+    pub tenant: String,
+    pub vcpus: f32,
+    pub memory_mib: u64,
+    pub priority: i32,
+    pub preemptible: bool,
+    /// Its run is revoked: it is being stopped.
+    pub revoked: bool,
 }
 
 /// A run's reservation.
@@ -155,6 +174,39 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Records the terms `run`'s box started with (#579 step 4): its limits as requests, its
+    /// priority, and whether it may be preempted. Recorded for every box at its start.
+    pub fn record_run_terms(&self, run: &str, vcpus: f32, memory_mib: u64, priority: i32, preemptible: bool, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO run_terms (run, vcpus, memory_mib, priority, preemptible, at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![run, vcpus as f64, memory_mib as i64, priority, preemptible, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Every running box placed on a node with its recorded terms: what preemption may choose from.
+    /// A box without terms (started before they were recorded) is left out: it is never preempted.
+    pub fn preemption_view(&self) -> Result<Vec<BoxTerms>> {
+        let mut st = self.conn.prepare(
+            "SELECT r.id, r.node, r.tenant, t.vcpus, t.memory_mib, t.priority, t.preemptible, v.run IS NOT NULL
+             FROM runs r JOIN run_terms t ON t.run = r.id LEFT JOIN revocations v ON v.run = r.id
+             WHERE r.status = 'running' AND r.node IS NOT NULL ORDER BY r.node, r.id",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(BoxTerms {
+                run: r.get(0)?,
+                node: r.get(1)?,
+                tenant: r.get(2)?,
+                vcpus: r.get::<_, f64>(3)? as f32,
+                memory_mib: r.get::<_, i64>(4)?.max(0) as u64,
+                priority: r.get(5)?,
+                preemptible: r.get(6)?,
+                revoked: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Every running run placed on a node: what affinity sees on each (#579 step 4).
     pub fn running_boxes(&self) -> Result<Vec<RunningBox>> {
         let mut st = self.conn.prepare(
@@ -180,7 +232,12 @@ impl Ledger {
     /// reconcile pass's upkeep drops (#582), so the table holds the boxes being started.
     pub fn drop_settled_placements(&self, now: i64) -> Result<usize> {
         let cutoff = (now - 86_400) * 1000;
-        let n = self.conn.execute("DELETE FROM placements WHERE state != 'reserved' AND at_ms < ?1", params![cutoff])?;
+        let mut n = self.conn.execute("DELETE FROM placements WHERE state != 'reserved' AND at_ms < ?1", params![cutoff])?;
+        // A box's terms go with it: once its run has ended (a day ago, as for reservations).
+        n += self.conn.execute(
+            "DELETE FROM run_terms WHERE at_ms < ?1 AND run NOT IN (SELECT id FROM runs WHERE status = 'running')",
+            params![cutoff],
+        )?;
         // Decisions are kept with their run: a week, as #582's archive keeps its settled rows.
         let week = (now - crate::ARCHIVE_AFTER_SECS) * 1000;
         Ok(n + self.conn.execute("DELETE FROM placement_decisions WHERE at_ms < ?1", params![week])?)
@@ -238,6 +295,43 @@ mod tests {
         assert_eq!(names(l.live_waiters(t + 5 + WAIT_SEEN_MS).unwrap()), ["run_b"]);
         l.stop_waiting("run_b").unwrap();
         assert_eq!(names(l.live_waiters(t + 6).unwrap()), ["run_a"]);
+    }
+
+    #[test]
+    fn preemption_sees_running_boxes_with_their_terms() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId("t0".into());
+        for (run, node) in [("r1", "n1"), ("r2", "n1"), ("r3", "n2"), ("r4", "n2")] {
+            l.run_started(&t, &wicket_core::RunId(run.into()), "z", "a").unwrap();
+            l.set_run_node(run, node).unwrap();
+        }
+        l.record_run_terms("r1", 1.0, 1024, -1, true, 1).unwrap();
+        l.record_run_terms("r2", 0.5, 512, 3, false, 1).unwrap();
+        l.record_run_terms("r3", 2.0, 2048, 0, true, 1).unwrap();
+        // r4 has no terms (started before they were recorded): never a candidate.
+        l.revoke("r3", "x", "y").unwrap();
+        let v = l.preemption_view().unwrap();
+        assert_eq!(v.iter().map(|b| b.run.as_str()).collect::<Vec<_>>(), ["r1", "r2", "r3"]);
+        assert_eq!(
+            v[0],
+            BoxTerms {
+                run: "r1".into(),
+                node: "n1".into(),
+                tenant: "t0".into(),
+                vcpus: 1.0,
+                memory_mib: 1024,
+                priority: -1,
+                preemptible: true,
+                revoked: false
+            }
+        );
+        assert!(!v[1].preemptible && v[2].revoked);
+        l.run_ended(&wicket_core::RunId("r1".into()), "done", "").unwrap();
+        assert_eq!(l.preemption_view().unwrap().len(), 2, "running only");
+        // Settled a day on, an ended run's terms go; a running one's stay.
+        l.drop_settled_placements(1 + 86_400 + 1).unwrap();
+        let left: i64 = l.conn.query_row("SELECT count(*) FROM run_terms", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 2);
     }
 
     #[test]

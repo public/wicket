@@ -415,6 +415,16 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
   tenant's boxes are never seen. A required term that fails puts a node out (`no service npm-cache here,
   which the box requires`, `runs a box of zone research, which the box requires to be away from`); a
   preferred one ranks the nodes meeting the most first.
+- **Preemption.** A waiting wake with nothing ahead of it in the queue, which no node may take now, may
+  stop boxes to make room: only boxes of its own tenant whose manifest marks them
+  [`placement.preemptible`](manifest.md#placement) and whose priority is below its own, as few as it can
+  on one node, of the lowest priority first. Each is stopped the normal way: its run is revoked
+  (`wicket:preempt`; its supervisor stops its box within seconds, and a revoked run's children with it) and
+  audited as `placement.preempted` (the box, its node and priority, and the run it made room for). Room is
+  all it makes: a node out for a label, a taint, its CA or an affinity stays out. The wake then waits as
+  before, and is placed once the node's report shows the room; it stops no more for 2 minutes. Each box's
+  limits and priority are recorded at its start (`run_terms`, ledger schema 30); a box started by an older
+  build has none and is never preempted. A named node (`--node`) and a spawn never preempt.
 - **Score.** Of the nodes left, those meeting the most preferences first; then bin-pack: the one left with the least memory, then the fewest vCPUs, once
   the box is on it. Where the agent ran before breaks a tie, then the name, so the same inputs always give
   the same node. A spread strategy exists in the function for later.
