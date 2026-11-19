@@ -546,7 +546,22 @@ impl Gateway {
                 return (format!("request {id} is not this agent's"), true);
             }
             let now = wicket_store::now();
+            // Granted for this run only if the rule binds it: its agent (or zone) under this zone's
+            // definition (#572 re-review, N4).
+            let binds = s.live(now) && {
+                let spec = self.ctx.zone.spec();
+                let l = self.ctx.ledger.lock().expect("ledger");
+                l.standing_for_run(&self.ctx.tenant, &self.ctx.run, &spec.name, &wicket_store::zone_digest(spec))
+                    .map(|v| v.iter().any(|x| x.id == s.id))
+                    .unwrap_or(false)
+            };
             match s.status.as_str() {
+                "approved" if s.live(now) && !binds => {
+                    return (
+                        format!("approved, not for this run: standing reach {id} was approved, for a zone definition this run's zone no longer has (its reach or forbids changed since). Ask again from this run if you still need it."),
+                        false,
+                    )
+                }
                 "approved" if s.live(now) => {
                     let until = s
                         .expires_at
@@ -1484,7 +1499,8 @@ mod tests {
             let l = w.ledger.lock().unwrap();
             let me = l.identity("run_s").unwrap().unwrap().spiffe_id;
             let rule: wicket_core::manifest::ReachRule = wicket_core::yaml::from_str("{ host: ci.example, paths: ['/jobs/**'] }").unwrap();
-            l.ask_standing(&TenantId("t0".into()), &RunId("run_s".into()), "z", "d", &me, &rule, "logs").unwrap().0
+            let digest = wicket_store::zone_digest(gw.ctx.zone.spec());
+            l.ask_standing(&TenantId("t0".into()), &RunId("run_s".into()), "z", &digest, &me, &rule, "logs").unwrap().0
         };
         let (t, err) = gw.pending_requests();
         assert!(!err && t.contains(&id) && t.contains("standing reach"), "{t}");
@@ -1503,6 +1519,18 @@ mod tests {
         w.ledger.lock().unwrap().revoke_standing(&id, "ann").unwrap();
         let (t, _) = gw.await_grant(&json!({ "request_id": id, "timeout_seconds": 5 })).await;
         assert!(t.starts_with("revoked:"), "{t}");
+        // Approved under another zone definition: not granted for this run (N4).
+        let other_def = {
+            let l = w.ledger.lock().unwrap();
+            let me = l.identity("run_s").unwrap().unwrap().spiffe_id;
+            let rule: wicket_core::manifest::ReachRule = wicket_core::yaml::from_str("{ host: other.example }").unwrap();
+            let (id2, _) = l.ask_standing(&TenantId("t0".into()), &RunId("run_s".into()), "z", "an-older-zone", &me, &rule, "x").unwrap();
+            let terms = wicket_store::StandingTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: Some(3600) };
+            l.approve_standing(&id2, &rule, &terms, "ann", None).unwrap();
+            id2
+        };
+        let (t, _) = gw.await_grant(&json!({ "request_id": other_def, "timeout_seconds": 5 })).await;
+        assert!(t.starts_with("approved, not for this run"), "{t}");
     }
 
     /// #162: an agent can ask for an update to its own build, and that is all: an R4 request a human
