@@ -149,9 +149,11 @@ fn starts_the_program_once_the_forwarder_listens_and_records_each_step() {
     assert!(pipes.lines().all(|p| !fds.lines().any(|f| f == p)), "the program inherits none of the forwarder's pipes: {fds} / {pipes}");
     let times = std::fs::read_to_string(root.join("wicket/sock/entry.times")).unwrap();
     let steps: Vec<&str> = times.lines().map(|l| l.split(' ').next().unwrap()).collect();
-    assert_eq!(steps, ["start", "addrs", "setup", "fwd", "exec"], "{times}");
+    // The steps in turn, then when the kernel came up (#287: here the host's, so long before).
+    assert_eq!(steps, ["start", "addrs", "setup", "fwd", "exec", "boot"], "{times}");
     let at: Vec<f64> = times.lines().map(|l| l.split(' ').nth(1).unwrap().replace(',', ".").parse().unwrap()).collect();
-    assert!(at.windows(2).all(|w| w[0] <= w[1]), "{times}");
+    assert!(at[..5].windows(2).all(|w| w[0] <= w[1]), "{times}");
+    assert!(at[5] > 0.0 && at[5] <= at[0], "{times}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

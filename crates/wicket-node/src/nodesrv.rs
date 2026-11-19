@@ -2153,27 +2153,49 @@ fn read_entry_times(dir: &std::path::Path) -> Option<String> {
     Some(s)
 }
 
+/// How long before a box's script its sandbox's kernel can have come up: more is runc's uptime,
+/// the host's (#287).
+const SANDBOX_BOOT_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The box's own start (#287), from wicket-entry's `<step> <Unix seconds>` lines (start, addrs,
-/// setup, fwd, exec): `box.entry.init` from when the runtime started its first process (`started`,
-/// docker-init) to the script's start, then a span per step, named after it, from the step before;
-/// and `box.exec`, the moment the program was started. A line that doesn't read
-/// as one is skipped.
+/// setup, fwd, exec): `box.entry.init` from when Docker says the box started (`started`) to the
+/// script's start, then a span per step, named after it, from the step before; and `box.exec`, the
+/// moment the program was started. A line that doesn't read as one is skipped.
+///
+/// A `boot` line, wherever it is, is when the sandbox's kernel came up (its uptime's zero), and
+/// splits `box.entry.init` in two: `box.entry.runtime`, from `started` to it (the runtime's own
+/// start of the sandbox), and `box.entry.boot`, from it to the script's start (the init and bash).
+/// Each only when its order holds; and none under runc, whose uptime is the host's (a boot more than
+/// [`SANDBOX_BOOT_MAX`] before the script's start).
 fn entry_spans(started: Option<std::time::SystemTime>, text: &str) -> Vec<wicket_core::timing::Span> {
     use wicket_core::timing::wall_span;
-    let steps = text.lines().take(16).filter_map(|l| {
-        let (name, at) = l.trim().split_once(' ')?;
-        let ok = !name.is_empty() && name.len() <= 16 && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
-        // Bash's EPOCHREALTIME has the locale's decimal point.
-        let secs: f64 = at.trim().replace(',', ".").parse().ok().filter(|s: &f64| s.is_finite() && *s > 0.0)?;
-        ok.then(|| (name.to_string(), std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs)))
-    });
+    let steps: Vec<_> = text
+        .lines()
+        .take(16)
+        .filter_map(|l| {
+            let (name, at) = l.trim().split_once(' ')?;
+            let ok = !name.is_empty() && name.len() <= 16 && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+            // Bash's EPOCHREALTIME has the locale's decimal point.
+            let secs: f64 = at.trim().replace(',', ".").parse().ok().filter(|s: &f64| s.is_finite() && *s > 0.0)?;
+            ok.then(|| (name.to_string(), std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs)))
+        })
+        .collect();
+    let boot = steps.iter().find(|(n, _)| n == "boot").map(|(_, at)| *at);
     let mut out = vec![];
     let mut last: Option<std::time::SystemTime> = None;
-    for (name, at) in steps {
+    for (name, at) in steps.into_iter().filter(|(n, _)| n != "boot") {
         match (last, name.as_str()) {
             (None, "start") => {
                 if let Some(s) = started {
                     out.push(wall_span("box.entry.init", s, at));
+                }
+                // The sandbox's kernel came up before the script, and not long before (runc's uptime
+                // is the host's).
+                if let Some(b) = boot.filter(|b| at.duration_since(*b).is_ok_and(|d| d <= SANDBOX_BOOT_MAX)) {
+                    if let Some(s) = started.filter(|s| b >= *s) {
+                        out.push(wall_span("box.entry.runtime", s, b));
+                    }
+                    out.push(wall_span("box.entry.boot", b, at));
                 }
             }
             (None, _) => {}
@@ -2635,6 +2657,47 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             .unwrap();
         let s = entry_spans(None, &String::from_utf8_lossy(&out.stdout));
         assert_eq!(s.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["box.entry.exec", "box.exec"]);
+    }
+
+    #[test]
+    fn the_sandboxs_boot_splits_the_init_in_two() {
+        let at = |s: f64| std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(s);
+        let names_ms = |spans: Vec<wicket_core::timing::Span>| -> Vec<(String, i64)> {
+            spans.into_iter().map(|s| (s.name, s.ms.round() as i64)).collect()
+        };
+        // As wicket-entry writes it: the steps, then the sandbox kernel's start, last.
+        let text = "start 1700000000.150000\nexec 1700000000.160000\nboot 1700000000.115000\n";
+        assert_eq!(
+            names_ms(entry_spans(Some(at(1_700_000_000.0)), text)),
+            [
+                ("box.entry.init".to_string(), 150),
+                ("box.entry.runtime".to_string(), 115),
+                ("box.entry.boot".to_string(), 35),
+                ("box.entry.exec".to_string(), 10),
+                ("box.exec".to_string(), 0)
+            ]
+        );
+        // A boot before Docker's start (another clock): the box's own part only.
+        let early = "start 1700000000.150000\nboot 1699999999.900000\n";
+        assert_eq!(
+            names_ms(entry_spans(Some(at(1_700_000_000.0)), early)),
+            [("box.entry.init".to_string(), 150), ("box.entry.boot".to_string(), 250)]
+        );
+        // runc: the uptime is the host's, days long, so no split; nor a boot after the script.
+        for odd in ["start 1700000000.150000\nboot 1699000000.000000\n", "start 1700000000.150000\nboot 1700000000.200000\n"] {
+            assert_eq!(names_ms(entry_spans(Some(at(1_700_000_000.0)), odd)), [("box.entry.init".to_string(), 150)], "{odd}");
+        }
+        // What the script itself writes reads: its boot mark, from bash's builtins alone.
+        let script = include_str!("../../../images/claude-code/wicket-entry");
+        let head = &script[script.find("T=\"start").unwrap()..];
+        let head = &head[..head.find("\nfi\n").unwrap() + 4];
+        let out =
+            std::process::Command::new("bash").args(["-c", &format!("{head}\nT=\"$T\n$BOOT\"; printf '%s\\n' \"$T\"")]).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.lines().nth(1).is_some_and(|l| l.starts_with("boot ")), "{text}");
+        let s = entry_spans(None, &text);
+        // The host's uptime here (no sandbox) is more than SANDBOX_BOOT_MAX unless it just booted.
+        assert!(s.iter().all(|s| s.name != "box.entry.runtime"), "{s:?}");
     }
 
     #[test]

@@ -79,6 +79,8 @@ good as the two clocks agree):
 |---|---|
 | `box.started` | a moment: the runtime started the box's first process (Docker's `State.StartedAt`) |
 | `box.entry.init` | from then until `wicket-entry` began (docker-init, bash) |
+| `box.entry.runtime` | from `box.started` until the sandbox's kernel came up (its uptime's zero, from `wicket-entry`'s `boot` line, up to 10 ms late): what of the runtime's start comes after `State.StartedAt`. gVisor only, and only when the boot is after `box.started` |
+| `box.entry.boot` | from the sandbox's kernel up until `wicket-entry` began: docker-init and bash, inside the box |
 | `box.entry.addrs` | wicket.internal's, the links' and the synthetic addresses added |
 | `box.entry.setup` | wicket-fwd spawned, the CA bundle written |
 | `box.entry.fwd` | waiting for wicket-fwd to listen |
