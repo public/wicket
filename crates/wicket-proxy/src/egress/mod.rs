@@ -29,8 +29,10 @@ mod hosts;
 mod outgoing;
 
 pub(crate) use canary::tripped_response;
+pub(crate) use canary::{Scanner as CanaryScanner, Tripped};
 use outgoing::refused_shape;
 pub use outgoing::render_credential;
+pub(crate) use outgoing::{anomaly, guard_credential, placeholder_moved};
 
 /// The largest request body read whole: GET and HEAD (which must have none), and requests that
 /// arrived over HTTP/3, which are re-sent upstream from memory.
@@ -492,7 +494,7 @@ impl Egress {
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
         if let Some(llm) = self.model_gate.get().filter(|l| l.is_model_call(&host, &path)) {
-            return llm.clone().through_egress(&self, req, &host, &pq, via).await;
+            return llm.clone().through_egress(self.clone(), req, &host, &pq, via).await;
         }
         match self.forward(req, &host, scheme, &pq, via).await {
             Ok(r) => r,
@@ -856,7 +858,7 @@ mod tests {
     }
 
     /// #112: a wrapped session's model calls, which come through the egress proxy, get the model
-    /// proxy's budget and body checks there: never forwarded once the budget is spent, nor as a
+    /// proxy's route, budget and body checks there: never forwarded once the budget is spent, nor as a
     /// batch or an encoded body.
     #[tokio::test]
     async fn model_calls_through_egress_are_vetted_and_counted() {
@@ -880,9 +882,10 @@ mod tests {
                 (st, String::from_utf8_lossy(&r.into_body().collect().await.unwrap().to_bytes()).into_owned())
             }
         };
-        assert_eq!(send("/v1/messages/batches", None).await.0, 403);
+        // Not one of the provider's routes: refused as the model proxy refuses it (404), uncounted (#552).
+        assert_eq!(send("/v1/messages/batches", None).await.0, 404);
         assert_eq!(send("/v1/messages", Some("gzip")).await.0, 415);
-        assert_eq!(llm.count.requests.load(std::sync::atomic::Ordering::SeqCst), 2, "counted as model requests");
+        assert_eq!(llm.count.requests.load(std::sync::atomic::Ordering::SeqCst), 1, "counted as a model request");
         llm.spent_before(u64::MAX / 4, 0, 0);
         let (st, body) = send("/v1/messages", None).await;
         assert_eq!(st, 429, "{body}");
@@ -1298,6 +1301,75 @@ mod tests {
         assert_eq!(super::render_credential("Bearer {secret}", "tok"), "Bearer tok");
         // base64("x-access-token:tok")
         assert_eq!(super::render_credential("Basic {basic:x-access-token}", "tok"), "Basic eC1hY2Nlc3MtdG9rZW46dG9r");
+    }
+
+    /// An encoded answer is refused only when it has a body that could carry the credential: not
+    /// to a HEAD, and not a 204 or 304 (#362).
+    #[test]
+    fn an_encoded_answer_is_refused_only_when_it_has_a_body() {
+        let (c, dir) = ctx("reach: []", vec![], "encoded");
+        let answer =
+            |status: u16| http::Response::builder().status(status).header("content-encoding", "gzip").body(crate::full("x")).unwrap();
+        let injected = vec!["the-real-token".to_string()];
+        let status = |s: u16, m: http::Method| super::guard_credential(&c, answer(s), "api.github.com", &m, &injected).status();
+        assert_eq!(status(200, http::Method::GET), 502);
+        assert_eq!(status(200, http::Method::HEAD), 200);
+        assert_eq!(status(204, http::Method::GET), 204);
+        assert_eq!(status(304, http::Method::GET), 304);
+        let audited = c.ledger.lock().unwrap().audit_of_kind("anomaly").unwrap();
+        assert_eq!(audited.len(), 1, "only the refusal is an anomaly");
+        assert!(audited[0].body.contains("response.encoded"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The tripwire names what moved: this run's placeholder by its credential, another of this
+    /// run's or another run's by shape; a placeholder's one slot is `Authorization` to its own host
+    /// (#362).
+    #[test]
+    fn the_tripwire_names_the_placeholder_that_moved() {
+        let own = "wicket-placeholder-run-x0000000000000000000000000";
+        let ours = "wicket-session-placeholder-run-x1111111111111111111111111";
+        let theirs = "wicket-placeholder-run-01aaaaaaaaaaaaaaaaaaaaaaaa";
+        let swap = crate::CredentialSwap {
+            name: "gh".into(),
+            host: "api.github.com".into(),
+            placeholder: own.into(),
+            real: crate::SwapSource::Vault("gh".into()),
+            box_bearers: false,
+        };
+        let (c, dir) = ctx("reach: []", vec![swap], "tripwire");
+        let scan = super::CanaryScanner::placeholders([own].into_iter());
+        let moved = |headers: &[(&str, String)], host: &str| {
+            let mut h = http::HeaderMap::new();
+            for (n, v) in headers {
+                h.insert(http::HeaderName::from_bytes(n.as_bytes()).unwrap(), v.parse().unwrap());
+            }
+            super::placeholder_moved(&c, &scan, &h, host, "/x")
+        };
+        let bearer = |p: &str| ("authorization", format!("Bearer {p}"));
+        assert_eq!(moved(&[bearer(own)], "api.github.com"), None);
+        assert_eq!(moved(&[bearer("a-token-of-the-box's-own")], "api.github.com"), None);
+        assert_eq!(
+            moved(&[bearer(own)], "example.com").as_deref(),
+            Some("the placeholder for gh sent to example.com, which isn't its host (api.github.com)")
+        );
+        assert_eq!(
+            moved(&[("x-token", own.to_string())], "api.github.com").as_deref(),
+            Some("the placeholder for gh in the x-token header to api.github.com")
+        );
+        assert_eq!(
+            moved(&[("x-token", ours.to_string())], "api.github.com").as_deref(),
+            Some("one of this run's credential placeholders in the x-token header to api.github.com")
+        );
+        assert_eq!(
+            moved(&[bearer(theirs)], "api.github.com").as_deref(),
+            Some("another run's credential placeholder in the authorization header to api.github.com")
+        );
+        assert_eq!(
+            super::placeholder_moved(&c, &scan, &http::HeaderMap::new(), "api.github.com", &format!("/x?t={own}")).as_deref(),
+            Some("the placeholder for gh in the URL for api.github.com")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A decider that answers from a script, then its last line for ever, counting the calls.

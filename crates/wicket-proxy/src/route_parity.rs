@@ -1,7 +1,8 @@
 //! The model proxy's two routes, held to each other (#552): a model call reaches the model host
-//! either through the model proxy's own socket (`Llm::handle` → `forward`) or, from a wrapped
-//! session, through the egress proxy's gate (`Egress::handle` → `Llm::through_egress`). #360's 401
-//! retry was written on the first only, and #552 was the other. Every behaviour of a model call is
+//! either through the model proxy's own socket (`Llm::handle`) or, from a wrapped session, through
+//! the egress proxy's gate (`Egress::handle` → `Llm::through_egress`). #360's 401 retry was once
+//! written on the first only, and #552 was the other; both now make one `Llm::call`, which differs
+//! by route only in `ModelRoute` (where the call goes, how its credential is attached). Every behaviour of a model call is
 //! run here through both routes against one mock model host (the same handler, over plain HTTP for
 //! the model proxy's upstream and over TLS as `api.anthropic.com` for the egress proxy), and each
 //! route must answer, record and charge alike.
@@ -53,8 +54,12 @@ struct Seen {
     beta_header: bool,
     /// Output tokens charged (settled or reserved).
     charged: u64,
+    /// The output tokens each `llm` op recorded.
+    recorded: Vec<u64>,
     /// Whether the run's first model request was recorded (a node reports it, #152).
     first_request: bool,
+    /// The anomalies audited (#362): `placeholder.moved`, `secret.reflected`, `response.encoded`.
+    anomalies: Vec<String>,
 }
 
 impl Seen {
@@ -74,6 +79,10 @@ enum Answer {
     Echo,
     /// As `Ok`, `Content-Encoding: gzip` though identity was asked for.
     Gzip,
+    /// As `Ok`, saying `Content-Encoding: identity` (nothing to note).
+    Identity,
+    /// A 200 with no usage in it: nothing to settle by.
+    NoUsage,
 }
 
 #[derive(Default)]
@@ -160,10 +169,15 @@ async fn answer(st: Arc<MockState>, req: http::Request<hyper::body::Incoming>) -
             Answer::Echo => http::Response::builder()
                 .header("content-type", "application/json")
                 .body(MockBody::from(format!(r#"{{"echo":"{bearer}",{usage}}}"#))),
+            Answer::Identity => http::Response::builder()
+                .header("content-type", "application/json")
+                .header("content-encoding", "identity")
+                .body(MockBody::from(format!("{{{usage}}}"))),
             Answer::Gzip => http::Response::builder()
                 .header("content-type", "application/json")
                 .header("content-encoding", "gzip")
                 .body(MockBody::from(&b"\x1f\x8b\x08\x00compressed"[..])),
+            Answer::NoUsage => http::Response::builder().header("content-type", "application/json").body(MockBody::from("{}")),
         }
     };
     Ok(r.unwrap())
@@ -207,6 +221,8 @@ enum Secret {
     Missing,
     /// A node's copy that its source can't fetch (#152).
     NodeUnfetchable,
+    /// A value bound to no hosts: refused for every upstream (not a read that gave up).
+    Unbound,
 }
 
 fn messages(max_tokens: u64, extra: &str) -> String {
@@ -281,6 +297,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
     let login = dir.join("login.json");
     match &s.secret {
         Secret::Value(v) => vault.set("model", v).unwrap(),
+        Secret::Unbound => vault.set("model", T1).unwrap(),
         Secret::Linked { refreshed_after } => {
             write_login(&login, T1);
             vault.link("model", login.to_str().unwrap(), Some("/o/accessToken"), None, None).unwrap();
@@ -318,7 +335,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
         }
         Secret::NodeUnfetchable => {}
     }
-    if !matches!(s.secret, Secret::NodeUnfetchable) {
+    if !matches!(s.secret, Secret::NodeUnfetchable | Secret::Unbound) {
         vault.set_hosts("model", &["127.0.0.1".into(), "api.anthropic.com".into()]).unwrap();
     }
     let ledger = Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap()));
@@ -362,7 +379,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
     let (status, body) = out.unwrap();
     // Let the call settle: its accounting runs on a task, and a box that gave up leaves it running.
     tokio::time::sleep(Duration::from_millis(if s.give_up_after.is_some() { 900 } else { 100 })).await;
-    let notes = ledger
+    let ops: Vec<serde_json::Value> = ledger
         .lock()
         .unwrap()
         .audit_of_kind("op")
@@ -370,9 +387,17 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
         .into_iter()
         .map(|r| r.body)
         .filter(|b| b.contains("\"kind\":\"llm\""))
-        .map(|b| {
-            serde_json::from_str::<serde_json::Value>(&b).ok().and_then(|v| v["outcome"].as_str().map(String::from)).unwrap_or_default()
-        })
+        .map(|b| serde_json::from_str(&b).unwrap_or_default())
+        .collect();
+    let notes = ops.iter().map(|v| v["outcome"].as_str().unwrap_or_default().to_string()).collect();
+    let recorded = ops.iter().map(|v| v["output_tokens"].as_u64().unwrap_or_default()).collect();
+    let anomalies = ledger
+        .lock()
+        .unwrap()
+        .audit_of_kind("anomaly")
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok().and_then(|v| v["anomaly"].as_str().map(String::from)))
         .collect();
     let seen = mock.state.seen.lock().unwrap().clone();
     let counts = llm.count.counts();
@@ -384,7 +409,9 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
         bearers: seen.iter().map(|(b, _)| b.clone()).collect(),
         beta_header: seen.iter().any(|(_, beta)| *beta),
         charged: counts.output_tokens,
+        recorded,
         first_request: llm.first_request_ms().is_some(),
+        anomalies,
     };
     let _ = std::fs::remove_dir_all(&dir);
     r
@@ -515,80 +542,10 @@ const INTENDED_UNTESTED: &[(u8, &str)] = &[(
     "the destination and transport: the model proxy calls its route's upstream with its own client; a wrapped session's call goes to the host the box named, on the egress dialer (DNS pinning, dial-time address checks, HTTP/3)",
 )];
 
-/// Drift the audit found (`out/one-route/proposal.md`), to be deleted from this list as the two
-/// routes become one. Each entry says what each route does today.
-const KNOWN: &[Differs] = &[
-    Differs {
-        case: "a path that isn't a model route",
-        row: 2,
-        why: "the model proxy refuses it by its profile's routes (404); the egress gate takes it as a model call and its body filter refuses it (403)",
-        direct: |s| s.status == 404,
-        egress: |s| s.status == 403,
-    },
-    Differs {
-        case: "an oversized body",
-        row: 6,
-        why: "the model proxy answers a body it can't read as an upstream error (502); the egress gate as the box's (400)",
-        direct: |s| s.status == 502,
-        egress: |s| s.status == 400,
-    },
-    Differs {
-        case: "a login being rewritten",
-        row: 8,
-        why: "the model proxy reads the secret patiently (#350); the egress proxy's swap reads it once, and fails",
-        direct: |s| s.status == 200,
-        egress: |s| s.status == 502,
-    },
-    Differs {
-        case: "a login that can't be read",
-        row: 9,
-        why: "the model proxy says the secret is unavailable (503, #350); the egress proxy's swap fails as an upstream error (502)",
-        direct: |s| s.status == 503 && s.body.contains("secret-unavailable"),
-        egress: |s| s.status == 502,
-    },
-    Differs {
-        case: "a node without the credential",
-        row: 10,
-        why: "the model proxy says the credential is unavailable on this node (503, #152); the egress proxy's swap fails as an upstream error (502)",
-        direct: |s| s.status == 503 && s.body.contains("credential"),
-        egress: |s| s.status == 502,
-    },
-    Differs {
-        case: "the run's placeholder in another header",
-        row: 14,
-        why: "the egress proxy's tripwire (#362) refuses a placeholder anywhere but its own host's Authorization; the model proxy forwards the header",
-        direct: |s| s.status == 200 && s.beta_header,
-        egress: |s| s.status == 403 && s.bearers.is_empty(),
-    },
-    Differs {
-        case: "an upstream that echoes the credential",
-        row: 13,
-        why: "only the egress proxy masks a credential reflected in the response (#362)",
-        direct: |s| s.status == 200 && s.body.contains(T1),
-        egress: |s| s.status == 200 && !s.body.contains(T1),
-    },
-    Differs {
-        case: "an upstream that encodes anyway",
-        row: 15,
-        why: "with a credential attached, the egress proxy refuses an answer encoded so it can't be checked for that credential (#362); the model proxy passes it on, charged its whole reservation",
-        direct: |s| s.status == 200 && s.charged == 50 && s.note("no final usage seen"),
-        egress: |s| s.status == 502 && s.body.contains("gzip-encoded"),
-    },
-    Differs {
-        case: "the box gives up while the call is out",
-        row: 16,
-        why: "the model proxy sends the call on its own task and settles it by the provider's answer (#422); the egress gate's call goes with the box's future, charged its whole reservation",
-        direct: |s| s.charged == 2,
-        egress: |s| s.charged == 50,
-    },
-    Differs {
-        case: "an ordinary call",
-        row: 17,
-        why: "only the model proxy records the run's first model request, which a node reports (#152)",
-        direct: |s| s.status == 200 && s.first_request,
-        egress: |s| s.status == 200 && !s.first_request,
-    },
-];
+/// Drift the audit found (`out/one-route/proposal.md`), deleted from this list as the two routes
+/// became one call (`Llm::call`, rows 2, 6, 8, 9, 10, 13, 14, 15, 16 and 17). A new difference is a
+/// regression: make the routes alike rather than list it here.
+const KNOWN: &[Differs] = &[];
 
 const CASES: &[Case] = &[
     Case { name: "an ordinary call", setup: Setup::default, both: |s| s.status == 200 && s.requests == 1 && s.bearers == [T1] },
@@ -660,14 +617,33 @@ const CASES: &[Case] = &[
     Case {
         name: "the run's placeholder in another header",
         setup: || Setup { headers: vec![("anthropic-beta", "ph-run")], ..Setup::default() },
-        both: |s| s.status == 403 && s.bearers.is_empty(),
+        both: |s| s.status == 403 && s.bearers.is_empty() && s.anomalies.iter().any(|a| a == "placeholder.moved"),
     },
     Case {
         name: "an upstream that echoes the credential",
         setup: || Setup { ..Setup::default() },
-        both: |s| s.status == 200 && !s.body.contains(T1),
+        both: |s| s.status == 200 && !s.body.contains(T1) && s.anomalies.iter().any(|a| a == "secret.reflected"),
     },
-    Case { name: "an upstream that encodes anyway", setup: Setup::default, both: |s| s.status == 502 && s.body.contains("gzip-encoded") },
+    Case {
+        name: "an upstream that encodes anyway",
+        setup: Setup::default,
+        both: |s| s.status == 502 && s.body.contains("gzip-encoded") && s.anomalies.iter().any(|a| a == "response.encoded"),
+    },
+    Case {
+        name: "an upstream that says it isn't encoded",
+        setup: Setup::default,
+        both: |s| s.status == 200 && s.charged == 2 && !s.note("Content-Encoding"),
+    },
+    Case {
+        name: "an answer without its usage",
+        setup: Setup::default,
+        both: |s| s.status == 200 && s.note("no final usage seen") && s.charged > 2 && s.recorded == [s.charged],
+    },
+    Case {
+        name: "a secret bound to no hosts",
+        setup: || Setup { secret: Secret::Unbound, ..Setup::default() },
+        both: |s| s.status == 502 && s.note("bound to no hosts") && s.bearers.is_empty(),
+    },
     Case { name: "the model host down", setup: || Setup { upstream_down: true, ..Setup::default() }, both: |s| s.status == 502 },
     Case {
         name: "the box gives up while the call is out",
@@ -683,6 +659,8 @@ fn answer_for(case: &str) -> (Answer, u64) {
     match case {
         "an upstream that echoes the credential" => (Answer::Echo, 0),
         "an upstream that encodes anyway" => (Answer::Gzip, 0),
+        "an upstream that says it isn't encoded" => (Answer::Identity, 0),
+        "an answer without its usage" => (Answer::NoUsage, 0),
         "the box gives up while the call is out" => (Answer::Ok, 400),
         _ => (Answer::Ok, 0),
     }

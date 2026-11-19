@@ -106,64 +106,19 @@ impl Egress {
                 None,
             );
         }
-        let scan = canary::Scanner::secrets(injected);
-        if !injected.is_empty() {
-            if let Some(enc) = encoded(&parts.headers).filter(|_| *method != Method::HEAD && !matches!(parts.status.as_u16(), 204 | 304)) {
-                let why = format!(
-                    "{host} answered with a {enc}-encoded body, which wicket can't check for the credential it attached to the request"
-                );
-                self.anomaly(host, "response.encoded", &why);
-                return problem(
-                    502,
-                    "upstream",
-                    "Upstream error",
-                    &format!("refused: {why} (it was asked for an unencoded one). {}", crate::BOX_FACT),
-                    None,
-                );
-            }
-        }
         let names: Vec<http::HeaderName> = parts.headers.keys().cloned().collect();
         for name in names {
             if HOP_BY_HOP.contains(&name.as_str()) {
                 parts.headers.remove(&name);
-                continue;
-            }
-            let leaks = parts.headers.get_all(&name).iter().any(|v| scan.first(v.as_bytes()).is_some());
-            if leaks {
-                parts.headers.remove(&name);
             }
         }
-        if scan.is_empty() {
-            return Response::from_parts(parts, body);
-        }
-        let (ledger, tenant, run, h) = (self.ctx.ledger.clone(), self.ctx.tenant.clone(), self.ctx.run.clone(), host.to_string());
-        let body = canary::guard_response(body, scan, move || {
-            let why = format!("{h} reflected the credential wicket attached to the request; it was masked before the box saw it");
-            tracing::warn!(host = %h, "{why}");
-            if let Ok(l) = ledger.lock() {
-                let _ = l.audit_deferred(
-                    &tenant,
-                    Some(&run),
-                    "anomaly",
-                    &serde_json::json!({ "anomaly": "secret.reflected", "host": h, "why": why }),
-                );
-            }
-        });
-        Response::from_parts(parts, body)
+        guard_credential(&self.ctx, Response::from_parts(parts, body), host, method, injected)
     }
 
     /// Audits an anomaly (#362): something the box (or an upstream) did that wicket refused or
     /// masked, kept apart from ordinary refusals.
-    fn anomaly(&self, host: &str, anomaly: &str, why: &str) {
-        tracing::warn!(host, anomaly, "{why}");
-        if let Ok(l) = self.ctx.ledger.lock() {
-            let _ = l.audit_deferred(
-                &self.ctx.tenant,
-                Some(&self.ctx.run),
-                "anomaly",
-                &serde_json::json!({ "anomaly": anomaly, "host": host, "why": why }),
-            );
-        }
+    fn anomaly(&self, host: &str, kind: &str, why: &str) {
+        anomaly(&self.ctx, host, kind, why);
     }
 
     /// The tripwire went off (#362): audited as an anomaly, counted as a strike, and the error that
@@ -177,39 +132,10 @@ impl Egress {
     /// The tripwire on the request's URL and headers (#362): this run's placeholders (and any other
     /// run's) appear only as `Authorization: Bearer <placeholder>` to the placeholder's own host.
     fn tripwire(&self, headers: &http::HeaderMap, host: &str, pq: &str, scan: &canary::Scanner) -> Result<()> {
-        let tag = self.ctx.run.0.replace('_', "-");
-        let whose = |seen: &[u8]| {
-            let seen = String::from_utf8_lossy(seen);
-            match self.ctx.swaps.iter().find(|s| s.placeholder == seen) {
-                Some(s) => format!("the placeholder for {}", s.name),
-                None if seen.contains(&tag) => "one of this run's credential placeholders".to_string(),
-                None => "another run's credential placeholder".to_string(),
-            }
-        };
-        let decoded = canary::percent_decode(pq);
-        for url in [pq.as_bytes(), &decoded] {
-            if let Some(r) = scan.first(url) {
-                return Err(self.trip(host, &format!("{} in the URL for {host}", whose(&url[r]))));
-            }
+        match placeholder_moved(&self.ctx, scan, headers, host, pq) {
+            Some(what) => Err(self.trip(host, &what)),
+            None => Ok(()),
         }
-        for (name, value) in headers {
-            if name == http::header::AUTHORIZATION {
-                if let Some(p) = value.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")) {
-                    if self.ctx.swaps.iter().any(|s| s.placeholder == p && host_matches(&s.host, host)) {
-                        continue; // its one slot, on its own host
-                    }
-                    if let Some(s) = self.ctx.swaps.iter().find(|s| s.placeholder == p) {
-                        return Err(
-                            self.trip(host, &format!("the placeholder for {} sent to {host}, which isn't its host ({})", s.name, s.host))
-                        );
-                    }
-                }
-            }
-            if let Some(r) = scan.first(value.as_bytes()) {
-                return Err(self.trip(host, &format!("{} in the {name} header to {host}", whose(&value.as_bytes()[r]))));
-            }
-        }
-        Ok(())
     }
 
     /// A bearer the box presented to a host it holds a placeholder for, that isn't the placeholder
@@ -430,6 +356,108 @@ fn encoded(h: &http::HeaderMap) -> Option<String> {
             if !c.is_empty() && c != "identity" && c != "chunked" {
                 return Some(c);
             }
+        }
+    }
+    None
+}
+
+/// The checks on an answer from a host a credential was attached to (#362), on both of the model
+/// proxy's routes (#552) and every request the egress proxy forwards: the body must come
+/// unencoded (or is refused, 502), a header that reflects the credential is dropped, and every
+/// form of the credential in the body is masked as it streams, each audited as an anomaly.
+pub(crate) fn guard_credential(
+    ctx: &RunCtx,
+    resp: Response<BoxBody>,
+    host: &str,
+    method: &Method,
+    injected: &[String],
+) -> Response<BoxBody> {
+    let (mut parts, body) = resp.into_parts();
+    let scan = canary::Scanner::secrets(injected);
+    if !injected.is_empty() {
+        if let Some(enc) = encoded(&parts.headers).filter(|_| *method != Method::HEAD && !matches!(parts.status.as_u16(), 204 | 304)) {
+            let why = format!(
+                "{host} answered with a {enc}-encoded body, which wicket can't check for the credential it attached to the request"
+            );
+            anomaly(ctx, host, "response.encoded", &why);
+            return problem(
+                502,
+                "upstream",
+                "Upstream error",
+                &format!("refused: {why} (it was asked for an unencoded one). {}", crate::BOX_FACT),
+                None,
+            );
+        }
+    }
+    let names: Vec<http::HeaderName> = parts.headers.keys().cloned().collect();
+    for name in names {
+        let leaks = parts.headers.get_all(&name).iter().any(|v| scan.first(v.as_bytes()).is_some());
+        if leaks {
+            parts.headers.remove(&name);
+        }
+    }
+    if scan.is_empty() {
+        return Response::from_parts(parts, body);
+    }
+    let (ledger, tenant, run, h) = (ctx.ledger.clone(), ctx.tenant.clone(), ctx.run.clone(), host.to_string());
+    let body = canary::guard_response(body, scan, move || {
+        let why = format!("{h} reflected the credential wicket attached to the request; it was masked before the box saw it");
+        tracing::warn!(host = %h, "{why}");
+        if let Ok(l) = ledger.lock() {
+            let _ = l.audit_deferred(
+                &tenant,
+                Some(&run),
+                "anomaly",
+                &serde_json::json!({ "anomaly": "secret.reflected", "host": h, "why": why }),
+            );
+        }
+    });
+    Response::from_parts(parts, body)
+}
+
+/// Audits an anomaly (#362): something the box (or an upstream) did that wicket refused or masked,
+/// kept apart from ordinary refusals.
+pub(crate) fn anomaly(ctx: &RunCtx, host: &str, anomaly: &str, why: &str) {
+    tracing::warn!(host, anomaly, "{why}");
+    if let Ok(l) = ctx.ledger.lock() {
+        let _ =
+            l.audit_deferred(&ctx.tenant, Some(&ctx.run), "anomaly", &serde_json::json!({ "anomaly": anomaly, "host": host, "why": why }));
+    }
+}
+
+/// What in a request's URL or headers moves a credential placeholder (#362), if anything: this
+/// run's placeholders (and any other run's) appear only as `Authorization: Bearer <placeholder>`
+/// to the placeholder's own host. The tripwire of both of the model proxy's routes (#552) and of
+/// every request the egress proxy forwards.
+pub(crate) fn placeholder_moved(ctx: &RunCtx, scan: &canary::Scanner, headers: &http::HeaderMap, host: &str, pq: &str) -> Option<String> {
+    let tag = ctx.run.0.replace('_', "-");
+    let whose = |seen: &[u8]| {
+        let seen = String::from_utf8_lossy(seen);
+        match ctx.swaps.iter().find(|s| s.placeholder == seen) {
+            Some(s) => format!("the placeholder for {}", s.name),
+            None if seen.contains(&tag) => "one of this run's credential placeholders".to_string(),
+            None => "another run's credential placeholder".to_string(),
+        }
+    };
+    let decoded = canary::percent_decode(pq);
+    for url in [pq.as_bytes(), &decoded] {
+        if let Some(r) = scan.first(url) {
+            return Some(format!("{} in the URL for {host}", whose(&url[r])));
+        }
+    }
+    for (name, value) in headers {
+        if name == http::header::AUTHORIZATION {
+            if let Some(p) = value.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")) {
+                if ctx.swaps.iter().any(|s| s.placeholder == p && host_matches(&s.host, host)) {
+                    continue; // its one slot, on its own host
+                }
+                if let Some(s) = ctx.swaps.iter().find(|s| s.placeholder == p) {
+                    return Some(format!("the placeholder for {} sent to {host}, which isn't its host ({})", s.name, s.host));
+                }
+            }
+        }
+        if let Some(r) = scan.first(value.as_bytes()) {
+            return Some(format!("{} in the {name} header to {host}", whose(&value.as_bytes()[r])));
         }
     }
     None
