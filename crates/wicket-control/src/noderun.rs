@@ -2048,10 +2048,17 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             p.standing.remove(&id);
             rebuild = true;
         }
-        for s in standing.iter().filter(|s| !p.standing.contains(&s.id)) {
+        let fresh: Vec<&wicket_store::Standing> = standing.iter().filter(|s| !p.standing.contains(&s.id)).collect();
+        for s in fresh {
             if p.live.len() >= wicket_feed::token::MAX_GRANTS {
                 if p.waiting.insert(s.id.clone()) {
-                    say!("[wicket] node {} holds {} live grants for {}: standing rule {} waits until one ends", sh.node, p.live.len(), sh.run, s.id);
+                    say!(
+                        "[wicket] node {} holds {} live grants for {}: standing rule {} waits until one ends",
+                        sh.node,
+                        p.live.len(),
+                        sh.run,
+                        s.id
+                    );
                 }
                 continue;
             }
@@ -2246,6 +2253,33 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #572: an approved standing rule goes in the box's token as its rule: its host, methods and
+    /// globs, no use count, approved by the human who decided it, until revoked or its lapse.
+    #[test]
+    fn a_standing_rule_is_a_token_block_with_its_rule_and_end() {
+        let tenant = TenantId::single();
+        let run = RunId("run_s".into());
+        let zone: ZoneSpec = wicket_core::yaml::from_str("name: z\nreach: []\n").unwrap();
+        let key = wicket_authz::SigningKey::generate();
+        let issuer = wicket_feed::Issuer::root(&key, &tenant.0, "run:run_s", &run.0, 0, &zone, &[], 2_000_000_000, vec![]).unwrap();
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        let rule: wicket_core::manifest::ReachRule =
+            wicket_core::yaml::from_str("{ host: CI.example, methods: [GET], paths: ['/jobs/*/logs'] }").unwrap();
+        let rule = wicket_core::manifest::ReachRule { host: "ci.example".into(), ..rule };
+        let (id, _) = l.ask_standing(&tenant, &run, "z", "spiffe://w/t/t0/z/z/a/a", &rule, "logs").unwrap();
+        let terms = wicket_store::StandingTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: None };
+        l.approve_standing(&id, &rule, &terms, "ann", None).unwrap();
+        let s = l.standing(&id).unwrap();
+        let live = standing_live(&issuer, &s);
+        assert_eq!((live.grant.gid.as_str(), live.grant.host.as_str(), live.uses, live.prefix), (id.as_str(), "ci.example", None, false));
+        assert_eq!(live.grant.not_after, STANDING_FOREVER, "until revoked");
+        assert_eq!(live.grant.approver, "standing:ann");
+        assert_eq!(live.standing.as_ref().map(|r| r.paths.clone()), Some(vec!["/jobs/*/logs".to_string()]));
+        // With a lapse, the block ends as a grant's does.
+        let lapsing = wicket_store::Standing { expires_at: Some(1_900_000_000), ..s };
+        assert_eq!(standing_live(&issuer, &lapsing).grant.not_after, 1_899_999_999);
+    }
 
     /// #56: a renewed grant the box's token carries is published with its new end; one the token
     /// doesn't carry (not handed to this node, revoked or expired) changes nothing.
