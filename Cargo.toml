@@ -130,3 +130,47 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.globset]
 opt-level = 2
+
+# Proc-macros and build tools at level 0 (#219): the `"*"` entry above outranks cargo's
+# `build-override`, so without these it optimizes code that only generates code. Measured: a clean
+# `cargo build --workspace --all-targets` 375 s -> 323 s at -j2 (experiments/build-times); wicket's
+# own crates compile no slower. ci/determinator's `host_only_crates_are_at_opt_level_0` keeps the
+# list to every proc-macro the build has, and to crates built only for the host.
+[profile.dev.package]
+asn1-rs-derive = { opt-level = 0 }
+asn1-rs-impl = { opt-level = 0 }
+async-recursion = { opt-level = 0 }
+async-trait = { opt-level = 0 }
+clap_derive = { opt-level = 0 }
+curve25519-dalek-derive = { opt-level = 0 }
+darling_core = { opt-level = 0 }
+darling_macro = { opt-level = 0 }
+displaydoc = { opt-level = 0 }
+educe = { opt-level = 0 }
+enum-ordinalize-derive = { opt-level = 0 }
+futures-macro = { opt-level = 0 }
+jiff-static = { opt-level = 0 }
+jni-macros = { opt-level = 0 }
+jni-sys-macros = { opt-level = 0 }
+lalrpop = { opt-level = 0 }
+logos-derive = { opt-level = 0 }
+miette-derive = { opt-level = 0 }
+multiversion_no_op = { opt-level = 0 }
+prost-derive = { opt-level = 0 }
+ref-cast-impl = { opt-level = 0 }
+rustversion = { opt-level = 0 }
+serde_derive = { opt-level = 0 }
+serde_with_macros = { opt-level = 0 }
+syn = { opt-level = 0 }
+synstructure = { opt-level = 0 }
+thiserror-impl = { opt-level = 0 }
+time-macros = { opt-level = 0 }
+tokio-macros = { opt-level = 0 }
+tracing-attributes = { opt-level = 0 }
+wasm-bindgen-macro = { opt-level = 0 }
+windows-implement = { opt-level = 0 }
+windows-interface = { opt-level = 0 }
+yoke-derive = { opt-level = 0 }
+zerocopy-derive = { opt-level = 0 }
+zerofrom-derive = { opt-level = 0 }
+zerovec-derive = { opt-level = 0 }

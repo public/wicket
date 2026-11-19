@@ -424,6 +424,54 @@ fn every_out_of_crate_input_selects_its_crate() {
     assert!(fails.is_empty(), "add them to ci/determinator/rules.toml: {fails:#?}");
 }
 
+/// #219: the root Cargo.toml's `[profile.dev.package."*"] opt-level = 1` outranks cargo's
+/// `build-override`, so every proc-macro and build tool would be optimized too, for nothing. Each is
+/// listed at level 0 instead. This keeps that list to every proc-macro the workspace depends on, to
+/// names some package has (cargo warns about others on every build), and to crates built only for
+/// the host: one also built for the target at 0 would slow the tests that run its code. "Built for
+/// the target" is reachable from a workspace crate by normal edges (and the workspace's own dev
+/// edges), never through a proc-macro or a build edge; optional dependencies count, so the target
+/// side is if anything too large, never too small.
+#[test]
+fn host_only_crates_are_at_opt_level_0() {
+    let g = head();
+    let mut target: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<_> = g.workspace().iter().collect();
+    let mut seen: BTreeSet<_> = queue.iter().map(|p| p.id().clone()).collect();
+    while let Some(p) = queue.pop() {
+        for link in p.direct_links() {
+            let to = link.to();
+            let runs = link.normal().is_present() || (p.in_workspace() && link.dev().is_present());
+            if runs && !to.is_proc_macro() && seen.insert(to.id().clone()) {
+                if !to.in_workspace() {
+                    target.insert(to.name().to_string());
+                }
+                queue.push(to);
+            }
+        }
+    }
+    let workspace_deps: BTreeSet<_> = g.query_workspace().resolve().package_ids(guppy::graph::DependencyDirection::Forward).collect();
+    let proc_macros: BTreeSet<String> =
+        g.packages().filter(|p| workspace_deps.contains(p.id()) && !p.in_workspace() && p.is_proc_macro()).map(|p| p.name().to_string()).collect();
+    assert!(proc_macros.contains("serde_derive"), "the graph has no proc-macros: {proc_macros:?}");
+
+    let manifest: toml::Value = toml::from_str(&std::fs::read_to_string(root().join("Cargo.toml")).unwrap()).unwrap();
+    let listed: BTreeSet<String> = manifest["profile"]["dev"]["package"]
+        .as_table()
+        .unwrap()
+        .iter()
+        .filter(|(_, v)| v.get("opt-level").and_then(|o| o.as_integer()) == Some(0))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let unlisted: Vec<_> = proc_macros.difference(&listed).collect();
+    assert!(unlisted.is_empty(), "proc-macros at the dependencies' opt-level 1: add `<name> = {{ opt-level = 0 }}` to Cargo.toml's [profile.dev.package]: {unlisted:?}");
+    let known: BTreeSet<String> = g.packages().map(|p| p.name().to_string()).collect();
+    let stale: Vec<_> = listed.difference(&known).collect();
+    assert!(stale.is_empty(), "listed at opt-level 0, but no package has the name: {stale:?}");
+    let for_target: Vec<_> = listed.intersection(&target).collect();
+    assert!(for_target.is_empty(), "listed at opt-level 0, but also built for the target (their code runs in the tests): {for_target:?}");
+}
+
 #[test]
 fn doctest_detection() {
     for (body, want) in [
