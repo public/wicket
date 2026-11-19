@@ -33,6 +33,17 @@ pub const WAIT_SEEN_MS: i64 = 10_000;
 /// How long an unconfirmed reservation counts against its node (s).
 pub const RESERVE_SECS: i64 = 120;
 
+/// A running run on a node ([`Ledger::running_boxes`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunningBox {
+    pub run: String,
+    pub node: String,
+    pub tenant: String,
+    pub zone: String,
+    /// Its principal's id, if it has an identity.
+    pub principal: Option<String>,
+}
+
 /// A run's reservation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Placement {
@@ -135,16 +146,33 @@ impl Ledger {
         Ok(())
     }
 
-    /// The live waiters ahead of `run`, oldest first: (run, request). All of them if `run` isn't
-    /// waiting. A waiter not seen for [`WAIT_SEEN_MS`] is left out.
-    pub fn waiting_before(&self, run: &str, now_ms: i64) -> Result<Vec<(String, String)>> {
-        let mine: Option<i64> =
-            self.conn.query_row("SELECT at_ms FROM placement_waits WHERE run = ?1", params![run], |r| r.get(0)).optional()?;
+    /// The live waiters, oldest first: (run, when it first waited (ms), request). A waiter not seen
+    /// for [`WAIT_SEEN_MS`] is left out. Which go ahead of a run is the scheduler's
+    /// (`wicket-placement::schedule::ahead`: by priority, then first come, first served).
+    pub fn live_waiters(&self, now_ms: i64) -> Result<Vec<(String, i64, String)>> {
+        let mut st = self.conn.prepare("SELECT run, at_ms, request FROM placement_waits WHERE seen_ms > ?1 ORDER BY at_ms, run")?;
+        let rows = st.query_map(params![now_ms - WAIT_SEEN_MS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every running run placed on a node: what affinity sees on each (#579 step 4).
+    pub fn running_boxes(&self) -> Result<Vec<RunningBox>> {
         let mut st = self.conn.prepare(
-            "SELECT run, request FROM placement_waits WHERE run != ?1 AND seen_ms > ?2 AND (?3 IS NULL OR at_ms < ?3 OR (at_ms = ?3 AND run < ?1))
-             ORDER BY at_ms, run",
+            "SELECT r.id, r.node, r.tenant, r.zone, i.spiffe_id FROM runs r LEFT JOIN identities i ON i.run = r.id
+             WHERE r.status = 'running' AND r.node IS NOT NULL ORDER BY r.node, r.id",
         )?;
-        let rows = st.query_map(params![run, now_ms - WAIT_SEEN_MS, mine], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = st.query_map([], |r| {
+            Ok(RunningBox { run: r.get(0)?, node: r.get(1)?, tenant: r.get(2)?, zone: r.get(3)?, principal: r.get(4)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The nodes that ran a box of `tenant`'s `zone`, by name: where its kept volumes are (#377: a
+    /// kept volume is the zone's, on the node, until its retention deletes it).
+    pub fn nodes_that_ran(&self, tenant: &str, zone: &str) -> Result<Vec<String>> {
+        let mut st =
+            self.conn.prepare("SELECT DISTINCT node FROM runs WHERE tenant = ?1 AND zone = ?2 AND node IS NOT NULL ORDER BY node")?;
+        let rows = st.query_map(params![tenant, zone], |r| r.get(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -202,18 +230,31 @@ mod tests {
         l.wait_for_placement("run_a", "{}", t).unwrap();
         l.wait_for_placement("run_b", "{\"b\":1}", t + 1).unwrap();
         l.wait_for_placement("run_a", "{\"a\":2}", t + 5).unwrap(); // a heartbeat keeps its place
-        let names = |v: Vec<(String, String)>| v.into_iter().map(|(r, _)| r).collect::<Vec<_>>();
-        assert_eq!(names(l.waiting_before("run_b", t + 6).unwrap()), ["run_a"]);
-        assert!(l.waiting_before("run_a", t + 6).unwrap().is_empty(), "first");
-        assert_eq!(
-            l.waiting_before("run_c", t + 6).unwrap(),
-            [("run_a".into(), "{\"a\":2}".into()), ("run_b".into(), "{\"b\":1}".into())],
-            "a newcomer is behind all"
-        );
-        // run_a's process went: not seen for WAIT_SEEN_MS, it holds no place.
-        assert!(l.waiting_before("run_b", t + 5 + WAIT_SEEN_MS).unwrap().is_empty());
+        let names = |v: Vec<(String, i64, String)>| v.into_iter().map(|(r, _, _)| r).collect::<Vec<_>>();
+        assert_eq!(names(l.live_waiters(t + 6).unwrap()), ["run_a", "run_b"]);
+        assert_eq!(l.live_waiters(t + 6).unwrap()[0], ("run_a".into(), t, "{\"a\":2}".into()), "its first wait, its latest request");
+        // run_a's process went: not seen for WAIT_SEEN_MS, it holds no place; run_b, seen since, does.
+        l.wait_for_placement("run_b", "{\"b\":1}", t + 6).unwrap();
+        assert_eq!(names(l.live_waiters(t + 5 + WAIT_SEEN_MS).unwrap()), ["run_b"]);
         l.stop_waiting("run_b").unwrap();
-        assert_eq!(names(l.waiting_before("run_c", t + 6).unwrap()), ["run_a"]);
+        assert_eq!(names(l.live_waiters(t + 6).unwrap()), ["run_a"]);
+    }
+
+    #[test]
+    fn what_runs_where() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId("t0".into());
+        for (run, zone, node) in [("r1", "z1", Some("n1")), ("r2", "z2", Some("n1")), ("r3", "z1", Some("n2")), ("r4", "z1", None)] {
+            l.run_started(&t, &wicket_core::RunId(run.into()), zone, "a").unwrap();
+            if let Some(n) = node {
+                l.set_run_node(run, n).unwrap();
+            }
+        }
+        l.run_ended(&wicket_core::RunId("r3".into()), "done", "").unwrap();
+        let on: Vec<(String, String, String)> = l.running_boxes().unwrap().into_iter().map(|b| (b.run, b.node, b.zone)).collect();
+        assert_eq!(on, [("r1".into(), "n1".into(), "z1".into()), ("r2".into(), "n1".into(), "z2".into())], "running and placed only");
+        assert_eq!(l.nodes_that_ran("t0", "z1").unwrap(), ["n1", "n2"], "ended runs too");
+        assert!(l.nodes_that_ran("t1", "z1").unwrap().is_empty(), "per tenant");
     }
 
     #[test]

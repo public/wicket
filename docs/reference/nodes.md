@@ -381,8 +381,9 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
 - **The queue.** A wake that no node may take now waits instead of failing: `queued: no node may take agent
   … now (n1: …; n2: …)`, then it tries again every 2 s, asking the nodes with no fresh report every 30 s,
   for up to `wicket wake --wait` (default 30 minutes; `--wait 0` fails at once, as before). Waiting wakes
-  are served first come, first served (`placement_waits`): one is placed only when no wake waiting longer
-  fits a node now, so a wake that fits nowhere doesn't hold up the ones behind it. A waiting wake keeps its
+  are served by their manifest's [`placement.priority`](manifest.md#placement), highest first, and first
+  come, first served within one (`placement_waits`): one is placed only when no wake ahead of it fits a node
+  now, so a wake that fits nowhere doesn't hold up the ones behind it. A waiting wake keeps its
   claim on the agent, and holds its place only while its process is alive. The queue never creates
   capacity: `request_capacity` and `wicket node create` stay the only ways.
 - **Why here.** Every decision is recorded (`placement_decisions`, a run's latest, kept a week): what the box
@@ -407,7 +408,14 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
   ask for, by its report and its admission's room ([above](#health-admission-and-disk-377)); a label or
   taint mismatch; and a node whose CA doesn't cover the box's inspected hosts and whose policy keeps them
   out ([#573](https://github.com/public/wicket/issues/573); a node it may be widened to is in).
-- **Score.** Of the nodes left, bin-pack: the one left with the least memory, then the fewest vCPUs, once
+- **Affinity.** A box's [`placement.affinity`](manifest.md#placement) names a service its zone uses or a
+  kept volume; its `anti_affinity` a zone or a principal. A node is seen with the boxes of the box's own
+  tenant running there (their zones and principals), the live instances of the services it may use there
+  (its tenant's, or a shared one), and, for a kept volume, whether it ran a box of the box's zone. Another
+  tenant's boxes are never seen. A required term that fails puts a node out (`no service npm-cache here,
+  which the box requires`, `runs a box of zone research, which the box requires to be away from`); a
+  preferred one ranks the nodes meeting the most first.
+- **Score.** Of the nodes left, those meeting the most preferences first; then bin-pack: the one left with the least memory, then the fewest vCPUs, once
   the box is on it. Where the agent ran before breaks a tie, then the name, so the same inputs always give
   the same node. A spread strategy exists in the function for later.
 - **Refusal.** With no node left the wake is refused, naming every node and every reason it was out

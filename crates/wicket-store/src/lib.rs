@@ -31,7 +31,7 @@ mod nodeca;
 mod nodelabels;
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
-pub use placements::{Placement, RESERVE_SECS, WAIT_SEEN_MS};
+pub use placements::{Placement, RunningBox, RESERVE_SECS, WAIT_SEEN_MS};
 pub mod money;
 mod node;
 #[cfg(test)]
