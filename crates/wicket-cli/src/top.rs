@@ -695,6 +695,37 @@ async fn live_frame(now: i64) -> Result<ControlFrame> {
     Ok(f)
 }
 
+/// A node's size and use, as `top --json` prints it (#574): every field, always.
+fn capacity_json(c: &crate::chan::NodeCapacity) -> serde_json::Value {
+    serde_json::json!({
+        "vcpus": c.vcpus, "memory_mib": c.memory_mib, "used_vcpus": c.used_vcpus, "used_memory_mib": c.used_memory_mib,
+        "boxes": c.boxes, "room_mib": c.room_mib, "full": c.full,
+    })
+}
+
+/// A node's latest health report, as `top --json` prints it: times in ms like the rest of `top`.
+fn health_json(h: &crate::health::NodeHealth) -> serde_json::Value {
+    let event = |e: &Option<crate::health::HealthEvent>| e.as_ref().map(|e| serde_json::json!({ "at_ms": e.at_ms, "what": e.what }));
+    serde_json::json!({
+        "at_ms": h.at_ms,
+        "disk": { "total_bytes": h.disk.total_bytes, "avail_bytes": h.disk.avail_bytes, "reserve_bytes": h.disk.reserve_bytes },
+        "memory": { "total_mib": h.memory.total_mib, "available_mib": h.memory.available_mib, "committed_mib": h.memory.committed_mib },
+        "feed_mode": h.feed_mode, "feed_fresh_until_ms": h.feed_fresh_until_ms,
+        "oom_kills": h.oom_kills, "last_oom": event(&h.last_oom),
+        "persist_failures": h.persist_failures, "last_persist_failure": event(&h.last_persist_failure),
+        "ca_not_after_ms": h.ca_not_after.map(|t| t * 1000),
+        "orphaned": h.orphaned.iter().map(|o| serde_json::json!({ "run": o.run, "bytes": o.bytes })).collect::<Vec<_>>(),
+    })
+}
+
+/// A run's model use, as `top --json` prints it.
+fn spent_json(s: &Spent) -> serde_json::Value {
+    serde_json::json!({
+        "requests": s.requests, "input_tokens": s.input_tokens, "cache_read_tokens": s.cache_read_tokens,
+        "cache_creation_tokens": s.cache_creation_tokens, "output_tokens": s.output_tokens,
+    })
+}
+
 /// `wicket top --json`: one frame. Times are Unix ms here, as the node's status has them.
 /// `connected` is null for a node no run's supervisor has talked to, and for a run not yet seen.
 pub fn control_json(f: &ControlFrame) -> serde_json::Value {
@@ -704,7 +735,8 @@ pub fn control_json(f: &ControlFrame) -> serde_json::Value {
         .map(|n| {
             serde_json::json!({
                 "name": n.name, "status": n.status, "connected": n.link.map(|l| l.0), "since_ms": n.link.map(|l| l.1),
-                "boxes": n.boxes, "capacity": n.capacity, "health": n.health,
+                "boxes": n.boxes, "capacity": n.capacity.as_ref().map(capacity_json),
+                "health": n.health.as_ref().map(health_json),
             })
         })
         .collect();
@@ -714,7 +746,7 @@ pub fn control_json(f: &ControlFrame) -> serde_json::Value {
         .map(|r| {
             serde_json::json!({
                 "run": r.run, "node": r.node, "agent": r.agent, "zone": r.zone, "status": r.status, "started_ms": r.started_ms,
-                "spent": r.spent, "connected": r.connected,
+                "spent": r.spent.as_ref().map(spent_json), "connected": r.connected,
             })
         })
         .collect();

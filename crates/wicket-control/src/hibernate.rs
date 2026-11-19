@@ -920,7 +920,6 @@ pub async fn hibernate(who: &str, wait_secs: u64) -> Result<()> {
     }
 }
 
-/// `wicket agents`.
 /// `wicket agents --json`: one object per long-lived agent.
 pub fn agents_json(rows: &[wicket_store::AgentRow]) -> serde_json::Value {
     serde_json::Value::Array(
@@ -935,6 +934,7 @@ pub fn agents_json(rows: &[wicket_store::AgentRow]) -> serde_json::Value {
     )
 }
 
+/// `wicket agents`.
 pub fn list(json: bool) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     let rows = l.agents(&TenantId::single().0)?;

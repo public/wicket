@@ -184,8 +184,22 @@ fn top_json() {
     use crate::top::{ControlFrame, LeaseLine, NodeLine, RunLine};
     let f = ControlFrame {
         now_ms: 1_000_000,
-        nodes: vec![NodeLine { name: "local".into(), status: "active".into(), link: Some((true, 1)), boxes: 1, ..Default::default() }],
-        runs: vec![RunLine { run: "run_a".into(), agent: "worker".into(), status: "running".into(), ..Default::default() }],
+        nodes: vec![NodeLine {
+            name: "local".into(),
+            status: "active".into(),
+            link: Some((true, 1)),
+            boxes: 1,
+            capacity: Some(crate::chan::NodeCapacity::default()),
+            // A report with nothing orphaned and no capacity: the fields are there all the same.
+            health: Some(crate::health::NodeHealth { ca_not_after: Some(1000), ..Default::default() }),
+        }],
+        runs: vec![RunLine {
+            run: "run_a".into(),
+            agent: "worker".into(),
+            status: "running".into(),
+            spent: Some(Default::default()),
+            ..Default::default()
+        }],
         pending: 1,
         leases: vec![LeaseLine { id: "lease_1".into(), not_after: Some(1000), ..Default::default() }],
     };
@@ -195,4 +209,11 @@ fn top_json() {
     documented_as("`wicket top --json`, each of `nodes`", &v["nodes"]);
     documented_as("`wicket top --json`, each of `runs`", &v["runs"]);
     documented_as("`wicket top --json`, each of `leases`", &v["leases"]);
+    let n = &v["nodes"][0];
+    documented_as("`wicket top --json`, a node's `capacity`", &n["capacity"]);
+    documented_as("`wicket top --json`, a node's `health`", &n["health"]);
+    assert_eq!((n["health"]["ca_not_after_ms"].as_i64(), n["health"]["orphaned"].as_array().map(Vec::len)), (Some(1_000_000), Some(0)));
+    assert_eq!(keys(&n["health"]["disk"]), ["avail_bytes", "reserve_bytes", "total_bytes"]);
+    assert_eq!(keys(&n["health"]["memory"]), ["available_mib", "committed_mib", "total_mib"]);
+    documented_as("`wicket top --json`, a run's `spent`", &v["runs"][0]["spent"]);
 }

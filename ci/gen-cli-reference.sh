@@ -84,14 +84,17 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
-| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`) |
+| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
 | `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
 | `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
 | an agent's `used` | `requests`, `input_tokens`, `output_tokens`, `secs` |
 | `wicket top --json` | `now_ms`, `nodes`, `runs`, `pending` (how many requests wait), `leases` |
-| `wicket top --json`, each of `nodes` | `name`, `status`, `connected` (null: no run's supervisor has talked to it), `since_ms`, `boxes`, `capacity`, `health` |
-| `wicket top --json`, each of `runs` | `run`, `node`, `agent`, `zone`, `status`, `started_ms`, `spent`, `connected` |
+| `wicket top --json`, each of `nodes` | `name`, `status`, `connected` (null: no run's supervisor has talked to it), `since_ms`, `boxes`, `capacity` (null: not reported), `health` (its latest report; null: none yet) |
+| `wicket top --json`, a node's `capacity` | `vcpus`, `memory_mib`, `used_vcpus`, `used_memory_mib`, `boxes`, `room_mib` (the memory a new box may have now; null from an older node), `full` (it starts no box now) |
+| `wicket top --json`, a node's `health` | `at_ms`, `disk` (`total_bytes`, `avail_bytes`, `reserve_bytes`), `memory` (`total_mib`, `available_mib`, `committed_mib`), `feed_mode`, `feed_fresh_until_ms`, `oom_kills`, `last_oom` (`at_ms` and `what`, or null), `persist_failures`, `last_persist_failure` (likewise), `ca_not_after_ms` (null: no CA), `orphaned` (runs' directories kept with no box: each `run` and `bytes`) |
+| `wicket top --json`, each of `runs` | `run`, `node`, `agent`, `zone`, `status`, `started_ms`, `spent` (null: not reported yet), `connected` |
+| `wicket top --json`, a run's `spent` | `requests`, `input_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `output_tokens` |
 | `wicket top --json`, each of `leases` | `id`, `provider`, `run`, `node`, `not_after_ms`, `reserved_micro_usd` |
 
 EOF

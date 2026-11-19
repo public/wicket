@@ -9,6 +9,9 @@ use crate::*;
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
         Cmd::Audit { tail, verify, against, issuer_jwk, json, cmd } => {
+            if json && cmd.is_some() {
+                bail!("--json lists the audit records: not with export (`wicket audit export --status` shows the sinks)");
+            }
             if let Some(AuditCmd::Export { once, checkpoint, status }) = cmd {
                 // The exporter blocks (its own runtime, file and HTTP writes): off the async runtime.
                 return std::thread::spawn(move || audit_export_cmd(once, checkpoint, status))
