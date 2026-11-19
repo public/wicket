@@ -3954,6 +3954,13 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(err && t.contains("must start with /"), "{t}");
         let (t, err) = call(serde_json::json!({ "url": "http://ci.example/x", "scope": "forever", "reason": "r" })).await;
         assert!(err && t.contains("exact, prefix or standing"), "{t}");
+        // Nothing that could hide part of the rule from whoever reads it (#572 review, H1).
+        for p in ["/a\r{ host: x }", "/a\x1b[2K"] {
+            let (t, err) =
+                call(serde_json::json!({ "url": "http://ci.example/x", "scope": "standing", "reason": "r", "paths": [p] })).await;
+            assert!(err && t.contains("a character a path can't"), "{t}");
+        }
+        assert_eq!(crate::AGENT_ASKS, wicket_store::AGENT_ASKS_PREFIX, "the store tells an agent's own asks by this prefix");
 
         let mut c = connect_run(&node, 2, &inst, RUN).await;
         c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();

@@ -60,12 +60,15 @@ fn bound(s: &str) -> Result<wicket_store::StandingBound> {
     }
 }
 
+/// A rule as a manifest would carry it. Every part through `clip`: a rule is an agent's words,
+/// and nothing in it may move the cursor or hide the rest of the line (#572 review, H1).
 fn rule_text(r: &wicket_core::manifest::ReachRule) -> String {
+    let c = |s: &str| wicket_agent::clip(s, 200);
     format!(
         "{{ host: {}, methods: [{}], paths: [{}]{} }}",
-        r.host,
-        r.methods.join(", "),
-        r.paths.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", "),
+        c(&r.host),
+        r.methods.iter().map(|m| c(m)).collect::<Vec<_>>().join(", "),
+        r.paths.iter().map(|p| format!("'{}'", c(p))).collect::<Vec<_>>().join(", "),
         if r.allow_dangerous { ", allow_dangerous: true" } else { "" }
     )
 }
@@ -84,7 +87,7 @@ pub fn line(s: &wicket_store::Standing, now: i64) -> String {
     };
     let to = match s.bound {
         Some(wicket_store::StandingBound::Zone) => format!("zone {}", s.zone),
-        _ => s.principal.clone(),
+        _ => wicket_agent::clip(&s.principal, 200),
     };
     format!("{}  {}  for {}  {}", s.id, rule_text(&s.rule), wicket_agent::clip(&to, 200), state)
 }
@@ -97,29 +100,41 @@ pub fn show(s: &wicket_store::Standing, rule: &wicket_core::manifest::ReachRule)
         s.id,
         s.status,
         rule_text(rule),
-        s.principal,
+        wicket_agent::clip(&s.principal, 200),
         s.run,
-        s.zone,
+        wicket_agent::clip(&s.zone, 64),
         wicket_agent::clip(&s.reason, 400)
     );
     out.push_str(&format!(
-        "  evidence:  {} request(s) it covers in the last 14 days ({} granted, {} denied){}\n",
-        e.requests,
+        "  evidence:  {} granted of {} blocked request(s) it covers in the last 14 days ({} denied, {} undecided), in {} run(s) on {} day(s){}\n",
         e.granted,
+        e.requests,
         e.denied,
+        e.undecided,
+        e.runs,
+        e.days,
         match (e.first, e.last) {
             (Some(f), Some(l)) => format!(", {} to {}", when(f), when(l)),
             _ => String::new(),
         }
     ));
-    for (m, p, n) in &e.ops {
-        out.push_str(&format!("             {n} × {m} {}\n", wicket_agent::clip(p, 200)));
+    if e.own_asks > 0 {
+        out.push_str(&format!("             and {} ask(s) ahead of its own (request_access), not counted as evidence\n", e.own_asks));
+    }
+    for o in &e.ops {
+        out.push_str(&format!(
+            "             {} × {} {} ({} granted)\n",
+            o.count,
+            wicket_agent::clip(&o.method, 16),
+            wicket_agent::clip(&o.path, 200),
+            o.granted
+        ));
     }
     let beyond = st::beyond(s, rule);
     if !beyond.is_empty() {
-        out.push_str("  beyond what was asked:\n");
+        out.push_str("  wider than the evidence:\n");
         for b in beyond {
-            out.push_str(&format!("             {b}\n"));
+            out.push_str(&format!("             {}\n", wicket_agent::clip(&b, 300)));
         }
     }
     out
@@ -200,6 +215,49 @@ pub async fn dispatch(c: StandingCmd) -> Result<()> {
             st::revoke(&l, &operator(), &id)?;
             println!("revoked {id}; each run it allowed publishes the revocation to its node");
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #572 review, H1: whatever is in a stored rule (the store refuses these now, and this holds
+    /// for any row that has them), nothing printed can move the cursor, clear the line or turn the
+    /// text around: the rule a terminal shows is the whole rule.
+    #[test]
+    fn a_rule_prints_whole_whatever_it_holds() {
+        let hidden = "/**\r{ host: api.github.com, methods: [GET], paths: ['/repos/o/r/actions/jobs/*/logs'] }    ";
+        let rule = wicket_core::manifest::ReachRule {
+            host: "api.github.com".into(),
+            methods: vec!["GET\x1b[2K".into()],
+            paths: vec!["/repos/o/r/actions/jobs/*/logs".into(), hidden.into(), "/a\u{202e}b".into()],
+            allow_dangerous: false,
+        };
+        let s = wicket_store::Standing {
+            id: "s-1".into(),
+            tenant: "t0".into(),
+            run: "run_w".into(),
+            zone: "work".into(),
+            principal: "spiffe://w/t/t0/z/work/a/worker\x1b]0;x\x07".into(),
+            zone_digest: "d".into(),
+            rule: rule.clone(),
+            reason: "logs\r".into(),
+            evidence: Default::default(),
+            status: "pending".into(),
+            created_at: 0,
+            decided_at: None,
+            decided_by: None,
+            bound: None,
+            expires_at: None,
+            effect_sha256: None,
+            revoked_at: None,
+            revoked_by: None,
+        };
+        for out in [show(&s, &rule), line(&s, 0)] {
+            assert!(!out.contains(['\r', '\x1b', '\u{202e}', '\x07']), "{out:?}");
+            assert!(out.contains("/**"), "the hidden path is shown: {out}");
         }
     }
 }

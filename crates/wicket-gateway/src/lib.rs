@@ -143,6 +143,9 @@ impl Gateway {
             return ("request_id is required".into(), true);
         };
         let timeout = Duration::from_secs(args.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(300).clamp(5, 600));
+        if id.starts_with("s-") {
+            return self.await_standing(id, timeout).await;
+        }
         let start = Instant::now();
         let _waiting = Waiting::start(&self.ctx);
         let mut granted_at: Option<Instant> = None;
@@ -528,6 +531,73 @@ impl Gateway {
         (text.into(), false)
     }
 
+    /// `await_grant` on a standing ask (#572, its `s-` id, from `request_access` with scope
+    /// standing): this run's agent's own ask (any run of it may wait), answered as it is decided.
+    async fn await_standing(&self, id: &str, timeout: Duration) -> (String, bool) {
+        let start = Instant::now();
+        let _waiting = Waiting::start(&self.ctx);
+        loop {
+            let (s, me) = {
+                let l = self.ctx.ledger.lock().expect("ledger");
+                (l.standing(id), l.identity(&self.ctx.run.0).ok().flatten().map(|i| i.spiffe_id))
+            };
+            let Ok(s) = s else { return (format!("no request {id}"), true) };
+            if s.tenant != self.ctx.tenant.0 || me.as_deref() != Some(s.principal.as_str()) {
+                return (format!("request {id} is not this agent's"), true);
+            }
+            let now = wicket_store::now();
+            match s.status.as_str() {
+                "approved" if s.live(now) => {
+                    let until = s
+                        .expires_at
+                        .map(|e| format!("until {}", wicket_core::time::unix_rfc3339(e)))
+                        .unwrap_or_else(|| "until revoked".into());
+                    let to = match s.bound {
+                        Some(wicket_store::StandingBound::Zone) => format!("every agent of zone {}", s.zone),
+                        _ => "you, in this run and your later ones".into(),
+                    };
+                    return (
+                        format!(
+                            "granted: standing reach {id} was approved for {to}, {until}: {} {} {}. Make the requests it covers; don't ask for them again. (It applies on a node that speaks wicket protocol 17.)",
+                            s.rule.methods.join(","),
+                            s.rule.host,
+                            s.rule.paths.join(" ")
+                        ),
+                        false,
+                    );
+                }
+                "approved" => {
+                    return (format!("lapsed: standing reach {id} was approved, and has lapsed. Ask again if you still need it."), false)
+                }
+                "denied" => {
+                    return (
+                        format!(
+                        "denied: standing reach {id} was denied. Do not ask again; ask for what you need now with scope exact or prefix."
+                    ),
+                        false,
+                    )
+                }
+                "revoked" => {
+                    return (
+                        format!("revoked: standing reach {id} was approved and then revoked. Do not ask again without a new reason."),
+                        false,
+                    )
+                }
+                _ => {}
+            }
+            if start.elapsed() >= timeout {
+                return (
+                    format!(
+                        "pending: standing reach {id} is still waiting for a decision after {}s. You may call await_grant again.",
+                        timeout.as_secs()
+                    ),
+                    false,
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     fn pending_requests(&self) -> (String, bool) {
         let pending = self.ctx.ledger.lock().expect("ledger").pending(&self.ctx.tenant);
         let mut out = match pending {
@@ -537,6 +607,25 @@ impl Gateway {
                     .filter(|r| r.run == self.ctx.run.0)
                     .map(|r| format!("{} {} {}{} ({})", r.id, r.method, r.host, r.path, r.risk))
                     .collect();
+                // This agent's standing asks waiting (#572).
+                let l = self.ctx.ledger.lock().expect("ledger");
+                let me = l.identity(&self.ctx.run.0).ok().flatten().map(|i| i.spiffe_id);
+                let standing: Vec<String> = l
+                    .standing_with_status(&self.ctx.tenant, "pending")
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| me.as_deref() == Some(s.principal.as_str()))
+                    .map(|s| {
+                        format!(
+                            "{} standing reach {} {} {} (yours, for your later runs too)",
+                            s.id,
+                            s.rule.methods.join(","),
+                            s.rule.host,
+                            s.rule.paths.join(" ")
+                        )
+                    })
+                    .collect();
+                let mine: Vec<String> = mine.into_iter().chain(standing).collect();
                 if mine.is_empty() {
                     "no pending requests".to_string()
                 } else {
@@ -1381,6 +1470,39 @@ mod tests {
         // Handed to a node, which counts its uses: the control host's count isn't judged.
         let handed = wicket_store::GrantRow { uses_left: Some(0), node: Some("n1".into()), ..g };
         assert!(granted_answer(&rid, &req, Some(&handed), now).starts_with("granted:"));
+    }
+
+    /// #572 review, M5: `await_grant` on a standing ask's `s-` id answers from the ask (pending,
+    /// then granted for the agent, with what it covers), for any run of the asking agent and no
+    /// other's; `pending_requests` lists the agent's waiting standing asks.
+    #[tokio::test]
+    async fn await_grant_follows_a_standing_ask() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let gw = Gateway { ctx: w.agent("t0", "z", "worker", "run_s", None, &[]) };
+        let other = Gateway { ctx: w.agent("t0", "z", "someone", "run_o", None, &[]) };
+        let id = {
+            let l = w.ledger.lock().unwrap();
+            let me = l.identity("run_s").unwrap().unwrap().spiffe_id;
+            let rule: wicket_core::manifest::ReachRule = wicket_core::yaml::from_str("{ host: ci.example, paths: ['/jobs/**'] }").unwrap();
+            l.ask_standing(&TenantId("t0".into()), &RunId("run_s".into()), "z", "d", &me, &rule, "logs").unwrap().0
+        };
+        let (t, err) = gw.pending_requests();
+        assert!(!err && t.contains(&id) && t.contains("standing reach"), "{t}");
+        let (t, err) = gw.await_grant(&json!({ "request_id": id, "timeout_seconds": 5 })).await;
+        assert!(!err && t.starts_with("pending: standing reach"), "{t}");
+        let (t, err) = other.await_grant(&json!({ "request_id": id, "timeout_seconds": 5 })).await;
+        assert!(err && t.contains("not this agent's"), "{t}");
+        {
+            let l = w.ledger.lock().unwrap();
+            let s = l.standing(&id).unwrap();
+            let terms = wicket_store::StandingTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: Some(3600) };
+            l.approve_standing(&id, &s.rule, &terms, "ann", None).unwrap();
+        }
+        let (t, err) = gw.await_grant(&json!({ "request_id": id, "timeout_seconds": 5 })).await;
+        assert!(!err && t.starts_with("granted: standing reach") && t.contains("GET,HEAD ci.example /jobs/**"), "{t}");
+        w.ledger.lock().unwrap().revoke_standing(&id, "ann").unwrap();
+        let (t, _) = gw.await_grant(&json!({ "request_id": id, "timeout_seconds": 5 })).await;
+        assert!(t.starts_with("revoked:"), "{t}");
     }
 
     /// #162: an agent can ask for an update to its own build, and that is all: an R4 request a human

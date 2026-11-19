@@ -37,8 +37,8 @@ mod standing;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use standing::{
-    new_standing_id, standing_effect, Bound as StandingBound, Evidence as StandingEvidence, Standing, StandingTerms,
-    EVIDENCE_SECS as STANDING_EVIDENCE_SECS,
+    new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
+    Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
 };
 pub mod objects;
 pub mod sealed;
