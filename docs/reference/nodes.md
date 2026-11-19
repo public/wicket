@@ -117,7 +117,10 @@ wicket node revoke n1
     renewal over the channel signed for the operator's hosts plus every live want, at most 64 entries;
   - the renewal is audited `node.ca_renewed` and `node.ca_widened` (hosts added and removed, and the runs that
     wanted them);
-  - a run's wants end with it, and the next due renewal prunes the hosts no box wants any more.
+  - a run's wants end with it, and the next due renewal prunes the hosts no box wants any more;
+  - a box's `request_access` for an https host outside the CA is asked for when the policy (as it was when the
+    box started) lets the CA be widened to that host: its approval's grant is wanted like the box's reach.
+    Otherwise the node answers "not requested", naming `wicket node set <node> --ca-hosts` (#571).
 
   The default is `fixed`: the CA keeps its hosts, as before, and a box start says which hosts it would need.
   The local node's CA is unconstrained, so none of this applies to it.

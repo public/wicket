@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wicket_proxy::decide::Asked;
+use wicket_proxy::egress::Router;
 
 /// A tool call that needs a human, made while the run's control host was unreachable.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -875,6 +876,26 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
         }
         wicket_core::HostVerdict::Hidden => return (format!("not requested: {host} is not a host name this box can see."), false),
         wicket_core::HostVerdict::Open => {}
+    }
+    // An https host this node can't terminate (outside its CA, #257) is passed through uncovered only
+    // where the box's zone allows it wholesale, and refused otherwise, whatever is granted. It is
+    // asked for only if the node's CA policy lets the control host widen the CA to it, as an
+    // approval's grant then does (#573); otherwise nothing is asked for that no approval could make
+    // usable. Plain http needs no CA.
+    if url.starts_with("https://") {
+        if let wicket_proxy::decide::Route::Uncovered(why) = super::NodeRouter::of(node).route(&host) {
+            let spliced = node.replica.lock().expect("replica").splice(&tenant, run, &host, (node.clock)()).is_some();
+            let policy = node.edge_start(run).and_then(|e| e.ca_widen).unwrap_or(wicket_store::CaHosts::Fixed);
+            if !spliced && !policy.allows(&host) {
+                let n = &node.name;
+                return (
+                    format!(
+                        "not requested: {host} isn't served by this box's node, {n} ({why}), and the node's CA policy doesn't let it be widened to {host}; only a host this box's zone allows wholesale is passed through without it. No approval can change that, so nothing was asked for: tell the user. An operator can let the node's CA be widened to it (wicket node set {n} --ca-hosts auto, or a list that includes {host}), or have it cover it now (wicket node renew-ca {n} --hosts {host}).",
+                    ),
+                    false,
+                );
+            }
+        }
     }
     // A push's discovery is asked for as the push it is part of (#26).
     let op = wicket_core::git::op_for(&tenant, &wicket_core::RunId(run.into()), &zone, &method, &host, &path, query);
