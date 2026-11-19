@@ -162,12 +162,7 @@ impl Ledger {
     /// Records a new agent, active in its first run at generation 1.
     pub fn create_agent(&mut self, a: &NewAgent) -> Result<()> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let t = now();
-        tx.execute(
-            &format!("INSERT INTO agents ({COLS}) VALUES (?1, ?2, ?3, ?4, 'active', 1, ?5, ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, 1, NULL, NULL, ?11, ?11, 0, 0, 0, 0)"),
-            params![a.id, a.tenant, a.zone, a.name, a.run, a.session_id, a.manifest, a.image, a.workspace, a.claim_until, t],
-        )?;
-        tx.execute("INSERT INTO agent_runs (run, agent, generation, started_at) VALUES (?1, ?2, 1, ?3)", params![a.run, a.id, t])?;
+        insert_agent(&tx, a)?;
         tx.commit()?;
         Ok(())
     }
@@ -415,6 +410,17 @@ impl Ledger {
         let r = st.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(r.collect::<std::result::Result<Vec<_>, _>>()?)
     }
+}
+
+/// An agent's row and its first activation's, in whatever transaction `conn` is in.
+pub(crate) fn insert_agent(conn: &rusqlite::Connection, a: &NewAgent) -> Result<()> {
+    let t = now();
+    conn.execute(
+        &format!("INSERT INTO agents ({COLS}) VALUES (?1, ?2, ?3, ?4, 'active', 1, ?5, ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, 1, NULL, NULL, ?11, ?11, 0, 0, 0, 0)"),
+        params![a.id, a.tenant, a.zone, a.name, a.run, a.session_id, a.manifest, a.image, a.workspace, a.claim_until, t],
+    )?;
+    conn.execute("INSERT INTO agent_runs (run, agent, generation, started_at) VALUES (?1, ?2, 1, ?3)", params![a.run, a.id, t])?;
+    Ok(())
 }
 
 #[cfg(test)]
