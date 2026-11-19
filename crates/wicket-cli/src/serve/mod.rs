@@ -1859,6 +1859,10 @@ fn dashboard(state: &State) -> Result<Value> {
         "pending": l.pending(t)?.into_iter().map(|r| {
             let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);
             v["identity"] = (state.identity)(&l, &r.run);
+            // What the card's first button would grant, as the grant is made (#574 review): a git
+            // push is a window, any number of uses for 5 minutes (#26), whatever is picked.
+            let (uses, ttl_secs) = wicket_core::git::grant_terms(&r.method, &r.path, Some(1), 600);
+            v["once_terms"] = json!({ "uses": uses, "ttl_secs": ttl_secs });
             v
         }).collect::<Vec<_>>(),
         "decided": l.decided(t, 15)?,
