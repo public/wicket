@@ -117,11 +117,25 @@ pub struct TokenGrant {
     /// `wicket_core::prefix_covers` says. Only nodes at protocol 16 or later are sent one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prefix: bool,
+    /// A standing grant (#572): a reach rule on `host` (its methods and path globs; `method` and
+    /// `path` are unused). Only nodes at protocol 17 or later are sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing: Option<authz::StandingRule>,
 }
 
 /// Whether listed grant `g` is one to try for `op`: its host and method, and its path or (a prefix
-/// grant) a path under it.
+/// grant) a path under it, or (a standing grant) one of its methods and path globs. The token's
+/// block decides, risk included; this only picks the candidates.
 fn grant_matches(g: &TokenGrant, op: &Op) -> bool {
+    if let Some(s) = &g.standing {
+        let rule = wicket_core::manifest::ReachRule {
+            host: g.host.clone(),
+            methods: s.methods.clone(),
+            paths: s.paths.clone(),
+            allow_dangerous: true,
+        };
+        return rule.allows(op).unwrap_or(false);
+    }
     g.host.eq_ignore_ascii_case(&op.host)
         && g.method.eq_ignore_ascii_case(&op.method)
         && if g.prefix { wicket_core::prefix_covers(&g.path, &op.path) } else { g.path == op.path }
@@ -549,6 +563,8 @@ pub struct LiveGrant {
     pub uses: Option<u32>,
     /// A path-prefix grant (#257 4a): `grant.path` is the prefix, canonical and ending in `/`.
     pub prefix: bool,
+    /// A standing grant (#572): this rule on `grant.host`, for nodes at protocol 17 or later.
+    pub standing: Option<authz::StandingRule>,
 }
 
 impl Issuer {
@@ -643,9 +659,10 @@ impl Issuer {
             let mut grant = g.grant.clone();
             grant.box_id = self.box_path.clone();
             grant.epoch = self.epoch;
-            token = match g.prefix {
-                true => authz::grant_prefix(&token, approver, &grant)?,
-                false => authz::grant(&token, approver, &grant)?,
+            token = match (&g.standing, g.prefix) {
+                (Some(rule), _) => authz::grant_standing(&token, approver, &grant, rule)?,
+                (None, true) => authz::grant_prefix(&token, approver, &grant)?,
+                (None, false) => authz::grant(&token, approver, &grant)?,
             };
             listed.push(TokenGrant {
                 id: grant.gid.clone(),
@@ -654,6 +671,7 @@ impl Issuer {
                 path: grant.path.clone(),
                 uses: g.uses,
                 prefix: g.prefix,
+                standing: g.standing.clone(),
             });
         }
         Ok(BoxAuthority {

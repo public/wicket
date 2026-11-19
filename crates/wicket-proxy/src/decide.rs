@@ -71,8 +71,15 @@ pub trait Decider: Send + Sync {
 /// The control host's answer when a node asks it to raise a pending request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Asked {
-    Pending { request: String, fresh: bool },
-    Denied { request: String },
+    /// `hint`: for the agent, beside its answer (#572: it asked for this before).
+    Pending {
+        request: String,
+        fresh: bool,
+        hint: Option<String>,
+    },
+    Denied {
+        request: String,
+    },
 }
 
 /// A node's link to the control host, as the decider needs it.
@@ -143,7 +150,7 @@ impl Decider for NodeDecider {
                     Err(_) => Outcome::Unavailable(UNREACHABLE.into()),
                 },
                 Decision::NeedsGrant(why) => match self.control.ask(op, &why, who.map(|(v, _)| v)).await {
-                    Ok(Asked::Pending { request, fresh }) => Outcome::Pending { request, fresh, why },
+                    Ok(Asked::Pending { request, fresh, .. }) => Outcome::Pending { request, fresh, why },
                     Ok(Asked::Denied { request }) => Outcome::Denied { request },
                     // The link looked up but the control host didn't answer (a partition the node
                     // hasn't noticed yet): queued, as when it is known to be down (#153).
@@ -197,20 +204,7 @@ pub enum Route {
     Uncovered(String),
 }
 
-/// Whether a host is inside one X.509 permitted DNS subtree, as a verifier reads it: `api.example.com`
-/// permits itself and every name under it; `.example.org` permits names under it, not the apex.
-pub fn subtree_permits(subtree: &str, host: &str) -> bool {
-    // The control host's own node's CA: any name.
-    if subtree == "*" {
-        return true;
-    }
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let subtree = subtree.to_ascii_lowercase();
-    match subtree.strip_prefix('.') {
-        Some(base) => host.len() > base.len() + 1 && host.ends_with(&subtree),
-        None => host == subtree || host.ends_with(&format!(".{subtree}")),
-    }
-}
+pub use wicket_core::splice::subtree_permits;
 
 /// Whether the node can terminate `host` (#257): never outside the node CA's name constraints (e.g.
 /// a host approved later under `unlisted_hosts: escalate`, for which a leaf wouldn't verify
@@ -291,7 +285,7 @@ mod tests {
         }
         fn ask<'a>(&'a self, _op: &'a Op, _why: &'a str, _who: Option<&'a serde_json::Value>) -> BoxFuture<'a, Result<Asked, String>> {
             let n = self.asks.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok(Asked::Pending { request: format!("r-{n}"), fresh: true }) })
+            Box::pin(async move { Ok(Asked::Pending { request: format!("r-{n}"), fresh: true, hint: None }) })
         }
         fn queue(&self, _op: &Op, _why: &str, _who: Option<&serde_json::Value>) -> Result<String, String> {
             Ok("q-1".into())
@@ -436,7 +430,7 @@ mod tests {
             approver: "human:test".into(),
             digest: vec![],
         };
-        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: Some(2), prefix: false }]).unwrap();
+        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: Some(2), prefix: false, standing: None }]).unwrap();
         let delta = p.commit(vec![Change::PutZone { zone: a }], t1).unwrap();
         replica.lock().unwrap().accept(&delta, t1).unwrap();
         replica.lock().unwrap().accept(&p.statement(t1), t1).unwrap();
@@ -500,7 +494,7 @@ mod tests {
             approver: "human:test".into(),
             digest: vec![],
         };
-        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: None, prefix: false }]).unwrap();
+        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: None, prefix: false, standing: None }]).unwrap();
         let delta = p.commit(vec![Change::PutZone { zone: a }], t1).unwrap();
         replica.lock().unwrap().accept(&delta, t1).unwrap();
         for _ in 0..3 {

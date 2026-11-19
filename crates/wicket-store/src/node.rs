@@ -94,16 +94,44 @@ pub(crate) fn row_to_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> 
 
 impl Ledger {
     /// Grants made for requests that `run` raised, oldest first.
+    /// A run ended long ago has its grants in the archive (#582); they are read from there too.
+    ///
+    /// Every running run's supervisor asks this four times a second, so its statement is one plain
+    /// join: the archive is read only for a run that has ended (only those have rows there).
+    /// Preparing a compound statement over both costs about 100 µs a call, this about 5 (and
+    /// rusqlite's statement cache, measured, more than preparing it).
     pub fn grants_for_run(&self, run: &str) -> Result<Vec<GrantRow>> {
-        let mut st = self.conn.prepare(&format!(
-            "SELECT {GRANT_COLS} FROM grants g JOIN requests q ON q.id = g.request_id WHERE q.run = ?1 ORDER BY g.created_at, g.id"
-        ))?;
-        let rows = st.query_map(params![run], row_to_grant)?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let ended = self
+            .conn
+            .query_row("SELECT ended_at IS NOT NULL FROM runs WHERE id = ?1", params![run], |r| r.get::<_, bool>(0))
+            .optional()?
+            .unwrap_or(true);
+        let mut out: Vec<(i64, GrantRow)> = vec![];
+        let live = format!("SELECT {GRANT_COLS}, g.created_at FROM grants g JOIN requests q ON q.id = g.request_id WHERE q.run = ?1");
+        let archived = format!(
+            "SELECT {GRANT_COLS}, g.created_at FROM grants_archive g JOIN requests q ON q.id = g.request_id WHERE q.run = ?1
+             UNION ALL
+             SELECT {GRANT_COLS}, g.created_at FROM grants_archive g JOIN requests_archive q ON q.id = g.request_id WHERE q.run = ?1"
+        );
+        for sql in std::iter::once(live).chain(ended.then_some(archived)) {
+            let mut st = self.conn.prepare(&sql)?;
+            let rows = st.query_map(params![run], |r| Ok((r.get(15)?, row_to_grant(r)?)))?;
+            out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        }
+        out.sort_by(|a, b| (a.0, &a.1.id).cmp(&(b.0, &b.1.id)));
+        Ok(out.into_iter().map(|(_, g)| g).collect())
     }
 
     pub fn grant(&self, id: &str) -> Result<Option<GrantRow>> {
-        Ok(self.conn.query_row(&format!("SELECT {GRANT_COLS} FROM grants g WHERE g.id = ?1"), params![id], row_to_grant).optional()?)
+        let live =
+            self.conn.query_row(&format!("SELECT {GRANT_COLS} FROM grants g WHERE g.id = ?1"), params![id], row_to_grant).optional()?;
+        match live {
+            Some(g) => Ok(Some(g)),
+            None => Ok(self
+                .conn
+                .query_row(&format!("SELECT {GRANT_COLS} FROM grants_archive g WHERE g.id = ?1"), params![id], row_to_grant)
+                .optional()?),
+        }
     }
 
     /// Records that a grant is published to a node, which counts its uses (the ledger never
@@ -142,6 +170,11 @@ impl Ledger {
             params![node, at_ms, health],
         )?;
         Ok(())
+    }
+
+    /// When `node`'s latest health report was received (ms), if it has one.
+    pub fn node_health_at(&self, node: &str) -> Result<Option<i64>> {
+        Ok(self.conn.query_row("SELECT at_ms FROM node_health WHERE node = ?1", params![node], |r| r.get(0)).optional()?)
     }
 
     /// Every node's latest health report: (node, received at ms, JSON), by node.
@@ -251,21 +284,9 @@ impl Ledger {
     }
 
     /// The last record shipped from `node`: its seq and hash on the node.
+    /// Kept per node as records are appended (#582), not searched for through the audit table.
     pub fn node_audit_head(&self, node: &str) -> Result<Option<(i64, String)>> {
-        let body: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT body FROM audit WHERE kind = 'node.audit' AND json_extract(body, '$.node') = ?1 ORDER BY seq DESC LIMIT 1",
-                params![node],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(b) = body else { return Ok(None) };
-        let v: serde_json::Value = serde_json::from_str(&b)?;
-        match (v["seq"].as_i64(), v["hash"].as_str()) {
-            (Some(s), Some(h)) => Ok(Some((s, h.to_string()))),
-            _ => Err(StoreError::Node(node.into(), "unreadable node.audit record")),
-        }
+        self.stored_node_audit_head(node)
     }
 
     /// Records that `run` was placed on `node`: records the node ships for it are filed under it.

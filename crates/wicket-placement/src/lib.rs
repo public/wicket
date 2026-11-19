@@ -71,6 +71,7 @@ pub mod model;
 pub mod money;
 pub mod placer;
 pub mod reconcile;
+pub mod schedule;
 pub mod static_hosts;
 pub mod vultr;
 
