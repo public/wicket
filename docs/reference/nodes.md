@@ -385,6 +385,18 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
   fits a node now, so a wake that fits nowhere doesn't hold up the ones behind it. A waiting wake keeps its
   claim on the agent, and holds its place only while its process is alive. The queue never creates
   capacity: `request_capacity` and `wicket node create` stay the only ways.
+- **Why here.** Every decision is recorded (`placement_decisions`, a run's latest, kept a week): what the box
+  asked for, the node chosen, the nodes it may go on in order, and every reason each other node was out (at
+  most 10 of each), or the waiting run it went behind. `wicket why-here <run>` prints it (`--json` too):
+
+  ```text
+  run_01J…: on node n1, the best fit of 2 it may go on (of 4 candidates), decided 30 s ago
+    asked for: 1 vCPU, 2048 MiB; labels gpu=a100; its node's CA must cover api.example.com
+    ranked (bin-packed, best first): n1, n3
+    refused:
+      n2: 0.5 vCPU, 512 MiB free
+      n4: no label gpu (wanted gpu=a100)
+  ```
 
 - **Labels and taints.** `wicket node set <node> --label gpu=a100 --taint dedicated=ci` records them in the
   ledger (`key-` removes one; audited `node.labels`). A box goes on a node only if the node has every label

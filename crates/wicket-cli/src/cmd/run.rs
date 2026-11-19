@@ -1,4 +1,4 @@
-//! `wicket run`, `wrap`, `attach`, `session`, `hibernate`, `wake` and `agents`: starting and steering runs.
+//! `wicket run`, `wrap`, `attach`, `session`, `hibernate`, `wake`, `agents` and `why-here`: starting and steering runs.
 //!
 //! One module per command group, out of `main.rs` (#220): a PR that changes one group's flags or
 //! handling touches only its own file.
@@ -82,6 +82,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             hibernate::wake(&agent, (!text.trim().is_empty()).then_some(text), by, wait).await
         }
         Cmd::Agents { json } => hibernate::list(json),
+        Cmd::WhyHere { run, json } => wicket_control::whyhere::why_here(&run, json),
         _ => unreachable!("dispatched to the wrong command group"),
     }
 }
