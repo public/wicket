@@ -33,7 +33,7 @@ mod nodeca;
 mod nodelabels;
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
-pub use placements::{Placement, RESERVE_SECS, WAIT_SEEN_MS};
+pub use placements::{Placement, RunningBox, RESERVE_SECS, WAIT_SEEN_MS};
 mod changes;
 pub mod money;
 mod node;
@@ -185,7 +185,10 @@ pub enum StoreError {
 /// Version 28 (expand, after #582 step 2's 27) adds `names`, `host_ports` and `name_records`
 /// (#575): the names boxes hold, the host ports public names are published on, and the DNS records
 /// this installation created. Older builds don't read them; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 28;
+/// Version 30 (expand, after #575's 28; 29 is #578 step 3's) adds `placement_owners` (#579 step 4):
+/// whose box each reservation is for, so affinity counts a box being started. Older builds don't read
+/// it; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 30;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
