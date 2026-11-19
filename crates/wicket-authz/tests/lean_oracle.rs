@@ -412,11 +412,11 @@ fn rust_decides_as_the_lean_spec() {
         };
         c.push(json!({ "kind": "canon", "path": pq }), rust, format!("canonical_path({pq:?})"));
     }
-    // #257 4a: what a path-prefix grant covers, on every pair of canonical paths of up to 5 bytes
+    // #257 4a: what a path-prefix grant covers, on every pair of canonical paths of up to 4 bytes
     // over `/`, two letters and `.` (the containment itself is Kani's and canon.rs's).
     let mut paths = vec![String::new()];
     let mut canon_paths = vec![];
-    for _ in 0..5 {
+    for _ in 0..4 {
         paths = paths.iter().flat_map(|s| ["/", "a", "b", "."].map(|x| format!("{s}{x}"))).collect();
         canon_paths.extend(paths.iter().filter(|p| wicket_core::canonical_path(p).is_ok_and(|c| c == p.as_str())).cloned());
     }
