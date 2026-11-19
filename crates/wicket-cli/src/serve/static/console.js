@@ -302,11 +302,15 @@ function line(op) {
 
 // A node's latest health report (#377): disk, memory, what went wrong, and what is alerted.
 function healthRow(n) {
+  // The row (name, summary) and its alerts under it, each a line of its own (#574, B7): inside the
+  // flex row they were squeezed into side columns.
+  const w = el("div");
   const d = el("div", "row");
   d.append(el("span", "mono", strip(n.node)));
   d.append(el("span", (n.alerts || []).length ? "blocked" : "", strip(n.summary) + " · reported " + whenMs(n.received_ms)));
-  for (const a of n.alerts || []) d.append(el("div", "blocked", "! " + strip(a)));
-  return d;
+  w.append(d);
+  for (const a of n.alerts || []) w.append(el("div", "blocked", "! " + strip(a)));
+  return w;
 }
 
 // A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
@@ -596,6 +600,12 @@ function fromHash() {
   const m = /^#pending(?:\/([A-Za-z0-9_-]{1,64}))?$/.exec(h);
   if (m) openPending(m[1]);
   if (h === "#notifications") openNotifications();
+  if (h === "#health") openHealth();
+}
+// A node-health notification opens the nodes' health, not the pending list (#574, B5).
+function openHealth() {
+  const box = document.getElementById("health");
+  if (box && box.scrollIntoView) box.scrollIntoView();
 }
 
 // Signed out, the server answers /api/me with 401 and tells the page nothing else: the page offers
@@ -970,8 +980,15 @@ async function submitSecret(ev) {
   else signed({ action: "delete_secret", name: m.name });
 }
 
+// One poll at a time (#574, B9): on a slow link an older answer landing after a newer one would
+// bring a decided card back for a moment.
+let polling = false;
 async function refresh() {
-  if (ceremony) return;
+  if (ceremony || polling) return;
+  polling = true;
+  try { await refreshOnce(); } finally { polling = false; }
+}
+async function refreshOnce() {
   try {
     const r = await fetch("/api/state");
     if (!r.ok) { boot(); return; }
@@ -1004,6 +1021,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("detail-close").addEventListener("click", () => { document.getElementById("detail").hidden = true; });
   if (typeof navigator !== "undefined" && navigator.serviceWorker) navigator.serviceWorker.addEventListener("message", e => {
     if (e.data && typeof e.data.open === "string") openPending(e.data.open);
+    if (e.data && e.data.health === true) openHealth();
     if (e.data && e.data.resubscribe === true) openNotifications();
   });
   if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("hashchange", fromHash);

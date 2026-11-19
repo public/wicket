@@ -375,6 +375,18 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console capacity: ok");
 
+  // Health alerts are lines under their node's row, not items squeezed into it (B7).
+  state = { ...base, pending: [], health: { nodes: [{ node: "n1", summary: "ok", received_ms: 1, alerts: ["disk 91% full"] }] } };
+  await run("refresh()"); await flush();
+  const hrow = ids.health.children[0];
+  assert.strictEqual(hrow.children[0].className, "row");
+  assert.ok(hrow.children[1].textContent === "! disk 91% full" && hrow.children[1].className === "blocked", hrow.textContent);
+  // One poll at a time (B9): a second while one is in flight doesn't start another.
+  const polled = calls.filter(c => c.path === "/api/state").length;
+  await Promise.all([run("refresh()"), run("refresh()")]); await flush();
+  assert.strictEqual(calls.filter(c => c.path === "/api/state").length - polled, 1, "overlapping polls");
+  console.log("console health and polling: ok");
+
   // The service worker: a replaced subscription is subscribed again with the same key, any open
   // console is told, and one notification says so; tapping it opens the console's notifications.
   const sw = { listeners: {}, shown: [], posted: [], opened: [], subscribedWith: null, wins: [] };
@@ -406,5 +418,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual(sw.opened, ["https://console.example/#notifications"]);
   await fire("notificationclick", { notification: { close() {}, data: { id: "q-b" } } });
   assert.deepStrictEqual(sw.opened[1], "https://console.example/#pending/q-b");
+  // A node-health notification opens the health section, in a new window or an open one (B5).
+  await fire("notificationclick", { notification: { close() {}, data: { health: true } } });
+  assert.deepStrictEqual(sw.opened[2], "https://console.example/#health");
+  sw.posted = [];
+  sw.wins = [{ url: "https://console.example/", postMessage: m => sw.posted.push(m), focus: async () => {} }];
+  await fire("notificationclick", { notification: { close() {}, data: { health: true } } });
+  assert.strictEqual(JSON.stringify(sw.posted), JSON.stringify([{ health: true }]));
   console.log("console service worker: ok");
 })().catch(e => { console.error(e); process.exit(1); });
