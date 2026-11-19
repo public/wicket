@@ -1331,8 +1331,8 @@ Per-node services (#579): programs kept running on every node whose boxes use th
 Usage: wicket service <COMMAND>
 
 Commands:
-  add     Install a per-node service: a program manifest with a `service:` section. Its manifest is read where it is, at each start: keep it there
-  remove  Uninstall one: no new instance starts
+  add     Install a per-node service: a program manifest with a `service:` section. Its manifest and source are copied into wicket's data directory and pinned: what was there when it was added is what runs. Adding again replaces it (audited)
+  remove  Uninstall one: its instances stop, and no new one starts
   list    The installed services
   help    Print this message or the help of the given subcommand(s)
 
@@ -1343,7 +1343,7 @@ Options:
 ### `wicket service add`
 
 ```text
-Install a per-node service: a program manifest with a `service:` section. Its manifest is read where it is, at each start: keep it there
+Install a per-node service: a program manifest with a `service:` section. Its manifest and source are copied into wicket's data directory and pinned: what was there when it was added is what runs. Adding again replaces it (audited)
 
 Usage: wicket service add <MANIFEST>
 
@@ -1357,7 +1357,7 @@ Options:
 ### `wicket service remove`
 
 ```text
-Uninstall one: no new instance starts
+Uninstall one: its instances stop, and no new one starts
 
 Usage: wicket service remove <NAME>
 
