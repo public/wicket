@@ -123,7 +123,11 @@ fail=0
 # Checks and waits run without pipefail: `... | grep -q` may stop reading early, and its writer's
 # SIGPIPE isn't a failure.
 check() {
-  if (set +o pipefail; eval "$2"); then results+=("ok   $1"); echo "ok   $1"; else results+=("FAIL $1"); echo "FAIL $1"; fail=1; fi
+  if (set +o pipefail; eval "$2"); then results+=("ok   $1"); echo "ok   $1"; else
+    results+=("FAIL $1"); echo "FAIL $1"; fail=1
+    # In GitHub Actions, each failed check as an annotation too: readable from the API without the log.
+    [ -z "${GITHUB_ACTIONS:-}" ] || echo "::error title=acceptance ($mode) check failed::$(sed 's/%/%25/g' <<<"$1")"
+  fi
 }
 skip() { results+=("skip $1 ($2)"); echo "skip $1 ($2)"; }
 log() { echo "== $(date +%T) $*"; }

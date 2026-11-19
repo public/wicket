@@ -59,7 +59,7 @@ fi
 
 $docker run --rm --name "$name" --network host \
   -v "$repo:/src:ro" -v "$pkg:/pkg:ro" -v "$sock:/run/host-docker.sock" -v "$data:$data" \
-  -e IMAGE="$image" "$base" bash -euo pipefail -c '
+  -e IMAGE="$image" -e GITHUB_ACTIONS="${GITHUB_ACTIONS:-}" "$base" bash -euo pipefail -c '
 apt-get update -q >/dev/null && apt-get install -y -q sudo jq curl socat python3 >/dev/null
 useradd --create-home you
 echo "you ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/you
@@ -83,7 +83,11 @@ mkdir /home/you/wicket && tar -C /src --exclude=./target --exclude=./ci/h3get/ta
 cp /pkg/h3get /home/you/h3get && chown you /home/you/h3get
 status=0
 (cd /home/you/wicket && runuser -u you -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/you USER=you \
-  IMAGE="$IMAGE" H3GET=/home/you/h3get WICKET_DOCKER="sudo -n docker" ACC_AUDIT_SINK=1 ci/acceptance.sh --installed) || status=$?
-[ "$status" = 0 ] || { echo "== wicketd log (tail)"; tail -30 /tmp/wicketd.log; }
+  IMAGE="$IMAGE" H3GET=/home/you/h3get WICKET_DOCKER="sudo -n docker" ACC_AUDIT_SINK=1 GITHUB_ACTIONS="$GITHUB_ACTIONS" ci/acceptance.sh --installed) || status=$?
+if [ "$status" != 0 ]; then
+  echo "== wicketd log (tail)"; tail -30 /tmp/wicketd.log
+  # As an annotation too, in GitHub Actions: readable without the log.
+  [ -z "$GITHUB_ACTIONS" ] || echo "::error title=wicketd log (tail)::$(tail -30 /tmp/wicketd.log | cut -c1-300 | sed "s/%/%25/g" | sed ":a;N;\$!ba;s/\n/%0A/g")"
+fi
 exit $status
 '
