@@ -32,6 +32,7 @@ mod nodelabels;
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
 pub use placements::{Placement, RESERVE_SECS, WAIT_SEEN_MS};
+mod changes;
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -41,6 +42,7 @@ mod props;
 mod quota;
 mod receipts;
 mod scale;
+pub use changes::{ChangeWatch, Topic};
 mod standing;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
@@ -168,7 +170,11 @@ pub enum StoreError {
 /// Version 25 (expand, after #579 step 2's 24) adds `services`, `service_wants` and
 /// `service_instances` (#579 step 3): the per-node services installed, which runs use them on which
 /// node, and the instances kept for them. Older builds don't read them; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 25;
+/// Version 27 (expand, after #579 step 3's 25 and 26) adds `ledger_changes` and its triggers (#582
+/// step 2): a counter per topic (grants, asks, revocations, node CAs) that every write to its tables
+/// moves, so a supervisor reads its rows only when they changed. Older builds don't read it, and its
+/// triggers fire under them too; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 27;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -581,6 +587,7 @@ impl Ledger {
         conn.execute_batch("DROP TABLE IF EXISTS operator_messages")?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_turns ON messages (to_run, kind, delivered_at)")?;
         scale::migrate(&conn)?;
+        changes::migrate(&conn)?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -621,6 +628,7 @@ impl Ledger {
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
         scale::migrate(&conn)?;
+        changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
