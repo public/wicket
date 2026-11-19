@@ -4,8 +4,8 @@ import Wicket
 /-!
 # The spec as an oracle (#322)
 
-`lake env lean --run Oracle.lean cases.json` reads a file of cases and prints one decision per case,
-one per line, in order. wicket-authz's `lean_oracle` test writes the cases (its fixtures and
+`lake env lean --run Oracle.lean cases.json` reads a file of cases and prints a line `--- decisions`,
+then one decision per case, one per line, in order. wicket-authz's `lean_oracle` test writes the cases (its fixtures and
 generated ones), runs this, and compares every line with what the Rust code decided.
 
 Input: `{"zones": [zone…], "cases": [case…]}`. A case is one of
@@ -245,6 +245,8 @@ def main (args : List String) : IO UInt32 := do
   let zs := zs.toArray
   let cases ← IO.ofExcept (jArr j "cases")
   let out ← IO.getStdout
+  -- What `lean --run` printed before this (a warning compiling this file) isn't a decision.
+  out.putStrLn "--- decisions"
   for c in cases do
     match decideCase zs c with
     | .ok r => out.putStrLn r

@@ -42,7 +42,7 @@ annotate() {
   awk -v dir="$2" '
     function esc(l) { gsub(/%/, "%25", l); return l }
     function flush() { if (msg != "") { print "::error" loc "::" msg; n++ } msg = "" }
-    /error|panicked|divergen/ && n < 20 { flush(); loc = ""
+    /error|panicked|divergen|printed before its decisions/ && n < 20 { flush(); loc = ""
       if (match($0, /^[^: ]+\.lean:[0-9]+:/)) { split(substr($0, 1, RLENGTH), p, ":"); loc = " file=" dir p[1] ",line=" p[2] }
       msg = esc($0); lines = 1; next }
     msg != "" && /^$/ { flush(); next }

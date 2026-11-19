@@ -309,7 +309,18 @@ fn run_lean(file: &Path) -> Vec<String> {
         .output()
         .unwrap_or_else(|e| panic!("{lake}: {e}"));
     assert!(out.status.success(), "the oracle failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap().lines().map(String::from).collect()
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    // The decisions follow the marker; anything before it is what compiling Oracle.lean printed.
+    let (before, decisions) = stdout
+        .split_once(
+            "--- decisions
+",
+        )
+        .unwrap_or_else(|| panic!("the oracle printed no decisions: {stdout}"));
+    for l in before.lines() {
+        eprintln!("lean oracle: Oracle.lean printed before its decisions: {l}");
+    }
+    decisions.lines().map(String::from).collect()
 }
 
 #[test]
