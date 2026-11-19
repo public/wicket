@@ -884,6 +884,8 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
     // wicketd re-executes itself last, at once, handing its running commands (this one, and runs) to
     // the new image (#455, #468).
     if let Some(pid) = hangup(&pidfile("daemon"), "daemon") {
+        // With wicketd's `daemon.started` after its re-exec, the audit trail shows the drain (#487).
+        audit(&ledger, "daemon.sighup", serde_json::json!({ "to": green, "by": crate::operator() }));
         say(format!("wicketd (pid {pid}) moves to {green} now, handing its running commands over"));
     }
     say(format!(
@@ -1776,6 +1778,8 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
     }
     if !only_nodes {
         if let Some(pid) = hangup(&pidfile("daemon"), "daemon") {
+            let to = Versions::control().pointer("current");
+            audit(&ledger, "daemon.sighup", serde_json::json!({ "to": to, "by": crate::operator() }));
             say(format!("wicketd (pid {pid}) moves back now, handing its running commands over"));
         }
     }

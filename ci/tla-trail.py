@@ -13,7 +13,15 @@ identities or tasks), and the TLA+ trail of the actions they are:
 - `reconcile.run_adopted` then `run.attach` for a run: Update.tla's `Reattach(r)`; its supervisor
   was stopped before (`HandOver(r)`, not audited);
 - `run.exit_cause` "stopped by wicket" for that run within 30 s of its attach: the `Reattach` left
-  its box stopped (`box'[r] = "stopped"`), else running.
+  its box stopped (`box'[r] = "stopped"`), else running;
+- `self.switched` of the control host: `SelfUpdate`;
+- `daemon.started` (wicketd's start, audited since #544's follow-up): `DrainDone` after a
+  `daemon.sighup` (`wicket self update`'s), else `DaemonStart` (a restart);
+- a `daemon.sighup` with no `daemon.started` after it: a `Tick` for each --drain-bound seconds
+  (default 10) until the next record or the export's end, at most two (Update.tla's `DrainMax` is
+  one), and a warning: the daemon may not have taken commands since (#487).
+
+A trail with `daemon.started` records needs `DaemonAudited = TRUE` in its config.
 
 wicketd's restart, the local serve's re-exec, stopping the old supervisors and prompts aren't
 audited: UpdateTrace.tla lets them happen between the trail's steps.
@@ -42,9 +50,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("audit")
     ap.add_argument("--gap", type=int, default=600)
+    ap.add_argument("--drain-bound", type=int, default=10)
     a = ap.parse_args()
     rs = list(records(a.audit))
-    attaches = [r for r in rs if r["kind"] == "run.attach"]
+    end = max((r["t"] for r in rs), default=0)
+    def update_record(r):
+        if r["kind"] == "self.switched":
+            return r["body"].get("target") == "control"
+        return r["kind"] in ("run.attach", "daemon.sighup", "daemon.started")
+    attaches = [r for r in rs if update_record(r)]
     stops = [r for r in rs if r["kind"] == "run.exit_cause" and "stopped by wicket" in str(r["body"].get("cause", ""))]
     updates, cur = [], []
     for r in attaches:
@@ -55,23 +69,51 @@ def main():
     if cur:
         updates.append(cur)
     for u in updates:
-        local = [r["run"] for r in u if r["body"].get("node") == "local"]
-        others = [r["run"] for r in u if r["body"].get("node") != "local"]
+        local = [r["run"] for r in u if r["kind"] == "run.attach" and r["body"].get("node") == "local"]
+        others = [r["run"] for r in u if r["kind"] == "run.attach" and r["body"].get("node") != "local"]
         names = {}
         for run in local + others:
             names.setdefault(run, f"r{len(names) + 1}")
         when = u[0]["t"]
         hhmm = f"{when // 3600 % 24:02d}{when // 60 % 60:02d}"
-        print(f"\\* update at {hhmm} UTC (unix {when}): {len(u)} re-attach(es)")
+        print(f"\\* update at {hhmm} UTC (unix {when}): {sum(r['kind'] == 'run.attach' for r in u)} re-attach(es)")
         steps = []
-        for r in u:
+        sighup = None
+
+        def none_step(action):
+            return f'[action |-> "{action}", run |-> "none", box |-> "none"]'
+
+        def ticks(upto):
+            n = min(2, (upto - sighup["t"]) // a.drain_bound)
+            print(f"\\*   WARNING: no daemon.started {upto - sighup['t']}s after the SIGHUP: the daemon may not have taken commands since (#487)")
+            steps.extend(none_step("Tick") for _ in range(n))
+
+        audited = any(r["kind"].startswith("daemon.") for r in u)
+        for k, r in enumerate(u):
+            if r["kind"] == "self.switched":
+                print(f"\\*   +{r['t'] - when}s self.switched {r['body'].get('from')} -> {r['body'].get('to')}")
+                steps.append(none_step("SelfUpdate"))
+                continue
+            if r["kind"] == "daemon.sighup":
+                print(f"\\*   +{r['t'] - when}s daemon.sighup")
+                sighup = r
+                continue
+            if r["kind"] == "daemon.started":
+                after = sighup is not None
+                print(f"\\*   +{r['t'] - when}s daemon.started" + (f", {r['t'] - sighup['t']}s after the SIGHUP" if after else ""))
+                steps.append(none_step("DrainDone" if after else "DaemonStart"))
+                sighup = None
+                continue
             node = "local" if r["body"].get("node") == "local" else "remote"
             stopped = [s for s in stops if s["run"] == r["run"] and 0 <= s["t"] - r["t"] <= 30]
             box = "stopped" if stopped else "running"
             print(f"\\*   +{r['t'] - when}s reconcile.run_adopted, run.attach {names[r['run']]} on node {node}")
-            for s in stopped:
-                print(f"\\*   +{s['t'] - when}s run.exit_cause {names[r['run']]}: {s['body'].get('cause')} (exit {s['body'].get('code')})")
+            for st in stopped:
+                print(f"\\*   +{st['t'] - when}s run.exit_cause {names[r['run']]}: {st['body'].get('cause')} (exit {st['body'].get('code')})")
             steps.append(f'[action |-> "Reattach", run |-> "{names[r["run"]]}", box |-> "{box}"]')
+        if sighup is not None:
+            ticks(end)
+        print(f"\\*   DaemonAudited = {'TRUE' if audited else 'FALSE'}")
         print(f"Trail{hhmm} == << {', '.join(steps)} >>")
         print()
     return 0
