@@ -117,6 +117,14 @@ function describe(a) {
     return (a.action === "capacity_grant" ? "Grant " + s(a.principal) + " " + what + ", for " + hours + " h"
       : "Renew capacity grant " + s(a.grant) + " (" + s(a.principal) + ": " + what + ") for " + hours + " h from now");
   }
+  if (a.action === "standing_approve" || a.action === "standing_renew") {
+    const days = a.ttl_secs ? "for " + Math.round(a.ttl_secs / 86400) + " days" : "until revoked";
+    if (a.action === "standing_renew") return "Renew standing reach " + s(a.standing) + " (" + ruleText(a.rule) + ") " + (a.ttl_secs ? days + " from now" : days);
+    const to = a.for === "zone" ? "every agent of zone " + s(a.zone) : s(a.principal) + " (each later run of it)";
+    return "Approve standing reach " + s(a.standing) + (a.narrowed ? " narrowed to its evidence" : "") + ": " + ruleText(a.rule) +
+      " \u00b7 for " + to + " \u00b7 " + days + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
+  }
+  if (a.action === "standing_deny") return "Deny standing reach " + s(a.standing) + ": " + ruleText(a.rule);
   if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
@@ -145,7 +153,7 @@ async function signed(body, after, extra) {
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   document.getElementById("confirm-state").textContent = "";
-  const deny = begin.action.decision === "deny" || begin.action.action === "revoke" || begin.action.action === "delete_secret";
+  const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny"].includes(begin.action.action);
   go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
@@ -298,6 +306,34 @@ function renderPending(s) {
   if (openId) for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
 }
 
+// Rows kept across polls (#574): each by its id and content, rebuilt only when it changed, and the
+// list replaced only when something did. Then the layout moved: taps are ignored for a moment, as
+// on the pending cards (`settled`), so a tap can't land on a row that just moved under it.
+const keyed = new Map();
+function renderKeyed(id, rows, f, emptyText) {
+  const box = document.getElementById(id);
+  const had = keyed.get(id) || new Map(), now = new Map();
+  const nodes = rows.map(r => {
+    const key = JSON.stringify(r), old = had.get(r.id);
+    const node = old && old.key === key ? old.node : f(r);
+    now.set(r.id, { key, node });
+    return node;
+  });
+  keyed.set(id, now);
+  if (!rows.length) {
+    if (!(box.children.length === 1 && box.children[0].className === "empty")) box.replaceChildren(el("div", "empty", emptyText));
+    return;
+  }
+  if (nodes.length === box.children.length && nodes.every((n, i) => n === box.children[i])) return;
+  box.replaceChildren(...nodes);
+  layoutAt = performance.now();
+}
+// A signed action from a row's button, once the layout has settled.
+const signedSettled = body => {
+  if (!settled()) { toast("The list just changed: check the row and tap again."); return; }
+  signed(body);
+};
+
 function renderRows(id, rows, f, emptyText) {
   const box = document.getElementById(id); box.replaceChildren();
   if (!rows.length) { box.append(el("div", "empty", emptyText)); return; }
@@ -380,6 +416,72 @@ function capacityRow(g) {
   revoke.onclick = async () => { try { toast((await post("/api/capacity/revoke", { id: g.id })).ok); } catch (e) { toastError(e); } refresh(); };
   b.append(renew, revoke);
   d.append(head, what, use, b);
+  return d;
+}
+// Standing reach (#572). A rule as a manifest would carry it.
+function ruleText(r) {
+  r = r || {};
+  return "{ host: " + strip(r.host) + ", methods: [" + (r.methods || []).map(strip).join(", ") + "], paths: [" +
+    (r.paths || []).map(p => "'" + strip(p) + "'").join(", ") + "]" + (r.allow_dangerous ? ", allow_dangerous: true" : "") + " }";
+}
+// An agent's ask: the rule, who asked and why, the ledger's evidence, and what it allows beyond it.
+// Approved once (signed): as asked or narrowed to the evidence, for the agent or its zone, 30 days.
+function standingAskRow(a) {
+  const d = el("div", "card req");
+  const e = a.evidence || {};
+  const r = a.rule || {};
+  const agent = String(a.principal || "").split("/a/").pop();
+  d.append(el("div", "what", "Standing reach on " + strip(r.host)));
+  d.append(el("div", "meta", "Methods: " + (r.methods || []).map(strip).join(", ") + (r.allow_dangerous ? " \u00b7 dangerous requests too (R3, R4)" : "")));
+  d.append(el("div", "meta", "Paths: " + (r.paths || []).map(strip).join(", ")));
+  d.append(el("div", "why", strip(a.reason)));
+  const who = el("div", "meta", "Asked by " + strip(agent) + " (zone " + strip(a.zone) + ") \u00b7 for its later runs with this zone definition" +
+    (a.zone_digest ? " (" + strip(a.zone_digest).slice(0, 12) + "\u2026)" : ""));
+  who.title = strip(a.principal);
+  d.append(who);
+  d.append(el("div", "meta", "Evidence: " + e.granted + " granted of " + e.requests + " blocked request(s) it covers in the last 14 days (" +
+    e.denied + " denied, " + e.undecided + " undecided), in " + e.runs + " run(s) on " + e.days + " day(s)" +
+    ((e.ops || []).length >= 10 ? ", the 10 most asked:" : (e.ops || []).length ? ":" : "")));
+  for (const o of (e.ops || [])) d.append(el("div", "meta mono", o.count + " \u00d7 " + strip(o.method) + " " + strip(o.path) + " (" + o.granted + " granted)"));
+  if (e.own_asks) d.append(el("div", "meta", "and " + e.own_asks + " ask(s) ahead of its own, not counted as evidence"));
+  for (const b of (a.beyond || [])) d.append(el("div", "blocked", "Wider than the evidence: " + strip(b)));
+  const b = el("div", "buttons");
+  // The narrowest choice first, and the default; the widest (a whole zone) marked as such.
+  const narrow = el("button", a.narrowed ? "approve" : "", a.narrowed ? "Approve narrowed (30 days)" : "Approve narrowed: no evidence to narrow to");
+  narrow.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent", narrow: true });
+  narrow.disabled = !a.narrowed;
+  const asAsked = el("button", a.narrowed ? "" : "approve", "Approve as asked (30 days)");
+  asAsked.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent" });
+  const zone = el("button", "deny", "Approve for every agent in zone " + strip(a.zone) + " (30 days)");
+  zone.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "zone" });
+  const deny = el("button", "deny", "Deny");
+  deny.onclick = () => signedSettled({ action: "standing_deny", id: a.id });
+  b.append(narrow, asAsked, zone);
+  const b2 = el("div", "buttons");
+  b2.append(deny);
+  if (a.narrowed) d.append(el("div", "meta", "Narrowed: methods " + (a.narrowed.methods || []).map(strip).join(", ") + ", paths " + (a.narrowed.paths || []).map(strip).join(", ")));
+  d.append(b, b2, el("div", "meta", strip(a.id) + " \u00b7 asked " + when(a.created_at)));
+  return d;
+}
+// An approved rule: who it is for, when it lapses; renewed (signed, 30 days) or revoked (session).
+function standingRuleRow(r) {
+  const d = el("div", "row cap");
+  const head = el("div");
+  head.append(el("span", "mono", strip(r.id) + " "), el("span", "", ruleText(r.rule)));
+  const to = r.for === "zone" ? "every agent of zone " + strip(r.zone) : strip(r.principal);
+  const until = r.expires_at ? (r.live ? "until " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
+  const b = el("div", "buttons");
+  const renew = el("button", "approve", "Renew (30 days)");
+  renew.onclick = () => signedSettled({ action: "standing_renew", id: r.id });
+  renew.disabled = !r.live;
+  const revoke = el("button", "deny", "Revoke");
+  revoke.onclick = async () => {
+    if (!settled()) { toast("The list just changed: check the row and tap again."); return; }
+    try { toast((await post("/api/standing/revoke", { id: r.id })).ok); } catch (e) { toast(e.message); }
+    refresh();
+  };
+  b.append(renew, revoke);
+  d.append(head, el("div", "meta", "for " + to + " · " + until + " · by " + strip(r.decided_by)), b);
   return d;
 }
 // The form's inputs, by name; built once, so what the operator types survives the poll.
@@ -1025,6 +1127,13 @@ async function refresh() {
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
+    const st = s.standing || {};
+    // Standing asks wait below (their own section); said at the top, where decisions are made.
+    const ptr = document.getElementById("standing-pointer");
+    const n = (st.asks || []).length;
+    if (ptr) ptr.textContent = n ? n + " standing reach ask" + (n === 1 ? "" : "s") + " waiting, under Standing reach below" : "";
+    renderKeyed("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
+    renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: every one-off ask waits for a decision.");
     renderStart(s);
     renderManifests(s);
     renderSecrets(s);

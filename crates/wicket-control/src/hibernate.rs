@@ -452,7 +452,7 @@ fn wake_text(by: &str, said: &[(String, String)], messages: i64) -> String {
 
 /// `wicket wake <agent>` (internal, #249): claims the agent and runs its next activation in the
 /// foreground. What [`trigger_wake`] starts, and wicket's own tests run.
-pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result<()> {
+pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std::time::Duration) -> Result<()> {
     let (agent, generation, run, first, last_node) = {
         let mut l = Ledger::open(&ledger_path())?;
         let a = resolve(&l, who)?;
@@ -535,7 +535,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
     };
     // The agent's state is its bundle, here, so it can wake on any node: bin-packed into the nodes
     // available now, by its zone's limits.
-    let node = match place(&agent, last_node.as_deref()).await {
+    let node = match place(&agent, &run, generation, last_node.as_deref(), wait).await {
         Ok(n) => n,
         Err(e) => {
             let l = Ledger::open(&ledger_path())?;
@@ -604,93 +604,245 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
 pub struct Candidate {
     pub name: String,
     pub cap: crate::chan::NodeCapacity,
+    /// When its room was read (ms): its report's receipt, or the probe. Reservations made since
+    /// count against it (#579).
+    pub at_ms: i64,
 }
 
-/// Best fit: of the nodes with room for `want` (vCPUs, MiB), the one left with the least memory free
-/// once it is placed (then the fewest vCPUs free; then `last`, where the agent ran before; then the
-/// name). With room nowhere, the node with the most memory free, and false. A node's memory free is
-/// what its limits leave, and no more than its admission says a box may have now (#377); a node
-/// that starts no box (its disk below the floor) has no room.
-pub fn pick(cands: &[Candidate], want: (f32, u64), last: Option<&str>) -> Option<(String, bool)> {
-    let free = |c: &Candidate| {
-        let by_limits = c.cap.memory_mib as i64 - c.cap.used_memory_mib as i64;
-        let mem = c.cap.room_mib.map_or(by_limits, |r| by_limits.min(r as i64));
-        (c.cap.vcpus - c.cap.used_vcpus, if c.cap.full { -1 } else { mem })
+/// What the scheduler sees of `c` (#579): its reported room, and from the ledger its labels, taints,
+/// and whether its CA covers `need` (the box's inspected hosts) or may be widened to them (#573).
+pub fn scheduled_node(l: &Ledger, c: &Candidate, need: &[String]) -> wicket_placement::schedule::Node {
+    use wicket_placement::schedule::Coverage;
+    let ca = match wicket_node::controlca::active(l, &c.name) {
+        None => Coverage::Covers,
+        Some(ca) => {
+            let missing = wicket_core::splice::uncovered(&ca.hosts, need);
+            let policy = l.node_ca_policy(&c.name).unwrap_or(wicket_store::CaHosts::Fixed);
+            let (may, kept_out): (Vec<String>, Vec<String>) = missing.into_iter().partition(|h| policy.allows(h));
+            match (may.is_empty(), kept_out.is_empty()) {
+                (_, false) => Coverage::Refuses(kept_out),
+                (false, true) => Coverage::Widens(may),
+                (true, true) => Coverage::Covers,
+            }
+        }
     };
-    let fits = |c: &&Candidate| {
-        let (cpu, mem) = free(c);
-        cpu + 1e-3 >= want.0 && mem >= want.1 as i64 && !c.cap.full
-    };
-    let key = |c: &Candidate| {
-        let (cpu, mem) = free(c);
-        (mem - want.1 as i64, ((cpu - want.0) * 1000.0) as i64, Some(c.name.as_str()) != last, c.name.clone())
-    };
-    if let Some(best) = cands.iter().filter(fits).min_by_key(|c| key(c)) {
-        return Some((best.name.clone(), true));
+    wicket_placement::schedule::Node {
+        name: c.name.clone(),
+        vcpus: c.cap.vcpus,
+        used_vcpus: c.cap.used_vcpus,
+        memory_mib: c.cap.memory_mib,
+        used_memory_mib: c.cap.used_memory_mib,
+        room_mib: c.cap.room_mib,
+        full: c.cap.full,
+        labels: l.node_labels(&c.name).unwrap_or_default(),
+        taints: l.node_taints(&c.name).unwrap_or_default(),
+        ca,
     }
-    cands.iter().max_by_key(|c| (free(c).1, std::cmp::Reverse(c.name.clone()))).map(|c| (c.name.clone(), false))
 }
 
-/// Where a woken agent's box goes: every enrolled, active node that answers within 10 s (this host's
-/// own among them) and isn't held by a capacity lease, bin-packed ([`pick`]).
-async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
-    let m = wicket_agent::load(&agent.manifest)?;
-    let want = (m.zone.limits.cpus, m.zone.limits.memory_bytes().unwrap_or(0) >> 20);
-    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
-    crate::localnode::ensure(&ledger).await?;
-    let (names, leased) = {
-        let l = ledger.lock().expect("ledger");
-        let names: Vec<String> = l.nodes()?.into_iter().filter(|n| n.status == "active").map(|n| n.name).collect();
-        let leased: Vec<String> = l.leases(wicket_store::LIVE_LEASES)?.into_iter().filter_map(|x| x.node_name).collect();
-        (names, leased)
-    };
-    let probes = names.into_iter().filter(|n| !leased.contains(n)).map(|n| {
-        let ledger = ledger.clone();
-        async move {
-            let r = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                crate::nodecall::Link::connect(&n, &format!("place:{}", std::process::id()), &ledger),
-            )
-            .await;
-            match r {
-                Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap }),
-                Ok(Err(e)) => {
-                    say!("[wicket] node {n} is not available for the wake: {e:#}");
-                    None
-                }
-                Err(_) => {
-                    say!("[wicket] node {n} is not available for the wake: no answer within 10 s");
-                    None
+/// Chooses a node for `run`'s box among `cands` and reserves what it asks for there, in one
+/// transaction under the ledger's write lock (#579 step 2): each candidate's room is what it
+/// reported less what reservations made since hold on it (`Ledger::held_on`), so two starts never
+/// count the same room. Nothing is reserved when no node may take it.
+///
+/// With `fifo` (a wake, which may wait), the runs waiting ahead of it (`Ledger::waiting_before`)
+/// go first: if one of them fits a node now, nothing is reserved for this one, and `behind` names
+/// it. A named node (`--node`) doesn't wait, so it isn't queued.
+pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: Option<&str>, now_ms: i64, fifo: bool) -> Result<Bound> {
+    use wicket_placement::schedule::{schedule, Strategy};
+    let (req, need) = (&ask.req, &ask.need[..]);
+    l.immediate(|l| {
+        let mut held = vec![];
+        for c in cands {
+            held.push(l.held_on(&c.name, c.at_ms, now_ms)?);
+        }
+        let nodes = |need: &[String]| -> Vec<wicket_placement::schedule::Node> {
+            cands
+                .iter()
+                .zip(&held)
+                .map(|(c, (cpu, mib))| {
+                    let mut n = scheduled_node(l, c, need);
+                    n.used_vcpus += cpu;
+                    n.used_memory_mib += mib;
+                    n.room_mib = n.room_mib.map(|r| r.saturating_sub(*mib));
+                    n
+                })
+                .collect()
+        };
+        if fifo {
+            for (older, json) in l.waiting_before(&run.0, now_ms)? {
+                let Ok(w) = serde_json::from_str::<Waiting>(&json) else { continue };
+                if schedule(&w.req, &nodes(&w.need), Strategy::BinPack, None).node.is_some() {
+                    return Ok(Bound { decision: Default::default(), behind: Some(older) });
                 }
             }
         }
-    });
-    let cands: Vec<Candidate> = futures_util::future::join_all(probes).await.into_iter().flatten().collect();
-    match pick(&cands, want, last) {
-        Some((n, true)) => {
-            say!("[wicket] placing agent {} on node {n} (best fit of {} available)", agent.id, cands.len());
-            Ok(Some(n))
+        let d = schedule(req, &nodes(need), Strategy::BinPack, last);
+        if let Some(node) = &d.node {
+            l.reserve_placement(&run.0, node, req.vcpus, req.memory_mib, now_ms)?;
         }
-        // No silent overcommit (#377): each node would refuse the box itself.
-        Some((_, false)) => {
-            let seen: Vec<String> = cands
-                .iter()
-                .map(|c| match (c.cap.full, c.cap.room_mib) {
-                    (true, _) => format!("{} (its disk is below the floor)", c.name),
-                    (false, Some(r)) => format!("{} ({:.1} vCPU, {r} MiB free)", c.name, c.cap.vcpus - c.cap.used_vcpus),
-                    (false, None) => format!(
-                        "{} ({:.1} vCPU, {} MiB free by limits)",
-                        c.name,
-                        c.cap.vcpus - c.cap.used_vcpus,
-                        c.cap.memory_mib.saturating_sub(c.cap.used_memory_mib)
-                    ),
-                })
-                .collect();
-            bail!("no available node has room for agent {} ({} vCPU, {} MiB needed): {}", agent.id, want.0, want.1, seen.join(", "))
+        Ok(Bound { decision: d, behind: None })
+    })
+}
+
+/// What [`bind`] decided: the decision, or the older waiting run it yielded to.
+#[derive(Debug, Default)]
+pub struct Bound {
+    pub decision: wicket_placement::schedule::Decision,
+    pub behind: Option<String>,
+}
+
+/// A waiting run's request, as `placement_waits` keeps it.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Waiting {
+    pub req: wicket_placement::schedule::Request,
+    pub need: Vec<String>,
+}
+
+/// A node's last report older than this (ms) is not trusted for its room: it is asked (#579).
+pub const INDEX_FRESH_MS: i64 = 90_000;
+
+/// Which of `names` placement can read from the ledger (#579): those whose latest health report,
+/// received under [`INDEX_FRESH_MS`] ago, carries the node's capacity. The rest (no report, an old
+/// one, a node from before it carried capacity) are returned to be asked, as before: a node no run
+/// is connected to reports nothing.
+pub fn from_index(names: &[String], health: &[(String, i64, String)], now_ms: i64) -> (Vec<Candidate>, Vec<String>) {
+    let (mut found, mut ask) = (vec![], vec![]);
+    for n in names {
+        let cap = health.iter().find(|(node, at, _)| node == n && now_ms - at < INDEX_FRESH_MS).and_then(|(_, at, j)| {
+            serde_json::from_str::<wicket_chan::health::NodeHealth>(j).ok().and_then(|h| h.capacity).map(|c| (c, *at))
+        });
+        match cap {
+            Some((cap, at_ms)) => found.push(Candidate { name: n.clone(), cap, at_ms }),
+            None => ask.push(n.clone()),
         }
-        None => Ok(None),
+    }
+    (found, ask)
+}
+
+/// Where a woken agent's box goes: every enrolled, active node (this host's own among them) not held
+/// by a capacity lease, its room read from its last report in the ledger ([`from_index`]) or, with
+/// none fresh, asked of it (within 10 s); filtered by the box's requests, labels, taints and CA
+/// coverage, then bin-packed (`wicket_placement::schedule`).
+async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str>, wait: std::time::Duration) -> Result<Option<String>> {
+    let m = wicket_agent::load(&agent.manifest)?;
+    let req = wicket_placement::schedule::Request::of(&m);
+    let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
+    crate::localnode::ensure(&ledger).await?;
+    let index = || -> Result<(Vec<Candidate>, Vec<String>)> {
+        let l = ledger.lock().expect("ledger");
+        let leased: Vec<String> = l.leases(wicket_store::LIVE_LEASES)?.into_iter().filter_map(|x| x.node_name).collect();
+        let names: Vec<String> =
+            l.nodes()?.into_iter().filter(|n| n.status == "active" && !leased.contains(&n.name)).map(|n| n.name).collect();
+        Ok(from_index(&names, &l.node_health()?, wicket_feed::now_ms()))
+    };
+    let ask = |names: Vec<String>| {
+        let ledger = ledger.clone();
+        async move {
+            let probes = names.into_iter().map(|n| {
+                let ledger = ledger.clone();
+                async move {
+                    let r = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        crate::nodecall::Link::connect(&n, &format!("place:{}", std::process::id()), &ledger),
+                    )
+                    .await;
+                    match r {
+                        Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap, at_ms: wicket_feed::now_ms() }),
+                        Ok(Err(e)) => {
+                            say!("[wicket] node {n} is not available for the wake: {e:#}");
+                            None
+                        }
+                        Err(_) => {
+                            say!("[wicket] node {n} is not available for the wake: no answer within 10 s");
+                            None
+                        }
+                    }
+                }
+            });
+            futures_util::future::join_all(probes).await.into_iter().flatten().collect::<Vec<Candidate>>()
+        }
+    };
+    // Choosing and reserving are one transaction (#579 step 2): nothing is reserved when none fits,
+    // and a wake waiting longer goes first.
+    let me = Waiting { req: req.clone(), need: need.clone() };
+    let decide = |cands: &[Candidate]| bind(&ledger.lock().expect("ledger"), run, &me, cands, last, wicket_feed::now_ms(), true);
+    let waiting = serde_json::to_string(&me)?;
+    let started = std::time::Instant::now();
+    let (indexed, to_probe) = index()?;
+    let mut probed = ask(to_probe).await;
+    let mut probed_at = std::time::Instant::now();
+    let mut cands: Vec<Candidate> = indexed.iter().cloned().chain(probed.iter().cloned()).collect();
+    if cands.is_empty() {
+        return Ok(None);
+    }
+    let mut b = decide(&cands)?;
+    // A report can be up to 30 s old: it may still count a box that has ended since (one that just
+    // hibernated, say). Before waiting or refusing, the nodes read from reports are asked.
+    if b.decision.node.is_none() && b.behind.is_none() && !indexed.is_empty() {
+        let fresh = ask(indexed.iter().map(|c| c.name.clone()).collect()).await;
+        cands = fresh.into_iter().chain(probed.iter().cloned()).collect();
+        b = decide(&cands)?;
+    }
+    let mut told = false;
+    loop {
+        if let Some(n) = &b.decision.node {
+            let _ = ledger.lock().expect("ledger").stop_waiting(&run.0);
+            say!(
+                "[wicket] placing agent {} on node {n} (best fit of {} it may go on, of {} available{})",
+                agent.id,
+                b.decision.ranked.len(),
+                cands.len(),
+                if told { format!(", after {} s in the queue", started.elapsed().as_secs()) } else { String::new() }
+            );
+            return Ok(Some(n.clone()));
+        }
+        let why = match &b.behind {
+            Some(r) => format!("waiting behind {r}, which waited first and fits"),
+            None => b.decision.why_not(),
+        };
+        if started.elapsed() >= wait {
+            let _ = ledger.lock().expect("ledger").stop_waiting(&run.0);
+            // No silent overcommit (#377): each node would refuse the box itself.
+            bail!(
+                "no available node may take agent {} ({} vCPU, {} MiB needed){}: {why}",
+                agent.id,
+                req.vcpus,
+                req.memory_mib,
+                if told { format!(" after {} s in the queue", started.elapsed().as_secs()) } else { String::new() }
+            );
+        }
+        {
+            let l = ledger.lock().expect("ledger");
+            l.wait_for_placement(&run.0, &waiting, wicket_feed::now_ms())?;
+            l.renew_agent_claim(&agent.id, generation, wicket_store::now() + BUSY_CLAIM_SECS)?;
+        }
+        if !told {
+            say!(
+                "[wicket] queued: no node may take agent {} now ({why}); waiting up to {} s (wicket wake --wait 0 to fail instead)",
+                agent.id,
+                wait.as_secs()
+            );
+            told = true;
+        }
+        tokio::time::sleep(QUEUE_RETRY).await;
+        let (indexed, to_probe) = index()?;
+        if probed_at.elapsed() >= QUEUE_REPROBE {
+            probed = ask(to_probe).await;
+            probed_at = std::time::Instant::now();
+        }
+        cands = indexed.into_iter().chain(probed.iter().cloned()).collect();
+        b = decide(&cands)?;
     }
 }
+
+/// How often a waiting wake tries again, and how often it asks the nodes with no fresh report.
+const QUEUE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+const QUEUE_REPROBE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a wake waits for a node by default (`wicket wake --wait`).
+pub const QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// `wicket hibernate <run|agent>`: asks the agent's supervisor to hibernate it at the next quiet
 /// point, and reports what happened.
@@ -793,31 +945,156 @@ mod tests {
                 boxes: 0,
                 ..Default::default()
             },
+            at_ms: 0,
         }
     }
 
-    /// Wake placement is best fit: the fullest node the box still fits on; where it ran before only
-    /// breaks ties, and with room nowhere the least loaded node is used.
+    /// Wake placement is best fit (the fullest node the box still fits on), among the nodes whose
+    /// labels, taints and CA let it on (#579); where it ran before only breaks ties.
     #[test]
-    fn a_woken_agent_is_bin_packed_onto_the_fullest_node_it_fits() {
-        let nodes = [cand("local", 4.0, 8192, 1.0, 1024), cand("n1", 2.0, 2048, 0.0, 512), cand("n2", 2.0, 4096, 1.5, 3000)];
-        assert_eq!(pick(&nodes, (1.0, 1024), None), Some(("n1".into(), true)), "n2 has no vCPU, local more room than n1");
-        assert_eq!(pick(&nodes, (0.5, 1024), None), Some(("n2".into(), true)), "n2 fits and is fullest");
-        assert_eq!(pick(&nodes, (1.0, 1024), Some("local")), Some(("n1".into(), true)), "where it ran before doesn't beat a better fit");
-        let twins = [cand("a", 2.0, 2048, 0.0, 0), cand("b", 2.0, 2048, 0.0, 0)];
-        assert_eq!(pick(&twins, (1.0, 512), Some("b")), Some(("b".into(), true)), "it breaks a tie");
-        assert_eq!(pick(&nodes, (8.0, 65536), None), Some(("local".into(), false)), "no room: the least loaded");
-        assert_eq!(pick(&[], (1.0, 1), None), None);
-        // #377: a node's admission room caps its free memory, and a full node has none.
-        let mut tight = nodes.clone();
-        for c in tight.iter_mut().filter(|c| c.name == "local") {
-            c.cap.room_mib = Some(512);
-        }
-        assert_ne!(pick(&tight, (1.0, 1024), None).map(|p| p.0), Some("local".into()));
-        for c in tight.iter_mut() {
-            c.cap.full = true;
-        }
-        assert_eq!(pick(&tight, (0.1, 1), None).map(|p| p.1), Some(false), "no node starts a box: no fit");
+    fn a_woken_agent_is_placed_from_the_nodes_last_reports_and_asks_only_the_rest() {
+        let now = 10_000_000;
+        let report = |cap: Option<crate::chan::NodeCapacity>| {
+            serde_json::to_string(&wicket_chan::health::NodeHealth { at_ms: now, capacity: cap, ..Default::default() }).unwrap()
+        };
+        let cap = cand("x", 4.0, 8192, 1.0, 1024).cap;
+        let names: Vec<String> = ["fresh", "stale", "old-node", "silent"].map(String::from).to_vec();
+        let health = vec![
+            ("fresh".to_string(), now - 30_000, report(Some(cap))),
+            ("stale".to_string(), now - INDEX_FRESH_MS, report(Some(cap))),
+            ("old-node".to_string(), now - 1_000, report(None)),
+            ("unlisted".to_string(), now, report(Some(cap))),
+        ];
+        let (found, ask) = from_index(&names, &health, now);
+        assert_eq!(found, vec![Candidate { name: "fresh".into(), cap, at_ms: now - 30_000 }]);
+        assert_eq!(ask, ["stale", "old-node", "silent"], "a stale report, one without capacity, or none: asked");
+        // A node's report carries what its Welcome would: the two read the same.
+        let h: wicket_chan::health::NodeHealth = serde_json::from_str(&report(Some(cap))).unwrap();
+        assert_eq!(h.capacity, Some(cap));
+        let before: wicket_chan::health::NodeHealth = serde_json::from_str("{\"at_ms\":1,\"disk\":{\"total_bytes\":0,\"avail_bytes\":0,\"files_total\":0,\"files_avail\":0},\"memory\":{\"total_mib\":0,\"available_mib\":0,\"committed_mib\":0},\"feed_mode\":\"\",\"feed_fresh_until_ms\":null,\"oom_kills\":0,\"last_oom\":null,\"persist_failures\":0,\"last_persist_failure\":null}").unwrap();
+        assert_eq!(before.capacity, None, "a node from before it");
+    }
+
+    /// #579 step 2: a bind reserves what it chose, so the next bind, reading the same reports,
+    /// doesn't count that room again; a box the node has reported counts once, and a released
+    /// reservation gives its room back.
+    #[test]
+    fn two_starts_never_count_the_same_room() {
+        use wicket_placement::schedule::Request;
+        let l = Ledger::open_in_memory().unwrap();
+        let now = 50_000_000;
+        // n1 has room for one 2 GiB box, n2 for one more.
+        let mut n1 = cand("n1", 4.0, 4096, 0.0, 1024);
+        n1.at_ms = now - 10_000;
+        let mut n2 = cand("n2", 4.0, 8192, 0.0, 5120);
+        n2.at_ms = now - 10_000;
+        let cands = [n1.clone(), n2.clone()];
+        let req = Request { vcpus: 1.0, memory_mib: 2048, ..Request::default() };
+        let run = |r: &str| RunId(r.into());
+        let a = bind(&l, &run("run_a"), &Waiting { req: req.clone(), need: vec![] }, &cands, None, now, true).unwrap().decision;
+        assert_eq!(a.node.as_deref(), Some("n1"), "bin-packed: n1 has less left");
+        assert_eq!(l.placement("run_a").unwrap().unwrap().node, "n1");
+        let b = bind(&l, &run("run_b"), &Waiting { req: req.clone(), need: vec![] }, &cands, None, now + 1, true).unwrap().decision;
+        assert_eq!(b.node.as_deref(), Some("n2"), "n1's room is run_a's now: {}", b.why_not());
+        let c = bind(&l, &run("run_c"), &Waiting { req: req.clone(), need: vec![] }, &cands, None, now + 2, true).unwrap().decision;
+        assert_eq!(c.node, None, "both taken");
+        assert!(l.placement("run_c").unwrap().is_none(), "nothing reserved when nothing fits");
+        assert!(c.why_not().contains("n1 (") && c.why_not().contains("n2 ("), "{}", c.why_not());
+        // run_b's start failed: its room is free again.
+        l.placement_released("run_b").unwrap();
+        assert_eq!(
+            bind(&l, &run("run_d"), &Waiting { req: req.clone(), need: vec![] }, &cands, None, now + 3, true)
+                .unwrap()
+                .decision
+                .node
+                .as_deref(),
+            Some("n2")
+        );
+        // run_a started; n1's next report counts its box, and its reservation stops counting.
+        l.placement_bound("run_a", now + 4).unwrap();
+        let mut n1_after = cand("n1", 4.0, 4096, 1.0, 3072);
+        n1_after.at_ms = now + 5;
+        let e = bind(&l, &run("run_e"), &Waiting { req: req.clone(), need: vec![] }, &[n1_after], None, now + 6, true).unwrap().decision;
+        assert_eq!(e.node, None, "full by its own report, not by twice: {}", e.why_not());
+        assert!(e.why_not().contains("1024 MiB free"), "{}", e.why_not());
+    }
+
+    /// #579 step 2's queue: a run waiting longer goes first when it fits; one that fits nowhere
+    /// doesn't hold up a smaller one behind it; a waiter that has gone holds no place; a named node
+    /// (not queued) doesn't look.
+    #[test]
+    fn the_queue_is_first_come_first_served_without_head_of_line_blocking() {
+        use wicket_placement::schedule::Request;
+        let l = Ledger::open_in_memory().unwrap();
+        let now = 70_000_000;
+        let mut n1 = cand("n1", 4.0, 4096, 0.0, 2048);
+        n1.at_ms = now - 1_000;
+        let small = Request { vcpus: 1.0, memory_mib: 1024, ..Request::default() };
+        let huge = Request { vcpus: 1.0, memory_mib: 65536, ..Request::default() };
+        let wait = |run: &str, req: &Request, at: i64| {
+            let w = serde_json::to_string(&Waiting { req: req.clone(), need: vec![] }).unwrap();
+            l.wait_for_placement(run, &w, at).unwrap();
+        };
+        // run_old waits for a small box (it fits n1 now): run_new yields to it.
+        wait("run_old", &small, now - 5_000);
+        let b = bind(&l, &RunId("run_new".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1.clone()], None, now, true).unwrap();
+        assert_eq!((b.decision.node, b.behind.as_deref()), (None, Some("run_old")));
+        assert!(l.placement("run_new").unwrap().is_none());
+        // A named node isn't queued: it doesn't yield.
+        let named =
+            bind(&l, &RunId("run_named".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1.clone()], None, now, false).unwrap();
+        assert_eq!(named.decision.node.as_deref(), Some("n1"));
+        l.placement_released("run_named").unwrap();
+        // run_old binds, then a waiter for a huge box (fits nowhere) doesn't block run_new.
+        let old =
+            bind(&l, &RunId("run_old".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1.clone()], None, now + 1, true).unwrap();
+        assert_eq!(old.decision.node.as_deref(), Some("n1"), "first in the queue: nothing ahead");
+        l.stop_waiting("run_old").unwrap();
+        l.placement_released("run_old").unwrap();
+        wait("run_huge", &huge, now - 4_000);
+        let b =
+            bind(&l, &RunId("run_new".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1.clone()], None, now + 2, true).unwrap();
+        assert_eq!(b.decision.node.as_deref(), Some("n1"), "{b:?}");
+        // A waiter not seen for WAIT_SEEN_MS has gone: no place held.
+        l.placement_released("run_new").unwrap();
+        wait("run_gone", &small, now - 20_000);
+        let late = now - 20_000 + wicket_store::WAIT_SEEN_MS + 1;
+        let b = bind(&l, &RunId("run_late".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1], None, late.max(now + 3), true)
+            .unwrap();
+        assert_eq!(b.decision.node.as_deref(), Some("n1"), "{b:?}");
+        assert_eq!(wicket_core::time::parse_duration("0").unwrap(), std::time::Duration::ZERO, "--wait 0");
+    }
+
+    #[test]
+    fn a_woken_agent_is_bin_packed_onto_the_fullest_node_it_may_go_on() {
+        use wicket_placement::schedule::{schedule, Coverage, Request, Strategy};
+        let l = Ledger::open_in_memory().unwrap();
+        let cands = [cand("local", 4.0, 8192, 1.0, 1024), cand("n1", 2.0, 2048, 0.0, 512), cand("n2", 2.0, 4096, 1.5, 3000)];
+        let pick = |l: &Ledger, req: &Request, last: Option<&str>| {
+            let nodes: Vec<_> = cands.iter().map(|c| scheduled_node(l, c, &["api.example.com".to_string()])).collect();
+            schedule(req, &nodes, Strategy::BinPack, last)
+        };
+        let req = |cpu: f32, mib: u64| Request { vcpus: cpu, memory_mib: mib, ..Request::default() };
+        assert_eq!(pick(&l, &req(1.0, 1024), None).node.as_deref(), Some("n1"), "n2 has no vCPU, local more room than n1");
+        assert_eq!(pick(&l, &req(0.5, 1024), None).node.as_deref(), Some("n2"), "n2 fits and is fullest");
+        assert_eq!(pick(&l, &req(1.0, 1024), Some("local")).node.as_deref(), Some("n1"), "a better fit beats where it ran");
+        let none = pick(&l, &req(8.0, 65536), None);
+        assert_eq!(none.node, None);
+        assert!(none.why_not().starts_with("local (3.0 vCPU, 7168 MiB free)"), "{}", none.why_not());
+
+        // n1 is kept for CI: a box goes there only if it tolerates that, and n2 is the GPU node.
+        l.set_node_taint("n1", &wicket_core::placement::Taint::parse("dedicated=ci").unwrap()).unwrap();
+        l.set_node_label("n2", "gpu", Some("t4")).unwrap();
+        assert_eq!(pick(&l, &req(1.0, 1024), None).node.as_deref(), Some("local"), "n1's taint keeps it off");
+        let mut ci = req(1.0, 1024);
+        ci.tolerations.push(wicket_core::placement::Taint::parse("dedicated").unwrap());
+        assert_eq!(pick(&l, &ci, None).node.as_deref(), Some("n1"));
+        let mut gpu = req(0.5, 1024);
+        gpu.node_selector.insert("gpu".into(), "t4".into());
+        let d = pick(&l, &gpu, None);
+        assert_eq!((d.node.as_deref(), d.ranked.len()), (Some("n2"), 1), "only n2 has the label");
+        // No node CA recorded (this host's own node): nothing to cover.
+        assert_eq!(scheduled_node(&l, &cands[0], &["api.example.com".to_string()]).ca, Coverage::Covers);
     }
 
     use super::*;

@@ -35,8 +35,35 @@ zone:
 | `agent` | [agent](#agent) | none | An agent, run by its [harness](#harness-modes). |
 | `program` | [program](#program) | none | A deterministic workload with no model. |
 | `zone` | [zone](#zone) | required | Where the workload runs, and what it may reach. |
+| `placement` | [placement](#placement) | none | What the box asks of the node it goes on. |
+| `service` | [service](#service) | none | For a program: what makes it a per-node service other boxes use. |
 
 Exactly one of `agent` and `program` must be given.
+
+## `service`
+
+What makes a program a per-node service ([#579](https://github.com/public/wicket/issues/579)): one instance on every node that matches, which other boxes on that node use through a link (`zone.uses`). An operator installs it; no agent can start one. A service is a program, and its own zone's reach is what it fetches under.
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `per_node` | bool | `true` | One instance per matching node (the only kind so far). |
+| `node_selector` | map of string to string | none | Labels a node must have to run it. |
+| `tenancy` | `per_tenant` or `shared` | `per_tenant` | One instance per tenant using it on a node, or one for all of them. `shared` needs `public_only: true`. |
+| `public_only` | bool | `false` | The operator's statement that it serves only public content, so a shared instance carries nothing from one tenant to another. |
+| `port` | integer | required | The port its users connect to. |
+| `env` | map of string to string | none | Environment its users get, `{host}` and `{port}` filled in: what points their tools at it (`npm_config_registry: http://{host}:{port}/`). Never a variable wicket controls (proxies, CA bundles, `WICKET_*`, `PATH`, `HOME`). |
+| `drain` | `drop` or `keep` | `drop` | What happens to its volumes when its node is released. |
+
+## `placement`
+
+What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. Today it decides where a woken agent goes ([nodes](nodes.md#placement)); `wicket run --node` and a spawn's placement hint name the node themselves.
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `node_selector` | map of string to string | none | Labels the node must have, each with this value (`gpu: a100`). |
+| `tolerations` | list of strings | none | Node taints the box may go on despite: `key` (any value) or `key=value`. A node's taint keeps off every box that doesn't tolerate it. |
+
+Keys are lowercase letters and digits with `.`, `_`, `-` or `/` inside, at most 63; values are letters, digits, `.`, `_` and `-`, at most 63. A manifest without `placement` reads the same to a node that doesn't know it; one with it needs its node on this release or later when it spawns there.
 
 ## `agent`
 
@@ -130,6 +157,7 @@ request: true }` it becomes a pending request, as an agent's would, and the prog
 | `images` | list of strings | `[]` | Images boxes in this zone may start children from with `spawn`, besides their own: by tag, or [pinned by digest](#image-pins). |
 | `accept_from` | list of principals or zone names | `[]` | Who may message agents in this zone besides parent and children: a principal (`spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>`), or a zone name for every agent in it. Those listed (a principal, or every agent in a listed zone) may also connect to its exposed ports. Senders are identified by wicket, never by their own claim. |
 | `escalation` | `{ request, grant }` | `{ request: true, grant: true }`; for a program, `request: false` | Who in this zone may escalate ([#50](https://github.com/public/wicket/issues/50)). `request: false`: anything outside the zone's reach is "never allowed" instead of a pending request (`request_access`, `spawn` with `escalate`, `request_capacity` and `request_update` ask nobody). `grant: false`: the zone's agents can't [`decide`](mcp-tools.md#decide) their descendants' requests. A spawned zone keeps its parent's unless it narrows them, and can't be given one the parent lacks. |
+| `uses` | list of service names | `[]` | Per-node services the zone's boxes use ([#579](https://github.com/public/wicket/issues/579)): each reached at `<name>.wicket.internal`, the instance on the box's own node. **Using a service is having its reach**: a box that uses an npm cache can make it fetch whatever the box names, so its link to the service opens without a human only if this zone's reach covers the service's. A spawned zone may use only the services its parent uses. See [`service`](#service). |
 | `limits` | [limits](#limits) | see below | Resources, time and output. |
 
 ### `reach`

@@ -840,6 +840,60 @@ fn whoami(node: &Arc<Node>, run: &str) -> (String, bool) {
 
 /// An agent asking ahead for reach it needs, decided from its token here: already allowed or never
 /// allowed are answered at once; anything else is put to a human (queued while unreachable).
+/// `request_access` with `scope: "standing"` (#572): one reach rule for the agent's workload, asked
+/// for once and approved once for its later runs. The rule is `methods` (default GET) on the url's
+/// host, at `paths` (default: the url's directory and everything under it), `dangerous` for
+/// `allow_dangerous`; held to what a manifest could say. Asked of the control host, which attaches
+/// the ledger's evidence; never queued (a queued ask is an op), so while the control host is
+/// unreachable the agent is told to ask again later.
+async fn ask_standing(node: &Arc<Node>, run: &str, args: &Value, host: &str, path: &str, reason: &str) -> (String, bool) {
+    let strings = |k: &str| -> Option<Vec<String>> {
+        args.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+    };
+    let methods: Vec<String> =
+        strings("methods").unwrap_or_else(|| vec!["GET".into()]).into_iter().map(|m| m.to_ascii_uppercase()).collect();
+    let paths = strings("paths").unwrap_or_else(|| vec![format!("{}**", wicket_core::prefix_dir(path))]);
+    let rule = wicket_core::manifest::ReachRule {
+        host: host.to_string(),
+        methods,
+        paths,
+        allow_dangerous: args.get("dangerous").and_then(|v| v.as_bool()).unwrap_or(false),
+    };
+    if let Err(why) = rule.check_standing() {
+        return (format!("not requested: {why}"), true);
+    }
+    // One rule of the box's token per method and path glob: at most 16 (`max_grant_rules`).
+    if rule.methods.len() * rule.paths.len() > 16 {
+        return (
+            format!(
+                "not requested: {} methods × {} paths is more than 16 pairs; ask for fewer, or wider globs",
+                rule.methods.len(),
+                rule.paths.len()
+            ),
+            true,
+        );
+    }
+    let shown =
+        format!("{} {host} {}{}", rule.methods.join(","), rule.paths.join(" "), if rule.allow_dangerous { " (dangerous)" } else { "" });
+    if !connected(node, run) {
+        return (
+            format!("not requested: the control host is unreachable, and a standing ask isn't queued. Ask again for standing reach for {shown} once it is back; meanwhile, ask for what you need now with scope exact or prefix."),
+            false,
+        );
+    }
+    match node.ask_standing_control(run, &rule, &format!("{}{reason}", crate::AGENT_ASKS)).await {
+        Ok(Asked::Pending { request, fresh, .. }) => (
+            format!(
+                "{} {request}: standing reach for {shown}, for your later runs too. An operator decides it once, and may narrow it to what your past requests needed. Call await_grant with request_id {request} to wait for the decision.",
+                if fresh { "requested:" } else { "already requested:" }
+            ),
+            false,
+        ),
+        Ok(Asked::Denied { request }) => (format!("not requested: {request} for this was denied. Don't ask again; continue without it."), false),
+        Err(e) => (e, true),
+    }
+}
+
 async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
     let Some(url) = args.get("url").and_then(|v| v.as_str()) else {
         return ("`url` is required, e.g. https://example.org/docs/".into(), true);
@@ -849,7 +903,11 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
         return ("`reason` is required: say what you need it for, in a sentence".into(), true);
     }
     let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_ascii_uppercase();
-    let prefix = args.get("scope").and_then(|v| v.as_str()) == Some("prefix");
+    let scope_arg = args.get("scope").and_then(|v| v.as_str()).unwrap_or("exact");
+    if !matches!(scope_arg, "exact" | "prefix" | "standing") {
+        return (format!("`scope` is exact, prefix or standing, not {scope_arg:?}"), true);
+    }
+    let prefix = scope_arg == "prefix";
     let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) else {
         return ("`url` must start with https:// (or http://)".into(), true);
     };
@@ -878,21 +936,27 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
         wicket_core::HostVerdict::Open => {}
     }
     // An https host this node can't terminate (outside its CA, #257) is passed through uncovered only
-    // where the box's zone allows it wholesale, and refused otherwise, whatever is granted: so
-    // nothing is asked for that no approval could make usable. Plain http needs no CA.
+    // where the box's zone allows it wholesale, and refused otherwise, whatever is granted. It is
+    // asked for only if the node's CA policy lets the control host widen the CA to it, as an
+    // approval's grant then does (#573); otherwise nothing is asked for that no approval could make
+    // usable. Plain http needs no CA.
     if url.starts_with("https://") {
         if let wicket_proxy::decide::Route::Uncovered(why) = super::NodeRouter::of(node).route(&host) {
             let spliced = node.replica.lock().expect("replica").splice(&tenant, run, &host, (node.clock)()).is_some();
-            if !spliced {
+            let policy = node.edge_start(run).and_then(|e| e.ca_widen).unwrap_or(wicket_store::CaHosts::Fixed);
+            if !spliced && !policy.allows(&host) {
+                let n = &node.name;
                 return (
                     format!(
-                        "not requested: {host} isn't served by this box's node, {} ({why}), and only a host this box's zone allows wholesale is passed through without it. No approval can change that, so nothing was asked for: tell the user. An operator can have the node's CA cover it (wicket node renew-ca {} --hosts {host}).",
-                        node.name, node.name
+                        "not requested: {host} isn't served by this box's node, {n} ({why}), and the node's CA policy doesn't let it be widened to {host}; only a host this box's zone allows wholesale is passed through without it. No approval can change that, so nothing was asked for: tell the user. An operator can let the node's CA be widened to it (wicket node set {n} --ca-hosts auto, or a list that includes {host}), or have it cover it now (wicket node renew-ca {n} --hosts {host}).",
                     ),
                     false,
                 );
             }
         }
+    }
+    if scope_arg == "standing" {
+        return ask_standing(node, run, args, &host, &path, reason).await;
     }
     // A push's discovery is asked for as the push it is part of (#26).
     let op = wicket_core::git::op_for(&tenant, &wicket_core::RunId(run.into()), &zone, &method, &host, &path, query);
@@ -918,11 +982,12 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
     let why = format!("{}{reason}", crate::AGENT_ASKS);
     if connected(node, run) {
         match node.ask_control(run, &op, &why, None, prefix).await {
-            Ok(Asked::Pending { request, fresh }) => {
+            Ok(Asked::Pending { request, fresh, hint }) => {
                 return (
                     format!(
-                        "{} {request} for {scope}. Call await_grant with request_id {request} to wait for the decision. Don't try other routes meanwhile.",
-                        if fresh { "requested:" } else { "already requested:" }
+                        "{} {request} for {scope}. Call await_grant with request_id {request} to wait for the decision. Don't try other routes meanwhile.{}",
+                        if fresh { "requested:" } else { "already requested:" },
+                        hint.map(|h| format!("\n\n{h}")).unwrap_or_default()
                     ),
                     false,
                 )

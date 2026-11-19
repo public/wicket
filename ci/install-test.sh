@@ -10,6 +10,36 @@
 # container), the Docker daemon, systemd starting the units, and building the agent image.
 #   ci/install-test.sh [path/to/wicket] [ubuntu:24.04|debian:12]
 set -euo pipefail
+
+# The host's own Ubuntu mirror, if it has one: a CI runner's is near it. The image's default
+# (archive.ubuntu.com) once took 26 of the job's 30 minutes for install.sh's packages, and is
+# reached over IPv6 where the runner has none (#219). The host's sources may name several URIs on
+# a line, https ones, a path after the host, or a `mirror+file:` list of them (a runner's): the
+# first archive (not security) URI is used, as plain http, since the image has no CA certificates
+# for https (apt checks the archive's signatures either way).
+host_mirror() {
+    local sources=${1:-/etc/apt/sources.list.d/ubuntu.sources} u
+    [ -r "$sources" ] || return 0
+    for u in $(sed -n 's/^URIs:[[:space:]]*//p' "$sources"); do
+        case $u in
+        mirror+file:*) u=$(grep -m1 -Eo '^https?://[^[:space:]]+' "${u#mirror+file:}" 2>/dev/null) || continue ;;
+        esac
+        case $u in
+        *security*) ;;
+        http://* | https://*)
+            u=${u#https://}
+            u=${u#http://}
+            echo "http://${u%/}/"
+            return 0
+            ;;
+        esac
+    done
+}
+# `ci/install-test.sh --host-mirror [sources]`: the mirror it would use, alone.
+if [ "${1:-}" = --host-mirror ]; then
+    host_mirror "${2:-}"
+    exit 0
+fi
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 bin=$(realpath "${1:-$repo/target/release/wicket}")
 image=${2:-ubuntu:24.04}
@@ -19,15 +49,20 @@ pkg=$(mktemp -d)
 trap '$docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$pkg"' EXIT
 "$repo/ci/package.sh" "$bin" "$pkg" >/dev/null
 
-# The host's own Ubuntu mirror, if it has one: a CI runner's is near it. The image's default
-# (archive.ubuntu.com) once took 26 of the job's 30 minutes for install.sh's packages.
-mirror=$(sed -n 's|^URIs: *\(https\{0,1\}://[^ ]*\).*|\1|p' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null | grep -v security | head -1 || true)
+mirror=$(host_mirror || true)
 
 $docker run --rm --name "$name" --network host \
     -v "$repo:/src:ro" -v "$pkg:/pkg:ro" -e MIRROR="$mirror" \
     "$image" bash -euo pipefail -c '
 fail() { echo "FAIL: $*"; exit 1; }
-[ -z "$MIRROR" ] || sed -i "s|^URIs: http://archive.ubuntu.com/ubuntu/\$|URIs: $MIRROR|" /etc/apt/sources.list.d/ubuntu.sources
+# apt over IPv4 only: with --network host the container has the network of the runner, which may have no
+# IPv6 route, and apt does not fall back from an unreachable address (#219).
+echo "Acquire::ForceIPv4 \"true\";" >/etc/apt/apt.conf.d/99wicket-ipv4
+# A mirror answering 503 for a while (the EC2 mirror of a runner has, #219): each fetch is tried again.
+echo "Acquire::Retries \"5\";" >/etc/apt/apt.conf.d/99wicket-retries
+# Every stanza (the archive and security) from the mirror of the host first, and its own Ubuntu host
+# after it: apt fetches a file that fails from one from the next source that has it.
+[ -z "$MIRROR" ] || [ ! -f /etc/apt/sources.list.d/ubuntu.sources ] || sed -i "s|^URIs:[[:space:]]*\(.*\)|URIs: $MIRROR \1|" /etc/apt/sources.list.d/ubuntu.sources
 echo "packages from: $(sed -n "s/^URIs: //p" /etc/apt/sources.list.d/ubuntu.sources | tr "\n" " ")"
 useradd --create-home alex
 groupadd --system docker

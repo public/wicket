@@ -4235,6 +4235,7 @@ dependencies = [
  "time",
  "tokio",
  "ulid",
+ "wicket-core",
  "wicket-placement",
 ]
 
