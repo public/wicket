@@ -8,3 +8,4 @@ import Wicket.Spawn
 import Wicket.Decisions
 import Wicket.Standing
 import Wicket.Message
+import Wicket.NodeCa
