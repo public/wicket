@@ -38,8 +38,8 @@ runs:
         # only gvisor.tar.bz2 (and .zstd) with their .sha512 files. To update: the version, and the
         # sha512 from https://storage.googleapis.com/gvisor/releases/release/<version>/x86_64/gvisor.tar.bz2.sha512.
         version=20261116.0
-        # Empty until pinned from the first run's annotation (the published sha512, checked here).
-        sha512=
+        # From the release's published gvisor.tar.bz2.sha512 (checked against it on #566's run).
+        sha512=c87d792d5842efb70c38ee822124cfe0821a547715e7abcf3f2b14997cd02784edaa0b91e238ec5c27a25a1b9e00bf98113398eb62a0778d8d20d4e222f8b0e0
         url=https://storage.googleapis.com/gvisor/releases/release/$version/x86_64/gvisor.tar.bz2
         dl=$(mktemp -d)
         curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors -o "$dl/gvisor.tar.bz2" "$url"
@@ -51,11 +51,16 @@ runs:
         fi
         echo "$sha512  $dl/gvisor.tar.bz2" | sha512sum -c -
         # What the archive holds, for the log; then its one runsc, wherever it sits in it.
-        tar -tjf "$dl/gvisor.tar.bz2"
+        listing=$(tar -tjf "$dl/gvisor.tar.bz2")
+        echo "$listing"
         tar -xjf "$dl/gvisor.tar.bz2" -C "$dl"
         mapfile -t found < <(find "$dl" -type f -name runsc)
         [ "${#found[@]}" = 1 ] || { echo "gvisor.tar.bz2 holds ${#found[@]} runsc binaries: ${found[*]}" >&2; exit 1; }
         sudo install -m 0755 "${found[0]}" /usr/bin/runsc
+        # The rest of what the archive holds next to runsc (a shim, say), installed beside it.
+        for f in "$(dirname "${found[0]}")"/*; do
+          [ "$f" = "${found[0]}" ] || [ ! -f "$f" ] || sudo install -m 0755 "$f" "/usr/bin/$(basename "$f")"
+        done
         rm -r "$dl"
         # Keep the runner's own Docker settings; add runsc with host unix sockets (wicket's proxies).
         cfg=/etc/docker/daemon.json
@@ -65,6 +70,21 @@ runs:
         sudo systemctl restart docker
         runsc --version | head -1
         docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
+        # A self-test before the suites, whose failure says why (#566: boxes didn't start on the
+        # archive's runsc): runsc on its own, then a container through Docker. On a failure, what
+        # failed goes into an annotation, with runsc's debug log and Docker's journal.
+        dbg=$(mktemp -d)
+        say() { printf '%s' "$1" | tail -c 3500 | sed 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }'; }
+        if ! out=$(sudo runsc --debug --debug-log="$dbg/" --network=none do true 2>&1); then
+          echo "::error title=runsc do true failed::$(say "version: $(runsc --version 2>&1 | head -2); listing: $listing; $out; log: $(sudo sh -c "tail -n 40 $dbg/*" 2>&1)")"
+          exit 1
+        fi
+        if ! out=$(sudo docker run --rm --runtime=runsc --network=none busybox:1.36 true 2>&1); then
+          echo "::error title=docker run --runtime=runsc failed::$(say "version: $(runsc --version 2>&1 | head -2); listing: $listing; $out; journal: $(sudo journalctl -u docker -n 30 --no-pager 2>&1)")"
+          exit 1
+        fi
+        echo "runsc self-test: ok"
+        sudo rm -rf "$dbg"
     - name: Build wicket
       shell: bash
       run: cargo build -p wicket-cli --locked
