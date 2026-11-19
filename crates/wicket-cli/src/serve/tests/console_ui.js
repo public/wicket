@@ -196,6 +196,14 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-cancel"].listeners.click(); await flush();
   assert.strictEqual(ids.confirm.hidden, true);
   assert.strictEqual(ceremonies, 1);
+  // #574: the confirmation states the effect's terms, which the passkey signs: a git push is a
+  // window (unlimited uses for 5 minutes, #26), whatever the card asked for.
+  const push = JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "POST", host: "github.com",
+    path: "/acme/app.git/git-receive-pack", risk: "R4ExecOrPrivilege", request: "r-p", run: "run_a",
+    effect: { terms: { uses: null, ttl_secs: 300, scope: "run" } } });
+  const said = run("describe(" + push + ")");
+  assert.ok(said.startsWith("Allow any number of uses for 5 min: POST github.com/acme/app.git/git-receive-pack"), said);
+  assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "GET", host: "h", path: "/p", effect: { terms: { uses: 1, ttl_secs: 600 } } }) + ")").startsWith("Approve once for 10 min"));
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
