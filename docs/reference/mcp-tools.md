@@ -411,8 +411,13 @@ it needs no approval:
 - it must not be held by another agent in the zone;
 - an agent holds at most 3 internal names at once.
 
-It is held by the run that asked, and ends with it. Asking again from the same run changes the
-port. Audited as `name.registered`.
+The zone part is the zone's name in DNS form: lower case, with `_` as `-` (zone `Build` gives
+`<name>.build`, a spawned zone `lead.fetcher.run_01J…` gives `<name>.lead.fetcher.run-01j…`); a zone
+whose name can't be put in that form can't hold names. The answer says the name in full.
+
+It is held by the run that asked, and ends with it (audited as `name.released`). Asking again from
+the same run moves the name to another port, and the old port is no longer offered under it. Audited
+as `name.registered`.
 
 Public names, on the internet, aren't available yet: `kind: public` is refused. The tool needs a
 control host and node at protocol 18; with an older control host the node refuses it.
@@ -430,7 +435,9 @@ Reaches a TCP port of another box: one of the caller's children (by name or run 
 needed), its parent, a box that exposed the port, or the box holding an internal name
 ([`request_name`](#request_name)), given as `name` instead of `box`. A name's link is named after it,
 so the caller's box resolves `<name>.<zone>.wicket.internal` too, and the port defaults to the
-name's. Returns the address to use in the caller's box,
+name's. A by-name link is always named exactly after the name: if the box still has an open link
+under it to an earlier holder, or already links to the holder under another name, it is refused until
+that link is closed. Returns the address to use in the caller's box,
 `<name>.wicket.internal:<port>`, relayed by wicket. Connecting lends the caller the target's
 authority, so a target whose reach isn't within the caller's needs an operator: the answer is then a
 request id for `await_grant`, after which the caller calls `connect` again.

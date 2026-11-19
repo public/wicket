@@ -46,6 +46,10 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
     wicket_names::check_shape(label, false).map_err(|e| e.to_string())?;
     let reason: String = args.get("reason").and_then(Value::as_str).unwrap_or("").chars().take(MAX_REASON).collect();
     let spec = ctx.zone.spec();
+    // The one DNS form of the zone's name (#575 review, M3): what the name is registered, looked
+    // up and linked under, and what the box is told.
+    let zone =
+        wicket_names::zone_part(&spec.name).map_err(|e| format!("this zone's name ({}) can't be part of a DNS name: {e}", spec.name))?;
     let zone_json = serde_json::to_string(spec).map_err(|e| e.to_string())?;
     let digest = wicket_store::zone_digest(spec);
     let l = ctx.ledger.lock().expect("ledger");
@@ -58,7 +62,7 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
     let ask = NameAsk {
         tenant: &ctx.tenant,
         run: &ctx.run,
-        zone: &spec.name,
+        zone: &zone,
         zone_digest: &digest,
         principal: &principal,
         label,
@@ -67,22 +71,38 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
         reason: &reason,
         scope: NameScope::Run,
     };
+    // This run's name already, if it asks again (to change the port).
+    let before = l.internal_name(&ctx.tenant, &zone, label).map_err(|e| e.to_string())?.filter(|n| n.holder.as_deref() == Some(&ctx.run.0));
     let n = l.register_internal(&ask, INTERNAL_PER_WORKLOAD, 0).map_err(|e| e.to_string())?;
-    let fqdn = format!("{label}.{}.{}", spec.name, policy::DOMAIN);
-    // Exposed under the name, so connect finds the port offered (and names the link after it).
-    let undo = |l: &wicket_store::Ledger| {
-        let _ = l.revoke_name(&n.id, "wicket");
-        let _ = l.unexpose(&ctx.run.0, port);
+    let fqdn = format!("{label}.{zone}.{}", policy::DOMAIN);
+    // On a failure below: a new name goes; a name asked again keeps its old port, still exposed.
+    let undo = |l: &wicket_store::Ledger| match &before {
+        None => {
+            let _ = l.revoke_name(&n.id, "wicket");
+            let _ = l.unexpose(&ctx.run.0, port);
+        }
+        Some(old) => {
+            let _ = l.register_internal(&NameAsk { port: old.port, ..ask.clone() }, INTERNAL_PER_WORKLOAD, 0);
+            if old.port != port {
+                let _ = l.unexpose(&ctx.run.0, port);
+            }
+        }
     };
+    // Exposed under the name, so connect finds the port offered.
     if let Err(e) = l.expose(&ctx.tenant, &ctx.run.0, port, Some(label), &zone_json) {
         undo(&l);
         return Err(e.to_string());
     }
     // On the record before it takes effect (fail closed).
-    let body = serde_json::json!({ "id": n.id, "name": fqdn, "kind": "internal", "port": port, "scope": "run", "reason": reason });
+    let body = serde_json::json!({ "id": n.id, "name": fqdn, "kind": "internal", "port": port, "scope": "run", "reason": reason,
+        "was_port": before.as_ref().map(|b| b.port) });
     if let Err(e) = l.audit(&ctx.tenant, Some(&ctx.run), "name.registered", &body) {
         undo(&l);
         return Err(format!("the audit record could not be written ({e})"));
+    }
+    // The port it named before is no longer offered under the name.
+    if let Some(old) = before.as_ref().filter(|b| b.port != port) {
+        let _ = l.unexpose(&ctx.run.0, old.port);
     }
     drop(l);
     ctx.emit(wicket_proxy::Event::Tool { name: "request_name".into(), detail: format!("registered {fqdn} for port {port}") });
@@ -92,7 +112,7 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
         format!("your parent and boxes your accept_from lists ({}) at once, others once a human approves", ctx.zone.accept_from.join(", "))
     };
     Ok(format!(
-        "registered {fqdn} ({}) for port {port} of this box. Other boxes of your tenant reach it with connect(name: \"{label}.{}\"): {who}. Listen on 127.0.0.1:{port} (or 0.0.0.0). The name is yours until this run ends.",
-        n.id, spec.name
+        "registered {fqdn} ({}) for port {port} of this box. Other boxes of your tenant reach it with connect(name: \"{label}.{zone}\"): {who}. Listen on 127.0.0.1:{port} (or 0.0.0.0). The name is yours until this run ends.",
+        n.id
     ))
 }
