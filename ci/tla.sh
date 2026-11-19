@@ -3,6 +3,8 @@
 # A Temurin 21 JRE and tla2tools.jar, both pinned by URL and sha256 and checked. Every `pass_*.cfg`
 # (and each model's own .cfg) must pass; every `fail_*.cfg` must be refused with the invariant this
 # script names for it, so a variant that stops failing (the model stopped seeing the bug) fails too.
+# A `trail_*_matched.cfg` (a real update's audited steps, UpdateTrace.tla) must be refused with
+# TrailUnmatched: the trail is a behaviour of the model; a `trail_*_unmatched.cfg` must pass.
 #
 #   ci/tla.sh [--traces] [--shard I/N] [CFG...]     (default: every .cfg under verification/tla/)
 #
@@ -119,6 +121,10 @@ expect_fail() {
     fail_update_old_build_lingers) echo 'OldBuildBounded' ;;
     fail_update_drain_hangs) echo 'DaemonTakesCommands' ;;
     fail_update_local_serve_left_old | fail_update_serve_after_stop) echo 'BoxesKept' ;;
+    # Trails of real updates (UpdateTrace.tla, made by ci/tla-trail.py): a matched trail is one TLC
+    # finds a behaviour of the model for, refusing TrailUnmatched; an unmatched one, none.
+    trail_*_unmatched) echo "" ;;
+    trail_*_matched) echo 'TrailUnmatched' ;;
     *) echo "" ;;
   esac
 }

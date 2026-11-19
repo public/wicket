@@ -358,3 +358,39 @@ Not modelled:
 - the reconciler service's own restart: `wicket-reconcile.service` has `KillMode=process`, so its
   restart leaves the supervisors its passes started running (#529).
 
+## Update: trails of real updates
+
+`UpdateTrace.tla` checks the model against what happened (trace validation, #321 and #324, as
+#421 does for the ledger). A trail is the control host's audited steps during a real update.
+`ci/tla-trail.py` makes it from an audit export: each run's `reconcile.run_adopted` and
+`run.attach` is `Reattach(r)`, with its box left `stopped` when the run ended "stopped by wicket"
+within seconds, and `running` otherwise.
+
+The steps the audit doesn't record may happen between the trail's: wicketd's restart, the local
+serve's re-exec, the old supervisors being stopped, ticks and prompts. They are any of the model's
+own actions except the other way of updating.
+
+A `trail_*.cfg` checks `TrailUnmatched`. TLC refuses it exactly when some behaviour of the model
+takes every step of the trail, which makes the trail a behaviour of the model.
+
+The trails are 2026-11-18's, scrubbed, in `trails/update-2026-11-18.txt`:
+
+| config | trail | switches | result |
+|---|---|---|---|
+| `trail_1848_merged_matched` | the 18:48 install, with #531: both runs re-attached, both boxes kept | the design as merged (`Update.cfg`) | matched: a behaviour of the spec |
+| `trail_1759_merged_unmatched` | the 17:58 install: the local run re-attached and its box stopped 2 s later (#529) | the design as merged | unmatched: no behaviour of the spec |
+| `trail_1759_serve_left_old_matched` | the same | `fail_update_local_serve_left_old`'s (`ServeFirstOnStart = FALSE`) | matched: a behaviour of #529's fail variant |
+
+The 10:04 self update that hung (#487) has no trail: the export starts at 11:00:06. Between the
+updates, the only records are each run's identity rotations. A drain that never returns shows as the
+CLI's commands refused, and this export holds no record of a refused command or of the drain. A trail
+for such an incident would need the daemon's own log (`wicketd: handing N running command(s)`,
+`waiting for N command(s)`) as well.
+
+To check a new update: export the audit records around it, run
+`python3 -I ci/tla-trail.py <export>`, and paste its `TrailHHMM` into `UpdateTrace.tla`. Then
+add a `trail_<HHMM>_<switches>_matched.cfg` (or `_unmatched`) for the switches it should and
+shouldn't match. Check the printed records against the public-repository rules before
+committing: the script drops owners, trust domains and node names, but not every field an audit
+record could hold.
+

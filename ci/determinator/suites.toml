@@ -36,7 +36,7 @@ paths = ["ci/kani.sh", "ci/shard.awk"]
 # Each README maps the models' actions to the code; a change to that code is reviewed against them,
 # but rerunning TLC can't catch a drift.
 [suite.tla]
-paths = ["verification/tla/**", "ci/tla.sh", "ci/shard.awk"]
+paths = ["verification/tla/**", "ci/tla.sh", "ci/tla-trail.py", "ci/shard.awk"]
 
 [suite.smoke]
 binary = true
