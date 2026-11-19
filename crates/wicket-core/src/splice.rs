@@ -136,6 +136,76 @@ pub fn view(zone: &ZoneSpec) -> Vec<(String, Inspection)> {
     seen
 }
 
+/// Whether a host is inside one X.509 permitted DNS subtree, as a verifier reads it (a node CA's
+/// name constraints, #257): `api.example.com` permits itself and every name under it;
+/// `.example.org` permits names under it, not the apex; `*` (the control host's own node) any name.
+pub fn subtree_permits(subtree: &str, host: &str) -> bool {
+    if subtree == "*" {
+        return true;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let subtree = subtree.to_ascii_lowercase();
+    match subtree.strip_prefix('.') {
+        Some(base) => host.len() > base.len() + 1 && host.ends_with(&subtree),
+        None => host == subtree || host.ends_with(&format!(".{subtree}")),
+    }
+}
+
+/// Whether permitted subtree `p` covers every name needed subtree `need` stands for (both in name
+/// constraint form: `h` for `h` and every name under it, `.d` for the names under `d`).
+fn subtree_covers(p: &str, need: &str) -> bool {
+    if p == "*" {
+        return true;
+    }
+    let p = p.to_ascii_lowercase();
+    let need = need.to_ascii_lowercase();
+    match need.strip_prefix('.') {
+        // Every name under d: p is d itself (either form) or an ancestor of d.
+        Some(d) => p == d || p.strip_prefix('.') == Some(d) || subtree_permits(&p, d),
+        // h and every name under it: p is h, or an ancestor of h.
+        None => p == need || subtree_permits(&p, &need),
+    }
+}
+
+/// The name constraints a box's node CA needs for it (#573): every inspected host its zone reaches,
+/// injects into or calls as its model host, and `extra` (the hosts of its credential swaps and of
+/// the grants published for it), as subtrees (`h`, or `.d` for `*.d`). Spliced hosts need no
+/// certificate, and hosts wicket never reaches are left out. Entries another entry covers are
+/// dropped, and the list is sorted.
+pub fn ca_hosts(zone: &ZoneSpec, extra: &[String]) -> Vec<String> {
+    let mut want: Vec<String> = vec![];
+    let candidates = zone
+        .reach
+        .iter()
+        .map(|r| r.host.clone())
+        .chain(zone.inject.iter().map(|i| i.host.clone()))
+        .chain(model_hosts(zone))
+        .chain(extra.iter().cloned());
+    for h in candidates {
+        let h = h.trim_end_matches('.').to_ascii_lowercase();
+        let concrete = h.strip_prefix("*.").unwrap_or(&h).to_string();
+        if concrete.is_empty() || never_reachable(&concrete).is_some() || inspection(zone, &h).is_spliced() {
+            continue;
+        }
+        let entry = match h.strip_prefix("*.") {
+            Some(d) => format!(".{d}"),
+            None => h,
+        };
+        if !want.contains(&entry) {
+            want.push(entry);
+        }
+    }
+    let mut kept: Vec<String> = want.iter().filter(|e| !want.iter().any(|o| o != *e && subtree_covers(o, e))).cloned().collect();
+    kept.sort();
+    kept
+}
+
+/// The entries of `needed` (as [`ca_hosts`] gives them) that a CA permitting `permitted` doesn't
+/// cover: what a renewal would have to add.
+pub fn uncovered(permitted: &[String], needed: &[String]) -> Vec<String> {
+    needed.iter().filter(|n| !permitted.iter().any(|p| subtree_covers(p, n))).cloned().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +513,35 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], ("static.example".into(), Inspection::Spliced { rule: 0 }));
         assert!(matches!(&v[1].1, Inspection::Inspected(why) if why.contains("forbid")), "{v:?}");
+    }
+
+    /// #573: what a box needs of its node's CA: its inspected hosts only, wildcards as subtrees,
+    /// nothing a wider entry covers; and what a CA's list leaves uncovered.
+    #[test]
+    fn a_box_needs_its_inspected_hosts_of_its_node_ca() {
+        let z: ZoneSpec = crate::yaml::from_str(concat!(
+            "name: z\n",
+            "reach:\n",
+            "  - { host: api.github.com, methods: [GET], paths: ['/repos/**'] }\n",
+            "  - { host: '*.example.org', methods: [GET], paths: ['/x/**'] }\n",
+            "  - { host: a.example.org, methods: [GET], paths: ['/x/**'] }\n",
+            "  - { host: wide.test, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE], paths: ['/**'] }\n",
+            "  - { host: localhost, methods: [GET], paths: ['/**'] }\n",
+        ))
+        .unwrap();
+        // wide.test is spliced (wholesale), localhost never reachable, a.example.org under .example.org.
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(ca_hosts(&z, &[]), s(&[".example.org", "api.github.com"]));
+        assert_eq!(ca_hosts(&z, &["Late.Test.".into()]), s(&[".example.org", "api.github.com", "late.test"]));
+        assert_eq!(uncovered(&s(&["api.github.com"]), &ca_hosts(&z, &[])), s(&[".example.org"]));
+        // An exact entry covers its names; `.d` only what is under d.
+        assert!(uncovered(&s(&["example.org"]), &s(&[".example.org", "a.example.org", "example.org"])).is_empty());
+        assert_eq!(uncovered(&s(&[".example.org"]), &s(&["example.org", "a.example.org"])), s(&["example.org"]));
+        assert!(uncovered(&s(&[".org"]), &s(&[".example.org", "x.example.org"])).is_empty());
+        assert_eq!(uncovered(&s(&["a.example.org"]), &s(&["example.org", ".example.org"])), s(&["example.org", ".example.org"]));
+        assert!(uncovered(&s(&["*"]), &s(&["anything.test", ".any.test"])).is_empty());
+        // As a verifier reads it.
+        assert!(subtree_permits("api.example.com", "x.api.example.com") && !subtree_permits(".example.org", "example.org"));
     }
 }
 
