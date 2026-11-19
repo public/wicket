@@ -283,7 +283,7 @@ your passkey. It is read-only without a passkey signature.
 - **Change hosts** (`secret_hosts`, **Hosts…**), as `wicket secret hosts`: replaces the list; a
   secret is sent only to hosts it is bound to. At least one host; `*.example.com` covers every host
   under it. A reference's hosts can be changed too.
-- **Delete** (`delete_secret`, **Delete…**), as `wicket secret rm`: a first tap shows which zones
+- **Delete** (`delete_secret`, **Delete…**), as `wicket secret remove`: a first tap shows which zones
   and running runs use it, and the passkey's confirmation names them again. A reference's deletion
   removes only the reference, not the file.
 - **References are made on the host.** A reference names a path on the host, so the console can't

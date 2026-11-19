@@ -109,6 +109,7 @@ pub enum SecretCmd {
     List,
     /// Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it
     /// when the control host next checks that run's secrets, within seconds while connected (#152).
+    #[command(name = "remove", alias = "rm")]
     Rm { name: String },
     /// Bind a secret to the only host names it may be sent to, replacing its list.
     Hosts {

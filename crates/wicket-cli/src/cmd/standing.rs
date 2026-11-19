@@ -23,7 +23,7 @@ pub enum StandingCmd {
         #[arg(long = "for", default_value = "agent")]
         bound: String,
         /// How long it lasts (at most 366d), or `forever`: until revoked.
-        #[arg(long, default_value = "30d")]
+        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d")]
         lasts: String,
         /// Approve only the methods and paths the evidence shows were asked for.
         #[arg(long)]
@@ -34,10 +34,11 @@ pub enum StandingCmd {
     },
     /// Deny a standing ask.
     Deny { id: String },
-    /// Move an approved rule's lapse to --lasts from now (or `forever`).
+    /// Move an approved rule's lapse to --ttl from now (or `forever`).
     Renew {
         id: String,
-        #[arg(long, default_value = "30d")]
+        /// How long it lasts from now (at most 366d), or `forever`: until revoked.
+        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d")]
         lasts: String,
     },
     /// Revoke an approved rule: it allows nothing from now on (a box's node, once its run publishes
@@ -48,7 +49,7 @@ pub enum StandingCmd {
 fn lasts(s: &str) -> Result<Option<std::time::Duration>> {
     match s {
         "forever" => Ok(None),
-        d => Ok(Some(wicket_core::time::parse_duration(d).context("bad --lasts (a duration such as 30d, or forever)")?)),
+        d => Ok(Some(wicket_core::time::parse_duration(d).context("bad --ttl (a duration such as 30d, or forever)")?)),
     }
 }
 

@@ -81,6 +81,38 @@ use wicket_core::TenantId;
 use wicket_proxy::vault::Vault;
 use wicket_store::Ledger;
 
+/// `wicket --help`'s commands, by area (#574): what an operator does daily first. Every visible
+/// command is in one area; a test holds it to that.
+const AREAS: &[(&str, &[&str])] = &[
+    ("Runs and agents", &["run", "session", "top", "agents", "hibernate", "wrap", "links", "unlink", "zone", "program", "image"]),
+    ("Approvals and grants", &["pending", "approve", "deny", "grant", "standing", "audit"]),
+    ("Nodes and placement", &["node", "lease", "service", "why-here", "reconcile"]),
+    (
+        "The installation",
+        &["serve", "operator", "secret", "identity", "policy", "state", "keys", "doctor", "self", "daemon", "dev", "help"],
+    ),
+];
+
+/// The command line's parser: [`Cli`]'s, with `wicket --help` listing the commands by [`AREAS`]
+/// (clap lists a command's subcommands under one heading).
+pub(crate) fn command() -> clap::Command {
+    let mut c = <Cli as clap::CommandFactory>::command();
+    c.build();
+    let (h, lit) = (c.get_styles().get_header(), c.get_styles().get_literal());
+    let width = AREAS.iter().flat_map(|(_, names)| names.iter().map(|n| n.len())).max().unwrap_or(0);
+    let mut areas = String::new();
+    for (area, names) in AREAS {
+        areas.push_str(&format!("{}{area}:{}\n", h.render(), h.render_reset()));
+        for n in *names {
+            let about = c.find_subcommand(n).and_then(|s| s.get_about()).map(|a| a.to_string()).unwrap_or_default();
+            areas.push_str(&format!("  {}{n}{}{:pad$}  {about}\n", lit.render(), lit.render_reset(), "", pad = width - n.len()));
+        }
+        areas.push('\n');
+    }
+    let options = format!("{}Options:{}", h.render(), h.render_reset());
+    c.help_template(format!("{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{areas}{options}\n{{options}}{{after-help}}"))
+}
+
 #[derive(Parser)]
 #[command(name = "wicket", version, about = "Run agents in least-privilege boxes (proof of concept)")]
 struct Cli {
@@ -132,9 +164,10 @@ enum Cmd {
         /// With TEXT: queue it and exit at once.
         #[arg(long)]
         no_wait: bool,
-        /// With TEXT: stop following its turn after this many seconds (it stays queued).
-        #[arg(long)]
-        timeout: Option<u64>,
+        /// With TEXT: stop following its turn after this long (it stays queued). Seconds, or a
+        /// duration (`90s`, `5m`).
+        #[arg(long, value_parser = seconds_or_duration)]
+        timeout: Option<Duration>,
     },
     /// Hibernate a long-lived agent at its next quiet point.
     ///
@@ -143,9 +176,9 @@ enum Cmd {
     /// limits.exit_grace.
     Hibernate {
         run: String,
-        /// How long to wait for the outcome (seconds).
-        #[arg(long, default_value_t = 120)]
-        wait: u64,
+        /// How long to wait for the outcome: seconds, or a duration (`90s`, `5m`).
+        #[arg(long, default_value = "120s", value_parser = seconds_or_duration)]
+        wait: Duration,
     },
     /// Internal: wake a hibernated agent (rebuild its box, restore its state, resume its harness
     /// session) and run the woken activation in the foreground. What a message to the agent, or
@@ -177,6 +210,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Why a run's box went on the node it did, or why it went nowhere.
+    ///
     /// Why a run's box went on the node it did, or why it went nowhere (#579): what it asked for,
     /// the nodes it may go on in order, and every reason each other node was out.
     WhyHere {
@@ -245,6 +280,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GrantCmd,
     },
+    /// Standing reach: a reach rule an agent asked for once, approved once for its later runs.
+    ///
     /// Standing reach (#572): a reach rule an agent asked for once, approved once for its later runs.
     Standing {
         #[command(subcommand)]
@@ -381,6 +418,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Per-node services: programs kept running on every node whose boxes use them.
+    ///
     /// Per-node services (#579): programs kept running on every node whose boxes use them.
     Service {
         #[command(subcommand)]
@@ -442,6 +481,15 @@ enum Cmd {
     },
 }
 
+/// A flag that took a number of seconds and takes a duration too (#574), so it reads as the
+/// others do: `120` is still 120 seconds.
+fn seconds_or_duration(s: &str) -> std::result::Result<Duration, String> {
+    match s.parse::<u64>() {
+        Ok(n) => Ok(Duration::from_secs(n)),
+        Err(_) => wicket_core::time::parse_duration(s).map_err(|e| e.to_string()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -451,7 +499,7 @@ async fn main() -> Result<()> {
         .init();
     // Root runs only its own copies of wicket (#261).
     rootcopy::refuse_untrusted_exe()?;
-    let cli = Cli::parse();
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&command().get_matches()).unwrap_or_else(|e| e.exit());
     // Root's link behind the build wicket's services run: one line, on stderr (not for
     // `self update`, `self admit` and `self rollback`, which are how it catches up).
     if !matches!(&cli.cmd, Cmd::Itself { cmd: SelfCmd::Update { .. } | SelfCmd::Admit { .. } | SelfCmd::Rollback { .. } }) {
@@ -507,6 +555,50 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// #574: `wicket --help` lists every visible command once, in its area, and nothing else.
+    #[test]
+    fn every_command_is_in_one_area() {
+        let mut c = <crate::Cli as clap::CommandFactory>::command();
+        c.build();
+        let mut visible: Vec<&str> = c.get_subcommands().filter(|s| !s.is_hide_set()).map(|s| s.get_name()).collect();
+        let mut listed: Vec<&str> = crate::AREAS.iter().flat_map(|(_, n)| n.iter().copied()).collect();
+        visible.sort();
+        listed.sort();
+        assert_eq!(listed, visible);
+        let help = crate::command().render_help().to_string();
+        assert!(help.contains("Runs and agents:\n  run ") && help.contains("Approvals and grants:\n  pending "), "{help}");
+        assert!(!help.contains("Commands:"), "{help}");
+        // Every line of the list fits in about 100 columns.
+        let long: Vec<&str> = help.lines().filter(|l| l.chars().count() > 100).collect();
+        assert!(long.is_empty(), "{long:#?}");
+    }
+
+    /// #574: the flags that took seconds take a duration too, and a number is still seconds.
+    #[test]
+    fn seconds_flags_take_durations_too() {
+        let wait = |args: &[&str]| match <crate::Cli as clap::Parser>::try_parse_from(args).unwrap().cmd {
+            crate::Cmd::Hibernate { wait, .. } => wait,
+            _ => unreachable!(),
+        };
+        assert_eq!(wait(&["wicket", "hibernate", "a"]), std::time::Duration::from_secs(120));
+        assert_eq!(wait(&["wicket", "hibernate", "a", "--wait", "90"]), std::time::Duration::from_secs(90));
+        assert_eq!(wait(&["wicket", "hibernate", "a", "--wait", "5m"]), std::time::Duration::from_secs(300));
+        assert!(<crate::Cli as clap::Parser>::try_parse_from(["wicket", "hibernate", "a", "--wait", "5q"]).is_err());
+    }
+
+    /// #574: one name for one thing, the old one kept as an alias.
+    #[test]
+    fn the_old_names_still_parse() {
+        use clap::Parser;
+        for (old, new) in [
+            (&["wicket", "secret", "rm", "x"][..], &["wicket", "secret", "remove", "x"][..]),
+            (&["wicket", "standing", "approve", "s-1", "--lasts", "7d"], &["wicket", "standing", "approve", "s-1", "--ttl", "7d"]),
+            (&["wicket", "standing", "renew", "s-1", "--lasts", "forever"], &["wicket", "standing", "renew", "s-1", "--ttl", "forever"]),
+        ] {
+            let (a, b) = (crate::Cli::try_parse_from(old).unwrap().cmd, crate::Cli::try_parse_from(new).unwrap().cmd);
+            assert_eq!(crate::daemon::policy::route(&a), crate::daemon::policy::route(&b), "{old:?}");
+        }
+    }
     /// `wicket run --image` is parsed, and without it nothing is named: no default that would hide
     /// the manifest's agent.image (wicket-control's `run::box_image` applies it).
     #[test]
