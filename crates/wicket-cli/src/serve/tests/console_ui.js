@@ -396,6 +396,18 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(ids["confirm-what"].textContent.startsWith("Approve standing reach s-1 narrowed to its evidence: { host: ci.example, methods: [GET], paths: ['/jobs/1/logs'] }"), ids["confirm-what"].textContent);
   assert.ok(ids["confirm-what"].textContent.includes("for 30 days"), ids["confirm-what"].textContent);
   ids["confirm-cancel"].listeners.click(); await flush();
+  // A poll with the same state keeps the same rows (a tap mid-poll lands where it was aimed).
+  const askNode = ids["standing-asks"].children[0];
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids["standing-asks"].children[0], askNode, "rebuilt on an unchanged poll");
+  // A denial is signed as one.
+  await advance(1000);
+  nextAction = { v: 1, action: "standing_deny", standing: "s-1", rule: ask.rule };
+  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Deny")[0].click(); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Deny standing reach s-1"), ids["confirm-what"].textContent);
+  assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: deny"]);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  await advance(1000);
   const sr = ids["standing-rules"];
   assert.ok(sr.textContent.includes("until revoked") && sr.textContent.includes("by passkey:laptop"), sr.textContent);
   await sr.all(n => n.tagName === "button" && n.textContent === "Revoke")[0].click(); await flush();

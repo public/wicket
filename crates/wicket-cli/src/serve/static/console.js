@@ -122,7 +122,7 @@ async function signed(body, after, extra) {
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   document.getElementById("confirm-state").textContent = "";
-  const deny = begin.action.decision === "deny" || begin.action.action === "revoke" || begin.action.action === "delete_secret";
+  const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny"].includes(begin.action.action);
   go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
@@ -266,6 +266,34 @@ function renderPending(s) {
   if (openId) for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
 }
 
+// Rows kept across polls (#574): each by its id and content, rebuilt only when it changed, and the
+// list replaced only when something did. Then the layout moved: taps are ignored for a moment, as
+// on the pending cards (`settled`), so a tap can't land on a row that just moved under it.
+const keyed = new Map();
+function renderKeyed(id, rows, f, emptyText) {
+  const box = document.getElementById(id);
+  const had = keyed.get(id) || new Map(), now = new Map();
+  const nodes = rows.map(r => {
+    const key = JSON.stringify(r), old = had.get(r.id);
+    const node = old && old.key === key ? old.node : f(r);
+    now.set(r.id, { key, node });
+    return node;
+  });
+  keyed.set(id, now);
+  if (!rows.length) {
+    if (!(box.children.length === 1 && box.children[0].className === "empty")) box.replaceChildren(el("div", "empty", emptyText));
+    return;
+  }
+  if (nodes.length === box.children.length && nodes.every((n, i) => n === box.children[i])) return;
+  box.replaceChildren(...nodes);
+  layoutAt = performance.now();
+}
+// A signed action from a row's button, once the layout has settled.
+const signedSettled = body => {
+  if (!settled()) { toast("The list just changed: check the row and tap again."); return; }
+  signed(body);
+};
+
 function renderRows(id, rows, f, emptyText) {
   const box = document.getElementById(id); box.replaceChildren();
   if (!rows.length) { box.append(el("div", "empty", emptyText)); return; }
@@ -370,14 +398,14 @@ function standingAskRow(a) {
   if (a.narrowed) d.append(el("div", "meta", "narrowed to the evidence: " + ruleText(a.narrowed)));
   const b = el("div", "buttons");
   const asAsked = el("button", "approve", "Approve for the agent (30 days)");
-  asAsked.onclick = () => signed({ action: "standing_approve", id: a.id, for: "agent" });
+  asAsked.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent" });
   const narrow = el("button", "", "Approve narrowed");
-  narrow.onclick = () => signed({ action: "standing_approve", id: a.id, for: "agent", narrow: true });
+  narrow.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent", narrow: true });
   narrow.disabled = !a.narrowed;
   const zone = el("button", "", "Approve for zone " + strip(a.zone));
-  zone.onclick = () => signed({ action: "standing_approve", id: a.id, for: "zone" });
+  zone.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "zone" });
   const deny = el("button", "deny", "Deny");
-  deny.onclick = () => signed({ action: "standing_deny", id: a.id });
+  deny.onclick = () => signedSettled({ action: "standing_deny", id: a.id });
   b.append(asAsked, narrow, zone, deny);
   d.append(el("div", "meta", strip(a.id) + " · " + when(a.created_at)), b);
   return d;
@@ -391,10 +419,14 @@ function standingRuleRow(r) {
   const until = r.expires_at ? (r.live ? "until " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
   const b = el("div", "buttons");
   const renew = el("button", "approve", "Renew (30 days)");
-  renew.onclick = () => signed({ action: "standing_renew", id: r.id });
+  renew.onclick = () => signedSettled({ action: "standing_renew", id: r.id });
   renew.disabled = !r.live;
   const revoke = el("button", "deny", "Revoke");
-  revoke.onclick = async () => { try { toast((await post("/api/standing/revoke", { id: r.id })).ok); } catch (e) { toast(e.message); } refresh(); };
+  revoke.onclick = async () => {
+    if (!settled()) { toast("The list just changed: check the row and tap again."); return; }
+    try { toast((await post("/api/standing/revoke", { id: r.id })).ok); } catch (e) { toast(e.message); }
+    refresh();
+  };
   b.append(renew, revoke);
   d.append(head, el("div", "meta", "for " + to + " · " + until + " · by " + strip(r.decided_by)), b);
   return d;
@@ -1043,8 +1075,8 @@ async function refresh() {
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};
-    renderRows("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
-    renderRows("standing-rules", st.rules || [], standingRuleRow, "No standing rules: every one-off ask waits for a decision.");
+    renderKeyed("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
+    renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: every one-off ask waits for a decision.");
     renderStart(s);
     renderManifests(s);
     renderSecrets(s);
