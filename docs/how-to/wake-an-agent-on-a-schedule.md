@@ -16,9 +16,8 @@ trigger: morning-triage            # unique among your triggers: a-z, 0-9 and -
 source:
   schedule: { cron: "0 7 * * 1-5", tz: Europe/London }   # weekdays at 07:00 London time
 action:
-  wake: release-captain            # a long-lived agent: its name, its id, or its principal
-  message:
-    to: release-captain
+  wake: release-captain            # a long-lived agent: its name or its id
+  message:                         # its next turn once woken
     body: "Morning: triage what failed overnight ({{ event.at }})."
 limits: { per_hour: 6 }            # the default; at most 60
 ```
@@ -27,9 +26,11 @@ limits: { per_hour: 6 }            # the default; at most 60
   week, with `*`, lists, ranges and steps) and a time zone from the host's zoneinfo (`UTC` by
   default). Use `timer: { at: 2026-11-20T07:00:00Z }` or `timer: { after: 2h }` instead for one
   firing.
-- **The action.** `wake` wakes a hibernated agent. `message` queues a turn for an agent: the agent
-  reads it as its next turn, and a hibernated agent is woken to read it. Use either or both. An
-  agent named by its name must be the only one of that name; otherwise name it by its principal.
+- **The action.** `wake` wakes a hibernated agent; with a `message` beside it, the message is the
+  woken agent's next turn (leave `message.to` out). A `message` alone goes to the agent whose
+  principal is in `to` (`spiffe://…`): the agent reads it as its next turn, and a hibernated agent
+  is woken to read it. An agent named by its name must be the only one of that name; otherwise
+  name it by its id (`wicket agents`).
 - **The template.** `{{ event.<field> }}` fills in a field of the event. A time-told event has
   `trigger` (its name), `at` (the minute, RFC 3339) and `slot` (the minute, Unix seconds).
 

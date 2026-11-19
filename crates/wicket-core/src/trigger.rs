@@ -277,6 +277,10 @@ impl TriggerSpec {
             if m.to != "self" && !m.to.starts_with("spiffe://") {
                 return Err(format!("message.to {:?}: self, or a principal (spiffe://…)", crate::text::strip(&m.to)));
             }
+            // Waking and messaging are one action: the message is the woken agent's next turn.
+            if a.wake.is_some() && m.to != "self" {
+                return Err("with wake, the message goes to the agent woken: leave message.to out".into());
+            }
             template(&m.body)?;
         }
         let l = &self.limits;
@@ -577,6 +581,10 @@ mod tests {
         );
         bad("trigger: t\nsource: { wicket: { kinds: [run.end] } }\naction: { message: { body: 'x {{ event.a' } }\n", "unclosed");
         bad("trigger: t\nsource: { wicket: { kinds: [run.end] } }\naction: { message: { to: alex, body: x } }\n", "principal");
+        bad(
+            "trigger: t\nsource: { wicket: { kinds: [run.end] } }\naction: { wake: a, message: { to: 'spiffe://w/t/t0/z/z/a/b', body: x } }\n",
+            "leave message.to out",
+        );
         bad("trigger: t\nsource: { wicket: { kinds: [run.end] } }\naction: { wake: self }\nlimits: { per_hour: 1000 }\n", "per_hour");
         bad("trigger: t\nsource: { wicket: { kinds: [run.end] } }\nfilter: { x: [] }\naction: { wake: self }\n", "matches nothing");
         let start = format!(

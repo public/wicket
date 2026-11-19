@@ -369,7 +369,7 @@ pub fn target_agent(l: &Ledger, t: &Trigger, who: &str) -> Result<AgentRow> {
     match named.len() {
         0 => bail!("no long-lived agent named {who}"),
         1 => Ok(named.remove(0)),
-        n => bail!("{n} agents are named {who} (in zones {}): name it by its principal", {
+        n => bail!("{n} agents are named {who} (in zones {}): name it by its id (wicket agents)", {
             named.iter().map(|a| a.zone.as_str()).collect::<Vec<_>>().join(", ")
         }),
     }
@@ -489,7 +489,7 @@ mod tests {
             name: "captain",
             run: "run_a",
             session_id: "s",
-            manifest: "m",
+            manifest: "agent:\n  name: captain\ntask: triage\nzone:\n  name: rel\n  llm: {}\n",
             image: "i",
             workspace: None,
             claim_until: 0,
@@ -498,7 +498,7 @@ mod tests {
         assert!(l.set_agent_state(&agent, 1, "hibernated", None).unwrap());
         let s = spec(
             "trigger: morning\nsource: { schedule: { cron: '* * * * *' } }\n\
-             action: { wake: captain, message: { to: captain, body: 'Triage {{ event.trigger }} at {{ event.at }}' } }\n",
+             action: { wake: captain, message: { body: 'Triage {{ event.trigger }} at {{ event.at }}' } }\n",
         );
         let id = create(&l, &operator(), &s, None, "test").unwrap();
         let t = l.trigger(&id).unwrap().unwrap();
