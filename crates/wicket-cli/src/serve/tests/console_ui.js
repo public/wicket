@@ -146,6 +146,11 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(what.includes("/harmless") && what.includes("q-a") && what.startsWith("Approve once"), what);
   // #369: the effect it signs, and what else it would allow, are shown before the passkey.
   assert.ok(what.includes("effect 0123456789abcdef"), what);
+  // In lines, the decision first and the ids last (#574, item 1).
+  const lines = what.split("\n");
+  assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
+  assert.strictEqual(lines[1], "Risk: R1 \u00b7 read (scoped)");
+  assert.ok(lines[lines.length - 1].startsWith("Request q-a \u00b7 run run_a"), what);
   const blast = ids["confirm-blast"];
   assert.strictEqual(blast.hidden, false);
   assert.ok(blast.textContent.includes("every path under /h/") && blast.textContent.includes("POST api.example.com/h/any-file") &&

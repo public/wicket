@@ -76,11 +76,16 @@ function describe(a) {
     const verb = a.decision === "deny" ? "Deny" : t.uses === 1 ? "Approve once" : "Approve" + (t.uses ? " " + t.uses + " uses" : " any number of uses");
     const how = a.decision === "deny" ? "" : " for " + span(t.ttl_secs);
     const what = a.path_prefix ? s(a.method + " " + a.host + a.path_prefix) : s(a.method + " " + a.host + a.path);
-    return verb + how + ": " + what + (a.prefix ? "\u2026 (every path under it)" : "") +
-      (a.scope === "zone" ? " \u00b7 any run in zone " + s(a.zone) : "") +
-      " \u00b7 " + riskLabel(a.risk) + " \u00b7 request " + s(a.request) + " \u00b7 run " + s(a.run) +
-      (a.agent ? " \u00b7 agent " + s(a.agent) : "") + ((a.requested_by || []).length ? " (" + a.requested_by.map(s).join(", ") + ")" : "") +
-      (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
+    // In lines (#574, item 1): the decision and its target first, as the passkey signs them; then
+    // the risk, who it is for, and the ids last and apart.
+    const agent = a.agent ? String(a.agent).split("/a/").pop() : "";
+    const lines = [verb + how + ": " + what + (a.prefix ? "\u2026 (every path under it)" : ""),
+      "Risk: " + riskLabel(a.risk) + (a.scope === "zone" ? " \u00b7 for any run in zone " + s(a.zone) : "")];
+    if (agent || (a.requested_by || []).length) {
+      lines.push((agent ? "For " + s(agent) : "For run " + s(a.run)) + ((a.requested_by || []).length ? " \u00b7 asked by " + a.requested_by.map(s).join(", ") : ""));
+    }
+    lines.push("Request " + s(a.request) + " \u00b7 run " + s(a.run) + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : ""));
+    return lines.join("\n");
   }
   if (a.action === "revoke") return "Revoke " + s(a.run) + " (" + s(a.agent) + "): " + s(a.reason);
   if (a.action === "save_manifest" || a.action === "restore_manifest") {
