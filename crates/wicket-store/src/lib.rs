@@ -136,10 +136,10 @@ pub enum StoreError {
 /// had its rows copied into `messages`. Builds of schema 17 and 18 never read it (version 17 was the
 /// expand step that stopped them), so the floor is 17, not 19: a rollback to them stays safe, and only
 /// builds from before one inbox, which read prompts from that table, can no longer open the ledger.
-/// Version 21 (expand, after #576's 20) adds `node_ca_policy` and `node_ca_wants` (#573): how a
+/// Version 20 (expand) adds `node_ca_policy` and `node_ca_wants` (#573): how a
 /// node's CA may be widened at runtime, and the hosts its boxes want of it. Older builds don't read
 /// them, so the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 20;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
