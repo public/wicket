@@ -25,6 +25,8 @@ pub mod cas;
 #[cfg(test)]
 mod lifecycle_props;
 mod links;
+mod nodeca;
+pub use nodeca::{CaHosts, CaWant};
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -134,7 +136,10 @@ pub enum StoreError {
 /// had its rows copied into `messages`. Builds of schema 17 and 18 never read it (version 17 was the
 /// expand step that stopped them), so the floor is 17, not 19: a rollback to them stays safe, and only
 /// builds from before one inbox, which read prompts from that table, can no longer open the ledger.
-pub const SCHEMA_VERSION: u32 = 19;
+/// Version 20 (expand) adds `node_ca_policy` and `node_ca_wants` (#573): how a node's CA may be
+/// widened at runtime, and the hosts its boxes want of it. Older builds don't read them, so the
+/// floor stays 17.
+pub const SCHEMA_VERSION: u32 = 20;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -530,6 +535,7 @@ impl Ledger {
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
+        conn.execute_batch(nodeca::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -575,6 +581,7 @@ impl Ledger {
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
+        conn.execute_batch(nodeca::SCHEMA)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
