@@ -37,7 +37,7 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 | [`request_capacity`](#request_capacity) | Ask for a machine of its own (a lease) | `placement.yaml` |
 | [`request_update`](#request_update) | Ask the operator to update wicket to a build | |
 | [`expose`](#expose) | Offer a TCP port to other boxes | |
-| [`request_name`](#request_name) | Give a port a stable internal name | protocol 19 |
+| [`request_name`](#request_name) | Give a port a stable internal name | protocol 18 |
 | [`connect`](#connect) | Reach another box's port, by box or by internal name | |
 | [`link`](#link) | Wire two boxes the caller controls | |
 | [`unlink`](#unlink) | Close a link | |
@@ -415,7 +415,7 @@ It is held by the run that asked, and ends with it. Asking again from the same r
 port. Audited as `name.registered`.
 
 Public names, on the internet, aren't available yet: `kind: public` is refused. The tool needs a
-control host and node at protocol 19; with an older control host the node refuses it.
+control host and node at protocol 18; with an older control host the node refuses it.
 
 | argument | type | default |
 |---|---|---|

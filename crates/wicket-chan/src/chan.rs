@@ -45,11 +45,11 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 2, a connection talks
-/// 17, 18 or 19, so only the versions above 16 have a check here; the checks for features of 14 and
+/// 16, 17 or 18, so only the versions above 15 have a check here; the checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
-pub const PROTOCOL: u32 = 19;
+pub const PROTOCOL: u32 = 18;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -66,7 +66,7 @@ pub const STANDING: u32 = 17;
 /// The first protocol version with names for boxes (#575): a node sends a box's `request_name` as
 /// [`ControlTool::RequestName`]. A control host below it can't read that tool in a [`Msg::Call`],
 /// so a node asks it only over a connection that talks this version.
-pub const NAMES: u32 = 19;
+pub const NAMES: u32 = 18;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -1279,23 +1279,24 @@ mod tests {
     }
 
     /// Why this build has no checks for features of protocol 14 or before (CA renewal, #416, the
-    /// last): with [`PROTOCOL_SKEW`] 2 and protocol 19 (#575), every connection talks 17, 18 or 19.
-    /// 15's message reads (#445) and 16's prefix grants (#257 4a) keep their checks until they go in
-    /// a change of their own; 17's standing reach (#572) is on every connection; 19's names keep
-    /// theirs while a peer at 17 or 18 can connect.
+    /// last): with [`PROTOCOL_SKEW`] 2 and protocol 18 (#575), every connection talks 16, 17 or 18.
+    /// 15's message reads (#445) keep their check until it goes in a change of its own; 16's prefix
+    /// grants (#257 4a) are on every connection; 17's standing reach (#572) and 18's names keep
+    /// theirs while a peer at 16 or 17 can connect.
     #[test]
-    fn no_connection_talks_below_protocol_17() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES), (19, 2, 15, 16, 17, 19));
+    fn no_connection_talks_below_protocol_16() {
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES), (18, 2, 15, 16, 17, 18));
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((17..=19).contains(&at) && (17..=21).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(17..=21).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((16..=18).contains(&at) && (16..=20).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(16..=20).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 20 or 21 talking to a control host at 19 from the other side.
-        assert_eq!((negotiate(20, PROTOCOL), negotiate(21, PROTOCOL)), (Ok(19), Ok(19)));
+        // And a node at 19 or 20 talking to a control host at 18 from the other side.
+        assert_eq!((negotiate(19, PROTOCOL), negotiate(20, PROTOCOL)), (Ok(18), Ok(18)));
+        assert!(negotiate(16, PROTOCOL).unwrap() < STANDING, "a node at 16 sends no AskStanding, and gets no standing block");
         assert!(negotiate(17, PROTOCOL).unwrap() < NAMES, "a node at 17 sends no RequestName");
-        assert!(negotiate(PROTOCOL, 16).is_err() && negotiate(16, PROTOCOL).is_err());
+        assert!(negotiate(PROTOCOL, 15).is_err() && negotiate(15, PROTOCOL).is_err());
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start

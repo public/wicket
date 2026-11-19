@@ -59,6 +59,12 @@ So a name saves an agent finding the box's run id; whether it may connect is the
 NetworkPolicy is to Service DNS in Kubernetes. A link across nodes still passes through the control
 host as #6's links do.
 
+**Direct, with nothing in between, is for public names.** Internal names are box-to-box traffic, and
+box-to-box traffic always goes through a link: the control host decides it, and the box edge enforces
+it (the link's listener in the box, the node's relay), whatever name the box used. A public record
+is different: it points at the node's own address and the host port the service is published on,
+with no proxy and no relay through the control host, only the node copying bytes into the box.
+
 *Changed from the first version of this note:* it had the resolver answer a name, and the first
 connection open the link, for a box that may connect by default. But `connect` is decided on the
 control host, and a link's address, listener and hosts line are set up when it opens. A lookup that
@@ -319,8 +325,8 @@ has a name's records as the zone last listed them, and its last connections.
   revoked by), `name_records` (the records this installation created: zone, name, type, value,
   provider, created, last seen) and `host_ports` (`node`, protocol, port unique; the name holding it,
   released at). Node public addresses are columns of the node's row.
-- **Protocol 19:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
-  node only of a control host at 19. Public names will add the feed's published ports (name, run,
+- **Protocol 18:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
+  node only of a control host at 18. Public names will add the feed's published ports (name, run,
   node, host port, box port, until) for the nodes that listen on them, and a node's report of a
   listener it couldn't bind.
 
@@ -329,7 +335,7 @@ has a name's records as the zone last listed them, and its last connections.
 1. This note.
 2. The provider trait, the `noop` provider and the plan function, in their own crate
    (`wicket-names`), with property tests for ownership.
-3. Ledger schema 28 (#658); `request_name` for internal names, `connect` by name, protocol 19.
+3. Ledger schema 28 (#658); `request_name` for internal names, `connect` by name, protocol 18.
 4. Public names: the approval, standing names, port allocation, the node's listener, the reconciler,
    the console card.
 5. The `vultr` and `rfc2136` providers.

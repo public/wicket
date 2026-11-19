@@ -751,7 +751,7 @@ impl Node {
     async fn call_control(&self, run: &str, tool: chan::ControlTool, args: &serde_json::Value) -> std::io::Result<(String, bool)> {
         let unreachable = || std::io::Error::new(std::io::ErrorKind::NotConnected, "the control host is unreachable");
         let gen = self.owner(run).ok_or_else(unreachable)?;
-        // A control host below protocol 19 can't read this tool in a call (#575): it would drop the
+        // A control host below protocol 18 can't read this tool in a call (#575): it would drop the
         // connection. Answered here instead.
         let proto = self.links.lock().expect("links").get(&gen).map_or(0, |l| l.proto);
         if let Some(why) = too_old_for(tool, proto) {
@@ -2684,9 +2684,9 @@ fn too_old_for(tool: chan::ControlTool, proto: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn request_name_is_asked_only_of_a_control_host_at_19() {
+    fn request_name_is_asked_only_of_a_control_host_at_18() {
         use super::{chan, too_old_for};
-        assert!(too_old_for(chan::ControlTool::RequestName, 18).unwrap().contains("protocol 18"));
+        assert!(too_old_for(chan::ControlTool::RequestName, 17).unwrap().contains("protocol 17"));
         assert_eq!(too_old_for(chan::ControlTool::RequestName, chan::NAMES), None);
         assert_eq!(too_old_for(chan::ControlTool::Connect, 17), None);
     }

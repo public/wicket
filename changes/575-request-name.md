@@ -11,7 +11,7 @@ type: Added
     agent in the zone, an agent holds at most 3 names, and a name ends with its run.
   - Public names aren't available yet.
   - Audited as `name.registered`.
-- **Protocol 19:** the control channel goes from 17 to 19, so wicket talks to peers at 17, 18 and 19
-  (it talked to 15, 16 and 17). A node at 15 or 16 must be updated with its control host. A node at
-  19 sends `request_name` only to a control host at 19, and otherwise tells the box its control host
+- **Protocol 18:** the control channel goes from 17 to 18, so wicket talks to peers at 16, 17 and 18
+  (it talked to 15, 16 and 17). A node at 15 must be updated with its control host. A node at 18
+  sends `request_name` only to a control host at 18, and otherwise tells the box its control host
   must be updated.
