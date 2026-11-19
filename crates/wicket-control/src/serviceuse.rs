@@ -17,9 +17,18 @@ const APPROVAL_POLL: Duration = Duration::from_secs(5);
 /// The environment a box whose zone uses `uses` gets from them (each installed service's `env`,
 /// `{host}` and `{port}` filled in), at its start. A service not installed gives nothing (its link
 /// says why).
+///
+/// It also gets `WICKET_WAIT_LINKS`: the box's program starts once those links are up
+/// (`wicket-entry`), not before, so its first request finds the service.
 pub fn user_env(l: &Ledger, uses: &[String]) -> Vec<(String, String)> {
     let Ok(all) = installed(l) else { return vec![] };
-    uses.iter().filter_map(|u| all.get(u).map(|s| s.spec.user_env(u))).flat_map(|e| e.into_iter()).collect()
+    let used: Vec<&String> = uses.iter().filter(|u| all.contains_key(*u)).collect();
+    let mut env: Vec<(String, String)> = used.iter().flat_map(|u| all[*u].spec.user_env(u).into_iter()).collect();
+    if !used.is_empty() {
+        let names: Vec<String> = used.iter().map(|u| format!("{u}.{}", wicket_core::link::DOMAIN)).collect();
+        env.push(("WICKET_WAIT_LINKS".into(), names.join(",")));
+    }
+    env
 }
 
 /// Whether `run`, whose zone is `zone`, may run in it (#579): an installed service's zone is its
@@ -155,7 +164,14 @@ mod tests {
         let l = Ledger::open_in_memory().unwrap();
         l.add_service("npm-cache", &snap.path.display().to_string(), &snap.sha256, "t0", "alex").unwrap();
         let uses = vec!["npm-cache".to_string(), "not-installed".to_string()];
-        assert_eq!(user_env(&l, &uses), vec![("npm_config_registry".to_string(), "http://npm-cache.wicket.internal:4873/".to_string())]);
+        assert_eq!(
+            user_env(&l, &uses),
+            vec![
+                ("npm_config_registry".to_string(), "http://npm-cache.wicket.internal:4873/".to_string()),
+                ("WICKET_WAIT_LINKS".to_string(), "npm-cache.wicket.internal".to_string()),
+            ],
+            "and the box waits for its link before its program starts"
+        );
         // The file it was installed from changes: nothing installed does.
         std::fs::write(&path, "task: x\nprogram: { name: npm-cache, command: [x] }\nservice: { port: 1, env: { npm_config_registry: 'http://evil/' } }\nzone: { name: npm-cache }\n").unwrap();
         assert_eq!(user_env(&l, &uses)[0].1, "http://npm-cache.wicket.internal:4873/");

@@ -55,6 +55,17 @@ paths = [
   "crates/wicket-control/src/transcript.rs",
 ]
 
+# Per-node services (#579 step 3): the npm cache example installed, kept on its node, and used
+# by boxes through their links.
+[suite.services]
+binary = true
+packages = ["wicket-store"]
+paths = [
+  "ci/service-e2e.sh", "examples/services/**",
+  "crates/wicket-control/src/services.rs", "crates/wicket-store/src/services.rs", "crates/wicket-core/src/service.rs",
+  "crates/wicket-gateway/src/link.rs", "crates/wicket-cli/src/cmd/service.rs",
+]
+
 # Control-plane state off the host (#154): the ledger streamed to S3, the recovery kit, the roots
 # taken offline, a standby restored, and the hibernated agent's bundle there.
 [suite.restore]
