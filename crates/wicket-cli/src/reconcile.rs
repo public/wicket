@@ -2030,6 +2030,57 @@ mod tests {
         );
     }
 
+    /// #256 (#326's mutants): a pass keeps a placed node's money reserved a day at a time while it
+    /// bills, lease or not; a dry run leaves it as it was.
+    #[tokio::test]
+    async fn a_pass_renews_a_placed_nodes_money_for_a_day_and_a_dry_run_does_not() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        placed(&l, &st, "placed-renew", "renew-node", NOW + 2400);
+        let budget = wicket_store::LeaseBudget { max_hourly: 42_000, max_total: 56_000 };
+        let key = wicket_store::money::node_money_key("renew-node");
+        l.reserve_money("t", &key, 14_000, 20_000, 60, budget, wicket_store::money::NODE_MONEY_BY).unwrap().unwrap();
+        let expires = |l: &Ledger| {
+            let path = format!("/quota/money.reserved/{key}");
+            let g = l.grants(&TenantId("t".into()), false, 100).unwrap().into_iter().find(|g| g.grant.path == path).expect("reserved");
+            g.grant.expires_at - wicket_store::now()
+        };
+        assert!(expires(&l) <= 60);
+        let w = World::new(vultr(&base));
+        placed_pass(&mut l, &w.placer, retire, NOW, true).await.unwrap();
+        assert!(expires(&l) <= 60, "a dry run renews nothing");
+        placed_pass(&mut l, &w.placer, retire, NOW, false).await.unwrap();
+        let left = expires(&l);
+        assert!((24 * 3600 - 5..=24 * 3600).contains(&left), "renewed for a day: {left} s left");
+    }
+
+    /// #326's mutants: the provider's node went between the pass reading it and releasing it. The
+    /// release says it was already gone, and names no bill (nothing was destroyed by this pass).
+    #[tokio::test]
+    async fn a_placed_node_gone_before_its_release_is_reported_as_already_gone() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-race", "race-node", end);
+        let inst = st.lock().unwrap().instances.iter().find(|i| i["id"] == "placed-race").cloned().unwrap();
+        let w = World::new(vultr(&base));
+        // One read first, so the provider has its plans (it asks for them once).
+        assert!(w.placer.get(&NodeId("placed-race".into())).await.unwrap().is_some());
+        // The pass's read finds it; the release's own read doesn't.
+        st.lock().unwrap().injected.extend([
+            (200, serde_json::json!({ "instance": inst })),
+            (404, serde_json::json!({"error": "Invalid instance-id.", "status": 404})),
+        ]);
+        let d = placed_pass(&mut l, &w.placer, retire, end + 1, false).await.unwrap();
+        let x = d.iter().find(|x| x.kind == "placed_released").unwrap_or_else(|| panic!("released: {d:?}"));
+        assert!(x.detail.contains("already gone") && !x.detail.contains("billed"), "{}", x.detail);
+        // A node this pass destroyed says so, with what it billed.
+        placed(&l, &st, "placed-gone", "gone-node", end);
+        let d = placed_pass(&mut l, &w.placer, retire, end + 1, false).await.unwrap();
+        let x = d.iter().find(|x| x.kind == "placed_released" && x.target == "placed-gone").expect("released");
+        assert!(x.detail.contains("released (") && x.detail.contains("billed"), "{}", x.detail);
+    }
+
     #[tokio::test]
     async fn a_held_placed_node_is_kept_and_flagged_then_released_when_its_run_ends() {
         let (base, st) = vultr_mock::serve().await;
