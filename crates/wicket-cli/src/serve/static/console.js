@@ -144,7 +144,7 @@ let afterConfirm = null;
 // How long the server keeps a begun action's challenge (`CHALLENGE_TTL` in serve/mod.rs).
 const CHALLENGE_MS = 120000;
 const EXPIRY_MARGIN_MS = 5000;
-let expiryTimer = null;
+let expiryTimer = null, sheetToken = 0;
 async function signed(body, after, extra) {
   if (ceremony) return;
   ceremony = true;
@@ -159,9 +159,13 @@ async function signed(body, after, extra) {
 async function openSheet(body, extra) {
   const go = document.getElementById("confirm-go");
   const state = document.getElementById("confirm-state");
+  // Each sheet has a token; closing it (Cancel, say, while "Ask again" prepares) bumps it, and the
+  // begin that comes back afterwards is dropped rather than reopening a closed sheet.
+  const sheet = ++sheetToken;
   let begin;
   try { begin = await post("/api/action/begin", body); }
-  catch (e) { toastError(e); closeConfirm(); return; }
+  catch (e) { if (sheet === sheetToken) { toastError(e); closeConfirm(); } return; }
+  if (sheet !== sheetToken) return;
   document.getElementById("msg").hidden = true;
   document.getElementById("confirm-what").textContent = describe(begin.action);
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
@@ -172,10 +176,11 @@ async function openSheet(body, extra) {
   go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
-  go.disabled = true; setTimeout(() => { go.disabled = false; }, SETTLE_MS);
-  // The challenge expires on the server's clock: a wall-clock deadline it sent (a phone that sleeps
-  // still knows), a few seconds early for the signature's trip back.
-  const deadline = (begin.expires_at_ms || Date.now() + CHALLENGE_MS) - EXPIRY_MARGIN_MS;
+  go.disabled = true; setTimeout(() => { if (sheet === sheetToken) go.disabled = false; }, SETTLE_MS);
+  // The challenge expires on the server's clock. The time it has left, counted from its arrival on
+  // the wall clock (a phone that sleeps still counts it), a few seconds early for the signature's
+  // trip back; the phone's own clock being out doesn't matter.
+  const deadline = Date.now() + (begin.expires_in_ms || CHALLENGE_MS) - EXPIRY_MARGIN_MS;
   clearInterval(expiryTimer);
   const tick = () => {
     if (go.dataset.waiting) return;
@@ -242,6 +247,7 @@ function renderUpdate(box, u) {
   box.append(ul);
 }
 function closeConfirm() {
+  sheetToken++;
   clearInterval(expiryTimer);
   delete document.getElementById("confirm-go").dataset.waiting;
   document.getElementById("confirm").hidden = true;

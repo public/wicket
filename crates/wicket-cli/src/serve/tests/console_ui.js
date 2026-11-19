@@ -31,6 +31,7 @@ for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runfor
 ids.confirm.hidden = true;
 let now = 100000;
 const EPOCH = 1700000000000;
+let skew = 0; // how far the phone's clock is off
 let slowBegin = null, slowPasskey = null;
 let timers = [];
 let intervalId = 0;
@@ -64,7 +65,7 @@ const fetch = async (path, opts) => {
       : b.action === "push_details" ? { v: 1, action: b.action, device: b.id, label: "laptop", service: "fcm.googleapis.com", details: true } : nextAction;
     begun = { body: b, action: a };
     if (slowBegin) await slowBegin;
-    return reply({ action: a, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] }, expires_at_ms: EPOCH + now + 120000 });
+    return reply({ action: a, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] }, expires_in_ms: 120000 });
   }
   if (path === "/api/action/finish") {
     const b = begun && begun.body;
@@ -106,7 +107,7 @@ const sandbox = {
   atob: s => Buffer.from(s, "base64").toString("binary"),
   Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error,
   // The wall clock moves with the harness's timers (a fixed offset keeps it a plausible date).
-  Date: Object.assign(function (...a) { return a.length ? new Date(...a) : new Date(EPOCH + now); }, { now: () => EPOCH + now, UTC: Date.UTC, parse: Date.parse }),
+  Date: Object.assign(function (...a) { return a.length ? new Date(...a) : new Date(EPOCH + now + skew); }, { now: () => EPOCH + now + skew, UTC: Date.UTC, parse: Date.parse }),
 };
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), sandbox);
@@ -254,10 +255,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await advance(4000);
   assert.deepStrictEqual([ids.msg.hidden, ids.msg.textContent], [false, "Preparing…"], "a slow begin still says so");
   assert.strictEqual(ids.confirm.hidden, true);
+  // The phone's clock is three minutes fast: it doesn't matter, the time left is counted from arrival.
+  skew = 180000;
   slowBegin = null; answer(); await opening; await flush();
   assert.strictEqual(ids.msg.hidden, true, "the sheet replaces it");
-  // The deadline is the server's (expires_at_ms), on the wall clock, five seconds early.
-  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55");
+  // The time the server says is left (expires_in_ms), on the wall clock, five seconds early.
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55", "a fast phone clock doesn't expire it at once");
   await advance(116000);
   assert.strictEqual(ids["confirm-state"].textContent, "This expired before it was signed. Nothing was signed.");
   assert.strictEqual(ids["confirm-go"].textContent, "Ask again");
@@ -287,6 +290,22 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(ids["confirm-state"].textContent, "Waiting for your passkey…", "no expiry while waiting for the passkey");
   slowPasskey = null; passkeyDone(); await flush(); await flush(); await flush();
   assert.strictEqual(ids.confirm.hidden, true);
+  // Cancel while "Ask again" prepares: the begin that comes back late doesn't reopen the sheet.
+  await advance(1000);
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  await advance(116000);
+  slowBegin = new Promise(r => { answer = r; });
+  ids["confirm-go"].click(); await flush();
+  ids["confirm-cancel"].listeners.click(); await flush();
+  assert.strictEqual(ids.confirm.hidden, true);
+  slowBegin = null; answer(); await flush(); await flush();
+  assert.strictEqual(ids.confirm.hidden, true, "a begin for a closed sheet is dropped");
+  await advance(1000);
+  const afterCancel = began().length;
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  assert.deepStrictEqual([began().length, ids.confirm.hidden], [afterCancel + 1, false], "and the next tap opens a sheet as usual");
+  ids["confirm-cancel"].listeners.click(); await flush();
+  skew = 0;
   // A push's card says the window it is granted as, from the server's terms (#574 review).
   const pushReq = { id: "q-push", risk: "R4ExecOrPrivilege", method: "POST", host: "github.com", path: "/acme/app.git/git-receive-pack", scope_prefix: false,
     reason: "push", identity: { verified: true, agent: "a", zone: "z", acting_for: [], id: "spiffe://x/a/a" }, attribution: [], zone: "z", run: "run_a",
