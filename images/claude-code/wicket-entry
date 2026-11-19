@@ -29,6 +29,19 @@ fi
 T="start ${EPOCHREALTIME:-}"
 mark() { T="$T
 $1 ${EPOCHREALTIME:-}"; }
+# And when the sandbox's kernel came up: now less its uptime (builtins only, in microseconds; the
+# uptime's hundredths make it up to 10 ms late). The node splits the runtime's start from the box's
+# own boot with it (`box.entry.runtime`, `box.entry.boot`). Written last, so an older node, which
+# reads the lines as steps in turn, only sees a step of nothing at the end. Under runc the uptime is
+# the host's, which the node knows by its size.
+BOOT=
+if read -r up _ </proc/uptime 2>/dev/null && [[ "$up" =~ ^([0-9]+)[.,]([0-9]{1,6})$ && "${T#start }" =~ ^([0-9]+)[.,]([0-9]{6})$ ]]; then
+  now=$((10#${BASH_REMATCH[1]} * 1000000 + 10#${BASH_REMATCH[2]}))
+  [[ "$up" =~ ^([0-9]+)[.,]([0-9]{1,6})$ ]]
+  frac=${BASH_REMATCH[2]}000000
+  b=$((now - 10#${BASH_REMATCH[1]} * 1000000 - 10#${frac:0:6}))
+  printf -v BOOT 'boot %d.%06d' $((b / 1000000)) $((b % 1000000))
+fi
 fail() { echo "wicket-entry: $*" >&2; exit 1; }
 AS="${WICKET_AS_USER:?wicket-entry needs WICKET_AS_USER=uid:gid}"
 U=${AS%%:*}
@@ -97,6 +110,8 @@ export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }$J"
 # starts (best effort). Bash makes these descriptors close-on-exec, so the program inherits neither
 # pipe anyway; closing the write ends is what tells the forwarder the times are complete.
 mark exec
+[ -z "$BOOT" ] || T="$T
+$BOOT"
 # Both of the forwarder's stdin's write ends closed (ours and bash's) are the end of the times.
 printf '%s\n' "$T" >&"$FWD_IN"
 fd=${FWD[1]:-}; [ -z "$fd" ] || exec {fd}>&-

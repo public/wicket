@@ -37,3 +37,11 @@ RUN git config --system core.hooksPath /dev/null \
  && git config --system advice.detachedHead false
 
 WORKDIR /workspace
+
+# No entrypoint of node's: its docker-entrypoint.sh is a shell, and a fork for `$(command -v …)`,
+# before every box's own entry, about 10-25 ms of each start under gVisor (#287). wicket always
+# starts a box with a command (`wicket-entry …`), which that script would only have exec'd. Without
+# one, the box still runs node, as `docker-entrypoint.sh node` did. ENTRYPOINT resets CMD, so this
+# order.
+ENTRYPOINT []
+CMD ["node"]
