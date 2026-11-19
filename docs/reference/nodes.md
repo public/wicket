@@ -109,6 +109,18 @@ wicket node revoke n1
   a quarter of its life is left), in `wicket top`, the console's health panel and push, and the health summary
   shows the CA's end. Such a node refuses to start a box whose zone needs the CA (a model route, or a reach or
   inject host inside its name constraints), saying why, instead of starting one whose every request fails.
+- **Widening the node CA at runtime** (#573). `wicket node set <node> --ca-hosts auto` (or a list such as
+  `api.example.com,*.example.org`) lets the control host add hosts to a node's CA when its boxes need them:
+  - before a box starts, the inspected hosts its zone reaches, injects into, swaps a credential for or calls as
+    its model host, and the hosts of grants published to it, are compared with the CA's name constraints;
+  - what's missing and allowed is recorded as wanted by that run, and the box's start waits (up to 60 s) for a
+    renewal over the channel signed for the operator's hosts plus every live want, at most 64 entries;
+  - the renewal is audited `node.ca_renewed` and `node.ca_widened` (hosts added and removed, and the runs that
+    wanted them);
+  - a run's wants end with it, and the next due renewal prunes the hosts no box wants any more.
+
+  The default is `fixed`: the CA keeps its hosts, as before, and a box start says which hosts it would need.
+  The local node's CA is unconstrained, so none of this applies to it.
 - **Name constraints are subtrees.** `api.example.com` also permits names under it (`x.api.example.com`), and
   `*.example.org` permits every name under `example.org` but not `example.org` itself. X.509 can't express
   "exactly this host". The reach rules stay the exact gate, and the constraint bounds what a stolen node CA can
