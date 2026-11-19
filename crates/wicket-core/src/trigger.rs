@@ -195,7 +195,9 @@ impl TriggerSpec {
         }
         match &self.source {
             Source::Schedule { cron, tz } => {
-                Cron::parse(cron)?;
+                if !Cron::parse(cron)?.fires() {
+                    return Err(format!("schedule {:?} never fires: no month it names has the days it names", crate::text::strip(cron)));
+                }
                 if tz != "UTC"
                     && !tz.split('/').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"_+-".contains(&b)))
                 {
@@ -277,6 +279,10 @@ impl TriggerSpec {
             if m.to != "self" && !m.to.starts_with("spiffe://") {
                 return Err(format!("message.to {:?}: self, or a principal (spiffe://…)", crate::text::strip(&m.to)));
             }
+            // Waking and messaging are one action: the message is the woken agent's next turn.
+            if a.wake.is_some() && m.to != "self" {
+                return Err("with wake, the message goes to the agent woken: leave message.to out".into());
+            }
             template(&m.body)?;
         }
         let l = &self.limits;
@@ -338,6 +344,112 @@ pub fn template(t: &str) -> Result<Vec<String>, String> {
         return Err("a template has a }} with no {{".into());
     }
     Ok(fields)
+}
+
+/// An event's field by its dotted path (`pr.number`), if it has it.
+pub fn field<'a>(fields: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.').try_fold(fields, |v, k| v.get(k))
+}
+
+/// The longest a field's text may be in a filled-in template: longer is cut, and marked.
+pub const MAX_FIELD_TEXT: usize = 1000;
+
+/// A field's value as a filter and a template read it: a string as itself, a number or a bool as
+/// written, anything else (an object, a list, null) as nothing.
+fn text_of(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether `text` matches `pattern`: `*` is any run of characters, everything else is itself.
+fn glob(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // The classic two-pointer match, with the last `*` to fall back to.
+    let (mut i, mut j, mut star, mut mark) = (0, 0, None, 0);
+    while j < t.len() {
+        if i < p.len() && p[i] != '*' && p[i] == t[j] {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == '*' {
+            star = Some(i);
+            mark = j;
+            i += 1;
+        } else if let Some(s) = star {
+            i = s + 1;
+            mark += 1;
+            j = mark;
+        } else {
+            return false;
+        }
+    }
+    p[i..].iter().all(|c| *c == '*')
+}
+
+/// Whether one string condition holds for `text`: a glob, or with a leading `!`, not.
+fn holds(cond: &str, text: Option<&str>) -> bool {
+    match cond.strip_prefix('!') {
+        Some(c) => text.is_none_or(|t| !glob(c, t)),
+        None => text.is_some_and(|t| glob(cond, t)),
+    }
+}
+
+impl FilterValue {
+    /// Whether a field's value (None: the event hasn't it) meets this condition. A list matches
+    /// when any of its conditions does; a `!` condition matches a missing field.
+    pub fn matches(&self, v: Option<&serde_json::Value>) -> bool {
+        match self {
+            FilterValue::Number(n) => v.and_then(serde_json::Value::as_i64) == Some(*n),
+            FilterValue::Bool(b) => v.and_then(serde_json::Value::as_bool) == Some(*b),
+            FilterValue::One(c) => holds(c, v.and_then(text_of).as_deref()),
+            FilterValue::Any(cs) => {
+                let t = v.and_then(text_of);
+                cs.iter().any(|c| holds(c, t.as_deref()))
+            }
+        }
+    }
+}
+
+impl TriggerSpec {
+    /// Whether an event with these fields passes the filter: every condition holds.
+    pub fn admits(&self, fields: &serde_json::Value) -> bool {
+        self.filter.iter().all(|(k, c)| c.matches(field(fields, k)))
+    }
+}
+
+/// A template filled in from an event's fields: each `{{ event.<field> }}` becomes the field's
+/// text, stripped of control characters and cut at [`MAX_FIELD_TEXT`], or nothing if the event
+/// hasn't it. The result is text to quote to the work, never anything wicket reads as authority.
+/// A template [`template`] refuses is returned as it is (`check` refused it before it was kept).
+pub fn render(t: &str, fields: &serde_json::Value) -> String {
+    if template(t).is_err() {
+        return t.to_string();
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut rest = t;
+    while let Some(i) = rest.find("{{") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        let j = after.find("}}").unwrap_or(after.len());
+        let name = after[..j].trim().trim_start_matches("event.");
+        let mut v = field(fields, name).and_then(text_of).map(|s| crate::text::strip(&s)).unwrap_or_default();
+        if v.len() > MAX_FIELD_TEXT {
+            let mut cut = MAX_FIELD_TEXT;
+            while !v.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            v.truncate(cut);
+            v.push('…');
+        }
+        out.push_str(&v);
+        rest = after.get(j + 2..).unwrap_or("");
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A five-field cron schedule, each field the set of values it matches.
@@ -407,6 +519,13 @@ impl Cron {
     /// Whether the schedule fires at this minute (local time in its zone): minute, hour and month
     /// match, and the day of month or the weekday does (cron's rule: when both are restricted,
     /// either matches).
+    /// Whether it ever matches: a day of the month it names exists in a month it names (29
+    /// February counts), or it names days of the week, which every month has.
+    pub fn fires(&self) -> bool {
+        const LAST: [u8; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        self.weekdays.len() < 7 || self.months.iter().any(|m| self.days.iter().any(|d| *d <= LAST[(*m as usize).saturating_sub(1).min(11)]))
+    }
+
     pub fn matches(&self, minute: u8, hour: u8, day: u8, month: u8, weekday: u8) -> bool {
         let all_days = self.days.len() == 31;
         let all_weekdays = self.weekdays.len() == 7;
@@ -454,6 +573,9 @@ mod tests {
         bad(&format!("trigger: Bad_Name\nsource: {{ schedule: {{ cron: '* * * * *' }} }}\n{act}"), "trigger name");
         bad(&format!("trigger: t\nsource: {{ schedule: {{ cron: '60 * * * *' }} }}\n{act}"), "outside 0-59");
         bad(&format!("trigger: t\nsource: {{ schedule: {{ cron: '* * *' }} }}\n{act}"), "five fields");
+        bad(&format!("trigger: t\nsource: {{ schedule: {{ cron: '0 0 31 2 *' }} }}\n{act}"), "never fires");
+        assert!(spec(&format!("trigger: t\nsource: {{ schedule: {{ cron: '0 0 29 2 *' }} }}\n{act}")).is_ok(), "29 February comes");
+        assert!(spec(&format!("trigger: t\nsource: {{ schedule: {{ cron: '0 0 31 2 1' }} }}\n{act}")).is_ok(), "or Mondays");
         bad(&format!("trigger: t\nsource: {{ timer: {{ at: '2026-11-20T07:00:00Z', after: 2h }} }}\n{act}"), "exactly one");
         bad(&format!("trigger: t\nsource: {{ wicket: {{ kinds: [secret.set] }} }}\n{act}"), "is not one of");
         bad(
@@ -471,6 +593,10 @@ mod tests {
         );
         bad("trigger: t\nsource: { wicket: { kinds: [run.end] } }\naction: { message: { body: 'x {{ event.a' } }\n", "unclosed");
         bad("trigger: t\nsource: { wicket: { kinds: [run.end] } }\naction: { message: { to: alex, body: x } }\n", "principal");
+        bad(
+            "trigger: t\nsource: { wicket: { kinds: [run.end] } }\naction: { wake: a, message: { to: 'spiffe://w/t/t0/z/z/a/b', body: x } }\n",
+            "leave message.to out",
+        );
         bad("trigger: t\nsource: { wicket: { kinds: [run.end] } }\naction: { wake: self }\nlimits: { per_hour: 1000 }\n", "per_hour");
         bad("trigger: t\nsource: { wicket: { kinds: [run.end] } }\nfilter: { x: [] }\naction: { wake: self }\n", "matches nothing");
         let start = format!(
@@ -482,6 +608,35 @@ mod tests {
             crate::yaml::from_str::<TriggerSpec>("trigger: t\nsource: { cron: x }\naction: { wake: self }\n").is_err(),
             "unknown source"
         );
+    }
+
+    /// A filter's conditions over an event's dotted fields: values, lists, globs and `!`.
+    #[test]
+    fn a_filter_admits_the_events_it_names() {
+        let s = spec("trigger: t\nsource: { wicket: { kinds: [run.end] } }\nfilter: { conclusion: [failure, timed_out], branch: '!main', pr.number: 7, repo: 'acme/*' }\naction: { wake: self }\n").unwrap();
+        let ev = |c: &str, b: Option<&str>, n: i64| {
+            let mut v = serde_json::json!({ "conclusion": c, "pr": { "number": n }, "repo": "acme/app" });
+            if let Some(b) = b {
+                v["branch"] = b.into();
+            }
+            v
+        };
+        assert!(s.admits(&ev("failure", Some("fix/x"), 7)));
+        assert!(s.admits(&ev("timed_out", None, 7)), "a ! condition admits a missing field");
+        assert!(!s.admits(&ev("success", Some("fix/x"), 7)));
+        assert!(!s.admits(&ev("failure", Some("main"), 7)));
+        assert!(!s.admits(&ev("failure", Some("fix/x"), 8)));
+        assert!(glob("a*b*c", "aXXbYc") && glob("*", "") && !glob("a*b", "acb-") && glob("**x", "x"));
+    }
+
+    /// A template is filled with the event's text, stripped and cut; a missing field is nothing.
+    #[test]
+    fn a_template_is_filled_with_quoted_text() {
+        let f = serde_json::json!({ "pr": { "number": 12 }, "title": "fix\u{1b}[31m it", "long": "é".repeat(800) });
+        assert_eq!(render("PR {{ event.pr.number }}: {{event.title}} ({{ event.none }})", &f), "PR 12: fix [31m it ()");
+        let long = render("{{ event.long }}", &f);
+        assert!(long.ends_with('…') && long.len() <= MAX_FIELD_TEXT + '…'.len_utf8(), "{}", long.len());
+        assert_eq!(render("{{ zone.reach }}", &f), "{{ zone.reach }}", "not a template: left as it is");
     }
 
     /// Cron: lists, ranges, steps, Sunday as 0 or 7, and cron's day-of-month-or-weekday rule.

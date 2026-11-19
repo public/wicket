@@ -498,6 +498,19 @@ impl Daemon {
                 }
                 Plan { argv, cwd: default_cwd(), stage: Some(st), caller }
             }
+            // A trigger's document and a sample event go as content, as the key does.
+            Cmd::Trigger { cmd: crate::TriggerCmd::Create { lasts, .. } } => {
+                let st = upload::Stage::new(&stage_parent, vec![("trigger".into(), "trigger.yaml".into())])?;
+                let file = st.dir.join("trigger.yaml").display().to_string();
+                let argv = vec!["trigger".into(), "create".into(), "--file".into(), file, "--lasts".into(), lasts.clone()];
+                Plan { argv, cwd: self.data_dir.clone(), stage: Some(st), caller }
+            }
+            Cmd::Trigger { cmd: crate::TriggerCmd::Fire { trigger: id, event: Some(_), .. } } => {
+                let st = upload::Stage::new(&stage_parent, vec![("event".into(), "event.json".into())])?;
+                let file = st.dir.join("event.json").display().to_string();
+                let argv = vec!["trigger".into(), "fire".into(), id.clone(), "--event".into(), file, "--dry-run".into()];
+                Plan { argv, cwd: self.data_dir.clone(), stage: Some(st), caller }
+            }
             _ => Plan { argv: hello.argv.clone(), cwd: default_cwd(), stage: None, caller },
         })
     }
@@ -575,6 +588,8 @@ fn check_staged(cmd: &Cmd, hello: &Hello, st: &upload::Stage, vault_dir: &Path) 
     let one_file = match cmd {
         Cmd::Itself { cmd: crate::SelfCmd::TrustKey { .. } } => Some("key"),
         Cmd::Itself { cmd: crate::SelfCmd::Update { artifact: Some(_), .. } } => Some("artifact"),
+        Cmd::Trigger { cmd: crate::TriggerCmd::Create { .. } } => Some("trigger"),
+        Cmd::Trigger { cmd: crate::TriggerCmd::Fire { event: Some(_), .. } } => Some("event"),
         _ => None,
     };
     if let Some(role) = one_file {

@@ -29,10 +29,10 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 
 | command | class |
 |---|---|
-| `run`, `wrap`, `session`, `hibernate`, `wake` | run |
+| `run`, `wrap`, `session`, `hibernate`, `wake`, `trigger create\|resume\|renew` | run |
 | `agents`, `pending`, `links`, `audit` (and `audit export`), `doctor` | read |
-| `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list` (without `--provider`), `state check`, `self status` | read |
-| `unlink`, `grant revoke`, `identity revoke`, `lease release` | revoke |
+| `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list` (without `--provider`), `state check`, `self status`, `trigger list\|show\|fire` | read |
+| `unlink`, `grant revoke`, `identity revoke`, `lease release`, `trigger pause\|rm` | revoke |
 | `approve`, `deny`, `grant renew` | privileged |
 | `secret set\|link\|hosts\|rm` | privileged |
 | `image` | privileged |
@@ -47,7 +47,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 
 Arguments only wicket itself passes are refused from any caller: `run --run-id` and `--ssh-key`,
 and `wake --by`. (A child run's parent, lease and takeover are no arguments: its supervisor runs
-in its parent's process.) Manifests and `--workdir` are sent to the daemon as
+in its parent's process.) Manifests, `--workdir`, and a trigger's `--file` and `--event` are sent to the daemon as
 content; mounting a directory in place (`run --workspace-dir`, and `wrap`, which mounts its
 launcher's directory) is root's only.
 

@@ -144,6 +144,9 @@ check "the state store takes writes" 'grep -q "it takes writes" "$work/check.log
 "${HA[@]}" "$WICKET" state replicate >"$work/replicate-a.log" 2>&1 &
 repl_pid=$!
 mock HA
+# Litestream's own position, read from its control socket (#635).
+for _ in $(seq 60); do "${HA[@]}" "$WICKET" state check >"$work/check-stream.log" 2>&1; grep -q ": streaming, last sync" "$work/check-stream.log" && break; sleep 0.5; done
+check "state check reads the stream's position from Litestream" 'grep -q ": streaming, last sync" "$work/check-stream.log"'
 # A node on this machine, as ci/hibernate.sh --node enrols one: its own home, the ssh hop replaced.
 nodehome=$work/n
 mkdir -p "$nodehome"

@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS work_claims (
 CREATE UNIQUE INDEX IF NOT EXISTS work_claims_live ON work_claims (tenant, key) WHERE released_at IS NULL;
 "#;
 
+/// How long triggers' settled firings and the events they fired on are kept (as the design keeps
+/// raw deliveries): [`Ledger::maintain`] deletes older ones.
+pub const TRIGGER_RETENTION_SECS: i64 = 14 * 86400;
+
+/// The most live triggers one owner may keep.
+pub const MAX_TRIGGERS_PER_OWNER: usize = 100;
+
 /// A firing's states.
 pub const FIRING_STATES: &[&str] = &["queued", "started", "skipped", "failed", "dead"];
 
@@ -64,6 +71,9 @@ pub struct Trigger {
     /// When it lapses (None: until deleted).
     pub until: Option<i64>,
     pub decided_by: Option<String>,
+    /// When it last changed: made, approved, paused, resumed or renewed. A schedule fires only for
+    /// minutes after it, so a trigger resumed or approved isn't caught up on the time before.
+    pub updated_at: i64,
 }
 
 impl Trigger {
@@ -96,6 +106,8 @@ pub struct Firing {
     pub detail: Option<String>,
     pub run: Option<String>,
     pub attempts: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 fn id(prefix: &str) -> String {
@@ -103,7 +115,7 @@ fn id(prefix: &str) -> String {
     format!("{prefix}-{}", &r[2..])
 }
 
-const COLS: &str = "id, tenant, owner, name, spec, status, approval, created_at, created_by, until, decided_by";
+const COLS: &str = "id, tenant, owner, name, spec, status, approval, created_at, created_by, until, decided_by, updated_at";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Trigger, String)> {
     Ok((
@@ -125,6 +137,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Trigger, String)> {
             created_by: r.get(8)?,
             until: r.get(9)?,
             decided_by: r.get(10)?,
+            updated_at: r.get(11)?,
         },
         r.get(4)?,
     ))
@@ -203,6 +216,58 @@ impl Ledger {
         Ok(())
     }
 
+    /// Moves a live trigger's lapse to `until` (None: until removed).
+    pub fn renew_trigger(&self, id: &str, until: Option<i64>) -> Result<()> {
+        let n = self
+            .conn
+            .execute("UPDATE triggers SET until = ?2, updated_at = ?3 WHERE id = ?1 AND status != 'deleted'", params![id, until, now()])?;
+        if n != 1 {
+            return Err(StoreError::Refused(format!("no trigger {id}, or it is deleted")));
+        }
+        Ok(())
+    }
+
+    /// The last minute a time-told trigger recorded an event for (its `slot` field), if any: where
+    /// its next pass starts.
+    pub fn last_trigger_slot(&self, tenant: &str, trigger: &str) -> Result<Option<i64>> {
+        // Its deliveries are `<trigger>@<slot>`: a range over the delivery index ('A' follows '@').
+        Ok(self.conn.query_row(
+            "SELECT MAX(json_extract(fields, '$.slot')) FROM trigger_events
+             WHERE tenant = ?1 AND source IN ('schedule', 'timer') AND delivery_id >= ?2 || '@' AND delivery_id < ?2 || 'A'",
+            params![tenant, trigger],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Counts one more skip on a skipped firing (its `attempts`), with `detail`: the hour's one
+    /// record of a trigger over its limit.
+    pub fn count_skip(&self, id: &str, detail: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE trigger_firings SET attempts = attempts + 1, detail = ?2, updated_at = ?3 WHERE id = ?1 AND status = 'skipped'",
+            params![id, detail, now()],
+        )?;
+        Ok(())
+    }
+
+    /// The newest firing of `trigger` in `status` since `since`, if any.
+    pub fn last_firing(&self, trigger: &str, status: &str, since: i64) -> Result<Option<Firing>> {
+        Ok(self.firings_where(trigger, Some(status), &format!("AND created_at >= {since} ORDER BY created_at DESC, id DESC"), 1)?.pop())
+    }
+
+    /// Deletes triggers' settled firings, and events no firing waits on, last touched before
+    /// `before`: what [`Ledger::maintain`] keeps them to. The rows deleted.
+    pub fn prune_triggers(&self, before: i64) -> Result<usize> {
+        let f = self.conn.execute(
+            "DELETE FROM trigger_firings WHERE updated_at < ?1 AND status IN ('started', 'skipped', 'failed', 'dead')",
+            params![before],
+        )?;
+        let e = self.conn.execute(
+            "DELETE FROM trigger_events WHERE received_at < ?1 AND id NOT IN (SELECT event FROM trigger_firings)",
+            params![before],
+        )?;
+        Ok(f + e)
+    }
+
     /// A human's approval of a trigger that waited for one.
     pub fn approve_trigger(&self, id: &str, by: &str) -> Result<()> {
         let n = self.conn.execute(
@@ -246,6 +311,20 @@ impl Ledger {
             params![eid, tenant, source, kind, delivery_id, now(), fields.to_string(), raw_sha256, verified_by],
         )?;
         Ok((eid, true))
+    }
+
+    /// Whether a source already delivered `delivery_id`: what a dry run asks, so it reports only
+    /// events not yet recorded.
+    pub fn trigger_event_known(&self, tenant: &str, source: &str, delivery_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM trigger_events WHERE tenant = ?1 AND source = ?2 AND delivery_id = ?3",
+                params![tenant, source, delivery_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn trigger_event(&self, id: &str) -> Result<Option<TriggerEvent>> {
@@ -311,11 +390,20 @@ impl Ledger {
 
     /// A trigger's firings in `status`, oldest first.
     pub fn firings(&self, trigger: &str, status: Option<&str>) -> Result<Vec<Firing>> {
-        let mut st = self.conn.prepare(
-            "SELECT id, trigger, event, status, detail, run, attempts FROM trigger_firings
-             WHERE trigger = ?1 AND (?2 IS NULL OR status = ?2) ORDER BY created_at, id",
-        )?;
-        let rows = st.query_map(params![trigger, status], |r| {
+        self.firings_where(trigger, status, "ORDER BY created_at, id", -1)
+    }
+
+    /// A trigger's last `n` firings, newest first: what `wicket trigger show` lists.
+    pub fn recent_firings(&self, trigger: &str, n: i64) -> Result<Vec<Firing>> {
+        self.firings_where(trigger, None, "ORDER BY created_at DESC, id DESC", n)
+    }
+
+    fn firings_where(&self, trigger: &str, status: Option<&str>, order: &str, n: i64) -> Result<Vec<Firing>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, trigger, event, status, detail, run, attempts, created_at, updated_at FROM trigger_firings
+             WHERE trigger = ?1 AND (?2 IS NULL OR status = ?2) {order} LIMIT ?3"
+        ))?;
+        let rows = st.query_map(params![trigger, status, n], |r| {
             Ok(Firing {
                 id: r.get(0)?,
                 trigger: r.get(1)?,
@@ -324,9 +412,21 @@ impl Ledger {
                 detail: r.get(4)?,
                 run: r.get(5)?,
                 attempts: r.get(6)?,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many of a trigger's firings since `since` are in `status`: what its hourly limit counts
+    /// (started ones) and its queue holds (queued ones, `since` 0).
+    pub fn count_firings(&self, trigger: &str, status: &str, since: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM trigger_firings WHERE trigger = ?1 AND status = ?2 AND created_at >= ?3",
+            params![trigger, status, since],
+            |r| r.get(0),
+        )?)
     }
 
     /// `run`'s claim on a piece of work (`github.com/acme/app#123`). One live claim per key: a
@@ -423,6 +523,9 @@ mod tests {
             (e.clone(), false)
         );
         assert_eq!(l.trigger_event(&e).unwrap().unwrap().fields, fields);
+        assert!(l.trigger_event_known("t0", "github", "d-1").unwrap());
+        assert!(!l.trigger_event_known("t0", "github", "d-2").unwrap());
+        assert!(!l.trigger_event_known("t0", "webhook", "d-1").unwrap(), "per source");
         let (f, fresh) = l.record_firing("t-1", &e, "queued", None).unwrap();
         assert!(fresh);
         assert_eq!(l.record_firing("t-1", &e, "queued", None).unwrap(), (f.clone(), false), "once per trigger and event");
@@ -434,6 +537,37 @@ mod tests {
             ("started", Some("run_x"), 1, Some("no capacity"))
         );
         assert!(l.record_firing("t-1", "e-2", "maybe", None).is_err());
+        l.record_firing("t-1", "e-3", "queued", None).unwrap();
+        assert_eq!(l.count_firings("t-1", "started", 0).unwrap(), 1);
+        assert_eq!(l.count_firings("t-1", "queued", 0).unwrap(), 1);
+        assert_eq!(l.count_firings("t-1", "started", now() + 10).unwrap(), 0, "only since the time asked");
+        let recent = l.recent_firings("t-1", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(l.recent_firings("t-1", 10).unwrap().len(), 2);
+    }
+
+    /// A time-told trigger's last recorded minute is its own (not another's whose id it starts
+    /// with); an hour's skips count on one firing; old settled rows are pruned, waiting ones kept.
+    #[test]
+    fn slots_skips_and_pruning() {
+        let l = Ledger::open_in_memory().unwrap();
+        let ev = |d: &str, slot: i64| {
+            l.record_trigger_event("t0", "schedule", "tick", d, &serde_json::json!({ "slot": slot }), "x", "wicket").unwrap().0
+        };
+        assert_eq!(l.last_trigger_slot("t0", "t-1").unwrap(), None);
+        ev("t-1@120", 120);
+        let e = ev("t-1@60", 60);
+        ev("t-10@999", 999);
+        assert_eq!(l.last_trigger_slot("t0", "t-1").unwrap(), Some(120));
+        let (f, _) = l.record_firing("t-1", &e, "skipped", Some("over")).unwrap();
+        l.count_skip(&f, "over, 2 times").unwrap();
+        let got = l.last_firing("t-1", "skipped", 0).unwrap().unwrap();
+        assert_eq!((got.attempts, got.detail.as_deref()), (1, Some("over, 2 times")));
+        assert!(l.last_firing("t-1", "skipped", now() + 10).unwrap().is_none());
+        let (q, _) = l.record_firing("t-1", &ev("t-1@180", 180), "queued", None).unwrap();
+        assert_eq!(l.prune_triggers(now() + 10).unwrap(), 4, "the skipped firing and three events no firing waits on");
+        assert_eq!(l.firings("t-1", None).unwrap().iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), [q.as_str()]);
+        assert_eq!(l.last_trigger_slot("t0", "t-1").unwrap(), Some(180), "a waiting firing's event stays");
     }
 
     /// Work is claimed by one live run at a time, released by it (or all of a run's at its end),

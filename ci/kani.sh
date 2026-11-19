@@ -33,9 +33,10 @@ harnesses() {
 }
 
 # Each harness's (and loom's) seconds on a CI runner, as the run's "kani shard I/N times"
-# annotations print them (these from #542's run, with #540's and #541's harnesses, and #568's
-# prefix harness from its own), so they can be pasted in as they are. Only the split depends on
-# them: a stale or missing time can slow a part, never skip an item.
+# annotations print them (these from #542's run, with #540's and #541's harnesses, #568's prefix
+# harness from its own, and #565's message harness from a local run), so they can be pasted in as
+# they are. Only the split depends on them: a stale or missing time can slow a part, never skip an
+# item.
 ci_times() {
   cat <<'EOF'
 a_prefix_grant_covers_only_paths_under_it 158 s
@@ -54,6 +55,7 @@ host_covers_sound 24 s
 a_carve_out_keeps_the_run_within_its_budget 22 s
 overlap_with_a_host_is_matching_it 21 s
 a_chain_is_a_strict_ancestry 18 s
+a_message_goes_as_one_relation_wherever_decided 18 s
 accept_from_lets_in_exactly_whom_it_names 17 s
 a_principal_list_ignores_the_senders_zone 15 s
 matching_ignores_case_and_trailing_dots 14 s

@@ -29,6 +29,12 @@ Input: `{"zones": [zone…], "cases": [case…]}`. A case is one of
 - `{"kind": "take_use", "uses_left": n|null}` → `take_use` (`refused`, `uncounted`, or the uses left);
 - `{"kind": "money", "rh", "rt", "nh", "nt", "mh", "mt"}` → `money_fits` (`fits`, `hourly`, `total`);
 - `{"kind": "spawn", limits (or null), ask}` → `SpawnLimits::admits`.
+- `{"kind": "relation", "to_child", "to_parent", "accept_from", "zone", "principal", "reply"}` →
+  `message::relation` (#565): `child`, `parent`, `peer`, `reply` or `none`;
+- `{"kind": "subtree_permits", "subtree": s, "host": h}` → `splice::subtree_permits` (#573);
+- `{"kind": "covered", "permitted": [s…], "need": n}` → whether `uncovered(permitted, [n])` is empty;
+- `{"kind": "widen", "base": [s…], "wants": [[run, s]…], "max": n}` → `splice::widen`, as
+  `[hosts, dropped]` in compact JSON.
 
 Every string is read as its UTF-8 bytes (`bytesOf`): the spec is over any alphabet, and wicket's
 matchers and checks work on bytes.
@@ -237,6 +243,32 @@ def decideCase (zs : Array Zone) (c : Json) : Except String String := do
     let g : String → Except String Int := fun k => c.getObjValAs? Int k
     return toString (spawnAdmits (← oi "min_isolation") (← oi "max_mem") (← oi "max_cpus") (← oi "max_pids") (← oi "max_timeout")
       (← g "isolation") (← g "mem") (← g "cpus") (← g "pids") (← g "timeout"))
+  | "relation" =>
+    let pr ← match c.getObjVal? "principal" with
+      | .ok .null => pure none
+      | .ok v => pure (some (bytesOf (← v.getStr?)))
+      | .error _ => pure none
+    let f : Facts := { toChild := ← jBool c "to_child", toParent := ← jBool c "to_parent",
+                       acceptFrom := ← jStrs c "accept_from", senderZone := ← jStr c "zone", sender := pr,
+                       reply := ← jBool c "reply" }
+    return match relation f with
+      | none => "none"
+      | some .child => "child"
+      | some .parent => "parent"
+      | some .peer => "peer"
+      | some .reply => "reply"
+  | "subtree_permits" => return toString (subtreePermits (← jStr c "subtree") (← jStr c "host"))
+  | "covered" => return toString (coveredBy (← jStrs c "permitted") (← jStr c "need"))
+  | "widen" =>
+    let ws ← (← jArr c "wants").mapM (fun w => do
+      let a ← w.getArr?
+      let g := fun (i : Nat) => do
+        let v ← (a[i]?).elim (.error "want") pure
+        return bytesOf (← v.getStr?)
+      return (← g 0, ← g 1))
+    let (hosts, dropped) := widen (← jStrs c "base") ws (← jNat c "max")
+    let strs := fun (l : List Str) => Json.arr (l.map (fun x => Json.str (stringOf x))).toArray
+    return (Json.arr #[strs hosts, strs dropped]).compress
   | k => throw s!"unknown case kind {k}"
 
 def main (args : List String) : IO UInt32 := do

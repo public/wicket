@@ -700,10 +700,11 @@ impl OnNodes {
 /// reported less what reservations made since hold on it (`Ledger::held_on`), so two starts never
 /// count the same room. Nothing is reserved when no node may take it.
 ///
-/// With `fifo` (a wake, which may wait), the runs waiting ahead of it go first: those of a higher
-/// priority, then those of its own that waited longer (`wicket_placement::schedule::ahead`). If one
-/// of them fits a node now, nothing is reserved for this one, and `behind` names it. A named node
-/// (`--node`) doesn't wait, so it isn't queued.
+/// With `fifo` (a wake, which may wait), the runs waiting ahead of it go first, in the queue's
+/// tenant-fair order (`wicket_placement::schedule::queue_order`): first come, first served across
+/// tenants, and within a tenant its own runs fill its places by priority. If one of them fits a node
+/// now, nothing is reserved for this one, and `behind` names it (or says only "a run of another
+/// tenant"). A named node (`--node`) doesn't wait, so it isn't queued.
 ///
 /// Each node is seen with what runs on it ([`OnNodes`]), for affinity.
 pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: Option<&str>, now_ms: i64, fifo: bool) -> Result<Bound> {
