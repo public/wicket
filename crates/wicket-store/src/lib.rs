@@ -33,8 +33,13 @@ mod previous_build;
 mod props;
 mod quota;
 mod receipts;
+mod standing;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
+pub use standing::{
+    new_standing_id, standing_effect, Bound as StandingBound, Evidence as StandingEvidence, Standing, StandingTerms,
+    EVIDENCE_SECS as STANDING_EVIDENCE_SECS,
+};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
@@ -134,7 +139,9 @@ pub enum StoreError {
 /// had its rows copied into `messages`. Builds of schema 17 and 18 never read it (version 17 was the
 /// expand step that stopped them), so the floor is 17, not 19: a rollback to them stays safe, and only
 /// builds from before one inbox, which read prompts from that table, can no longer open the ledger.
-pub const SCHEMA_VERSION: u32 = 19;
+/// Version 20 (expand) adds the `standing` table: standing reach (#572), a reach rule an agent asks
+/// for once and a human approves for its principal or zone.
+pub const SCHEMA_VERSION: u32 = 20;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -530,6 +537,7 @@ impl Ledger {
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
+        conn.execute_batch(standing::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -575,6 +583,7 @@ impl Ledger {
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
+        conn.execute_batch(standing::SCHEMA)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 

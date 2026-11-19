@@ -410,6 +410,47 @@ pub(crate) fn decide(forbidden: impl FnOnce() -> bool, risk: RiskClass, reach: i
     Decision::NeedsGrant(first_match)
 }
 
+impl crate::manifest::ReachRule {
+    /// Whether this rule alone allows `op`, as it would among a zone's reach: its host, one of its
+    /// methods and one of its path globs match, and the op's risk is within it (R3 and R4 only with
+    /// `allow_dangerous`). What a standing rule (#572) decides, once the run's own zone (its forbid
+    /// rules first) has said the op needs a grant.
+    pub fn allows(&self, op: &Op) -> Result<bool, ManifestError> {
+        let globs = self.paths.iter().map(|p| compile_glob(p)).collect::<Result<Vec<_>, _>>()?;
+        let matches = self.host_matches(&op.host)
+            && self.methods.iter().any(|m| m.eq_ignore_ascii_case(&op.method))
+            && globs.iter().any(|g| g.is_match(&op.path));
+        Ok(matches!(decide(|| false, op.risk, [(matches, self.allow_dangerous)]), Decision::AllowByReach(_)))
+    }
+
+    /// Why this rule couldn't be written in a manifest, if it couldn't: an exact or `*.` host,
+    /// HTTP methods only, and paths that are absolute globs. What an agent's ask for a standing rule
+    /// (#572) is held to.
+    pub fn check(&self) -> Result<(), String> {
+        let bare = self.host.strip_prefix("*.").unwrap_or(&self.host);
+        match crate::canon::canonical_host(bare) {
+            Ok(h) if h == bare => {}
+            _ => return Err(format!("host {:?} is not a canonical host name", self.host)),
+        }
+        if self.methods.is_empty() {
+            return Err("a rule needs at least one method".into());
+        }
+        if let Some(m) = self.methods.iter().find(|m| !HTTP_METHODS.contains(&m.as_str())) {
+            return Err(format!("method {m:?} is not one of {}", HTTP_METHODS.join(", ")));
+        }
+        if self.paths.is_empty() {
+            return Err("a rule needs at least one path".into());
+        }
+        for p in &self.paths {
+            if !p.starts_with('/') {
+                return Err(format!("path {p:?} must start with /"));
+            }
+            compile_glob(p).map_err(|e| format!("path {p:?}: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(kani)]
 #[path = "proofs/decide.rs"]
 mod decide_proofs;
@@ -490,6 +531,36 @@ pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
 mod tests {
     use super::*;
     use crate::Manifest;
+
+    /// #572: a standing rule allows what the same rule would among a zone's reach, and is held to
+    /// what a manifest could say.
+    #[test]
+    fn a_rule_alone_allows_what_it_would_in_a_zone() {
+        let rule = |y: &str| -> crate::manifest::ReachRule { crate::yaml::from_str(y).unwrap() };
+        let op = |m: &str, h: &str, p: &str| Op::egress(&TenantId::single(), &RunId("run_s".into()), "z", m, h, p);
+        let logs = rule("{ host: api.github.com, methods: [GET], paths: ['/repos/*/*/actions/jobs/*/logs'] }");
+        assert!(logs.allows(&op("GET", "api.github.com", "/repos/public/wicket/actions/jobs/1/logs")).unwrap());
+        assert!(!logs.allows(&op("POST", "api.github.com", "/repos/public/wicket/actions/jobs/1/logs")).unwrap(), "method");
+        assert!(!logs.allows(&op("GET", "api.github.com", "/repos/public/wicket/actions/jobs/1/logs/x")).unwrap(), "* is one segment");
+        assert!(!logs.allows(&op("GET", "github.com", "/repos/public/wicket/actions/jobs/1/logs")).unwrap(), "host");
+        // Risk: R3 only with allow_dangerous, as in a zone.
+        let mut risky = op("GET", "api.github.com", "/repos/public/wicket/actions/jobs/1/logs");
+        risky.risk = RiskClass::R3ExternalOrIrreversible;
+        assert!(!logs.allows(&risky).unwrap());
+        let dangerous = crate::manifest::ReachRule { allow_dangerous: true, ..logs.clone() };
+        assert!(dangerous.allows(&risky).unwrap());
+        // Defaults as a manifest's: GET and HEAD, every path.
+        let wide = rule("{ host: '*.example.com' }");
+        assert!(wide.allows(&op("HEAD", "a.example.com", "/x/y")).unwrap() && !wide.allows(&op("GET", "example.com", "/")).unwrap());
+        assert_eq!(wide.check(), Ok(()));
+        assert_eq!(logs.check(), Ok(()));
+        let bad = |r: crate::manifest::ReachRule| r.check().unwrap_err();
+        assert!(bad(crate::manifest::ReachRule { host: "API.github.com".into(), ..logs.clone() }).contains("canonical"));
+        assert!(bad(crate::manifest::ReachRule { methods: vec!["SPAWN".into()], ..logs.clone() }).contains("SPAWN"));
+        assert!(bad(crate::manifest::ReachRule { methods: vec![], ..logs.clone() }).contains("method"));
+        assert!(bad(crate::manifest::ReachRule { paths: vec!["repos/**".into()], ..logs.clone() }).contains("start with /"));
+        assert!(bad(crate::manifest::ReachRule { paths: vec![], ..logs }).contains("path"));
+    }
 
     /// #325: `is_wicket_host` and `is_reserved_method` compare bytes now (for Kani); they decide
     /// as the lowercasing forms did.
