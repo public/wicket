@@ -24,6 +24,8 @@ pub mod vault;
 #[cfg(test)]
 extern crate self as wicket_proxy;
 #[cfg(test)]
+mod route_parity;
+#[cfg(test)]
 #[path = "../tests/support/zone_decider.rs"]
 pub(crate) mod zone_decider;
 
