@@ -27,7 +27,9 @@ mod lifecycle_props;
 mod links;
 mod nodeca;
 mod nodelabels;
+mod placements;
 pub use nodeca::{CaHosts, CaWant};
+pub use placements::{Placement, RESERVE_SECS, WAIT_SEEN_MS};
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -159,7 +161,11 @@ pub enum StoreError {
 /// Version 23 (expand, after #587's 22) adds the `standing` table: standing reach (#572), a reach
 /// rule an agent asks for once and a human approves for its principal or zone. Older builds don't
 /// read it, so the floor stays 17.
-/// Version 26 (expand, after the services' 24 and 25) adds triggers (#578): `triggers`,
+/// Version 24 (expand, after #576's 23) adds `placements`, `placement_waits` and
+/// `placement_decisions` (#579 step 2): the node room reserved for boxes being started, the runs
+/// waiting for a node, and why each run went where it did.
+///
+/// Version 26 (expand; 25 is the services', #578 step 3) adds triggers (#578): `triggers`,
 /// `trigger_events`, `trigger_firings` and `work_claims`. Older builds don't read them; the floor
 /// stays 17.
 pub const SCHEMA_VERSION: u32 = 26;
@@ -561,6 +567,7 @@ impl Ledger {
         conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
+        conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(triggers::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
@@ -611,6 +618,7 @@ impl Ledger {
         conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
+        conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(triggers::SCHEMA)?;
         scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
@@ -639,6 +647,9 @@ impl Ledger {
         self.conn.execute("UPDATE grants SET revoked = 1 WHERE run = ?1 AND revoked = 0", params![run.0])?;
         // And what it wanted of its node's CA (#573), on every way a run ends.
         self.drop_node_ca_wants(&run.0)?;
+        // And the room it reserved on a node (#579).
+        self.placement_released(&run.0)?;
+        self.stop_waiting(&run.0)?;
         self.close_links_of(&run.0)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
