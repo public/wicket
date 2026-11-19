@@ -49,6 +49,8 @@ pub fn expose(ctx: &RunCtx, port: u16, name: Option<&str>) -> Reply {
     if let Err(e) = l.expose(&ctx.tenant, &ctx.run.0, port, name.as_deref(), &zone) {
         return (e.to_string(), true);
     }
+    // The box's own now, whatever exposed it before: no name's move takes it away (#668).
+    let _ = l.drop_name_exposure(&ctx.run, port);
     // On the record before it takes effect (fail closed).
     if let Err(e) = l.audit(&ctx.tenant, Some(&ctx.run), "link.expose", &serde_json::json!({ "port": port, "name": name })) {
         let _ = l.unexpose(&ctx.run.0, port);
@@ -1098,6 +1100,49 @@ mod tests {
         let l = w.ledger.lock().unwrap();
         assert!(l.internal_name(&TenantId::single(), "build", "four").unwrap().is_none());
         assert!(l.exposed("run_api", 3004).unwrap().is_none());
+    }
+
+    /// #668 review, F1 and F2: two names on one port keep it offered while either is there, in
+    /// whichever order they move away; and a port the box exposed itself stays exposed when a name
+    /// on it moves.
+    #[tokio::test]
+    async fn a_port_stays_offered_while_a_name_or_the_box_offers_it() {
+        let w = World::new();
+        let api = w.boxed(w.zone("build", &["web"]), "api", "run_api", None, &[]);
+        let web = w.boxed(w.zone("web", &[]), "web", "run_web", None, &[]);
+        let req = |name: &str, port: u16| {
+            let (text, err) = crate::names::request_name(&api, &serde_json::json!({ "name": name, "port": port }));
+            assert!(!err, "{name}@{port}: {text}");
+        };
+        let offered = |port: u16| w.ledger.lock().unwrap().exposed("run_api", port).unwrap().is_some();
+        for (first, second) in [("one", "two"), ("two", "one")] {
+            req("one", 3000);
+            req("two", 3000);
+            // The first moves away: the second still names 3000, so it stays offered.
+            req(first, 3005);
+            assert!(offered(3000), "after moving {first}");
+            let (text, err) = connect_name(&web, &format!("{second}.build"), None).await;
+            assert!(!err, "{text}");
+            assert!(!unlink(&web, &link_id(&text)).1);
+            wait_closed(&w, &link_id(&text)).await;
+            // The second moves too: nothing names 3000, which a name exposed, so it goes.
+            req(second, 3006);
+            assert!(!offered(3000), "after moving {second}");
+            // Back for the next round.
+            req("one", 3000);
+            req("two", 3000);
+            assert!(offered(3000));
+        }
+        // F2: the box exposes 4000 itself, under the same label; a name on it moves away.
+        assert!(!expose(&api, 4000, Some("one")).1);
+        req("one", 4000);
+        req("one", 4001);
+        assert!(offered(4000), "the box's own exposure stays");
+        // And a port a name exposed that the box then exposes itself is the box's.
+        req("two", 4002);
+        assert!(!expose(&api, 4002, Some("mine")).1);
+        req("two", 4003);
+        assert!(offered(4002));
     }
 
     #[tokio::test]

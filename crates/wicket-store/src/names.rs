@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS host_ports (
 );
 DROP INDEX IF EXISTS host_ports_name;
 CREATE UNIQUE INDEX IF NOT EXISTS host_ports_held ON host_ports (name, node, proto) WHERE name IS NOT NULL;
+CREATE TABLE IF NOT EXISTS name_exposures (
+  run TEXT NOT NULL, port INTEGER NOT NULL, PRIMARY KEY (run, port)
+);
 CREATE TABLE IF NOT EXISTS name_records (
   zone TEXT NOT NULL, name TEXT NOT NULL, rtype TEXT NOT NULL, value TEXT NOT NULL, ttl INTEGER NOT NULL,
   provider TEXT NOT NULL, created_at INTEGER NOT NULL,
@@ -509,6 +512,8 @@ impl Ledger {
         let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
         let c = &self.conn;
         let t = now();
+        // The ports its names exposed are its no more.
+        c.execute("DELETE FROM name_exposures WHERE run = ?1", params![run.0])?;
         // Its run-scoped asks nobody decided go with it, as its requests do.
         c.execute(
             "UPDATE names SET status = 'withdrawn', decided_at = ?2, decided_by = 'wicket:run-ended' WHERE asked_run = ?1 AND status = 'pending' AND scope = 'run'",
@@ -530,15 +535,11 @@ impl Ledger {
     pub fn sweep_stale_names(&self) -> Result<usize> {
         // One write lock from the read on (#668 review): another process's sweep, or a run taking
         // a standing name, can't slip in between what this one reads and what it writes.
-        let own = self.conn.is_autocommit();
-        if own {
-            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        if self.conn.is_autocommit() {
+            self.immediate(|l| l.sweep_in())
+        } else {
+            self.sweep_in()
         }
-        let r = self.sweep_in();
-        if own {
-            let _ = self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
-        }
-        r
     }
 
     fn sweep_in(&self) -> Result<usize> {
@@ -640,6 +641,37 @@ impl Ledger {
             }
         }
         Ok(ended)
+    }
+
+    /// Records that a name of `run` exposed `port` (the box hadn't): what `request_name` may take
+    /// away again, unlike an exposure the box made itself (#668 review, F2).
+    pub fn mark_name_exposure(&self, run: &RunId, port: u16) -> Result<()> {
+        self.conn.execute("INSERT OR IGNORE INTO name_exposures (run, port) VALUES (?1, ?2)", params![run.0, port])?;
+        Ok(())
+    }
+
+    /// Whether `run`'s exposure of `port` was made by one of its names.
+    pub fn is_name_exposure(&self, run: &RunId, port: u16) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM name_exposures WHERE run = ?1 AND port = ?2", params![run.0, port], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    pub fn drop_name_exposure(&self, run: &RunId, port: u16) -> Result<()> {
+        self.conn.execute("DELETE FROM name_exposures WHERE run = ?1 AND port = ?2", params![run.0, port])?;
+        Ok(())
+    }
+
+    /// How many live names `run` holds on `port`.
+    pub fn names_on_port(&self, run: &RunId, port: u16) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM names WHERE holder = ?1 AND port = ?2 AND status = 'live'",
+            params![run.0, port],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// The host port name `name` is published on at `node` (`proto`: `tcp`), allocating one from

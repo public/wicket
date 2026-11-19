@@ -73,12 +73,14 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
     };
     // This run's name already, if it asks again (to change the port).
     let before = l.internal_name(&ctx.tenant, &zone, label).map_err(|e| e.to_string())?.filter(|n| n.holder.as_deref() == Some(&ctx.run.0));
-    // What the box itself exposed on this port, if anything: an undo puts it back (#668).
-    let exposed_before = l.exposed(&ctx.run.0, port).map_err(|e| e.to_string())?;
+    // Whether the port is exposed already, by the box itself or by another of this run's names: then
+    // it stays as it is (#668 review, F1 and F2). Only an exposure a name made is the names' to take
+    // away (`name_exposures`).
+    let exposed_before = l.exposed(&ctx.run.0, port).map_err(|e| e.to_string())?.is_some();
     let n = l.register_internal(&ask, INTERNAL_PER_WORKLOAD, 0).map_err(|e| e.to_string())?;
     let fqdn = format!("{label}.{zone}.{}", policy::DOMAIN);
-    // On a failure below: a new name goes; a name asked again keeps its old port; and the port's
-    // exposure is as it was before this call, the box's own included.
+    // On a failure below: a new name goes, a name asked again keeps its old port, and an exposure
+    // this call made goes.
     let undo = |l: &wicket_store::Ledger| {
         match &before {
             None => {
@@ -88,21 +90,15 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
                 let _ = l.register_internal(&NameAsk { port: old.port, ..ask.clone() }, INTERNAL_PER_WORKLOAD, 0);
             }
         }
-        match &exposed_before {
-            Some(e) => {
-                let _ = l.expose(&ctx.tenant, &ctx.run.0, port, e.name.as_deref(), &e.zone);
-            }
-            None => {
-                let _ = l.unexpose(&ctx.run.0, port);
-            }
+        if !exposed_before {
+            let _ = l.unexpose(&ctx.run.0, port);
+            let _ = l.drop_name_exposure(&ctx.run, port);
         }
     };
-    // Exposed under the name, so connect finds the port offered. A port the box exposed itself
-    // (under no name, or another) keeps that exposure: connect needs only the port offered, and the
-    // box's own name for it stays its own (#668 review).
-    let own = exposed_before.as_ref().is_some_and(|e| e.name.as_deref() != Some(label));
-    if !own {
-        if let Err(e) = l.expose(&ctx.tenant, &ctx.run.0, port, Some(label), &zone_json) {
+    // Exposed under the name if nothing exposed the port, so connect finds it offered.
+    if !exposed_before {
+        let made = l.expose(&ctx.tenant, &ctx.run.0, port, Some(label), &zone_json).and_then(|_| l.mark_name_exposure(&ctx.run, port));
+        if let Err(e) = made {
             undo(&l);
             return Err(e.to_string());
         }
@@ -114,11 +110,13 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
         undo(&l);
         return Err(format!("the audit record could not be written ({e})"));
     }
-    // The port it named before is no longer offered under the name (left alone if the box has
-    // exposed it under another name since).
+    // A move: the port it named before stops being offered, if a name exposed it and no other live
+    // name of this run still names it. The box's own exposure stays.
     if let Some(old) = before.as_ref().filter(|b| b.port != port) {
-        if l.exposed(&ctx.run.0, old.port).ok().flatten().is_some_and(|e| e.name.as_deref() == Some(label)) {
+        let others = l.names_on_port(&ctx.run, old.port).unwrap_or(1);
+        if others == 0 && l.is_name_exposure(&ctx.run, old.port).unwrap_or(false) {
             let _ = l.unexpose(&ctx.run.0, old.port);
+            let _ = l.drop_name_exposure(&ctx.run, old.port);
         }
     }
     drop(l);

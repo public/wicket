@@ -185,7 +185,10 @@ pub enum StoreError {
 /// Version 28 (expand, after #582 step 2's 27) adds `names`, `host_ports` and `name_records`
 /// (#575): the names boxes hold, the host ports public names are published on, and the DNS records
 /// this installation created. Older builds don't read them; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 28;
+/// Version 31 (expand, #668; 29 and 30 are others') adds `name_exposures`: the ports a run's names
+/// exposed, which `request_name` may take away again, unlike an exposure the box made itself.
+/// Older builds don't read it; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 31;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is

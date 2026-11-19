@@ -114,7 +114,10 @@ pub fn zone_part(zone: &str) -> Result<String, LabelError> {
     }
     // A zone named like wicket's own domain would make `<label>.<zone>.wicket.internal` read as a
     // name of another zone once a lookup strips the suffix (#668 review).
-    if zone == INTERNAL_DOMAIN || zone.ends_with(&format!(".{INTERNAL_DOMAIN}")) {
+    // Compared in any case and without a trailing dot, so the refusal doesn't rest on the shape
+    // check below.
+    let folded = zone.trim_end_matches('.').to_ascii_lowercase();
+    if folded == INTERNAL_DOMAIN || folded.ends_with(&format!(".{INTERNAL_DOMAIN}")) {
         return Err(LabelError::Reserved(INTERNAL_DOMAIN.to_string()));
     }
     for part in zone.split('.') {
@@ -197,6 +200,10 @@ mod tests {
         assert!(zone_part("wicket.internal").is_err());
         assert!(zone_part("build.wicket.internal").is_err());
         assert!(zone_part("wicket.internals").is_ok());
+        // In any case, or with a trailing dot, refused as wicket's domain, not only by its shape.
+        for z in ["Build.Wicket.Internal", "build.wicket.internal.", "build.WICKET.INTERNAL", "BUILD.wicket.internal", "wicket.internal."] {
+            assert_eq!(zone_part(z), Err(LabelError::Reserved(INTERNAL_DOMAIN.into())), "{z}");
+        }
     }
 
     #[test]
