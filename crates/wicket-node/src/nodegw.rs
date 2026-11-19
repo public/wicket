@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wicket_proxy::decide::Asked;
+use wicket_proxy::egress::Router;
 
 /// A tool call that needs a human, made while the run's control host was unreachable.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -875,6 +876,23 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
         }
         wicket_core::HostVerdict::Hidden => return (format!("not requested: {host} is not a host name this box can see."), false),
         wicket_core::HostVerdict::Open => {}
+    }
+    // An https host this node can't terminate (outside its CA, #257) is passed through uncovered only
+    // where the box's zone allows it wholesale, and refused otherwise, whatever is granted: so
+    // nothing is asked for that no approval could make usable. Plain http needs no CA.
+    if url.starts_with("https://") {
+        if let wicket_proxy::decide::Route::Uncovered(why) = super::NodeRouter::of(node).route(&host) {
+            let spliced = node.replica.lock().expect("replica").splice(&tenant, run, &host, (node.clock)()).is_some();
+            if !spliced {
+                return (
+                    format!(
+                        "not requested: {host} isn't served by this box's node, {} ({why}), and only a host this box's zone allows wholesale is passed through without it. No approval can change that, so nothing was asked for: tell the user. An operator can have the node's CA cover it (wicket node renew-ca {} --hosts {host}).",
+                        node.name, node.name
+                    ),
+                    false,
+                );
+            }
+        }
     }
     // A push's discovery is asked for as the push it is part of (#26).
     let op = wicket_core::git::op_for(&tenant, &wicket_core::RunId(run.into()), &zone, &method, &host, &path, query);
