@@ -9,7 +9,7 @@
 
 use crate::{Ledger, Result};
 use rusqlite::params;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS node_ca_policy (
@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS node_ca_wants (
 "#;
 
 /// How the control host may widen a node's CA at runtime.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", content = "allowed", rename_all = "snake_case")]
 pub enum CaHosts {
     /// Never: the CA keeps the hosts it was enrolled or renewed with (`wicket node renew-ca`).
