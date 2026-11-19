@@ -1,8 +1,9 @@
 # What the gVisor jobs in ci.yml (the smoke test and acceptance, #460) each need before their
-# suites: Rust's cache, gVisor as a Docker runtime, the debug `wicket`, the static HTTP/3 client and
-# the agent image. After actions/checkout.
-name: gVisor, wicket and the agent image
-description: Install gVisor as a Docker runtime; build wicket, the HTTP/3 client and the agent image.
+# suites: Rust's cache, gVisor as a Docker runtime, the debug `wicket` and the static HTTP/3 client.
+# After actions/checkout. The agent image is each job's own next step (`wicket image`), so its time
+# shows on its own (#219): the jobs API reports this composite action as one step.
+name: gVisor and wicket
+description: Install gVisor as a Docker runtime; build wicket and the HTTP/3 client.
 inputs:
   save-cache:
     description: Whether this job saves Rust's cache (one of the jobs sharing it does).
@@ -75,6 +76,3 @@ runs:
           cp "$out" "$kept/h3get"
           echo "$stamp" >"$kept/stamp"
         fi
-    - name: Build the agent image
-      shell: bash
-      run: target/debug/wicket image

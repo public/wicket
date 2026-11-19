@@ -217,3 +217,30 @@ Incremental builds after a one-line change are already short (5–10 s) and are 
 - **CI:** it already caches with Swatinem/rust-cache (pinned by commit) and runs nextest. Not
   measured this round: a CI run before and after, and `cargo test --workspace` (the box-only
   failures above still make it red here).
+
+## Fourth round: proc-macros and build tools back at opt-level 0
+
+Measured in a wicket box (5 CPUs, 8 GiB, nothing else building) on origin/main b4a9ec18, at `-j2`,
+incremental builds, no sccache; one clean build per variant, each in its own empty target dir,
+with `--timings` (`units.py`). Compare these rows with each other only.
+
+#524 put every dependency at opt-level 1 (`[profile.dev.package."*"]`), for the tests' sake. Cargo
+ranks `package."*"` above `build-override`, so that optimized every proc-macro and build tool too:
+lalrpop went from 5 s (round three) to 21 s, and syn, serde_derive, darling, educe, clap_derive and
+the rest each about doubled. Their code only generates code; the tests never run it.
+
+| `cargo build --workspace --all-targets`, clean | wall | unit time | units |
+|---|---:|---:|---:|
+| before (b4a9ec18) | 375 s | 747 s | 504 |
+| proc-macros and build tools at 0 (37 crates, `Cargo.toml`) | **323 s** | 642 s | 504 |
+
+wicket's own units are unchanged within 2 s (macro expansion is barely slower unoptimized), and
+cedar-policy-core's build script takes 2 s longer (lalrpop's parser generation). Peak memory 2.0 GiB
+both times. A rebuild after a one-line change is unaffected (wicket-core 33-36 s, wicket-cli 6 s at
+`-j2`): nothing listed is rebuilt by it. The `wicket` binary (135 MB) links in 1.16 s with LLD.
+
+The list is `[profile.dev.package]`'s `<name> = { opt-level = 0 }` entries. ci/determinator's
+`host_only_crates_are_at_opt_level_0` keeps it to every proc-macro the workspace depends on, to
+names some package has (cargo warns about others), and to crates built only for the host. That's
+why `quote` and `proc-macro2` aren't on it: the vendored biscuit-parser depends on both, so they're
+built for the target too.
