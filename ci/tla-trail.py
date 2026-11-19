@@ -17,6 +17,9 @@ identities or tasks), and the TLA+ trail of the actions they are:
 - `self.switched` of the control host: `SelfUpdate`;
 - `daemon.started` (wicketd's start, audited since #544's follow-up): `DrainDone` after a
   `daemon.sighup` (`wicket self update`'s), else `DaemonStart` (a restart);
+- a `daemon.started` just before a `daemon.sighup` (within 5 s): the same drain, recorded out of
+  order by a build that audited the SIGHUP after sending it (before #548's review). Paired as
+  `DrainDone`, with a warning; mapped as written it would be a restart and a hung drain;
 - a `daemon.sighup` with no `daemon.started` after it: a `Tick` for each --drain-bound seconds
   (default 10) until the next record or the export's end, at most two (Update.tla's `DrainMax` is
   one), and a warning: the daemon may not have taken commands since (#487).
@@ -89,7 +92,10 @@ def main():
             steps.extend(none_step("Tick") for _ in range(n))
 
         audited = any(r["kind"].startswith("daemon.") for r in u)
+        paired = set()
         for k, r in enumerate(u):
+            if k in paired:
+                continue
             if r["kind"] == "self.switched":
                 print(f"\\*   +{r['t'] - when}s self.switched {r['body'].get('from')} -> {r['body'].get('to')}")
                 steps.append(none_step("SelfUpdate"))
@@ -98,6 +104,14 @@ def main():
                 print(f"\\*   +{r['t'] - when}s daemon.sighup")
                 sighup = r
                 continue
+            if r["kind"] == "daemon.started" and sighup is None:
+                nxt = next((j for j in range(k + 1, len(u)) if u[j]["kind"] == "daemon.sighup"), None)
+                if nxt is not None and u[nxt]["t"] - r["t"] <= 5:
+                    print(f"\\*   +{r['t'] - when}s daemon.started, then +{u[nxt]['t'] - when}s daemon.sighup: "
+                          "WARNING: out of order (audited after the signal by an older build): paired as the drain's end")
+                    steps.append(none_step("DrainDone"))
+                    paired.add(nxt)
+                    continue
             if r["kind"] == "daemon.started":
                 after = sighup is not None
                 print(f"\\*   +{r['t'] - when}s daemon.started" + (f", {r['t'] - sighup['t']}s after the SIGHUP" if after else ""))

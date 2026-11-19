@@ -86,4 +86,18 @@ TrailSelfUpdate == << [action |-> "SelfUpdate", run |-> "none", box |-> "none"],
                       [action |-> "Reattach", run |-> "r2", box |-> "running"],
                       [action |-> "DrainDone", run |-> "none", box |-> "none"] >>
 
+
+\* The same self update, its records out of order (`daemon.started` audited before the
+\* `daemon.sighup` that caused it, by a build that audited the SIGHUP after sending it) and mapped as
+\* written: a restart, then a drain with no end. A behaviour of neither the merged design nor
+\* #487's fail variant, since a self update's daemon drains and never restarts: so
+\* `ci/tla-trail.py` pairs the two records as the drain's end (TrailSelfUpdate), and since #548's
+\* review the SIGHUP is audited before it is sent.
+TrailMisordered == << [action |-> "SelfUpdate", run |-> "none", box |-> "none"],
+                      [action |-> "Reattach", run |-> "r1", box |-> "running"],
+                      [action |-> "Reattach", run |-> "r2", box |-> "running"],
+                      [action |-> "DaemonStart", run |-> "none", box |-> "none"],
+                      [action |-> "Tick", run |-> "none", box |-> "none"],
+                      [action |-> "Tick", run |-> "none", box |-> "none"] >>
+
 =============================================================================

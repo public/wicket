@@ -416,6 +416,14 @@ what the tool prints for a self update with these records:
 | `trail_self_update_merged_matched` | a self update whose drain returns: switch, re-attaches, `daemon.started` | the design as merged | matched |
 | `trail_hung_drain_merged_unmatched` | #487: switch, re-attaches, `daemon.sighup`, and two drain bounds with no `daemon.started` | the design as merged | unmatched |
 | `trail_hung_drain_drain_hangs_matched` | the same | `fail_update_drain_hangs`'s (`DrainReturns = FALSE`) | matched |
+| `trail_misordered_merged_unmatched` | a self update's `daemon.started` before its `daemon.sighup`, mapped as written (a restart, then ticks) | the design as merged | unmatched |
+| `trail_misordered_drain_hangs_unmatched` | the same | `fail_update_drain_hangs`'s | unmatched |
+
+The last two show why the order matters. A build that audited the SIGHUP after sending it could
+record wicketd's `daemon.started` first, and read as written that trail matches neither switch set.
+Since #548's review, `wicket self update` and `rollback` audit `daemon.sighup` before the signal,
+once the pidfile names a live wicketd. For older exports, `ci/tla-trail.py` pairs a
+`daemon.started` followed within 5 s by its `daemon.sighup` as the drain's end, with a warning.
 
 To check a new update: export the audit records around it, run
 `python3 -I ci/tla-trail.py <export>`, and paste its `TrailHHMM` into `UpdateTrace.tla`. Then
