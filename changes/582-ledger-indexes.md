@@ -13,4 +13,4 @@ type: Changed
 - Each `wicket reconcile` pass now does the ledger's upkeep. It moves the settled requests and dead
   grants of runs ended over 7 days ago to `requests_archive` and `grants_archive` (2,000 at a time;
   still read for those runs), and drops spent cancel asks. It also runs `PRAGMA optimize` and a passive
-  WAL checkpoint. Ledger schema 22 (an expand step, after 21).
+  WAL checkpoint. Ledger schema 21 (an expand step, after 20).

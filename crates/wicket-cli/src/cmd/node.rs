@@ -68,6 +68,20 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 enrol::renew_ca(&name, hosts, wicket_core::time::parse_duration(&ca_ttl)?, wicket_core::time::parse_duration(&cert_ttl)?)
                     .await
             }
+            NodeCmd::Set { name, ca_hosts } => {
+                let policy = wicket_store::CaHosts::parse(&ca_hosts).map_err(anyhow::Error::msg)?;
+                let l = Ledger::open(&ledger_path())?;
+                l.set_node_ca_policy_audited(&name, &policy, &operator())?;
+                println!(
+                    "node {name}: its CA is widened at runtime {}",
+                    match &policy {
+                        wicket_store::CaHosts::Fixed => "never (its hosts change only with wicket node renew-ca)".to_string(),
+                        wicket_store::CaHosts::Auto => "to every inspected host its boxes need".to_string(),
+                        wicket_store::CaHosts::Allowed(h) => format!("to the hosts its boxes need that match {}", h.join(", ")),
+                    }
+                );
+                Ok(())
+            }
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
@@ -209,6 +223,16 @@ pub enum NodeCmd {
     Attach {
         #[arg(long)]
         dir: Option<PathBuf>,
+    },
+    /// Set how an enrolled node's CA may be widened at runtime (#573): `fixed` (never: its hosts
+    /// change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need),
+    /// or a list of hosts it may be widened to (`api.example.com,*.example.org`). The widening is
+    /// a renewal over the run's channel, audited as `node.ca_widened`.
+    Set {
+        name: String,
+        /// fixed, auto, or a comma-separated list of hosts.
+        #[arg(long)]
+        ca_hosts: String,
     },
     /// Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity
     /// certificate for its node key, over its pinned ssh: also how a node whose identity certificate

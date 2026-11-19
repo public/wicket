@@ -39,6 +39,7 @@ CREATE INDEX IF NOT EXISTS runs_ended ON runs (ended_at) WHERE ended_at IS NOT N
 CREATE INDEX IF NOT EXISTS turn_cancels_run ON turn_cancels (run, consumed_at);
 CREATE INDEX IF NOT EXISTS mode_changes_run ON mode_changes (run, consumed_at);
 CREATE INDEX IF NOT EXISTS audit_kind ON audit (kind, seq);
+CREATE INDEX IF NOT EXISTS node_ca_wants_run ON node_ca_wants (run);
 CREATE TABLE IF NOT EXISTS grants_archive AS SELECT * FROM grants WHERE 0;
 CREATE TABLE IF NOT EXISTS requests_archive AS SELECT * FROM requests WHERE 0;
 CREATE INDEX IF NOT EXISTS grants_archive_id ON grants_archive (id);
@@ -214,6 +215,7 @@ pub(crate) mod tests {
         "mode_changes",
         "identities",
         "identity_history",
+        "node_ca_wants",
         "grants_archive",
         "requests_archive",
     ];

@@ -86,6 +86,7 @@ reference](manifest.md)).
   - [`wicket node serve`](#wicket-node-serve)
   - [`wicket node top`](#wicket-node-top)
   - [`wicket node forget`](#wicket-node-forget)
+  - [`wicket node set`](#wicket-node-set)
   - [`wicket node renew-ca`](#wicket-node-renew-ca)
 - [`wicket dev`](#wicket-dev)
   - [`wicket dev node-feed-probe`](#wicket-dev-node-feed-probe)
@@ -1147,6 +1148,7 @@ Commands:
   serve     On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
   top       On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
   forget    Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
+  set       Set how an enrolled node's CA may be widened at runtime (#573): `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need), or a list of hosts it may be widened to (`api.example.com,*.example.org`). The widening is a renewal over the run's channel, audited as `node.ca_widened`
   renew-ca  Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
   help      Print this message or the help of the given subcommand(s)
 
@@ -1363,6 +1365,21 @@ Arguments:
 Options:
       --force  Delete them even though the run's work was never collected
   -h, --help   Print help
+```
+
+### `wicket node set`
+
+```text
+Set how an enrolled node's CA may be widened at runtime (#573): `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need), or a list of hosts it may be widened to (`api.example.com,*.example.org`). The widening is a renewal over the run's channel, audited as `node.ca_widened`
+
+Usage: wicket node set --ca-hosts <CA_HOSTS> <NAME>
+
+Arguments:
+  <NAME>  
+
+Options:
+      --ca-hosts <CA_HOSTS>  fixed, auto, or a comma-separated list of hosts
+  -h, --help                 Print help
 ```
 
 ### `wicket node renew-ca`

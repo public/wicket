@@ -25,6 +25,8 @@ pub mod cas;
 #[cfg(test)]
 mod lifecycle_props;
 mod links;
+mod nodeca;
+pub use nodeca::{CaHosts, CaWant};
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -136,12 +138,15 @@ pub enum StoreError {
 /// had its rows copied into `messages`. Builds of schema 17 and 18 never read it (version 17 was the
 /// expand step that stopped them), so the floor is 17, not 19: a rollback to them stays safe, and only
 /// builds from before one inbox, which read prompts from that table, can no longer open the ledger.
-/// Version 22 (expand, after #576's 20 and #581's 21) is #582's first step: indexes on what every
-/// run's supervisor and node feed status look up, `node_audit_heads` (each node's last shipped record,
-/// kept by a trigger on `audit`, which an older build fires too), and `grants_archive` and
-/// `requests_archive` for the settled rows of runs long ended. Older builds don't read the new tables
-/// (one reading an archived run's grants sees none), so the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 22;
+/// Version 20 (expand) adds `node_ca_policy` and `node_ca_wants` (#573): how a
+/// node's CA may be widened at runtime, and the hosts its boxes want of it. Older builds don't read
+/// them, so the floor stays 17.
+/// Version 21 (expand, after #581's 20) is #582's first step: indexes on what every run's supervisor
+/// and node feed status look up, `node_audit_heads` (each node's last shipped record, kept by a
+/// trigger on `audit`, which an older build fires too), and `grants_archive` and `requests_archive`
+/// for the settled rows of runs long ended. Older builds don't read the new tables (one reading an
+/// archived run's grants sees none), so the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 21;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -537,6 +542,7 @@ impl Ledger {
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
+        conn.execute_batch(nodeca::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -583,6 +589,7 @@ impl Ledger {
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
+        conn.execute_batch(nodeca::SCHEMA)?;
         scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
@@ -608,6 +615,8 @@ impl Ledger {
         )?;
         // So are the grants bound to it: nothing else may use them (#127).
         self.conn.execute("UPDATE grants SET revoked = 1 WHERE run = ?1 AND revoked = 0", params![run.0])?;
+        // And what it wanted of its node's CA (#573), on every way a run ends.
+        self.drop_node_ca_wants(&run.0)?;
         self.close_links_of(&run.0)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
@@ -1948,6 +1957,8 @@ impl Ledger {
                 node.enrolled_at
             ],
         )?;
+        // A machine enrolled under a name starts with no CA policy or wants (#573).
+        nodeca::forget_node_ca(&tx, &node.name)?;
         insert_node_ca(&tx, ca)?;
         tx.commit()?;
         Ok(())
@@ -2020,7 +2031,8 @@ impl Ledger {
         }
         tx.execute("UPDATE node_cas SET status = 'superseded' WHERE node = ?1 AND status = 'active'", params![ca.node])?;
         insert_node_ca(&tx, ca)?;
-        tx.execute("UPDATE nodes SET hosts = ?2 WHERE name = ?1", params![ca.node, serde_json::Value::from(ca.hosts.clone()).to_string()])?;
+        // `nodes.hosts` stays what the operator set (enrolment, renew-ca): a CA widened at runtime
+        // (#573) adds its boxes' wants to it, which a later renewal prunes.
         tx.commit()?;
         Ok(serials)
     }
@@ -2046,6 +2058,7 @@ impl Ledger {
             tx.execute("UPDATE node_cas SET status = 'revoked', revoked_at = ?2 WHERE serial = ?1", params![s, t])?;
         }
         tx.execute("UPDATE node_certs SET status = 'revoked', revoked_at = ?2 WHERE node = ?1 AND status != 'revoked'", params![name, t])?;
+        nodeca::forget_node_ca(&tx, name)?;
         tx.commit()?;
         Ok(serials)
     }
@@ -2180,6 +2193,29 @@ mod node_tests {
         assert!(l.enrol_node(&t2, &node("n1"), &ca("n1", "02")).is_err(), "n1 is enrolled already");
         assert!(l.enrol_node(&t, &node("n1"), &ca("n1", "03")).is_err(), "second use");
         assert!(matches!(l.check_node_token("wkt_nope", now()), Err(StoreError::Token("unknown"))));
+    }
+
+    /// #573's review, 4 and 7: a node's CA policy is set and audited together, with who set it;
+    /// revoking a node, or enrolling a machine under its name again, starts with no policy and no
+    /// wants (not another machine's `auto`).
+    #[test]
+    fn a_nodes_ca_policy_goes_with_it_and_is_audited_with_its_setter() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        assert!(l.set_node_ca_policy_audited("n1", &CaHosts::Auto, "alex").is_err(), "not enrolled");
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0a")).unwrap();
+        l.set_node_ca_policy_audited("n1", &CaHosts::Auto, "alex").unwrap();
+        let a = l.audit_tail(1).unwrap();
+        assert!(a[0].2 == "node.ca_policy" && a[0].4.contains("\"by\":\"alex\""), "{a:?}");
+        l.run_started(&TenantId::single(), &RunId("run_a".into()), "z", "a").unwrap();
+        l.want_node_ca_hosts("n1", &["x.example.com".into()], "run_a", "reach", 1).unwrap();
+        l.revoke_node("n1").unwrap();
+        assert_eq!(l.node_ca_policy("n1").unwrap(), CaHosts::Fixed);
+        assert!(l.node_ca_wants("n1").unwrap().is_empty());
+        l.set_node_ca_policy("n1", &CaHosts::Auto).unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0b")).unwrap();
+        assert_eq!(l.node_ca_policy("n1").unwrap(), CaHosts::Fixed, "a new machine under the name");
     }
 
     #[test]
