@@ -3699,6 +3699,7 @@ dependencies = [
  "time",
  "tokio",
  "ulid",
+ "wicket-core",
 ]
 
 [[package]]

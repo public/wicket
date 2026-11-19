@@ -131,7 +131,8 @@ fn wicket_core_is_nearly_everything_but_not_everything() {
     assert!(!s.everything);
     assert_eq!(s.roots, set(&["wicket-core"]));
     assert_eq!(s.filter(), "rdeps(=wicket-core)");
-    for c in ["wicket-identity", "wicket-fwd", "wicket-placement"] {
+    // Not wicket-placement any more: it reads a manifest's placement (#579).
+    for c in ["wicket-identity", "wicket-fwd"] {
         assert!(!s.affected.contains(c), "{c}");
     }
     assert!(s.affected.len() >= 10);
