@@ -1253,6 +1253,8 @@ async function refreshOnce() {
     renderSecrets(s);
     renderRows("decided", s.decided, x => { const d = el("div", "row"); d.append(el("span", "mono", strip(x.id + " " + x.method + " " + x.host + x.path)), el("span", x.status === "granted" ? "ok" : "blocked", ({ granted: "approved", denied: "denied" })[x.status] || x.status)); return d; }, "No decisions yet.");
     renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
+    const ar = document.getElementById("audit-retention");
+    if (ar) ar.textContent = s.audit_retention ? strip(s.audit_retention.line) : "";
     renderOperator(s);
     renderPolicy();
   } catch (e) { /* keep polling */ }

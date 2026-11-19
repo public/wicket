@@ -945,6 +945,22 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
         }
         Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
     }
+    // Audit retention on the host (#582): over its size limit, the audit table's oldest records
+    // (ones every sink has, behind a checkpoint one acknowledged) are pruned and the space given
+    // back. Never without a sink and the state store.
+    match wicket_home::audit_export::retention_pass(&ledger, dry_run) {
+        Ok(r) if r.pruned > 0 || r.vacuumed || r.waiting.is_some() => done.push(Done {
+            kind: if r.pruned > 0 { "audit_pruned" } else { "audit_retention" },
+            target: "ledger".into(),
+            detail: format!(
+                "{}{}",
+                if r.vacuumed { "switched the ledger to auto_vacuum=incremental (a one-off VACUUM); " } else { "" },
+                wicket_home::audit_export::retention_line(&r)
+            ),
+        }),
+        Ok(_) => {}
+        Err(e) => done.push(Done { kind: "error", target: "audit retention".into(), detail: format!("{e:#}") }),
+    }
     // The ledger's own upkeep (#582): settled rows of runs long ended to the archive, planner
     // statistics, and a WAL checkpoint.
     if !dry_run {
@@ -1070,7 +1086,9 @@ pub fn print(done: &[Done], dry_run: bool) {
     }
     let changed = done
         .iter()
-        .filter(|d| !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held" | "store_gc"))
+        .filter(|d| {
+            !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held" | "store_gc" | "audit_retention")
+        })
         .count();
     say!("reconcile: {changed} change(s){}", if dry_run { " (dry run: nothing changed)" } else { "" });
 }
