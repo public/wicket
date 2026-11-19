@@ -106,6 +106,12 @@ impl Ledger {
         Ok(self.conn.query_row("SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
     }
 
+    /// When the first record after `seq` was written (Unix seconds), if there is one: how long a
+    /// sink at cursor `seq` has been behind.
+    pub fn audit_ts_after(&self, seq: i64) -> Result<Option<i64>> {
+        Ok(self.conn.query_row("SELECT ts FROM audit WHERE seq > ?1 ORDER BY seq LIMIT 1", params![seq], |r| r.get(0)).optional()?)
+    }
+
     /// The record at `seq`, with its chain fields, if there is one.
     pub fn audit_record_at(&self, seq: i64) -> Result<Option<crate::AuditRecord>> {
         Ok(self.audit_records_after(seq - 1, 1)?.into_iter().next().filter(|r| r.seq == seq))
@@ -207,5 +213,18 @@ mod tests {
         assert_eq!(l.export_cursor("s").unwrap().error.as_deref(), Some("connection refused"));
         l.advance_export("s", 11).unwrap();
         assert_eq!(l.export_cursor("s").unwrap().error, None);
+    }
+
+    #[test]
+    fn how_long_a_cursor_has_been_behind() {
+        let l = Ledger::open_in_memory().unwrap();
+        assert_eq!(l.audit_ts_after(0).unwrap(), None, "no records: nothing behind");
+        let t = crate::TenantId::default();
+        l.audit(&t, None, "a", &serde_json::json!({})).unwrap();
+        l.audit(&t, None, "b", &serde_json::json!({})).unwrap();
+        let (head, _) = l.audit_head().unwrap().unwrap();
+        let first = l.audit_record_at(head - 1).unwrap().unwrap();
+        assert_eq!(l.audit_ts_after(head - 2).unwrap(), Some(first.ts));
+        assert_eq!(l.audit_ts_after(head).unwrap(), None, "caught up");
     }
 }
