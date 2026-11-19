@@ -628,29 +628,31 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         l.audit(&m.tenant, Some(&run), "run.attach", &serde_json::json!({ "owner": crate::owner::owner_label(), "node": node_name }))?;
     }
     if record.is_none() {
-        let l = ledger.lock().expect("ledger");
-        l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
-        // Who supervises it, for the reconciler (#38), and the lease it is placed on, if any.
-        l.set_run_owner(&run.0, &crate::owner::owner_label())?;
-        if let Some(lease) = &lease {
-            l.set_run_lease(&run.0, lease)?;
-        }
-        drop(l);
-        if long_lived && wake.is_none() {
-            let mut l = ledger.lock().expect("ledger");
-            let id = wicket_store::new_agent_id();
-            l.create_agent(&wicket_store::NewAgent {
-                id: &id,
-                tenant: &m.tenant.0,
-                zone: &m.zone.name,
-                name: &workload,
-                run: &run.0,
-                session_id: &session.id,
-                manifest: &text,
-                image,
-                workspace: workspace_dir.as_deref().and_then(|w| w.to_str()),
-                claim_until: wicket_store::now() + crate::hibernate::CLAIM_SECS,
-            })?;
+        // The run's row, who supervises it (for the reconciler, #38), the lease it is placed on,
+        // and a new long-lived agent's row: one transaction (#582 step 2).
+        let agent_id = (long_lived && wake.is_none()).then(wicket_store::new_agent_id);
+        let new_agent = agent_id.as_deref().map(|id| wicket_store::NewAgent {
+            id,
+            tenant: &m.tenant.0,
+            zone: &m.zone.name,
+            name: &workload,
+            run: &run.0,
+            session_id: &session.id,
+            manifest: &text,
+            image,
+            workspace: workspace_dir.as_deref().and_then(|w| w.to_str()),
+            claim_until: wicket_store::now() + crate::hibernate::CLAIM_SECS,
+        });
+        ledger.lock().expect("ledger").record_run_start(
+            &m.tenant,
+            &run,
+            &m.zone.name,
+            &workload,
+            &crate::owner::owner_label(),
+            lease.as_deref(),
+            new_agent.as_ref(),
+        )?;
+        if let Some(id) = agent_id {
             fence = Some(wicket_proxy::Fence { agent: id, generation: 1 });
         }
         let l = ledger.lock().expect("ledger");
