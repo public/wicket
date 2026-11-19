@@ -709,33 +709,48 @@ async fn place(agent: &AgentRow, run: &RunId, last: Option<&str>) -> Result<Opti
             l.nodes()?.into_iter().filter(|n| n.status == "active" && !leased.contains(&n.name)).map(|n| n.name).collect();
         from_index(&names, &l.node_health()?, wicket_feed::now_ms())
     };
-    let probes = to_probe.into_iter().map(|n| {
+    let ask = |names: Vec<String>| {
         let ledger = ledger.clone();
         async move {
-            let r = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                crate::nodecall::Link::connect(&n, &format!("place:{}", std::process::id()), &ledger),
-            )
-            .await;
-            match r {
-                Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap, at_ms: wicket_feed::now_ms() }),
-                Ok(Err(e)) => {
-                    say!("[wicket] node {n} is not available for the wake: {e:#}");
-                    None
+            let probes = names.into_iter().map(|n| {
+                let ledger = ledger.clone();
+                async move {
+                    let r = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        crate::nodecall::Link::connect(&n, &format!("place:{}", std::process::id()), &ledger),
+                    )
+                    .await;
+                    match r {
+                        Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap, at_ms: wicket_feed::now_ms() }),
+                        Ok(Err(e)) => {
+                            say!("[wicket] node {n} is not available for the wake: {e:#}");
+                            None
+                        }
+                        Err(_) => {
+                            say!("[wicket] node {n} is not available for the wake: no answer within 10 s");
+                            None
+                        }
+                    }
                 }
-                Err(_) => {
-                    say!("[wicket] node {n} is not available for the wake: no answer within 10 s");
-                    None
-                }
-            }
+            });
+            futures_util::future::join_all(probes).await.into_iter().flatten().collect::<Vec<Candidate>>()
         }
-    });
-    let probed = futures_util::future::join_all(probes).await.into_iter().flatten();
-    let cands: Vec<Candidate> = indexed.into_iter().chain(probed).collect();
+    };
+    // Choosing and reserving are one transaction (#579 step 2): nothing is reserved when none fits.
+    let decide = |cands: &[Candidate]| bind(&ledger.lock().expect("ledger"), run, &req, cands, &need, last, wicket_feed::now_ms());
+    let probed = ask(to_probe.clone()).await;
+    let mut cands: Vec<Candidate> = indexed.iter().cloned().chain(probed.iter().cloned()).collect();
     if cands.is_empty() {
         return Ok(None);
     }
-    let d = bind(&ledger.lock().expect("ledger"), run, &req, &cands, &need, last, wicket_feed::now_ms())?;
+    let mut d = decide(&cands)?;
+    // A report can be up to 30 s old: it may still count a box that has ended since (one that just
+    // hibernated, say). Before refusing the wake, the nodes read from reports are asked.
+    if d.node.is_none() && !indexed.is_empty() {
+        let fresh = ask(indexed.iter().map(|c| c.name.clone()).collect()).await;
+        cands = fresh.into_iter().chain(probed).collect();
+        d = decide(&cands)?;
+    }
     match d.node {
         Some(n) => {
             say!(

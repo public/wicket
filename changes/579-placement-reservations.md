@@ -8,5 +8,6 @@ type: Changed
   node reports can't both take its last room. A reservation counts until the node reports the box,
   or until its start fails or its run ends (2 minutes at most unconfirmed). `wicket run --node` and
   a lease's node pass the same filters (labels, taints, room, CA) when the node's last report says
-  its room, and the start is refused with the reasons if the node may not take the box. Ledger
+  its room, and the start is refused with the reasons if a label, taint or CA keeps it off (for room,
+  the node's own admission decides). Ledger
   schema 24 (`placements`; an expand step, after #576's 23).

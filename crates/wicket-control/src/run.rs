@@ -1311,7 +1311,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let req = wicket_placement::schedule::Request::of(&m);
                     let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
                     let d = crate::hibernate::bind(&l, &run, &req, &found, &need, None, now)?;
-                    if d.node.is_none() {
+                    // Refused for room only, the node's own admission decides: its report may
+                    // still count a box that has ended.
+                    let room_only = d.refused.iter().all(|(_, why)| {
+                        why.iter().all(|r| {
+                            matches!(r, wicket_placement::schedule::Refusal::NoRoom { .. } | wicket_placement::schedule::Refusal::Full)
+                        })
+                    });
+                    if d.node.is_none() && !room_only {
                         bail!("node {node_name} may not take this box: {}", d.why_not());
                     }
                 }
