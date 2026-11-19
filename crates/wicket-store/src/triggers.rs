@@ -96,6 +96,8 @@ pub struct Firing {
     pub detail: Option<String>,
     pub run: Option<String>,
     pub attempts: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 fn id(prefix: &str) -> String {
@@ -311,11 +313,20 @@ impl Ledger {
 
     /// A trigger's firings in `status`, oldest first.
     pub fn firings(&self, trigger: &str, status: Option<&str>) -> Result<Vec<Firing>> {
-        let mut st = self.conn.prepare(
-            "SELECT id, trigger, event, status, detail, run, attempts FROM trigger_firings
-             WHERE trigger = ?1 AND (?2 IS NULL OR status = ?2) ORDER BY created_at, id",
-        )?;
-        let rows = st.query_map(params![trigger, status], |r| {
+        self.firings_where(trigger, status, "ORDER BY created_at, id", -1)
+    }
+
+    /// A trigger's last `n` firings, newest first: what `wicket trigger show` lists.
+    pub fn recent_firings(&self, trigger: &str, n: i64) -> Result<Vec<Firing>> {
+        self.firings_where(trigger, None, "ORDER BY created_at DESC, id DESC", n)
+    }
+
+    fn firings_where(&self, trigger: &str, status: Option<&str>, order: &str, n: i64) -> Result<Vec<Firing>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, trigger, event, status, detail, run, attempts, created_at, updated_at FROM trigger_firings
+             WHERE trigger = ?1 AND (?2 IS NULL OR status = ?2) {order} LIMIT ?3"
+        ))?;
+        let rows = st.query_map(params![trigger, status, n], |r| {
             Ok(Firing {
                 id: r.get(0)?,
                 trigger: r.get(1)?,
@@ -324,9 +335,21 @@ impl Ledger {
                 detail: r.get(4)?,
                 run: r.get(5)?,
                 attempts: r.get(6)?,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many of a trigger's firings since `since` are in `status`: what its hourly limit counts
+    /// (started ones) and its queue holds (queued ones, `since` 0).
+    pub fn count_firings(&self, trigger: &str, status: &str, since: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM trigger_firings WHERE trigger = ?1 AND status = ?2 AND created_at >= ?3",
+            params![trigger, status, since],
+            |r| r.get(0),
+        )?)
     }
 
     /// `run`'s claim on a piece of work (`github.com/acme/app#123`). One live claim per key: a
@@ -434,6 +457,13 @@ mod tests {
             ("started", Some("run_x"), 1, Some("no capacity"))
         );
         assert!(l.record_firing("t-1", "e-2", "maybe", None).is_err());
+        l.record_firing("t-1", "e-3", "queued", None).unwrap();
+        assert_eq!(l.count_firings("t-1", "started", 0).unwrap(), 1);
+        assert_eq!(l.count_firings("t-1", "queued", 0).unwrap(), 1);
+        assert_eq!(l.count_firings("t-1", "started", now() + 10).unwrap(), 0, "only since the time asked");
+        let recent = l.recent_firings("t-1", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(l.recent_firings("t-1", 10).unwrap().len(), 2);
     }
 
     /// Work is claimed by one live run at a time, released by it (or all of a run's at its end),
