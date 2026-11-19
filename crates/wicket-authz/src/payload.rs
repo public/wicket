@@ -380,6 +380,15 @@ impl Ceiling {
     }
 }
 
+/// What a standing grant (#572) covers beyond its host: a reach rule's methods and path globs, and
+/// whether it reaches the risk only `allow_dangerous` does. Its host is the grant's (exact).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandingRule {
+    pub methods: Vec<String>,
+    pub paths: Vec<String>,
+    pub allow_dangerous: bool,
+}
+
 /// A grant: one exact request (host, method, path) a box may make while the grant is live and its
 /// ledger entry has uses left. Signed as a third-party block by the approver's key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
