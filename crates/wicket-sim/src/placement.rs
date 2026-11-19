@@ -23,7 +23,8 @@
 //!   - The reconciler follows `reconcile.rs`: the machine half (`reconcile_machines`, with no
 //!     capacity leases: owned nodes no placed node records are destroyed) and [`placed_pass`] (#294),
 //!     every [`PASS_S`] (`wicket reconcile --every 30s`), each pass with its own `Placer`, as
-//!     `place::release_placer` makes one.
+//!     `place::release_placer` makes one. A node it holds past its lease has what it bills reserved
+//!     ([`wicket_placement::billing::held_reservation`], #494, #495).
 //!   - The provider ([`Cloud`]) stands in for Vultr as `wicket_placement::mock` does: instances by
 //!     tag, created at once and answered after a latency, destroyed on request.
 //!   - A node (`m0`..) stands in for `wicket node serve`'s boxes: a box works for its run's time and

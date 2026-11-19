@@ -294,17 +294,11 @@ fn without_the_grace_the_reconciler_destroys_a_node_just_placed() {
 /// #494, #495 (the nightly run): a run started on a placed node shortly before its lease ended,
 /// and its box held the node past it (#294). The node billed hours past its worst case, nothing
 /// reserved them, and the next `node create`'s spend check passed on what was reserved: owned nodes
-/// were committed past the money limit's total. With the held node's billing reserved, both seeds
-/// refuse that create; without it, both still break the limit.
+/// were committed past the money limit's total. Without the held node's billing reserved, both
+/// seeds still break it (with it, `placement_seed_32200164_…` and `…_32200188_…`).
 #[test]
-fn a_held_nodes_billing_counts_against_the_money_limit() {
+fn without_the_held_reservation_a_held_node_breaks_the_money_limit() {
     for seed in [32_200_164, 32_200_188] {
-        let r = wicket_sim::placement::run(seed, &dir().join(format!("held-{seed}")), Default::default());
-        assert!(r.ok(), "placement seed {seed}: {r}");
-        assert!(
-            !r.stats.contains("held: 0,") && !r.stats.contains("creates_refused: 0,"),
-            "seed {seed} holds a node and refuses a create: {r}"
-        );
         let o = wicket_sim::placement::Options { reserve_held: false, ..Default::default() };
         placement_without(&format!("held-{seed}"), seed, o, "over the money limit's");
     }
@@ -373,6 +367,19 @@ fn placement_seed_32000129_starts_no_box_past_a_lease() {
 #[test]
 fn placement_seed_32000134_releases_a_node_whose_work_was_collected() {
     nightly_placement_seed(32_000_134);
+}
+
+/// #494: a node held past its lease billed an hour nothing reserved, and the next create's spend
+/// check passed: with the hold's billing reserved, that create is refused.
+#[test]
+fn placement_seed_32200164_counts_a_held_nodes_billing() {
+    nightly_placement_seed(32_200_164);
+}
+
+/// #495: the same, with four nodes and partitions.
+#[test]
+fn placement_seed_32200188_counts_a_held_nodes_billing() {
+    nightly_placement_seed(32_200_188);
 }
 
 /// #398: the start race on a partitioned node.

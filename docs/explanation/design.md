@@ -1097,7 +1097,8 @@ Only Vultr and static hosts are built. A `HostProvider` across six clouds, grade
   replaced at every check). What is reserved is the live pairs of money quota grants,
   `/quota/money.hourly/<key>` and `/quota/money.reserved/<key>`: one per capacity lease (made by
   `wicket:lease-budget`, bound to the run that asked) and one per node `wicket node create` makes
-  (`node-<name>`, made by `wicket:node-create`, renewed while the node bills). One check, in the
+  (`node-<name>`, made by `wicket:node-create`, renewed while the node bills, and raised while it is
+  held past its lease to every hour it has started and the next, #494). One check, in the
   transaction that records a new pair: the live pairs' sums plus the new pair must fit the limit
   grant. Leases, created nodes and warm-pool claims all go through it, so they share one budget. A
   request beyond it is refused, and no approval widens it. Inside it, every paid node needs a human's

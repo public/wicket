@@ -1990,6 +1990,46 @@ mod tests {
         assert_eq!(deletes(&st), vec!["placed-files"]);
     }
 
+    /// #494, #495: a node held past its lease bills hours its worst case didn't reserve. The pass
+    /// reserves them (every started hour and the next), so the next node's spend check counts them;
+    /// a dry run changes nothing.
+    #[tokio::test]
+    async fn a_held_placed_node_has_what_it_bills_past_its_lease_reserved() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-held", "held-node", end);
+        let mut row = l.placed_node("placed-held").unwrap().unwrap();
+        row.hourly = Some(14_000);
+        l.record_placed_node(&row).unwrap();
+        let key = wicket_store::money::node_money_key("held-node");
+        let budget = wicket_store::LeaseBudget { max_hourly: 42_000, max_total: 56_000 };
+        // Its worst case at creation: one hour, rounded to the cent.
+        l.reserve_money("t", &key, 14_000, 20_000, 3600, budget, wicket_store::money::NODE_MONEY_BY).unwrap().unwrap();
+        started(&l, "run_busy", "alive:1");
+        l.set_run_node("run_busy", "held-node").unwrap();
+        let w = World::new(vultr(&base));
+        full_pass(&w, &mut l, end + 1, true).await;
+        assert_eq!(l.money_reserved("t").unwrap().1, 20_000, "a dry run reserves nothing");
+        full_pass(&w, &mut l, end + 1, false).await;
+        // 3001 s old: its first hour, and the second, $0.028 → $0.03.
+        assert_eq!(l.money_reserved("t").unwrap().1, 30_000);
+        assert!(
+            l.reserve_money(
+                "t",
+                &wicket_store::money::node_money_key("next"),
+                14_000,
+                30_000,
+                3600,
+                budget,
+                wicket_store::money::NODE_MONEY_BY
+            )
+            .unwrap()
+            .is_err(),
+            "the next node's $0.03 no longer fits the $0.056"
+        );
+    }
+
     #[tokio::test]
     async fn a_held_placed_node_is_kept_and_flagged_then_released_when_its_run_ends() {
         let (base, st) = vultr_mock::serve().await;
