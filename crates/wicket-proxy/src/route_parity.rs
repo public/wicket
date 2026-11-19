@@ -56,6 +56,8 @@ struct Seen {
     charged: u64,
     /// Whether the run's first model request was recorded (a node reports it, #152).
     first_request: bool,
+    /// The anomalies audited (#362): `placeholder.moved`, `secret.reflected`, `response.encoded`.
+    anomalies: Vec<String>,
 }
 
 impl Seen {
@@ -75,6 +77,8 @@ enum Answer {
     Echo,
     /// As `Ok`, `Content-Encoding: gzip` though identity was asked for.
     Gzip,
+    /// As `Ok`, saying `Content-Encoding: identity` (nothing to note).
+    Identity,
 }
 
 #[derive(Default)]
@@ -161,6 +165,10 @@ async fn answer(st: Arc<MockState>, req: http::Request<hyper::body::Incoming>) -
             Answer::Echo => http::Response::builder()
                 .header("content-type", "application/json")
                 .body(MockBody::from(format!(r#"{{"echo":"{bearer}",{usage}}}"#))),
+            Answer::Identity => http::Response::builder()
+                .header("content-type", "application/json")
+                .header("content-encoding", "identity")
+                .body(MockBody::from(format!("{{{usage}}}"))),
             Answer::Gzip => http::Response::builder()
                 .header("content-type", "application/json")
                 .header("content-encoding", "gzip")
@@ -208,6 +216,8 @@ enum Secret {
     Missing,
     /// A node's copy that its source can't fetch (#152).
     NodeUnfetchable,
+    /// A value bound to no hosts: refused for every upstream (not a read that gave up).
+    Unbound,
 }
 
 fn messages(max_tokens: u64, extra: &str) -> String {
@@ -282,6 +292,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
     let login = dir.join("login.json");
     match &s.secret {
         Secret::Value(v) => vault.set("model", v).unwrap(),
+        Secret::Unbound => vault.set("model", T1).unwrap(),
         Secret::Linked { refreshed_after } => {
             write_login(&login, T1);
             vault.link("model", login.to_str().unwrap(), Some("/o/accessToken"), None, None).unwrap();
@@ -319,7 +330,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
         }
         Secret::NodeUnfetchable => {}
     }
-    if !matches!(s.secret, Secret::NodeUnfetchable) {
+    if !matches!(s.secret, Secret::NodeUnfetchable | Secret::Unbound) {
         vault.set_hosts("model", &["127.0.0.1".into(), "api.anthropic.com".into()]).unwrap();
     }
     let ledger = Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap()));
@@ -375,6 +386,14 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
             serde_json::from_str::<serde_json::Value>(&b).ok().and_then(|v| v["outcome"].as_str().map(String::from)).unwrap_or_default()
         })
         .collect();
+    let anomalies = ledger
+        .lock()
+        .unwrap()
+        .audit_of_kind("anomaly")
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok().and_then(|v| v["anomaly"].as_str().map(String::from)))
+        .collect();
     let seen = mock.state.seen.lock().unwrap().clone();
     let counts = llm.count.counts();
     let r = Seen {
@@ -386,6 +405,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
         beta_header: seen.iter().any(|(_, beta)| *beta),
         charged: counts.output_tokens,
         first_request: llm.first_request_ms().is_some(),
+        anomalies,
     };
     let _ = std::fs::remove_dir_all(&dir);
     r
@@ -591,14 +611,28 @@ const CASES: &[Case] = &[
     Case {
         name: "the run's placeholder in another header",
         setup: || Setup { headers: vec![("anthropic-beta", "ph-run")], ..Setup::default() },
-        both: |s| s.status == 403 && s.bearers.is_empty(),
+        both: |s| s.status == 403 && s.bearers.is_empty() && s.anomalies.iter().any(|a| a == "placeholder.moved"),
     },
     Case {
         name: "an upstream that echoes the credential",
         setup: || Setup { ..Setup::default() },
-        both: |s| s.status == 200 && !s.body.contains(T1),
+        both: |s| s.status == 200 && !s.body.contains(T1) && s.anomalies.iter().any(|a| a == "secret.reflected"),
     },
-    Case { name: "an upstream that encodes anyway", setup: Setup::default, both: |s| s.status == 502 && s.body.contains("gzip-encoded") },
+    Case {
+        name: "an upstream that encodes anyway",
+        setup: Setup::default,
+        both: |s| s.status == 502 && s.body.contains("gzip-encoded") && s.anomalies.iter().any(|a| a == "response.encoded"),
+    },
+    Case {
+        name: "an upstream that says it isn't encoded",
+        setup: Setup::default,
+        both: |s| s.status == 200 && s.charged == 2 && !s.note("Content-Encoding"),
+    },
+    Case {
+        name: "a secret bound to no hosts",
+        setup: || Setup { secret: Secret::Unbound, ..Setup::default() },
+        both: |s| s.status == 502 && s.note("bound to no hosts") && s.bearers.is_empty(),
+    },
     Case { name: "the model host down", setup: || Setup { upstream_down: true, ..Setup::default() }, both: |s| s.status == 502 },
     Case {
         name: "the box gives up while the call is out",
@@ -614,6 +648,7 @@ fn answer_for(case: &str) -> (Answer, u64) {
     match case {
         "an upstream that echoes the credential" => (Answer::Echo, 0),
         "an upstream that encodes anyway" => (Answer::Gzip, 0),
+        "an upstream that says it isn't encoded" => (Answer::Identity, 0),
         "the box gives up while the call is out" => (Answer::Ok, 400),
         _ => (Answer::Ok, 0),
     }

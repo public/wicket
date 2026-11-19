@@ -1303,6 +1303,75 @@ mod tests {
         assert_eq!(super::render_credential("Basic {basic:x-access-token}", "tok"), "Basic eC1hY2Nlc3MtdG9rZW46dG9r");
     }
 
+    /// An encoded answer is refused only when it has a body that could carry the credential: not
+    /// to a HEAD, and not a 204 or 304 (#362).
+    #[test]
+    fn an_encoded_answer_is_refused_only_when_it_has_a_body() {
+        let (c, dir) = ctx("reach: []", vec![], "encoded");
+        let answer =
+            |status: u16| http::Response::builder().status(status).header("content-encoding", "gzip").body(crate::full("x")).unwrap();
+        let injected = vec!["the-real-token".to_string()];
+        let status = |s: u16, m: http::Method| super::guard_credential(&c, answer(s), "api.github.com", &m, &injected).status();
+        assert_eq!(status(200, http::Method::GET), 502);
+        assert_eq!(status(200, http::Method::HEAD), 200);
+        assert_eq!(status(204, http::Method::GET), 204);
+        assert_eq!(status(304, http::Method::GET), 304);
+        let audited = c.ledger.lock().unwrap().audit_of_kind("anomaly").unwrap();
+        assert_eq!(audited.len(), 1, "only the refusal is an anomaly");
+        assert!(audited[0].body.contains("response.encoded"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The tripwire names what moved: this run's placeholder by its credential, another of this
+    /// run's or another run's by shape; a placeholder's one slot is `Authorization` to its own host
+    /// (#362).
+    #[test]
+    fn the_tripwire_names_the_placeholder_that_moved() {
+        let own = "wicket-placeholder-run-x0000000000000000000000000";
+        let ours = "wicket-session-placeholder-run-x1111111111111111111111111";
+        let theirs = "wicket-placeholder-run-01aaaaaaaaaaaaaaaaaaaaaaaa";
+        let swap = crate::CredentialSwap {
+            name: "gh".into(),
+            host: "api.github.com".into(),
+            placeholder: own.into(),
+            real: crate::SwapSource::Vault("gh".into()),
+            box_bearers: false,
+        };
+        let (c, dir) = ctx("reach: []", vec![swap], "tripwire");
+        let scan = super::CanaryScanner::placeholders([own].into_iter());
+        let moved = |headers: &[(&str, String)], host: &str| {
+            let mut h = http::HeaderMap::new();
+            for (n, v) in headers {
+                h.insert(http::HeaderName::from_bytes(n.as_bytes()).unwrap(), v.parse().unwrap());
+            }
+            super::placeholder_moved(&c, &scan, &h, host, "/x")
+        };
+        let bearer = |p: &str| ("authorization", format!("Bearer {p}"));
+        assert_eq!(moved(&[bearer(own)], "api.github.com"), None);
+        assert_eq!(moved(&[bearer("a-token-of-the-box's-own")], "api.github.com"), None);
+        assert_eq!(
+            moved(&[bearer(own)], "example.com").as_deref(),
+            Some("the placeholder for gh sent to example.com, which isn't its host (api.github.com)")
+        );
+        assert_eq!(
+            moved(&[("x-token", own.to_string())], "api.github.com").as_deref(),
+            Some("the placeholder for gh in the x-token header to api.github.com")
+        );
+        assert_eq!(
+            moved(&[("x-token", ours.to_string())], "api.github.com").as_deref(),
+            Some("one of this run's credential placeholders in the x-token header to api.github.com")
+        );
+        assert_eq!(
+            moved(&[bearer(theirs)], "api.github.com").as_deref(),
+            Some("another run's credential placeholder in the authorization header to api.github.com")
+        );
+        assert_eq!(
+            super::placeholder_moved(&c, &scan, &http::HeaderMap::new(), "api.github.com", &format!("/x?t={own}")).as_deref(),
+            Some("the placeholder for gh in the URL for api.github.com")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A decider that answers from a script, then its last line for ever, counting the calls.
     struct Scripted {
         script: std::sync::Mutex<std::collections::VecDeque<crate::decide::Outcome>>,
