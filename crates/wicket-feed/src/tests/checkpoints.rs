@@ -207,9 +207,12 @@ fn a_publisher_keeps_a_bounded_tail_and_serves_older_nodes_a_snapshot() {
 fn a_statement_is_due_a_refresh_after_the_last_any_publisher_signed() {
     let (mut cp, mut r) = setup();
     let mut b = cp.open_publisher(cfg());
-    // B's first statement is due at once; then none until a refresh after the newest signed by
-    // either, as the shared last statement time says.
+    // B knows of no statement yet: one is due at once. Told of A's, none is due until a refresh
+    // after the newest signed by either, as the shared last statement time says.
     let first = b.tick(T0 + 100).expect("B's first");
+    let mut c = cp.open_publisher(cfg());
+    c.note_issued(b.last_issued());
+    assert!(c.tick(T0 + 150).is_none(), "a publisher opened after B signed");
     r.accept(&first, T0 + 100).unwrap();
     cp.p.note_issued(b.last_issued());
     assert!(cp.p.tick(T0 + 200).is_none(), "B signed one 100 ms ago");

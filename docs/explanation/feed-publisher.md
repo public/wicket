@@ -42,7 +42,8 @@ The delta log keeps its format and is still append-only, so an older build can s
 4. **One statement per node per refresh.** `Publisher::tick` is due a refresh after the newest
    statement signed for the feed by any publisher (the shared `feed/issued` time), not after its own.
    Every run's connection reaches the same replica on the node, so one statement per refresh is enough;
-   `b` processes no longer sign `b`. A connection's catch-up still signs its own statement.
+   `b` processes no longer sign `b`, and a process just started doesn't sign one at once. A
+   connection's catch-up still signs its own statement.
 5. **One publisher per node per process** (the second PR): `SharedFeed::open` hands every run in a
    process the same publisher for a node (children's supervisors and link relays share their parent's
    process). With #582 step 5 (supervisors as tasks in a few processes) that becomes one, or a few,

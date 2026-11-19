@@ -318,7 +318,7 @@ pub struct Publisher<P: Policy> {
     checkpointed: u64,
     checkpoint_every: u64,
     staged: Vec<Change<P>>,
-    /// A statement is due at once (none signed yet under this certificate's version).
+    /// A statement is due at once (none signed yet under a new certificate's version).
     statement_due: bool,
     last_issued: i64,
 }
@@ -395,7 +395,7 @@ impl<P: Policy> Publisher<P> {
             checkpointed: l.checkpoint.unwrap_or(0),
             checkpoint_every: CHECKPOINT_EVERY,
             staged: vec![],
-            statement_due: true,
+            statement_due: false,
             last_issued: i64::MIN,
         };
         // A long replay is saved, so the next process to open the feed starts from here. (A
@@ -597,8 +597,8 @@ impl<P: Policy> Publisher<P> {
 
     /// A new statement if one is due, to push to the node: `refresh_ms` after the last one signed
     /// for this feed, by this publisher or another ([`Publisher::note_issued`]), so the node gets
-    /// one per refresh, however many processes publish to it. Its first under a certificate's
-    /// version is due at once.
+    /// one per refresh, however many processes publish to it. One is due at once when none has
+    /// been signed (that this publisher knows of), and after a rotation to a new version.
     pub fn tick(&mut self, now: i64) -> Option<Frame> {
         let due = self.statement_due || now >= self.last_issued.saturating_add(self.cfg.refresh_ms);
         due.then(|| self.statement(now))
