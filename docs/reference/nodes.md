@@ -347,6 +347,31 @@ wicket node revoke n1
   and the node keeps the files until `wicket node forget <run> --force` (audited as
   `run.cleanup_forced`). The node audits the deletion as `run.files_deleted`.
 
+## Placement
+
+Where a box goes ([#579](https://github.com/public/wicket/issues/579)): `wicket run --node` or a spawn's
+placement hint names a node; otherwise a run goes on this host's own node. A woken agent is placed by the
+scheduler, `wicket-placement::schedule`, a pure function of what the control host knows when it decides:
+
+- **Labels and taints.** `wicket node set <node> --label gpu=a100 --taint dedicated=ci` records them in the
+  ledger (`key-` removes one; audited `node.labels`). A box goes on a node only if the node has every label
+  its manifest's [`placement.node_selector`](manifest.md#placement) names, with that value, and the box
+  tolerates every taint the node has (`placement.tolerations`: `key` for any value, or `key=value`). A
+  taint keeps a node for the boxes that say they belong there.
+- **Filter.** Out are: a node that starts no box (`full`); one without the vCPUs and memory the box's limits
+  ask for, by its report and its admission's room ([above](#health-admission-and-disk-377)); a label or
+  taint mismatch; and a node whose CA doesn't cover the box's inspected hosts and whose policy keeps them
+  out ([#573](https://github.com/public/wicket/issues/573); a node it may be widened to is in).
+- **Score.** Of the nodes left, bin-pack: the one left with the least memory, then the fewest vCPUs, once
+  the box is on it. Where the agent ran before breaks a tie, then the name, so the same inputs always give
+  the same node. A spread strategy exists in the function for later.
+- **Refusal.** With no node left the wake is refused, naming every node and every reason it was out
+  (`n1 (tainted dedicated=ci, not tolerated), n2 (0.5 vCPU, 512 MiB free)`). The node's own admission
+  stays the last word: it may still refuse the box it was given.
+
+A queue, reservations for starts in flight, and placing new runs (not only wakes) come next, on #582's
+cached capacity index.
+
 ## Images on nodes
 
 A box on a node starts from an image its node has. A box whose image is pinned by digest (#192,

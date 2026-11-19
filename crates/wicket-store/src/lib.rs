@@ -140,9 +140,9 @@ pub enum StoreError {
 /// Version 21 (expand, after #576's 20) adds `node_ca_policy` and `node_ca_wants` (#573): how a
 /// node's CA may be widened at runtime, and the hosts its boxes want of it. Older builds don't read
 /// them, so the floor stays 17.
-/// Version 22 (expand) adds `node_labels` and `node_taints` (#579): what placement filters nodes by.
-/// Older builds don't read them; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 22;
+/// Version 23 (expand, after #582's 22) adds `node_labels` and `node_taints` (#579): what placement
+/// filters nodes by. Older builds don't read them; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 23;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
