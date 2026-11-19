@@ -178,7 +178,12 @@ pub fn allocate(used: &[Named], to_run: &str, wanted: &str) -> Result<(String, I
     if let Some(n) = used.iter().find(|n| n.to_run == to_run) {
         return Ok((n.name.clone(), n.addr));
     }
-    let base = label(wanted);
+    // An internal name (#575), `<label>.<zone>`, keeps its dots: each part a label.
+    let base = if wanted.contains('.') {
+        wanted.split('.').filter(|p| !p.is_empty()).map(label).collect::<Vec<_>>().join(".")
+    } else {
+        label(wanted)
+    };
     let mut name = base.clone();
     let mut i = 2;
     while used.iter().any(|n| n.name == name) {

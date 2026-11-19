@@ -8,8 +8,9 @@
 //! - A **public** name (`<label>.<boxes domain>`) is asked for ([`Ledger::ask_public`]) and
 //!   approved by a human ([`Ledger::approve_name`]), bound to the effect that was shown, as standing
 //!   reach is (#572).
-//! - Status: `pending` (a public ask), `live`, `denied`, or `ended` (released with its run,
-//!   revoked, or lapsed; [`NameRow::end_reason`]).
+//! - Status: `pending` (a public ask), `live`, `denied`, `withdrawn` (a run-scoped ask whose run
+//!   ended undecided), or `ended` (released with its run, revoked, or lapsed;
+//!   [`NameRow::end_reason`]).
 //! - Scope: a `run` name is held by the run that asked and ends with it. A `standing` name is the
 //!   workload's: bound to the agent's principal (or, for a public one, its zone if the human chose
 //!   so) and to the zone's digest, it is let go when its run ends ([`Ledger::release_run_names`])
@@ -153,7 +154,7 @@ pub struct NameRow {
     pub service: Option<String>,
     pub reason: String,
     pub scope: NameScope,
-    /// `pending`, `live`, `denied` or `ended`.
+    /// `pending`, `live`, `denied`, `withdrawn` or `ended`.
     pub status: String,
     pub created_at: i64,
     pub decided_at: Option<i64>,
@@ -479,6 +480,11 @@ impl Ledger {
         let held = self.names_held_by(run)?;
         let tx = self.conn.unchecked_transaction()?;
         let t = now();
+        // Its run-scoped asks nobody decided go with it, as its requests do.
+        tx.execute(
+            "UPDATE names SET status = 'withdrawn', decided_at = ?2, decided_by = 'wicket:run-ended' WHERE asked_run = ?1 AND status = 'pending' AND scope = 'run'",
+            params![run.0, t],
+        )?;
         for n in &held {
             match n.scope {
                 NameScope::Run => tx.execute(
@@ -792,6 +798,12 @@ mod tests {
         assert!(matches!(l.ask_public(&ask(&t, &r2, P2, "demo", NameScope::Run)), Err(StoreError::Refused(_))));
         l.deny_name(&other, "alice").unwrap();
         assert_eq!(l.name(&other).unwrap().status, "denied");
+        // A run-scoped ask whose run ends undecided is withdrawn; a standing one waits.
+        let (gone, _) = l.ask_public(&ask(&t, &r2, P2, "gone", NameScope::Run)).unwrap();
+        let (waits, _) = l.ask_public(&ask(&t, &r2, P2, "waits", NameScope::Standing)).unwrap();
+        l.run_ended(&r2, "succeeded", "").unwrap();
+        assert_eq!(l.name(&gone).unwrap().status, "withdrawn");
+        assert_eq!(l.name(&waits).unwrap().status, "pending");
 
         // Revoked: the label is free.
         let r = l.revoke_name(&id, "alice").unwrap();

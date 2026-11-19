@@ -24,7 +24,7 @@ pub mod record;
 #[cfg(test)]
 mod props;
 
-pub use label::{check_label, LabelError, Rules};
+pub use label::{check_label, check_shape, LabelError, Rules};
 pub use plan::{plan, Change, Conflict, Desired, Owned, Plan, PlanError};
 pub use provider::{Applied, Caps, DnsProvider, MemoryProvider, NoopProvider, ProviderError};
 pub use record::{OwnerId, Record, RecordType, Zone};

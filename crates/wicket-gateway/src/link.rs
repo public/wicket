@@ -188,6 +188,37 @@ async fn connect_inner(ctx: &RunCtx, target: &str, port: Option<u64>) -> Result<
     open(ctx, ops, &me, &t, port, d, &wanted).await
 }
 
+/// `connect(name, port?)` (#575): this box reaches the box holding internal name `name`
+/// (`<label>.<zone>`, with or without `.wicket.internal`), at the name's port. Decided as
+/// `connect` decides; the link is named after the name, so the box resolves it too.
+pub async fn connect_name(ctx: &RunCtx, name: &str, port: Option<u64>) -> Reply {
+    match connect_name_inner(ctx, name, port).await {
+        Ok(s) => (s, false),
+        Err(e) => (format!("not linked: {e}"), true),
+    }
+}
+
+async fn connect_name_inner(ctx: &RunCtx, name: &str, port: Option<u64>) -> Result<String, String> {
+    let ops = ctx.boxes.clone().ok_or("links need a box wicket runs on a node (this one can't link)")?;
+    let n = name.trim_end_matches('.').to_ascii_lowercase();
+    let n = n.strip_suffix(&format!(".{}", policy::DOMAIN)).unwrap_or(&n);
+    let (label, zone) = n.split_once('.').ok_or_else(|| format!("{name:?} isn't an internal name: <name>.<zone>"))?;
+    let row = ledger(ctx)
+        .internal_name(&ctx.tenant, zone, label)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no box holds the name {label}.{zone}"))?;
+    let to = row.holder.clone().ok_or_else(|| format!("{label}.{zone} is held by no running box now"))?;
+    let port = match port {
+        None => row.port,
+        Some(p) if p == u64::from(row.port) => row.port,
+        Some(p) => return Err(format!("{label}.{zone} names port {}, not {p}", row.port)),
+    };
+    let (me, _) = end_info(ctx, &*ops, &ctx.run.0, None)?;
+    let (t, exposed) = end_info(ctx, &*ops, &to, Some(port))?;
+    let d = policy::connect(&me.end(), &t.end(), exposed.is_some())?;
+    open(ctx, ops, &me, &t, port, d, &format!("{label}.{zone}")).await
+}
+
 /// What became of a box's use of a service (#579 step 3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UseOutcome {
@@ -876,6 +907,50 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         panic!("link {id} did not close");
+    }
+
+    /// #575: a box names its port; a box its accept_from lists reaches it by that name, which
+    /// resolves in the connecting box (its hosts line); any other box needs a human; the name ends
+    /// with the run that holds it.
+    #[tokio::test]
+    async fn an_internal_name_is_reached_by_connect_and_ends_with_its_run() {
+        let w = World::new();
+        let api = w.boxed(w.zone("build", &["web"]), "api", "run_api", None, &[]);
+        let web = w.boxed(w.zone("web", &[]), "web", "run_web", None, &[]);
+        let other = w.boxed(w.zone("other", &[]), "other", "run_other", None, &[]);
+
+        let (text, err) = crate::names::request_name(&api, &serde_json::json!({ "name": "api", "port": 3000, "reason": "the API" }));
+        assert!(!err && text.contains("api.build.wicket.internal"), "{text}");
+        // Taken in the zone (by another agent of it); refused shapes and kinds.
+        let api2 = w.boxed(w.zone("build", &[]), "api2", "run_api2", None, &[]);
+        let (text, err) = crate::names::request_name(&api2, &serde_json::json!({ "name": "api", "port": 3001 }));
+        assert!(err && text.contains("taken"), "{text}");
+        let (text, err) = crate::names::request_name(&web, &serde_json::json!({ "name": "Bad.Name", "port": 1 }));
+        assert!(err && text.contains("a-z"), "{text}");
+        let (text, err) = crate::names::request_name(&web, &serde_json::json!({ "name": "x", "port": 1, "kind": "public" }));
+        assert!(err && text.contains("aren't available yet"), "{text}");
+
+        // web is in api's accept_from: linked by the name, at the name's port, and it resolves there.
+        let (text, err) = connect_name(&web, "api.build.wicket.internal", None).await;
+        assert!(!err && text.contains("api.build.wicket.internal:3000") && text.contains("accept_from"), "{text}");
+        let hosts = std::fs::read_to_string(w.root.join("run_web/hosts")).unwrap();
+        assert!(hosts.contains("\tapi.build.wicket.internal\n"), "{hosts}");
+        let id = link_id(&text);
+        assert_eq!(roundtrip(&w.root.join("run_web/sock").join(format!("link-{id}.sock"))).await.unwrap(), "run_api:ping");
+        let (text, err) = connect_name(&web, "api.build", Some(4000)).await;
+        assert!(err && text.contains("names port 3000"), "{text}");
+
+        // other isn't: a human decides exactly that link.
+        let (text, err) = connect_name(&other, "api.build", None).await;
+        assert!(!err && text.contains("needs approval"), "{text}");
+        let audit = w.ledger.lock().unwrap().audit_tail(30).unwrap();
+        assert!(audit.iter().any(|a| a.2 == "name.registered" && a.4.contains("api.build.wicket.internal")));
+
+        // The run ends: so does the name, and the label is free.
+        w.ledger.lock().unwrap().run_ended(&RunId("run_api".into()), "succeeded", "").unwrap();
+        let (text, err) = connect_name(&other, "api.build", None).await;
+        assert!(err && text.contains("no box holds"), "{text}");
+        assert!(w.ledger.lock().unwrap().internal_name(&TenantId::single(), "build", "api").unwrap().is_none());
     }
 
     #[tokio::test]

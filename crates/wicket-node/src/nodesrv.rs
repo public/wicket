@@ -751,6 +751,12 @@ impl Node {
     async fn call_control(&self, run: &str, tool: chan::ControlTool, args: &serde_json::Value) -> std::io::Result<(String, bool)> {
         let unreachable = || std::io::Error::new(std::io::ErrorKind::NotConnected, "the control host is unreachable");
         let gen = self.owner(run).ok_or_else(unreachable)?;
+        // A control host below protocol 19 can't read this tool in a call (#575): it would drop the
+        // connection. Answered here instead.
+        let proto = self.links.lock().expect("links").get(&gen).map_or(0, |l| l.proto);
+        if let Some(why) = too_old_for(tool, proto) {
+            return Ok((why, true));
+        }
         let id = self.id();
         let (tx, rx) = oneshot::channel();
         self.calls.lock().expect("calls").insert(id, (gen, tx));
@@ -2664,8 +2670,27 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Why `tool` can't be sent over a connection that talks `proto`, if it can't: a tool added after
+/// the oldest protocol a control host may talk (#575's `request_name`, [`chan::NAMES`]).
+fn too_old_for(tool: chan::ControlTool, proto: u32) -> Option<String> {
+    (tool == chan::ControlTool::RequestName && proto < chan::NAMES).then(|| {
+        format!(
+            "not requested: this box's control host speaks protocol {proto}, and names need {} (an update of the control host)",
+            chan::NAMES
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_name_is_asked_only_of_a_control_host_at_19() {
+        use super::{chan, too_old_for};
+        assert!(too_old_for(chan::ControlTool::RequestName, 18).unwrap().contains("protocol 18"));
+        assert_eq!(too_old_for(chan::ControlTool::RequestName, chan::NAMES), None);
+        assert_eq!(too_old_for(chan::ControlTool::Connect, 17), None);
+    }
+
     use super::*;
 
     #[test]

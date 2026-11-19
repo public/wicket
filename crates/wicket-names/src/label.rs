@@ -56,8 +56,26 @@ impl fmt::Display for LabelError {
 
 impl std::error::Error for LabelError {}
 
-/// Checks `label` against the rules.
+/// Checks `label` against the rules: its shape ([`check_shape`]), then the reserved labels and
+/// their lookalikes. For public names.
 pub fn check_label(label: &str, rules: &Rules) -> Result<(), LabelError> {
+    check_shape(label, rules.allow_idn)?;
+    let s = skeleton(label);
+    let reserved = RESERVED.iter().map(|r| r.to_string()).chain(rules.reserved.iter().map(|r| r.to_ascii_lowercase()));
+    for r in reserved {
+        if r == label {
+            return Err(LabelError::Reserved(String::new()));
+        }
+        if !r.is_empty() && skeleton(&r) == s {
+            return Err(LabelError::Reserved(r));
+        }
+    }
+    Ok(())
+}
+
+/// Checks only that `label` is one DNS label wicket accepts (no reserved names): for internal
+/// names, which live under their zone's name, where no lookalike of the console's can be.
+pub fn check_shape(label: &str, allow_idn: bool) -> Result<(), LabelError> {
     if label.is_empty() {
         return Err(LabelError::Empty);
     }
@@ -70,18 +88,8 @@ pub fn check_label(label: &str, rules: &Rules) -> Result<(), LabelError> {
     if label.starts_with('-') || label.ends_with('-') {
         return Err(LabelError::Hyphen);
     }
-    if label.starts_with("xn--") && !rules.allow_idn {
+    if label.starts_with("xn--") && !allow_idn {
         return Err(LabelError::Idn);
-    }
-    let s = skeleton(label);
-    let reserved = RESERVED.iter().map(|r| r.to_string()).chain(rules.reserved.iter().map(|r| r.to_ascii_lowercase()));
-    for r in reserved {
-        if r == label {
-            return Err(LabelError::Reserved(String::new()));
-        }
-        if !r.is_empty() && skeleton(&r) == s {
-            return Err(LabelError::Reserved(r));
-        }
     }
     Ok(())
 }
@@ -142,5 +150,13 @@ mod tests {
         assert!(check_label("5tatus", &rules).is_err());
         assert!(check_label("0ps", &rules).is_err());
         assert_eq!(check_label("demo", &rules), Ok(()));
+    }
+
+    #[test]
+    fn shapes_alone_allow_reserved_labels() {
+        assert_eq!(check_shape("api", false), Ok(()));
+        assert_eq!(check_shape("console", false), Ok(()));
+        assert_eq!(check_shape("a.b", false), Err(LabelError::Character('.')));
+        assert_eq!(check_shape("xn--bcher-kva", false), Err(LabelError::Idn));
     }
 }

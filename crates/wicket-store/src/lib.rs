@@ -701,6 +701,8 @@ impl Ledger {
         // And what it used of per-node services (#579).
         self.drop_service_wants(&run.0)?;
         self.close_links_of(&run.0)?;
+        // And its names (#575): run-scoped ones end, standing ones wait for the next run.
+        self.release_run_names(run)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
             "UPDATE leases SET status = 'withdrawn', detail = 'its run ended before a decision', ended_at = ?2 WHERE run = ?1 AND status = 'pending'",

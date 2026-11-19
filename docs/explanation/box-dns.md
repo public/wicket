@@ -42,22 +42,30 @@ Registering one is `expose` with a name. It grants nothing, so it needs no appro
 the operator's limit (names per workload). A label is unique within its zone, so a box can't take a
 name in another zone.
 
-Resolving it, in a box's resolver (`wicket-proxy/src/dns.rs`, #92), on the box's node:
+Resolving it goes through `connect`, as built (step 3):
 
-- **The resolving box may connect by default** (the target is its child, or the target's
-  `accept_from` lists its zone or principal, as `wicket_core::link::connect` decides): the answer is
-  an address from the box's link pool (198.18.1.1–32). The first connection to it opens the link,
-  decided there as `connect` decides it, and audited as a link.
-- **Otherwise NXDOMAIN,** as for a host the zone hides. The agent can still `connect` by name, which
-  asks a human for exactly that link, as today.
-- **The name's owner isn't running:** NXDOMAIN.
+- **`connect(name: "<label>.<zone>")`** finds the run holding the name in the ledger and decides
+  exactly as `connect` to that box decides (`wicket_core::link::connect`): its parent, a box the
+  target's `accept_from` lists by zone or principal, or a human approving exactly that link. The
+  port defaults to the name's.
+- **The link is named after the name,** so the connecting box's hosts file (which wicket owns) maps
+  `<label>.<zone>.wicket.internal` to the link's address from its pool (198.18.1.1–32), and the box
+  resolves it like any linked name. Its in-box resolver (`wicket-proxy/src/dns.rs`, #92) is
+  unchanged: it never answers a `.wicket.internal` name itself.
+- **No name, or its holder isn't running:** `connect` says so. A box that never connected doesn't
+  resolve the name.
 
-So a name only saves an agent the lookup. Whether it may connect is the link's decision, as
-NetworkPolicy is to Service DNS in Kubernetes.
+So a name saves an agent finding the box's run id; whether it may connect is the link's decision, as
+NetworkPolicy is to Service DNS in Kubernetes. A link across nodes still passes through the control
+host as #6's links do.
 
-To answer from its replica, the node needs the tenant's internal names on the feed: each name, its
-zone, and the run that holds it, signed like grants. A link across nodes still passes through the
-control host as #6's links do; this design doesn't change that.
+*Changed from the first version of this note:* it had the resolver answer a name, and the first
+connection open the link, for a box that may connect by default. But `connect` is decided on the
+control host, and a link's address, listener and hosts line are set up when it opens. A lookup that
+opened links would put a control-host call, and a box exec, inside a DNS query, and would need the
+names on the feed, while `connect` by name needs neither. That lookup can come later, on its own, if
+agents need names without calling `connect`. Internal names are also run-scoped only: a box asks
+again when it starts. Standing applies to public names, which need a human's approval each time.
 
 A box in `filtered` or `direct` mode (§7.3, not built) would get the same answers from the node's
 resolver on its veth. Nothing else changes for it.
@@ -91,6 +99,7 @@ A box asks with one gateway tool, `request_name`:
 - `port`: the box's own port, 1–65535. TCP only at first; UDP (HTTP/3, games) is a later step.
 - `service`: the SRV service label (`http`, `https`, …), public names only.
 - `scope`: `run` (default: this run only) or `standing` (every later run of the workload, as #572).
+  Public names only: an internal name is always the run's.
 
 **Internal names** are registered at once if the label is valid, free in the zone and within the
 workload's limit. The answer says the name. Audited `name.registered`.
@@ -310,16 +319,17 @@ has a name's records as the zone last listed them, and its last connections.
   revoked by), `name_records` (the records this installation created: zone, name, type, value,
   provider, created, last seen) and `host_ports` (`node`, protocol, port unique; the name holding it,
   released at). Node public addresses are columns of the node's row.
-- **Protocol 19:** the feed carries a tenant's internal names and each published port (name, run,
-  node, host port, box port, until) to the nodes that need them; a node reports a listener it
-  couldn't bind. An older node is refused boxes that hold names, and boxes on it ask as before.
+- **Protocol 19:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
+  node only of a control host at 19. Public names will add the feed's published ports (name, run,
+  node, host port, box port, until) for the nodes that listen on them, and a node's report of a
+  listener it couldn't bind.
 
 ## Steps
 
 1. This note.
 2. The provider trait, the `noop` provider and the plan function, in their own crate
    (`wicket-names`), with property tests for ownership.
-3. Ledger schema 28, `request_name` for internal names, the resolver's answers, protocol 19.
+3. Ledger schema 28 (#658); `request_name` for internal names, `connect` by name, protocol 19.
 4. Public names: the approval, standing names, port allocation, the node's listener, the reconciler,
    the console card.
 5. The `vultr` and `rfc2136` providers.
