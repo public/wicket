@@ -45,10 +45,12 @@ mod quota;
 mod receipts;
 mod scale;
 pub use changes::{ChangeWatch, Topic};
+mod retention;
 mod standing;
 mod triggers;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
+pub use retention::{Anchor as AuditAnchor, AuditUsage, Checkpoint as AuditCheckpoint};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
 pub use standing::{
     new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
@@ -185,7 +187,12 @@ pub enum StoreError {
 /// Version 28 (expand, after #582 step 2's 27) adds `names`, `host_ports` and `name_records`
 /// (#575): the names boxes hold, the host ports public names are published on, and the DNS records
 /// this installation created. Older builds don't read them; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 28;
+/// Version 32 (expand; 29 to 31 are triggers', placement's and names') adds `audit_checkpoints`
+/// and `audit_anchor` (#582): the checkpoints sinks acknowledged, and where the audit chain starts
+/// once retention has pruned its front. Older builds don't read them, but one opening a pruned
+/// ledger fails `wicket audit --verify` (it walks from seq 1): roll back only to a build that
+/// knows the anchor, or restore the snapshot taken before the update. The floor stays 17.
+pub const SCHEMA_VERSION: u32 = 32;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -573,6 +580,9 @@ impl Ledger {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        // Before any table exists, so a new ledger gives freed pages back (#582); on an existing
+        // one it changes nothing until a VACUUM (`make_auto_vacuum_incremental`).
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
         check_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(links::SCHEMA)?;
@@ -587,6 +597,7 @@ impl Ledger {
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
         conn.execute_batch(triggers::SCHEMA)?;
+        conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
@@ -644,6 +655,7 @@ impl Ledger {
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
         conn.execute_batch(triggers::SCHEMA)?;
+        conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
@@ -1775,8 +1787,11 @@ impl Ledger {
             .optional()?)
     }
 
-    /// Recomputes the whole chain. Returns the number of records verified.
+    /// Recomputes the whole chain: from seq 1, or after a prune (#582) from the anchor, whose
+    /// record must be the first kept and hash to what the anchor's checkpoint signed (its own
+    /// `prev` is the deleted record's, taken as stored). Returns the number of records verified.
     pub fn verify_audit(&self) -> Result<i64> {
+        let anchor = self.audit_anchor()?;
         let mut st = self.conn.prepare("SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit ORDER BY seq")?;
         let mut rows = st.query([])?;
         let mut prev = CHAIN_ZERO.to_string();
@@ -1784,6 +1799,14 @@ impl Ledger {
         while let Some(r) = rows.next()? {
             let (seq, ts, tenant, run, kind, body, p, h): (i64, i64, String, Option<String>, String, String, String, String) =
                 (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?);
+            if n == 0 {
+                if let Some(a) = &anchor {
+                    if seq != a.seq || h != a.hash {
+                        return Err(StoreError::ChainBroken(seq));
+                    }
+                    prev = p.clone();
+                }
+            }
             let f = ChainFields { seq, ts, tenant: &tenant, run: run.as_deref(), kind: &kind, body: &body };
             if p != prev || chain_hash_v2(&prev, &f) != h {
                 return Err(StoreError::ChainBroken(seq));
