@@ -11,5 +11,6 @@ pub mod operator;
 pub mod policy;
 pub mod run;
 pub mod secret;
+pub mod service;
 pub mod standing;
 pub mod zone;

@@ -71,6 +71,7 @@ pub(crate) use cmd::policy::KeysCmd;
 pub(crate) use cmd::policy::PolicyCmd;
 pub(crate) use cmd::policy::StateCmd;
 pub(crate) use cmd::secret::SecretCmd;
+pub(crate) use cmd::service::ServiceCmd;
 pub(crate) use cmd::standing::StandingCmd;
 pub(crate) use cmd::zone::ZoneCmd;
 use std::io::{IsTerminal, Read};
@@ -380,6 +381,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Per-node services (#579): programs kept running on every node whose boxes use them.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
     /// Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes.
     Doctor {
         /// The agent image to check [default: the default harness's agent image].
@@ -490,6 +496,7 @@ async fn main() -> Result<()> {
         c @ Cmd::Secret { .. } => cmd::secret::dispatch(c).await,
         c @ (Cmd::Image { .. } | Cmd::Doctor { .. }) => cmd::image::dispatch(c).await,
         c @ Cmd::Zone { .. } => cmd::zone::dispatch(c).await,
+        c @ Cmd::Service { .. } => cmd::service::dispatch(c).await,
         c @ (Cmd::Policy { .. } | Cmd::State { .. } | Cmd::Keys { .. }) => cmd::policy::dispatch(c).await,
         c @ (Cmd::Node { .. } | Cmd::Lease { .. } | Cmd::Reconcile { .. }) => cmd::node::dispatch(c).await,
         c @ Cmd::Itself { .. } => cmd::itself::dispatch(c).await,
