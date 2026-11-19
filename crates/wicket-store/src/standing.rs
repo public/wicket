@@ -359,6 +359,27 @@ impl Ledger {
         Ok(e)
     }
 
+    /// How often `principal`'s runs asked for `method` on `host` under directory `dir` since
+    /// `since`, and when first: what the repeat hint (#572) is given on. Every request counts, in
+    /// any state, the one just raised included.
+    pub fn asked_before(
+        &self,
+        tenant: &TenantId,
+        principal: &str,
+        method: &str,
+        host: &str,
+        dir: &str,
+        since: i64,
+    ) -> Result<(u64, Option<i64>)> {
+        Ok(self.conn.query_row(
+            "SELECT count(*), min(r.created_at) FROM requests r JOIN identities i ON i.run = r.run
+             WHERE r.tenant = ?1 AND i.spiffe_id = ?2 AND r.method = ?3 AND r.host = ?4 AND substr(r.path, 1, length(?5)) = ?5
+               AND r.created_at >= ?6",
+            params![tenant.0, principal, method, host, dir, since],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Option<i64>>(1)?)),
+        )?)
+    }
+
     pub fn standing(&self, id: &str) -> Result<Standing> {
         let r = self
             .conn

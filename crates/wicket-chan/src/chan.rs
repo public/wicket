@@ -45,11 +45,11 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 1, a connection talks
-/// 15 or 16, so only the versions above 14 have a check here; the checks for features of 13 and
+/// 15, 16 or 17, so only the versions above 14 have a check here; the checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
-/// forwarded egress, node health, the control host's tools as [`Msg::Call`]) went once every peer
-/// had them.
-pub const PROTOCOL: u32 = 16;
+/// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
+/// every peer had them.
+pub const PROTOCOL: u32 = 17;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -59,6 +59,10 @@ pub const MESSAGE_READ: u32 = 15;
 /// prefix grant is published for its own path exactly, as before; an older node's structural check
 /// would refuse the whole token.
 pub const PREFIX_GRANTS: u32 = 16;
+/// The first protocol version with standing reach (#572): a node sends a box's ask for it as
+/// [`Msg::AskStanding`], and the control host publishes approved rules to the node as token
+/// blocks. A node below it neither asks for nor honours one.
+pub const STANDING: u32 = 17;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -100,7 +104,7 @@ impl ControlTool {
     }
 }
 /// How far apart two peers' versions may be.
-pub const PROTOCOL_SKEW: u32 = 1;
+pub const PROTOCOL_SKEW: u32 = 2;
 
 /// The version two peers talk at: the lower of the two, if they are at most [`PROTOCOL_SKEW`]
 /// apart. `theirs` is 0 for a peer from before protocol versions (it required the same build).
@@ -118,6 +122,7 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 const _: () = {
     assert!(MESSAGE_READ <= PROTOCOL);
     assert!(PREFIX_GRANTS <= PROTOCOL);
+    assert!(STANDING <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -495,12 +500,16 @@ pub enum Msg {
     Forget {
         run: String,
     },
-    /// Answer to [`Msg::Ask`].
+    /// Answer to [`Msg::Ask`] and [`Msg::AskStanding`].
     Asked {
         id: u64,
         pending: Option<(String, bool)>,
         denied: Option<String>,
         error: Option<String>,
+        /// For the agent, beside its answer (#572): it has asked for this before, and standing
+        /// reach would save it asking again. An older node ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
     },
     /// Node → control host (#257 slice 4b): one of the control host's tools for `run`'s box, with
     /// its arguments as the box gave them. Answered with [`Msg::Called`] once the tool is done (a
@@ -754,6 +763,15 @@ pub enum Msg {
         /// prefix`, #164).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         prefix: bool,
+    },
+    /// Raise (or find) `run`'s ask for standing reach (#572): `rule`, for the asking agent's later
+    /// runs, in the agent's words. Answered with [`Msg::Asked`]. Sent only on a connection that
+    /// talks [`STANDING`] or later.
+    AskStanding {
+        id: u64,
+        run: String,
+        rule: wicket_core::manifest::ReachRule,
+        why: String,
     },
     /// A secret `run` needs now, on its first use on this node (#152): its model credential, or an
     /// injected secret. Never prefetched.
@@ -1233,8 +1251,9 @@ mod tests {
         assert_eq!(negotiate(5, 5), Ok(5));
         assert_eq!(negotiate(5, 4), Ok(4), "a control host at N, a node at N-1");
         assert_eq!(negotiate(4, 5), Ok(4), "a node at N, a control host rolled back to N-1");
-        assert!(negotiate(5, 3).unwrap_err().contains("at most 1 apart"));
-        assert!(negotiate(3, 5).is_err());
+        assert_eq!(negotiate(5, 3), Ok(3), "within a skew of 2");
+        assert!(negotiate(5, 2).unwrap_err().contains("at most 2 apart"));
+        assert!(negotiate(2, 5).is_err());
         assert!(negotiate(PROTOCOL, 0).unwrap_err().contains("before protocol versions"));
     }
 
@@ -1252,22 +1271,24 @@ mod tests {
     }
 
     /// Why this build has no checks for features of protocol 14 or before (CA renewal, #416, the
-    /// last): a peer below 15 can't connect, so every connection talks 15 or 16, and a check for a
-    /// feature of version N matters only while a peer at N - 1 can connect. 16 (prefix grants,
-    /// #257 4a) keeps its check for as long as a node at 15 can connect; 15's (message reads, #445)
-    /// is now true of every connection and can go with the next protocol.
+    /// last): with [`PROTOCOL_SKEW`] 2 a peer below 15 can't connect, so every connection talks 15,
+    /// 16 or 17, and a check for a feature of version N matters only while a peer below N can
+    /// connect: 15's message reads (#445), 16's prefix grants (#257 4a) and 17's standing reach
+    /// (#572) each keep theirs. The skew is 2 so a control host can go from 15 to 17 in one update
+    /// while its nodes still talk 15 (#572 followed #568's 16 within a release).
     #[test]
     fn no_connection_talks_below_protocol_15() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS), (16, 1, 15, 16));
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING), (17, 2, 15, 16, 17));
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((15..=16).contains(&at) && (15..=17).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(15..=17).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((15..=17).contains(&at) && (15..=19).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(15..=19).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 16 or 17 talking to a control host at 16 from the other side.
-        assert_eq!(negotiate(17, PROTOCOL), Ok(16));
+        // And a node at 18 or 19 talking to a control host at 17 from the other side.
+        assert_eq!((negotiate(18, PROTOCOL), negotiate(19, PROTOCOL)), (Ok(17), Ok(17)));
         assert!(negotiate(15, PROTOCOL).unwrap() < PREFIX_GRANTS, "a node at 15 is sent no prefix grant");
+        assert!(negotiate(16, PROTOCOL).unwrap() < STANDING, "a node at 16 sends no AskStanding, and gets no standing block");
         assert!(negotiate(PROTOCOL, 14).is_err() && negotiate(14, PROTOCOL).is_err());
     }
 

@@ -701,7 +701,40 @@ impl Node {
         };
         self.asks.lock().expect("asks").remove(&id);
         match reply {
-            Some(Msg::Asked { pending: Some((request, fresh)), .. }) => Ok(Asked::Pending { request, fresh }),
+            Some(Msg::Asked { pending: Some((request, fresh)), hint, .. }) => Ok(Asked::Pending { request, fresh, hint }),
+            Some(Msg::Asked { denied: Some(request), .. }) => Ok(Asked::Denied { request }),
+            Some(Msg::Asked { error: Some(e), .. }) => Err(e),
+            _ => Err(NO_ANSWER.into()),
+        }
+    }
+
+    /// Asks the control host for standing reach for `run` (#572): `rule`, in the agent's words.
+    /// Only over a connection that talks [`chan::STANDING`]; an older control host is said to be one.
+    async fn ask_standing_control(
+        &self,
+        run: &str,
+        rule: &wicket_core::manifest::ReachRule,
+        why: &str,
+    ) -> std::result::Result<Asked, String> {
+        let Some(g) = self.owner(run) else { return Err(NO_ANSWER.into()) };
+        let proto = self.links.lock().expect("links").get(&g).map_or(0, |l| l.proto);
+        if proto < chan::STANDING {
+            return Err(format!(
+                "not requested: this box's control host speaks protocol {proto}, and standing reach needs {} (an update of the control host): ask with scope exact or prefix meanwhile",
+                chan::STANDING
+            ));
+        }
+        let id = self.id();
+        let (tx, rx) = oneshot::channel();
+        self.asks.lock().expect("asks").insert(id, tx);
+        let ask = Msg::AskStanding { id, run: run.into(), rule: rule.clone(), why: why.into() };
+        let reply = match self.send_to(g, Frame::Msg(ask)) {
+            true => tokio::time::timeout(std::time::Duration::from_secs(10), rx).await.ok().and_then(|r| r.ok()),
+            false => None,
+        };
+        self.asks.lock().expect("asks").remove(&id);
+        match reply {
+            Some(Msg::Asked { pending: Some((request, fresh)), hint, .. }) => Ok(Asked::Pending { request, fresh, hint }),
             Some(Msg::Asked { denied: Some(request), .. }) => Ok(Asked::Denied { request }),
             Some(Msg::Asked { error: Some(e), .. }) => Err(e),
             _ => Err(NO_ANSWER.into()),
@@ -3303,15 +3336,18 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 record: fake_record("run_a"),
             },
         );
-        // A control host from before protocol versions, or two versions apart, is refused.
+        // A control host from before protocol versions, or three versions apart, is refused.
         let (_, r) = handshake(&node, 1, 0, &inst, &inst.issuer).await;
         assert!(
             matches!(&r, Err(HsError::Refused(why)) if why.contains("before protocol versions") && why.contains("self update --nodes n1")),
             "{r:?}"
         );
+        let (_, r) = handshake(&node, 1, chan::PROTOCOL + 3, &inst, &inst.issuer).await;
+        assert!(matches!(&r, Err(HsError::Refused(why)) if why.contains("at most 2 apart")), "{r:?}");
+        // Within the skew (2, #572) either way is accepted, at the lower version (`connect` below is at
+        // this build's).
         let (_, r) = handshake(&node, 1, chan::PROTOCOL + 2, &inst, &inst.issuer).await;
-        assert!(matches!(&r, Err(HsError::Refused(why)) if why.contains("at most 1 apart")), "{r:?}");
-        // One apart either way is accepted, at the lower version (`connect` below is at this build's).
+        assert!(matches!(r, Ok(Msg::Welcome { proto, .. }) if proto == chan::PROTOCOL), "{r:?}");
         let (_, r) = handshake(&node, 1, chan::PROTOCOL + 1, &inst, &inst.issuer).await;
         assert!(matches!(r, Ok(Msg::Welcome { proto, .. }) if proto == chan::PROTOCOL), "{r:?}");
 
@@ -3396,9 +3432,11 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         };
         assert_eq!(queued.as_ref().map(|q| q.0.as_str()), Some(id.as_str()));
         assert_eq!(node.queue.of(RUN).len(), 1, "kept until answered");
-        c.write_all(&Frame::Msg(Msg::Asked { id: mid, pending: Some(("r-1".into(), true)), denied: None, error: None }).encode())
-            .await
-            .unwrap();
+        c.write_all(
+            &Frame::Msg(Msg::Asked { id: mid, pending: Some(("r-1".into(), true)), denied: None, error: None, hint: None }).encode(),
+        )
+        .await
+        .unwrap();
         // A budget slice: kept on disk for a restarted `serve`.
         let slice = wicket_proxy::llm::Slice { requests: 3, output_tokens: 300, input_tokens: None };
         c.write_all(&Frame::Msg(Msg::BudgetSlice { run: RUN.into(), slice }).encode()).await.unwrap();
@@ -3929,9 +3967,11 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                     assert!(why.starts_with(crate::AGENT_ASKS), "{why}");
                     assert_eq!(p, q == prefix);
                     let rid = format!("r-{}", asks.len() + 1);
-                    c.write_all(&Frame::Msg(Msg::Asked { id, pending: Some((rid.clone(), true)), denied: None, error: None }).encode())
-                        .await
-                        .unwrap();
+                    c.write_all(
+                        &Frame::Msg(Msg::Asked { id, pending: Some((rid.clone(), true)), denied: None, error: None, hint: None }).encode(),
+                    )
+                    .await
+                    .unwrap();
                     asks.push((q, rid));
                 }
                 Frame::Msg(Msg::Call { id, tool, args, .. }) => {
@@ -3959,6 +3999,79 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(node.queue.of(RUN).is_empty());
         // Tools the node doesn't decide are the control host's.
         assert!(gw::tool(&node, RUN, "send_message", &serde_json::json!({})).await.is_none());
+    }
+
+    /// #572: `request_access` with scope standing asks the control host for one reach rule (the
+    /// url's directory by default, or the paths and methods named), as `Msg::AskStanding`; never
+    /// queued while cut off; a rule a manifest couldn't say is refused on the node. The control
+    /// host's hint on a repeated ask reaches the agent.
+    #[tokio::test]
+    async fn a_box_asks_its_control_host_for_standing_reach() {
+        const RUN: &str = "run_ssssssssssssssssssssssssss";
+        let inst = Install::new("nodesrv-standing");
+        let node = test_node(&inst);
+        fed_box(&node, &inst, RUN, "name: z\n");
+        let call = |args: serde_json::Value| {
+            let node = node.clone();
+            async move { gw::tool(&node, RUN, "request_access", &args).await.expect("decided on the node") }
+        };
+        let logs = serde_json::json!({
+            "url": "http://ci.example/repos/o/r/actions/jobs/", "scope": "standing", "reason": "CI logs",
+            "paths": ["/repos/o/r/actions/jobs/*/logs"],
+        });
+        let (t, err) = call(logs.clone()).await;
+        assert!(!err && t.contains("unreachable") && t.contains("isn't queued"), "{t}");
+        assert!(node.queue.of(RUN).is_empty());
+        let (t, err) = call(serde_json::json!({ "url": "http://ci.example/x", "scope": "standing", "reason": "r", "paths": ["x"] })).await;
+        assert!(err && t.contains("must start with /"), "{t}");
+        let (t, err) = call(serde_json::json!({ "url": "http://ci.example/x", "scope": "forever", "reason": "r" })).await;
+        assert!(err && t.contains("exact, prefix or standing"), "{t}");
+        // Nothing that could hide part of the rule from whoever reads it (#572 review, H1).
+        for p in ["/a\r{ host: x }", "/a\x1b[2K"] {
+            let (t, err) =
+                call(serde_json::json!({ "url": "http://ci.example/x", "scope": "standing", "reason": "r", "paths": [p] })).await;
+            assert!(err && t.contains("a character a path can't"), "{t}");
+        }
+        assert_eq!(crate::AGENT_ASKS, wicket_store::AGENT_ASKS_PREFIX, "the store tells an agent's own asks by this prefix");
+
+        let mut c = connect_run(&node, 2, &inst, RUN).await;
+        c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        // The connection owns the box once its Resume is read.
+        for _ in 0..50 {
+            if node.owner(RUN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let asking = tokio::spawn(call(logs));
+        loop {
+            if let Frame::Msg(Msg::AskStanding { id, run, rule, why }) = next_msg(&mut c).await {
+                assert_eq!((run.as_str(), rule.host.as_str()), (RUN, "ci.example"));
+                assert_eq!(
+                    (rule.methods, rule.paths, rule.allow_dangerous),
+                    (vec!["GET".to_string()], vec!["/repos/o/r/actions/jobs/*/logs".to_string()], false)
+                );
+                assert!(why.starts_with(crate::AGENT_ASKS) && why.ends_with("CI logs"), "{why}");
+                let a = Msg::Asked { id, pending: Some(("s-1".into(), true)), denied: None, error: None, hint: None };
+                c.write_all(&Frame::Msg(a).encode()).await.unwrap();
+                break;
+            }
+        }
+        let (t, err) = asking.await.unwrap();
+        assert!(!err && t.starts_with("requested: s-1: standing reach for GET ci.example /repos/o/r/actions/jobs/*/logs"), "{t}");
+        // An exact ask's answer carries the control host's hint.
+        let asking = tokio::spawn(call(serde_json::json!({ "url": "http://ci.example/repos/o/r/actions/jobs/3/logs", "reason": "logs" })));
+        loop {
+            if let Frame::Msg(Msg::Ask { id, .. }) = next_msg(&mut c).await {
+                let hint = Some("You have asked for GET ci.example/repos/o/r/actions/jobs/3/… 3 times".to_string());
+                c.write_all(&Frame::Msg(Msg::Asked { id, pending: Some(("r-9".into(), true)), denied: None, error: None, hint }).encode())
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
+        let (t, _) = asking.await.unwrap();
+        assert!(t.starts_with("requested: r-9") && t.contains("\n\nYou have asked for GET"), "{t}");
     }
 
     /// #164: cut off, a message between two boxes on one node is decided there from both tokens
