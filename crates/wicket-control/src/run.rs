@@ -627,6 +627,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         l.set_run_owner(&run.0, &crate::owner::owner_label())?;
         l.audit(&m.tenant, Some(&run), "run.attach", &serde_json::json!({ "owner": crate::owner::owner_label(), "node": node_name }))?;
     }
+    // An installed service's zone is its instances' alone (#579).
+    if record.is_none() {
+        crate::serviceuse::check_zone(&ledger.lock().expect("ledger"), &m.zone.name, &run.0)?;
+    }
     if record.is_none() {
         let l = ledger.lock().expect("ledger");
         l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
@@ -1111,7 +1115,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         image: image.to_string(),
         isolation: m.zone.isolation,
         mounts: vec![],
-        env: plan.env,
+        env: plan.env.into_iter().chain(crate::serviceuse::user_env(&ledger.lock().expect("ledger"), &m.zone.uses)).collect(),
         argv: plan.argv,
         // In bytes, as the subset check read it, so Docker can't read the limit differently (#126).
         memory: m.zone.limits.memory_bytes().context("limits.memory is unreadable")?.to_string(),
@@ -1376,6 +1380,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         let nb = nb?;
         timings.since("box_start", box_lap);
+        // #579 step 3: a per-node service offers its port, under its name, to the boxes that use it;
+        // a box that uses services is linked to their instances on its node once they run.
+        crate::serviceuse::after_start(&ctx, &m, &node_name);
         timings.mark("started");
         // The image's digest as its node started it (#192), or (re-attached, taken over) as pinned
         // or recorded: in the run's record and the audit, the parent's pin for children that name

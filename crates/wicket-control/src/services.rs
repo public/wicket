@@ -49,6 +49,9 @@ pub struct Installed {
     pub manifest: String,
     pub sha256: String,
     pub tenant: String,
+    /// The snapshot's zone and program: what its instances' identities say.
+    pub zone: String,
+    pub program: String,
 }
 
 /// An instance to start.
@@ -127,10 +130,12 @@ pub fn installed(l: &Ledger) -> Result<BTreeMap<String, Installed>> {
                 out.insert(
                     s.name.clone(),
                     Installed {
-                        spec: m.service.expect("checked"),
+                        spec: m.service.clone().expect("checked"),
                         manifest: s.manifest.clone(),
                         sha256: s.sha256.clone(),
                         tenant: s.tenant.clone(),
+                        zone: m.zone.name.clone(),
+                        program: m.program.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
                     },
                 );
             }
@@ -340,7 +345,14 @@ mod tests {
     use wicket_store::Instance;
 
     fn svc(y: &str, tenant: &str) -> Installed {
-        Installed { spec: wicket_core::yaml::from_str(y).unwrap(), manifest: "/m".into(), sha256: "aa".into(), tenant: tenant.into() }
+        Installed {
+            spec: wicket_core::yaml::from_str(y).unwrap(),
+            manifest: "/m".into(),
+            sha256: "aa".into(),
+            tenant: tenant.into(),
+            zone: "z".into(),
+            program: "p".into(),
+        }
     }
 
     fn inst(started_at: i64, live: bool) -> Instance {
