@@ -72,7 +72,7 @@ fn fixture(tag: &str) -> Fixture {
         approver: "human:passkey:laptop".into(),
         digest: vec![1, 2, 3],
     };
-    let record = issuer.publish(&approver, &[LiveGrant { grant, uses: Some(2) }]).unwrap();
+    let record = issuer.publish(&approver, &[LiveGrant { grant, uses: Some(2), prefix: false }]).unwrap();
     // This host's node's feed, as a supervisor publishes it.
     let feed_root = wicket_identity::SigningKey::from_bytes(&[7; 32]);
     let feed_key = wicket_identity::SigningKey::from_bytes(&[8; 32]);
