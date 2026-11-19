@@ -56,11 +56,14 @@ runs:
         tar -xjf "$dl/gvisor.tar.bz2" -C "$dl"
         mapfile -t found < <(find "$dl" -type f -name runsc)
         [ "${#found[@]}" = 1 ] || { echo "gvisor.tar.bz2 holds ${#found[@]} runsc binaries: ${found[*]}" >&2; exit 1; }
+        # runsc starts its sentry (and the rest) from gvisor-bin/ beside itself, as the .deb installs
+        # them (#566: "sidecar gvisor_sentry not usable: stat /usr/bin/gvisor-bin/gvisor_sentry").
+        bin=$(dirname "${found[0]}")
+        [ -d "$bin/gvisor-bin" ] || { echo "gvisor.tar.bz2 has no gvisor-bin/ beside runsc" >&2; exit 1; }
         sudo install -m 0755 "${found[0]}" /usr/bin/runsc
-        # The rest of what the archive holds next to runsc (a shim, say), installed beside it.
-        for f in "$(dirname "${found[0]}")"/*; do
-          [ "$f" = "${found[0]}" ] || [ ! -f "$f" ] || sudo install -m 0755 "$f" "/usr/bin/$(basename "$f")"
-        done
+        sudo rm -rf /usr/bin/gvisor-bin
+        sudo cp -a "$bin/gvisor-bin" /usr/bin/gvisor-bin
+        sudo chown -R root:root /usr/bin/gvisor-bin
         rm -r "$dl"
         # Keep the runner's own Docker settings; add runsc with host unix sockets (wicket's proxies).
         cfg=/etc/docker/daemon.json
