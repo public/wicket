@@ -27,8 +27,17 @@ not a permanent decision.
 - **Reach rules and grants carry no scheme or port.** HTTPS (port 443) and plain HTTP (port 80) to a
   host are decided alike, except that a credential is never sent over plain HTTP: a plain-HTTP request
   to a host the zone injects a credential into (or swaps one for) is refused.
-- **Response bodies are not scrubbed.** If an upstream echoes an injected credential back in a
-  response body, the box sees it. Headers are scrubbed.
+- **A reflected credential is masked only in the forms wicket looks for.** On a response from a host
+  wicket attached a credential to (the egress proxy's and the model proxy's), the body is scanned as
+  it streams for that credential: as it is, in hex (either case), and in standard or URL-safe
+  base64 at any alignment. Each match is replaced with the same number of `*`, so `content-length`
+  still holds, and the reflection is audited as an anomaly (`secret.reflected`). A response header
+  that holds one is dropped. wicket asks such a host for an unencoded body and refuses a compressed
+  one (502), because it can't scan it ([#381](https://github.com/public/wicket/pull/381)). Other
+  forms reach the box unmasked: percent-encoded or JSON-escaped (where that changes it), split by other bytes, part of the
+  credential, or anything an upstream computes from it. So does a credential shorter than 8 bytes.
+  Responses from hosts wicket attached nothing to aren't scanned, because they carry no credential
+  of wicket's to reflect.
 - **A host allowed wholesale is spliced through, not inspected.** If a reach rule allows a host for
   every method and path, the proxy decides on the hostname and relays the TLS unmodified. This needs
   nothing injected, nothing forbidden, and not the model host. Such a host gets one audit row per
