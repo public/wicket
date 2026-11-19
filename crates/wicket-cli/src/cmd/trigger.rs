@@ -9,28 +9,35 @@ use wicket_control::triggers as tr;
 #[derive(Subcommand)]
 pub enum TriggerCmd {
     /// Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one;
-    /// it is audited (`trigger.created`).
+    /// it is audited (`trigger.created`). The agent it wakes or messages is resolved now (a live
+    /// agent; a `wake` is kept as the agent's id).
     Create {
         #[arg(long)]
         file: PathBuf,
-        /// How long it lasts, or `forever`: until removed.
-        #[arg(long, default_value = "forever")]
+        /// How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew`.
+        #[arg(long, default_value = tr::DEFAULT_LASTS)]
         lasts: String,
     },
     /// Triggers that aren't removed: each with its state, source, action and next firing.
     List,
-    /// One trigger: its document, state, next firing and last firings.
-    Show { id: String },
-    /// Pause a trigger: it fires nothing until resumed (events while paused are not caught up).
-    Pause { id: String },
-    /// Resume a paused trigger.
-    Resume { id: String },
+    /// One trigger (its id, or its name): its document, agent, state, next firing and last firings.
+    Show { trigger: String },
+    /// Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up).
+    Pause { trigger: String },
+    /// Resume a paused trigger: only its owner (or root), since it fires as its owner.
+    Resume { trigger: String },
+    /// Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root).
+    Renew {
+        trigger: String,
+        #[arg(long, default_value = tr::DEFAULT_LASTS)]
+        lasts: String,
+    },
     /// Remove a trigger: it fires nothing again.
-    Rm { id: String },
+    Rm { trigger: String },
     /// Show what a trigger would do for an event, its templates filled in, changing nothing. The
     /// event is a JSON object of the source's fields (--event); without one, a time-told event now.
     Fire {
-        id: String,
+        trigger: String,
         /// A JSON file with the event's fields.
         #[arg(long)]
         event: Option<PathBuf>,
@@ -68,8 +75,18 @@ pub fn line(t: &wicket_store::Trigger, now: i64) -> String {
     format!("{}  {}  {}  {} → {}{next}", t.id, t.name, state(t, now), c(&tr::source_text(&t.spec)), c(&tr::action_text(&t.spec)))
 }
 
-/// The whole trigger, with its last firings.
-pub fn show(t: &wicket_store::Trigger, firings: &[wicket_store::TriggerFiring], now: i64) -> String {
+/// An agent as a trigger reaches it.
+fn agent_text(a: &wicket_store::AgentRow) -> String {
+    format!("{} ({}, zone {}), {}", c(&a.name), a.id, c(&a.zone), a.state)
+}
+
+/// The whole trigger, with the agent it reaches (as found now, or why not) and its last firings.
+pub fn show(
+    t: &wicket_store::Trigger,
+    agent: Option<&std::result::Result<wicket_store::AgentRow, String>>,
+    firings: &[wicket_store::TriggerFiring],
+    now: i64,
+) -> String {
     let mut out = format!(
         "trigger {} ({}): {}\n  owner:    {} (made by {}, {})\n  source:   {}\n  action:   {}\n",
         t.name,
@@ -81,6 +98,11 @@ pub fn show(t: &wicket_store::Trigger, firings: &[wicket_store::TriggerFiring], 
         c(&tr::source_text(&t.spec)),
         c(&tr::action_text(&t.spec)),
     );
+    match agent {
+        Some(Ok(a)) => out.push_str(&format!("  agent:    {}\n", agent_text(a))),
+        Some(Err(e)) => out.push_str(&format!("  agent:    {}\n", c(e))),
+        None => {}
+    }
     if !t.spec.filter.is_empty() {
         let f = serde_json::to_string(&t.spec.filter).unwrap_or_default();
         out.push_str(&format!("  filter:   {}\n", c(&f)));
@@ -89,7 +111,7 @@ pub fn show(t: &wicket_store::Trigger, firings: &[wicket_store::TriggerFiring], 
         out.push_str(&format!("  message:  {}\n", wicket_agent::clip(&m.body, 1000)));
     }
     let l = &t.spec.limits;
-    out.push_str(&format!("  limits:   {} an hour, {} at once, a queue of {}\n", l.per_hour, l.concurrency, l.queue));
+    out.push_str(&format!("  limits:   {} an hour, a queue of {}\n", l.per_hour, l.queue));
     if let (Some(n), true) = (tr::next_due(t, now), t.live(now)) {
         out.push_str(&format!("  next:     {}\n", when(n)));
     }
@@ -98,7 +120,8 @@ pub fn show(t: &wicket_store::Trigger, firings: &[wicket_store::TriggerFiring], 
     } else {
         out.push_str("  last firings:\n");
         for f in firings {
-            out.push_str(&format!("    {}  {}  {}  {}\n", when(f.created_at), f.id, f.status, c(f.detail.as_deref().unwrap_or(""))));
+            let more = if f.status == "skipped" && f.attempts > 0 { format!(" (+{} more)", f.attempts) } else { String::new() };
+            out.push_str(&format!("    {}  {}  {}{more}  {}\n", when(f.created_at), f.id, f.status, c(f.detail.as_deref().unwrap_or(""))));
         }
     }
     out
@@ -114,19 +137,47 @@ fn lasts(s: &str) -> Result<Option<i64>> {
     }
 }
 
+/// The trigger `which` names: its id, or its name (the caller's own trigger of that name first,
+/// else the only one of that name).
+fn find(l: &Ledger, op: &operators::Operator, which: &str) -> Result<wicket_store::Trigger> {
+    if let Some(t) = l.trigger(which)?.filter(|t| t.status != "deleted") {
+        return Ok(t);
+    }
+    let named: Vec<wicket_store::Trigger> = l.triggers(&TenantId::single().0, None)?.into_iter().filter(|t| t.name == which).collect();
+    if let Some(t) = named.iter().find(|t| t.owner == op.id) {
+        return Ok(t.clone());
+    }
+    match named.len() {
+        0 => bail!("no trigger {which}"),
+        1 => Ok(named.into_iter().next().expect("one")),
+        n => bail!("{n} triggers are named {which} (owners {}): name it by its id", {
+            named.iter().map(|t| c(&t.owner)).collect::<Vec<_>>().join(", ")
+        }),
+    }
+}
+
+/// Whether the caller is root: root over wicketd's socket (its peer credentials), or root itself.
+fn is_root() -> bool {
+    let p = wicket_home::cli_principal();
+    p["id"].as_str() == Some("root") && p["via"].as_str() == Some("cli")
+}
+
 pub async fn dispatch(c: TriggerCmd) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     let now = wicket_store::now();
+    let op = operators::Operator::cli(&TenantId::single().0)?;
     match c {
         TriggerCmd::Create { file, lasts: d } => {
             let raw = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
             let spec: wicket_core::trigger::TriggerSpec =
                 wicket_core::yaml::from_str(&raw).with_context(|| format!("{}: not a trigger document", file.display()))?;
-            let op = operators::Operator::cli(&TenantId::single().0)?;
-            let id = tr::create(&l, &op, &spec, lasts(&d)?, "cli")?;
+            let (id, agent) = tr::create(&l, &op, &spec, lasts(&d)?, "cli")?;
             let t = l.trigger(&id)?.context("the trigger just kept")?;
             println!("kept trigger {} as {id}", t.name);
             println!("{}", line(&t, now));
+            if let Some(a) = agent {
+                println!("  it reaches agent {}", agent_text(&a));
+            }
             Ok(())
         }
         TriggerCmd::List => {
@@ -139,28 +190,43 @@ pub async fn dispatch(c: TriggerCmd) -> Result<()> {
             }
             Ok(())
         }
-        TriggerCmd::Show { id } => {
-            let t = l.trigger(&id)?.filter(|t| t.status != "deleted").with_context(|| format!("no trigger {id}"))?;
-            print!("{}", show(&t, &l.recent_firings(&id, tr::SHOWN_FIRINGS)?, now));
+        TriggerCmd::Show { trigger } => {
+            let t = find(&l, &op, &trigger)?;
+            let a = &t.spec.action;
+            let agent = a
+                .wake
+                .as_deref()
+                .or(a.message.as_ref().map(|m| m.to.as_str()))
+                .map(|who| tr::target_agent(&l, &t, who).map_err(|e| format!("{e:#}")));
+            print!("{}", show(&t, agent.as_ref(), &l.recent_firings(&t.id, tr::SHOWN_FIRINGS)?, now));
             Ok(())
         }
-        TriggerCmd::Pause { id } => {
-            let t = tr::set_status(&l, &operator(), &id, "paused")?;
-            println!("paused trigger {} ({id}): it fires nothing until resumed", t.name);
+        TriggerCmd::Pause { trigger } => {
+            let t = tr::set_status(&l, &op, &find(&l, &op, &trigger)?.id, "paused")?;
+            println!("paused trigger {} ({}): it fires nothing until resumed", t.name, t.id);
             Ok(())
         }
-        TriggerCmd::Resume { id } => {
-            let t = tr::set_status(&l, &operator(), &id, "active")?;
-            println!("resumed trigger {} ({id}): it fires from its next due minute", t.name);
+        TriggerCmd::Resume { trigger } => {
+            let t = tr::resume(&l, &op, is_root(), &find(&l, &op, &trigger)?.id)?;
+            println!("resumed trigger {} ({}): it fires from its next due minute", t.name, t.id);
             Ok(())
         }
-        TriggerCmd::Rm { id } => {
-            let t = tr::set_status(&l, &operator(), &id, "deleted")?;
-            println!("removed trigger {} ({id})", t.name);
+        TriggerCmd::Renew { trigger, lasts: d } => {
+            let until = lasts(&d)?;
+            let t = tr::renew(&l, &op, is_root(), &find(&l, &op, &trigger)?.id, until)?;
+            match until {
+                Some(u) => println!("renewed trigger {} ({}): until {}", t.name, t.id, when(u)),
+                None => println!("renewed trigger {} ({}): until removed", t.name, t.id),
+            }
             Ok(())
         }
-        TriggerCmd::Fire { id, event, dry_run: _ } => {
-            let t = l.trigger(&id)?.filter(|t| t.status != "deleted").with_context(|| format!("no trigger {id}"))?;
+        TriggerCmd::Rm { trigger } => {
+            let t = tr::set_status(&l, &op, &find(&l, &op, &trigger)?.id, "deleted")?;
+            println!("removed trigger {} ({})", t.name, t.id);
+            Ok(())
+        }
+        TriggerCmd::Fire { trigger, event, dry_run: _ } => {
+            let t = find(&l, &op, &trigger)?;
             let fields = match event {
                 Some(p) => {
                     let raw = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
@@ -200,6 +266,7 @@ mod tests {
             created_by: "unix:alex".into(),
             until: None,
             decided_by: None,
+            updated_at: 0,
         };
         let f = wicket_store::TriggerFiring {
             id: "f-1".into(),
@@ -212,9 +279,10 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        for out in [line(&t, 0), show(&t, &[f], 0)] {
+        let bad: std::result::Result<wicket_store::AgentRow, String> = Err("no agent \x1b[2J".into());
+        for out in [line(&t, 0), show(&t, Some(&bad), &[f], 0)] {
             assert!(!out.contains(['\r', '\x1b', '\x07']), "{out:?}");
         }
-        assert!(show(&t, &[], 0).contains("next:     1970-01-01T01:00:00Z"));
+        assert!(show(&t, None, &[], 0).contains("next:     1970-01-01T01:00:00Z"));
     }
 }

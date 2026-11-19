@@ -505,7 +505,7 @@ impl Daemon {
                 let argv = vec!["trigger".into(), "create".into(), "--file".into(), file, "--lasts".into(), lasts.clone()];
                 Plan { argv, cwd: self.data_dir.clone(), stage: Some(st), caller }
             }
-            Cmd::Trigger { cmd: crate::TriggerCmd::Fire { id, event: Some(_), .. } } => {
+            Cmd::Trigger { cmd: crate::TriggerCmd::Fire { trigger: id, event: Some(_), .. } } => {
                 let st = upload::Stage::new(&stage_parent, vec![("event".into(), "event.json".into())])?;
                 let file = st.dir.join("event.json").display().to_string();
                 let argv = vec!["trigger".into(), "fire".into(), id.clone(), "--event".into(), file, "--dry-run".into()];

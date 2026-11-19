@@ -80,7 +80,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // `session` do now. Pausing and removing one only narrows.
         Cmd::Trigger { cmd } => match cmd {
             TriggerCmd::List | TriggerCmd::Show { .. } | TriggerCmd::Fire { .. } => Forward(Read),
-            TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } => Forward(Run),
+            TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } => Forward(Run),
             TriggerCmd::Pause { .. } | TriggerCmd::Rm { .. } => Forward(Revoke),
         },
         Cmd::Secret { cmd } => match cmd {
@@ -368,6 +368,7 @@ mod tests {
             (&["trigger", "fire", "t-1", "--dry-run"], Route::Forward(Read)),
             (&["trigger", "create", "--file", "t.yaml"], Route::Forward(Run)),
             (&["trigger", "resume", "t-1"], Route::Forward(Run)),
+            (&["trigger", "renew", "t-1", "--lasts", "30d"], Route::Forward(Run)),
             (&["trigger", "pause", "t-1"], Route::Forward(Revoke)),
             (&["trigger", "rm", "t-1"], Route::Forward(Revoke)),
             (&["secret", "list"], Route::Forward(Read)),

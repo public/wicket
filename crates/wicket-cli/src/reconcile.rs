@@ -912,10 +912,13 @@ pub async fn node_runs(ledger: &Ledger, dry_run: bool) -> Result<HashMap<String,
 pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     let _lock = Lock::take()?;
     let mut ledger = Ledger::open(&crate::ledger_path())?;
+    let now = wicket_store::now();
+    // Triggers (#578) first: the schedules' minutes and the timers that came due since the last
+    // pass, whatever the nodes and machines below make of this one.
+    let mut done = triggers_pass(&ledger, now, dry_run, &wicket_control::hibernate::trigger_wake, &trigger_owner_may);
     let asked = node_runs(&ledger, dry_run).await?;
     let local = Docker::from_env();
-    let now = wicket_store::now();
-    let mut done = machines_pass(&mut ledger, asked, &local, now, dry_run).await?;
+    done.extend(machines_pass(&mut ledger, asked, &local, now, dry_run).await?);
     done.extend(placed_nodes(&mut ledger, now, dry_run).await?);
     // The CI principals' standing grants (#258): renewed while their release key is trusted,
     // revoked once it isn't.
@@ -942,8 +945,6 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
         }
         Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
     }
-    // Triggers (#578): the schedules' minutes and the timers that came due since the last pass.
-    done.extend(triggers_pass(&ledger, now, dry_run, &wicket_control::hibernate::trigger_wake));
     // The ledger's own upkeep (#582): settled rows of runs long ended to the archive, planner
     // statistics, and a WAL checkpoint.
     if !dry_run {
@@ -978,8 +979,14 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
 /// The triggers' scheduler pass ([`wicket_control::triggers::pass`]), as the pass's report: one
 /// line per firing, skip or failure (each already audited as `trigger.*`), and per due one in a
 /// dry run.
-fn triggers_pass(ledger: &Ledger, now: i64, dry_run: bool, wake: wicket_control::triggers::Waker<'_>) -> Vec<Done> {
-    match wicket_control::triggers::pass(ledger, now, dry_run, wake) {
+fn triggers_pass(
+    ledger: &Ledger,
+    now: i64,
+    dry_run: bool,
+    wake: wicket_control::triggers::Waker<'_>,
+    owner: wicket_control::triggers::OwnerCheck<'_>,
+) -> Vec<Done> {
+    match wicket_control::triggers::pass(ledger, now, dry_run, wake, owner) {
         Ok(fired) => fired
             .into_iter()
             .map(|f| Done {
@@ -988,6 +995,7 @@ fn triggers_pass(ledger: &Ledger, now: i64, dry_run: bool, wake: wicket_control:
                     "queued" => "trigger_queued",
                     "skipped" => "trigger_skipped",
                     "due" => "trigger_due",
+                    "paused" => "trigger_paused",
                     _ => "trigger_failed",
                 },
                 target: format!("trigger {} ({})", f.name, f.trigger),
@@ -996,6 +1004,32 @@ fn triggers_pass(ledger: &Ledger, now: i64, dry_run: bool, wake: wicket_control:
             .collect(),
         Err(e) => vec![Done { kind: "error", target: "triggers".into(), detail: format!("{e:#}") }],
     }
+}
+
+/// Whether a trigger's owner may still have it fire (#578): `operators.yaml`
+/// ([`wicket_control::triggers::operator_may`]) and, on a host where wicketd decides who may do
+/// what, wicketd's policy as it stands now: the run class that keeping one needed, for the unix
+/// user the owner is. A user removed from the host, or from the policy's groups, has their
+/// triggers paused. Root and wicket's own user keep theirs, as wicketd lets them do anything.
+fn trigger_owner_may(t: &wicket_store::Trigger) -> std::result::Result<(), String> {
+    use crate::daemon::policy;
+    wicket_control::triggers::operator_may(t)?;
+    let installed = std::path::Path::new(policy::POLICY_PATH).exists() || std::path::Path::new(crate::daemon::SOCKET_PATH).exists();
+    if !installed {
+        // Development mode: one user, who owns wicket's data and every trigger in it.
+        return Ok(());
+    }
+    let Some(wicket_identity::Principal::Operator { via, name, .. }) = wicket_identity::Principal::parse(&t.owner) else {
+        return Err(format!("{} is not an operator's principal", t.owner));
+    };
+    if via != "unix" {
+        return Err(format!("{} isn't a unix user, whom wicketd's policy names", t.owner));
+    }
+    let peer = crate::daemon::proto::user_as_peer(&name).ok_or_else(|| format!("there is no user {name} on this host"))?;
+    let rules = policy::Policy::load(std::path::Path::new(policy::POLICY_PATH)).map_err(|e| format!("{e:#}"))?;
+    // SAFETY: a plain getter.
+    let me = unsafe { libc::geteuid() };
+    policy::authorize(&peer, policy::Class::Run, &rules, me).map(|_| ())
 }
 
 /// Runs, leases, the capacity leases' machines (with placement.yaml) and boxes.

@@ -195,7 +195,9 @@ impl TriggerSpec {
         }
         match &self.source {
             Source::Schedule { cron, tz } => {
-                Cron::parse(cron)?;
+                if !Cron::parse(cron)?.fires() {
+                    return Err(format!("schedule {:?} never fires: no month it names has the days it names", crate::text::strip(cron)));
+                }
                 if tz != "UTC"
                     && !tz.split('/').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"_+-".contains(&b)))
                 {
@@ -517,6 +519,13 @@ impl Cron {
     /// Whether the schedule fires at this minute (local time in its zone): minute, hour and month
     /// match, and the day of month or the weekday does (cron's rule: when both are restricted,
     /// either matches).
+    /// Whether it ever matches: a day of the month it names exists in a month it names (29
+    /// February counts), or it names days of the week, which every month has.
+    pub fn fires(&self) -> bool {
+        const LAST: [u8; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        self.weekdays.len() < 7 || self.months.iter().any(|m| self.days.iter().any(|d| *d <= LAST[(*m as usize).saturating_sub(1).min(11)]))
+    }
+
     pub fn matches(&self, minute: u8, hour: u8, day: u8, month: u8, weekday: u8) -> bool {
         let all_days = self.days.len() == 31;
         let all_weekdays = self.weekdays.len() == 7;
@@ -564,6 +573,9 @@ mod tests {
         bad(&format!("trigger: Bad_Name\nsource: {{ schedule: {{ cron: '* * * * *' }} }}\n{act}"), "trigger name");
         bad(&format!("trigger: t\nsource: {{ schedule: {{ cron: '60 * * * *' }} }}\n{act}"), "outside 0-59");
         bad(&format!("trigger: t\nsource: {{ schedule: {{ cron: '* * *' }} }}\n{act}"), "five fields");
+        bad(&format!("trigger: t\nsource: {{ schedule: {{ cron: '0 0 31 2 *' }} }}\n{act}"), "never fires");
+        assert!(spec(&format!("trigger: t\nsource: {{ schedule: {{ cron: '0 0 29 2 *' }} }}\n{act}")).is_ok(), "29 February comes");
+        assert!(spec(&format!("trigger: t\nsource: {{ schedule: {{ cron: '0 0 31 2 1' }} }}\n{act}")).is_ok(), "or Mondays");
         bad(&format!("trigger: t\nsource: {{ timer: {{ at: '2026-11-20T07:00:00Z', after: 2h }} }}\n{act}"), "exactly one");
         bad(&format!("trigger: t\nsource: {{ wicket: {{ kinds: [secret.set] }} }}\n{act}"), "is not one of");
         bad(
