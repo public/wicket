@@ -403,7 +403,7 @@ pub struct Start {
     pub keep: bool,
     /// The run's own model proxy: it sends the node budget slices and takes the node's spend
     /// (#152). None: no model route.
-    pub llm: Option<Arc<wicket_proxy::llm::Llm>>,
+    pub llm: Option<Arc<wicket_proxy::llm::Budget>>,
     /// Where the secrets the node fetches come from (#152).
     pub vault: wicket_proxy::vault::Vault,
     /// The run's credential swaps, with their real sources (#257): `start.swaps` names them for the
@@ -455,7 +455,7 @@ struct Shared {
     /// Who in the box made a request, as the run reads the agent's event stream (for asks the node
     /// didn't attribute).
     attribute: Option<wicket_proxy::Attributor>,
-    llm: Option<Arc<wicket_proxy::llm::Llm>>,
+    llm: Option<Arc<wicket_proxy::llm::Budget>>,
     vault: wicket_proxy::vault::Vault,
     /// What the node had counted when this supervisor took over, if that was already counted.
     spent_base: Mutex<Option<Option<wicket_proxy::llm::Spent>>>,

@@ -401,7 +401,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
         .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok().and_then(|v| v["anomaly"].as_str().map(String::from)))
         .collect();
     let seen = mock.state.seen.lock().unwrap().clone();
-    let counts = llm.count.counts();
+    let counts = llm.budget.count.counts();
     let r = Seen {
         status,
         body,

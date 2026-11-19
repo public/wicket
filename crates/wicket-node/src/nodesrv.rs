@@ -369,7 +369,7 @@ impl Node {
         let llms = self.llms.lock().expect("llms").clone();
         for (run, mut b) in boxes {
             if let Some(l) = llms.get(&run) {
-                b.spent = l.spent();
+                b.spent = l.budget.spent();
                 b.slice = l.slice();
             }
             (b.egress_allowed, b.egress_refused) = self.seen.counts(&run);
@@ -2278,7 +2278,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     // can miss a model call made just before the box ended (an agent that hibernates or finishes
     // right after its turn, #249), and the box would not be charged for it.
     if let Some(l) = llm {
-        n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent(), first_request_ms: l.first_request_ms() }));
+        n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.budget.spent(), first_request_ms: l.first_request_ms() }));
     }
     t.step("node.teardown.release");
     say_err!("[node] {run}: box exited ({code})");
@@ -2356,10 +2356,10 @@ async fn serve_box(
         let mut c = ctx.clone();
         c.events = quiet_tx;
         let l = wicket_proxy::llm::Llm::new(c)?;
-        l.spent_before(bs.llm_prior.0, bs.llm_prior.1, bs.llm_prior.2);
+        l.budget.spent_before(bs.llm_prior.0, bs.llm_prior.1, bs.llm_prior.2);
         // What this node already counted for the box, before a restart of `serve`.
         if let Some(sp) = std::fs::read(dir.join(SPEND_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
-            l.merge_spent(sp);
+            l.budget.merge_spent(sp);
         }
         l.set_slice(node.slices.get(&bs.run));
         node.llms.lock().expect("llms").insert(bs.run.clone(), l.clone());
@@ -2396,7 +2396,7 @@ async fn serve_box(
             loop {
                 t.tick().await;
                 i += 1;
-                let now = l2.spent();
+                let now = l2.budget.spent();
                 let charged = l2.spent_charged();
                 if charged != last_charged {
                     l2.journal();

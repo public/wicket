@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
-use wicket_proxy::{llm::Llm, vault::Vault, Event, RunCtx};
+use wicket_proxy::{llm::Budget, vault::Vault, Event, RunCtx};
 use wicket_sandbox::SandboxSpec;
 use wicket_store::Ledger;
 
@@ -867,7 +867,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     timings.since("quotas", lap);
     let children: Arc<Mutex<Vec<(String, crate::spawn::Supervisor)>>> = Arc::new(Mutex::new(Vec::new()));
-    let llm_slot: Arc<std::sync::OnceLock<Arc<Llm>>> = Arc::new(std::sync::OnceLock::new());
+    let llm_slot: Arc<std::sync::OnceLock<Arc<Budget>>> = Arc::new(std::sync::OnceLock::new());
     let spawn_ctx: Option<Arc<crate::spawn::SpawnCtx>> = match &m.agent {
         Some(a) if a.max_children > 0 => Some(Arc::new(crate::spawn::SpawnCtx {
             parent: m.clone(),
@@ -1019,7 +1019,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // of record (#152, #257), whose reports are merged in here and whose budget slices are sent from here.
     // Nothing listens for model calls on this side.
     // Its budget is its quota grants' amounts (#256), whatever its zone says.
-    let llm = Llm::with_quota(ctx.clone(), limits.model)?;
+    let llm = Arc::new(wicket_proxy::llm::run_budget(&m.zone, limits.model));
     let _ = llm_slot.set(llm.clone());
     // A woken agent's budget continues from what its earlier activations spent (#70); a re-attached
     // long-lived agent's from what its agent row records (this activation's spend included, up to its

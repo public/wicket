@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use wicket_core::{subset, Manifest, Op, RunId};
 use wicket_node::childplan::{plan_child, ChildPlan, PlanIn};
-use wicket_proxy::{llm::Llm, SpawnRequest};
+use wicket_proxy::{llm::Budget, SpawnRequest};
 use wicket_store::{EffectUse, Filed, Ledger};
 
 pub struct SpawnCtx {
@@ -32,7 +32,7 @@ pub struct SpawnCtx {
     pub ssh_key: Option<PathBuf>,
     pub ledger: Arc<Mutex<Ledger>>,
     pub children: Arc<Mutex<Vec<(String, Supervisor)>>>,
-    pub llm: Arc<OnceLock<Arc<Llm>>>,
+    pub llm: Arc<OnceLock<Arc<Budget>>>,
     pub deadline: Instant,
     /// The parent's org layer (#51): what spawns the org policy allows it, whatever it is approved.
     pub org: Option<Arc<wicket_authz::OrgLayer>>,
