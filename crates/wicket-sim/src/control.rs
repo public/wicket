@@ -192,6 +192,7 @@ fn apply(env: &Env, st: &mut State, run_i: usize, action: Option<(usize, &str, &
                     digest: hex::decode(op.digest()).unwrap_or_default(),
                 },
                 uses: None,
+                prefix: false,
             }
         })
         .collect();

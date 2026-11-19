@@ -45,15 +45,20 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 1, a connection talks
-/// 14 or 15, so only the versions above 13 have a check here; the checks for features of 13 and
+/// 15 or 16, so only the versions above 14 have a check here; the checks for features of 13 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`]) went once every peer
 /// had them.
-pub const PROTOCOL: u32 = 15;
+pub const PROTOCOL: u32 = 16;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
 pub const MESSAGE_READ: u32 = 15;
+/// The first protocol version whose nodes admit a path-prefix grant block in a box's token
+/// (#257 4a: `approved(gid, host, method, $p) <- path($p), $p.starts_with(prefix), …`). Until then a
+/// prefix grant is published for its own path exactly, as before; an older node's structural check
+/// would refuse the whole token.
+pub const PREFIX_GRANTS: u32 = 16;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -112,6 +117,7 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
     assert!(MESSAGE_READ <= PROTOCOL);
+    assert!(PREFIX_GRANTS <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -1241,22 +1247,23 @@ mod tests {
     }
 
     /// Why this build has no checks for features of protocol 14 or before (CA renewal, #416, the
-    /// last): a peer below 14 can't connect, so every connection talks 14 or 15, and a check for a
-    /// feature of version N matters only while a peer at N - 1 can connect. 15 (message reads,
-    /// #445) keeps its check for as long as a node at 14 can connect.
+    /// last): a peer below 15 can't connect, so every connection talks 15 or 16, and a check for a
+    /// feature of version N matters only while a peer at N - 1 can connect. 16 (prefix grants,
+    /// #257 4a) keeps its check for as long as a node at 15 can connect; 15's (message reads, #445)
+    /// is now true of every connection and can go with the next protocol.
     #[test]
-    fn no_connection_talks_below_protocol_14() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ), (15, 1, 15));
+    fn no_connection_talks_below_protocol_15() {
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS), (16, 1, 15, 16));
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((14..=15).contains(&at) && (14..=16).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(14..=16).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((15..=16).contains(&at) && (15..=17).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(15..=17).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 15 or 16 talking to a control host at 15 from the other side.
-        assert_eq!(negotiate(16, PROTOCOL), Ok(15));
-        assert!(negotiate(14, PROTOCOL).unwrap() < MESSAGE_READ, "a node at 14 sends no MessageRead, and gets messages read as handed");
-        assert!(negotiate(PROTOCOL, 13).is_err() && negotiate(13, PROTOCOL).is_err());
+        // And a node at 16 or 17 talking to a control host at 16 from the other side.
+        assert_eq!(negotiate(17, PROTOCOL), Ok(16));
+        assert!(negotiate(15, PROTOCOL).unwrap() < PREFIX_GRANTS, "a node at 15 is sent no prefix grant");
+        assert!(negotiate(PROTOCOL, 14).is_err() && negotiate(14, PROTOCOL).is_err());
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start

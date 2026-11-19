@@ -436,7 +436,7 @@ mod tests {
             approver: "human:test".into(),
             digest: vec![],
         };
-        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: Some(2) }]).unwrap();
+        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: Some(2), prefix: false }]).unwrap();
         let delta = p.commit(vec![Change::PutZone { zone: a }], t1).unwrap();
         replica.lock().unwrap().accept(&delta, t1).unwrap();
         replica.lock().unwrap().accept(&p.statement(t1), t1).unwrap();
@@ -500,7 +500,7 @@ mod tests {
             approver: "human:test".into(),
             digest: vec![],
         };
-        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: None }]).unwrap();
+        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: None, prefix: false }]).unwrap();
         let delta = p.commit(vec![Change::PutZone { zone: a }], t1).unwrap();
         replica.lock().unwrap().accept(&delta, t1).unwrap();
         for _ in 0..3 {

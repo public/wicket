@@ -15,6 +15,7 @@ Input: `{"zones": [zone…], "cases": [case…]}`. A case is one of
 - `{"kind": "reach_within", "outer": i, "inner": j}` → `true`/`false`;
 - `{"kind": "host", "pattern": p, "host": h}` → `true`/`false`;
 - `{"kind": "canon", "path": pq}` → the canonical path as a JSON string, or `null`.
+- `{"kind": "prefix_covers", "prefix": p, "path": q}` → `prefix_covers` (#257 4a): `true`/`false`;
 - `{"kind": "model", "zone": i, "model": m}` → whether the zone's boxes may call model `m`;
 - `{"kind": "accepts", "list": [e…], "zone": z, "principal": p}` → `manifest::accepts` (`p` may be
   `null`);
@@ -162,6 +163,7 @@ def decideCase (zs : Array Zone) (c : Json) : Except String String := do
     if !(o.supported && i.supported) then return "unsupported"
     return toString (reachWithin o i)
   | "host" => return toString (hostMatches (← jStr c "pattern") (← jStr c "host"))
+  | "prefix_covers" => return toString (prefixCovers (← jStr c "prefix") (← jStr c "path"))
   | "canon" =>
     match canonicalPath (← jStr c "path") with
     | some p => return (Json.str (stringOf p)).compress
