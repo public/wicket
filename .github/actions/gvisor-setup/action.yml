@@ -32,24 +32,31 @@ runs:
     - name: Install gVisor as a Docker runtime
       shell: bash
       run: |
-        # gVisor's release binary, pinned by version and sha512 (#219): no apt repository, whose
+        # gVisor's release archive, pinned by version and sha512 (#219): no apt repository, whose
         # mid-sync retries (20, 40 and 60 s sleeps) made this step 255-359 s on some runs, against
-        # about 90 s; and the same runsc in every job. To update: the version, and the sha512 from
-        # https://storage.googleapis.com/gvisor/releases/release/<version>/x86_64/runsc.sha512.
-        version=20261102.0
+        # about 90 s; and the same runsc in every job. A release has no bare runsc binary any more,
+        # only gvisor.tar.bz2 (and .zstd) with their .sha512 files. To update: the version, and the
+        # sha512 from https://storage.googleapis.com/gvisor/releases/release/<version>/x86_64/gvisor.tar.bz2.sha512.
+        version=20261116.0
         # Empty until pinned from the first run's annotation (the published sha512, checked here).
         sha512=
-        url=https://storage.googleapis.com/gvisor/releases/release/$version/x86_64/runsc
-        curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors -o /tmp/runsc "$url"
+        url=https://storage.googleapis.com/gvisor/releases/release/$version/x86_64/gvisor.tar.bz2
+        dl=$(mktemp -d)
+        curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors -o "$dl/gvisor.tar.bz2" "$url"
         if [ -z "$sha512" ]; then
           published=$(curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors "$url.sha512" | cut -d' ' -f1)
-          echo "$published  /tmp/runsc" | sha512sum -c -
-          echo "::notice title=runsc $version sha512 (to pin in .github/actions/gvisor-setup)::$published"
+          echo "$published  $dl/gvisor.tar.bz2" | sha512sum -c -
+          echo "::notice title=gvisor $version gvisor.tar.bz2 sha512 (to pin in .github/actions/gvisor-setup)::$published"
           sha512=$published
         fi
-        echo "$sha512  /tmp/runsc" | sha512sum -c -
-        sudo install -m 0755 /tmp/runsc /usr/bin/runsc
-        rm /tmp/runsc
+        echo "$sha512  $dl/gvisor.tar.bz2" | sha512sum -c -
+        # What the archive holds, for the log; then its one runsc, wherever it sits in it.
+        tar -tjf "$dl/gvisor.tar.bz2"
+        tar -xjf "$dl/gvisor.tar.bz2" -C "$dl"
+        mapfile -t found < <(find "$dl" -type f -name runsc)
+        [ "${#found[@]}" = 1 ] || { echo "gvisor.tar.bz2 holds ${#found[@]} runsc binaries: ${found[*]}" >&2; exit 1; }
+        sudo install -m 0755 "${found[0]}" /usr/bin/runsc
+        rm -r "$dl"
         # Keep the runner's own Docker settings; add runsc with host unix sockets (wicket's proxies).
         cfg=/etc/docker/daemon.json
         [ -f "$cfg" ] || echo '{}' | sudo tee "$cfg" >/dev/null
