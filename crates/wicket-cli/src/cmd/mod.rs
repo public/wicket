@@ -13,4 +13,5 @@ pub mod run;
 pub mod secret;
 pub mod service;
 pub mod standing;
+pub mod trigger;
 pub mod zone;

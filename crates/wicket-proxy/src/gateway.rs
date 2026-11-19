@@ -233,15 +233,30 @@ pub fn tools() -> Value {
             }
         },
         {
+            "name": "request_name",
+            "description": "Give a TCP port of this box a stable internal name other boxes of your tenant can find it by: <name>.<your zone>.wicket.internal. It grants nothing: whoever connects to it is decided as connect decides (your parent and boxes your accept_from lists at once, others once a human approves). The name is yours until this run ends. Public names (on the internet) aren't available yet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "one DNS label: a-z, 0-9 and '-', at most 63 characters" },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                    "kind": { "type": "string", "enum": ["internal"], "default": "internal" },
+                    "reason": { "type": "string", "description": "what it serves, for the record" }
+                },
+                "required": ["name", "port"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "connect",
-            "description": "Reach a TCP port of another box: one of your children (by name or run id, no expose needed), or a box that exposed the port. Returns the address to use here, <name>.wicket.internal:<port>, relayed by wicket (boxes have no network). Connecting lends you the target's authority, so a target that reaches beyond your zone needs a human: you get a request_id for await_grant, then call connect again.",
+            "description": "Reach a TCP port of another box: one of your children (by name or run id, no expose needed), a box that exposed the port, or a box by the internal name it registered (request_name: give `name`, such as api.build, and the port defaults to the name's). Returns the address to use here, <name>.wicket.internal:<port>, relayed by wicket (boxes have no network). Connecting lends you the target's authority, so a target that reaches beyond your zone needs a human: you get a request_id for await_grant, then call connect again.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "box": { "type": "string", "description": "a child's name, a run id, or \"parent\"" },
+                    "name": { "type": "string", "description": "instead of box: an internal name, <name>.<zone> (or with .wicket.internal)" },
                     "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
                 },
-                "required": ["box", "port"],
                 "additionalProperties": false
             }
         },

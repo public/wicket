@@ -74,6 +74,7 @@ pub(crate) use cmd::policy::StateCmd;
 pub(crate) use cmd::secret::SecretCmd;
 pub(crate) use cmd::service::ServiceCmd;
 pub(crate) use cmd::standing::StandingCmd;
+pub(crate) use cmd::trigger::TriggerCmd;
 pub(crate) use cmd::zone::ZoneCmd;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
@@ -250,6 +251,11 @@ enum Cmd {
     Standing {
         #[command(subcommand)]
         cmd: StandingCmd,
+    },
+    /// Triggers (#578): when a schedule or timer comes due, wake or message an agent.
+    Trigger {
+        #[command(subcommand)]
+        cmd: TriggerCmd,
     },
     /// Show or verify the hash-chained audit log, or export it to the configured sinks.
     Audit {
@@ -492,6 +498,7 @@ async fn main() -> Result<()> {
             cmd::approve::dispatch(c).await
         }
         Cmd::Standing { cmd } => cmd::standing::dispatch(cmd).await,
+        Cmd::Trigger { cmd } => cmd::trigger::dispatch(cmd).await,
         c @ Cmd::Identity { .. } => cmd::identity::dispatch(c).await,
         c @ Cmd::Audit { .. } => cmd::audit::dispatch(c).await,
         c @ Cmd::Secret { .. } => cmd::secret::dispatch(c).await,

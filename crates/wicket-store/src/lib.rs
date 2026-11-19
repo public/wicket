@@ -25,7 +25,9 @@ pub mod cas;
 #[cfg(test)]
 mod lifecycle_props;
 mod links;
+mod names;
 mod services;
+pub use names::{name_effect, new_name_id, NameAsk, NameKind, NameRow, NameScope, NameTerms, MAX_PENDING_NAMES};
 pub use services::{Instance, ServiceRow, SHARED_TENANT};
 mod nodeca;
 mod nodelabels;
@@ -44,12 +46,16 @@ mod receipts;
 mod scale;
 pub use changes::{ChangeWatch, Topic};
 mod standing;
+mod triggers;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
 pub use standing::{
     new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
     Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
+};
+pub use triggers::{
+    Firing as TriggerFiring, Trigger, TriggerEvent, FIRING_STATES as TRIGGER_FIRING_STATES, MAX_TRIGGERS_PER_OWNER, TRIGGER_RETENTION_SECS,
 };
 pub mod objects;
 pub mod sealed;
@@ -170,11 +176,16 @@ pub enum StoreError {
 /// Version 25 (expand, after #579 step 2's 24) adds `services`, `service_wants` and
 /// `service_instances` (#579 step 3): the per-node services installed, which runs use them on which
 /// node, and the instances kept for them. Older builds don't read them; the floor stays 17.
+/// Version 26 (expand, after 25) adds triggers (#578): `triggers`, `trigger_events`,
+/// `trigger_firings` and `work_claims`. Older builds don't read them; the floor stays 17.
 /// Version 27 (expand, after #579 step 3's 25 and 26) adds `ledger_changes` and its triggers (#582
 /// step 2): a counter per topic (grants, asks, revocations, node CAs) that every write to its tables
 /// moves, so a supervisor reads its rows only when they changed. Older builds don't read it, and its
 /// triggers fire under them too; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 27;
+/// Version 28 (expand, after #582 step 2's 27) adds `names`, `host_ports` and `name_records`
+/// (#575): the names boxes hold, the host ports public names are published on, and the DNS records
+/// this installation created. Older builds don't read them; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 28;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -575,6 +586,8 @@ impl Ledger {
         conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
+        conn.execute_batch(triggers::SCHEMA)?;
+        conn.execute_batch(names::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -588,7 +601,10 @@ impl Ledger {
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_turns ON messages (to_run, kind, delivered_at)")?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
-        Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
+        let l = Ledger { conn, path: Some(path.to_path_buf()), writer: None };
+        // Names a run that ended without releasing them still holds (#575 review, M2).
+        l.sweep_stale_names()?;
+        Ok(l)
     }
 
     /// A ledger's recorded schema, read without migrating it (`wicket self rollback` checks it
@@ -627,6 +643,8 @@ impl Ledger {
         conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
+        conn.execute_batch(triggers::SCHEMA)?;
+        conn.execute_batch(names::SCHEMA)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
@@ -672,6 +690,17 @@ impl Ledger {
     /// Ends a run. Its still-pending requests are withdrawn: a request belongs to the work that
     /// raised it, and must not be approvable after that work is gone.
     pub fn run_ended(&self, run: &RunId, status: &str, detail: &str) -> Result<usize> {
+        // One transaction (#575 review, H1): a run ends whole or not at all. Inside a caller's
+        // (`run_lost`'s), these writes join it.
+        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let n = self.run_ended_in(run, status, detail)?;
+        if let Some(own) = own {
+            own.commit()?;
+        }
+        Ok(n)
+    }
+
+    fn run_ended_in(&self, run: &RunId, status: &str, detail: &str) -> Result<usize> {
         self.conn
             .execute("UPDATE runs SET status = ?2, ended_at = ?3, detail = ?4 WHERE id = ?1", params![run.0, status, now(), detail])?;
         let n = self.conn.execute(
@@ -688,6 +717,8 @@ impl Ledger {
         // And what it used of per-node services (#579).
         self.drop_service_wants(&run.0)?;
         self.close_links_of(&run.0)?;
+        // And its names (#575): run-scoped ones end, standing ones wait for the next run.
+        self.release_run_names(run)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
             "UPDATE leases SET status = 'withdrawn', detail = 'its run ended before a decision', ended_at = ?2 WHERE run = ?1 AND status = 'pending'",
