@@ -205,7 +205,7 @@ def decideCase (zs : Array Zone) (c : Json) : Except String String := do
     return toString (checkEscalatable (← jBool c "one") (← jBool c "policy") (← jBool c "host") (← jBool c "risk") (← jBool c "approved"))
   | "needs_grant" =>
     -- Each failed check: "node", "soft", "hard" or "unknown".
-    let fs ← (← jStrs c "failed").mapM (fun f => match String.mk f with
+    let fs ← (← jStrs c "failed").mapM (fun f => match String.ofList f with
       | "node" => pure Failed.node
       | "soft" => pure (Failed.block (some true))
       | "hard" => pure (Failed.block (some false))
