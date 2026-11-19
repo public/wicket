@@ -740,6 +740,13 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
                 row.id
             );
             let changed = if dry_run { false } else { ledger.set_placed_node_held(&row.id, Some(&runs))? };
+            // Past its lease it bills hours its worst case didn't reserve (#494, #495): reserved
+            // now, through the next hour, so the next node's spend check counts them.
+            if let (false, Some(hourly)) = (dry_run, row.hourly) {
+                let held =
+                    wicket_placement::billing::held_reservation(wicket_placement::MicroUsd(hourly.max(0) as u64), row.created_at, now);
+                ledger.raise_money(&wicket_store::money::node_money_key(&row.name), held.0 as i64)?;
+            }
             record(ledger, "placed_held", detail, changed);
             continue;
         }

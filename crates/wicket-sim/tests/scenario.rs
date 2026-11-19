@@ -291,6 +291,25 @@ fn without_the_grace_the_reconciler_destroys_a_node_just_placed() {
     placement_without("grace", 4, o, "before its lease ends");
 }
 
+/// #494, #495 (the nightly run): a run started on a placed node shortly before its lease ended,
+/// and its box held the node past it (#294). The node billed hours past its worst case, nothing
+/// reserved them, and the next `node create`'s spend check passed on what was reserved: owned nodes
+/// were committed past the money limit's total. With the held node's billing reserved, both seeds
+/// refuse that create; without it, both still break the limit.
+#[test]
+fn a_held_nodes_billing_counts_against_the_money_limit() {
+    for seed in [32_200_164, 32_200_188] {
+        let r = wicket_sim::placement::run(seed, &dir().join(format!("held-{seed}")), Default::default());
+        assert!(r.ok(), "placement seed {seed}: {r}");
+        assert!(
+            !r.stats.contains("held: 0,") && !r.stats.contains("creates_refused: 0,"),
+            "seed {seed} holds a node and refuses a create: {r}"
+        );
+        let o = wicket_sim::placement::Options { reserve_held: false, ..Default::default() };
+        placement_without(&format!("held-{seed}"), seed, o, "over the money limit's");
+    }
+}
+
 /// The known loss the messages scenario found (#324, see `wicket_sim::messages::run`): a relayed
 /// `await_message` answer lost with the node's channel after the control host recorded the message
 /// read. Seed 13 still loses one; when this fails, the loss is fixed: make `strict_relay` the

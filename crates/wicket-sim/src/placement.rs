@@ -1205,6 +1205,11 @@ async fn placed_pass<A: SpendApprover>(env: &Rc<Env>, ledger: &mut Ledger, place
                 env.stat(|s| s.held += 1);
                 done.push(format!("reconcile.placed_held {} by {runs}", row.name));
             }
+            // What it bills past its lease, reserved through the next hour (#494, #495).
+            if let (true, Some(hourly)) = (env.options.reserve_held, row.hourly) {
+                let held = wicket_placement::billing::held_reservation(MicroUsd(hourly.max(0) as u64), row.created_at, now);
+                ledger.raise_money(&wicket_store::money::node_money_key(&row.name), held.0 as i64).expect("raise");
+            }
             continue;
         }
         let why = format!("its lease ended at {} and no run is placed on it", row.lease_until);
@@ -1252,11 +1257,21 @@ pub struct Options {
     /// The machine half leaves a node nothing records alone while it is new
     /// (`reconcile::too_new_to_judge`).
     pub young_grace: bool,
+    /// A node held past its lease has what it bills past it reserved (`reconcile::placed_pass`,
+    /// #494, #495). Off: only its worst case at creation, which the next node's spend check trusts.
+    pub reserve_held: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { keep_trace: false, refuse_past_lease: true, start_by: true, hold_uncollected: true, young_grace: true }
+        Options {
+            keep_trace: false,
+            refuse_past_lease: true,
+            start_by: true,
+            hold_uncollected: true,
+            young_grace: true,
+            reserve_held: true,
+        }
     }
 }
 
