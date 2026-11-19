@@ -535,7 +535,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
     };
     // The agent's state is its bundle, here, so it can wake on any node: bin-packed into the nodes
     // available now, by its zone's limits.
-    let node = match place(&agent, last_node.as_deref()).await {
+    let node = match place(&agent, &run, last_node.as_deref()).await {
         Ok(n) => n,
         Err(e) => {
             let l = Ledger::open(&ledger_path())?;
@@ -604,6 +604,9 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
 pub struct Candidate {
     pub name: String,
     pub cap: crate::chan::NodeCapacity,
+    /// When its room was read (ms): its report's receipt, or the probe. Reservations made since
+    /// count against it (#579).
+    pub at_ms: i64,
 }
 
 /// What the scheduler sees of `c` (#579): its reported room, and from the ledger its labels, taints,
@@ -637,6 +640,37 @@ pub fn scheduled_node(l: &Ledger, c: &Candidate, need: &[String]) -> wicket_plac
     }
 }
 
+/// Chooses a node for `run`'s box among `cands` and reserves what it asks for there, in one
+/// transaction under the ledger's write lock (#579 step 2): each candidate's room is what it
+/// reported less what reservations made since hold on it (`Ledger::held_on`), so two starts never
+/// count the same room. Nothing is reserved when no node may take it.
+pub fn bind(
+    l: &Ledger,
+    run: &RunId,
+    req: &wicket_placement::schedule::Request,
+    cands: &[Candidate],
+    need: &[String],
+    last: Option<&str>,
+    now_ms: i64,
+) -> Result<wicket_placement::schedule::Decision> {
+    l.immediate(|l| {
+        let mut nodes = vec![];
+        for c in cands {
+            let mut n = scheduled_node(l, c, need);
+            let (cpu, mib) = l.held_on(&c.name, c.at_ms, now_ms)?;
+            n.used_vcpus += cpu;
+            n.used_memory_mib += mib;
+            n.room_mib = n.room_mib.map(|r| r.saturating_sub(mib));
+            nodes.push(n);
+        }
+        let d = wicket_placement::schedule::schedule(req, &nodes, wicket_placement::schedule::Strategy::BinPack, last);
+        if let Some(node) = &d.node {
+            l.reserve_placement(&run.0, node, req.vcpus, req.memory_mib, now_ms)?;
+        }
+        Ok(d)
+    })
+}
+
 /// A node's last report older than this (ms) is not trusted for its room: it is asked (#579).
 pub const INDEX_FRESH_MS: i64 = 90_000;
 
@@ -647,13 +681,11 @@ pub const INDEX_FRESH_MS: i64 = 90_000;
 pub fn from_index(names: &[String], health: &[(String, i64, String)], now_ms: i64) -> (Vec<Candidate>, Vec<String>) {
     let (mut found, mut ask) = (vec![], vec![]);
     for n in names {
-        let cap = health
-            .iter()
-            .find(|(node, at, _)| node == n && now_ms - at < INDEX_FRESH_MS)
-            .and_then(|(_, _, j)| serde_json::from_str::<wicket_chan::health::NodeHealth>(j).ok())
-            .and_then(|h| h.capacity);
+        let cap = health.iter().find(|(node, at, _)| node == n && now_ms - at < INDEX_FRESH_MS).and_then(|(_, at, j)| {
+            serde_json::from_str::<wicket_chan::health::NodeHealth>(j).ok().and_then(|h| h.capacity).map(|c| (c, *at))
+        });
         match cap {
-            Some(cap) => found.push(Candidate { name: n.clone(), cap }),
+            Some((cap, at_ms)) => found.push(Candidate { name: n.clone(), cap, at_ms }),
             None => ask.push(n.clone()),
         }
     }
@@ -664,7 +696,7 @@ pub fn from_index(names: &[String], health: &[(String, i64, String)], now_ms: i6
 /// by a capacity lease, its room read from its last report in the ledger ([`from_index`]) or, with
 /// none fresh, asked of it (within 10 s); filtered by the box's requests, labels, taints and CA
 /// coverage, then bin-packed (`wicket_placement::schedule`).
-async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
+async fn place(agent: &AgentRow, run: &RunId, last: Option<&str>) -> Result<Option<String>> {
     let m = wicket_agent::load(&agent.manifest)?;
     let req = wicket_placement::schedule::Request::of(&m);
     let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
@@ -686,7 +718,7 @@ async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
             )
             .await;
             match r {
-                Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap }),
+                Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap, at_ms: wicket_feed::now_ms() }),
                 Ok(Err(e)) => {
                     say!("[wicket] node {n} is not available for the wake: {e:#}");
                     None
@@ -703,11 +735,7 @@ async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
     if cands.is_empty() {
         return Ok(None);
     }
-    let nodes: Vec<_> = {
-        let l = ledger.lock().expect("ledger");
-        cands.iter().map(|c| scheduled_node(&l, c, &need)).collect()
-    };
-    let d = wicket_placement::schedule::schedule(&req, &nodes, wicket_placement::schedule::Strategy::BinPack, last);
+    let d = bind(&ledger.lock().expect("ledger"), run, &req, &cands, &need, last, wicket_feed::now_ms())?;
     match d.node {
         Some(n) => {
             say!(
@@ -824,6 +852,7 @@ mod tests {
                 boxes: 0,
                 ..Default::default()
             },
+            at_ms: 0,
         }
     }
 
@@ -844,13 +873,50 @@ mod tests {
             ("unlisted".to_string(), now, report(Some(cap))),
         ];
         let (found, ask) = from_index(&names, &health, now);
-        assert_eq!(found, vec![Candidate { name: "fresh".into(), cap }]);
+        assert_eq!(found, vec![Candidate { name: "fresh".into(), cap, at_ms: now - 30_000 }]);
         assert_eq!(ask, ["stale", "old-node", "silent"], "a stale report, one without capacity, or none: asked");
         // A node's report carries what its Welcome would: the two read the same.
         let h: wicket_chan::health::NodeHealth = serde_json::from_str(&report(Some(cap))).unwrap();
         assert_eq!(h.capacity, Some(cap));
         let before: wicket_chan::health::NodeHealth = serde_json::from_str("{\"at_ms\":1,\"disk\":{\"total_bytes\":0,\"avail_bytes\":0,\"files_total\":0,\"files_avail\":0},\"memory\":{\"total_mib\":0,\"available_mib\":0,\"committed_mib\":0},\"feed_mode\":\"\",\"feed_fresh_until_ms\":null,\"oom_kills\":0,\"last_oom\":null,\"persist_failures\":0,\"last_persist_failure\":null}").unwrap();
         assert_eq!(before.capacity, None, "a node from before it");
+    }
+
+    /// #579 step 2: a bind reserves what it chose, so the next bind, reading the same reports,
+    /// doesn't count that room again; a box the node has reported counts once, and a released
+    /// reservation gives its room back.
+    #[test]
+    fn two_starts_never_count_the_same_room() {
+        use wicket_placement::schedule::Request;
+        let l = Ledger::open_in_memory().unwrap();
+        let now = 50_000_000;
+        // n1 has room for one 2 GiB box, n2 for one more.
+        let mut n1 = cand("n1", 4.0, 4096, 0.0, 1024);
+        n1.at_ms = now - 10_000;
+        let mut n2 = cand("n2", 4.0, 8192, 0.0, 5120);
+        n2.at_ms = now - 10_000;
+        let cands = [n1.clone(), n2.clone()];
+        let req = Request { vcpus: 1.0, memory_mib: 2048, ..Request::default() };
+        let run = |r: &str| RunId(r.into());
+        let a = bind(&l, &run("run_a"), &req, &cands, &[], None, now).unwrap();
+        assert_eq!(a.node.as_deref(), Some("n1"), "bin-packed: n1 has less left");
+        assert_eq!(l.placement("run_a").unwrap().unwrap().node, "n1");
+        let b = bind(&l, &run("run_b"), &req, &cands, &[], None, now + 1).unwrap();
+        assert_eq!(b.node.as_deref(), Some("n2"), "n1's room is run_a's now: {}", b.why_not());
+        let c = bind(&l, &run("run_c"), &req, &cands, &[], None, now + 2).unwrap();
+        assert_eq!(c.node, None, "both taken");
+        assert!(l.placement("run_c").unwrap().is_none(), "nothing reserved when nothing fits");
+        assert!(c.why_not().contains("n1 (") && c.why_not().contains("n2 ("), "{}", c.why_not());
+        // run_b's start failed: its room is free again.
+        l.placement_released("run_b").unwrap();
+        assert_eq!(bind(&l, &run("run_d"), &req, &cands, &[], None, now + 3).unwrap().node.as_deref(), Some("n2"));
+        // run_a started; n1's next report counts its box, and its reservation stops counting.
+        l.placement_bound("run_a", now + 4).unwrap();
+        let mut n1_after = cand("n1", 4.0, 4096, 1.0, 3072);
+        n1_after.at_ms = now + 5;
+        let e = bind(&l, &run("run_e"), &req, &[n1_after], &[], None, now + 6).unwrap();
+        assert_eq!(e.node, None, "full by its own report, not by twice: {}", e.why_not());
+        assert!(e.why_not().contains("1024 MiB free"), "{}", e.why_not());
     }
 
     #[test]

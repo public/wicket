@@ -369,6 +369,13 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
   stored once per node at most every 20 s) carries its capacity, and a wake reads it there. A node with no
   report under 90 s old, or one from a node before #579, is asked over its control channel instead (within
   10 s): an idle node, with no run connected to it, reports nothing.
+- **Reservations.** Choosing a node and reserving what the box asks for there are one ledger transaction
+  (`placements`), so two starts never count the same room: a node's room is its report less what boxes
+  chosen since hold on it. A reservation counts until the node reports the box (after it starts), or is
+  given back when the start fails or the run ends; one never confirmed stops counting after 2 minutes.
+  A node named for the box (`wicket run --node`, a lease's node) passes the same filters and is reserved
+  the same way when its last report says its room, and the start is refused, saying why, if it may not
+  take the box.
 
 - **Labels and taints.** `wicket node set <node> --label gpu=a100 --taint dedicated=ci` records them in the
   ledger (`key-` removes one; audited `node.labels`). A box goes on a node only if the node has every label
