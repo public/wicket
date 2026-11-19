@@ -408,6 +408,43 @@ fn a_grant_reaches_the_node_and_its_use_count_is_enforced_there() {
     assert!(matches!(&e, Err(PublishError::Invalid(w)) if w.contains("no first-party block trusts")), "{e:?}");
 }
 
+/// #257 4a: a path-prefix grant reaches the node as the prefix it is (protocol 16), and the node
+/// covers what the ledger covers: the directory and every path under it, one use counted per
+/// request whichever path it is, and nothing beside it.
+#[test]
+fn a_prefix_grant_covers_its_paths_on_the_node() {
+    let mut cp = Cp::new();
+    let z = zone("z", &["/repos/acme/**"]);
+    let issuer = cp.issue("r1", &z);
+    cp.put(issuer.publish(&cp.approver, &[]).unwrap(), T0 - 100);
+    let mut r = cp.replica();
+    sync(&mut cp.p, &mut r, T0);
+    let post = |path: &str| gh("z", "r1", "POST", path);
+    assert_eq!(kind(&r.decide(&post("/repos/acme/app/hooks/1"), T0)), "needs-grant");
+    let g = LiveGrant { grant: authz_grant("gp", "POST", "/repos/acme/app/hooks/", T0 + 600_000), uses: Some(3), prefix: true };
+    let a = issuer.publish(&cp.approver, std::slice::from_ref(&g)).unwrap();
+    assert!(a.grants[0].prefix);
+    r.accept(&cp.put(a, T0 + 10), T0 + 10).unwrap();
+    for path in ["/repos/acme/app/hooks", "/repos/acme/app/hooks/1", "/repos/acme/app/hooks/2/pings"] {
+        assert_eq!(r.decide(&post(path), T0 + 20), Decision::Allow(Allowed::Grant("gp".into())), "{path}");
+    }
+    assert_eq!(r.uses("gp"), 3, "one use per request, whichever path");
+    assert_eq!(kind(&r.decide(&post("/repos/acme/app/hooks/3"), T0 + 30)), "needs-grant", "three uses, then none");
+    // Beside the prefix: never, uses or not.
+    let g2 = LiveGrant { grant: authz_grant("gq", "POST", "/repos/acme/app/hooks/", T0 + 600_000), uses: None, prefix: true };
+    r.accept(&cp.put(issuer.publish(&cp.approver, std::slice::from_ref(&g2)).unwrap(), T0 + 40), T0 + 40).unwrap();
+    // (Some of these the zone's own reach allows; none by the grant.)
+    for path in ["/repos/acme/app/hooksx/1", "/repos/acme/app", "/repos/acme/app/", "/repos/acme/app-x/hooks/1"] {
+        assert_ne!(r.decide(&post(path), T0 + 50), Decision::Allow(Allowed::Grant("gq".into())), "{path}");
+    }
+    assert_eq!(r.decide(&post("/repos/acme/app/hooks/9"), T0 + 50), Decision::Allow(Allowed::Grant("gq".into())));
+    // A record claiming a prefix its token's block doesn't hold covers no more than the block does.
+    let mut forged = issuer.publish(&cp.approver, &[LiveGrant { prefix: false, ..g2.clone() }]).unwrap();
+    forged.grants[0].prefix = true;
+    r.accept(&cp.put(forged, T0 + 60), T0 + 60).unwrap();
+    assert_eq!(kind(&r.decide(&post("/repos/acme/app/hooks/9"), T0 + 70)), "needs-grant", "the block is exact: the listing can't widen it");
+}
+
 #[test]
 fn a_hostile_appended_block_is_refused_at_load() {
     let mut cp = Cp::new();

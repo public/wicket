@@ -1923,7 +1923,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             continue;
         }
         // A prefix grant as the prefix it is, on a node that admits one (#257 4a, protocol 16).
-        let as_prefix = g.prefix && p.proto >= wicket_chan::chan::PREFIX_GRANTS;
+        let as_prefix = publish_as_prefix(g.prefix, p.proto);
         let live = live_grant(&sh.tenant, &sh.run, &sh.zone.name, &issuer, &g, as_prefix);
         let mut trial = p.live.clone();
         trial.push(live.clone());
@@ -2047,6 +2047,13 @@ fn renewed(sh: &Shared, issuer: wicket_feed::Issuer, until: i64) {
 
 /// A ledger grant as a block of the box's token. Its use count is the ledger's at handover: a
 /// re-minted token (a re-attached run) gives the node that count again.
+/// Whether a ledger grant is published to a node as a path-prefix grant (#257 4a): a prefix grant,
+/// to a node at protocol 16 or later. An older node's structural check refuses the block, and with
+/// it the box's whole token, so it is sent the grant for its own path exactly, as before.
+fn publish_as_prefix(prefix: bool, proto: u32) -> bool {
+    prefix && proto >= wicket_chan::chan::PREFIX_GRANTS
+}
+
 /// `prefix`: published as the path-prefix grant it is (#257 4a), for a node at protocol 16 or later;
 /// otherwise (`false`) for its own path exactly.
 fn live_grant(
@@ -2129,6 +2136,45 @@ mod tests {
         let revoked = wicket_store::GrantRow { revoked: true, ..row("g-1", Some("n1"), now + 7200) };
         assert!(!renew_live(&mut live, &[revoked, row("g-1", Some("n2"), now + 7200)], "n1", now));
         assert_eq!(live[0].grant.not_after, (now + 3600 - 1) as u64);
+    }
+
+    /// #257 4a: a prefix grant goes to a node at protocol 16 as its prefix (the ledger's path as a
+    /// canonical directory), and its token loads; to an older node, or as an exact grant, as before.
+    #[test]
+    fn a_prefix_grant_is_published_as_a_prefix_from_protocol_16() {
+        assert!(publish_as_prefix(true, wicket_chan::chan::PREFIX_GRANTS));
+        assert!(!publish_as_prefix(true, wicket_chan::chan::PREFIX_GRANTS - 1), "a node at 15: exactly, as before");
+        assert!(!publish_as_prefix(false, wicket_chan::chan::PROTOCOL));
+        let tenant = TenantId::single();
+        let run = RunId("run_r".into());
+        let zone: ZoneSpec = wicket_core::yaml::from_str("name: z\nreach: []\n").unwrap();
+        let (root, approver) = (wicket_authz::SigningKey::generate(), wicket_authz::SigningKey::generate());
+        let issuer =
+            wicket_feed::Issuer::root(&root, &tenant.0, "run:run_r", &run.0, 0, &zone, &[], 2_000_000_000, vec![approver.public()])
+                .unwrap();
+        let row = wicket_store::GrantRow {
+            id: "g-p".into(),
+            tenant: tenant.0.clone(),
+            zone: "z".into(),
+            method: "PUT".into(),
+            host: "api.example.com".into(),
+            path: "/repos/acme/app".into(),
+            prefix: true,
+            uses_left: None,
+            expires_at: 1_900_000_000,
+            request_id: Some("r-1".into()),
+            revoked: false,
+            node: Some("n1".into()),
+            max_risk: Some(4),
+            run: Some(run.0.clone()),
+            amount: None,
+        };
+        let live = live_grant(&tenant, &run, "z", &issuer, &row, true);
+        assert_eq!((live.grant.path.as_str(), live.prefix), ("/repos/acme/app/", true));
+        let a = issuer.publish(&approver, std::slice::from_ref(&live)).unwrap();
+        assert!(a.grants[0].prefix);
+        let exact = live_grant(&tenant, &run, "z", &issuer, &row, false);
+        assert_eq!((exact.grant.path.as_str(), exact.prefix), ("/repos/acme/app", false));
     }
 
     /// #152: `wicket node list` shows, per run on a node, its authority, the secrets released to it
