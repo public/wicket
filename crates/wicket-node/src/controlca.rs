@@ -314,4 +314,75 @@ mod tests {
         assert!(fresh.on_csr(&i.ledger, None, "n1", Some("x".into()), None, now).is_none());
         assert!(fresh.on_installed(&i.ledger, "n1", "x", None, now).is_none());
     }
+
+    /// #573: a host a box wants of its node's CA widens it at once (no waiting for half its life),
+    /// within the node's policy, audited with who wanted it; a due renewal prunes what no box wants.
+    #[test]
+    fn a_want_widens_the_ca_within_its_policy_and_a_due_renewal_prunes_it() {
+        let i = Install::new("ca-widen");
+        let root = InstallationCa::generate().unwrap();
+        let t0 = wicket_store::now();
+        let enrolled = NodeCaRow {
+            serial: "ca2".into(),
+            node: "n1".into(),
+            issued_at: t0,
+            not_after: t0 + 3600,
+            hosts: vec!["api.example.com".into(), ".example.org".into()],
+            status: "active".into(),
+        };
+        i.ledger.lock().unwrap().renew_node_ca(&enrolled).unwrap();
+        let p = crate::chan::PROTOCOL;
+        let renew = |r: &mut CaRenewal, at: i64| -> (NodeCaRow, Vec<String>) {
+            assert_eq!(r.tick(&i.ledger, "n1", p, at), Some(Msg::CaRenew {}));
+            let key = rcgen::KeyPair::generate().unwrap();
+            let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
+            let Some(Msg::NodeCa { pem }) = r.on_csr(&i.ledger, Some(&root), "n1", Some(csr), None, at) else { panic!("no certificate") };
+            let ca = wicket_proxy::ca::NodeCa::load_any(&pem, &key.serialize_pem()).unwrap();
+            let (_, x) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap();
+            let serial = hex::encode(x.parse_x509().unwrap().raw_serial());
+            (r.on_installed(&i.ledger, "n1", &serial, None, at).unwrap(), ca.permitted)
+        };
+        let kinds = || {
+            i.ledger
+                .lock()
+                .unwrap()
+                .audit_tail(50)
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.2 == "node.ca_widened")
+                .map(|a| a.4)
+                .collect::<Vec<_>>()
+        };
+        let mut r = CaRenewal::default();
+        let want = |host: &str, run: &str| {
+            i.ledger.lock().unwrap().want_node_ca_hosts("n1", &[host.to_string()], run, "the box's reach", t0).unwrap()
+        };
+        // Fixed (no policy recorded): a want changes nothing.
+        want("late.test", "run_a");
+        assert!(r.tick(&i.ledger, "n1", p, t0 + 10).is_none());
+        // Auto: renewed now, for the union.
+        i.ledger.lock().unwrap().set_node_ca_policy("n1", &wicket_store::CaHosts::Auto).unwrap();
+        let (row, permitted) = renew(&mut r, t0 + 20);
+        assert_eq!(permitted, [".example.org", "api.example.com", "late.test"]);
+        assert_eq!(row.hosts, permitted);
+        assert_eq!(
+            i.ledger.lock().unwrap().node("n1").unwrap().unwrap().hosts,
+            ["api.example.com", ".example.org"],
+            "the operator's hosts are kept apart"
+        );
+        let w = kinds();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("\"added\":[\"late.test\"]") && w[0].contains("run_a"), "{}", w[0]);
+        assert!(r.tick(&i.ledger, "n1", p, t0 + 30).is_none(), "covered now");
+        // An allowed list that doesn't name a want: no renewal for it.
+        i.ledger.lock().unwrap().set_node_ca_policy("n1", &wicket_store::CaHosts::parse("late.test,*.example.org").unwrap()).unwrap();
+        want("other.test", "run_b");
+        assert!(r.tick(&i.ledger, "n1", p, t0 + 40).is_none());
+        // run_a ended: at the next due renewal, late.test is pruned (other.test still kept out).
+        i.ledger.lock().unwrap().drop_node_ca_wants("run_a").unwrap();
+        let due = row.issued_at + (row.not_after - row.issued_at) / 2;
+        let (_, permitted) = renew(&mut r, due);
+        assert_eq!(permitted, [".example.org", "api.example.com"]);
+        assert!(kinds().last().unwrap().contains("\"removed\":[\"late.test\"]"));
+    }
 }
