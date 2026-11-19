@@ -44,5 +44,20 @@ fn runs_in_a_process_share_a_publisher_that_follows_other_processes() {
     let again = SharedFeed::open("n1", feed_config()).unwrap();
     assert!(again.lock().unwrap().tick(now + 2).is_none(), "a publisher opened afterwards");
     assert!(again.lock().unwrap().tick(now + feed_config().refresh_ms + 1).is_some());
+
+    // A run that panics holding the feed doesn't take the node's other runs down with it: the
+    // publisher is opened again from the files.
+    let a = again.clone();
+    let panicked = std::thread::spawn(move || {
+        let _g = a.lock().unwrap();
+        panic!("a run's supervisor fails holding the feed");
+    })
+    .join();
+    assert!(panicked.is_err());
+    let mut g = again.lock().expect("the feed after a panic");
+    assert_eq!(g.epoch(), 3);
+    g.commit(vec![revoke("run_e")], wicket_feed::now_ms()).unwrap();
+    drop(g);
+    assert_eq!(again.lock().unwrap().epoch(), 4);
     let _ = std::fs::remove_dir_all(&home);
 }

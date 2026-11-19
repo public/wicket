@@ -115,7 +115,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
     // With the roots offline (#154) a certificate is used to its end (`wicket keys certify` renews it);
     // with them here, renewed when under a day is left.
     let offline = crate::roots::offline();
-    let margin = if offline { 0 } else { 86_400_000 };
+    let margin = renew_margin().unwrap_or(0);
     let cert_jws = match old {
         Some((c, j)) if !new_generation && c.kid == kid && c.not_after > now + margin && c.max_ttl_ms >= cfg.ttl_ms => {
             if offline && c.not_after < now + 7 * 86_400_000 {
@@ -158,6 +158,12 @@ pub struct SharedFeed {
     inner: Mutex<(Publisher<BoxAuthority>, i64)>,
 }
 
+/// How long before its end a feed's certificate is renewed when the feed is opened: a day, with the
+/// roots on this host; none without them (`wicket keys certify` renews it then).
+fn renew_margin() -> Option<i64> {
+    (!crate::roots::offline()).then_some(86_400_000)
+}
+
 /// How often a feed's certificate is checked for nearing its end, to be renewed.
 const CERT_CHECK_MS: i64 = 3_600_000;
 
@@ -168,6 +174,7 @@ static FEEDS: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, std::
 /// A held feed: the publisher, current, with the feed's lock taken.
 pub struct FeedGuard<'a> {
     g: std::sync::MutexGuard<'a, (Publisher<BoxAuthority>, i64)>,
+    name: &'a str,
     dir: &'a Path,
     /// The last statement time when the lock was taken.
     issued: i64,
@@ -189,6 +196,10 @@ impl std::ops::DerefMut for FeedGuard<'_> {
 
 impl Drop for FeedGuard<'_> {
     fn drop(&mut self) {
+        if let Some(e) = self.g.0.take_checkpoint_error() {
+            // Only the next open is slower: tried again at the next interval.
+            say_err!("[wicket] could not write node {}'s feed checkpoint: {e}", self.name);
+        }
         if self.g.0.last_issued() != self.issued {
             let _ = std::fs::write(self.dir.join("feed/issued"), self.g.0.last_issued().to_string());
         }
@@ -248,7 +259,15 @@ impl SharedFeed {
     /// The feed, locked and current.
     pub fn lock(&self) -> Result<FeedGuard<'_>> {
         let lock = feed_lock(&self.dir)?;
-        let mut g = self.inner.lock().expect("feed");
+        // A run that panicked holding the feed may have left the publisher half-updated: it is
+        // opened again from the files, and the other runs on the node carry on.
+        let (mut g, poisoned) = match self.inner.lock() {
+            Ok(g) => (g, false),
+            Err(e) => {
+                self.inner.clear_poison();
+                (e.into_inner(), true)
+            }
+        };
         let now = wicket_feed::now_ms();
         // Another process (or `wicket keys certify`) renewed the certificate, or it nears its end
         // (`open_feed` renews it, with the roots at hand; checked hourly, as without them it can't).
@@ -256,9 +275,10 @@ impl SharedFeed {
         let mut cert_due = on_disk.as_deref() != Some(g.0.key_frame().jws.as_str());
         if now >= g.1.saturating_add(CERT_CHECK_MS) {
             g.1 = now;
-            cert_due |= g.0.cert().not_after <= now + 2 * 86_400_000;
+            // The same window `open_feed` renews in, so the reopen does renew it.
+            cert_due |= renew_margin().is_some_and(|m| g.0.cert().not_after <= now + m);
         }
-        let current = !cert_due && matches!(g.0.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_)));
+        let current = !poisoned && !cert_due && matches!(g.0.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_)));
         if !current {
             let issued = g.0.last_issued();
             g.0 = open_feed(&self.name, self.cfg.clone())?;
@@ -266,7 +286,7 @@ impl SharedFeed {
         }
         g.0.note_issued(last_issued(&self.dir.join("feed")));
         let issued = g.0.last_issued();
-        Ok(FeedGuard { g, dir: &self.dir, issued, _lock: lock })
+        Ok(FeedGuard { g, name: &self.name, dir: &self.dir, issued, _lock: lock })
     }
 }
 
