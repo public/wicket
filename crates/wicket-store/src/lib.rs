@@ -25,6 +25,8 @@ pub mod cas;
 #[cfg(test)]
 mod lifecycle_props;
 mod links;
+mod services;
+pub use services::{Instance, ServiceRow, SHARED_TENANT};
 mod nodeca;
 mod nodelabels;
 mod placements;
@@ -163,7 +165,10 @@ pub enum StoreError {
 /// `placement_decisions` (#579 step 2): the node room reserved for boxes being started, the runs
 /// waiting for a node, and why each run went where it did. Older builds don't read them; the floor
 /// stays 17.
-pub const SCHEMA_VERSION: u32 = 24;
+/// Version 25 (expand, after #579 step 2's 24) adds `services`, `service_wants` and
+/// `service_instances` (#579 step 3): the per-node services installed, which runs use them on which
+/// node, and the instances kept for them. Older builds don't read them; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 25;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -563,6 +568,7 @@ impl Ledger {
         conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
+        conn.execute_batch(services::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -613,6 +619,7 @@ impl Ledger {
         conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
+        conn.execute_batch(services::SCHEMA)?;
         scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
@@ -643,6 +650,8 @@ impl Ledger {
         // And the room it reserved on a node (#579).
         self.placement_released(&run.0)?;
         self.stop_waiting(&run.0)?;
+        // And what it used of per-node services (#579).
+        self.drop_service_wants(&run.0)?;
         self.close_links_of(&run.0)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
