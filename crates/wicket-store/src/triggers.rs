@@ -11,6 +11,8 @@
 //!   failed, or dead-lettered, and what it started or sent. At most one per (trigger, event).
 //! - **`work_claims`:** a run's claim on a piece of work (`github.com/acme/app#123`), live while
 //!   the run is, and what `owner_of` reads.
+//! - **`trigger_cursors`:** how far a source that reads a sequence has read: wicket's own events,
+//!   by the audit chain's seq.
 //!
 //! The scheduler, intake and engine that fill these come later (the design's steps 2 to 5).
 
@@ -41,6 +43,9 @@ CREATE TABLE IF NOT EXISTS work_claims (
   key TEXT NOT NULL, tenant TEXT NOT NULL, run TEXT NOT NULL, claimed_at INTEGER NOT NULL, released_at INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS work_claims_live ON work_claims (tenant, key) WHERE released_at IS NULL;
+CREATE TABLE IF NOT EXISTS trigger_cursors (
+  tenant TEXT NOT NULL, source TEXT NOT NULL, seq INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (tenant, source)
+);
 "#;
 
 /// How long triggers' settled firings and the events they fired on are kept (as the design keeps
@@ -327,6 +332,25 @@ impl Ledger {
             .is_some())
     }
 
+    /// How far a source that reads a sequence (wicket's own events: the audit chain's seq) has
+    /// read, if it has started.
+    pub fn trigger_cursor(&self, tenant: &str, source: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT seq FROM trigger_cursors WHERE tenant = ?1 AND source = ?2", params![tenant, source], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Moves a source's cursor on to `seq`. It never moves back.
+    pub fn set_trigger_cursor(&self, tenant: &str, source: &str, seq: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO trigger_cursors (tenant, source, seq, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (tenant, source) DO UPDATE SET seq = MAX(seq, excluded.seq), updated_at = excluded.updated_at",
+            params![tenant, source, seq, now()],
+        )?;
+        Ok(())
+    }
+
     pub fn trigger_event(&self, id: &str) -> Result<Option<TriggerEvent>> {
         Ok(self
             .conn
@@ -526,6 +550,12 @@ mod tests {
         assert!(l.trigger_event_known("t0", "github", "d-1").unwrap());
         assert!(!l.trigger_event_known("t0", "github", "d-2").unwrap());
         assert!(!l.trigger_event_known("t0", "webhook", "d-1").unwrap(), "per source");
+        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), None);
+        l.set_trigger_cursor("t0", "wicket", 7).unwrap();
+        l.set_trigger_cursor("t0", "wicket", 5).unwrap();
+        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), Some(7), "never back");
+        l.set_trigger_cursor("t0", "wicket", 9).unwrap();
+        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), Some(9));
         let (f, fresh) = l.record_firing("t-1", &e, "queued", None).unwrap();
         assert!(fresh);
         assert_eq!(l.record_firing("t-1", &e, "queued", None).unwrap(), (f.clone(), false), "once per trigger and event");
