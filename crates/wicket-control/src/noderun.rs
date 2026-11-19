@@ -59,6 +59,16 @@ pub fn feed_config() -> PublisherConfig {
 /// A node's delta log past this size starts a new feed generation when no box holds authority from it.
 const COMPACT_BYTES: u64 = 1 << 20;
 
+/// The supervisor's loops do their ledger work at least this often, whether or not the change
+/// counters moved (#582 step 2): what a counter can't see (a grant's end, a due renewal) is caught.
+const FULL_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether `topic` changed since this connection last looked (true if the ledger can't say).
+fn changed(sh: &Shared, p: &mut Progress, topic: wicket_store::Topic) -> bool {
+    let l = sh.ledger.lock().expect("ledger");
+    p.watch.changed(&l, topic).unwrap_or(true)
+}
+
 /// A node's health is written to the ledger at most this often (ms), whichever of its runs'
 /// connections has it first: each reports the same, every 30 s.
 const HEALTH_WRITE_MS: i64 = 20_000;
@@ -945,6 +955,11 @@ struct Progress {
     fetched: std::collections::HashMap<String, String>,
     /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
     remint_failed: i64,
+    /// What changed in the ledger since this connection's loops last looked (#582 step 2), and when
+    /// each last did its work regardless (the fallback every [`FULL_EVERY`]).
+    watch: wicket_store::ChangeWatch,
+    grants_full: std::time::Instant,
+    ident_full: std::time::Instant,
     /// What `wicket top` reads of this run's node (`ctl/link.json`).
     link: wicket_node::status::LinkRecord,
     /// The standing rules (#572) the box's token carries now, by id, with the end each was
@@ -979,6 +994,9 @@ async fn manage(
         slice: None,
         fetched: std::collections::HashMap::new(),
         remint_failed: 0,
+        watch: wicket_store::ChangeWatch::new(),
+        grants_full: std::time::Instant::now(),
+        ident_full: std::time::Instant::now(),
         link: wicket_node::status::LinkRecord { node: sh.node.clone(), ..Default::default() },
         standing: std::collections::HashMap::new(),
     };
@@ -1237,12 +1255,25 @@ async fn session(
                 }
             }
             _ = grants.tick() => {
-                for f in sync_grants(sh, p) {
-                    send(feed_frame(f));
+                // Only when the grants changed (#582 step 2), or every FULL_EVERY regardless.
+                if changed(sh, p, wicket_store::Topic::Grants) || p.grants_full.elapsed() >= FULL_EVERY {
+                    p.grants_full = std::time::Instant::now();
+                    for f in sync_grants(sh, p) {
+                        send(feed_frame(f));
+                    }
                 }
             }
             _ = ident.tick() => {
-                if let Some(why) = revoked(sh, p) {
+                // Revocations and the node's status when they changed, or every FULL_EVERY, or as
+                // the node's certificate (held here) reaches its end.
+                let now = wicket_store::now();
+                let ending = p.cert.as_ref().is_some_and(|c| c.exp <= now + 1);
+                let check = changed(sh, p, wicket_store::Topic::Revocations) || ending || p.ident_full.elapsed() >= FULL_EVERY;
+                let ca_check = changed(sh, p, wicket_store::Topic::NodeCa) || check || p.ca.busy();
+                if check {
+                    p.ident_full = std::time::Instant::now();
+                }
+                if let Some(why) = check.then(|| revoked(sh, p)).flatten() {
                     // Stop the box (in case the node still obeys), then drop the node for good.
                     send(Frame::Msg(Msg::Kill { run: sh.run.0.clone() }));
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1252,7 +1283,7 @@ async fn session(
                 if let Some(f) = renewal(sh, p) {
                     send(f);
                 }
-                if let Some(m) = p.ca.tick(&sh.ledger, &sh.node, p.proto, wicket_store::now()) {
+                if let Some(m) = ca_check.then(|| p.ca.tick(&sh.ledger, &sh.node, p.proto, wicket_store::now())).flatten() {
                     send(Frame::Msg(m));
                 }
             }
