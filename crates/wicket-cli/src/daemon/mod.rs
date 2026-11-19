@@ -74,8 +74,10 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
     let listener = listen(socket)?;
     // The commands a previous image of this process handed over (#455): followed on to their end.
     let handoff_path = d.data_dir.join(handoff::FILE);
+    let mut followed = None;
     if let Some(h) = handoff::take(&handoff_path) {
         say_err!("wicketd: following {} command(s) handed over by the previous build", h.children.len());
+        followed = Some(h.children.len());
         handoff::adopt(h);
     }
     // Runs that outlived a previous wicketd (#468: `deploy/install.sh` restarts it) go on with
@@ -83,7 +85,7 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
     // moves to this build, as `wicket self update` moves them.
     {
         let exe = d.exe.clone();
-        std::thread::spawn(move || hand_over_runs(&exe));
+        std::thread::spawn(move || hand_over_runs(&exe, followed));
     }
     // `wicket self update` moves the daemon to the new build last: on SIGHUP it re-executes itself
     // at once, handing its running commands (long-lived runs among them) to the new image
@@ -137,7 +139,19 @@ fn drain(handoff_path: &Path, draining: &'static AtomicBool, in_flight: &std::sy
 ///
 /// This host's own node's serve moves to `exe` first (#529): a restart of wicketd leaves it, its
 /// child, on the build it started on, and the new supervisors re-attach to it.
-fn hand_over_runs(exe: &Path) {
+///
+/// First it audits its own start (`daemon.started`: its build, and how many commands it followed
+/// from a previous image, if it re-executed): with `wicket self update`'s `daemon.sighup`, what
+/// shows a drain and how long it took in the audit trail (#487 left none: verification/tla's
+/// `UpdateTrace`). Here, not in the drain: the drain must not wait on the ledger.
+fn hand_over_runs(exe: &Path, followed: Option<usize>) {
+    let build = std::fs::canonicalize(exe).ok().and_then(|p| Some(p.parent()?.file_name()?.to_string_lossy().into_owned()));
+    let started = serde_json::json!({ "build": build, "followed": followed });
+    if let Err(e) =
+        Ledger::open(&crate::ledger_path()).and_then(|l| l.audit(&wicket_core::TenantId::single(), None, "daemon.started", &started))
+    {
+        say_err!("wicketd: auditing its start: {e:#}");
+    }
     if let Some(line) = crate::update::reexec_local_node(exe) {
         say_err!("wicketd: {line}");
     }

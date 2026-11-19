@@ -5,7 +5,9 @@ domains, identities and tasks are left out. Times are UTC.
 
 The export runs from 11:00:06 to 18:48:58. Between its updates it holds only each run's identity
 rotations, every 300 s, which show the supervisors alive. It doesn't reach the 10:04 self update
-(#487), so that update has no trail here.
+(#487), so that update has no trail here. Nor could that day's builds have given it one that
+showed the hang: nothing audited wicketd's drain, or a refused command, until `daemon.sighup` and
+`daemon.started` (see README.md, "Update: trails of real updates").
 
 Neither update's other steps are audited: wicketd's restart, the local serve's re-exec, the old
 supervisors being stopped, prompts. UpdateTrace.tla lets the model take them between the trail's

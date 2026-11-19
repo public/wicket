@@ -255,14 +255,31 @@ pub fn pidfile(role: &str) -> PathBuf {
 /// Sends SIGHUP to the process a pid file names, if it is still a wicket process whose command line
 /// has `expect` in it. Returns its pid.
 fn hangup(pidfile: &Path, expect: &str) -> Option<u32> {
+    let pid = live(pidfile, expect)?;
+    sighup(pid).then_some(pid)
+}
+
+/// The pid `pidfile` names, if it is a live wicket process whose command line has `expect` (and
+/// not this one): what [`hangup`] would signal.
+fn live(pidfile: &Path, expect: &str) -> Option<u32> {
     let pid: u32 = std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
     let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
-    if !cmd.contains("wicket") || !cmd.contains(expect) || pid == std::process::id() {
-        return None;
-    }
+    (cmd.contains("wicket") && cmd.contains(expect) && pid != std::process::id()).then_some(pid)
+}
+
+fn sighup(pid: u32) -> bool {
     // SAFETY: a plain syscall.
-    (unsafe { libc::kill(pid as i32, libc::SIGHUP) } == 0).then_some(pid)
+    unsafe { libc::kill(pid as i32, libc::SIGHUP) == 0 }
+}
+
+/// Moves wicketd to the current build (SIGHUP: it drains and re-executes), audited first as
+/// `daemon.sighup` (`to`, the build): before the signal, so the re-executed wicketd's
+/// `daemon.started` always comes after it in the trail. Returns its pid if it was signalled.
+fn hangup_daemon(ledger: &Mutex<Ledger>, to: Option<&str>) -> Option<u32> {
+    let pid = live(&pidfile("daemon"), "daemon")?;
+    audit(ledger, "daemon.sighup", serde_json::json!({ "to": to, "by": crate::operator() }));
+    sighup(pid).then_some(pid)
 }
 
 /// Whether process `pid` now runs `bin`.
@@ -883,7 +900,8 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
     }
     // wicketd re-executes itself last, at once, handing its running commands (this one, and runs) to
     // the new image (#455, #468).
-    if let Some(pid) = hangup(&pidfile("daemon"), "daemon") {
+    // With wicketd's `daemon.started` after its re-exec, the audit trail shows the drain (#487).
+    if let Some(pid) = hangup_daemon(&ledger, Some(&green)) {
         say(format!("wicketd (pid {pid}) moves to {green} now, handing its running commands over"));
     }
     say(format!(
@@ -1775,7 +1793,8 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
         say(format!("node {n}: rolled back {cur} → {to}"));
     }
     if !only_nodes {
-        if let Some(pid) = hangup(&pidfile("daemon"), "daemon") {
+        let to = Versions::control().pointer("current");
+        if let Some(pid) = hangup_daemon(&ledger, to.as_deref()) {
             say(format!("wicketd (pid {pid}) moves back now, handing its running commands over"));
         }
     }

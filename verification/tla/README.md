@@ -381,11 +381,49 @@ The trails are 2026-11-18's, scrubbed, in `trails/update-2026-11-18.txt`:
 | `trail_1759_merged_unmatched` | the 17:58 install: the local run re-attached and its box stopped 2 s later (#529) | the design as merged | unmatched: no behaviour of the spec |
 | `trail_1759_serve_left_old_matched` | the same | `fail_update_local_serve_left_old`'s (`ServeFirstOnStart = FALSE`) | matched: a behaviour of #529's fail variant |
 
-The 10:04 self update that hung (#487) has no trail: the export starts at 11:00:06. Between the
-updates, the only records are each run's identity rotations. A drain that never returns shows as the
-CLI's commands refused, and this export holds no record of a refused command or of the drain. A trail
-for such an incident would need the daemon's own log (`wicketd: handing N running command(s)`,
-`waiting for N command(s)`) as well.
+The 10:04 self update that hung (#487) has no trail, for two reasons:
+
+- **No records.** The export starts at 11:00:06. Between the updates, the only records are each
+  run's identity rotations.
+- **The builds of that day couldn't show #487.** A self update audits `self.staged`,
+  `self.switched`, its health rounds and `self.committed`, and its handover leaves
+  `reconcile.run_adopted` and `run.attach`. wicketd's SIGHUP drain, and the commands it refused,
+  left no record at all. Its trail would have been the switch and two re-attaches: a behaviour of
+  the merged spec and of `fail_update_drain_hangs` alike, so nothing a trail check could tell
+  apart.
+
+Since #544's follow-up, two records make a drain visible:
+- `wicket self update` audits `daemon.sighup` when it signals wicketd;
+- each start of wicketd audits `daemon.started` (its build, and how many commands it followed from
+  a previous image) from its handover thread. It isn't audited in the drain, which must not wait on
+  the ledger: #487 was a deadlock there.
+
+`ci/tla-trail.py` maps them:
+- `self.switched` of the control host is `SelfUpdate`;
+- `daemon.started` is `DrainDone` after a SIGHUP, and `DaemonStart` otherwise;
+- a SIGHUP with no `daemon.started` becomes a `Tick` for each drain bound of time that passes
+  after it (at most two), with a warning.
+
+`UpdateTrace.tla` takes those steps, and with `DaemonAudited = TRUE` wicketd's start is no longer
+a hidden step. So a drain that doesn't return is a trail of the fail variant only. The merged spec
+lets time pass a due drain only by its `DrainDone`, which the trail would then show.
+
+The two such trails are constructed, not audited (the records didn't exist on 2026-11-18). They are
+what the tool prints for a self update with these records:
+
+| config | trail | switches | result |
+|---|---|---|---|
+| `trail_self_update_merged_matched` | a self update whose drain returns: switch, re-attaches, `daemon.started` | the design as merged | matched |
+| `trail_hung_drain_merged_unmatched` | #487: switch, re-attaches, `daemon.sighup`, and two drain bounds with no `daemon.started` | the design as merged | unmatched |
+| `trail_hung_drain_drain_hangs_matched` | the same | `fail_update_drain_hangs`'s (`DrainReturns = FALSE`) | matched |
+| `trail_misordered_merged_unmatched` | a self update's `daemon.started` before its `daemon.sighup`, mapped as written (a restart, then ticks) | the design as merged | unmatched |
+| `trail_misordered_drain_hangs_unmatched` | the same | `fail_update_drain_hangs`'s | unmatched |
+
+The last two show why the order matters. A build that audited the SIGHUP after sending it could
+record wicketd's `daemon.started` first, and read as written that trail matches neither switch set.
+Since #548's review, `wicket self update` and `rollback` audit `daemon.sighup` before the signal,
+once the pidfile names a live wicketd. For older exports, `ci/tla-trail.py` pairs a
+`daemon.started` followed within 5 s by its `daemon.sighup` as the drain's end, with a warning.
 
 To check a new update: export the audit records around it, run
 `python3 -I ci/tla-trail.py <export>`, and paste its `TrailHHMM` into `UpdateTrace.tla`. Then
