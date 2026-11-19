@@ -10,14 +10,27 @@
 //! taint the box doesn't tolerate, or has a CA that doesn't cover the box's hosts and may not be
 //! widened to them. Each node that is out says every reason why.
 //!
-//! **Score:** of the nodes left, bin-pack (the default: the one left with the least memory, then the
-//! fewest vCPUs, once the box is on it, so the fewest nodes are kept busy) or spread (the most).
-//! Ties go to `last` (where the box ran before), then to the name, so the same inputs always give
-//! the same node.
+//! A node is also out if it lacks something the box requires near it (a service's instance, a
+//! volume), or runs a box the box requires to be away from (another zone's, or one principal's).
+//!
+//! **Score:** of the nodes left, first the most preferences met (each preferred affinity it has,
+//! each preferred anti-affinity it doesn't break), then bin-pack (the default: the one left with
+//! the least memory, then the fewest vCPUs, once the box is on it, so the fewest nodes are kept busy)
+//! or spread (the most). Ties go to `last` (where the box ran before), then to the name, so the same
+//! inputs always give the same node.
+//!
+//! **Queue** ([`queue_cmp`]): runs waiting for a node are served by priority, highest first, and
+//! first come, first served within one.
+//!
+//! **Preemption** ([`preempt`]): when no node may take a box, which boxes to stop to make room: only
+//! those whose manifest marks them preemptible and whose priority is below the box's, the fewest on
+//! one node, of the lowest priority. It decides; stopping them is the caller's, through the normal
+//! stop, and the node's admission still decides the start that follows.
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use wicket_core::placement::Taint;
+use wicket_core::placement::{Affinity, AntiAffinity, Away, Near, Taint};
 
 /// What a box asks for: its limits, as requests, and its placement constraints.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -26,6 +39,24 @@ pub struct Request {
     pub memory_mib: u64,
     pub node_selector: BTreeMap<String, String>,
     pub tolerations: Vec<Taint>,
+    /// Where it waits, and which boxes it may displace (#579 step 4). Absent from a request recorded
+    /// before step 4: 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub priority: i32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub preemptible: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affinity: Vec<Affinity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anti_affinity: Vec<AntiAffinity>,
+}
+
+fn is_zero(n: &i32) -> bool {
+    *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Request {
@@ -35,7 +66,19 @@ impl Request {
             memory_mib: m.zone.limits.memory_bytes().unwrap_or(0) >> 20,
             node_selector: m.placement.node_selector.clone(),
             tolerations: m.placement.tolerations(),
+            priority: m.placement.priority,
+            preemptible: m.placement.preemptible,
+            affinity: m.placement.affinity.clone(),
+            anti_affinity: m.placement.anti_affinity.clone(),
         }
+    }
+
+    /// How many of its preferences `node` meets: each preferred affinity it has, each preferred
+    /// anti-affinity it doesn't break.
+    pub fn preferences_met(&self, node: &Node) -> usize {
+        let near = self.affinity.iter().filter(|a| !a.required).filter_map(Affinity::near).filter(|n| node.has(n)).count();
+        let away = self.anti_affinity.iter().filter(|a| !a.required).filter_map(AntiAffinity::away).filter(|a| !node.runs(a)).count();
+        near + away
     }
 }
 
@@ -66,9 +109,32 @@ pub struct Node {
     pub labels: BTreeMap<String, String>,
     pub taints: Vec<Taint>,
     pub ca: Coverage,
+    /// The per-node services whose instance runs on it.
+    pub services: BTreeSet<String>,
+    /// The volumes it holds.
+    pub volumes: BTreeSet<String>,
+    /// The zones of the boxes on it, and their principals' ids.
+    pub zones: BTreeSet<String>,
+    pub principals: BTreeSet<String>,
 }
 
 impl Node {
+    /// Whether it has what an affinity term names.
+    pub fn has(&self, near: &Near) -> bool {
+        match near {
+            Near::Service(s) => self.services.contains(s),
+            Near::Volume(v) => self.volumes.contains(v),
+        }
+    }
+
+    /// Whether it runs a box an anti-affinity term names.
+    pub fn runs(&self, away: &Away) -> bool {
+        match away {
+            Away::Zone(z) => self.zones.contains(z),
+            Away::Principal(p) => self.principals.contains(p),
+        }
+    }
+
     /// vCPUs and MiB free: what its limits leave, and no more memory than its admission allows.
     pub fn free(&self) -> (f32, i64) {
         let by_limits = self.memory_mib as i64 - self.used_memory_mib as i64;
@@ -88,10 +154,21 @@ pub enum Strategy {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Refusal {
     Full,
-    NoRoom { free_vcpus: f32, free_mib: i64 },
-    Label { key: String, want: String, has: Option<String> },
+    NoRoom {
+        free_vcpus: f32,
+        free_mib: i64,
+    },
+    Label {
+        key: String,
+        want: String,
+        has: Option<String>,
+    },
     Taint(Taint),
     Ca(Vec<String>),
+    /// It lacks what the box requires near it.
+    Near(Near),
+    /// It runs a box the box requires to be away from.
+    Away(Away),
 }
 
 impl fmt::Display for Refusal {
@@ -103,6 +180,8 @@ impl fmt::Display for Refusal {
             Refusal::Label { key, want, has: Some(h) } => write!(f, "label {key}={h}, not {want}"),
             Refusal::Taint(t) => write!(f, "tainted {t}, not tolerated"),
             Refusal::Ca(h) => write!(f, "its CA doesn't cover {} and its policy keeps them out", h.join(", ")),
+            Refusal::Near(n) => write!(f, "no {n} here, which the box requires"),
+            Refusal::Away(a) => write!(f, "runs a box of {a}, which the box requires to be away from"),
         }
     }
 }
@@ -154,6 +233,16 @@ pub fn filter(req: &Request, node: &Node) -> Vec<Refusal> {
     if let Coverage::Refuses(h) = &node.ca {
         out.push(Refusal::Ca(h.clone()));
     }
+    for n in req.affinity.iter().filter(|a| a.required).filter_map(Affinity::near) {
+        if !node.has(&n) {
+            out.push(Refusal::Near(n));
+        }
+    }
+    for a in req.anti_affinity.iter().filter(|a| a.required).filter_map(AntiAffinity::away) {
+        if node.runs(&a) {
+            out.push(Refusal::Away(a));
+        }
+    }
     out
 }
 
@@ -179,11 +268,132 @@ pub fn schedule(req: &Request, nodes: &[Node], strategy: Strategy, last: Option<
             Strategy::BinPack => la.cmp(&lb),
             Strategy::Spread => lb.cmp(&la),
         };
-        by_room.then_with(|| (Some(a.name.as_str()) != last).cmp(&(Some(b.name.as_str()) != last))).then_with(|| a.name.cmp(&b.name))
+        let by_preference = req.preferences_met(b).cmp(&req.preferences_met(a));
+        by_preference
+            .then(by_room)
+            .then_with(|| (Some(a.name.as_str()) != last).cmp(&(Some(b.name.as_str()) != last)))
+            .then_with(|| a.name.cmp(&b.name))
     });
     refused.sort_by(|a, b| a.0.cmp(&b.0));
     let ranked: Vec<String> = ok.iter().map(|n| n.name.clone()).collect();
     Decision { node: ranked.first().cloned(), ranked, refused }
+}
+
+/// A run waiting for a node, as the queue orders it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waiter {
+    pub run: String,
+    pub priority: i32,
+    /// When it first waited (ms).
+    pub at_ms: i64,
+}
+
+/// The order waiting runs are served in: the highest priority first, first come, first served
+/// within one, then by run id (so it is total).
+pub fn queue_cmp(a: &Waiter, b: &Waiter) -> Ordering {
+    b.priority.cmp(&a.priority).then(a.at_ms.cmp(&b.at_ms)).then_with(|| a.run.cmp(&b.run))
+}
+
+/// The waiters served before `me`, in the order they're served (`me` itself, if listed, is not).
+pub fn ahead<'a>(me: &Waiter, waiting: &'a [Waiter]) -> Vec<&'a Waiter> {
+    let mut v: Vec<&Waiter> = waiting.iter().filter(|w| w.run != me.run && queue_cmp(w, me) == Ordering::Less).collect();
+    v.sort_by(|a, b| queue_cmp(a, b));
+    v
+}
+
+/// A box running on a node, as preemption sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Running {
+    pub run: String,
+    pub vcpus: f32,
+    pub memory_mib: u64,
+    pub priority: i32,
+    pub preemptible: bool,
+}
+
+impl Running {
+    /// Whether a box asking `req` may stop it: its manifest marks it preemptible, and it ranks below.
+    pub fn yields_to(&self, req: &Request) -> bool {
+        self.preemptible && self.priority < req.priority
+    }
+}
+
+/// What to stop for a box no node may take now: on `node`, the runs `victims` (by run id).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preemption {
+    pub node: String,
+    pub victims: Vec<String>,
+    /// The highest priority among them.
+    pub max_priority: i32,
+}
+
+/// `node` with `gone`'s boxes stopped: their vCPUs and memory free, and as much more room by its
+/// admission.
+fn without(node: &Node, gone: &[&Running]) -> Node {
+    let cpu: f32 = gone.iter().map(|r| r.vcpus).sum();
+    let mib: u64 = gone.iter().map(|r| r.memory_mib).sum();
+    Node {
+        used_vcpus: (node.used_vcpus - cpu).max(0.0),
+        used_memory_mib: node.used_memory_mib.saturating_sub(mib),
+        room_mib: node.room_mib.map(|r| r.saturating_add(mib)),
+        ..node.clone()
+    }
+}
+
+/// Which boxes to stop so `req` may go on a node (see the module's doc), or None: a node may take it
+/// already, or stopping every box it may stop on a node still leaves no room there.
+///
+/// Only room is made: a node that is out for any other reason (its disk, a label, a taint, its CA,
+/// an affinity) stays out. On each node the boxes it may stop are taken lowest priority first (then
+/// the most memory, then the most vCPUs, then by run id) until it fits, and then any it fits without
+/// is put back, so every one chosen is needed. Of the nodes it can be made to fit on, the one whose
+/// highest-priority victim is lowest, then with the fewest victims, then by name.
+pub fn preempt(req: &Request, nodes: &[Node], running: &BTreeMap<String, Vec<Running>>, strategy: Strategy) -> Option<Preemption> {
+    if schedule(req, nodes, strategy, None).node.is_some() {
+        return None;
+    }
+    let fits = |n: &Node, gone: &[&Running]| filter(req, &without(n, gone)).is_empty();
+    let mut best: Option<Preemption> = None;
+    for n in nodes {
+        if !filter(req, n).iter().all(|r| matches!(r, Refusal::NoRoom { .. })) {
+            continue;
+        }
+        let mut may: Vec<&Running> = running.get(&n.name).map(|v| v.iter().filter(|r| r.yields_to(req)).collect()).unwrap_or_default();
+        may.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then(b.memory_mib.cmp(&a.memory_mib))
+                .then(b.vcpus.total_cmp(&a.vcpus))
+                .then_with(|| a.run.cmp(&b.run))
+        });
+        let mut gone: Vec<&Running> = vec![];
+        for r in may {
+            if fits(n, &gone) {
+                break;
+            }
+            gone.push(r);
+        }
+        if gone.is_empty() || !fits(n, &gone) {
+            continue;
+        }
+        // Put back any it fits without, highest priority first: fitting only gets harder as fewer
+        // are stopped, so each one left is needed.
+        for i in (0..gone.len()).rev() {
+            let mut fewer = gone.clone();
+            fewer.remove(i);
+            if fits(n, &fewer) {
+                gone = fewer;
+            }
+        }
+        let mut victims: Vec<String> = gone.iter().map(|r| r.run.clone()).collect();
+        victims.sort();
+        let p = Preemption { node: n.name.clone(), max_priority: gone.iter().map(|r| r.priority).max().unwrap_or(i32::MIN), victims };
+        let key = |p: &Preemption| (p.max_priority, p.victims.len(), p.node.clone());
+        if best.as_ref().is_none_or(|b| key(&p) < key(b)) {
+            best = Some(p);
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -287,7 +497,43 @@ mod tests {
             1 => Coverage::Widens(vec!["x.example".into()]),
             _ => Coverage::Covers,
         };
+        for (i, name) in ["npm-cache", "oci-mirror"].into_iter().enumerate() {
+            if rng.below(2) == 0 {
+                n.services.insert(name.into());
+            }
+            if rng.below(3) == 0 {
+                n.volumes.insert(format!("v{i}"));
+            }
+            if rng.below(3) == 0 {
+                n.zones.insert(format!("z{i}"));
+            }
+            if rng.below(4) == 0 {
+                n.principals.insert(format!("spiffe://w.test/t/t0/z/z{i}/a/a{i}"));
+            }
+        }
         n
+    }
+
+    fn random_affinity(rng: &mut Rng, r: &mut Request) {
+        for _ in 0..rng.below(3) {
+            let mut a = Affinity { required: rng.below(3) == 0, ..Affinity::default() };
+            if rng.below(2) == 0 {
+                a.service = Some(["npm-cache", "oci-mirror"][rng.below(2) as usize].into());
+            } else {
+                a.volume = Some(format!("v{}", rng.below(2)));
+            }
+            r.affinity.push(a);
+        }
+        for _ in 0..rng.below(3) {
+            let mut a = AntiAffinity { required: rng.below(3) == 0, ..AntiAffinity::default() };
+            let i = rng.below(2);
+            if rng.below(2) == 0 {
+                a.zone = Some(format!("z{i}"));
+            } else {
+                a.principal = Some(format!("spiffe://w.test/t/t0/z/z{i}/a/a{i}"));
+            }
+            r.anti_affinity.push(a);
+        }
     }
 
     fn random_request(rng: &mut Rng) -> Request {
@@ -298,6 +544,10 @@ mod tests {
         if rng.below(3) == 0 {
             r.tolerations.push(Taint { key: "dedicated".into(), value: (rng.below(2) == 0).then(|| "ci".into()) });
         }
+        if rng.below(2) == 0 {
+            random_affinity(rng, &mut r);
+        }
+        r.priority = rng.below(5) as i32 - 2;
         r
     }
 
@@ -327,7 +577,17 @@ mod tests {
                     assert!(r.node_selector.iter().all(|(k, v)| n.labels.get(k) == Some(v)), "seed {seed}: labels");
                     assert!(n.taints.iter().all(|t| r.tolerations.iter().any(|x| x.tolerates(t))), "seed {seed}: taints");
                     assert!(!matches!(n.ca, Coverage::Refuses(_)), "seed {seed}: CA");
+                    for a in r.affinity.iter().filter(|a| a.required) {
+                        assert!(n.has(&a.near().unwrap()), "seed {seed}: required affinity");
+                    }
+                    for a in r.anti_affinity.iter().filter(|a| a.required) {
+                        assert!(!n.runs(&a.away().unwrap()), "seed {seed}: required anti-affinity");
+                    }
                 }
+                // The preferences met never rise down the ranking.
+                let met: Vec<usize> =
+                    d.ranked.iter().map(|name| r.preferences_met(nodes.iter().find(|n| &n.name == name).unwrap())).collect();
+                assert!(met.windows(2).all(|w| w[0] >= w[1]), "seed {seed}: most preferences met first: {met:?}");
                 for (name, why) in &d.refused {
                     let n = nodes.iter().find(|n| &n.name == name).unwrap();
                     assert_eq!(why, &filter(&r, n), "seed {seed}");
@@ -339,10 +599,226 @@ mod tests {
                 }
                 assert_eq!(schedule(&r, &shuffled, strategy, last.as_deref()), d, "seed {seed}: deterministic, whatever the order");
                 if let (Strategy::BinPack, Some(chosen)) = (strategy, &d.node) {
-                    let left = |name: &String| nodes.iter().find(|n| &n.name == name).unwrap().free().1;
-                    assert!(d.ranked.iter().all(|o| left(o) >= left(chosen)), "seed {seed}: bin-pack takes the least room left");
+                    let node = |name: &String| nodes.iter().find(|n| &n.name == name).unwrap();
+                    let left = |name: &String| node(name).free().1;
+                    let met = r.preferences_met(node(chosen));
+                    assert!(
+                        d.ranked.iter().filter(|o| r.preferences_met(node(o)) == met).all(|o| left(o) >= left(chosen)),
+                        "seed {seed}: bin-pack takes the least room left, among the nodes meeting as many preferences"
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn affinity_requires_or_prefers_and_anti_affinity_keeps_away() {
+        let mut cached = node("cached", 4.0, 3.0, 8192, 0);
+        cached.services.insert("npm-cache".into());
+        let mut busy = node("busy", 4.0, 0.0, 8192, 0);
+        busy.zones.insert("research".into());
+        busy.principals.insert("spiffe://w.test/t/t0/z/research/a/r".into());
+        let plain = node("plain", 4.0, 0.0, 8192, 4096);
+        let nodes = vec![busy.clone(), cached.clone(), plain.clone()];
+
+        // Preferred: the node with the service first, though bin-pack alone would take another.
+        let mut r = req(0.5, 512);
+        assert_eq!(schedule(&r, &nodes, Strategy::BinPack, None).node.as_deref(), Some("plain"), "bin-pack alone");
+        r.affinity.push(Affinity { service: Some("npm-cache".into()), ..Affinity::default() });
+        let d = schedule(&r, &nodes, Strategy::BinPack, None);
+        assert_eq!(d.ranked, vec!["cached", "plain", "busy"], "the service's node, then bin-packed");
+        // Required: the others are out, saying why.
+        r.affinity[0].required = true;
+        let d = schedule(&r, &nodes, Strategy::BinPack, None);
+        assert_eq!(d.ranked, vec!["cached"]);
+        assert_eq!(
+            d.why_not(),
+            "busy (no service npm-cache here, which the box requires), plain (no service npm-cache here, which the box requires)"
+        );
+        // A volume.
+        let mut v = req(0.5, 512);
+        v.affinity.push(Affinity { volume: Some("data".into()), required: true, ..Affinity::default() });
+        assert!(schedule(&v, &nodes, Strategy::BinPack, None).node.is_none());
+        let mut holder = plain.clone();
+        holder.volumes.insert("data".into());
+        assert_eq!(schedule(&v, &[busy.clone(), holder], Strategy::BinPack, None).node.as_deref(), Some("plain"));
+
+        // Anti-affinity: preferred moves it off, required keeps it off.
+        let mut a = req(0.5, 512);
+        a.anti_affinity.push(AntiAffinity { zone: Some("research".into()), ..AntiAffinity::default() });
+        let solo = vec![busy.clone(), node("free", 4.0, 0.0, 8192, 0)];
+        assert_eq!(schedule(&req(0.5, 512), &solo, Strategy::Spread, Some("busy")).node.as_deref(), Some("busy"), "a tie, to where it ran");
+        assert_eq!(schedule(&a, &solo, Strategy::Spread, Some("busy")).node.as_deref(), Some("free"));
+        a.anti_affinity[0] =
+            AntiAffinity { principal: Some("spiffe://w.test/t/t0/z/research/a/r".into()), required: true, ..AntiAffinity::default() };
+        let d = schedule(&a, &[busy], Strategy::BinPack, None);
+        assert_eq!(d.node, None);
+        assert_eq!(d.refused[0].1, vec![Refusal::Away(Away::Principal("spiffe://w.test/t/t0/z/research/a/r".into()))]);
+    }
+
+    #[test]
+    fn the_queue_serves_the_highest_priority_first_and_fifo_within_one() {
+        let w = |run: &str, priority, at_ms| Waiter { run: run.into(), priority, at_ms };
+        let q = vec![w("a", 0, 10), w("b", 5, 30), w("c", 0, 5), w("d", 5, 20), w("e", -1, 1)];
+        let order = |me: &Waiter| ahead(me, &q).into_iter().map(|w| w.run.as_str()).collect::<Vec<_>>();
+        assert_eq!(order(&w("new", -9, 99)), ["d", "b", "c", "a", "e"]);
+        assert_eq!(order(&q[0]), ["d", "b", "c"], "a waits behind every higher one and the older at its own");
+        assert!(order(&w("urgent", 6, 99)).is_empty(), "a higher priority goes first, however late");
+    }
+
+    /// For many random queues: the order is total and antisymmetric, a run is never served before
+    /// one of higher priority, and within a priority the one waiting longer goes first.
+    #[test]
+    fn queue_properties() {
+        for seed in 1..=2000u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let q: Vec<Waiter> = (0..rng.below(12))
+                .map(|i| Waiter { run: format!("r{i}"), priority: rng.below(4) as i32 - 1, at_ms: rng.below(6) as i64 })
+                .collect();
+            for a in &q {
+                for b in &q {
+                    assert_eq!(queue_cmp(a, b), queue_cmp(b, a).reverse(), "seed {seed}");
+                    assert_eq!(queue_cmp(a, b) == Ordering::Equal, a.run == b.run, "seed {seed}: total");
+                }
+                let before = ahead(a, &q);
+                for b in &q {
+                    let served_first = before.iter().any(|x| x.run == b.run);
+                    if b.priority != a.priority {
+                        assert_eq!(served_first, b.priority > a.priority, "seed {seed}: by priority");
+                    } else if b.at_ms != a.at_ms {
+                        assert_eq!(served_first, b.at_ms < a.at_ms, "seed {seed}: FIFO within one");
+                    }
+                }
+                assert!(before.windows(2).all(|w| queue_cmp(w[0], w[1]) == Ordering::Less), "seed {seed}: in order");
+            }
+        }
+    }
+
+    fn running(run: &str, vcpus: f32, memory_mib: u64, priority: i32, preemptible: bool) -> Running {
+        Running { run: run.into(), vcpus, memory_mib, priority, preemptible }
+    }
+
+    #[test]
+    fn preemption_stops_only_preemptible_boxes_of_lower_priority_and_as_few_as_it_can() {
+        // n1 is full of: a preemptible batch box (priority 0), a protected one (priority 0), and a
+        // preemptible one of priority 10.
+        let nodes = vec![node("n1", 4.0, 4.0, 8192, 8192), node("n2", 2.0, 2.0, 4096, 4096)];
+        let mut on = BTreeMap::new();
+        on.insert(
+            "n1".to_string(),
+            vec![running("batch", 1.0, 2048, 0, true), running("kept", 1.0, 2048, 0, false), running("high", 2.0, 4096, 10, true)],
+        );
+        on.insert("n2".to_string(), vec![running("small-a", 1.0, 1024, -1, true), running("small-b", 1.0, 1024, -1, true)]);
+
+        let mut r = req(1.0, 2048);
+        r.priority = 5;
+        let p = preempt(&r, &nodes, &on, Strategy::BinPack).unwrap();
+        // n2 needs two victims of priority -1; n1 one of priority 0. The lowest highest-priority
+        // victim wins: n2's.
+        assert_eq!(p, Preemption { node: "n2".into(), victims: vec!["small-a".into(), "small-b".into()], max_priority: -1 });
+
+        on.remove("n2");
+        let p = preempt(&r, &nodes, &on, Strategy::BinPack).unwrap();
+        assert_eq!(p.victims, ["batch"], "never kept (not preemptible) nor high (not lower)");
+
+        r.priority = 0;
+        assert!(preempt(&r, &nodes, &on, Strategy::BinPack).is_none(), "an equal priority stops nothing");
+        r.priority = 20;
+        r.vcpus = 4.0;
+        r.memory_mib = 8192;
+        assert!(preempt(&r, &nodes, &on, Strategy::BinPack).is_none(), "stopping all it may still leaves no room: kept stays");
+
+        // Room is all it makes: a node out for a label stays out.
+        let mut r = req(1.0, 2048);
+        r.priority = 5;
+        r.node_selector.insert("gpu".into(), "a100".into());
+        assert!(preempt(&r, &nodes, &on, Strategy::BinPack).is_none());
+        // And nothing is stopped when a node may take it already.
+        let roomy = vec![nodes[0].clone(), node("n3", 4.0, 0.0, 8192, 0)];
+        assert!(preempt(&req(1.0, 2048), &roomy, &on, Strategy::BinPack).is_none());
+    }
+
+    /// For many random clusters and the boxes on them: preemption is chosen only when no node may
+    /// take the box; every victim is preemptible, of lower priority, and on the node chosen; with
+    /// them stopped the box fits there, and with any one of them kept it doesn't; when none is
+    /// chosen, no node can be made to fit by stopping every box it may stop there; and of the nodes
+    /// that can, none has a lower highest-priority victim.
+    #[test]
+    fn preemption_properties() {
+        let mut chosen = 0;
+        for seed in 1..=3000u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let count = 1 + rng.below(5) as usize;
+            let mut nodes: Vec<Node> = (0..count)
+                .map(|i| {
+                    let mut n = random_node(&mut rng, i);
+                    n.name = format!("n{i}");
+                    n.full = rng.below(20) == 0;
+                    n
+                })
+                .collect();
+            let mut on: BTreeMap<String, Vec<Running>> = BTreeMap::new();
+            for n in nodes.iter_mut() {
+                let boxes: Vec<Running> = (0..rng.below(5))
+                    .map(|j| {
+                        running(
+                            &format!("{}-r{j}", n.name),
+                            (1 + rng.below(4)) as f32 / 2.0,
+                            256 * (1 + rng.below(16)),
+                            rng.below(5) as i32 - 2,
+                            rng.below(3) != 0,
+                        )
+                    })
+                    .collect();
+                // What its boxes hold is what it uses (at most).
+                n.used_vcpus = boxes.iter().map(|b| b.vcpus).sum::<f32>().min(n.vcpus);
+                n.used_memory_mib = boxes.iter().map(|b| b.memory_mib).sum::<u64>().min(n.memory_mib);
+                on.insert(n.name.clone(), boxes);
+            }
+            let mut r = random_request(&mut rng);
+            r.vcpus = (1 + rng.below(8)) as f32 / 2.0;
+            r.memory_mib = 512 * (1 + rng.below(16));
+            let p = preempt(&r, &nodes, &on, Strategy::BinPack);
+            let placeable = schedule(&r, &nodes, Strategy::BinPack, None).node.is_some();
+            let by_name = |name: &str| nodes.iter().find(|n| n.name == name).unwrap();
+            // What stopping every box it may stop on each node gives.
+            let all_gone = |n: &Node| -> bool {
+                let may: Vec<&Running> = on[&n.name].iter().filter(|b| b.yields_to(&r)).collect();
+                !may.is_empty()
+                    && filter(&r, n).iter().all(|x| matches!(x, Refusal::NoRoom { .. }))
+                    && filter(&r, &without(n, &may)).is_empty()
+            };
+            match &p {
+                None => assert!(placeable || nodes.iter().all(|n| !all_gone(n)), "seed {seed}: no preemption that would work is missed"),
+                Some(p) => {
+                    chosen += 1;
+                    assert!(!placeable, "seed {seed}: never when a node may take it");
+                    let n = by_name(&p.node);
+                    let boxes = &on[&p.node];
+                    let gone: Vec<&Running> = p.victims.iter().map(|v| boxes.iter().find(|b| &b.run == v).expect("on its node")).collect();
+                    assert!(!gone.is_empty());
+                    assert!(gone.iter().all(|b| b.preemptible && b.priority < r.priority), "seed {seed}: only those that yield");
+                    assert_eq!(p.max_priority, gone.iter().map(|b| b.priority).max().unwrap());
+                    assert!(filter(&r, &without(n, &gone)).is_empty(), "seed {seed}: it fits with them stopped");
+                    for i in 0..gone.len() {
+                        let mut kept = gone.clone();
+                        kept.remove(i);
+                        assert!(!filter(&r, &without(n, &kept)).is_empty(), "seed {seed}: each victim is needed");
+                    }
+                    // On each node, the lowest k such that stopping every box it may stop of
+                    // priority k or less makes room: no node does with less than the choice's.
+                    for other in nodes.iter().filter(|o| all_gone(o)) {
+                        let least = (-2..=2)
+                            .find(|k| {
+                                let upto: Vec<&Running> = on[&other.name].iter().filter(|b| b.yields_to(&r) && b.priority <= *k).collect();
+                                filter(&r, &without(other, &upto)).is_empty()
+                            })
+                            .unwrap();
+                        assert!(p.max_priority <= least, "seed {seed}: never a needlessly high victim ({} on {})", least, other.name);
+                    }
+                }
+            }
+        }
+        assert!(chosen > 100, "the generator makes preemption happen ({chosen})");
     }
 }

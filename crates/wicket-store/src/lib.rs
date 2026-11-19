@@ -25,7 +25,9 @@ pub mod cas;
 #[cfg(test)]
 mod lifecycle_props;
 mod links;
+mod names;
 mod services;
+pub use names::{name_effect, new_name_id, NameAsk, NameKind, NameRow, NameScope, NameTerms, MAX_PENDING_NAMES};
 pub use services::{Instance, ServiceRow, SHARED_TENANT};
 mod nodeca;
 mod nodelabels;
@@ -180,7 +182,10 @@ pub enum StoreError {
 /// step 2): a counter per topic (grants, asks, revocations, node CAs) that every write to its tables
 /// moves, so a supervisor reads its rows only when they changed. Older builds don't read it, and its
 /// triggers fire under them too; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 27;
+/// Version 28 (expand, after #582 step 2's 27) adds `names`, `host_ports` and `name_records`
+/// (#575): the names boxes hold, the host ports public names are published on, and the DNS records
+/// this installation created. Older builds don't read them; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 28;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -582,6 +587,7 @@ impl Ledger {
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
         conn.execute_batch(triggers::SCHEMA)?;
+        conn.execute_batch(names::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -635,6 +641,7 @@ impl Ledger {
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
         conn.execute_batch(triggers::SCHEMA)?;
+        conn.execute_batch(names::SCHEMA)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })

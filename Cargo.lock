@@ -4363,7 +4363,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tokio",
  "wicket-core",
+ "wicket-names",
  "zstd",
 ]
 

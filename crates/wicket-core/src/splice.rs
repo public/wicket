@@ -261,6 +261,45 @@ pub fn uncovered(permitted: &[String], needed: &[String]) -> Vec<String> {
     needed.iter().filter(|n| !permitted.iter().any(|p| subtree_covers(p, n))).cloned().collect()
 }
 
+/// What a widened node CA is signed for (#573): the operator's hosts `base`, always, and of `wants`
+/// (each a run and a subtree, as the ledger lists them, oldest first, already within the node's
+/// policy) those `base` doesn't cover, a run at a time so no run takes every slot, up to `max` in
+/// all; without entries another covers ([`merge_subtrees`]). Also the wants left out, over the cap.
+///
+/// Lean: `widen` (`Wicket/NodeCa.lean`); `widen_keeps_base`, `widen_keeps_wants`,
+/// `widen_from_inputs`.
+pub fn widen(base: &[String], wants: &[(String, String)], max: usize) -> (Vec<String>, Vec<String>) {
+    let mut by_run: Vec<(&str, std::collections::VecDeque<&str>)> = vec![];
+    for (run, host) in wants {
+        // The operator's hosts cover it already.
+        if uncovered(base, std::slice::from_ref(host)).is_empty() {
+            continue;
+        }
+        match by_run.iter_mut().find(|(r, _)| r == run) {
+            Some((_, q)) => q.push_back(host),
+            None => by_run.push((run, [host.as_str()].into())),
+        }
+    }
+    let room = max.saturating_sub(base.len());
+    let (mut kept, mut dropped): (Vec<String>, Vec<String>) = (vec![], vec![]);
+    while by_run.iter().any(|(_, q)| !q.is_empty()) {
+        for (_, q) in by_run.iter_mut() {
+            let Some(h) = q.pop_front() else { continue };
+            let h = h.to_string();
+            let covered = uncovered(&[base, &kept[..]].concat(), std::slice::from_ref(&h)).is_empty();
+            if covered {
+                continue;
+            }
+            if kept.len() < room {
+                kept.push(h);
+            } else if !dropped.contains(&h) {
+                dropped.push(h);
+            }
+        }
+    }
+    (merge_subtrees(&[base, &kept[..]].concat()), dropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +611,29 @@ mod tests {
 
     /// #573's review: only what a remote node CA may be constrained to is ever wanted of one.
     /// `*` would sign an unconstrained intermediate; the rest would fail every renewal.
+    /// #573: what `Wicket/NodeCa.lean`'s `widen_no_star` takes as given, as `ca_subtree`'s IDNA
+    /// parsing is outside the spec: no host, however spelt, gives a subtree with a `*` (so no want
+    /// widens a remote node's CA to every name), and every subtree it gives is issuable. Every
+    /// string of up to six bytes over a few letters, `.`, `*`, `-` and an upper-case one.
+    #[test]
+    fn no_host_gives_a_subtree_with_a_star() {
+        let mut hosts = vec![String::new()];
+        let mut all = vec![];
+        for _ in 0..6 {
+            hosts = hosts.iter().flat_map(|h| ["a", "b", ".", "*", "-", "C"].map(|c| format!("{h}{c}"))).collect();
+            all.extend(hosts.iter().cloned());
+        }
+        let mut some = 0;
+        for h in &all {
+            if let Some(s) = ca_subtree(h) {
+                some += 1;
+                assert!(!s.contains('*'), "{h:?} gives {s:?}");
+                assert!(issuable_subtree(&s), "{h:?} gives {s:?}, not issuable");
+            }
+        }
+        assert!(some > 100, "only {some} hosts give a subtree");
+    }
+
     #[test]
     fn only_issuable_subtrees_are_wanted_of_a_node_ca() {
         assert_eq!(ca_subtree("API.Example.com."), Some("api.example.com".into()));

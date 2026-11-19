@@ -407,4 +407,73 @@ def prefixDir (p : Str) : Str :=
 def prefixCovers (pre path : Str) : Bool :=
   (prefixDir pre).isPrefixOf path || (path ++ ['/']) == prefixDir pre
 
+/-- The directory a prefix grant names: its prefix without a trailing `/` (`prefix_covers`'s
+`dir`). -/
+def prefixBase (p : Str) : Str := (prefixDir p).dropLast
+
+theorem eq_dropLast_append : ∀ (p : Str) (c : Char), p.getLast? = some c → p = p.dropLast ++ [c]
+  | [], _, h => by simp at h
+  | [a], c, h => by simp at h; simp [h]
+  | a :: b :: l, c, h => by
+    have := eq_dropLast_append (b :: l) c (by simpa using h)
+    simp only [List.dropLast_cons_cons, List.cons_append]
+    exact congrArg (a :: ·) this
+
+theorem prefixDir_eq (p : Str) : prefixDir p = prefixBase p ++ ['/'] := by
+  unfold prefixBase prefixDir
+  split
+  · rename_i h; exact eq_dropLast_append p '/' h
+  · simp
+
+/-- **What a prefix grant covers** (#568): its directory itself, or a path that continues it with
+`/`. Never a sibling that only starts with the same characters (`/a/app` covers neither
+`/a/app-secrets` nor `/a/ap`). -/
+theorem prefixCovers_iff {pre path : Str} :
+    prefixCovers pre path = true ↔ path = prefixBase pre ∨ ∃ w, path = prefixBase pre ++ '/' :: w := by
+  unfold prefixCovers
+  rw [prefixDir_eq, Bool.or_eq_true, List.isPrefixOf_iff_prefix, beq_iff_eq, List.append_left_inj]
+  constructor
+  · rintro (⟨w, hw⟩ | h)
+    · exact .inr ⟨w, by rw [← hw]; simp⟩
+    · exact .inl h
+  · rintro (h | ⟨w, hw⟩)
+    · exact .inr h
+    · exact .inl ⟨w, by rw [hw]; simp⟩
+
+/-- A prefix grant covers only paths whose first segments are its directory's. -/
+theorem prefix_covers_segments {pre path : Str} (h : prefixCovers pre path = true) :
+    ∃ t, split path = split (prefixBase pre) ++ t := by
+  rcases prefixCovers_iff.mp h with rfl | ⟨w, rfl⟩
+  · exact ⟨[], by simp⟩
+  · exact ⟨split w, split_append_slash _ _⟩
+
+/-- **A prefix grant is no wider than a reach rule `Q/**`**: for a directory `Q` without `*` or `?`,
+it covers `Q` itself and only paths the glob `Q/**` matches. -/
+theorem prefix_grant_is_globstar {pre path : Str} (hq : (prefixBase pre).all plainChar)
+    (h : prefixCovers pre path = true) :
+    path = prefixBase pre ∨ Lang csEq (prefixBase pre ++ ['/', '*', '*']) path := by
+  rcases prefixCovers_iff.mp h with e | ⟨w, rfl⟩
+  · exact .inl e
+  · exact .inr (globstar_crosses hq w)
+
+/-- **A covered path can't escape its prefix upstream**: a canonical path a prefix grant covers
+(for a directory without `%`) still has the directory's segments first as an upstream that
+decodes and resolves dot segments reads it. -/
+theorem prefix_no_escape {pre path : Str} (hp : plainOk path = true) (hpct : '%' ∉ prefixBase pre)
+    (h : prefixCovers pre path = true) :
+    ∃ t, resolve (split (decode path)) = split (prefixBase pre) ++ t := by
+  obtain ⟨t, ht⟩ := prefix_covers_segments h
+  refine ⟨t.map decode, ?_⟩
+  rw [(upstream_eq hp).1, ht, List.map_append]
+  congr 1
+  have : ∀ s ∈ split (prefixBase pre), decode s = s := fun s hs =>
+    decode_of_no_pct (fun e => hpct (mem_of_mem_split hs e))
+  clear ht h
+  generalize split (prefixBase pre) = qs at this ⊢
+  induction qs with
+  | nil => rfl
+  | cons s ss ih =>
+    simp only [List.map_cons, this s List.mem_cons_self]
+    rw [ih (fun x hx => this x (List.mem_cons_of_mem _ hx))]
+
 end Wicket
