@@ -68,27 +68,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 enrol::renew_ca(&name, hosts, wicket_core::time::parse_duration(&ca_ttl)?, wicket_core::time::parse_duration(&cert_ttl)?)
                     .await
             }
-            NodeCmd::Set { name, ca_hosts } => {
-                let l = Ledger::open(&ledger_path())?;
-                anyhow::ensure!(l.node(&name)?.is_some(), "node {name} is not enrolled");
-                let policy = wicket_store::CaHosts::parse(&ca_hosts).map_err(anyhow::Error::msg)?;
-                l.set_node_ca_policy(&name, &policy)?;
-                l.audit(
-                    &wicket_core::TenantId::single(),
-                    None,
-                    "node.ca_policy",
-                    &serde_json::json!({ "name": name, "ca_hosts": policy }),
-                )?;
-                println!(
-                    "node {name}: its CA is widened at runtime {}",
-                    match &policy {
-                        wicket_store::CaHosts::Fixed => "never (its hosts change only with wicket node renew-ca)".to_string(),
-                        wicket_store::CaHosts::Auto => "to every inspected host its boxes need".to_string(),
-                        wicket_store::CaHosts::Allowed(h) => format!("to the hosts its boxes need that match {}", h.join(", ")),
-                    }
-                );
-                Ok(())
-            }
+            NodeCmd::Set { name, ca_hosts, labels, taints } => set(&name, ca_hosts.as_deref(), &labels, &taints),
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
@@ -96,6 +76,120 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Forget { run, force } => noderun::forget_command(&run, force, &operator()).await,
         },
         _ => unreachable!("dispatched to the wrong command group"),
+    }
+}
+
+/// What `--label` and `--taint` say: set or remove, by key.
+#[derive(Debug, PartialEq)]
+enum Mark {
+    Label(String, Option<String>),
+    Taint(String, Option<wicket_core::placement::Taint>),
+}
+
+/// `key=value` sets a label and `key-` removes it; `key` or `key=value` taints, `key-` removes.
+fn marks(labels: &[String], taints: &[String]) -> Result<Vec<Mark>> {
+    use wicket_core::placement::{check_key, check_value, Taint};
+    let mut out = vec![];
+    for l in labels {
+        out.push(match (l.split_once('='), l.strip_suffix('-')) {
+            (Some((k, v)), _) => {
+                check_key(k).and_then(|_| check_value(v)).map_err(|e| anyhow::anyhow!("--label {l}: {e}"))?;
+                Mark::Label(k.into(), Some(v.into()))
+            }
+            (None, Some(k)) => {
+                check_key(k).map_err(|e| anyhow::anyhow!("--label {l}: {e}"))?;
+                Mark::Label(k.into(), None)
+            }
+            (None, None) => bail!("--label {l}: key=value sets a label, key- removes it"),
+        });
+    }
+    for t in taints {
+        out.push(match t.strip_suffix('-').filter(|_| !t.contains('=')) {
+            Some(k) => {
+                check_key(k).map_err(|e| anyhow::anyhow!("--taint {t}: {e}"))?;
+                Mark::Taint(k.into(), None)
+            }
+            None => {
+                let parsed = Taint::parse(t).map_err(|e| anyhow::anyhow!("--taint {t}: {e}"))?;
+                Mark::Taint(parsed.key.clone(), Some(parsed))
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// `wicket node set`: a node's CA policy, labels and taints, each change audited. Everything is
+/// parsed before anything is written.
+fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String]) -> Result<()> {
+    anyhow::ensure!(ca_hosts.is_some() || !labels.is_empty() || !taints.is_empty(), "say what to set: --ca-hosts, --label or --taint");
+    let policy = ca_hosts.map(|c| wicket_store::CaHosts::parse(c).map_err(anyhow::Error::msg)).transpose()?;
+    let marks = marks(labels, taints)?;
+    let l = Ledger::open(&ledger_path())?;
+    anyhow::ensure!(l.node(name)?.is_some(), "node {name} is not enrolled");
+    let tenant = wicket_core::TenantId::single();
+    if let Some(policy) = policy {
+        l.set_node_ca_policy(name, &policy)?;
+        l.audit(&tenant, None, "node.ca_policy", &serde_json::json!({ "name": name, "ca_hosts": policy }))?;
+        println!(
+            "node {name}: its CA is widened at runtime {}",
+            match &policy {
+                wicket_store::CaHosts::Fixed => "never (its hosts change only with wicket node renew-ca)".to_string(),
+                wicket_store::CaHosts::Auto => "to every inspected host its boxes need".to_string(),
+                wicket_store::CaHosts::Allowed(h) => format!("to the hosts its boxes need that match {}", h.join(", ")),
+            }
+        );
+    }
+    if marks.is_empty() {
+        return Ok(());
+    }
+    let mut changed = false;
+    for m in &marks {
+        changed |= match m {
+            Mark::Label(k, v) => l.set_node_label(name, k, v.as_deref())?,
+            Mark::Taint(_, Some(t)) => l.set_node_taint(name, t)?,
+            Mark::Taint(k, None) => l.remove_node_taint(name, k)?,
+        };
+    }
+    let (labels, taints) = (l.node_labels(name)?, l.node_taints(name)?);
+    if changed {
+        l.audit(&tenant, None, "node.labels", &serde_json::json!({ "name": name, "labels": labels, "taints": taints }))?;
+    }
+    let show = |xs: Vec<String>| if xs.is_empty() { "none".to_string() } else { xs.join(", ") };
+    println!(
+        "node {name}: labels {}; taints {}",
+        show(labels.iter().map(|(k, v)| format!("{k}={v}")).collect()),
+        show(taints.iter().map(|t| t.to_string()).collect())
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod set_tests {
+    use super::*;
+    use wicket_core::placement::Taint;
+
+    #[test]
+    fn labels_and_taints_parse_as_set_or_remove() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            marks(&s(&["gpu=a100", "zone-", "empty="]), &s(&["dedicated=ci", "spot", "old-"])).unwrap(),
+            vec![
+                Mark::Label("gpu".into(), Some("a100".into())),
+                Mark::Label("zone".into(), None),
+                Mark::Label("empty".into(), Some(String::new())),
+                Mark::Taint("dedicated".into(), Some(Taint::parse("dedicated=ci").unwrap())),
+                Mark::Taint("spot".into(), Some(Taint::parse("spot").unwrap())),
+                Mark::Taint("old".into(), None),
+            ]
+        );
+        assert_eq!(
+            marks(&[], &s(&["k=v-"])).unwrap(),
+            vec![Mark::Taint("k".into(), Some(Taint::parse("k=v-").unwrap()))],
+            "a value may end in -"
+        );
+        for (l, t) in [(vec!["gpu"], vec![]), (vec!["Bad=x"], vec![]), (vec![], vec!["a b"]), (vec![], vec!["-"])] {
+            assert!(marks(&s(&l), &s(&t)).is_err(), "{l:?} {t:?}");
+        }
     }
 }
 
@@ -231,15 +325,24 @@ pub enum NodeCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Set how an enrolled node's CA may be widened at runtime (#573): `fixed` (never: its hosts
-    /// change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need),
-    /// or a list of hosts it may be widened to (`api.example.com,*.example.org`). The widening is
-    /// a renewal over the run's channel, audited as `node.ca_widened`.
+    /// Set what placement and the control host know of an enrolled node: its labels and taints
+    /// (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the
+    /// node has every label the box's `placement.node_selector` names, and the box tolerates every
+    /// taint the node has. A CA widening is a renewal over the run's channel, audited as
+    /// `node.ca_widened`.
     Set {
         name: String,
-        /// fixed, auto, or a comma-separated list of hosts.
+        /// `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its
+        /// boxes' reach or grants need), or a comma-separated list of hosts it may be widened to
+        /// (`api.example.com,*.example.org`).
         #[arg(long)]
-        ca_hosts: String,
+        ca_hosts: Option<String>,
+        /// `key=value` sets a label, `key-` removes it. Repeatable.
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        /// `key` or `key=value` taints the node (one taint per key), `key-` removes it. Repeatable.
+        #[arg(long = "taint")]
+        taints: Vec<String>,
     },
     /// Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity
     /// certificate for its node key, over its pinned ssh: also how a node whose identity certificate

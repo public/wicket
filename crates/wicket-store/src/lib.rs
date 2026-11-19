@@ -26,6 +26,7 @@ pub mod cas;
 mod lifecycle_props;
 mod links;
 mod nodeca;
+mod nodelabels;
 pub use nodeca::{CaHosts, CaWant};
 pub mod money;
 mod node;
@@ -139,7 +140,9 @@ pub enum StoreError {
 /// Version 21 (expand, after #576's 20) adds `node_ca_policy` and `node_ca_wants` (#573): how a
 /// node's CA may be widened at runtime, and the hosts its boxes want of it. Older builds don't read
 /// them, so the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 21;
+/// Version 22 (expand) adds `node_labels` and `node_taints` (#579): what placement filters nodes by.
+/// Older builds don't read them; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 22;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -536,6 +539,7 @@ impl Ledger {
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
         conn.execute_batch(nodeca::SCHEMA)?;
+        conn.execute_batch(nodelabels::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -582,6 +586,7 @@ impl Ledger {
         conn.execute_batch(delegations::SCHEMA)?;
         conn.execute_batch(capgrant::SCHEMA)?;
         conn.execute_batch(nodeca::SCHEMA)?;
+        conn.execute_batch(nodelabels::SCHEMA)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
