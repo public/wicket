@@ -565,6 +565,12 @@ fn rust_decides_as_the_lean_spec() {
     decisions(&mut c, &mut rng);
     let decisions = c.cases.len() - decisions_from;
 
+    // 11. A node CA's name constraints (#573): permitting, covering, and what a widened CA is
+    // signed for.
+    let node_ca_from = c.cases.len();
+    node_ca(&mut c, &mut rng);
+    let node_ca = c.cases.len() - node_ca_from;
+
     let file = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lean-oracle-cases.json");
     std::fs::write(&file, serde_json::to_vec(&json!({ "zones": c.zones, "cases": c.cases })).unwrap()).unwrap();
     let lean = run_lean(&file);
@@ -591,6 +597,7 @@ fn rust_decides_as_the_lean_spec() {
     println!("lean oracle: {routes_admitted} of 600 route children admitted; {chains} token chains, {node_admitted} of their leaves admitted by check");
     assert!(routes_admitted > 50 && routes_admitted < 550, "route children admitted: {routes_admitted} of 600");
     assert!(chains > 100, "too few token chains ({chains})");
+    println!("lean oracle: {node_ca} cases of node CA name constraints");
     println!("lean oracle: {decisions} cases of wicket-core's pure decisions (is_public_ip, the token's end, agents' terms, escalation, uses, money, spawn)");
     assert!(
         divergent.is_empty(),
@@ -747,5 +754,52 @@ fn decisions(c: &mut Cases, rng: &mut Rng) {
             rust,
             format!("{l:?}.admits({a:?})"),
         );
+    }
+}
+
+/// The cases of section 11: `splice::subtree_permits` on every pair of subtrees and hosts below,
+/// coverage by generated lists, and `splice::widen` on generated operator's hosts and runs' wants
+/// (sometimes over the cap).
+fn node_ca(c: &mut Cases, rng: &mut Rng) {
+    use wicket_core::splice::{subtree_permits, uncovered, widen};
+    const SUBTREES: [&str; 14] = [
+        "a.test",
+        "b.a.test",
+        ".a.test",
+        ".test",
+        "test",
+        "*",
+        "A.Test",
+        ".b.a.test",
+        "ab.test",
+        "x.b.a.test",
+        ".A.TEST",
+        "b.test",
+        ".",
+        "",
+    ];
+    const NAMES: [&str; 12] =
+        ["a.test", "b.a.test", "x.b.a.test", "ab.test", "test", "A.TEST.", "a.test..", ".a.test", "b.test", "xa.test", "*", "c.ab.test"];
+    for s in SUBTREES {
+        for h in NAMES.iter().chain(&SUBTREES) {
+            let rust = subtree_permits(s, h).to_string();
+            c.push(json!({ "kind": "subtree_permits", "subtree": s, "host": h }), rust, format!("subtree_permits({s:?}, {h:?})"));
+        }
+    }
+    let pick = |rng: &mut Rng, n: usize| -> Vec<String> { (0..rng.below(n)).map(|_| rng.pick(&SUBTREES[..12]).to_string()).collect() };
+    for _ in 0..1500 {
+        let permitted = pick(rng, 4);
+        let need = rng.pick(&SUBTREES[..12]).to_string();
+        let rust = uncovered(&permitted, std::slice::from_ref(&need)).is_empty().to_string();
+        c.push(json!({ "kind": "covered", "permitted": permitted, "need": need }), rust, format!("covered({permitted:?}, {need:?})"));
+    }
+    for _ in 0..1500 {
+        let base: Vec<String> = pick(rng, 3).into_iter().filter(|s| s != "*" || rng.chance(10)).collect();
+        let wants: Vec<(String, String)> =
+            (0..rng.below(9)).map(|_| (rng.pick(&["r1", "r2", "r3"]).to_string(), rng.pick(&SUBTREES[..12]).to_string())).collect();
+        let max = rng.below(7);
+        let (hosts, dropped) = widen(&base, &wants, max);
+        let rust = serde_json::to_string(&json!([hosts, dropped])).unwrap();
+        c.push(json!({ "kind": "widen", "base": base, "wants": wants, "max": max }), rust, format!("widen({base:?}, {wants:?}, {max})"));
     }
 }
