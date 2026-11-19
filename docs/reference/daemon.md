@@ -29,7 +29,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 
 | command | class |
 |---|---|
-| `run`, `wrap`, `session`, `hibernate`, `wake`, `trigger create\|resume` | run |
+| `run`, `wrap`, `session`, `hibernate`, `wake`, `trigger create\|resume\|renew` | run |
 | `agents`, `pending`, `links`, `audit` (and `audit export`), `doctor` | read |
 | `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list` (without `--provider`), `state check`, `self status`, `trigger list\|show\|fire` | read |
 | `unlink`, `grant revoke`, `identity revoke`, `lease release`, `trigger pause\|rm` | revoke |

@@ -38,6 +38,7 @@ reference](manifest.md)).
   - [`wicket trigger show`](#wicket-trigger-show)
   - [`wicket trigger pause`](#wicket-trigger-pause)
   - [`wicket trigger resume`](#wicket-trigger-resume)
+  - [`wicket trigger renew`](#wicket-trigger-renew)
   - [`wicket trigger rm`](#wicket-trigger-rm)
   - [`wicket trigger fire`](#wicket-trigger-fire)
 - [`wicket audit`](#wicket-audit)
@@ -560,11 +561,12 @@ Triggers (#578): when a schedule or timer comes due, wake or message an agent
 Usage: wicket trigger <COMMAND>
 
 Commands:
-  create  Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`)
+  create  Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`). The agent it wakes or messages is resolved now (a live agent; a `wake` is kept as the agent's id)
   list    Triggers that aren't removed: each with its state, source, action and next firing
-  show    One trigger: its document, state, next firing and last firings
-  pause   Pause a trigger: it fires nothing until resumed (events while paused are not caught up)
-  resume  Resume a paused trigger
+  show    One trigger (its id, or its name): its document, agent, state, next firing and last firings
+  pause   Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up)
+  resume  Resume a paused trigger: only its owner (or root), since it fires as its owner
+  renew   Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root)
   rm      Remove a trigger: it fires nothing again
   fire    Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now
   help    Print this message or the help of the given subcommand(s)
@@ -576,13 +578,13 @@ Options:
 ### `wicket trigger create`
 
 ```text
-Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`)
+Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`). The agent it wakes or messages is resolved now (a live agent; a `wake` is kept as the agent's id)
 
 Usage: wicket trigger create [OPTIONS] --file <FILE>
 
 Options:
       --file <FILE>    
-      --lasts <LASTS>  How long it lasts, or `forever`: until removed [default: forever]
+      --lasts <LASTS>  How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew` [default: 30d]
   -h, --help           Print help
 ```
 
@@ -600,12 +602,12 @@ Options:
 ### `wicket trigger show`
 
 ```text
-One trigger: its document, state, next firing and last firings
+One trigger (its id, or its name): its document, agent, state, next firing and last firings
 
-Usage: wicket trigger show <ID>
+Usage: wicket trigger show <TRIGGER>
 
 Arguments:
-  <ID>  
+  <TRIGGER>  
 
 Options:
   -h, --help  Print help
@@ -614,12 +616,12 @@ Options:
 ### `wicket trigger pause`
 
 ```text
-Pause a trigger: it fires nothing until resumed (events while paused are not caught up)
+Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up)
 
-Usage: wicket trigger pause <ID>
+Usage: wicket trigger pause <TRIGGER>
 
 Arguments:
-  <ID>  
+  <TRIGGER>  
 
 Options:
   -h, --help  Print help
@@ -628,15 +630,30 @@ Options:
 ### `wicket trigger resume`
 
 ```text
-Resume a paused trigger
+Resume a paused trigger: only its owner (or root), since it fires as its owner
 
-Usage: wicket trigger resume <ID>
+Usage: wicket trigger resume <TRIGGER>
 
 Arguments:
-  <ID>  
+  <TRIGGER>  
 
 Options:
   -h, --help  Print help
+```
+
+### `wicket trigger renew`
+
+```text
+Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root)
+
+Usage: wicket trigger renew [OPTIONS] <TRIGGER>
+
+Arguments:
+  <TRIGGER>  
+
+Options:
+      --lasts <LASTS>  [default: 30d]
+  -h, --help           Print help
 ```
 
 ### `wicket trigger rm`
@@ -644,10 +661,10 @@ Options:
 ```text
 Remove a trigger: it fires nothing again
 
-Usage: wicket trigger rm <ID>
+Usage: wicket trigger rm <TRIGGER>
 
 Arguments:
-  <ID>  
+  <TRIGGER>  
 
 Options:
   -h, --help  Print help
@@ -658,10 +675,10 @@ Options:
 ```text
 Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now
 
-Usage: wicket trigger fire [OPTIONS] --dry-run <ID>
+Usage: wicket trigger fire [OPTIONS] --dry-run <TRIGGER>
 
 Arguments:
-  <ID>  
+  <TRIGGER>  
 
 Options:
       --event <EVENT>  A JSON file with the event's fields
