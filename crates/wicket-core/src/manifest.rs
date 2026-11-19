@@ -893,6 +893,20 @@ impl Manifest {
         for u in &self.zone.uses {
             crate::service::check_name(u).map_err(|e| ManifestError::Invalid(format!("zone.uses: {e}")))?;
         }
+        // Affinity names what this box has: a service its zone uses, a volume its zone declares.
+        for a in &self.placement.affinity {
+            match a.near() {
+                Some(crate::placement::Near::Service(s)) if !self.zone.uses.contains(&s) => {
+                    return Err(ManifestError::Invalid(format!("placement.affinity: service {s} is not one zone.uses names")));
+                }
+                Some(crate::placement::Near::Volume(v)) if !self.zone.volumes.iter().any(|x| x.name == v && x.keep) => {
+                    return Err(ManifestError::Invalid(format!(
+                        "placement.affinity: volume {v} is not one zone.volumes declares with keep: true (only a kept volume stays on a node)"
+                    )));
+                }
+                _ => {}
+            }
+        }
         if let Some(s) = &self.service {
             s.check().map_err(ManifestError::Invalid)?;
             if self.program.is_none() {
@@ -1167,6 +1181,25 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// #579 step 4: affinity names a service the zone uses or a volume it declares.
+    #[test]
+    fn affinity_names_what_the_box_has() {
+        let m = |placement: &str| {
+            super::Manifest::from_yaml(&format!(
+                "task: t\nprogram: {{ name: p, command: [x] }}\nplacement: {placement}\n\
+                 zone: {{ name: z, uses: [npm-cache], volumes: [{{ name: data, path: /volumes/data, keep: true }}, \
+                 {{ name: scratch, path: /volumes/scratch }}] }}\n"
+            ))
+        };
+        let ok = m("{ priority: 5, affinity: [{ service: npm-cache }, { volume: data, required: true }] }").unwrap();
+        assert_eq!(ok.placement.priority, 5);
+        assert_eq!(super::Manifest::from_yaml(&crate::yaml::to_string(&ok).unwrap()).unwrap().placement, ok.placement);
+        assert!(m("{ affinity: [{ service: crates-mirror }] }").unwrap_err().to_string().contains("not one zone.uses names"));
+        assert!(m("{ affinity: [{ volume: other }] }").unwrap_err().to_string().contains("not one zone.volumes declares"));
+        assert!(m("{ affinity: [{ volume: scratch }] }").unwrap_err().to_string().contains("keep: true"), "a run's cache is on no node");
+        assert!(m("{ priority: 5000 }").is_err());
+    }
 
     /// #579 step 3: a service is a program with `service:`, its users name it in `zone.uses`, and
     /// both are written out only when set.
