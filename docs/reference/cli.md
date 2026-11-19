@@ -14,6 +14,7 @@ reference](manifest.md)).
 - [`wicket hibernate`](#wicket-hibernate)
 - [`wicket top`](#wicket-top)
 - [`wicket agents`](#wicket-agents)
+- [`wicket why-here`](#wicket-why-here)
 - [`wicket wrap`](#wicket-wrap)
 - [`wicket pending`](#wicket-pending)
 - [`wicket approve`](#wicket-approve)
@@ -118,6 +119,7 @@ Commands:
   hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
   top        A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes, what their boxes are given), runs (node, agent, status, uptime, model usage), pending requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`
   agents     Long-lived agents: state, generation, current run and bundle size
+  why-here   Why a run's box went on the node it did, or why it went nowhere (#579): what it asked for, the nodes it may go on in order, and every reason each other node was out
   wrap       Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its Remote Control sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
   pending    List pending requests: what boxes asked for that their zones don't allow, waiting for a grant or a denial
   approve    Approve a pending request. The grant is never wider than the request
@@ -220,6 +222,21 @@ Options:
 Long-lived agents: state, generation, current run and bundle size
 
 Usage: wicket agents [OPTIONS]
+
+Options:
+      --json  
+  -h, --help  Print help
+```
+
+## `wicket why-here`
+
+```text
+Why a run's box went on the node it did, or why it went nowhere (#579): what it asked for, the nodes it may go on in order, and every reason each other node was out
+
+Usage: wicket why-here [OPTIONS] <RUN>
+
+Arguments:
+  <RUN>  
 
 Options:
       --json  

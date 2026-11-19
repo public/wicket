@@ -46,3 +46,4 @@ pub mod snapstore;
 pub mod spawn;
 pub mod storegc;
 pub mod transcript;
+pub mod whyhere;

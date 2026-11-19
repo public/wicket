@@ -151,9 +151,10 @@ pub enum StoreError {
 /// archived run's grants sees none), so the floor stays 17.
 /// Version 22 (expand, after #582's 21) adds `node_labels` and `node_taints` (#579): what placement
 /// filters nodes by. Older builds don't read them; the floor stays 17.
-/// Version 24 (expand, after #576's 23) adds `placements` and `placement_waits` (#579 step 2): the
-/// node room reserved for boxes being started, and the runs waiting for a node. Older builds don't
-/// read them; the floor stays 17.
+/// Version 24 (expand, after #576's 23) adds `placements`, `placement_waits` and
+/// `placement_decisions` (#579 step 2): the node room reserved for boxes being started, the runs
+/// waiting for a node, and why each run went where it did. Older builds don't read them; the floor
+/// stays 17.
 pub const SCHEMA_VERSION: u32 = 24;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;

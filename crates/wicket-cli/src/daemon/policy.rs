@@ -65,7 +65,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // Hibernating and waking steer an agent the way prompting its session does; waking reruns its
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
-        Cmd::Agents { .. } | Cmd::Top { .. } => Forward(Read),
+        Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } => Forward(Read),
         Cmd::Pending | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
