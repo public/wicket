@@ -445,11 +445,61 @@ impl crate::manifest::ReachRule {
             if !p.starts_with('/') {
                 return Err(format!("path {p:?} must start with /"));
             }
+            // A canonical path's characters (RFC 3986's, percent-encoded beyond them) and the glob
+            // metacharacters, nothing else: no space, control or bidi character can hide part of a
+            // rule from whoever reads it on a terminal (#572).
+            if let Some(c) = p.chars().find(|c| !(c.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/%?[]{}".contains(*c))) {
+                return Err(format!("path {:?} has a character a path can't: {:?}", crate::text::strip(p), c));
+            }
             compile_glob(p).map_err(|e| format!("path {p:?}: {e}"))?;
         }
         Ok(())
     }
+
+    /// [`ReachRule::check`], and what a standing rule (#572) must also be to reach a box's node as a
+    /// token block: an exact host, at most [`STANDING_PAIRS`] method and path pairs (one Datalog rule
+    /// each), and path globs whose regexes fit a block's cap.
+    pub fn check_standing(&self) -> Result<(), String> {
+        self.check()?;
+        if self.host.starts_with("*.") {
+            return Err(format!("standing reach names its host exactly, not {}", self.host));
+        }
+        let pairs = self.methods.len() * self.paths.len();
+        if pairs > STANDING_PAIRS {
+            return Err(format!(
+                "{} method(s) × {} path(s) is {pairs} pairs, more than {STANDING_PAIRS}: fewer methods or paths, or wider globs",
+                self.methods.len(),
+                self.paths.len()
+            ));
+        }
+        for p in &self.paths {
+            let re = compile_glob(p).map_err(|e| e.to_string())?.glob().regex().to_string();
+            if re.len() > STANDING_REGEX {
+                return Err(format!("path {p:?} is too long a glob for standing reach"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The rule as it is kept and compared (#572): its methods upper-case, sorted and once each,
+    /// its paths sorted and once each. Two asks for the same reach are the same rule.
+    pub fn canonical(&self) -> crate::manifest::ReachRule {
+        let mut methods: Vec<String> = self.methods.iter().map(|m| m.to_ascii_uppercase()).collect();
+        methods.sort();
+        methods.dedup();
+        let mut paths = self.paths.clone();
+        paths.sort();
+        paths.dedup();
+        crate::manifest::ReachRule { host: self.host.to_ascii_lowercase(), methods, paths, allow_dangerous: self.allow_dangerous }
+    }
 }
+
+/// The most method and path pairs a standing rule may have: one rule each in its token block,
+/// wicket-authz's `max_grant_rules`.
+pub const STANDING_PAIRS: usize = 16;
+/// The longest regex a standing rule's path glob may compile to (with globset's `(?-u)` prefix):
+/// wicket-authz's `max_regex_len` (256), and the prefix.
+pub const STANDING_REGEX: usize = 256 + 5;
 
 #[cfg(kani)]
 #[path = "proofs/decide.rs"]
@@ -559,7 +609,31 @@ mod tests {
         assert!(bad(crate::manifest::ReachRule { methods: vec!["SPAWN".into()], ..logs.clone() }).contains("SPAWN"));
         assert!(bad(crate::manifest::ReachRule { methods: vec![], ..logs.clone() }).contains("method"));
         assert!(bad(crate::manifest::ReachRule { paths: vec!["repos/**".into()], ..logs.clone() }).contains("start with /"));
-        assert!(bad(crate::manifest::ReachRule { paths: vec![], ..logs }).contains("path"));
+        assert!(bad(crate::manifest::ReachRule { paths: vec![], ..logs.clone() }).contains("path"));
+        // Nothing that can hide part of a rule on a terminal (#572 review, H1).
+        for p in ["/a\r{ host: x }", "/a\x1b[2K", "/a\u{202e}", "/a b", "/a\n"] {
+            assert!(
+                bad(crate::manifest::ReachRule { paths: vec![p.into()], ..logs.clone() }).contains("a character a path can't"),
+                "{p:?}"
+            );
+        }
+        assert!(bad(crate::manifest::ReachRule { methods: vec!["GET\r".into()], ..logs.clone() }).contains("is not one of"));
+        // Publishable as a token block: an exact host, at most 16 pairs.
+        assert!(wide.check_standing().unwrap_err().contains("exactly"));
+        let many = crate::manifest::ReachRule {
+            methods: vec!["GET".into(), "HEAD".into()],
+            paths: (0..9).map(|i| format!("/p{i}/**")).collect(),
+            ..logs.clone()
+        };
+        assert!(many.check() == Ok(()) && many.check_standing().unwrap_err().contains("18 pairs"));
+        assert_eq!(logs.check_standing(), Ok(()));
+        let messy = crate::manifest::ReachRule {
+            methods: vec!["get".into(), "GET".into(), "DELETE".into()],
+            paths: vec!["/b".into(), "/a".into(), "/b".into()],
+            ..logs
+        };
+        let c = messy.canonical();
+        assert_eq!((c.methods, c.paths), (vec!["DELETE".to_string(), "GET".to_string()], vec!["/a".to_string(), "/b".to_string()]));
     }
 
     /// #325: `is_wicket_host` and `is_reserved_method` compare bytes now (for Kani); they decide
