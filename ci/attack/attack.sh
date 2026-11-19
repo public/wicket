@@ -272,6 +272,11 @@ case "$kind" in
   pending-approval) note dns-registered-domain known "$DOMAIN_MARK.com was looked up or couldn't be (#19): pending" ;;
   *) note dns-registered-domain "$(by_kind "${kind:-none}")" "HTTP ${code:-000}, wicket: ${kind:-none}" ;;
 esac
+# Past #19's bound: 300 more distinct registered domains, each with a label under it. At most 256
+# per run may be looked up, each as its registered domain alone (the host counts them in its DNS
+# capture); the rest escalate as before. The row only records what the box saw.
+seq 300 | xargs -P 16 -I{} curl -s -m 10 -o /dev/null -w '%{http_code}\n' "http://x.${DOMAIN_MARK}n{}.com/" 2>/dev/null >"$out/bodies/dns-registered-bound"
+note dns-registered-bound info "300 more unlisted registered domains asked for: $(sort "$out/bodies/dns-registered-bound" | uniq -c | tr '\n' ' ')"
 
 # ---- path tricks against the reach rules (the echo host shows what the upstream saw) ----
 echo_try control-echo-rule public "https://$ECHO/anything/public/x"

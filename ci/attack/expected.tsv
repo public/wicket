@@ -57,6 +57,7 @@ other-port	refused
 other-port-canary	refused
 other-port-https	refused
 dns-registered-domain	known
+dns-registered-bound	info
 
 # path tricks against the reach rules (the echo host shows the path the upstream saw: contained means
 # within the rule, as the upstream reads it)

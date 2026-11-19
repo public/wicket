@@ -309,8 +309,20 @@ check "nothing was written outside the run through its symlinks" '[ ! -e "$work/
 check "the host file is unchanged" '[ "$(sha256sum "$work/host-secret.txt")" = "$host_sum" ]'
 check "the box's own Authorization header never reached the echo host" '[ -s "$atk_dir/workspace/out/bodies/reflect-own-auth" ] && ! grep -qsF "$BOX_MARK" "$atk_dir/workspace/out/bodies/reflect-own-auth"'
 if [ "$capture" = 1 ]; then
-  check "the host's DNS capture saw the registered-domain lookup (#19), so it saw DNS at all" 'sudo -n cat "$pcap" | grep -qaF "$DOMAIN_MARK"'
-  check "no label the box chose (BOX_MARK) left the host by DNS" '! sudo -n cat "$pcap" | grep -qaF "$BOX_MARK"'
+  # Every name the host asked its resolvers for, while the attacker ran.
+  sudo -n tcpdump -nr "$pcap" 'dst port 53' 2>/dev/null | grep -oE '[A-Z]+\? [^ ]+' | awk '{print tolower($2)}' | sed 's/\.$//' | sort -u >"$work/dns-names.txt" || true
+  # The names the box chose carry one of the run's marks. #19's lookups (DOMAIN_MARK) are the known
+  # channel: each only a registered domain (one label under .com, as the box asked for them), at
+  # most 256 per run. Any other name with a mark (BOX_MARK, or a label under a registered domain)
+  # is a label that left.
+  chosen=$(grep -E "atk[0-9a-f]{32}" "$work/dns-names.txt" || true)
+  known=$(grep -xE "${DOMAIN_MARK}(n[0-9]+)?\.com" <<<"$chosen" || true)
+  leaked=$(grep -vxE "${DOMAIN_MARK}(n[0-9]+)?\.com" <<<"$chosen" | grep . || true)
+  n_known=$(grep -c . <<<"$known" || true)
+  echo "   the host's DNS capture: $(grep -c . "$work/dns-names.txt" || true) names, $n_known registered-domain lookups the box chose (#19)"
+  check "the host's DNS capture saw the registered-domain lookup (#19), so it saw DNS at all" 'grep -qx "$DOMAIN_MARK.com" <<<"$known"'
+  check "  #19's lookups stayed within its bound: at most 256 per run (${n_known})" '[ "$n_known" -le 256 ]'
+  check "no other label the box chose left the host by DNS" '[ -z "$leaked" ] || { sed "s/^/     left: /" <<<"$leaked" | head -20; false; }'
 fi
 
 log "the audit, from outside"
