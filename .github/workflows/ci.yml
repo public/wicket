@@ -501,6 +501,8 @@ jobs:
       - uses: ./.github/actions/gvisor-setup
         with:
           save-cache: "true"
+      - name: Build the agent image
+        run: target/debug/wicket image
       - name: Smoke test
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') }}
         run: WICKET=target/debug/wicket H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/smoke.sh
@@ -533,5 +535,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/gvisor-setup
+      - name: Build the agent image
+        run: target/debug/wicket image
       - name: Acceptance
         run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:poc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh
