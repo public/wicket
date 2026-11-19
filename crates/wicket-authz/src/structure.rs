@@ -278,33 +278,49 @@ fn classify(queries: &[Rule], kind: &CheckKind) -> CheckClass {
     }
 }
 
-/// A grant rule: `approved(<lit>, <lit>, <lit>, <lit>) <- time($t), box(<lit>), epoch(<lit>), uses_left(<gid>, $n)`.
+/// A grant rule, in one of two shapes:
+/// - exact: `approved(<lit>, <lit>, <lit>, <lit>) <- time($t), box(<lit>), epoch(<lit>), uses_left(<gid>, $n)`;
+/// - prefix (#257 4a): `approved(<lit>, <lit>, <lit>, $p) <- path($p), $p.starts_with(<prefix>), time($t), …`,
+///   the same bounds, where `$p` is bound only by `path` and the prefix is a canonical path ending in
+///   `/` (so it covers whole segments of a canonical request path, `wicket_core::prefix_covers`).
+///
+/// Either way with exactly `$t <= <date>` and `$n > <int>`: the grant's expiry and its uses.
 fn grant_rule(r: &Rule, p: &Policy) -> Result<(), String> {
     if r.head.name != "approved" || r.head.terms.len() != 4 || !r.scopes.is_empty() {
         return Err("only approved/4 rules without scopes".into());
     }
-    for t in &r.head.terms {
-        if !matches!(t, Term::Str(_)) {
-            return Err("a grant must name a literal grant id, host, method and path".into());
+    let path_var = match &r.head.terms[3] {
+        Term::Variable(v) => Some(v.as_str()),
+        _ => None,
+    };
+    for (i, t) in r.head.terms.iter().enumerate() {
+        match t {
+            Term::Str(_) => literal(t, p)?,
+            Term::Variable(_) if i == 3 => {}
+            _ => return Err("a grant must name a literal grant id, host and method, and a literal path or a prefix's".into()),
         }
-        literal(t, p)?;
     }
     let mut names: Vec<&str> = r.body.iter().map(|b| b.name.as_str()).collect();
     names.sort_unstable();
-    if names != ["box", "epoch", "time", "uses_left"] {
-        return Err(format!("a grant rule reads exactly time, box, epoch and uses_left, not {names:?}"));
+    let want: &[&str] =
+        if path_var.is_some() { &["box", "epoch", "path", "time", "uses_left"] } else { &["box", "epoch", "time", "uses_left"] };
+    if names != want {
+        return Err(format!("a grant rule reads exactly {want:?}, not {names:?}"));
     }
-    let (mut time, mut uses) = (None, None);
+    let (mut time, mut uses, mut path) = (None, None, None);
     for b in &r.body {
         match (b.name.as_str(), b.terms.as_slice()) {
             ("time", [Term::Variable(v)]) => time = Some(v.as_str()),
             ("box", [Term::Str(s)]) => literal(&Term::Str(s.clone()), p)?,
             ("epoch", [Term::Integer(_)]) => {}
             ("uses_left", [gid @ Term::Str(_), Term::Variable(v)]) if *gid == r.head.terms[0] => uses = Some(v.as_str()),
+            ("path", [Term::Variable(v)]) if Some(v.as_str()) == path_var => path = Some(v.as_str()),
             _ => return Err(format!("grant rule predicate not allowed: {}/{}", b.name, b.terms.len())),
         }
     }
-    // Exactly `$t <= <date>` and `$n > <int>`: the grant's expiry and its uses.
+    if path_var.is_some() && path.is_none() {
+        return Err("a prefix grant's path must be the request's path".into());
+    }
     let mut shapes: Vec<&str> = Vec::new();
     for e in &r.expressions {
         let shape = match e.ops.as_slice() {
@@ -314,13 +330,29 @@ fn grant_rule(r: &Rule, p: &Policy) -> Result<(), String> {
             [Op::Value(Term::Variable(v)), Op::Value(Term::Integer(_)), Op::Binary(Binary::GreaterThan)] if Some(v.as_str()) == uses => {
                 "uses"
             }
+            [Op::Value(Term::Variable(v)), Op::Value(Term::Str(pre)), Op::Binary(Binary::Prefix)]
+                if path.is_some() && Some(v.as_str()) == path =>
+            {
+                literal(&Term::Str(pre.clone()), p)?;
+                // Whole segments of a canonical path only: no `..`, no escape that isn't canonical,
+                // no doubled `/`, and a trailing `/` so `/a/b/` can't cover `/a/bc`.
+                match wicket_core::canonical_path(pre) {
+                    Ok(c) if c == pre.as_str() && pre.ends_with('/') => {}
+                    _ => return Err(format!("a prefix grant's prefix must be a canonical path ending in '/', not {pre:?}")),
+                }
+                "prefix"
+            }
             _ => return Err(format!("grant rule expression not allowed: {:?}", e.ops)),
         };
         shapes.push(shape);
     }
     shapes.sort_unstable();
-    if shapes != ["expiry", "uses"] {
-        return Err("a grant rule bounds exactly its expiry and its uses".into());
+    match path_var {
+        None if shapes != ["expiry", "uses"] => return Err("a grant rule bounds exactly its expiry and its uses".into()),
+        Some(_) if shapes != ["expiry", "prefix", "uses"] => {
+            return Err("a prefix grant rule bounds exactly its expiry, its uses and its prefix".into())
+        }
+        _ => {}
     }
     Ok(())
 }

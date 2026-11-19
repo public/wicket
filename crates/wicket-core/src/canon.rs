@@ -372,10 +372,15 @@ mod tests {
         all.sort();
         all.dedup();
         let canonical: Vec<String> = all.iter().filter_map(|s| canonical_path(s).ok().map(|p| p.into_owned())).collect();
-        let segs = |p: &str| -> Vec<String> { p.trim_start_matches('/').trim_end_matches('/').split('/').filter(|s| !s.is_empty()).map(String::from).collect() };
+        let segs = |p: &str| -> Vec<String> {
+            p.trim_start_matches('/').trim_end_matches('/').split('/').filter(|s| !s.is_empty()).map(String::from).collect()
+        };
         // What a canonical path can't hold: a doubled `/`, an encoded dot, a `.` or `..` segment.
         assert!(canonical.len() > 20);
-        assert!(canonical.iter().all(|p| !p.contains("//") && !p.contains("%2") && segs(p).iter().all(|s| s != "." && s != "..")), "{canonical:?}");
+        assert!(
+            canonical.iter().all(|p| !p.contains("//") && !p.contains("%2") && segs(p).iter().all(|s| s != "." && s != "..")),
+            "{canonical:?}"
+        );
         let mut covered = 0;
         for pre in &canonical {
             for path in &canonical {
