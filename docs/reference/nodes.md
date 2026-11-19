@@ -368,7 +368,9 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
 - **Capacity, from the ledger.** Each node's latest health report (every 30 s, on every connection to it;
   stored once per node at most every 20 s) carries its capacity, and a wake reads it there. A node with no
   report under 90 s old, or one from a node before #579, is asked over its control channel instead (within
-  10 s): an idle node, with no run connected to it, reports nothing.
+  10 s): an idle node, with no run connected to it, reports nothing. A report may still count a box that
+  ended since it (one that just hibernated), so before a wake is refused for room, the nodes read from
+  reports are asked too.
 
 - **Labels and taints.** `wicket node set <node> --label gpu=a100 --taint dedicated=ci` records them in the
   ledger (`key-` removes one; audited `node.labels`). A box goes on a node only if the node has every label
