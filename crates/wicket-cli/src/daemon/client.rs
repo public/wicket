@@ -3,7 +3,7 @@
 
 use super::proto::{self, kind, Hello, Welcome};
 use super::{policy, upload, SOCKET_PATH};
-use crate::{Cmd, SecretCmd, SelfCmd};
+use crate::{Cmd, SecretCmd, SelfCmd, TriggerCmd};
 use anyhow::{bail, Context, Result};
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -57,9 +57,13 @@ pub async fn forward(sock: &Path, cmd: &Cmd) -> Result<i32> {
 
 /// The files `self trust-key` and `self update` name, which go as content as a run's do: the key,
 /// and the build with its signature (`--sig`, or the one beside it, if there is one). Read by the
-/// caller, who may be root with them in `/root`, where wicketd's user can't read.
+/// caller, who may be root with them in `/root`, where wicketd's user can't read. So do a
+/// trigger's document (`trigger create --file`) and a sample event (`trigger fire --event`): wicketd
+/// must not read a file its caller merely names.
 pub(super) fn self_uploads(cmd: &Cmd) -> Vec<(&'static str, PathBuf)> {
     match cmd {
+        Cmd::Trigger { cmd: TriggerCmd::Create { file, .. } } => vec![("trigger", file.clone())],
+        Cmd::Trigger { cmd: TriggerCmd::Fire { event: Some(e), .. } } => vec![("event", e.clone())],
         Cmd::Itself { cmd: SelfCmd::TrustKey { public } } => vec![("key", public.clone())],
         Cmd::Itself { cmd: SelfCmd::Update { artifact: Some(a), sig, .. } } => {
             let sig = sig.clone().or_else(|| Some(PathBuf::from(format!("{}.sig", a.display()))).filter(|s| s.is_file()));

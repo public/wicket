@@ -41,6 +41,9 @@
 //! - *Stores*: once an hour ([`crate::storegc::EVERY_SECS`]), the content-addressed stores'
 //!   collection (#258, `wicket state gc`): the local store and the state store's, then the local
 //!   store's cache cap. Audited as `store.gc` and `store.deleted`, not `reconcile.*`.
+//! - *Triggers* (#578): each pass fires the schedules' minutes and the timers that came due since
+//!   the last one (at most `wicket_control::triggers::CATCH_UP_SECS` back), once each: waking or
+//!   messaging the agent a trigger names, or queueing the run it starts. Audited as `trigger.*`.
 //!
 //! **Order.** Runs, then leases, then machines, then boxes, so killing every control-plane process
 //! mid-run and restarting leaves nothing behind after one pass: the lost runs end, their leases end,
@@ -939,6 +942,8 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
         }
         Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
     }
+    // Triggers (#578): the schedules' minutes and the timers that came due since the last pass.
+    done.extend(triggers_pass(&ledger, now, dry_run, &wicket_control::hibernate::trigger_wake));
     // The ledger's own upkeep (#582): settled rows of runs long ended to the archive, planner
     // statistics, and a WAL checkpoint.
     if !dry_run {
@@ -968,6 +973,29 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
         }
     }
     Ok(done)
+}
+
+/// The triggers' scheduler pass ([`wicket_control::triggers::pass`]), as the pass's report: one
+/// line per firing, skip or failure (each already audited as `trigger.*`), and per due one in a
+/// dry run.
+fn triggers_pass(ledger: &Ledger, now: i64, dry_run: bool, wake: wicket_control::triggers::Waker<'_>) -> Vec<Done> {
+    match wicket_control::triggers::pass(ledger, now, dry_run, wake) {
+        Ok(fired) => fired
+            .into_iter()
+            .map(|f| Done {
+                kind: match f.status.as_str() {
+                    "started" => "trigger_fired",
+                    "queued" => "trigger_queued",
+                    "skipped" => "trigger_skipped",
+                    "due" => "trigger_due",
+                    _ => "trigger_failed",
+                },
+                target: format!("trigger {} ({})", f.name, f.trigger),
+                detail: f.detail,
+            })
+            .collect(),
+        Err(e) => vec![Done { kind: "error", target: "triggers".into(), detail: format!("{e:#}") }],
+    }
 }
 
 /// Runs, leases, the capacity leases' machines (with placement.yaml) and boxes.

@@ -225,16 +225,73 @@ pub fn pass(l: &Ledger, now: i64, dry_run: bool, wake: Waker<'_>) -> Result<Vec<
     Ok(out)
 }
 
+/// The fields of a time-told event: the trigger's name, and the minute (RFC 3339 and Unix).
+fn time_fields(t: &Trigger, slot: i64) -> Value {
+    json!({ "trigger": t.name, "at": wicket_core::time::unix_rfc3339(slot), "slot": slot })
+}
+
+/// What firing `t` on an event with `fields` (None: a time-told event now) would do, changing
+/// nothing: whether its filter admits the event, and the action with its templates filled in.
+/// `wicket trigger fire --dry-run`.
+pub fn preview(l: &Ledger, t: &Trigger, fields: Option<Value>, now: i64) -> Result<String> {
+    let fields = fields.unwrap_or_else(|| time_fields(t, now));
+    let mut out = format!("trigger {} ({}): {} → {}\n", t.name, t.id, source_text(&t.spec), action_text(&t.spec));
+    if !t.live(now) {
+        let why = match (t.status.as_str(), t.approval.as_str()) {
+            ("paused", _) => "it is paused".to_string(),
+            (_, "pending") => "it waits for a human's approval".to_string(),
+            _ => "it has lapsed".to_string(),
+        };
+        out.push_str(&format!("  not live: {why}, so nothing would fire\n"));
+    }
+    if !t.spec.admits(&fields) {
+        out.push_str("  filter:  the event doesn't pass it: nothing would fire\n");
+        return Ok(out);
+    }
+    out.push_str("  filter:  passes\n");
+    let a = &t.spec.action;
+    if let Some(st) = &a.start {
+        out.push_str(&format!("  start:   {} (sha256 {}), queued for the engine\n", st.manifest, st.sha256));
+        if let Some(task) = &st.task {
+            out.push_str(&format!("  task:\n{}\n", indent(&render(task, &fields))));
+        }
+    }
+    if let Some(who) = a.wake.as_deref().or(a.message.as_ref().map(|m| m.to.as_str())) {
+        match target_agent(l, t, who) {
+            Ok(agent) => out.push_str(&format!("  agent:   {} ({}, zone {}), {}\n", agent.name, agent.id, agent.zone, agent.state)),
+            Err(e) => out.push_str(&format!("  agent:   {e:#}: the firing would fail\n")),
+        }
+    }
+    if let Some(m) = &a.message {
+        out.push_str(&format!("  message:\n{}\n", indent(&message_text(t, &fields, &m.body))));
+    }
+    Ok(out)
+}
+
+fn indent(s: &str) -> String {
+    s.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n")
+}
+
+/// The turn a message action gives its agent: a header naming the trigger, then the body filled
+/// from the event.
+fn message_text(t: &Trigger, fields: &Value, body: &str) -> String {
+    format!("[wicket] Trigger {} fired ({}):\n{}", t.name, fields["at"].as_str().unwrap_or(""), render(body, fields))
+}
+
 /// One time-told event for `t` at `slot`: recorded once, and fired if it is new and admitted.
 fn fire(l: &Ledger, t: &Trigger, slot: i64, dry_run: bool, wake: Waker<'_>) -> Result<Option<Fired>> {
     let (source, kind) = match t.spec.source {
         Source::Timer { .. } => ("timer", "timer"),
         _ => ("schedule", "tick"),
     };
-    let fields = json!({ "trigger": t.name, "at": wicket_core::time::unix_rfc3339(slot), "slot": slot });
+    let fields = time_fields(t, slot);
     let delivery = format!("{}@{slot}", t.id);
     let done = |status: &str, detail: String| Fired { trigger: t.id.clone(), name: t.name.clone(), status: status.into(), detail };
     if dry_run {
+        // Only what a real pass would fire now: a minute already recorded is done.
+        if l.trigger_event_known(&t.tenant, source, &delivery)? || !t.spec.admits(&fields) {
+            return Ok(None);
+        }
         return Ok(Some(done("due", format!("{} at {} (dry run)", action_text(&t.spec), fields["at"].as_str().unwrap_or("")))));
     }
     let raw = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(fields.to_string().as_bytes()));
@@ -324,10 +381,7 @@ fn reach(l: &Ledger, t: &Trigger, fields: &Value, wake: Waker<'_>) -> Result<Str
     let a = &t.spec.action;
     let who = a.wake.as_deref().or(a.message.as_ref().map(|m| m.to.as_str())).context("the trigger wakes or messages no one")?;
     let agent = target_agent(l, t, who)?;
-    let text = a
-        .message
-        .as_ref()
-        .map(|m| format!("[wicket] Trigger {} fired ({}):\n{}", t.name, fields["at"].as_str().unwrap_or(""), render(&m.body, fields)));
+    let text = a.message.as_ref().map(|m| message_text(t, fields, &m.body));
     let label = format!("trigger:{}", t.name);
     match agent.state.as_str() {
         "active" | "waking" | "hibernating" => match &text {
@@ -409,13 +463,67 @@ mod tests {
         assert_eq!(st, ["failed"; 5], "{first:?}");
         assert!(first[0].detail.contains("no long-lived agent named nobody"));
         assert!(pass(&l, at, false, &w).unwrap().is_empty(), "the same minutes are the same events");
-        assert!(pass(&l, at, true, &w).unwrap().iter().all(|f| f.status == "due"), "a dry run reports");
+        assert!(pass(&l, at, true, &w).unwrap().is_empty(), "a dry run reports only minutes not yet recorded");
+        let due = pass(&l, at + 60, true, &w).unwrap();
+        assert_eq!(due.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(), ["due"], "{due:?}");
+        assert_eq!(pass(&l, at + 60, true, &w).unwrap().len(), 1, "a dry run records nothing");
         set_status(&l, "unix:alex", &id, "paused").unwrap();
         assert!(pass(&l, at + 120, false, &w).unwrap().is_empty(), "paused: nothing fires");
         assert!(woke.borrow().is_empty());
         let kinds: Vec<String> = l.audit_tail(20).unwrap().into_iter().map(|r| r.2).collect();
         assert!(kinds.contains(&"trigger.created".to_string()) && kinds.contains(&"trigger.paused".to_string()));
         assert_eq!(kinds.iter().filter(|k| *k == "trigger.failed").count(), 5);
+    }
+
+    /// #578's first "done when": a morning schedule wakes a hibernated agent with its message as
+    /// the next turn, recorded as woken by the trigger; an awake agent gets the message in its run.
+    /// The dry run shows the same, filled in, and changes nothing.
+    #[test]
+    fn a_schedule_wakes_an_agent_with_its_message() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let agent = wicket_store::new_agent_id();
+        l.create_agent(&wicket_store::NewAgent {
+            id: &agent,
+            tenant: "t0",
+            zone: "rel",
+            name: "captain",
+            run: "run_a",
+            session_id: "s",
+            manifest: "m",
+            image: "i",
+            workspace: None,
+            claim_until: 0,
+        })
+        .unwrap();
+        assert!(l.set_agent_state(&agent, 1, "hibernated", None).unwrap());
+        let s = spec(
+            "trigger: morning\nsource: { schedule: { cron: '* * * * *' } }\n\
+             action: { wake: captain, message: { to: captain, body: 'Triage {{ event.trigger }} at {{ event.at }}' } }\n",
+        );
+        let id = create(&l, &operator(), &s, None, "test").unwrap();
+        let t = l.trigger(&id).unwrap().unwrap();
+        let shown = preview(&l, &t, None, t.created_at).unwrap();
+        assert!(shown.contains("filter:  passes") && shown.contains("captain") && shown.contains("Triage morning at 20"), "{shown}");
+        let woke = RefCell::new(vec![]);
+        let w = |a: &str, b: &str| woke.borrow_mut().push((a.to_string(), b.to_string()));
+        let at = (t.created_at.div_euclid(60) + 1) * 60;
+        let got = pass(&l, at, false, &w).unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].status, "started", "{got:?}");
+        assert_eq!(*woke.borrow(), [(agent.clone(), "trigger morning".to_string())]);
+        let prompts = l.take_prompts(&agent).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].text.starts_with("[wicket] Trigger morning fired") && prompts[0].text.contains("Triage morning at "));
+        // Awake: the message goes to its run, and nothing is woken.
+        assert!(l.set_agent_state(&agent, 1, "active", None).unwrap());
+        let got = pass(&l, at + 60, false, &w).unwrap();
+        assert!(got[0].detail.contains("messaged agent"), "{got:?}");
+        assert_eq!(l.take_prompts("run_a").unwrap().len(), 1);
+        assert_eq!(woke.borrow().len(), 1);
+        // A filter that doesn't pass: the preview says so.
+        let quiet = spec("trigger: quiet\nsource: { schedule: { cron: '* * * * *' } }\nfilter: { trigger: other }\naction: { wake: captain }\n");
+        let q = l.trigger(&create(&l, &operator(), &quiet, None, "test").unwrap()).unwrap().unwrap();
+        assert!(preview(&l, &q, None, q.created_at).unwrap().contains("doesn't pass"));
     }
 
     /// `start` is queued for the engine, within the hourly limit and the queue: the oldest beyond

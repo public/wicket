@@ -250,6 +250,20 @@ impl Ledger {
         Ok((eid, true))
     }
 
+    /// Whether a source already delivered `delivery_id`: what a dry run asks, so it reports only
+    /// events not yet recorded.
+    pub fn trigger_event_known(&self, tenant: &str, source: &str, delivery_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM trigger_events WHERE tenant = ?1 AND source = ?2 AND delivery_id = ?3",
+                params![tenant, source, delivery_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     pub fn trigger_event(&self, id: &str) -> Result<Option<TriggerEvent>> {
         Ok(self
             .conn
@@ -446,6 +460,9 @@ mod tests {
             (e.clone(), false)
         );
         assert_eq!(l.trigger_event(&e).unwrap().unwrap().fields, fields);
+        assert!(l.trigger_event_known("t0", "github", "d-1").unwrap());
+        assert!(!l.trigger_event_known("t0", "github", "d-2").unwrap());
+        assert!(!l.trigger_event_known("t0", "webhook", "d-1").unwrap(), "per source");
         let (f, fresh) = l.record_firing("t-1", &e, "queued", None).unwrap();
         assert!(fresh);
         assert_eq!(l.record_firing("t-1", &e, "queued", None).unwrap(), (f.clone(), false), "once per trigger and event");
