@@ -32,15 +32,39 @@ runs:
     - name: Install gVisor as a Docker runtime
       shell: bash
       run: |
-        curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
-          | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
-        # gVisor's apt repository is sometimes caught mid-sync ("File has unexpected size"): retry.
-        for i in 1 2 3 4; do
-          if sudo apt-get update -q && sudo apt-get install -y -q runsc; then break; fi
-          [ "$i" = 4 ] && exit 1
-          echo "gVisor apt install failed (attempt $i), retrying in $((i * 20)) s"; sleep $((i * 20))
-        done
+        # gVisor's release archive, pinned by version and sha512 (#219): no apt repository, whose
+        # mid-sync retries (20, 40 and 60 s sleeps) made this step 255-359 s on some runs, against
+        # about 90 s; and the same runsc in every job. A release has no bare runsc binary any more,
+        # only gvisor.tar.bz2 (and .zstd) with their .sha512 files. To update: the version, and the
+        # sha512 from https://storage.googleapis.com/gvisor/releases/release/<version>/x86_64/gvisor.tar.bz2.sha512.
+        version=20261116.0
+        # From the release's published gvisor.tar.bz2.sha512 (checked against it on #566's run).
+        sha512=c87d792d5842efb70c38ee822124cfe0821a547715e7abcf3f2b14997cd02784edaa0b91e238ec5c27a25a1b9e00bf98113398eb62a0778d8d20d4e222f8b0e0
+        url=https://storage.googleapis.com/gvisor/releases/release/$version/x86_64/gvisor.tar.bz2
+        dl=$(mktemp -d)
+        curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors -o "$dl/gvisor.tar.bz2" "$url"
+        if [ -z "$sha512" ]; then
+          published=$(curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors "$url.sha512" | cut -d' ' -f1)
+          echo "$published  $dl/gvisor.tar.bz2" | sha512sum -c -
+          echo "::notice title=gvisor $version gvisor.tar.bz2 sha512 (to pin in .github/actions/gvisor-setup)::$published"
+          sha512=$published
+        fi
+        echo "$sha512  $dl/gvisor.tar.bz2" | sha512sum -c -
+        # What the archive holds, for the log; then its one runsc, wherever it sits in it.
+        listing=$(tar -tjf "$dl/gvisor.tar.bz2")
+        echo "$listing"
+        tar -xjf "$dl/gvisor.tar.bz2" -C "$dl"
+        mapfile -t found < <(find "$dl" -type f -name runsc)
+        [ "${#found[@]}" = 1 ] || { echo "gvisor.tar.bz2 holds ${#found[@]} runsc binaries: ${found[*]}" >&2; exit 1; }
+        # runsc starts its sentry (and the rest) from gvisor-bin/ beside itself, as the .deb installs
+        # them (#566: "sidecar gvisor_sentry not usable: stat /usr/bin/gvisor-bin/gvisor_sentry").
+        bin=$(dirname "${found[0]}")
+        [ -d "$bin/gvisor-bin" ] || { echo "gvisor.tar.bz2 has no gvisor-bin/ beside runsc" >&2; exit 1; }
+        sudo install -m 0755 "${found[0]}" /usr/bin/runsc
+        sudo rm -rf /usr/bin/gvisor-bin
+        sudo cp -a "$bin/gvisor-bin" /usr/bin/gvisor-bin
+        sudo chown -R root:root /usr/bin/gvisor-bin
+        rm -r "$dl"
         # Keep the runner's own Docker settings; add runsc with host unix sockets (wicket's proxies).
         cfg=/etc/docker/daemon.json
         [ -f "$cfg" ] || echo '{}' | sudo tee "$cfg" >/dev/null
@@ -49,6 +73,21 @@ runs:
         sudo systemctl restart docker
         runsc --version | head -1
         docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
+        # A self-test before the suites, whose failure says why (#566: boxes didn't start on the
+        # archive's runsc): runsc on its own, then a container through Docker. On a failure, what
+        # failed goes into an annotation, with runsc's debug log and Docker's journal.
+        dbg=$(mktemp -d)
+        say() { printf '%s' "$1" | tail -c 3500 | sed 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }'; }
+        if ! out=$(sudo runsc --debug --debug-log="$dbg/" --network=none do true 2>&1); then
+          echo "::error title=runsc do true failed::$(say "version: $(runsc --version 2>&1 | head -2); listing: $listing; $out; log: $(sudo sh -c "tail -n 40 $dbg/*" 2>&1)")"
+          exit 1
+        fi
+        if ! out=$(sudo docker run --rm --runtime=runsc --network=none busybox:1.36 true 2>&1); then
+          echo "::error title=docker run --runtime=runsc failed::$(say "version: $(runsc --version 2>&1 | head -2); listing: $listing; $out; journal: $(sudo journalctl -u docker -n 30 --no-pager 2>&1)")"
+          exit 1
+        fi
+        echo "runsc self-test: ok"
+        sudo rm -rf "$dbg"
     - name: Build wicket
       shell: bash
       run: cargo build -p wicket-cli --locked
