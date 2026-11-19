@@ -64,3 +64,7 @@ if ! cargo test -q --locked -p wicket-authz --test lean_oracle -- --ignored --no
   annotate "$work/oracle.log" ""
   exit 1
 fi
+# What compiling Oracle.lean printed (a warning), as notes on a run that passed.
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+  grep "printed before its decisions" "$work/oracle.log" | head -n 20 | sed 's/%/%25/g; s/^/::warning::/' || true
+fi
