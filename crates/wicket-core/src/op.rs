@@ -410,6 +410,97 @@ pub(crate) fn decide(forbidden: impl FnOnce() -> bool, risk: RiskClass, reach: i
     Decision::NeedsGrant(first_match)
 }
 
+impl crate::manifest::ReachRule {
+    /// Whether this rule alone allows `op`, as it would among a zone's reach: its host, one of its
+    /// methods and one of its path globs match, and the op's risk is within it (R3 and R4 only with
+    /// `allow_dangerous`). What a standing rule (#572) decides, once the run's own zone (its forbid
+    /// rules first) has said the op needs a grant.
+    pub fn allows(&self, op: &Op) -> Result<bool, ManifestError> {
+        let globs = self.paths.iter().map(|p| compile_glob(p)).collect::<Result<Vec<_>, _>>()?;
+        let matches = self.host_matches(&op.host)
+            && self.methods.iter().any(|m| m.eq_ignore_ascii_case(&op.method))
+            && globs.iter().any(|g| g.is_match(&op.path));
+        Ok(matches!(decide(|| false, op.risk, [(matches, self.allow_dangerous)]), Decision::AllowByReach(_)))
+    }
+
+    /// Why this rule couldn't be written in a manifest, if it couldn't: an exact or `*.` host,
+    /// HTTP methods only, and paths that are absolute globs. What an agent's ask for a standing rule
+    /// (#572) is held to.
+    pub fn check(&self) -> Result<(), String> {
+        let bare = self.host.strip_prefix("*.").unwrap_or(&self.host);
+        match crate::canon::canonical_host(bare) {
+            Ok(h) if h == bare => {}
+            _ => return Err(format!("host {:?} is not a canonical host name", self.host)),
+        }
+        if self.methods.is_empty() {
+            return Err("a rule needs at least one method".into());
+        }
+        if let Some(m) = self.methods.iter().find(|m| !HTTP_METHODS.contains(&m.as_str())) {
+            return Err(format!("method {m:?} is not one of {}", HTTP_METHODS.join(", ")));
+        }
+        if self.paths.is_empty() {
+            return Err("a rule needs at least one path".into());
+        }
+        for p in &self.paths {
+            if !p.starts_with('/') {
+                return Err(format!("path {p:?} must start with /"));
+            }
+            // A canonical path's characters (RFC 3986's, percent-encoded beyond them) and the glob
+            // metacharacters, nothing else: no space, control or bidi character can hide part of a
+            // rule from whoever reads it on a terminal (#572).
+            if let Some(c) = p.chars().find(|c| !(c.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/%?[]{}".contains(*c))) {
+                return Err(format!("path {:?} has a character a path can't: {:?}", crate::text::strip(p), c));
+            }
+            compile_glob(p).map_err(|e| format!("path {p:?}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// [`ReachRule::check`], and what a standing rule (#572) must also be to reach a box's node as a
+    /// token block: an exact host, at most [`STANDING_PAIRS`] method and path pairs (one Datalog rule
+    /// each), and path globs whose regexes fit a block's cap.
+    pub fn check_standing(&self) -> Result<(), String> {
+        self.check()?;
+        if self.host.starts_with("*.") {
+            return Err(format!("standing reach names its host exactly, not {}", self.host));
+        }
+        let pairs = self.methods.len() * self.paths.len();
+        if pairs > STANDING_PAIRS {
+            return Err(format!(
+                "{} method(s) × {} path(s) is {pairs} pairs, more than {STANDING_PAIRS}: fewer methods or paths, or wider globs",
+                self.methods.len(),
+                self.paths.len()
+            ));
+        }
+        for p in &self.paths {
+            let re = compile_glob(p).map_err(|e| e.to_string())?.glob().regex().to_string();
+            if re.len() > STANDING_REGEX {
+                return Err(format!("path {p:?} is too long a glob for standing reach"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The rule as it is kept and compared (#572): its methods upper-case, sorted and once each,
+    /// its paths sorted and once each. Two asks for the same reach are the same rule.
+    pub fn canonical(&self) -> crate::manifest::ReachRule {
+        let mut methods: Vec<String> = self.methods.iter().map(|m| m.to_ascii_uppercase()).collect();
+        methods.sort();
+        methods.dedup();
+        let mut paths = self.paths.clone();
+        paths.sort();
+        paths.dedup();
+        crate::manifest::ReachRule { host: self.host.to_ascii_lowercase(), methods, paths, allow_dangerous: self.allow_dangerous }
+    }
+}
+
+/// The most method and path pairs a standing rule may have: one rule each in its token block,
+/// wicket-authz's `max_grant_rules`.
+pub const STANDING_PAIRS: usize = 16;
+/// The longest regex a standing rule's path glob may compile to (with globset's `(?-u)` prefix):
+/// wicket-authz's `max_regex_len` (256), and the prefix.
+pub const STANDING_REGEX: usize = 256 + 5;
+
 #[cfg(kani)]
 #[path = "proofs/decide.rs"]
 mod decide_proofs;
@@ -490,6 +581,60 @@ pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
 mod tests {
     use super::*;
     use crate::Manifest;
+
+    /// #572: a standing rule allows what the same rule would among a zone's reach, and is held to
+    /// what a manifest could say.
+    #[test]
+    fn a_rule_alone_allows_what_it_would_in_a_zone() {
+        let rule = |y: &str| -> crate::manifest::ReachRule { crate::yaml::from_str(y).unwrap() };
+        let op = |m: &str, h: &str, p: &str| Op::egress(&TenantId::single(), &RunId("run_s".into()), "z", m, h, p);
+        let logs = rule("{ host: api.github.com, methods: [GET], paths: ['/repos/*/*/actions/jobs/*/logs'] }");
+        assert!(logs.allows(&op("GET", "api.github.com", "/repos/public/wicket/actions/jobs/1/logs")).unwrap());
+        assert!(!logs.allows(&op("POST", "api.github.com", "/repos/public/wicket/actions/jobs/1/logs")).unwrap(), "method");
+        assert!(!logs.allows(&op("GET", "api.github.com", "/repos/public/wicket/actions/jobs/1/logs/x")).unwrap(), "* is one segment");
+        assert!(!logs.allows(&op("GET", "github.com", "/repos/public/wicket/actions/jobs/1/logs")).unwrap(), "host");
+        // Risk: R3 only with allow_dangerous, as in a zone.
+        let mut risky = op("GET", "api.github.com", "/repos/public/wicket/actions/jobs/1/logs");
+        risky.risk = RiskClass::R3ExternalOrIrreversible;
+        assert!(!logs.allows(&risky).unwrap());
+        let dangerous = crate::manifest::ReachRule { allow_dangerous: true, ..logs.clone() };
+        assert!(dangerous.allows(&risky).unwrap());
+        // Defaults as a manifest's: GET and HEAD, every path.
+        let wide = rule("{ host: '*.example.com' }");
+        assert!(wide.allows(&op("HEAD", "a.example.com", "/x/y")).unwrap() && !wide.allows(&op("GET", "example.com", "/")).unwrap());
+        assert_eq!(wide.check(), Ok(()));
+        assert_eq!(logs.check(), Ok(()));
+        let bad = |r: crate::manifest::ReachRule| r.check().unwrap_err();
+        assert!(bad(crate::manifest::ReachRule { host: "API.github.com".into(), ..logs.clone() }).contains("canonical"));
+        assert!(bad(crate::manifest::ReachRule { methods: vec!["SPAWN".into()], ..logs.clone() }).contains("SPAWN"));
+        assert!(bad(crate::manifest::ReachRule { methods: vec![], ..logs.clone() }).contains("method"));
+        assert!(bad(crate::manifest::ReachRule { paths: vec!["repos/**".into()], ..logs.clone() }).contains("start with /"));
+        assert!(bad(crate::manifest::ReachRule { paths: vec![], ..logs.clone() }).contains("path"));
+        // Nothing that can hide part of a rule on a terminal (#572 review, H1).
+        for p in ["/a\r{ host: x }", "/a\x1b[2K", "/a\u{202e}", "/a b", "/a\n"] {
+            assert!(
+                bad(crate::manifest::ReachRule { paths: vec![p.into()], ..logs.clone() }).contains("a character a path can't"),
+                "{p:?}"
+            );
+        }
+        assert!(bad(crate::manifest::ReachRule { methods: vec!["GET\r".into()], ..logs.clone() }).contains("is not one of"));
+        // Publishable as a token block: an exact host, at most 16 pairs.
+        assert!(wide.check_standing().unwrap_err().contains("exactly"));
+        let many = crate::manifest::ReachRule {
+            methods: vec!["GET".into(), "HEAD".into()],
+            paths: (0..9).map(|i| format!("/p{i}/**")).collect(),
+            ..logs.clone()
+        };
+        assert!(many.check() == Ok(()) && many.check_standing().unwrap_err().contains("18 pairs"));
+        assert_eq!(logs.check_standing(), Ok(()));
+        let messy = crate::manifest::ReachRule {
+            methods: vec!["get".into(), "GET".into(), "DELETE".into()],
+            paths: vec!["/b".into(), "/a".into(), "/b".into()],
+            ..logs
+        };
+        let c = messy.canonical();
+        assert_eq!((c.methods, c.paths), (vec!["DELETE".to_string(), "GET".to_string()], vec!["/a".to_string(), "/b".to_string()]));
+    }
 
     /// #325: `is_wicket_host` and `is_reserved_method` compare bytes now (for Kani); they decide
     /// as the lowercasing forms did.

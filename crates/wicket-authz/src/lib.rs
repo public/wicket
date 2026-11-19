@@ -34,10 +34,10 @@ pub use decide::{limits, load, load_with, Decision, Loaded, MEASURED_MAX_STEPS, 
 pub use describe::{describe, BlockView};
 pub use payload::{
     isolation_level, risk_level, Action, Ceiling, Forbid, Grant, HostPat, HttpMatch, Inject, LlmBudget, OpKind, OrgLayer, PathPat,
-    PublicKey, Reach, Request, SpawnLimits, SpawnMatch, MAX_REACH_RISK,
+    PublicKey, Reach, Request, SpawnLimits, SpawnMatch, StandingRule, MAX_REACH_RISK,
 };
 pub use structure::Policy;
-pub use token::{grant, grant_prefix, mint, sign_grant, GrantRequest, SignedGrant, SigningKey, Token};
+pub use token::{grant, grant_prefix, grant_standing, mint, sign_grant, GrantRequest, SignedGrant, SigningKey, Token};
 
 /// Re-exported for tests and tools that need the token format itself.
 #[doc(hidden)]

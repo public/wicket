@@ -71,6 +71,7 @@ pub(crate) use cmd::policy::KeysCmd;
 pub(crate) use cmd::policy::PolicyCmd;
 pub(crate) use cmd::policy::StateCmd;
 pub(crate) use cmd::secret::SecretCmd;
+pub(crate) use cmd::standing::StandingCmd;
 pub(crate) use cmd::zone::ZoneCmd;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
@@ -222,6 +223,11 @@ enum Cmd {
     Grant {
         #[command(subcommand)]
         cmd: GrantCmd,
+    },
+    /// Standing reach (#572): a reach rule an agent asked for once, approved once for its later runs.
+    Standing {
+        #[command(subcommand)]
+        cmd: StandingCmd,
     },
     /// Show or verify the hash-chained audit log, or export it to the configured sinks.
     Audit {
@@ -433,6 +439,7 @@ async fn main() -> Result<()> {
         c @ (Cmd::Pending | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await
         }
+        Cmd::Standing { cmd } => cmd::standing::dispatch(cmd).await,
         c @ Cmd::Identity { .. } => cmd::identity::dispatch(c).await,
         c @ Cmd::Audit { .. } => cmd::audit::dispatch(c).await,
         c @ Cmd::Secret { .. } => cmd::secret::dispatch(c).await,
