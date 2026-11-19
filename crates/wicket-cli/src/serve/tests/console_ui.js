@@ -399,6 +399,26 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console capacity: ok");
 
+  // Health alerts are lines under their node's row, not items squeezed into it (B7).
+  state = { ...base, pending: [], health: { nodes: [{ node: "n1", summary: "ok", received_ms: 1, alerts: ["disk 91% full"] }] } };
+  await run("refresh()"); await flush();
+  const hrow = ids.health.children[0];
+  assert.strictEqual(hrow.children[0].className, "row");
+  assert.ok(hrow.children[1].textContent === "! disk 91% full" && hrow.children[1].className === "blocked", hrow.textContent);
+  // One poll at a time (B9): a second asked for while one is in flight runs after it, not beside it.
+  let inFlight = 0, most = 0;
+  const realFetch = sandbox.fetch;
+  sandbox.fetch = async (p, o) => { inFlight++; most = Math.max(most, inFlight); try { await flush(); return await realFetch(p, o); } finally { inFlight--; } };
+  const polled = calls.filter(c => c.path === "/api/state").length;
+  await Promise.all([run("refresh()"), run("refresh()")]); for (let i = 0; i < 10; i++) await flush();
+  assert.strictEqual(calls.filter(c => c.path === "/api/state").length - polled, 2, "the second ran after the first");
+  assert.strictEqual(most, 1, "never two at once");
+  // A decision made while a poll is in flight drops that poll's (older) answer, and polls again.
+  const before2 = calls.filter(c => c.path === "/api/state").length;
+  run("refresh()"); run("closeConfirm()"); for (let i = 0; i < 10; i++) await flush();
+  assert.strictEqual(calls.filter(c => c.path === "/api/state").length - before2, 2, "polled again after the decision");
+  sandbox.fetch = realFetch;
+  console.log("console health and polling: ok");
   // Standing reach (#572): an ask shows its evidence and what it allows beyond it; approving it
   // narrowed is signed from a confirmation that names the narrowed rule; a rule is revoked with
   // the session only.
@@ -477,5 +497,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual(sw.opened, ["https://console.example/#notifications"]);
   await fire("notificationclick", { notification: { close() {}, data: { id: "q-b" } } });
   assert.deepStrictEqual(sw.opened[1], "https://console.example/#pending/q-b");
+  // A node-health notification opens the health section, in a new window or an open one (B5).
+  await fire("notificationclick", { notification: { close() {}, data: { health: true } } });
+  assert.deepStrictEqual(sw.opened[2], "https://console.example/#health");
+  sw.posted = [];
+  sw.wins = [{ url: "https://console.example/", postMessage: m => sw.posted.push(m), focus: async () => {} }];
+  await fire("notificationclick", { notification: { close() {}, data: { health: true } } });
+  assert.strictEqual(JSON.stringify(sw.posted), JSON.stringify([{ health: true }]));
   console.log("console service worker: ok");
 })().catch(e => { console.error(e); process.exit(1); });
