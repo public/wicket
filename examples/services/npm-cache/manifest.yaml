@@ -8,12 +8,13 @@
 task: an npm pull-through cache for the boxes on this node
 program:
   name: npm-cache
-  # Verdaccio, installed under the cache's own reach at each start (wicket's agent image has node,
-  # npm and wicket-fwd, which a link into the box needs), then serving with ./config.yaml.
+  # Verdaccio from ./package-lock.json (verdaccio 6.1.6 and its 275 packages, none with install
+  # scripts), installed under the cache's own reach at each start, on wicket's agent image (node,
+  # npm, and the wicket-fwd a link into the box needs), then serving with ./config.yaml.
   command:
     - sh
     - -c
-    - npm install --global --prefix /tmp/verdaccio --no-audit --no-fund verdaccio@6.1.6 && exec /tmp/verdaccio/bin/verdaccio --config /workspace/config.yaml --listen 0.0.0.0:4873
+    - mkdir -p /tmp/verdaccio && cp /workspace/package.json /workspace/package-lock.json /tmp/verdaccio/ && cd /tmp/verdaccio && npm ci --ignore-scripts --no-audit --no-fund && exec ./node_modules/.bin/verdaccio --config /workspace/config.yaml --listen 0.0.0.0:4873
   source: .
 service:
   port: 4873
