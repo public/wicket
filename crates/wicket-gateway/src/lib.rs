@@ -184,10 +184,8 @@ impl Gateway {
                     )
                 }
                 "granted" => {
-                    return (
-                        format!("granted: {id} was approved. Retry the same request now ({} {}{}).", req.method, req.host, req.path),
-                        false,
-                    )
+                    let g = self.ctx.ledger.lock().expect("ledger").grant_for_request(id).ok().flatten();
+                    return (granted_answer(id, &req, g.as_ref(), wicket_store::now()), false);
                 }
                 "denied" => return (format!("denied: {id} was denied. Do not retry it or look for another route."), false),
                 "withdrawn" => return (format!("withdrawn: {id} is no longer pending."), false),
@@ -728,6 +726,46 @@ fn deliver(
         "note": note,
     });
     (serde_json::to_string_pretty(&v).unwrap_or_default(), false)
+}
+
+/// What `await_grant` tells the agent once its request is approved: the grant's terms, so a
+/// one-use grant isn't spent on a probe; that every attempt spends a use, whatever the host
+/// answers (a host's own 403 isn't wicket's); and a grant that has since expired, been used up or
+/// been revoked, which a retry won't find (it asks again, as a new request for a human). Uses are
+/// judged here only while the grant isn't handed to a node, which counts them from then on.
+fn granted_answer(id: &str, req: &wicket_store::Request, g: Option<&wicket_store::GrantRow>, now: i64) -> String {
+    let what = format!("{} {}{}", req.method, req.host, req.path);
+    let gone = |why: String| {
+        format!(
+            "granted, but spent: {id} was approved, and {why}, so a retry of {what} won't find it: it asks again, as a new request a human must decide. Retry only if the request still matters, and say why when you ask."
+        )
+    };
+    let Some(g) = g else { return gone("its grant has been revoked".into()) };
+    if g.expires_at <= now {
+        return gone(format!("its grant expired {} ago", span(now - g.expires_at)));
+    }
+    if g.node.is_none() && g.uses_left == Some(0) {
+        return gone("its grant has been used up".into());
+    }
+    let uses = match g.uses_left {
+        Some(1) => "one use".to_string(),
+        Some(n) => format!("{n} uses"),
+        None => "any number of uses".to_string(),
+    };
+    format!(
+        "granted: {id} was approved for {uses}, for the next {}. Retry the same request now ({what}), once. Each attempt spends a use, whatever the host answers: a 403 without \"Blocked by wicket box\" in it is the host's own answer, not wicket's.",
+        span(g.expires_at - now)
+    )
+}
+
+/// `secs` as minutes and seconds (or hours and minutes), for an agent to read.
+fn span(secs: i64) -> String {
+    let s = secs.max(0);
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, s % 3600 / 60),
+    }
 }
 
 /// What `send_message` tells the sender: where its message went (#250).
@@ -1300,6 +1338,49 @@ mod tests {
         let (text, err) = gw.await_grant(&json!({ "request_id": rid })).await;
         assert!(!err && text.starts_with("granted"), "{text}");
         assert!((HAND_OFF..Duration::from_secs(5)).contains(&t.elapsed()), "{:?}", t.elapsed());
+        assert!(text.contains("for one use") && text.contains("Retry the same request now"), "{text}");
+    }
+
+    /// `await_grant`'s answer names the grant's terms (a one-use grant isn't for probing) and says
+    /// when the grant can no longer be found by a retry: expired, used up, or revoked. Three
+    /// approvals for one dispatch came of an agent spending a one-use grant on an attempt the host
+    /// refused, then asking again (#552's follow-up).
+    #[test]
+    fn a_granted_answer_says_what_the_grant_allows_and_when_it_is_spent() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let (rid, gid) = {
+            let mut l = w.ledger.lock().unwrap();
+            let op = wicket_core::Op::egress(&TenantId("t0".into()), &RunId("run_g".into()), "z", "POST", "api.example.com", "/d");
+            let (rid, _) = l.pending_for(&op, "out of reach", None).unwrap();
+            let a = wicket_store::Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "t".into() };
+            let gid = l.approve(&rid, &a).unwrap();
+            (rid, gid)
+        };
+        let l = w.ledger.lock().unwrap();
+        let req = l.request(&rid).unwrap();
+        let g = l.grant_for_request(&rid).unwrap().unwrap();
+        assert_eq!(g.id, gid);
+        let now = g.expires_at - 600;
+        let live = granted_answer(&rid, &req, Some(&g), now);
+        assert!(live.starts_with("granted:") && live.contains("for one use, for the next 10m 0s"), "{live}");
+        assert!(live.contains("Retry the same request now (POST api.example.com/d), once"), "{live}");
+        assert!(live.contains("the host's own answer"), "{live}");
+        let more = wicket_store::GrantRow { uses_left: Some(3), ..g.clone() };
+        assert!(granted_answer(&rid, &req, Some(&more), now).contains("for 3 uses"));
+        let unlimited = wicket_store::GrantRow { uses_left: None, ..g.clone() };
+        assert!(granted_answer(&rid, &req, Some(&unlimited), now).contains("any number of uses"));
+        // Spent, three ways: none of them says retry now.
+        let expired = granted_answer(&rid, &req, Some(&g), g.expires_at + 125);
+        assert!(expired.starts_with("granted, but spent") && expired.contains("expired 2m 5s ago"), "{expired}");
+        let used = wicket_store::GrantRow { uses_left: Some(0), ..g.clone() };
+        assert!(granted_answer(&rid, &req, Some(&used), now).contains("used up"));
+        assert!(granted_answer(&rid, &req, None, now).contains("revoked"));
+        for spent in [expired, granted_answer(&rid, &req, Some(&used), now), granted_answer(&rid, &req, None, now)] {
+            assert!(!spent.contains("Retry the same request now") && spent.contains("a new request"), "{spent}");
+        }
+        // Handed to a node, which counts its uses: the control host's count isn't judged.
+        let handed = wicket_store::GrantRow { uses_left: Some(0), node: Some("n1".into()), ..g };
+        assert!(granted_answer(&rid, &req, Some(&handed), now).starts_with("granted:"));
     }
 
     /// #162: an agent can ask for an update to its own build, and that is all: an R4 request a human
