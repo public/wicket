@@ -20,5 +20,5 @@ type: Added
     Only a human approves standing reach.
   - **An agent that asks for the same method on a host a third time in a week** is told, with its
     answer, that standing reach would save it asking again.
-  - **Needs protocol 16:** the control host and the box's node must both be on this release. A
+  - **Needs protocol 17:** the control host and the box's node must both be on this release. A
     node on the previous one is refused standing asks and asks as before.
