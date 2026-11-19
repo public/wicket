@@ -2660,7 +2660,7 @@ mod tests {
     fn a_standing_ask_is_approved_signed_renewed_and_revoked_from_the_card() {
         let mut t = setup("standing");
         let id = {
-            let l = t.ledger();
+            let mut l = t.ledger();
             let tenant = TenantId::single();
             let run = wicket_core::RunId("run_w".into());
             l.run_started(&tenant, &run, "work", "worker").unwrap();
@@ -2676,11 +2676,14 @@ mod tests {
                 issued_at: 1,
             })
             .unwrap();
+            // A blocked request, granted: the evidence (an agent's own asks aren't).
             let op = wicket_core::Op::egress(&tenant, &run, "work", "GET", "ci.example", "/jobs/1/logs");
-            l.ask(&op, "logs", false, None).unwrap();
+            let (rid, _) = l.pending_for(&op, "blocked", None).unwrap();
+            let a = wicket_store::Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "op".into() };
+            l.approve(&rid, &a).unwrap();
             let rule: wicket_core::manifest::ReachRule =
                 wicket_core::yaml::from_str("{ host: ci.example, methods: [GET, POST], paths: ['/jobs/**'] }").unwrap();
-            l.ask_standing(&tenant, &run, "work", "spiffe://w.test/t/t0/z/work/a/worker", &rule, "CI logs").unwrap().0
+            l.ask_standing(&tenant, &run, "work", "zone-digest", "spiffe://w.test/t/t0/z/work/a/worker", &rule, "CI logs").unwrap().0
         };
         let view = standing::view(&t.ledger(), &TenantId::single().0).unwrap();
         let ask = &view["asks"][0];

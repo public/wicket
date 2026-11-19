@@ -164,7 +164,7 @@ pub(crate) fn view(l: &Ledger, tenant: &str) -> anyhow::Result<Value> {
         .into_iter()
         .map(|s| {
             json!({
-                "id": s.id, "principal": s.principal, "zone": s.zone, "run": s.run, "rule": s.rule, "reason": s.reason,
+                "id": s.id, "principal": s.principal, "zone": s.zone, "zone_digest": s.zone_digest, "run": s.run, "rule": s.rule, "reason": s.reason,
                 "evidence": s.evidence, "beyond": st::beyond(&s, &s.rule), "narrowed": st::narrowed(&s), "created_at": s.created_at,
             })
         })

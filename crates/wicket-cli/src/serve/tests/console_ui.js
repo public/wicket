@@ -380,13 +380,16 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // the session only.
   const ask = { id: "s-1", principal: "spiffe://x/t/t0/z/work/a/worker", zone: "work", run: "run_w", reason: "CI <b>logs</b>",
     rule: { host: "ci.example", methods: ["GET", "POST"], paths: ["/jobs/**"], allow_dangerous: false },
-    evidence: { requests: 3, granted: 2, denied: 1, ops: [["GET", "/jobs/1/logs", 2]] }, beyond: ["methods never asked for: POST"],
+    zone_digest: "0123456789abcdef0123",
+    evidence: { requests: 3, granted: 2, denied: 1, undecided: 0, runs: 2, days: 1, own_asks: 4, ops: [{ method: "GET", path: "/jobs/1/logs", count: 2, granted: 2 }] },
+    beyond: ["methods never asked for: POST"],
     narrowed: { host: "ci.example", methods: ["GET"], paths: ["/jobs/1/logs"], allow_dangerous: false }, created_at: 1700000000 };
   const rule = { id: "s-2", principal: ask.principal, zone: "work", rule: ask.narrowed, for: "agent", expires_at: null, live: true, decided_by: "passkey:laptop" };
   state = { ...base, pending: [], standing: { asks: [ask], rules: [rule] } };
   await run("refresh()"); await flush();
   const sa = ids["standing-asks"].textContent;
-  for (const want of ["Standing reach on ci.example", "Methods: GET, POST", "Paths: /jobs/**", "Asked by worker (zone work)", "3 request(s) it covers in the last 14 days",
+  for (const want of ["Standing reach on ci.example", "Methods: GET, POST", "Paths: /jobs/**", "Asked by worker (zone work)", "with this zone definition (0123456789ab", "2 granted of 3 blocked request(s) it covers in the last 14 days", "in 2 run(s) on 1 day(s)",
+    "2 \u00d7 GET /jobs/1/logs (2 granted)", "and 4 ask(s) ahead of its own, not counted as evidence",
     "Wider than the evidence: methods never asked for: POST", "Narrowed: methods GET, paths /jobs/1/logs"]) assert.ok(sa.includes(want), want + " in " + sa);
   assert.strictEqual(ids["standing-pointer"].textContent, "1 standing reach ask waiting, under Standing reach below");
   const sbuttons = ids["standing-asks"].all(n => n.tagName === "button");

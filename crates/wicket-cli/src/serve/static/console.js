@@ -395,12 +395,15 @@ function standingAskRow(a) {
   d.append(el("div", "meta", "Methods: " + (r.methods || []).map(strip).join(", ") + (r.allow_dangerous ? " \u00b7 dangerous requests too (R3, R4)" : "")));
   d.append(el("div", "meta", "Paths: " + (r.paths || []).map(strip).join(", ")));
   d.append(el("div", "why", strip(a.reason)));
-  const who = el("div", "meta", "Asked by " + strip(agent) + " (zone " + strip(a.zone) + ") \u00b7 for its later runs");
+  const who = el("div", "meta", "Asked by " + strip(agent) + " (zone " + strip(a.zone) + ") \u00b7 for its later runs with this zone definition" +
+    (a.zone_digest ? " (" + strip(a.zone_digest).slice(0, 12) + "\u2026)" : ""));
   who.title = strip(a.principal);
   d.append(who);
-  d.append(el("div", "meta", "Evidence: " + e.requests + " request(s) it covers in the last 14 days (" + e.granted + " granted, " + e.denied + " denied)" +
+  d.append(el("div", "meta", "Evidence: " + e.granted + " granted of " + e.requests + " blocked request(s) it covers in the last 14 days (" +
+    e.denied + " denied, " + e.undecided + " undecided), in " + e.runs + " run(s) on " + e.days + " day(s)" +
     ((e.ops || []).length >= 10 ? ", the 10 most asked:" : (e.ops || []).length ? ":" : "")));
-  for (const o of (e.ops || [])) d.append(el("div", "meta mono", o[2] + " \u00d7 " + strip(o[0]) + " " + strip(o[1])));
+  for (const o of (e.ops || [])) d.append(el("div", "meta mono", o.count + " \u00d7 " + strip(o.method) + " " + strip(o.path) + " (" + o.granted + " granted)"));
+  if (e.own_asks) d.append(el("div", "meta", "and " + e.own_asks + " ask(s) ahead of its own, not counted as evidence"));
   for (const b of (a.beyond || [])) d.append(el("div", "blocked", "Wider than the evidence: " + strip(b)));
   const b = el("div", "buttons");
   // The narrowest choice first, and the default; the widest (a whole zone) marked as such.
