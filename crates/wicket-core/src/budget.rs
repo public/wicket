@@ -404,6 +404,80 @@ impl Counter {
     }
 }
 
+/// A run's model budget (#256) and what counts against it: its counter, and the quota it is held
+/// to. The control host keeps one per run, without a model proxy (#257): it counts nothing itself,
+/// merges what the run's node reports, carves its children's budgets out of it, and leases the
+/// node slices of it. A node's model proxy (`wicket_proxy::llm::Llm`) holds one too, and counts
+/// its calls in it.
+#[derive(Debug, Default)]
+pub struct Budget {
+    pub count: Counter,
+    /// The limits: the run's quota grants on the control host, its token's zone on a node. None:
+    /// the zone has no model route.
+    quota: Option<ModelQuota>,
+}
+
+impl Budget {
+    pub fn new(quota: Option<ModelQuota>) -> Budget {
+        Budget { count: Counter::default(), quota }
+    }
+
+    /// The limits it is held to: see [`ModelQuota`].
+    pub fn quota(&self) -> Option<ModelQuota> {
+        self.quota
+    }
+
+    /// Model requests and output tokens left to spend or hand on.
+    pub fn remaining(&self) -> Option<(u64, u64)> {
+        Some(self.count.counts().remaining(self.quota?))
+    }
+
+    /// Input tokens left to spend or hand on, if the zone caps them.
+    pub fn remaining_input(&self) -> Option<u64> {
+        self.count.counts().remaining_input(self.quota?)
+    }
+
+    /// Every input token counted: uncached, cache reads and cache writes.
+    pub fn input_total(&self) -> u64 {
+        self.count.input_total()
+    }
+
+    /// What this activation has counted itself.
+    pub fn spent(&self) -> Spent {
+        self.count.spent()
+    }
+
+    /// Takes in what another counter of this activation has seen (#152): the run's node, which
+    /// calls the model itself and is the counter of record. Counters only go up.
+    pub fn merge_spent(&self, s: Spent) {
+        self.count.merge_spent(s);
+    }
+
+    /// The slice the activation's node may be sent next (#152): what it has counted plus
+    /// `fraction` of the budget, never past what is left of it.
+    pub fn next_slice(&self, fraction: f64) -> Option<Slice> {
+        Some(self.count.next_slice(self.quota?, fraction))
+    }
+
+    /// Starts this activation from what the agent's earlier ones spent (#70).
+    pub fn spent_before(&self, requests: u64, input_tokens: u64, output_tokens: u64) {
+        self.count.prior_requests.store(requests, SeqCst);
+        self.count.prior_input_tokens.store(input_tokens, SeqCst);
+        self.count.prior_output_tokens.store(output_tokens, SeqCst);
+    }
+
+    /// What counts against the budget so far, over the agent's life: (requests, input tokens with
+    /// cached ones, output tokens). Budget handed to children counts as spent.
+    pub fn spent_total(&self) -> (u64, u64, u64) {
+        let c = self.count.counts();
+        (
+            c.requests_committed(),
+            c.input_committed(),
+            c.output_tokens.saturating_add(c.reserved_output_tokens).saturating_add(c.prior_output_tokens),
+        )
+    }
+}
+
 /// Exact values, so a changed operator or boundary fails here, in the crate's own fast suite: the
 /// Kani harnesses and the loom test (which `cargo test` doesn't run) prove the properties, and
 /// mutation testing (#326) found nothing else in `cargo test -p wicket-core` that would notice.

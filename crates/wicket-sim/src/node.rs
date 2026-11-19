@@ -71,7 +71,7 @@ pub async fn run(env: Rc<Env>) -> turmoil::Result {
         let l = Llm::new(crate::run_ctx(run, &env.zone)).map_err(|e| e.to_string())?;
         let disk = env.node_disk.lock().expect("node disk");
         if let Some(sp) = disk.spend.get(run) {
-            l.merge_spent(*sp);
+            l.budget.merge_spent(*sp);
         }
         l.set_slice(disk.slices.get(run).copied());
         drop(disk);
@@ -109,7 +109,7 @@ async fn spend_file(node: Rc<Node>) {
             if node.env.options.spend_journal {
                 l.journal();
             } else {
-                node.env.node_disk.lock().expect("node disk").spend.insert(run.clone(), l.spent());
+                node.env.node_disk.lock().expect("node disk").spend.insert(run.clone(), l.budget.spent());
             }
         }
     }
@@ -181,7 +181,7 @@ async fn link(node: &Rc<Node>, s: turmoil::net::TcpStream) {
                     return;
                 }
                 for (run, l) in &node.llms {
-                    if wire::write_json(&mut wr, &Ctl::Spent { run: run.clone(), spent: l.spent() }).await.is_err() {
+                    if wire::write_json(&mut wr, &Ctl::Spent { run: run.clone(), spent: l.budget.spent() }).await.is_err() {
                         return;
                     }
                 }

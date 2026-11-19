@@ -16,9 +16,9 @@
 //!   slice 3 a host it can't cover is spliced when the box's token allows it wholesale
 //!   (`Replica::splice`) and refused otherwise, never forwarded to the control host, which
 //!   decides no request;
-//! - the model budget: [`wicket_proxy::llm::Llm`] on both sides. On the node it is the box's model
-//!   proxy, with its slice; on the control host it is the run's counter, which leases the slices
-//!   ([`wicket_proxy::llm::Llm::next_slice`] and [`wicket_proxy::llm::Slice::renewed`], the rule
+//! - the model budget: on the node, the box's model proxy ([`wicket_proxy::llm::Llm`]), with its
+//!   slice; on the control host, the run's [`wicket_proxy::llm::Budget`], which leases the slices
+//!   ([`wicket_proxy::llm::Budget::next_slice`] and [`wicket_proxy::llm::Slice::renewed`], the rule
 //!   `noderun::slice_due` uses). Each call goes through the proxy's own admit, reserve and settle
 //!   (`Llm::sim_begin`, `Llm::sim_settle`: the `sim` feature's seam).
 //!

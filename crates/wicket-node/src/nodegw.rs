@@ -530,15 +530,15 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
     let slice = llm.as_ref().and_then(|l| l.slice());
     let (llm_left, llm_input_left) = match &llm {
         Some(l) => {
-            let spent = l.spent();
-            let r = l.remaining().map(|(r, o)| match slice {
+            let spent = l.budget.spent();
+            let r = l.budget.remaining().map(|(r, o)| match slice {
                 Some(sl) => {
                     (r.min(sl.requests.saturating_sub(spent.requests)), o.min(sl.output_tokens.saturating_sub(spent.output_tokens)))
                 }
                 None => (r, o),
             });
-            let i = match (l.remaining_input(), slice.and_then(|sl| sl.input_tokens)) {
-                (Some(a), Some(b)) => Some(a.min(b.saturating_sub(l.input_total()))),
+            let i = match (l.budget.remaining_input(), slice.and_then(|sl| sl.input_tokens)) {
+                (Some(a), Some(b)) => Some(a.min(b.saturating_sub(l.budget.input_total()))),
                 (a, _) => a,
             };
             (r, i)

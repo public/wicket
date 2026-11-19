@@ -10,12 +10,12 @@
 //! - **The feed** (`wicket_feed::Publisher`, persisted under its directory): catch-up from the
 //!   node's hello on every connection, then deltas as they are committed and a statement at each
 //!   refresh.
-//! - **Budget slices** (`slice_due`): per connection, the run's [`Llm::next_slice`], renewed by
+//! - **Budget slices** (`slice_due`): per connection, the run's [`Budget::next_slice`], renewed by
 //!   [`wicket_proxy::llm::Slice::renewed`], sent when it changes. The node's spend reports are
 //!   merged into the run's counter (`Msg::Spent`'s handler, with its `spent_base`).
 //!
 //! What survives a crash ([`Disk`]): the publisher's log, the ledger's grant records and the
-//! run's counted spend (`used_*`, restored with `Llm::spent_before`, the re-attach path).
+//! run's counted spend (`used_*`, restored with `Budget::spent_before`, the re-attach path).
 
 use crate::oracle::Oracle;
 use crate::wire::{self, Ctl};
@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use wicket_core::{Op, RunId, TenantId};
 use wicket_feed::{BoxAuthority, Change, Frame, LiveGrant, Publisher, PublisherConfig, RevokeKind};
-use wicket_proxy::llm::{Llm, Slice, Spent};
+use wicket_proxy::llm::{Budget, Slice, Spent};
 
 /// What the control host has on disk besides the publisher's log: the ledger's part.
 #[derive(Default)]
@@ -47,7 +47,7 @@ pub struct Disk {
 type Note = Box<dyn FnOnce(&mut Oracle, u64)>;
 
 struct Run {
-    llm: Arc<Llm>,
+    llm: Arc<Budget>,
     /// `noderun::Shared::spent_base`: for a re-attached run, the node's first report, which later
     /// ones count from.
     spent_base: Option<Option<Spent>>,
@@ -78,7 +78,7 @@ pub async fn run(env: Rc<Env>) -> turmoil::Result {
     )?;
     let mut runs = BTreeMap::new();
     for run in RUNS {
-        let llm = Llm::with_quota(crate::run_ctx(run, &env.zone), Some(QUOTA)).map_err(|e| e.to_string())?;
+        let llm = Arc::new(wicket_proxy::llm::run_budget(&env.zone, Some(QUOTA)));
         let spent_base = match env.control_disk.borrow().used.get(run) {
             Some(&(r, i, o)) => {
                 llm.spent_before(r, i, o);
@@ -299,7 +299,7 @@ async fn serve(env: Rc<Env>, st: Rc<RefCell<State>>, s: turmoil::net::TcpStream)
 }
 
 /// `noderun::slice_due`: the slice to send, if it differs from the one this connection sent.
-fn slice_due(l: &Llm, cur: Option<Slice>, base: Spent) -> Option<Slice> {
+fn slice_due(l: &Budget, cur: Option<Slice>, base: Spent) -> Option<Slice> {
     let next = l.next_slice(crate::SLICE_FRACTION)?;
     let slice = Slice::renewed_from(cur, next, l.spent(), l.input_total(), base);
     (cur != Some(slice)).then_some(slice)

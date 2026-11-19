@@ -41,19 +41,22 @@ const SECRET_UNAVAILABLE_FIX: &str =
     "On the host, `wicket doctor` checks every secret; a login linked from a file wicket can't read can be served by `wicket secret serve` \
      (docs/how-to/store-and-link-secrets.md)";
 
+/// The control host's budget for a run (#256, #257): the amounts of its quota grants, `quota`. A
+/// zone with a model route and no quota is given none to spend; one with no model route has no
+/// budget. No model proxy: the run's node is the only one, and the counter of record.
+pub fn run_budget(zone: &wicket_core::manifest::ZoneSpec, quota: Option<ModelQuota>) -> Budget {
+    Budget::new(zone.llm.as_ref().map(|_| quota.unwrap_or_default()))
+}
+
 pub struct Llm {
     ctx: RunCtx,
     client: reqwest::Client,
-    /// What this run has counted, carved out for its children, and spent in earlier activations
-    /// (#70, #152, #256): shared by its calls, its spawns' carve-outs and its node's reports.
-    pub count: Counter,
+    /// The model budget this proxy enforces and what counts against it (#70, #152, #256): the zone
+    /// its token carries, its slices bounding it.
+    pub budget: Budget,
     /// On a node (#152): the slice of the budget the control host has sent it, as caps on this
     /// activation's own counters. None: no slice (the zone's budget alone bounds it).
     slice: std::sync::Mutex<Option<Slice>>,
-    /// The model budget this proxy enforces (#256): on the control host, the amounts of the run's
-    /// quota grants ([`Llm::with_quota`]); on a node, the zone its token carries, its slices
-    /// bounding it. None: the zone has no model route.
-    quota: Option<ModelQuota>,
     /// When the box's first request reached this proxy (Unix ms, #287).
     first_request_ms: std::sync::OnceLock<i64>,
     /// Told [`Llm::spent_charged`] as each call is sent upstream ([`Llm::set_journal`]).
@@ -63,46 +66,31 @@ pub struct Llm {
 /// Where a node writes its count before a call goes upstream ([`Llm::set_journal`]).
 type Journal = Box<dyn Fn(Spent) + Send + Sync>;
 
-use wicket_core::budget::Counter;
-pub use wicket_core::budget::{ModelQuota, Slice, Spent};
+pub use wicket_core::budget::{Budget, ModelQuota, Slice, Spent};
 
 impl Llm {
-    /// Model requests and output tokens this run has left to spend or hand on.
-    pub fn remaining(&self) -> Option<(u64, u64)> {
-        Some(self.count.counts().remaining(self.quota()?))
-    }
-
     /// Output tokens spent, handed to children, spent by earlier activations, or reserved by calls
     /// in flight: what is no longer available to a new call.
     fn output_committed(&self) -> u64 {
-        self.count.counts().output_committed()
+        self.budget.count.counts().output_committed()
     }
 
     /// Reserves up to `want` output tokens for one call, atomically (parallel calls, and a spawn's
     /// carve-out, can't each claim the same tokens): what is left, if less. None when nothing is left.
     fn reserve_output(&self, max: u64, want: u64) -> Option<u64> {
-        self.count.reserve_output(max, want)
+        self.budget.count.reserve_output(max, want)
     }
 
     /// Settles a call's reservation: releases it and charges what the call used. A call whose final
     /// usage wasn't seen is charged its whole reservation (or what was seen, if more).
     fn settle(&self, reserved: u64, u: Usage, settled: bool) {
-        self.count.settle(reserved, u.input, u.cache_read, u.cache_creation, if settled { u.output } else { u.output.max(reserved) });
-    }
-
-    /// Every input token this run's model calls used: uncached, cache reads and cache writes.
-    pub fn input_total(&self) -> u64 {
-        self.count.input_total()
-    }
-
-    /// Input tokens this run has left to spend or hand on, if its zone caps them.
-    pub fn remaining_input(&self) -> Option<u64> {
-        self.count.counts().remaining_input(self.quota()?)
-    }
-
-    /// The model budget this proxy enforces: see [`ModelQuota`].
-    pub fn quota(&self) -> Option<ModelQuota> {
-        self.quota
+        self.budget.count.settle(
+            reserved,
+            u.input,
+            u.cache_read,
+            u.cache_creation,
+            if settled { u.output } else { u.output.max(reserved) },
+        );
     }
 
     /// A model proxy enforcing its zone's budget: a node's, whose slices bound it.
@@ -111,10 +99,10 @@ impl Llm {
         Self::with_quota(ctx, quota)
     }
 
-    /// A model proxy enforcing `quota` (#256): the control host's, from the run's quota grants. A
-    /// zone with a model route and no quota is given none to spend.
+    /// A model proxy enforcing `quota`, for tests that give it one ([`run_budget`]'s rule). A
+    /// node's proxy is [`Llm::new`], its zone's budget.
     pub fn with_quota(ctx: RunCtx, quota: Option<ModelQuota>) -> Result<Arc<Llm>> {
-        let quota = ctx.zone.llm.as_ref().map(|_| quota.unwrap_or_default());
+        let quota = run_budget(&ctx.zone, quota).quota();
         // As the egress proxy's (#116): the model route's host is resolved by wicket and dialled
         // only at checked, public addresses, and a connection that doesn't come up in 15 s fails.
         // An address the zone names itself (`http://127.0.0.1:…`, the tests' local models) is the
@@ -129,17 +117,11 @@ impl Llm {
         Ok(Arc::new(Llm {
             ctx,
             client,
-            count: Counter::default(),
+            budget: Budget::new(quota),
             slice: std::sync::Mutex::new(None),
-            quota,
             first_request_ms: std::sync::OnceLock::new(),
             journal: std::sync::Mutex::new(None),
         }))
-    }
-
-    /// What this activation has counted itself.
-    pub fn spent(&self) -> Spent {
-        self.count.spent()
     }
 
     /// What this activation has counted, with the output tokens reserved by calls in flight charged
@@ -147,7 +129,7 @@ impl Llm {
     /// billed upstream and is never settled here, so a restarted node counts it as a call whose
     /// final usage wasn't seen is counted: its whole reservation.
     pub fn spent_charged(&self) -> Spent {
-        self.count.spent_charged()
+        self.budget.count.spent_charged()
     }
 
     /// Has `f` told [`Llm::spent_charged`] as each model call is sent, before it goes upstream:
@@ -164,12 +146,6 @@ impl Llm {
         }
     }
 
-    /// Takes in what another counter of this activation has seen (#152): the run's node, which
-    /// calls the model itself and is the counter of record. Counters only go up.
-    pub fn merge_spent(&self, s: Spent) {
-        self.count.merge_spent(s);
-    }
-
     /// The budget slice sent to this node (#152).
     pub fn set_slice(&self, s: Option<Slice>) {
         *self.slice.lock().expect("slice") = s;
@@ -179,33 +155,9 @@ impl Llm {
         *self.slice.lock().expect("slice")
     }
 
-    /// The slice this activation's node may be sent next (#152): what it has counted plus `fraction` of
-    /// the zone's budget, never past what is left of it.
-    pub fn next_slice(&self, fraction: f64) -> Option<Slice> {
-        Some(self.count.next_slice(self.quota()?, fraction))
-    }
-
-    /// Starts this activation from what the agent's earlier ones spent (#70).
-    pub fn spent_before(&self, requests: u64, input_tokens: u64, output_tokens: u64) {
-        self.count.prior_requests.store(requests, Ordering::SeqCst);
-        self.count.prior_input_tokens.store(input_tokens, Ordering::SeqCst);
-        self.count.prior_output_tokens.store(output_tokens, Ordering::SeqCst);
-    }
-
-    /// What counts against the zone's budget so far, over the agent's life: (requests, input tokens
-    /// with cached ones, output tokens). Budget handed to children counts as spent.
-    pub fn spent_total(&self) -> (u64, u64, u64) {
-        let c = self.count.counts();
-        (
-            c.requests_committed(),
-            c.input_committed(),
-            c.output_tokens.saturating_add(c.reserved_output_tokens).saturating_add(c.prior_output_tokens),
-        )
-    }
-
     /// How the budget is described: per run, or (for a woken agent) over its life.
     fn whose(&self) -> &'static str {
-        if self.count.prior_requests.load(Ordering::SeqCst) + self.count.prior_output_tokens.load(Ordering::SeqCst) > 0 {
+        if self.budget.count.prior_requests.load(Ordering::SeqCst) + self.budget.count.prior_output_tokens.load(Ordering::SeqCst) > 0 {
             "this agent, over all its activations,"
         } else {
             "this run"
@@ -283,9 +235,9 @@ impl Llm {
         // A node's slice (#152), before counting: a refusal here spends nothing, so a box retrying
         // against a spent slice offline doesn't burn its budget.
         if let (Some(_), Some(sl)) = (spec, self.slice()) {
-            let over = if self.count.requests.load(Ordering::SeqCst) >= sl.requests {
+            let over = if self.budget.count.requests.load(Ordering::SeqCst) >= sl.requests {
                 Some("request")
-            } else if sl.input_tokens.is_some_and(|m| self.input_total() >= m) {
+            } else if sl.input_tokens.is_some_and(|m| self.budget.input_total() >= m) {
                 Some("input token")
             } else {
                 None
@@ -301,9 +253,9 @@ impl Llm {
                 ));
             }
         }
-        let n = self.count.admit_request();
+        let n = self.budget.count.admit_request();
         spec?;
-        let spec = self.quota()?;
+        let spec = self.budget.quota()?;
         if n > spec.requests {
             self.event(None, 429, Usage::default(), "budget: request cap reached");
             return Some(problem(
@@ -324,7 +276,7 @@ impl Llm {
                 None,
             ));
         }
-        if let (Some(max), Some(0)) = (spec.input_tokens, self.remaining_input()) {
+        if let (Some(max), Some(0)) = (spec.input_tokens, self.budget.remaining_input()) {
             self.event(None, 429, Usage::default(), "budget: input token cap reached");
             return Some(problem(
                 429,
@@ -345,7 +297,7 @@ impl Llm {
             input_tokens: u.input,
             cached_tokens: u.cache_read + u.cache_creation,
             output_tokens: u.output,
-            requests: self.count.requests.load(Ordering::SeqCst),
+            requests: self.budget.count.requests.load(Ordering::SeqCst),
             outcome: outcome.into(),
         });
     }
@@ -629,11 +581,11 @@ impl Llm {
             let Some(asked) = json.get("max_tokens").and_then(|v| v.as_u64()) else {
                 return Err(refuse(400, "a messages request without an integer max_tokens".into()));
             };
-            if let (Some(_), Some(q)) = (spec, self.quota()) {
+            if let (Some(_), Some(q)) = (spec, self.budget.quota()) {
                 // A node's slice (#152) caps this activation's own output, in flight included.
                 let cap = match self.slice() {
                     Some(sl) => {
-                        let c = self.count.counts();
+                        let c = self.budget.count.counts();
                         q.output_tokens.min(sl.output_tokens.saturating_add(c.reserved_output_tokens).saturating_add(c.prior_output_tokens))
                     }
                     None => q.output_tokens,
@@ -805,7 +757,7 @@ impl Drop for Reservation {
         if self.tokens == 0 {
             return;
         }
-        self.llm.count.settle(self.tokens, 0, 0, 0, 0);
+        self.llm.budget.count.settle(self.tokens, 0, 0, 0, 0);
         self.llm.journal();
     }
 }
@@ -1438,7 +1390,7 @@ mod tests {
         let (status, body) = post(llm.clone(), "fence").await;
         assert_eq!(status, 409);
         assert!(body.contains("generation 2"), "{body}");
-        assert_eq!(llm.count.requests.load(std::sync::atomic::Ordering::SeqCst), 0, "not counted, never forwarded");
+        assert_eq!(llm.budget.count.requests.load(std::sync::atomic::Ordering::SeqCst), 0, "not counted, never forwarded");
     }
 
     /// #70: the zone's model budget is the agent's over its life. A woken activation starts from
@@ -1447,20 +1399,20 @@ mod tests {
     async fn a_woken_agent_continues_its_budget() {
         let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_requests: 5, max_output_tokens: 100}"))
             .unwrap();
-        llm.spent_before(3, 40, 60);
-        assert_eq!(llm.remaining(), Some((2, 40)), "children are carved from what is left");
-        llm.count.reserved_requests.store(1, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(llm.spent_total(), (4, 40, 60));
+        llm.budget.spent_before(3, 40, 60);
+        assert_eq!(llm.budget.remaining(), Some((2, 40)), "children are carved from what is left");
+        llm.budget.count.reserved_requests.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(llm.budget.spent_total(), (4, 40, 60));
         // Every request is spent: refused, never forwarded (the default upstream is never contacted).
-        llm.spent_before(5, 40, 60);
-        llm.count.reserved_requests.store(0, std::sync::atomic::Ordering::SeqCst);
+        llm.budget.spent_before(5, 40, 60);
+        llm.budget.count.reserved_requests.store(0, std::sync::atomic::Ordering::SeqCst);
         let (status, body) = post(llm.clone(), "budget").await;
         assert_eq!(status, 429, "{body}");
         assert!(body.contains("over all its activations"), "{body}");
         // Output tokens spent instead.
         let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_requests: 5, max_output_tokens: 100}"))
             .unwrap();
-        llm.spent_before(1, 0, 100);
+        llm.budget.spent_before(1, 0, 100);
         let (status, _) = post(llm, "tokens").await;
         assert_eq!(status, 429);
     }
@@ -1472,22 +1424,22 @@ mod tests {
         let zone = "{max_requests: 50, max_output_tokens: 1000, max_input_tokens: 9000}";
         let q = super::ModelQuota { requests: 2, output_tokens: 100, input_tokens: Some(500) };
         let llm = super::Llm::with_quota(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, zone), Some(q)).unwrap();
-        assert_eq!(llm.quota(), Some(q));
-        assert_eq!((llm.remaining(), llm.remaining_input()), (Some((2, 100)), Some(500)));
-        let sl = llm.next_slice(0.5).unwrap();
+        assert_eq!(llm.budget.quota(), Some(q));
+        assert_eq!((llm.budget.remaining(), llm.budget.remaining_input()), (Some((2, 100)), Some(500)));
+        let sl = llm.budget.next_slice(0.5).unwrap();
         assert_eq!((sl.requests, sl.output_tokens, sl.input_tokens), (1, 50, Some(250)), "slices are cut from the grant's amount");
-        llm.spent_before(2, 0, 0);
+        llm.budget.spent_before(2, 0, 0);
         let (status, body) = post(llm.clone(), "quota").await;
         assert_eq!(status, 429, "{body}");
         assert!(body.contains("at most 2 model requests"), "{body}");
         // A zone with a model route and no quota granted has nothing to spend.
         let llm = super::Llm::with_quota(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, zone), None).unwrap();
-        assert_eq!(llm.remaining(), Some((0, 0)));
+        assert_eq!(llm.budget.remaining(), Some((0, 0)));
         let (status, _) = post(llm, "none").await;
         assert_eq!(status, 429);
         // A node's proxy enforces the zone in its token, as before.
         let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, zone)).unwrap();
-        assert_eq!(llm.quota(), Some(super::ModelQuota { requests: 50, output_tokens: 1000, input_tokens: Some(9000) }));
+        assert_eq!(llm.budget.quota(), Some(super::ModelQuota { requests: 50, output_tokens: 1000, input_tokens: Some(9000) }));
     }
 
     /// A model upstream that answers every request with `chunks` (an SSE stream, chunked), pausing
@@ -1625,22 +1577,22 @@ mod tests {
             .unwrap();
         let pending = tokio::spawn(async move { send.send_request(req).await.map(|r| r.status().as_u16()) });
         for _ in 0..300 {
-            if llm.count.inflight_output_tokens.load(SeqCst) == 300 {
+            if llm.budget.count.inflight_output_tokens.load(SeqCst) == 300 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(llm.count.inflight_output_tokens.load(SeqCst), 300, "the call holds its reservation while it waits");
+        assert_eq!(llm.budget.count.inflight_output_tokens.load(SeqCst), 300, "the call holds its reservation while it waits");
         pending.abort();
         conn.abort();
         for _ in 0..300 {
-            if llm.count.inflight_output_tokens.load(SeqCst) == 0 {
+            if llm.budget.count.inflight_output_tokens.load(SeqCst) == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(llm.count.inflight_output_tokens.load(SeqCst), 0, "given up before it was sent: its reservation is back");
-        assert_eq!(llm.count.output_tokens.load(SeqCst), 0, "and nothing is charged for it");
+        assert_eq!(llm.budget.count.inflight_output_tokens.load(SeqCst), 0, "given up before it was sent: its reservation is back");
+        assert_eq!(llm.budget.count.output_tokens.load(SeqCst), 0, "and nothing is charged for it");
         assert!(seen.lock().await.is_empty(), "it never reached the upstream");
         // The credential arrives: the next call gets the whole budget and completes within it.
         source.go.notify_one();
@@ -1680,32 +1632,32 @@ mod tests {
         let budget = 4000;
         // Before the restart: two calls settled at 20 tokens, and one in flight with 1000 reserved.
         let (before, dir) = llm_to(port, budget, "restart-inflight");
-        before.count.admit_request();
-        before.count.admit_request();
-        before.count.settle(0, 10, 0, 0, 40);
-        before.count.admit_request();
-        assert_eq!(before.count.reserve_output(budget, 1000), Some(1000));
+        before.budget.count.admit_request();
+        before.budget.count.admit_request();
+        before.budget.count.settle(0, 10, 0, 0, 40);
+        before.budget.count.admit_request();
+        assert_eq!(before.budget.count.reserve_output(budget, 1000), Some(1000));
         // What the node's journal holds, and the supervisor's last heartbeat (the agent's row).
         let journaled = before.spent_charged();
-        let heartbeat = before.spent_total();
+        let heartbeat = before.budget.spent_total();
         // The node's `serve` restarts: it counts the journal, the call in flight charged in full.
         let (node, _) = llm_to(port, budget, "restart-inflight");
-        node.merge_spent(journaled);
-        assert_eq!(node.spent().output_tokens, 1040);
+        node.budget.merge_spent(journaled);
+        assert_eq!(node.budget.spent().output_tokens, 1040);
         // The re-attached supervisor: the agent's spend as its prior, the node's first report its base.
         let (control, _) = llm_to(port, budget, "restart-inflight-control");
-        control.spent_before(heartbeat.0, heartbeat.1, heartbeat.2);
-        let base = node.spent();
-        control.merge_spent(base.since(base));
+        control.budget.spent_before(heartbeat.0, heartbeat.1, heartbeat.2);
+        let base = node.budget.spent();
+        control.budget.merge_spent(base.since(base));
         let fraction = 0.25;
-        let next = control.next_slice(fraction).unwrap();
-        let slice = super::Slice::renewed_from(None, next, control.spent(), control.input_total(), base);
-        assert!(slice.output_tokens > node.spent().output_tokens, "{slice:?}: the node holds more than it spent");
+        let next = control.budget.next_slice(fraction).unwrap();
+        let slice = super::Slice::renewed_from(None, next, control.budget.spent(), control.budget.input_total(), base);
+        assert!(slice.output_tokens > node.budget.spent().output_tokens, "{slice:?}: the node holds more than it spent");
         node.set_slice(Some(slice));
         assert_eq!(call(node.clone(), "restart-inflight", ASK, true).await, 200);
         assert_eq!(output_settles(&node, 1040 + 250).await, 1040 + 250);
         // A slice in the supervisor's own counts would have left the node nothing.
-        let unoffset = super::Slice::renewed(None, next, control.spent(), control.input_total());
+        let unoffset = super::Slice::renewed(None, next, control.budget.spent(), control.budget.input_total());
         assert!(unoffset.output_tokens <= base.output_tokens, "{unoffset:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1789,14 +1741,14 @@ mod tests {
 
     async fn output_settles(llm: &super::Llm, want: u64) -> u64 {
         for _ in 0..300 {
-            if llm.count.inflight_output_tokens.load(std::sync::atomic::Ordering::SeqCst) == 0
-                && llm.count.output_tokens.load(std::sync::atomic::Ordering::SeqCst) == want
+            if llm.budget.count.inflight_output_tokens.load(std::sync::atomic::Ordering::SeqCst) == 0
+                && llm.budget.count.output_tokens.load(std::sync::atomic::Ordering::SeqCst) == want
             {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        llm.count.output_tokens.load(std::sync::atomic::Ordering::SeqCst)
+        llm.budget.count.output_tokens.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     const ASK: &str = r#"{"model":"m","max_tokens":300,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
@@ -1908,7 +1860,7 @@ mod tests {
         };
         let enabled = |b: u64| format!(r#"{{"type":"enabled","budget_tokens":{b}}}"#);
         // 2000 spent: 88000 left. Thinking within the lowered max_tokens stays as it is.
-        llm.spent_before(0, 0, 2000);
+        llm.budget.spent_before(0, 0, 2000);
         let f = llm.filter(Some(&spec), &parts(), ask(128000, &enabled(31999))).ok().unwrap();
         let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
         assert_eq!((out["max_tokens"].as_u64(), out["thinking"]["budget_tokens"].as_u64()), (Some(88000), Some(31999)));
@@ -1925,19 +1877,19 @@ mod tests {
         assert_eq!((out["max_tokens"].as_u64(), out["thinking"]["type"].as_str()), (Some(88000), Some("adaptive")));
         llm.settle(f.reserved, Usage::default(), true);
         // 1024 left: no thinking budget is both at least 1024 and below max_tokens. Refused, clearly.
-        llm.spent_before(0, 0, 90000 - 1024);
+        llm.budget.spent_before(0, 0, 90000 - 1024);
         let r = llm.filter(Some(&spec), &parts(), ask(128000, &enabled(4000))).err().expect("refused");
         assert_eq!(r.status().as_u16(), 429);
         let body = http_body_util::BodyExt::collect(r.into_body()).await.unwrap().to_bytes();
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("budget left: 1024 output tokens") && body.contains("thinking.budget_tokens 4000"), "{body}");
-        assert_eq!(llm.count.inflight_output_tokens.load(std::sync::atomic::Ordering::SeqCst), 0, "the reservation is released");
+        assert_eq!(llm.budget.count.inflight_output_tokens.load(std::sync::atomic::Ordering::SeqCst), 0, "the reservation is released");
         // Without thinking (or with it disabled) the same request is lowered and sent.
         let f = llm.filter(Some(&spec), &parts(), ask(128000, r#"{"type":"disabled"}"#)).ok().unwrap();
         assert_eq!(f.reserved, 1024);
         // 1025 left: the smallest valid lowering, thinking 1024 below max_tokens 1025.
         llm.settle(f.reserved, Usage::default(), true);
-        llm.spent_before(0, 0, 90000 - 1025);
+        llm.budget.spent_before(0, 0, 90000 - 1025);
         let f = llm.filter(Some(&spec), &parts(), ask(128000, &enabled(4000))).ok().unwrap();
         let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
         assert_eq!((out["max_tokens"].as_u64(), out["thinking"]["budget_tokens"].as_u64()), (Some(1025), Some(1024)));
@@ -1950,8 +1902,8 @@ mod tests {
     fn a_node_spends_its_slice_and_nothing_more() {
         let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_requests: 8, max_output_tokens: 1000}"))
             .unwrap();
-        assert_eq!(llm.next_slice(0.25), Some(super::Slice { requests: 2, output_tokens: 250, input_tokens: None }));
-        llm.set_slice(llm.next_slice(0.25));
+        assert_eq!(llm.budget.next_slice(0.25), Some(super::Slice { requests: 2, output_tokens: 250, input_tokens: None }));
+        llm.set_slice(llm.budget.next_slice(0.25));
         let spec = llm.ctx.zone.llm.clone().unwrap();
         assert!(llm.admit(Some(&spec)).is_none());
         assert!(llm.admit(Some(&spec)).is_none());
@@ -1965,14 +1917,14 @@ mod tests {
         assert_eq!(f.reserved, 250);
         llm.settle(f.reserved, Usage { output: 250, ..Usage::default() }, true);
         // Renewed (connected): what was counted plus a quarter, never past the budget.
-        assert_eq!(llm.spent().requests, 2, "the refusal spent nothing");
-        let next = llm.next_slice(0.25).unwrap();
+        assert_eq!(llm.budget.spent().requests, 2, "the refusal spent nothing");
+        let next = llm.budget.next_slice(0.25).unwrap();
         assert_eq!((next.requests, next.output_tokens), (2 + 2, 250 + 250));
-        llm.merge_spent(super::Spent { requests: 7, output_tokens: 900, ..Default::default() });
-        assert_eq!(llm.next_slice(0.25).map(|s| (s.requests, s.output_tokens)), Some((8, 1000)), "never past what is left");
-        assert_eq!(llm.spent().requests, 7, "a node's count only raises this one");
-        llm.merge_spent(super::Spent { requests: 1, ..Default::default() });
-        assert_eq!(llm.spent().requests, 7);
+        llm.budget.merge_spent(super::Spent { requests: 7, output_tokens: 900, ..Default::default() });
+        assert_eq!(llm.budget.next_slice(0.25).map(|s| (s.requests, s.output_tokens)), Some((8, 1000)), "never past what is left");
+        assert_eq!(llm.budget.spent().requests, 7, "a node's count only raises this one");
+        llm.budget.merge_spent(super::Spent { requests: 1, ..Default::default() });
+        assert_eq!(llm.budget.spent().requests, 7);
     }
 
     /// #324: what a node persists counts the calls in flight at their whole reservation, so a node
@@ -1989,12 +1941,12 @@ mod tests {
         let parts = http::Request::post("/v1/messages").body(()).unwrap().into_parts().0;
         let f =
             llm.filter(Some(&spec), &parts, bytes::Bytes::from_static(br#"{"model":"m","max_tokens":300,"messages":[]}"#)).ok().unwrap();
-        assert_eq!((llm.spent().output_tokens, llm.spent_charged().output_tokens), (0, 300));
+        assert_eq!((llm.budget.spent().output_tokens, llm.spent_charged().output_tokens), (0, 300));
         llm.journal();
         llm.settle(f.reserved, Usage { output: 40, ..Usage::default() }, true);
         llm.journal();
         assert_eq!(*seen.lock().unwrap(), vec![300, 40], "in flight: its reservation; settled: what it used");
-        assert_eq!(llm.spent_charged(), llm.spent());
+        assert_eq!(llm.spent_charged(), llm.budget.spent());
     }
 
     #[test]
@@ -2003,11 +1955,11 @@ mod tests {
         assert_eq!(llm.reserve_output(100, 60), Some(60));
         assert_eq!(llm.reserve_output(100, 60), Some(40));
         assert_eq!(llm.reserve_output(100, 1), None);
-        assert_eq!(llm.remaining().map(|r| r.1), Some(0), "spawn carve-outs see the reservations");
+        assert_eq!(llm.budget.remaining().map(|r| r.1), Some(0), "spawn carve-outs see the reservations");
         llm.settle(60, Usage { output: 10, ..Usage::default() }, true);
-        assert_eq!(llm.remaining().map(|r| r.1), Some(50));
+        assert_eq!(llm.budget.remaining().map(|r| r.1), Some(50));
         llm.settle(40, Usage { output: 3, ..Usage::default() }, false);
-        assert_eq!(llm.count.output_tokens.load(std::sync::atomic::Ordering::SeqCst), 50, "10 settled, 40 charged in full");
+        assert_eq!(llm.budget.count.output_tokens.load(std::sync::atomic::Ordering::SeqCst), 50, "10 settled, 40 charged in full");
     }
 
     #[test]
@@ -2245,7 +2197,7 @@ mod tests {
         let (status, body) = post(llm.clone(), "relogin").await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(*seen.lock().unwrap(), ["tok-old", "tok-new"], "one retry, with the new token");
-        assert_eq!(llm.count.requests.load(std::sync::atomic::Ordering::SeqCst), 1, "one call for the budget");
+        assert_eq!(llm.budget.count.requests.load(std::sync::atomic::Ordering::SeqCst), 1, "one call for the budget");
         let ops = llm_ops(&llm, 2).await;
         assert!(ops.iter().any(|o| o.contains("\"status\":401") && o.contains("retrying once with its new value")), "{ops:?}");
         assert!(ops.iter().any(|o| o.contains("\"status\":200") && o.contains("retried once after a 401")), "{ops:?}");
