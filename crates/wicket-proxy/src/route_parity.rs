@@ -54,6 +54,8 @@ struct Seen {
     beta_header: bool,
     /// Output tokens charged (settled or reserved).
     charged: u64,
+    /// The output tokens each `llm` op recorded.
+    recorded: Vec<u64>,
     /// Whether the run's first model request was recorded (a node reports it, #152).
     first_request: bool,
     /// The anomalies audited (#362): `placeholder.moved`, `secret.reflected`, `response.encoded`.
@@ -79,6 +81,8 @@ enum Answer {
     Gzip,
     /// As `Ok`, saying `Content-Encoding: identity` (nothing to note).
     Identity,
+    /// A 200 with no usage in it: nothing to settle by.
+    NoUsage,
 }
 
 #[derive(Default)]
@@ -173,6 +177,7 @@ async fn answer(st: Arc<MockState>, req: http::Request<hyper::body::Incoming>) -
                 .header("content-type", "application/json")
                 .header("content-encoding", "gzip")
                 .body(MockBody::from(&b"\x1f\x8b\x08\x00compressed"[..])),
+            Answer::NoUsage => http::Response::builder().header("content-type", "application/json").body(MockBody::from("{}")),
         }
     };
     Ok(r.unwrap())
@@ -374,7 +379,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
     let (status, body) = out.unwrap();
     // Let the call settle: its accounting runs on a task, and a box that gave up leaves it running.
     tokio::time::sleep(Duration::from_millis(if s.give_up_after.is_some() { 900 } else { 100 })).await;
-    let notes = ledger
+    let ops: Vec<serde_json::Value> = ledger
         .lock()
         .unwrap()
         .audit_of_kind("op")
@@ -382,10 +387,10 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
         .into_iter()
         .map(|r| r.body)
         .filter(|b| b.contains("\"kind\":\"llm\""))
-        .map(|b| {
-            serde_json::from_str::<serde_json::Value>(&b).ok().and_then(|v| v["outcome"].as_str().map(String::from)).unwrap_or_default()
-        })
+        .map(|b| serde_json::from_str(&b).unwrap_or_default())
         .collect();
+    let notes = ops.iter().map(|v| v["outcome"].as_str().unwrap_or_default().to_string()).collect();
+    let recorded = ops.iter().map(|v| v["output_tokens"].as_u64().unwrap_or_default()).collect();
     let anomalies = ledger
         .lock()
         .unwrap()
@@ -404,6 +409,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
         bearers: seen.iter().map(|(b, _)| b.clone()).collect(),
         beta_header: seen.iter().any(|(_, beta)| *beta),
         charged: counts.output_tokens,
+        recorded,
         first_request: llm.first_request_ms().is_some(),
         anomalies,
     };
@@ -629,6 +635,11 @@ const CASES: &[Case] = &[
         both: |s| s.status == 200 && s.charged == 2 && !s.note("Content-Encoding"),
     },
     Case {
+        name: "an answer without its usage",
+        setup: Setup::default,
+        both: |s| s.status == 200 && s.note("no final usage seen") && s.charged > 2 && s.recorded == [s.charged],
+    },
+    Case {
         name: "a secret bound to no hosts",
         setup: || Setup { secret: Secret::Unbound, ..Setup::default() },
         both: |s| s.status == 502 && s.note("bound to no hosts") && s.bearers.is_empty(),
@@ -649,6 +660,7 @@ fn answer_for(case: &str) -> (Answer, u64) {
         "an upstream that echoes the credential" => (Answer::Echo, 0),
         "an upstream that encodes anyway" => (Answer::Gzip, 0),
         "an upstream that says it isn't encoded" => (Answer::Identity, 0),
+        "an answer without its usage" => (Answer::NoUsage, 0),
         "the box gives up while the call is out" => (Answer::Ok, 400),
         _ => (Answer::Ok, 0),
     }
