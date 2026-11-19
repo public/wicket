@@ -659,6 +659,9 @@ fn fire_event(l: &Ledger, t: &Trigger, ev: &Ev<'_>) -> Result<(Option<Fired>, Op
     }
 }
 
+/// A trigger's part in one record's firings: what it did, and the agent to wake.
+type Outcome = (Trigger, Option<Fired>, Option<String>);
+
 /// How many audit records a pass reads at a time, and at most in one pass: a long backlog (the
 /// reconciler down for a while) is read over several passes.
 pub const AUDIT_BATCH: usize = 1000;
@@ -779,7 +782,7 @@ fn wicket_pass(l: &Ledger, now: i64, dry_run: bool, wake: Waker<'_>, owner: Owne
                 }
             }
             let delivery = format!("audit:{}", r.seq);
-            let results = l.immediate(|l| -> Result<Vec<(Trigger, Option<Fired>, Option<String>)>> {
+            let results = l.immediate(|l| -> Result<Vec<Outcome>> {
                 let (event, _) = l.record_trigger_event(&tenant, "wicket", kind, &delivery, &fields, &r.hash, "audit chain")?;
                 let ev = Ev { id: event, source: "wicket", at: r.ts, fields: fields.clone() };
                 let mut v = vec![];
