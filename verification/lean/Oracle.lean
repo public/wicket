@@ -20,6 +20,14 @@ Input: `{"zones": [zone…], "cases": [case…]}`. A case is one of
   `null`);
 - `{"kind": "chain", "zones": [i…], "op": {…}}` → how a token of one block per zone (block 0, then
   spawn blocks) decides the request.
+- `{"kind": "public_ip", "v": 4|6, "addr": "<decimal>"}` → `op::is_public_ip`;
+- `{"kind": "token_end", "expires_at": e, "now_ms": t}` → `token_allows(not_after_for(e), t)`;
+- `{"kind": "agent_terms", "rules": {…}, "shape": {…}}` → `agent_term_refusal` (`none` or the term);
+- `{"kind": "escalatable", "one", "policy", "host", "risk", "approved"}` → `check_escalatable`;
+- `{"kind": "needs_grant", "failed": ["node"|"soft"|"hard"|"unknown"…]}` → `Loaded::classify`'s rule;
+- `{"kind": "take_use", "uses_left": n|null}` → `take_use` (`refused`, `uncounted`, or the uses left);
+- `{"kind": "money", "rh", "rt", "nh", "nt", "mh", "mt"}` → `money_fits` (`fits`, `hourly`, `total`);
+- `{"kind": "spawn", limits (or null), ask}` → `SpawnLimits::admits`.
 
 Every string is read as its UTF-8 bytes (`bytesOf`): the spec is over any alphabet, and wicket's
 matchers and checks work on bytes.
@@ -173,6 +181,60 @@ def decideCase (zs : Array Zone) (c : Json) : Except String String := do
       (zs[n]?).elim (.error s!"no zone {n}") pure)
     if !(bs.all Zone.supported) then return "unsupported"
     return verdictName (chainVerdict bs (← parseOp (← c.getObjVal? "op")))
+  | "public_ip" =>
+    -- The address as a decimal string (a u128 doesn't fit a JSON number).
+    let a ← (← c.getObjValAs? String "addr").toNat?.elim (.error "addr") pure
+    let v ← jNat c "v"
+    return toString (if v == 4 then isPublic4 a else isPublic6 a)
+  | "token_end" =>
+    let e ← c.getObjValAs? Int "expires_at"
+    let now ← c.getObjValAs? Int "now_ms"
+    return toString (tokenAllows (notAfterFor e) now)
+  | "agent_terms" =>
+    let r ← c.getObjVal? "rules"
+    let s ← c.getObjVal? "shape"
+    let got := agentTermRefusal (← jBool r "zone_wide") (← jBool r "prefix") (← jBool r "unbounded") (← jBool r "git_push")
+      (← jBool s "zone_wide") (← jBool s "prefix") (← jBool s "unbounded") (← jBool s "git_push")
+    return match got with
+      | none => "none"
+      | some .zoneWide => "zone_wide"
+      | some .pfx => "prefix"
+      | some .unbounded => "unbounded"
+      | some .gitPush => "git_push"
+  | "escalatable" =>
+    return toString (checkEscalatable (← jBool c "one") (← jBool c "policy") (← jBool c "host") (← jBool c "risk") (← jBool c "approved"))
+  | "needs_grant" =>
+    -- Each failed check: "node", "soft", "hard" or "unknown".
+    let fs ← (← jStrs c "failed").mapM (fun f => match String.mk f with
+      | "node" => pure Failed.node
+      | "soft" => pure (Failed.block (some true))
+      | "hard" => pure (Failed.block (some false))
+      | "unknown" => pure (Failed.block none)
+      | x => throw s!"failed check {x}")
+    return toString (refusalNeedsGrant fs)
+  | "take_use" =>
+    let u ← match c.getObjVal? "uses_left" with
+      | .ok .null => pure none
+      | .ok v => pure (some (← v.getInt?))
+      | .error _ => pure none
+    return match takeUse u with
+      | none => "refused"
+      | some none => "uncounted"
+      | some (some n) => toString n
+  | "money" =>
+    let g : String → Except String Int := fun k => c.getObjValAs? Int k
+    return match moneyFits (← g "rh") (← g "rt") (← g "nh") (← g "nt") (← g "mh") (← g "mt") with
+      | none => "fits"
+      | some .hourly => "hourly"
+      | some .total => "total"
+  | "spawn" =>
+    let oi : String → Except String (Option Int) := fun k => match c.getObjVal? k with
+      | .ok .null => pure none
+      | .ok v => (some <$> v.getInt?)
+      | .error _ => pure none
+    let g : String → Except String Int := fun k => c.getObjValAs? Int k
+    return toString (spawnAdmits (← oi "min_isolation") (← oi "max_mem") (← oi "max_cpus") (← oi "max_pids") (← oi "max_timeout")
+      (← g "isolation") (← g "mem") (← g "cpus") (← g "pids") (← g "timeout"))
   | k => throw s!"unknown case kind {k}"
 
 def main (args : List String) : IO UInt32 := do

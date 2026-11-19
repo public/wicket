@@ -59,6 +59,26 @@ wicket-core decides as the spec does on its fixtures and generated cases. They d
 - **The ledger's identities** are a parent function. That an agent never decides its own request
   (`not_own`) needs them acyclic.
 
+## Decisions in wicket-core's pure functions (`Wicket/Decisions.lean`)
+
+The decisions #325 moved into pure functions for Kani, each defined as the Rust computes it, with
+`Int` and `Nat` for its numbers (so no overflow: the Rust's exact sums are what the oracle holds it
+to). Each Kani harness names its theorem here.
+
+| Rust (wicket-core) | Lean | theorems |
+|---|---|---|
+| `op::is_public_ip`, the SSRF guard | `isPublic4`, `isPublic6`: outside `v4Blocks`, `v6Blocks` | `in_block_not_public4`, `in_block_not_public6`, `metadata_never_public` |
+| `quota::not_after_for`, `token_secs`, `token_allows` (#342) | `notAfterFor`, `tokenSecs`, `tokenAllows` | `token_ends_at_ledger_ms`: for every end after the epoch and every reading, the token allows exactly while the ledger's grant is live |
+| `authority::agent_term_refusal` | `agentTermRefusal` | `default_rules_refuse`, `each_rule_lifts_its_own` |
+| `escalation::check_escalatable`, `needs_grant` | `checkEscalatable`, `refusalNeedsGrant` | `org_policy_never_escalatable`, `needs_grant_fail_closed` |
+| `quota::take_use` | `takeUse` | `take_use_never_below_zero`, `take_use_refused_at_zero` |
+| `quota::money_fits` | `moneyFits` | `money_fits_exactly` |
+| `quota::SpawnLimits::admits` | `spawnAdmits` | `spawn_within_admitted` |
+
+`metadata_never_public` is decided by evaluation, over concrete addresses (169.254.169.254 and
+168.63.129.16, and the first behind IPv4-mapped, NAT64 and 6to4 forms). For every address, the
+oracle compares the table with the Rust, and Kani compares it with the Rust over every address.
+
 ## Running it
 
 `ci/lean.sh` installs the pinned toolchain (`lean-toolchain`, by URL and SHA-256), builds the spec
@@ -68,7 +88,14 @@ compares each decision with wicket-core's and fails on any difference, with the 
 the fixtures (the zones and probes of `oracles.rs`, and the parents and children of
 `subset_cases.rs`), plus generated globs, paths, hosts, path spellings and parent/child zones, model
 allowlists and `accept_from` lists (`check`, `allows_model`, `accepts`), and tokens of up to four
-blocks, minted and attenuated by wicket-authz and decided by its evaluator (`chain`).
+blocks, minted and attenuated by wicket-authz and decided by its evaluator (`chain`). Section 8 of the
+test adds the pure decisions above: generated IPv4 and IPv6 addresses (biased to the special blocks
+and the IPv4 forms), grant ends and clock readings around the boundary, every combination of
+agents' rules and escalation classes, lists of failed checks, counted uses, money amounts at the
+edges of `i64`, and spawn limits and asks.
+
+In GitHub Actions, `ci/lean.sh` also turns the build's errors and the oracle's divergences into
+annotations on the run, so they show in the pull request without its log.
 
 With elan, `lake build` here builds the spec, and `LAKE=lake cargo test -p wicket-authz --test
 lean_oracle -- --ignored` runs the oracle.

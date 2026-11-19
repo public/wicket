@@ -80,10 +80,10 @@ fn any_shape() -> GrantShape {
     GrantShape { zone_wide: kani::any(), prefix: kani::any(), unbounded: kani::any(), git_push: kani::any() }
 }
 
-/// `agentTerms`' refusals under the policy's `agents:` rules (#256; the Lean spec has the
-/// default only): a default `AgentRules` refuses every refusal-shaped grant `agent_terms` refused
-/// before the rules existed (a whole zone, a prefix, no number of uses, a git push), and nothing
-/// else.
+/// `agentTerms`' refusals under the policy's `agents:` rules (#256; Lean: `default_rules_refuse`,
+/// Wicket/Decisions.lean): a default `AgentRules` refuses every refusal-shaped grant `agent_terms`
+/// refused before the rules existed (a whole zone, a prefix, no number of uses, a git push), and
+/// nothing else.
 #[kani::proof]
 fn default_agent_rules_refuse_what_agent_terms_did() {
     let shape = any_shape();
@@ -91,9 +91,10 @@ fn default_agent_rules_refuse_what_agent_terms_did() {
     assert_eq!(refused, shape.zone_wide || shape.prefix || shape.unbounded || shape.git_push);
 }
 
-/// And each rule lifts exactly its own refusal: for any rules and shape, a grant is refused
-/// exactly when it has a refusal-shaped term whose rule is off, and the refusal named is one of
-/// those. So turning one rule on accepts only grants whose sole such term is its own.
+/// And (Lean: `each_rule_lifts_its_own`) each rule lifts exactly its own refusal: for any rules and
+/// shape, a grant is refused exactly when it has a refusal-shaped term whose rule is off, and the
+/// refusal named is one of those. So turning one rule on accepts only grants whose sole such term
+/// is its own.
 #[kani::proof]
 fn each_agent_rule_lifts_only_its_refusal() {
     let (r, s) = (any_rules(), any_shape());
