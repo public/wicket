@@ -71,7 +71,7 @@ theorem metadata_never_public :
     isPublic6 0xffffa9fea9fe = false ∧ isPublic6 0x0064ff9b0000000000000000a9fea9fe = false ∧
     isPublic6 0x2002a9fea9fe00000000000000000000 = false := by decide
 
-/-- A public address stays one (for the record: 192.0.2.0/24's neighbour 192.0.3.1). -/
+/-- The first address past the documentation block 192.0.2.0/24 is public. -/
 theorem neighbour_public : isPublic4 0xc0000301 = true := by decide
 
 /-! ## A grant's end in a node's token (#342): `quota::not_after_for`, `token_secs`, `token_allows` -/
