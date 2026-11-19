@@ -129,13 +129,21 @@ const settled = () => performance.now() - layoutAt >= SETTLE_MS;
 // `after`, if given, runs once the confirmation closes (signed, refused or cancelled). `extra`, if
 // given, adds fields to finish's body only (a secret's value: never sent with begin, never signed).
 let afterConfirm = null;
+// How long the server keeps a begun action's challenge (`CHALLENGE_TTL` in serve/mod.rs).
+const CHALLENGE_MS = 120000;
+let expiryTimer = null;
 async function signed(body, after, extra) {
   if (ceremony) return;
   ceremony = true;
   afterConfirm = after || null;
+  // Something shows between the tap and the sheet (#574, item 6): on a slow link the operator
+  // otherwise taps again, or thinks the tap failed.
+  toast("Preparing\u2026");
   let begin;
   try { begin = await post("/api/action/begin", body); }
   catch (e) { toastError(e); closeConfirm(); return; }
+  document.getElementById("msg").hidden = true;
+  const began = performance.now();
   const go = document.getElementById("confirm-go");
   document.getElementById("confirm-what").textContent = describe(begin.action);
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
@@ -146,8 +154,23 @@ async function signed(body, after, extra) {
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
   go.disabled = true; setTimeout(() => { go.disabled = false; }, SETTLE_MS);
+  // The challenge expires: count it down, and once it has, offer to ask again rather than fail.
+  const state = document.getElementById("confirm-state");
+  clearInterval(expiryTimer);
+  const tick = () => {
+    const left = Math.max(0, CHALLENGE_MS - (performance.now() - began));
+    if (left > 0) { if (!go.dataset.waiting) state.textContent = "Expires in " + Math.floor(left / 60000) + ":" + String(Math.floor(left / 1000) % 60).padStart(2, "0"); return; }
+    clearInterval(expiryTimer);
+    state.textContent = "This expired before it was signed. Nothing was signed.";
+    go.textContent = "Ask again"; go.className = "approve"; go.disabled = false;
+    go.onclick = () => { const again = afterConfirm; afterConfirm = null; closeConfirm(); signed(body, again, extra); };
+  };
+  tick();
+  expiryTimer = setInterval(tick, 1000);
   go.onclick = async () => {
     go.disabled = true;
+    go.dataset.waiting = "1";
+    clearInterval(expiryTimer);
     document.getElementById("confirm-state").textContent = "Waiting for your passkey\u2026";
     try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
     catch (e) { toastError(e); }
@@ -198,6 +221,8 @@ function renderUpdate(box, u) {
   box.append(ul);
 }
 function closeConfirm() {
+  clearInterval(expiryTimer);
+  delete document.getElementById("confirm-go").dataset.waiting;
   document.getElementById("confirm").hidden = true;
   document.getElementById("confirm-go").onclick = null;
   ceremony = false;

@@ -29,6 +29,8 @@ for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runfor
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
+let intervalId = 0;
+const alive = new Set();
 const calls = [];
 let state = null;
 // A hostile string an agent chose (a grant's path): it must stay text.
@@ -93,7 +95,8 @@ const sandbox = {
   performance: { now: () => now },
   setTimeout: (f, ms) => { timers.push({ f, at: now + ms }); return timers.length; },
   clearTimeout: () => {},
-  setInterval: () => 0,
+  setInterval: (f, ms) => { const id = ++intervalId; alive.add(id); const arm = () => timers.push({ f: () => { if (alive.has(id)) { f(); arm(); } }, at: now + ms }); arm(); return id; },
+  clearInterval: id => { alive.delete(id); },
   btoa: s => Buffer.from(s, "binary").toString("base64"),
   atob: s => Buffer.from(s, "base64").toString("binary"),
   Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error, Date,
@@ -146,6 +149,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(what.includes("/harmless") && what.includes("q-a") && what.startsWith("Approve once"), what);
   // #369: the effect it signs, and what else it would allow, are shown before the passkey.
   assert.ok(what.includes("effect 0123456789abcdef"), what);
+  // The challenge counts down, and once it has expired the sheet offers to ask again (#574, item 6).
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 2:00");
   // In lines, the decision first and the ids last (#574, item 1).
   const lines = what.split("\n");
   assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
@@ -218,6 +223,18 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   run("toast(undefined)");
   assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Done.", ""]);
   assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "GET", host: "h", path: "/p", effect: { terms: { uses: 1, ttl_secs: 600 } } }) + ")").startsWith("Approve once for 10 min"));
+  // Left open past the challenge's two minutes: said, nothing signed, and "Ask again" begins anew.
+  await advance(1000);
+  nextAction = { v: 1, action: "decide", request: "q-x", run: "run_a", method: "GET", host: "h", path: "/p", risk: "R0Read", decision: "approve", uses: 1, ttl_secs: 600 };
+  const expiryBegun = began().length;
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 2:00");
+  await advance(121000);
+  assert.strictEqual(ids["confirm-state"].textContent, "This expired before it was signed. Nothing was signed.");
+  assert.strictEqual(ids["confirm-go"].textContent, "Ask again");
+  ids["confirm-go"].click(); await flush();
+  assert.strictEqual(began().length, expiryBegun + 2, "asked again");
+  ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
