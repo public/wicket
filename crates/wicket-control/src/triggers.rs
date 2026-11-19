@@ -304,16 +304,51 @@ pub struct Fired {
     pub detail: String,
 }
 
-/// The minutes in `(from, to]` a schedule matches, in its zone.
+/// Whether `cron` matches a local wall-clock time.
+fn matches_at(cron: &wicket_core::trigger::Cron, dt: jiff::civil::DateTime) -> bool {
+    cron.matches(dt.minute() as u8, dt.hour() as u8, dt.day() as u8, dt.month() as u8, dt.weekday().to_sunday_zero_offset() as u8)
+}
+
+/// The minutes in `(from, to]` a schedule matches, in its zone, read as cron reads wall-clock
+/// time across a daylight-saving change. A schedule with fixed hours (`30 1 * * *`) fires once a
+/// day either way: in an hour the clocks go back over, only the first time the wall clock shows
+/// its minute; in an hour the clocks skip, at the first minute after the gap. A schedule that
+/// runs every hour (`*` hours, `*/15 * * * *`) goes by the clock as it is: through both copies of
+/// a repeated hour, and nothing for minutes that don't exist.
 pub fn schedule_minutes(cron: &wicket_core::trigger::Cron, tz: &jiff::tz::TimeZone, from: i64, to: i64) -> Vec<i64> {
+    let fixed_hours = cron.hours.len() < 24;
+    let local = |m: i64| jiff::Timestamp::from_second(m).ok().map(|ts| ts.to_zoned(tz.clone()));
     let mut out = vec![];
     let mut m = (from.div_euclid(60) + 1) * 60;
     while m <= to {
-        if let Ok(ts) = jiff::Timestamp::from_second(m) {
-            let z = ts.to_zoned(tz.clone());
-            if cron.matches(z.minute() as u8, z.hour() as u8, z.day() as u8, z.month() as u8, z.weekday().to_sunday_zero_offset() as u8) {
-                out.push(m);
+        let Some(z) = local(m) else {
+            m += 60;
+            continue;
+        };
+        let dt = z.datetime();
+        let mut hit = matches_at(cron, dt);
+        if fixed_hours {
+            let before = local(m - 60).map(|p| (p.offset(), p.datetime()));
+            match before {
+                // The clocks went forward between the last minute and this one: the wall-clock
+                // minutes skipped fire here, as cron runs them.
+                Some((off, prev)) if z.offset() > off => {
+                    let mut skipped = prev.checked_add(jiff::Span::new().minutes(1)).ok();
+                    while let Some(t) = skipped.filter(|t| *t < dt) {
+                        hit |= matches_at(cron, t);
+                        skipped = t.checked_add(jiff::Span::new().minutes(1)).ok();
+                    }
+                }
+                // A wall-clock time shown a second time (the clocks went back): fired the first time.
+                _ if hit => {
+                    let first = tz.to_ambiguous_timestamp(dt).earlier().map(|t| t.as_second());
+                    hit = first.map_or(true, |f| f == m);
+                }
+                _ => {}
             }
+        }
+        if hit {
+            out.push(m);
         }
         m += 60;
     }
@@ -894,6 +929,36 @@ mod tests {
         let june = utc("2026-06-17T00:00:00Z");
         assert_eq!(schedule_minutes(&c, &london, june, june + 86400), [utc("2026-06-17T06:00:00Z")]);
         assert!(zone("Mars/Olympus").is_err());
+    }
+
+    /// L1: across the daylight-saving changes in Europe/London (2026: clocks forward 29 March
+    /// 01:00 GMT, back 25 October 02:00 BST), a fixed-hours schedule fires once a day: once in the
+    /// repeated hour, and right after the skipped one. An every-hour schedule goes by the clock.
+    #[test]
+    fn a_schedule_fires_once_across_daylight_saving() {
+        let utc = |s: &str| s.parse::<jiff::Timestamp>().unwrap().as_second();
+        let london = zone("Europe/London").unwrap();
+        let cron = |c: &str| wicket_core::trigger::Cron::parse(c).unwrap();
+        let day = |d: &str| (utc(&format!("{d}T00:00:00Z")) - 3600, utc(&format!("{d}T00:00:00Z")) + 82800);
+        // October: 01:30 comes twice (BST, then GMT); it fires the first time.
+        let (a, b) = day("2026-10-25");
+        assert_eq!(schedule_minutes(&cron("30 1 * * *"), &london, a, b), [utc("2026-10-25T00:30:00Z")]);
+        // March: 01:30 doesn't exist; it fires at 02:00 BST, the first minute after the gap.
+        let (a, b) = day("2026-03-29");
+        assert_eq!(schedule_minutes(&cron("30 1 * * *"), &london, a, b), [utc("2026-03-29T01:00:00Z")]);
+        // 02:00 itself is unaffected, and a job outside the change is too.
+        assert_eq!(schedule_minutes(&cron("0 2 * * *"), &london, a, b), [utc("2026-03-29T01:00:00Z")]);
+        assert_eq!(schedule_minutes(&cron("0 9 * * *"), &london, a, b), [utc("2026-03-29T08:00:00Z")]);
+        // Several skipped minutes still fire once.
+        assert_eq!(schedule_minutes(&cron("0,30 1 * * *"), &london, a, b), [utc("2026-03-29T01:00:00Z")]);
+        // Every quarter-hour goes by the clock: eight in October's repeated hour, none in March's gap.
+        let (a, b) = (utc("2026-10-25T00:00:00Z") - 1, utc("2026-10-25T02:00:00Z") - 1);
+        assert_eq!(schedule_minutes(&cron("*/15 * * * *"), &london, a, b).len(), 8);
+        let (a, b) = (utc("2026-03-29T00:00:00Z") - 1, utc("2026-03-29T01:00:00Z"));
+        assert_eq!(schedule_minutes(&cron("*/15 * * * *"), &london, a, b).len(), 5);
+        // UTC has no changes: nothing moves.
+        let (a, b) = day("2026-03-29");
+        assert_eq!(schedule_minutes(&cron("30 1 * * *"), &jiff::tz::TimeZone::UTC, a, b), [utc("2026-03-29T01:30:00Z")]);
     }
 
     fn operator() -> Operator {
