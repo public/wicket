@@ -23,6 +23,11 @@ Collector's `<endpoint>/v1/logs`; a `store` sink writes objects to the state sto
 ([state off the host](state-off-host-and-restore.md)). The file must be readable, and a `jsonl`
 path writable, by whoever runs wicket: the `wicket` user on an installed host.
 
+
+Once a sink and the state store are both set up, the host keeps the audit table under `host_gb`
+(2 GB by default) by pruning records the sinks already have. Sinks keep everything
+([retention on the host](../reference/audit.md#retention-on-the-host)).
+
 ## 2. Start exporting
 
 Nothing to start: `wicket serve` and every `wicket run` export when the sinks file exists, each sink

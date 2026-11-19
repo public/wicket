@@ -47,6 +47,9 @@ in `$WICKET_AUDIT_SINKS`.
 checkpoint_every: 5m
 # The most records per delivery.
 batch: 500
+# How big the audit table on this host may grow, in GB, before its oldest records are pruned
+# (only with a sink and the state store: see Retention below). Default 2.
+host_gb: 2
 sinks:
   # JSON lines, for journald, Vector or Fluent Bit. path "-" means stdout; only
   # `wicket audit export` writes to stdout.
@@ -156,6 +159,56 @@ A rewritten chain fails this check even if it was consistently re-chained, and s
 one. The files can be wicket's JSON lines, or a Collector `file` exporter's output (OTLP JSON, one
 batch per line), from which the log bodies are read. `--issuer-jwk` checks signatures against a
 public key you keep elsewhere (as `wicket identity issuer` prints it) rather than the local key file.
+
+## Retention on the host
+
+The audit table only grows, so without retention a busy installation's ledger grows by gigabytes.
+On a small installation it grew by about 30 MB a day, mostly `node.audit` records copied up from
+the nodes (#582). wicket prunes the oldest records on the host once the table is over a size limit
+(`host_gb` in the sinks file). How long a sink keeps what it was sent is a separate matter: a
+sink's `retention` is `forever`, the default and so far the only value. Expire old records in the
+sink itself, with a bucket lifecycle rule or a Collector's own retention.
+
+**When it prunes.** Every reconcile pass (`wicket reconcile --every 1m`) checks the table, and
+prunes only when all of these hold:
+
+- the sinks file has at least one sink;
+- the state store streams the ledger off the host (`state-store.yaml` with `ledger:`, run by
+  `wicket state replicate`), so no history is lost with the host;
+- the table's estimated size is over `host_gb`.
+
+It then deletes the oldest records, back towards 90% of the limit (so it isn't pruning on every
+pass). It never cuts past a **checkpoint a sink acknowledged** that **every configured sink has
+exported past**: what is deleted here is in every sink. If no such checkpoint exists yet (a sink
+is behind, or has had no checkpoint), it waits and says so. Without a sink or the state store it
+never prunes, however big the table.
+
+**The anchor.** The checkpoint a prune cuts back to becomes the chain's anchor. Its record is kept,
+the ones before it deleted, and the anchor (seq, hash and the signed checkpoint) is kept in the
+ledger. `wicket audit --verify` starts from the anchor:
+
+- the first record kept must be the anchor's, with the hash its checkpoint signed;
+- the anchor's signature is checked against the issuer key (or `--issuer-jwk`);
+- the chain is walked from there as before, and so are the nodes' chains.
+
+`--verify --against` counts exported records and checkpoints from before the anchor as pruned,
+not as mismatches. The output says how many records were pruned and which sink holds them.
+
+**Space.** Ledgers are created with SQLite's `auto_vacuum = incremental`, and each prune gives the
+freed pages back in chunks of 2,000 pages (8 MB) a transaction, so the file shrinks without long
+locks. A ledger made by an earlier build is switched the first time a prune is due. That takes one
+full `VACUUM`, which rewrites the file under an exclusive lock: about 6 to 8 seconds for a 250 MB
+ledger on a box with network storage, so roughly 5 seconds for 200 MB. Writers wait for it
+(they retry for 5 seconds). The reconcile report says when it happened.
+
+**Why 2 GB by default.** That is about two months of the small installation above. It's well
+within what SQLite handles quickly, and under 5% of a typical 40 to 80 GB control host disk. The
+limit is on the host only: sinks keep everything. At larger scale, keeping node detail on the
+nodes (#582 step 7) is what keeps the table small, and `host_gb` is the backstop.
+
+**Where to see it.** `wicket top` shows the table against its limit and the anchor on its last
+line ("audit 0.18 GB of 2.00 GB, pruned to seq …"), and so does the console, above Activity.
+Reconcile reports `audit_pruned`, or `audit_retention` while it waits.
 
 ## Record kinds
 
