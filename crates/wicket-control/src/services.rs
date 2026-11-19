@@ -380,7 +380,7 @@ mod tests {
         assert!(m.zone.reach.iter().all(|r| r.host == "registry.npmjs.org" && r.methods.iter().all(|x| x == "GET" || x == "HEAD")));
         let root = std::env::temp_dir().join(format!("wicket-svc-example-{}", std::process::id()));
         let snap = snapshot(path, &root).unwrap();
-        for f in ["config.yaml", "package.json", "package-lock.json"] {
+        for f in ["config.yaml", "package.json", "package-lock.json", "start.sh"] {
             assert!(snap.path.parent().unwrap().join("source").join(f).is_file(), "{f} in the snapshot");
         }
         let _ = std::fs::remove_dir_all(&root);
