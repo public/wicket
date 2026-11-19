@@ -36,8 +36,10 @@ mod previous_build;
 mod props;
 mod quota;
 mod receipts;
+mod scale;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
+pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
@@ -140,6 +142,11 @@ pub enum StoreError {
 /// Version 20 (expand) adds `node_ca_policy` and `node_ca_wants` (#573): how a
 /// node's CA may be widened at runtime, and the hosts its boxes want of it. Older builds don't read
 /// them, so the floor stays 17.
+/// Version 21 (expand, after #581's 20) is #582's first step: indexes on what every run's supervisor
+/// and node feed status look up, `node_audit_heads` (each node's last shipped record, kept by a
+/// trigger on `audit`, which an older build fires too), and `grants_archive` and `requests_archive`
+/// for the settled rows of runs long ended. Older builds don't read the new tables (one reading an
+/// archived run's grants sees none), so the floor stays 17.
 /// Version 22 (expand, after #582's 21) adds `node_labels` and `node_taints` (#579): what placement
 /// filters nodes by. Older builds don't read them; the floor stays 17.
 pub const SCHEMA_VERSION: u32 = 22;
@@ -551,6 +558,7 @@ impl Ledger {
         // A build of schema 17 or 18 that opens the ledger again creates it empty, and never reads it.
         conn.execute_batch("DROP TABLE IF EXISTS operator_messages")?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_turns ON messages (to_run, kind, delivered_at)")?;
+        scale::migrate(&conn)?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -587,6 +595,7 @@ impl Ledger {
         conn.execute_batch(capgrant::SCHEMA)?;
         conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(nodelabels::SCHEMA)?;
+        scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
@@ -783,6 +792,10 @@ impl Ledger {
     /// Takes `run`'s cancel requests: who asked, oldest first, of those made within the last
     /// `fresh_secs` (older ones are dropped: a supervisor that was away mustn't cancel a later turn).
     pub fn take_turn_cancels(&mut self, run: &str, fresh_secs: i64) -> Result<Vec<String>> {
+        // Asked several times a second by every supervisor: the write lock only when there is one.
+        if !self.untaken("turn_cancels", run)? {
+            return Ok(vec![]);
+        }
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let t = now();
         let by: Vec<String> = {
@@ -796,6 +809,16 @@ impl Ledger {
         Ok(by)
     }
 
+    /// Whether `run` has an ask in `table` (`turn_cancels` or `mode_changes`) not yet taken: a read,
+    /// so a supervisor with nothing to take doesn't take the write lock (#582).
+    fn untaken(&self, table: &str, run: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE run = ?1 AND consumed_at IS NULL)"),
+            params![run],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Asks `run`'s supervisor to change its driven session's permission mode while it runs (#363),
     /// to `mode` as the manifest spells it. Taken within a second or so, like a turn cancel.
     pub fn request_mode_change(&self, run: &str, mode: &str, by: &str) -> Result<i64> {
@@ -806,6 +829,9 @@ impl Ledger {
     /// Takes `run`'s mode changes: (mode, who asked), oldest first, of those made within the last
     /// `fresh_secs` (older ones are dropped, as stale cancels are).
     pub fn take_mode_changes(&mut self, run: &str, fresh_secs: i64) -> Result<Vec<(String, String)>> {
+        if !self.untaken("mode_changes", run)? {
+            return Ok(vec![]);
+        }
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let t = now();
         let asked: Vec<(String, String)> = {
@@ -1212,11 +1238,18 @@ impl Ledger {
         Ok((id, true))
     }
 
+    /// A request of a run ended long ago is read from the archive (#582).
     pub fn request(&self, id: &str) -> Result<Request> {
-        self.conn
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests WHERE id = ?1", params![id], row_to_request)
-            .optional()?
-            .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))
+        for table in ["requests", "requests_archive"] {
+            let found = self
+                .conn
+                .query_row(&format!("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM {table} WHERE id = ?1"), params![id], row_to_request)
+                .optional()?;
+            if let Some(r) = found {
+                return Ok(r);
+            }
+        }
+        Err(StoreError::NoSuchRequest(id.to_string()))
     }
 
     /// The most recent runs, newest first.
