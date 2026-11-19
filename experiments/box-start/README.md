@@ -24,6 +24,18 @@ experiments/box-start/measure.sh -n 20 --isolation runc      # the same without 
 Run it alone on the host: other load shows up in every span. The raw spans of each run go to
 `logs/<label>-<time>.jsonl`.
 
+`runsc-trace.sh` looks inside runsc's own start (#287, `box.entry.runtime`). It adds `--debug
+--debug-log` to runsc's `runtimeArgs` for a few `measure.sh` starts, then puts `daemon.json` back.
+It prints, for the last box, each runsc command's first and last line (create, gofer, boot, start,
+…) and the 15 largest gaps between lines, each with the line after it:
+
+```sh
+sudo -E experiments/box-start/runsc-trace.sh -n 3 --keep /tmp/runsc-trace
+```
+
+It restarts Docker twice, so run it on a node with no boxes. The debug log slows runsc, so read the
+gaps, not the totals.
+
 ## The spans
 
 On the control host (the supervisor, `wicket run`):
