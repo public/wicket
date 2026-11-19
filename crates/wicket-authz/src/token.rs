@@ -154,6 +154,15 @@ pub fn grant(token: &Token, approver: &SigningKey, g: &Grant) -> Result<Token, A
     token.add_grant(&approver.public(), signed)
 }
 
+/// [`grant`] for a standing grant (#572): `g`'s host, every method and path glob of `rule`
+/// (`g.path` is unused), within a reach rule's risk unless `rule.allow_dangerous`. A node accepts
+/// one from protocol 17.
+pub fn grant_standing(token: &Token, approver: &SigningKey, g: &Grant, rule: &crate::StandingRule) -> Result<Token, AuthzError> {
+    let block = crate::generator::grant_standing_code(g, rule)?.block()?;
+    let signed = token.grant_request()?.0.create_block(&approver.0, block).map(SignedGrant).map_err(enc)?;
+    token.add_grant(&approver.public(), signed)
+}
+
 /// [`grant`] for a path-prefix grant (#257 4a): `g.path` is the prefix, canonical and ending in
 /// `/`; the grant covers the directory itself and every path under it, as the ledger's does. A node
 /// before protocol 16 refuses a token with such a block (its structural check doesn't admit it), so
