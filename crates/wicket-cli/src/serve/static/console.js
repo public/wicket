@@ -706,7 +706,16 @@ function fromHash() {
 // Signed out, the server answers /api/me with 401 and tells the page nothing else: the page offers
 // passkey sign-in (and says where enrolment links come from) whatever the server's state.
 async function boot() {
-  const r = await fetch("/api/me");
+  // Signed out is what the server says (401, 403, or who: none); a server that can't answer now (a
+  // restart's 502, a network error) is retried, not shown as a sign-in (#574).
+  let r;
+  try { r = await fetch("/api/me"); } catch (e) { r = null; }
+  if (!r || (!r.ok && r.status !== 401 && r.status !== 403)) {
+    showStale(r ? "HTTP " + r.status : "no answer");
+    setTimeout(boot, 5000);
+    return;
+  }
+  showStale(null);
   const me = r.ok ? await r.json() : { who: { state: "none" } };
   const auth = document.getElementById("auth"), con = document.getElementById("console");
   auth.replaceChildren();
@@ -1075,11 +1084,29 @@ async function submitSecret(ev) {
   else signed({ action: "delete_secret", name: m.name });
 }
 
+// When the console last heard from wicket, and a line saying so while it can't (#574): what is on
+// the page is as of then, and the poll goes on.
+let lastHeard = 0;
+function showStale(why) {
+  const b = document.getElementById("stale");
+  if (!b) return;
+  if (!why) { b.hidden = true; return; }
+  b.hidden = false;
+  const since = lastHeard ? " since " + new Date(lastHeard).toISOString().slice(11, 19) + "Z; what is shown is as of then" : "";
+  b.textContent = "Can't reach wicket (" + why + ")" + since + ". Retrying.";
+}
+
 async function refresh() {
   if (ceremony) return;
+  let r;
+  try { r = await fetch("/api/state"); } catch (e) { showStale("no answer"); return; }
+  // Only the server saying the session is gone signs the page out; anything else is a moment's
+  // trouble, said as such, and the poll carries on.
+  if (r.status === 401 || r.status === 403) { boot(); return; }
+  if (!r.ok) { showStale("HTTP " + r.status); return; }
+  lastHeard = Date.now();
+  showStale(null);
   try {
-    const r = await fetch("/api/state");
-    if (!r.ok) { boot(); return; }
     const s = await r.json();
     if (ceremony) return; // opened while this poll was in flight
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
