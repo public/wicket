@@ -59,6 +59,10 @@ pub fn feed_config() -> PublisherConfig {
 /// A node's delta log past this size starts a new feed generation when no box holds authority from it.
 const COMPACT_BYTES: u64 = 1 << 20;
 
+/// A node's health is written to the ledger at most this often (ms), whichever of its runs'
+/// connections has it first: each reports the same, every 30 s.
+const HEALTH_WRITE_MS: i64 = 20_000;
+
 /// A node feed's directory holds this file when its feed must start a new generation the next time
 /// it is opened (after a restore, #154: its delta log stayed behind).
 pub const REGENESIS: &str = "regenesis";
@@ -1435,9 +1439,18 @@ async fn on_frame(
             }
             // The node's health (#377): its latest, per node, for `wicket top`, the console and its
             // alerts (each run's connection to the node reports it; the latest wins).
+            //
+            // Every run's connection to the node gets the same report: one written per node every
+            // 20 s is enough (#582), and the rest are a read, not the ledger's write lock. Placement
+            // reads the row as its capacity index (#579).
             Msg::Health { health } => {
-                if let Ok(j) = serde_json::to_string(&health) {
-                    let _ = sh.ledger.lock().expect("ledger").set_node_health(&sh.node, wicket_feed::now_ms(), &j);
+                let now = wicket_feed::now_ms();
+                let l = sh.ledger.lock().expect("ledger");
+                let fresh = l.node_health_at(&sh.node).ok().flatten().is_some_and(|at| now - at < HEALTH_WRITE_MS);
+                if !fresh {
+                    if let Ok(j) = serde_json::to_string(&health) {
+                        let _ = l.set_node_health(&sh.node, now, &j);
+                    }
                 }
             }
             Msg::Spent { run, spent, first_request_ms } if run == sh.run.0 => {

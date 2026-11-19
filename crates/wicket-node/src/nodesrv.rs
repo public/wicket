@@ -473,12 +473,15 @@ impl Node {
         let (oom_kills, last_oom) = self.ooms.get();
         let (persist_failures, last_persist_failure) = self.persists.get();
         let ca = std::fs::read(self.paths.root.join("ca.pem")).ok().and_then(|pem| ca_validity(&pem));
+        let capacity = self.capacity();
         crate::health::NodeHealth {
             ca_not_before: ca.map(|c| c.0),
             ca_not_after: ca.map(|c| c.1),
             at_ms: now,
             disk: crate::health::Disk { reserve_bytes: self.reserve.held(), ..crate::health::disk(&self.paths.root) },
-            memory: crate::health::Memory { total_mib, available_mib, committed_mib: self.capacity().used_memory_mib },
+            memory: crate::health::Memory { total_mib, available_mib, committed_mib: capacity.used_memory_mib },
+            // What placement reads (#579): the same as its Welcome's.
+            capacity: Some(capacity),
             feed_mode: mode,
             feed_fresh_until_ms: fresh_until,
             oom_kills,
@@ -652,7 +655,7 @@ impl Node {
     fn report_health(&self) {
         let h = self.health();
         for l in self.links.lock().expect("links").values() {
-            let _ = l.out.send(Frame::Msg(Msg::Health { health: h.clone() }));
+            let _ = l.out.send(Frame::Msg(Msg::Health { health: Box::new(h.clone()) }));
         }
     }
 
