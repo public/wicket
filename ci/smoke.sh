@@ -87,3 +87,17 @@ if [ "$fail" != 0 ]; then
   exit 1
 fi
 echo "smoke test passed"
+
+# In CI, where a box's start goes (#287): experiments/box-start/measure.sh's medians over 8 starts
+# of a trivial program box (after a warm-up), the runtime's and the box's own spans as an annotation
+# on the run, to compare a change's start with main's. Never fails the smoke test.
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+  echo "== box start spans (experiments/box-start/measure.sh -n 8)"
+  if spans=$(WICKET="$WICKET" experiments/box-start/measure.sh -n 8 ${IMAGE:+--image "$IMAGE"} --label ci 2>&1); then
+    echo "$spans"
+    keep=$(grep -E 'wicket run, end to end|docker\.run|box\.(started|entry|exec)' <<<"$spans" || true)
+    [ -z "$keep" ] || echo "::notice title=box start spans (median and p90, ms; 8 starts)::$(sed 's/%/%25/g' <<<"$keep" | awk '{ printf "%s%%0A", $0 }')"
+  else
+    echo "box start spans: not measured"; tail -n 20 <<<"$spans"
+  fi
+fi
