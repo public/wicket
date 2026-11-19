@@ -1246,8 +1246,9 @@ mod tests {
         assert_eq!(negotiate(5, 5), Ok(5));
         assert_eq!(negotiate(5, 4), Ok(4), "a control host at N, a node at N-1");
         assert_eq!(negotiate(4, 5), Ok(4), "a node at N, a control host rolled back to N-1");
-        assert!(negotiate(5, 3).unwrap_err().contains("at most 1 apart"));
-        assert!(negotiate(3, 5).is_err());
+        assert_eq!(negotiate(5, 3), Ok(3), "within a skew of 2");
+        assert!(negotiate(5, 2).unwrap_err().contains("at most 2 apart"));
+        assert!(negotiate(2, 5).is_err());
         assert!(negotiate(PROTOCOL, 0).unwrap_err().contains("before protocol versions"));
     }
 
