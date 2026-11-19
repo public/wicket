@@ -112,18 +112,30 @@ wicket node revoke n1
 - **Widening the node CA at runtime** (#573). `wicket node set <node> --ca-hosts auto` (or a list such as
   `api.example.com,*.example.org`) lets the control host add hosts to a node's CA when its boxes need them:
   - before a box starts, the inspected hosts its zone reaches, injects into, swaps a credential for or calls as
-    its model host, and the hosts of grants published to it, are compared with the CA's name constraints;
+    its model host, and the hosts of its live grants, are compared with the operator's hosts (`nodes.hosts`,
+    from enrolment or `wicket node renew-ca`), not with the CA as it is now, so a host two runs need stays while
+    either runs; a grant's host is wanted again when it is handed to the node;
   - what's missing and allowed is recorded as wanted by that run, and the box's start waits (up to 60 s) for a
-    renewal over the channel signed for the operator's hosts plus every live want, at most 64 entries;
+    renewal over the channel;
+  - every renewal signs the operator's hosts plus the live runs' wants (under `fixed`, the operator's hosts
+    alone), so what no run wants any more goes at the next one; a run's wants end with it, however it ends;
+  - only what a node CA may be constrained to is ever wanted: never `*`, an IP, a single label (`intranet`, or
+    `*.com`), or a label outside letters, digits, `-` and `_`; names are canonical (punycode). `--ca-hosts`
+    refuses the same;
+  - at most 64 name constraints: the operator's hosts are always kept, and the room left is shared a run at a
+    time; what doesn't fit is audited `node.ca_wants_dropped`. If the widened CA can't be signed, the operator's
+    hosts are (`node.ca_widen_failed`), so the CA never lapses for a want;
   - the renewal is audited `node.ca_renewed` and `node.ca_widened` (hosts added and removed, and the runs that
-    wanted them);
-  - a run's wants end with it, and the next due renewal prunes the hosts no box wants any more;
+    wanted them); `wicket node set` is audited `node.ca_policy`, with who set it;
   - a box's `request_access` for an https host outside the CA is asked for when the policy (as it was when the
-    box started) lets the CA be widened to that host: its approval's grant is wanted like the box's reach.
-    Otherwise the node answers "not requested", naming `wicket node set <node> --ca-hosts` (#571).
+    box started) lets the CA be widened to that host: its approval's grant is wanted like the box's reach. A
+    grant whose host the policy keeps out by the time it is published is said in the run's output and audited
+    `node.ca_want_refused`. Otherwise the node answers "not requested", naming
+    `wicket node set <node> --ca-hosts` (#571);
+  - revoking a node, or enrolling a machine under its name again, clears its policy and wants.
 
-  The default is `fixed`: the CA keeps its hosts, as before, and a box start says which hosts it would need.
-  The local node's CA is unconstrained, so none of this applies to it.
+  The default is `fixed`: the CA keeps the operator's hosts, as before, and a box start says which hosts it would
+  need. The local node's CA is unconstrained, so none of this applies to it.
 - **Name constraints are subtrees.** `api.example.com` also permits names under it (`x.api.example.com`), and
   `*.example.org` permits every name under `example.org` but not `example.org` itself. X.509 can't express
   "exactly this host". The reach rules stay the exact gate, and the constraint bounds what a stolen node CA can

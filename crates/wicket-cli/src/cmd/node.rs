@@ -69,16 +69,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     .await
             }
             NodeCmd::Set { name, ca_hosts } => {
-                let l = Ledger::open(&ledger_path())?;
-                anyhow::ensure!(l.node(&name)?.is_some(), "node {name} is not enrolled");
                 let policy = wicket_store::CaHosts::parse(&ca_hosts).map_err(anyhow::Error::msg)?;
-                l.set_node_ca_policy(&name, &policy)?;
-                l.audit(
-                    &wicket_core::TenantId::single(),
-                    None,
-                    "node.ca_policy",
-                    &serde_json::json!({ "name": name, "ca_hosts": policy }),
-                )?;
+                let l = Ledger::open(&ledger_path())?;
+                l.set_node_ca_policy_audited(&name, &policy, &operator())?;
                 println!(
                     "node {name}: its CA is widened at runtime {}",
                     match &policy {

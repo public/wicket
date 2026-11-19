@@ -606,6 +606,8 @@ impl Ledger {
         )?;
         // So are the grants bound to it: nothing else may use them (#127).
         self.conn.execute("UPDATE grants SET revoked = 1 WHERE run = ?1 AND revoked = 0", params![run.0])?;
+        // And what it wanted of its node's CA (#573), on every way a run ends.
+        self.drop_node_ca_wants(&run.0)?;
         self.close_links_of(&run.0)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
@@ -1922,6 +1924,8 @@ impl Ledger {
                 node.enrolled_at
             ],
         )?;
+        // A machine enrolled under a name starts with no CA policy or wants (#573).
+        nodeca::forget_node_ca(&tx, &node.name)?;
         insert_node_ca(&tx, ca)?;
         tx.commit()?;
         Ok(())
@@ -2021,6 +2025,7 @@ impl Ledger {
             tx.execute("UPDATE node_cas SET status = 'revoked', revoked_at = ?2 WHERE serial = ?1", params![s, t])?;
         }
         tx.execute("UPDATE node_certs SET status = 'revoked', revoked_at = ?2 WHERE node = ?1 AND status != 'revoked'", params![name, t])?;
+        nodeca::forget_node_ca(&tx, name)?;
         tx.commit()?;
         Ok(serials)
     }
@@ -2155,6 +2160,29 @@ mod node_tests {
         assert!(l.enrol_node(&t2, &node("n1"), &ca("n1", "02")).is_err(), "n1 is enrolled already");
         assert!(l.enrol_node(&t, &node("n1"), &ca("n1", "03")).is_err(), "second use");
         assert!(matches!(l.check_node_token("wkt_nope", now()), Err(StoreError::Token("unknown"))));
+    }
+
+    /// #573's review, 4 and 7: a node's CA policy is set and audited together, with who set it;
+    /// revoking a node, or enrolling a machine under its name again, starts with no policy and no
+    /// wants (not another machine's `auto`).
+    #[test]
+    fn a_nodes_ca_policy_goes_with_it_and_is_audited_with_its_setter() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        assert!(l.set_node_ca_policy_audited("n1", &CaHosts::Auto, "alex").is_err(), "not enrolled");
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0a")).unwrap();
+        l.set_node_ca_policy_audited("n1", &CaHosts::Auto, "alex").unwrap();
+        let a = l.audit_tail(1).unwrap();
+        assert!(a[0].2 == "node.ca_policy" && a[0].4.contains("\"by\":\"alex\""), "{a:?}");
+        l.run_started(&TenantId::single(), &RunId("run_a".into()), "z", "a").unwrap();
+        l.want_node_ca_hosts("n1", &["x.example.com".into()], "run_a", "reach", 1).unwrap();
+        l.revoke_node("n1").unwrap();
+        assert_eq!(l.node_ca_policy("n1").unwrap(), CaHosts::Fixed);
+        assert!(l.node_ca_wants("n1").unwrap().is_empty());
+        l.set_node_ca_policy("n1", &CaHosts::Auto).unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0b")).unwrap();
+        assert_eq!(l.node_ca_policy("n1").unwrap(), CaHosts::Fixed, "a new machine under the name");
     }
 
     #[test]
