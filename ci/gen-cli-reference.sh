@@ -64,6 +64,36 @@ only: [the daemon](daemon.md#who-may-run-what) lists which commands need `sudo`.
 numbers with units (`90s`, `10m`, `1h`, `1h 30m`; the units in [the manifest
 reference](manifest.md)).
 
+## Output for scripts
+
+The commands that list things take `--json`: `pending`, `top`, `agents`, `links`, `grant list`,
+`standing list`, `node list`, `service list` and `audit` (and `why-here`, `zone` and `node top`,
+which print one record). With it, stdout holds one JSON document and nothing else: a list is an
+array, `[]` when there is nothing to list, and `top --json` is one frame, an object. Messages and
+warnings go to stderr. A field is never renamed or removed, and its meaning doesn't change; new
+fields may be added, so a script should ignore fields it doesn't know. A field with nothing in it
+is `null`, not left out. Times are Unix seconds (`…_at`, `expires_at`, `not_after`), except
+`top`'s, which are Unix milliseconds (`…_ms`). What an agent wrote (a reason, a rule, an
+attribution) is as it wrote it: shown to a person, it needs the cleaning the text output gives it.
+
+| Output | Fields |
+| --- | --- |
+| `wicket pending --json`, a request | `kind` (`request`), `id`, `run`, `zone`, `method`, `host`, `path`, `prefix` (the whole path prefix asked for), `risk`, `reason`, `created_at`, `attribution` (who in the box asked, as the agent reported it: untrusted) |
+| `wicket pending --json`, a standing ask | `kind` (`standing`), `id`, `run`, `zone`, `principal`, `rule`, `reason`, `created_at` |
+| a standing `rule` | `host`, `methods`, `paths`, `allow_dangerous` |
+| `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
+| `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
+| `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
+| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`) |
+| `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
+| `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
+| `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
+| an agent's `used` | `requests`, `input_tokens`, `output_tokens`, `secs` |
+| `wicket top --json` | `now_ms`, `nodes`, `runs`, `pending` (how many requests wait), `leases` |
+| `wicket top --json`, each of `nodes` | `name`, `status`, `connected` (null: no run's supervisor has talked to it), `since_ms`, `boxes`, `capacity`, `health` |
+| `wicket top --json`, each of `runs` | `run`, `node`, `agent`, `zone`, `status`, `started_ms`, `spent`, `connected` |
+| `wicket top --json`, each of `leases` | `id`, `provider`, `run`, `node`, `not_after_ms`, `reserved_micro_usd` |
+
 EOF
     toc ""
     printf '\n'

@@ -665,29 +665,70 @@ pub async fn node_top(dir: Option<std::path::PathBuf>, once: bool, json: bool) -
 }
 
 /// `wicket top`: the control host's view, across its nodes.
-pub async fn control_top(once: bool) -> Result<()> {
+pub async fn control_top(once: bool, json: bool) -> Result<()> {
+    if json {
+        let f = live_frame(wicket_feed::now_ms()).await?;
+        return crate::cmd::print_json(&control_json(&f));
+    }
     show(once, |w| async move {
         let now = wicket_feed::now_ms();
-        let f = wicket_store::Ledger::open(&crate::ledger_path())
-            .map_err(anyhow::Error::from)
-            .and_then(|l| control_frame(&l, &crate::data_dir().join("runs"), now));
-        match f {
-            Ok(mut f) => {
-                // This host's own node answers its status socket here.
-                if let Ok(sock) = crate::localnode::socket() {
-                    if let Ok(s) = read_status(&status_socket(&sock)).await {
-                        if let Some(n) = f.nodes.iter_mut().find(|n| n.name == crate::localnode::NAME) {
-                            n.link = Some((s.control.connections > 0, s.control.since_ms));
-                            n.boxes = s.boxes.iter().filter(|b| b.state != "exited").count();
-                        }
-                    }
-                }
-                render_control(&f, w)
-            }
+        match live_frame(now).await {
+            Ok(f) => render_control(&f, w),
             Err(e) => fit_all(vec![format!("wicket top — {}", clock(now)), format!("the ledger can't be read: {e:#}")], w),
         }
     })
     .await
+}
+
+/// The control host's frame now: the ledger's, with this host's own node from its status socket.
+async fn live_frame(now: i64) -> Result<ControlFrame> {
+    let l = wicket_store::Ledger::open(&crate::ledger_path())?;
+    let mut f = control_frame(&l, &crate::data_dir().join("runs"), now)?;
+    if let Ok(sock) = crate::localnode::socket() {
+        if let Ok(s) = read_status(&status_socket(&sock)).await {
+            if let Some(n) = f.nodes.iter_mut().find(|n| n.name == crate::localnode::NAME) {
+                n.link = Some((s.control.connections > 0, s.control.since_ms));
+                n.boxes = s.boxes.iter().filter(|b| b.state != "exited").count();
+            }
+        }
+    }
+    Ok(f)
+}
+
+/// `wicket top --json`: one frame. Times are Unix ms here, as the node's status has them.
+/// `connected` is null for a node no run's supervisor has talked to, and for a run not yet seen.
+pub fn control_json(f: &ControlFrame) -> serde_json::Value {
+    let nodes: Vec<_> = f
+        .nodes
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "name": n.name, "status": n.status, "connected": n.link.map(|l| l.0), "since_ms": n.link.map(|l| l.1),
+                "boxes": n.boxes, "capacity": n.capacity, "health": n.health,
+            })
+        })
+        .collect();
+    let runs: Vec<_> = f
+        .runs
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "run": r.run, "node": r.node, "agent": r.agent, "zone": r.zone, "status": r.status, "started_ms": r.started_ms,
+                "spent": r.spent, "connected": r.connected,
+            })
+        })
+        .collect();
+    let leases: Vec<_> = f
+        .leases
+        .iter()
+        .map(|x| {
+            serde_json::json!({
+                "id": x.id, "provider": x.provider, "run": x.run, "node": x.node, "not_after_ms": x.not_after.map(|t| t * 1000),
+                "reserved_micro_usd": x.reserved_micro_usd,
+            })
+        })
+        .collect();
+    serde_json::json!({ "now_ms": f.now_ms, "nodes": nodes, "runs": runs, "pending": f.pending, "leases": leases })
 }
 
 #[cfg(test)]
