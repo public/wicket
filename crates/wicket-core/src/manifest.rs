@@ -1049,11 +1049,13 @@ impl Manifest {
     }
 }
 
-/// A reach or forbid rule's path glob, as a manifest may have it: absolute (a request's path always
-/// is, `canon::canonical_path`), and one globset compiles. A glob without its leading `/` never
-/// matches a request, so in a forbid rule it forbids nothing and in a reach rule it allows nothing,
-/// and `subset::check` could admit it under a parent's `/**` while the parent's own glob doesn't
-/// match what it does (fuzz findings: `fuzz/regressions/manifest/relative-*`).
+/// A reach or forbid rule's path glob, as a manifest may have it: starting with `/`, as a request's
+/// path always does (`canon::canonical_path`), and one globset compiles. Some globs that don't start
+/// with `/` match absolute paths anyway (`**/merge`, `{/a/**,/b}`, `[/]repos/*`); others
+/// (`repos/**`) match none, and `subset::check` could admit one of those under a parent's `/**`
+/// while the parent's glob doesn't match what it does (the manifest fuzzer's
+/// `fuzz/regressions/manifest/relative-*`). Requiring the leading `/` refuses both kinds; a glob of
+/// the first is written `/**/merge` instead.
 fn check_path_glob(kind: &str, p: &str) -> Result<(), ManifestError> {
     if !p.starts_with('/') {
         return Err(ManifestError::Invalid(format!("{kind} path {p:?} must start with / (a request's path always does)")));
@@ -1237,9 +1239,9 @@ mod tests {
         assert!(!y.contains("uses") && !y.contains("service"), "{y}");
     }
 
-    /// A reach or forbid path glob must be absolute: one without its leading `/` matches no request,
-    /// and `subset::check` could admit it under a parent's `/**` (the manifest fuzzer's
-    /// `relative-child-*` findings).
+    /// A reach or forbid path glob must start with `/`: one that doesn't either matches no request
+    /// (`subset::check` could admit it under a parent's `/**`, the manifest fuzzer's
+    /// `relative-child-*` findings) or is spelt without it (`**/merge`, written `/**/merge`).
     #[test]
     fn a_path_glob_starts_with_a_slash() {
         let m =
