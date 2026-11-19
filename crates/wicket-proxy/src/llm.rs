@@ -24,6 +24,18 @@ const DRAIN_AFTER_DISCONNECT: std::time::Duration = std::time::Duration::from_se
 /// (a harness rewriting its login file, or its secret helper restarting), then it fails, naming the
 /// secret and the cause.
 pub const SECRET_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a call refused with a 401 waits for its secret to change before the 401 goes to the box
+/// (#552). A login refresh revokes the old access token when the new one is issued, and its owner
+/// writes the new one a moment later: read once at once, the secret is often still the old value.
+#[cfg(not(test))]
+pub const RELOGIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// In tests, shorter: the race tests write the new token well within it.
+#[cfg(test)]
+pub const RELOGIN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often, while waiting, the secret is read again.
+const RELOGIN_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// What a refusal for an unreadable model secret suggests.
 const SECRET_UNAVAILABLE_FIX: &str =
     "On the host, `wicket doctor` checks every secret; a login linked from a file wicket can't read can be served by `wicket secret serve` \
@@ -411,8 +423,9 @@ impl Llm {
 
     /// Sends a call upstream with the model secret's current value; if the upstream refuses that
     /// value (401: a login refreshed by its owner while the call was out revokes the old access
-    /// token, #360), reads the secret again from its source and, only if the value changed, sends
-    /// the call once more with the new one. The retry is audited; an unchanged value is never sent
+    /// token, #360), reads the secret again from its source, for up to [`RELOGIN_WAIT`] until it
+    /// changes (#552: the owner writes the new token a moment after the old one is revoked) and,
+    /// only if the value changed, sends the call once more with the new one. The retry is audited; an unchanged value is never sent
     /// again, so a real revocation still surfaces as the 401. Nothing of the first response has
     /// reached the box when this decides (its body is only streamed by [`Llm::account`], after),
     /// and the request body is the one this proxy holds, so the box sees one call either way.
@@ -430,16 +443,16 @@ impl Llm {
         if first.status() != StatusCode::UNAUTHORIZED {
             return Ok(first);
         }
-        let fresh = match self.ctx.vault.refetch(&spec.secret).await {
-            Ok(()) => self.ctx.vault.get_for_patiently(&spec.secret, &up_host, SECRET_PATIENCE).await,
-            Err(e) => Err(e),
-        };
-        let fresh = match fresh {
-            Ok(f) if f != token => f,
-            Ok(_) => {
+        // Read again until the value changes, for up to RELOGIN_WAIT (#552): the refresh that revoked
+        // this token may not have written the new one yet. A value that stays the same is a real
+        // revocation, and its 401 goes to the box.
+        let fresh = match Self::changed_secret(&self.ctx.vault, &spec.secret, &up_host, &token).await {
+            Ok(Some(f)) => f,
+            Ok(None) => {
                 note.push_str(&format!(
-                    "; upstream refused the credential (401); secret {:?} read again is unchanged: not retried",
-                    spec.secret
+                    "; upstream refused the credential (401); secret {:?} read again for {}s is unchanged: not retried",
+                    spec.secret,
+                    RELOGIN_WAIT.as_secs()
                 ));
                 return Ok(first);
             }
@@ -463,6 +476,24 @@ impl Llm {
         );
         note.push_str(&format!("; retried once after a 401 with the new value of secret {:?}", spec.secret));
         self.send_upstream(spec, parts, body, &fresh).await
+    }
+
+    /// Reads secret `name` again from its source until its value is no longer `old`, for up to
+    /// [`RELOGIN_WAIT`] (#552: a login refresh revokes the old token before its owner writes the new
+    /// one). `Ok(Some(new))` if it changed, `Ok(None)` if it stayed `old` (a real revocation).
+    async fn changed_secret(vault: &crate::vault::Vault, name: &str, host: &str, old: &str) -> Result<Option<String>> {
+        let deadline = tokio::time::Instant::now() + RELOGIN_WAIT;
+        loop {
+            vault.refetch(name).await?;
+            let now = vault.get_for_patiently(name, host, SECRET_PATIENCE).await?;
+            if now != old {
+                return Ok(Some(now));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(RELOGIN_POLL).await;
+        }
     }
 
     async fn send_upstream(
@@ -686,12 +717,67 @@ impl Llm {
         // `Accept-Encoding` would get a compressed stream that the usage scanner can't read.
         parts.headers.insert(http::header::CONTENT_LENGTH, f.body.len().into());
         parts.headers.insert(http::header::ACCEPT_ENCODING, http::HeaderValue::from_static("identity"));
+        // What a retry after a 401 needs (#552): the request again, and the secret the egress proxy
+        // puts on it with the value it puts on now.
+        let again = (parts.method.clone(), parts.uri.clone(), parts.version, parts.headers.clone(), f.body.clone());
+        let secret = egress.credential_secret(host, &parts.headers);
+        let before = match &secret {
+            Some(name) => match egress.ctx.vault.ensure(name).await {
+                Ok(()) => egress.ctx.vault.get_for(name, host).ok(),
+                Err(_) => None,
+            },
+            None => None,
+        };
         let req = Request::from_parts(parts, http_body_util::Full::new(f.body));
         // Sent: a box that gives up on it now leaves it charged its reservation, as a call whose
         // final usage wasn't seen (the provider may bill it).
         held.sent();
         let sent = egress.forward(req, host, "https", pq, via).await;
         let reserved = held.take();
+        // The upstream refused the credential (401): a login refreshed by its owner while the call
+        // was out revokes the old token (#360, #552). Wait for the secret to change and send the
+        // call once more with the new value; an unchanged one is a real revocation, passed on. The
+        // box has seen nothing of the first answer yet. Either way the call's note says so.
+        let mut relogin = String::new();
+        let sent = match (sent, &secret, &before) {
+            (Ok(resp), Some(name), Some(old)) if resp.status() == StatusCode::UNAUTHORIZED => {
+                match Self::changed_secret(&egress.ctx.vault, name, host, old).await {
+                    Ok(Some(_)) => {
+                        drop(resp);
+                        self.event(
+                            f.model.clone(),
+                            401,
+                            Usage::default(),
+                            &format!("upstream refused the credential (401); secret {name:?} has changed since it was read: retrying once with its new value"),
+                        );
+                        relogin = format!("; retried once after a 401 with the new value of secret {name:?}");
+                        let (method, uri, version, headers, body) = again;
+                        let mut b = Request::builder().method(method).uri(uri).version(version);
+                        if let Some(h) = b.headers_mut() {
+                            *h = headers;
+                        }
+                        match b.body(http_body_util::Full::new(body)) {
+                            Ok(req) => egress.forward(req, host, "https", pq, via).await,
+                            Err(e) => Err(anyhow::Error::from(e)),
+                        }
+                    }
+                    Ok(None) => {
+                        relogin = format!(
+                            "; upstream refused the credential (401); secret {name:?} read again for {}s is unchanged: not retried",
+                            RELOGIN_WAIT.as_secs()
+                        );
+                        Ok(resp)
+                    }
+                    Err(e) => {
+                        relogin = format!(
+                            "; upstream refused the credential (401); secret {name:?} could not be read again ({e:#}): not retried"
+                        );
+                        Ok(resp)
+                    }
+                }
+            }
+            (sent, ..) => sent,
+        };
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -701,6 +787,7 @@ impl Llm {
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|v| v.starts_with("text/event-stream"));
                 let mut note = f.note;
+                note.push_str(&relogin);
                 // An upstream that encodes anyway: its usage can't be read, so say why it is charged.
                 if let Some(enc) =
                     resp.headers().get(http::header::CONTENT_ENCODING).filter(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
@@ -2173,6 +2260,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A linked login and an upstream that accepts only `tok-new`; the refused call's `on_reject`
+    /// writes `tok-new` into the login after `delay`, as a refresh's owner does a moment after the
+    /// old token is revoked (#552). Returns the proxy, the bearers seen, and the directory.
+    async fn relogin_after(
+        delay: std::time::Duration,
+        tag: &str,
+    ) -> (std::sync::Arc<super::Llm>, std::sync::Arc<std::sync::Mutex<Vec<String>>>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("wicket-llm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds = dir.join("creds.json");
+        fn write(p: &std::path::Path, t: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = p.with_extension("tmp");
+            std::fs::write(&tmp, format!(r#"{{"o":{{"accessToken":"{t}"}}}}"#)).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(&tmp, p).unwrap();
+        }
+        write(&creds, "tok-old");
+        let c2 = creds.clone();
+        let (port, seen) = relogin_upstream("tok-new", move || {
+            let c3 = c2.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                write(&c3, "tok-new");
+            });
+        })
+        .await;
+        let vault = crate::vault::Vault::new(dir.join("vault"));
+        vault.link("model", creds.to_str().unwrap(), Some("/o/accessToken"), None, None).unwrap();
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let mut c =
+            ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &format!("{{secret: model, upstream: 'http://127.0.0.1:{port}'}}"));
+        c.vault = vault;
+        (super::Llm::new(c).unwrap(), seen, dir)
+    }
+
+    /// #552: the login's new token is written a moment after the upstream refused the old one (the
+    /// refresh revokes first). The call waits for it, is sent once more with it, and succeeds; the
+    /// box never sees the 401.
+    #[tokio::test]
+    async fn a_login_written_just_after_the_401_is_waited_for() {
+        let (llm, seen, dir) = relogin_after(std::time::Duration::from_millis(300), "relogin-late").await;
+        let (status, body) = post(llm.clone(), "late").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(*seen.lock().unwrap(), ["tok-old", "tok-new"], "one retry, with the new token");
+        let ops = llm_ops(&llm, 2).await;
+        assert!(ops.iter().any(|o| o.contains("\"status\":200") && o.contains("retried once after a 401")), "{ops:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #552: the client's own retry arrives while the refresh is still being written (Claude Code
+    /// retries a 401 at once). Both calls wait for the new token, and both succeed: neither 401
+    /// reaches the box.
+    #[tokio::test]
+    async fn a_client_retry_during_the_refresh_also_succeeds() {
+        let (llm, seen, dir) = relogin_after(std::time::Duration::from_millis(500), "relogin-retry").await;
+        let first = tokio::spawn(post(llm.clone(), "first"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (s2, b2) = post(llm.clone(), "retry").await;
+        let (s1, b1) = first.await.unwrap();
+        assert_eq!((s1, s2), (200, 200), "{b1} / {b2}");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.iter().filter(|b| *b == "tok-new").count(), 2, "each call ends with the new token: {seen:?}");
+        assert!(seen.iter().filter(|b| *b == "tok-old").count() <= 2, "the old token at most once per call: {seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A 401 when the secret hasn't changed (#360): a real revocation, passed through to the box,
     /// and the same value is never sent again.
     #[tokio::test]
@@ -2192,7 +2347,7 @@ mod tests {
         assert!(body.contains("authentication_error"), "the upstream's answer: {body}");
         assert_eq!(*seen.lock().unwrap(), ["tok-revoked"], "not retried");
         let ops = llm_ops(&llm, 1).await;
-        assert!(ops.iter().any(|o| o.contains("\"status\":401") && o.contains("read again is unchanged: not retried")), "{ops:?}");
+        assert!(ops.iter().any(|o| o.contains("\"status\":401") && o.contains("is unchanged: not retried")), "{ops:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

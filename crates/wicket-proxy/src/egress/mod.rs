@@ -889,6 +889,162 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A node's copy of a secret that a source serves (the control host's, which reads a linked login
+    /// through the secret helper, `wicket secret serve`): `get` returns what the source holds, and
+    /// `refetch` asks it again. `next` is what it will hold once `changed` is set (#552).
+    struct Served {
+        value: std::sync::Mutex<String>,
+        next: Option<&'static str>,
+        changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl crate::vault::SecretSource for Served {
+        fn get(&self, _: &str) -> anyhow::Result<String> {
+            Ok(self.value.lock().unwrap().clone())
+        }
+        fn hosts(&self, _: &str) -> Vec<String> {
+            vec!["api.anthropic.com".into()]
+        }
+        fn has(&self, _: &str) -> bool {
+            true
+        }
+        fn refetch<'a>(&'a self, _: &'a str) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
+            if let (Some(n), true) = (self.next, self.changed.load(std::sync::atomic::Ordering::SeqCst)) {
+                *self.value.lock().unwrap() = n.into();
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A model call through the egress gate whose credential is swapped in from a served secret, to a
+    /// stand-in for the model host that accepts only `tok-new`. On its first refusal the source
+    /// holds `next` after `delay` (a login refreshed by its owner: the old token revoked first, the
+    /// new one written a moment later). Returns the status, the bearers the host saw, and the
+    /// call's `llm` op records.
+    async fn served_relogin(next: Option<&'static str>, delay: std::time::Duration, tag: &str) -> (u16, Vec<String>, Vec<String>) {
+        use http_body_util::BodyExt;
+        let origin = crate::ca::RunCa::generate("origin").unwrap();
+        let mut cfg = (*origin.server_config("api.anthropic.com").unwrap()).clone();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen2, changed2) = (seen.clone(), changed.clone());
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let (acceptor, seen, changed) = (acceptor.clone(), seen2.clone(), changed2.clone());
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(s).await else { return };
+                    let svc = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        let (seen, changed) = (seen.clone(), changed.clone());
+                        async move {
+                            let bearer = req
+                                .headers()
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .trim_start_matches("Bearer ")
+                                .to_string();
+                            let _ = req.into_body().collect().await?;
+                            seen.lock().unwrap().push(bearer.clone());
+                            let r = if bearer == "tok-new" {
+                                http::Response::builder().header("content-type", "application/json").body(http_body_util::Full::new(
+                                    bytes::Bytes::from_static(br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#),
+                                ))
+                            } else {
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delay).await;
+                                    changed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                });
+                                http::Response::builder().status(401).header("content-type", "application/json").body(
+                                    http_body_util::Full::new(bytes::Bytes::from_static(
+                                        br#"{"type":"error","error":{"type":"authentication_error","message":"OAuth token revoked"}}"#,
+                                    )),
+                                )
+                            };
+                            Ok::<_, hyper::Error>(r.unwrap())
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tls), svc).await;
+                });
+            }
+        });
+        let swap = crate::CredentialSwap {
+            name: "claude-login".into(),
+            host: "api.anthropic.com".into(),
+            placeholder: "ph-run-x".into(),
+            real: crate::SwapSource::Vault("claude-login".into()),
+            box_bearers: false,
+        };
+        let (mut c, dir) = ctx("reach: [{host: api.anthropic.com, methods: [POST]}]", vec![swap], tag);
+        let source = Served { value: std::sync::Mutex::new("tok-old".into()), next, changed };
+        c.vault = crate::vault::Vault::from_source(std::sync::Arc::new(source));
+        let up = super::Upstream {
+            resolve: [("api.anthropic.com".to_string(), addr)].into(),
+            roots_pem: Some(origin.cert_pem()),
+            ..Default::default()
+        };
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::with_upstream(c.clone(), ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None, up).unwrap();
+        let llm = crate::llm::Llm::new(c.clone()).unwrap();
+        e.set_model_gate(llm.clone());
+        let body = r#"{"model":"m","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}"#;
+        let req = http::Request::post("/v1/messages")
+            .header("host", "api.anthropic.com")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer ph-run-x")
+            .header("content-length", body.len())
+            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+            .unwrap();
+        let r = e.clone().handle(req, "api.anthropic.com".into(), "https", super::Via::Tcp).await;
+        let status = r.status().as_u16();
+        let _ = r.into_body().collect().await;
+        let mut ops = vec![];
+        for _ in 0..300 {
+            ops = c
+                .ledger
+                .lock()
+                .unwrap()
+                .audit_of_kind("op")
+                .unwrap()
+                .into_iter()
+                .map(|r| r.body)
+                .filter(|b| b.contains("\"kind\":\"llm\""))
+                .collect::<Vec<_>>();
+            if ops.iter().any(|o| o.contains("\"status\":200") || o.contains("not retried")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        let seen = seen.lock().unwrap().clone();
+        (status, seen, ops)
+    }
+
+    /// #552: a wrapped session's model call through the egress gate, its credential swapped in from
+    /// a served login (as `claude-login` is on a node), races a refresh: the host refuses the old
+    /// token, the new one is served 300 ms later. The call waits for it, goes once more, and
+    /// succeeds; the box never sees the 401, and the call's note says it was retried.
+    #[tokio::test]
+    async fn a_model_call_through_egress_that_races_a_login_refresh_is_retried() {
+        let (status, seen, ops) = served_relogin(Some("tok-new"), std::time::Duration::from_millis(300), "egress-relogin").await;
+        assert_eq!(status, 200, "{ops:?}");
+        assert_eq!(seen, ["tok-old", "tok-new"], "one retry, with the new token");
+        assert!(ops.iter().any(|o| o.contains("\"status\":200") && o.contains("retried once after a 401")), "{ops:?}");
+        assert!(ops.iter().all(|o| !o.contains("tok-")), "no token in the audit: {ops:?}");
+    }
+
+    /// #552: the same with a login that doesn't change (a real revocation): the 401 goes to the box,
+    /// once, and the call's note says why it wasn't retried (#552's calls had no note at all).
+    #[tokio::test]
+    async fn a_revoked_login_through_egress_passes_its_401_on_with_a_note() {
+        let (status, seen, ops) = served_relogin(None, std::time::Duration::from_millis(10), "egress-revoked").await;
+        assert_eq!(status, 401, "{ops:?}");
+        assert_eq!(seen, ["tok-old"], "not retried");
+        assert!(ops.iter().any(|o| o.contains("\"status\":401") && o.contains("is unchanged: not retried")), "{ops:?}");
+    }
+
     /// #310: a model call through the egress gate is charged its real usage, as one through the model
     /// proxy is. The box asks for a compressed response; the gate asks upstream for identity (an
     /// upstream given the box's `Accept-Encoding` answers gzip here, whose usage can't be read), and
