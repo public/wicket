@@ -281,7 +281,10 @@ pub async fn use_service(ctx: &RunCtx, svc: &ServiceRef<'_>) -> UseOutcome {
             // The name a link gets is unique per box: one other than the service's would leave its
             // users' environment pointing at nothing.
             _ if !text.contains(&format!("{}.{}", svc.name, policy::DOMAIN)) => {
-                UseOutcome::Refused(format!("linked under another name than {}: {text}", svc.name))
+                // Closed again: its users' environment names the service, not this.
+                let id = text.split_whitespace().nth(1).unwrap_or("").trim_end_matches(':').trim_matches(|c| c == '(' || c == ')');
+                let (closed, _) = unlink(ctx, id);
+                UseOutcome::Refused(format!("linked under another name than {} ({text}); closed: {closed}", svc.name))
             }
             _ => UseOutcome::Linked(text),
         },
