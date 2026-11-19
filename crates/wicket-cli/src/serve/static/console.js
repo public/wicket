@@ -452,6 +452,44 @@ function healthRow(n) {
   return w;
 }
 
+// The state store's sync and the audit export's progress (#635), as `wicket state check` and
+// `wicket audit export --status` compute them: a row for the ledger's stream, one per audit sink,
+// each with its last error under it. A span in seconds, short.
+const secs = s => { s = Math.max(0, Math.round(s || 0)); return s < 120 ? s + " s" : s < 7200 ? Math.floor(s / 60) + " min" : s < 172800 ? Math.floor(s / 3600) + " h" : Math.floor(s / 86400) + " d"; };
+function stateStoreRows(p, nowMs) {
+  const out = [];
+  const row = (name, cls, text, err) => {
+    const w = el("div", "hrow");
+    const d = el("div", "row");
+    d.append(el("span", "mono", name));
+    d.append(el("span", cls, text));
+    w.append(d);
+    if (err) w.append(el("div", "blocked", "! " + err));
+    return w;
+  };
+  const st = p.stream;
+  if (st) {
+    let text = strip(st.endpoint) + " (" + strip(st.bucket) + ") \u00b7 ledger " + strip(st.state);
+    if (st.last_sync_ms) text += " \u00b7 last sync " + secs((nowMs - st.last_sync_ms) / 1000) + " ago";
+    else if (st.behind_secs !== null && st.behind_secs !== undefined) text += " \u00b7 no sync yet in " + secs(st.behind_secs);
+    const cls = st.state === "streaming" ? "" : st.state === "starting" ? "pend" : "blocked";
+    // An error is shown while the stream isn't streaming, or if it came after the last sync: an
+    // old one, recovered from, isn't news.
+    const live = st.error && (st.state !== "streaming" || (st.error_ms || 0) > (st.last_sync_ms || 0));
+    const err = live ? "last error" + (st.error_ms ? " " + secs((nowMs - st.error_ms) / 1000) + " ago" : "") + ": " + strip(st.error) : null;
+    out.push(row("State store", cls, text, err));
+  }
+  for (const a of p.audit || []) {
+    let text = a.behind ? a.behind + " record" + (a.behind === 1 ? "" : "s") + " behind (oldest " + secs(a.behind_secs) + ")" : "caught up";
+    // A jsonl sink to stdout is fed only by `wicket audit export` in the foreground: behind is expected.
+    if (a.manual) text += " (manual: fed only by `wicket audit export`)";
+    text += " at " + a.seq + " of " + a.head + " \u00b7 last checkpoint " + (a.checkpoint_at ? secs(nowMs / 1000 - a.checkpoint_at) + " ago" : "never");
+    out.push(row("Audit export " + strip(a.sink) + " (" + strip(a.kind) + ")", a.error ? "blocked" : a.behind && !a.manual ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
+  }
+  for (const e of p.errors || []) out.push(el("div", "blocked", "! " + strip(e)));
+  return out;
+}
+
 // A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
 // a run still holds it, which is a warning until renewals exist (#56).
 function placedRow(p) {
@@ -1238,6 +1276,7 @@ async function refreshOnce() {
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
     renderRows("health", ((s.health || {}).nodes) || [], healthRow, "No node has reported its health yet.");
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
+    if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();

@@ -501,8 +501,6 @@ pub(crate) mod tests {
         assert_eq!(check(&ask(&cst), &bounds(&st)), Ok(()));
     }
 
-    /// What no approval can give is named field by field: each of the route's three, and each of an
-    /// injection's four.
     /// #579 step 3: using a service is having its reach, so a child may use only the services its
     /// parent uses, and no human approval widens that.
     #[test]
@@ -515,6 +513,8 @@ pub(crate) mod tests {
         assert_eq!(unapprovable(&zone("  uses: [npm-cache]\n"), &zone("")).len(), 1, "a parent that uses none");
     }
 
+    /// What no approval can give is named field by field: each of the route's three, and each of an
+    /// injection's four.
     #[test]
     fn unapprovable_names_each_differing_field() {
         let p = zone("  inject: [{ host: api.github.com, header: Authorization, format: \"Bearer {secret}\", secret: gh }]\n");

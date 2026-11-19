@@ -57,35 +57,9 @@ pub fn target(ledger: &Ledger, node: &str) -> Option<Target> {
     if policy == wicket_store::CaHosts::Fixed {
         return Some(Target { hosts: base.clone(), base, dropped: vec![] });
     }
-    let wants = ledger.node_ca_wants(node).unwrap_or_default();
-    let mut by_run: Vec<(String, std::collections::VecDeque<String>)> = vec![];
-    for w in wants {
-        // Not allowed, or the operator's hosts cover it already.
-        if !policy.allows(&w.host) || wicket_core::splice::uncovered(&base, std::slice::from_ref(&w.host)).is_empty() {
-            continue;
-        }
-        match by_run.iter_mut().find(|(r, _)| *r == w.run) {
-            Some((_, q)) => q.push_back(w.host),
-            None => by_run.push((w.run, [w.host].into())),
-        }
-    }
-    let room = MAX_CA_HOSTS.saturating_sub(base.len());
-    let (mut kept, mut dropped): (Vec<String>, Vec<String>) = (vec![], vec![]);
-    while by_run.iter().any(|(_, q)| !q.is_empty()) {
-        for (_, q) in by_run.iter_mut() {
-            let Some(h) = q.pop_front() else { continue };
-            let covered = wicket_core::splice::uncovered(&[base.clone(), kept.clone()].concat(), std::slice::from_ref(&h)).is_empty();
-            if covered {
-                continue;
-            }
-            if kept.len() < room {
-                kept.push(h);
-            } else if !dropped.contains(&h) {
-                dropped.push(h);
-            }
-        }
-    }
-    let hosts = wicket_core::splice::merge_subtrees(&[base.clone(), kept].concat());
+    let wants: Vec<(String, String)> =
+        ledger.node_ca_wants(node).unwrap_or_default().into_iter().filter(|w| policy.allows(&w.host)).map(|w| (w.run, w.host)).collect();
+    let (hosts, dropped) = wicket_core::splice::widen(&base, &wants, MAX_CA_HOSTS);
     Some(Target { hosts, base, dropped })
 }
 
@@ -129,6 +103,11 @@ pub struct CaRenewal {
 }
 
 impl CaRenewal {
+    /// Whether a renewal is under way on this connection (its steps time out on the tick).
+    pub fn busy(&self) -> bool {
+        self.step.is_some()
+    }
+
     /// A new connection: nothing under way on it.
     pub fn reset(&mut self) {
         self.step = None;

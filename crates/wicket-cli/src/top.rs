@@ -209,6 +209,8 @@ pub struct ControlFrame {
     pub runs: Vec<RunLine>,
     pub pending: usize,
     pub leases: Vec<LeaseLine>,
+    /// The state store's sync and the audit export's progress (#635), if either is set up.
+    pub progress: Option<crate::statesync::Progress>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -348,9 +350,12 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
             f.leases.len(),
             plural(f.leases.len())
         ),
-        String::new(),
-        format!("{:<16} {:<26} {:>5} {:>10} {:>12} {:>5}", "NODE", "CONTROL", "BOXES", "CPU", "MEM", "DISK"),
     ];
+    if let Some(p) = &f.progress {
+        out.extend(progress_lines(p, now));
+    }
+    out.push(String::new());
+    out.push(format!("{:<16} {:<26} {:>5} {:>10} {:>12} {:>5}", "NODE", "CONTROL", "BOXES", "CPU", "MEM", "DISK"));
     let mut alerts = Vec::new();
     for n in &f.nodes {
         let link = match (n.status.as_str(), n.link) {
@@ -419,6 +424,46 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
         }
     }
     fit_all(out, width)
+}
+
+/// The ledger stream's line and one per audit sink, their errors under them.
+fn progress_lines(p: &crate::statesync::Progress, now_ms: i64) -> Vec<String> {
+    let ago = |ms: i64| crate::audit_export::ago((now_ms - ms) / 1000);
+    let mut out = vec![String::new()];
+    let mut errs = Vec::new();
+    if let Some(st) = &p.stream {
+        let at = match (st.last_sync_ms, st.behind_secs) {
+            (Some(t), _) => format!(", last sync {} ago", ago(t)),
+            (None, Some(b)) => format!(", no sync yet in {}", crate::audit_export::ago(b)),
+            (None, None) => String::new(),
+        };
+        let state =
+            if st.state == crate::statesync::StreamState::Streaming { "streaming".into() } else { st.state.as_str().to_uppercase() };
+        out.push(format!("ledger stream   {state}{at}"));
+        if st.state != crate::statesync::StreamState::Streaming || st.error_ms > st.last_sync_ms {
+            if let Some(e) = &st.error {
+                errs.push(format!("ledger stream: {}", clean(e, 300)));
+            }
+        }
+    }
+    for s in &p.audit {
+        let behind = match s.behind {
+            0 => "caught up".to_string(),
+            n => format!("{n} behind (oldest {})", crate::audit_export::ago(s.behind_secs)),
+        };
+        let cp = match s.checkpoint_at {
+            0 => "never".to_string(),
+            t => format!("{} ago", ago(t * 1000)),
+        };
+        let behind = if s.manual { format!("{behind} (manual)") } else { behind };
+        out.push(format!("audit {:<9} {behind}, checkpoint {cp}", cut(&clean(&s.sink, 64), 9)));
+        if let Some(e) = &s.error {
+            errs.push(format!("audit sink {}: {}", clean(&s.sink, 64), clean(e, 300)));
+        }
+    }
+    errs.extend(p.errors.iter().map(|e| clean(e, 300)));
+    out.extend(errs.into_iter().map(|e| format!("  ! {e}")));
+    out
 }
 
 fn plural(n: usize) -> &'static str {
@@ -684,6 +729,7 @@ pub async fn control_top(once: bool, json: bool) -> Result<()> {
 async fn live_frame(now: i64) -> Result<ControlFrame> {
     let l = wicket_store::Ledger::open(&crate::ledger_path())?;
     let mut f = control_frame(&l, &crate::data_dir().join("runs"), now)?;
+    f.progress = crate::statesync::installed_progress(&l, &crate::ledger_path(), now);
     if let Ok(sock) = crate::localnode::socket() {
         if let Ok(s) = read_status(&status_socket(&sock)).await {
             if let Some(n) = f.nodes.iter_mut().find(|n| n.name == crate::localnode::NAME) {
@@ -901,7 +947,7 @@ mod tests {
             boxes: 2,
             ..Default::default()
         };
-        let f = ControlFrame {
+        let mut f = ControlFrame {
             now_ms: NOW,
             nodes: vec![
                 NodeLine {
@@ -980,7 +1026,49 @@ mod tests {
                 not_after: Some(NOW / 1000 + 2280),
                 reserved_micro_usd: 120_000,
             }],
+            progress: None,
         };
+        // The state store lagging, one sink behind and failing (#635).
+        f.progress = Some(crate::statesync::Progress {
+            stream: Some(crate::statesync::StreamStatus {
+                endpoint: "https://s3.example.com".into(),
+                bucket: "b-1".into(),
+                lineage: None,
+                state: crate::statesync::StreamState::Lagging,
+                last_sync_ms: Some(NOW - 420_000),
+                behind_secs: Some(420),
+                lag_secs: 60,
+                error: Some("monitor error: calc pos: connection refused".into()),
+                error_ms: Some(NOW - 5_000),
+            }),
+            audit: vec![
+                crate::audit_export::SinkStatus {
+                    sink: "store".into(),
+                    kind: "store",
+                    seq: 1180,
+                    head: 1204,
+                    behind: 24,
+                    behind_secs: 400,
+                    checkpoint_at: NOW / 1000 - 900,
+                    holder: None,
+                    error: Some("PUT: connection refused".into()),
+                    manual: false,
+                },
+                crate::audit_export::SinkStatus {
+                    sink: "collector".into(),
+                    kind: "otlp",
+                    seq: 1204,
+                    head: 1204,
+                    behind: 0,
+                    behind_secs: 0,
+                    checkpoint_at: NOW / 1000 - 120,
+                    holder: Some("serve".into()),
+                    error: None,
+                    manual: false,
+                },
+            ],
+            errors: vec![],
+        });
         let got = render_control(&f, 80).join("\n");
         fixture("control-80.txt", &got);
         let want = include_str!("top/testdata/control-80.txt");

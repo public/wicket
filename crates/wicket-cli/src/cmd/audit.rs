@@ -119,17 +119,8 @@ pub(crate) fn audit_export_cmd(once: bool, checkpoint: bool, status: bool) -> Re
         .with_context(|| format!("no audit sinks configured ({} does not exist)", audit_export::sinks_path().display()))?;
     if status {
         let l = Ledger::open(&ledger_path())?;
-        let head = l.audit_head()?.map(|h| h.0).unwrap_or(0);
-        for s in &cfg.sinks {
-            let c = l.export_cursor(&s.name)?;
-            let holder = if c.lease_until >= wicket_store::now() { c.holder.unwrap_or_default() } else { "-".into() };
-            println!(
-                "{:<16} at {} of {head}  last checkpoint {}  fed by {holder}{}",
-                s.name,
-                c.seq,
-                c.checkpoint_at,
-                c.error.map(|e| format!("  error: {e}")).unwrap_or_default()
-            );
+        for s in audit_export::status(&l, &cfg, wicket_store::now())? {
+            println!("{}", audit_export::status_line(&s, wicket_store::now()));
         }
         return Ok(());
     }
