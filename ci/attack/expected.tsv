@@ -35,6 +35,8 @@ loopback-hex	curl-7
 loopback-v6	curl-7
 loopback-mapped	refused
 localhost-name	curl-7
+loopback-via-proxy	refused
+localhost-via-proxy	refused
 cloud-metadata	refused
 cloud-metadata-v6	refused
 gcp-metadata	refused

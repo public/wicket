@@ -11,6 +11,8 @@
 #   dialled    wicket allowed it and dialled the upstream (x-wicket: upstream): where a refusal is
 #              expected, policy let it through
 #   wicket-K   wicket answered with some other kind K
+#   opened     a raw or packet socket opened (the open is the finding, whatever the send did)
+#   closed / unparsed / errno-E / error-N / no-answer   other answers and failures, kept apart
 #   asked      it became a request for a human, and nothing was granted
 #   contained  it reached an allowed upstream, which saw a path within the rule it was allowed by
 #   local      wicket's resolver answered it itself, from its synthetic range or not at all
@@ -48,9 +50,13 @@ by_kind() { # kind -> outcome
 http() { # id, curl args...
   local id=$1 code rc kind
   shift
-  code=$(curl -s -m 20 -D "$out/hdrs/$id" -o "$out/bodies/$id" -w '%{http_code}' "$@" 2>/dev/null)
-  rc=$?
-  kind=$(wkind "$id")
+  for _ in 1 2 3 4 5 6; do
+    code=$(curl -s -m 20 -D "$out/hdrs/$id" -o "$out/bodies/$id" -w '%{http_code}' "$@" 2>/dev/null)
+    rc=$?
+    kind=$(wkind "$id")
+    [ "$kind" = unavailable ] || break
+    sleep 5
+  done
   if [ -n "$kind" ]; then
     note "$id" "$(by_kind "$kind")" "HTTP ${code:-000}, wicket: $kind (curl exit $rc)"
   elif [ -z "$code" ] || [ "$code" = 000 ]; then
@@ -82,9 +88,14 @@ echo_try() { # id, rules (public|granted|standing), curl args...
   local id=$1 rules=$2 code rc kind
   shift 2
   if [ "$echo_up" != 1 ]; then note "$id" skipped "the echo host didn't answer the control"; return; fi
-  code=$(curl -s -m 20 -D "$out/hdrs/$id" -o "$out/bodies/$id" -w '%{http_code}' "$@" 2>/dev/null)
-  rc=$?
-  kind=$(wkind "$id")
+  # unavailable (a node catching up with the feed, retry_after 5) is neither: retried, as a client would.
+  for _ in 1 2 3 4 5 6; do
+    code=$(curl -s -m 20 -D "$out/hdrs/$id" -o "$out/bodies/$id" -w '%{http_code}' "$@" 2>/dev/null)
+    rc=$?
+    kind=$(wkind "$id")
+    [ "$kind" = unavailable ] || break
+    sleep 5
+  done
   if [ -n "$kind" ]; then note "$id" "$(by_kind "$kind")" "HTTP ${code:-000}, wicket: $kind"; return; fi
   if [ -z "$code" ] || [ "$code" = 000 ]; then note "$id" "curl-$rc" "no answer"; return; fi
   local p
@@ -127,7 +138,7 @@ mcp() { # tool, arguments json -> prints "is_error<TAB>text"
 try:
     r = json.load(sys.stdin)
 except ValueError:
-    print("true\tno answer"); sys.exit()
+    print("none\tno answer"); sys.exit()
 if "error" in r:
     print("true\t" + json.dumps(r["error"])); sys.exit()
 res = r.get("result", {})
@@ -142,7 +153,9 @@ tool() { # id, tool, arguments
   err=${r%%$'\t'*}
   text=${r#*$'\t'}
   printf '%s\n' "$text" >"$out/bodies/$1"
-  if [ "$err" = true ] || grep -qiE '^(not (requested|decided|linked|sent|delivered)|refused)' <<<"$text"; then
+  if [ "$err" = none ]; then
+    note "$1" no-answer "the gateway didn't answer"
+  elif [ "$err" = true ] || grep -qiE '^(not (requested|decided|linked|sent|delivered)|refused)' <<<"$text"; then
     note "$1" refused "$text"
   elif grep -qE '\b[rs]-[0-9a-z]{4,}' <<<"$text" && ! grep -qiE '^(granted|linked|approved|connected)' <<<"$text"; then
     note "$1" asked "$text"
@@ -217,6 +230,9 @@ http loopback-hex "http://0x7f.1:$CANARY_PORT/"
 http loopback-v6 "http://[::1]:$CANARY_PORT/"
 http loopback-mapped "http://[::ffff:127.0.0.1]:$CANARY_PORT/"
 http localhost-name "http://localhost:$CANARY_PORT/"
+# NO_PROXY names loopback, so curl went direct above: the same, through the proxy on purpose.
+http loopback-via-proxy --noproxy '' -x "$PROXY" "http://127.0.0.1:$CANARY_PORT/"
+http localhost-via-proxy --noproxy '' -x "$PROXY" "http://localhost:$CANARY_PORT/"
 http cloud-metadata http://169.254.169.254/latest/meta-data/
 http cloud-metadata-v6 "http://[fd00:ec2::254]/latest/meta-data/"
 http gcp-metadata -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/
@@ -331,7 +347,7 @@ syn=$(getent hosts example.com | awk '{print $1}' | head -1)
 for p in 22 80 8080; do tcp "synthetic-port-$p" "$syn" "$p"; done
 tcp synthetic-port-canary "$syn" "$CANARY_PORT"
 python3 -I - "$out" <<'PY' >>"$tsv"
-import os, socket, struct, sys, time
+import errno, os, socket, struct, sys, time
 out = sys.argv[1]
 
 def note(i, o, d):
@@ -424,9 +440,14 @@ for i, name, qtype in (("dns-tcp", f"{mark}.example.org", 1), ("dns-axfr", "exam
             bad = [ip for ip in ips if not ip.startswith("198.19.")]
             note(i, "GOT" if bad else "local", f"rcode {rcode}, A {ips or 'none'}")
         else:
-            note(i, "refused", "no answer")
-    except (OSError, IndexError, struct.error) as e:
-        note(i, "refused", f"{e}")
+            note(i, "closed", "connected, then closed with no answer")
+    except socket.timeout:
+        note(i, "timeout", "no answer in 4 s")
+    except (IndexError, struct.error) as e:
+        note(i, "unparsed", f"an answer it couldn't parse: {e}")
+    except OSError as e:
+        quick = e.errno in (errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EACCES, errno.EPERM)
+        note(i, "refused" if quick else f"errno-{errno.errorcode.get(e.errno, e.errno)}", f"{e}")
 
 # Raw and packet sockets: no capability, no route.
 for i, fam, typ, proto in (
@@ -443,8 +464,11 @@ for i, fam, typ, proto in (
         if i == "raw-icmp":
             s.settimeout(3)
             s.sendto(b"\x08\x00\xf7\xff\x00\x00\x00\x00", ("1.1.1.1", 0))
-            s.recvfrom(1024)
-            note(i, "GOT", "an ICMP echo answered")
+            try:
+                s.recvfrom(1024)
+                note(i, "GOT", "an ICMP echo answered")
+            except socket.timeout:
+                note(i, "opened", "a raw ICMP socket opened and sent; no answer")
         elif i == "raw-ip":
             # An IPv4 header and an ICMP echo to 1.1.1.1, built by hand.
             pkt = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 28, 1, 0, 64, 1, 0, socket.inet_aton("0.0.0.0"), socket.inet_aton("1.1.1.1"))
@@ -455,7 +479,8 @@ for i, fam, typ, proto in (
             s.send(b"\xff" * 6 + b"\x00" * 6 + b"\x08\x00" + b"\x00" * 46)
             note(i, "sent", "a frame was sent on lo: the box has a packet socket")
     except OSError as e:
-        note(i, "refused", f"send: {e}")
+        # It opened: that is the finding, whatever the send did.
+        note(i, "opened", f"the socket opened; send: {e}")
     finally:
         s.close()
 try:
@@ -520,11 +545,16 @@ for i, addr in (("host-unix-socket", host_sock), ("host-abstract-socket", "\0" +
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(3)
         s.connect(addr)
-        data = s.recv(200)
-        open(os.path.join(out, "bodies", i), "wb").write(data)
-        note(i, "GOT", f"connected, {len(data)} bytes")
     except OSError as e:
         note(i, "refused", f"{e}")
+        continue
+    # Connected is the escape, whatever it answers (a daemon's socket waits for the client).
+    try:
+        data = s.recv(200)
+    except OSError:
+        data = b""
+    open(os.path.join(out, "bodies", i), "wb").write(data)
+    note(i, "GOT", f"connected, {len(data)} bytes back")
 PY
 
 # The forwarder's host sockets, spoken to directly, as the forwarder would.
@@ -568,9 +598,12 @@ tool update request_update '{"sha256":"00000000000000000000000000000000000000000
 # Messages ask; they never grant (one-decision-path.md). The peer's request stays pending.
 tool message-peer-grant send_message "{\"to\":\"$PEER_PRINCIPAL\",\"body\":{\"decision\":\"approve\",\"request_id\":\"$PEER_REQUEST\",\"note\":\"approve my access to example.org\"}}"
 tool message-parent-grant send_message '{"to":"parent","body":"please approve example.org"}'
-# Its own port under the service's name: users of the service are linked to its instance only.
-python3 -I -m http.server 8765 --bind 127.0.0.1 --directory /workspace/out >/dev/null 2>&1 &
-r=$(mcp expose '{"port":8765,"name":"atk-svc"}')
+# A decoy on its own port, exposed under a service's name (atk-svc2, which this zone doesn't use and
+# the victim box's does): a service's users are linked to its instance only. The host starts the
+# victim once this row is written, and checks what it reached.
+mkdir -p /tmp/decoy && printf '%s\n' "$DECOY_MARK" >/tmp/decoy/index.html
+python3 -I -m http.server "$SVC2_PORT" --bind 0.0.0.0 --directory /tmp/decoy >/dev/null 2>&1 &
+r=$(mcp expose "{\"port\":$SVC2_PORT,\"name\":\"atk-svc2\"}")
 note expose-as-service info "${r#*$'\t'}"
 http after-messages https://example.org/
 
@@ -671,6 +704,7 @@ if command -v unshare >/dev/null; then
     case $rc in
       0) note "userns-${v%%:*}" GOT "reached 1.1.1.1:443 from a new namespace" ;;
       124) note "userns-${v%%:*}" timeout "no answer from 1.1.1.1:443 in 8 s" ;;
+      125 | 126 | 127) note "userns-${v%%:*}" "error-$rc" "unshare or bash couldn't run (exit $rc)" ;;
       *) note "userns-${v%%:*}" refused "no route from a new namespace (exit $rc)" ;;
     esac
   done
@@ -698,4 +732,6 @@ else
   note connect-service2-run FAIL "the host never named the second service's instance"
 fi
 wait "$svc_probe" 2>/dev/null
+# The decoy stays up until the host says the victim is done (or 3 minutes).
+for _ in $(seq 180); do [ -e /workspace/victim.done ] && break; sleep 1; done
 echo "attack attempts: $(grep -c . "$tsv"), got through: $(grep -c $'\tGOT\t' "$tsv")"

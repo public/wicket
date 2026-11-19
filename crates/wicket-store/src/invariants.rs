@@ -374,7 +374,12 @@ fn standing_fault(
     path: &str,
     ts: i64,
 ) -> Result<Option<String>> {
-    let Ok(s) = l.standing(id) else { return Ok(Some("which was never issued".into())) };
+    let s = match l.standing(id) {
+        Ok(s) => s,
+        Err(crate::StoreError::NoSuchRequest(_)) => return Ok(Some("which was never issued".into())),
+        // A ledger that can't be read isn't a rule that was never issued: say so, as an error.
+        Err(e) => return Err(e),
+    };
     let Some(decided) = s.decided_at.filter(|_| matches!(s.status.as_str(), "approved" | "revoked")) else {
         return Ok(Some(format!("which was never approved (it is {})", s.status)));
     };

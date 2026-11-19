@@ -65,6 +65,7 @@ C_SVC=atk$(rand)     # the service's port
 C_SVC2=atk$(rand)    # the second service's port (one the attacker's zone doesn't use)
 BOX_MARK=atk$(rand)  # held by the box: may leave only to what its zone reaches
 DOMAIN_MARK=atk$(rand) # the registered domain the box makes wicket look up (#19's known channel)
+DECOY_MARK=atk$(rand)  # what the attacker's decoy serves under the second service's name
 canaries=("$C_INJECT" "$C_FILE" "$C_PEER" "$C_SOCK" "$C_SVC" "$C_SVC2")
 names=(injected-secret host-file peer-port host-socket service-port second-service-port)
 
@@ -187,14 +188,16 @@ SVC_PORT=4873
 SVC2_PORT=4874
 BOX_MARK=$BOX_MARK
 DOMAIN_MARK=$DOMAIN_MARK
+DECOY_MARK=$DECOY_MARK
 EOF
 # RUN_DIR: the attacker learns its run id from WICKET_RUN; the host path is the data dir's.
 echo "RUN_DIR=$WICKET_HOME/runs/\$WICKET_RUN" >>"$ws/atk.env"
 # The operator: grants the one prefix and approves the one narrow standing rule the attacker asks
 # for, nothing else.
 (
+  set +e
   done_p='' done_s=''
-  for _ in $(seq 400); do
+  for _ in $(seq 600); do
     if [ -z "$done_p" ]; then
       id=$(w pending 2>/dev/null | grep 'anything/granted' | grep -oE 'r-[0-9a-z]+' | head -1 || true)
       [ -z "$id" ] || { w approve "$id" --uses 20 --yes >"$work/approve.log" 2>&1; done_p=1; }
@@ -210,16 +213,36 @@ echo "RUN_DIR=$WICKET_HOME/runs/\$WICKET_RUN" >>"$ws/atk.env"
 pids+=("$!")
 # Each service's instance, named to the attacker (in its live workspace) once it starts.
 (
+  set +e
   n1='' n2=''
-  for _ in $(seq 400); do
+  for _ in $(seq 600); do
     atk_now=$(run_id_of "$work/attack.log")
     if [ -n "$atk_now" ] && [ -d "$WICKET_HOME/runs/$atk_now/workspace" ]; then
-      started=$(w audit --tail 5000 2>/dev/null | awk '$3 == "service.instance_started"' || true)
+      started=$(w audit --tail 100000 2>>"$work/loops.err" | awk '$3 == "service.instance_started"')
       r1=$(grep '"service":"atk-svc"' <<<"$started" | awk '{print $4}' | tail -1 || true)
       r2=$(grep '"service":"atk-svc2"' <<<"$started" | awk '{print $4}' | tail -1 || true)
       [ -n "$n1" ] || [ -z "$r1" ] || { printf '%s\n' "$r1" >"$WICKET_HOME/runs/$atk_now/workspace/svc.run"; n1=1; }
       [ -n "$n2" ] || [ -z "$r2" ] || { printf '%s\n' "$r2" >"$WICKET_HOME/runs/$atk_now/workspace/svc2.run"; n2=1; }
       [ -n "$n1" ] && [ -n "$n2" ] && exit
+    fi
+    sleep 1
+  done
+) &
+pids+=("$!")
+# The victim: a box that uses atk-svc2, started once the attacker has exposed its decoy under that
+# name. It must reach the service's instance (C_SVC2), never the decoy; the attacker keeps its decoy
+# up until the victim is done.
+mkdir -p "$work/victim"
+cp ci/attack/victim.sh "$work/victim/"
+(
+  set +e
+  for _ in $(seq 600); do
+    atk_now=$(run_id_of "$work/attack.log")
+    t=$WICKET_HOME/runs/$atk_now/workspace/out/attempts.tsv
+    if [ -n "$atk_now" ] && grep -q $'^expose-as-service\t' "$t" 2>/dev/null; then
+      timeout 240 "$WICKET" run ci/attack/victim.yaml --workdir "$work/victim" ${IMAGE:+--image "$IMAGE"} >"$work/victim.log" 2>&1 || true
+      touch "$WICKET_HOME/runs/$atk_now/workspace/victim.done"
+      exit
     fi
     sleep 1
   done
@@ -299,7 +322,22 @@ hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
 # Anywhere the box could read or leave anything (its run directory: workspace, state, the
 # forwarder's directory; the node's directory, its volumes), and the output it printed: raw, in
 # base64 and in hex.
-seen_in() { grep -rlsF -e "$1" -e "$(b64 "$1")" -e "$(hex "$1")" "$atk_dir" "$WICKET_HOME/local-node" "$work/attack.log" 2>/dev/null || true; }
+# Base64 at each of the three offsets the value can start at in an encoded stream (the characters
+# its bytes alone decide), and the raw value and hex in any case.
+b64_forms() {
+  python3 -I -c '
+import base64, sys
+v = sys.argv[1].encode()
+for k in range(3):
+    e = base64.b64encode(b"\0" * k + v).decode()
+    print(e[4 if k else 0:-4])
+' "$1"
+}
+seen_in() {
+  { grep -rlsiF -e "$1" -e "$(hex "$1")" "$atk_dir" "$WICKET_HOME/local-node" "$work/attack.log" 2>/dev/null
+    b64_forms "$1" >"$work/b64.pat"
+    grep -rlsF -f "$work/b64.pat" "$atk_dir" "$WICKET_HOME/local-node" "$work/attack.log" 2>/dev/null; } | sort -u || true
+}
 for i in "${!canaries[@]}"; do
   where=$(seen_in "${canaries[$i]}" | sed "s#$work/##" | head -5 | tr '\n' ' ')
   check "the ${names[$i]} canary is nowhere the box could see${where:+ (found in: $where)}" '[ -z "$where" ]'
@@ -322,6 +360,7 @@ if [ "$capture" = 1 ]; then
   echo "   the host's DNS capture: $(grep -c . "$work/dns-names.txt" || true) names, $n_known registered-domain lookups the box chose (#19)"
   check "the host's DNS capture saw the registered-domain lookup (#19), so it saw DNS at all" 'grep -qx "$DOMAIN_MARK.com" <<<"$known"'
   check "  #19's lookups stayed within its bound: at most 256 per run (${n_known})" '[ "$n_known" -le 256 ]'
+  check "  and the bound was reached (the 300-name push made at least 200 of them)" '[ "$n_known" -ge 200 ]'
   check "no other label the box chose left the host by DNS" '[ -z "$leaked" ] || { sed "s/^/     left: /" <<<"$leaked" | head -20; false; }'
 fi
 
@@ -385,7 +424,8 @@ decisions=$(awk '$3 == "decision"' "$audit_all")
 prefix_grant=$(grep "\"request\":\"$prefix_req\"" <<<"$decisions" | grep -oE '"grant":"g-[0-9a-z]+"' | cut -d'"' -f4 | head -1)
 standing_req=$(cat "$atk_dir/workspace/out/standing.request" 2>/dev/null || true)
 check "the only decisions are the operator's on the prefix (${prefix_req:-?}, ${prefix_grant:-no grant}) and the narrow standing rule (${standing_req:-?}): nothing the attacker said decided the peer's" '[ -n "$prefix_req" ] && [ -n "$prefix_grant" ] && [ -n "$standing_req" ] && [ "$(grep -c . <<<"$decisions")" = 2 ] && grep -q "\"standing\":\"$standing_req\"" <<<"$decisions" || { sed "s/^/     decision: /" <<<"$decisions" | cut -c1-200; false; }'
-other_grants=$(grep -vE "^\S+ +quota " "$grants_all" | grep -vE "^\S+ +DIGEST .* any run in zone atk-svc2?," | grep -v "^$prefix_grant " || true)
+# A quota line exactly as `wicket grant list` prints one (a kind, a number, a run), nothing else.
+other_grants=$(grep -vE "^g-[0-9a-z]+ +quota [a-z_.]+ = [0-9]+ +run run_[0-9a-z]+, (revoked|ends in [0-9dhms ]+) +by human:operator$" "$grants_all" | grep -vE "^g-[0-9a-z]+ +DIGEST wicket\.internal/digest/sha256:[0-9a-f]{64} +any run in zone atk-svc2?," | grep -v "^$prefix_grant " || true)
 check "the grants are the quotas, the services' digest grants and that prefix only" '[ "$grants_ok" = 1 ] && grep -q "^$prefix_grant .*anything/granted/\* \[prefix\]" "$grants_all" && [ -z "$other_grants" ] || { sed "s/^/     grant: /" <<<"$other_grants"; false; }'
 standing_all=$(w standing list --all 2>&1) || standing_all="ERROR: $standing_all"
 approved=$(grep -E '^s-' <<<"$standing_all" | grep -vE ' (pending|denied|revoked|lapsed)$' || true)
@@ -397,6 +437,12 @@ links_ok=0
 links=$(w links --tail 500 2>&1) && links_ok=1
 check "wicket links reads" '[ "$links_ok" = 1 ] || { echo "     $links"; false; }'
 check "no link has the attacker at either end (its port exposed as atk-svc included)" '! grep -qF "$atk" <<<"$links" || { grep -F "$atk" <<<"$links" | sed "s/^/     link: /"; false; }'
+victim=$(run_id_of "$work/victim.log")
+victim_out=$WICKET_HOME/runs/$victim/workspace/out
+svc2_run=$(grep '"service":"atk-svc2"' <<<"$started" | awk '{print $4}' | tail -1)
+check "the victim (${victim:-never started}) reached atk-svc2 through its link, after the attacker exposed its decoy under that name" '[ -s "$victim_out/svc2.body" ] || { cat "$victim_out/svc2.error" "$work/victim.log" 2>/dev/null | tail -5; false; }'
+check "  and got the service's instance (its canary), never the attacker's decoy" '[ "$(cat "$victim_out/svc2.body" 2>/dev/null)" = "$C_SVC2" ] && ! grep -qsF "$DECOY_MARK" "$victim_out/svc2.body"'
+check "  wicket links lists the victim's and the peer's links to the instance ${svc2_run:-?}" '[ -n "$svc2_run" ] && grep "$svc2_run" <<<"$links" | grep -qF "$victim" && grep "$svc2_run" <<<"$links" | grep -qF "$peer"'
 check "the service's link needed a human, who never came" 'grep -qE "atk-svc on node .*(approv|request)" "$work/attack.log"'
 check "the audit chain verifies" 'w audit --verify >/dev/null'
 check "wicket doctor --invariants holds" 'w doctor --invariants >"$work/invariants.log" 2>&1 || { tail -20 "$work/invariants.log"; false; }'
