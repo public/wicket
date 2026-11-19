@@ -216,7 +216,7 @@ pub fn renew(l: &Ledger, by: &Granter, id: &str, ttl: Option<Duration>) -> Resul
         &serde_json::json!({ "decision": "renew", "standing": id, "by": by.label(), "until": until, "previous_until": s.expires_at }),
     );
     if let Err(e) = recorded {
-        let _ = l.renew_standing(id, s.expires_at);
+        l.restore_standing_end(id, s.expires_at)?;
         return Err(anyhow::Error::from(e).context("the renewal could not be recorded in the audit log, so it was undone"));
     }
     Ok(until)

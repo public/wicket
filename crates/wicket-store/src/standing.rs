@@ -440,6 +440,14 @@ impl Ledger {
         Ok(())
     }
 
+    /// Puts an approved rule's lapse back to `until` whatever it is now: the undo of a renewal whose
+    /// audit record couldn't be written, which must hold even if the old end has passed meanwhile
+    /// (#572 re-review, N6).
+    pub fn restore_standing_end(&self, id: &str, until: Option<i64>) -> Result<()> {
+        self.conn.execute("UPDATE standing SET expires_at = ?2 WHERE id = ?1", params![id, until])?;
+        Ok(())
+    }
+
     /// The live standing rules for `run`: approved, not lapsed, and bound to its principal (its
     /// identity's) or its zone, under the zone definition `zone_digest` ([`zone_digest`]).
     pub fn standing_for_run(&self, tenant: &TenantId, run: &RunId, zone: &str, zone_digest: &str) -> Result<Vec<Standing>> {
@@ -638,5 +646,21 @@ mod tests {
         assert_eq!(base, zone_digest(&z("name: work\nreach: [{ host: ci.example }]\nimages: [x]\nlimits: { timeout: 2h }\n")));
         assert_ne!(base, zone_digest(&z("name: work\nreach: [{ host: ci.example }, { host: other.example }]\n")));
         assert_ne!(base, zone_digest(&z("name: work\nreach: [{ host: ci.example }]\nforbid: [{ host: evil.example }]\n")));
+    }
+
+    /// #572 re-review, N6: a renewal's undo puts the old end back even once the rule has lapsed,
+    /// where a renewal (which refuses a rule that isn't live) couldn't.
+    #[test]
+    fn a_renewals_undo_restores_the_old_end_whatever_it_is() {
+        let l = ledger();
+        let t = TenantId::single();
+        let (r1, who) = run(&l, "run_n6", "work", "worker");
+        let (id, _) = l.ask_standing(&t, &r1, "work", DIGEST, &who, &rule("{ host: ci.example }"), "x").unwrap();
+        l.approve_standing(&id, &rule("{ host: ci.example }"), &StandingTerms { bound: Bound::Agent, ttl_secs: Some(60) }, "op", None)
+            .unwrap();
+        l.renew_standing(&id, Some(now() - 5)).unwrap();
+        assert!(l.renew_standing(&id, Some(now() + 60)).is_err(), "lapsed: not renewed");
+        l.restore_standing_end(&id, Some(now() + 60)).unwrap();
+        assert!(l.standing(&id).unwrap().live(now()));
     }
 }
