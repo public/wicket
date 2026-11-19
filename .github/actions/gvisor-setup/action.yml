@@ -32,15 +32,24 @@ runs:
     - name: Install gVisor as a Docker runtime
       shell: bash
       run: |
-        curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
-          | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
-        # gVisor's apt repository is sometimes caught mid-sync ("File has unexpected size"): retry.
-        for i in 1 2 3 4; do
-          if sudo apt-get update -q && sudo apt-get install -y -q runsc; then break; fi
-          [ "$i" = 4 ] && exit 1
-          echo "gVisor apt install failed (attempt $i), retrying in $((i * 20)) s"; sleep $((i * 20))
-        done
+        # gVisor's release binary, pinned by version and sha512 (#219): no apt repository, whose
+        # mid-sync retries (20, 40 and 60 s sleeps) made this step 255-359 s on some runs, against
+        # about 90 s; and the same runsc in every job. To update: the version, and the sha512 from
+        # https://storage.googleapis.com/gvisor/releases/release/<version>/x86_64/runsc.sha512.
+        version=20261102.0
+        # Empty until pinned from the first run's annotation (the published sha512, checked here).
+        sha512=
+        url=https://storage.googleapis.com/gvisor/releases/release/$version/x86_64/runsc
+        curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors -o /tmp/runsc "$url"
+        if [ -z "$sha512" ]; then
+          published=$(curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors "$url.sha512" | cut -d' ' -f1)
+          echo "$published  /tmp/runsc" | sha512sum -c -
+          echo "::notice title=runsc $version sha512 (to pin in .github/actions/gvisor-setup)::$published"
+          sha512=$published
+        fi
+        echo "$sha512  /tmp/runsc" | sha512sum -c -
+        sudo install -m 0755 /tmp/runsc /usr/bin/runsc
+        rm /tmp/runsc
         # Keep the runner's own Docker settings; add runsc with host unix sockets (wicket's proxies).
         cfg=/etc/docker/daemon.json
         [ -f "$cfg" ] || echo '{}' | sudo tee "$cfg" >/dev/null
