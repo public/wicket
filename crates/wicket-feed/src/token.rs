@@ -113,6 +113,18 @@ pub struct TokenGrant {
     /// At most this many uses, counted on this node. `None`: until the grant expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uses: Option<u32>,
+    /// A path-prefix grant (#257 4a): `path` is the prefix, ending in `/`, and the grant covers what
+    /// `wicket_core::prefix_covers` says. Only nodes at protocol 16 or later are sent one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefix: bool,
+}
+
+/// Whether listed grant `g` is one to try for `op`: its host and method, and its path or (a prefix
+/// grant) a path under it.
+fn grant_matches(g: &TokenGrant, op: &Op) -> bool {
+    g.host.eq_ignore_ascii_case(&op.host)
+        && g.method.eq_ignore_ascii_case(&op.method)
+        && if g.prefix { wicket_core::prefix_covers(&g.path, &op.path) } else { g.path == op.path }
 }
 
 /// A loaded token, and the zone's compiled form for host verdicts.
@@ -235,11 +247,7 @@ pub fn explain(entry: &BoxAuthority, c: &CompiledAuthority, op: &Op, at_ms: i64)
         authz::Decision::Allow => e("allow", "the token's ceilings (block 0 and the spawn blocks under it)".into()),
         authz::Decision::Forbidden(r) => e("forbidden", r),
         authz::Decision::NeedsGrant(r) => {
-            for g in entry
-                .grants
-                .iter()
-                .filter(|g| g.host.eq_ignore_ascii_case(&op.host) && g.method.eq_ignore_ascii_case(&op.method) && g.path == op.path)
-            {
+            for g in entry.grants.iter().filter(|g| grant_matches(g, op)) {
                 req.uses_left = vec![(g.id.clone(), i64::from(g.uses.unwrap_or(u32::MAX)).max(1))];
                 if c.loaded.decide(&req) == authz::Decision::Allow {
                     let uses = g.uses.map(|u| format!(" (at most {u} uses, counted on the node)")).unwrap_or_default();
@@ -306,9 +314,7 @@ impl Replica<BoxAuthority> {
                             authz::Decision::NeedsGrant(r) => {
                                 let r = reason(c, op, false, r);
                                 let candidates = entry.spec.grants.iter().filter(|g| {
-                                    g.host.eq_ignore_ascii_case(&op.host)
-                                        && g.method.eq_ignore_ascii_case(&op.method)
-                                        && g.path == op.path
+                                    grant_matches(g, op)
                                         && !st.is_revoked(RevokeKind::Grant, &g.id)
                                         && g.uses.is_none_or(|max| self.uses(&g.id) < max)
                                 });
@@ -541,6 +547,8 @@ pub struct Issuer {
 pub struct LiveGrant {
     pub grant: authz::Grant,
     pub uses: Option<u32>,
+    /// A path-prefix grant (#257 4a): `grant.path` is the prefix, canonical and ending in `/`.
+    pub prefix: bool,
 }
 
 impl Issuer {
@@ -635,13 +643,17 @@ impl Issuer {
             let mut grant = g.grant.clone();
             grant.box_id = self.box_path.clone();
             grant.epoch = self.epoch;
-            token = authz::grant(&token, approver, &grant)?;
+            token = match g.prefix {
+                true => authz::grant_prefix(&token, approver, &grant)?,
+                false => authz::grant(&token, approver, &grant)?,
+            };
             listed.push(TokenGrant {
                 id: grant.gid.clone(),
                 host: grant.host.to_ascii_lowercase(),
                 method: grant.method.to_ascii_uppercase(),
                 path: grant.path.clone(),
                 uses: g.uses,
+                prefix: g.prefix,
             });
         }
         Ok(BoxAuthority {

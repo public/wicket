@@ -242,8 +242,9 @@ wicket node revoke n1
   | closed (no verified state, or the feed key's certificate expired) | nothing | 403 |
 
   Approved grants for the box's requests are pushed to the node as feed grants bound to the box, and the node
-  counts their uses: the ledger hands them over and never consumes them too. A path-prefix grant is honoured on
-  a node for the asked path only. `wicket grant revoke <id>` (picked up within 250 ms) and a run revocation
+  counts their uses: the ledger hands them over and never consumes them too. A path-prefix grant covers its
+  directory and every path under it, whole segments of the canonical path only, on a node at protocol 16 or
+  later (#257); a node at 15 honours it for the asked path only. `wicket grant revoke <id>` (picked up within 250 ms) and a run revocation
   (`wicket identity revoke`, within 2 s) are pushed to the node, which applies them as soon as they arrive; a node
   that hears nothing keeps what it holds until it expires: for a cut-off node, revocation takes the
   remaining lifetime of what was revoked. A tampered, replayed or rolled-back
