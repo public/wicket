@@ -258,37 +258,20 @@ impl Llm {
     }
 
     async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<BoxBody> {
-        self.first_request_ms
-            .get_or_init(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0));
         let Some(spec) = self.ctx.zone.llm.as_ref() else {
             return problem(404, "no-model", "No model", "this zone has no model route", None);
         };
-        let Some(profile) = crate::provider::profile(&spec.provider) else {
+        if crate::provider::profile(&spec.provider).is_none() {
             return problem(404, "no-model", "No model", &format!("no provider profile for {:?}", spec.provider), None);
-        };
-        if let Err(why) = profile.allowed_route(req.method().as_str(), req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/")) {
-            self.event(None, 404, Usage::default(), &format!("refused route: {why}"));
-            return problem(404, "route", "Not a model route", &why, None);
         }
+        // A stale activation (#70). The egress proxy refuses one for its whole tunnel, before a
+        // wrapped session's call reaches its gate (`route_parity.rs`'s INTENDED).
         if let Some(why) = self.ctx.superseded() {
             self.event(None, 409, Usage::default(), "stale generation");
             return problem(409, "stale-generation", "This activation is stale", &why, None);
         }
-        if let Some(r) = self.admit(Some(spec)) {
-            return r;
-        }
-        match self.forward(req).await {
-            Ok(r) => r,
-            // The model secret couldn't be read (#350): say which and why, not a bare upstream error.
-            Err(e) if e.downcast_ref::<crate::vault::SecretUnavailable>().is_some() => {
-                self.event(None, 503, Usage::default(), &format!("model secret unavailable: {e}"));
-                problem(503, "secret-unavailable", "Model secret unavailable", &format!("{e}. {SECRET_UNAVAILABLE_FIX}"), None)
-            }
-            Err(e) => {
-                self.event(None, 502, Usage::default(), &format!("upstream error: {e}"));
-                problem(502, "upstream", "Model upstream error", &e.to_string(), None)
-            }
-        }
+        let pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
+        self.call(ModelRoute::Direct, pq, req).await
     }
 
     /// Counts a model request and checks the budgets before it is sent: None if it may go, else the
@@ -364,28 +347,71 @@ impl Llm {
         });
     }
 
-    async fn forward(self: &Arc<Self>, req: Request<Incoming>) -> Result<Response<BoxBody>> {
-        let spec = self.ctx.zone.llm.as_ref().ok_or_else(|| anyhow::anyhow!("this zone has no model route"))?;
+    /// The one model call, whichever route it came by (#552): the provider's routes, the budgets,
+    /// the body and its filter, the reservation, the credential (fetched to a node, #152, and read
+    /// patiently, #350), the send on a task of its own (settled by what the provider answers,
+    /// whether or not the box still waits, #422), a 401's wait for a refreshed login and one
+    /// retry (#360), the answer's credential checks (#362), and the accounting. Only where the
+    /// call goes and how its credential is attached differ by route ([`ModelRoute`]), so the two
+    /// can't drift apart (`route_parity.rs`).
+    pub(crate) async fn call<B>(self: &Arc<Self>, route: ModelRoute, pq: String, req: Request<B>) -> Response<BoxBody>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.first_request_ms
+            .get_or_init(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0));
+        if let Some(profile) = self.profile() {
+            if let Err(why) = profile.allowed_route(req.method().as_str(), &pq) {
+                self.event(None, 404, Usage::default(), &format!("refused route: {why}"));
+                return problem(404, "route", "Not a model route", &why, None);
+            }
+        }
+        let spec = self.ctx.zone.llm.as_ref();
+        if let Some(r) = self.admit(spec) {
+            return r;
+        }
         let (parts, body) = req.into_parts();
-        let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
-        let Filtered { body, model, mut note, reserved } = match self.filter(Some(spec), &parts, body) {
-            Ok(f) => f,
-            Err(r) => return Ok(*r),
+        let body = match Limited::new(body, MAX_REQUEST_BODY).collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(e) => {
+                self.event(None, 400, Usage::default(), &format!("refused: request body: {e}"));
+                return problem(400, "bad-request", "Bad model request", &format!("request body: {e}"), None);
+            }
         };
-        // From here the reservation is held by `held`: a box that gives up on the call (its client
-        // times out while the credential is fetched, #422) drops this future, and the drop gives
-        // the reservation back instead of leaving it counted for good.
+        let Filtered { body, model, note, reserved } = match self.filter(spec, &parts, body) {
+            Ok(f) => f,
+            Err(r) => return *r,
+        };
+        // From here the reservation is held by `held`: a box that gives up on the call before it is
+        // sent (its client times out while the credential is fetched, #422) drops this future, and
+        // the drop gives the reservation back instead of leaving it counted for good.
         let held = Reservation::new(self, reserved);
         self.journal();
-        // On a node (#152), the credential comes from the node's cache (fetched from the control host
-        // on first use) and the call goes from here; the control host isn't asked per call. Without
-        // the credential (first use while the control host is unreachable), the call fails clearly.
-        // Only the node runs a model proxy for a box (#257): nothing relays a call to another one.
-        if self.ctx.vault.is_sourced() {
-            if let Err(e) = self.ctx.vault.ensure(&spec.secret).await {
+        let head = Head { method: parts.method, uri: parts.uri, version: parts.version, headers: parts.headers, pq };
+        let host = route.host(self);
+        // The credential this route attaches: on a node fetched from the control host on first use
+        // (#152), and read patiently (a linked login's owner may be rewriting its file, #350).
+        let secret = route.secret(self, &head.headers);
+        let mut token = None;
+        if let Some(name) = &secret {
+            if let Err(e) = self.ctx.vault.ensure(name).await {
                 drop(held);
                 self.event(model, 503, Usage::default(), "credential unavailable on this node");
-                return Ok(problem(503, "credential", "Model credential unavailable on this node", &format!("{e:#}"), None));
+                return problem(503, "credential", "Model credential unavailable on this node", &format!("{e:#}"), None);
+            }
+            match self.ctx.vault.get_for_patiently(name, &host, SECRET_PATIENCE).await {
+                Ok(t) => token = Some(t),
+                Err(e) if e.downcast_ref::<crate::vault::SecretUnavailable>().is_some() => {
+                    drop(held);
+                    self.event(model, 503, Usage::default(), &format!("model secret unavailable: {e}"));
+                    return problem(503, "secret-unavailable", "Model secret unavailable", &format!("{e}. {SECRET_UNAVAILABLE_FIX}"), None);
+                }
+                Err(e) => {
+                    drop(held);
+                    self.event(model, 502, Usage::default(), &format!("upstream error: {e:#}"));
+                    return problem(502, "upstream", "Model upstream error", &format!("{e:#}"), None);
+                }
             }
         }
         // Sent upstream on a task of its own: once the call may reach the provider it is settled by
@@ -394,88 +420,73 @@ impl Llm {
         let me = self.clone();
         let call = tokio::spawn(async move {
             let reserved = held.take();
-            let spec = me.ctx.zone.llm.as_ref().expect("checked: a model route");
-            let up = me.send_once_more_if_relogged(spec, &parts, body, model.as_deref(), &mut note).await.map(|r| {
-                let (status, headers) = (r.status().as_u16(), r.headers().clone());
-                let stream = r.bytes_stream().map(|c| c.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)).boxed();
-                (status, headers, stream)
-            });
-            let (status, headers, stream) = match up {
-                Ok(r) => r,
+            let mut note = note;
+            let first = route.send(&me, &head, body.clone(), token.as_deref()).await;
+            // The upstream refused the credential (401): a login refreshed by its owner while the
+            // call was out revokes the old token (#360), and its new one is written a moment later
+            // (#552). Wait for the secret to change and send the call once more with the new value;
+            // an unchanged one is a real revocation, passed on. Nothing of the first answer has
+            // reached the box yet, so it sees one call either way.
+            let sent = match (first, &secret, &token) {
+                (Ok(resp), Some(name), Some(old)) if resp.status() == StatusCode::UNAUTHORIZED => {
+                    match Self::changed_secret(&me.ctx.vault, name, &host, old).await {
+                        Ok(Some(fresh)) => {
+                            drop(resp);
+                            me.event(
+                                model.clone(),
+                                401,
+                                Usage::default(),
+                                &format!("upstream refused the credential (401); secret {name:?} has changed since it was read: retrying once with its new value"),
+                            );
+                            note.push_str(&format!("; retried once after a 401 with the new value of secret {name:?}"));
+                            route.send(&me, &head, body, Some(&fresh)).await
+                        }
+                        Ok(None) => {
+                            note.push_str(&format!(
+                                "; upstream refused the credential (401); secret {name:?} read again for {}s is unchanged: not retried",
+                                RELOGIN_WAIT.as_secs()
+                            ));
+                            Ok(resp)
+                        }
+                        Err(e) => {
+                            note.push_str(&format!(
+                                "; upstream refused the credential (401); secret {name:?} could not be read again ({e:#}): not retried"
+                            ));
+                            Ok(resp)
+                        }
+                    }
+                }
+                (sent, ..) => sent,
+            };
+            match sent {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let sse = resp
+                        .headers()
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v.starts_with("text/event-stream"));
+                    // An upstream that encodes anyway: its usage can't be read, so say why it is charged.
+                    if let Some(enc) =
+                        resp.headers().get(http::header::CONTENT_ENCODING).filter(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+                    {
+                        note.push_str(&format!("; response Content-Encoding {}", String::from_utf8_lossy(enc.as_bytes())));
+                    }
+                    let (head, body) = resp.into_parts();
+                    Response::from_parts(head, me.account(model, status, sse, body.into_data_stream(), reserved, note))
+                }
                 Err(e) => {
                     me.settle(reserved, Usage::default(), true);
-                    return Err(e);
-                }
-            };
-            let mut out = Response::builder().status(StatusCode::from_u16(status)?);
-            for (name, value) in headers.iter() {
-                if !STRIP_RESPONSE.contains(&name.as_str()) {
-                    out = out.header(name.as_str(), value.as_bytes());
+                    if let Some(r) = crate::egress::tripped_response(&e) {
+                        me.event(model, 403, Usage::default(), &format!("{e}"));
+                        return r;
+                    }
+                    me.event(model, 502, Usage::default(), &format!("upstream error: {e:#}"));
+                    problem(502, "upstream", "Model upstream error", &format!("{e:#}"), None)
                 }
             }
-            let sse =
-                headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
-            let body = me.account(model, status, sse, stream, reserved, note);
-            Ok(out.body(body)?)
         });
-        call.await.map_err(|e| anyhow::anyhow!("the model call's task: {e}"))?
-    }
-
-    /// Sends a call upstream with the model secret's current value; if the upstream refuses that
-    /// value (401: a login refreshed by its owner while the call was out revokes the old access
-    /// token, #360), reads the secret again from its source, for up to [`RELOGIN_WAIT`] until it
-    /// changes (#552: the owner writes the new token a moment after the old one is revoked) and,
-    /// only if the value changed, sends the call once more with the new one. The retry is audited; an unchanged value is never sent
-    /// again, so a real revocation still surfaces as the 401. Nothing of the first response has
-    /// reached the box when this decides (its body is only streamed by [`Llm::account`], after),
-    /// and the request body is the one this proxy holds, so the box sees one call either way.
-    async fn send_once_more_if_relogged(
-        &self,
-        spec: &wicket_core::manifest::LlmSpec,
-        parts: &http::request::Parts,
-        body: Bytes,
-        model: Option<&str>,
-        note: &mut String,
-    ) -> Result<reqwest::Response> {
-        let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
-        let token = self.ctx.vault.get_for_patiently(&spec.secret, &up_host, SECRET_PATIENCE).await?;
-        let first = self.send_upstream(spec, parts, body.clone(), &token).await?;
-        if first.status() != StatusCode::UNAUTHORIZED {
-            return Ok(first);
-        }
-        // Read again until the value changes, for up to RELOGIN_WAIT (#552): the refresh that revoked
-        // this token may not have written the new one yet. A value that stays the same is a real
-        // revocation, and its 401 goes to the box.
-        let fresh = match Self::changed_secret(&self.ctx.vault, &spec.secret, &up_host, &token).await {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                note.push_str(&format!(
-                    "; upstream refused the credential (401); secret {:?} read again for {}s is unchanged: not retried",
-                    spec.secret,
-                    RELOGIN_WAIT.as_secs()
-                ));
-                return Ok(first);
-            }
-            Err(e) => {
-                note.push_str(&format!(
-                    "; upstream refused the credential (401); secret {:?} could not be read again ({e:#}): not retried",
-                    spec.secret
-                ));
-                return Ok(first);
-            }
-        };
-        drop(first);
-        self.event(
-            model.map(String::from),
-            401,
-            Usage::default(),
-            &format!(
-                "upstream refused the credential (401); secret {:?} has changed since it was read: retrying once with its new value",
-                spec.secret
-            ),
-        );
-        note.push_str(&format!("; retried once after a 401 with the new value of secret {:?}", spec.secret));
-        self.send_upstream(spec, parts, body, &fresh).await
+        call.await.unwrap_or_else(|e| problem(502, "upstream", "Model upstream error", &format!("the model call's task: {e}"), None))
     }
 
     /// Reads secret `name` again from its source until its value is no longer `old`, for up to
@@ -515,7 +526,7 @@ impl Llm {
             }
         }
         // The real credential, attached as the provider's profile says (the one slot it uses).
-        // Only to an upstream the secret is bound to ([`Llm::send_once_more_if_relogged`] read it
+        // Only to an upstream the secret is bound to ([`Llm::call`] read it
         // for this host), whatever the zone's `upstream` says.
         let profile =
             crate::provider::profile(&spec.provider).ok_or_else(|| anyhow::anyhow!("no provider profile for {:?}", spec.provider))?;
@@ -683,7 +694,7 @@ impl Llm {
     /// filter and accounting as a call to this proxy, then the egress proxy's own forwarding.
     pub(crate) async fn through_egress<B>(
         self: &Arc<Self>,
-        egress: &crate::egress::Egress,
+        egress: Arc<crate::egress::Egress>,
         req: Request<B>,
         host: &str,
         pq: &str,
@@ -693,120 +704,7 @@ impl Llm {
         B: hyper::body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let spec = self.ctx.zone.llm.as_ref();
-        if let Some(r) = self.admit(spec) {
-            return r;
-        }
-        let (parts, body) = req.into_parts();
-        let body = match Limited::new(body, MAX_REQUEST_BODY).collect().await {
-            Ok(b) => b.to_bytes(),
-            Err(e) => return problem(400, "bad-request", "Bad model request", &format!("request body: {e}"), None),
-        };
-        let f = match self.filter(spec, &parts, body) {
-            Ok(f) => f,
-            Err(r) => return *r,
-        };
-        // Held until the call goes upstream, given back if the box gives up first (#422); from
-        // there it is settled on a task of its own, as `forward`'s.
-        let mut held = Reservation::new(self, f.reserved);
-        self.journal();
-        let mut parts = parts;
-        // The body may have been rewritten (fields stripped, max_tokens lowered): its own length goes
-        // up, not the one the box declared. And the response is asked for unencoded, as the model
-        // proxy asks for it, so its usage can be read as it streams past (#310): the box's
-        // `Accept-Encoding` would get a compressed stream that the usage scanner can't read.
-        parts.headers.insert(http::header::CONTENT_LENGTH, f.body.len().into());
-        parts.headers.insert(http::header::ACCEPT_ENCODING, http::HeaderValue::from_static("identity"));
-        // What a retry after a 401 needs (#552): the request again, and the secret the egress proxy
-        // puts on it with the value it puts on now.
-        let again = (parts.method.clone(), parts.uri.clone(), parts.version, parts.headers.clone(), f.body.clone());
-        let secret = egress.credential_secret(host, &parts.headers);
-        let before = match &secret {
-            Some(name) => match egress.ctx.vault.ensure(name).await {
-                Ok(()) => egress.ctx.vault.get_for(name, host).ok(),
-                Err(_) => None,
-            },
-            None => None,
-        };
-        let req = Request::from_parts(parts, http_body_util::Full::new(f.body));
-        // Sent: a box that gives up on it now leaves it charged its reservation, as a call whose
-        // final usage wasn't seen (the provider may bill it).
-        held.sent();
-        let sent = egress.forward(req, host, "https", pq, via).await;
-        let reserved = held.take();
-        // The upstream refused the credential (401): a login refreshed by its owner while the call
-        // was out revokes the old token (#360, #552). Wait for the secret to change and send the
-        // call once more with the new value; an unchanged one is a real revocation, passed on. The
-        // box has seen nothing of the first answer yet. Either way the call's note says so.
-        let mut relogin = String::new();
-        let sent = match (sent, &secret, &before) {
-            (Ok(resp), Some(name), Some(old)) if resp.status() == StatusCode::UNAUTHORIZED => {
-                match Self::changed_secret(&egress.ctx.vault, name, host, old).await {
-                    Ok(Some(_)) => {
-                        drop(resp);
-                        self.event(
-                            f.model.clone(),
-                            401,
-                            Usage::default(),
-                            &format!("upstream refused the credential (401); secret {name:?} has changed since it was read: retrying once with its new value"),
-                        );
-                        relogin = format!("; retried once after a 401 with the new value of secret {name:?}");
-                        let (method, uri, version, headers, body) = again;
-                        let mut b = Request::builder().method(method).uri(uri).version(version);
-                        if let Some(h) = b.headers_mut() {
-                            *h = headers;
-                        }
-                        match b.body(http_body_util::Full::new(body)) {
-                            Ok(req) => egress.forward(req, host, "https", pq, via).await,
-                            Err(e) => Err(anyhow::Error::from(e)),
-                        }
-                    }
-                    Ok(None) => {
-                        relogin = format!(
-                            "; upstream refused the credential (401); secret {name:?} read again for {}s is unchanged: not retried",
-                            RELOGIN_WAIT.as_secs()
-                        );
-                        Ok(resp)
-                    }
-                    Err(e) => {
-                        relogin = format!(
-                            "; upstream refused the credential (401); secret {name:?} could not be read again ({e:#}): not retried"
-                        );
-                        Ok(resp)
-                    }
-                }
-            }
-            (sent, ..) => sent,
-        };
-        match sent {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let sse = resp
-                    .headers()
-                    .get(http::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| v.starts_with("text/event-stream"));
-                let mut note = f.note;
-                note.push_str(&relogin);
-                // An upstream that encodes anyway: its usage can't be read, so say why it is charged.
-                if let Some(enc) =
-                    resp.headers().get(http::header::CONTENT_ENCODING).filter(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
-                {
-                    note.push_str(&format!("; response Content-Encoding {}", String::from_utf8_lossy(enc.as_bytes())));
-                }
-                let (head, body) = resp.into_parts();
-                Response::from_parts(head, self.account(f.model, status, sse, body.into_data_stream(), reserved, note))
-            }
-            Err(e) => {
-                self.settle(reserved, Usage::default(), true);
-                if let Some(r) = crate::egress::tripped_response(&e) {
-                    self.event(f.model, 403, Usage::default(), &format!("{e}"));
-                    return r;
-                }
-                self.event(f.model, 502, Usage::default(), &format!("upstream error: {e:#}"));
-                problem(502, "upstream", "Model upstream error", &format!("{e:#}"), None)
-            }
-        }
+        self.call(ModelRoute::Through { egress, host: host.to_string(), pq: pq.to_string(), via }, pq.to_string(), req).await
     }
 
     /// Streams an upstream response to the agent while reading its usage as it goes (in constant
@@ -879,24 +777,18 @@ impl Llm {
     }
 }
 
-/// A call's output reservation (#113) while its call is being made: settled by whoever takes it
-/// ([`Reservation::take`]). Dropped untaken, the call was given up on (the box's client went away,
-/// #422): a call not yet sent gives its reservation back, uncharged; one sent is charged it in full,
-/// as a call whose final usage wasn't seen.
+/// A call's output reservation (#113) until its call is sent: settled by whoever takes it
+/// ([`Reservation::take`], the call's task). Dropped untaken, the call was given up on before it
+/// went (the box's client went away, #422): its reservation is given back, uncharged. Once sent, a
+/// call runs on its own task and is settled by what the provider answers, on either route (#552).
 struct Reservation {
     llm: Arc<Llm>,
     tokens: u64,
-    sent: bool,
 }
 
 impl Reservation {
     fn new(llm: &Arc<Llm>, tokens: u64) -> Reservation {
-        Reservation { llm: llm.clone(), tokens, sent: false }
-    }
-
-    /// The call is going upstream: the provider may bill it from here.
-    fn sent(&mut self) {
-        self.sent = true;
+        Reservation { llm: llm.clone(), tokens }
     }
 
     /// Hands the reservation to the caller, who settles it.
@@ -910,8 +802,7 @@ impl Drop for Reservation {
         if self.tokens == 0 {
             return;
         }
-        let charged = if self.sent { self.tokens } else { 0 };
-        self.llm.count.settle(self.tokens, 0, 0, 0, charged);
+        self.llm.count.settle(self.tokens, 0, 0, 0, 0);
         self.llm.journal();
     }
 }
@@ -996,6 +887,105 @@ fn named(mut names: Vec<String>) -> String {
         out.push_str(", …");
     }
     out
+}
+
+/// A model call's request line and headers, kept for its attempts (one, or two after a 401).
+struct Head {
+    method: http::Method,
+    uri: http::Uri,
+    version: http::Version,
+    headers: http::HeaderMap,
+    /// Its path and query, as the box sent them.
+    pq: String,
+}
+
+/// How one attempt of a model call reaches its upstream: all that differs between the two routes
+/// a model call takes (#552). Everything else is [`Llm::call`]'s.
+pub(crate) enum ModelRoute {
+    /// The model proxy's own socket: the route's upstream, the zone's model secret attached by the
+    /// provider's profile, sent with this proxy's client.
+    Direct,
+    /// A wrapped session's call, through the egress proxy's gate (#112): the host the box named,
+    /// the run's swap or inject rule, and the egress proxy's dialer (`route_parity.rs`'s
+    /// INTENDED_UNTESTED).
+    Through { egress: Arc<crate::egress::Egress>, host: String, pq: String, via: crate::egress::Via },
+}
+
+impl ModelRoute {
+    /// The host the call goes to: what a secret's host binding is checked against.
+    fn host(&self, llm: &Llm) -> String {
+        match self {
+            ModelRoute::Direct => llm
+                .ctx
+                .zone
+                .llm
+                .as_ref()
+                .and_then(|s| reqwest::Url::parse(&s.upstream).ok())
+                .and_then(|u| u.host_str().map(String::from))
+                .unwrap_or_default(),
+            ModelRoute::Through { host, .. } => host.clone(),
+        }
+    }
+
+    /// The vault secret this route attaches to the call, if any.
+    fn secret(&self, llm: &Llm, headers: &http::HeaderMap) -> Option<String> {
+        match self {
+            ModelRoute::Direct => llm.ctx.zone.llm.as_ref().map(|s| s.secret.clone()),
+            ModelRoute::Through { egress, host, .. } => egress.credential_secret(host, headers),
+        }
+    }
+
+    /// Sends one attempt, with `token` (the secret's value read for it), and answers what the box
+    /// may see: the answer's credential checks (#362) applied on both routes.
+    async fn send(&self, llm: &Llm, head: &Head, body: Bytes, token: Option<&str>) -> Result<Response<BoxBody>> {
+        match self {
+            ModelRoute::Direct => {
+                let spec = llm.ctx.zone.llm.as_ref().ok_or_else(|| anyhow::anyhow!("this zone has no model route"))?;
+                let host = self.host(llm);
+                // The tripwire (#362): a placeholder of this run's anywhere in the URL or a header
+                // the model proxy would forward. (The box's Authorization isn't forwarded here: the
+                // proxy attaches the zone's secret.) The egress proxy runs it in its own forwarding.
+                let scan = crate::egress::CanaryScanner::placeholders(llm.ctx.swaps.iter().map(|s| s.placeholder.as_str()));
+                let mut seen = head.headers.clone();
+                seen.remove(http::header::AUTHORIZATION);
+                if let Some(what) = crate::egress::placeholder_moved(&llm.ctx, &scan, &seen, &host, &head.pq) {
+                    crate::egress::anomaly(&llm.ctx, &host, "placeholder.moved", &what);
+                    return Err(crate::egress::Tripped { what, note: String::new() }.into());
+                }
+                let token = token.ok_or_else(|| anyhow::anyhow!("no model secret to send"))?;
+                let mut b = Request::builder().method(head.method.clone()).uri(head.uri.clone()).version(head.version);
+                if let Some(h) = b.headers_mut() {
+                    *h = head.headers.clone();
+                }
+                let (parts, ()) = b.body(())?.into_parts();
+                let r = llm.send_upstream(spec, &parts, body, token).await?;
+                let mut out = Response::builder().status(StatusCode::from_u16(r.status().as_u16())?);
+                for (name, value) in r.headers().iter() {
+                    if !STRIP_RESPONSE.contains(&name.as_str()) {
+                        out = out.header(name.as_str(), value.as_bytes());
+                    }
+                }
+                let stream = r
+                    .bytes_stream()
+                    .map(|c| c.map(hyper::body::Frame::data).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
+                let resp = out.body(BodyExt::boxed(http_body_util::StreamBody::new(stream)))?;
+                Ok(crate::egress::guard_credential(&llm.ctx, resp, &host, &head.method, &[token.to_string()]))
+            }
+            ModelRoute::Through { egress, host, pq, via } => {
+                // The body may have been rewritten (fields stripped, max_tokens lowered): its own
+                // length goes up, not the one the box declared. And the answer is asked for
+                // unencoded, so its usage can be read as it streams past (#310) and it can be
+                // checked for the credential (#362). The egress proxy swaps the credential in.
+                let mut b = Request::builder().method(head.method.clone()).uri(head.uri.clone()).version(head.version);
+                if let Some(h) = b.headers_mut() {
+                    *h = head.headers.clone();
+                    h.insert(http::header::CONTENT_LENGTH, body.len().into());
+                    h.insert(http::header::ACCEPT_ENCODING, http::HeaderValue::from_static("identity"));
+                }
+                egress.forward(b.body(http_body_util::Full::new(body))?, host, "https", pq, *via).await
+            }
+        }
+    }
 }
 
 /// A vetted model request body, and what it reserves.

@@ -1,7 +1,8 @@
 //! The model proxy's two routes, held to each other (#552): a model call reaches the model host
-//! either through the model proxy's own socket (`Llm::handle` → `forward`) or, from a wrapped
-//! session, through the egress proxy's gate (`Egress::handle` → `Llm::through_egress`). #360's 401
-//! retry was written on the first only, and #552 was the other. Every behaviour of a model call is
+//! either through the model proxy's own socket (`Llm::handle`) or, from a wrapped session, through
+//! the egress proxy's gate (`Egress::handle` → `Llm::through_egress`). #360's 401 retry was once
+//! written on the first only, and #552 was the other; both now make one `Llm::call`, which differs
+//! by route only in `ModelRoute` (where the call goes, how its credential is attached). Every behaviour of a model call is
 //! run here through both routes against one mock model host (the same handler, over plain HTTP for
 //! the model proxy's upstream and over TLS as `api.anthropic.com` for the egress proxy), and each
 //! route must answer, record and charge alike.
@@ -515,80 +516,10 @@ const INTENDED_UNTESTED: &[(u8, &str)] = &[(
     "the destination and transport: the model proxy calls its route's upstream with its own client; a wrapped session's call goes to the host the box named, on the egress dialer (DNS pinning, dial-time address checks, HTTP/3)",
 )];
 
-/// Drift the audit found (`out/one-route/proposal.md`), to be deleted from this list as the two
-/// routes become one. Each entry says what each route does today.
-const KNOWN: &[Differs] = &[
-    Differs {
-        case: "a path that isn't a model route",
-        row: 2,
-        why: "the model proxy refuses it by its profile's routes (404); the egress gate takes it as a model call and its body filter refuses it (403)",
-        direct: |s| s.status == 404,
-        egress: |s| s.status == 403,
-    },
-    Differs {
-        case: "an oversized body",
-        row: 6,
-        why: "the model proxy answers a body it can't read as an upstream error (502); the egress gate as the box's (400)",
-        direct: |s| s.status == 502,
-        egress: |s| s.status == 400,
-    },
-    Differs {
-        case: "a login being rewritten",
-        row: 8,
-        why: "the model proxy reads the secret patiently (#350); the egress proxy's swap reads it once, and fails",
-        direct: |s| s.status == 200,
-        egress: |s| s.status == 502,
-    },
-    Differs {
-        case: "a login that can't be read",
-        row: 9,
-        why: "the model proxy says the secret is unavailable (503, #350); the egress proxy's swap fails as an upstream error (502)",
-        direct: |s| s.status == 503 && s.body.contains("secret-unavailable"),
-        egress: |s| s.status == 502,
-    },
-    Differs {
-        case: "a node without the credential",
-        row: 10,
-        why: "the model proxy says the credential is unavailable on this node (503, #152); the egress proxy's swap fails as an upstream error (502)",
-        direct: |s| s.status == 503 && s.body.contains("credential"),
-        egress: |s| s.status == 502,
-    },
-    Differs {
-        case: "the run's placeholder in another header",
-        row: 14,
-        why: "the egress proxy's tripwire (#362) refuses a placeholder anywhere but its own host's Authorization; the model proxy forwards the header",
-        direct: |s| s.status == 200 && s.beta_header,
-        egress: |s| s.status == 403 && s.bearers.is_empty(),
-    },
-    Differs {
-        case: "an upstream that echoes the credential",
-        row: 13,
-        why: "only the egress proxy masks a credential reflected in the response (#362)",
-        direct: |s| s.status == 200 && s.body.contains(T1),
-        egress: |s| s.status == 200 && !s.body.contains(T1),
-    },
-    Differs {
-        case: "an upstream that encodes anyway",
-        row: 15,
-        why: "with a credential attached, the egress proxy refuses an answer encoded so it can't be checked for that credential (#362); the model proxy passes it on, charged its whole reservation",
-        direct: |s| s.status == 200 && s.charged == 50 && s.note("no final usage seen"),
-        egress: |s| s.status == 502 && s.body.contains("gzip-encoded"),
-    },
-    Differs {
-        case: "the box gives up while the call is out",
-        row: 16,
-        why: "the model proxy sends the call on its own task and settles it by the provider's answer (#422); the egress gate's call goes with the box's future, charged its whole reservation",
-        direct: |s| s.charged == 2,
-        egress: |s| s.charged == 50,
-    },
-    Differs {
-        case: "an ordinary call",
-        row: 17,
-        why: "only the model proxy records the run's first model request, which a node reports (#152)",
-        direct: |s| s.status == 200 && s.first_request,
-        egress: |s| s.status == 200 && !s.first_request,
-    },
-];
+/// Drift the audit found (`out/one-route/proposal.md`), deleted from this list as the two routes
+/// became one call (`Llm::call`, rows 2, 6, 8, 9, 10, 13, 14, 15, 16 and 17). A new difference is a
+/// regression: make the routes alike rather than list it here.
+const KNOWN: &[Differs] = &[];
 
 const CASES: &[Case] = &[
     Case { name: "an ordinary call", setup: Setup::default, both: |s| s.status == 200 && s.requests == 1 && s.bearers == [T1] },

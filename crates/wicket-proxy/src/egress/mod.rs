@@ -494,7 +494,7 @@ impl Egress {
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
         if let Some(llm) = self.model_gate.get().filter(|l| l.is_model_call(&host, &path)) {
-            return llm.clone().through_egress(&self, req, &host, &pq, via).await;
+            return llm.clone().through_egress(self.clone(), req, &host, &pq, via).await;
         }
         match self.forward(req, &host, scheme, &pq, via).await {
             Ok(r) => r,
@@ -858,7 +858,7 @@ mod tests {
     }
 
     /// #112: a wrapped session's model calls, which come through the egress proxy, get the model
-    /// proxy's budget and body checks there: never forwarded once the budget is spent, nor as a
+    /// proxy's route, budget and body checks there: never forwarded once the budget is spent, nor as a
     /// batch or an encoded body.
     #[tokio::test]
     async fn model_calls_through_egress_are_vetted_and_counted() {
@@ -882,9 +882,10 @@ mod tests {
                 (st, String::from_utf8_lossy(&r.into_body().collect().await.unwrap().to_bytes()).into_owned())
             }
         };
-        assert_eq!(send("/v1/messages/batches", None).await.0, 403);
+        // Not one of the provider's routes: refused as the model proxy refuses it (404), uncounted (#552).
+        assert_eq!(send("/v1/messages/batches", None).await.0, 404);
         assert_eq!(send("/v1/messages", Some("gzip")).await.0, 415);
-        assert_eq!(llm.count.requests.load(std::sync::atomic::Ordering::SeqCst), 2, "counted as model requests");
+        assert_eq!(llm.count.requests.load(std::sync::atomic::Ordering::SeqCst), 1, "counted as a model request");
         llm.spent_before(u64::MAX / 4, 0, 0);
         let (st, body) = send("/v1/messages", None).await;
         assert_eq!(st, 429, "{body}");
