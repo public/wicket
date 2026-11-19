@@ -1994,7 +1994,8 @@ impl Ledger {
         }
         tx.execute("UPDATE node_cas SET status = 'superseded' WHERE node = ?1 AND status = 'active'", params![ca.node])?;
         insert_node_ca(&tx, ca)?;
-        tx.execute("UPDATE nodes SET hosts = ?2 WHERE name = ?1", params![ca.node, serde_json::Value::from(ca.hosts.clone()).to_string()])?;
+        // `nodes.hosts` stays what the operator set (enrolment, renew-ca): a CA widened at runtime
+        // (#573) adds its boxes' wants to it, which a later renewal prunes.
         tx.commit()?;
         Ok(serials)
     }

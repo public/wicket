@@ -200,6 +200,21 @@ pub fn ca_hosts(zone: &ZoneSpec, extra: &[String]) -> Vec<String> {
     kept
 }
 
+/// `entries` (name constraint subtrees) without the ones another covers, in their order: the
+/// first of two equal ones is kept. What a widened node CA is signed for (#573).
+pub fn merge_subtrees(entries: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for (i, e) in entries.iter().enumerate() {
+        let e = e.to_ascii_lowercase();
+        let covered_later = entries[i + 1..].iter().any(|o| !o.eq_ignore_ascii_case(&e) && subtree_covers(o, &e));
+        if !covered_later && !out.iter().any(|o| subtree_covers(o, &e)) {
+            out.retain(|o| !subtree_covers(&e, o));
+            out.push(e);
+        }
+    }
+    out
+}
+
 /// The entries of `needed` (as [`ca_hosts`] gives them) that a CA permitting `permitted` doesn't
 /// cover: what a renewal would have to add.
 pub fn uncovered(permitted: &[String], needed: &[String]) -> Vec<String> {
@@ -540,6 +555,7 @@ mod tests {
         assert!(uncovered(&s(&[".org"]), &s(&[".example.org", "x.example.org"])).is_empty());
         assert_eq!(uncovered(&s(&["a.example.org"]), &s(&["example.org", ".example.org"])), s(&["example.org", ".example.org"]));
         assert!(uncovered(&s(&["*"]), &s(&["anything.test", ".any.test"])).is_empty());
+        assert_eq!(merge_subtrees(&s(&["a.example.org", "api.test", ".example.org", "API.test"])), s(&["api.test", ".example.org"]));
         // As a verifier reads it.
         assert!(subtree_permits("api.example.com", "x.api.example.com") && !subtree_permits(".example.org", "example.org"));
     }

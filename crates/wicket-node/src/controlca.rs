@@ -28,6 +28,37 @@ use wicket_store::{Ledger, NodeCaRow};
 /// An unanswered step is given up after this long (s), and a failed one retried after this.
 const STEP_SECS: i64 = 60;
 
+/// The most name constraints a widened node CA carries (#573): certificate size, and what
+/// verifiers take.
+pub const MAX_CA_HOSTS: usize = 64;
+
+/// What `node`'s CA should cover (#573): the hosts its operator set (`nodes.hosts`, from enrolment
+/// or `wicket node renew-ca`) and the live wants its node CA policy allows, oldest first, without
+/// entries another covers, at most [`MAX_CA_HOSTS`]. None: the policy is `fixed`, so the CA keeps
+/// its hosts.
+pub fn target(ledger: &Ledger, node: &str) -> Option<Vec<String>> {
+    let policy = ledger.node_ca_policy(node).ok()?;
+    if policy == wicket_store::CaHosts::Fixed {
+        return None;
+    }
+    let base = ledger.node(node).ok()??.hosts;
+    let wants = ledger.node_ca_wants(node).ok()?;
+    let mut all = base;
+    all.extend(wants.into_iter().map(|w| w.host).filter(|h| policy.allows(h)));
+    let mut merged = wicket_core::splice::merge_subtrees(&all);
+    if merged.len() > MAX_CA_HOSTS {
+        say!("[wicket] node {node}'s CA would need {} name constraints; it is widened to the first {MAX_CA_HOSTS}", merged.len());
+        merged.truncate(MAX_CA_HOSTS);
+    }
+    Some(merged)
+}
+
+/// Whether `node`'s CA leaves out a host its target has: a renewal widens it now, not at half its
+/// life.
+fn wants_widening(ledger: &Ledger, node: &str, ca: &NodeCaRow) -> bool {
+    target(ledger, node).is_some_and(|t| !wicket_core::splice::uncovered(&ca.hosts, &t).is_empty())
+}
+
 /// A renewal is due once the active CA is past half its life (or has expired).
 pub fn due(ca: &NodeCaRow, now: i64) -> bool {
     now >= ca.issued_at + (ca.not_after - ca.issued_at) / 2
@@ -39,8 +70,15 @@ pub fn active(ledger: &Ledger, node: &str) -> Option<NodeCaRow> {
 }
 
 enum Step {
-    Asked { at: i64 },
-    Sent { at: i64, cert: NodeCaCert },
+    Asked {
+        at: i64,
+    },
+    /// `before`: the hosts of the CA it replaces, for the audit of a widening.
+    Sent {
+        at: i64,
+        cert: NodeCaCert,
+        before: Vec<String>,
+    },
 }
 
 /// One connection's renewal of its node's CA.
@@ -71,7 +109,11 @@ impl CaRenewal {
             }
             None => {}
         }
-        if now < self.after || !active(&ledger.lock().expect("ledger"), node).is_some_and(|c| due(&c, now)) {
+        let renew = {
+            let l = ledger.lock().expect("ledger");
+            active(&l, node).is_some_and(|c| due(&c, now) || wants_widening(&l, node, &c))
+        };
+        if now < self.after || !renew {
             return None;
         }
         self.step = Some(Step::Asked { at: now });
@@ -94,18 +136,26 @@ impl CaRenewal {
         let signed = (|| {
             let csr = csr.with_context(|| error.unwrap_or_else(|| "no signing request".into()))?;
             let ca = ca.context("this control host has no installation CA")?;
-            let current = active(&ledger.lock().expect("ledger"), node).context("the node has no active CA in the ledger")?;
-            // The same name constraints as the CA it replaces (stored as subtrees: `.d` is `*.d`),
-            // and the same lifetime.
+            let l = ledger.lock().expect("ledger");
+            let current = active(&l, node).context("the node has no active CA in the ledger")?;
+            // The name constraints of the CA it replaces; with #573's policy, its target: widened by
+            // what its boxes want, and pruned to the target only at a due renewal (a box ending
+            // doesn't renew the CA early). Stored as subtrees: `.d` is `*.d`. The same lifetime.
+            let wanted = match target(&l, node) {
+                None => current.hosts.clone(),
+                Some(t) if due(&current, now) => t,
+                Some(t) => wicket_core::splice::merge_subtrees(&[current.hosts.clone(), t].concat()),
+            };
+            drop(l);
             let hosts: Vec<String> =
-                current.hosts.iter().map(|h| h.strip_prefix('.').map(|d| format!("*.{d}")).unwrap_or_else(|| h.clone())).collect();
+                wanted.iter().map(|h| h.strip_prefix('.').map(|d| format!("*.{d}")).unwrap_or_else(|| h.clone())).collect();
             let ttl = time::Duration::seconds((current.not_after - current.issued_at).clamp(300, 30 * 86_400));
-            ca.issue_node_ca(&csr, node, &hosts, ttl)
+            ca.issue_node_ca(&csr, node, &hosts, ttl).map(|c| (c, current.hosts))
         })();
         match signed {
-            Ok(cert) => {
+            Ok((cert, before)) => {
                 let pem = cert.pem.clone();
-                self.step = Some(Step::Sent { at: now, cert });
+                self.step = Some(Step::Sent { at: now, cert, before });
                 Some(Msg::NodeCa { pem })
             }
             Err(e) => {
@@ -120,7 +170,7 @@ impl CaRenewal {
     /// The node's answer to the certificate: recorded (and audited) once it is the node's CA.
     /// Returns the new CA's row.
     pub fn on_installed(&mut self, ledger: &Mutex<Ledger>, node: &str, serial: &str, error: Option<String>, now: i64) -> Option<NodeCaRow> {
-        let Some(Step::Sent { cert, .. }) = self.step.take() else { return None };
+        let Some(Step::Sent { cert, before, .. }) = self.step.take() else { return None };
         if let Some(e) = error.or_else(|| (serial != cert.serial).then(|| format!("it installed {serial}, not {}", cert.serial))) {
             say!("[wicket] node {node} did not take its renewed CA ({e}); retrying in a minute");
             self.after = now + STEP_SECS;
@@ -143,6 +193,23 @@ impl CaRenewal {
                 &serde_json::json!({ "name": node, "ca_serial": cert.serial, "ca_not_after": cert.not_after, "hosts": cert.permitted,
                                      "revoked": revoked, "via": "channel" }),
             )?;
+            // #573: what changed, and who wanted the hosts added.
+            let added: Vec<&String> = cert.permitted.iter().filter(|h| !before.contains(h)).collect();
+            let removed: Vec<&String> = before.iter().filter(|h| !cert.permitted.contains(h)).collect();
+            if !added.is_empty() || !removed.is_empty() {
+                let wants = l.node_ca_wants(node).unwrap_or_default();
+                let by: Vec<_> = wants
+                    .iter()
+                    .filter(|w| added.iter().any(|a| **a == w.host))
+                    .map(|w| serde_json::json!({ "host": w.host, "run": w.run, "why": w.why }))
+                    .collect();
+                l.audit(
+                    &TenantId::single(),
+                    None,
+                    "node.ca_widened",
+                    &serde_json::json!({ "name": node, "ca_serial": cert.serial, "added": added, "removed": removed, "wanted_by": by }),
+                )?;
+            }
             Ok(())
         });
         match recorded {

@@ -717,16 +717,73 @@ async fn ca_current(sh: &Shared, proto: u32) {
     }
     let expired =
         || wicket_node::controlca::active(&sh.ledger.lock().expect("ledger"), &sh.node).is_some_and(|c| c.not_after <= wicket_store::now());
-    if !expired() {
+    // What the box needs of the CA that it doesn't cover (#573), wanted of it if the node allows.
+    let wanted = want_ca_hosts(sh);
+    let missing = || {
+        wicket_node::controlca::active(&sh.ledger.lock().expect("ledger"), &sh.node)
+            .map(|c| wicket_core::splice::uncovered(&c.hosts, &wanted))
+            .unwrap_or_default()
+    };
+    if !expired() && missing().is_empty() {
         return;
     }
-    say!("[wicket] node {}'s CA has expired: renewing it before the box starts", sh.node);
-    for _ in 0..120 {
+    if expired() {
+        say!("[wicket] node {}'s CA has expired: renewing it before the box starts", sh.node);
+    } else {
+        say!("[wicket] widening node {}'s CA for {}, which the box's reach needs", sh.node, missing().join(", "));
+    }
+    for _ in 0..240 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if !expired() {
+        if !expired() && missing().is_empty() {
             return;
         }
     }
+    let left = missing();
+    if !left.is_empty() {
+        say!("[wicket] node {}'s CA still doesn't cover {}: the box's requests to them are refused there", sh.node, left.join(", "));
+    }
+}
+
+/// A grant's host, wanted of the node's CA if it doesn't cover it and the policy allows (#573): the
+/// grant holds from when it is published, and takes effect once the CA covers its host.
+fn want_grant_host(sh: &Shared, g: &wicket_store::GrantRow) {
+    if sh.node == crate::localnode::NAME {
+        return;
+    }
+    let l = sh.ledger.lock().expect("ledger");
+    let host = vec![g.host.to_ascii_lowercase()];
+    let covered = wicket_node::controlca::active(&l, &sh.node).is_none_or(|c| wicket_core::splice::uncovered(&c.hosts, &host).is_empty());
+    if covered || !l.node_ca_policy(&sh.node).is_ok_and(|p| p.allows(&host[0])) {
+        return;
+    }
+    let _ = l.want_node_ca_hosts(&sh.node, &host, &sh.run.0, &format!("grant {}", g.id), wicket_store::now());
+}
+
+/// The inspected hosts the box needs of its node's CA that the CA doesn't cover (#573): recorded as
+/// wants (by this run) if the node's CA policy allows them, so the next renewal over the channel
+/// widens the CA. Returns the ones wanted; says which the policy keeps out.
+fn want_ca_hosts(sh: &Shared) -> Vec<String> {
+    let l = sh.ledger.lock().expect("ledger");
+    let policy = l.node_ca_policy(&sh.node).unwrap_or(wicket_store::CaHosts::Fixed);
+    let Some(ca) = wicket_node::controlca::active(&l, &sh.node) else { return vec![] };
+    let swaps: Vec<String> = sh.swaps.iter().map(|s| s.host.clone()).collect();
+    let missing = wicket_core::splice::uncovered(&ca.hosts, &wicket_core::splice::ca_hosts(&sh.zone, &swaps));
+    let (allowed, kept_out): (Vec<String>, Vec<String>) = missing.into_iter().partition(|h| policy.allows(h));
+    if !kept_out.is_empty() {
+        say!(
+            "[wicket] node {}'s CA doesn't cover {}, and its CA policy keeps them out (wicket node set {} --ca-hosts …)",
+            sh.node,
+            kept_out.join(", "),
+            sh.node
+        );
+    }
+    if !allowed.is_empty() {
+        if let Err(e) = l.want_node_ca_hosts(&sh.node, &allowed, &sh.run.0, "the box's reach", wicket_store::now()) {
+            say!("[wicket] could not record what {} needs of node {}'s CA: {e}", sh.run, sh.node);
+            return vec![];
+        }
+    }
+    allowed
 }
 
 /// Makes sure node `node` has image `pin` (#191): if it hasn't, this host's runtime exports it as an
@@ -1229,6 +1286,8 @@ async fn on_frame(
                 sh.timings.mark("box.exited");
                 // The node says the box has stopped: nothing fences a wake of its agent any more.
                 confirm_stopped(&sh.dir);
+                // Nor does it need its node's CA any more (#573): the next due renewal prunes it.
+                let _ = sh.ledger.lock().expect("ledger").drop_node_ca_wants(&sh.run.0);
                 if let Some(why) = &reason {
                     say!("[wicket] the box ended (exit status {code}): {why}");
                     let _ = sh.ledger.lock().expect("ledger").audit(
@@ -1934,6 +1993,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         if !sh.ledger.lock().expect("ledger").hand_grant_to_node(&g.id, &sh.node).unwrap_or(false) {
             continue;
         }
+        want_grant_host(sh, &g);
         if g.prefix {
             say!("[wicket] grant {} is for a path prefix; node {} honours it for {} exactly", g.id, sh.node, g.path);
         }
