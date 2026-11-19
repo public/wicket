@@ -31,10 +31,11 @@ mkdir -p /etc/docker && echo "{\"log-driver\": \"local\"}" >/etc/docker/daemon.j
 mkdir /opt/pkg && tar -C /opt/pkg -xzf /pkg/wicket-*-x86_64-linux.tar.gz
 (cd /pkg && sha256sum -c --quiet wicket-*.tar.gz.sha256) || fail "archive checksum"
 inst=$(echo /opt/pkg/wicket-*/deploy/install.sh)
-$inst --operator alex --skip-image --trust-domain wicket.example.com >/tmp/install1.log
+# Its steps as they start (each with its time), so a stalled fetch shows where it is.
+$inst --operator alex --skip-image --trust-domain wicket.example.com | tee /tmp/install1.log | sed -un "/^==> /p"
 echo "ok: install.sh ran, from the release archive"
 before=$(stat -c %i /usr/local/bin/wicket; sha256sum /etc/docker/daemon.json /etc/wicket/*)
-$inst --operator alex --skip-image >/tmp/install2.log
+$inst --operator alex --skip-image | tee /tmp/install2.log | sed -un "/^==> /p"
 [ "$before" = "$(stat -c %i /usr/local/bin/wicket; sha256sum /etc/docker/daemon.json /etc/wicket/*)" ] || fail "the second run changed the binary or the configuration"
 echo "ok: install.sh ran again and changed nothing"
 python3 -c "import json; c = json.load(open(\"/etc/docker/daemon.json\")); assert c[\"log-driver\"] == \"local\", c; assert c[\"runtimes\"][\"runsc\"] == {\"path\": \"/usr/bin/runsc\", \"runtimeArgs\": [\"--host-uds=open\"]}, c" \
