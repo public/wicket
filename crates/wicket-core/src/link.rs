@@ -197,9 +197,10 @@ pub fn allocate(used: &[Named], to_run: &str, wanted: &str) -> Result<(String, I
 /// form (`<label>.<zone part>`), never suffixed, so the name a box connected by always reaches the
 /// name's holder. `open` holds only this box's open links: closed ones don't keep a name. Its
 /// address avoids every address in `used` (all of this box's links, open or closed), as
-/// [`allocate`]'s do, since `allocate` gives a target back the address it had. Refused if an open
-/// link of this box uses the name for another box (a holder that ended, whose link is still
-/// closing), or links to `to_run` under another name.
+/// [`allocate`]'s do, since `allocate` gives a target back the address it had. A target this box
+/// already links to keeps its address, whatever its other links are named (#668). Refused only if
+/// an open link of this box uses the name for another box (a holder that ended, whose link is still
+/// closing).
 pub fn allocate_exact(open: &[Named], used: &[Named], to_run: &str, name: &str) -> Result<(String, Ipv4Addr), String> {
     if let Some(n) = open.iter().find(|n| n.name == name) {
         return match n.to_run == to_run {
@@ -210,7 +211,7 @@ pub fn allocate_exact(open: &[Named], used: &[Named], to_run: &str, name: &str) 
         };
     }
     if let Some(n) = open.iter().find(|n| n.to_run == to_run) {
-        return Err(format!("this box already links to that box as {}.{DOMAIN}: unlink it to link it by name", n.name));
+        return Ok((name.to_string(), n.addr));
     }
     let start = u32::from(POOL_START);
     let addr = (start..start + POOL_SIZE)
@@ -255,11 +256,12 @@ mod tests {
         assert!(allocate_exact(std::slice::from_ref(&closed), std::slice::from_ref(&closed), "run_b", "api.build")
             .unwrap_err()
             .contains("open link named api.build"));
-        // Already linked to that box under another name: refused.
+        // Already linked to that box under another name: the new name shares its address (#668).
         let other = n("api", 3, "run_b");
-        assert!(allocate_exact(std::slice::from_ref(&other), std::slice::from_ref(&other), "run_b", "api.build")
-            .unwrap_err()
-            .contains("as api.wicket.internal"));
+        assert_eq!(
+            allocate_exact(std::slice::from_ref(&other), std::slice::from_ref(&other), "run_b", "api.build").unwrap(),
+            ("api.build".to_string(), Ipv4Addr::new(198, 18, 1, 3))
+        );
         // The same name to the same box: kept.
         let same = n("api.build", 4, "run_b");
         assert_eq!(allocate_exact(std::slice::from_ref(&same), &[], "run_b", "api.build").unwrap().1, Ipv4Addr::new(198, 18, 1, 4));

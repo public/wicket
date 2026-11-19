@@ -982,19 +982,25 @@ mod tests {
         assert!(w.ledger.lock().unwrap().internal_name(&TenantId::single(), "build", "api").unwrap().is_none());
     }
 
-    /// #575 review: a zone whose name isn't DNS-safe as written (upper case, `_`, dotted like a
-    /// spawned zone's) gets one DNS form, announced, looked up and linked alike; a name asked again
-    /// moves to the new port; and after the holder's run ends and another takes the name, a box
-    /// reconnects under exactly the same name (never a suffixed one), to the new holder.
+    /// #575 review and #668: only a zone already in DNS form holds names (a dotted one like a
+    /// spawned zone's included), and is looked up in any case; a zone that would share its DNS form
+    /// with another (`Build`, `web_api`) is refused; a name asked again moves to the new port; and
+    /// after the holder's run ends and another takes the name, a box reconnects under exactly the
+    /// same name (never a suffixed one), to the new holder.
     #[tokio::test]
     async fn a_name_keeps_its_exact_form_across_zones_ports_and_holders() {
         let w = World::new();
-        let zone = "lead.Fetch_er.run_01X";
+        let zone = "lead.fetch-er.01x";
         let a = w.boxed(w.zone(zone, &["web"]), "api", "run_a", None, &[]);
         let web = w.boxed(w.zone("web", &[]), "web", "run_web", None, &[]);
+        for odd in ["Build", "web_api"] {
+            let b = w.boxed(w.zone(odd, &[]), "odd", &format!("run_{}", odd.to_ascii_lowercase()), None, &[]);
+            let (text, err) = crate::names::request_name(&b, &serde_json::json!({ "name": "api", "port": 3000 }));
+            assert!(err && text.contains("can't be part of a DNS name"), "{odd}: {text}");
+        }
 
         let (text, err) = crate::names::request_name(&a, &serde_json::json!({ "name": "api", "port": 3000 }));
-        assert!(!err && text.contains("api.lead.fetch-er.run-01x.wicket.internal"), "{text}");
+        assert!(!err && text.contains("api.lead.fetch-er.01x.wicket.internal"), "{text}");
         // Asked again with another port: the name moves, the old port is no longer offered.
         let (text, err) = crate::names::request_name(&a, &serde_json::json!({ "name": "api", "port": 3001 }));
         assert!(!err && text.contains("port 3001"), "{text}");
@@ -1002,8 +1008,8 @@ mod tests {
         assert!(w.ledger.lock().unwrap().exposed("run_a", 3001).unwrap().is_some());
 
         // Looked up in any case or spelling of the zone that has the same DNS form.
-        let (text, err) = connect_name(&web, "api.Lead.Fetch_er.run_01X", None).await;
-        assert!(!err && text.contains("api.lead.fetch-er.run-01x.wicket.internal:3001"), "{text}");
+        let (text, err) = connect_name(&web, "api.Lead.Fetch-ER.01X", None).await;
+        assert!(!err && text.contains("api.lead.fetch-er.01x.wicket.internal:3001"), "{text}");
         let first = link_id(&text);
 
         // A's run ends; B, another run of the same agent in the same zone, takes the name.
@@ -1011,11 +1017,11 @@ mod tests {
         wait_closed(&w, &first).await;
         let b = w.boxed(w.zone(zone, &["web"]), "api", "run_b", None, &[]);
         assert!(!crate::names::request_name(&b, &serde_json::json!({ "name": "api", "port": 3001 })).1);
-        let (text, err) = connect_name(&web, "api.lead.fetch-er.run-01x", None).await;
+        let (text, err) = connect_name(&web, "api.lead.fetch-er.01x", None).await;
         assert!(!err, "{text}");
-        assert!(text.contains("api.lead.fetch-er.run-01x.wicket.internal:3001") && !text.contains("-2."), "{text}");
+        assert!(text.contains("api.lead.fetch-er.01x.wicket.internal:3001") && !text.contains("-2."), "{text}");
         let hosts = std::fs::read_to_string(w.root.join("run_web/hosts")).unwrap();
-        assert_eq!(hosts.matches("api.lead.fetch-er.run-01x.wicket.internal").count(), 1, "{hosts}");
+        assert_eq!(hosts.matches("api.lead.fetch-er.01x.wicket.internal").count(), 1, "{hosts}");
         assert_eq!(roundtrip(&w.root.join("run_web/sock").join(format!("link-{}.sock", link_id(&text)))).await.unwrap(), "run_b:ping");
     }
 

@@ -754,7 +754,7 @@ impl Node {
         // A control host below protocol 18 can't read this tool in a call (#575): it would drop the
         // connection. Answered here instead.
         let proto = self.links.lock().expect("links").get(&gen).map_or(0, |l| l.proto);
-        if let Some(why) = too_old_for(tool, proto) {
+        if let Some(why) = too_old_for(tool, args, proto) {
             return Ok((why, true));
         }
         let id = self.id();
@@ -2670,10 +2670,15 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Why `tool` can't be sent over a connection that talks `proto`, if it can't: a tool added after
-/// the oldest protocol a control host may talk (#575's `request_name`, [`chan::NAMES`]).
-fn too_old_for(tool: chan::ControlTool, proto: u32) -> Option<String> {
-    (tool == chan::ControlTool::RequestName && proto < chan::NAMES).then(|| {
+/// Why `tool` (with `args`) can't be sent over a connection that talks `proto`, if it can't: what
+/// a control host before #575's names ([`chan::NAMES`]) can't read or would misread. `request_name`
+/// isn't a tool it knows, and it would take `connect(name: …)` for `connect(box: "")` (#668).
+fn too_old_for(tool: chan::ControlTool, args: &serde_json::Value, proto: u32) -> Option<String> {
+    if proto >= chan::NAMES {
+        return None;
+    }
+    let by_name = tool == chan::ControlTool::Connect && args.get("name").is_some();
+    (tool == chan::ControlTool::RequestName || by_name).then(|| {
         format!(
             "not requested: this box's control host speaks protocol {proto}, and names need {} (an update of the control host)",
             chan::NAMES
@@ -2686,9 +2691,14 @@ mod tests {
     #[test]
     fn request_name_is_asked_only_of_a_control_host_at_18() {
         use super::{chan, too_old_for};
-        assert!(too_old_for(chan::ControlTool::RequestName, 17).unwrap().contains("protocol 17"));
-        assert_eq!(too_old_for(chan::ControlTool::RequestName, chan::NAMES), None);
-        assert_eq!(too_old_for(chan::ControlTool::Connect, 17), None);
+        let none = serde_json::json!({});
+        assert!(too_old_for(chan::ControlTool::RequestName, &none, 17).unwrap().contains("protocol 17"));
+        assert_eq!(too_old_for(chan::ControlTool::RequestName, &none, chan::NAMES), None);
+        assert_eq!(too_old_for(chan::ControlTool::Connect, &serde_json::json!({ "box": "x", "port": 1 }), 17), None);
+        // connect by name: an older control host would read it as connect(box: "") (#668).
+        let by_name = serde_json::json!({ "name": "api.build" });
+        assert!(too_old_for(chan::ControlTool::Connect, &by_name, 17).is_some());
+        assert_eq!(too_old_for(chan::ControlTool::Connect, &by_name, chan::NAMES), None);
     }
 
     use super::*;

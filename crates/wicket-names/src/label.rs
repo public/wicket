@@ -98,20 +98,21 @@ pub fn check_shape(label: &str, allow_idn: bool) -> Result<(), LabelError> {
 /// `.wicket.internal`, the whole name stays within DNS's 253.
 pub const MAX_ZONE_PART: usize = 170;
 
-/// A zone's name as it appears in internal names (`<label>.<zone part>.wicket.internal`, #575):
-/// lower case, `_` as `-`, each dot-separated part one label ([`check_shape`]). Zone names allow
-/// upper case and `_`, and spawned zones are dotted (`<parent>.<agent>.<run>`): this is the one
-/// form a name is registered, looked up and linked under. A zone name it can't make DNS-safe is
-/// refused.
+/// A zone's name as it appears in internal names (`<label>.<zone>.wicket.internal`, #575): only
+/// a zone whose name is already in DNS form, each dot-separated part one label ([`check_shape`]:
+/// lower case, digits and `-`), may hold names, and its name is used as it is. No other zone name
+/// is mapped to one (#668): `Build` and `build`, or `web_api` and `web-api`, are different zones to
+/// `accept_from`, so one DNS form for both would let one zone's box take the other's names. A
+/// spawned zone (`<parent>.<agent>.<run id without run_>`) is in DNS form when its parent's and
+/// agent's names are, since run ids are lower case and digits.
 pub fn zone_part(zone: &str) -> Result<String, LabelError> {
-    let z = zone.to_ascii_lowercase().replace('_', "-");
-    if z.len() > MAX_ZONE_PART {
-        return Err(LabelError::TooLong(z.len()));
+    if zone.len() > MAX_ZONE_PART {
+        return Err(LabelError::TooLong(zone.len()));
     }
-    for part in z.split('.') {
+    for part in zone.split('.') {
         check_shape(part, false)?;
     }
-    Ok(z)
+    Ok(zone.to_string())
 }
 
 /// The label with lookalikes folded: `0`→`o`, `1` and `i`→`l`, `5`→`s`, `rn`→`m`, `vv`→`w`, and
@@ -173,10 +174,13 @@ mod tests {
     }
 
     #[test]
-    fn zone_parts_are_dns_safe() {
-        assert_eq!(zone_part("Build").unwrap(), "build");
-        assert_eq!(zone_part("web_api").unwrap(), "web-api");
-        assert_eq!(zone_part("lead.fetcher.run_01JABCD").unwrap(), "lead.fetcher.run-01jabcd");
+    fn only_zones_already_in_dns_form_hold_names() {
+        assert_eq!(zone_part("build").unwrap(), "build");
+        assert_eq!(zone_part("lead.fetcher.01jabcd0123456789abcdefghj").unwrap(), "lead.fetcher.01jabcd0123456789abcdefghj");
+        // Not mapped (#668): each of these is a zone apart from its look-alike.
+        assert!(zone_part("Build").is_err());
+        assert!(zone_part("web_api").is_err());
+        assert!(zone_part("lead.fetch_er.01jabcd").is_err());
         assert!(zone_part("a..b").is_err());
         assert!(zone_part("-x").is_err());
         assert!(zone_part("caf\u{e9}").is_err());

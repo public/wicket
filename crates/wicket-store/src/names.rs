@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS host_ports (
   held_since INTEGER NOT NULL, released_at INTEGER, free_after INTEGER,
   PRIMARY KEY (node, proto, port)
 );
+DROP INDEX IF EXISTS host_ports_name;
 CREATE UNIQUE INDEX IF NOT EXISTS host_ports_held ON host_ports (name, node, proto) WHERE name IS NOT NULL;
 CREATE TABLE IF NOT EXISTS name_records (
   zone TEXT NOT NULL, name TEXT NOT NULL, rtype TEXT NOT NULL, value TEXT NOT NULL, ttl INTEGER NOT NULL,
@@ -442,6 +443,10 @@ impl Ledger {
         if let Some(shown) = shown.filter(|x| *x != effect) {
             return Err(StoreError::EffectChanged(id.into(), shown.into(), effect));
         }
+        // A run-scoped name is its run's: once that run isn't running, nobody would hold it (#668).
+        if n.scope == NameScope::Run && self.run_status(&n.asked_run)?.as_deref() != Some("running") {
+            return Err(StoreError::Refused(format!("{id} was asked for by run {}, which isn't running", n.asked_run)));
+        }
         let t = now();
         let (bound, expires) = match n.scope {
             NameScope::Run => (None, None),
@@ -504,23 +509,7 @@ impl Ledger {
             params![run.0, t],
         )?;
         for n in &held {
-            match n.scope {
-                NameScope::Run => {
-                    c.execute(
-                        "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = 'wicket', end_reason = 'run ended' WHERE id = ?1",
-                        params![n.id, t],
-                    )?;
-                    self.release_ports(&n.id)?;
-                }
-                NameScope::Standing => {
-                    c.execute("UPDATE names SET holder = NULL WHERE id = ?1", params![n.id])?;
-                }
-            };
-            let body = serde_json::json!({
-                "id": n.id, "kind": n.kind.as_str(), "label": n.label, "zone": n.zone, "port": n.port,
-                "scope": n.scope.as_str(), "ended": n.scope == NameScope::Run, "why": "run ended",
-            });
-            self.audit(&TenantId(n.tenant.clone()), Some(run), "name.released", &body)?;
+            self.release_held(n, run, t, "run ended")?;
         }
         if let Some(own) = own {
             own.commit()?;
@@ -535,18 +524,50 @@ impl Ledger {
     pub fn sweep_stale_names(&self) -> Result<usize> {
         let gone =
             "holder IS NOT NULL AND status = 'live' AND NOT EXISTS (SELECT 1 FROM runs WHERE id = names.holder AND status = 'running')";
-        let t = now();
-        let mut st = self.conn.prepare(&format!("SELECT id FROM names WHERE scope = 'run' AND {gone}"))?;
-        let ended = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        for id in &ended {
-            self.conn.execute(
-                "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = 'wicket', end_reason = 'run ended' WHERE id = ?1",
-                params![id, t],
-            )?;
-            self.release_ports(id)?;
+        let mut st = self.conn.prepare(&format!("SELECT {COLS} FROM names WHERE {gone}"))?;
+        let stale = st.query_map([], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Run-scoped asks of runs that aren't running go too (#668), as `run_ended` withdraws them.
+        let withdrawn = self.conn.execute(
+            "UPDATE names SET status = 'withdrawn', decided_at = ?1, decided_by = 'wicket:run-ended'
+             WHERE status = 'pending' AND scope = 'run' AND NOT EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running')",
+            params![now()],
+        )?;
+        if stale.is_empty() {
+            return Ok(withdrawn);
         }
-        let let_go = self.conn.execute(&format!("UPDATE names SET holder = NULL WHERE scope = 'standing' AND {gone}"), [])?;
-        Ok(ended.len() + let_go)
+        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let t = now();
+        for n in &stale {
+            let holder = RunId(n.holder.clone().unwrap_or_default());
+            self.release_held(n, &holder, t, "its run isn't running")?;
+        }
+        if let Some(own) = own {
+            own.commit()?;
+        }
+        Ok(stale.len() + withdrawn)
+    }
+
+    /// Lets go of name `n` that `run` held: a run-scoped one ends (its ports released), a standing
+    /// one waits for the next run. Audited `name.released`.
+    fn release_held(&self, n: &NameRow, run: &RunId, t: i64, why: &str) -> Result<()> {
+        match n.scope {
+            NameScope::Run => {
+                self.conn.execute(
+                    "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = 'wicket', end_reason = 'run ended' WHERE id = ?1",
+                    params![n.id, t],
+                )?;
+                self.release_ports(&n.id)?;
+            }
+            NameScope::Standing => {
+                self.conn.execute("UPDATE names SET holder = NULL WHERE id = ?1", params![n.id])?;
+            }
+        }
+        let body = serde_json::json!({
+            "id": n.id, "kind": n.kind.as_str(), "label": n.label, "zone": n.zone, "port": n.port,
+            "scope": n.scope.as_str(), "ended": n.scope == NameScope::Run, "why": why,
+        });
+        self.audit(&TenantId(n.tenant.clone()), Some(run), "name.released", &body)?;
+        Ok(())
     }
 
     /// A run of `principal` in `zone` (definition `zone_digest`) started: it holds the live,
@@ -916,6 +937,28 @@ mod tests {
         // P1's limit of 1 is free again.
         l.register_internal(&ask(&t, &r2, P1, "db", NameScope::Run), 1, 3600).unwrap();
         assert_eq!(l.sweep_stale_names().unwrap(), 0);
+    }
+
+    /// #668: the sweep audits what it lets go, and withdraws run-scoped asks of runs that aren't
+    /// running; and such an ask can't be approved into a name nobody holds.
+    #[test]
+    fn the_sweep_audits_and_withdraws_and_dead_asks_cant_be_approved() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let (r1, r2) = (RunId("run-1".into()), RunId("run-2".into()));
+        let api = l.register_internal(&ask(&t, &r1, P1, "api", NameScope::Run), 3, 3600).unwrap();
+        let (dead_ask, _) = l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Run)).unwrap();
+        let (live_ask, _) = l.ask_public(&ask(&t, &r2, P2, "live", NameScope::Run)).unwrap();
+        // As an older build ends a run: the runs row only.
+        l.conn.execute("UPDATE runs SET status = 'succeeded' WHERE id = 'run-1'", []).unwrap();
+        let terms = NameTerms { bound: Bound::Agent, ttl_secs: None };
+        assert!(matches!(l.approve_name(&dead_ask, &terms, "alice", None), Err(StoreError::Refused(m)) if m.contains("isn't running")));
+        assert_eq!(l.sweep_stale_names().unwrap(), 2);
+        assert_eq!(l.name(&api.id).unwrap().end_reason.as_deref(), Some("run ended"));
+        assert_eq!(l.name(&dead_ask).unwrap().status, "withdrawn");
+        assert_eq!(l.name(&live_ask).unwrap().status, "pending");
+        let audit = l.audit_tail(10).unwrap();
+        assert!(audit.iter().any(|a| a.2 == "name.released" && a.4.contains(&api.id) && a.4.contains("isn't running")), "{audit:?}");
     }
 
     #[test]
