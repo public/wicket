@@ -285,6 +285,8 @@ struct State {
     /// The state store's sync and the audit export's progress (#635), as [`spawn_progress`] last
     /// read them.
     progress: Mutex<Option<crate::statesync::Progress>>,
+    /// What the alerts remember between reads, and the alerts the last read raised (#635).
+    progress_alerts: Mutex<(crate::statesync::Watch, Vec<crate::health::Alert>)>,
 }
 
 impl State {
@@ -331,6 +333,7 @@ impl State {
             sockets: Arc::new(Mutex::new(session::Sockets::default())),
             push,
             progress: Mutex::new(None),
+            progress_alerts: Mutex::new((crate::statesync::Watch::new(wicket_feed::now_ms()), Vec::new())),
         }
     }
 }
@@ -1812,6 +1815,16 @@ fn refresh_progress(state: &State, now_ms: i64) {
             return;
         }
     };
+    store_progress(state, p, now_ms);
+}
+
+/// Caches a read of the progress, and the alerts it raises.
+fn store_progress(state: &State, p: Option<crate::statesync::Progress>, now_ms: i64) {
+    {
+        let mut w = state.progress_alerts.lock().unwrap_or_else(|e| e.into_inner());
+        w.0.observe(p.as_ref(), now_ms);
+        w.1 = p.as_ref().map(|p| crate::statesync::alerts(p, &w.0, now_ms)).unwrap_or_default();
+    }
     *state.progress.lock().unwrap_or_else(|e| e.into_inner()) = p;
 }
 
@@ -1874,6 +1887,7 @@ fn health_view(state: &State, now_ms: i64) -> Result<(Value, Vec<crate::health::
     alerts.extend(crate::health::disk_alerts("control", "the control host", &disk));
     // Read in the background ([`spawn_progress`]): a request never waits on Litestream's socket.
     let store = state.progress.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(Value::Null, |p| json!(p));
+    alerts.extend(state.progress_alerts.lock().unwrap_or_else(|e| e.into_inner()).1.iter().cloned());
     Ok((
         json!({ "nodes": nodes, "control_disk_pct": disk.used_pct().round(), "state_store": store,
                 "alerts": alerts.iter().map(|a| a.text.clone()).collect::<Vec<_>>() }),
@@ -1881,7 +1895,7 @@ fn health_view(state: &State, now_ms: i64) -> Result<(Value, Vec<crate::health::
     ))
 }
 
-/// Pushes node health alerts as they appear (#377), to devices of passkeys still enrolled.
+/// Pushes health alerts (nodes, #377; the state store, #635) as they appear, to devices of passkeys still enrolled.
 async fn notify_health(state: &State, h: &mut push::HealthNotifier, now_ms: i64) -> Vec<(String, u16)> {
     let Some(p) = &state.push else { return Vec::new() };
     let (alerts, creds) = match (health_view(state, now_ms), creds(state)) {
@@ -2167,6 +2181,44 @@ mod tests {
             dashboard(&t.state).unwrap()["health"]["state_store"]["errors"][0],
             "audit-sinks.yaml can't be read: `wicket audit export --status` says why"
         );
+    }
+
+    /// The background read's alerts reach the health view (and so the push): a stopped stream 5 min
+    /// after the console started watching, cleared once it streams (#635).
+    #[test]
+    fn the_state_stores_alerts_reach_the_health_view_and_clear() {
+        use crate::statesync::{Progress, StreamState, StreamStatus};
+        let t = setup("streamalert");
+        let now = wicket_feed::now_ms();
+        let p = |state, last_sync_ms| Progress {
+            stream: Some(StreamStatus {
+                endpoint: "https://s3.example.com".into(),
+                bucket: "b-1".into(),
+                lineage: None,
+                state,
+                last_sync_ms,
+                behind_secs: None,
+                lag_secs: 60,
+                error: None,
+                error_ms: None,
+            }),
+            audit: vec![],
+            errors: vec![],
+        };
+        let keys =
+            |at| health_view(&t.state, at).unwrap().1.into_iter().map(|a| a.key).filter(|k| k.starts_with("control:")).collect::<Vec<_>>();
+        store_progress(&t.state, Some(p(StreamState::Stopped, None)), now + 1_000);
+        assert!(keys(now + 1_000).is_empty(), "the console only just started watching");
+        store_progress(&t.state, Some(p(StreamState::Starting, None)), now + 302_000);
+        assert_eq!(keys(now + 302_000), ["control:state-store/stream"]);
+        let v = health_view(&t.state, now + 302_000).unwrap().0;
+        assert_eq!(v["state_store"]["stream"]["state"], "starting");
+        store_progress(&t.state, Some(p(StreamState::Streaming, Some(now + 303_000))), now + 304_000);
+        assert!(keys(now + 304_000).is_empty(), "cleared");
+        store_progress(&t.state, Some(p(StreamState::Stopped, None)), now + 400_000);
+        assert!(keys(now + 400_000).is_empty(), "current 97 s ago");
+        store_progress(&t.state, None, now + 900_000);
+        assert!(keys(now + 900_000).is_empty(), "nothing set up: nothing alerted");
     }
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {
