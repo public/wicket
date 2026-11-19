@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 /// What a supervisor watches, and the tables each covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Topic {
+    /// Grants, standing reach (#572), and runs' authority ends (#56): what a grant sync reads.
     Grants,
     /// Turn cancels and mode changes (#327, #363).
     Asks,
@@ -37,7 +38,9 @@ impl Topic {
 
     fn tables(self) -> &'static [&'static str] {
         match self {
-            Topic::Grants => &["grants"],
+            // Everything a supervisor's grant sync reads: its grants, the standing reach (#572)
+            // published with them, and (below) its box's authority end.
+            Topic::Grants => &["grants", "standing"],
             Topic::Asks => &["turn_cancels", "mode_changes"],
             Topic::Revocations => &["revocations", "nodes", "node_certs"],
             Topic::NodeCa => &["node_cas", "node_ca_policy", "node_ca_wants"],
@@ -61,6 +64,14 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
             }
         }
     }
+    // A run's authority end (a renewal, #56) is what a supervisor's grant sync re-mints its token
+    // for. Only that column: `runs` is written all the time (activity, owners), and those mustn't
+    // move the topic.
+    sql.push_str(
+        "CREATE TRIGGER IF NOT EXISTS ledger_changes_runs_authority AFTER UPDATE OF authority_until ON runs \
+         BEGIN UPDATE ledger_changes SET seq = seq + 1 WHERE topic = 'grants'; END;
+",
+    );
     conn.execute_batch(&sql)?;
     Ok(())
 }
@@ -163,6 +174,34 @@ mod tests {
         // A new connection's watch sees everything once.
         w.reset();
         assert!(w.changed(&reader, Topic::Revocations).unwrap());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #616's review: a grant sync also publishes standing reach (#572) and re-mints for a renewed
+    /// authority end (#56), so both move `grants`; other writes to `runs` (activity, owners) don't.
+    #[test]
+    fn standing_reach_and_a_renewed_authority_move_the_grants_topic() {
+        let (path, writer) = file_ledger("standing");
+        let reader = Ledger::open(&path).unwrap();
+        let mut w = ChangeWatch::new();
+        w.changed(&reader, Topic::Grants).unwrap();
+        writer
+            .conn
+            .execute(
+                "INSERT INTO standing (id, tenant, run, zone, principal, rule, reason, evidence, status, created_at)
+                 VALUES ('s-1', 't0', 'run_a', 'z', 'p', '{}', 'r', '[]', 'approved', 1)",
+                [],
+            )
+            .unwrap();
+        assert!(w.changed(&reader, Topic::Grants).unwrap(), "a standing rule approved");
+        writer.revoke_standing("s-1", "alex").unwrap();
+        assert!(w.changed(&reader, Topic::Grants).unwrap(), "a standing rule revoked");
+        writer.run_started(&TenantId::single(), &RunId("run_a".into()), "z", "a").unwrap();
+        w.changed(&reader, Topic::Grants).unwrap();
+        writer.set_run_owner("run_a", "pid:1").unwrap();
+        assert!(!w.changed(&reader, Topic::Grants).unwrap(), "another column of runs moves nothing");
+        writer.set_run_authority("run_a", 2_000_000_000, 2_000_000_000).unwrap();
+        assert!(w.changed(&reader, Topic::Grants).unwrap(), "a renewed authority end");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
