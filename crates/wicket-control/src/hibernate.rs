@@ -606,36 +606,44 @@ pub struct Candidate {
     pub cap: crate::chan::NodeCapacity,
 }
 
-/// Best fit: of the nodes with room for `want` (vCPUs, MiB), the one left with the least memory free
-/// once it is placed (then the fewest vCPUs free; then `last`, where the agent ran before; then the
-/// name). With room nowhere, the node with the most memory free, and false. A node's memory free is
-/// what its limits leave, and no more than its admission says a box may have now (#377); a node
-/// that starts no box (its disk below the floor) has no room.
-pub fn pick(cands: &[Candidate], want: (f32, u64), last: Option<&str>) -> Option<(String, bool)> {
-    let free = |c: &Candidate| {
-        let by_limits = c.cap.memory_mib as i64 - c.cap.used_memory_mib as i64;
-        let mem = c.cap.room_mib.map_or(by_limits, |r| by_limits.min(r as i64));
-        (c.cap.vcpus - c.cap.used_vcpus, if c.cap.full { -1 } else { mem })
+/// What the scheduler sees of `c` (#579): its reported room, and from the ledger its labels, taints,
+/// and whether its CA covers `need` (the box's inspected hosts) or may be widened to them (#573).
+pub fn scheduled_node(l: &Ledger, c: &Candidate, need: &[String]) -> wicket_placement::schedule::Node {
+    use wicket_placement::schedule::Coverage;
+    let ca = match wicket_node::controlca::active(l, &c.name) {
+        None => Coverage::Covers,
+        Some(ca) => {
+            let missing = wicket_core::splice::uncovered(&ca.hosts, need);
+            let policy = l.node_ca_policy(&c.name).unwrap_or(wicket_store::CaHosts::Fixed);
+            let (may, kept_out): (Vec<String>, Vec<String>) = missing.into_iter().partition(|h| policy.allows(h));
+            match (may.is_empty(), kept_out.is_empty()) {
+                (_, false) => Coverage::Refuses(kept_out),
+                (false, true) => Coverage::Widens(may),
+                (true, true) => Coverage::Covers,
+            }
+        }
     };
-    let fits = |c: &&Candidate| {
-        let (cpu, mem) = free(c);
-        cpu + 1e-3 >= want.0 && mem >= want.1 as i64 && !c.cap.full
-    };
-    let key = |c: &Candidate| {
-        let (cpu, mem) = free(c);
-        (mem - want.1 as i64, ((cpu - want.0) * 1000.0) as i64, Some(c.name.as_str()) != last, c.name.clone())
-    };
-    if let Some(best) = cands.iter().filter(fits).min_by_key(|c| key(c)) {
-        return Some((best.name.clone(), true));
+    wicket_placement::schedule::Node {
+        name: c.name.clone(),
+        vcpus: c.cap.vcpus,
+        used_vcpus: c.cap.used_vcpus,
+        memory_mib: c.cap.memory_mib,
+        used_memory_mib: c.cap.used_memory_mib,
+        room_mib: c.cap.room_mib,
+        full: c.cap.full,
+        labels: l.node_labels(&c.name).unwrap_or_default(),
+        taints: l.node_taints(&c.name).unwrap_or_default(),
+        ca,
     }
-    cands.iter().max_by_key(|c| (free(c).1, std::cmp::Reverse(c.name.clone()))).map(|c| (c.name.clone(), false))
 }
 
 /// Where a woken agent's box goes: every enrolled, active node that answers within 10 s (this host's
-/// own among them) and isn't held by a capacity lease, bin-packed ([`pick`]).
+/// own among them) and isn't held by a capacity lease, filtered by the box's requests, labels,
+/// taints and CA coverage, then bin-packed (`wicket_placement::schedule`).
 async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
     let m = wicket_agent::load(&agent.manifest)?;
-    let want = (m.zone.limits.cpus, m.zone.limits.memory_bytes().unwrap_or(0) >> 20);
+    let req = wicket_placement::schedule::Request::of(&m);
+    let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
     crate::localnode::ensure(&ledger).await?;
     let (names, leased) = {
@@ -666,29 +674,26 @@ async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
         }
     });
     let cands: Vec<Candidate> = futures_util::future::join_all(probes).await.into_iter().flatten().collect();
-    match pick(&cands, want, last) {
-        Some((n, true)) => {
-            say!("[wicket] placing agent {} on node {n} (best fit of {} available)", agent.id, cands.len());
+    if cands.is_empty() {
+        return Ok(None);
+    }
+    let nodes: Vec<_> = {
+        let l = ledger.lock().expect("ledger");
+        cands.iter().map(|c| scheduled_node(&l, c, &need)).collect()
+    };
+    let d = wicket_placement::schedule::schedule(&req, &nodes, wicket_placement::schedule::Strategy::BinPack, last);
+    match d.node {
+        Some(n) => {
+            say!(
+                "[wicket] placing agent {} on node {n} (best fit of {} it may go on, of {} available)",
+                agent.id,
+                d.ranked.len(),
+                cands.len()
+            );
             Ok(Some(n))
         }
         // No silent overcommit (#377): each node would refuse the box itself.
-        Some((_, false)) => {
-            let seen: Vec<String> = cands
-                .iter()
-                .map(|c| match (c.cap.full, c.cap.room_mib) {
-                    (true, _) => format!("{} (its disk is below the floor)", c.name),
-                    (false, Some(r)) => format!("{} ({:.1} vCPU, {r} MiB free)", c.name, c.cap.vcpus - c.cap.used_vcpus),
-                    (false, None) => format!(
-                        "{} ({:.1} vCPU, {} MiB free by limits)",
-                        c.name,
-                        c.cap.vcpus - c.cap.used_vcpus,
-                        c.cap.memory_mib.saturating_sub(c.cap.used_memory_mib)
-                    ),
-                })
-                .collect();
-            bail!("no available node has room for agent {} ({} vCPU, {} MiB needed): {}", agent.id, want.0, want.1, seen.join(", "))
-        }
-        None => Ok(None),
+        None => bail!("no available node may take agent {} ({} vCPU, {} MiB needed): {}", agent.id, req.vcpus, req.memory_mib, d.why_not()),
     }
 }
 
@@ -796,28 +801,38 @@ mod tests {
         }
     }
 
-    /// Wake placement is best fit: the fullest node the box still fits on; where it ran before only
-    /// breaks ties, and with room nowhere the least loaded node is used.
+    /// Wake placement is best fit (the fullest node the box still fits on), among the nodes whose
+    /// labels, taints and CA let it on (#579); where it ran before only breaks ties.
     #[test]
-    fn a_woken_agent_is_bin_packed_onto_the_fullest_node_it_fits() {
-        let nodes = [cand("local", 4.0, 8192, 1.0, 1024), cand("n1", 2.0, 2048, 0.0, 512), cand("n2", 2.0, 4096, 1.5, 3000)];
-        assert_eq!(pick(&nodes, (1.0, 1024), None), Some(("n1".into(), true)), "n2 has no vCPU, local more room than n1");
-        assert_eq!(pick(&nodes, (0.5, 1024), None), Some(("n2".into(), true)), "n2 fits and is fullest");
-        assert_eq!(pick(&nodes, (1.0, 1024), Some("local")), Some(("n1".into(), true)), "where it ran before doesn't beat a better fit");
-        let twins = [cand("a", 2.0, 2048, 0.0, 0), cand("b", 2.0, 2048, 0.0, 0)];
-        assert_eq!(pick(&twins, (1.0, 512), Some("b")), Some(("b".into(), true)), "it breaks a tie");
-        assert_eq!(pick(&nodes, (8.0, 65536), None), Some(("local".into(), false)), "no room: the least loaded");
-        assert_eq!(pick(&[], (1.0, 1), None), None);
-        // #377: a node's admission room caps its free memory, and a full node has none.
-        let mut tight = nodes.clone();
-        for c in tight.iter_mut().filter(|c| c.name == "local") {
-            c.cap.room_mib = Some(512);
-        }
-        assert_ne!(pick(&tight, (1.0, 1024), None).map(|p| p.0), Some("local".into()));
-        for c in tight.iter_mut() {
-            c.cap.full = true;
-        }
-        assert_eq!(pick(&tight, (0.1, 1), None).map(|p| p.1), Some(false), "no node starts a box: no fit");
+    fn a_woken_agent_is_bin_packed_onto_the_fullest_node_it_may_go_on() {
+        use wicket_placement::schedule::{schedule, Coverage, Request, Strategy};
+        let l = Ledger::open_in_memory().unwrap();
+        let cands = [cand("local", 4.0, 8192, 1.0, 1024), cand("n1", 2.0, 2048, 0.0, 512), cand("n2", 2.0, 4096, 1.5, 3000)];
+        let pick = |l: &Ledger, req: &Request, last: Option<&str>| {
+            let nodes: Vec<_> = cands.iter().map(|c| scheduled_node(l, c, &["api.example.com".to_string()])).collect();
+            schedule(req, &nodes, Strategy::BinPack, last)
+        };
+        let req = |cpu: f32, mib: u64| Request { vcpus: cpu, memory_mib: mib, ..Request::default() };
+        assert_eq!(pick(&l, &req(1.0, 1024), None).node.as_deref(), Some("n1"), "n2 has no vCPU, local more room than n1");
+        assert_eq!(pick(&l, &req(0.5, 1024), None).node.as_deref(), Some("n2"), "n2 fits and is fullest");
+        assert_eq!(pick(&l, &req(1.0, 1024), Some("local")).node.as_deref(), Some("n1"), "a better fit beats where it ran");
+        let none = pick(&l, &req(8.0, 65536), None);
+        assert_eq!(none.node, None);
+        assert!(none.why_not().starts_with("local (3.0 vCPU, 7168 MiB free)"), "{}", none.why_not());
+
+        // n1 is kept for CI: a box goes there only if it tolerates that, and n2 is the GPU node.
+        l.set_node_taint("n1", &wicket_core::placement::Taint::parse("dedicated=ci").unwrap()).unwrap();
+        l.set_node_label("n2", "gpu", Some("t4")).unwrap();
+        assert_eq!(pick(&l, &req(1.0, 1024), None).node.as_deref(), Some("local"), "n1's taint keeps it off");
+        let mut ci = req(1.0, 1024);
+        ci.tolerations.push(wicket_core::placement::Taint::parse("dedicated").unwrap());
+        assert_eq!(pick(&l, &ci, None).node.as_deref(), Some("n1"));
+        let mut gpu = req(0.5, 1024);
+        gpu.node_selector.insert("gpu".into(), "t4".into());
+        let d = pick(&l, &gpu, None);
+        assert_eq!((d.node.as_deref(), d.ranked.len()), (Some("n2"), 1), "only n2 has the label");
+        // No node CA recorded (this host's own node): nothing to cover.
+        assert_eq!(scheduled_node(&l, &cands[0], &["api.example.com".to_string()]).ca, Coverage::Covers);
     }
 
     use super::*;
