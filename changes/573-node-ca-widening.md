@@ -13,7 +13,7 @@ type: Added
   entries a run at a time (what doesn't fit is audited). A CA that can't be widened is renewed for
   the operator's hosts instead of lapsing. Revoking or re-enrolling a node clears its policy. The
   default is `fixed`, as before: then a box start says which hosts the CA would need. Ledger schema
-  21 (an expand step, after 20).
+  20 (an expand step).
 - A box's `request_access` for an https host its node's CA doesn't cover is asked for when the
   node's policy lets the CA be widened to it (`auto`, or a list that includes it): the approval's
   grant widens the CA. Under `fixed`, or a list that leaves the host out, the node still answers
