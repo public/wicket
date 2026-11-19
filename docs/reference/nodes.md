@@ -335,9 +335,9 @@ wicket node revoke n1
   margin of 5% of memory, at least 256 MiB. Limits are never overcommitted against what is actually
   free. The disk must have at least 5% (at least 1 GiB) free, and 1% of its inodes. The refusal
   (`no room on this node for the box: …`) is audited as `box.refused` on the node, and `wicket run`
-  reports it. A node's `Welcome` carries the room it has now (`room_mib`) and whether it starts
-  no box at all (`full`). Placing a waking agent uses both, and refuses the wake when no node has
-  room, rather than overcommitting one.
+  reports it. A node's `Welcome`, and since #579 its health report, carry its size and use, the room
+  it has now (`room_mib`) and whether it starts no box at all (`full`). Placing a waking agent uses
+  them, and refuses the wake when no node has room, rather than overcommitting one.
 - **Reserve.** A node holds a disk reserve, `reserve` in its directory: preallocated space box
   volumes can't use, 2% of the disk (at least 256 MiB, at most 2 GiB), or `WICKET_NODE_RESERVE_MIB`
   (0 for none). When a feed frame can't be persisted, the node releases the reserve and tries the
@@ -364,6 +364,11 @@ wicket node revoke n1
 Where a box goes ([#579](https://github.com/public/wicket/issues/579)): `wicket run --node` or a spawn's
 placement hint names a node; otherwise a run goes on this host's own node. A woken agent is placed by the
 scheduler, `wicket-placement::schedule`, a pure function of what the control host knows when it decides:
+
+- **Capacity, from the ledger.** Each node's latest health report (every 30 s, on every connection to it;
+  stored once per node at most every 20 s) carries its capacity, and a wake reads it there. A node with no
+  report under 90 s old, or one from a node before #579, is asked over its control channel instead (within
+  10 s): an idle node, with no run connected to it, reports nothing.
 
 - **Labels and taints.** `wicket node set <node> --label gpu=a100 --taint dedicated=ci` records them in the
   ledger (`key-` removes one; audited `node.labels`). A box goes on a node only if the node has every label

@@ -790,9 +790,10 @@ pub enum Msg {
     Audit {
         records: Vec<wicket_store::AuditRecord>,
     },
-    /// The node's health (#377), every [`crate::health::REPORT_EVERY`] on each connection.
+    /// The node's health (#377), every [`crate::health::REPORT_EVERY`] on each connection. Boxed: it
+    /// is the largest message, and the others stay small.
     Health {
-        health: crate::health::NodeHealth,
+        health: Box<crate::health::NodeHealth>,
     },
 }
 
