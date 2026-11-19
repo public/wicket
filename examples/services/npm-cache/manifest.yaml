@@ -1,0 +1,34 @@
+# A pull-through npm cache on every node whose boxes use it (#579 step 3).
+#
+#   wicket service add examples/services/npm-cache/manifest.yaml
+#
+# A box uses it with `zone.uses: [npm-cache]`: it gets npm_config_registry pointing here, and a
+# link to the instance on its own node. Using a service is having its reach, so the box's own zone
+# must reach what this one does (GET of registry.npmjs.org), or a human approves the link.
+task: an npm pull-through cache for the boxes on this node
+program:
+  name: npm-cache
+  # Verdaccio, installed under the cache's own reach at each start (wicket's agent image has node,
+  # npm and wicket-fwd, which a link into the box needs), then serving with ./config.yaml.
+  command:
+    - sh
+    - -c
+    - npm install --global --prefix /tmp/verdaccio verdaccio@6 && exec /tmp/verdaccio/bin/verdaccio --config /workspace/config.yaml --listen 0.0.0.0:4873
+  source: .
+service:
+  port: 4873
+  env:
+    npm_config_registry: "http://{host}:{port}/"
+  # Per tenant (the default): a tenant's installs, and what it asked for, stay in its own instance.
+  # `tenancy: shared` would need `public_only: true` here, declared by whoever installs it.
+  tenancy: per_tenant
+  drain: drop
+zone:
+  name: npm-cache
+  # What the cache fetches under: public packages, read only.
+  reach:
+    - { host: registry.npmjs.org, methods: [GET, HEAD], paths: ["/**"] }
+  unlisted_hosts: hide
+  volumes:
+    - { name: storage, path: /volumes/storage, keep: true, retention: 7d }
+  limits: { memory: 1g, cpus: 1, timeout: 30d, memory_advice: "one npm install at a time" }

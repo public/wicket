@@ -121,7 +121,7 @@ globs = [
   "ci/check-public.py", "ci/check-doc-links.sh", "ci/check-terms.sh", "ci/check-terms.allow", "ci/check-plugin.py",
   "ci/changelog.py", "ci/changelog_test.py", "ci/preflight.sh",
   "deny.toml", "ci/mutants.sh", "ci/mutants.accepted", "ci/package.sh", "ci/sim.sh",
-  "ci/smoke.sh", "ci/smoke.yaml", "ci/h3get/**", "ci/hibernate.sh", "ci/hibernate.yaml", "ci/restore.sh",
+  "ci/smoke.sh", "ci/smoke.yaml", "ci/h3get/**", "ci/hibernate.sh", "ci/hibernate.yaml", "ci/restore.sh", "ci/service-e2e.sh",
   "ci/acceptance.sh", "ci/acceptance/**", "ci/install-acceptance.sh", "ci/install-test.sh", "ci/daemon-uids.sh",
   "ci/node-e2e.sh", "ci/node-e2e/**", "ci/update.sh", "ci/update/**", "ci/policy-diff.sh", "ci/kani.sh",
   "ci/lean.sh", "ci/tla.sh", "ci/tla-trail.py", "ci/shard.awk", "ci/fuzz.sh", "fuzz/**", "verification/**", "deploy/**", "programs/**",

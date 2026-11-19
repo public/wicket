@@ -187,6 +187,19 @@ mod tests {
         Instance { run: "run_i".into(), service: "s".into(), node: "n".into(), tenant: "t".into(), started_at, live }
     }
 
+    /// The example (examples/services/npm-cache) is a valid service: per tenant, read-only reach of
+    /// the public registry, and the env that points npm at it.
+    #[test]
+    fn the_npm_cache_example_is_a_per_tenant_service() {
+        let y = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/services/npm-cache/manifest.yaml")).unwrap();
+        let m = wicket_core::Manifest::from_yaml(&y).unwrap();
+        let s = m.service.as_ref().unwrap();
+        assert_eq!((s.port, s.tenancy, s.public_only), (4873, Tenancy::PerTenant, false));
+        assert_eq!(s.user_env("npm-cache")["npm_config_registry"], "http://npm-cache.wicket.internal:4873/");
+        assert_eq!(m.program.as_ref().unwrap().name, "npm-cache");
+        assert!(m.zone.reach.iter().all(|r| r.host == "registry.npmjs.org" && r.methods.iter().all(|x| x == "GET" || x == "HEAD")));
+    }
+
     #[test]
     fn a_box_gets_the_environment_of_the_installed_services_it_uses() {
         let dir = std::env::temp_dir().join(format!("wicket-svc-env-{}", std::process::id()));
