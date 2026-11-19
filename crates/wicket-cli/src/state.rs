@@ -95,7 +95,7 @@ pub fn check(probe: bool) -> Result<()> {
         return Ok(());
     };
     if let Some(c) = &s.s3 {
-        println!("state store: {} bucket {} prefix {:?}", c.endpoint, c.bucket, c.prefix);
+        println!("state store: {} bucket {} prefix {:?}", c.shown_endpoint(), c.bucket, c.prefix);
         if probe {
             s.open_s3()?.probe().context("writing to the state store")?;
             println!("  it takes writes (a probe object written, read back and deleted)");

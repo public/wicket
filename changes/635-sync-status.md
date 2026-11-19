@@ -11,3 +11,7 @@ type: Added
 - `wicket audit export --status` shows how many records each sink is behind the chain head, how long
   the oldest of them has waited, and how long ago its last signed checkpoint was. The console's
   `/api/state` carries both under `health.state_store`.
+- An audit sink's stored error (`wicket audit export --status`, the console) and Litestream's no longer
+  keep a URL's user info, query or fragment, where tokens travel.
+- `state-store.yaml` refuses an `s3.endpoint` with user info in it (`https://key:secret@…`): the
+  secret access key goes in `secret:`. Its errors no longer repeat the endpoint.
