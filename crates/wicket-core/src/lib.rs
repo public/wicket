@@ -18,6 +18,7 @@ pub mod message;
 pub mod op;
 pub mod placement;
 pub mod quota;
+pub mod service;
 pub mod splice;
 pub mod subset;
 pub mod text;
