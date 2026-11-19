@@ -95,7 +95,7 @@ pub fn check(probe: bool) -> Result<()> {
         return Ok(());
     };
     if let Some(c) = &s.s3 {
-        println!("state store: {} bucket {} prefix {:?}", c.endpoint, c.bucket, c.prefix);
+        println!("state store: {} bucket {} prefix {:?}", c.shown_endpoint(), c.bucket, c.prefix);
         if probe {
             s.open_s3()?.probe().context("writing to the state store")?;
             println!("  it takes writes (a probe object written, read back and deleted)");
@@ -103,15 +103,27 @@ pub fn check(probe: bool) -> Result<()> {
     }
     println!("bundles: {}", if s.bundles == crate::statestore::Where::S3 { "the state store" } else { "this host" });
     match &s.ledger {
-        Some(l) => println!("ledger: streamed every {} (kept {}), by Litestream ({})", l.sync_interval, l.retention, litestream_desc(l)),
+        Some(l) => {
+            println!("ledger: streamed every {} (kept {}), by Litestream ({})", l.sync_interval, l.retention, litestream_desc(l));
+            let now = wicket_feed::now_ms();
+            println!("  {}", crate::statesync::line(&crate::statesync::status_of(&s, &ledger_path(), now)?, now));
+        }
         None => println!("ledger: this host only"),
     }
-    let stores: Vec<String> = crate::audit_export::SinksConfig::load()?
-        .map(|c| c.sinks.into_iter().filter(|k| matches!(k.kind, crate::audit_export::SinkKind::Store {})).map(|k| k.name).collect())
-        .unwrap_or_default();
-    match stores.is_empty() {
-        true => println!("audit: no sink of type store"),
-        false => println!("audit: to the state store by sink(s) {}", stores.join(", ")),
+    let mut cfg = crate::audit_export::SinksConfig::load()?;
+    if let Some(c) = &mut cfg {
+        c.sinks.retain(|k| matches!(k.kind, crate::audit_export::SinkKind::Store {}));
+    }
+    match cfg.filter(|c| !c.sinks.is_empty()) {
+        None => println!("audit: no sink of type store"),
+        Some(c) => {
+            let names: Vec<&str> = c.sinks.iter().map(|k| k.name.as_str()).collect();
+            println!("audit: to the state store by sink(s) {}", names.join(", "));
+            let now = wicket_store::now();
+            for st in crate::audit_export::status(&wicket_store::Ledger::open(&ledger_path())?, &c, now)? {
+                println!("  {}", crate::audit_export::status_line(&st, now));
+            }
+        }
     }
     println!("roots: {}", if crate::roots::offline() { "offline" } else { "on this host" });
     Ok(())
@@ -122,7 +134,17 @@ fn litestream_desc(l: &LedgerStream) -> String {
 }
 
 /// Litestream's configuration for the ledger, with the store's credentials if given.
-fn litestream_config(s: &StateStore, l: &LedgerStream, db: &Path, lineage: &str, creds: Option<&crate::s3::Creds>) -> Result<String> {
+/// `replicate` also turns on Litestream's control socket, beside the ledger, which
+/// [`crate::statesync`] asks for the stream's position, and logs to stderr, which
+/// [`replicate`] reads for errors.
+fn litestream_config(
+    s: &StateStore,
+    l: &LedgerStream,
+    db: &Path,
+    lineage: &str,
+    creds: Option<&crate::s3::Creds>,
+    replicate: bool,
+) -> Result<String> {
     let c = s.s3()?;
     let mut cfg = serde_json::json!({
         "snapshot": { "interval": "1h", "retention": l.retention },
@@ -134,6 +156,11 @@ fn litestream_config(s: &StateStore, l: &LedgerStream, db: &Path, lineage: &str,
             },
         }],
     });
+    if replicate {
+        let sock = crate::statesync::socket_path(db);
+        cfg["socket"] = serde_json::json!({ "enabled": true, "path": sock.to_string_lossy(), "permissions": 0o600 });
+        cfg["logging"] = serde_json::json!({ "level": "info", "type": "text", "stderr": true });
+    }
     if let Some(k) = creds {
         cfg["dbs"][0]["replica"]["access-key-id"] = k.access_key_id.clone().into();
         cfg["dbs"][0]["replica"]["secret-access-key"] = k.secret_access_key.clone().into();
@@ -152,7 +179,7 @@ fn litestream(s: &StateStore, args: &[&str], db: &Path, lineage: &str) -> Result
     let cfg_path = dir.join(format!("litestream-{}.yml", args[0]));
     let _ = std::fs::remove_file(&cfg_path);
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&cfg_path)?;
-    std::io::Write::write_all(&mut f, litestream_config(s, l, db, lineage, Some(&creds))?.as_bytes())?;
+    std::io::Write::write_all(&mut f, litestream_config(s, l, db, lineage, Some(&creds), args[0] == "replicate")?.as_bytes())?;
     let default_image = Some(crate::statestore::LITESTREAM_IMAGE.to_string());
     let image = l.litestream.image.as_ref().or(default_image.as_ref());
     let mut cmd = match (&l.litestream.binary, image) {
@@ -186,21 +213,44 @@ fn litestream(s: &StateStore, args: &[&str], db: &Path, lineage: &str) -> Result
     Ok((cmd, cfg_path))
 }
 
-/// `wicket state replicate`: streams the ledger to the state store until stopped.
+/// `wicket state replicate`: streams the ledger to the state store until stopped. Why it stopped,
+/// or couldn't start, is kept for [`crate::statesync`] (`<data dir>/state-stream.json`).
 pub fn replicate() -> Result<()> {
+    let db = ledger_path();
+    let r = replicate_ledger(&db);
+    if let Err(e) = &r {
+        crate::statesync::StreamLog::record_error(&db, &format!("{e:#}"), wicket_feed::now_ms());
+    }
+    r
+}
+
+fn replicate_ledger(db: &Path) -> Result<()> {
     let s = StateStore::load()?.context("no state-store.yaml")?;
     let Some(l) = &s.ledger else {
         // Not an error (the service would restart for ever): nothing to stream.
         println!("[wicket] state-store.yaml has no ledger: section: the ledger isn't streamed");
         return Ok(());
     };
-    let db = ledger_path();
     // Litestream needs the database in WAL mode, which the ledger is; make sure it exists.
-    drop(wicket_store::Ledger::open(&db)?);
+    drop(wicket_store::Ledger::open(db)?);
     let lineage = my_lineage(&s.open_s3()?)?;
-    let (mut cmd, cfg) = litestream(&s, &["replicate"], &db, &lineage)?;
+    let (mut cmd, cfg) = litestream(&s, &["replicate"], db, &lineage)?;
     println!("[wicket] streaming {} to the state store as lineage {lineage} ({})", db.display(), litestream_desc(l));
-    let status = cmd.status();
+    let prev = crate::statesync::StreamLog::read(db);
+    crate::statesync::StreamLog { started_ms: wicket_feed::now_ms(), lineage: Some(lineage), ..prev }.write(db)?;
+    cmd.stderr(std::process::Stdio::piped());
+    let child = cmd.spawn();
+    let status = child.and_then(|mut c| {
+        // Litestream's log, passed on as it is, its errors kept for the status.
+        let err = c.stderr.take().expect("piped");
+        for line in std::io::BufRead::lines(std::io::BufReader::new(err)).map_while(|l| l.ok()) {
+            eprintln!("{line}");
+            if let Some(e) = crate::statesync::log_error(&line) {
+                crate::statesync::StreamLog::record_error(db, &e, wicket_feed::now_ms());
+            }
+        }
+        c.wait()
+    });
     let _ = std::fs::remove_file(&cfg);
     let status = status.context("starting Litestream")?;
     if !status.success() {

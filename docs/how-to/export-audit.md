@@ -40,6 +40,13 @@ wicket audit export --checkpoint
 wicket audit export --status   # each sink's position, last checkpoint, who feeds it, last error
 ```
 
+Each line says how far the sink is behind the chain head, in records and in how long the oldest of
+them has waited:
+
+```
+store            store at 1180 of 1204, 24 behind (oldest 40 s)  last checkpoint 3 min ago  fed by serve-…
+```
+
 An OTLP sink that gets a 4xx stops at that record and shows the error here: a record that is never
 accepted needs a person, not silence. Records can arrive twice; deduplicate on `seq` where that
 matters.

@@ -13,6 +13,7 @@ const assert = require("assert");
 class Node {
   constructor(tag) { this.tagName = tag; this.children = []; this.parent = null; this._text = ""; this.className = ""; this.hidden = false; this.disabled = false; this.dataset = {}; this.onclick = null; this.listeners = {}; this.value = ""; }
   append(...ns) { for (const n of ns) { if (typeof n === "string") n = new Text(n); if (n.parent) n.parent.children.splice(n.parent.children.indexOf(n), 1); n.parent = this; this.children.push(n); } }
+  prepend(...ns) { const keep = this.children; this.children = []; this.append(...ns); for (const c of keep) this.children.push(c); }
   replaceChildren(...ns) { for (const c of this.children) c.parent = null; this.children = []; this.append(...ns); }
   set textContent(t) { this._text = String(t); this.children = []; }
   get textContent() { return this._text + this.children.map(c => c.textContent).join(""); }
@@ -552,6 +553,51 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   const hrow = ids.health.children[0];
   assert.strictEqual(hrow.children[0].className, "row");
   assert.ok(hrow.children[1].textContent === "! disk 91% full" && hrow.children[1].className === "blocked", hrow.textContent);
+  // The state store's sync and the audit export's progress (#635): a row each, above the nodes,
+  // lagging and failing ones marked, the last error under its row.
+  const nowS = 1763200000;
+  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: {
+    stream: { endpoint: "https://s3.example.com", bucket: "b-1", state: "lagging", last_sync_ms: (nowS - 420) * 1000, behind_secs: 420, error: "monitor error: <b>refused</b>", error_ms: (nowS - 5) * 1000 },
+    audit: [{ sink: "store", kind: "store", seq: 1180, head: 1204, behind: 24, behind_secs: 400, checkpoint_at: nowS - 900, error: "PUT: refused" },
+            { sink: "collector", kind: "otlp", seq: 1204, head: 1204, behind: 0, behind_secs: 0, checkpoint_at: 0, error: null }],
+    errors: ["audit-sinks.yaml: bad"] } } };
+  await run("refresh()"); await flush();
+  const hs = ids.health.children;
+  assert.strictEqual(hs[0].children[0].textContent, "State store" + "https://s3.example.com (b-1) \u00b7 ledger lagging \u00b7 last sync 7 min ago");
+  assert.strictEqual(hs[0].children[0].children[1].className, "blocked");
+  assert.strictEqual(hs[0].children[1].textContent, "! last error 5 s ago: monitor error: <b>refused</b>", "as text, never markup");
+  assert.ok(hs[1].children[0].textContent.endsWith("24 records behind (oldest 6 min) at 1180 of 1204 \u00b7 last checkpoint 15 min ago"), hs[1].textContent);
+  assert.strictEqual(hs[1].children[0].children[1].className, "blocked");
+  assert.strictEqual(hs[1].children[1].textContent, "! last error: PUT: refused");
+  assert.strictEqual(hs[2].children[0].textContent, "Audit export collector (otlp)caught up at 1204 of 1204 \u00b7 last checkpoint never");
+  assert.strictEqual(hs[2].children.length, 1, "no error, no line");
+  assert.strictEqual(hs[3].textContent, "! audit-sinks.yaml: bad");
+  assert.strictEqual(hs[4].className, "empty", "then the nodes");
+  // Streaming: no mark, and an error from before the last sync isn't shown; one since is.
+  const streaming = (error_ms) => ({ ...base, now: nowS, pending: [], health: { nodes: [], state_store: {
+    stream: { endpoint: "https://s3.example.com", bucket: "b-1", state: "streaming", last_sync_ms: (nowS - 2) * 1000, behind_secs: 2, error: "old trouble", error_ms },
+    audit: [], errors: [] } } });
+  state = streaming((nowS - 600) * 1000);
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
+  assert.ok(ids.health.children[0].children[0].textContent.endsWith("ledger streaming \u00b7 last sync 2 s ago"));
+  assert.strictEqual(ids.health.children[0].children.length, 1, "an error recovered from isn't shown");
+  state = streaming((nowS - 1) * 1000);
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.health.children[0].children[1].textContent, "! last error 1 s ago: old trouble", "one after the last sync is");
+  // Starting: pending, saying how long it has had no sync.
+  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: {
+    stream: { endpoint: "https://s3.example.com", bucket: "b-1", state: "starting", last_sync_ms: null, behind_secs: 12, error: null, error_ms: null }, audit: [], errors: [] } } };
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.health.children[0].children[0].children[1].className, "pend");
+  assert.ok(ids.health.children[0].children[0].textContent.endsWith("ledger starting \u00b7 no sync yet in 12 s"));
+  // Sinks only (no state store): a row per sink and no state store row; a manual sink behind isn't marked.
+  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, errors: [],
+    audit: [{ sink: "stdout", kind: "jsonl", seq: 3, head: 9, behind: 6, behind_secs: 4000, checkpoint_at: 0, error: null, manual: true }] } } };
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.health.children.length, 2, "the sink's row, then the nodes");
+  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Audit export stdout (jsonl)6 records behind (oldest 66 min) (manual: fed only by `wicket audit export`)"), ids.health.children[0].textContent);
+  assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
   // One poll at a time (B9): a second asked for while one is in flight runs after it, not beside it.
   let inFlight = 0, most = 0;
   const realFetch = sandbox.fetch;
