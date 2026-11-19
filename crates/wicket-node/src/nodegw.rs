@@ -858,7 +858,7 @@ async fn ask_standing(node: &Arc<Node>, run: &str, args: &Value, host: &str, pat
         paths,
         allow_dangerous: args.get("dangerous").and_then(|v| v.as_bool()).unwrap_or(false),
     };
-    if let Err(why) = rule.check() {
+    if let Err(why) = rule.check_standing() {
         return (format!("not requested: {why}"), true);
     }
     let shown =

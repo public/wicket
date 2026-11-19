@@ -1582,18 +1582,33 @@ fn ask_standing(
         }
         _ => return reply(None, None, Some("not requested: this run has no identity to bind standing reach to".into())),
     };
-    // Denied in the last day: not asked again.
-    let rule_json = serde_json::to_value(rule).ok();
+    // Denied in the last day, or one covering it was: not asked again. By coverage, not the JSON as
+    // sent, so the same ask reordered, or a part of it, isn't a new one (#572 review, L4).
+    let asked = rule.canonical();
     let day = wicket_store::now() - 24 * 3600;
+    let covers = |d: &wicket_core::manifest::ReachRule| {
+        d.host == asked.host
+            && asked.methods.iter().all(|m| d.methods.contains(m))
+            && asked.paths.iter().all(|p| d.paths.contains(p))
+            && (d.allow_dangerous || !asked.allow_dangerous)
+    };
     if let Ok(denied) = l.standing_with_status(tenant, "denied") {
-        if let Some(d) = denied
-            .iter()
-            .find(|d| d.principal == who.spiffe_id && serde_json::to_value(&d.rule).ok() == rule_json && d.decided_at.unwrap_or(0) >= day)
+        if let Some(d) =
+            denied.iter().find(|d| d.principal == who.spiffe_id && covers(&d.rule.canonical()) && d.decided_at.unwrap_or(0) >= day)
         {
             return reply(None, Some(d.id.clone()), None);
         }
     }
-    match l.ask_standing(tenant, own, &zone.name, &who.spiffe_id, rule, &format!("{AGENT_ASKS}{}", wicket_core::text::clip(reason, 300))) {
+    let digest = wicket_store::zone_digest(zone);
+    match l.ask_standing(
+        tenant,
+        own,
+        &zone.name,
+        &digest,
+        &who.spiffe_id,
+        &asked,
+        &format!("{AGENT_ASKS}{}", wicket_core::text::clip(reason, 300)),
+    ) {
         Ok((sid, fresh)) => reply(Some((sid, fresh)), None, None),
         Err(e) => reply(None, None, Some(e.to_string())),
     }
@@ -2359,6 +2374,14 @@ mod tests {
         assert!(refused(ask(&quiet, &own, "run_s", &why)).contains("escalation.request: false"));
         l.deny_standing(&sid, "op").unwrap();
         assert!(matches!(ask(&zone, &own, "run_s", &why), Msg::Asked { denied: Some(d), .. } if d == sid));
+        // The same ask reordered, or a part of it, is denied too (L4).
+        for r in
+            ["{ host: ci.example, methods: [HEAD, GET], paths: ['/jobs/**'] }", "{ host: ci.example, methods: [GET], paths: ['/jobs/**'] }"]
+        {
+            let r: wicket_core::manifest::ReachRule = wicket_core::yaml::from_str(r).unwrap();
+            let m = ask_standing(&l, &t, &own, &zone, 1, "run_s", &r, &why);
+            assert!(matches!(&m, Msg::Asked { denied: Some(d), .. } if *d == sid), "{m:?}");
+        }
 
         // The hint: by method and host, from the third ask in a week, in any of the agent's runs.
         let get = |job: u32| Op::egress(&t, &own, "z", "GET", "ci.example", &format!("/jobs/{job}/logs"));
