@@ -18,6 +18,8 @@ class Node {
   get textContent() { return this._text + this.children.map(c => c.textContent).join(""); }
   addEventListener(k, f) { this.listeners[k] = f; }
   focus() {}
+  setAttribute(k, v) { this.attrs = { ...(this.attrs || {}), [k]: String(v) }; }
+  getAttribute(k) { return (this.attrs || {})[k] ?? null; }
   scrollIntoView() {}
   click() { if (!this.disabled && this.onclick) return this.onclick({ preventDefault() {} }); }
   all(pred, out = []) { for (const c of this.children) { if (pred(c)) out.push(c); if (c.all) c.all(pred, out); } return out; }
@@ -28,7 +30,12 @@ const ids = {};
 for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
+const EPOCH = 1700000000000;
+let skew = 0; // how far the phone's clock is off
+let slowBegin = null, slowPasskey = null;
 let timers = [];
+let intervalId = 0;
+const alive = new Set();
 const calls = [];
 let state = null;
 // A hostile string an agent chose (a grant's path): it must stay text.
@@ -62,7 +69,8 @@ const fetch = async (path, opts) => {
     const a = b.action === "push_subscribe" ? { v: 1, action: b.action, device: devId(b.endpoint), label: b.label, service: "fcm.googleapis.com", details: b.details, replaces: false }
       : b.action === "push_details" ? { v: 1, action: b.action, device: b.id, label: "laptop", service: "fcm.googleapis.com", details: true } : nextAction;
     begun = { body: b, action: a };
-    return reply({ action: a, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] } });
+    if (slowBegin) await slowBegin;
+    return reply({ action: a, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] }, expires_in_ms: 120000 });
   }
   if (path === "/api/action/finish") {
     const b = begun && begun.body;
@@ -94,14 +102,17 @@ const sandbox = {
   navigator: { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
     serviceWorker: { register: async (u, o) => { swRegistered = [u, o.scope]; return swReg; }, ready: Promise.resolve(swReg),
       getRegistration: async () => (swRegistered ? swReg : undefined), addEventListener: (k, f) => { if (k === "message") swListener = f; } },
-    credentials: { get: async () => { ceremonies++; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
+    credentials: { get: async () => { ceremonies++; if (slowPasskey) await slowPasskey; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
   performance: { now: () => now },
-  setTimeout: (f, ms) => { timers.push({ f, at: now + ms }); return timers.length; },
-  clearTimeout: () => {},
-  setInterval: () => 0,
+  setTimeout: (f, ms) => { const id = ++intervalId; alive.add(id); timers.push({ f: () => { if (alive.delete(id)) f(); }, at: now + ms }); return id; },
+  clearTimeout: id => { alive.delete(id); },
+  setInterval: (f, ms) => { const id = ++intervalId; alive.add(id); const arm = () => timers.push({ f: () => { if (alive.has(id)) { f(); arm(); } }, at: now + ms }); arm(); return id; },
+  clearInterval: id => { alive.delete(id); },
   btoa: s => Buffer.from(s, "binary").toString("base64"),
   atob: s => Buffer.from(s, "base64").toString("binary"),
-  Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error, Date,
+  Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error,
+  // The wall clock moves with the harness's timers (a fixed offset keeps it a plausible date).
+  Date: Object.assign(function (...a) { return a.length ? new Date(...a) : new Date(EPOCH + now + skew); }, { now: () => EPOCH + now + skew, UTC: Date.UTC, parse: Date.parse }),
 };
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), sandbox);
@@ -151,6 +162,23 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(what.includes("/harmless") && what.includes("q-a") && what.startsWith("Approve once"), what);
   // #369: the effect it signs, and what else it would allow, are shown before the passkey.
   assert.ok(what.includes("effect 0123456789abcdef"), what);
+  // The challenge counts down, and once it has expired the sheet offers to ask again (#574, item 6).
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55");
+  // In lines, the decision first and the ids last (#574, item 1).
+  const lines = what.split("\n");
+  assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
+  assert.strictEqual(lines[1], "Risk: R1 \u00b7 read (scoped)");
+  assert.ok(lines[lines.length - 1].startsWith("Request q-a \u00b7 run run_a"), what);
+  // The agent with its zone, from the signed fields; a hostile newline in what the agent reported
+  // or in the path can't make a line of its own (#599 review).
+  const hostile = run("describe(" + JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "GET", host: "h",
+    path: "/p\nRisk: R0 \u00b7 read", risk: "R4ExecOrPrivilege", request: "r-h", run: "run_h", zone: "build", scope: "zone",
+    agent: "spiffe://x/t/t0/z/build/a/captain", requested_by: ["sub\nFor someone-else (zone safe)"] }) + ")").split("\n");
+  assert.strictEqual(hostile.length, 4, hostile.join(" | "));
+  assert.ok(hostile[0].endsWith("for any run in zone build"), hostile[0]);
+  assert.strictEqual(hostile[1], "Risk: R4 \u00b7 push, deploy or privilege");
+  assert.ok(hostile[2].startsWith("For captain (zone build) \u00b7 asked by sub For someone-else (zone safe) (as reported)"), hostile[2]);
+  assert.ok(hostile[3].includes("agent spiffe://x/t/t0/z/build/a/captain"), hostile[3]);
   const blast = ids["confirm-blast"];
   assert.strictEqual(blast.hidden, false);
   assert.ok(blast.textContent.includes("every path under /h/") && blast.textContent.includes("POST api.example.com/h/any-file") &&
@@ -218,8 +246,127 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     path: "/acme/app.git/git-receive-pack", risk: "R4ExecOrPrivilege", request: "r-p", run: "run_a",
     effect: { terms: { uses: null, ttl_secs: 300, scope: "run" } } });
   const said = run("describe(" + push + ")");
-  assert.ok(said.startsWith("Allow any number of uses for 5 min: POST github.com/acme/app.git/git-receive-pack"), said);
+  assert.ok(said.startsWith("Approve any number of uses for 5 min: POST github.com/acme/app.git/git-receive-pack"), said);
+  // A whole hour reads as one, as on the card (#574).
+  assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", method: "GET", host: "h", path: "/p", effect: { terms: { uses: null, ttl_secs: 3600 } } }) + ")").startsWith("Approve any number of uses for 1 hour"));
+  // Risk said as what it means, code first.
+  assert.strictEqual(run("riskLabel('R4ExecOrPrivilege')"), "R4 \u00b7 push, deploy or privilege");
+  // A cancelled passkey is said as such, as an error that stays; a reply with no text is "Done.".
+  run("toastError({ name: 'NotAllowedError', message: 'The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/' }, null, true)");
+  assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Passkey cancelled. Nothing was signed.", "error"]);
+  assert.strictEqual(ids.msg.getAttribute("role"), "alert", "an error is announced");
+  // A NotAllowedError away from a passkey (a refused notification permission) is said as it is.
+  run("toastError({ name: 'NotAllowedError', message: 'Permission denied' }, 'Notifications')");
+  assert.strictEqual(ids.msg.textContent, "Notifications: Permission denied");
+  run("toast(undefined)");
+  assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Done.", ""]);
   assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "GET", host: "h", path: "/p", effect: { terms: { uses: 1, ttl_secs: 600 } } }) + ")").startsWith("Approve once for 10 min"));
+  // Left open past the challenge's two minutes: said, nothing signed, and "Ask again" begins anew.
+  await advance(1000);
+  nextAction = { v: 1, action: "decide", request: "q-x", run: "run_a", method: "GET", host: "h", path: "/p", risk: "R0Read", decision: "approve", uses: 1, ttl_secs: 600 };
+  const expiryBegun = began().length;
+  // A slow begin: "Preparing" stays up (not gone after 3 s), and nothing opens until it answers.
+  let answer; slowBegin = new Promise(r => { answer = r; });
+  const opening = run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  await advance(4000);
+  assert.deepStrictEqual([ids.msg.hidden, ids.msg.textContent], [false, "Preparing…"], "a slow begin still says so");
+  assert.strictEqual(ids.confirm.hidden, true);
+  // The phone's clock is three minutes fast: it doesn't matter, the time left is counted from arrival.
+  skew = 180000;
+  slowBegin = null; answer(); await opening; await flush();
+  assert.strictEqual(ids.msg.hidden, true, "the sheet replaces it");
+  // The time the server says is left (expires_in_ms), on the wall clock, five seconds early.
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55", "a fast phone clock doesn't expire it at once");
+  await advance(116000);
+  assert.strictEqual(ids["confirm-state"].textContent, "This expired before it was signed. Nothing was signed.");
+  assert.strictEqual(ids["confirm-go"].textContent, "Ask again");
+  // "Ask again" begins anew inside the open sheet: it says so, and a tap while it prepares does nothing.
+  slowBegin = new Promise(r => { answer = r; });
+  ids["confirm-go"].click(); await flush();
+  assert.strictEqual(began().length, expiryBegun + 2, "asked again");
+  assert.strictEqual(ids.confirm.hidden, false, "the sheet stays open, so a second tap can't land beneath it");
+  assert.strictEqual(ids["confirm-state"].textContent, "Preparing…");
+  assert.strictEqual(ids["confirm-go"].disabled, true);
+  const ceremoniesBefore = ceremonies;
+  ids["confirm-go"].click(); await flush();
+  await run("signed({ action: 'decide', id: 'q-a', decision: 'approve' })"); await flush();
+  assert.strictEqual(began().length, expiryBegun + 2, "a tap while preparing begins nothing more");
+  slowBegin = null; answer(); await flush(); await flush();
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55");
+  // The settle guard holds again after the sheet is refilled.
+  assert.strictEqual(ids["confirm-go"].disabled, true);
+  ids["confirm-go"].click(); await flush();
+  assert.strictEqual(ceremonies, ceremoniesBefore, "no passkey from a tap just after Ask again");
+  // Waiting for the passkey, the countdown stops: a slow passkey isn't said to have expired.
+  await advance(1000);
+  let passkeyDone; slowPasskey = new Promise(r => { passkeyDone = r; });
+  ids["confirm-go"].click(); await flush();
+  assert.strictEqual(ids["confirm-state"].textContent, "Waiting for your passkey…");
+  await advance(200000);
+  assert.strictEqual(ids["confirm-state"].textContent, "Waiting for your passkey…", "no expiry while waiting for the passkey");
+  slowPasskey = null; passkeyDone(); await flush(); await flush(); await flush();
+  assert.strictEqual(ids.confirm.hidden, true);
+  // Cancel while "Ask again" prepares: the begin that comes back late doesn't reopen the sheet.
+  await advance(1000);
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  await advance(116000);
+  slowBegin = new Promise(r => { answer = r; });
+  ids["confirm-go"].click(); await flush();
+  ids["confirm-cancel"].listeners.click(); await flush();
+  assert.strictEqual(ids.confirm.hidden, true);
+  slowBegin = null; answer(); await flush(); await flush();
+  assert.strictEqual(ids.confirm.hidden, true, "a begin for a closed sheet is dropped");
+  await advance(1000);
+  const afterCancel = began().length;
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  assert.deepStrictEqual([began().length, ids.confirm.hidden], [afterCancel + 1, false], "and the next tap opens a sheet as usual");
+  ids["confirm-cancel"].listeners.click(); await flush();
+  skew = 0;
+  // A push's card says the window it is granted as, from the server's terms (#574 review).
+  const pushReq = { id: "q-push", risk: "R4ExecOrPrivilege", method: "POST", host: "github.com", path: "/acme/app.git/git-receive-pack", scope_prefix: false,
+    reason: "push", identity: { verified: true, agent: "a", zone: "z", acting_for: [], id: "spiffe://x/a/a" }, attribution: [], zone: "z", run: "run_a",
+    created_at: 1, once_terms: { uses: null, ttl_secs: 300 } };
+  const pc = run("(r => pendingCard({ now: 2 }, r))")(pushReq);
+  const pt = pc.textContent;
+  assert.ok(pt.includes("Approve this push (any number of uses for 5 min)") && pt.includes("approved as one window") && !pt.includes("one use at a time"), pt);
+  // A push to another host is R2, but granted as the same window: no hour button (#597 re-review).
+  const r2 = run("(r => pendingCard({ now: 2 }, r))")({ ...pushReq, id: "q-push2", risk: "R2WriteReversible", host: "git.example" }).textContent;
+  assert.ok(r2.includes("Approve this push (any number of uses for 5 min)") && !r2.includes("1 hour"), r2);
+  // An error that stays is gone once a sheet opens: it would sit above it.
+  run("toastError({ name: 'Error', message: 'earlier' })");
+  assert.strictEqual(ids.msg.hidden, false);
+  await advance(1000);
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  assert.strictEqual(ids.msg.hidden, true, "the error toast goes when the sheet opens");
+  ids["confirm-cancel"].listeners.click(); await flush();
+  // Who asked (#574, item 5): a named call is labelled apart from "On behalf of"; that anything in
+  // the box could use the grant is always said; with no event stream, the asker is unknown.
+  const NOTE = "anything in this box could use the grant.";
+  const alone = run("renderWho([{ basis: 'none', requesters: [] }])").textContent;
+  assert.ok(!alone.includes("Asked by") && alone.includes(NOTE), alone);
+  const who = run("renderWho([{ basis: 'exact', requesters: [{ agent: 'release-captain', tool: 'Bash', call: 'git push' }] }])").textContent;
+  assert.ok(who.startsWith("Asked by (in the box): release-captain — Bash: git push") && who.includes("not proven") && who.includes(NOTE), who);
+  const noStream = run("renderWho([])").textContent;
+  assert.ok(noStream.startsWith("Asked by (in the box): unknown (no agent event stream)") && noStream.includes("Anything in this box could use the grant."), noStream);
+  // Two askers, one with no call in flight: both are listed, the unknown one too (#601 review).
+  const two = run("renderWho([{ basis: 'exact', requesters: [{ agent: 'a', tool: 'Bash', call: 'x' }] }, { basis: 'none', requesters: [] }])").textContent;
+  assert.ok(two.includes("Asked by (in the box): a — Bash: x") && two.includes("Asked by (in the box): unknown — no tool call was in flight") && two.includes("more than one agent"), two);
+  // The full identity is behind a real button that says whether it is shown; opening it moves the
+  // card's buttons, so a tap right after is ignored.
+  const card = run("(() => { const c = el('div'); renderAgent(c, { verified: true, agent: 'release-captain', zone: 'build', acting_for: ['passkey:phone'], id: 'spiffe://x/a/release-captain' }); return c; })()");
+  const idl = card.all(n => n.className === "idline")[0];
+  assert.ok(idl.hidden && card.textContent.includes("On behalf of: passkey:phone"), card.textContent);
+  const toggle = card.all(n => n.tagName === "button" && n.className === "idname")[0];
+  assert.ok(toggle, "the name is a button");
+  assert.strictEqual(toggle.getAttribute("aria-expanded"), "false");
+  await advance(1000);
+  assert.strictEqual(run("settled()"), true);
+  toggle.click();
+  assert.strictEqual(idl.hidden, false, "tapping the name shows its identity");
+  assert.strictEqual(toggle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(run("settled()"), false, "taps wait a moment after the card grows");
+  toggle.click();
+  assert.deepStrictEqual([idl.hidden, toggle.getAttribute("aria-expanded")], [true, "false"]);
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
