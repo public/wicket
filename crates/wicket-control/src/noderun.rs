@@ -2392,10 +2392,13 @@ fn sync_standing(
         let block = standing_live(issuer, s);
         match published.get(&s.id) {
             Some(end) if *end == block.grant.not_after => continue,
-            // Renewed or shortened: the same block with its new end.
+            // Renewed or shortened: the same block with its new end. Put back if the sweep of
+            // ended blocks took it this tick (a renewal that lands right at the old end, #572
+            // re-review, N2).
             Some(_) => {
-                for l in live.iter_mut().filter(|l| l.grant.gid == s.id) {
-                    l.grant.not_after = block.grant.not_after;
+                match live.iter_mut().find(|l| l.grant.gid == s.id) {
+                    Some(l) => l.grant.not_after = block.grant.not_after,
+                    None => live.push(block.clone()),
                 }
                 published.insert(s.id.clone(), block.grant.not_after);
                 rebuild = true;
@@ -2509,6 +2512,12 @@ mod tests {
             assert_eq!(live[0].grant.not_after, wicket_authz::Grant::not_after_for(end));
             assert_eq!(published[&id], wicket_authz::Grant::not_after_for(end));
         }
+        // Swept at its old end in the same tick its renewal lands: put back with the new end (N2).
+        live.clear();
+        let renewed = wicket_store::Standing { expires_at: Some(rule_row.expires_at.unwrap() + 7 * 86_400), ..rule_row.clone() };
+        let (c, r) = sync(&mut published, &mut live, Ok(vec![renewed.clone()]), p17, true);
+        assert!(c.is_empty() && r && live.len() == 1, "put back");
+        assert_eq!(live[0].grant.not_after, wicket_authz::Grant::not_after_for(renewed.expires_at.unwrap()));
         // A read error: nothing changes (not "no rules", which would revoke it on the node).
         let (c, r) = sync(&mut published, &mut live, Err("database is locked".into()), p17, true);
         assert!(c.is_empty() && !r && live.len() == 1);
