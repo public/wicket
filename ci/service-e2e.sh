@@ -103,14 +103,26 @@ grep -q "service_started .*npm-cache on local" "$work/reconcile.log" || { cat "$
 ok "box A got the cache's registry, was linked to it, and installed left-pad through it"
 
 slog=$(ls "$WICKET_HOME"/services/npm-cache/logs/*.log | head -1)
-fetched() { grep -c "registry.npmjs.org/left-pad" "$slog" || true; }
-n1=$(fetched)
-[ "$n1" -ge 1 ] || { cat "$slog"; fail "the cache never fetched left-pad"; }
+# The cache's own upstream requests for left-pad (its packument and tarball), not every line that
+# names the URL: the egress log and the response lines land at their own pace.
+fetched() { grep -c "making request: 'GET https://registry.npmjs.org/left-pad" "$slog" || true; }
+# The count once the log has stopped growing: the same in two reads a second apart (10 s at most).
+settled() {
+  local a b
+  a=$(fetched)
+  for _ in $(seq 10); do sleep 1; b=$(fetched); [ "$b" = "$a" ] && break; a=$b; done
+  echo "$a"
+}
+# Box A's install ends before the cache has necessarily written its log: wait for its tarball fetch.
+for _ in $(seq 10); do grep -q "making request: 'GET https://registry.npmjs.org/left-pad/-/" "$slog" && break; sleep 1; done
+grep -q "making request: 'GET https://registry.npmjs.org/left-pad/-/" "$slog" || { cat "$slog"; fail "the cache never fetched left-pad's tarball"; }
+n1=$(settled)
 
 user build-b yes
 W run "$work/build-b.yaml" >"$work/b.log" 2>&1 || { cat "$work/b.log"; diag; fail "box B"; }
 grep -q installed-left-pad "$work/b.log" || { cat "$work/b.log"; diag; fail "box B's npm install"; }
-[ "$(fetched)" = "$n1" ] || { cat "$slog"; fail "box B's install went to the registry again ($n1 then $(fetched))"; }
+n2=$(settled)
+[ "$n2" = "$n1" ] || { cat "$slog"; fail "box B's install went to the registry again ($n1 then $n2)"; }
 ok "box B's install was served from the cache's storage"
 
 runs=$(sed -n 's/^wicket run \(run_[a-z0-9]*\).*/\1/p' "$work/a.log" "$work/b.log")
