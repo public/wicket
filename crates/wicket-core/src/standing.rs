@@ -12,9 +12,11 @@ use crate::op::STANDING_PAIRS;
 /// where the granted methods were on different paths only the most granted method (and any others
 /// granted on exactly its paths) is kept: never a pair the evidence lacks. No `allow_dangerous`
 /// (the evidence says nothing of risk: the operator adds it by editing). At most
-/// [`STANDING_PAIRS`] pairs, the most granted paths first. None if nothing was granted.
+/// [`STANDING_PAIRS`] pairs (or one path, if more methods than that share its paths), the paths
+/// in evidence order, the most requested first. None if nothing was granted.
 ///
-/// Lean: `narrow`; `narrow_pairs_granted`, `narrow_not_dangerous` and `narrow_allows_only_evidence`.
+/// Lean: `narrow`; `narrow_pairs_granted`, `narrow_not_dangerous`, `narrow_allows_only_evidence`
+/// and `narrow_pairs_bound`.
 pub fn narrow<'a>(host: &str, ops: impl IntoIterator<Item = (&'a str, &'a str, u64)>) -> Option<ReachRule> {
     use std::collections::BTreeMap;
     let mut by: BTreeMap<&str, (u64, Vec<String>)> = BTreeMap::new();

@@ -16,8 +16,8 @@ zone's reach and within everything else.
   `rule_allows_within_globs`, it allows only a path one of its globs matches.
 - `Standing.binds` is `wicket_store::Standing::binds`, and `zoneDigest` its digest of a zone's
   egress (`zone_digest`): `binds_digest`, a rule binds only to a run whose zone hashes as the one it
-  was approved under, and `digest_decides_alike`, for a digest that doesn't collide, every such zone
-  decides every request as that one did.
+  was approved under, and `digest_decides_alike`, for a digest that doesn't collide on the two
+  zones, every such zone decides every request as that one did.
 -/
 
 namespace Wicket
@@ -84,7 +84,8 @@ def canonicalRule (host : Str) (methods paths : List Str) : Reach :=
 def keptMethods (gs : List Group) (top : Group) : List Str :=
   (gs.filter (fun g => g.method == top.method || sortS g.paths == sortS top.paths)).map (·.method)
 
-/-- The rule `narrow` builds from the map and its top entry: at most 16 pairs (`STANDING_PAIRS`). -/
+/-- The rule `narrow` builds from the map and its top entry: at most 16 pairs (`STANDING_PAIRS`), or
+one path when more than 16 methods share it (`narrow_pairs_bound`). -/
 def narrowTo (host : Str) (gs : List Group) (top : Group) : Reach :=
   let methods := keptMethods gs top
   canonicalRule host methods (top.paths.take (max (16 / methods.length) 1))
@@ -163,6 +164,51 @@ theorem narrow_host {host : Str} {ops : List EvOp} {r : Reach} (h : narrow host 
     r.host = lowerS host := by
   obtain ⟨top, _, rfl⟩ := narrow_some h
   rfl
+
+theorem length_nub_le : ∀ (l : List Str), (nub l).length ≤ l.length
+  | [] => by simp [nub]
+  | a :: l => by
+    simp only [nub, List.length_cons]
+    have := length_nub_le l
+    have := List.length_filter_le (· != a) (nub l)
+    omega
+
+theorem length_sortS (l : List Str) : (sortS l).length = l.length := List.length_mergeSort _
+
+/-- **A narrowed rule has at most 16 pairs** (`STANDING_PAIRS`, one Datalog rule each in a node's
+token block), or, when more than 16 methods share its paths, one path. -/
+theorem narrow_pairs_bound {host : Str} {ops : List EvOp} {r : Reach} (h : narrow host ops = some r) :
+    r.methods.length * r.paths.length ≤ 16 ∨ r.paths.length ≤ 1 := by
+  obtain ⟨top, _, rfl⟩ := narrow_some h
+  simp only [narrowTo, canonicalRule]
+  generalize keptMethods (groups ops) top = ms
+  have hm : (nub (sortS (ms.map upperS))).length ≤ ms.length := by
+    have := length_nub_le (sortS (ms.map upperS))
+    rw [length_sortS, List.length_map] at this; exact this
+  have hp : (nub (sortS (top.paths.take (max (16 / ms.length) 1)))).length ≤ max (16 / ms.length) 1 := by
+    have := length_nub_le (sortS (top.paths.take (max (16 / ms.length) 1)))
+    rw [length_sortS] at this
+    exact Nat.le_trans this (List.length_take_le _ _)
+  generalize (nub (sortS (ms.map upperS))).length = a at hm
+  generalize (nub (sortS (top.paths.take (max (16 / ms.length) 1)))).length = b at hp
+  by_cases hl : ms.length ≤ 16
+  · left
+    have hk : max (16 / ms.length) 1 * ms.length ≤ 16 ∨ ms.length = 0 := by
+      rcases Nat.eq_zero_or_pos ms.length with h0 | h0
+      · exact .inr h0
+      · left
+        have h1 : 1 ≤ 16 / ms.length := (Nat.le_div_iff_mul_le h0).mpr (by omega)
+        rw [Nat.max_eq_left h1]
+        exact Nat.div_mul_le_self 16 ms.length
+    rcases hk with hk | hk
+    · calc a * b ≤ ms.length * max (16 / ms.length) 1 := Nat.mul_le_mul hm hp
+        _ = max (16 / ms.length) 1 * ms.length := Nat.mul_comm _ _
+        _ ≤ 16 := hk
+    · have : a = 0 := by omega
+      simp [this]
+  · right
+    have : 16 / ms.length = 0 := Nat.div_eq_of_lt (by omega)
+    rw [this] at hp; simpa using hp
 
 /-- Nothing granted, nothing to narrow to. -/
 theorem narrow_none_of_ungranted {host : Str} {ops : List EvOp} (h : ∀ o ∈ ops, o.granted = 0) :
@@ -339,9 +385,10 @@ theorem binds_digest {D : Type} [DecidableEq D] {s : Standing D} {p : Option Str
 doesn't collide, a zone hashing as the one a rule was approved under has its reach, forbids,
 injections and the rest of its egress, so it decides every request as that one did. (Edits outside
 the subset, a timeout or a model budget, keep the rule.) -/
-theorem digest_decides_alike {D : Type} {H : Egress → D} (hinj : ∀ a b, H a = H b → a = b) {z z₀ : Zone}
+theorem digest_decides_alike {D : Type} {H : Egress → D} {z z₀ : Zone}
+    (hcol : H z.egress = H z₀.egress → z.egress = z₀.egress)
     (h : zoneDigest H z = zoneDigest H z₀) : z.egress = z₀.egress ∧ ∀ o, evaluate z o = evaluate z₀ o := by
-  have he := hinj _ _ h
+  have he := hcol h
   refine ⟨he, fun o => ?_⟩
   have hr : z.reach = z₀.reach := congrArg Egress.reach he
   have hf : z.forbid = z₀.forbid := congrArg Egress.forbid he

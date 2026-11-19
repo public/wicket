@@ -774,20 +774,28 @@ fn decisions(c: &mut Cases, rng: &mut Rng) {
 fn standing(c: &mut Cases, rng: &mut Rng) {
     use wicket_core::standing::narrow;
     let methods = ["GET", "HEAD", "POST", "DELETE", "get", "PUT"];
-    let paths = ["/a", "/b", "/a/b", "/b/a", "/c*", "/[x]", "/a?", "/", "/a/b/c"];
-    let probes = ["/a", "/b", "/a/b", "/b/a", "/c", "/cd", "/x", "/a/", "/", "/a/b/c", "/A"];
+    // Edge spellings too: an escape, a brace, a backslash, the empty path and a non-ASCII one.
+    let paths = ["/a", "/b", "/a/b", "/b/a", "/c*", "/[x]", "/a?", "/", "/a/b/c", "/a%2Fb", "/a{b}", "/a\\b", "", "/\u{e9}"];
+    let probes = ["/a", "/b", "/a/b", "/b/a", "/c", "/cd", "/x", "/a/", "/", "/a/b/c", "/A", "/a%2Fb", "/\u{e9}"];
     let rule_json = |r: &ReachRule| json!({ "host": r.host, "methods": r.methods, "paths": r.paths, "dangerous": r.allow_dangerous });
-    let mut narrowed = 0;
+    let (mut narrowed, mut truncated) = (0, 0);
     for i in 0..2000 {
+        // Every tenth ask is wide: 17 to 24 granted paths, each for one or both of GET and HEAD,
+        // so the rule has more pairs than `STANDING_PAIRS` allows and `narrow` truncates its paths.
         let wide = i % 10 == 0;
-        let ops: Vec<(String, String, u64)> = (0..rng.below(if wide { 24 } else { 7 }))
-            .map(|k| {
-                let m = rng.pick(&methods).to_string();
-                let p = if wide { format!("/p{k}") } else { rng.pick(&paths).to_string() };
-                (m, p, rng.below(4) as u64)
-            })
-            .collect();
-        let host = *rng.pick(&["a.test", "A.Test"]);
+        let ops: Vec<(String, String, u64)> = if wide {
+            let both = rng.chance(50);
+            (0..17 + rng.below(8))
+                .flat_map(|k| {
+                    let ms: &[&str] = if both { &["GET", "HEAD"] } else { &["GET"] };
+                    ms.iter().map(move |m| (m.to_string(), format!("/p{k}"))).collect::<Vec<_>>()
+                })
+                .map(|(m, p)| (m, p, 1 + rng.below(3) as u64))
+                .collect()
+        } else {
+            (0..rng.below(7)).map(|_| (rng.pick(&methods).to_string(), rng.pick(&paths).to_string(), rng.below(4) as u64)).collect()
+        };
+        let host = *rng.pick(&["a.test", "A.Test", "a.test."]);
         let got = narrow(host, ops.iter().map(|(m, p, n)| (m.as_str(), p.as_str(), *n)));
         let rust = match &got {
             None => "none".to_string(),
@@ -797,6 +805,8 @@ fn standing(c: &mut Cases, rng: &mut Rng) {
         let rule = match got {
             Some(r) => {
                 narrowed += 1;
+                let granted: std::collections::BTreeSet<&str> = ops.iter().filter(|o| o.2 > 0).map(|o| o.1.as_str()).collect();
+                truncated += usize::from(r.paths.len() < granted.len() && r.methods.len() * r.paths.len() <= 16);
                 r
             }
             None => gen_rule(rng),
@@ -814,6 +824,7 @@ fn standing(c: &mut Cases, rng: &mut Rng) {
         }
     }
     assert!(narrowed > 1000, "too few asks narrowed ({narrowed} of 2000)");
+    assert!(truncated >= 150, "too few asks truncated to the pairs a rule may have ({truncated} of 200 wide ones)");
 }
 
 /// The cases of section 10: `message::relation` on every combination of family and reply, generated
