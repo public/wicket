@@ -187,8 +187,7 @@ impl Egress {
         // placeholder (an agent reading its own files): it isn't scanned; its URL and headers are.
         let scan = canary::Scanner::placeholders(self.ctx.swaps.iter().map(|s| s.placeholder.as_str()));
         self.tripwire(&parts.headers, host, pq, &scan)?;
-        let path = pq.split('?').next().unwrap_or("/");
-        let scan_body = !self.model_gate.get().is_some_and(|l| l.is_model_call(host, path));
+        let scan_body = !self.model_gate.get().is_some_and(|l| l.is_model_call(host, parts.method.as_str(), pq));
         let tripped: Arc<std::sync::OnceLock<String>> = Arc::default();
         // Only allow-listed headers go upstream (#130); credentials are added below, by wicket.
         let mut headers = http::HeaderMap::new();

@@ -9,10 +9,11 @@
 //!
 //! Two lists say where they differ, each entry with why:
 //!
-//! - [`INTENDED`]: differences by design, which stay (the destination and transport, where a stale
-//!   activation is refused, a zone without a model route, an upstream error's wording);
-//! - [`KNOWN`]: differences that are drift, found by the audit (`out/one-route/proposal.md`'s
-//!   rows), each to be deleted from the list as the routes are made one (`Llm::call`).
+//! - [`INTENDED`]: differences by design, which stay (the destination and transport, a request
+//!   that isn't a model route, where a stale activation is refused, a zone without a model route,
+//!   an upstream error's wording);
+//! - [`KNOWN`]: differences that are drift, found by #552's audit (its rows are the numbers here),
+//!   each to be deleted from the list as the routes are made one (`Llm::call`).
 //!
 //! A case whose routes differ and that is in neither list fails; so does a [`KNOWN`] entry whose
 //! routes no longer differ (delete it). [`INTENDED_UNTESTED`] names what no single call can show.
@@ -514,6 +515,13 @@ struct Differs {
 /// Differences by design: they stay, and are named here.
 const INTENDED: &[Differs] = &[
     Differs {
+        case: "a path that isn't a model route",
+        row: 2,
+        why: "the model proxy serves only the provider's model routes (anything else under its upstream would carry the zone's secret); to the egress proxy anything else to a model host is plain egress, decided by the zone's reach rules as any other request (not a model call, not counted)",
+        direct: |s| s.status == 404 && s.bearers.is_empty() && s.note("refused route"),
+        egress: |s| s.requests == 0 && s.notes.is_empty() && s.charged == 0,
+    },
+    Differs {
         case: "stale activation",
         row: 3,
         why: "the egress proxy refuses a stale activation for the whole tunnel, before the model gate, with its own wording; the model proxy refuses the call (409)",
@@ -542,9 +550,9 @@ const INTENDED_UNTESTED: &[(u8, &str)] = &[(
     "the destination and transport: the model proxy calls its route's upstream with its own client; a wrapped session's call goes to the host the box named, on the egress dialer (DNS pinning, dial-time address checks, HTTP/3)",
 )];
 
-/// Drift the audit found (`out/one-route/proposal.md`), deleted from this list as the two routes
-/// became one call (`Llm::call`, rows 2, 6, 8, 9, 10, 13, 14, 15, 16 and 17). A new difference is a
-/// regression: make the routes alike rather than list it here.
+/// Drift #552's audit found, deleted from this list as the two routes became one call
+/// (`Llm::call`, rows 6, 8, 9, 10, 13, 14, 15, 16 and 17; row 2 was decided intended). A new
+/// difference is a regression: make the routes alike rather than list it here.
 const KNOWN: &[Differs] = &[];
 
 const CASES: &[Case] = &[
