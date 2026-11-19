@@ -304,7 +304,7 @@ fn a_grant_is_allowed_until_expires_at_on_the_node_and_refused_at_it() {
     let end_ms = expires_at * 1000;
     let mut g = authz_grant("g1", "POST", "/repos/acme/app/hooks", 0);
     g.not_after = AuthzGrant::not_after_for(expires_at);
-    let a = issuer.publish(&cp.approver, &[LiveGrant { grant: g, uses: None, prefix: false }]).unwrap();
+    let a = issuer.publish(&cp.approver, &[LiveGrant { grant: g, uses: None, prefix: false, standing: None }]).unwrap();
     r.accept(&cp.put(a, T0 + 10), T0 + 10).unwrap();
     // A node cut off from T0 + 20 on (offline, #153).
     let mut cut = cp.replica();
@@ -322,7 +322,7 @@ fn a_grant_is_allowed_until_expires_at_on_the_node_and_refused_at_it() {
     // What #337's F1 found: `not_after = expires_at` honours the grant up to 999 ms past it.
     let mut late = authz_grant("g2", "POST", "/repos/acme/app/hooks", 0);
     late.not_after = u64::try_from(expires_at).unwrap();
-    let a = issuer.publish(&cp.approver, &[LiveGrant { grant: late, uses: None, prefix: false }]).unwrap();
+    let a = issuer.publish(&cp.approver, &[LiveGrant { grant: late, uses: None, prefix: false, standing: None }]).unwrap();
     let mut old = cp.replica();
     let now = end_ms - 500;
     cp.put(a, now);
@@ -348,7 +348,7 @@ fn a_grant_reaches_the_node_and_its_use_count_is_enforced_there() {
     assert_eq!(kind(&r.decide(&hook, T0)), "needs-grant");
 
     // Approved with two uses: the control host appends the grant block and ships the whole token.
-    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 600_000), uses: Some(2), prefix: false };
+    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 600_000), uses: Some(2), prefix: false, standing: None };
     let a = issuer.publish(&cp.approver, std::slice::from_ref(&g)).unwrap();
     assert_eq!(a.grants.len(), 1);
     r.accept(&cp.put(a, T0 + 10), T0 + 10).unwrap();
@@ -366,7 +366,7 @@ fn a_grant_reaches_the_node_and_its_use_count_is_enforced_there() {
 
     // A fresh grant (new id, one use) and a revocation of it by grant id: only that grant stops; the
     // token itself still decides.
-    let g2 = LiveGrant { grant: authz_grant("g2", "POST", "/repos/acme/app/hooks", T0 + 600_000), uses: Some(1), prefix: false };
+    let g2 = LiveGrant { grant: authz_grant("g2", "POST", "/repos/acme/app/hooks", T0 + 600_000), uses: Some(1), prefix: false, standing: None };
     let now = T0 + TTL + 500;
     r.accept(&cp.put(issuer.publish(&cp.approver, &[g.clone(), g2]).unwrap(), now), now).unwrap();
     let rev = cp.p.commit(vec![Change::Revoke { kind: RevokeKind::Grant, id: "g2".into(), until: T0 + 600_000 }], now).unwrap();
@@ -384,11 +384,12 @@ fn a_grant_reaches_the_node_and_its_use_count_is_enforced_there() {
         path: "/repos/acme/app/hooks".into(),
         uses: None,
         prefix: false,
+        standing: None,
     });
     r.accept(&cp.put(forged, now + 1), now + 1).unwrap();
     assert_eq!(kind(&r.decide(&hook, now + 1)), "needs-grant");
     let other_box = cp.issue("r2", &z);
-    let g4 = LiveGrant { grant: authz_grant("g4", "POST", "/repos/acme/app/hooks", T0 + 600_000), uses: None, prefix: false };
+    let g4 = LiveGrant { grant: authz_grant("g4", "POST", "/repos/acme/app/hooks", T0 + 600_000), uses: None, prefix: false, standing: None };
     let mut a = other_box.publish(&cp.approver, std::slice::from_ref(&g4)).unwrap();
     // r2's token filed under r1: refused at load (the box path isn't r1's)...
     a.run = "r1".into();
@@ -421,7 +422,7 @@ fn a_prefix_grant_covers_its_paths_on_the_node() {
     sync(&mut cp.p, &mut r, T0);
     let post = |path: &str| gh("z", "r1", "POST", path);
     assert_eq!(kind(&r.decide(&post("/repos/acme/app/hooks/1"), T0)), "needs-grant");
-    let g = LiveGrant { grant: authz_grant("gp", "POST", "/repos/acme/app/hooks/", T0 + 600_000), uses: Some(3), prefix: true };
+    let g = LiveGrant { grant: authz_grant("gp", "POST", "/repos/acme/app/hooks/", T0 + 600_000), uses: Some(3), prefix: true, standing: None };
     let a = issuer.publish(&cp.approver, std::slice::from_ref(&g)).unwrap();
     assert!(a.grants[0].prefix);
     r.accept(&cp.put(a, T0 + 10), T0 + 10).unwrap();
@@ -431,7 +432,7 @@ fn a_prefix_grant_covers_its_paths_on_the_node() {
     assert_eq!(r.uses("gp"), 3, "one use per request, whichever path");
     assert_eq!(kind(&r.decide(&post("/repos/acme/app/hooks/3"), T0 + 30)), "needs-grant", "three uses, then none");
     // Beside the prefix: never, uses or not.
-    let g2 = LiveGrant { grant: authz_grant("gq", "POST", "/repos/acme/app/hooks/", T0 + 600_000), uses: None, prefix: true };
+    let g2 = LiveGrant { grant: authz_grant("gq", "POST", "/repos/acme/app/hooks/", T0 + 600_000), uses: None, prefix: true, standing: None };
     r.accept(&cp.put(issuer.publish(&cp.approver, std::slice::from_ref(&g2)).unwrap(), T0 + 40), T0 + 40).unwrap();
     // (Some of these the zone's own reach allows; none by the grant.)
     for path in ["/repos/acme/app/hooksx/1", "/repos/acme/app", "/repos/acme/app/", "/repos/acme/app-x/hooks/1"] {
@@ -620,7 +621,7 @@ fn a_node_derives_a_child_only_from_its_parents_own_base_token() {
     let keys = vec![cp.approver.public()];
     let parent = cp.issue("p", &zp);
     let other = cp.issue("o", &zp);
-    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 600_000), uses: None, prefix: false };
+    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 600_000), uses: None, prefix: false, standing: None };
     let with_grant = parent.publish(&cp.approver, std::slice::from_ref(&g)).unwrap();
     cp.put(with_grant.clone(), T0 - 100);
     cp.put(other.publish(&cp.approver, &[]).unwrap(), T0 - 100);
@@ -705,7 +706,7 @@ fn renewals_reach_the_node_in_the_rebuilt_token() {
     };
     let old_end = secs(T0) + 60;
     let (renewed, kept) = (mint(&cp, "r1", old_end), mint(&cp, "r2", old_end));
-    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 30_000), uses: Some(5), prefix: false };
+    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 30_000), uses: Some(5), prefix: false, standing: None };
     cp.put(renewed.publish(&cp.approver, std::slice::from_ref(&g)).unwrap(), T0 - 100);
     cp.put(kept.publish(&cp.approver, &[]).unwrap(), T0 - 100);
     let mut r = cp.replica();
@@ -720,7 +721,7 @@ fn renewals_reach_the_node_in_the_rebuilt_token() {
 
     // Renewed: the grant to T0 + 5 min, the box's authority to T0 + 10 min.
     let reminted = mint(&cp, "r1", secs(T0) + 600);
-    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 300_000), uses: Some(5), prefix: false };
+    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 300_000), uses: Some(5), prefix: false, standing: None };
     cp.put(reminted.publish(&cp.approver, std::slice::from_ref(&g)).unwrap(), T0 + 1_000);
     sync(&mut cp.p, &mut r, T0 + 1_000);
     assert_eq!(r.authority_until("r1"), Some((secs(T0) as i64 + 601) * 1000));

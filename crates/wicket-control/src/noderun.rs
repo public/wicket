@@ -842,6 +842,8 @@ struct Progress {
     remint_failed: i64,
     /// What `wicket top` reads of this run's node (`ctl/link.json`).
     link: wicket_node::status::LinkRecord,
+    /// The standing rules (#572) the box's token carries now, by id.
+    standing: HashSet<String>,
 }
 
 async fn manage(
@@ -872,6 +874,7 @@ async fn manage(
         fetched: std::collections::HashMap::new(),
         remint_failed: 0,
         link: wicket_node::status::LinkRecord { node: sh.node.clone(), ..Default::default() },
+        standing: HashSet::new(),
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
@@ -2031,6 +2034,42 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         p.published.insert(g.id);
         rebuild = true;
     }
+    // Standing reach (#572): the live standing rules bound to this run's agent or zone, as blocks of
+    // its token, on a node at protocol 17 or later and for a top-level box only (a spawned child's
+    // token is narrowed by its parent's ceilings, and it has no principal of its own). One revoked
+    // or lapsed since is revoked on the node, as a grant is.
+    if p.proto >= wicket_chan::chan::STANDING && issuer.box_path == sh.run.0 {
+        let standing = sh.ledger.lock().expect("ledger").standing_for_run(&sh.tenant, &sh.run, &sh.zone.name).unwrap_or_default();
+        let ids: HashSet<String> = standing.iter().map(|s| s.id.clone()).collect();
+        for id in p.standing.iter().filter(|id| !ids.contains(*id)).cloned().collect::<Vec<_>>() {
+            let until = now_s.saturating_add(366 * 24 * 3600).saturating_mul(1000);
+            changes.push(Change::Revoke { kind: RevokeKind::Grant, id: id.clone(), until });
+            p.live.retain(|l| l.grant.gid != id);
+            p.standing.remove(&id);
+            rebuild = true;
+        }
+        for s in standing.iter().filter(|s| !p.standing.contains(&s.id)) {
+            if p.live.len() >= wicket_feed::token::MAX_GRANTS {
+                if p.waiting.insert(s.id.clone()) {
+                    say!("[wicket] node {} holds {} live grants for {}: standing rule {} waits until one ends", sh.node, p.live.len(), sh.run, s.id);
+                }
+                continue;
+            }
+            let live = standing_live(&issuer, s);
+            let mut trial = p.live.clone();
+            trial.push(live.clone());
+            if let Err(e) = loads(&trial) {
+                if p.waiting.insert(s.id.clone()) {
+                    say!("[wicket] standing rule {} can't go in {}'s token ({e}): it isn't published", s.id, sh.run);
+                }
+                continue;
+            }
+            say!("[wicket] standing rule {} published to node {} for {}", s.id, sh.node, sh.run);
+            p.live.push(live);
+            p.standing.insert(s.id.clone());
+            rebuild = true;
+        }
+    }
     if !rebuild {
         return vec![];
     }
@@ -2161,6 +2200,37 @@ fn live_grant(
         },
         uses: g.uses_left.map(|u| u.clamp(0, i64::from(u32::MAX)) as u32),
         prefix,
+        standing: None,
+    }
+}
+
+/// The end a standing rule approved until revoked is published with: 9999-12-31, the latest date
+/// the token's check reads.
+const STANDING_FOREVER: u64 = 253_402_300_799;
+
+/// An approved standing rule (#572) as a block of the box's token: its host, methods and path
+/// globs, until it lapses (or [`STANDING_FOREVER`]), with no use count (the node gives it all the
+/// uses it asks for). Approved by the human whose decision it records.
+fn standing_live(issuer: &wicket_feed::Issuer, s: &wicket_store::Standing) -> LiveGrant {
+    LiveGrant {
+        grant: wicket_authz::Grant {
+            gid: s.id.clone(),
+            box_id: issuer.box_path.clone(),
+            epoch: issuer.epoch,
+            host: s.rule.host.to_ascii_lowercase(),
+            method: s.rule.methods.first().cloned().unwrap_or_default(),
+            path: String::new(),
+            not_after: s.expires_at.map_or(STANDING_FOREVER, wicket_authz::Grant::not_after_for),
+            approver: format!("standing:{}", s.decided_by.as_deref().unwrap_or("operator")),
+            digest: s.effect_sha256.as_deref().and_then(|e| hex::decode(e).ok()).unwrap_or_default(),
+        },
+        uses: None,
+        prefix: false,
+        standing: Some(wicket_authz::StandingRule {
+            methods: s.rule.methods.clone(),
+            paths: s.rule.paths.clone(),
+            allow_dangerous: s.rule.allow_dangerous,
+        }),
     }
 }
 
