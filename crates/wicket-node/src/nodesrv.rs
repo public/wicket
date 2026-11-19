@@ -3909,7 +3909,10 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let (t, err) = call(A, "send_message", serde_json::json!({ "to": to("zb", B), "body": { "hello": 1 } })).await;
         assert!(!err && t.starts_with("sent m-node-") && t.contains("attested by the node"), "{t}");
         let (t, err) = call(A, "send_message", serde_json::json!({ "to": to("zc", C), "body": {} })).await;
-        assert!(err && t.starts_with("refused: m-node-") && t.contains("does not accept messages from zone za"), "{t}");
+        assert!(
+            err && t.starts_with("refused: m-node-") && t.contains("does not accept messages from you") && t.contains("zone za"),
+            "{t}"
+        );
         assert!(t.contains("\"state\":\"refused\""), "with a receipt that says so: {t}");
         let (t, err) = call(A, "send_message", serde_json::json!({ "to": to("zz", "run_zzzzzzzzzzzzzzzzzzzzzzzzzz"), "body": {} })).await;
         assert!(err && t.contains("isn't running on your node"), "{t}");
@@ -3919,8 +3922,24 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let v: serde_json::Value = serde_json::from_str(&t).unwrap();
         assert_eq!((v["from"]["run"].as_str(), v["body"]["hello"].as_i64()), (Some(A), Some(1)), "{t}");
         assert_eq!(v["from"]["verified_by"], "node n1");
+        let first = v["message_id"].as_str().unwrap().to_string();
         let (t, _) = call(B, "await_message", serde_json::json!({ "timeout_seconds": 1 })).await;
         assert!(t.starts_with("no message"), "taken once: {t}");
+        // #257: the control host's rule here too. za accepts no one, so B can't write to A, but it
+        // can answer A's message; not with an id A didn't send it.
+        let (t, err) = call(B, "send_message", serde_json::json!({ "to": to("za", A), "body": {} })).await;
+        assert!(err && t.starts_with("refused: m-node-"), "{t}");
+        let (t, err) = call(B, "send_message", serde_json::json!({ "to": to("za", A), "body": {}, "in_reply_to": "m-other" })).await;
+        assert!(err && t.contains("is not a message"), "{t}");
+        let (t, err) = call(B, "send_message", serde_json::json!({ "to": to("za", A), "body": { "re": 1 }, "in_reply_to": first })).await;
+        assert!(!err && t.starts_with("sent m-node-"), "{t}");
+        let (t, _) = call(A, "await_message", serde_json::json!({ "timeout_seconds": 1 })).await;
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(
+            (v["from"]["run"].as_str(), v["in_reply_to"].as_str(), v["body"]["re"].as_i64()),
+            (Some(B), Some(first.as_str()), Some(1)),
+            "{t}"
+        );
         let audit = node.audit.lock().unwrap().audit_tail(50).unwrap();
         assert!(audit.iter().any(|r| r.2 == "node.message"), "{audit:?}");
     }
