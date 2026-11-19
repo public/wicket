@@ -467,6 +467,10 @@ function stateStoreRows(p, nowMs) {
     if (err) w.append(el("div", "blocked", "! " + err));
     return w;
   };
+  // What is alerted (and pushed, if notifications are on) first, so a sink past its threshold
+  // doesn't look like one a few records behind; then whether these rows are current.
+  for (const a of p.alerts || []) out.push(el("div", "blocked", "! " + strip(a)));
+  if (p.stale) out.push(el("div", "pend", "! not checked for " + secs((nowMs - (p.read_ms || 0)) / 1000) + ": these rows may be out of date"));
   const st = p.stream;
   if (st) {
     let text = strip(st.endpoint) + " (" + strip(st.bucket) + ") \u00b7 ledger " + strip(st.state);

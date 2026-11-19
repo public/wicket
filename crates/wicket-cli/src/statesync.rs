@@ -190,7 +190,7 @@ pub fn status_of(s: &StateStore, db: &Path, now_ms: i64) -> Result<StreamStatus>
         Ok(v) => v,
         Err(e) => {
             if st.error.is_none() || log.error_ms < log.started_ms {
-                st.error = Some(format!("Litestream isn't running (its control socket: {e:#})"));
+                st.error = Some(wicket_core::text::redact_urls(&format!("Litestream isn't running (its control socket: {e:#})")));
                 st.error_ms = None;
             }
             return Ok(st);
@@ -238,8 +238,26 @@ fn go_time_ms(s: &str) -> Option<i64> {
     Some(ms)
 }
 
-/// A GET on Litestream's control socket (HTTP over a unix socket), its JSON body.
+/// How long a question to Litestream's socket may take, connecting included.
+const ASK_DEADLINE: Duration = Duration::from_secs(3);
+
+/// A GET on Litestream's control socket (HTTP over a unix socket), its JSON body, within
+/// [`ASK_DEADLINE`]. std has no connect timeout for unix sockets (a listener with a full backlog
+/// blocks it), so the question runs on a thread of its own, left behind if it doesn't answer.
 fn ask(sock: &Path, path: &str) -> Result<serde_json::Value> {
+    ask_within(sock, path, ASK_DEADLINE)
+}
+
+fn ask_within(sock: &Path, path: &str, deadline: Duration) -> Result<serde_json::Value> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (sock, path) = (sock.to_path_buf(), path.to_string());
+    std::thread::Builder::new().name("litestream-ask".into()).spawn(move || {
+        let _ = tx.send(ask_now(&sock, &path));
+    })?;
+    rx.recv_timeout(deadline).unwrap_or_else(|_| bail!("Litestream didn't answer on its control socket within {} s", deadline.as_secs()))
+}
+
+fn ask_now(sock: &Path, path: &str) -> Result<serde_json::Value> {
     let mut s = std::os::unix::net::UnixStream::connect(sock).with_context(|| format!("{}", sock.display()))?;
     s.set_read_timeout(Some(Duration::from_secs(2)))?;
     s.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -251,7 +269,9 @@ fn ask(sock: &Path, path: &str) -> Result<serde_json::Value> {
     let (head, body) = resp.split_once("\r\n\r\n").context("Litestream's reply has no body")?;
     let status = head.lines().next().unwrap_or("");
     if status.split_whitespace().nth(1) != Some("200") {
-        bail!("Litestream said {status:?}: {}", body.trim());
+        // Shown in the console: cut, and any URL in it without its user info or query.
+        let body = wicket_core::text::redact_urls(&wicket_core::text::clip(body.trim(), 200));
+        bail!("Litestream said {:?}: {body}", wicket_core::text::clip(status, 60));
     }
     serde_json::from_str(body).context("Litestream's reply")
 }
@@ -343,7 +363,8 @@ impl Watch {
 
 /// The health alerts `p` raises at `now_ms` (#635), which the console shows and pushes as it does a
 /// node's: once each until it clears.
-/// - The ledger stream, in any state but streaming, not current for [`STREAM_ALERT_SECS`]: since
+/// - The ledger stream, in any state but streaming, not current for [`STREAM_ALERT_SECS`] (or its
+///   lag threshold, 10 sync intervals, if longer): since
 ///   Litestream's last sync if it reports one, else since `w` last saw one.
 /// - An audit sink (not a manual one) whose oldest unacknowledged record has waited
 ///   [`AUDIT_ALERT_SECS`], or that is [`AUDIT_ALERT_RECORDS`] behind.
@@ -356,7 +377,8 @@ pub fn alerts(p: &Progress, w: &Watch, now_ms: i64) -> Vec<crate::health::Alert>
     let mut out = Vec::new();
     if let Some(st) = p.stream.as_ref().filter(|s| s.state != StreamState::Streaming) {
         let current = st.last_sync_ms.unwrap_or(w.stream_current_ms);
-        if now_ms - current > STREAM_ALERT_SECS * 1000 {
+        // Never sooner than the stream counts as lagging: 10 sync intervals, if that is longer.
+        if now_ms - current > STREAM_ALERT_SECS.max(st.lag_secs) * 1000 {
             let since = match st.last_sync_ms {
                 Some(t) => format!("last sync {} ago", ago(now_ms - t)),
                 None => format!("not current for {}", ago(now_ms - current)),
@@ -378,13 +400,29 @@ pub fn alerts(p: &Progress, w: &Watch, now_ms: i64) -> Vec<crate::health::Alert>
     if let Some(since) = w.errors_since_ms.filter(|t| !p.errors.is_empty() && now_ms - t > CONFIG_ALERT_SECS * 1000) {
         out.push(crate::health::Alert {
             key: "control:state-store/config".into(),
-            text: format!(
-                "the state store or audit sinks: a config can't be read for {}: `wicket state check` says why",
-                ago(now_ms - since)
-            ),
+            // The errors name the file and the command that says why, never a value.
+            text: format!("{} (for {})", p.errors.join("; "), ago(now_ms - since)),
         });
     }
     out
+}
+
+/// A read of the progress older than this is stale: the console marks its rows so, as they may no
+/// longer say what is true (the ledger couldn't be opened, or a read hung).
+pub const STALE_SECS: i64 = 30;
+
+/// Whether a read made at `read_ms` is stale at `now_ms`, and the alert once it has been for
+/// [`STREAM_ALERT_SECS`]: then nothing about the stream or the sinks is being checked.
+pub fn staleness(read_ms: i64, now_ms: i64) -> (bool, Option<crate::health::Alert>) {
+    let age = (now_ms - read_ms) / 1000;
+    let alert = (age > STREAM_ALERT_SECS).then(|| crate::health::Alert {
+        key: "control:state-store/unread".into(),
+        text: format!(
+            "the state store and audit export haven't been checked for {}: the console's reads fail or hang (its log says why)",
+            crate::audit_export::ago(age)
+        ),
+    });
+    (age > STALE_SECS, alert)
 }
 
 /// [`progress`] with this installation's configs, at the ledger `l` opened from `ledger`.
@@ -598,12 +636,60 @@ mod tests {
         assert!(keys(&bad, &w, NOW).is_empty());
         w.observe(Some(&bad), NOW + 2_000);
         assert_eq!(keys(&bad, &w, NOW + 2_000), ["control:state-store/config"]);
+        let sinks_bad = progress_of(None, vec![], &["audit-sinks.yaml can't be read: `wicket audit export --status` says why"]);
+        assert_eq!(
+            alerts(&sinks_bad, &w, NOW + 2_000)[0].text,
+            "audit-sinks.yaml can't be read: `wicket audit export --status` says why (for 5 min)",
+            "names the file that is broken"
+        );
         let good = progress_of(None, vec![sink("store", 0, 0, false)], &[]);
         w.observe(Some(&good), NOW + 5_000);
         assert_eq!(w.errors_since_ms, None);
         assert!(keys(&good, &w, NOW + 5_000).is_empty(), "cleared");
         w.observe(Some(&bad), NOW + 8_000);
         assert!(keys(&bad, &w, NOW + 9_000).is_empty(), "back: the delay starts again");
+    }
+
+    #[test]
+    fn a_slow_sync_interval_alerts_no_sooner_than_it_lags() {
+        let w = Watch::new(NOW - 3_600_000);
+        let mut st = stream(StreamState::Starting, Some(NOW - 400_000), NOW);
+        st.lag_secs = 600; // sync_interval: 60s
+        assert!(keys(&progress_of(Some(st.clone()), vec![], &[]), &w, NOW).is_empty());
+        st.last_sync_ms = Some(NOW - 601_000);
+        assert_eq!(keys(&progress_of(Some(st), vec![], &[]), &w, NOW), ["control:state-store/stream"]);
+    }
+
+    #[test]
+    fn a_read_goes_stale_then_alerts() {
+        assert_eq!(staleness(NOW - 30_000, NOW), (false, None));
+        assert!(staleness(NOW - 31_000, NOW).0);
+        assert_eq!(staleness(NOW - 299_000, NOW).1, None);
+        assert_eq!(staleness(NOW - 301_000, NOW).1.unwrap().key, "control:state-store/unread");
+    }
+
+    /// A socket that accepts nothing (its backlog full, or a process that never reads) doesn't hold a
+    /// read past the deadline; and a refusal's body is cut and its URLs redacted.
+    #[test]
+    fn litestreams_socket_is_asked_within_a_deadline() {
+        let d = Dir::new();
+        let db = d.0.join("ledger.db");
+        let _held = std::os::unix::net::UnixListener::bind(socket_path(&db)).unwrap(); // never accepted, never answered
+        let t = std::time::Instant::now();
+        let e = ask_within(&socket_path(&db), "/list", Duration::from_millis(300)).unwrap_err().to_string();
+        assert!(t.elapsed() < Duration::from_secs(2) && e.contains("didn't answer"), "{e}");
+        drop(_held);
+        std::fs::remove_file(socket_path(&db)).unwrap();
+        let l = std::os::unix::net::UnixListener::bind(socket_path(&db)).unwrap();
+        let h = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = c.read(&mut req).unwrap();
+            write!(c, "HTTP/1.0 500 Internal Server Error\r\n\r\nfailed: https://k:s3cr3t@s3.example.com/b?sig=abc").unwrap();
+        });
+        let e = ask(&socket_path(&db), "/list").unwrap_err().to_string();
+        h.join().unwrap();
+        assert!(e.contains("https://s3.example.com/b?…") && !e.contains("s3cr3t") && !e.contains("sig=abc"), "{e}");
     }
 
     #[test]

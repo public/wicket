@@ -42,10 +42,12 @@ pub fn redact_urls(s: &str) -> String {
         let end =
             rest[i + 3..].find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')).map_or(rest.len(), |j| i + 3 + j);
         out.push_str(&rest[..i + 3]);
+        // User info ends at the last '@' (a secret can hold '/', '?' or '#'), so the host starts
+        // after it; with none, at once. Over-redacting a path that holds '@' is the safe mistake.
         let url = &rest[i + 3..end];
+        let url = url.rsplit_once('@').map_or(url, |(_, after)| after);
         let auth_end = url.find(['/', '?', '#']).unwrap_or(url.len());
-        let authority = &url[..auth_end];
-        out.push_str(authority.rsplit_once('@').map_or(authority, |(_, h)| h));
+        out.push_str(&url[..auth_end]);
         let tail = &url[auth_end..];
         let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
         out.push_str(&tail[..path_end]);
@@ -70,6 +72,7 @@ mod tests {
         );
         assert_eq!(redact_urls("get \"http://h/a?X-Amz-Signature=abc\": refused"), "get \"http://h/a?…\": refused");
         assert_eq!(redact_urls("no url here"), "no url here");
+        assert_eq!(redact_urls("PUT https://AKIA:wJal/K7?x#y@host/x failed"), "PUT https://host/x failed", "a secret holding '/'");
         assert_eq!(redact_urls("dial tcp 10.0.0.1:443: refused; s3://b/k"), "dial tcp 10.0.0.1:443: refused; s3://b/k");
     }
 

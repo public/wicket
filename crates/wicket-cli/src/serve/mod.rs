@@ -284,7 +284,8 @@ struct State {
     push: Option<push::Push>,
     /// The state store's sync and the audit export's progress (#635), as [`spawn_progress`] last
     /// read them.
-    progress: Mutex<Option<crate::statesync::Progress>>,
+    /// With when it was read (Unix ms): a read that stops coming makes the rows stale.
+    progress: Mutex<(i64, Option<crate::statesync::Progress>)>,
     /// What the alerts remember between reads, and the alerts the last read raised (#635).
     progress_alerts: Mutex<(crate::statesync::Watch, Vec<crate::health::Alert>)>,
 }
@@ -332,7 +333,7 @@ impl State {
             tickets: Mutex::new(HashMap::new()),
             sockets: Arc::new(Mutex::new(session::Sockets::default())),
             push,
-            progress: Mutex::new(None),
+            progress: Mutex::new((0, None)),
             progress_alerts: Mutex::new((crate::statesync::Watch::new(wicket_feed::now_ms()), Vec::new())),
         }
     }
@@ -1825,7 +1826,7 @@ fn store_progress(state: &State, p: Option<crate::statesync::Progress>, now_ms: 
         w.0.observe(p.as_ref(), now_ms);
         w.1 = p.as_ref().map(|p| crate::statesync::alerts(p, &w.0, now_ms)).unwrap_or_default();
     }
-    *state.progress.lock().unwrap_or_else(|e| e.into_inner()) = p;
+    *state.progress.lock().unwrap_or_else(|e| e.into_inner()) = (now_ms, p);
 }
 
 /// Watches the ledger and pushes to subscribed devices when a new request is waiting. Pushes go
@@ -1886,8 +1887,22 @@ fn health_view(state: &State, now_ms: i64) -> Result<(Value, Vec<crate::health::
     let disk = crate::health::disk(&state.data);
     alerts.extend(crate::health::disk_alerts("control", "the control host", &disk));
     // Read in the background ([`spawn_progress`]): a request never waits on Litestream's socket.
-    let store = state.progress.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(Value::Null, |p| json!(p));
-    alerts.extend(state.progress_alerts.lock().unwrap_or_else(|e| e.into_inner()).1.iter().cloned());
+    // The rows carry when they were read, stale once reads stop coming, and their own alerts.
+    let (read_ms, progress) = state.progress.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let store = match progress {
+        None => Value::Null,
+        Some(p) => {
+            let mut mine = state.progress_alerts.lock().unwrap_or_else(|e| e.into_inner()).1.clone();
+            let (stale, unread) = crate::statesync::staleness(read_ms, now_ms);
+            mine.extend(unread);
+            let mut v = json!(p);
+            v["read_ms"] = read_ms.into();
+            v["stale"] = stale.into();
+            v["alerts"] = json!(mine.iter().map(|a| a.text.clone()).collect::<Vec<_>>());
+            alerts.extend(mine);
+            v
+        }
+    };
     Ok((
         json!({ "nodes": nodes, "control_disk_pct": disk.used_pct().round(), "state_store": store,
                 "alerts": alerts.iter().map(|a| a.text.clone()).collect::<Vec<_>>() }),
@@ -2176,7 +2191,8 @@ mod tests {
         assert_eq!(v["errors"], json!(["state-store.yaml can't be read: `wicket state check` says why"]), "no value quoted");
         // The dashboard serves what the background read last cached.
         assert_eq!(dashboard(&t.state).unwrap()["health"]["state_store"], Value::Null, "nothing read yet");
-        *t.state.progress.lock().unwrap() = crate::statesync::progress(&l, &t.state.ledger, Ok(None), Err(anyhow::anyhow!("x")), now_ms);
+        *t.state.progress.lock().unwrap() =
+            (now_ms, crate::statesync::progress(&l, &t.state.ledger, Ok(None), Err(anyhow::anyhow!("x")), now_ms));
         assert_eq!(
             dashboard(&t.state).unwrap()["health"]["state_store"]["errors"][0],
             "audit-sinks.yaml can't be read: `wicket audit export --status` says why"
@@ -2213,10 +2229,25 @@ mod tests {
         assert_eq!(keys(now + 302_000), ["control:state-store/stream"]);
         let v = health_view(&t.state, now + 302_000).unwrap().0;
         assert_eq!(v["state_store"]["stream"]["state"], "starting");
+        assert_eq!(v["state_store"]["stale"], false);
+        assert_eq!(
+            v["state_store"]["alerts"][0], "the state store: the ledger stream is starting (not current for 5 min)",
+            "the rows carry their alerts"
+        );
         store_progress(&t.state, Some(p(StreamState::Streaming, Some(now + 303_000))), now + 304_000);
         assert!(keys(now + 304_000).is_empty(), "cleared");
         store_progress(&t.state, Some(p(StreamState::Stopped, None)), now + 400_000);
         assert!(keys(now + 400_000).is_empty(), "current 97 s ago");
+        // Reads stop (the ledger can't be opened, a read hangs): stale after 30 s, alerted after 5 min.
+        let v = health_view(&t.state, now + 431_000).unwrap().0;
+        assert_eq!((v["state_store"]["stale"].as_bool(), v["state_store"]["read_ms"].as_i64()), (Some(true), Some(now + 400_000)));
+        assert!(keys(now + 699_000).is_empty());
+        assert_eq!(keys(now + 701_000), ["control:state-store/unread"]);
+        let v = health_view(&t.state, now + 701_000).unwrap().0;
+        assert!(v["state_store"]["alerts"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("the state store and audit export haven't been checked for 5 min"));
         store_progress(&t.state, None, now + 900_000);
         assert!(keys(now + 900_000).is_empty(), "nothing set up: nothing alerted");
     }

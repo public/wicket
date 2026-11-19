@@ -317,12 +317,18 @@ when `state-store.yaml` or `audit-sinks.yaml` exists. `wicket top` shows the sam
   again only after it has cleared, under the `wicket-health` tag. Their text names the condition,
   never an error (that stays in the rows, as it can quote a collector's reply).
   - **The ledger stream** is in any state but streaming, and its last sync was more than 5 minutes
-    ago. When Litestream doesn't report a last sync (it is stopped, or restarting), that counts from
+    ago (or 10 sync intervals, if that is longer: with `sync_interval` over 30 s, the stream isn't
+    lagging before then). When Litestream doesn't report a last sync (it is stopped, or restarting), that counts from
     the last sync the console saw while it was streaming, or from when the console started.
   - **An audit sink**'s oldest unacknowledged record has waited more than 5 minutes, or the sink is
     more than 10,000 records behind. A `jsonl` sink to standard output (`path: "-"`) is fed only by
     `wicket audit export` in the foreground: its row says *manual*, and it never alerts.
   - **A config** (`state-store.yaml` or `audit-sinks.yaml`) can't be read for more than 5 minutes.
+    The alert names the file.
+  - **The console's own reads** haven't succeeded for more than 5 minutes (the ledger can't be
+    opened, or a read hangs). After 30 seconds without one, the rows say they may be out of date.
+- The section lists these alerts above its rows, so they show with notifications off too.
+- A question to Litestream's socket, connecting included, gives up after 3 seconds.
 - The console reads all of this every 3 seconds in the background, whether or not notifications are
   on, and the page shows what it last read: a request never waits on Litestream.
 
