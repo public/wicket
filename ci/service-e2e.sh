@@ -27,6 +27,17 @@ export WICKET_BOX_PREFIX=svc
 work=$(mktemp -d)
 W() { "$WICKET" "$@"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# On a failure: what the service's instances said, what the reconciler did, and how they ended.
+diag() {
+  local f r
+  for f in "$WICKET_HOME"/services/npm-cache/logs/*.log; do
+    [ -f "$f" ] || continue
+    echo "---- $f" >&2; tail -n 80 "$f" >&2
+    r=$(basename "$f" .log)
+    echo "---- audit of $r" >&2; W audit --tail 3000 2>/dev/null | grep "$r" | tail -n 20 >&2 || true
+  done
+  echo "---- reconcile" >&2; tail -n 40 "$work/reconcile.log" >&2 || true
+}
 ok() { echo "ok: $*"; }
 
 stop_pid() { [ -n "${1:-}" ] || return 0; kill "$1" 2>/dev/null || return 0; for _ in $(seq 50); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done; kill -9 "$1" 2>/dev/null || true; }
@@ -65,7 +76,7 @@ program:
     - |
       echo "registry=\$(npm config get registry)"
       for i in \$(seq $wait_for); do curl -sf -o /dev/null http://npm-cache.wicket.internal:4873/-/ping && break; sleep 1; done
-      cd /workspace && npm init -y >/dev/null && npm install left-pad --no-audit --no-fund && test -f node_modules/left-pad/package.json && echo installed-left-pad
+      cd /workspace && npm init -y >/dev/null && timeout 300 npm install left-pad --no-audit --no-fund --fetch-retries=1 --fetch-timeout=30000 && test -f node_modules/left-pad/package.json && echo installed-left-pad
 zone:
   name: $1
   uses: [npm-cache]
@@ -84,10 +95,10 @@ W reconcile --every 5s >"$work/reconcile.log" 2>&1 &
 rec_pid=$!
 
 user build-a yes
-W run "$work/build-a.yaml" >"$work/a.log" 2>&1 || { cat "$work/a.log"; fail "box A"; }
+W run "$work/build-a.yaml" >"$work/a.log" 2>&1 || { cat "$work/a.log"; diag; fail "box A"; }
 grep -q "registry=http://npm-cache.wicket.internal:4873/" "$work/a.log" || { cat "$work/a.log"; fail "box A's npm_config_registry"; }
-grep -q "npm-cache on node local: linked" "$work/a.log" || { cat "$work/a.log"; fail "box A not linked to the cache"; }
-grep -q installed-left-pad "$work/a.log" || { cat "$work/a.log"; fail "box A's npm install"; }
+grep -q "npm-cache on node local: linked" "$work/a.log" || { cat "$work/a.log"; diag; fail "box A not linked to the cache"; }
+grep -q installed-left-pad "$work/a.log" || { cat "$work/a.log"; diag; fail "box A's npm install"; }
 grep -q "service_started .*npm-cache on local" "$work/reconcile.log" || { cat "$work/reconcile.log"; fail "the reconciler didn't start the cache"; }
 ok "box A got the cache's registry, was linked to it, and installed left-pad through it"
 
@@ -97,8 +108,8 @@ n1=$(fetched)
 [ "$n1" -ge 1 ] || { cat "$slog"; fail "the cache never fetched left-pad"; }
 
 user build-b yes
-W run "$work/build-b.yaml" >"$work/b.log" 2>&1 || { cat "$work/b.log"; fail "box B"; }
-grep -q installed-left-pad "$work/b.log" || { cat "$work/b.log"; fail "box B's npm install"; }
+W run "$work/build-b.yaml" >"$work/b.log" 2>&1 || { cat "$work/b.log"; diag; fail "box B"; }
+grep -q installed-left-pad "$work/b.log" || { cat "$work/b.log"; diag; fail "box B's npm install"; }
 [ "$(fetched)" = "$n1" ] || { cat "$slog"; fail "box B's install went to the registry again ($n1 then $(fetched))"; }
 ok "box B's install was served from the cache's storage"
 

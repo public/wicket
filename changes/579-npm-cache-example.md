@@ -9,3 +9,6 @@ type: Added
   it needs the same reach. `ci/service-e2e.sh` checks it end to end: two boxes install `left-pad`
   through it, the second from its storage, neither reaching the registry itself, and a box without
   the cache's reach isn't linked without a human.
+- A box whose zone uses a per-node service starts its program once its link to the service is up
+  (`wicket-entry` waits up to 150 s for each name in `WICKET_WAIT_LINKS`), so a first request
+  doesn't fail before the link exists.
