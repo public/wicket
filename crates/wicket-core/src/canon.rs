@@ -355,6 +355,40 @@ mod tests {
         assert!(prefix_covers("/", "/anything/at/all"));
     }
 
+    /// #257 4a: a prefix grant, now also honoured on nodes, never covers a path outside it. Every
+    /// path of up to 6 bytes over `/`, two letters, `.`, `%2E` and `%2e` (dot segments, encoded
+    /// dots, doubled `/`, case) that `canonical_path` accepts is checked against every other as a
+    /// prefix: if the grant covers it, its segments begin with all of the prefix's. (The Kani
+    /// harness `a_prefix_grant_covers_only_paths_under_it` proves it for its alphabet too.)
+    #[test]
+    fn a_prefix_grant_covers_only_paths_under_it() {
+        let alphabet = ["/", "a", "b", ".", "%2E", "%2e"];
+        let mut raw = vec![String::new()];
+        let mut all = vec![];
+        for _ in 0..6 {
+            raw = raw.iter().flat_map(|s| alphabet.iter().map(move |a| format!("{s}{a}"))).filter(|s| s.len() <= 6).collect();
+            all.extend(raw.iter().cloned());
+        }
+        all.sort();
+        all.dedup();
+        let canonical: Vec<String> = all.iter().filter_map(|s| canonical_path(s).ok().map(|p| p.into_owned())).collect();
+        let segs = |p: &str| -> Vec<String> { p.trim_start_matches('/').trim_end_matches('/').split('/').filter(|s| !s.is_empty()).map(String::from).collect() };
+        // What a canonical path can't hold: a doubled `/`, an encoded dot, a `.` or `..` segment.
+        assert!(canonical.len() > 20);
+        assert!(canonical.iter().all(|p| !p.contains("//") && !p.contains("%2") && segs(p).iter().all(|s| s != "." && s != "..")), "{canonical:?}");
+        let mut covered = 0;
+        for pre in &canonical {
+            for path in &canonical {
+                if prefix_covers(pre, path) {
+                    covered += 1;
+                    let (ps, qs) = (segs(pre), segs(path));
+                    assert!(qs.len() >= ps.len() && qs[..ps.len()] == ps[..], "{pre} covers {path}");
+                }
+            }
+        }
+        assert!(covered > canonical.len(), "the check saw prefixes that cover other paths");
+    }
+
     /// #116: hosts are decided in one spelling, and IP addresses in none.
     #[test]
     fn hosts_are_canonical_or_refused() {
