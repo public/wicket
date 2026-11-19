@@ -1,13 +1,14 @@
 //! When a refused request may be asked for (`escalation`): `wicket-authz`'s structural check
 //! classes each token check, and its decision turns the failed checks into `NeedsGrant` or
-//! `Forbidden` with these. #322's Lean spec has no counterpart: its `needsGrant` is a zone's
-//! verdict (Wicket/Zone.lean), not a token's. Over every class and lists of up to four failed
-//! checks.
+//! `Forbidden` with these. #322's Lean spec states the same in Wicket/Decisions.lean (its
+//! `refusalNeedsGrant`; Wicket/Zone.lean's `needsGrant` is a zone's verdict, not a token's). Over
+//! every class and lists of up to four failed checks.
 
 use super::{check_escalatable, needs_grant, Failed};
 
-/// A check that reads the org policy is never escalatable, whatever else it reads; nor is one
-/// that must hold for all its alternatives, or one that reads nothing a grant names.
+/// Lean: `org_policy_never_escalatable`. A check that reads the org policy is never escalatable,
+/// whatever else it reads; nor is one that must hold for all its alternatives, or one that reads
+/// nothing a grant names.
 #[kani::proof]
 fn an_org_policy_check_is_never_escalatable() {
     let (one, policy, host, risk, approved): (bool, bool, bool, bool, bool) = kani::any();
@@ -18,10 +19,10 @@ fn an_org_policy_check_is_never_escalatable() {
     }
 }
 
-/// Fail-closed, as `Loaded::classify` counts them: a refusal needs a grant exactly when it failed
-/// at least one check and every check it failed is a token check known to be escalatable. One
-/// node check, one hard check, or one check of unknown class forbids; so does a refusal naming
-/// no check.
+/// Lean: `needs_grant_fail_closed`. Fail-closed, as `Loaded::classify` counts them: a refusal needs
+/// a grant exactly when it failed at least one check and every check it failed is a token check
+/// known to be escalatable. One node check, one hard check, or one check of unknown class forbids;
+/// so does a refusal naming no check.
 #[kani::proof]
 #[kani::unwind(6)]
 fn a_refusal_needs_a_grant_only_if_every_failure_is_escalatable() {

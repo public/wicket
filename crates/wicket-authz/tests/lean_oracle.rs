@@ -309,7 +309,18 @@ fn run_lean(file: &Path) -> Vec<String> {
         .output()
         .unwrap_or_else(|e| panic!("{lake}: {e}"));
     assert!(out.status.success(), "the oracle failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap().lines().map(String::from).collect()
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    // The decisions follow the marker; anything before it is what compiling Oracle.lean printed.
+    let (before, decisions) = stdout
+        .split_once(
+            "--- decisions
+",
+        )
+        .unwrap_or_else(|| panic!("the oracle printed no decisions: {stdout}"));
+    for l in before.lines() {
+        eprintln!("lean oracle: Oracle.lean printed before its decisions: {l}");
+    }
+    decisions.lines().map(String::from).collect()
 }
 
 #[test]
@@ -534,6 +545,12 @@ fn rust_decides_as_the_lean_spec() {
         }
     }
 
+    // 8. The decisions moved into wicket-core's pure functions (#325), each against its definition in
+    // Wicket/Decisions.lean.
+    let decisions_from = c.cases.len();
+    decisions(&mut c, &mut rng);
+    let decisions = c.cases.len() - decisions_from;
+
     let file = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lean-oracle-cases.json");
     std::fs::write(&file, serde_json::to_vec(&json!({ "zones": c.zones, "cases": c.cases })).unwrap()).unwrap();
     let lean = run_lean(&file);
@@ -560,10 +577,161 @@ fn rust_decides_as_the_lean_spec() {
     println!("lean oracle: {routes_admitted} of 600 route children admitted; {chains} token chains, {node_admitted} of their leaves admitted by check");
     assert!(routes_admitted > 50 && routes_admitted < 550, "route children admitted: {routes_admitted} of 600");
     assert!(chains > 100, "too few token chains ({chains})");
+    println!("lean oracle: {decisions} cases of wicket-core's pure decisions (is_public_ip, the token's end, agents' terms, escalation, uses, money, spawn)");
     assert!(
         divergent.is_empty(),
         "{} divergences from the Lean spec:\n{}",
         divergent.len(),
         divergent.iter().take(30).cloned().collect::<Vec<_>>().join("\n")
     );
+}
+
+/// The cases of section 8: `op::is_public_ip`, `quota::not_after_for`/`token_allows`,
+/// `authority::agent_term_refusal`, `escalation`, `quota::take_use`, `quota::money_fits` and
+/// `quota::SpawnLimits::admits`, on edges and generated values.
+fn decisions(c: &mut Cases, rng: &mut Rng) {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use wicket_core::authority::{agent_term_refusal, GrantRules, GrantShape, TermRefusal};
+    use wicket_core::escalation::{check_escalatable, needs_grant, Failed};
+    use wicket_core::quota::{money_fits, not_after_for, take_use, token_allows, Money, MoneyOver, SpawnAsk, SpawnLimits};
+
+    // The SSRF guard. IPv4: first octets that start a special block, or any; IPv6: the special
+    // prefixes (and the IPv4 forms behind them), or any.
+    let octets: [u32; 14] = [0, 10, 100, 127, 168, 169, 172, 192, 198, 203, 224, 240, 255, 8];
+    for _ in 0..3000 {
+        let low = rng.next() as u32;
+        let a = if rng.chance(70) { (rng.pick(&octets) << 24) | (low & 0x00ff_ffff) } else { low };
+        let rust = wicket_core::op::is_public_ip(&IpAddr::V4(Ipv4Addr::from(a))).to_string();
+        c.push(json!({ "kind": "public_ip", "v": 4, "addr": a.to_string() }), rust, format!("is_public_ip({})", Ipv4Addr::from(a)));
+    }
+    let tops: [u128; 12] = [
+        0,
+        0x0000_0000,
+        0x0064_ff9b,
+        0x0100_0000,
+        0x2001_0000,
+        0x2001_01ff,
+        0x2001_0db8,
+        0x2002_0000,
+        0xfc00_0000,
+        0xfe80_0000,
+        0xfec0_0000,
+        0xff02_0000,
+    ];
+    for _ in 0..3000 {
+        let r = (u128::from(rng.next()) << 64) | u128::from(rng.next());
+        let a = match rng.below(4) {
+            0 => r,
+            1 => (rng.pick(&tops) << 96) | (r & ((1u128 << 96) - 1)),
+            // An IPv4-mapped or -compatible address.
+            2 => (if rng.chance(50) { 0xffffu128 << 32 } else { 0 }) | u128::from(rng.next() as u32),
+            // The top 32 bits and then zeros up to a /64: the discard and Teredo-like shapes.
+            _ => (rng.pick(&tops) << 96) | (u128::from(rng.next() as u16) << 80),
+        };
+        let rust = wicket_core::op::is_public_ip(&IpAddr::V6(Ipv6Addr::from(a))).to_string();
+        c.push(json!({ "kind": "public_ip", "v": 6, "addr": a.to_string() }), rust, format!("is_public_ip({})", Ipv6Addr::from(a)));
+    }
+
+    // The token's end: grant ends and clock readings around the boundary, and anywhere.
+    let ends: [i64; 9] = [1, 2, 1_700_000_000, 4_294_967_295, i64::MAX / 1000, i64::MAX, 0, -5, i64::MIN];
+    for _ in 0..2000 {
+        let e = if rng.chance(50) { *rng.pick(&ends) } else { (rng.next() >> 24) as i64 };
+        let near = i128::from(e) * 1000 + i128::from(rng.below(4001) as i64 - 2000);
+        let now = if rng.chance(70) { near.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64 } else { rng.next() as i64 };
+        let rust = token_allows(not_after_for(e), now).to_string();
+        c.push(json!({ "kind": "token_end", "expires_at": e, "now_ms": now }), rust, format!("token_allows(not_after_for({e}), {now})"));
+    }
+
+    // Agents' terms and escalation: every combination.
+    for bits in 0u32..256 {
+        let b = |i: u32| bits & (1 << i) != 0;
+        let rules = GrantRules { zone_wide: b(0), prefix: b(1), unbounded: b(2), git_push: b(3) };
+        let shape = GrantShape { zone_wide: b(4), prefix: b(5), unbounded: b(6), git_push: b(7) };
+        let rust = match agent_term_refusal(rules, shape) {
+            None => "none",
+            Some(TermRefusal::ZoneWide) => "zone_wide",
+            Some(TermRefusal::Prefix) => "prefix",
+            Some(TermRefusal::Unbounded) => "unbounded",
+            Some(TermRefusal::GitPush) => "git_push",
+        };
+        let j = |zw: bool, p: bool, u: bool, g: bool| json!({ "zone_wide": zw, "prefix": p, "unbounded": u, "git_push": g });
+        c.push(
+            json!({ "kind": "agent_terms", "rules": j(b(0), b(1), b(2), b(3)), "shape": j(b(4), b(5), b(6), b(7)) }),
+            rust.to_string(),
+            format!("agent_term_refusal({rules:?}, {shape:?})"),
+        );
+    }
+    for bits in 0u32..32 {
+        let b = |i: u32| bits & (1 << i) != 0;
+        let rust = check_escalatable(b(0), b(1), b(2), b(3), b(4)).to_string();
+        c.push(
+            json!({ "kind": "escalatable", "one": b(0), "policy": b(1), "host": b(2), "risk": b(3), "approved": b(4) }),
+            rust,
+            format!("check_escalatable({bits:05b})"),
+        );
+    }
+    let kinds = [
+        ("node", Failed::Node),
+        ("soft", Failed::Block(Some(true))),
+        ("hard", Failed::Block(Some(false))),
+        ("unknown", Failed::Block(None)),
+    ];
+    for _ in 0..300 {
+        let picked: Vec<&(&str, Failed)> = (0..rng.below(5)).map(|_| rng.pick(&kinds)).collect();
+        let soft = picked.iter().filter(|(_, f)| f.soft()).count();
+        let rust = needs_grant(picked.len() - soft, soft).to_string();
+        let names: Vec<&str> = picked.iter().map(|(n, _)| *n).collect();
+        c.push(json!({ "kind": "needs_grant", "failed": names }), rust, format!("needs_grant of {names:?}"));
+    }
+
+    // Counted uses.
+    let uses: [Option<i64>; 8] = [None, Some(i64::MIN), Some(-1), Some(0), Some(1), Some(2), Some(i64::MAX), Some(1_000_000)];
+    for _ in 0..200 {
+        let u = if rng.chance(60) { *rng.pick(&uses) } else { Some(rng.next() as i64) };
+        let rust = match take_use(u) {
+            None => "refused".to_string(),
+            Some(None) => "uncounted".to_string(),
+            Some(Some(n)) => n.to_string(),
+        };
+        c.push(json!({ "kind": "take_use", "uses_left": u }), rust, format!("take_use({u:?})"));
+    }
+
+    // Money: amounts at the edges of i64 (where a sum would overflow), and anywhere.
+    let edge: [i64; 7] = [0, 1, -1, i64::MAX, i64::MIN, i64::MAX / 2, 1_000_000];
+    let amount = |rng: &mut Rng| if rng.chance(40) { *rng.pick(&edge) } else { (rng.next() >> rng.below(64)) as i64 };
+    for _ in 0..1000 {
+        let (rh, rt, nh, nt, mh, mt) = (amount(rng), amount(rng), amount(rng), amount(rng), amount(rng), amount(rng));
+        let rust = match money_fits(Money { hourly: rh, total: rt }, Money { hourly: nh, total: nt }, Money { hourly: mh, total: mt }) {
+            Ok(()) => "fits",
+            Err(MoneyOver::Hourly) => "hourly",
+            Err(MoneyOver::Total) => "total",
+        };
+        c.push(
+            json!({ "kind": "money", "rh": rh, "rt": rt, "nh": nh, "nt": nt, "mh": mh, "mt": mt }),
+            rust.to_string(),
+            format!("money_fits({rh}, {rt}, {nh}, {nt}, {mh}, {mt})"),
+        );
+    }
+
+    // The spawn ceiling: small values, so asks fall on both sides of limits.
+    let small = |rng: &mut Rng| rng.below(7) as i64 - 1;
+    for _ in 0..1000 {
+        let lim = |rng: &mut Rng| if rng.chance(30) { None } else { Some(small(rng)) };
+        let l = SpawnLimits {
+            min_isolation: lim(rng),
+            max_mem_bytes: lim(rng),
+            max_cpus_milli: lim(rng),
+            max_pids: lim(rng),
+            max_timeout_s: lim(rng),
+        };
+        let a = SpawnAsk { isolation: small(rng), mem_bytes: small(rng), cpus_milli: small(rng), pids: small(rng), timeout_s: small(rng) };
+        let rust = l.admits(a).to_string();
+        c.push(
+            json!({ "kind": "spawn", "min_isolation": l.min_isolation, "max_mem": l.max_mem_bytes, "max_cpus": l.max_cpus_milli,
+                    "max_pids": l.max_pids, "max_timeout": l.max_timeout_s, "isolation": a.isolation, "mem": a.mem_bytes,
+                    "cpus": a.cpus_milli, "pids": a.pids, "timeout": a.timeout_s }),
+            rust,
+            format!("{l:?}.admits({a:?})"),
+        );
+    }
 }
