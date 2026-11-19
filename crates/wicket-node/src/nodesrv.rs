@@ -3325,15 +3325,18 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 record: fake_record("run_a"),
             },
         );
-        // A control host from before protocol versions, or two versions apart, is refused.
+        // A control host from before protocol versions, or three versions apart, is refused.
         let (_, r) = handshake(&node, 1, 0, &inst, &inst.issuer).await;
         assert!(
             matches!(&r, Err(HsError::Refused(why)) if why.contains("before protocol versions") && why.contains("self update --nodes n1")),
             "{r:?}"
         );
+        let (_, r) = handshake(&node, 1, chan::PROTOCOL + 3, &inst, &inst.issuer).await;
+        assert!(matches!(&r, Err(HsError::Refused(why)) if why.contains("at most 2 apart")), "{r:?}");
+        // Within the skew (2, #572) either way is accepted, at the lower version (`connect` below is at
+        // this build's).
         let (_, r) = handshake(&node, 1, chan::PROTOCOL + 2, &inst, &inst.issuer).await;
-        assert!(matches!(&r, Err(HsError::Refused(why)) if why.contains("at most 1 apart")), "{r:?}");
-        // One apart either way is accepted, at the lower version (`connect` below is at this build's).
+        assert!(matches!(r, Ok(Msg::Welcome { proto, .. }) if proto == chan::PROTOCOL), "{r:?}");
         let (_, r) = handshake(&node, 1, chan::PROTOCOL + 1, &inst, &inst.issuer).await;
         assert!(matches!(r, Ok(Msg::Welcome { proto, .. }) if proto == chan::PROTOCOL), "{r:?}");
 
