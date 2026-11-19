@@ -389,25 +389,35 @@ function ruleText(r) {
 function standingAskRow(a) {
   const d = el("div", "card req");
   const e = a.evidence || {};
-  d.append(el("div", "what", "standing reach: " + ruleText(a.rule)));
+  const r = a.rule || {};
+  const agent = String(a.principal || "").split("/a/").pop();
+  d.append(el("div", "what", "Standing reach on " + strip(r.host)));
+  d.append(el("div", "meta", "Methods: " + (r.methods || []).map(strip).join(", ") + (r.allow_dangerous ? " \u00b7 dangerous requests too (R3, R4)" : "")));
+  d.append(el("div", "meta", "Paths: " + (r.paths || []).map(strip).join(", ")));
   d.append(el("div", "why", strip(a.reason)));
-  d.append(el("div", "meta", "asked by " + strip(a.principal) + " (run " + strip(a.run) + ", zone " + strip(a.zone) + ")"));
-  d.append(el("div", "meta", "evidence: " + e.requests + " request(s) it covers in 14 days (" + e.granted + " granted, " + e.denied + " denied)"));
-  for (const o of (e.ops || [])) d.append(el("div", "meta mono", "  " + o[2] + " × " + strip(o[0]) + " " + strip(o[1])));
-  for (const b of (a.beyond || [])) d.append(el("div", "blocked", "beyond what was asked: " + strip(b)));
-  if (a.narrowed) d.append(el("div", "meta", "narrowed to the evidence: " + ruleText(a.narrowed)));
+  const who = el("div", "meta", "Asked by " + strip(agent) + " (zone " + strip(a.zone) + ") \u00b7 for its later runs");
+  who.title = strip(a.principal);
+  d.append(who);
+  d.append(el("div", "meta", "Evidence: " + e.requests + " request(s) it covers in the last 14 days (" + e.granted + " granted, " + e.denied + " denied)" +
+    ((e.ops || []).length >= 10 ? ", the 10 most asked:" : (e.ops || []).length ? ":" : "")));
+  for (const o of (e.ops || [])) d.append(el("div", "meta mono", o[2] + " \u00d7 " + strip(o[0]) + " " + strip(o[1])));
+  for (const b of (a.beyond || [])) d.append(el("div", "blocked", "Wider than the evidence: " + strip(b)));
   const b = el("div", "buttons");
-  const asAsked = el("button", "approve", "Approve for the agent (30 days)");
-  asAsked.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent" });
-  const narrow = el("button", "", "Approve narrowed");
+  // The narrowest choice first, and the default; the widest (a whole zone) marked as such.
+  const narrow = el("button", a.narrowed ? "approve" : "", a.narrowed ? "Approve narrowed (30 days)" : "Approve narrowed: no evidence to narrow to");
   narrow.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent", narrow: true });
   narrow.disabled = !a.narrowed;
-  const zone = el("button", "", "Approve for zone " + strip(a.zone));
+  const asAsked = el("button", a.narrowed ? "" : "approve", "Approve as asked (30 days)");
+  asAsked.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent" });
+  const zone = el("button", "deny", "Approve for every agent in zone " + strip(a.zone) + " (30 days)");
   zone.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "zone" });
   const deny = el("button", "deny", "Deny");
   deny.onclick = () => signedSettled({ action: "standing_deny", id: a.id });
-  b.append(asAsked, narrow, zone, deny);
-  d.append(el("div", "meta", strip(a.id) + " · " + when(a.created_at)), b);
+  b.append(narrow, asAsked, zone);
+  const b2 = el("div", "buttons");
+  b2.append(deny);
+  if (a.narrowed) d.append(el("div", "meta", "Narrowed: methods " + (a.narrowed.methods || []).map(strip).join(", ") + ", paths " + (a.narrowed.paths || []).map(strip).join(", ")));
+  d.append(b, b2, el("div", "meta", strip(a.id) + " \u00b7 asked " + when(a.created_at)));
   return d;
 }
 // An approved rule: who it is for, when it lapses; renewed (signed, 30 days) or revoked (session).
@@ -1075,6 +1085,10 @@ async function refresh() {
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};
+    // Standing asks wait below (their own section); said at the top, where decisions are made.
+    const ptr = document.getElementById("standing-pointer");
+    const n = (st.asks || []).length;
+    if (ptr) ptr.textContent = n ? n + " standing reach ask" + (n === 1 ? "" : "s") + " waiting, under Standing reach below" : "";
     renderKeyed("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
     renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: every one-off ask waits for a decision.");
     renderStart(s);

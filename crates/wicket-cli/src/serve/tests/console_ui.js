@@ -25,7 +25,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
@@ -386,11 +386,16 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   state = { ...base, pending: [], standing: { asks: [ask], rules: [rule] } };
   await run("refresh()"); await flush();
   const sa = ids["standing-asks"].textContent;
-  for (const want of ["standing reach: { host: ci.example", "3 request(s) it covers", "beyond what was asked: methods never asked for: POST", "narrowed to the evidence"]) assert.ok(sa.includes(want), want + " in " + sa);
+  for (const want of ["Standing reach on ci.example", "Methods: GET, POST", "Paths: /jobs/**", "Asked by worker (zone work)", "3 request(s) it covers in the last 14 days",
+    "Wider than the evidence: methods never asked for: POST", "Narrowed: methods GET, paths /jobs/1/logs"]) assert.ok(sa.includes(want), want + " in " + sa);
+  assert.strictEqual(ids["standing-pointer"].textContent, "1 standing reach ask waiting, under Standing reach below");
+  const sbuttons = ids["standing-asks"].all(n => n.tagName === "button");
+  assert.deepStrictEqual(sbuttons.map(n => [n.textContent, n.className]), [["Approve narrowed (30 days)", "approve"], ["Approve as asked (30 days)", ""],
+    ["Approve for every agent in zone work (30 days)", "deny"], ["Deny", "deny"]], "the narrowest first and primary; the widest marked");
   assert.strictEqual(ids["standing-asks"].all(n => n.tagName === "b").length, 0, "an agent's reason stays text");
   await advance(1000);
   nextAction = { v: 1, action: "standing_approve", standing: "s-1", principal: ask.principal, zone: "work", rule: ask.narrowed, for: "agent", ttl_secs: 2592000, narrowed: true, effect_sha256: "ab".repeat(32) };
-  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Approve narrowed")[0].click(); await flush();
+  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Approve narrowed (30 days)")[0].click(); await flush();
   const stb = began().pop().body;
   assert.deepStrictEqual([stb.action, stb.id, stb.for, stb.narrow], ["standing_approve", "s-1", "agent", true]);
   assert.ok(ids["confirm-what"].textContent.startsWith("Approve standing reach s-1 narrowed to its evidence: { host: ci.example, methods: [GET], paths: ['/jobs/1/logs'] }"), ids["confirm-what"].textContent);

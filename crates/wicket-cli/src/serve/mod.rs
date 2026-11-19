@@ -1759,17 +1759,23 @@ fn push_post(state: &State, cred: &str, path: &str, body: &Value) -> Reply {
 }
 
 /// What is waiting for a decision, for the notifier: every pending request (egress asks, and
-/// wicket's own capacity, update, spawn and link asks), oldest first.
+/// wicket's own capacity, update, spawn and link asks), oldest first, then standing asks (#572).
 fn waiting(state: &State) -> Result<Vec<push::Waiting>> {
     let l = state.ledger()?;
-    Ok(l.pending(&state.tenant)?
+    let mut out: Vec<push::Waiting> = l
+        .pending(&state.tenant)?
         .into_iter()
         .map(|r| {
             let agent = l.identity(&r.run).ok().flatten().map(|i| i.agent).unwrap_or_else(|| r.run.clone());
             let ask = format!("{} {}{}{}", r.method, r.host, r.path, if r.scope_prefix { "…" } else { "" });
             push::Waiting { id: r.id, summary: format!("{agent} asks {ask}") }
         })
-        .collect())
+        .collect();
+    for s in l.standing_with_status(&state.tenant, "pending")? {
+        let agent = s.principal.rsplit("/a/").next().unwrap_or(&s.principal).to_string();
+        out.push(push::Waiting { id: s.id, summary: format!("{agent} asks for standing reach on {}", s.rule.host) });
+    }
+    Ok(out)
 }
 
 /// How often the notifier looks at the ledger for new requests.

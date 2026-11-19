@@ -21,6 +21,7 @@
   <div id="console" hidden>
   <h2>Waiting for you</h2>
   <div id="pending"></div>
+  <a class="meta" id="standing-pointer" href="#standing"></a>
   <h2>Runs</h2>
   <div class="card" id="runs"></div>
   <!-- A run's authority, or an explained decision (#173): read-only, opened from a row. -->
@@ -42,7 +43,7 @@
   <!-- Standing reach (#572): an agent's ask, decided once with the ledger's evidence (passkey-signed),
        and the approved rules, renewed (signed) or revoked (session only). -->
   <h2>Standing reach</h2>
-  <div class="card"><div id="standing-asks"></div><div id="standing-rules"></div></div>
+  <div class="card" id="standing"><div id="standing-asks"></div><div id="standing-rules"></div></div>
   <h2>Manifests</h2>
   <div class="card" id="manifests"></div>
   <!-- A manifest, viewed and edited (#172): every save is passkey-signed. -->

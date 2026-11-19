@@ -117,7 +117,7 @@ pub fn show(s: &wicket_store::Standing, rule: &wicket_core::manifest::ReachRule)
     }
     let beyond = st::beyond(s, rule);
     if !beyond.is_empty() {
-        out.push_str("  beyond what was asked:\n");
+        out.push_str("  wider than the evidence:\n");
         for b in beyond {
             out.push_str(&format!("             {b}\n"));
         }
