@@ -36,3 +36,15 @@ crates/wicket-proxy/src/egress/hosts.rs: replace < with <= in Egress::domain_exi
 crates/wicket-proxy/src/egress/outgoing.rs: replace match guard seen.contains(&tag) with false in Egress::tripwire   # the message only
 # HEAD, 204 and 304 carry no body: `||` refuses one of those that says it is encoded, which has none to check.
 crates/wicket-proxy/src/egress/outgoing.rs: replace && with || in Egress::clean   # bodiless responses only
+
+# The reconciler's placed pass renews a node's money until `now + 24 h`; the store caps a renewal at
+# MAX_QUOTA_TTL_SECS, which is 24 h, so asking for `now * 24 h` gives the same expiry.
+crates/wicket-cli/src/reconcile.rs: replace + with * in placed_pass   # renew_money caps it at the same 24 h
+# Not equivalent, and not this set's target: cargo-mutants 27.1's -F/-E filters don't apply to
+# struct-field deletions, so the reconcile set also gets setup::vultr_provider's. It builds the
+# provider from the installation's vault and placement.yaml, which no unit test has; a missing
+# field is a placement setting left at Vultr's default.
+crates/wicket-cli/src/reconcile.rs: delete field os_id from struct VultrConfig expression in setup::vultr_provider   # outside the set; needs a real vault
+crates/wicket-cli/src/reconcile.rs: delete field sshkey_ids from struct VultrConfig expression in setup::vultr_provider   # outside the set; needs a real vault
+crates/wicket-cli/src/reconcile.rs: delete field plan_type from struct VultrConfig expression in setup::vultr_provider   # outside the set; needs a real vault
+crates/wicket-cli/src/reconcile.rs: delete field default_region from struct VultrConfig expression in setup::vultr_provider   # outside the set; needs a real vault

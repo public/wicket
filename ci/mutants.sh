@@ -7,14 +7,16 @@
 # bounds (wicket-control grant.rs), the digest grants and the money check (wicket-store
 # digestgrant.rs, money.rs, #258, #256), digest acceptance (wicket-control digest.rs), and the
 # egress proxy's host judging, request preparation, node decisions and dial-time address checks
-# (wicket-proxy). Each mutant is a small change to the code (`>` for `>=`, a
+# (wicket-proxy), and a held placed node's money (#494, #495: wicket-placement's held_reservation,
+# the reconciler's placed pass). Each mutant is a small change to the code (`>` for `>=`, a
 # function returning a constant, a deleted match arm); one the tests still pass on is a test gap.
 # Kani's proofs (authority, version) don't run under `cargo test`: unit tests at the boundaries
 # stand in for them here.
 #
 #   ci/mutants.sh [--jobs N] [--only <name>] [--list]
 #
-#   --only   one set: core, authority, decisions, matchers, authz, grant, digest, accept or proxy
+#   --only   one set: core, authority, decisions, matchers, authz, grant, digest, accept, proxy,
+#            placement or reconcile
 #   --list   print the mutants each set would test, and test none
 #
 # A surviving mutant fails the run unless ci/mutants.accepted lists it (equivalent mutants: ones no
@@ -56,6 +58,8 @@ sets=(
   "grant|wicket-control|-f crates/wicket-control/src/grant.rs -F within_authority|check_terms|agent_terms|outlasts|descendant_chain|agent_renews|bounds|check_ttl|check_prefix|grant"
   "digest|wicket-store|-f crates/wicket-store/src/digestgrant.rs -f crates/wicket-store/src/money.rs|store"
   "accept|wicket-control|-f crates/wicket-control/src/digest.rs|accept"
+  "placement|wicket-placement|-f crates/wicket-placement/src/billing.rs -F held_reservation|placement"
+  "reconcile|wicket-cli|-f crates/wicket-cli/src/reconcile.rs -F placed_pass -E vultr_provider|reconcile"
   "proxy|wicket-proxy|-f crates/wicket-proxy/src/decide.rs -f crates/wicket-proxy/src/egress/hosts.rs -f crates/wicket-proxy/src/egress/outgoing.rs -f crates/wicket-proxy/src/egress/connect.rs -f crates/wicket-proxy/src/dial.rs|proxy"
 )
 survived=()
@@ -70,6 +74,8 @@ for s in "${sets[@]}"; do
     store) targs=(-- --lib -- digestgrant money props approved_update lease) ;;
     accept) targs=(-- --lib -- digest) ;;
     proxy) targs=() ;;
+    placement) targs=(-- --lib) ;;
+    reconcile) targs=(-- --bin wicket -- reconcile) ;;
   esac
   # The -F regex holds `|`: split the filters on spaces only.
   read -r -a fargs <<<"$filters"
