@@ -73,6 +73,10 @@ reference](manifest.md)).
   - [`wicket lease release`](#wicket-lease-release)
 - [`wicket zone`](#wicket-zone)
   - [`wicket zone pin`](#wicket-zone-pin)
+- [`wicket service`](#wicket-service)
+  - [`wicket service add`](#wicket-service-add)
+  - [`wicket service remove`](#wicket-service-remove)
+  - [`wicket service list`](#wicket-service-list)
 - [`wicket doctor`](#wicket-doctor)
 - [`wicket node`](#wicket-node)
   - [`wicket node token`](#wicket-node-token)
@@ -138,6 +142,7 @@ Commands:
   reconcile  Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Records every change in the audit log
   lease      Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the request with `wicket approve`/`deny` (see `wicket pending`)
   zone       The zone view of a manifest: for each host its reach names, whether the egress proxy inspects it (terminates TLS and decides every request) or splices it through (decides on the hostname, relays the encrypted bytes), and why (#62)
+  service    Per-node services (#579): programs kept running on every node whose boxes use them
   doctor     Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes
   node       Nodes (#16, #37), machines that run boxes: leased from a provider (create, release, plans) or your own (one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA); listing with leases and cost, revoking, renewing the CA
   dev        Development helpers
@@ -1113,6 +1118,62 @@ Arguments:
 Options:
       --dry-run  Say what would change; write nothing
   -h, --help     Print help
+```
+
+## `wicket service`
+
+```text
+Per-node services (#579): programs kept running on every node whose boxes use them
+
+Usage: wicket service <COMMAND>
+
+Commands:
+  add     Install a per-node service: a program manifest with a `service:` section. Its manifest is read where it is, at each start: keep it there
+  remove  Uninstall one: no new instance starts
+  list    The installed services
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket service add`
+
+```text
+Install a per-node service: a program manifest with a `service:` section. Its manifest is read where it is, at each start: keep it there
+
+Usage: wicket service add <MANIFEST>
+
+Arguments:
+  <MANIFEST>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket service remove`
+
+```text
+Uninstall one: no new instance starts
+
+Usage: wicket service remove <NAME>
+
+Arguments:
+  <NAME>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket service list`
+
+```text
+The installed services
+
+Usage: wicket service list
+
+Options:
+  -h, --help  Print help
 ```
 
 ## `wicket doctor`

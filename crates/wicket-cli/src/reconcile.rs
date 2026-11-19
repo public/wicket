@@ -910,6 +910,15 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
             Err(e) => done.push(Done { kind: "error", target: "release keys".into(), detail: format!("renewing their grants: {e:#}") }),
         }
     }
+    // Per-node services (#579): an instance on each node whose boxes use one, started if missing.
+    match wicket_control::services::pass(&ledger, dry_run) {
+        Ok(started) => done.extend(started.into_iter().map(|(s, run)| Done {
+            kind: "service_started",
+            target: format!("{} on {}", s.service, s.node),
+            detail: if dry_run { format!("for {} (dry run)", s.tenant) } else { format!("for {}: run {run}", s.tenant) },
+        })),
+        Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
+    }
     // The ledger's own upkeep (#582): settled rows of runs long ended to the archive, planner
     // statistics, and a WAL checkpoint.
     if !dry_run {

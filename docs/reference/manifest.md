@@ -54,6 +54,8 @@ What makes a program a per-node service ([#579](https://github.com/public/wicket
 | `env` | map of string to string | none | Environment its users get, `{host}` and `{port}` filled in: what points their tools at it (`npm_config_registry: http://{host}:{port}/`). Never a variable wicket controls (proxies, CA bundles, `WICKET_*`, `PATH`, `HOME`). |
 | `drain` | `drop` or `keep` | `drop` | What happens to its volumes when its node is released. |
 
+`wicket service add <manifest>` installs one (audited `service.added`; `wicket service list`, `wicket service remove`). Each `wicket reconcile` pass then keeps one instance of it on every active node its `node_selector` matches where a live box's zone `uses` it, per tenant unless `tenancy: shared`. An instance is an ordinary run of the program on that node (`services/<name>/<run>.log` in the data directory has its output). One that exits is started again, at most once a minute. Its manifest is read where it was installed from, at each start.
+
 ## `placement`
 
 What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. Today it decides where a woken agent goes ([nodes](nodes.md#placement)); `wicket run --node` and a spawn's placement hint name the node themselves.
