@@ -736,17 +736,25 @@ update_flow() {
   r=$(restart_start update)
   b=$(box_of "$r")
   check "  the run started through wicketd took its first turn" '[ "$(restart_result "$r" | jq -r .turn 2>/dev/null)" = 1 ]'
-  # Root's own directory, so root's copy is made from it (#261).
+  # A directory root owns and the wicket user can read but not write. Root makes its copy only
+  # from an artifact the wicket user can't write (#261), and wicketd, as the wicket user, reads
+  # the artifact, its signature and the key `self trust-key` names. Under /root (0700) it could
+  # read none of them: the 11-18 nightly's "Permission denied" on rk.pub.
   # Each step's failure is the check below, not the end of the run.
-  d=$(sudo -n mktemp -d /root/acc-update.XXXXXX || true)
+  d=$(sudo -n mktemp -d /var/tmp/acc-update.XXXXXX || true)
+  sudo -n chmod 755 "$d" || true
   sudo -n sh -c "cp '$(readlink -f "$W")' '$d/wicket' && printf 'build b' >>'$d/wicket' && chmod 755 '$d/wicket'" || true
-  { wroot self keygen "$d/rk" && wroot self trust-key "$d/rk.pub" && wroot self sign --key "$d/rk" "$d/wicket"; } >"$work/update-sign.log" 2>&1 || true
+  { wroot self keygen "$d/rk" && sudo -n chmod 644 "$d/rk.pub" && wroot self trust-key "$d/rk.pub" &&
+    wroot self sign --key "$d/rk" "$d/wicket" && sudo -n chmod 644 "$d/wicket.sig"; } >"$work/update-sign.log" 2>&1 || true
   id=$(sudo -n sha256sum "$d/wicket" 2>/dev/null | cut -c1-12 || true)
   # The new build's agent image is the one under test, so the update builds none.
   $DOCKER tag "$IMAGE_TAG" "wicket/claude-code:$id" >/dev/null 2>&1 || true
-  check "  a second build was made, signed with a trusted key" '[ -n "$id" ] && sudo -n test -s "$d/wicket.sig"' || cat "$work/update-sign.log"
+  # (`check` doesn't fail the shell, so what went wrong is printed by a test of its own.)
+  check "  a second build was made, signed with a trusted key" '[ -n "$id" ] && sudo -n test -s "$d/wicket.sig"'
+  sudo -n test -s "$d/wicket.sig" || cat "$work/update-sign.log"
   wroot self update "$d/wicket" --window 5s --interval 5s --no-prune >"$work/update.log" 2>&1 || true
   check "  the update went through" 'grep -q "done: the control host run $id" "$work/update.log"'
+  grep -q "done: the control host run $id" "$work/update.log" || tail -n 30 "$work/update.log"
   t0=$(date +%s)
   wait_for 20 'wt 5 pending >/dev/null 2>&1' || true
   check "  then the CLI answered through wicketd within seconds" \
