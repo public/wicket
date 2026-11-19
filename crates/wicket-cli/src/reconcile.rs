@@ -910,6 +910,24 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
             Err(e) => done.push(Done { kind: "error", target: "release keys".into(), detail: format!("renewing their grants: {e:#}") }),
         }
     }
+    // The ledger's own upkeep (#582): settled rows of runs long ended to the archive, planner
+    // statistics, and a WAL checkpoint.
+    if !dry_run {
+        match ledger.maintain(now) {
+            Ok(m) if m.archived_grants + m.archived_requests > 0 => done.push(Done {
+                kind: "archived",
+                target: "ledger".into(),
+                detail: format!(
+                    "{} grant(s) and {} request(s) of runs ended over {} days ago",
+                    m.archived_grants,
+                    m.archived_requests,
+                    wicket_store::ARCHIVE_AFTER_SECS / 86400
+                ),
+            }),
+            Ok(_) => {}
+            Err(e) => done.push(Done { kind: "error", target: "ledger".into(), detail: format!("maintaining it: {e:#}") }),
+        }
+    }
     if !dry_run && crate::storegc::due() {
         // The store clients block: off the async runtime.
         let passes = tokio::task::spawn_blocking(|| crate::storegc::run(&Ledger::open(&crate::ledger_path())?, false)).await?;

@@ -1291,6 +1291,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 },
                 // Push delivery of messages (#252), if the harness takes it in a box.
                 push: harness.and_then(|h| h.message_push(&m)),
+                // What the node may ask for beyond its CA (#573).
+                ca_widen: ledger.lock().ok().and_then(|l| l.node_ca_policy(&node_name).ok()),
             })),
             image_pin: image_pin.clone(),
             timings: wicket_core::timing::enabled(),
