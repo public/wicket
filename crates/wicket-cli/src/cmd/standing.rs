@@ -68,7 +68,9 @@ fn rule_text(r: &wicket_core::manifest::ReachRule) -> String {
         "{{ host: {}, methods: [{}], paths: [{}]{} }}",
         c(&r.host),
         r.methods.iter().map(|m| c(m)).collect::<Vec<_>>().join(", "),
-        r.paths.iter().map(|p| format!("'{}'", c(p))).collect::<Vec<_>>().join(", "),
+        // Paths whole: they are held to a path's characters (#576), so cleaning them is all that's
+        // needed, and a long glob's tail is part of what is approved (#572 re-review, N5).
+        r.paths.iter().map(|p| format!("'{}'", wicket_agent::clip(p, 4096))).collect::<Vec<_>>().join(", "),
         if r.allow_dangerous { ", allow_dangerous: true" } else { "" }
     )
 }
