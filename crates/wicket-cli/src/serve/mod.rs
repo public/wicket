@@ -2448,7 +2448,7 @@ mod tests {
     /// the window (any number of uses for 5 minutes); anything else is one use for 10 minutes.
     #[test]
     fn a_pending_row_carries_the_terms_its_first_button_grants() {
-        let mut t = setup("once-terms");
+        let t = setup("once-terms");
         t.running("run_o", "lead");
         let run = RunId("run_o".into());
         let push = wicket_core::Op::egress(&TenantId::single(), &run, "z", "POST", "git.example", "/acme/app.git/git-receive-pack");
