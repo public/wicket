@@ -205,7 +205,10 @@ fn a_prefix_grant_covers_only_paths_under_it() {
     let path = AnyStr::<{ N - 1 }>::new(SEGS);
     let (p, q) = (pre.bytes(), path.bytes());
     kani::assume(p.first() == Some(&b'/') && q.first() == Some(&b'/'));
-    kani::assume(plain_fault(p).is_none() && plain_fault(q).is_none());
+    // Canonical, over [`SEGS`]: `check_plain_is_plain_ok` proves `plain_fault` is Lean's `plainOk`, which
+    // on these bytes (no escape, no `;`, `\\` or byte a parser would encode) is `segs_ok` alone. Using
+    // that here keeps CBMC off `plain_fault` for two symbolic paths (401 s with it).
+    kani::assume(segs_ok(p) && segs_ok(q));
     let (Ok(ps), Ok(qs)) = (std::str::from_utf8(p), std::str::from_utf8(q)) else { return };
     if !prefix_covers(ps, qs) {
         return;
