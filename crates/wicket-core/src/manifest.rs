@@ -537,7 +537,7 @@ pub enum Persist {
     /// Re-derivable (`node_modules`, `target/`): never bundled, and may be empty on wake.
     Cache,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReachRule {
     /// Exact host, or `*.example.com`.

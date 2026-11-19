@@ -24,6 +24,13 @@ reference](manifest.md)).
   - [`wicket grant list`](#wicket-grant-list)
   - [`wicket grant revoke`](#wicket-grant-revoke)
   - [`wicket grant renew`](#wicket-grant-renew)
+- [`wicket standing`](#wicket-standing)
+  - [`wicket standing list`](#wicket-standing-list)
+  - [`wicket standing show`](#wicket-standing-show)
+  - [`wicket standing approve`](#wicket-standing-approve)
+  - [`wicket standing deny`](#wicket-standing-deny)
+  - [`wicket standing renew`](#wicket-standing-renew)
+  - [`wicket standing revoke`](#wicket-standing-revoke)
 - [`wicket audit`](#wicket-audit)
   - [`wicket audit export`](#wicket-audit-export)
 - [`wicket secret`](#wicket-secret)
@@ -129,6 +136,7 @@ Commands:
   links      Links between boxes (expose/connect/link), newest first
   unlink     Cut a link between boxes: its relay closes it and drops its connections within seconds
   grant      Grants made by approvals
+  standing   Standing reach (#572): a reach rule an agent asked for once, approved once for its later runs
   audit      Show or verify the hash-chained audit log, or export it to the configured sinks
   secret     Manage vault secrets (values are read from the terminal, never from arguments)
   image      Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build). Without --dir, from the copy embedded in this binary, so the image matches it
@@ -375,6 +383,113 @@ Arguments:
 Options:
       --ttl <TTL>  The new lifetime, from now [default: 10m]
   -h, --help       Print help
+```
+
+## `wicket standing`
+
+```text
+Standing reach (#572): a reach rule an agent asked for once, approved once for its later runs
+
+Usage: wicket standing <COMMAND>
+
+Commands:
+  list     Standing rules: pending asks, and approved rules (with when they lapse). --all adds denied, revoked and lapsed ones
+  show     One ask or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
+  approve  Approve a standing ask (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
+  deny     Deny a standing ask
+  renew    Move an approved rule's lapse to --lasts from now (or `forever`)
+  revoke   Revoke an approved rule: it allows nothing from now on (a box's node, once its run publishes the revocation)
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket standing list`
+
+```text
+Standing rules: pending asks, and approved rules (with when they lapse). --all adds denied, revoked and lapsed ones
+
+Usage: wicket standing list [OPTIONS]
+
+Options:
+      --all   
+  -h, --help  Print help
+```
+
+### `wicket standing show`
+
+```text
+One ask or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
+
+Usage: wicket standing show <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket standing approve`
+
+```text
+Approve a standing ask (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
+
+Usage: wicket standing approve [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --for <BOUND>    Who it is for: `agent` (the asking agent's principal) or `zone` (its zone) [default: agent]
+      --lasts <LASTS>  How long it lasts (at most 366d), or `forever`: until revoked [default: 30d]
+      --narrow         Approve only the methods and paths the evidence shows were asked for
+  -y, --yes            Don't ask for confirmation at a terminal (the ask is printed either way)
+  -h, --help           Print help
+```
+
+### `wicket standing deny`
+
+```text
+Deny a standing ask
+
+Usage: wicket standing deny <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket standing renew`
+
+```text
+Move an approved rule's lapse to --lasts from now (or `forever`)
+
+Usage: wicket standing renew [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --lasts <LASTS>  [default: 30d]
+  -h, --help           Print help
+```
+
+### `wicket standing revoke`
+
+```text
+Revoke an approved rule: it allows nothing from now on (a box's node, once its run publishes the revocation)
+
+Usage: wicket standing revoke <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
 ```
 
 ## `wicket audit`
