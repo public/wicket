@@ -447,23 +447,22 @@ impl RunCtx {
             },
         };
         let id = format!("m-{}", wicket_core::new_ulid().to_string().to_lowercase());
-        let relation = if rec.parent_run.as_deref() == Some(&self.run.0) {
-            "child"
-        } else if prefer.is_some()
-            || me.claims.parent_run.as_deref().is_some_and(|p| l.identity(p).ok().flatten().is_some_and(|i| i.spiffe_id == principal))
-        {
-            "parent"
-        } else if wicket_core::manifest::accepts(&rec.accept_from, &self.zone.name, Some(&me.claims.sub)) {
-            "peer"
-        } else if replies {
-            "reply"
+        // Who may message whom: the rule a node cut off from here decides by too (#257).
+        let facts = wicket_core::message::Facts {
+            to_child: rec.parent_run.as_deref() == Some(&self.run.0),
+            to_parent: prefer.is_some()
+                || me.claims.parent_run.as_deref().is_some_and(|p| l.identity(p).ok().flatten().is_some_and(|i| i.spiffe_id == principal)),
+            accept_from: &rec.accept_from,
+            sender_zone: &self.zone.name,
+            sender: Some(&me.claims.sub),
+            reply: replies,
+        };
+        let relation = if let Some(r) = wicket_core::message::relation(&facts) {
+            r.as_str()
         } else {
             // Refused on the record (#252): the sender has a receipt that says so, and nothing
             // reaches the recipient.
-            let why = format!(
-                "{principal} does not accept messages from you ({}, zone {}): its accept_from lists neither",
-                me.claims.sub, self.zone.name
-            );
+            let why = wicket_core::message::refusal(&principal, &self.zone.name, Some(&me.claims.sub));
             l.refuse_message(&id, &self.tenant.0, &self.run.0, Some(&me.claims.sub), &principal, &why).map_err(|e| e.to_string())?;
             let audited = l.audit(
                 &self.tenant,
