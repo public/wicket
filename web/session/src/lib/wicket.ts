@@ -61,11 +61,11 @@ export const strip = (s: unknown) =>
   String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, ' ');
 
 const RISK: Record<string, string> = {
-  R0Read: 'R0 read',
-  R1ReadScoped: 'R1 read',
-  R2WriteReversible: 'R2 write',
-  R3ExternalOrIrreversible: 'R3 external',
-  R4ExecOrPrivilege: 'R4 exec/privilege',
+  R0Read: 'R0 · read',
+  R1ReadScoped: 'R1 · read (scoped)',
+  R2WriteReversible: 'R2 · changes data',
+  R3ExternalOrIrreversible: "R3 · visible to others, or can't be undone",
+  R4ExecOrPrivilege: 'R4 · push, deploy or privilege',
 };
 export const riskLabel = (r: unknown) => RISK[String(r)] ?? strip(r);
 
@@ -78,8 +78,9 @@ export function describe(a: Record<string, any>): string {
     // The terms are the effect's (what the passkey signs and the grant is made with), not the
     // page's ask: a git push's grant is a window, unlimited uses for 5 minutes (#26, #574).
     const t = a.effect?.terms ?? { uses: a.uses, ttl_secs: a.ttl_secs };
-    const verb = a.decision === 'deny' ? 'Deny' : t.uses === 1 ? 'Approve once' : `Allow${t.uses ? ` ${t.uses} uses` : ' any number of uses'}`;
-    const how = a.decision === 'deny' ? '' : ` for ${Math.round((t.ttl_secs || 0) / 60)} min`;
+    const verb = a.decision === 'deny' ? 'Deny' : t.uses === 1 ? 'Approve once' : `Approve${t.uses ? ` ${t.uses} uses` : ' any number of uses'}`;
+    const secs = Math.round(t.ttl_secs || 0);
+    const how = a.decision === 'deny' ? '' : ` for ${secs >= 3600 && secs % 3600 === 0 ? `${secs / 3600} hour${secs === 3600 ? '' : 's'}` : `${Math.round(secs / 60)} min`}`;
     const what = a.path_prefix ? s(a.method + ' ' + a.host + a.path_prefix) : s(a.method + ' ' + a.host + a.path);
     return (
       `${verb}${how}: ${what}${a.prefix ? '… (every path under it)' : ''}` +

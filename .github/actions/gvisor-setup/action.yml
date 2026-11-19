@@ -68,7 +68,9 @@ runs:
         # Keep the runner's own Docker settings; add runsc with host unix sockets (wicket's proxies).
         cfg=/etc/docker/daemon.json
         [ -f "$cfg" ] || echo '{}' | sudo tee "$cfg" >/dev/null
-        jq '.runtimes.runsc = {path: "/usr/bin/runsc", runtimeArgs: ["--host-uds=open"]}' "$cfg" | sudo tee "$cfg.new" >/dev/null
+        # Docker Hub pulls (busybox below, the agent image's base images) through Google's
+        # unauthenticated mirror first (#219): Hub's anonymous rate limit once failed this setup.
+        jq '.runtimes.runsc = {path: "/usr/bin/runsc", runtimeArgs: ["--host-uds=open"]} | ."registry-mirrors" = ((."registry-mirrors" // []) + ["https://mirror.gcr.io"] | unique)' "$cfg" | sudo tee "$cfg.new" >/dev/null
         sudo mv "$cfg.new" "$cfg"
         sudo systemctl restart docker
         runsc --version | head -1
