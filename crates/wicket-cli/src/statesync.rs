@@ -302,6 +302,51 @@ pub fn progress(
     (stream.is_some() || !audit.is_empty() || !errors.is_empty()).then_some(Progress { stream, audit, errors })
 }
 
+/// The ledger stream not current for longer than this is an alert (and a push).
+pub const STREAM_ALERT_SECS: i64 = 300;
+/// An audit sink whose oldest unacknowledged record has waited longer than this is an alert.
+pub const AUDIT_ALERT_SECS: i64 = 300;
+/// So is one behind by more records than this, however recent.
+pub const AUDIT_ALERT_RECORDS: i64 = 10_000;
+
+/// The health alerts `p` raises at `now_ms` (#635): the console shows and pushes them as it does a
+/// node's, once each until it clears. `last_good_ms` is when the caller last saw the stream current
+/// (streaming or starting), or when it started looking: a stopped Litestream doesn't say when it
+/// last synced, so the caller remembers.
+pub fn alerts(p: &Progress, last_good_ms: i64, now_ms: i64) -> Vec<crate::health::Alert> {
+    let mut out = Vec::new();
+    if let Some(st) = &p.stream {
+        let good = st.last_sync_ms.unwrap_or(0).max(last_good_ms);
+        let bad = matches!(st.state, StreamState::Lagging | StreamState::Stopped);
+        if bad && now_ms - good > STREAM_ALERT_SECS * 1000 {
+            let since = match st.last_sync_ms {
+                Some(t) => format!("last sync {} ago", crate::audit_export::ago((now_ms - t) / 1000)),
+                None => format!("not current for {}", crate::audit_export::ago((now_ms - good) / 1000)),
+            };
+            let err = st.error.as_ref().map(|e| format!(": {e}")).unwrap_or_default();
+            out.push(crate::health::Alert {
+                key: "state-store/stream".into(),
+                text: format!("the state store: the ledger stream is {} ({since}){err}", st.state.as_str()),
+            });
+        }
+    }
+    for s in &p.audit {
+        if s.behind_secs > AUDIT_ALERT_SECS || s.behind > AUDIT_ALERT_RECORDS {
+            let err = s.error.as_ref().map(|e| format!(": {e}")).unwrap_or_default();
+            out.push(crate::health::Alert {
+                key: format!("audit/{}", s.sink),
+                text: format!(
+                    "audit sink {}: {} records behind (oldest {}){err}",
+                    s.sink,
+                    s.behind,
+                    crate::audit_export::ago(s.behind_secs)
+                ),
+            });
+        }
+    }
+    out
+}
+
 /// [`progress`] with this installation's configs, at the ledger `l` opened from `ledger`.
 pub fn installed_progress(l: &wicket_store::Ledger, ledger: &Path, now_ms: i64) -> Option<Progress> {
     progress(l, ledger, StateStore::load(), crate::audit_export::SinksConfig::load(), now_ms)
@@ -413,6 +458,56 @@ mod tests {
         std::fs::remove_file(socket_path(&db)).unwrap();
         let st = status_of(&s, &db, synced + 200_000).unwrap();
         assert_eq!((st.state, st.error.as_deref()), (StreamState::Stopped, Some("monitor error: calc pos: connection refused")));
+    }
+
+    #[test]
+    fn a_stream_or_a_sink_behind_past_its_threshold_is_an_alert() {
+        let now = 1_763_200_000_000;
+        let stream = |state, last_sync_ms: Option<i64>| StreamStatus {
+            endpoint: "https://s3.example.com".into(),
+            bucket: "b-1".into(),
+            lineage: None,
+            state,
+            last_sync_ms,
+            behind_secs: last_sync_ms.map(|t| (now - t) / 1000),
+            lag_secs: 60,
+            error: Some("calc pos: connection refused".into()),
+            error_ms: Some(now - 1000),
+        };
+        let p = |s: Option<StreamStatus>, audit| Progress { stream: s, audit, errors: vec![] };
+        let keys = |p: &Progress, good: i64| alerts(p, good, now).into_iter().map(|a| a.key).collect::<Vec<_>>();
+        // Lagging under the threshold: shown as lagging, not alerted; past it, alerted.
+        assert!(keys(&p(Some(stream(StreamState::Lagging, Some(now - 299_000))), vec![]), 0).is_empty());
+        let lag = p(Some(stream(StreamState::Lagging, Some(now - 301_000))), vec![]);
+        let a = alerts(&lag, 0, now);
+        assert_eq!(a[0].key, "state-store/stream");
+        assert_eq!(a[0].text, "the state store: the ledger stream is lagging (last sync 5 min ago): calc pos: connection refused");
+        // Stopped: from when it was last seen current.
+        let stopped = p(Some(stream(StreamState::Stopped, None)), vec![]);
+        assert!(keys(&stopped, now - 60_000).is_empty(), "seen streaming a minute ago");
+        assert_eq!(keys(&stopped, now - 400_000), ["state-store/stream"]);
+        assert!(alerts(&stopped, now - 400_000, now)[0].text.contains("stopped (not current for 6 min)"));
+        // Streaming, however long ago it started: no alert.
+        assert!(keys(&p(Some(stream(StreamState::Streaming, Some(now - 1_000))), vec![]), 0).is_empty());
+        // A sink by the age of its oldest record, or by how many.
+        let sink = |behind, behind_secs| crate::audit_export::SinkStatus {
+            sink: "store".into(),
+            kind: "store",
+            seq: 1,
+            head: 1 + behind,
+            behind,
+            behind_secs,
+            checkpoint_at: 0,
+            holder: None,
+            error: Some("PUT: refused".into()),
+        };
+        assert!(keys(&p(None, vec![sink(24, 299)]), 0).is_empty());
+        let a = alerts(&p(None, vec![sink(24, 301)]), 0, now);
+        assert_eq!(
+            (a[0].key.as_str(), a[0].text.as_str()),
+            ("audit/store", "audit sink store: 24 records behind (oldest 5 min): PUT: refused")
+        );
+        assert_eq!(keys(&p(None, vec![sink(10_001, 2)]), 0), ["audit/store"]);
     }
 
     #[test]

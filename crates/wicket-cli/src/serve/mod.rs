@@ -282,6 +282,9 @@ struct State {
     sockets: Arc<Mutex<session::Sockets>>,
     /// Web Push to the operators' devices ([`push`]); None if its state couldn't be opened.
     push: Option<push::Push>,
+    /// When the ledger's stream was last seen current, or when this console started (#635): a
+    /// stopped Litestream doesn't say when it last synced ([`crate::statesync::alerts`]).
+    stream_seen_ms: Mutex<i64>,
 }
 
 impl State {
@@ -327,6 +330,7 @@ impl State {
             tickets: Mutex::new(HashMap::new()),
             sockets: Arc::new(Mutex::new(session::Sockets::default())),
             push,
+            stream_seen_ms: Mutex::new(wicket_feed::now_ms()),
         }
     }
 }
@@ -1840,7 +1844,11 @@ fn health_view(state: &State, now_ms: i64) -> Result<(Value, Vec<crate::health::
     }
     let disk = crate::health::disk(&state.data);
     alerts.extend(crate::health::disk_alerts("control", "the control host", &disk));
-    let store = crate::statesync::installed_progress(&l, &state.ledger, now_ms).map_or(Value::Null, |p| json!(p));
+    let progress = crate::statesync::installed_progress(&l, &state.ledger, now_ms);
+    if let Some(p) = &progress {
+        alerts.extend(state_store_alerts(state, p, now_ms));
+    }
+    let store = progress.map_or(Value::Null, |p| json!(p));
     Ok((
         json!({ "nodes": nodes, "control_disk_pct": disk.used_pct().round(), "state_store": store,
                 "alerts": alerts.iter().map(|a| a.text.clone()).collect::<Vec<_>>() }),
@@ -1848,7 +1856,17 @@ fn health_view(state: &State, now_ms: i64) -> Result<(Value, Vec<crate::health::
     ))
 }
 
-/// Pushes node health alerts as they appear (#377), to devices of passkeys still enrolled.
+/// The state store's alerts (#635), remembering when the ledger's stream was last current.
+fn state_store_alerts(state: &State, p: &crate::statesync::Progress, now_ms: i64) -> Vec<crate::health::Alert> {
+    use crate::statesync::StreamState;
+    let mut seen = state.stream_seen_ms.lock().unwrap_or_else(|e| e.into_inner());
+    if p.stream.as_ref().is_some_and(|s| matches!(s.state, StreamState::Streaming | StreamState::Starting)) {
+        *seen = (*seen).max(now_ms);
+    }
+    crate::statesync::alerts(p, *seen, now_ms)
+}
+
+/// Pushes health alerts (nodes, #377; the state store, #635) as they appear, to devices of passkeys still enrolled.
 async fn notify_health(state: &State, h: &mut push::HealthNotifier, now_ms: i64) -> Vec<(String, u16)> {
     let Some(p) = &state.push else { return Vec::new() };
     let (alerts, creds) = match (health_view(state, now_ms), creds(state)) {
@@ -2127,6 +2145,36 @@ mod tests {
         assert!(a["behind"].as_i64().unwrap() >= 1 && a["behind"] == a["head"], "{a}");
         let v = json!(crate::statesync::progress(&l, &t.state.ledger, Err(anyhow::anyhow!("bad yaml")), Ok(None), now_ms));
         assert_eq!(v["errors"], json!(["state-store.yaml: bad yaml"]));
+    }
+
+    /// A stopped stream is alerted 5 min after the console last saw it current, and seeing it
+    /// current again clears it (#635).
+    #[test]
+    fn a_stopped_stream_is_alerted_from_when_the_console_last_saw_it_current() {
+        use crate::statesync::{Progress, StreamState, StreamStatus};
+        let t = setup("streamalert");
+        let now = wicket_feed::now_ms();
+        let p = |state| Progress {
+            stream: Some(StreamStatus {
+                endpoint: "https://s3.example.com".into(),
+                bucket: "b-1".into(),
+                lineage: None,
+                state,
+                last_sync_ms: None,
+                behind_secs: None,
+                lag_secs: 60,
+                error: None,
+                error_ms: None,
+            }),
+            audit: vec![],
+            errors: vec![],
+        };
+        assert!(state_store_alerts(&t.state, &p(StreamState::Stopped), now).is_empty(), "the console only just started");
+        let a = state_store_alerts(&t.state, &p(StreamState::Stopped), now + 301_000);
+        assert_eq!(a.iter().map(|a| a.key.as_str()).collect::<Vec<_>>(), ["state-store/stream"]);
+        assert!(state_store_alerts(&t.state, &p(StreamState::Streaming), now + 302_000).is_empty());
+        assert!(state_store_alerts(&t.state, &p(StreamState::Stopped), now + 400_000).is_empty(), "current 98 s ago");
+        assert_eq!(state_store_alerts(&t.state, &p(StreamState::Stopped), now + 603_000).len(), 1);
     }
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {

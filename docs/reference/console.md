@@ -313,6 +313,13 @@ when `state-store.yaml` or `audit-sinks.yaml` exists. `wicket top` shows the sam
   the sink is behind the chain head and how long the oldest of them has waited, where its cursor
   is, how long ago its last signed checkpoint was, and its last error.
 - A config that can't be read is a line of its own. It doesn't stop the rest of the page.
+- **Alerts.** Two conditions are health alerts, pushed like a node's (once when one appears, and
+  again only after it has cleared, under the `wicket-health` tag):
+  - the ledger stream is lagging or stopped and hasn't been current for more than 5 minutes. For a
+    stopped Litestream, which can't say when it last synced, that counts from when the console last
+    saw the stream current, or from when the console started;
+  - an audit sink's oldest unacknowledged record has waited more than 5 minutes, or the sink is more
+    than 10,000 records behind.
 
 The data is under `health.state_store` in `/api/state`: `stream`, `audit` and `errors`.
 
