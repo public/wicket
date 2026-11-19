@@ -2084,10 +2084,17 @@ without reading the message (which goes to stderr, after `Error: `).
 | Code | Means | For example |
 | --- | --- | --- |
 | 0 | Done. | |
-| 1 | Failed, for any reason the others don't name. | The ledger can't be opened; a node doesn't answer; wicketd is moving to a new build (try again); asking for a spend's approval failed. |
+| 1 | Failed, for any reason the others don't name. | The ledger can't be opened; a node doesn't answer; the daemon's policy file can't be read; asking for a spend's approval failed; `wicket run` or `wicket wrap` whose box failed (a non-zero exit, out of memory, over a cap) or timed out. |
 | 2 | A usage error: the command line is wrong. Nothing was changed. | An unknown flag; `--ttl 5q`; `wicket approve s-…` (a standing ask: `wicket standing approve`). |
 | 3 | Refused: wicket won't do it as asked. | The daemon's policy doesn't allow this caller the command; a decision outside the decider's authority; deciding a request that is already decided; terms wider than the request; answering no at `approve`'s or `standing approve`'s confirmation; a spend an operator denied, or over the installation's money limit; a lease that is already ended; a session on a run that isn't running; `self update` of an artifact whose signature doesn't verify. |
 | 4 | Not found: what the command names doesn't exist. | `no such request r-…`; no grant, link, lease, run, agent, node, service or identity by that name; no placement decision for the run. |
 | 5 | It needs an approval nobody has given yet. | `wicket node create` whose spend no capacity grant covers and no operator decided within `--wait` (or `--wait 0`); `wicket self update` of an artifact no trusted key signed and no operator approved. |
+| 75 | Try again shortly: nothing was done. | wicketd is moving to a new build and took no command. |
 
 `wicket wake`, which wicket runs itself, exits 3 when the agent is already being woken or is running.
+
+A command the daemon runs passes its code back through it; one ended by a signal exits 128 + the
+signal's number (130 for Ctrl-C), as a shell reports it. If the daemon restarts while a command
+runs, the connection drops and the caller exits 1 with "wicketd closed the connection before the
+command finished": the command may have done some or all of its work (a run it started goes on), so
+look (`wicket top`, `wicket audit`) before running it again.

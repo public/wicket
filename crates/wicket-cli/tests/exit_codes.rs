@@ -55,6 +55,8 @@ fn every_kind_of_outcome_has_its_code() {
         (&["grant", "renew", "g-nope"], 4),
         (&["grant", "renew", "r-nope"], 4),
         (&["operator", "enrol-link", "--ttl", "2h"], 2),
+        (&["serve", "--listen", "0.0.0.0:8080"], 2),
+        (&["wake", "agent_1", "--wait", "5q"], 2),
         (&["unlink", "lk-nope"], 4),
         (&["lease", "release", "lease_nope"], 4),
         (&["standing", "show", "s-nope"], 4),

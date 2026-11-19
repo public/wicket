@@ -24,6 +24,9 @@ pub enum Code {
     /// It needs an approval nobody has given yet: a spend no capacity grant covers and no operator
     /// decided within --wait, an update no trusted key signed and no operator approved.
     NeedsApproval = 5,
+    /// Try again shortly: the daemon is moving to a new build and took no command (sysexits'
+    /// EX_TEMPFAIL). Nothing was done, so retrying is safe.
+    TryAgain = 75,
 }
 
 /// A failure with its exit code.
@@ -72,11 +75,33 @@ pub fn usage(msg: impl Into<String>) -> anyhow::Error {
     exit(Code::Usage, msg)
 }
 
-/// The code an [`Exit`] in `e` says, if one does: the innermost error that says one, else an
-/// [`Exit`] added as `e`'s context (a refusal over a cause that says nothing more specific).
+/// The exit code `e` says, if it says one (#574): the innermost error in its chain that does (an
+/// [`Exit`] a command tagged, or the store's and placement's own errors), else an [`Exit`] added as
+/// `e`'s context (a refusal over a cause that says none). `wicket`'s main exits with it, or 1.
 pub fn code_of(e: &anyhow::Error) -> Option<Code> {
-    let inner = e.chain().filter_map(|c| c.downcast_ref::<Exit>()).last();
-    inner.or_else(|| e.downcast_ref::<Exit>()).map(|x| x.code)
+    e.chain().filter_map(says).last().or_else(|| e.downcast_ref::<Exit>().map(|x| x.code))
+}
+
+/// The code one error in a chain says, if any.
+fn says(c: &(dyn std::error::Error + 'static)) -> Option<Code> {
+    use wicket_placement::PlacementError as P;
+    use wicket_store::StoreError as S;
+    if let Some(x) = c.downcast_ref::<Exit>() {
+        return Some(x.code);
+    }
+    if let Some(s) = c.downcast_ref::<S>() {
+        return match s {
+            S::NoSuchRequest(_) => Some(Code::NotFound),
+            S::NotPending(..) | S::Refused(_) | S::EffectChanged(..) | S::EgressGrant(_) => Some(Code::Refused),
+            _ => None,
+        };
+    }
+    match c.downcast_ref::<P>()? {
+        P::Undecided(_) => Some(Code::NeedsApproval),
+        P::NotApproved(_) | P::NotOwned(_) | P::Protected(_) => Some(Code::Refused),
+        P::NotFound(_) => Some(Code::NotFound),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

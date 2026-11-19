@@ -458,33 +458,10 @@ async fn main() {
     }
 }
 
-/// The exit code for `e` (#574; docs/reference/cli.md lists them): the innermost error in its
-/// chain that says one (what a command tagged, or the store's and placement's own errors), else a
-/// code added as `e`'s context (a refusal over a cause that says none), else 1.
+/// The exit code for `e` (#574; docs/reference/cli.md lists them): [`wicket_home::exit::code_of`],
+/// the one classifier, else 1.
 fn exit_code(e: &anyhow::Error) -> i32 {
-    use wicket_home::exit::{Code, Exit};
-    use wicket_placement::PlacementError as P;
-    use wicket_store::StoreError as S;
-    let says = |c: &(dyn std::error::Error + 'static)| -> Option<Code> {
-        if let Some(x) = c.downcast_ref::<Exit>() {
-            return Some(x.code);
-        }
-        if let Some(s) = c.downcast_ref::<S>() {
-            return match s {
-                S::NoSuchRequest(_) => Some(Code::NotFound),
-                S::NotPending(..) | S::Refused(_) | S::EffectChanged(..) | S::EgressGrant(_) => Some(Code::Refused),
-                _ => None,
-            };
-        }
-        match c.downcast_ref::<P>()? {
-            P::Undecided(_) => Some(Code::NeedsApproval),
-            P::NotApproved(_) | P::NotOwned(_) | P::Protected(_) => Some(Code::Refused),
-            P::NotFound(_) => Some(Code::NotFound),
-            _ => None,
-        }
-    };
-    let code = e.chain().filter_map(says).last().or_else(|| e.downcast_ref::<Exit>().map(|x| x.code));
-    code.unwrap_or(Code::Failed) as i32
+    wicket_home::exit::code_of(e).unwrap_or(wicket_home::exit::Code::Failed) as i32
 }
 
 async fn run() -> Result<()> {
@@ -562,6 +539,7 @@ mod tests {
         assert_eq!(code(exit::refused("x")), 3);
         assert_eq!(code(exit::not_found("x")), 4);
         assert_eq!(code(exit::needs_approval("x")), 5);
+        assert_eq!(code(exit::Exit { code: exit::Code::TryAgain, msg: "moving".into() }.into()), 75);
         assert_eq!(code(wicket_store::StoreError::NoSuchRequest("r-1".into()).into()), 4);
         assert_eq!(code(anyhow::Error::from(wicket_store::StoreError::NotPending("r-1".into(), "denied".into())).context("deciding")), 3);
         assert_eq!(code(wicket_store::StoreError::Refused("x".into()).into()), 3);

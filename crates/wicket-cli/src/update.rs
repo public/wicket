@@ -825,7 +825,7 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         None => vec![],
     };
     if o.only_nodes && nodes.is_empty() {
-        bail!("--only-nodes needs --nodes");
+        return Err(wicket_home::exit::usage("--only-nodes needs --nodes"));
     }
     let v = Versions::control();
     let stage = crate::data_dir().join(format!("self-stage-{}", std::process::id()));
@@ -987,7 +987,8 @@ async fn node_switch_together(
     bytes: Option<(&[u8], &str)>,
     why: &str,
 ) -> Result<Option<String>> {
-    let row = ledger.lock().expect("ledger").node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    let row =
+        ledger.lock().expect("ledger").node(name)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {name} is not enrolled")))?;
     let node = crate::enrol::resolve_installed(&row.name, None)?;
     let prev = match bytes {
         Some((b, sha)) => {
@@ -1372,7 +1373,8 @@ pub async fn prune(nodes: Option<String>, only_nodes: bool, keep: usize, dry_run
         }
     }
     for n in &nodes {
-        let row = ledger.lock().expect("ledger").node(n)?.with_context(|| format!("node {n} is not enrolled"))?;
+        let row =
+            ledger.lock().expect("ledger").node(n)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {n} is not enrolled")))?;
         let node = crate::enrol::resolve_installed(&row.name, None)?;
         let out = node.script("pruning versions", &format!("set -u\n{NODE_ROOT}\nD=docker\n{}", prune_sh(dry_run))).await?;
         report(&format!("node:{n}"), &out, vec![]);
@@ -1684,7 +1686,8 @@ async fn wait_node(ledger: &Arc<Mutex<Ledger>>, name: &str, sha: &str) -> std::r
 
 /// Updates one node to `green`, gated; on failure, switches it back and fails.
 async fn node_update(ledger: &Arc<Mutex<Ledger>>, v: &Versions, name: &str, green: &str, g: &Gate, canary: bool) -> Result<()> {
-    let row = ledger.lock().expect("ledger").node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    let row =
+        ledger.lock().expect("ledger").node(name)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {name} is not enrolled")))?;
     let node = crate::enrol::resolve_installed(&row.name, None)?;
     let bin = v.binary(green);
     let sha = v.manifest(green)?.describe.build;
@@ -1786,7 +1789,8 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
         }
     }
     for n in nodes.iter().filter(|_| !jumped) {
-        let row = ledger.lock().expect("ledger").node(n)?.with_context(|| format!("node {n} is not enrolled"))?;
+        let row =
+            ledger.lock().expect("ledger").node(n)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {n} is not enrolled")))?;
         let node = crate::enrol::resolve_installed(&row.name, None)?;
         let cur = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/current\" 2>/dev/null || true")).await?;
         let to = node_rollback(&ledger, &node, n).await?;
@@ -1853,7 +1857,7 @@ pub fn status() -> Result<()> {
 pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Result<()> {
     use sha2::Digest;
     let ledger = Ledger::open(&crate::ledger_path())?;
-    let row = ledger.node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    let row = ledger.node(name)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {name} is not enrolled")))?;
     if row.status != "active" {
         bail!("node {name} is {}", row.status);
     }

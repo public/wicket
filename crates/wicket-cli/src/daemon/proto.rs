@@ -322,10 +322,27 @@ pub fn group_id(name: &str) -> Option<u32> {
     (r == 0 && !out.is_null()).then_some(gr.gr_gid)
 }
 
-/// What an `ERROR` frame's text starts with when the daemon refuses the command for its policy (the
-/// caller exits 3, #574); without it, the command failed otherwise (1). A client before it shows
-/// the text as it is.
-pub const REFUSED: &str = "refused: ";
+/// An `ERROR` frame's text starts with the caller's exit code in words (#574): `usage: ` (2),
+/// `refused: ` (3, the daemon's policy) or `try again: ` (75, the daemon is moving to a new build);
+/// with none, the command failed otherwise (1). A client before it shows the text as it is.
+const MARKS: [(wicket_home::exit::Code, &str); 3] = [
+    (wicket_home::exit::Code::Usage, "usage: "),
+    (wicket_home::exit::Code::Refused, "refused: "),
+    (wicket_home::exit::Code::TryAgain, "try again: "),
+];
+
+/// `why`, marked with `code` for the caller.
+pub fn marked(code: wicket_home::exit::Code, why: &str) -> String {
+    match MARKS.iter().find(|(c, _)| *c == code) {
+        Some((_, m)) => format!("{m}{why}"),
+        None => why.to_string(),
+    }
+}
+
+/// The code an `ERROR` frame's text is marked with (`Failed` if none).
+pub fn mark_of(text: &str) -> wicket_home::exit::Code {
+    MARKS.iter().find(|(_, m)| text.starts_with(m)).map(|(c, _)| *c).unwrap_or(wicket_home::exit::Code::Failed)
+}
 
 #[cfg(test)]
 mod tests {
