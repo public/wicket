@@ -46,6 +46,7 @@ mod receipts;
 mod scale;
 pub use changes::{ChangeWatch, Topic};
 mod standing;
+mod triggers;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
@@ -53,6 +54,7 @@ pub use standing::{
     new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
     Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
 };
+pub use triggers::{Firing as TriggerFiring, Trigger, TriggerEvent, FIRING_STATES as TRIGGER_FIRING_STATES};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
@@ -172,6 +174,8 @@ pub enum StoreError {
 /// Version 25 (expand, after #579 step 2's 24) adds `services`, `service_wants` and
 /// `service_instances` (#579 step 3): the per-node services installed, which runs use them on which
 /// node, and the instances kept for them. Older builds don't read them; the floor stays 17.
+/// Version 26 (expand, after 25) adds triggers (#578): `triggers`, `trigger_events`,
+/// `trigger_firings` and `work_claims`. Older builds don't read them; the floor stays 17.
 /// Version 27 (expand, after #579 step 3's 25 and 26) adds `ledger_changes` and its triggers (#582
 /// step 2): a counter per topic (grants, asks, revocations, node CAs) that every write to its tables
 /// moves, so a supervisor reads its rows only when they changed. Older builds don't read it, and its
@@ -580,6 +584,7 @@ impl Ledger {
         conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
+        conn.execute_batch(triggers::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
@@ -633,6 +638,7 @@ impl Ledger {
         conn.execute_batch(standing::SCHEMA)?;
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
+        conn.execute_batch(triggers::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
