@@ -939,6 +939,13 @@ struct NodeRouter {
     clock: Clock,
 }
 
+impl NodeRouter {
+    /// The node's router as its CA is now.
+    fn of(node: &Node) -> NodeRouter {
+        NodeRouter { ca: node.ca(), clock: node.clock.clone() }
+    }
+}
+
 impl Router for NodeRouter {
     fn route(&self, host: &str) -> Route {
         let now = (self.clock)() / 1000;
@@ -1712,7 +1719,7 @@ fn child_start(
         output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
         output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
         swaps: vec![],
-        edge: Some(Box::new(chan::EdgeStart { who, spawn: None, push: None })),
+        edge: Some(Box::new(chan::EdgeStart { who, spawn: None, push: None, ca_widen: None })),
         image_pin: plan.image_pin.clone(),
         timings: parent.timings,
         memory_advice: m.zone.limits.memory_advice().map(str::to_string),
@@ -3216,8 +3223,12 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
 
         let mut rec = fake_record("run_a");
         rec.started_ms = 1000;
-        rec.start.edge =
-            Some(Box::new(chan::EdgeStart { who: serde_json::json!({ "agent": "coder", "id": "x" }), spawn: None, push: None }));
+        rec.start.edge = Some(Box::new(chan::EdgeStart {
+            who: serde_json::json!({ "agent": "coder", "id": "x" }),
+            spawn: None,
+            push: None,
+            ca_widen: None,
+        }));
         node.boxes.lock().unwrap().insert(
             "run_a".into(),
             BoxState {
@@ -3673,6 +3684,64 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         fed_boxes(node, inst, &[(run, zone)]);
     }
 
+    /// A node CA covering `hosts` (and the names under them), as an enrolled node's covers its
+    /// zones'.
+    fn cover(inst: &Install, hosts: &[&str]) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
+        let root = wicket_proxy::ca::InstallationCa::generate().unwrap();
+        let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+        let cert = root.issue_node_ca(&csr, "n1", &hosts, time::Duration::hours(1)).unwrap();
+        std::fs::write(inst.dir.join("ca.pem"), &cert.pem).unwrap();
+        std::fs::write(inst.dir.join("ca.key"), key.serialize_pem()).unwrap();
+    }
+
+    /// An approval of an https host this node's CA doesn't cover could never be used here: the
+    /// node passes such a host through uncovered only where the zone allows it wholesale, whatever
+    /// is granted (#257). So the node's request_access refuses to ask, saying why and what an
+    /// operator can do. Plain http needs no CA; a host the zone allows wholesale is spliced.
+    #[tokio::test]
+    async fn the_nodes_request_access_asks_for_nothing_it_could_not_serve() {
+        const RUN: &str = "run_uuuuuuuuuuuuuuuuuuuuuuuuuu";
+        let inst = Install::new("nodesrv-uncovered");
+        let node = test_node(&inst);
+        let whole = "{ host: whole.test, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE], paths: ['/**'] }";
+        fed_box(&node, &inst, RUN, &format!("name: z\nreach: [{whole}]\n"));
+        cover(&inst, &["covered.test"]);
+        let ask = |url: &str, scope: &str| {
+            let (node, args) = (node.clone(), serde_json::json!({ "url": url, "reason": "a release", "scope": scope }));
+            async move { gw::tool(&node, RUN, "request_access", &args).await.expect("decided on the node") }
+        };
+        let (t, err) = ask("https://storage.example/gvisor/releases/release/", "prefix").await;
+        assert!(!err && t.starts_with("not requested: storage.example isn't served by this box's node, n1"), "{t}");
+        assert!(t.contains("name constraints") && t.contains("No approval can change that"), "{t}");
+        assert!(t.contains("wicket node set n1 --ca-hosts auto"), "{t}");
+        assert!(t.contains("wicket node renew-ca n1 --hosts storage.example"), "{t}");
+        assert!(node.queue.of(RUN).is_empty(), "nothing asked");
+        // #573: under a policy that lets the CA be widened to the host, it is asked for (the grant
+        // widens the CA); a list that leaves it out refuses as `fixed` does.
+        let set_policy = |p: wicket_store::CaHosts| {
+            node.boxes.lock().unwrap().get_mut(RUN).unwrap().record.start.edge.as_mut().unwrap().ca_widen = Some(p);
+        };
+        set_policy(wicket_store::CaHosts::Allowed(vec!["*.example.org".into()]));
+        let (t, _) = ask("https://storage.example/x", "exact").await;
+        assert!(t.starts_with("not requested: storage.example"), "outside the list: {t}");
+        set_policy(wicket_store::CaHosts::Allowed(vec!["storage.example".into()]));
+        let (t, _) = ask("https://storage.example/w", "exact").await;
+        assert!(t.starts_with("queued: q-"), "within the list: {t}");
+        set_policy(wicket_store::CaHosts::Auto);
+        let (t, _) = ask("https://storage.example/y", "exact").await;
+        assert!(t.starts_with("queued: q-"), "auto: {t}");
+        set_policy(wicket_store::CaHosts::Fixed);
+        let (t, _) = ask("https://covered.test/x", "exact").await;
+        assert!(t.starts_with("queued: q-"), "a covered host is asked for: {t}");
+        let (t, _) = ask("http://storage.example/x", "exact").await;
+        assert!(t.starts_with("queued: q-"), "plain http needs no CA: {t}");
+        let (t, _) = ask("https://whole.test/x", "exact").await;
+        assert!(t.contains("already allowed"), "uncovered, but spliced: {t}");
+        assert_eq!(node.queue.of(RUN).len(), 4, "two under the widening policies, two here");
+    }
+
     /// [`fed_box`] for several boxes on this node.
     fn fed_boxes(node: &Arc<Node>, inst: &Install, boxes: &[(&str, &str)]) {
         use wicket_feed::{Change, Issuer, KeyCert, Publisher, PublisherConfig};
@@ -3713,6 +3782,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             who: serde_json::json!({ "id": format!("spiffe://wicket.test/t/t0/z/{}/a/{run}", z.name), "run": run, "zone": z.name }),
             spawn: None,
             push: None,
+            ca_widen: None,
         }));
         let st = BoxState {
             streams: [1, 2, 3],
@@ -3811,6 +3881,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         const RUN: &str = "run_pppppppppppppppppppppppppp";
         const QUIET: &str = "run_qqqqqqqqqqqqqqqqqqqqqqqqqq";
         let inst = Install::new("nodesrv-push-ask");
+        cover(&inst, &["github.com", "api.example.com"]);
         let node = test_node(&inst);
         fed_boxes(
             &node,
@@ -3853,6 +3924,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
     async fn the_node_decides_gateway_tools_and_queues_what_needs_a_human() {
         const RUN: &str = "run_eeeeeeeeeeeeeeeeeeeeeeeeee";
         let inst = Install::new("nodesrv-edge");
+        cover(&inst, &["api.example"]);
         let node = test_node(&inst);
         fed_box(
             &node,
