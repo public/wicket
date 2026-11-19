@@ -34,10 +34,10 @@ not a permanent decision.
   still holds, and the reflection is audited as an anomaly (`secret.reflected`). A response header
   that holds one is dropped. wicket asks such a host for an unencoded body and refuses a compressed
   one (502), because it can't scan it ([#381](https://github.com/public/wicket/pull/381)). Other
-  forms reach the box unmasked: percent-encoded or JSON-escaped (where that changes it), split by other bytes, part of the
-  credential, or anything an upstream computes from it. So does a credential shorter than 8 bytes.
-  Responses from hosts wicket attached nothing to aren't scanned, because they carry no credential
-  of wicket's to reflect.
+  forms reach the box unmasked: percent-encoded or JSON-escaped (where that changes it), split by
+  other bytes, part of the credential, or anything an upstream computes from it. So does a
+  credential shorter than 8 bytes. Responses from hosts wicket attached nothing to aren't scanned,
+  because they carry no credential of wicket's to reflect.
 - **A host allowed wholesale is spliced through, not inspected.** If a reach rule allows a host for
   every method and path, the proxy decides on the hostname and relays the TLS unmodified. This needs
   nothing injected, nothing forbidden, and not the model host. Such a host gets one audit row per
