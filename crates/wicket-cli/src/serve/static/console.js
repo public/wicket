@@ -142,6 +142,8 @@ async function signed(body, after, extra) {
   let begin;
   try { begin = await post("/api/action/begin", body); }
   catch (e) { toastError(e); closeConfirm(); return; }
+  // An error that stays sits above the sheet (#597): it goes when the sheet opens.
+  document.getElementById("msg").hidden = true;
   const go = document.getElementById("confirm-go");
   document.getElementById("confirm-what").textContent = describe(begin.action);
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
@@ -277,7 +279,9 @@ function pendingCard(s, p) {
   const hour = el("button", "", p.scope_prefix ? "Approve prefix for 1 hour (any number of uses)" : "Approve for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
   const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
   if (!idOk) { once.disabled = true; hour.disabled = true; }
-  if (p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
+  // A push to a host that isn't github.com can be R2, but it is still granted as the window: no
+  // hour button, which would promise what the grant doesn't give (#597 re-review).
+  if (window_ || p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
     b.append(once, deny);
     c.append(el("div", "meta", window_ ? "A push is approved as one window: any number of uses for " + span(ot.ttl_secs) + ", for its ref discovery and upload." : "R3 and R4 are approved one use at a time."));
   } else b.append(once, hour, deny);

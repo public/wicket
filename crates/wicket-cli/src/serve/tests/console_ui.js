@@ -226,6 +226,16 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   const pc = run("(r => pendingCard({ now: 2 }, r))")(pushReq);
   const pt = pc.textContent;
   assert.ok(pt.includes("Approve this push (any number of uses for 5 min)") && pt.includes("approved as one window") && !pt.includes("one use at a time"), pt);
+  // A push to another host is R2, but granted as the same window: no hour button (#597 re-review).
+  const r2 = run("(r => pendingCard({ now: 2 }, r))")({ ...pushReq, id: "q-push2", risk: "R2WriteReversible", host: "git.example" }).textContent;
+  assert.ok(r2.includes("Approve this push (any number of uses for 5 min)") && !r2.includes("1 hour"), r2);
+  // An error that stays is gone once a sheet opens: it would sit above it.
+  run("toastError({ name: 'Error', message: 'earlier' })");
+  assert.strictEqual(ids.msg.hidden, false);
+  await advance(1000);
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  assert.strictEqual(ids.msg.hidden, true, "the error toast goes when the sheet opens");
+  ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
