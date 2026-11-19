@@ -14,6 +14,7 @@ reference](manifest.md)).
 - [`wicket hibernate`](#wicket-hibernate)
 - [`wicket top`](#wicket-top)
 - [`wicket agents`](#wicket-agents)
+- [`wicket why-here`](#wicket-why-here)
 - [`wicket wrap`](#wicket-wrap)
 - [`wicket pending`](#wicket-pending)
 - [`wicket approve`](#wicket-approve)
@@ -125,6 +126,7 @@ Commands:
   hibernate  Hibernate a long-lived agent at its next quiet point
   top        A live view of nodes, runs, pending requests and leases (read-only)
   agents     Long-lived agents: state, generation, current run and bundle size
+  why-here   Why a run's box went on the node it did, or why it went nowhere (#579): what it asked for, the nodes it may go on in order, and every reason each other node was out
   wrap       Run an agent command line that another program launches, inside a wicket box
   pending    List pending requests: what boxes asked for, waiting for a decision
   approve    Approve a pending request. The grant is never wider than the request
@@ -251,6 +253,21 @@ Options:
 Long-lived agents: state, generation, current run and bundle size
 
 Usage: wicket agents [OPTIONS]
+
+Options:
+      --json  
+  -h, --help  Print help
+```
+
+## `wicket why-here`
+
+```text
+Why a run's box went on the node it did, or why it went nowhere (#579): what it asked for, the nodes it may go on in order, and every reason each other node was out
+
+Usage: wicket why-here [OPTIONS] <RUN>
+
+Arguments:
+  <RUN>  
 
 Options:
       --json  
