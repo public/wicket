@@ -291,6 +291,19 @@ fn without_the_grace_the_reconciler_destroys_a_node_just_placed() {
     placement_without("grace", 4, o, "before its lease ends");
 }
 
+/// #494, #495 (the nightly run): a run started on a placed node shortly before its lease ended,
+/// and its box held the node past it (#294). The node billed hours past its worst case, nothing
+/// reserved them, and the next `node create`'s spend check passed on what was reserved: owned nodes
+/// were committed past the money limit's total. Without the held node's billing reserved, both
+/// seeds still break it (with it, `placement_seed_32200164_…` and `…_32200188_…`).
+#[test]
+fn without_the_held_reservation_a_held_node_breaks_the_money_limit() {
+    for seed in [32_200_164, 32_200_188] {
+        let o = wicket_sim::placement::Options { reserve_held: false, ..Default::default() };
+        placement_without(&format!("held-{seed}"), seed, o, "over the money limit's");
+    }
+}
+
 /// The known loss the messages scenario found (#324, see `wicket_sim::messages::run`): a relayed
 /// `await_message` answer lost with the node's channel after the control host recorded the message
 /// read. Seed 13 still loses one; when this fails, the loss is fixed: make `strict_relay` the
@@ -354,6 +367,19 @@ fn placement_seed_32000129_starts_no_box_past_a_lease() {
 #[test]
 fn placement_seed_32000134_releases_a_node_whose_work_was_collected() {
     nightly_placement_seed(32_000_134);
+}
+
+/// #494: a node held past its lease billed an hour nothing reserved, and the next create's spend
+/// check passed: with the hold's billing reserved, that create is refused.
+#[test]
+fn placement_seed_32200164_counts_a_held_nodes_billing() {
+    nightly_placement_seed(32_200_164);
+}
+
+/// #495: the same, with four nodes and partitions.
+#[test]
+fn placement_seed_32200188_counts_a_held_nodes_billing() {
+    nightly_placement_seed(32_200_188);
 }
 
 /// #398: the start race on a partitioned node.

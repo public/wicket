@@ -19,6 +19,16 @@ pub enum BillingModel {
     PerSecond { rate_per_hour: MicroUsd, min_secs: u64 },
 }
 
+/// What to keep reserved for a node held past its lease (#494, #495), created at `created` and
+/// costing `hourly`, seen at `now`: every hour it has started, and the next one, each at its hourly
+/// rate, rounded up to the cent. Per started hour that is what it will have billed before the next
+/// hour after this one starts; any billing at an hourly rate bills no more. The next hour is there
+/// so a reconciler that is down for a while (a restart) doesn't leave the hour it misses unreserved.
+pub fn held_reservation(hourly: MicroUsd, created: Timestamp, now: Timestamp) -> MicroUsd {
+    let hours = BillingModel::started_hours(now - created) + 1;
+    hourly.times(hours.min(VULTR_MONTHLY_CAP_HOURS)).ceil_to_cent()
+}
+
 impl BillingModel {
     pub fn vultr(rate: MicroUsd) -> BillingModel {
         BillingModel::PerStartedHour { rate, monthly_cap_hours: VULTR_MONTHLY_CAP_HOURS }
@@ -161,6 +171,24 @@ mod tests {
         // The monthly cap: a month-long node bills 672 hours, not 744.
         assert_eq!(m.billed(31 * 24 * HOUR), MicroUsd(59_500 * 672).ceil_to_cent());
         assert_eq!(BillingModel::Free.billed(10 * HOUR), MicroUsd::ZERO);
+    }
+
+    /// #494, #495: a held node keeps reserved every hour it started and the next, so it never bills
+    /// past what is reserved before the next pass, and covers what it has billed so far.
+    #[test]
+    fn a_held_node_reserves_its_started_hours_and_the_next() {
+        let rate = MicroUsd(14_000);
+        // Seed 32200164's p0, held at 3014 s: its second hour isn't started yet, but is reserved.
+        assert_eq!(held_reservation(rate, 1_617, 4_631), MicroUsd::from_cents(3));
+        // At an hour boundary the next hour has started: that and one more.
+        assert_eq!(held_reservation(rate, 0, HOUR), MicroUsd(14_000 * 3).ceil_to_cent());
+        for now in [0, 1, 3_599, 3_600, 3_601, 7_199, 7_200, 50_000] {
+            let held = held_reservation(rate, 0, now);
+            assert!(held >= vultr(140).billed(now), "covers what it billed at {now}");
+            assert!(held >= vultr(140).billed(now + HOUR - 1), "and up to the next hour's start, at {now}");
+        }
+        // Clock skew (now before created) is the first hour, not less.
+        assert_eq!(held_reservation(rate, 100, 0), MicroUsd::from_cents(3));
     }
 
     #[test]

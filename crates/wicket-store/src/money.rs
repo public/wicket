@@ -188,6 +188,20 @@ impl Ledger {
         )?)
     }
 
+    /// Raises what `key`'s live reservation holds to at least `reserved` micro-USD: the reconciler,
+    /// for a node held past its lease (#494, #495), which bills hours its worst case didn't reserve.
+    /// No check against the limit: that money is spent whatever this says, and recording it is what
+    /// makes the next reservation see it (and be refused if it no longer fits). The number of grants
+    /// changed (0 when nothing live is reserved under `key`, or it holds as much already).
+    pub fn raise_money(&self, key: &str, reserved: i64) -> Result<usize> {
+        let [_, rp] = lease_quota_paths(key);
+        Ok(self.conn.execute(
+            "UPDATE grants SET amount = ?4 WHERE method = ?1 AND host = ?2 AND path = ?3 AND amount IS NOT NULL
+               AND amount < ?4 AND revoked = 0 AND expires_at > ?5",
+            params![QUOTA_METHOD, QUOTA_HOST, rp, reserved, now()],
+        )?)
+    }
+
     /// `tenant`'s live money limit grant, if one is recorded.
     pub fn money_limit(&self, tenant: &str) -> Result<Option<LeaseBudget>> {
         limit(&self.conn, tenant)
@@ -235,6 +249,26 @@ mod tests {
         // Reserving again for a key that holds one keeps it (an acquire retried).
         l.reserve_money("t", &node_money_key("n2"), 500_000, 5_000_000, 3600, TODAY, NODE_MONEY_BY).unwrap().unwrap();
         assert_eq!(l.money_reserved("t").unwrap(), (500_000, 5_000_000));
+    }
+
+    /// #494, #495: a node held past its lease bills more than its worst case; raising its
+    /// reservation records that without a check, and the next reservation is refused if it no longer
+    /// fits. A raise never lowers, and touches nothing that isn't live.
+    #[test]
+    fn a_raised_reservation_counts_against_the_next() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let (p0, p1) = (node_money_key("p0"), node_money_key("p1"));
+        l.reserve_money("t", &p0, 14_000, 20_000, 3600, TODAY, NODE_MONEY_BY).unwrap().unwrap();
+        // Past the limit's total: recorded anyway (the money is spent).
+        assert_eq!(l.raise_money(&p0, 25_000_000).unwrap(), 1);
+        assert_eq!(l.money_reserved("t").unwrap(), (14_000, 25_000_000));
+        assert!(matches!(l.reserve_money("t", &p1, 14_000, 20_000, 3600, TODAY, NODE_MONEY_BY).unwrap(), Err(BudgetRefusal::Total { .. })));
+        // Never lowered; nothing to raise once released.
+        assert_eq!(l.raise_money(&p0, 30_000).unwrap(), 0);
+        assert_eq!(l.money_reserved("t").unwrap().1, 25_000_000);
+        l.release_money(&p0).unwrap();
+        assert_eq!(l.raise_money(&p0, 26_000_000).unwrap(), 0);
+        assert_eq!(l.money_reserved("t").unwrap(), (0, 0));
     }
 
     /// Changed limits replace the grant; the same ones renew it.
