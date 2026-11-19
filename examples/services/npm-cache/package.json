@@ -1,0 +1,6 @@
+{
+  "name": "wicket-npm-cache",
+  "private": true,
+  "description": "Verdaccio for the npm-cache example, pinned with its lockfile",
+  "dependencies": { "verdaccio": "6.1.6" }
+}
