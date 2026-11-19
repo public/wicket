@@ -35,8 +35,9 @@ The rules of [one decision path](one-decision-path.md), applied to names:
 ### Internal names
 
 An internal name is `<label>.<zone>.wicket.internal`: a label the box chose, under its zone's name
-in DNS form (lower case, `_` as `-`; `wicket_names::zone_part`), the one form a name is registered,
-looked up and linked under.
+as it is, so only a zone whose name is already in DNS form holds names (`wicket_names::zone_part`;
+#668: `Build` and `build`, or `web_api` and `web-api`, are different zones to `accept_from`, so no
+zone name is mapped onto another's form).
 Links today give `<name>.wicket.internal` (one label), so the two-label form can't collide with them.
 Internal names are per tenant: a box never resolves another tenant's.
 

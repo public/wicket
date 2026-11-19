@@ -73,17 +73,26 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
     };
     // This run's name already, if it asks again (to change the port).
     let before = l.internal_name(&ctx.tenant, &zone, label).map_err(|e| e.to_string())?.filter(|n| n.holder.as_deref() == Some(&ctx.run.0));
+    // What the box itself exposed on this port, if anything: an undo puts it back (#668).
+    let exposed_before = l.exposed(&ctx.run.0, port).map_err(|e| e.to_string())?;
     let n = l.register_internal(&ask, INTERNAL_PER_WORKLOAD, 0).map_err(|e| e.to_string())?;
     let fqdn = format!("{label}.{zone}.{}", policy::DOMAIN);
-    // On a failure below: a new name goes; a name asked again keeps its old port, still exposed.
-    let undo = |l: &wicket_store::Ledger| match &before {
-        None => {
-            let _ = l.revoke_name(&n.id, "wicket");
-            let _ = l.unexpose(&ctx.run.0, port);
+    // On a failure below: a new name goes; a name asked again keeps its old port; and the port's
+    // exposure is as it was before this call, the box's own included.
+    let undo = |l: &wicket_store::Ledger| {
+        match &before {
+            None => {
+                let _ = l.revoke_name(&n.id, "wicket");
+            }
+            Some(old) => {
+                let _ = l.register_internal(&NameAsk { port: old.port, ..ask.clone() }, INTERNAL_PER_WORKLOAD, 0);
+            }
         }
-        Some(old) => {
-            let _ = l.register_internal(&NameAsk { port: old.port, ..ask.clone() }, INTERNAL_PER_WORKLOAD, 0);
-            if old.port != port {
+        match &exposed_before {
+            Some(e) => {
+                let _ = l.expose(&ctx.tenant, &ctx.run.0, port, e.name.as_deref(), &e.zone);
+            }
+            None => {
                 let _ = l.unexpose(&ctx.run.0, port);
             }
         }
@@ -100,9 +109,12 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
         undo(&l);
         return Err(format!("the audit record could not be written ({e})"));
     }
-    // The port it named before is no longer offered under the name.
+    // The port it named before is no longer offered under the name (left alone if the box has
+    // exposed it under another name since).
     if let Some(old) = before.as_ref().filter(|b| b.port != port) {
-        let _ = l.unexpose(&ctx.run.0, old.port);
+        if l.exposed(&ctx.run.0, old.port).ok().flatten().is_some_and(|e| e.name.as_deref() == Some(label)) {
+            let _ = l.unexpose(&ctx.run.0, old.port);
+        }
     }
     drop(l);
     ctx.emit(wicket_proxy::Event::Tool { name: "request_name".into(), detail: format!("registered {fqdn} for port {port}") });
