@@ -440,6 +440,27 @@ impl ZoneSpec {
         Ok(())
     }
 
+    /// Whether every reach and forbid path glob compiles and starts with `/`, as every canonical
+    /// path a request carries does (`canon::canonical_path`) and as a standing rule's must
+    /// (`ReachRule::check`). Subset admission (`subset::path_covered`, the Lean spec's `pathCovered`)
+    /// is sound for canonical paths only: a parent's `/**` admits a child's `tena/repos/**`, which
+    /// matches the non-canonical `tena/repos/a` that `/**` doesn't. Checked when a manifest loads,
+    /// not when a zone compiles: the Lean oracle compiles relative globs on purpose. `/**/x`
+    /// replaces `**/x`.
+    pub fn check_paths(&self) -> Result<(), ManifestError> {
+        let rules =
+            self.reach.iter().map(|r| ("reach", &r.host, &r.paths)).chain(self.forbid.iter().map(|f| ("forbid", &f.host, &f.paths)));
+        for (kind, host, paths) in rules {
+            for p in paths {
+                if !p.starts_with('/') {
+                    return Err(ManifestError::Invalid(format!("zone.{kind}: rule for {host}: path {p:?} must start with /")));
+                }
+                compile_glob(p)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The wildcard reach rule `host` is reached through, if no exact reach rule names it: the
     /// first wildcard pattern that matches. None for a host named exactly, or not reached at all.
     pub fn wildcard_for(&self, host: &str) -> Option<&str> {
@@ -889,6 +910,7 @@ impl Manifest {
         self.zone.limits.authority()?;
         self.zone.limits.exit_grace()?;
         self.zone.check_wildcards()?;
+        self.zone.check_paths()?;
         self.placement.check().map_err(ManifestError::Invalid)?;
         for u in &self.zone.uses {
             crate::service::check_name(u).map_err(|e| ManifestError::Invalid(format!("zone.uses: {e}")))?;
@@ -1009,16 +1031,10 @@ impl Manifest {
             if r.host.is_empty() || r.host.contains('/') {
                 return Err(ManifestError::Invalid(format!("bad reach host {:?}", r.host)));
             }
-            for p in &r.paths {
-                compile_glob(p)?;
-            }
         }
         for f in &self.zone.forbid {
             if f.host.is_empty() || f.host.contains('/') {
                 return Err(ManifestError::Invalid(format!("bad forbid host {:?}", f.host)));
-            }
-            for p in &f.paths {
-                compile_glob(p)?;
             }
         }
         for i in &self.zone.inject {
@@ -1438,6 +1454,21 @@ mod tests {
         for bad in ["memory: \"0\"", "memory: 0g", "memory: lots", "cpus: 0", "cpus: -1", "cpus: .nan", "pids: 0", "timeout: 0s"] {
             assert!(with(bad).is_err(), "{bad} was accepted");
         }
+    }
+
+    /// Reach and forbid path globs start with `/` when a manifest loads, as a standing rule's do
+    /// (`ReachRule::check`): a parent's `/**` admits any child glob as a subset, and the child's
+    /// `tena/repos/**` matches what `/**` doesn't (fuzz finding `regressions/manifest/relative-child-glob`).
+    /// `**/merge` is refused too: `/**/merge` says the same.
+    #[test]
+    fn a_relative_path_glob_is_refused() {
+        let with = |z: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, {z} }}\n"));
+        let e = with("reach: [{ host: api.github.com, paths: ['tena/repos/**'] }]").unwrap_err().to_string();
+        assert!(e.contains("\"tena/repos/**\" must start with /"), "{e}");
+        let e = with("forbid: [{ host: api.github.com, paths: ['**'] }]").unwrap_err().to_string();
+        assert!(e.contains("zone.forbid") && e.contains("must start with /"), "{e}");
+        assert!(with("forbid: [{ host: api.github.com, paths: ['**/merge'] }]").is_err());
+        assert!(with("forbid: [{ host: api.github.com, paths: ['/**/merge'] }]").is_ok());
     }
 
     /// #20: a zone may forbid wildcard reach rules; one that does and has one is refused, at load

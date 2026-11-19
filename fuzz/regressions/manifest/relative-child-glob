@@ -1,0 +1,16 @@
+task: t
+agent: { name: a }
+zone:
+  name: p
+  llm: {}
+  reach:
+    - { host: api.github.com, methods: [GET, Pe/*/hooks"] }
+
+---8<---
+task: t
+agent: { name: a }
+zone:
+  name: c
+  llm: {}
+  reach:
+    - { host: api.github.com, methods: [GET], paths: ["tena/repos/**"] }
