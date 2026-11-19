@@ -75,7 +75,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             }
             session::open(session::Opts { run, text, wait: !no_wait, timeout }).await
         }
-        Cmd::Hibernate { run, wait } => hibernate::hibernate(&run, wait.as_secs()).await,
+        // Whole seconds, rounded up: a wait under a second is still a wait.
+        Cmd::Hibernate { run, wait } => hibernate::hibernate(&run, wait.as_millis().div_ceil(1000) as u64).await,
         Cmd::Wake { agent, text, by, wait } => {
             let text = text.join(" ");
             let wait = wicket_core::time::parse_duration(&wait).context("bad --wait")?;

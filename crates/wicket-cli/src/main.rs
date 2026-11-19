@@ -597,7 +597,24 @@ mod tests {
         ] {
             let (a, b) = (crate::Cli::try_parse_from(old).unwrap().cmd, crate::Cli::try_parse_from(new).unwrap().cmd);
             assert_eq!(crate::daemon::policy::route(&a), crate::daemon::policy::route(&b), "{old:?}");
+            assert_eq!(fields(a), fields(b), "{old:?}");
         }
+        // What each parsed to, field by field.
+        fn fields(c: crate::Cmd) -> String {
+            use crate::{Cmd, SecretCmd, StandingCmd};
+            match c {
+                Cmd::Secret { cmd: SecretCmd::Rm { name } } => format!("secret remove {name}"),
+                Cmd::Standing { cmd: StandingCmd::Approve { id, bound, lasts, narrow, yes } } => {
+                    format!("standing approve {id} for={bound} ttl={lasts} narrow={narrow} yes={yes}")
+                }
+                Cmd::Standing { cmd: StandingCmd::Renew { id, lasts } } => format!("standing renew {id} ttl={lasts}"),
+                _ => unreachable!("not one of the renamed commands"),
+            }
+        }
+        assert_eq!(
+            fields(crate::Cli::try_parse_from(["wicket", "standing", "renew", "s-1", "--lasts", "5d"]).unwrap().cmd),
+            "standing renew s-1 ttl=5d"
+        );
     }
     /// `wicket run --image` is parsed, and without it nothing is named: no default that would hide
     /// the manifest's agent.image (wicket-control's `run::box_image` applies it).
