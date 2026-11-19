@@ -51,6 +51,10 @@ pub struct NodeHealth {
     /// A boxed slice: `Msg::Health` carries this, and the message enum stays small.
     #[serde(default, skip_serializing_if = "<[_]>::is_empty")]
     pub orphaned: Box<[OrphanedRun]>,
+    /// Its size and use, and the room its admission has for a new box (#579): what placement reads
+    /// from the ledger instead of connecting to the node. None from a node before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<crate::chan::NodeCapacity>,
 }
 
 /// A run's directory on a node with no record of its box (#449), and what it takes on disk.

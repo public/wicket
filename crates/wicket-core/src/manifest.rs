@@ -33,6 +33,9 @@ pub struct Manifest {
     #[serde(default)]
     pub program: Option<ProgramSpec>,
     pub zone: ZoneSpec,
+    /// What the box asks of the node it goes on (#579): labels to match, taints it tolerates.
+    #[serde(default)]
+    pub placement: crate::placement::PlacementSpec,
 }
 
 /// As derived, except that a program's zone always writes its `escalation`: a program's default is
@@ -47,6 +50,8 @@ impl Serialize for Manifest {
             agent: &'a Option<AgentSpec>,
             program: &'a Option<ProgramSpec>,
             zone: ZoneOut<'a>,
+            #[serde(skip_serializing_if = "crate::placement::PlacementSpec::is_default")]
+            placement: &'a crate::placement::PlacementSpec,
         }
         #[derive(Serialize)]
         struct ZoneOut<'a> {
@@ -62,6 +67,7 @@ impl Serialize for Manifest {
             agent: &self.agent,
             program: &self.program,
             zone: ZoneOut { zone: &self.zone, escalation },
+            placement: &self.placement,
         }
         .serialize(s)
     }
@@ -518,7 +524,7 @@ pub enum Persist {
     /// Re-derivable (`node_modules`, `target/`): never bundled, and may be empty on wake.
     Cache,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReachRule {
     /// Exact host, or `*.example.com`.
@@ -870,6 +876,7 @@ impl Manifest {
         self.zone.limits.authority()?;
         self.zone.limits.exit_grace()?;
         self.zone.check_wildcards()?;
+        self.placement.check().map_err(ManifestError::Invalid)?;
         self.zone.llm.as_ref().map_or(Ok(()), LlmSpec::check_models)?;
         // Every image named, by tag or pinned by digest (#192): a pin is strict, never a tag.
         let named = self.zone.images.iter().map(|i| ("zone.images", i.as_str()));

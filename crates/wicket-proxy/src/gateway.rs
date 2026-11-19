@@ -153,13 +153,16 @@ pub fn tools() -> Value {
         },
         {
             "name": "request_access",
-            "description": "Ask for reach you need but don't have (an operator decides, or an agent above you may), before trying or after a 'needs approval' block: one URL, or (scope prefix) every path under a URL's path. Give a one-sentence reason. Returns a request_id: then call await_grant with it. Ask once per need; never probe for other routes.",
+            "description": "Ask for reach you need but don't have (an operator decides, or an agent above you may), before trying or after a 'needs approval' block: one URL, or (scope prefix) every path under a URL's path. Give a one-sentence reason. Returns a request_id: then call await_grant with it. Ask once per need; never probe for other routes. For reach your work needs again and again (CI logs every hour, say), ask once with scope standing: one rule (the URL's host; `methods`, default GET; `paths`, globs, default the URL's directory and everything under it), approved once by an operator for your later runs too, who sees the requests you made for it and may narrow it to them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "e.g. https://news.ycombinator.com/ or https://api.example.org/v2/items" },
                     "method": { "type": "string", "default": "GET" },
-                    "scope": { "type": "string", "enum": ["exact", "prefix"], "default": "exact" },
+                    "scope": { "type": "string", "enum": ["exact", "prefix", "standing"], "default": "exact" },
+                    "methods": { "type": "array", "items": { "type": "string" }, "description": "scope standing: the methods (default GET)" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "scope standing: path globs on the URL's host (* within one segment, ** across), e.g. /repos/o/r/actions/jobs/*/logs" },
+                    "dangerous": { "type": "boolean", "description": "scope standing: also requests rated dangerous (R3 and R4); an operator sees it marked" },
                     "reason": { "type": "string", "description": "what you need it for" }
                 },
                 "required": ["url", "reason"],

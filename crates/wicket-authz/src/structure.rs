@@ -70,7 +70,8 @@ impl Default for Policy {
             max_str_len: 1024,
             max_regex_len: 256,
             max_regexes_per_block: 128,
-            max_grant_rules: 4,
+            // A standing grant (#572) is a rule per method and path glob.
+            max_grant_rules: 16,
             max_grant_facts: 4,
         }
     }
@@ -302,11 +303,15 @@ fn grant_rule(r: &Rule, p: &Policy) -> Result<(), String> {
     }
     let mut names: Vec<&str> = r.body.iter().map(|b| b.name.as_str()).collect();
     names.sort_unstable();
+    // A standing grant (#572) may also read the request's risk, to bound it.
+    let read_risk = names.contains(&"risk");
+    names.retain(|n| *n != "risk");
     let want: &[&str] =
         if path_var.is_some() { &["box", "epoch", "path", "time", "uses_left"] } else { &["box", "epoch", "time", "uses_left"] };
-    if names != want {
-        return Err(format!("a grant rule reads exactly {want:?}, not {names:?}"));
+    if names != want || (read_risk && path_var.is_none()) {
+        return Err(format!("a grant rule reads exactly {want:?} (and a standing grant's risk), not {names:?}"));
     }
+    let mut risk = None;
     let (mut time, mut uses, mut path) = (None, None, None);
     for b in &r.body {
         match (b.name.as_str(), b.terms.as_slice()) {
@@ -315,6 +320,7 @@ fn grant_rule(r: &Rule, p: &Policy) -> Result<(), String> {
             ("epoch", [Term::Integer(_)]) => {}
             ("uses_left", [gid @ Term::Str(_), Term::Variable(v)]) if *gid == r.head.terms[0] => uses = Some(v.as_str()),
             ("path", [Term::Variable(v)]) if Some(v.as_str()) == path_var => path = Some(v.as_str()),
+            ("risk", [Term::Variable(v)]) if risk.is_none() && Some(v.as_str()) != path_var => risk = Some(v.as_str()),
             _ => return Err(format!("grant rule predicate not allowed: {}/{}", b.name, b.terms.len())),
         }
     }
@@ -342,6 +348,22 @@ fn grant_rule(r: &Rule, p: &Policy) -> Result<(), String> {
                 }
                 "prefix"
             }
+            // A standing grant's path glob (#572): a regex Biscuit compiles, within the caps.
+            [Op::Value(Term::Variable(v)), Op::Value(Term::Str(pat)), Op::Binary(Binary::Regex)]
+                if path.is_some() && Some(v.as_str()) == path =>
+            {
+                if pat.len() > p.max_regex_len {
+                    return Err(format!("regex longer than {} bytes", p.max_regex_len));
+                }
+                regex::RegexBuilder::new(pat).size_limit(1 << 16).build().map_err(|e| format!("regex refused: {e}"))?;
+                "matches"
+            }
+            // And its risk bound, a reach rule's.
+            [Op::Value(Term::Variable(v)), Op::Value(Term::Integer(max)), Op::Binary(Binary::LessOrEqual)]
+                if risk.is_some() && Some(v.as_str()) == risk && *max <= crate::MAX_REACH_RISK =>
+            {
+                "risk"
+            }
             _ => return Err(format!("grant rule expression not allowed: {:?}", e.ops)),
         };
         shapes.push(shape);
@@ -349,6 +371,10 @@ fn grant_rule(r: &Rule, p: &Policy) -> Result<(), String> {
     shapes.sort_unstable();
     match path_var {
         None if shapes != ["expiry", "uses"] => return Err("a grant rule bounds exactly its expiry and its uses".into()),
+        Some(_)
+            if (!read_risk && shapes == ["expiry", "matches", "uses"])
+                || (read_risk && shapes == ["expiry", "matches", "risk", "uses"]) => {}
+        Some(_) if read_risk => return Err("a standing grant rule bounds exactly its expiry, its uses, its path glob and its risk".into()),
         Some(_) if shapes != ["expiry", "prefix", "uses"] => {
             return Err("a prefix grant rule bounds exactly its expiry, its uses and its prefix".into())
         }
