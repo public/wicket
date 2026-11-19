@@ -840,6 +840,60 @@ fn whoami(node: &Arc<Node>, run: &str) -> (String, bool) {
 
 /// An agent asking ahead for reach it needs, decided from its token here: already allowed or never
 /// allowed are answered at once; anything else is put to a human (queued while unreachable).
+/// `request_access` with `scope: "standing"` (#572): one reach rule for the agent's workload, asked
+/// for once and approved once for its later runs. The rule is `methods` (default GET) on the url's
+/// host, at `paths` (default: the url's directory and everything under it), `dangerous` for
+/// `allow_dangerous`; held to what a manifest could say. Asked of the control host, which attaches
+/// the ledger's evidence; never queued (a queued ask is an op), so while the control host is
+/// unreachable the agent is told to ask again later.
+async fn ask_standing(node: &Arc<Node>, run: &str, args: &Value, host: &str, path: &str, reason: &str) -> (String, bool) {
+    let strings = |k: &str| -> Option<Vec<String>> {
+        args.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+    };
+    let methods: Vec<String> =
+        strings("methods").unwrap_or_else(|| vec!["GET".into()]).into_iter().map(|m| m.to_ascii_uppercase()).collect();
+    let paths = strings("paths").unwrap_or_else(|| vec![format!("{}**", wicket_core::prefix_dir(path))]);
+    let rule = wicket_core::manifest::ReachRule {
+        host: host.to_string(),
+        methods,
+        paths,
+        allow_dangerous: args.get("dangerous").and_then(|v| v.as_bool()).unwrap_or(false),
+    };
+    if let Err(why) = rule.check_standing() {
+        return (format!("not requested: {why}"), true);
+    }
+    // One rule of the box's token per method and path glob: at most 16 (`max_grant_rules`).
+    if rule.methods.len() * rule.paths.len() > 16 {
+        return (
+            format!(
+                "not requested: {} methods × {} paths is more than 16 pairs; ask for fewer, or wider globs",
+                rule.methods.len(),
+                rule.paths.len()
+            ),
+            true,
+        );
+    }
+    let shown =
+        format!("{} {host} {}{}", rule.methods.join(","), rule.paths.join(" "), if rule.allow_dangerous { " (dangerous)" } else { "" });
+    if !connected(node, run) {
+        return (
+            format!("not requested: the control host is unreachable, and a standing ask isn't queued. Ask again for standing reach for {shown} once it is back; meanwhile, ask for what you need now with scope exact or prefix."),
+            false,
+        );
+    }
+    match node.ask_standing_control(run, &rule, &format!("{}{reason}", crate::AGENT_ASKS)).await {
+        Ok(Asked::Pending { request, fresh, .. }) => (
+            format!(
+                "{} {request}: standing reach for {shown}, for your later runs too. An operator decides it once, and may narrow it to what your past requests needed. Call await_grant with request_id {request} to wait for the decision.",
+                if fresh { "requested:" } else { "already requested:" }
+            ),
+            false,
+        ),
+        Ok(Asked::Denied { request }) => (format!("not requested: {request} for this was denied. Don't ask again; continue without it."), false),
+        Err(e) => (e, true),
+    }
+}
+
 async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
     let Some(url) = args.get("url").and_then(|v| v.as_str()) else {
         return ("`url` is required, e.g. https://example.org/docs/".into(), true);
@@ -849,7 +903,11 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
         return ("`reason` is required: say what you need it for, in a sentence".into(), true);
     }
     let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_ascii_uppercase();
-    let prefix = args.get("scope").and_then(|v| v.as_str()) == Some("prefix");
+    let scope_arg = args.get("scope").and_then(|v| v.as_str()).unwrap_or("exact");
+    if !matches!(scope_arg, "exact" | "prefix" | "standing") {
+        return (format!("`scope` is exact, prefix or standing, not {scope_arg:?}"), true);
+    }
+    let prefix = scope_arg == "prefix";
     let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) else {
         return ("`url` must start with https:// (or http://)".into(), true);
     };
@@ -897,6 +955,9 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
             }
         }
     }
+    if scope_arg == "standing" {
+        return ask_standing(node, run, args, &host, &path, reason).await;
+    }
     // A push's discovery is asked for as the push it is part of (#26).
     let op = wicket_core::git::op_for(&tenant, &wicket_core::RunId(run.into()), &zone, &method, &host, &path, query);
     if let Some(why) = op.refused_for_agents() {
@@ -921,11 +982,12 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
     let why = format!("{}{reason}", crate::AGENT_ASKS);
     if connected(node, run) {
         match node.ask_control(run, &op, &why, None, prefix).await {
-            Ok(Asked::Pending { request, fresh }) => {
+            Ok(Asked::Pending { request, fresh, hint }) => {
                 return (
                     format!(
-                        "{} {request} for {scope}. Call await_grant with request_id {request} to wait for the decision. Don't try other routes meanwhile.",
-                        if fresh { "requested:" } else { "already requested:" }
+                        "{} {request} for {scope}. Call await_grant with request_id {request} to wait for the decision. Don't try other routes meanwhile.{}",
+                        if fresh { "requested:" } else { "already requested:" },
+                        hint.map(|h| format!("\n\n{h}")).unwrap_or_default()
                     ),
                     false,
                 )
