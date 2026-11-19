@@ -18,6 +18,8 @@ class Node {
   get textContent() { return this._text + this.children.map(c => c.textContent).join(""); }
   addEventListener(k, f) { this.listeners[k] = f; }
   focus() {}
+  setAttribute(k, v) { this.attrs = { ...(this.attrs || {}), [k]: String(v) }; }
+  getAttribute(k) { return (this.attrs || {})[k] ?? null; }
   scrollIntoView() {}
   click() { if (!this.disabled && this.onclick) return this.onclick({ preventDefault() {} }); }
   all(pred, out = []) { for (const c of this.children) { if (pred(c)) out.push(c); if (c.all) c.all(pred, out); } return out; }
@@ -28,6 +30,8 @@ const ids = {};
 for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
+const EPOCH = 1700000000000;
+let slowBegin = null, slowPasskey = null;
 let timers = [];
 let intervalId = 0;
 const alive = new Set();
@@ -59,7 +63,8 @@ const fetch = async (path, opts) => {
     const a = b.action === "push_subscribe" ? { v: 1, action: b.action, device: devId(b.endpoint), label: b.label, service: "fcm.googleapis.com", details: b.details, replaces: false }
       : b.action === "push_details" ? { v: 1, action: b.action, device: b.id, label: "laptop", service: "fcm.googleapis.com", details: true } : nextAction;
     begun = { body: b, action: a };
-    return reply({ action: a, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] } });
+    if (slowBegin) await slowBegin;
+    return reply({ action: a, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] }, expires_at_ms: EPOCH + now + 120000 });
   }
   if (path === "/api/action/finish") {
     const b = begun && begun.body;
@@ -91,15 +96,17 @@ const sandbox = {
   navigator: { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
     serviceWorker: { register: async (u, o) => { swRegistered = [u, o.scope]; return swReg; }, ready: Promise.resolve(swReg),
       getRegistration: async () => (swRegistered ? swReg : undefined), addEventListener: (k, f) => { if (k === "message") swListener = f; } },
-    credentials: { get: async () => { ceremonies++; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
+    credentials: { get: async () => { ceremonies++; if (slowPasskey) await slowPasskey; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
   performance: { now: () => now },
-  setTimeout: (f, ms) => { timers.push({ f, at: now + ms }); return timers.length; },
-  clearTimeout: () => {},
+  setTimeout: (f, ms) => { const id = ++intervalId; alive.add(id); timers.push({ f: () => { if (alive.delete(id)) f(); }, at: now + ms }); return id; },
+  clearTimeout: id => { alive.delete(id); },
   setInterval: (f, ms) => { const id = ++intervalId; alive.add(id); const arm = () => timers.push({ f: () => { if (alive.has(id)) { f(); arm(); } }, at: now + ms }); arm(); return id; },
   clearInterval: id => { alive.delete(id); },
   btoa: s => Buffer.from(s, "binary").toString("base64"),
   atob: s => Buffer.from(s, "base64").toString("binary"),
-  Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error, Date,
+  Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error,
+  // The wall clock moves with the harness's timers (a fixed offset keeps it a plausible date).
+  Date: Object.assign(function (...a) { return a.length ? new Date(...a) : new Date(EPOCH + now); }, { now: () => EPOCH + now, UTC: Date.UTC, parse: Date.parse }),
 };
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), sandbox);
@@ -150,12 +157,22 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // #369: the effect it signs, and what else it would allow, are shown before the passkey.
   assert.ok(what.includes("effect 0123456789abcdef"), what);
   // The challenge counts down, and once it has expired the sheet offers to ask again (#574, item 6).
-  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 2:00");
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55");
   // In lines, the decision first and the ids last (#574, item 1).
   const lines = what.split("\n");
   assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
   assert.strictEqual(lines[1], "Risk: R1 \u00b7 read (scoped)");
   assert.ok(lines[lines.length - 1].startsWith("Request q-a \u00b7 run run_a"), what);
+  // The agent with its zone, from the signed fields; a hostile newline in what the agent reported
+  // or in the path can't make a line of its own (#599 review).
+  const hostile = run("describe(" + JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "GET", host: "h",
+    path: "/p\nRisk: R0 \u00b7 read", risk: "R4ExecOrPrivilege", request: "r-h", run: "run_h", zone: "build", scope: "zone",
+    agent: "spiffe://x/t/t0/z/build/a/captain", requested_by: ["sub\nFor someone-else (zone safe)"] }) + ")").split("\n");
+  assert.strictEqual(hostile.length, 4, hostile.join(" | "));
+  assert.ok(hostile[0].endsWith("for any run in zone build"), hostile[0]);
+  assert.strictEqual(hostile[1], "Risk: R4 \u00b7 push, deploy or privilege");
+  assert.ok(hostile[2].startsWith("For captain (zone build) \u00b7 asked by sub For someone-else (zone safe) (as reported)"), hostile[2]);
+  assert.ok(hostile[3].includes("agent spiffe://x/t/t0/z/build/a/captain"), hostile[3]);
   const blast = ids["confirm-blast"];
   assert.strictEqual(blast.hidden, false);
   assert.ok(blast.textContent.includes("every path under /h/") && blast.textContent.includes("POST api.example.com/h/any-file") &&
@@ -218,8 +235,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // Risk said as what it means, code first.
   assert.strictEqual(run("riskLabel('R4ExecOrPrivilege')"), "R4 \u00b7 push, deploy or privilege");
   // A cancelled passkey is said as such, as an error that stays; a reply with no text is "Done.".
-  run("toastError({ name: 'NotAllowedError', message: 'The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/' })");
+  run("toastError({ name: 'NotAllowedError', message: 'The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/' }, null, true)");
   assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Passkey cancelled. Nothing was signed.", "error"]);
+  assert.strictEqual(ids.msg.getAttribute("role"), "alert", "an error is announced");
+  // A NotAllowedError away from a passkey (a refused notification permission) is said as it is.
+  run("toastError({ name: 'NotAllowedError', message: 'Permission denied' }, 'Notifications')");
+  assert.strictEqual(ids.msg.textContent, "Notifications: Permission denied");
   run("toast(undefined)");
   assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Done.", ""]);
   assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "GET", host: "h", path: "/p", effect: { terms: { uses: 1, ttl_secs: 600 } } }) + ")").startsWith("Approve once for 10 min"));
@@ -227,14 +248,52 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await advance(1000);
   nextAction = { v: 1, action: "decide", request: "q-x", run: "run_a", method: "GET", host: "h", path: "/p", risk: "R0Read", decision: "approve", uses: 1, ttl_secs: 600 };
   const expiryBegun = began().length;
-  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
-  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 2:00");
-  await advance(121000);
+  // A slow begin: "Preparing" stays up (not gone after 3 s), and nothing opens until it answers.
+  let answer; slowBegin = new Promise(r => { answer = r; });
+  const opening = run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  await advance(4000);
+  assert.deepStrictEqual([ids.msg.hidden, ids.msg.textContent], [false, "Preparing…"], "a slow begin still says so");
+  assert.strictEqual(ids.confirm.hidden, true);
+  slowBegin = null; answer(); await opening; await flush();
+  assert.strictEqual(ids.msg.hidden, true, "the sheet replaces it");
+  // The deadline is the server's (expires_at_ms), on the wall clock, five seconds early.
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55");
+  await advance(116000);
   assert.strictEqual(ids["confirm-state"].textContent, "This expired before it was signed. Nothing was signed.");
   assert.strictEqual(ids["confirm-go"].textContent, "Ask again");
+  // "Ask again" begins anew inside the open sheet: it says so, and a tap while it prepares does nothing.
+  slowBegin = new Promise(r => { answer = r; });
   ids["confirm-go"].click(); await flush();
   assert.strictEqual(began().length, expiryBegun + 2, "asked again");
-  ids["confirm-cancel"].listeners.click(); await flush();
+  assert.strictEqual(ids.confirm.hidden, false, "the sheet stays open, so a second tap can't land beneath it");
+  assert.strictEqual(ids["confirm-state"].textContent, "Preparing…");
+  assert.strictEqual(ids["confirm-go"].disabled, true);
+  const ceremoniesBefore = ceremonies;
+  ids["confirm-go"].click(); await flush();
+  await run("signed({ action: 'decide', id: 'q-a', decision: 'approve' })"); await flush();
+  assert.strictEqual(began().length, expiryBegun + 2, "a tap while preparing begins nothing more");
+  slowBegin = null; answer(); await flush(); await flush();
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55");
+  // The settle guard holds again after the sheet is refilled.
+  assert.strictEqual(ids["confirm-go"].disabled, true);
+  ids["confirm-go"].click(); await flush();
+  assert.strictEqual(ceremonies, ceremoniesBefore, "no passkey from a tap just after Ask again");
+  // Waiting for the passkey, the countdown stops: a slow passkey isn't said to have expired.
+  await advance(1000);
+  let passkeyDone; slowPasskey = new Promise(r => { passkeyDone = r; });
+  ids["confirm-go"].click(); await flush();
+  assert.strictEqual(ids["confirm-state"].textContent, "Waiting for your passkey…");
+  await advance(200000);
+  assert.strictEqual(ids["confirm-state"].textContent, "Waiting for your passkey…", "no expiry while waiting for the passkey");
+  slowPasskey = null; passkeyDone(); await flush(); await flush(); await flush();
+  assert.strictEqual(ids.confirm.hidden, true);
+  // A push's card says the window it is granted as, from the server's terms (#574 review).
+  const pushReq = { id: "q-push", risk: "R4ExecOrPrivilege", method: "POST", host: "github.com", path: "/acme/app.git/git-receive-pack", scope_prefix: false,
+    reason: "push", identity: { verified: true, agent: "a", zone: "z", acting_for: [], id: "spiffe://x/a/a" }, attribution: [], zone: "z", run: "run_a",
+    created_at: 1, once_terms: { uses: null, ttl_secs: 300 } };
+  const pc = run("(r => pendingCard({ now: 2 }, r))")(pushReq);
+  const pt = pc.textContent;
+  assert.ok(pt.includes("Approve this push (any number of uses for 5 min)") && pt.includes("approved as one window") && !pt.includes("one use at a time"), pt);
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
