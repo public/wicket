@@ -349,7 +349,9 @@ fn grant_rule(r: &Rule, p: &Policy) -> Result<(), String> {
                 "prefix"
             }
             // A standing grant's path glob (#572): a regex Biscuit compiles, within the caps.
-            [Op::Value(Term::Variable(v)), Op::Value(Term::Str(pat)), Op::Binary(Binary::Regex)] if path.is_some() && Some(v.as_str()) == path => {
+            [Op::Value(Term::Variable(v)), Op::Value(Term::Str(pat)), Op::Binary(Binary::Regex)]
+                if path.is_some() && Some(v.as_str()) == path =>
+            {
                 if pat.len() > p.max_regex_len {
                     return Err(format!("regex longer than {} bytes", p.max_regex_len));
                 }
@@ -369,7 +371,9 @@ fn grant_rule(r: &Rule, p: &Policy) -> Result<(), String> {
     shapes.sort_unstable();
     match path_var {
         None if shapes != ["expiry", "uses"] => return Err("a grant rule bounds exactly its expiry and its uses".into()),
-        Some(_) if (!read_risk && shapes == ["expiry", "matches", "uses"]) || (read_risk && shapes == ["expiry", "matches", "risk", "uses"]) => {}
+        Some(_)
+            if (!read_risk && shapes == ["expiry", "matches", "uses"])
+                || (read_risk && shapes == ["expiry", "matches", "risk", "uses"]) => {}
         Some(_) if read_risk => return Err("a standing grant rule bounds exactly its expiry, its uses, its path glob and its risk".into()),
         Some(_) if shapes != ["expiry", "prefix", "uses"] => {
             return Err("a prefix grant rule bounds exactly its expiry, its uses and its prefix".into())
