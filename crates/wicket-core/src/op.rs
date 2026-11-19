@@ -493,6 +493,18 @@ mod tests {
 
     /// #325: `is_wicket_host` and `is_reserved_method` compare bytes now (for Kani); they decide
     /// as the lowercasing forms did.
+    /// `agent_op_refusal`: either half of the namespace alone refuses (mutation testing, #326: `||`
+    /// for `&&` survived); past it, only an HTTP method as written.
+    #[test]
+    fn an_agent_is_refused_a_wicket_host_or_a_reserved_method_alone() {
+        assert_eq!(agent_op_refusal("GET", "wicket.internal"), Some(AgentOpRefusal::Reserved));
+        assert_eq!(agent_op_refusal("spawn", "example.com"), Some(AgentOpRefusal::Reserved));
+        assert_eq!(agent_op_refusal("SPAWN", "x.wicket.internal"), Some(AgentOpRefusal::Reserved));
+        assert_eq!(agent_op_refusal("CONNECT", "example.com"), Some(AgentOpRefusal::NotHttp));
+        assert_eq!(agent_op_refusal("get", "example.com"), Some(AgentOpRefusal::NotHttp));
+        assert_eq!(agent_op_refusal("GET", "example.com"), None);
+    }
+
     #[test]
     fn the_reserved_namespace_decides_as_lowercasing_did() {
         let old_host = |host: &str| {

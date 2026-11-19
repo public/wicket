@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Mutation testing of wicket's decision code (#326), with cargo-mutants: zone subsets and reach
 # (wicket-core subset.rs, op.rs), path canonicalisation (canon.rs), the host and glob matchers
-# (manifest.rs), the model budget (budget.rs), what an agent may decide (authority.rs), version
+# (manifest.rs), the model budget (budget.rs), what an agent may decide (authority.rs), the pure
+# decisions #325 moved out of the ledger and wicket-authz (quota.rs, escalation.rs), version
 # skew (version.rs), who may link (link.rs), token loading and cost (wicket-authz), grant
 # bounds (wicket-control grant.rs), the digest grants and the money check (wicket-store
 # digestgrant.rs, money.rs, #258, #256), digest acceptance (wicket-control digest.rs), and the
@@ -13,7 +14,7 @@
 #
 #   ci/mutants.sh [--jobs N] [--only <name>] [--list]
 #
-#   --only   one set: core, authority, matchers, authz, grant, digest, accept or proxy
+#   --only   one set: core, authority, decisions, matchers, authz, grant, digest, accept or proxy
 #   --list   print the mutants each set would test, and test none
 #
 # A surviving mutant fails the run unless ci/mutants.accepted lists it (equivalent mutants: ones no
@@ -49,6 +50,7 @@ core_tests=(-- --lib -- --skip segment_proofs --skip compiled_zones_decide)
 sets=(
   "core|wicket-core|-f crates/wicket-core/src/subset.rs -f crates/wicket-core/src/op.rs -f crates/wicket-core/src/canon.rs -f crates/wicket-core/src/budget.rs|core"
   "authority|wicket-core|-f crates/wicket-core/src/authority.rs -f crates/wicket-core/src/version.rs -f crates/wicket-core/src/link.rs|core"
+  "decisions|wicket-core|-f crates/wicket-core/src/quota.rs -f crates/wicket-core/src/escalation.rs|core"
   "matchers|wicket-core|-f crates/wicket-core/src/manifest.rs -F host_matches|compile_glob|wildcard_for|allows_model|model_covers|names_host|covers_host|ReachRule::matches|check_models|fold_case_glob|core"
   "authz|wicket-authz|-f crates/wicket-authz/src/decide.rs -f crates/wicket-authz/src/token.rs -f crates/wicket-authz/src/cost.rs|authz"
   "grant|wicket-control|-f crates/wicket-control/src/grant.rs -F within_authority|check_terms|agent_terms|outlasts|descendant_chain|agent_renews|bounds|check_ttl|check_prefix|grant"
