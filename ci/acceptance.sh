@@ -52,6 +52,12 @@
 # static ci/h3get), WICKET_DOCKER (e.g. "sudo -n docker"), ACC_KEEP=1 (keep the work dir), ACC_TMP
 # (where the work dir goes, default /tmp: keep it short, the runs' unix sockets live under it).
 set -euo pipefail
+# A command that fails outside a check (under `set -e`, it ends the run) names its line and
+# command, and in GitHub Actions is an annotation too. The 11-18 nightly's installed run ended with
+# neither. Written to fd 3, this script's own stdout, so a command substitution doesn't capture it.
+exec 3>&1
+set -E
+trap 'rc=$?; echo "ABORTED (exit $rc) at line $LINENO: $BASH_COMMAND" >&3; [ -z "${GITHUB_ACTIONS:-}" ] || echo "::error title=acceptance (${mode:-?}) aborted::line $LINENO: $(sed "s/%/%25/g" <<<"$BASH_COMMAND")" >&3' ERR
 cd "$(dirname "$0")/.."
 
 mode=dev nodes=
@@ -687,12 +693,12 @@ daemon_flow() {
   local r b p t0 starts
   r=$(restart_start daemon)
   b=$(box_of "$r")
-  p=$(data pids/daemon.pid 2>/dev/null | head -1)
+  p=$(data pids/daemon.pid 2>/dev/null | head -1 || true)
   check "  the run started through wicketd took its first turn" '[ "$(restart_result "$r" | jq -r .turn 2>/dev/null)" = 1 ] && [ -n "$p" ]'
   starts() { grep -c "wicketd: /run/wicket/wicketd.sock as" /tmp/wicketd.log 2>/dev/null || true; }
   local before; before=$(starts)
   t0=$(date +%s)
-  sudo -n kill -HUP "$p"
+  [ -z "$p" ] || sudo -n kill -HUP "$p" || true
   wait_for 30 '[ "$(starts)" -gt "$before" ]' || true
   check "  on SIGHUP wicketd re-executed at once, handing the run over" \
     '[ $(( $(date +%s) - t0 )) -lt 30 ] && grep -q "following [0-9]* command(s) handed over" /tmp/wicketd.log'
@@ -702,7 +708,7 @@ daemon_flow() {
   check "  and its caller stayed connected" '! grep -q "wicketd closed the connection" "$work/restart-daemon.log"'
   # A restart, as systemd's KillMode=process does it: the daemon alone stops, then starts again.
   before=$(starts)
-  sudo -n kill -TERM "$p"
+  [ -z "$p" ] || sudo -n kill -TERM "$p" || true
   wait_for 20 'grep -q "wicketd closed the connection" "$work/restart-daemon.log"' || true
   check "  stopping wicketd ended the caller's connection, saying the run goes on" 'grep -q "a run it started goes on" "$work/restart-daemon.log"'
   check "  and left its box running" '[ "$(box_of "$r")" = "$b" ]'
@@ -731,12 +737,14 @@ update_flow() {
   b=$(box_of "$r")
   check "  the run started through wicketd took its first turn" '[ "$(restart_result "$r" | jq -r .turn 2>/dev/null)" = 1 ]'
   # Root's own directory, so root's copy is made from it (#261).
-  d=$(sudo -n mktemp -d /root/acc-update.XXXXXX)
-  sudo -n sh -c "cp '$(readlink -f "$W")' '$d/wicket' && printf 'build b' >>'$d/wicket' && chmod 755 '$d/wicket'"
-  wroot self keygen "$d/rk" >/dev/null && wroot self trust-key "$d/rk.pub" >/dev/null && wroot self sign --key "$d/rk" "$d/wicket" >/dev/null
-  id=$(sudo -n sha256sum "$d/wicket" | cut -c1-12)
+  # Each step's failure is the check below, not the end of the run.
+  d=$(sudo -n mktemp -d /root/acc-update.XXXXXX || true)
+  sudo -n sh -c "cp '$(readlink -f "$W")' '$d/wicket' && printf 'build b' >>'$d/wicket' && chmod 755 '$d/wicket'" || true
+  { wroot self keygen "$d/rk" && wroot self trust-key "$d/rk.pub" && wroot self sign --key "$d/rk" "$d/wicket"; } >"$work/update-sign.log" 2>&1 || true
+  id=$(sudo -n sha256sum "$d/wicket" 2>/dev/null | cut -c1-12 || true)
   # The new build's agent image is the one under test, so the update builds none.
-  $DOCKER tag "$IMAGE_TAG" "wicket/claude-code:$id" >/dev/null
+  $DOCKER tag "$IMAGE_TAG" "wicket/claude-code:$id" >/dev/null 2>&1 || true
+  check "  a second build was made, signed with a trusted key" '[ -n "$id" ] && sudo -n test -s "$d/wicket.sig"' || cat "$work/update-sign.log"
   wroot self update "$d/wicket" --window 5s --interval 5s --no-prune >"$work/update.log" 2>&1 || true
   check "  the update went through" 'grep -q "done: the control host run $id" "$work/update.log"'
   t0=$(date +%s)
@@ -758,7 +766,7 @@ update_flow() {
   check "  and its next turn was in the same run, on the same box" '[ "$(restart_result "$r" | jq -r .turn)" = 3 ] && [ "$(box_of "$r")" = "$b" ]'
   wroot identity revoke "$r" --reason "acceptance: update check done" >/dev/null 2>&1 || true
   wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true
-  sudo -n rm -f "$d/wicket" "$d/wicket.sig" "$d/rk" "$d/rk.pub"
+  sudo -n rm -f "$d/wicket" "$d/wicket.sig" "$d/rk" "$d/rk.pub" || true
   sudo -n rmdir "$d" 2>/dev/null || true
 }
 if [ "$mode" = installed ]; then update_flow; else skip "a self update over a run on the older build" "installed only (wicketd)"; fi
@@ -781,18 +789,19 @@ install_flow() {
   r=$(restart_start install)
   b=$(box_of "$r")
   check "  the run started through wicketd took its first turn" '[ "$(restart_result "$r" | jq -r .turn 2>/dev/null)" = 1 ]'
-  d=$(sudo -n mktemp -d /root/acc-install.XXXXXX)
-  sudo -n sh -c "cp '$(readlink -f "$W")' '$d/wicket' && printf 'build c' >>'$d/wicket' && chmod 755 '$d/wicket'"
-  id=$(sudo -n sha256sum "$d/wicket" | cut -c1-12)
-  $DOCKER tag "$IMAGE_TAG" "wicket/claude-code:$id" >/dev/null
-  p=$(data pids/daemon.pid 2>/dev/null | head -1)
+  d=$(sudo -n mktemp -d /root/acc-install.XXXXXX || true)
+  sudo -n sh -c "cp '$(readlink -f "$W")' '$d/wicket' && printf 'build c' >>'$d/wicket' && chmod 755 '$d/wicket'" || true
+  id=$(sudo -n sha256sum "$d/wicket" 2>/dev/null | cut -c1-12 || true)
+  $DOCKER tag "$IMAGE_TAG" "wicket/claude-code:$id" >/dev/null 2>&1 || true
+  check "  a third build was made" '[ -n "$id" ]'
+  p=$(data pids/daemon.pid 2>/dev/null | head -1 || true)
   starts() { grep -c "wicketd: /run/wicket/wicketd.sock as" /tmp/wicketd.log 2>/dev/null || true; }
   before=$(starts)
   attach0=$(data "runs/$r/ctl/attach.log" 2>/dev/null | wc -l)
   sudo -n "$sh" --binary "$d/wicket" --operator "$(id -un)" --skip-gvisor --skip-image --trust-domain acc.wicket.test >"$work/install.log" 2>&1 || true
   check "  install.sh installed the new build" '[ "$(basename "$(readlink /var/lib/wicket-versions/current)")" = "$id" ]'
   if [ ! -d /run/systemd/system ]; then
-    sudo -n kill -TERM "$p"
+    [ -z "$p" ] || sudo -n kill -TERM "$p" || true
     wait_for 20 '! sudo -n kill -0 '"$p"' 2>/dev/null' || true
     sudo -n sh -c 'cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /var/lib/wicket-versions/current/wicket daemon >>/tmp/wicketd.log 2>&1 &'
   fi
@@ -810,7 +819,7 @@ install_flow() {
   check "  and the re-attach didn't end its box" '! data "runs/$r/ctl/attach.log" 2>/dev/null | tail -n +"$((attach0 + 1))" | grep -q "the box ended"'
   wroot identity revoke "$r" --reason "acceptance: install check done" >/dev/null 2>&1 || true
   wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true
-  sudo -n rm -f "$d/wicket"
+  sudo -n rm -f "$d/wicket" || true
   sudo -n rmdir "$d" 2>/dev/null || true
 }
 if [ "$mode" = installed ]; then install_flow; else skip "install.sh over a run on this host's own node" "installed only (wicketd)"; fi
