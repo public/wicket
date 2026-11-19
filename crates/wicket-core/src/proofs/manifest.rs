@@ -92,6 +92,29 @@ fn a_zone_list_ignores_the_senders_principal() {
     assert_eq!(accepts(list, zone.as_ref(), id(&principal)), accepts(list, zone.as_ref(), None));
 }
 
+/// The message rule (#565), `message::relation`: family first, then `accept_from`, then a reply. A
+/// peer is accepted exactly when `accepts` lets it in (so exactly when an entry names its zone or
+/// principal, `accept_from_lets_in_exactly_whom_it_names`); refused exactly when it is none of the
+/// four; and a side that doesn't know the sender's principal (a node cut off from the control host)
+/// refuses whatever one that knows it refuses. Lean: `peer_iff`, `refused_iff` and
+/// `less_known_allows_no_more` (`Wicket/Message.lean`).
+#[kani::proof]
+#[kani::unwind(7)]
+fn a_message_goes_as_one_relation_wherever_decided() {
+    use crate::message::{relation, Facts, Relation};
+    let entries = [any_entry(), any_entry()];
+    let list = &entries[..kani::any_where(|&l: &usize| l <= 2)];
+    let (zone, principal) = (any_zone(), any_principal());
+    let (to_child, to_parent, reply) = (kani::any(), kani::any(), kani::any());
+    let f = Facts { to_child, to_parent, accept_from: list, sender_zone: zone.as_ref(), sender: id(&principal), reply };
+    let got = relation(&f);
+    let named = accepts(list, zone.as_ref(), id(&principal));
+    assert_eq!(got == Some(Relation::Peer), !to_child && !to_parent && named);
+    assert_eq!(got.is_none(), !to_child && !to_parent && !named && !reply);
+    let unknown = relation(&Facts { sender: None, ..f });
+    assert!(unknown.is_none() || got.is_some());
+}
+
 /// Whether a model pattern is one `check_models` lets a zone list: not empty, and a `*` only as
 /// its last byte.
 fn valid_pattern(p: &[u8]) -> bool {
