@@ -339,6 +339,9 @@ fn end_to_end_scripts_select_their_suites() {
     check(&["ci/h3get/src/main.rs"], &[], &["smoke", "acceptance"]);
     check(&["ci/kani.sh"], &[], &["kani"]);
     check(&["ci/tla.sh"], &[], &["tla"]);
+    // The trails of real updates, and the script that makes them (UpdateTrace.tla).
+    check(&["ci/tla-trail.py"], &[], &["tla"]);
+    check(&["verification/tla/trails/update-2026-11-18.txt"], &[], &["tla"]);
     // Both scripts split their CI parts with it.
     check(&["ci/shard.awk"], &[], &["kani", "tla"]);
     check(&["ci/update/x"], &[], &["update"]);
