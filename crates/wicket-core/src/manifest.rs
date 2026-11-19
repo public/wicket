@@ -1010,7 +1010,7 @@ impl Manifest {
                 return Err(ManifestError::Invalid(format!("bad reach host {:?}", r.host)));
             }
             for p in &r.paths {
-                compile_glob(p)?;
+                check_path_glob("reach", p)?;
             }
         }
         for f in &self.zone.forbid {
@@ -1018,7 +1018,7 @@ impl Manifest {
                 return Err(ManifestError::Invalid(format!("bad forbid host {:?}", f.host)));
             }
             for p in &f.paths {
-                compile_glob(p)?;
+                check_path_glob("forbid", p)?;
             }
         }
         for i in &self.zone.inject {
@@ -1047,6 +1047,18 @@ impl Manifest {
         self.zone.limits.check()?;
         Ok(())
     }
+}
+
+/// A reach or forbid rule's path glob, as a manifest may have it: absolute (a request's path always
+/// is, `canon::canonical_path`), and one globset compiles. A glob without its leading `/` never
+/// matches a request, so in a forbid rule it forbids nothing and in a reach rule it allows nothing,
+/// and `subset::check` could admit it under a parent's `/**` while the parent's own glob doesn't
+/// match what it does (fuzz findings: `fuzz/regressions/manifest/relative-*`).
+fn check_path_glob(kind: &str, p: &str) -> Result<(), ManifestError> {
+    if !p.starts_with('/') {
+        return Err(ManifestError::Invalid(format!("{kind} path {p:?} must start with / (a request's path always does)")));
+    }
+    compile_glob(p).map(|_| ())
 }
 
 pub(crate) fn compile_glob(p: &str) -> Result<GlobMatcher, ManifestError> {
@@ -1223,6 +1235,25 @@ mod tests {
         let plain = super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z }\n").unwrap();
         let y = crate::yaml::to_string(&plain).unwrap();
         assert!(!y.contains("uses") && !y.contains("service"), "{y}");
+    }
+
+    /// A reach or forbid path glob must be absolute: one without its leading `/` matches no request,
+    /// and `subset::check` could admit it under a parent's `/**` (the manifest fuzzer's
+    /// `relative-child-*` findings).
+    #[test]
+    fn a_path_glob_starts_with_a_slash() {
+        let m =
+            |rule: &str| super::Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  {rule}\n"));
+        for p in ["tena/repos/**", "re/po/*", "**/merge", "*", ""] {
+            let reach = m(&format!("reach: [{{ host: a.test, methods: [GET], paths: ['{p}'] }}]")).unwrap_err().to_string();
+            assert!(reach.contains("must start with /"), "{p:?}: {reach}");
+            let forbid = m(&format!("forbid: [{{ host: a.test, paths: ['{p}'] }}]")).unwrap_err().to_string();
+            assert!(forbid.contains("must start with /"), "{p:?}: {forbid}");
+        }
+        for p in ["/**", "/", "/repos/*/merge", "/**/merge"] {
+            assert!(m(&format!("reach: [{{ host: a.test, methods: [GET], paths: ['{p}'] }}]")).is_ok(), "{p:?}");
+            assert!(m(&format!("forbid: [{{ host: a.test, paths: ['{p}'] }}]")).is_ok(), "{p:?}");
+        }
     }
 
     /// #325: `is_principal_entry` scans bytes now (for Kani); it decides as `contains("://")` did.
