@@ -447,6 +447,57 @@ impl Daemon {
                 argv.extend(agent.iter().cloned());
                 Plan { argv, cwd, stage: Some(st), caller }
             }
+            // The key and the build root names go as content too: the wicket user can't read a file
+            // only root can (`/root/k.pub`), and must not read one root merely names.
+            Cmd::Itself { cmd: crate::SelfCmd::TrustKey { .. } } => {
+                let st = upload::Stage::new(&stage_parent, vec![("key".into(), "key.pub".into())])?;
+                let argv = vec!["self".into(), "trust-key".into(), st.dir.join("key.pub").display().to_string()];
+                Plan { argv, cwd: self.data_dir.clone(), stage: Some(st), caller }
+            }
+            Cmd::Itself {
+                cmd:
+                    crate::SelfCmd::Update {
+                        artifact: Some(_),
+                        from_ci: None,
+                        sig: _,
+                        nodes,
+                        only_nodes,
+                        window,
+                        interval,
+                        check,
+                        canary,
+                        image,
+                        no_prune,
+                    },
+            } => {
+                // Its signature (`--sig`, or the one beside it) lands beside it, where `update`
+                // looks by default.
+                let st = upload::Stage::new(
+                    &stage_parent,
+                    vec![("artifact".into(), "build/artifact".into()), ("sig".into(), "build/artifact.sig".into())],
+                )?;
+                let mut argv = vec!["self".into(), "update".into(), st.dir.join("build/artifact").display().to_string()];
+                if let Some(n) = nodes {
+                    argv.extend(["--nodes".into(), n.clone()]);
+                }
+                if *only_nodes {
+                    argv.push("--only-nodes".into());
+                }
+                argv.extend(["--window".into(), window.clone(), "--interval".into(), interval.clone()]);
+                for c in check {
+                    argv.extend(["--check".into(), c.clone()]);
+                }
+                if let Some(c) = canary {
+                    argv.extend(["--canary".into(), c.display().to_string()]);
+                }
+                if let Some(i) = image {
+                    argv.extend(["--image".into(), i.clone()]);
+                }
+                if *no_prune {
+                    argv.push("--no-prune".into());
+                }
+                Plan { argv, cwd: default_cwd(), stage: Some(st), caller }
+            }
             _ => Plan { argv: hello.argv.clone(), cwd: default_cwd(), stage: None, caller },
         })
     }
@@ -520,6 +571,24 @@ impl Daemon {
 /// After uploads: the staged manifest's program source is the one the layout was made for, so it
 /// resolves inside the staging directory.
 fn check_staged(cmd: &Cmd, hello: &Hello, st: &upload::Stage, vault_dir: &Path) -> Result<()> {
+    // `self trust-key`'s key and `self update`'s build: one file each, as named.
+    let one_file = match cmd {
+        Cmd::Itself { cmd: crate::SelfCmd::TrustKey { .. } } => Some("key"),
+        Cmd::Itself { cmd: crate::SelfCmd::Update { artifact: Some(_), .. } } => Some("artifact"),
+        _ => None,
+    };
+    if let Some(role) = one_file {
+        let p = st.root(role).context("no upload role")?;
+        if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) {
+            bail!("the {role} did not arrive as a file");
+        }
+        // A signature is optional (an operator may approve the build's sha256 instead).
+        let sig = st.root("sig").and_then(|s| std::fs::symlink_metadata(s).ok());
+        if role == "artifact" && sig.is_some_and(|m| !m.file_type().is_file()) {
+            bail!("the signature did not arrive as a file");
+        }
+        return Ok(());
+    }
     if !matches!(cmd, Cmd::Run { .. } | Cmd::Wrap { .. }) {
         return Ok(());
     }

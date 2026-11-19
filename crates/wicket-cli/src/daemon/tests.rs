@@ -252,6 +252,131 @@ async fn an_operator_manifest_cannot_send_a_secret_anywhere_root_did_not_bind_it
     assert_eq!(refused, 4);
 }
 
+/// Plans `args` as root would have them run through the daemon, sends the files the client sends
+/// for them (as content, in frames), and stages them as the daemon does. The child's argv, what
+/// the stage holds, and `check_staged`'s verdict.
+fn staged(args: &[&str], cwd: &Path) -> (Vec<String>, PathBuf, Result<()>, (upload::Stage, Tmp)) {
+    use clap::Parser;
+    let dir = tmp();
+    let data = dir.0.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let d = Daemon {
+        data_dir: data,
+        policy_path: dir.0.join("policy.yaml"),
+        uid: 4242,
+        user: "wicket".into(),
+        exe: "/bin/false".into(),
+        vault_dir: dir.0.join("vault"),
+    };
+    let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let cmd = crate::Cli::try_parse_from(std::iter::once("wicket".to_string()).chain(argv.clone())).unwrap().cmd;
+    let hello = Hello {
+        version: "0".into(),
+        argv,
+        cwd: cwd.display().to_string(),
+        log: None,
+        dir_fd: false,
+        manifest_name: None,
+        program_source: None,
+    };
+    let peer = proto::Peer { pid: 1, uid: 0, gid: 0, user: "root".into(), groups: vec![] };
+    let mut plan = d.plan(&peer, &Basis::Root, &cmd, &hello, None).unwrap();
+    let mut frames = vec![];
+    for (role, path) in client::self_uploads(&cmd) {
+        upload::send(&mut frames, role, &path).unwrap();
+    }
+    let mut st = plan.stage.take().expect("staged");
+    let mut r = &frames[..];
+    while let Some((k, p)) = proto::read_frame(&mut r).unwrap() {
+        assert_eq!(k, kind::UPLOAD);
+        let (e, data) = proto::parse_upload(&p).unwrap();
+        st.add(&e, data).unwrap();
+    }
+    st.finish().unwrap();
+    let checked = check_staged(&cmd, &hello, &st, &d.vault_dir);
+    let at = st.dir.clone();
+    // The stage before the directory it lives in.
+    (plan.argv, at, checked, (st, dir))
+}
+
+/// #564: `self trust-key` and `self update` name files that may be root's alone (`/root/k.pub`),
+/// which wicketd, as the wicket user, can't read. They go as content, as a run's manifest does,
+/// and the command runs on the staged copies.
+#[test]
+fn a_trusted_key_and_an_update_build_go_to_the_daemon_as_content() {
+    let src = tmp();
+    std::fs::write(src.0.join("k.pub"), "the key").unwrap();
+    let (argv, stage, checked, _st) = staged(&["self", "trust-key", src.0.join("k.pub").to_str().unwrap()], &src.0);
+    checked.unwrap();
+    assert_eq!(argv, ["self", "trust-key", stage.join("key.pub").to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(stage.join("key.pub")).unwrap(), "the key");
+
+    // A build and the signature beside it; every option carried over, the paths staged.
+    std::fs::write(src.0.join("wicket"), "the build").unwrap();
+    std::fs::write(src.0.join("wicket.sig"), "its signature").unwrap();
+    let a = src.0.join("wicket");
+    let args = [
+        "self",
+        "update",
+        a.to_str().unwrap(),
+        "--nodes",
+        "all",
+        "--window",
+        "5s",
+        "--interval",
+        "2s",
+        "--check",
+        "true",
+        "--image",
+        "i",
+        "--no-prune",
+    ];
+    let (argv, stage, checked, _st) = staged(&args, &src.0);
+    checked.unwrap();
+    let built = stage.join("build/artifact");
+    assert_eq!(
+        argv,
+        [
+            "self",
+            "update",
+            built.to_str().unwrap(),
+            "--nodes",
+            "all",
+            "--window",
+            "5s",
+            "--interval",
+            "2s",
+            "--check",
+            "true",
+            "--image",
+            "i",
+            "--no-prune",
+        ]
+    );
+    assert_eq!(std::fs::read_to_string(&built).unwrap(), "the build");
+    assert_eq!(std::fs::read_to_string(stage.join("build/artifact.sig")).unwrap(), "its signature");
+    // The re-made command line means what the caller's did.
+    use clap::Parser;
+    assert!(crate::Cli::try_parse_from(std::iter::once("wicket".to_string()).chain(argv)).is_ok());
+
+    // `--sig` elsewhere lands beside the build too; none at all sends none (an approval of its
+    // sha256 may stand in).
+    std::fs::write(src.0.join("other.sig"), "elsewhere").unwrap();
+    let (_, stage, checked, _st) =
+        staged(&["self", "update", a.to_str().unwrap(), "--sig", src.0.join("other.sig").to_str().unwrap()], &src.0);
+    checked.unwrap();
+    assert_eq!(std::fs::read_to_string(stage.join("build/artifact.sig")).unwrap(), "elsewhere");
+    std::fs::remove_file(src.0.join("wicket.sig")).unwrap();
+    let (_, stage, checked, _st) = staged(&["self", "update", a.to_str().unwrap()], &src.0);
+    checked.unwrap();
+    assert!(!stage.join("build/artifact.sig").exists());
+
+    // A directory where the build should be is refused before anything runs.
+    std::fs::create_dir(src.0.join("adir")).unwrap();
+    let (_, _, checked, _st) = staged(&["self", "update", src.0.join("adir").to_str().unwrap()], &src.0);
+    assert!(checked.unwrap_err().to_string().contains("did not arrive as a file"));
+}
+
 /// #487: on SIGHUP, with commands running (long-lived runs), the daemon writes their handoff and
 /// moves on at once. It once deadlocked here, asking the registry it held how many it handed over,
 /// and refused every command until it was restarted.

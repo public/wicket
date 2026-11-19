@@ -3,7 +3,7 @@
 
 use super::proto::{self, kind, Hello, Welcome};
 use super::{policy, upload, SOCKET_PATH};
-use crate::{Cmd, SecretCmd};
+use crate::{Cmd, SecretCmd, SelfCmd};
 use anyhow::{bail, Context, Result};
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -53,6 +53,20 @@ pub async fn forward(sock: &Path, cmd: &Cmd) -> Result<i32> {
         .map(|a| a.into_string().map_err(|a| anyhow::anyhow!("argument {a:?} is not UTF-8")))
         .collect::<Result<_>>()?;
     forward_with(sock, cmd, argv, [0, 1, 2]).await
+}
+
+/// The files `self trust-key` and `self update` name, which go as content as a run's do: the key,
+/// and the build with its signature (`--sig`, or the one beside it, if there is one). Read by the
+/// caller, who may be root with them in `/root`, where wicketd's user can't read.
+pub(super) fn self_uploads(cmd: &Cmd) -> Vec<(&'static str, PathBuf)> {
+    match cmd {
+        Cmd::Itself { cmd: SelfCmd::TrustKey { public } } => vec![("key", public.clone())],
+        Cmd::Itself { cmd: SelfCmd::Update { artifact: Some(a), sig, .. } } => {
+            let sig = sig.clone().or_else(|| Some(PathBuf::from(format!("{}.sig", a.display()))).filter(|s| s.is_file()));
+            std::iter::once(("artifact", a.clone())).chain(sig.map(|s| ("sig", s))).collect()
+        }
+        _ => vec![],
+    }
 }
 
 /// [`forward`], with the command line and the stdio fds given.
@@ -106,6 +120,7 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
     if let Cmd::Run { workdir: Some(w), .. } = cmd {
         uploads.push(("workdir", w.clone()));
     }
+    uploads.extend(self_uploads(cmd));
 
     let mut w = s.try_clone()?;
     let mut r = s.try_clone()?;
