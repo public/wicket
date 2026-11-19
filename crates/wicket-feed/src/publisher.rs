@@ -503,6 +503,11 @@ impl<P: Policy> Publisher<P> {
         self.cert.version
     }
 
+    /// The feed key's certificate.
+    pub fn cert(&self) -> &KeyCert {
+        &self.cert
+    }
+
     pub fn key_frame(&self) -> Frame {
         Frame::new(FrameKind::Key, self.cert_jws.clone())
     }
