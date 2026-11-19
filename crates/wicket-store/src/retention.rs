@@ -112,9 +112,12 @@ impl Ledger {
         Ok(AuditUsage { first, head, rows, bytes })
     }
 
-    /// The checkpoint a prune may cut back to, at most `target`: the newest checkpoint some sink in
-    /// `sinks` acknowledged, at or below `target`, that every sink in `sinks` has exported past
-    /// (its records acknowledged), and past the current anchor. None if there is none.
+    /// The checkpoint a prune may cut back to, for a cut wanted at `target`: of the checkpoints
+    /// some sink in `sinks` acknowledged that every sink in `sinks` has exported past (its records
+    /// acknowledged) and that are past the current anchor, the newest at or below `target`, or
+    /// failing that the oldest above it (checkpoints are made at a sink's cursor, so the first may
+    /// be newer than the cut: pruning a little more is still only records every sink has). None
+    /// if there is none.
     pub fn prune_point(&self, sinks: &[&str], target: i64) -> Result<Option<Checkpoint>> {
         if sinks.is_empty() {
             return Ok(None);
@@ -124,8 +127,10 @@ impl Ledger {
             exported = exported.min(self.export_cursor(s)?.seq);
         }
         let floor = self.audit_anchor()?.map(|a| a.seq).unwrap_or(0);
-        let limit = target.min(exported);
-        Ok(self.checkpoints()?.into_iter().find(|c| sinks.contains(&c.sink.as_str()) && c.seq <= limit && c.seq > floor))
+        let ok: Vec<Checkpoint> =
+            self.checkpoints()?.into_iter().filter(|c| sinks.contains(&c.sink.as_str()) && c.seq <= exported && c.seq > floor).collect();
+        // Newest first: the first at or below the target, else the last (oldest) above it.
+        Ok(ok.iter().find(|c| c.seq <= target).cloned().or_else(|| ok.last().cloned()))
     }
 
     /// Deletes every audit record before `cp`'s, which becomes the chain's anchor (its record is
@@ -204,7 +209,7 @@ mod tests {
         l.advance_export("b", 50).unwrap();
         assert_eq!(l.prune_point(&["a"], 90).unwrap().map(|c| c.seq), Some(70));
         assert_eq!(l.prune_point(&["a", "b"], 90).unwrap().map(|c| c.seq), Some(40), "b has only 50");
-        assert_eq!(l.prune_point(&["a", "b"], 30).unwrap(), None, "no checkpoint that low");
+        assert_eq!(l.prune_point(&["a", "b"], 30).unwrap().map(|c| c.seq), Some(40), "none that low: the nearest above");
         assert_eq!(l.prune_point(&[], 90).unwrap(), None, "no sink, no prune");
         let cp = l.prune_point(&["a", "b"], 90).unwrap().unwrap();
         let before = l.audit_usage().unwrap();

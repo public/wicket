@@ -92,7 +92,33 @@ pub struct SinksConfig {
     /// The most records per delivery.
     #[serde(default = "default_batch")]
     pub batch: usize,
+    /// How big the audit table on this host may grow, in GB, before its oldest records (ones
+    /// every sink has, behind a checkpoint one acknowledged) are pruned (#582). Only with a sink
+    /// and the state store configured; otherwise nothing is ever pruned.
+    #[serde(default = "default_host_gb")]
+    pub host_gb: f64,
     pub sinks: Vec<SinkSpec>,
+}
+
+/// The audit table's default limit on the host, in GB (see the docs for why).
+pub const DEFAULT_HOST_GB: f64 = 2.0;
+
+fn default_host_gb() -> f64 {
+    DEFAULT_HOST_GB
+}
+
+fn forever() -> String {
+    "forever".into()
+}
+
+fn sink_retention<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    let s = String::deserialize(d)?;
+    if s != "forever" {
+        return Err(serde::de::Error::custom(format!(
+            "retention {s:?}: a sink keeps everything (`forever`); expire old records in the sink itself (a bucket lifecycle rule, a Collector's own retention)"
+        )));
+    }
+    Ok(s)
 }
 
 fn default_every() -> Duration {
@@ -115,6 +141,11 @@ mod duration_serde {
 pub struct SinkSpec {
     /// The sink's name: its cursor in the ledger. Renaming a sink starts it from the beginning.
     pub name: String,
+    /// How long the sink keeps what it was sent: `forever`, the default and (for now) the only
+    /// value. A separate setting from the host's `host_gb` (#582): pruning the host never prunes
+    /// a sink.
+    #[serde(default = "forever", deserialize_with = "sink_retention")]
+    pub retention: String,
     #[serde(flatten)]
     pub kind: SinkKind,
 }
@@ -188,6 +219,115 @@ impl SinksConfig {
             Err(e) => Err(e).with_context(|| format!("{}", p.display())),
         }
     }
+}
+
+// ---- retention on the host (#582) ----
+
+/// What retention did, or would do, and where it stands: for reconcile's report, `wicket top`
+/// and the console.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Retention {
+    /// Whether pruning is on: a sink and the state store configured. Why not, if not.
+    pub enabled: bool,
+    pub why_not: Option<String>,
+    /// The limit, the table's estimated size, and the anchor (the prune checkpoint) if any.
+    pub limit_bytes: i64,
+    pub usage: wicket_store::AuditUsage,
+    pub anchor: Option<wicket_store::AuditAnchor>,
+    /// Records pruned by this pass (0 for a status), and whether it switched the file to
+    /// `auto_vacuum = incremental` (a one-off VACUUM).
+    pub pruned: i64,
+    pub vacuumed: bool,
+    /// Over the limit with nothing safe to prune yet (no checkpoint every sink has passed).
+    pub waiting: Option<String>,
+}
+
+/// The fraction of the limit a prune cuts the table back to, so it isn't pruned every pass.
+const PRUNE_TO: f64 = 0.9;
+/// Free pages given back per transaction, so the vacuum never holds the write lock long.
+const VACUUM_PAGES: i64 = 2000;
+
+/// Whether this installation may prune: sinks configured, and the state store streaming the
+/// ledger off the host (so no history is lost with the host). The sinks, or why not.
+pub fn retention_config() -> Result<std::result::Result<SinksConfig, String>> {
+    let sinks = match SinksConfig::load()? {
+        Some(c) if !c.sinks.is_empty() => c,
+        _ => return Ok(Err(format!("no audit sink is configured ({})", sinks_path().display()))),
+    };
+    match crate::statestore::StateStore::load()? {
+        Some(s) if s.ledger.is_some() => Ok(Ok(sinks)),
+        _ => Ok(Err("the state store doesn't stream the ledger off the host (wicket state replicate)".into())),
+    }
+}
+
+/// Where retention stands, changing nothing.
+pub fn retention_status(l: &Ledger) -> Result<Retention> {
+    let cfg = retention_config()?;
+    retention_with(l, cfg.as_ref().map_err(|e| e.as_str()), true)
+}
+
+/// One retention pass (reconcile runs one after each pass): if pruning is on and the audit table
+/// is over its limit, its oldest records are pruned back towards [`PRUNE_TO`] of it, never past a
+/// checkpoint a sink acknowledged that every sink has exported past, and the space is given back.
+pub fn retention_pass(l: &Ledger, dry_run: bool) -> Result<Retention> {
+    let cfg = retention_config()?;
+    retention_with(l, cfg.as_ref().map_err(|e| e.as_str()), dry_run)
+}
+
+/// [`retention_pass`] with the configuration given: `Err` why pruning is off.
+pub fn retention_with(l: &Ledger, cfg: std::result::Result<&SinksConfig, &str>, dry_run: bool) -> Result<Retention> {
+    let limit_bytes = (cfg.as_ref().map(|c| c.host_gb).unwrap_or(DEFAULT_HOST_GB) * 1e9) as i64;
+    let mut r = Retention {
+        enabled: cfg.is_ok(),
+        why_not: cfg.as_ref().err().map(|e| e.to_string()),
+        limit_bytes,
+        usage: l.audit_usage()?,
+        anchor: l.audit_anchor()?,
+        pruned: 0,
+        vacuumed: false,
+        waiting: None,
+    };
+    let Ok(cfg) = cfg else { return Ok(r) };
+    if r.usage.bytes <= limit_bytes || r.usage.rows == 0 {
+        return Ok(r);
+    }
+    let per_row = (r.usage.bytes / r.usage.rows).max(1);
+    let keep = ((limit_bytes as f64 * PRUNE_TO) as i64 / per_row).max(1);
+    let target = r.usage.head - keep + 1;
+    let names: Vec<&str> = cfg.sinks.iter().map(|s| s.name.as_str()).collect();
+    let Some(cp) = l.prune_point(&names, target)? else {
+        r.waiting = Some(format!(
+            "over its limit, but no checkpoint at or before seq {target} that every sink ({}) has exported past",
+            names.join(", ")
+        ));
+        return Ok(r);
+    };
+    if dry_run {
+        r.waiting = Some(format!("would prune the records before seq {} (dry run)", cp.seq));
+        return Ok(r);
+    }
+    r.vacuumed = l.make_auto_vacuum_incremental()?;
+    r.pruned = l.prune_audit_to(&cp)?;
+    while l.vacuum_step(VACUUM_PAGES)? > 0 {}
+    r.usage = l.audit_usage()?;
+    r.anchor = l.audit_anchor()?;
+    Ok(r)
+}
+
+/// Retention in a line: the table against its limit, and the anchor.
+pub fn retention_line(r: &Retention) -> String {
+    let gb = |b: i64| format!("{:.2} GB", b as f64 / 1e9);
+    let mut out = format!("audit {} of {}", gb(r.usage.bytes), gb(r.limit_bytes));
+    match &r.anchor {
+        Some(a) => out.push_str(&format!(", pruned to seq {} ({} records, kept in sink {})", a.seq, a.pruned, a.sink)),
+        None => out.push_str(", nothing pruned"),
+    }
+    if let Some(w) = &r.why_not {
+        out.push_str(&format!("; never pruned: {w}"));
+    } else if let Some(w) = &r.waiting {
+        out.push_str(&format!("; {w}"));
+    }
+    out
 }
 
 // ---- what is sent ----
@@ -506,8 +646,11 @@ impl Exporter {
         if due && cur.seq > 0 && self.issuer.is_some() {
             let head = self.ledger.audit_hash_at(cur.seq)?.context("the sink's cursor is past the local chain")?;
             let cp = checkpoint_json(self.issuer.as_ref().expect("checked"), cur.seq, &head, at);
+            let jws = cp["jws"].as_str().unwrap_or_default().to_string();
             self.deliver(i, &[cp])?;
             self.ledger.export_checkpointed(&name, at)?;
+            // What retention may prune back to (#582): kept with what it signed.
+            self.ledger.record_checkpoint(&name, cur.seq, &head, at, &jws)?;
             cps = 1;
         }
         Ok((sent, cps))
@@ -677,6 +820,9 @@ pub struct Against {
     /// Exported before a restore that went back to an earlier point (`state.restored` with
     /// `rolled_back_after`): history the restore declared discarded, not compared (#154).
     pub superseded: usize,
+    /// Exported records and checkpoints from before the local chain's anchor: pruned here by
+    /// retention (#582), so kept only in the sinks, not compared.
+    pub pruned: usize,
     pub problems: Vec<String>,
 }
 
@@ -720,6 +866,8 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
     // An exported copy that doesn't match is discarded history if a restore went back before it and
     // it was made before that restore (the same second counts: records carry whole seconds).
     let discarded = |seq: i64, ts: i64| rollbacks.iter().any(|&(after, at)| seq > after && ts <= at);
+    // Before the anchor: deleted here by retention, after every sink had it (#582).
+    let anchor = l.audit_anchor()?.map(|x| x.seq).unwrap_or(0);
     for o in objects {
         match o["type"].as_str() {
             Some("wicket.audit.checkpoint") => {
@@ -739,6 +887,10 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
                     continue;
                 };
                 let local = l.audit_hash_at(seq)?;
+                if seq < anchor && local.is_none() {
+                    a.pruned += 1;
+                    continue;
+                }
                 if local.as_deref() != Some(want) && discarded(seq, p["ts"].as_i64().unwrap_or(i64::MAX)) {
                     a.superseded += 1;
                     continue;
@@ -771,13 +923,14 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
                         }
                     }
                     None if gone => a.superseded += 1,
+                    None if seq < anchor => a.pruned += 1,
                     None => a.problems.push(format!("record {seq}: exported, but missing locally")),
                 }
             }
             _ => {}
         }
     }
-    if a.checkpoints + a.records == 0 && a.problems.is_empty() {
+    if a.checkpoints + a.records + a.pruned == 0 && a.problems.is_empty() {
         a.problems.push("the exported copies hold no wicket audit records or checkpoints: nothing was compared".into());
     }
     if newest > head {
@@ -891,6 +1044,80 @@ mod tests {
         let i = forged.iter().position(|o| o["seq"] == 3 && o["type"] == "wicket.audit.record").unwrap();
         forged[i]["kind"] = json!("forged");
         assert!(verify_against(&r, &forged, &key).unwrap().problems.iter().any(|p| p.starts_with("record 3:")));
+    }
+
+    /// #582: with a sink (and the state store, given here as configured), a ledger over its limit
+    /// is pruned back under it, behind a checkpoint the sink acknowledged; the chain and the
+    /// exported copy still verify, across the prune and after more records. Without a sink nothing
+    /// is ever pruned, however big the table.
+    #[test]
+    fn retention_keeps_the_ledger_within_its_limit_and_verifiable() {
+        let d = TmpDir::new("retention");
+        let lp = d.0.join("ledger.db");
+        let out = d.0.join("out/audit.jsonl");
+        let issuer = wicket_identity::Issuer::generate("test.local");
+        let key = issuer.verifying_key();
+        let l = open_batched(&lp).unwrap();
+        let mut cfg = jsonl_cfg(&out);
+        // A small limit, so a few hundred records are over it.
+        cfg.host_gb = 0.000_02;
+        let limit = (cfg.host_gb * 1e9) as i64;
+        let mut x = Exporter::new(&lp, cfg.clone(), Some(issuer)).unwrap();
+        write_records(&l, 0, 300);
+        // No sink: never pruned.
+        let r = retention_with(&l, Err("no audit sink is configured"), false).unwrap();
+        assert!(!r.enabled && r.pruned == 0 && r.usage.bytes > limit, "{r:?}");
+        // A sink, but it hasn't acknowledged a checkpoint yet: nothing safe to prune.
+        let r = retention_with(&l, Ok(&cfg), false).unwrap();
+        assert!(r.pruned == 0 && r.waiting.is_some(), "{r:?}");
+        for round in 0..3 {
+            assert_eq!(x.pass(true).checkpoints, 1, "round {round}");
+            let r = retention_with(&l, Ok(&cfg), false).unwrap();
+            assert!(r.pruned > 0, "round {round}: {r:?}");
+            assert!(r.usage.bytes <= limit, "round {round}: within the limit: {} of {limit}", r.usage.bytes);
+            assert!(l.verify_audit().unwrap() > 0);
+            assert!(l.verify_node_audit().is_ok());
+            write_records(&l, 300 + round * 300, 300);
+        }
+        x.pass(true);
+        let a = verify_against(&l, &exported_objects(&std::fs::read_to_string(&out).unwrap()), &key).unwrap();
+        assert!(a.problems.is_empty(), "{:?}", a.problems);
+        assert!(a.pruned > 0 && a.records > 0, "{a:?}");
+        let anchor = l.audit_anchor().unwrap().unwrap();
+        let p = wicket_identity::verify_checkpoint(&anchor.jws, &key).unwrap();
+        assert_eq!(
+            (p["seq"].as_i64(), p["head"].as_str()),
+            (Some(anchor.seq), Some(anchor.hash.as_str())),
+            "the anchor is the signed checkpoint"
+        );
+        assert!(retention_line(&retention_with(&l, Ok(&cfg), true).unwrap()).contains("pruned to seq"));
+    }
+
+    /// A second sink that is behind holds pruning back to what it has.
+    #[test]
+    fn retention_waits_for_every_sink() {
+        let d = TmpDir::new("retention2");
+        let lp = d.0.join("ledger.db");
+        let (a, b) = (d.0.join("a.jsonl"), d.0.join("b.jsonl"));
+        let issuer = wicket_identity::Issuer::generate("test.local");
+        let l = open_batched(&lp).unwrap();
+        write_records(&l, 0, 300);
+        let mut one = Exporter::new(&lp, jsonl_cfg(&a), Some(issuer)).unwrap();
+        one.pass(true);
+        let mut both = SinksConfig::parse(&format!(
+            "host_gb: 0.00001\nsinks:\n  - name: file\n    type: jsonl\n    path: {}\n  - name: slow\n    type: jsonl\n    path: {}\n",
+            a.display(),
+            b.display()
+        ))
+        .unwrap();
+        let r = retention_with(&l, Ok(&both), false).unwrap();
+        assert_eq!(r.pruned, 0, "slow has nothing yet: {r:?}");
+        both.sinks.truncate(1);
+        assert!(retention_with(&l, Ok(&both), false).unwrap().pruned > 0);
+        assert!(
+            SinksConfig::parse("sinks:\n  - name: x\n    type: jsonl\n    path: /tmp/x\n    retention: 30d\n").is_err(),
+            "a sink keeps everything"
+        );
     }
 
     #[test]

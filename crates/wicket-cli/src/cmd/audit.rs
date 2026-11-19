@@ -18,6 +18,28 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             let l = Ledger::open(&ledger_path())?;
             if verify {
                 println!("audit chain OK: {} records", l.verify_audit()?);
+                // After a prune (#582) the chain starts at a checkpoint a sink acknowledged: its
+                // signature, and that it signed the record kept there, are checked too.
+                if let Some(a) = l.audit_anchor()? {
+                    let key = match &issuer_jwk {
+                        Some(p) => wicket_identity::verifying_key_from_jwk(&serde_json::from_slice(&std::fs::read(p)?)?)?,
+                        None => issuer()?.verifying_key(),
+                    };
+                    let p =
+                        wicket_identity::verify_checkpoint(&a.jws, &key).context("the audit chain's anchor checkpoint doesn't verify")?;
+                    if p["seq"].as_i64() != Some(a.seq) || p["head"].as_str() != Some(a.hash.as_str()) {
+                        bail!(
+                            "the audit chain's anchor checkpoint signs seq {} head {}, not the record kept at seq {}",
+                            p["seq"],
+                            p["head"],
+                            a.seq
+                        );
+                    }
+                    println!(
+                        "  from its anchor at seq {} (a checkpoint sink {} acknowledged, signed at {}): {} older record(s) pruned here, kept in the sinks",
+                        a.seq, a.sink, p["ts"], a.pruned
+                    );
+                }
                 let (ok, bad) = verify_signed_decisions(&l)?;
                 println!("passkey-signed decisions and console actions: {ok} verified offline, {bad} failed");
                 let (iok, ibad) = verify_identities_and_messages(&l)?;
@@ -45,6 +67,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     }
                     let a = audit_export::verify_against(&l, &objs, &key)?;
                     println!("against the exported copies: {} signed checkpoint(s) and {} record(s) match", a.checkpoints, a.records);
+                    if a.pruned > 0 {
+                        println!("  ({} exported from before the local anchor, pruned here by retention: not compared)", a.pruned);
+                    }
                     if a.superseded > 0 {
                         println!("  ({} exported before a restore to an earlier point, which discarded them: not compared)", a.superseded);
                     }
