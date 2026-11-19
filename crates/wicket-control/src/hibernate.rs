@@ -673,7 +673,9 @@ pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: O
             for (older, json) in l.waiting_before(&run.0, now_ms)? {
                 let Ok(w) = serde_json::from_str::<Waiting>(&json) else { continue };
                 if schedule(&w.req, &nodes(&w.need), Strategy::BinPack, None).node.is_some() {
-                    return Ok(Bound { decision: Default::default(), behind: Some(older) });
+                    let b = Bound { decision: Default::default(), behind: Some(older) };
+                    l.record_placement_decision(&run.0, &decision_record(ask, &b, cands.len()), now_ms)?;
+                    return Ok(b);
                 }
             }
         }
@@ -681,8 +683,35 @@ pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: O
         if let Some(node) = &d.node {
             l.reserve_placement(&run.0, node, req.vcpus, req.memory_mib, now_ms)?;
         }
-        Ok(Bound { decision: d, behind: None })
+        let b = Bound { decision: d, behind: None };
+        l.record_placement_decision(&run.0, &decision_record(ask, &b, cands.len()), now_ms)?;
+        Ok(b)
     })
+}
+
+/// The most nodes a decision record names, ranked and refused each: enough to say why, bounded so
+/// a large installation's records stay small (#582).
+pub const DECISION_NODES: usize = 10;
+
+/// A decision as `wicket why-here` shows it (`placement_decisions`): the request, the node, the
+/// ranking and the refusals with every reason (at most [`DECISION_NODES`] of each), or the run it
+/// waited behind.
+pub fn decision_record(ask: &Waiting, b: &Bound, candidates: usize) -> String {
+    let d = &b.decision;
+    serde_json::json!({
+        "request": ask.req,
+        "ca_hosts": ask.need,
+        "node": d.node,
+        "candidates": candidates,
+        "ranked": d.ranked.iter().take(DECISION_NODES).collect::<Vec<_>>(),
+        "ranked_more": d.ranked.len().saturating_sub(DECISION_NODES),
+        "refused": d.refused.iter().take(DECISION_NODES).map(|(n, why)| serde_json::json!({
+            "node": n, "why": why.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "refused_more": d.refused.len().saturating_sub(DECISION_NODES),
+        "behind": b.behind,
+    })
+    .to_string()
 }
 
 /// What [`bind`] decided: the decision, or the older waiting run it yielded to.

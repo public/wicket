@@ -144,7 +144,7 @@ let afterConfirm = null;
 // How long the server keeps a begun action's challenge (`CHALLENGE_TTL` in serve/mod.rs).
 const CHALLENGE_MS = 120000;
 const EXPIRY_MARGIN_MS = 5000;
-let expiryTimer = null;
+let expiryTimer = null, sheetToken = 0;
 async function signed(body, after, extra) {
   if (ceremony) return;
   ceremony = true;
@@ -159,9 +159,14 @@ async function signed(body, after, extra) {
 async function openSheet(body, extra) {
   const go = document.getElementById("confirm-go");
   const state = document.getElementById("confirm-state");
+  // Each sheet has a token; closing it (Cancel, say, while "Ask again" prepares) bumps it, and the
+  // begin that comes back afterwards is dropped rather than reopening a closed sheet.
+  const sheet = ++sheetToken;
   let begin;
   try { begin = await post("/api/action/begin", body); }
-  catch (e) { toastError(e); closeConfirm(); return; }
+  catch (e) { if (sheet === sheetToken) { toastError(e); closeConfirm(); } return; }
+  if (sheet !== sheetToken) return;
+  // An error that stays sits above the sheet (#597): it goes when the sheet opens.
   document.getElementById("msg").hidden = true;
   document.getElementById("confirm-what").textContent = describe(begin.action);
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
@@ -172,10 +177,11 @@ async function openSheet(body, extra) {
   go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
-  go.disabled = true; setTimeout(() => { go.disabled = false; }, SETTLE_MS);
-  // The challenge expires on the server's clock: a wall-clock deadline it sent (a phone that sleeps
-  // still knows), a few seconds early for the signature's trip back.
-  const deadline = (begin.expires_at_ms || Date.now() + CHALLENGE_MS) - EXPIRY_MARGIN_MS;
+  go.disabled = true; setTimeout(() => { if (sheet === sheetToken) go.disabled = false; }, SETTLE_MS);
+  // The challenge expires on the server's clock. The time it has left, counted from its arrival on
+  // the wall clock (a phone that sleeps still counts it), a few seconds early for the signature's
+  // trip back; the phone's own clock being out doesn't matter.
+  const deadline = Date.now() + (begin.expires_in_ms || CHALLENGE_MS) - EXPIRY_MARGIN_MS;
   clearInterval(expiryTimer);
   const tick = () => {
     if (go.dataset.waiting) return;
@@ -242,6 +248,8 @@ function renderUpdate(box, u) {
   box.append(ul);
 }
 function closeConfirm() {
+  sheetToken++;
+  pollGen++;
   clearInterval(expiryTimer);
   delete document.getElementById("confirm-go").dataset.waiting;
   document.getElementById("confirm").hidden = true;
@@ -336,7 +344,9 @@ function pendingCard(s, p) {
   const hour = el("button", "", p.scope_prefix ? "Approve prefix for 1 hour (any number of uses)" : "Approve for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
   const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
   if (!idOk) { once.disabled = true; hour.disabled = true; }
-  if (p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
+  // A push to a host that isn't github.com can be R2, but it is still granted as the window: no
+  // hour button, which would promise what the grant doesn't give (#597 re-review).
+  if (window_ || p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
     b.append(once, deny);
     c.append(el("div", "meta", window_ ? "A push is approved as one window: any number of uses for " + span(ot.ttl_secs) + ", for its ref discovery and upload." : "R3 and R4 are approved one use at a time."));
   } else b.append(once, hour, deny);
@@ -431,11 +441,15 @@ function line(op) {
 
 // A node's latest health report (#377): disk, memory, what went wrong, and what is alerted.
 function healthRow(n) {
+  // The row (name, summary) and its alerts under it, each a line of its own (#574, B7): inside the
+  // flex row they were squeezed into side columns.
+  const w = el("div", "hrow");
   const d = el("div", "row");
   d.append(el("span", "mono", strip(n.node)));
   d.append(el("span", (n.alerts || []).length ? "blocked" : "", strip(n.summary) + " · reported " + whenMs(n.received_ms)));
-  for (const a of n.alerts || []) d.append(el("div", "blocked", "! " + strip(a)));
-  return d;
+  w.append(d);
+  for (const a of n.alerts || []) w.append(el("div", "blocked", "! " + strip(a)));
+  return w;
 }
 
 // A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
@@ -791,12 +805,27 @@ function fromHash() {
   const m = /^#pending(?:\/([A-Za-z0-9_-]{1,64}))?$/.exec(h);
   if (m) openPending(m[1]);
   if (h === "#notifications") openNotifications();
+  if (h === "#health") openHealth();
+}
+// A node-health notification opens the nodes' health, not the pending list (#574, B5).
+function openHealth() {
+  const box = document.getElementById("health");
+  if (box && box.scrollIntoView) box.scrollIntoView();
 }
 
 // Signed out, the server answers /api/me with 401 and tells the page nothing else: the page offers
 // passkey sign-in (and says where enrolment links come from) whatever the server's state.
 async function boot() {
-  const r = await fetch("/api/me");
+  // Signed out is what the server says (401, 403, or who: none); a server that can't answer now (a
+  // restart's 502, a network error) is retried, not shown as a sign-in (#574).
+  let r;
+  try { r = await fetch("/api/me"); } catch (e) { r = null; }
+  if (!r || (!r.ok && r.status !== 401 && r.status !== 403)) {
+    showStale(r ? "HTTP " + r.status : "no answer");
+    setTimeout(boot, 5000);
+    return;
+  }
+  showStale(null);
   const me = r.ok ? await r.json() : { who: { state: "none" } };
   const auth = document.getElementById("auth"), con = document.getElementById("console");
   auth.replaceChildren();
@@ -1165,13 +1194,45 @@ async function submitSecret(ev) {
   else signed({ action: "delete_secret", name: m.name });
 }
 
+// When the console last heard from wicket, and a line saying so while it can't (#574): what is on
+// the page is as of then, and the poll goes on.
+let lastHeard = 0;
+function showStale(why) {
+  const b = document.getElementById("stale");
+  if (!b) return;
+  if (!why) { b.hidden = true; return; }
+  b.hidden = false;
+  const since = lastHeard ? " since " + new Date(lastHeard).toISOString().slice(11, 19) + "Z; what is shown is as of then" : "";
+  b.textContent = "Can't reach wicket (" + why + ")" + since + ". Retrying.";
+}
+
+// One poll at a time (#574, B9), each bounded: a hung fetch is a stale page, said so, not a frozen
+// one. An answer from before a decision is dropped (`pollGen` moves when the sheet closes), and a
+// poll asked for while one is in flight runs once it ends (review of #598).
+let polling = false, pollAgain = false, pollGen = 0;
+const POLL_TIMEOUT_MS = 10000;
 async function refresh() {
   if (ceremony) return;
+  if (polling) { pollAgain = true; return; }
+  polling = true;
+  try { await refreshOnce(); } finally { polling = false; }
+  if (pollAgain) { pollAgain = false; refresh(); }
+}
+async function refreshOnce() {
+  const gen = pollGen;
+  let r;
+  const opts = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? { signal: AbortSignal.timeout(POLL_TIMEOUT_MS) } : undefined;
+  try { r = await fetch("/api/state", opts); } catch (e) { showStale(e && e.name === "TimeoutError" ? "no answer in 10 s" : "no answer"); return; }
+  if (gen !== pollGen) return;
+  // Only the server saying the session is gone signs the page out; anything else is a moment's
+  // trouble, said as such, and the poll carries on.
+  if (r.status === 401 || r.status === 403) { boot(); return; }
+  if (!r.ok) { showStale("HTTP " + r.status); return; }
+  lastHeard = Date.now();
+  showStale(null);
   try {
-    const r = await fetch("/api/state");
-    if (!r.ok) { boot(); return; }
     const s = await r.json();
-    if (ceremony) return; // opened while this poll was in flight
+    if (ceremony || gen !== pollGen) return; // a sheet opened, or a decision was made, while this poll was in flight
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
     renderPending(s);
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
@@ -1206,6 +1267,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("detail-close").addEventListener("click", () => { document.getElementById("detail").hidden = true; });
   if (typeof navigator !== "undefined" && navigator.serviceWorker) navigator.serviceWorker.addEventListener("message", e => {
     if (e.data && typeof e.data.open === "string") openPending(e.data.open);
+    if (e.data && e.data.health === true) openHealth();
     if (e.data && e.data.resubscribe === true) openNotifications();
   });
   if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("hashchange", fromHash);
