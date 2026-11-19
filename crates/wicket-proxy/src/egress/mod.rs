@@ -393,7 +393,7 @@ impl Egress {
         let mut outcome = self.decider.decide(ctx, &op, who.as_ref()).await;
         // A model call the node can't decide yet (catching up with its feed, which takes
         // milliseconds, or a brief cut) is held a short, bounded while before it is answered (#352).
-        if matches!(outcome, Outcome::Unavailable(_)) && self.model_gate.get().is_some_and(|l| l.is_model_call(&host, &path)) {
+        if matches!(outcome, Outcome::Unavailable(_)) && self.model_gate.get().is_some_and(|l| l.is_model_call(&host, &method, &pq)) {
             let until = tokio::time::Instant::now() + MODEL_CALL_HOLD;
             while matches!(outcome, Outcome::Unavailable(_)) && tokio::time::Instant::now() < until {
                 tokio::time::sleep(MODEL_CALL_HOLD_POLL).await;
@@ -493,7 +493,7 @@ impl Egress {
             }
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
-        if let Some(llm) = self.model_gate.get().filter(|l| l.is_model_call(&host, &path)) {
+        if let Some(llm) = self.model_gate.get().filter(|l| l.is_model_call(&host, &method, &pq)) {
             return llm.clone().through_egress(self.clone(), req, &host, &pq, via).await;
         }
         match self.forward(req, &host, scheme, &pq, via).await {
@@ -858,12 +858,14 @@ mod tests {
     }
 
     /// #112: a wrapped session's model calls, which come through the egress proxy, get the model
-    /// proxy's route, budget and body checks there: never forwarded once the budget is spent, nor as a
-    /// batch or an encoded body.
+    /// proxy's route, budget and body checks there: never forwarded once the budget is spent, nor as
+    /// an encoded body. Anything else to the model host (a batch) is plain egress, decided by the
+    /// zone's reach rules, which here reach only the model routes (#552).
     #[tokio::test]
     async fn model_calls_through_egress_are_vetted_and_counted() {
         use http_body_util::BodyExt;
-        let (c, dir) = ctx("reach: [{host: api.anthropic.com, methods: [GET, POST]}]", vec![], "model-gate");
+        let reach = "reach: [{host: api.anthropic.com, methods: [POST], paths: ['/v1/messages', '/v1/messages/count_tokens']}]";
+        let (c, dir) = ctx(reach, vec![], "model-gate");
         let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
         let e = super::Egress::with(c.clone(), ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
         let llm = crate::llm::Llm::new(c).unwrap();
@@ -882,8 +884,10 @@ mod tests {
                 (st, String::from_utf8_lossy(&r.into_body().collect().await.unwrap().to_bytes()).into_owned())
             }
         };
-        // Not one of the provider's routes: refused as the model proxy refuses it (404), uncounted (#552).
-        assert_eq!(send("/v1/messages/batches", None).await.0, 404);
+        // Not a model call: the reach rules refuse it, as any request they don't reach, uncounted.
+        let (st, body) = send("/v1/messages/batches", None).await;
+        assert_eq!(st, 403, "{body}");
+        assert!(body.contains("Blocked by wicket box"), "{body}");
         assert_eq!(send("/v1/messages", Some("gzip")).await.0, 415);
         assert_eq!(llm.count.requests.load(std::sync::atomic::Ordering::SeqCst), 1, "counted as a model request");
         llm.spent_before(u64::MAX / 4, 0, 0);

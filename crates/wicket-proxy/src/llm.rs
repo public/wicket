@@ -252,9 +252,12 @@ impl Llm {
     }
 
     /// Whether a request to a model host is a model call, vetted and accounted as one, when it
-    /// arrives at the egress proxy (a wrapped session's).
-    pub(crate) fn is_model_call(&self, host: &str, path: &str) -> bool {
-        self.is_model_host(host) && self.profile().is_some_and(|p| (p.model_call)(path))
+    /// arrives at the egress proxy (a wrapped session's): a call the model proxy would take, one of
+    /// the provider's routes. Anything else to a model host (a batch, say) is plain egress, decided
+    /// by the zone's reach rules as any other request is (#552).
+    pub(crate) fn is_model_call(&self, host: &str, method: &str, pq: &str) -> bool {
+        let path = pq.split('?').next().unwrap_or("/");
+        self.is_model_host(host) && self.profile().is_some_and(|p| (p.model_call)(path) && p.allowed_route(method, pq).is_ok())
     }
 
     async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<BoxBody> {

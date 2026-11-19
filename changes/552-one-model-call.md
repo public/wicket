@@ -6,8 +6,9 @@ type: Changed
   proxy, or through the egress proxy as a wrapped session's call does
   ([#552](https://github.com/public/wicket/issues/552)). Both go through one code path, and a
   test runs every model-call behaviour through both routes. What changes:
-  - **A request that isn't one of the provider's model routes** (a batch, say) is refused with 404
-    on both routes, and not counted. The egress route used to count it and answer 403.
+  - **A request to the model host that isn't one of the provider's model routes** (a batch, say)
+    is no longer counted as a model call on the egress route. It is ordinary egress, decided by the
+    zone's reach rules like any other request. The model proxy still refuses it with 404.
   - **A request body too large to read** is a 400 on both. The model proxy used to answer 502.
   - **A login being rewritten by its owner** is waited for on both routes. A secret that can't be
     read, or isn't on a node yet, is a 503 that says so on both. The egress route used to fail with
