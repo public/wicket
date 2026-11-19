@@ -80,7 +80,8 @@ pub struct Evidence {
     pub days: u64,
     pub first: Option<i64>,
     pub last: Option<i64>,
-    /// The agent's own asks ahead the rule covers: not evidence, shown apart.
+    /// The agent's own asks ahead the rule covers that no human has decided: not evidence, shown
+    /// apart. (Decided ones are evidence, counted above.)
     pub own_asks: u64,
     /// The distinct ops of the blocked requests, most asked first, at most [`EVIDENCE_OPS`].
     pub ops: Vec<EvidenceOp>,
@@ -179,9 +180,22 @@ pub fn new_standing_id() -> String {
 
 const COLS: &str = "id, tenant, run, zone, principal, rule, reason, evidence, status, created_at, decided_at, decided_by, bound, expires_at, effect_sha256, revoked_at, revoked_by, zone_digest";
 
-/// A zone definition's digest, as a standing rule binds to it: sha256 of its JSON.
+/// A zone definition's digest, as a standing rule binds to it: sha256 of a versioned subset of it,
+/// what decides egress (its reach, forbids, injections, unlisted hosts, wildcards and escalation).
+/// Not the whole spec: an edit to a timeout, a model budget or an image, or a build that adds a
+/// defaulted field, mustn't unbind every rule of the zone (#572 re-review, N3). A change to the
+/// subset itself bumps the version, and rules made under the old one are asked for again.
 pub fn zone_digest(zone: &wicket_core::ZoneSpec) -> String {
-    hex::encode(Sha256::digest(serde_json::to_string(zone).unwrap_or_default().as_bytes()))
+    let egress = serde_json::json!({
+        "v": 1,
+        "reach": zone.reach,
+        "forbid": zone.forbid,
+        "inject": zone.inject,
+        "unlisted_hosts": zone.unlisted_hosts,
+        "wildcards": zone.wildcards,
+        "escalation": zone.escalation,
+    });
+    hex::encode(Sha256::digest(egress.to_string().as_bytes()))
 }
 
 /// At most this many of a principal's standing asks wait at once (#572 review, L4).
@@ -313,7 +327,10 @@ impl Ledger {
             if !any_risk.allows(&op).unwrap_or(false) {
                 continue;
             }
-            if reason.starts_with(AGENT_ASKS_PREFIX) {
+            // The agent's own asks ahead count once a human decided them (granted or denied):
+            // asking ahead and being granted is the commonest need. Only undecided ones are left
+            // apart, which an agent could raise as many of as it liked (#572 re-review, N1).
+            if reason.starts_with(AGENT_ASKS_PREFIX) && !matches!(status.as_str(), "granted" | "denied") {
                 e.own_asks += 1;
                 continue;
             }
@@ -588,5 +605,38 @@ mod tests {
         l.conn.execute("UPDATE standing SET rule = 'not json' WHERE id = ?1", params![id2]).unwrap();
         assert_eq!(l.standing_with_status(&t, "denied").unwrap().len(), 0);
         assert_eq!(l.standing_with_status(&t, "pending").unwrap().len(), MAX_PENDING);
+    }
+
+    /// #572 re-review, N1: an agent's asks ahead that a human decided are evidence (granted, the
+    /// commonest case); only undecided ones are left apart.
+    #[test]
+    fn decided_asks_ahead_are_evidence() {
+        let mut l = ledger();
+        let t = TenantId::single();
+        let (r1, who) = run(&l, "run_n1", "work", "worker");
+        let get = |job: u32| Op::egress(&t, &r1, "work", "GET", "ci.example", &format!("/jobs/{job}/logs"));
+        for job in [1, 2] {
+            let (rid, _) = l.ask(&get(job), &format!("{AGENT_ASKS_PREFIX}logs"), false, None).unwrap();
+            l.approve(
+                &rid,
+                &crate::Approval { uses: Some(1), ttl: std::time::Duration::from_secs(600), path_prefix: None, decided_by: "op".into() },
+            )
+            .unwrap();
+        }
+        l.ask(&get(3), &format!("{AGENT_ASKS_PREFIX}logs"), false, None).unwrap();
+        let (id, _) = l.ask_standing(&t, &r1, "work", DIGEST, &who, &rule("{ host: ci.example, paths: ['/jobs/**'] }"), "logs").unwrap();
+        let e = l.standing(&id).unwrap().evidence;
+        assert_eq!((e.requests, e.granted, e.own_asks), (2, 2, 1), "{e:?}");
+    }
+
+    /// #572 re-review, N3: the zone digest is what decides egress, so a timeout, a model budget or
+    /// an image doesn't unbind a zone's standing rules, and reach or a forbid does.
+    #[test]
+    fn the_zone_digest_is_what_decides_egress() {
+        let z = |y: &str| -> wicket_core::ZoneSpec { wicket_core::yaml::from_str(y).unwrap() };
+        let base = zone_digest(&z("name: work\nreach: [{ host: ci.example }]\n"));
+        assert_eq!(base, zone_digest(&z("name: work\nreach: [{ host: ci.example }]\nimages: [x]\nlimits: { timeout: 2h }\n")));
+        assert_ne!(base, zone_digest(&z("name: work\nreach: [{ host: ci.example }, { host: other.example }]\n")));
+        assert_ne!(base, zone_digest(&z("name: work\nreach: [{ host: ci.example }]\nforbid: [{ host: evil.example }]\n")));
     }
 }
