@@ -69,7 +69,8 @@ const DELTAS: &str = "deltas.jsonl";
 /// The checkpoint beside the delta log (#582): the state at an epoch, so opening the feed replays
 /// only the deltas after it.
 pub const CHECKPOINT: &str = "checkpoint.json";
-/// A publisher writes a checkpoint after this many deltas past the last one.
+/// A checkpoint is written at every epoch that is a multiple of this, by the publisher that commits
+/// it: one per that many deltas for the feed, however many publishers share it.
 pub const CHECKPOINT_EVERY: u64 = 64;
 
 /// What [`Publisher::refresh`] found.
@@ -84,19 +85,20 @@ pub enum Refreshed {
     Reopen,
 }
 
-/// A checkpoint: the state at `snap.epoch`, and where in the log that epoch ends. It is the
+/// A checkpoint: the state at an epoch, and where in the log that epoch ends. It is the
 /// publisher's own file, like its log (whose signatures aren't checked on open either); it is used
-/// only if the log's line at `end` hashes to `snap.head`, so a log replaced or rewritten since
-/// makes it be ignored, never trusted.
+/// only if its state reads back to its own hash and the deltas it keeps (at least its own epoch's)
+/// chain in the log up to its head, so a log replaced or rewritten since, or a damaged file, makes
+/// it be ignored, never trusted.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[serde(bound(serialize = "P: Serialize", deserialize = "P: serde::de::DeserializeOwned"))]
-struct Checkpoint<P> {
-    snap: Snapshot<P>,
+struct Checkpoint {
+    /// The state, a [`Snapshot`] as JSON, and its [`sha`].
+    snap: String,
+    sum: String,
     /// The log's byte offset just past delta `snap.epoch`'s line.
     end: u64,
-    /// The byte offset and epoch of the first delta kept for catch-up (`tail_epoch` is
-    /// `snap.epoch + 1`, at `end`, when none is).
+    /// The byte offset and epoch of the first delta kept for catch-up: at most `snap.epoch`.
     tail_from: u64,
     tail_epoch: u64,
     /// [`Publisher`]'s `gen_start`, for `snap.version`.
@@ -178,14 +180,18 @@ fn read_from(path: &Path, offset: u64) -> io::Result<String> {
 
 /// The checkpoint in `dir`, if there is one that reads and is for `feed` (and for `version`, when
 /// given). Whether it matches the log is checked as the log is read.
-fn read_checkpoint<P: Policy>(dir: &Path, feed: &str, version: Option<u64>) -> Option<Checkpoint<P>> {
-    let c: Checkpoint<P> = serde_json::from_str(&read_opt(&dir.join(CHECKPOINT)).ok()??).ok()?;
-    let ok = c.snap.feed == feed
-        && version.is_none_or(|v| v == c.snap.version)
-        && c.tail_from <= c.end
+fn read_checkpoint<P: Policy>(dir: &Path, feed: &str, version: Option<u64>) -> Option<(Checkpoint, Snapshot<P>)> {
+    let c: Checkpoint = serde_json::from_str(&read_opt(&dir.join(CHECKPOINT)).ok()??).ok()?;
+    if sha(&c.snap) != c.sum {
+        return None;
+    }
+    let snap: Snapshot<P> = serde_json::from_str(&c.snap).ok()?;
+    let ok = snap.feed == feed
+        && version.is_none_or(|v| v == snap.version)
+        && c.tail_from < c.end
         && c.tail_epoch >= 1
-        && c.tail_epoch <= c.snap.epoch + 1;
-    ok.then_some(c)
+        && c.tail_epoch <= snap.epoch;
+    ok.then_some((c, snap))
 }
 
 /// Loads the feed in `dir`: from its checkpoint and the deltas after it when the checkpoint
@@ -193,8 +199,9 @@ fn read_checkpoint<P: Policy>(dir: &Path, feed: &str, version: Option<u64>) -> O
 /// may be above (none for read-only views). Every delta is checked to extend the chain.
 fn load<P: Policy>(dir: &Path, feed: &str, ctx: P::Ctx, version: Option<u64>, keep: u64) -> Result<Loaded<P>, PublishError> {
     let path = dir.join(DELTAS);
-    if let Some(c) = read_checkpoint::<P>(dir, feed, version) {
-        if let Some(l) = load_from_checkpoint(&path, feed, ctx.clone(), version, keep, c)? {
+    let keep = keep.max(1);
+    if let Some((c, snap)) = read_checkpoint::<P>(dir, feed, version) {
+        if let Some(l) = load_from_checkpoint(&path, feed, ctx.clone(), version, keep, c, snap)? {
             return Ok(l);
         }
     }
@@ -254,7 +261,8 @@ fn load_from_checkpoint<P: Policy>(
     ctx: P::Ctx,
     version: Option<u64>,
     keep: u64,
-    c: Checkpoint<P>,
+    c: Checkpoint,
+    snap: Snapshot<P>,
 ) -> Result<Option<Loaded<P>>, PublishError> {
     let text = read_from(path, c.tail_from)?;
     let Some(split) = usize::try_from(c.end - c.tail_from).ok().filter(|s| *s <= text.len() && text.is_char_boundary(*s)) else {
@@ -283,16 +291,16 @@ fn load_from_checkpoint<P: Policy>(
         last_version = link.version;
         t.push(link.version, line.to_string(), sha(line));
     }
+    // At least the checkpoint's own delta is kept, so there is always a line to check it against.
     let tail = match tail {
-        Some(t) if t.heads.back() == Some(&c.snap.head) && c.tail_epoch + kept_lines.len() as u64 == c.snap.epoch + 1 => t,
-        None if c.tail_epoch == c.snap.epoch + 1 && c.tail_from == c.end => Tail::new(keep, c.snap.epoch, c.snap.head.clone(), c.end),
+        Some(t) if t.heads.back() == Some(&snap.head) && c.tail_epoch + kept_lines.len() as u64 == snap.epoch + 1 => t,
         _ => return Ok(None),
     };
-    let mut state = State::from_snapshot(&c.snap, ctx);
+    let mut state = State::from_snapshot(&snap, ctx);
     if let Some(v) = version {
         state.version = v;
     }
-    let mut l = Loaded { state, tail, gen_start: c.gen_start, end: c.end, torn: false, checkpoint: Some(c.snap.epoch), last_at: None };
+    let mut l = Loaded { state, tail, gen_start: c.gen_start, end: c.end, torn: false, checkpoint: Some(snap.epoch), last_at: None };
     apply_lines(&mut l, after, feed, version)?;
     Ok(Some(l))
 }
@@ -314,9 +322,12 @@ pub struct Publisher<P: Policy> {
     /// The log's length as this publisher last read or wrote it, and its inode then.
     end: u64,
     ino: u64,
-    /// The epoch of the last checkpoint written or loaded.
+    /// The epoch of the checkpoint loaded on open, if any.
     checkpointed: u64,
     checkpoint_every: u64,
+    /// Checkpoints this publisher wrote, and why its last attempt failed, if it did.
+    checkpoints: u64,
+    checkpoint_error: Option<String>,
     staged: Vec<Change<P>>,
     /// A statement is due at once (none signed yet under a new certificate's version).
     statement_due: bool,
@@ -394,14 +405,17 @@ impl<P: Policy> Publisher<P> {
             ino,
             checkpointed: l.checkpoint.unwrap_or(0),
             checkpoint_every: CHECKPOINT_EVERY,
+            checkpoints: 0,
+            checkpoint_error: None,
             staged: vec![],
             statement_due: false,
             last_issued: i64::MIN,
         };
         // A long replay is saved, so the next process to open the feed starts from here. (A
         // checkpoint that can't be written is only a slower next open.)
-        if let Some(at) = l.last_at.filter(|_| p.checkpoint_due()) {
-            let _ = p.checkpoint(at);
+        let behind = p.checkpoint_every > 0 && p.state.epoch >= p.checkpointed + p.checkpoint_every;
+        if let Some(at) = l.last_at.filter(|_| behind) {
+            p.try_checkpoint(at);
         }
         Ok(p)
     }
@@ -448,10 +462,27 @@ impl<P: Policy> Publisher<P> {
         Ok(Refreshed::Applied(applied))
     }
 
-    /// Whether a checkpoint is due: [`CHECKPOINT_EVERY`] deltas (or the number set with
-    /// [`Publisher::set_checkpoint_every`]) since the last one.
+    /// Whether the epoch just committed is due a checkpoint: a multiple of [`CHECKPOINT_EVERY`] (or
+    /// of the number set with [`Publisher::set_checkpoint_every`]). Each epoch is committed by one
+    /// publisher, so one checkpoint is written per that many deltas, whoever commits them.
     fn checkpoint_due(&self) -> bool {
-        self.checkpoint_every > 0 && self.state.epoch >= self.checkpointed + self.checkpoint_every
+        self.checkpoint_every > 0 && self.state.epoch.is_multiple_of(self.checkpoint_every)
+    }
+
+    /// [`Publisher::checkpoint`], keeping why it failed instead of failing: a checkpoint that
+    /// can't be written is only a slower next open, and the next is tried at the next due epoch.
+    fn try_checkpoint(&mut self, now: i64) {
+        self.checkpoint_error = self.checkpoint(now).err().map(|e| e.to_string());
+    }
+
+    /// Why this publisher's last checkpoint couldn't be written, once (for the caller to log).
+    pub fn take_checkpoint_error(&mut self) -> Option<String> {
+        self.checkpoint_error.take()
+    }
+
+    /// How many checkpoints this publisher has written.
+    pub fn checkpoints_written(&self) -> u64 {
+        self.checkpoints
     }
 
     /// How many deltas pass between checkpoints (0: none are written).
@@ -462,8 +493,11 @@ impl<P: Policy> Publisher<P> {
     /// Writes a checkpoint of the current state (without what has expired by `now`), atomically, so
     /// opening the feed replays only the deltas after it. The log itself is unchanged.
     pub fn checkpoint(&mut self, now: i64) -> Result<(), PublishError> {
+        let snap =
+            serde_json::to_string(&self.state.snapshot(&self.feed, now)).map_err(|e| PublishError::Invalid(format!("checkpoint: {e}")))?;
         let c = Checkpoint {
-            snap: self.state.snapshot(&self.feed, now),
+            sum: sha(&snap),
+            snap,
             end: self.end,
             tail_from: self.tail.from,
             tail_epoch: self.tail.base + 1,
@@ -472,6 +506,7 @@ impl<P: Policy> Publisher<P> {
         let json = serde_json::to_vec(&c).map_err(|e| PublishError::Invalid(format!("checkpoint: {e}")))?;
         write_atomic(&self.path.with_file_name(CHECKPOINT), &json)?;
         self.checkpointed = self.state.epoch;
+        self.checkpoints += 1;
         Ok(())
     }
 
@@ -538,8 +573,17 @@ impl<P: Policy> Publisher<P> {
             issued_at: now,
             changes,
         };
-        let jws = sign(&self.key, TYP_DELTA, &d);
         let len = self.file.metadata()?.len();
+        if len != self.end {
+            // Another publisher appended since this one last read the log: a delta now would fork
+            // the chain (its epoch and prev are stale). Refused, so a caller that skipped
+            // `refresh` fails closed instead of signing on a head the log no longer has.
+            return Err(PublishError::Invalid(format!(
+                "the delta log is {len} bytes, not the {} this publisher last read: refresh first",
+                self.end
+            )));
+        }
+        let jws = sign(&self.key, TYP_DELTA, &d);
         let written = self.file.write_all(format!("{jws}\n").as_bytes()).and_then(|()| self.file.sync_data());
         if let Err(e) = written {
             // Don't leave a partial line for the next append to extend.
@@ -552,7 +596,7 @@ impl<P: Policy> Publisher<P> {
         self.tail.push(d.version, jws.clone(), head);
         if self.checkpoint_due() {
             // The delta is durable: a checkpoint that can't be written is only a slower next open.
-            let _ = self.checkpoint(now);
+            self.try_checkpoint(now);
         }
         Ok(Frame::new(FrameKind::Delta, jws))
     }

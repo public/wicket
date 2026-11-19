@@ -148,27 +148,43 @@ fn a_checkpoint_that_does_not_match_the_log_is_ignored() {
         assert_eq!(viewed.head, cp.p.state().head, "{what}");
     };
 
-    // A checkpoint whose state was tampered with (a box added) but whose head still matches the
-    // log would be believed: it is the control host's own file, like the log. One whose head or
-    // offsets don't match the log is ignored.
-    let mut c: serde_json::Value = serde_json::from_str(&good).unwrap();
-    c["snap"]["head"] = serde_json::json!(GENESIS);
-    std::fs::write(&path, c.to_string()).unwrap();
+    // The state inside, edited: (`f` changes the snapshot; `resum` whether its hash follows).
+    let edit = |f: &dyn Fn(&mut serde_json::Value), resum: bool| {
+        let mut c: serde_json::Value = serde_json::from_str(&good).unwrap();
+        let mut snap: serde_json::Value = serde_json::from_str(c["snap"].as_str().unwrap()).unwrap();
+        f(&mut snap);
+        let text = snap.to_string();
+        if resum {
+            c["sum"] = serde_json::json!(crate::sha(&text));
+        }
+        c["snap"] = serde_json::json!(text);
+        std::fs::write(&path, c.to_string()).unwrap();
+    };
+    // Damaged (a box gone) with the right head: its hash no longer matches.
+    edit(&|s| s["zones"].as_array_mut().unwrap().clear(), false);
+    check(&cp, "a state that doesn't match its hash");
+    // Consistent in itself, but at another head than the log's line at its offset.
+    edit(&|s| s["head"] = serde_json::json!(GENESIS), true);
     check(&cp, "another head");
-    let mut c: serde_json::Value = serde_json::from_str(&good).unwrap();
-    c["end"] = serde_json::json!(c["end"].as_u64().unwrap() - 3);
-    std::fs::write(&path, c.to_string()).unwrap();
+    edit(&|s| s["feed"] = serde_json::json!("n2"), true);
+    check(&cp, "another node's");
+    let offsets = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut c: serde_json::Value = serde_json::from_str(&good).unwrap();
+        f(&mut c);
+        std::fs::write(&path, c.to_string()).unwrap();
+    };
+    offsets(&|c| c["end"] = serde_json::json!(c["end"].as_u64().unwrap() - 3));
     check(&cp, "a short offset");
-    let mut c: serde_json::Value = serde_json::from_str(&good).unwrap();
-    c["end"] = serde_json::json!(c["end"].as_u64().unwrap() * 10);
-    std::fs::write(&path, c.to_string()).unwrap();
+    offsets(&|c| c["end"] = serde_json::json!(c["end"].as_u64().unwrap() * 10));
     check(&cp, "past the log's end");
+    // No delta kept to check it against: refused, whatever it holds.
+    offsets(&|c| {
+        c["tail_from"] = c["end"].clone();
+        c["tail_epoch"] = serde_json::json!(cp.p.epoch() + 1);
+    });
+    check(&cp, "nothing kept to check it against");
     std::fs::write(&path, "{not json").unwrap();
     check(&cp, "unreadable");
-    let mut c: serde_json::Value = serde_json::from_str(&good).unwrap();
-    c["snap"]["feed"] = serde_json::json!("n2");
-    std::fs::write(&path, c.to_string()).unwrap();
-    check(&cp, "another node's");
 }
 
 #[test]
@@ -252,4 +268,59 @@ fn an_open_from_a_checkpoint_reads_nothing_before_its_tail() {
         cp.authz_root.public(),
     );
     assert!(replayed.is_err_and(|e| e.to_string().contains("unreadable")));
+}
+
+/// With `retain` 0, a checkpoint still keeps its own epoch's delta, and is checked against it.
+#[test]
+fn a_checkpoint_keeps_its_own_delta_with_retain_zero() {
+    let none = PublisherConfig { retain: 0, ..cfg() };
+    let mut cp = Cp::with(none.clone(), T0 + 86_400_000);
+    cp.p.set_checkpoint_every(4);
+    churn(&mut cp, 0, 4);
+    let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(cp.dir.path().join(CHECKPOINT)).unwrap()).unwrap();
+    assert!(c["tail_from"].as_u64() < c["end"].as_u64(), "{c}");
+    let mut p = cp.open_publisher(none);
+    assert_eq!(snap(&mut p, T0 + 100), snap(&mut cp.p, T0 + 100));
+}
+
+/// A publisher that missed another's append can't commit on the head it holds: that delta would
+/// fork the chain (its epoch and prev stale), and a node holding the other's (a revocation,
+/// say) would refuse it, or the other's, as a replay. It fails closed until it refreshes.
+#[test]
+fn a_publisher_behind_the_log_refuses_to_commit_until_it_refreshes() {
+    let mut cp = Cp::new();
+    churn(&mut cp, 0, 1);
+    let mut b = cp.open_publisher(cfg());
+    let before = (b.epoch(), b.state().head.clone());
+    cp.p.commit(vec![Change::Revoke { kind: RevokeKind::Run, id: "run-0".into(), until: T0 + 3_600_000 }], T0 + 10).unwrap();
+    let put = cp.put("from-b");
+    let e = b.commit(vec![put.clone()], T0 + 20).unwrap_err();
+    assert!(e.to_string().contains("refresh first"), "{e}");
+    assert_eq!((b.epoch(), b.state().head.clone()), before, "nothing applied");
+    assert_eq!(b.refresh().unwrap(), Refreshed::Applied(1));
+    assert!(b.state().is_revoked(RevokeKind::Run, "run-0"));
+    b.commit(vec![put], T0 + 20).unwrap();
+    assert_eq!(cp.p.refresh().unwrap(), Refreshed::Applied(1));
+    assert_eq!(cp.p.state().head, b.state().head);
+}
+
+/// Checkpoints are one per `CHECKPOINT_EVERY` deltas of the feed, however many publishers commit
+/// them in turn (each epoch is committed by one of them).
+#[test]
+fn many_publishers_write_one_checkpoint_per_interval_between_them() {
+    let cp = Cp::new();
+    let mut ps: Vec<Publisher<BoxAuthority>> = (0..8).map(|_| cp.open_publisher(cfg())).collect();
+    for p in &mut ps {
+        p.set_checkpoint_every(8);
+    }
+    for i in 0..200 {
+        let p = &mut ps[i % 8];
+        p.refresh().unwrap();
+        p.commit(vec![Change::Revoke { kind: RevokeKind::Run, id: format!("r{i}"), until: T0 + 3_600_000 }], T0 + i as i64).unwrap();
+    }
+    let written: u64 = ps.iter().map(|p| p.checkpoints_written()).sum();
+    assert_eq!(written, 200 / 8);
+    let mut last = cp.open_publisher(cfg());
+    assert_eq!(last.epoch(), 200);
+    assert_eq!(snap(&mut last, T0 + 300), snap(&mut ps[7], T0 + 300));
 }
