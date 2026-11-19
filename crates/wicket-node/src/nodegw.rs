@@ -862,6 +862,17 @@ async fn ask_standing(node: &Arc<Node>, run: &str, args: &Value, host: &str, pat
     if let Err(why) = rule.check_standing() {
         return (format!("not requested: {why}"), true);
     }
+    // One rule of the box's token per method and path glob: at most 16 (`max_grant_rules`).
+    if rule.methods.len() * rule.paths.len() > 16 {
+        return (
+            format!(
+                "not requested: {} methods × {} paths is more than 16 pairs; ask for fewer, or wider globs",
+                rule.methods.len(),
+                rule.paths.len()
+            ),
+            true,
+        );
+    }
     let shown =
         format!("{} {host} {}{}", rule.methods.join(","), rule.paths.join(" "), if rule.allow_dangerous { " (dangerous)" } else { "" });
     if !connected(node, run) {
