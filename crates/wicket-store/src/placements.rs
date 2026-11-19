@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS placements (
   at_ms INTEGER NOT NULL, state TEXT NOT NULL, bound_at_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS placements_node ON placements (node, state);
+CREATE TABLE IF NOT EXISTS placement_decisions (run TEXT PRIMARY KEY, at_ms INTEGER NOT NULL, decision TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS placement_waits (
   run TEXT PRIMARY KEY, at_ms INTEGER NOT NULL, seen_ms INTEGER NOT NULL, request TEXT NOT NULL
 );
@@ -99,6 +100,24 @@ impl Ledger {
             .optional()?)
     }
 
+    /// Records why `run`'s box went where it did, or why it went nowhere (JSON: the request, the
+    /// node, the ranking and the refusals): its latest decision, for `wicket why-here`.
+    pub fn record_placement_decision(&self, run: &str, decision: &str, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO placement_decisions (run, at_ms, decision) VALUES (?1, ?2, ?3)",
+            params![run, now_ms, decision],
+        )?;
+        Ok(())
+    }
+
+    /// `run`'s latest placement decision: (when, JSON).
+    pub fn placement_decision(&self, run: &str) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT at_ms, decision FROM placement_decisions WHERE run = ?1", params![run], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
     /// `run` waits for a node (#579 step 2's queue), asking for `request` (JSON, as placement reads
     /// it). Its place is when it first waited; each call is a heartbeat.
     pub fn wait_for_placement(&self, run: &str, request: &str, now_ms: i64) -> Result<()> {
@@ -132,7 +151,11 @@ impl Ledger {
     /// Deletes reservations settled (bound or released) over a day before `now` (s): what each
     /// reconcile pass's upkeep drops (#582), so the table holds the boxes being started.
     pub fn drop_settled_placements(&self, now: i64) -> Result<usize> {
-        Ok(self.conn.execute("DELETE FROM placements WHERE state != 'reserved' AND at_ms < ?1", params![(now - 86_400) * 1000])?)
+        let cutoff = (now - 86_400) * 1000;
+        let n = self.conn.execute("DELETE FROM placements WHERE state != 'reserved' AND at_ms < ?1", params![cutoff])?;
+        // Decisions are kept with their run: a week, as #582's archive keeps its settled rows.
+        let week = (now - crate::ARCHIVE_AFTER_SECS) * 1000;
+        Ok(n + self.conn.execute("DELETE FROM placement_decisions WHERE at_ms < ?1", params![week])?)
     }
 
     /// What reservations hold on `node` beyond its report received at `report_at_ms`: (vCPUs, MiB).
@@ -191,6 +214,20 @@ mod tests {
         assert!(l.waiting_before("run_b", t + 5 + WAIT_SEEN_MS).unwrap().is_empty());
         l.stop_waiting("run_b").unwrap();
         assert_eq!(names(l.waiting_before("run_c", t + 6).unwrap()), ["run_a"]);
+    }
+
+    #[test]
+    fn a_runs_latest_placement_decision_is_kept_a_week() {
+        let l = Ledger::open_in_memory().unwrap();
+        let now = crate::now();
+        l.record_placement_decision("run_a", r#"{"node":null}"#, now * 1000).unwrap();
+        l.record_placement_decision("run_a", r#"{"node":"n1"}"#, now * 1000 + 1).unwrap();
+        assert_eq!(l.placement_decision("run_a").unwrap().unwrap().1, r#"{"node":"n1"}"#, "the latest");
+        assert!(l.placement_decision("run_b").unwrap().is_none());
+        l.drop_settled_placements(now + 3600).unwrap();
+        assert!(l.placement_decision("run_a").unwrap().is_some());
+        l.drop_settled_placements(now + crate::ARCHIVE_AFTER_SECS + 1).unwrap();
+        assert!(l.placement_decision("run_a").unwrap().is_none());
     }
 
     #[test]

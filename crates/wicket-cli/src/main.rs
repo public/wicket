@@ -177,6 +177,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Why a run's box went on the node it did, or why it went nowhere (#579): what it asked for,
+    /// the nodes it may go on in order, and every reason each other node was out.
+    WhyHere {
+        run: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Supervise a run again whose supervisor died (#151): what `wicket reconcile` starts for a run
     /// still running on its node.
     #[command(hide = true)]
@@ -477,7 +484,8 @@ async fn main() -> Result<()> {
         | Cmd::Session { .. }
         | Cmd::Hibernate { .. }
         | Cmd::Wake { .. }
-        | Cmd::Agents { .. }) => cmd::run::dispatch(c).await,
+        | Cmd::Agents { .. }
+        | Cmd::WhyHere { .. }) => cmd::run::dispatch(c).await,
         Cmd::Top { once } => top::control_top(once).await,
         c @ (Cmd::Pending | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await

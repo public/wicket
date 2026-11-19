@@ -94,6 +94,9 @@ textarea.yaml { font:13px/1.45 var(--mono); min-height:260px; }
 .secret { padding:10px 0; border-bottom:1px solid var(--line); }
 .secret:first-child { padding-top:0; } .secret:last-of-type { border-bottom:0; }
 .secret .row { padding:0; border:0; }
+/* A node's health: its row and its alerts as one item, separated as rows are (#574 review). */
+.hrow { padding:9px 0; border-bottom:1px solid var(--line); } .hrow:first-child { padding-top:0; } .hrow:last-child { border-bottom:0; padding-bottom:0; }
+.hrow > .row { padding:0; border:0; }
 .secret .buttons { margin-top:8px; } .secret .buttons button { min-height:36px; padding:8px 12px; font-size:13px; }
 .secret .meta { margin-top:4px; word-break:break-word; }
 #secret-edit .warn { color:var(--warn); font-size:14px; margin-top:8px; }
