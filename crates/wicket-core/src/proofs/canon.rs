@@ -194,8 +194,9 @@ fn segments_end(b: &[u8], seg: usize) -> Option<(usize, usize)> {
 #[kani::proof]
 #[kani::unwind(10)]
 fn a_prefix_grant_covers_only_paths_under_it() {
-    let pre = AnyStr::<N>::new(PATH);
-    let path = AnyStr::<N>::new(PATH);
+    // Two paths, so one byte shorter than the single-path harnesses: `/../`, `/%2E/` and `//` still fit.
+    let pre = AnyStr::<{ N - 1 }>::new(PATH);
+    let path = AnyStr::<{ N - 1 }>::new(PATH);
     let (p, q) = (pre.bytes(), path.bytes());
     kani::assume(p.first() == Some(&b'/') && q.first() == Some(&b'/'));
     kani::assume(plain_fault(p).is_none() && plain_fault(q).is_none());
