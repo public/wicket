@@ -50,7 +50,7 @@ impl Bound {
             Bound::Zone => "zone",
         }
     }
-    fn parse(s: &str) -> Option<Bound> {
+    pub(crate) fn parse(s: &str) -> Option<Bound> {
         match s {
             "agent" => Some(Bound::Agent),
             "zone" => Some(Bound::Zone),

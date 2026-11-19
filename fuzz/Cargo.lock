@@ -3650,6 +3650,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wicket-names"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "wicket-node"
 version = "0.0.1"
 dependencies = [
@@ -3784,6 +3792,7 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror",
  "wicket-core",
+ "wicket-names",
  "zstd",
 ]
 
