@@ -1263,7 +1263,7 @@ Commands:
   serve     On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
   top       On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
   forget    Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
-  set       Set how an enrolled node's CA may be widened at runtime (#573): `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need), or a list of hosts it may be widened to (`api.example.com,*.example.org`). The widening is a renewal over the run's channel, audited as `node.ca_widened`
+  set       Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`
   renew-ca  Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
   help      Print this message or the help of the given subcommand(s)
 
@@ -1485,15 +1485,17 @@ Options:
 ### `wicket node set`
 
 ```text
-Set how an enrolled node's CA may be widened at runtime (#573): `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need), or a list of hosts it may be widened to (`api.example.com,*.example.org`). The widening is a renewal over the run's channel, audited as `node.ca_widened`
+Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`
 
-Usage: wicket node set --ca-hosts <CA_HOSTS> <NAME>
+Usage: wicket node set [OPTIONS] <NAME>
 
 Arguments:
   <NAME>  
 
 Options:
-      --ca-hosts <CA_HOSTS>  fixed, auto, or a comma-separated list of hosts
+      --ca-hosts <CA_HOSTS>  `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need), or a comma-separated list of hosts it may be widened to (`api.example.com,*.example.org`)
+      --label <LABELS>       `key=value` sets a label, `key-` removes it. Repeatable
+      --taint <TAINTS>       `key` or `key=value` taints the node (one taint per key), `key-` removes it. Repeatable
   -h, --help                 Print help
 ```
 
