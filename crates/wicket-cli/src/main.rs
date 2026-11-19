@@ -157,6 +157,9 @@ enum Cmd {
         /// What woke it (recorded and told to the agent).
         #[arg(long, hide = true)]
         by: Option<String>,
+        /// How long to wait in the queue when no node may take it now (#579); 0: fail at once.
+        #[arg(long, default_value = "30m")]
+        wait: String,
     },
     /// A live view of nodes, runs, pending requests and leases (read-only).
     ///

@@ -21,7 +21,13 @@ CREATE TABLE IF NOT EXISTS placements (
   at_ms INTEGER NOT NULL, state TEXT NOT NULL, bound_at_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS placements_node ON placements (node, state);
+CREATE TABLE IF NOT EXISTS placement_waits (
+  run TEXT PRIMARY KEY, at_ms INTEGER NOT NULL, seen_ms INTEGER NOT NULL, request TEXT NOT NULL
+);
 "#;
+
+/// A waiter not seen for this long (ms) has gone (its process ended): it no longer holds its place.
+pub const WAIT_SEEN_MS: i64 = 10_000;
 
 /// How long an unconfirmed reservation counts against its node (s).
 pub const RESERVE_SECS: i64 = 120;
@@ -93,6 +99,36 @@ impl Ledger {
             .optional()?)
     }
 
+    /// `run` waits for a node (#579 step 2's queue), asking for `request` (JSON, as placement reads
+    /// it). Its place is when it first waited; each call is a heartbeat.
+    pub fn wait_for_placement(&self, run: &str, request: &str, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO placement_waits (run, at_ms, seen_ms, request) VALUES (?1, ?2, ?2, ?3)
+             ON CONFLICT(run) DO UPDATE SET seen_ms = excluded.seen_ms, request = excluded.request",
+            params![run, now_ms, request],
+        )?;
+        Ok(())
+    }
+
+    /// `run` waits no more: placed, given up, or ended.
+    pub fn stop_waiting(&self, run: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM placement_waits WHERE run = ?1", params![run])?;
+        Ok(())
+    }
+
+    /// The live waiters ahead of `run`, oldest first: (run, request). All of them if `run` isn't
+    /// waiting. A waiter not seen for [`WAIT_SEEN_MS`] is left out.
+    pub fn waiting_before(&self, run: &str, now_ms: i64) -> Result<Vec<(String, String)>> {
+        let mine: Option<i64> =
+            self.conn.query_row("SELECT at_ms FROM placement_waits WHERE run = ?1", params![run], |r| r.get(0)).optional()?;
+        let mut st = self.conn.prepare(
+            "SELECT run, request FROM placement_waits WHERE run != ?1 AND seen_ms > ?2 AND (?3 IS NULL OR at_ms < ?3 OR (at_ms = ?3 AND run < ?1))
+             ORDER BY at_ms, run",
+        )?;
+        let rows = st.query_map(params![run, now_ms - WAIT_SEEN_MS, mine], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Deletes reservations settled (bound or released) over a day before `now` (s): what each
     /// reconcile pass's upkeep drops (#582), so the table holds the boxes being started.
     pub fn drop_settled_placements(&self, now: i64) -> Result<usize> {
@@ -134,6 +170,27 @@ mod tests {
         assert_eq!(l.held_on("n1", t - 1, t + 20).unwrap(), (1.0, 1024));
         assert_eq!(l.placement("run_b").unwrap().unwrap().state, "released");
         assert_eq!(l.held_on("n2", t - 1, t + 20).unwrap(), (2.0, 2048), "per node");
+    }
+
+    #[test]
+    fn waiters_keep_their_place_while_they_are_seen() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = 1_000_000;
+        l.wait_for_placement("run_a", "{}", t).unwrap();
+        l.wait_for_placement("run_b", "{\"b\":1}", t + 1).unwrap();
+        l.wait_for_placement("run_a", "{\"a\":2}", t + 5).unwrap(); // a heartbeat keeps its place
+        let names = |v: Vec<(String, String)>| v.into_iter().map(|(r, _)| r).collect::<Vec<_>>();
+        assert_eq!(names(l.waiting_before("run_b", t + 6).unwrap()), ["run_a"]);
+        assert!(l.waiting_before("run_a", t + 6).unwrap().is_empty(), "first");
+        assert_eq!(
+            l.waiting_before("run_c", t + 6).unwrap(),
+            [("run_a".into(), "{\"a\":2}".into()), ("run_b".into(), "{\"b\":1}".into())],
+            "a newcomer is behind all"
+        );
+        // run_a's process went: not seen for WAIT_SEEN_MS, it holds no place.
+        assert!(l.waiting_before("run_b", t + 5 + WAIT_SEEN_MS).unwrap().is_empty());
+        l.stop_waiting("run_b").unwrap();
+        assert_eq!(names(l.waiting_before("run_c", t + 6).unwrap()), ["run_a"]);
     }
 
     #[test]

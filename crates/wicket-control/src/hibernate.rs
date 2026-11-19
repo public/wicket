@@ -452,7 +452,7 @@ fn wake_text(by: &str, said: &[(String, String)], messages: i64) -> String {
 
 /// `wicket wake <agent>` (internal, #249): claims the agent and runs its next activation in the
 /// foreground. What [`trigger_wake`] starts, and wicket's own tests run.
-pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result<()> {
+pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std::time::Duration) -> Result<()> {
     let (agent, generation, run, first, last_node) = {
         let mut l = Ledger::open(&ledger_path())?;
         let a = resolve(&l, who)?;
@@ -535,7 +535,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
     };
     // The agent's state is its bundle, here, so it can wake on any node: bin-packed into the nodes
     // available now, by its zone's limits.
-    let node = match place(&agent, &run, last_node.as_deref()).await {
+    let node = match place(&agent, &run, generation, last_node.as_deref(), wait).await {
         Ok(n) => n,
         Err(e) => {
             let l = Ledger::open(&ledger_path())?;
@@ -644,31 +644,59 @@ pub fn scheduled_node(l: &Ledger, c: &Candidate, need: &[String]) -> wicket_plac
 /// transaction under the ledger's write lock (#579 step 2): each candidate's room is what it
 /// reported less what reservations made since hold on it (`Ledger::held_on`), so two starts never
 /// count the same room. Nothing is reserved when no node may take it.
-pub fn bind(
-    l: &Ledger,
-    run: &RunId,
-    req: &wicket_placement::schedule::Request,
-    cands: &[Candidate],
-    need: &[String],
-    last: Option<&str>,
-    now_ms: i64,
-) -> Result<wicket_placement::schedule::Decision> {
+///
+/// With `fifo` (a wake, which may wait), the runs waiting ahead of it (`Ledger::waiting_before`)
+/// go first: if one of them fits a node now, nothing is reserved for this one, and `behind` names
+/// it. A named node (`--node`) doesn't wait, so it isn't queued.
+pub fn bind(l: &Ledger, run: &RunId, ask: &Waiting, cands: &[Candidate], last: Option<&str>, now_ms: i64, fifo: bool) -> Result<Bound> {
+    use wicket_placement::schedule::{schedule, Strategy};
+    let (req, need) = (&ask.req, &ask.need[..]);
     l.immediate(|l| {
-        let mut nodes = vec![];
+        let mut held = vec![];
         for c in cands {
-            let mut n = scheduled_node(l, c, need);
-            let (cpu, mib) = l.held_on(&c.name, c.at_ms, now_ms)?;
-            n.used_vcpus += cpu;
-            n.used_memory_mib += mib;
-            n.room_mib = n.room_mib.map(|r| r.saturating_sub(mib));
-            nodes.push(n);
+            held.push(l.held_on(&c.name, c.at_ms, now_ms)?);
         }
-        let d = wicket_placement::schedule::schedule(req, &nodes, wicket_placement::schedule::Strategy::BinPack, last);
+        let nodes = |need: &[String]| -> Vec<wicket_placement::schedule::Node> {
+            cands
+                .iter()
+                .zip(&held)
+                .map(|(c, (cpu, mib))| {
+                    let mut n = scheduled_node(l, c, need);
+                    n.used_vcpus += cpu;
+                    n.used_memory_mib += mib;
+                    n.room_mib = n.room_mib.map(|r| r.saturating_sub(*mib));
+                    n
+                })
+                .collect()
+        };
+        if fifo {
+            for (older, json) in l.waiting_before(&run.0, now_ms)? {
+                let Ok(w) = serde_json::from_str::<Waiting>(&json) else { continue };
+                if schedule(&w.req, &nodes(&w.need), Strategy::BinPack, None).node.is_some() {
+                    return Ok(Bound { decision: Default::default(), behind: Some(older) });
+                }
+            }
+        }
+        let d = schedule(req, &nodes(need), Strategy::BinPack, last);
         if let Some(node) = &d.node {
             l.reserve_placement(&run.0, node, req.vcpus, req.memory_mib, now_ms)?;
         }
-        Ok(d)
+        Ok(Bound { decision: d, behind: None })
     })
+}
+
+/// What [`bind`] decided: the decision, or the older waiting run it yielded to.
+#[derive(Debug, Default)]
+pub struct Bound {
+    pub decision: wicket_placement::schedule::Decision,
+    pub behind: Option<String>,
+}
+
+/// A waiting run's request, as `placement_waits` keeps it.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Waiting {
+    pub req: wicket_placement::schedule::Request,
+    pub need: Vec<String>,
 }
 
 /// A node's last report older than this (ms) is not trusted for its room: it is asked (#579).
@@ -696,18 +724,18 @@ pub fn from_index(names: &[String], health: &[(String, i64, String)], now_ms: i6
 /// by a capacity lease, its room read from its last report in the ledger ([`from_index`]) or, with
 /// none fresh, asked of it (within 10 s); filtered by the box's requests, labels, taints and CA
 /// coverage, then bin-packed (`wicket_placement::schedule`).
-async fn place(agent: &AgentRow, run: &RunId, last: Option<&str>) -> Result<Option<String>> {
+async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str>, wait: std::time::Duration) -> Result<Option<String>> {
     let m = wicket_agent::load(&agent.manifest)?;
     let req = wicket_placement::schedule::Request::of(&m);
     let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
     crate::localnode::ensure(&ledger).await?;
-    let (indexed, to_probe) = {
+    let index = || -> Result<(Vec<Candidate>, Vec<String>)> {
         let l = ledger.lock().expect("ledger");
         let leased: Vec<String> = l.leases(wicket_store::LIVE_LEASES)?.into_iter().filter_map(|x| x.node_name).collect();
         let names: Vec<String> =
             l.nodes()?.into_iter().filter(|n| n.status == "active" && !leased.contains(&n.name)).map(|n| n.name).collect();
-        from_index(&names, &l.node_health()?, wicket_feed::now_ms())
+        Ok(from_index(&names, &l.node_health()?, wicket_feed::now_ms()))
     };
     let ask = |names: Vec<String>| {
         let ledger = ledger.clone();
@@ -736,35 +764,85 @@ async fn place(agent: &AgentRow, run: &RunId, last: Option<&str>) -> Result<Opti
             futures_util::future::join_all(probes).await.into_iter().flatten().collect::<Vec<Candidate>>()
         }
     };
-    // Choosing and reserving are one transaction (#579 step 2): nothing is reserved when none fits.
-    let decide = |cands: &[Candidate]| bind(&ledger.lock().expect("ledger"), run, &req, cands, &need, last, wicket_feed::now_ms());
-    let probed = ask(to_probe.clone()).await;
+    // Choosing and reserving are one transaction (#579 step 2): nothing is reserved when none fits,
+    // and a wake waiting longer goes first.
+    let me = Waiting { req: req.clone(), need: need.clone() };
+    let decide = |cands: &[Candidate]| bind(&ledger.lock().expect("ledger"), run, &me, cands, last, wicket_feed::now_ms(), true);
+    let waiting = serde_json::to_string(&me)?;
+    let started = std::time::Instant::now();
+    let (indexed, to_probe) = index()?;
+    let mut probed = ask(to_probe).await;
+    let mut probed_at = std::time::Instant::now();
     let mut cands: Vec<Candidate> = indexed.iter().cloned().chain(probed.iter().cloned()).collect();
     if cands.is_empty() {
         return Ok(None);
     }
-    let mut d = decide(&cands)?;
+    let mut b = decide(&cands)?;
     // A report can be up to 30 s old: it may still count a box that has ended since (one that just
-    // hibernated, say). Before refusing the wake, the nodes read from reports are asked.
-    if d.node.is_none() && !indexed.is_empty() {
+    // hibernated, say). Before waiting or refusing, the nodes read from reports are asked.
+    if b.decision.node.is_none() && b.behind.is_none() && !indexed.is_empty() {
         let fresh = ask(indexed.iter().map(|c| c.name.clone()).collect()).await;
-        cands = fresh.into_iter().chain(probed).collect();
-        d = decide(&cands)?;
+        cands = fresh.into_iter().chain(probed.iter().cloned()).collect();
+        b = decide(&cands)?;
     }
-    match d.node {
-        Some(n) => {
+    let mut told = false;
+    loop {
+        if let Some(n) = &b.decision.node {
+            let _ = ledger.lock().expect("ledger").stop_waiting(&run.0);
             say!(
-                "[wicket] placing agent {} on node {n} (best fit of {} it may go on, of {} available)",
+                "[wicket] placing agent {} on node {n} (best fit of {} it may go on, of {} available{})",
                 agent.id,
-                d.ranked.len(),
-                cands.len()
+                b.decision.ranked.len(),
+                cands.len(),
+                if told { format!(", after {} s in the queue", started.elapsed().as_secs()) } else { String::new() }
             );
-            Ok(Some(n))
+            return Ok(Some(n.clone()));
         }
-        // No silent overcommit (#377): each node would refuse the box itself.
-        None => bail!("no available node may take agent {} ({} vCPU, {} MiB needed): {}", agent.id, req.vcpus, req.memory_mib, d.why_not()),
+        let why = match &b.behind {
+            Some(r) => format!("waiting behind {r}, which waited first and fits"),
+            None => b.decision.why_not(),
+        };
+        if started.elapsed() >= wait {
+            let _ = ledger.lock().expect("ledger").stop_waiting(&run.0);
+            // No silent overcommit (#377): each node would refuse the box itself.
+            bail!(
+                "no available node may take agent {} ({} vCPU, {} MiB needed){}: {why}",
+                agent.id,
+                req.vcpus,
+                req.memory_mib,
+                if told { format!(" after {} s in the queue", started.elapsed().as_secs()) } else { String::new() }
+            );
+        }
+        {
+            let l = ledger.lock().expect("ledger");
+            l.wait_for_placement(&run.0, &waiting, wicket_feed::now_ms())?;
+            l.renew_agent_claim(&agent.id, generation, wicket_store::now() + BUSY_CLAIM_SECS)?;
+        }
+        if !told {
+            say!(
+                "[wicket] queued: no node may take agent {} now ({why}); waiting up to {} s (wicket wake --wait 0 to fail instead)",
+                agent.id,
+                wait.as_secs()
+            );
+            told = true;
+        }
+        tokio::time::sleep(QUEUE_RETRY).await;
+        let (indexed, to_probe) = index()?;
+        if probed_at.elapsed() >= QUEUE_REPROBE {
+            probed = ask(to_probe).await;
+            probed_at = std::time::Instant::now();
+        }
+        cands = indexed.into_iter().chain(probed.iter().cloned()).collect();
+        b = decide(&cands)?;
     }
 }
+
+/// How often a waiting wake tries again, and how often it asks the nodes with no fresh report.
+const QUEUE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+const QUEUE_REPROBE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a wake waits for a node by default (`wicket wake --wait`).
+pub const QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// `wicket hibernate <run|agent>`: asks the agent's supervisor to hibernate it at the next quiet
 /// point, and reports what happened.
@@ -913,25 +991,78 @@ mod tests {
         let cands = [n1.clone(), n2.clone()];
         let req = Request { vcpus: 1.0, memory_mib: 2048, ..Request::default() };
         let run = |r: &str| RunId(r.into());
-        let a = bind(&l, &run("run_a"), &req, &cands, &[], None, now).unwrap();
+        let a = bind(&l, &run("run_a"), &Waiting { req: req.clone(), need: vec![] }, &cands, None, now, true).unwrap().decision;
         assert_eq!(a.node.as_deref(), Some("n1"), "bin-packed: n1 has less left");
         assert_eq!(l.placement("run_a").unwrap().unwrap().node, "n1");
-        let b = bind(&l, &run("run_b"), &req, &cands, &[], None, now + 1).unwrap();
+        let b = bind(&l, &run("run_b"), &Waiting { req: req.clone(), need: vec![] }, &cands, None, now + 1, true).unwrap().decision;
         assert_eq!(b.node.as_deref(), Some("n2"), "n1's room is run_a's now: {}", b.why_not());
-        let c = bind(&l, &run("run_c"), &req, &cands, &[], None, now + 2).unwrap();
+        let c = bind(&l, &run("run_c"), &Waiting { req: req.clone(), need: vec![] }, &cands, None, now + 2, true).unwrap().decision;
         assert_eq!(c.node, None, "both taken");
         assert!(l.placement("run_c").unwrap().is_none(), "nothing reserved when nothing fits");
         assert!(c.why_not().contains("n1 (") && c.why_not().contains("n2 ("), "{}", c.why_not());
         // run_b's start failed: its room is free again.
         l.placement_released("run_b").unwrap();
-        assert_eq!(bind(&l, &run("run_d"), &req, &cands, &[], None, now + 3).unwrap().node.as_deref(), Some("n2"));
+        assert_eq!(
+            bind(&l, &run("run_d"), &Waiting { req: req.clone(), need: vec![] }, &cands, None, now + 3, true)
+                .unwrap()
+                .decision
+                .node
+                .as_deref(),
+            Some("n2")
+        );
         // run_a started; n1's next report counts its box, and its reservation stops counting.
         l.placement_bound("run_a", now + 4).unwrap();
         let mut n1_after = cand("n1", 4.0, 4096, 1.0, 3072);
         n1_after.at_ms = now + 5;
-        let e = bind(&l, &run("run_e"), &req, &[n1_after], &[], None, now + 6).unwrap();
+        let e = bind(&l, &run("run_e"), &Waiting { req: req.clone(), need: vec![] }, &[n1_after], None, now + 6, true).unwrap().decision;
         assert_eq!(e.node, None, "full by its own report, not by twice: {}", e.why_not());
         assert!(e.why_not().contains("1024 MiB free"), "{}", e.why_not());
+    }
+
+    /// #579 step 2's queue: a run waiting longer goes first when it fits; one that fits nowhere
+    /// doesn't hold up a smaller one behind it; a waiter that has gone holds no place; a named node
+    /// (not queued) doesn't look.
+    #[test]
+    fn the_queue_is_first_come_first_served_without_head_of_line_blocking() {
+        use wicket_placement::schedule::Request;
+        let l = Ledger::open_in_memory().unwrap();
+        let now = 70_000_000;
+        let mut n1 = cand("n1", 4.0, 4096, 0.0, 2048);
+        n1.at_ms = now - 1_000;
+        let small = Request { vcpus: 1.0, memory_mib: 1024, ..Request::default() };
+        let huge = Request { vcpus: 1.0, memory_mib: 65536, ..Request::default() };
+        let wait = |run: &str, req: &Request, at: i64| {
+            let w = serde_json::to_string(&Waiting { req: req.clone(), need: vec![] }).unwrap();
+            l.wait_for_placement(run, &w, at).unwrap();
+        };
+        // run_old waits for a small box (it fits n1 now): run_new yields to it.
+        wait("run_old", &small, now - 5_000);
+        let b = bind(&l, &RunId("run_new".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1.clone()], None, now, true).unwrap();
+        assert_eq!((b.decision.node, b.behind.as_deref()), (None, Some("run_old")));
+        assert!(l.placement("run_new").unwrap().is_none());
+        // A named node isn't queued: it doesn't yield.
+        let named =
+            bind(&l, &RunId("run_named".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1.clone()], None, now, false).unwrap();
+        assert_eq!(named.decision.node.as_deref(), Some("n1"));
+        l.placement_released("run_named").unwrap();
+        // run_old binds, then a waiter for a huge box (fits nowhere) doesn't block run_new.
+        let old =
+            bind(&l, &RunId("run_old".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1.clone()], None, now + 1, true).unwrap();
+        assert_eq!(old.decision.node.as_deref(), Some("n1"), "first in the queue: nothing ahead");
+        l.stop_waiting("run_old").unwrap();
+        l.placement_released("run_old").unwrap();
+        wait("run_huge", &huge, now - 4_000);
+        let b =
+            bind(&l, &RunId("run_new".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1.clone()], None, now + 2, true).unwrap();
+        assert_eq!(b.decision.node.as_deref(), Some("n1"), "{b:?}");
+        // A waiter not seen for WAIT_SEEN_MS has gone: no place held.
+        l.placement_released("run_new").unwrap();
+        wait("run_gone", &small, now - 20_000);
+        let late = now - 20_000 + wicket_store::WAIT_SEEN_MS + 1;
+        let b = bind(&l, &RunId("run_late".into()), &Waiting { req: small.clone(), need: vec![] }, &[n1], None, late.max(now + 3), true)
+            .unwrap();
+        assert_eq!(b.decision.node.as_deref(), Some("n1"), "{b:?}");
+        assert_eq!(wicket_core::time::parse_duration("0").unwrap(), std::time::Duration::ZERO, "--wait 0");
     }
 
     #[test]

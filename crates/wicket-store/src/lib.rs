@@ -29,7 +29,7 @@ mod nodeca;
 mod nodelabels;
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
-pub use placements::{Placement, RESERVE_SECS};
+pub use placements::{Placement, RESERVE_SECS, WAIT_SEEN_MS};
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -159,8 +159,9 @@ pub enum StoreError {
 /// Version 23 (expand, after #587's 22) adds the `standing` table: standing reach (#572), a reach
 /// rule an agent asks for once and a human approves for its principal or zone. Older builds don't
 /// read it, so the floor stays 17.
-/// Version 24 (expand, after #576's 23) adds `placements` (#579 step 2): the node room reserved for
-/// boxes being started. Older builds don't read it; the floor stays 17.
+/// Version 24 (expand, after #576's 23) adds `placements` and `placement_waits` (#579 step 2): the
+/// node room reserved for boxes being started, and the runs waiting for a node. Older builds don't
+/// read them; the floor stays 17.
 pub const SCHEMA_VERSION: u32 = 24;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
@@ -640,6 +641,7 @@ impl Ledger {
         self.drop_node_ca_wants(&run.0)?;
         // And the room it reserved on a node (#579).
         self.placement_released(&run.0)?;
+        self.stop_waiting(&run.0)?;
         self.close_links_of(&run.0)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
