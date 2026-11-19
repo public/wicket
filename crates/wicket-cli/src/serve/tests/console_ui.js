@@ -30,7 +30,12 @@ const ids = {};
 for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
+const EPOCH = 1700000000000;
+let skew = 0; // how far the phone's clock is off
+let slowBegin = null, slowPasskey = null;
 let timers = [];
+let intervalId = 0;
+const alive = new Set();
 const calls = [];
 let state = null;
 // A hostile string an agent chose (a grant's path): it must stay text.
@@ -64,7 +69,8 @@ const fetch = async (path, opts) => {
     const a = b.action === "push_subscribe" ? { v: 1, action: b.action, device: devId(b.endpoint), label: b.label, service: "fcm.googleapis.com", details: b.details, replaces: false }
       : b.action === "push_details" ? { v: 1, action: b.action, device: b.id, label: "laptop", service: "fcm.googleapis.com", details: true } : nextAction;
     begun = { body: b, action: a };
-    return reply({ action: a, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] } });
+    if (slowBegin) await slowBegin;
+    return reply({ action: a, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] }, expires_in_ms: 120000 });
   }
   if (path === "/api/action/finish") {
     const b = begun && begun.body;
@@ -96,14 +102,17 @@ const sandbox = {
   navigator: { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
     serviceWorker: { register: async (u, o) => { swRegistered = [u, o.scope]; return swReg; }, ready: Promise.resolve(swReg),
       getRegistration: async () => (swRegistered ? swReg : undefined), addEventListener: (k, f) => { if (k === "message") swListener = f; } },
-    credentials: { get: async () => { ceremonies++; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
+    credentials: { get: async () => { ceremonies++; if (slowPasskey) await slowPasskey; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
   performance: { now: () => now },
-  setTimeout: (f, ms) => { timers.push({ f, at: now + ms }); return timers.length; },
-  clearTimeout: () => {},
-  setInterval: () => 0,
+  setTimeout: (f, ms) => { const id = ++intervalId; alive.add(id); timers.push({ f: () => { if (alive.delete(id)) f(); }, at: now + ms }); return id; },
+  clearTimeout: id => { alive.delete(id); },
+  setInterval: (f, ms) => { const id = ++intervalId; alive.add(id); const arm = () => timers.push({ f: () => { if (alive.has(id)) { f(); arm(); } }, at: now + ms }); arm(); return id; },
+  clearInterval: id => { alive.delete(id); },
   btoa: s => Buffer.from(s, "binary").toString("base64"),
   atob: s => Buffer.from(s, "base64").toString("binary"),
-  Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error, Date,
+  Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error,
+  // The wall clock moves with the harness's timers (a fixed offset keeps it a plausible date).
+  Date: Object.assign(function (...a) { return a.length ? new Date(...a) : new Date(EPOCH + now + skew); }, { now: () => EPOCH + now + skew, UTC: Date.UTC, parse: Date.parse }),
 };
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), sandbox);
@@ -153,6 +162,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(what.includes("/harmless") && what.includes("q-a") && what.startsWith("Approve once"), what);
   // #369: the effect it signs, and what else it would allow, are shown before the passkey.
   assert.ok(what.includes("effect 0123456789abcdef"), what);
+  // The challenge counts down, and once it has expired the sheet offers to ask again (#574, item 6).
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55");
   // In lines, the decision first and the ids last (#574, item 1).
   const lines = what.split("\n");
   assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
@@ -250,6 +261,67 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   run("toast(undefined)");
   assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Done.", ""]);
   assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "GET", host: "h", path: "/p", effect: { terms: { uses: 1, ttl_secs: 600 } } }) + ")").startsWith("Approve once for 10 min"));
+  // Left open past the challenge's two minutes: said, nothing signed, and "Ask again" begins anew.
+  await advance(1000);
+  nextAction = { v: 1, action: "decide", request: "q-x", run: "run_a", method: "GET", host: "h", path: "/p", risk: "R0Read", decision: "approve", uses: 1, ttl_secs: 600 };
+  const expiryBegun = began().length;
+  // A slow begin: "Preparing" stays up (not gone after 3 s), and nothing opens until it answers.
+  let answer; slowBegin = new Promise(r => { answer = r; });
+  const opening = run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  await advance(4000);
+  assert.deepStrictEqual([ids.msg.hidden, ids.msg.textContent], [false, "Preparing…"], "a slow begin still says so");
+  assert.strictEqual(ids.confirm.hidden, true);
+  // The phone's clock is three minutes fast: it doesn't matter, the time left is counted from arrival.
+  skew = 180000;
+  slowBegin = null; answer(); await opening; await flush();
+  assert.strictEqual(ids.msg.hidden, true, "the sheet replaces it");
+  // The time the server says is left (expires_in_ms), on the wall clock, five seconds early.
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55", "a fast phone clock doesn't expire it at once");
+  await advance(116000);
+  assert.strictEqual(ids["confirm-state"].textContent, "This expired before it was signed. Nothing was signed.");
+  assert.strictEqual(ids["confirm-go"].textContent, "Ask again");
+  // "Ask again" begins anew inside the open sheet: it says so, and a tap while it prepares does nothing.
+  slowBegin = new Promise(r => { answer = r; });
+  ids["confirm-go"].click(); await flush();
+  assert.strictEqual(began().length, expiryBegun + 2, "asked again");
+  assert.strictEqual(ids.confirm.hidden, false, "the sheet stays open, so a second tap can't land beneath it");
+  assert.strictEqual(ids["confirm-state"].textContent, "Preparing…");
+  assert.strictEqual(ids["confirm-go"].disabled, true);
+  const ceremoniesBefore = ceremonies;
+  ids["confirm-go"].click(); await flush();
+  await run("signed({ action: 'decide', id: 'q-a', decision: 'approve' })"); await flush();
+  assert.strictEqual(began().length, expiryBegun + 2, "a tap while preparing begins nothing more");
+  slowBegin = null; answer(); await flush(); await flush();
+  assert.strictEqual(ids["confirm-state"].textContent, "Expires in 1:55");
+  // The settle guard holds again after the sheet is refilled.
+  assert.strictEqual(ids["confirm-go"].disabled, true);
+  ids["confirm-go"].click(); await flush();
+  assert.strictEqual(ceremonies, ceremoniesBefore, "no passkey from a tap just after Ask again");
+  // Waiting for the passkey, the countdown stops: a slow passkey isn't said to have expired.
+  await advance(1000);
+  let passkeyDone; slowPasskey = new Promise(r => { passkeyDone = r; });
+  ids["confirm-go"].click(); await flush();
+  assert.strictEqual(ids["confirm-state"].textContent, "Waiting for your passkey…");
+  await advance(200000);
+  assert.strictEqual(ids["confirm-state"].textContent, "Waiting for your passkey…", "no expiry while waiting for the passkey");
+  slowPasskey = null; passkeyDone(); await flush(); await flush(); await flush();
+  assert.strictEqual(ids.confirm.hidden, true);
+  // Cancel while "Ask again" prepares: the begin that comes back late doesn't reopen the sheet.
+  await advance(1000);
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  await advance(116000);
+  slowBegin = new Promise(r => { answer = r; });
+  ids["confirm-go"].click(); await flush();
+  ids["confirm-cancel"].listeners.click(); await flush();
+  assert.strictEqual(ids.confirm.hidden, true);
+  slowBegin = null; answer(); await flush(); await flush();
+  assert.strictEqual(ids.confirm.hidden, true, "a begin for a closed sheet is dropped");
+  await advance(1000);
+  const afterCancel = began().length;
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  assert.deepStrictEqual([began().length, ids.confirm.hidden], [afterCancel + 1, false], "and the next tap opens a sheet as usual");
+  ids["confirm-cancel"].listeners.click(); await flush();
+  skew = 0;
   // A push's card says the window it is granted as, from the server's terms (#574 review).
   const pushReq = { id: "q-push", risk: "R4ExecOrPrivilege", method: "POST", host: "github.com", path: "/acme/app.git/git-receive-pack", scope_prefix: false,
     reason: "push", identity: { verified: true, agent: "a", zone: "z", acting_for: [], id: "spiffe://x/a/a" }, attribution: [], zone: "z", run: "run_a",

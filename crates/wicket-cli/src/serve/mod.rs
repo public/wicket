@@ -1469,7 +1469,9 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
     else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "too many passkey ceremonies in progress; try again shortly");
     };
-    ok(json!({ "action": v, "publicKey": assertion_options(state, &key) }))
+    // How long the challenge has left (#574 review), not when it ends: the page counts from when
+    // this arrives, so a phone whose clock is minutes out still counts the server's two minutes.
+    ok(json!({ "action": v, "publicKey": assertion_options(state, &key), "expires_in_ms": CHALLENGE_TTL.as_millis() as u64 }))
 }
 
 fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Value) -> Reply {

@@ -14,7 +14,7 @@ const span = secs => { const s = Math.round(secs || 0); return s >= 3600 && s % 
 // What happened, at the foot of the page (#574): long enough to read (3 to 8 s by length), and an
 // error in its own style, kept until tapped.
 let toastTimer;
-function toast(t, error) {
+function toast(t, error, sticky) {
   const m = document.getElementById("msg");
   m.textContent = (t === undefined || t === null || t === "") ? "Done." : String(t);
   m.className = error ? "error" : "";
@@ -22,7 +22,7 @@ function toast(t, error) {
   m.hidden = false;
   m.onclick = () => { m.hidden = true; };
   clearTimeout(toastTimer);
-  if (!error) toastTimer = setTimeout(() => { m.hidden = true; }, Math.min(8000, Math.max(3000, 40 * m.textContent.length)));
+  if (!error && !sticky) toastTimer = setTimeout(() => { m.hidden = true; }, Math.min(8000, Math.max(3000, 40 * m.textContent.length)));
 }
 // An error, said plainly: a passkey sheet the operator closed is no failure of wicket's.
 function toastError(e, what, passkey) {
@@ -141,28 +141,64 @@ const settled = () => performance.now() - layoutAt >= SETTLE_MS;
 // `after`, if given, runs once the confirmation closes (signed, refused or cancelled). `extra`, if
 // given, adds fields to finish's body only (a secret's value: never sent with begin, never signed).
 let afterConfirm = null;
+// How long the server keeps a begun action's challenge (`CHALLENGE_TTL` in serve/mod.rs).
+const CHALLENGE_MS = 120000;
+const EXPIRY_MARGIN_MS = 5000;
+let expiryTimer = null, sheetToken = 0;
 async function signed(body, after, extra) {
   if (ceremony) return;
   ceremony = true;
   afterConfirm = after || null;
+  // Something shows between the tap and the sheet (#574, item 6), and stays until it opens: on a
+  // slow link the operator otherwise taps again, or thinks the tap failed.
+  toast("Preparing\u2026", false, true);
+  await openSheet(body, extra);
+}
+// Begins the action and fills the sheet with what the server returned: once from a tap, and again
+// from "Ask again" inside the open sheet, so a second tap never lands on the page beneath.
+async function openSheet(body, extra) {
+  const go = document.getElementById("confirm-go");
+  const state = document.getElementById("confirm-state");
+  // Each sheet has a token; closing it (Cancel, say, while "Ask again" prepares) bumps it, and the
+  // begin that comes back afterwards is dropped rather than reopening a closed sheet.
+  const sheet = ++sheetToken;
   let begin;
   try { begin = await post("/api/action/begin", body); }
-  catch (e) { toastError(e); closeConfirm(); return; }
+  catch (e) { if (sheet === sheetToken) { toastError(e); closeConfirm(); } return; }
+  if (sheet !== sheetToken) return;
   // An error that stays sits above the sheet (#597): it goes when the sheet opens.
   document.getElementById("msg").hidden = true;
-  const go = document.getElementById("confirm-go");
   document.getElementById("confirm-what").textContent = describe(begin.action);
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
-  document.getElementById("confirm-state").textContent = "";
+  state.textContent = "";
+  delete go.dataset.waiting;
   const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny"].includes(begin.action.action);
   go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
-  go.disabled = true; setTimeout(() => { go.disabled = false; }, SETTLE_MS);
+  go.disabled = true; setTimeout(() => { if (sheet === sheetToken) go.disabled = false; }, SETTLE_MS);
+  // The challenge expires on the server's clock. The time it has left, counted from its arrival on
+  // the wall clock (a phone that sleeps still counts it), a few seconds early for the signature's
+  // trip back; the phone's own clock being out doesn't matter.
+  const deadline = Date.now() + (begin.expires_in_ms || CHALLENGE_MS) - EXPIRY_MARGIN_MS;
+  clearInterval(expiryTimer);
+  const tick = () => {
+    if (go.dataset.waiting) return;
+    const left = Math.max(0, deadline - Date.now());
+    if (left > 0) { state.textContent = "Expires in " + Math.floor(left / 60000) + ":" + String(Math.floor(left / 1000) % 60).padStart(2, "0"); return; }
+    clearInterval(expiryTimer);
+    state.textContent = "This expired before it was signed. Nothing was signed.";
+    go.textContent = "Ask again"; go.className = "approve"; go.disabled = false;
+    go.onclick = () => { go.disabled = true; state.textContent = "Preparing\u2026"; openSheet(body, extra); };
+  };
+  tick();
+  expiryTimer = setInterval(tick, 1000);
   go.onclick = async () => {
     go.disabled = true;
-    document.getElementById("confirm-state").textContent = "Waiting for your passkey\u2026";
+    go.dataset.waiting = "1";
+    clearInterval(expiryTimer);
+    state.textContent = "Waiting for your passkey\u2026";
     try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
     catch (e) { toastError(e, null, true); }
     closeConfirm();
@@ -212,7 +248,10 @@ function renderUpdate(box, u) {
   box.append(ul);
 }
 function closeConfirm() {
+  sheetToken++;
   pollGen++;
+  clearInterval(expiryTimer);
+  delete document.getElementById("confirm-go").dataset.waiting;
   document.getElementById("confirm").hidden = true;
   document.getElementById("confirm-go").onclick = null;
   ceremony = false;
