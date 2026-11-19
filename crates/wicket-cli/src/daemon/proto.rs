@@ -251,6 +251,38 @@ pub fn peer(s: &UnixStream) -> Result<Peer> {
     Ok(Peer { pid: cred.pid, uid: cred.uid, gid: cred.gid, user: user_name(cred.uid).unwrap_or_else(|| cred.uid.to_string()), groups })
 }
 
+/// The user called `name` as the host knows them now: their uid, primary gid and groups, as a peer
+/// with those credentials would be seen (no process: `pid` 0). None if there is no such user.
+/// What a trigger's owner is checked as before it fires (#578).
+pub fn user_as_peer(name: &str) -> Option<Peer> {
+    let c = std::ffi::CString::new(name).ok()?;
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16384];
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwnam_r fills `pw` with pointers into `buf`, which outlives their use here.
+    let r = unsafe { libc::getpwnam_r(c.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r != 0 || out.is_null() {
+        return None;
+    }
+    let (uid, gid) = (pw.pw_uid, pw.pw_gid);
+    let mut n: libc::c_int = 256;
+    let mut gids = vec![0 as libc::gid_t; n as usize];
+    // SAFETY: getgrouplist writes at most `n` gids into `gids` and sets `n` to how many it has.
+    if unsafe { libc::getgrouplist(c.as_ptr(), gid, gids.as_mut_ptr(), &mut n) } < 0 {
+        gids.resize(n.max(0) as usize, 0);
+        // SAFETY: as above, with room for every group now.
+        if unsafe { libc::getgrouplist(c.as_ptr(), gid, gids.as_mut_ptr(), &mut n) } < 0 {
+            return None;
+        }
+    }
+    gids.truncate(n.max(0) as usize);
+    gids.push(gid);
+    gids.sort_unstable();
+    gids.dedup();
+    let groups = gids.into_iter().map(|g| (g, group_name(g).unwrap_or_default())).collect();
+    Some(Peer { pid: 0, uid, gid, user: name.to_string(), groups })
+}
+
 /// The name of `uid` in the user database.
 pub fn user_name(uid: u32) -> Option<String> {
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };

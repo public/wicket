@@ -638,6 +638,9 @@ pub fn scheduled_node(l: &Ledger, c: &Candidate, need: &[String]) -> wicket_plac
         labels: l.node_labels(&c.name).unwrap_or_default(),
         taints: l.node_taints(&c.name).unwrap_or_default(),
         ca,
+        // What runs there (services, zones, principals) and the volumes it holds: filled by #579
+        // step 4's wiring; empty, no preferred affinity is met and every anti-affinity holds.
+        ..Default::default()
     }
 }
 

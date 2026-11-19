@@ -1,6 +1,12 @@
 wicket top — control host — 09:46:40Z
 2 running runs   2 pending requests   1 active lease
 
+ledger stream   LAGGING, last sync 7 min ago
+audit store     24 behind (oldest 6 min), checkpoint 15 min ago
+audit collector caught up, checkpoint 2 min ago
+  ! ledger stream: monitor error: calc pos: connection refused
+  ! audit sink store: PUT: connection refused
+
 NODE             CONTROL                    BOXES        CPU          MEM  DISK
 local            connected 10m00s               1      1.5/4    2.5G/8.0G     -
 hyperv1          CUT OFF 1m35s ago              1      1.5/4    2.5G/8.0G   91%

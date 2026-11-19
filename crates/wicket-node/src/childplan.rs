@@ -195,7 +195,10 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
 
     // Within the parent's authority, or approved by a human for exactly this zone. A different model
     // route or credential is never approvable (#118).
-    let hard = subset::unapprovable(&cm.zone, &p.zone);
+    let mut hard = subset::unapprovable(&cm.zone, &p.zone);
+    // A child ranks no higher than its parent for room, approved or not (#579 step 4). It inherits
+    // its parent's placement, so this holds by construction; the check keeps it so.
+    hard.extend(wicket_core::placement::within(&cm.placement, &p.placement));
     if !hard.is_empty() {
         return Err(format!("this zone can't be started, with or without approval:\n- {}", hard.join("\n- ")));
     }
