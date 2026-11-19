@@ -257,7 +257,7 @@ fn ask(sock: &Path, path: &str) -> Result<serde_json::Value> {
 }
 
 /// The state store's sync and the audit export's progress together: what the console's health
-/// section shows (and, later, `wicket top`).
+/// section and `wicket top` show.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Progress {
     /// The ledger stream, if `state-store.yaml` has a `ledger:` section.
