@@ -171,7 +171,7 @@ if (diff?.textContent !== 'b') fail('the diff');
 
 // An escalation: once options only; decided with the passkey through /api/decide/*, then answered.
 await until('the escalation card', () => text().includes('wicket is asking you'));
-if (!text().includes('GET api.example.com/v1') || !text().includes('needs the API') || !text().includes('R1 read')) fail('the escalation described');
+if (!text().includes('GET api.example.com/v1') || !text().includes('needs the API') || !text().includes('R1 · read')) fail('the escalation described');
 if (button('Always allow')) fail('an "always" option offered');
 await tap('Approve once (passkey)');
 await until('the decision described', () => text().includes('Approve once for 10 min: GET api.example.com/v1'));
