@@ -8,3 +8,4 @@ mod oracles;
 mod org;
 mod prefix;
 mod properties;
+mod standing;
