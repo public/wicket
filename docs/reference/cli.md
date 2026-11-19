@@ -32,6 +32,14 @@ reference](manifest.md)).
   - [`wicket standing deny`](#wicket-standing-deny)
   - [`wicket standing renew`](#wicket-standing-renew)
   - [`wicket standing revoke`](#wicket-standing-revoke)
+- [`wicket trigger`](#wicket-trigger)
+  - [`wicket trigger create`](#wicket-trigger-create)
+  - [`wicket trigger list`](#wicket-trigger-list)
+  - [`wicket trigger show`](#wicket-trigger-show)
+  - [`wicket trigger pause`](#wicket-trigger-pause)
+  - [`wicket trigger resume`](#wicket-trigger-resume)
+  - [`wicket trigger rm`](#wicket-trigger-rm)
+  - [`wicket trigger fire`](#wicket-trigger-fire)
 - [`wicket audit`](#wicket-audit)
   - [`wicket audit export`](#wicket-audit-export)
 - [`wicket secret`](#wicket-secret)
@@ -139,6 +147,7 @@ Commands:
   unlink     Cut a link between boxes: its relay closes it and drops its connections within seconds
   grant      Grants made by approvals
   standing   Standing reach (#572): a reach rule an agent asked for once, approved once for its later runs
+  trigger    Triggers (#578): when a schedule or timer comes due, wake or message an agent
   audit      Show or verify the hash-chained audit log, or export it to the configured sinks
   secret     Manage vault secrets (values are read from the terminal, never from arguments)
   image      Build the agent image
@@ -541,6 +550,123 @@ Arguments:
 
 Options:
   -h, --help  Print help
+```
+
+## `wicket trigger`
+
+```text
+Triggers (#578): when a schedule or timer comes due, wake or message an agent
+
+Usage: wicket trigger <COMMAND>
+
+Commands:
+  create  Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`)
+  list    Triggers that aren't removed: each with its state, source, action and next firing
+  show    One trigger: its document, state, next firing and last firings
+  pause   Pause a trigger: it fires nothing until resumed (events while paused are not caught up)
+  resume  Resume a paused trigger
+  rm      Remove a trigger: it fires nothing again
+  fire    Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger create`
+
+```text
+Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`)
+
+Usage: wicket trigger create [OPTIONS] --file <FILE>
+
+Options:
+      --file <FILE>    
+      --lasts <LASTS>  How long it lasts, or `forever`: until removed [default: forever]
+  -h, --help           Print help
+```
+
+### `wicket trigger list`
+
+```text
+Triggers that aren't removed: each with its state, source, action and next firing
+
+Usage: wicket trigger list
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger show`
+
+```text
+One trigger: its document, state, next firing and last firings
+
+Usage: wicket trigger show <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger pause`
+
+```text
+Pause a trigger: it fires nothing until resumed (events while paused are not caught up)
+
+Usage: wicket trigger pause <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger resume`
+
+```text
+Resume a paused trigger
+
+Usage: wicket trigger resume <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger rm`
+
+```text
+Remove a trigger: it fires nothing again
+
+Usage: wicket trigger rm <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger fire`
+
+```text
+Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now
+
+Usage: wicket trigger fire [OPTIONS] --dry-run <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --event <EVENT>  A JSON file with the event's fields
+      --dry-run        Only show what would happen (the one mode this version has)
+  -h, --help           Print help
 ```
 
 ## `wicket audit`

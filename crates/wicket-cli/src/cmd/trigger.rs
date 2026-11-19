@@ -65,14 +65,7 @@ pub fn line(t: &wicket_store::Trigger, now: i64) -> String {
         Some(n) if t.live(now) => format!("  next {}", when(n)),
         _ => String::new(),
     };
-    format!(
-        "{}  {}  {}  {} → {}{next}",
-        t.id,
-        t.name,
-        state(t, now),
-        c(&tr::source_text(&t.spec)),
-        c(&tr::action_text(&t.spec))
-    )
+    format!("{}  {}  {}  {} → {}{next}", t.id, t.name, state(t, now), c(&tr::source_text(&t.spec)), c(&tr::action_text(&t.spec)))
 }
 
 /// The whole trigger, with its last firings.

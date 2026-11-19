@@ -43,11 +43,11 @@ pub fn action_text(s: &TriggerSpec) -> String {
     if let Some(st) = &a.start {
         parts.push(format!("start {} ({})", st.manifest, &st.sha256[..12.min(st.sha256.len())]));
     }
-    if let Some(w) = &a.wake {
-        parts.push(format!("wake {w}"));
-    }
-    if let Some(m) = &a.message {
-        parts.push(format!("message {}", m.to));
+    match (&a.wake, &a.message) {
+        (Some(w), Some(_)) => parts.push(format!("wake {w} with a message")),
+        (Some(w), None) => parts.push(format!("wake {w}")),
+        (None, Some(m)) => parts.push(format!("message {}", m.to)),
+        (None, None) => {}
     }
     parts.join(", ")
 }
@@ -521,7 +521,8 @@ mod tests {
         assert_eq!(l.take_prompts("run_a").unwrap().len(), 1);
         assert_eq!(woke.borrow().len(), 1);
         // A filter that doesn't pass: the preview says so.
-        let quiet = spec("trigger: quiet\nsource: { schedule: { cron: '* * * * *' } }\nfilter: { trigger: other }\naction: { wake: captain }\n");
+        let quiet =
+            spec("trigger: quiet\nsource: { schedule: { cron: '* * * * *' } }\nfilter: { trigger: other }\naction: { wake: captain }\n");
         let q = l.trigger(&create(&l, &operator(), &quiet, None, "test").unwrap()).unwrap().unwrap();
         assert!(preview(&l, &q, None, q.created_at).unwrap().contains("doesn't pass"));
     }
