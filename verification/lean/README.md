@@ -13,6 +13,7 @@ definitions as an oracle that wicket-core's decisions are checked against.
 | `Wicket/Canon.lean` | `canon::canonical_path` | `upstream_eq`: an upstream that percent-decodes and resolves dot segments, in either order, names the canonical path's segments; `decode_eq_unreserved`: no escape spells an unreserved character; `reach_no_escape`, `forbid_no_escape`: a canonical path can't get out from under a rule `Q/**` |
 | `Wicket/Spawn.lean` | `manifest::model_covers`, `LlmSpec::allows_model`, `subset::model_violations`, `manifest::accepts`, `Token::attenuate`, a node's spawn (`nodegw::spawn`: `plan_child`, `peek_spawn`, `derive_child`) | `check_models`: an admitted child calls no model its parent may not (for well-formed patterns, as manifests require); `accept_narrow`, `check_accepts`: it hears only from its parent's zone or a sender its parent hears from; `attenuate_allow`, `attenuate_forbid`, `attenuate_live`, `attenuate_spawns`: an appended spawn block never widens a token; `node_spawn_within`: a child its node starts is within its parent, and its token allows, outlives and starts nothing its parent's doesn't |
 | `Wicket/Grant.lean` | `grant::within_authority`, `check_terms`, `agent_terms`, `outlasts`, `operators::may_decide` | `agent_grant_within`: every use an agent's grant permits is one the agent's own zone allows by reach, by a strict descendant, before the agent's authority ends, for one or more uses; `grant_within_ancestor`: and within every zone the agent's is within; `agent_renewal_within`; `operator_within` (#320) |
+| `Wicket/Standing.lean` | `standing::narrow`, `glob_literal`, `ReachRule::allows`, `wicket_store::Standing::binds`, `zone_digest` (#572) | `narrow_pairs_granted`: every method and path pair of an ask narrowed to its evidence is one a human granted; `narrow_not_dangerous`; `narrow_allows_only_evidence`: for evidence paths without glob metacharacters, the narrowed rule allows only a granted method and path, to the asked host; `rule_allows_within_globs`: a rule allows only a path one of its globs matches; `binds_digest` and `digest_decides_alike`: a rule binds only to its principal or zone under the zone definition it was approved under, and (for a digest without collisions) every zone it binds to decides every request as that one did |
 
 ## What it doesn't cover
 
@@ -32,6 +33,11 @@ wicket-core decides as the spec does on its fixtures and generated cases. They d
   That the Biscuit evaluator decides as `chainVerdict` is tested (the oracle's `chain` cases mint
   tokens and append spawn blocks), not proved. What each block allows a box to start (`peek_spawn`'s
   facts) is a predicate of the block.
+- **Literal globs with metacharacters.** `glob_literal` puts `*`, `?`, `[`, `]`, `{`, `}` and `\` in
+  classes, which are outside the spec's language: that such a glob matches only its path is tested
+  (`standing.rs`'s `a_literal_glob_matches_only_its_path`), not proved, and the oracle's
+  `rule_allows` cases with one are `unsupported`. The hash behind `zone_digest` (SHA-256) is taken not
+  to collide.
 - Everything else: the proxies, parsing, the ledger, the feed's signatures and the node's replica.
 
 ## What the spec takes as given
@@ -92,7 +98,8 @@ blocks, minted and attenuated by wicket-authz and decided by its evaluator (`cha
 test adds the pure decisions above: generated IPv4 and IPv6 addresses (biased to the special blocks
 and the IPv4 forms), grant ends and clock readings around the boundary, every combination of
 agents' rules and escalation classes, lists of failed checks, counted uses, money amounts at the
-edges of `i64`, and spawn limits and asks.
+edges of `i64`, and spawn limits and asks. Section 9 adds standing reach (#572): asks narrowed to
+generated evidence (`narrow`), and what narrowed and generated rules decide (`rule_allows`).
 
 In GitHub Actions, `ci/lean.sh` also turns the build's errors and the oracle's divergences into
 annotations on the run, so they show in the pull request without its log.

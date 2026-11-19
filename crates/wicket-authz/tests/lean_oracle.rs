@@ -565,6 +565,11 @@ fn rust_decides_as_the_lean_spec() {
     decisions(&mut c, &mut rng);
     let decisions = c.cases.len() - decisions_from;
 
+    // 9. Standing reach (#572): asks narrowed to generated evidence, and what the rules decide.
+    let standing_from = c.cases.len();
+    standing(&mut c, &mut rng);
+    let standing = c.cases.len() - standing_from;
+
     let file = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lean-oracle-cases.json");
     std::fs::write(&file, serde_json::to_vec(&json!({ "zones": c.zones, "cases": c.cases })).unwrap()).unwrap();
     let lean = run_lean(&file);
@@ -591,6 +596,7 @@ fn rust_decides_as_the_lean_spec() {
     println!("lean oracle: {routes_admitted} of 600 route children admitted; {chains} token chains, {node_admitted} of their leaves admitted by check");
     assert!(routes_admitted > 50 && routes_admitted < 550, "route children admitted: {routes_admitted} of 600");
     assert!(chains > 100, "too few token chains ({chains})");
+    println!("lean oracle: {standing} cases of standing reach (narrowing to evidence, a rule's decisions)");
     println!("lean oracle: {decisions} cases of wicket-core's pure decisions (is_public_ip, the token's end, agents' terms, escalation, uses, money, spawn)");
     assert!(
         divergent.is_empty(),
@@ -748,4 +754,53 @@ fn decisions(c: &mut Cases, rng: &mut Rng) {
             format!("{l:?}.admits({a:?})"),
         );
     }
+}
+
+/// The cases of section 9: `standing::narrow` on generated evidence (methods in either case, paths
+/// with and without glob metacharacters, counts of 0 to 3, sometimes more distinct paths than a rule
+/// may have pairs), and `ReachRule::allows` for each narrowed rule and generated rules, on requests
+/// for the evidence's paths and others, at every risk the methods give.
+fn standing(c: &mut Cases, rng: &mut Rng) {
+    use wicket_core::standing::narrow;
+    let methods = ["GET", "HEAD", "POST", "DELETE", "get", "PUT"];
+    let paths = ["/a", "/b", "/a/b", "/b/a", "/c*", "/[x]", "/a?", "/", "/a/b/c"];
+    let probes = ["/a", "/b", "/a/b", "/b/a", "/c", "/cd", "/x", "/a/", "/", "/a/b/c", "/A"];
+    let rule_json = |r: &ReachRule| json!({ "host": r.host, "methods": r.methods, "paths": r.paths, "dangerous": r.allow_dangerous });
+    let mut narrowed = 0;
+    for i in 0..2000 {
+        let wide = i % 10 == 0;
+        let ops: Vec<(String, String, u64)> = (0..rng.below(if wide { 24 } else { 7 }))
+            .map(|k| {
+                let m = rng.pick(&methods).to_string();
+                let p = if wide { format!("/p{k}") } else { rng.pick(&paths).to_string() };
+                (m, p, rng.below(4) as u64)
+            })
+            .collect();
+        let host = *rng.pick(&["a.test", "A.Test"]);
+        let got = narrow(host, ops.iter().map(|(m, p, n)| (m.as_str(), p.as_str(), *n)));
+        let rust = match &got {
+            None => "none".to_string(),
+            Some(r) => serde_json::to_string(&json!([r.host, r.methods, r.paths, r.allow_dangerous])).unwrap(),
+        };
+        c.push(json!({ "kind": "narrow", "host": host, "ops": ops }), rust, format!("narrow({host:?}, {ops:?})"));
+        let rule = match got {
+            Some(r) => {
+                narrowed += 1;
+                r
+            }
+            None => gen_rule(rng),
+        };
+        for _ in 0..4 {
+            let m = *rng.pick(&methods);
+            let p = if rng.chance(50) && !ops.is_empty() { rng.pick(&ops).1.clone() } else { rng.pick(&probes).to_string() };
+            let o = op("z", m, "a.test", &p);
+            let Ok(allowed) = rule.allows(&o) else { continue };
+            let case = json!({ "kind": "rule_allows", "rule": rule_json(&rule), "op": {
+                "method": o.method, "host": o.host, "path": o.path, "risk": o.risk.rank(),
+                "unreachable": wicket_core::never_reachable(&o.host).is_some(),
+            }});
+            c.push(case, allowed.to_string(), format!("{rule:?}.allows({m} a.test{p}, risk {:?})", o.risk));
+        }
+    }
+    assert!(narrowed > 1000, "too few asks narrowed ({narrowed} of 2000)");
 }
