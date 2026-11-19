@@ -180,7 +180,7 @@ ordered list.
 |---|---|---|---|
 | `host` | string | required | A host name, exact (`api.github.com`) or `*.example.com` for one or more labels under `example.com` (not `example.com` itself). Matched ignoring case and a trailing dot. No `/`. |
 | `methods` | list of strings | `[GET, HEAD]` | The methods allowed. The proxy forwards only GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS. |
-| `paths` | list of globs | `["/**"]` | Path globs: `*` matches within one segment, `**` across segments. Case-sensitive. The query string isn't matched. |
+| `paths` | list of globs | `["/**"]` | Path globs, each starting with `/` (a request's path always does; a manifest with one that doesn't is refused): `*` matches within one segment, `**` across segments. Case-sensitive. The query string isn't matched. |
 | `allow_dangerous` | boolean | `false` | Allow requests the dangerous-pattern list rates R3 or R4 without a grant. |
 
 A host allowed wholesale (every forwarded method, `/**`, `allow_dangerous` where the host can be
@@ -193,7 +193,7 @@ inspected: see [performance](../explanation/performance.md#splice-through-for-ho
 | field | type | default | meaning |
 |---|---|---|---|
 | `host` | string | required | As in `reach`. |
-| `paths` | list of globs | `["/**"]` | As in `reach`, but matched ignoring ASCII case, since many upstreams fold case. `/**` forbids the whole host, which then can't be connected to at all. A glob that doesn't compile forbids everything on the host. |
+| `paths` | list of globs | `["/**"]` | As in `reach` (each starting with `/`), but matched ignoring ASCII case, since many upstreams fold case. `/**` forbids the whole host, which then can't be connected to at all. A glob that doesn't compile forbids everything on the host. |
 
 #### Git pushes
 
