@@ -381,9 +381,12 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
 - **The queue.** A wake that no node may take now waits instead of failing: `queued: no node may take agent
   … now (n1: …; n2: …)`, then it tries again every 2 s, asking the nodes with no fresh report every 30 s,
   for up to `wicket wake --wait` (default 30 minutes; `--wait 0` fails at once, as before). Waiting wakes
-  are served by their manifest's [`placement.priority`](manifest.md#placement), highest first, and first
-  come, first served within one (`placement_waits`): one is placed only when no wake ahead of it fits a node
-  now, so a wake that fits nowhere doesn't hold up the ones behind it. A waiting wake keeps its
+  are served first come, first served across tenants (`placement_waits`); within a tenant, its own wakes
+  fill the places in line it took by their manifest's [`placement.priority`](manifest.md#placement),
+  highest first, and first come, first served within one. A priority is the manifest's own word, so it
+  never moves another tenant's wakes. One is placed only when no wake ahead of it fits a node now, so a
+  wake that fits nowhere doesn't hold up the ones behind it. A wake behind another tenant's says so
+  without naming that run. A waiting wake keeps its
   claim on the agent, and holds its place only while its process is alive. The queue never creates
   capacity: `request_capacity` and `wicket node create` stay the only ways.
 - **Why here.** Every decision is recorded (`placement_decisions`, a run's latest, kept a week): what the box
@@ -411,20 +414,28 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
 - **Affinity.** A box's [`placement.affinity`](manifest.md#placement) names a service its zone uses or a
   kept volume; its `anti_affinity` a zone or a principal. A node is seen with the boxes of the box's own
   tenant running there (their zones and principals), the live instances of the services it may use there
-  (its tenant's, or a shared one), and, for a kept volume, whether it ran a box of the box's zone. Another
-  tenant's boxes are never seen. A required term that fails puts a node out (`no service npm-cache here,
+  (its tenant's, or a shared one), and, for a kept volume, whether a box of the box's zone runs there or
+  ran there within the volume's retention. A box being started counts from its reservation (whose box it
+  is is recorded with it, `placement_owners`, ledger schema 30), so two wakes placed at once see each
+  other. Another tenant's boxes are never seen. A box's tenant is its manifest's, which an operator vouches
+  for. A required term that fails puts a node out (`no service npm-cache here,
   which the box requires`, `runs a box of zone research, which the box requires to be away from`); a
   preferred one ranks the nodes meeting the most first.
-- **Preemption.** A waiting wake with nothing ahead of it in the queue, which no node may take now, may
-  stop boxes to make room: only boxes of its own tenant whose manifest marks them
-  [`placement.preemptible`](manifest.md#placement) and whose priority is below its own, as few as it can
-  on one node, of the lowest priority first. Each is stopped the normal way: its run is revoked
-  (`wicket:preempt`; its supervisor stops its box within seconds, and a revoked run's children with it) and
-  audited as `placement.preempted` (the box, its node and priority, and the run it made room for). Room is
-  all it makes: a node out for a label, a taint, its CA or an affinity stays out. The wake then waits as
-  before, and is placed once the node's report shows the room; it stops no more for 2 minutes. Each box's
-  limits and priority are recorded at its start (`run_terms`, ledger schema 30); a box started by an older
-  build has none and is never preempted. A named node (`--node`) and a spawn never preempt.
+- **Preemption.** A waiting wake which no node may take now may stop long-lived agents to make room. It
+  defers to a wake ahead of it in the queue only if that one fits a node now or could make room this way
+  itself, so a wake that can't be served doesn't hold preemption up. It stops only active long-lived agents
+  of its own tenant whose manifest marks them [`placement.preemptible`](manifest.md#placement) and whose
+  priority is below its own: on one node, each one needed to make the room, the lowest priority first. A
+  program, or any run that isn't a long-lived agent's, is never preempted. Each agent is stopped the normal
+  way an agent stops: it is asked to hibernate at its next quiet point, as `wicket hibernate` asks, so it
+  keeps its work and can be woken again; nothing is revoked. Each is audited as `placement.preempted` (the
+  run, its agent, node and priority, and the run it made room for). The wake reserves the room on that node
+  while they hibernate, so another start doesn't take it. Room is all it makes: a node out for a label, a
+  taint, its CA or an affinity stays out. The wake then waits as before, and is placed once the node's
+  report shows the room; an agent asked counts as gone for 2 minutes, so it stops no more meanwhile. Before
+  it preempts, it asks every node for its room, and it doesn't preempt with under 30 s of its wait left.
+  Each box's limits and priority are recorded at its start (`run_terms`, ledger schema 30); a box started
+  by an older build has none and is never preempted. A named node (`--node`) and a spawn never preempt.
 - **Score.** Of the nodes left, those meeting the most preferences first; then bin-pack: the one left with the least memory, then the fewest vCPUs, once
   the box is on it. Where the agent ran before breaks a tie, then the name, so the same inputs always give
   the same node. A spread strategy exists in the function for later.
