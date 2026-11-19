@@ -185,7 +185,40 @@ async fn connect_inner(ctx: &RunCtx, target: &str, port: Option<u64>) -> Result<
     let (t, exposed) = end_info(ctx, &*ops, &to, Some(port))?;
     let d = policy::connect(&me.end(), &t.end(), exposed.is_some())?;
     let wanted = exposed.and_then(|e| e.name).unwrap_or_else(|| t.agent.clone());
-    open(ctx, ops, &me, &t, port, d, &wanted).await
+    open(ctx, ops, &me, &t, port, d, LinkName::Label(&wanted)).await
+}
+
+/// `connect(name, port?)` (#575): this box reaches the box holding internal name `name`
+/// (`<label>.<zone>`, with or without `.wicket.internal`), at the name's port. Decided as
+/// `connect` decides; the link is named after the name, so the box resolves it too.
+pub async fn connect_name(ctx: &RunCtx, name: &str, port: Option<u64>) -> Reply {
+    match connect_name_inner(ctx, name, port).await {
+        Ok(s) => (s, false),
+        Err(e) => (format!("not linked: {e}"), true),
+    }
+}
+
+async fn connect_name_inner(ctx: &RunCtx, name: &str, port: Option<u64>) -> Result<String, String> {
+    let ops = ctx.boxes.clone().ok_or("links need a box wicket runs on a node (this one can't link)")?;
+    let n = name.trim_end_matches('.').to_ascii_lowercase();
+    let n = n.strip_suffix(&format!(".{}", policy::DOMAIN)).unwrap_or(&n);
+    let (label, zone) = n.split_once('.').ok_or_else(|| format!("{name:?} isn't an internal name: <name>.<zone>"))?;
+    // The one DNS form names are registered under (#575 review, M3).
+    let zone = wicket_names::zone_part(zone).map_err(|e| format!("{name:?} isn't an internal name: {e}"))?;
+    let row = ledger(ctx)
+        .internal_name(&ctx.tenant, &zone, label)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no box holds the name {label}.{zone}"))?;
+    let to = row.holder.clone().ok_or_else(|| format!("{label}.{zone} is held by no running box now"))?;
+    let port = match port {
+        None => row.port,
+        Some(p) if p == u64::from(row.port) => row.port,
+        Some(p) => return Err(format!("{label}.{zone} names port {}, not {p}", row.port)),
+    };
+    let (me, _) = end_info(ctx, &*ops, &ctx.run.0, None)?;
+    let (t, exposed) = end_info(ctx, &*ops, &to, Some(port))?;
+    let d = policy::connect(&me.end(), &t.end(), exposed.is_some())?;
+    open(ctx, ops, &me, &t, port, d, LinkName::Exact(&format!("{label}.{zone}"))).await
 }
 
 /// What became of a box's use of a service (#579 step 3).
@@ -272,7 +305,7 @@ pub async fn use_service(ctx: &RunCtx, svc: &ServiceRef<'_>) -> UseOutcome {
         Err(e) => return UseOutcome::Refused(e),
     };
     let needs_human = !d.allowed();
-    match open(ctx, ops, &me, &t, svc.port, d, svc.name).await {
+    match open(ctx, ops, &me, &t, svc.port, d, LinkName::Label(svc.name)).await {
         Err(e) => UseOutcome::Refused(e),
         Ok(text) => match text.split_whitespace().skip_while(|w| *w != "request").nth(1) {
             Some(r) if needs_human && !text.starts_with("linked") && !text.starts_with("already linked") => {
@@ -301,7 +334,7 @@ pub async fn link(ctx: &RunCtx, from: &str, to: &str, port: Option<u64>) -> Repl
         let (t, exposed) = end_info(ctx, &*ops, &to, Some(port))?;
         let d = policy::link(&ctx.run.0, &f.end(), &t.end())?;
         let wanted = exposed.and_then(|e| e.name).unwrap_or_else(|| t.agent.clone());
-        open(ctx, ops, &f, &t, port, d, &wanted).await
+        open(ctx, ops, &f, &t, port, d, LinkName::Label(&wanted)).await
     }
     .await;
     match r {
@@ -361,6 +394,15 @@ async fn write_hosts(ctx: &RunCtx, ops: &dyn BoxOps, from_run: &str) {
     }
 }
 
+/// What a link is named after.
+#[derive(Clone, Copy)]
+enum LinkName<'a> {
+    /// A wanted name, made a label (and suffixed if another target has it): `connect(box)`, `link`, services.
+    Label(&'a str),
+    /// An internal name, exactly (#575): `connect(name)`.
+    Exact(&'a str),
+}
+
 async fn open(
     ctx: &RunCtx,
     ops: Arc<dyn BoxOps>,
@@ -368,12 +410,24 @@ async fn open(
     to: &EndInfo,
     port: u16,
     d: Decision,
-    wanted: &str,
+    name: LinkName<'_>,
 ) -> Result<String, String> {
+    let (wanted, by_name) = match name {
+        LinkName::Label(w) => (w, false),
+        LinkName::Exact(w) => (w, true),
+    };
     ops.reachable(&from.run).await?;
     ops.reachable(&to.run).await?;
     let existing = ledger(ctx).open_link(&from.run, &to.run, port).map_err(|e| e.to_string())?;
     if let Some(r) = existing {
+        if by_name && r.name != wanted {
+            return Err(format!(
+                "this box already links to that port as {}.{} ({}): unlink it to link it by name",
+                r.name,
+                policy::DOMAIN,
+                r.id
+            ));
+        }
         return Ok(format!("already linked ({}): {}.{}:{port}", r.id, r.name, policy::DOMAIN));
     }
     // Beyond the default policy: a human approves exactly this link.
@@ -428,13 +482,19 @@ async fn open(
     }
     let basis = basis.unwrap_or_else(|| "approved".into());
 
-    let used: Vec<Named> = ledger(ctx)
-        .links_from(&from.run)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter_map(|r| Some(Named { name: r.name, addr: r.addr.parse().ok()?, to_run: r.to_run }))
-        .collect();
-    let (name, addr) = policy::allocate(&used, &to.run, wanted)?;
+    let links = ledger(ctx).links_from(&from.run).map_err(|e| e.to_string())?;
+    // A by-name link (#575) is named exactly after the name, never suffixed, and only open links
+    // count against it: a closed one doesn't keep a name (#575 review, M1).
+    let (name, addr) = if by_name {
+        let named = |r: &LinkRow| Some(Named { name: r.name.clone(), addr: r.addr.parse().ok()?, to_run: r.to_run.clone() });
+        let open: Vec<Named> = links.iter().filter(|r| r.status == "open").filter_map(named).collect();
+        let used: Vec<Named> = links.iter().filter_map(named).collect();
+        policy::allocate_exact(&open, &used, &to.run, wanted)?
+    } else {
+        let used: Vec<Named> =
+            links.into_iter().filter_map(|r| Some(Named { name: r.name, addr: r.addr.parse().ok()?, to_run: r.to_run })).collect();
+        policy::allocate(&used, &to.run, wanted)?
+    };
     let id = wicket_core::new_link_id();
     let sock = format!("link-{id}.sock");
     let box_sock = format!("/wicket/sock/{sock}");
@@ -876,6 +936,93 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         panic!("link {id} did not close");
+    }
+
+    /// #575: a box names its port; a box its accept_from lists reaches it by that name, which
+    /// resolves in the connecting box (its hosts line); any other box needs a human; the name ends
+    /// with the run that holds it.
+    #[tokio::test]
+    async fn an_internal_name_is_reached_by_connect_and_ends_with_its_run() {
+        let w = World::new();
+        let api = w.boxed(w.zone("build", &["web"]), "api", "run_api", None, &[]);
+        let web = w.boxed(w.zone("web", &[]), "web", "run_web", None, &[]);
+        let other = w.boxed(w.zone("other", &[]), "other", "run_other", None, &[]);
+
+        let (text, err) = crate::names::request_name(&api, &serde_json::json!({ "name": "api", "port": 3000, "reason": "the API" }));
+        assert!(!err && text.contains("api.build.wicket.internal"), "{text}");
+        // Taken in the zone (by another agent of it); refused shapes and kinds.
+        let api2 = w.boxed(w.zone("build", &[]), "api2", "run_api2", None, &[]);
+        let (text, err) = crate::names::request_name(&api2, &serde_json::json!({ "name": "api", "port": 3001 }));
+        assert!(err && text.contains("taken"), "{text}");
+        let (text, err) = crate::names::request_name(&web, &serde_json::json!({ "name": "Bad.Name", "port": 1 }));
+        assert!(err && text.contains("a-z"), "{text}");
+        let (text, err) = crate::names::request_name(&web, &serde_json::json!({ "name": "x", "port": 1, "kind": "public" }));
+        assert!(err && text.contains("aren't available yet"), "{text}");
+
+        // web is in api's accept_from: linked by the name, at the name's port, and it resolves there.
+        let (text, err) = connect_name(&web, "api.build.wicket.internal", None).await;
+        assert!(!err && text.contains("api.build.wicket.internal:3000") && text.contains("accept_from"), "{text}");
+        let hosts = std::fs::read_to_string(w.root.join("run_web/hosts")).unwrap();
+        assert!(hosts.contains("\tapi.build.wicket.internal\n"), "{hosts}");
+        let id = link_id(&text);
+        assert_eq!(roundtrip(&w.root.join("run_web/sock").join(format!("link-{id}.sock"))).await.unwrap(), "run_api:ping");
+        let (text, err) = connect_name(&web, "api.build", Some(4000)).await;
+        assert!(err && text.contains("names port 3000"), "{text}");
+
+        // other isn't: a human decides exactly that link.
+        let (text, err) = connect_name(&other, "api.build", None).await;
+        assert!(!err && text.contains("needs approval"), "{text}");
+        let audit = w.ledger.lock().unwrap().audit_tail(30).unwrap();
+        assert!(audit.iter().any(|a| a.2 == "name.registered" && a.4.contains("api.build.wicket.internal")));
+
+        // The run ends: so does the name, and the label is free.
+        w.ledger.lock().unwrap().run_ended(&RunId("run_api".into()), "succeeded", "").unwrap();
+        let (text, err) = connect_name(&other, "api.build", None).await;
+        assert!(err && text.contains("no box holds"), "{text}");
+        assert!(w.ledger.lock().unwrap().internal_name(&TenantId::single(), "build", "api").unwrap().is_none());
+    }
+
+    /// #575 review and #668: only a zone already in DNS form holds names (a dotted one like a
+    /// spawned zone's included), and is looked up in any case; a zone that would share its DNS form
+    /// with another (`Build`, `web_api`) is refused; a name asked again moves to the new port; and
+    /// after the holder's run ends and another takes the name, a box reconnects under exactly the
+    /// same name (never a suffixed one), to the new holder.
+    #[tokio::test]
+    async fn a_name_keeps_its_exact_form_across_zones_ports_and_holders() {
+        let w = World::new();
+        let zone = "lead.fetch-er.01x";
+        let a = w.boxed(w.zone(zone, &["web"]), "api", "run_a", None, &[]);
+        let web = w.boxed(w.zone("web", &[]), "web", "run_web", None, &[]);
+        for odd in ["Build", "web_api"] {
+            let b = w.boxed(w.zone(odd, &[]), "odd", &format!("run_{}", odd.to_ascii_lowercase()), None, &[]);
+            let (text, err) = crate::names::request_name(&b, &serde_json::json!({ "name": "api", "port": 3000 }));
+            assert!(err && text.contains("can't be part of a DNS name"), "{odd}: {text}");
+        }
+
+        let (text, err) = crate::names::request_name(&a, &serde_json::json!({ "name": "api", "port": 3000 }));
+        assert!(!err && text.contains("api.lead.fetch-er.01x.wicket.internal"), "{text}");
+        // Asked again with another port: the name moves, the old port is no longer offered.
+        let (text, err) = crate::names::request_name(&a, &serde_json::json!({ "name": "api", "port": 3001 }));
+        assert!(!err && text.contains("port 3001"), "{text}");
+        assert!(w.ledger.lock().unwrap().exposed("run_a", 3000).unwrap().is_none());
+        assert!(w.ledger.lock().unwrap().exposed("run_a", 3001).unwrap().is_some());
+
+        // Looked up in any case or spelling of the zone that has the same DNS form.
+        let (text, err) = connect_name(&web, "api.Lead.Fetch-ER.01X", None).await;
+        assert!(!err && text.contains("api.lead.fetch-er.01x.wicket.internal:3001"), "{text}");
+        let first = link_id(&text);
+
+        // A's run ends; B, another run of the same agent in the same zone, takes the name.
+        w.ledger.lock().unwrap().run_ended(&RunId("run_a".into()), "succeeded", "").unwrap();
+        wait_closed(&w, &first).await;
+        let b = w.boxed(w.zone(zone, &["web"]), "api", "run_b", None, &[]);
+        assert!(!crate::names::request_name(&b, &serde_json::json!({ "name": "api", "port": 3001 })).1);
+        let (text, err) = connect_name(&web, "api.lead.fetch-er.01x", None).await;
+        assert!(!err, "{text}");
+        assert!(text.contains("api.lead.fetch-er.01x.wicket.internal:3001") && !text.contains("-2."), "{text}");
+        let hosts = std::fs::read_to_string(w.root.join("run_web/hosts")).unwrap();
+        assert_eq!(hosts.matches("api.lead.fetch-er.01x.wicket.internal").count(), 1, "{hosts}");
+        assert_eq!(roundtrip(&w.root.join("run_web/sock").join(format!("link-{}.sock", link_id(&text)))).await.unwrap(), "run_b:ping");
     }
 
     #[tokio::test]

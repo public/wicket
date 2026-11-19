@@ -604,7 +604,10 @@ impl Ledger {
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_turns ON messages (to_run, kind, delivered_at)")?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
-        Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
+        let l = Ledger { conn, path: Some(path.to_path_buf()), writer: None };
+        // Names a run that ended without releasing them still holds (#575 review, M2).
+        l.sweep_stale_names()?;
+        Ok(l)
     }
 
     /// A ledger's recorded schema, read without migrating it (`wicket self rollback` checks it
@@ -690,6 +693,17 @@ impl Ledger {
     /// Ends a run. Its still-pending requests are withdrawn: a request belongs to the work that
     /// raised it, and must not be approvable after that work is gone.
     pub fn run_ended(&self, run: &RunId, status: &str, detail: &str) -> Result<usize> {
+        // One transaction (#575 review, H1): a run ends whole or not at all. Inside a caller's
+        // (`run_lost`'s), these writes join it.
+        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let n = self.run_ended_in(run, status, detail)?;
+        if let Some(own) = own {
+            own.commit()?;
+        }
+        Ok(n)
+    }
+
+    fn run_ended_in(&self, run: &RunId, status: &str, detail: &str) -> Result<usize> {
         self.conn
             .execute("UPDATE runs SET status = ?2, ended_at = ?3, detail = ?4 WHERE id = ?1", params![run.0, status, now(), detail])?;
         let n = self.conn.execute(
@@ -706,6 +720,8 @@ impl Ledger {
         // And what it used of per-node services (#579).
         self.drop_service_wants(&run.0)?;
         self.close_links_of(&run.0)?;
+        // And its names (#575): run-scoped ones end, standing ones wait for the next run.
+        self.release_run_names(run)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
             "UPDATE leases SET status = 'withdrawn', detail = 'its run ended before a decision', ended_at = ?2 WHERE run = ?1 AND status = 'pending'",
