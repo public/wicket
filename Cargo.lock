@@ -4129,6 +4129,7 @@ dependencies = [
  "tracing",
  "wicket-core",
  "wicket-identity",
+ "wicket-names",
  "wicket-proxy",
  "wicket-store",
 ]

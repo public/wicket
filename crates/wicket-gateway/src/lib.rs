@@ -15,6 +15,7 @@
 
 pub mod delegate;
 pub mod link;
+pub mod names;
 
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -116,10 +117,12 @@ impl Gateway {
                 args.get("port").and_then(|v| v.as_u64()).filter(|p| *p <= 65535).unwrap_or(0) as u16,
                 args.get("name").and_then(|v| v.as_str()),
             ),
-            "connect" => {
-                let b = args.get("box").and_then(|v| v.as_str()).unwrap_or("");
-                link::connect(&self.ctx, b, args.get("port").and_then(|v| v.as_u64())).await
-            }
+            "connect" => match (args.get("box").and_then(|v| v.as_str()), args.get("name").and_then(|v| v.as_str())) {
+                (Some(_), Some(_)) => ("not linked: give `box` or `name`, not both".into(), true),
+                (None, Some(n)) => link::connect_name(&self.ctx, n, args.get("port").and_then(|v| v.as_u64())).await,
+                (b, None) => link::connect(&self.ctx, b.unwrap_or(""), args.get("port").and_then(|v| v.as_u64())).await,
+            },
+            "request_name" => names::request_name(&self.ctx, &args),
             "link" => {
                 let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
                 link::link(&self.ctx, &s("from"), &s("to"), args.get("port").and_then(|v| v.as_u64())).await

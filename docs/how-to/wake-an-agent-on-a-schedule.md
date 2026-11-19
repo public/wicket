@@ -66,27 +66,40 @@ action:
     body: "Run {{ event.run }} ended {{ event.status }}: look at why."
 ```
 
-| kind | what it is | fields besides the common ones |
+| kind | what it is | fields from the record's body |
 |---|---|---|
 | `run.end` | a run ended | `status`, `cause`, `seconds`, `result`, token counts |
 | `run.lost` | the reconciler found a run's process or box gone | `target`, `detail` |
-| `box.exited` | a box ended with a cause (out of memory, killed, a non-zero exit) | `node`, `code`, `cause` |
-| `box.memory_pressure` | a node saw a box near its memory limit | `node`, `current`, `max`, `peak` |
-| `agent.wake`, `agent.hibernate` | a long-lived agent woke or hibernated | `agent`, `by` (a wake's cause) |
+| `box.exited` | a box ended with a cause (out of memory, killed, a non-zero exit) | `code`, `cause` |
+| `box.memory_pressure` | a node saw a box near its memory limit | `current`, `max`, `peak` |
+| `agent.wake`, `agent.hibernate` | a long-lived agent woke or hibernated | `by` (a wake's cause), `generation` |
 | `message.refused` | a message to an agent was refused | `from`, `to`, `why` |
 | `decision` | an approval, denial, renewal or revocation | `decision`, `request` or `grant`, `by` |
 
-Every event also has `kind`, `record` (the audit kind it came from), `seq`, `run` and `at`. Filters
-can name nested fields with dots (`pr.number`).
+wicket sets these fields itself, from the ledger, and a record's body can't replace them: `kind`,
+`record` (the audit kind it came from), `seq`, `run`, `at`, and the run's `zone`, `agent` (its
+name), `principal` and `agent_id` (null for a record of no run), plus `node` for a node's record.
+Everything else comes from the record's body. Some of that is the run's own words: a run's
+`result` is whatever its agent wrote. Filter on wicket's fields when it matters who a record is
+about. For example, `filter: { zone: build }` hears only the build zone's runs. Filters can name
+nested fields with dots (`pr.number`).
 
 - **When it fires.** Each reconcile pass reads the records written since the last pass, and fires
   each trigger once per record its filter passes. A trigger hears only records written while it
   was live (since it was made, approved or resumed). A new installation starts at the chain's
-  newest record.
-- **No loops.** A trigger never fires on the `agent.wake` its own firing caused.
-- **Quoted input.** What these records hold can include an agent's own words (a run's `result`).
-  So for these triggers every text field filled into the message is quoted, `«…»`, and the turn
-  ends by saying the quoted text is the event's data, not instructions.
+  newest record, and a record more than 15 minutes old when read (the reconciler was down) is
+  passed over.
+- **Chains of triggers.** Each turn a trigger queues records the triggers that led to it. A
+  record of the run that read the turn carries those triggers on. A trigger never fires on a
+  record its own firing led to, however many triggers came between (A wakes B, B wakes A, stops
+  at the second A), and no record fires a fifth trigger in a row. These are skipped and audited
+  (`trigger.skipped`). Only what a trigger queued is followed. If an agent a trigger woke goes on
+  to message another agent itself, that is the agent's doing, and the second agent's records
+  don't carry the chain.
+- **Quoted input.** Because body fields can hold an agent's words, every text field these
+  triggers fill into a message is a JSON string, `"…"`. Quote marks inside are escaped, a long
+  value is cut inside its quotes, and the turn ends by saying the quoted text is the event's data,
+  not instructions.
 
 ## Keep it
 
