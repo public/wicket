@@ -27,7 +27,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 const EPOCH = 1700000000000;
@@ -53,11 +53,16 @@ const fakeSub = { endpoint: "https://fcm.googleapis.com/fcm/send/dev1", options:
 const swReg = { pushManager: { getSubscription: async () => subscribed,
   subscribe: async o => { assert.strictEqual(o.userVisibleOnly, true); assert.deepStrictEqual(Array.from(o.applicationServerKey), [4, 1, 2]); fakeSub.options.applicationServerKey = o.applicationServerKey.buffer; subscribed = fakeSub; return fakeSub; } } };
 const devId = ep => require("crypto").createHash("sha256").update(ep).digest("hex").slice(0, 16);
+let stateFail = null;
 const reply = (body, ok = true) => ({ ok, status: ok ? 200 : 400, json: async () => body });
 const fetch = async (path, opts) => {
   calls.push({ path, body: opts && opts.body ? JSON.parse(opts.body) : null });
   if (path === "/api/me") return reply({ who: { state: "operator" } });
-  if (path === "/api/state") return reply(state);
+  if (path === "/api/state") {
+    if (stateFail === "network") throw new TypeError("Failed to fetch");
+    if (stateFail) return { ok: false, status: stateFail, json: async () => ({}) };
+    return reply(state);
+  }
   if (path === "/api/action/begin") {
     const b = JSON.parse(opts.body);
     // Push actions: the server's signed JSON, as the fake server sees the device.
@@ -224,6 +229,17 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-cancel"].listeners.click(); await flush();
   assert.strictEqual(ids.confirm.hidden, true);
   assert.strictEqual(ceremonies, 1);
+  // #574 (B4, item 8): a server that can't answer for a moment is said to be so, and the page stays
+  // up and goes on polling; only a 401 signs it out.
+  for (const fail of [502, "network"]) {
+    stateFail = fail;
+    await run("refresh()"); await flush();
+    assert.strictEqual(ids.console.hidden, false, "still signed in after " + fail);
+    assert.ok(!ids.stale.hidden && ids.stale.textContent.startsWith("Can't reach wicket (" + (fail === 502 ? "HTTP 502" : "no answer") + ")"), ids.stale.textContent);
+  }
+  stateFail = null;
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.stale.hidden, true, "heard from again");
   // #574: the confirmation states the effect's terms, which the passkey signs: a git push is a
   // window (unlimited uses for 5 minutes, #26), whatever the card asked for.
   const push = JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "POST", host: "github.com",
@@ -313,6 +329,16 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   const pc = run("(r => pendingCard({ now: 2 }, r))")(pushReq);
   const pt = pc.textContent;
   assert.ok(pt.includes("Approve this push (any number of uses for 5 min)") && pt.includes("approved as one window") && !pt.includes("one use at a time"), pt);
+  // A push to another host is R2, but granted as the same window: no hour button (#597 re-review).
+  const r2 = run("(r => pendingCard({ now: 2 }, r))")({ ...pushReq, id: "q-push2", risk: "R2WriteReversible", host: "git.example" }).textContent;
+  assert.ok(r2.includes("Approve this push (any number of uses for 5 min)") && !r2.includes("1 hour"), r2);
+  // An error that stays is gone once a sheet opens: it would sit above it.
+  run("toastError({ name: 'Error', message: 'earlier' })");
+  assert.strictEqual(ids.msg.hidden, false);
+  await advance(1000);
+  await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
+  assert.strictEqual(ids.msg.hidden, true, "the error toast goes when the sheet opens");
+  ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
@@ -492,6 +518,26 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console capacity: ok");
 
+  // Health alerts are lines under their node's row, not items squeezed into it (B7).
+  state = { ...base, pending: [], health: { nodes: [{ node: "n1", summary: "ok", received_ms: 1, alerts: ["disk 91% full"] }] } };
+  await run("refresh()"); await flush();
+  const hrow = ids.health.children[0];
+  assert.strictEqual(hrow.children[0].className, "row");
+  assert.ok(hrow.children[1].textContent === "! disk 91% full" && hrow.children[1].className === "blocked", hrow.textContent);
+  // One poll at a time (B9): a second asked for while one is in flight runs after it, not beside it.
+  let inFlight = 0, most = 0;
+  const realFetch = sandbox.fetch;
+  sandbox.fetch = async (p, o) => { inFlight++; most = Math.max(most, inFlight); try { await flush(); return await realFetch(p, o); } finally { inFlight--; } };
+  const polled = calls.filter(c => c.path === "/api/state").length;
+  await Promise.all([run("refresh()"), run("refresh()")]); for (let i = 0; i < 10; i++) await flush();
+  assert.strictEqual(calls.filter(c => c.path === "/api/state").length - polled, 2, "the second ran after the first");
+  assert.strictEqual(most, 1, "never two at once");
+  // A decision made while a poll is in flight drops that poll's (older) answer, and polls again.
+  const before2 = calls.filter(c => c.path === "/api/state").length;
+  run("refresh()"); run("closeConfirm()"); for (let i = 0; i < 10; i++) await flush();
+  assert.strictEqual(calls.filter(c => c.path === "/api/state").length - before2, 2, "polled again after the decision");
+  sandbox.fetch = realFetch;
+  console.log("console health and polling: ok");
   // Standing reach (#572): an ask shows its evidence and what it allows beyond it; approving it
   // narrowed is signed from a confirmation that names the narrowed rule; a rule is revoked with
   // the session only.
@@ -570,5 +616,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual(sw.opened, ["https://console.example/#notifications"]);
   await fire("notificationclick", { notification: { close() {}, data: { id: "q-b" } } });
   assert.deepStrictEqual(sw.opened[1], "https://console.example/#pending/q-b");
+  // A node-health notification opens the health section, in a new window or an open one (B5).
+  await fire("notificationclick", { notification: { close() {}, data: { health: true } } });
+  assert.deepStrictEqual(sw.opened[2], "https://console.example/#health");
+  sw.posted = [];
+  sw.wins = [{ url: "https://console.example/", postMessage: m => sw.posted.push(m), focus: async () => {} }];
+  await fire("notificationclick", { notification: { close() {}, data: { health: true } } });
+  assert.strictEqual(JSON.stringify(sw.posted), JSON.stringify([{ health: true }]));
   console.log("console service worker: ok");
 })().catch(e => { console.error(e); process.exit(1); });
