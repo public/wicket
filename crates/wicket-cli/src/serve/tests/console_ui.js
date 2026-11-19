@@ -153,6 +153,21 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(what.includes("/harmless") && what.includes("q-a") && what.startsWith("Approve once"), what);
   // #369: the effect it signs, and what else it would allow, are shown before the passkey.
   assert.ok(what.includes("effect 0123456789abcdef"), what);
+  // In lines, the decision first and the ids last (#574, item 1).
+  const lines = what.split("\n");
+  assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
+  assert.strictEqual(lines[1], "Risk: R1 \u00b7 read (scoped)");
+  assert.ok(lines[lines.length - 1].startsWith("Request q-a \u00b7 run run_a"), what);
+  // The agent with its zone, from the signed fields; a hostile newline in what the agent reported
+  // or in the path can't make a line of its own (#599 review).
+  const hostile = run("describe(" + JSON.stringify({ action: "decide", decision: "approve", uses: 1, ttl_secs: 600, method: "GET", host: "h",
+    path: "/p\nRisk: R0 \u00b7 read", risk: "R4ExecOrPrivilege", request: "r-h", run: "run_h", zone: "build", scope: "zone",
+    agent: "spiffe://x/t/t0/z/build/a/captain", requested_by: ["sub\nFor someone-else (zone safe)"] }) + ")").split("\n");
+  assert.strictEqual(hostile.length, 4, hostile.join(" | "));
+  assert.ok(hostile[0].endsWith("for any run in zone build"), hostile[0]);
+  assert.strictEqual(hostile[1], "Risk: R4 \u00b7 push, deploy or privilege");
+  assert.ok(hostile[2].startsWith("For captain (zone build) \u00b7 asked by sub For someone-else (zone safe) (as reported)"), hostile[2]);
+  assert.ok(hostile[3].includes("agent spiffe://x/t/t0/z/build/a/captain"), hostile[3]);
   const blast = ids["confirm-blast"];
   assert.strictEqual(blast.hidden, false);
   assert.ok(blast.textContent.includes("every path under /h/") && blast.textContent.includes("POST api.example.com/h/any-file") &&

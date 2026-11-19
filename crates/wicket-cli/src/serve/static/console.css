@@ -75,7 +75,7 @@ textarea { min-height:76px; resize:vertical; }
 #confirm { position:fixed; inset:0; z-index:10; background:rgba(10,12,16,.5); display:flex; align-items:flex-start; justify-content:center; padding:max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)); overflow-y:auto; overscroll-behavior:contain; }
 #confirm .card { width:100%; max-width:720px; margin:0 0 auto; padding:18px 20px; border-color:transparent; box-shadow:0 12px 40px rgba(0,0,0,.28); }
 #confirm-title { font-size:13px; font-weight:600; color:var(--quiet); letter-spacing:.01em; }
-#confirm-what { font:600 16px/1.45 var(--sans); margin-top:8px; word-break:break-word; }
+#confirm-what { font:600 16px/1.45 var(--sans); margin-top:8px; word-break:break-word; white-space:pre-line; }
 #confirm .buttons { margin-top:16px; }
 #confirm-go { flex:1 1 auto; }
 
