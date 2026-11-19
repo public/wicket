@@ -1,0 +1,27 @@
+# Verdaccio as a pull-through cache only: everything comes from npmjs, nothing is published, and
+# no one signs in (only boxes linked to it reach it).
+storage: /volumes/storage
+uplinks:
+  npmjs:
+    url: https://registry.npmjs.org/
+    cache: true
+    # Package metadata kept half an hour before it is asked for again.
+    maxage: 30m
+packages:
+  "@*/*":
+    access: $all
+    publish: $nobody
+    unpublish: $nobody
+    proxy: npmjs
+  "**":
+    access: $all
+    publish: $nobody
+    unpublish: $nobody
+    proxy: npmjs
+auth:
+  htpasswd:
+    file: /tmp/verdaccio-htpasswd
+    max_users: -1
+# No web interface: only npm clients, over the link.
+web: { enable: false }
+log: { type: stdout, format: pretty, level: http }

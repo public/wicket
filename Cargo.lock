@@ -4179,6 +4179,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wicket-names"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "wicket-node"
 version = "0.0.1"
 dependencies = [

@@ -110,7 +110,7 @@ if has tla; then
 fi
 if [ "$e2e" = 1 ]; then
   e2e_suites=()
-  for s in smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update; do
+  for s in smoke hibernate restore services acceptance daemon-uids install-test node-e2e acceptance-nodes update; do
     has "$s" && e2e_suites+=("$s")
   done
   if [ ${#e2e_suites[@]} -gt 0 ]; then
@@ -120,6 +120,7 @@ if [ "$e2e" = 1 ]; then
         smoke) hstep smoke ci/smoke.sh ;;
         hibernate) hstep "hibernate" ci/hibernate.sh; hstep "hibernate --node" ci/hibernate.sh --node ;;
         restore) hstep restore ci/restore.sh ;;
+        services) hstep "per-node services" ci/service-e2e.sh ;;
         # acceptance --nodes local includes the local flows.
         acceptance) has acceptance-nodes || hstep acceptance ci/acceptance.sh ;;
         acceptance-nodes) hstep "acceptance --nodes local" ci/acceptance.sh --nodes local ;;
