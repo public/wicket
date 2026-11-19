@@ -9,4 +9,4 @@ type: Added
   starts, the control host renews the CA over the run's channel for the operator's hosts plus what
   its boxes want, capped at 64 entries, and audits `node.ca_widened`. Hosts no box wants any more
   are pruned at the next due renewal. The default is `fixed`, as before: then a box start says which
-  hosts the CA would need. Ledger schema 20 (an expand step).
+  hosts the CA would need. Ledger schema 21 (an expand step, after 20).
