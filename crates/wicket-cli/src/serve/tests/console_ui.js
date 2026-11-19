@@ -339,6 +339,34 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await run("signed({ action: 'decide', id: 'q-x', decision: 'approve' })"); await flush();
   assert.strictEqual(ids.msg.hidden, true, "the error toast goes when the sheet opens");
   ids["confirm-cancel"].listeners.click(); await flush();
+  // Who asked (#574, item 5): a named call is labelled apart from "On behalf of"; that anything in
+  // the box could use the grant is always said; with no event stream, the asker is unknown.
+  const NOTE = "anything in this box could use the grant.";
+  const alone = run("renderWho([{ basis: 'none', requesters: [] }])").textContent;
+  assert.ok(!alone.includes("Asked by") && alone.includes(NOTE), alone);
+  const who = run("renderWho([{ basis: 'exact', requesters: [{ agent: 'release-captain', tool: 'Bash', call: 'git push' }] }])").textContent;
+  assert.ok(who.startsWith("Asked by (in the box): release-captain — Bash: git push") && who.includes("not proven") && who.includes(NOTE), who);
+  const noStream = run("renderWho([])").textContent;
+  assert.ok(noStream.startsWith("Asked by (in the box): unknown (no agent event stream)") && noStream.includes("Anything in this box could use the grant."), noStream);
+  // Two askers, one with no call in flight: both are listed, the unknown one too (#601 review).
+  const two = run("renderWho([{ basis: 'exact', requesters: [{ agent: 'a', tool: 'Bash', call: 'x' }] }, { basis: 'none', requesters: [] }])").textContent;
+  assert.ok(two.includes("Asked by (in the box): a — Bash: x") && two.includes("Asked by (in the box): unknown — no tool call was in flight") && two.includes("more than one agent"), two);
+  // The full identity is behind a real button that says whether it is shown; opening it moves the
+  // card's buttons, so a tap right after is ignored.
+  const card = run("(() => { const c = el('div'); renderAgent(c, { verified: true, agent: 'release-captain', zone: 'build', acting_for: ['passkey:phone'], id: 'spiffe://x/a/release-captain' }); return c; })()");
+  const idl = card.all(n => n.className === "idline")[0];
+  assert.ok(idl.hidden && card.textContent.includes("On behalf of: passkey:phone"), card.textContent);
+  const toggle = card.all(n => n.tagName === "button" && n.className === "idname")[0];
+  assert.ok(toggle, "the name is a button");
+  assert.strictEqual(toggle.getAttribute("aria-expanded"), "false");
+  await advance(1000);
+  assert.strictEqual(run("settled()"), true);
+  toggle.click();
+  assert.strictEqual(idl.hidden, false, "tapping the name shows its identity");
+  assert.strictEqual(toggle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(run("settled()"), false, "taps wait a moment after the card grows");
+  toggle.click();
+  assert.deepStrictEqual([idl.hidden, toggle.getAttribute("aria-expanded")], [true, "false"]);
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
