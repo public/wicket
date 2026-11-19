@@ -18,15 +18,18 @@ function toast(t, error) {
   const m = document.getElementById("msg");
   m.textContent = (t === undefined || t === null || t === "") ? "Done." : String(t);
   m.className = error ? "error" : "";
+  m.setAttribute("role", error ? "alert" : "status");
   m.hidden = false;
   m.onclick = () => { m.hidden = true; };
   clearTimeout(toastTimer);
   if (!error) toastTimer = setTimeout(() => { m.hidden = true; }, Math.min(8000, Math.max(3000, 40 * m.textContent.length)));
 }
 // An error, said plainly: a passkey sheet the operator closed is no failure of wicket's.
-function toastError(e, what) {
+function toastError(e, what, passkey) {
   const name = e && e.name, msg = (e && e.message) || String(e);
-  if (name === "NotAllowedError" || name === "AbortError") return toast("Passkey cancelled. Nothing was signed.", true);
+  // Only around a passkey call does NotAllowedError mean the sheet was closed; elsewhere (push
+  // subscription, say) it means a permission was refused, and says so as the browser does.
+  if (passkey && (name === "NotAllowedError" || name === "AbortError")) return toast("Passkey cancelled. Nothing was signed.", true);
   toast((what ? what + ": " : "") + msg, true);
 }
 
@@ -55,11 +58,11 @@ async function registerPasskey() {
     const name = (document.getElementById("pkname") || {}).value || "passkey";
     const j = await post("/api/register/finish", { challenge: pk.challenge, name, clientDataJSON: b2a(cred.response.clientDataJSON), attestationObject: b2a(cred.response.attestationObject) });
     toast(j.ok); boot();
-  } catch (e) { toastError(e, "Passkey"); }
+  } catch (e) { toastError(e, "Passkey", true); }
 }
 async function signIn() {
   try { const { publicKey } = await post("/api/login/begin"); const j = await post("/api/login/finish", await assertWith(publicKey)); toast(j.ok); boot(); }
-  catch (e) { toastError(e, "Sign-in"); }
+  catch (e) { toastError(e, "Sign-in", true); }
 }
 // Every action is signed: the passkey challenge is the hash of exactly the action the server
 // returns from begin. Signing takes two steps (#124): the click asks the server for that action, and
@@ -150,7 +153,7 @@ async function signed(body, after, extra) {
     go.disabled = true;
     document.getElementById("confirm-state").textContent = "Waiting for your passkey\u2026";
     try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
-    catch (e) { toastError(e); }
+    catch (e) { toastError(e, null, true); }
     closeConfirm();
   };
   document.getElementById("confirm").hidden = false;
@@ -261,13 +264,19 @@ function pendingCard(s, p) {
   const meta = el("div", "meta", p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 " + strip(p.run) + " \u00b7 " + ago(s.now, p.created_at));
   c.append(meta);
   const b = el("div", "buttons");
-  const once = el("button", "approve", p.scope_prefix ? "Approve prefix once (expires in 10 min)" : "Approve once (expires in 10 min)"); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
+  // The first button's words are the server's terms for it (`once_terms`): a git push is granted
+  // as a window whatever is picked, and the card mustn't say otherwise.
+  const ot = p.once_terms || { uses: 1, ttl_secs: 600 };
+  const window_ = ot.uses !== 1;
+  const onceLabel = window_ ? "Approve this push (any number of uses for " + span(ot.ttl_secs) + ")"
+    : p.scope_prefix ? "Approve prefix once (expires in 10 min)" : "Approve once (expires in 10 min)";
+  const once = el("button", "approve", onceLabel); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
   const hour = el("button", "", p.scope_prefix ? "Approve prefix for 1 hour (any number of uses)" : "Approve for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
   const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
   if (!idOk) { once.disabled = true; hour.disabled = true; }
   if (p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
     b.append(once, deny);
-    c.append(el("div", "meta", "R3 and R4 are approved one use at a time."));
+    c.append(el("div", "meta", window_ ? "A push is approved as one window: any number of uses for " + span(ot.ttl_secs) + ", for its ref discovery and upload." : "R3 and R4 are approved one use at a time."));
   } else b.append(once, hour, deny);
   c.append(b);
   cards.set(p.id, { key, node: c, meta });
