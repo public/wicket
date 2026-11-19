@@ -1441,7 +1441,10 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
     else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "too many passkey ceremonies in progress; try again shortly");
     };
-    ok(json!({ "action": v, "publicKey": assertion_options(state, &key) }))
+    // When the challenge expires, on the wall clock (#574 review): the page counts down to it, and
+    // a phone that sleeps meanwhile still knows.
+    let expires_at_ms = wicket_feed::now_ms() + CHALLENGE_TTL.as_millis() as i64;
+    ok(json!({ "action": v, "publicKey": assertion_options(state, &key), "expires_at_ms": expires_at_ms }))
 }
 
 fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Value) -> Reply {
@@ -1859,6 +1862,10 @@ fn dashboard(state: &State) -> Result<Value> {
         "pending": l.pending(t)?.into_iter().map(|r| {
             let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);
             v["identity"] = (state.identity)(&l, &r.run);
+            // What the card's first button would grant, as the grant is made (#574 review): a git
+            // push is a window, any number of uses for 5 minutes (#26), whatever is picked.
+            let (uses, ttl_secs) = wicket_core::git::grant_terms(&r.method, &r.path, Some(1), 600);
+            v["once_terms"] = json!({ "uses": uses, "ttl_secs": ttl_secs });
             v
         }).collect::<Vec<_>>(),
         "decided": l.decided(t, 15)?,

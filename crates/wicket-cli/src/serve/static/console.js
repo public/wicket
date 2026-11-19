@@ -14,19 +14,22 @@ const span = secs => { const s = Math.round(secs || 0); return s >= 3600 && s % 
 // What happened, at the foot of the page (#574): long enough to read (3 to 8 s by length), and an
 // error in its own style, kept until tapped.
 let toastTimer;
-function toast(t, error) {
+function toast(t, error, sticky) {
   const m = document.getElementById("msg");
   m.textContent = (t === undefined || t === null || t === "") ? "Done." : String(t);
   m.className = error ? "error" : "";
+  m.setAttribute("role", error ? "alert" : "status");
   m.hidden = false;
   m.onclick = () => { m.hidden = true; };
   clearTimeout(toastTimer);
-  if (!error) toastTimer = setTimeout(() => { m.hidden = true; }, Math.min(8000, Math.max(3000, 40 * m.textContent.length)));
+  if (!error && !sticky) toastTimer = setTimeout(() => { m.hidden = true; }, Math.min(8000, Math.max(3000, 40 * m.textContent.length)));
 }
 // An error, said plainly: a passkey sheet the operator closed is no failure of wicket's.
-function toastError(e, what) {
+function toastError(e, what, passkey) {
   const name = e && e.name, msg = (e && e.message) || String(e);
-  if (name === "NotAllowedError" || name === "AbortError") return toast("Passkey cancelled. Nothing was signed.", true);
+  // Only around a passkey call does NotAllowedError mean the sheet was closed; elsewhere (push
+  // subscription, say) it means a permission was refused, and says so as the browser does.
+  if (passkey && (name === "NotAllowedError" || name === "AbortError")) return toast("Passkey cancelled. Nothing was signed.", true);
   toast((what ? what + ": " : "") + msg, true);
 }
 
@@ -55,11 +58,11 @@ async function registerPasskey() {
     const name = (document.getElementById("pkname") || {}).value || "passkey";
     const j = await post("/api/register/finish", { challenge: pk.challenge, name, clientDataJSON: b2a(cred.response.clientDataJSON), attestationObject: b2a(cred.response.attestationObject) });
     toast(j.ok); boot();
-  } catch (e) { toastError(e, "Passkey"); }
+  } catch (e) { toastError(e, "Passkey", true); }
 }
 async function signIn() {
   try { const { publicKey } = await post("/api/login/begin"); const j = await post("/api/login/finish", await assertWith(publicKey)); toast(j.ok); boot(); }
-  catch (e) { toastError(e, "Sign-in"); }
+  catch (e) { toastError(e, "Sign-in", true); }
 }
 // Every action is signed: the passkey challenge is the hash of exactly the action the server
 // returns from begin. Signing takes two steps (#124): the click asks the server for that action, and
@@ -78,13 +81,14 @@ function describe(a) {
     const what = a.path_prefix ? s(a.method + " " + a.host + a.path_prefix) : s(a.method + " " + a.host + a.path);
     // In lines (#574, item 1): the decision and its target first, as the passkey signs them; then
     // the risk, who it is for, and the ids last and apart.
+    // Who it is for, from the signed fields: the agent's name with its zone (the same name in two
+    // zones mustn't read the same), its full id with the ids; who in the box asked, as reported.
     const agent = a.agent ? String(a.agent).split("/a/").pop() : "";
-    const lines = [verb + how + ": " + what + (a.prefix ? "\u2026 (every path under it)" : ""),
-      "Risk: " + riskLabel(a.risk) + (a.scope === "zone" ? " \u00b7 for any run in zone " + s(a.zone) : "")];
-    if (agent || (a.requested_by || []).length) {
-      lines.push((agent ? "For " + s(agent) : "For run " + s(a.run)) + ((a.requested_by || []).length ? " \u00b7 asked by " + a.requested_by.map(s).join(", ") : ""));
-    }
-    lines.push("Request " + s(a.request) + " \u00b7 run " + s(a.run) + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : ""));
+    const lines = [verb + how + ": " + what + (a.prefix ? "\u2026 (every path under it)" : "") + (a.scope === "zone" ? " \u00b7 for any run in zone " + s(a.zone) : ""),
+      "Risk: " + riskLabel(a.risk)];
+    lines.push((agent ? "For " + s(agent) : "For run " + s(a.run)) + " (zone " + s(a.zone) + ")" +
+      ((a.requested_by || []).length ? " \u00b7 asked by " + a.requested_by.map(s).join(", ") + " (as reported)" : ""));
+    lines.push("Request " + s(a.request) + " \u00b7 run " + s(a.run) + (a.agent ? " \u00b7 agent " + s(a.agent) : "") + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : ""));
     return lines.join("\n");
   }
   if (a.action === "revoke") return "Revoke " + s(a.run) + " (" + s(a.agent) + "): " + s(a.reason);
@@ -131,39 +135,48 @@ const settled = () => performance.now() - layoutAt >= SETTLE_MS;
 let afterConfirm = null;
 // How long the server keeps a begun action's challenge (`CHALLENGE_TTL` in serve/mod.rs).
 const CHALLENGE_MS = 120000;
+const EXPIRY_MARGIN_MS = 5000;
 let expiryTimer = null;
 async function signed(body, after, extra) {
   if (ceremony) return;
   ceremony = true;
   afterConfirm = after || null;
-  // Something shows between the tap and the sheet (#574, item 6): on a slow link the operator
-  // otherwise taps again, or thinks the tap failed.
-  toast("Preparing\u2026");
+  // Something shows between the tap and the sheet (#574, item 6), and stays until it opens: on a
+  // slow link the operator otherwise taps again, or thinks the tap failed.
+  toast("Preparing\u2026", false, true);
+  await openSheet(body, extra);
+}
+// Begins the action and fills the sheet with what the server returned: once from a tap, and again
+// from "Ask again" inside the open sheet, so a second tap never lands on the page beneath.
+async function openSheet(body, extra) {
+  const go = document.getElementById("confirm-go");
+  const state = document.getElementById("confirm-state");
   let begin;
   try { begin = await post("/api/action/begin", body); }
   catch (e) { toastError(e); closeConfirm(); return; }
   document.getElementById("msg").hidden = true;
-  const began = performance.now();
-  const go = document.getElementById("confirm-go");
   document.getElementById("confirm-what").textContent = describe(begin.action);
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
-  document.getElementById("confirm-state").textContent = "";
-  const deny = begin.action.decision === "deny" || begin.action.action === "revoke" || begin.action.action === "delete_secret";
+  state.textContent = "";
+  delete go.dataset.waiting;
+  const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny"].includes(begin.action.action);
   go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
   go.disabled = true; setTimeout(() => { go.disabled = false; }, SETTLE_MS);
-  // The challenge expires: count it down, and once it has, offer to ask again rather than fail.
-  const state = document.getElementById("confirm-state");
+  // The challenge expires on the server's clock: a wall-clock deadline it sent (a phone that sleeps
+  // still knows), a few seconds early for the signature's trip back.
+  const deadline = (begin.expires_at_ms || Date.now() + CHALLENGE_MS) - EXPIRY_MARGIN_MS;
   clearInterval(expiryTimer);
   const tick = () => {
-    const left = Math.max(0, CHALLENGE_MS - (performance.now() - began));
-    if (left > 0) { if (!go.dataset.waiting) state.textContent = "Expires in " + Math.floor(left / 60000) + ":" + String(Math.floor(left / 1000) % 60).padStart(2, "0"); return; }
+    if (go.dataset.waiting) return;
+    const left = Math.max(0, deadline - Date.now());
+    if (left > 0) { state.textContent = "Expires in " + Math.floor(left / 60000) + ":" + String(Math.floor(left / 1000) % 60).padStart(2, "0"); return; }
     clearInterval(expiryTimer);
     state.textContent = "This expired before it was signed. Nothing was signed.";
     go.textContent = "Ask again"; go.className = "approve"; go.disabled = false;
-    go.onclick = () => { const again = afterConfirm; afterConfirm = null; closeConfirm(); signed(body, again, extra); };
+    go.onclick = () => { go.disabled = true; state.textContent = "Preparing\u2026"; openSheet(body, extra); };
   };
   tick();
   expiryTimer = setInterval(tick, 1000);
@@ -171,9 +184,9 @@ async function signed(body, after, extra) {
     go.disabled = true;
     go.dataset.waiting = "1";
     clearInterval(expiryTimer);
-    document.getElementById("confirm-state").textContent = "Waiting for your passkey\u2026";
+    state.textContent = "Waiting for your passkey\u2026";
     try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
-    catch (e) { toastError(e); }
+    catch (e) { toastError(e, null, true); }
     closeConfirm();
   };
   document.getElementById("confirm").hidden = false;
@@ -295,13 +308,19 @@ function pendingCard(s, p) {
   const meta = el("div", "meta", p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 " + strip(p.run) + " \u00b7 " + ago(s.now, p.created_at));
   c.append(meta);
   const b = el("div", "buttons");
-  const once = el("button", "approve", p.scope_prefix ? "Approve prefix once (expires in 10 min)" : "Approve once (expires in 10 min)"); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
+  // The first button's words are the server's terms for it (`once_terms`): a git push is granted
+  // as a window whatever is picked, and the card mustn't say otherwise.
+  const ot = p.once_terms || { uses: 1, ttl_secs: 600 };
+  const window_ = ot.uses !== 1;
+  const onceLabel = window_ ? "Approve this push (any number of uses for " + span(ot.ttl_secs) + ")"
+    : p.scope_prefix ? "Approve prefix once (expires in 10 min)" : "Approve once (expires in 10 min)";
+  const once = el("button", "approve", onceLabel); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
   const hour = el("button", "", p.scope_prefix ? "Approve prefix for 1 hour (any number of uses)" : "Approve for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
   const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
   if (!idOk) { once.disabled = true; hour.disabled = true; }
   if (p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
     b.append(once, deny);
-    c.append(el("div", "meta", "R3 and R4 are approved one use at a time."));
+    c.append(el("div", "meta", window_ ? "A push is approved as one window: any number of uses for " + span(ot.ttl_secs) + ", for its ref discovery and upload." : "R3 and R4 are approved one use at a time."));
   } else b.append(once, hour, deny);
   c.append(b);
   cards.set(p.id, { key, node: c, meta });
