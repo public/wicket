@@ -64,7 +64,7 @@ impl StreamLog {
     /// Records `error` at `at_ms`, keeping the rest.
     pub fn record_error(db: &Path, error: &str, at_ms: i64) {
         let mut l = StreamLog::read(db);
-        l.error = Some(wicket_core::text::clip(error, 500));
+        l.error = Some(wicket_core::text::clip(&wicket_core::text::redact_urls(error), 500));
         l.error_ms = at_ms;
         if let Err(e) = l.write(db) {
             eprintln!("[wicket] recording the stream's error: {e:#}");
@@ -176,7 +176,7 @@ pub fn status_of(s: &StateStore, db: &Path, now_ms: i64) -> Result<StreamStatus>
     let lag_secs = LAG_SECS.max(10 * interval);
     let log = StreamLog::read(db);
     let mut st = StreamStatus {
-        endpoint: c.endpoint.clone(),
+        endpoint: c.shown_endpoint(),
         bucket: c.bucket.clone(),
         lineage: log.lineage.clone(),
         state: StreamState::Stopped,
@@ -256,7 +256,59 @@ fn ask(sock: &Path, path: &str) -> Result<serde_json::Value> {
     serde_json::from_str(body).context("Litestream's reply")
 }
 
-/// The stream on one line: `wicket state check` and `wicket top`.
+/// The state store's sync and the audit export's progress together: what the console's health
+/// section shows (and, later, `wicket top`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Progress {
+    /// The ledger stream, if `state-store.yaml` has a `ledger:` section.
+    pub stream: Option<StreamStatus>,
+    /// Every audit sink against the chain head.
+    pub audit: Vec<crate::audit_export::SinkStatus>,
+    /// What couldn't be read. These name the file and the command that says more, never the
+    /// file's values (an error can quote one, and these reach the console and its pushes).
+    pub errors: Vec<String>,
+}
+
+/// The progress at `now_ms` from the given configs (as `StateStore::load` and `SinksConfig::load`
+/// return them) and the ledger `l` at `ledger`. None with neither a state store nor sinks.
+pub fn progress(
+    l: &wicket_store::Ledger,
+    ledger: &Path,
+    store: Result<Option<StateStore>>,
+    sinks: Result<Option<crate::audit_export::SinksConfig>>,
+    now_ms: i64,
+) -> Option<Progress> {
+    let mut errors = Vec::new();
+    let stream = match store {
+        Ok(Some(s)) if s.ledger.is_some() => status_of(&s, ledger, now_ms)
+            .map_err(|_| errors.push("the ledger stream can't be read: `wicket state check` says why".into()))
+            .ok(),
+        Ok(_) => None,
+        Err(_) => {
+            errors.push("state-store.yaml can't be read: `wicket state check` says why".into());
+            None
+        }
+    };
+    let audit = match sinks {
+        Ok(Some(c)) => crate::audit_export::status(l, &c, now_ms / 1000).unwrap_or_else(|_| {
+            errors.push("the audit export's cursors can't be read: `wicket audit export --status` says why".into());
+            vec![]
+        }),
+        Ok(None) => vec![],
+        Err(_) => {
+            errors.push("audit-sinks.yaml can't be read: `wicket audit export --status` says why".into());
+            vec![]
+        }
+    };
+    (stream.is_some() || !audit.is_empty() || !errors.is_empty()).then_some(Progress { stream, audit, errors })
+}
+
+/// [`progress`] with this installation's configs, at the ledger `l` opened from `ledger`.
+pub fn installed_progress(l: &wicket_store::Ledger, ledger: &Path, now_ms: i64) -> Option<Progress> {
+    progress(l, ledger, StateStore::load(), crate::audit_export::SinksConfig::load(), now_ms)
+}
+
+/// The stream on one line: `wicket state check`.
 pub fn line(st: &StreamStatus, now_ms: i64) -> String {
     let ago = |ms: i64| crate::audit_export::ago((now_ms - ms) / 1000);
     let mut out = format!("ledger stream to {} ({}): {}", st.endpoint, st.bucket, st.state.as_str());

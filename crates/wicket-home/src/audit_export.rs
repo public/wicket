@@ -213,6 +213,9 @@ pub struct SinkStatus {
     pub holder: Option<String>,
     /// The last delivery error, cleared on success.
     pub error: Option<String>,
+    /// A `jsonl` sink to standard output (`path: "-"`): only a `wicket audit export` in the
+    /// foreground feeds it, so being behind is expected, not a fault.
+    pub manual: bool,
 }
 
 impl SinkKind {
@@ -231,7 +234,7 @@ pub fn status(l: &Ledger, cfg: &SinksConfig, now: i64) -> Result<Vec<SinkStatus>
     cfg.sinks
         .iter()
         .map(|s| {
-            let c = l.export_cursor(&s.name)?;
+            let c = l.peek_export_cursor(&s.name)?;
             let oldest = if c.seq < head { l.audit_ts_after(c.seq)? } else { None };
             Ok(SinkStatus {
                 sink: s.name.clone(),
@@ -243,6 +246,7 @@ pub fn status(l: &Ledger, cfg: &SinksConfig, now: i64) -> Result<Vec<SinkStatus>
                 checkpoint_at: c.checkpoint_at,
                 holder: c.holder.filter(|_| c.lease_until >= now),
                 error: c.error,
+                manual: matches!(&s.kind, SinkKind::Jsonl { path } if path == "-"),
             })
         })
         .collect()
@@ -258,6 +262,7 @@ pub fn status_line(s: &SinkStatus, now: i64) -> String {
         0 => "never".to_string(),
         at => format!("{} ago", ago(now - at)),
     };
+    let behind = if s.manual { format!("{behind} (manual: fed only by `wicket audit export`)") } else { behind };
     format!(
         "{:<16} {:<5} at {} of {}, {behind}  last checkpoint {cp}  fed by {}{}",
         s.sink,
@@ -553,7 +558,8 @@ impl Exporter {
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    let _ = self.ledger.export_failed(&name, &msg);
+                    // Stored and shown: a URL's user info and query (tokens) dropped.
+                    let _ = self.ledger.export_failed(&name, &wicket_core::text::redact_urls(&msg));
                     let s = &mut self.sinks[i];
                     s.next_try = now + s.backoff;
                     s.backoff = (s.backoff * 2).min(Duration::from_secs(60));
@@ -939,8 +945,14 @@ mod tests {
         let a = &st[0];
         assert_eq!((a.kind, a.seq, a.head, a.behind, a.behind_secs, a.checkpoint_at), ("jsonl", head, head, 0, 0, 77));
         assert_eq!(a.holder.as_deref(), Some("serve-1"));
+        assert!(a.manual, "a jsonl sink to stdout is fed by hand");
+        assert!(status_line(a, first.ts + 90).contains("(manual: fed only by `wicket audit export`)"));
         let s = &st[1];
-        assert_eq!((s.kind, s.seq, s.behind, s.behind_secs), ("store", 0, head, 90), "behind by every record, the first 90 s old");
+        assert_eq!(
+            (s.kind, s.seq, s.behind, s.behind_secs, s.manual),
+            ("store", 0, head, 90, false),
+            "behind by every record, the first 90 s old"
+        );
         assert_eq!(s.error.as_deref(), Some("connection refused"));
         let later = status(&l, &cfg, first.ts + 3600).unwrap();
         assert_eq!(later[0].holder, None, "a lapsed lease feeds nothing");

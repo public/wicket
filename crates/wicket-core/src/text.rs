@@ -32,9 +32,46 @@ pub fn clip(s: &str, n: usize) -> String {
     }
 }
 
+/// `s` with every URL in it cut to its scheme, host, port and path: user info (`user:pass@`), the
+/// query and the fragment dropped, as tokens and signed parameters travel there. For error text
+/// that is stored and shown (an exporter's or Litestream's last error).
+pub fn redact_urls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("://") {
+        let end =
+            rest[i + 3..].find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')).map_or(rest.len(), |j| i + 3 + j);
+        out.push_str(&rest[..i + 3]);
+        let url = &rest[i + 3..end];
+        let auth_end = url.find(['/', '?', '#']).unwrap_or(url.len());
+        let authority = &url[..auth_end];
+        out.push_str(authority.rsplit_once('@').map_or(authority, |(_, h)| h));
+        let tail = &url[auth_end..];
+        let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+        out.push_str(&tail[..path_end]);
+        if path_end < tail.len() {
+            out.push_str("?…");
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn urls_lose_their_user_info_and_query() {
+        assert_eq!(
+            redact_urls("POST https://u:tok@collector.example:4318/v1/logs?key=s3cr3t#x: 401: nope"),
+            "POST https://collector.example:4318/v1/logs?… 401: nope"
+        );
+        assert_eq!(redact_urls("get \"http://h/a?X-Amz-Signature=abc\": refused"), "get \"http://h/a?…\": refused");
+        assert_eq!(redact_urls("no url here"), "no url here");
+        assert_eq!(redact_urls("dial tcp 10.0.0.1:443: refused; s3://b/k"), "dial tcp 10.0.0.1:443: refused; s3://b/k");
+    }
 
     #[test]
     fn escapes_and_bidi_never_survive() {
