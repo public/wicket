@@ -554,6 +554,13 @@ const KNOWN: &[Differs] = &[
         egress: |s| s.status == 502,
     },
     Differs {
+        case: "the run's placeholder in another header",
+        row: 14,
+        why: "the egress proxy's tripwire (#362) refuses a placeholder anywhere but its own host's Authorization; the model proxy forwards the header",
+        direct: |s| s.status == 200 && s.beta_header,
+        egress: |s| s.status == 403 && s.bearers.is_empty(),
+    },
+    Differs {
         case: "an upstream that echoes the credential",
         row: 13,
         why: "only the egress proxy masks a credential reflected in the response (#362)",
@@ -649,6 +656,11 @@ const CASES: &[Case] = &[
         name: "a node without the credential",
         setup: || Setup { secret: Secret::NodeUnfetchable, ..Setup::default() },
         both: |s| s.status >= 500 && s.bearers.is_empty(),
+    },
+    Case {
+        name: "the run's placeholder in another header",
+        setup: || Setup { headers: vec![("anthropic-beta", "ph-run")], ..Setup::default() },
+        both: |s| s.status == 403 && s.bearers.is_empty(),
     },
     Case {
         name: "an upstream that echoes the credential",
