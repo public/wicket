@@ -240,9 +240,15 @@ const act = (kind, body) => {
 function renderAgent(c, id) {
   const w = el("div", "agent");
   if (id.verified) {
-    w.append(el("span", "ok", "✓ "), el("b", "", strip(id.agent)), document.createTextNode(" · zone " + strip(id.zone)));
-    w.append(el("div", "chain", "Acting for: " + (id.acting_for || []).map(strip).join(" → ")));
-    w.append(el("div", "idline", strip(id.id)));
+    // The agent by name; its full identity behind a tap (#574, item 5).
+    const name = el("b", "", strip(id.agent));
+    const idline = el("div", "idline", strip(id.id));
+    idline.hidden = true;
+    name.title = "Show its identity";
+    name.onclick = () => { idline.hidden = !idline.hidden; };
+    w.append(el("span", "ok", "✓ "), name, document.createTextNode(" · zone " + strip(id.zone)));
+    w.append(el("div", "chain", "On behalf of: " + (id.acting_for || []).map(strip).join(" → ")));
+    w.append(idline);
     c.append(w); return true;
   }
   if ((id.error || "").startsWith("no identity was issued")) {
@@ -253,18 +259,21 @@ function renderAgent(c, id) {
 }
 
 // Who in the box asked, from the agent's own event stream: helpful, not proof.
+// Which call in the box asked, as the agent's event stream reports it (#574, item 5): shown only
+// when it names one, labelled apart from "On behalf of" above, and with one short note.
 function renderWho(list) {
   const w = el("div", "who");
-  const line = r => strip(r.agent) + " — " + strip(r.tool) + ": " + strip(r.call).slice(0, 120);
-  if (!list.length) { w.append(el("div", "", "For: unknown (no agent event stream)")); }
+  const line = r => strip(r.agent) + " \u2014 " + strip(r.tool) + ": " + strip(r.call).slice(0, 120);
+  let shown = false;
   for (const a of list) {
     const rs = a.requesters || [];
-    if (a.basis === "none" || !rs.length) w.append(el("div", "", "For: unknown — no tool call was in flight"));
-    else if (a.basis === "ambiguous") { w.append(el("div", "", "For: one of " + rs.length + " concurrent calls:")); for (const r of rs) w.append(el("div", "cand", "• " + line(r))); }
-    else w.append(el("div", "", "For: " + line(r0(rs))));
+    if (a.basis === "none" || !rs.length) continue;
+    shown = true;
+    if (a.basis === "ambiguous") { w.append(el("div", "", "Asked by (in the box): one of " + rs.length + " concurrent calls:")); for (const r of rs) w.append(el("div", "cand", "\u2022 " + line(r))); }
+    else w.append(el("div", "", "Asked by (in the box): " + line(r0(rs))));
   }
   if (list.length > 1) w.append(el("div", "warn", "Asked by more than one agent: one grant would serve all of them."));
-  w.append(el("div", "note", "Reported by the agent's event stream, not proven. Anything in this box could use the grant."));
+  if (shown) w.append(el("div", "note", "As the agent reports it, not proven: anything in this box could use the grant."));
   return w;
 }
 const r0 = rs => rs[0];

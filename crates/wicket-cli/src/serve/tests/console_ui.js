@@ -235,6 +235,16 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-go"].click(); await flush();
   assert.strictEqual(began().length, expiryBegun + 2, "asked again");
   ids["confirm-cancel"].listeners.click(); await flush();
+  // Who asked (#574, item 5): nothing said when no call was in flight; a named call is labelled
+  // apart from "On behalf of"; the full identity is behind the agent's name.
+  assert.strictEqual(run("renderWho([{ basis: 'none', requesters: [] }])").textContent, "");
+  const who = run("renderWho([{ basis: 'exact', requesters: [{ agent: 'release-captain', tool: 'Bash', call: 'git push' }] }])").textContent;
+  assert.ok(who.startsWith("Asked by (in the box): release-captain \u2014 Bash: git push") && who.includes("not proven"), who);
+  const card = run("(() => { const c = el('div'); renderAgent(c, { verified: true, agent: 'release-captain', zone: 'build', acting_for: ['passkey:phone'], id: 'spiffe://x/a/release-captain' }); return c; })()");
+  const idl = card.all(n => n.className === "idline")[0];
+  assert.ok(idl.hidden && card.textContent.includes("On behalf of: passkey:phone"), card.textContent);
+  card.all(n => n.tagName === "b")[0].onclick();
+  assert.strictEqual(idl.hidden, false, "tapping the name shows its identity");
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
