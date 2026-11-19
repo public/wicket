@@ -5,7 +5,7 @@
 //! install's restart and a self update's re-exec under long-lived runs).
 //!
 //! - `seeds_<scenario>_<part>`: each scenario for a fixed set of seeds, in parts, or
-//!   `WICKET_SIM_SEEDS=<n>` seeds from
+//!   `WICKET_SIM_SEEDS=<n>` seeds (or a scenario's own `WICKET_SIM_SEEDS_<SCENARIO>=<n>`) from
 //!   `WICKET_SIM_FROM` (default 0): CI runs the fixed set on pull requests and more nightly
 //!   (`ci/sim.sh`). `WICKET_SIM_SCENARIO=<name>` runs one scenario only.
 //! - `replay`: one seed, `WICKET_SIM_SEED=<seed>` (and `WICKET_SIM_SCENARIO`), with its plan and
@@ -31,6 +31,24 @@ fn dir() -> PathBuf {
 
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+/// How many seeds `scenario` runs, by `var` (the environment): `WICKET_SIM_SEEDS_<SCENARIO>`
+/// (`WICKET_SIM_SEEDS_UPDATE`, …) if set, else `WICKET_SIM_SEEDS`, else none (the fixed set). The
+/// scenarios cost very different amounts a seed (`update` is thousands of times faster than
+/// `messages`), so a nightly run gives each its own count.
+fn seed_count(scenario: &str, var: impl Fn(&str) -> Option<u64>) -> Option<u64> {
+    var(&format!("WICKET_SIM_SEEDS_{}", scenario.to_uppercase())).or_else(|| var("WICKET_SIM_SEEDS"))
+}
+
+#[test]
+fn a_scenarios_own_seed_count_wins() {
+    let env = |vars: &'static [(&'static str, u64)]| move |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+    let both = env(&[("WICKET_SIM_SEEDS", 1000), ("WICKET_SIM_SEEDS_UPDATE", 100_000)]);
+    assert_eq!(seed_count("update", both), Some(100_000));
+    assert_eq!(seed_count("messages", both), Some(1000));
+    assert_eq!(seed_count("update", env(&[("WICKET_SIM_SEEDS_UPDATE", 7)])), Some(7));
+    assert_eq!(seed_count("feed", env(&[("WICKET_SIM_SEEDS_UPDATE", 7)])), None, "the fixed set");
 }
 
 /// The scenarios a run covers: all of them, or `WICKET_SIM_SCENARIO`'s.
@@ -96,7 +114,7 @@ fn seeds(scenario: &'static str, part: usize, parts: usize) {
     if !scenarios().contains(&scenario) {
         return;
     }
-    let seeds: Vec<u64> = match env_u64("WICKET_SIM_SEEDS") {
+    let seeds: Vec<u64> = match seed_count(scenario, env_u64) {
         Some(n) => {
             let from = env_u64("WICKET_SIM_FROM").unwrap_or(0);
             (from..from + n).collect()

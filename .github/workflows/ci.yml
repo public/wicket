@@ -460,13 +460,15 @@ jobs:
           [ "$SHARDS" = success ]
 
   # #324: the deterministic simulation (crates/wicket-sim). A pull request runs its fixed seeds with
-  # the crate's tests, whenever ci/determinator selects it. This runs a few hundred more, a different
-  # block each night, and files an issue for each failing seed with its replay command.
+  # the crate's tests, whenever ci/determinator selects it. This runs 1000 more of each scenario
+  # (and 100000 of `update`, which costs next to nothing), a different block each night, four at once
+  # (ci/sim.sh), and files an issue for each failing seed with its replay command. A bug in about
+  # 0.4% of seeds, as #494 was, is found on 98% of nights (on 70% with 300).
   simulation:
     name: Simulation seeds (nightly)
     if: ${{ github.event_name == 'schedule' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
       issues: write
@@ -477,7 +479,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ hashFiles('Cargo.toml') }}
-      - run: ci/sim.sh --seeds 300 --file-issues
+      - run: ci/sim.sh --seeds 1000 --file-issues
         env:
           GH_TOKEN: ${{ github.token }}
 

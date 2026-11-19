@@ -6,12 +6,15 @@
 # box or uncollected work is on it; the money limit, #256) and `messages` (no message lost or delivered
 # twice; a refused message's receipt says so).
 #
-#   ci/sim.sh [--seeds N] [--from S] [--file-issues]
+#   ci/sim.sh [--seeds N] [--update-seeds N] [--threads T] [--from S] [--file-issues]
 #
 # Pull requests don't need this script: `wicket-sim`'s tests run a fixed set of seeds whenever
 # ci/determinator selects the crate (a change to it, to a crate it uses, or to the node code its
 # stand-ins follow, ci/determinator/rules.toml). This runs N more (default 200) from S (default: a different
-# block each day, so the nightly runs cover new seeds), optimised. Every failing seed's replay
+# block each day, so the nightly runs cover new seeds), optimised. The `update` scenario costs next
+# to nothing a seed (about 18k seeds/s, against 0.2-1 for the others), so it runs its own count
+# (--update-seeds, default 100000: the whole day's block, WICKET_SIM_SEEDS_UPDATE). The scenarios'
+# parts run T at once (--threads, default 4: a CI runner's vCPUs). Every failing seed's replay
 # command goes to sim-failures.txt. With --file-issues (nightly, GH_TOKEN set), each failing seed
 # without an open issue gets one, filed with its replay command and what it broke. Known findings
 # not yet fixed (the messages scenario's relay loss) are counted in the log, not failures.
@@ -19,21 +22,25 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 seeds=200
+update_seeds=100000
+threads=4
 from=$((10#$(date -u +%j) * 100000))
 file=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --seeds) seeds=$2; shift 2 ;;
+    --update-seeds) update_seeds=$2; shift 2 ;;
+    --threads) threads=$2; shift 2 ;;
     --from) from=$2; shift 2 ;;
     --file-issues) file=true; shift ;;
-    *) echo "usage: ci/sim.sh [--seeds N] [--from S] [--file-issues]" >&2; exit 2 ;;
+    *) echo "usage: ci/sim.sh [--seeds N] [--update-seeds N] [--threads T] [--from S] [--file-issues]" >&2; exit 2 ;;
   esac
 done
 
-echo "simulation: seeds $from..$((from + seeds - 1))"
+echo "simulation: seeds $from..$((from + seeds - 1)) (update: ..$((from + update_seeds - 1))), $threads at once"
 status=0
-WICKET_SIM_SEEDS=$seeds WICKET_SIM_FROM=$from \
-  cargo test --release --locked -p wicket-sim --test scenario seeds -- --nocapture --test-threads 1 >sim.log 2>&1 || status=$?
+WICKET_SIM_SEEDS=$seeds WICKET_SIM_SEEDS_UPDATE=$update_seeds WICKET_SIM_FROM=$from \
+  cargo test --release --locked -p wicket-sim --test scenario seeds -- --nocapture --test-threads "$threads" >sim.log 2>&1 || status=$?
 grep -E '^seed [0-9]+: [a-z]+: hash' sim.log | tail -n 5 || true
 echo "simulation: $(grep -c '^  KNOWN' sim.log || true) known finding(s) (not failures)"
 grep -oE 'WICKET_SIM_SEED=[0-9]+ WICKET_SIM_SCENARIO=[a-z]+ cargo test [^`]*' sim.log | sort -u >sim-failures.txt || true
@@ -43,7 +50,7 @@ if [ "$status" -ne 0 ] && [ ! -s sim-failures.txt ]; then
   exit "$status"
 fi
 if [ ! -s sim-failures.txt ]; then
-  echo "simulation: all $seeds seeds hold every invariant"
+  echo "simulation: all $seeds seeds ($update_seeds for update) hold every invariant"
   exit 0
 fi
 echo "simulation: $(wc -l <sim-failures.txt) seed(s) broke an invariant:"
