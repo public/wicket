@@ -8,12 +8,21 @@
 //!
 //! The node holds `boxes` live tokens. First `history` deltas of churn are written (each run: its
 //! token, then three grant syncs re-publishing it with one more grant, then its drop), then
-//! `measured` more, after each of which every one of `boxes` publishers catches up, as
+//! `measured` more, each committed by the next of `boxes` publishers in turn (each run commits its
+//! own changes), after each of which every other publisher catches up, as
 //! `noderun::SharedFeed::lock` does: [`Publisher::refresh`], applying only the appended deltas, or
 //! with `reopen`, opening the feed again as it did before #582 step 3 (on this build that open
 //! starts from the checkpoint; the numbers before are in docs/explanation/feed-publisher.md).
-//! Printed: the median catch-up of one publisher after one append, the cost of one append to the
-//! node (every publisher's catch-up), and the time to open the feed.
+//! Printed: the time to open the feed; one publisher's catch-up after an append, an append's cost to
+//! the node's publishers (every other one catching up), and the commit itself, each as median, p99
+//! and maximum (a commit at a multiple of `CHECKPOINT_EVERY` writes the checkpoint); and how many
+//! checkpoints the publishers wrote between them.
+//!
+//! The numbers before #582 step 3 in docs/explanation/feed-publisher.md were measured with this
+//! harness's `reopen` path (a publisher opened again whenever the log's length moved, as
+//! `SharedFeed::lock` did), built against main's `publisher.rs`, which replays the whole log on
+//! open: on main, the `refresh` path and the `Refreshed` and `checkpoints_written` uses must first
+//! be removed for it to build.
 
 use ed25519_dalek::SigningKey as FeedKey;
 use std::path::{Path, PathBuf};
@@ -104,9 +113,11 @@ impl Churn {
     }
 }
 
-fn median(mut v: Vec<Duration>) -> Duration {
+/// Median, 99th percentile and maximum.
+fn stats(mut v: Vec<Duration>) -> String {
     v.sort();
-    v.get(v.len() / 2).copied().unwrap_or_default()
+    let at = |q: f64| v.get(((v.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or_default();
+    format!("median {:.1?}, p99 {:.1?}, max {:.1?}", at(0.5), at(0.99), at(1.0))
 }
 
 fn main() {
@@ -147,27 +158,35 @@ fn main() {
     println!("open: {:.1?} (epoch {}, {} live tokens)", t.elapsed(), opened.epoch(), opened.state().zones.len());
     drop(opened);
 
-    let mut followers: Vec<Follower> = (0..boxes.saturating_sub(1)).map(|_| Follower::new(&env)).collect();
-    let mut one = vec![];
-    let mut all = vec![];
-    for _ in 0..measured {
+    // Every run commits its own changes: the writer goes round the publishers, each catching up
+    // first (as under the lock), then the others catch up after its append.
+    drop(writer);
+    let mut pubs: Vec<Follower> = (0..boxes.max(1)).map(|_| Follower::new(&env)).collect();
+    let (mut one, mut all, mut commits) = (vec![], vec![], vec![]);
+    for step in 0..measured {
         now += 10;
         let c = churn.next(&env);
-        writer.commit(vec![c], now).unwrap();
+        let w = step % pubs.len();
+        pubs[w].catch_up(&env, reopen);
         let t = Instant::now();
-        for f in &mut followers {
-            let t1 = Instant::now();
-            f.catch_up(&env, reopen);
-            one.push(t1.elapsed());
+        pubs[w].p.commit(vec![c], now).unwrap();
+        commits.push(t.elapsed());
+        let t = Instant::now();
+        for (i, f) in pubs.iter_mut().enumerate() {
+            if i != w {
+                let t1 = Instant::now();
+                f.catch_up(&env, reopen);
+                one.push(t1.elapsed());
+            }
         }
         all.push(t.elapsed());
     }
-    println!(
-        "boxes {boxes}: one publisher's catch-up after an append {:.1?}; one append, all {} publishers {:.1?}",
-        median(one),
-        followers.len(),
-        median(all)
-    );
+    let checkpoints: u64 = pubs.iter().map(|f| f.written + f.p.checkpoints_written()).sum();
+    println!("boxes {boxes}, {measured} appends by {} publishers in turn{}:", pubs.len(), if reopen { " (reopening)" } else { "" });
+    println!("  one publisher's catch-up after an append: {}", stats(one));
+    println!("  one append, every other publisher catching up: {}", stats(all));
+    println!("  the commit itself (checkpoints included): {}", stats(commits));
+    println!("  checkpoints written: {checkpoints} (one per {CHECKPOINT_EVERY} deltas: {})", measured as u64 / CHECKPOINT_EVERY);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -179,24 +198,28 @@ fn size(dir: &Path) -> u64 {
 struct Follower {
     p: Publisher<BoxAuthority>,
     len: u64,
+    /// Checkpoints written by the publishers this one replaced (reopening).
+    written: u64,
 }
 
 impl Follower {
     fn new(env: &Env) -> Follower {
         let p = env.open();
-        Follower { len: len(&p), p }
+        Follower { len: len(&p), p, written: 0 }
     }
 
     /// What `SharedFeed::lock` does before each use.
     fn catch_up(&mut self, env: &Env, reopen: bool) {
         if !reopen {
             if self.p.refresh().unwrap() == Refreshed::Reopen {
+                self.written += self.p.checkpoints_written();
                 self.p = env.open();
             }
             return;
         }
         let l = len(&self.p);
         if l != self.len {
+            self.written += self.p.checkpoints_written();
             self.p = env.open();
             self.len = l;
         }
