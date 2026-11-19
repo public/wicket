@@ -19,10 +19,16 @@ pkg=$(mktemp -d)
 trap '$docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$pkg"' EXIT
 "$repo/ci/package.sh" "$bin" "$pkg" >/dev/null
 
+# The host's own Ubuntu mirror, if it has one: a CI runner's is near it. The image's default
+# (archive.ubuntu.com) once took 26 of the job's 30 minutes for install.sh's packages.
+mirror=$(sed -n 's|^URIs: *\(https\{0,1\}://[^ ]*\).*|\1|p' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null | grep -v security | head -1 || true)
+
 $docker run --rm --name "$name" --network host \
-    -v "$repo:/src:ro" -v "$pkg:/pkg:ro" \
+    -v "$repo:/src:ro" -v "$pkg:/pkg:ro" -e MIRROR="$mirror" \
     "$image" bash -euo pipefail -c '
 fail() { echo "FAIL: $*"; exit 1; }
+[ -z "$MIRROR" ] || sed -i "s|^URIs: http://archive.ubuntu.com/ubuntu/\$|URIs: $MIRROR|" /etc/apt/sources.list.d/ubuntu.sources
+echo "packages from: $(sed -n "s/^URIs: //p" /etc/apt/sources.list.d/ubuntu.sources | tr "\n" " ")"
 useradd --create-home alex
 groupadd --system docker
 usermod -aG docker alex   # an operator who had Docker: the install takes it away
@@ -31,10 +37,11 @@ mkdir -p /etc/docker && echo "{\"log-driver\": \"local\"}" >/etc/docker/daemon.j
 mkdir /opt/pkg && tar -C /opt/pkg -xzf /pkg/wicket-*-x86_64-linux.tar.gz
 (cd /pkg && sha256sum -c --quiet wicket-*.tar.gz.sha256) || fail "archive checksum"
 inst=$(echo /opt/pkg/wicket-*/deploy/install.sh)
-$inst --operator alex --skip-image --trust-domain wicket.example.com >/tmp/install1.log
+# Its steps as they start (each with its time), so a stalled fetch shows where it is.
+$inst --operator alex --skip-image --trust-domain wicket.example.com | tee /tmp/install1.log | sed -un "/^==> /p"
 echo "ok: install.sh ran, from the release archive"
 before=$(stat -c %i /usr/local/bin/wicket; sha256sum /etc/docker/daemon.json /etc/wicket/*)
-$inst --operator alex --skip-image >/tmp/install2.log
+$inst --operator alex --skip-image | tee /tmp/install2.log | sed -un "/^==> /p"
 [ "$before" = "$(stat -c %i /usr/local/bin/wicket; sha256sum /etc/docker/daemon.json /etc/wicket/*)" ] || fail "the second run changed the binary or the configuration"
 echo "ok: install.sh ran again and changed nothing"
 python3 -c "import json; c = json.load(open(\"/etc/docker/daemon.json\")); assert c[\"log-driver\"] == \"local\", c; assert c[\"runtimes\"][\"runsc\"] == {\"path\": \"/usr/bin/runsc\", \"runtimeArgs\": [\"--host-uds=open\"]}, c" \
