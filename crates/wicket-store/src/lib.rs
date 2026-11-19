@@ -38,6 +38,7 @@ mod quota;
 mod receipts;
 mod scale;
 mod standing;
+mod triggers;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
@@ -45,6 +46,7 @@ pub use standing::{
     new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
     Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
 };
+pub use triggers::{Firing as TriggerFiring, Trigger, TriggerEvent, FIRING_STATES as TRIGGER_FIRING_STATES};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD, WAKE_SKEW_SECS};
@@ -157,7 +159,10 @@ pub enum StoreError {
 /// Version 23 (expand, after #587's 22) adds the `standing` table: standing reach (#572), a reach
 /// rule an agent asks for once and a human approves for its principal or zone. Older builds don't
 /// read it, so the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 23;
+/// Version 26 (expand, after the services' 24 and 25) adds triggers (#578): `triggers`,
+/// `trigger_events`, `trigger_firings` and `work_claims`. Older builds don't read them; the floor
+/// stays 17.
+pub const SCHEMA_VERSION: u32 = 26;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -556,6 +561,7 @@ impl Ledger {
         conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
+        conn.execute_batch(triggers::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -605,6 +611,7 @@ impl Ledger {
         conn.execute_batch(nodeca::SCHEMA)?;
         conn.execute_batch(nodelabels::SCHEMA)?;
         conn.execute_batch(standing::SCHEMA)?;
+        conn.execute_batch(triggers::SCHEMA)?;
         scale::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
