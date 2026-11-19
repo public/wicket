@@ -42,10 +42,11 @@ pub fn prefix_dir(prefix: &str) -> String {
     }
 }
 
-/// Whether a path-prefix grant for `prefix` covers `path` (see [`prefix_dir`]).
+/// Whether a path-prefix grant for `prefix` covers `path` (see [`prefix_dir`]): the directory itself,
+/// or a path under it. Without allocating (a node decides it per request, and Kani checks it).
 pub fn prefix_covers(prefix: &str, path: &str) -> bool {
-    let dir = prefix_dir(prefix);
-    path.starts_with(&dir) || format!("{path}/") == dir
+    let dir = prefix.strip_suffix('/').unwrap_or(prefix);
+    path == dir || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The host a request names, lowercased and without a trailing dot, if that is how a URL parser
@@ -353,6 +354,16 @@ mod tests {
             assert!(!prefix_covers(p, "/repos/acme/ap"));
         }
         assert!(prefix_covers("/", "/anything/at/all"));
+        // As prefix_dir has it: with or without the trailing `/`, and `/` (or nothing) is everything.
+        for (pre, path) in [("/a", "/a"), ("/a/", "/a"), ("/a", "/a/"), ("/a/", "/a/b"), ("", "/x"), ("/", "/")] {
+            assert!(
+                prefix_covers(pre, path) && (path.starts_with(&prefix_dir(pre)) || format!("{path}/") == prefix_dir(pre)),
+                "{pre} {path}"
+            );
+        }
+        for (pre, path) in [("/a", "/ab"), ("/a/", "/"), ("/a/b", "/a"), ("/a", "")] {
+            assert!(!prefix_covers(pre, path), "{pre} {path}");
+        }
     }
 
     /// #257 4a: a prefix grant, now also honoured on nodes, never covers a path outside it. Every
@@ -371,6 +382,13 @@ mod tests {
         }
         all.sort();
         all.dedup();
+        // The allocation-free form means what `prefix_dir`'s did, on every pair, canonical or not.
+        let old = |pre: &str, path: &str| path.starts_with(&prefix_dir(pre)) || format!("{path}/") == prefix_dir(pre);
+        for pre in all.iter().take(400) {
+            for path in &all {
+                assert_eq!(prefix_covers(pre, path), old(pre, path), "{pre} {path}");
+            }
+        }
         let canonical: Vec<String> = all.iter().filter_map(|s| canonical_path(s).ok().map(|p| p.into_owned())).collect();
         let segs = |p: &str| -> Vec<String> {
             p.trim_start_matches('/').trim_end_matches('/').split('/').filter(|s| !s.is_empty()).map(String::from).collect()
