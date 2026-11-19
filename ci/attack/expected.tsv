@@ -247,7 +247,7 @@ write-/etc/resolv.conf	refused
 write-/usr/local/bin/wicket-fwd	refused
 write-/usr/x	refused
 userns-remount	refused
-userns-create	refused
+userns-create	info
 userns-same-net	refused
 userns-new-net	refused
 host-processes	refused

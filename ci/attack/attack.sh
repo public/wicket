@@ -656,7 +656,9 @@ if command -v unshare >/dev/null; then
   else
     note userns-remount refused "the read-only bind stayed read-only"
   fi
-  if unshare -Ur true 2>/dev/null; then note userns-create info "a user namespace can be made (the rows after it try to use it)"; else note userns-create refused "unshare -Ur: not permitted"; fi
+  # Whether one can be made depends on the runtime's version (CI's runsc allows it): info either way;
+  # the rows after it are what count.
+  if unshare -Ur true 2>/dev/null; then note userns-create info "a user namespace can be made (the rows after it use it)"; else note userns-create info "unshare -Ur: not permitted here"; fi
   # From a new user namespace, with the box's network, and with a network namespace of its own.
   for v in same-net:-Ur new-net:-Urn; do
     timeout 8 unshare "${v#*:}" bash -c 'ip link set lo up 2>/dev/null; exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null
