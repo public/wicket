@@ -24,7 +24,7 @@ main { max-width:720px; margin:0 auto; padding:8px 16px 56px; }
 h2 { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.07em; color:var(--quiet); margin:28px 4px 10px; }
 
 .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; margin:10px 0; box-shadow:var(--shadow); }
-.req .what { font:500 14px/1.45 var(--mono); margin-top:8px; word-break:break-all; }
+.req .what { font:500 14px/1.45 var(--mono); margin-top:8px; overflow-wrap:anywhere; }
 .why { color:var(--soft); font-size:14px; margin-top:6px; }
 .meta { color:var(--quiet); font-size:12.5px; margin-top:8px; font-variant-numeric:tabular-nums; }
 .note { color:var(--quiet); font-size:13px; margin-top:10px; }
@@ -36,7 +36,7 @@ h2 { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.
 .agent { margin:12px 0 0; padding-top:12px; border-top:1px solid var(--line); font-size:14px; }
 .agent .ok { color:var(--good); font-weight:700; } .agent .bad { color:var(--bad); font-weight:600; }
 .agent .chain { color:var(--soft); font-size:13px; margin-top:2px; }
-.agent .idline { color:var(--quiet); font:11.5px/1.4 var(--mono); margin-top:2px; word-break:break-all; }
+.agent .idline { color:var(--quiet); font:11.5px/1.4 var(--mono); margin-top:2px; overflow-wrap:anywhere; }
 .who { margin:8px 0 0; font-size:13.5px; color:var(--soft); }
 .who .cand { margin-left:10px; font:12px/1.45 var(--mono); }
 .who .note { font-size:12px; margin-top:4px; } .who .warn { color:var(--warn); font-size:13px; }
@@ -55,9 +55,9 @@ button.approve:disabled { background:var(--accent); }
 .row { display:flex; justify-content:space-between; align-items:center; gap:12px; font-size:14px; padding:9px 0; border-bottom:1px solid var(--line); }
 .row:first-child { padding-top:0; } .row:last-child { border-bottom:0; padding-bottom:0; }
 .row .acts { display:flex; gap:6px; flex-shrink:0; } .row .acts button { min-height:32px; padding:7px 11px; font-size:13px; }
-.mono { font:13px/1.45 var(--mono); word-break:break-all; }
+.mono { font:13px/1.45 var(--mono); overflow-wrap:anywhere; }
 a.session { color:var(--accent); font-weight:600; padding:6px 2px; }
-.log { font:12px/1.6 var(--mono); white-space:pre-wrap; word-break:break-all; color:var(--soft); }
+.log { font:12px/1.6 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; color:var(--soft); }
 .ok { color:var(--good); } .pend { color:var(--warn); } .blocked { color:var(--bad); }
 
 select, textarea, input.text { font:15px/1.4 var(--sans); padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--ink); width:100%; margin-top:8px; }
@@ -70,8 +70,8 @@ textarea { min-height:76px; resize:vertical; }
 [hidden] { display:none !important; }
 
 /* What the passkey is about to sign (#124): pinned to the top, above a phone's passkey sheet. */
-#confirm { position:fixed; inset:0; z-index:10; background:rgba(10,12,16,.5); display:flex; align-items:flex-start; justify-content:center; padding:max(12px, env(safe-area-inset-top)) 12px 12px; }
-#confirm .card { width:100%; max-width:720px; margin:0; padding:18px 20px; border-color:transparent; box-shadow:0 12px 40px rgba(0,0,0,.28); }
+#confirm { position:fixed; inset:0; z-index:10; background:rgba(10,12,16,.5); display:flex; align-items:flex-start; justify-content:center; padding:max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)); overflow-y:auto; overscroll-behavior:contain; }
+#confirm .card { width:100%; max-width:720px; margin:0 0 auto; padding:18px 20px; border-color:transparent; box-shadow:0 12px 40px rgba(0,0,0,.28); }
 #confirm-title { font-size:13px; font-weight:600; color:var(--quiet); letter-spacing:.01em; }
 #confirm-what { font:600 16px/1.45 var(--sans); margin-top:8px; word-break:break-word; }
 #confirm .buttons { margin-top:16px; }
@@ -79,7 +79,7 @@ textarea { min-height:76px; resize:vertical; }
 
 /* Read-only views of authority (#173) and the manifest viewer and editor (#172): decoded blocks, Cedar and
    YAML, and the link buttons that open them. */
-pre.src { font:12px/1.5 var(--mono); white-space:pre-wrap; word-break:break-all; background:color-mix(in srgb, var(--line) 35%, transparent); border-radius:8px; padding:8px 10px; margin:4px 0 10px; max-height:320px; overflow:auto; }
+pre.src { font:12px/1.5 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; background:color-mix(in srgb, var(--line) 35%, transparent); border-radius:8px; padding:8px 10px; margin:4px 0 10px; max-height:320px; overflow:auto; }
 button.link { background:none; border:none; padding:0 2px; color:var(--accent); font:inherit; text-decoration:underline; cursor:pointer; min-height:0; }
 #detail .buttons { justify-content:space-between; align-items:center; margin:0 0 8px; }
 textarea.yaml { font:13px/1.45 var(--mono); min-height:260px; }
