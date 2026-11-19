@@ -71,8 +71,15 @@ pub trait Decider: Send + Sync {
 /// The control host's answer when a node asks it to raise a pending request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Asked {
-    Pending { request: String, fresh: bool },
-    Denied { request: String },
+    /// `hint`: for the agent, beside its answer (#572: it asked for this before).
+    Pending {
+        request: String,
+        fresh: bool,
+        hint: Option<String>,
+    },
+    Denied {
+        request: String,
+    },
 }
 
 /// A node's link to the control host, as the decider needs it.
@@ -143,7 +150,7 @@ impl Decider for NodeDecider {
                     Err(_) => Outcome::Unavailable(UNREACHABLE.into()),
                 },
                 Decision::NeedsGrant(why) => match self.control.ask(op, &why, who.map(|(v, _)| v)).await {
-                    Ok(Asked::Pending { request, fresh }) => Outcome::Pending { request, fresh, why },
+                    Ok(Asked::Pending { request, fresh, .. }) => Outcome::Pending { request, fresh, why },
                     Ok(Asked::Denied { request }) => Outcome::Denied { request },
                     // The link looked up but the control host didn't answer (a partition the node
                     // hasn't noticed yet): queued, as when it is known to be down (#153).
@@ -291,7 +298,7 @@ mod tests {
         }
         fn ask<'a>(&'a self, _op: &'a Op, _why: &'a str, _who: Option<&'a serde_json::Value>) -> BoxFuture<'a, Result<Asked, String>> {
             let n = self.asks.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok(Asked::Pending { request: format!("r-{n}"), fresh: true }) })
+            Box::pin(async move { Ok(Asked::Pending { request: format!("r-{n}"), fresh: true, hint: None }) })
         }
         fn queue(&self, _op: &Op, _why: &str, _who: Option<&serde_json::Value>) -> Result<String, String> {
             Ok("q-1".into())

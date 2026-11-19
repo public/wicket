@@ -1297,6 +1297,10 @@ async fn on_frame(
             Msg::Ask { id, run, op, why, who, queued, prefix } => {
                 send(Frame::Msg(ask(sh, id, &run, &op, &why, who.as_ref(), queued.as_ref(), prefix)))
             }
+            Msg::AskStanding { id, run, rule, why } => {
+                let reply = ask_standing(&sh.ledger.lock().expect("ledger"), &sh.tenant, &sh.run, &sh.zone, id, &run, &rule, &why);
+                send(Frame::Msg(reply))
+            }
             Msg::SecretFetch { id, run, name } => {
                 // Only for this run, over its own connection: another run's ask is refused.
                 let reply = match run == sh.run.0 {
@@ -1479,7 +1483,7 @@ fn ask(
     queued: Option<&(String, i64)>,
     prefix: bool,
 ) -> Msg {
-    let reply = |pending, denied, error| Msg::Asked { id, pending, denied, error };
+    let reply = |pending, denied, error| Msg::Asked { id, pending, denied, error, hint: None };
     // An agent asking ahead (`request_access`, decided on its node, #164) gives its own reason.
     let agent = why_node.strip_prefix(AGENT_ASKS).map(|r| wicket_core::text::clip(r, 300));
     let (op, mut why) = match check_node_ask(&sh.tenant, &sh.run, &sh.zone, run, op, prefix && agent.is_some()) {
@@ -1505,7 +1509,7 @@ fn ask(
     }
     // As this host's gateway asks for it: in the agent's words, and for a prefix, every path
     // under the op's directory.
-    let asked = match agent {
+    let asked = match &agent {
         Some(reason) => {
             let old = why.split_once(" (asked ").map(|(_, q)| format!(" (asked {q}")).unwrap_or_default();
             l.ask(op, &format!("{AGENT_ASKS}{reason}{old}"), prefix, who)
@@ -1513,7 +1517,83 @@ fn ask(
         None => l.pending_for(op, &why, who),
     };
     match asked {
-        Ok((rid, fresh)) => reply(Some((rid, fresh)), None, None),
+        Ok((rid, fresh)) => {
+            let hint = if agent.is_some() { repeat_hint(&l, &sh.tenant, run, op) } else { None };
+            Msg::Asked { id, pending: Some((rid, fresh)), denied: None, error: None, hint }
+        }
+        Err(e) => reply(None, None, Some(e.to_string())),
+    }
+}
+
+/// How many asks, in [`REPEAT_SECS`], make an agent's ask a repeat worth a hint (#572).
+const REPEATS: u64 = 3;
+const REPEAT_SECS: i64 = 7 * 24 * 3600;
+
+/// When `run`'s agent has asked for `op`'s method on its host [`REPEATS`] times or more in the
+/// last week (this ask included, in any of its runs): what to say so it asks once for standing
+/// reach instead of again and again. By host and method, not path: the paths of one need (job
+/// logs) differ ask by ask.
+fn repeat_hint(l: &wicket_store::Ledger, tenant: &TenantId, run: &str, op: &Op) -> Option<String> {
+    let who = l.identity(run).ok().flatten().filter(|i| i.parent_run.is_none())?;
+    let (n, first) = l.asked_before(tenant, &who.spiffe_id, &op.method, &op.host, "/", wicket_store::now() - REPEAT_SECS).ok()?;
+    (n >= REPEATS).then(|| {
+        format!(
+            "You have asked for {} on {} {n} times since {} (in this run and earlier ones). If this is part of your workload, ask once for standing reach instead: request_access with scope \"standing\" (and `methods` and `paths` for what you need); an operator approves it once, and your later runs don't ask again.",
+            op.method,
+            op.host,
+            first.map(wicket_core::time::unix_rfc3339).unwrap_or_default()
+        )
+    })
+}
+
+/// A box's ask for standing reach (#572), from `request_access` on its node: for the agent's
+/// principal, filed with the ledger's evidence for a human. Only the agent's own ask (in its
+/// words), from its own connection; a spawned child has no principal of its own to bind it to.
+#[allow(clippy::too_many_arguments)]
+fn ask_standing(
+    l: &wicket_store::Ledger,
+    tenant: &TenantId,
+    own: &RunId,
+    zone: &ZoneSpec,
+    id: u64,
+    run: &str,
+    rule: &wicket_core::manifest::ReachRule,
+    why: &str,
+) -> Msg {
+    let reply = |pending, denied, error: Option<String>| Msg::Asked { id, pending, denied, error, hint: None };
+    if run != own.0 {
+        return reply(None, None, Some(format!("not run {run}'s connection")));
+    }
+    let Some(reason) = why.strip_prefix(AGENT_ASKS) else {
+        return reply(None, None, Some("not requested: standing reach is the agent's own ask (request_access)".into()));
+    };
+    if !zone.escalation.request {
+        return reply(None, None, Some(format!("not requested: {}.", wicket_proxy::NEVER_ASKS)));
+    }
+    let who = match l.identity(run) {
+        Ok(Some(i)) if i.parent_run.is_none() => i,
+        Ok(Some(_)) => {
+            return reply(
+                None,
+                None,
+                Some("not requested: a spawned child has no principal of its own to bind standing reach to (its zone names its parent's run); ask your parent to ask for it".into()),
+            )
+        }
+        _ => return reply(None, None, Some("not requested: this run has no identity to bind standing reach to".into())),
+    };
+    // Denied in the last day: not asked again.
+    let rule_json = serde_json::to_value(rule).ok();
+    let day = wicket_store::now() - 24 * 3600;
+    if let Ok(denied) = l.standing_with_status(tenant, "denied") {
+        if let Some(d) = denied
+            .iter()
+            .find(|d| d.principal == who.spiffe_id && serde_json::to_value(&d.rule).ok() == rule_json && d.decided_at.unwrap_or(0) >= day)
+        {
+            return reply(None, Some(d.id.clone()), None);
+        }
+    }
+    match l.ask_standing(tenant, own, &zone.name, &who.spiffe_id, rule, &format!("{AGENT_ASKS}{}", wicket_core::text::clip(reason, 300))) {
+        Ok((sid, fresh)) => reply(Some((sid, fresh)), None, None),
         Err(e) => reply(None, None, Some(e.to_string())),
     }
 }
@@ -2166,6 +2246,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
     use wicket_core::RiskClass;
+
+    /// #572: a box's standing ask is filed for its agent's principal, in the agent's words, from
+    /// its own connection; a spawned child's, a zone that may not ask, and another run's aren't; one
+    /// denied today is answered as denied. An agent asking for the same method on a host a third
+    /// time in a week is told about standing reach.
+    #[test]
+    fn a_standing_ask_is_the_agents_own_and_a_repeated_ask_is_hinted() {
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let identity = |run: &str, parent: Option<&str>| {
+            l.run_started(&t, &RunId(run.into()), "z", "a").unwrap();
+            l.put_identity(&wicket_store::IdentityRow {
+                run: run.into(),
+                tenant: t.0.clone(),
+                spiffe_id: format!("spiffe://w.test/t/{}/z/z/a/a{}", t.0, parent.map(|_| "-child").unwrap_or_default()),
+                zone: "z".into(),
+                agent: "a".into(),
+                parent_run: parent.map(String::from),
+                accept_from: vec![],
+                jws: "j".into(),
+                issued_at: 1,
+            })
+            .unwrap();
+        };
+        identity("run_s", None);
+        identity("run_c", Some("run_s"));
+        let zone = wicket_agent::load("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n").unwrap().zone;
+        let rule: wicket_core::manifest::ReachRule = wicket_core::yaml::from_str("{ host: ci.example, paths: ['/jobs/**'] }").unwrap();
+        let why = format!("{AGENT_ASKS}CI logs");
+        let own = RunId("run_s".into());
+        let ask = |zone: &ZoneSpec, own: &RunId, run: &str, why: &str| ask_standing(&l, &t, own, zone, 1, run, &rule, why);
+        let Msg::Asked { pending: Some((sid, true)), .. } = ask(&zone, &own, "run_s", &why) else { panic!("not filed") };
+        assert!(sid.starts_with("s-"));
+        assert_eq!(l.standing(&sid).unwrap().principal, "spiffe://w.test/t/t0/z/z/a/a");
+        let refused = |m: Msg| match m {
+            Msg::Asked { error: Some(e), .. } => e,
+            m => panic!("not refused: {m:?}"),
+        };
+        assert!(refused(ask(&zone, &own, "run_s", "blocked request")).contains("agent's own ask"));
+        assert!(refused(ask(&zone, &own, "run_x", &why)).contains("not run run_x's connection"));
+        assert!(refused(ask(&zone, &RunId("run_c".into()), "run_c", &why)).contains("spawned child"));
+        let quiet = wicket_agent::load("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  escalation: { request: false }\n")
+            .unwrap()
+            .zone;
+        assert!(refused(ask(&quiet, &own, "run_s", &why)).contains("escalation.request: false"));
+        l.deny_standing(&sid, "op").unwrap();
+        assert!(matches!(ask(&zone, &own, "run_s", &why), Msg::Asked { denied: Some(d), .. } if d == sid));
+
+        // The hint: by method and host, from the third ask in a week, in any of the agent's runs.
+        let get = |job: u32| Op::egress(&t, &own, "z", "GET", "ci.example", &format!("/jobs/{job}/logs"));
+        l.ask(&get(1), "logs", false, None).unwrap();
+        l.ask(&get(2), "logs", false, None).unwrap();
+        assert_eq!(repeat_hint(&l, &t, "run_s", &get(2)), None, "twice is not yet a pattern");
+        l.ask(&get(3), "logs", false, None).unwrap();
+        let hint = repeat_hint(&l, &t, "run_s", &get(3)).unwrap();
+        assert!(hint.starts_with("You have asked for GET on ci.example 3 times since") && hint.contains("scope \"standing\""), "{hint}");
+        assert_eq!(repeat_hint(&l, &t, "run_c", &get(3)), None, "a child is not hinted: it can't ask");
+    }
 
     /// #121, #117: what a node asks about is rebuilt and classified on the control host.
     #[test]

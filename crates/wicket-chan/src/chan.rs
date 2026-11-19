@@ -45,15 +45,19 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 1, a connection talks
-/// 14 or 15, so only the versions above 13 have a check here; the checks for features of 13 and
+/// 15 or 16, so only the versions above 14 have a check here; the checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
-/// forwarded egress, node health, the control host's tools as [`Msg::Call`]) went once every peer
-/// had them.
-pub const PROTOCOL: u32 = 15;
+/// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
+/// every peer had them.
+pub const PROTOCOL: u32 = 16;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
 pub const MESSAGE_READ: u32 = 15;
+/// The first protocol version with standing reach (#572): a node sends a box's ask for it as
+/// [`Msg::AskStanding`], and the control host publishes approved rules to the node as token
+/// blocks. A node at 15 neither asks for nor honours one.
+pub const STANDING: u32 = 16;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -112,6 +116,7 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
     assert!(MESSAGE_READ <= PROTOCOL);
+    assert!(STANDING <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -484,12 +489,16 @@ pub enum Msg {
     Forget {
         run: String,
     },
-    /// Answer to [`Msg::Ask`].
+    /// Answer to [`Msg::Ask`] and [`Msg::AskStanding`].
     Asked {
         id: u64,
         pending: Option<(String, bool)>,
         denied: Option<String>,
         error: Option<String>,
+        /// For the agent, beside its answer (#572): it has asked for this before, and standing
+        /// reach would save it asking again. An older node ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
     },
     /// Node → control host (#257 slice 4b): one of the control host's tools for `run`'s box, with
     /// its arguments as the box gave them. Answered with [`Msg::Called`] once the tool is done (a
@@ -743,6 +752,15 @@ pub enum Msg {
         /// prefix`, #164).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         prefix: bool,
+    },
+    /// Raise (or find) `run`'s ask for standing reach (#572): `rule`, for the asking agent's later
+    /// runs, in the agent's words. Answered with [`Msg::Asked`]. Sent only on a connection that
+    /// talks [`STANDING`] or later.
+    AskStanding {
+        id: u64,
+        run: String,
+        rule: wicket_core::manifest::ReachRule,
+        why: String,
     },
     /// A secret `run` needs now, on its first use on this node (#152): its model credential, or an
     /// injected secret. Never prefetched.
@@ -1240,23 +1258,24 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build has no checks for features of protocol 14 or before (CA renewal, #416, the
-    /// last): a peer below 14 can't connect, so every connection talks 14 or 15, and a check for a
-    /// feature of version N matters only while a peer at N - 1 can connect. 15 (message reads,
-    /// #445) keeps its check for as long as a node at 14 can connect.
+    /// Why this build has no checks for features of protocol 15 or before (message reads, #445,
+    /// the last): a peer below 15 can't connect, so every connection talks 15 or 16, and a check for
+    /// a feature of version N matters only while a peer at N - 1 can connect. 16 (standing reach,
+    /// #572) keeps its check for as long as a node at 15 can connect. (`MESSAGE_READ`'s check stays
+    /// until a release has removed it.)
     #[test]
-    fn no_connection_talks_below_protocol_14() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ), (15, 1, 15));
+    fn no_connection_talks_below_protocol_15() {
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, STANDING), (16, 1, 15, 16));
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((14..=15).contains(&at) && (14..=16).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(14..=16).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((15..=16).contains(&at) && (15..=17).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(15..=17).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 15 or 16 talking to a control host at 15 from the other side.
-        assert_eq!(negotiate(16, PROTOCOL), Ok(15));
-        assert!(negotiate(14, PROTOCOL).unwrap() < MESSAGE_READ, "a node at 14 sends no MessageRead, and gets messages read as handed");
-        assert!(negotiate(PROTOCOL, 13).is_err() && negotiate(13, PROTOCOL).is_err());
+        // And a node at 16 or 17 talking to a control host at 16 from the other side.
+        assert_eq!(negotiate(17, PROTOCOL), Ok(16));
+        assert!(negotiate(15, PROTOCOL).unwrap() < STANDING, "a node at 15 sends no AskStanding, and gets no standing block");
+        assert!(negotiate(PROTOCOL, 14).is_err() && negotiate(14, PROTOCOL).is_err());
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start
