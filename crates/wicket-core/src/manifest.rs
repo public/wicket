@@ -899,8 +899,10 @@ impl Manifest {
                 Some(crate::placement::Near::Service(s)) if !self.zone.uses.contains(&s) => {
                     return Err(ManifestError::Invalid(format!("placement.affinity: service {s} is not one zone.uses names")));
                 }
-                Some(crate::placement::Near::Volume(v)) if !self.zone.volumes.iter().any(|x| x.name == v) => {
-                    return Err(ManifestError::Invalid(format!("placement.affinity: volume {v} is not one zone.volumes declares")));
+                Some(crate::placement::Near::Volume(v)) if !self.zone.volumes.iter().any(|x| x.name == v && x.keep) => {
+                    return Err(ManifestError::Invalid(format!(
+                        "placement.affinity: volume {v} is not one zone.volumes declares with keep: true (only a kept volume stays on a node)"
+                    )));
                 }
                 _ => {}
             }
@@ -1186,7 +1188,8 @@ mod tests {
         let m = |placement: &str| {
             super::Manifest::from_yaml(&format!(
                 "task: t\nprogram: {{ name: p, command: [x] }}\nplacement: {placement}\n\
-                 zone: {{ name: z, uses: [npm-cache], volumes: [{{ name: data, path: /volumes/data }}] }}\n"
+                 zone: {{ name: z, uses: [npm-cache], volumes: [{{ name: data, path: /volumes/data, keep: true }}, \
+                 {{ name: scratch, path: /volumes/scratch }}] }}\n"
             ))
         };
         let ok = m("{ priority: 5, affinity: [{ service: npm-cache }, { volume: data, required: true }] }").unwrap();
@@ -1194,6 +1197,7 @@ mod tests {
         assert_eq!(super::Manifest::from_yaml(&crate::yaml::to_string(&ok).unwrap()).unwrap().placement, ok.placement);
         assert!(m("{ affinity: [{ service: crates-mirror }] }").unwrap_err().to_string().contains("not one zone.uses names"));
         assert!(m("{ affinity: [{ volume: other }] }").unwrap_err().to_string().contains("not one zone.volumes declares"));
+        assert!(m("{ affinity: [{ volume: scratch }] }").unwrap_err().to_string().contains("keep: true"), "a run's cache is on no node");
         assert!(m("{ priority: 5000 }").is_err());
     }
 
