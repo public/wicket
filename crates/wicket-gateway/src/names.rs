@@ -97,10 +97,15 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
             }
         }
     };
-    // Exposed under the name, so connect finds the port offered.
-    if let Err(e) = l.expose(&ctx.tenant, &ctx.run.0, port, Some(label), &zone_json) {
-        undo(&l);
-        return Err(e.to_string());
+    // Exposed under the name, so connect finds the port offered. A port the box exposed itself
+    // (under no name, or another) keeps that exposure: connect needs only the port offered, and the
+    // box's own name for it stays its own (#668 review).
+    let own = exposed_before.as_ref().is_some_and(|e| e.name.as_deref() != Some(label));
+    if !own {
+        if let Err(e) = l.expose(&ctx.tenant, &ctx.run.0, port, Some(label), &zone_json) {
+            undo(&l);
+            return Err(e.to_string());
+        }
     }
     // On the record before it takes effect (fail closed).
     let body = serde_json::json!({ "id": n.id, "name": fqdn, "kind": "internal", "port": port, "scope": "run", "reason": reason,
@@ -127,4 +132,13 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
         "registered {fqdn} ({}) for port {port} of this box. Other boxes of your tenant reach it with connect(name: \"{label}.{zone}\"): {who}. Listen on 127.0.0.1:{port} (or 0.0.0.0). The name is yours until this run ends.",
         n.id
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The domain names refuse as a zone is the one links live under (#668 review).
+    #[test]
+    fn internal_names_and_links_share_one_domain() {
+        assert_eq!(wicket_names::label::INTERNAL_DOMAIN, wicket_core::link::DOMAIN);
+    }
 }

@@ -166,7 +166,8 @@ pub struct NameRow {
     pub effect_sha256: Option<String>,
     pub ended_at: Option<i64>,
     pub ended_by: Option<String>,
-    /// `run ended`, `revoked` or `lapsed`.
+    /// `run ended`, `run gone` (its run had ended without letting it go, found by
+    /// [`Ledger::sweep_stale_names`]), `revoked` or `lapsed`.
     pub end_reason: Option<String>,
 }
 
@@ -458,12 +459,17 @@ impl Ledger {
             "UPDATE names SET status = 'live',
                holder = CASE WHEN EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running') THEN asked_run END,
                decided_at = ?2, decided_by = ?3, bound = ?4, expires_at = ?5, effect_sha256 = ?6
-             WHERE id = ?1 AND status = 'pending'",
+             WHERE id = ?1 AND status = 'pending'
+               AND (scope != 'run' OR EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running'))",
             params![id, t, by, bound, expires, effect],
         );
         match r {
             Err(e) if is_unique_violation(&e) => Err(taken(&n.label)),
-            Ok(0) => Err(StoreError::NotPending(id.into(), self.name(id)?.status)),
+            Ok(0) => match self.name(id)?.status.as_str() {
+                // Still pending: its run stopped between the check above and the update.
+                "pending" => Err(StoreError::Refused(format!("{id} was asked for by run {}, which isn't running", n.asked_run))),
+                status => Err(StoreError::NotPending(id.into(), status.to_string())),
+            },
             Ok(_) => Ok(effect),
             Err(e) => Err(e.into()),
         }
@@ -522,6 +528,20 @@ impl Ledger {
     /// doesn't know the table). Its run-scoped names end and its standing ones wait for the next run.
     /// Run when a ledger opens and before a name is registered. How many names it let go.
     pub fn sweep_stale_names(&self) -> Result<usize> {
+        // One write lock from the read on (#668 review): another process's sweep, or a run taking
+        // a standing name, can't slip in between what this one reads and what it writes.
+        let own = self.conn.is_autocommit();
+        if own {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let r = self.sweep_in();
+        if own {
+            let _ = self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        }
+        r
+    }
+
+    fn sweep_in(&self) -> Result<usize> {
         let gone =
             "holder IS NOT NULL AND status = 'live' AND NOT EXISTS (SELECT 1 FROM runs WHERE id = names.holder AND status = 'running')";
         let mut st = self.conn.prepare(&format!("SELECT {COLS} FROM names WHERE {gone}"))?;
@@ -532,42 +552,46 @@ impl Ledger {
              WHERE status = 'pending' AND scope = 'run' AND NOT EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running')",
             params![now()],
         )?;
-        if stale.is_empty() {
-            return Ok(withdrawn);
-        }
-        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
         let t = now();
+        let mut released = 0;
         for n in &stale {
             let holder = RunId(n.holder.clone().unwrap_or_default());
-            self.release_held(n, &holder, t, "its run isn't running")?;
+            released += self.release_held(n, &holder, t, "run gone")? as usize;
         }
-        if let Some(own) = own {
-            own.commit()?;
-        }
-        Ok(stale.len() + withdrawn)
+        Ok(released + withdrawn)
     }
 
-    /// Lets go of name `n` that `run` held: a run-scoped one ends (its ports released), a standing
-    /// one waits for the next run. Audited `name.released`.
-    fn release_held(&self, n: &NameRow, run: &RunId, t: i64, why: &str) -> Result<()> {
-        match n.scope {
+    /// Lets go of name `n` if `run` still holds it: a run-scoped one ends (its ports released), a
+    /// standing one waits for the next run. Audited `name.released`, with `why` (`run ended`, or
+    /// `run gone` for one the sweep found), only when this call changed it: a name another process
+    /// let go of, or that another run took, is left as it is. Whether it changed it.
+    fn release_held(&self, n: &NameRow, run: &RunId, t: i64, why: &str) -> Result<bool> {
+        let changed = match n.scope {
             NameScope::Run => {
-                self.conn.execute(
-                    "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = 'wicket', end_reason = 'run ended' WHERE id = ?1",
-                    params![n.id, t],
+                let c = self.conn.execute(
+                    "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = 'wicket', end_reason = ?4
+                     WHERE id = ?1 AND status = 'live' AND holder = ?3",
+                    params![n.id, t, run.0, why],
                 )?;
-                self.release_ports(&n.id)?;
+                if c > 0 {
+                    self.release_ports(&n.id)?;
+                }
+                c > 0
             }
             NameScope::Standing => {
-                self.conn.execute("UPDATE names SET holder = NULL WHERE id = ?1", params![n.id])?;
+                self.conn
+                    .execute("UPDATE names SET holder = NULL WHERE id = ?1 AND status = 'live' AND holder = ?2", params![n.id, run.0])?
+                    > 0
             }
+        };
+        if changed {
+            let body = serde_json::json!({
+                "id": n.id, "kind": n.kind.as_str(), "label": n.label, "zone": n.zone, "port": n.port,
+                "scope": n.scope.as_str(), "ended": n.scope == NameScope::Run, "why": why,
+            });
+            self.audit(&TenantId(n.tenant.clone()), Some(run), "name.released", &body)?;
         }
-        let body = serde_json::json!({
-            "id": n.id, "kind": n.kind.as_str(), "label": n.label, "zone": n.zone, "port": n.port,
-            "scope": n.scope.as_str(), "ended": n.scope == NameScope::Run, "why": why,
-        });
-        self.audit(&TenantId(n.tenant.clone()), Some(run), "name.released", &body)?;
-        Ok(())
+        Ok(changed)
     }
 
     /// A run of `principal` in `zone` (definition `zone_digest`) started: it holds the live,
@@ -931,7 +955,7 @@ mod tests {
         l.conn.execute("UPDATE runs SET status = 'succeeded' WHERE id = 'run-1'", []).unwrap();
         l.register_internal(&ask(&t, &r2, P2, "api", NameScope::Run), 2, 3600).unwrap();
         let ended = l.name(&api.id).unwrap();
-        assert_eq!((ended.status.as_str(), ended.end_reason.as_deref()), ("ended", Some("run ended")));
+        assert_eq!((ended.status.as_str(), ended.end_reason.as_deref()), ("ended", Some("run gone")));
         let standing = l.name(&web.id).unwrap();
         assert_eq!((standing.status.as_str(), standing.holder), ("live", None), "a standing name waits for the next run");
         // P1's limit of 1 is free again.
@@ -954,11 +978,33 @@ mod tests {
         let terms = NameTerms { bound: Bound::Agent, ttl_secs: None };
         assert!(matches!(l.approve_name(&dead_ask, &terms, "alice", None), Err(StoreError::Refused(m)) if m.contains("isn't running")));
         assert_eq!(l.sweep_stale_names().unwrap(), 2);
-        assert_eq!(l.name(&api.id).unwrap().end_reason.as_deref(), Some("run ended"));
+        assert_eq!(l.name(&api.id).unwrap().end_reason.as_deref(), Some("run gone"));
         assert_eq!(l.name(&dead_ask).unwrap().status, "withdrawn");
         assert_eq!(l.name(&live_ask).unwrap().status, "pending");
         let audit = l.audit_tail(10).unwrap();
-        assert!(audit.iter().any(|a| a.2 == "name.released" && a.4.contains(&api.id) && a.4.contains("isn't running")), "{audit:?}");
+        assert!(audit.iter().any(|a| a.2 == "name.released" && a.4.contains(&api.id) && a.4.contains("run gone")), "{audit:?}");
+    }
+
+    /// #668 review: releasing a name is conditional on the run still holding it, so a sweep that
+    /// read a stale holder doesn't clear a holder another run took since, or audit it twice.
+    #[test]
+    fn a_name_is_released_only_while_its_run_still_holds_it() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let (r1, r2) = (RunId("run-1".into()), RunId("run-2".into()));
+        let web = l.register_internal(&ask(&t, &r1, P1, "web", NameScope::Standing), 3, 3600).unwrap();
+        // What a sweep read: held by run-1. Meanwhile run-1 let go and run-2 took it.
+        let read = l.name(&web.id).unwrap();
+        l.conn.execute("UPDATE names SET holder = 'run-2' WHERE id = ?1", params![web.id]).unwrap();
+        let audits = l.audit_tail(50).unwrap().len();
+        assert!(!l.release_held(&read, &r1, now(), "run gone").unwrap());
+        assert_eq!(l.name(&web.id).unwrap().holder.as_deref(), Some("run-2"), "run-2's hold is kept");
+        assert_eq!(l.audit_tail(50).unwrap().len(), audits, "nothing audited");
+        // Released by its holder: once.
+        let read = l.name(&web.id).unwrap();
+        assert!(l.release_held(&read, &r2, now(), "run ended").unwrap());
+        assert!(!l.release_held(&read, &r2, now(), "run ended").unwrap());
+        assert_eq!(l.audit_tail(50).unwrap().iter().filter(|a| a.2 == "name.released").count(), 1);
     }
 
     #[test]
