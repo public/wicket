@@ -29,8 +29,10 @@ mod hosts;
 mod outgoing;
 
 pub(crate) use canary::tripped_response;
+pub(crate) use canary::{Scanner as CanaryScanner, Tripped};
 use outgoing::refused_shape;
 pub use outgoing::render_credential;
+pub(crate) use outgoing::{anomaly, guard_credential, placeholder_moved};
 
 /// The largest request body read whole: GET and HEAD (which must have none), and requests that
 /// arrived over HTTP/3, which are re-sent upstream from memory.
