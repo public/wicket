@@ -9,8 +9,9 @@ control-dns	ok
 control-gateway	ok
 
 # through the proxy, outside the zone: other hosts, methods, request shapes, the host's own addresses,
-# loopback in its spellings, cloud metadata, IP literals, wicket's own ports, names whose DNS answers
-# are internal (*.nip.io and localtest.me are in reach: the dial check refuses them), other ports
+# loopback in its spellings (curl-7: refused at once, no proxy involved), cloud metadata, IP
+# literals, wicket's own ports, names whose DNS answers are internal (*.nip.io and localtest.me are
+# in reach: the dial check must refuse their addresses), DoH, other ports, #19's known lookup
 other-host	refused
 other-host-https	refused
 other-path	refused
@@ -28,12 +29,12 @@ connect-other-host	refused
 connect-ip	refused
 host-canary	refused
 host-canary-tunnel	refused
-loopback-canary	refused
-loopback-decimal	refused
-loopback-hex	refused
-loopback-v6	refused
+loopback-canary	curl-7
+loopback-decimal	curl-7
+loopback-hex	curl-7
+loopback-v6	curl-7
 loopback-mapped	refused
-localhost-name	refused
+localhost-name	curl-7
 cloud-metadata	refused
 cloud-metadata-v6	refused
 gcp-metadata	refused
@@ -54,6 +55,8 @@ doh-google	refused
 doh-ip	refused
 other-port	refused
 other-port-canary	refused
+other-port-https	refused
+dns-registered-domain	known
 
 # path tricks against the reach rules (the echo host shows the path the upstream saw: contained means
 # within the rule, as the upstream reads it)
@@ -93,10 +96,12 @@ reflect-h2	contained
 reflect-own-auth	contained
 
 # around the proxy: no proxy, raw TCP and UDP, the forwarder's ports, the synthetic addresses' other
-# ports, DNS (wicket's resolver answers only from its synthetic range), raw and packet sockets, frames
-# written straight to the forwarder's UDP relay, the host's unix and abstract sockets
-no-proxy	refused
-no-proxy-https	refused
+# ports, DNS (local: wicket's resolver answered it itself; the host's DNS capture checks no label
+# left), raw and packet sockets, frames written straight to the forwarder's UDP relay (local: wicket's
+# resolver or its QUIC endpoint answered, which writes only to the box; dropped: no answer; the
+# host drops datagrams to addresses it didn't mint), the host's unix and abstract sockets
+no-proxy	curl-7
+no-proxy-https	curl-7
 raw-tcp-public	refused
 raw-tcp-dns	refused
 raw-tcp-host	refused
@@ -120,23 +125,24 @@ synthetic-port-8080	refused
 synthetic-port-canary	refused
 udp-dns-public	refused
 udp-dns-public-2	refused
-dns-exfil-label	refused
-dns-exfil-deep	refused
-dns-exfil-unregistered	refused
-dns-txt	refused
-dns-any	refused
-dns-ptr	refused
-dns-metadata-name	refused
+dns-exfil-label	local
+dns-exfil-deep	local
+dns-exfil-unregistered	local
+dns-txt	local
+dns-any	local
+dns-ptr	local
+dns-metadata-name	local
 dns-tcp	refused
 dns-axfr	refused
 raw-icmp	refused
 raw-ip	refused
 packet-socket	refused
 ping-socket	refused
-udp-relay-public-dns	refused
-udp-relay-quic-ip	refused
-udp-relay-wicket-dns-exfil	refused
-udp-relay-quic-synthetic-unreached	refused
+udp-relay-public-dns	local
+udp-relay-quic-ip	local
+udp-relay-quic-ip-v1	dropped
+udp-relay-wicket-dns-exfil	local
+udp-relay-quic-synthetic-unreached	local
 host-unix-socket	refused
 host-abstract-socket	refused
 docker-socket	refused
@@ -144,12 +150,14 @@ containerd-socket	refused
 
 # the forwarder's host sockets spoken to directly, and the model proxy (a program has no model route)
 egress-sock-direct	refused
+egress-sock-absolute	refused
 llm-sock	refused
 model-proxy	refused
 model-proxy-profile	refused
 
 # the gateway's tools: asking files a request for a human (asked) and grants nothing; deciding,
-# renewing, spawning, linking, connecting, capacity, updates and messages; prefix and standing asks
+# renewing, awaiting another's ask, spawning, linking, connecting, capacity, updates and messages;
+# prefix and standing asks, its own and the peer's
 ask-other-host	asked
 ask-metadata	refused
 ask-gateway	refused
@@ -164,6 +172,10 @@ self-decide	refused
 self-renew	refused
 peer-decide	refused
 peer-await	refused
+standing-self-decide	refused
+standing-peer-decide	refused
+standing-peer-await	refused
+standing-self-renew	refused
 spawn-child	refused
 spawn-service-zone	refused
 connect-peer	asked
@@ -185,10 +197,30 @@ prefix-below	contained
 prefix-dotdot	refused
 prefix-escaped-dots	refused
 prefix-escaped-slash	refused
+prefix-null	refused
+prefix-double-escape	refused
+prefix-semicolon	refused
+prefix-backslash	refused
 prefix-sibling	refused
 prefix-case	refused
 prefix-method	refused
 prefix-other-host	refused
+
+# a narrow standing rule an operator approved (ci/attack-matrix.sh approves it, #572): within it is
+# contained, any way out of it refused
+standing-granted	info
+standing-below	contained
+standing-dotdot	refused
+standing-escaped-dots	refused
+standing-escaped-slash	refused
+standing-null	refused
+standing-double-escape	refused
+standing-semicolon	refused
+standing-backslash	refused
+standing-sibling	refused
+standing-case	refused
+standing-method	refused
+standing-other-host	refused
 
 # files outside the box's volumes: the host's, wicket's data directory, the run directories, the vault;
 # symlinks to host paths left where the host reads (the host checks they weren't followed); read-only
@@ -215,7 +247,9 @@ write-/etc/resolv.conf	refused
 write-/usr/local/bin/wicket-fwd	refused
 write-/usr/x	refused
 userns-remount	refused
-userns-net	refused
+userns-create	refused
+userns-same-net	refused
+userns-new-net	refused
 host-processes	refused
 
 # the per-node service the zone uses (#579), whose reach is wider than the zone's: its link waits for a
@@ -223,3 +257,9 @@ host-processes	refused
 connect-service-run	asked
 link-service-run	refused
 svc-link	refused
+
+# a second installed service the zone doesn't use (the peer's does, so its instance runs here)
+connect-service2-run	asked
+link-service2-run	refused
+connect-service2	refused
+service2-name	refused
