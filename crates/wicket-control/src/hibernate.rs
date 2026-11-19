@@ -637,51 +637,91 @@ pub fn scheduled_node(l: &Ledger, c: &Candidate, need: &[String]) -> wicket_plac
     }
 }
 
-/// Where a woken agent's box goes: every enrolled, active node that answers within 10 s (this host's
-/// own among them) and isn't held by a capacity lease, filtered by the box's requests, labels,
-/// taints and CA coverage, then bin-packed (`wicket_placement::schedule`).
+/// A node's last report older than this (ms) is not trusted for its room: it is asked (#579).
+pub const INDEX_FRESH_MS: i64 = 90_000;
+
+/// Which of `names` placement can read from the ledger (#579): those whose latest health report,
+/// received under [`INDEX_FRESH_MS`] ago, carries the node's capacity. The rest (no report, an old
+/// one, a node from before it carried capacity) are returned to be asked, as before: a node no run
+/// is connected to reports nothing.
+pub fn from_index(names: &[String], health: &[(String, i64, String)], now_ms: i64) -> (Vec<Candidate>, Vec<String>) {
+    let (mut found, mut ask) = (vec![], vec![]);
+    for n in names {
+        let cap = health
+            .iter()
+            .find(|(node, at, _)| node == n && now_ms - at < INDEX_FRESH_MS)
+            .and_then(|(_, _, j)| serde_json::from_str::<wicket_chan::health::NodeHealth>(j).ok())
+            .and_then(|h| h.capacity);
+        match cap {
+            Some(cap) => found.push(Candidate { name: n.clone(), cap }),
+            None => ask.push(n.clone()),
+        }
+    }
+    (found, ask)
+}
+
+/// Where a woken agent's box goes: every enrolled, active node (this host's own among them) not held
+/// by a capacity lease, its room read from its last report in the ledger ([`from_index`]) or, with
+/// none fresh, asked of it (within 10 s); filtered by the box's requests, labels, taints and CA
+/// coverage, then bin-packed (`wicket_placement::schedule`).
 async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
     let m = wicket_agent::load(&agent.manifest)?;
     let req = wicket_placement::schedule::Request::of(&m);
     let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
     crate::localnode::ensure(&ledger).await?;
-    let (names, leased) = {
+    let (indexed, to_probe) = {
         let l = ledger.lock().expect("ledger");
-        let names: Vec<String> = l.nodes()?.into_iter().filter(|n| n.status == "active").map(|n| n.name).collect();
         let leased: Vec<String> = l.leases(wicket_store::LIVE_LEASES)?.into_iter().filter_map(|x| x.node_name).collect();
-        (names, leased)
+        let names: Vec<String> =
+            l.nodes()?.into_iter().filter(|n| n.status == "active" && !leased.contains(&n.name)).map(|n| n.name).collect();
+        from_index(&names, &l.node_health()?, wicket_feed::now_ms())
     };
-    let probes = names.into_iter().filter(|n| !leased.contains(n)).map(|n| {
+    let ask = |names: Vec<String>| {
         let ledger = ledger.clone();
         async move {
-            let r = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                crate::nodecall::Link::connect(&n, &format!("place:{}", std::process::id()), &ledger),
-            )
-            .await;
-            match r {
-                Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap }),
-                Ok(Err(e)) => {
-                    say!("[wicket] node {n} is not available for the wake: {e:#}");
-                    None
+            let probes = names.into_iter().map(|n| {
+                let ledger = ledger.clone();
+                async move {
+                    let r = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        crate::nodecall::Link::connect(&n, &format!("place:{}", std::process::id()), &ledger),
+                    )
+                    .await;
+                    match r {
+                        Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap }),
+                        Ok(Err(e)) => {
+                            say!("[wicket] node {n} is not available for the wake: {e:#}");
+                            None
+                        }
+                        Err(_) => {
+                            say!("[wicket] node {n} is not available for the wake: no answer within 10 s");
+                            None
+                        }
+                    }
                 }
-                Err(_) => {
-                    say!("[wicket] node {n} is not available for the wake: no answer within 10 s");
-                    None
-                }
-            }
+            });
+            futures_util::future::join_all(probes).await.into_iter().flatten().collect::<Vec<Candidate>>()
         }
-    });
-    let cands: Vec<Candidate> = futures_util::future::join_all(probes).await.into_iter().flatten().collect();
+    };
+    let decide = |cands: &[Candidate]| {
+        let l = ledger.lock().expect("ledger");
+        let nodes: Vec<_> = cands.iter().map(|c| scheduled_node(&l, c, &need)).collect();
+        wicket_placement::schedule::schedule(&req, &nodes, wicket_placement::schedule::Strategy::BinPack, last)
+    };
+    let probed = ask(to_probe.clone()).await;
+    let mut cands: Vec<Candidate> = indexed.iter().cloned().chain(probed.iter().cloned()).collect();
     if cands.is_empty() {
         return Ok(None);
     }
-    let nodes: Vec<_> = {
-        let l = ledger.lock().expect("ledger");
-        cands.iter().map(|c| scheduled_node(&l, c, &need)).collect()
-    };
-    let d = wicket_placement::schedule::schedule(&req, &nodes, wicket_placement::schedule::Strategy::BinPack, last);
+    let mut d = decide(&cands);
+    // A report can be up to 30 s old: it may still count a box that has ended since (one that just
+    // hibernated, say). Before refusing the wake, the nodes read from reports are asked.
+    if d.node.is_none() && !indexed.is_empty() {
+        let fresh = ask(indexed.iter().map(|c| c.name.clone()).collect()).await;
+        cands = fresh.into_iter().chain(probed).collect();
+        d = decide(&cands);
+    }
     match d.node {
         Some(n) => {
             say!(
@@ -803,6 +843,30 @@ mod tests {
 
     /// Wake placement is best fit (the fullest node the box still fits on), among the nodes whose
     /// labels, taints and CA let it on (#579); where it ran before only breaks ties.
+    #[test]
+    fn a_woken_agent_is_placed_from_the_nodes_last_reports_and_asks_only_the_rest() {
+        let now = 10_000_000;
+        let report = |cap: Option<crate::chan::NodeCapacity>| {
+            serde_json::to_string(&wicket_chan::health::NodeHealth { at_ms: now, capacity: cap, ..Default::default() }).unwrap()
+        };
+        let cap = cand("x", 4.0, 8192, 1.0, 1024).cap;
+        let names: Vec<String> = ["fresh", "stale", "old-node", "silent"].map(String::from).to_vec();
+        let health = vec![
+            ("fresh".to_string(), now - 30_000, report(Some(cap))),
+            ("stale".to_string(), now - INDEX_FRESH_MS, report(Some(cap))),
+            ("old-node".to_string(), now - 1_000, report(None)),
+            ("unlisted".to_string(), now, report(Some(cap))),
+        ];
+        let (found, ask) = from_index(&names, &health, now);
+        assert_eq!(found, vec![Candidate { name: "fresh".into(), cap }]);
+        assert_eq!(ask, ["stale", "old-node", "silent"], "a stale report, one without capacity, or none: asked");
+        // A node's report carries what its Welcome would: the two read the same.
+        let h: wicket_chan::health::NodeHealth = serde_json::from_str(&report(Some(cap))).unwrap();
+        assert_eq!(h.capacity, Some(cap));
+        let before: wicket_chan::health::NodeHealth = serde_json::from_str("{\"at_ms\":1,\"disk\":{\"total_bytes\":0,\"avail_bytes\":0,\"files_total\":0,\"files_avail\":0},\"memory\":{\"total_mib\":0,\"available_mib\":0,\"committed_mib\":0},\"feed_mode\":\"\",\"feed_fresh_until_ms\":null,\"oom_kills\":0,\"last_oom\":null,\"persist_failures\":0,\"last_persist_failure\":null}").unwrap();
+        assert_eq!(before.capacity, None, "a node from before it");
+    }
+
     #[test]
     fn a_woken_agent_is_bin_packed_onto_the_fullest_node_it_may_go_on() {
         use wicket_placement::schedule::{schedule, Coverage, Request, Strategy};

@@ -172,6 +172,11 @@ impl Ledger {
         Ok(())
     }
 
+    /// When `node`'s latest health report was received (ms), if it has one.
+    pub fn node_health_at(&self, node: &str) -> Result<Option<i64>> {
+        Ok(self.conn.query_row("SELECT at_ms FROM node_health WHERE node = ?1", params![node], |r| r.get(0)).optional()?)
+    }
+
     /// Every node's latest health report: (node, received at ms, JSON), by node.
     pub fn node_health(&self) -> Result<Vec<(String, i64, String)>> {
         let mut st = self.conn.prepare("SELECT node, at_ms, health FROM node_health ORDER BY node")?;
