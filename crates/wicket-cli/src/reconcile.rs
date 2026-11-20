@@ -1039,6 +1039,11 @@ fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done
         .iter()
         .map(|n| Done { kind: "name_lapsed", target: format!("{} ({})", n.label, n.id), detail: "its lifetime is over".into() })
         .collect();
+    done.extend(r.freed.iter().map(|(node, port)| Done {
+        kind: "port_freed",
+        target: format!("host port {port} on {node}"),
+        detail: "its name's records are gone: free again after twice the TTL".into(),
+    }));
     if !(r.recorded || dry_run) {
         return done;
     }

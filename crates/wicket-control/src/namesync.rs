@@ -24,7 +24,11 @@
 //!    Each conflict (a wanted name the zone holds records at that wicket doesn't own) is audited
 //!    `name.conflict` with it. A conflict is never adopted.
 //!
-//! A dry run computes the plan and changes nothing: no lapse, no apply, no record.
+//! 5. A host port its name let go of (quarantined) is freed for twice the TTL from now once none
+//!    of that name's records is left in the ledger's list: a cached record for the old name can't
+//!    reach the next box given the port.
+//!
+//! A dry run computes the plan and changes nothing: no lapse, no apply, no record, no port freed.
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -58,6 +62,8 @@ pub struct Report {
     pub applied: bool,
     /// Whether this pass recorded the plan (`name.plan`): it differed from the last one recorded.
     pub recorded: bool,
+    /// Released host ports given a time to be free again: `(node, port)`.
+    pub freed: Vec<(String, u16)>,
 }
 
 /// The records wanted for the live public names, and the names that can't be published yet.
@@ -137,7 +143,7 @@ pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &
     let owned_records = l.owned_records(&zone)?;
     let owned = wicket_names::Owned::new(&owned_records);
     let plan = wicket_names::plan(&zone, &owner, &want, &listed, &owned).map_err(|e| anyhow!("planning zone {}: {e}", zone.apex()))?;
-    let mut report = Report { provider: provider.id().to_string(), lapsed, waiting, plan, applied: false, recorded: false };
+    let mut report = Report { provider: provider.id().to_string(), lapsed, waiting, plan, applied: false, recorded: false, freed: vec![] };
     if dry_run {
         return Ok(report);
     }
@@ -184,6 +190,19 @@ pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &
             l.audit(&tenant_of(l, &c.name, &wanted, &owned_records), None, "name.conflict", &body)?;
         }
         report.recorded = true;
+    }
+
+    // A host port its name let go of is free again twice the TTL after none of the name's records
+    // is left in the ledger's list (which a failed apply keeps), so a cached record for the old
+    // name can't reach the next box given it.
+    let left = l.owned_records(&zone)?;
+    let free_at = now + 2 * i64::from(public.ttl);
+    for (node, proto, port, last) in l.quarantined_ports()? {
+        let name = l.name(&last).ok().map(|n| public.fqdn(&n.label));
+        if !name.is_some_and(|name| left.iter().any(|r| r.base() == name)) {
+            l.free_port_after(&node, &proto, port, free_at)?;
+            report.freed.push((node, port));
+        }
     }
     Ok(report)
 }
@@ -398,6 +417,28 @@ mod tests {
         // The same conflict next pass isn't recorded again.
         pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert_eq!(kinds(&l, "name.conflict"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_released_port_is_freed_once_its_names_records_are_gone() {
+        let (l, _run, id) = ledger();
+        let port = l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
+        let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
+        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        assert_eq!(p.records().len(), 3, "owner, A and SRV");
+        // Revoked: its port is released, and quarantined while its records are there.
+        crate::names::revoke(&l, "op", &id).unwrap();
+        assert_eq!(l.quarantined_ports().unwrap().len(), 1);
+        let noop = NoopProvider::new();
+        let r = pass(&l, &public(), &noop, wicket_store::now(), false).await.unwrap();
+        assert!(r.freed.is_empty(), "the ledger still lists its records: {:?}", r.freed);
+        // The records go: the port is freed for twice the TTL from now, not before.
+        let now = wicket_store::now();
+        let r = pass(&l, &public(), &p, now, false).await.unwrap();
+        assert!(p.records().is_empty());
+        assert_eq!(r.freed, vec![("n1".to_string(), port)]);
+        assert!(l.quarantined_ports().unwrap().is_empty());
+        assert_ne!(l.allocate_port("n1", PROTO, "n-other", port..=port + 1, Some(port)).unwrap(), port, "still quarantined");
     }
 
     #[tokio::test]

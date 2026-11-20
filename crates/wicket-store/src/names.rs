@@ -855,6 +855,16 @@ impl Ledger {
         Ok(held)
     }
 
+    /// The ports released and still quarantined with no time set to free them: `(node, proto,
+    /// port, the name that held it last)`.
+    pub fn quarantined_ports(&self) -> Result<Vec<(String, String, u16, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT node, proto, port, last_name FROM host_ports WHERE name IS NULL AND free_after IS NULL ORDER BY node, proto, port",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// A released port may be handed out again from `at`: what the reconciler sets once the
     /// records of the name that held it are gone (and twice their TTL has passed). A port held
     /// again since is left.

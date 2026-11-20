@@ -210,7 +210,8 @@ its own address could point a name at someone else's server.
   the new node if it is free there. Otherwise a new one, and the SRV record follows.
 - **Quarantined after release.** A port a name gave up isn't handed out again on that node until its
   records are gone and twice the TTL has passed. Otherwise a cached record for the old name would
-  reach the new box.
+  reach the new box. The reconciler frees it: once the ledger lists none of the name's records, the
+  port is free twice the TTL from then.
 - **Ports below 1024** (80, 443) only where the operator allows them on a node, for one name each,
   since a node has one port 443. Sharing 443 between boxes needs routing by TLS server name, which
   is ingress: not in this design. See [open questions](#open-questions).

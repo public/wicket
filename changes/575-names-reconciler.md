@@ -12,3 +12,4 @@ type: Added
   record is claimed as created. A provider that writes records each change (`name.record`), and a
   name the zone holds records at that wicket doesn't own is a conflict, left alone
   (`name.conflict`). `wicket reconcile --dry-run` shows the plan.
+  A host port a name let go of is freed, twice the TTL later, once none of its records is left.
