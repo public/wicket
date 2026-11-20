@@ -8,7 +8,7 @@ use crate::*;
 /// Runs one of this group's commands.
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
-        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id } => ended(
+        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, wait } => ended(
             run::run_to_end(run::RunOpts {
                 manifest: &manifest,
                 workdir: workdir.as_deref(),
@@ -25,6 +25,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 attach: false,
                 adopt: None,
                 stop: None,
+                place_wait: Some(wait),
             })
             .await,
             false,
@@ -46,6 +47,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 attach: false,
                 adopt: None,
                 stop: None,
+                place_wait: None,
             })
             .await,
             true,
@@ -66,6 +68,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             attach: true,
             adopt: None,
             stop: None,
+            place_wait: None,
         })
         .await
         .inspect_err(|e| run::attach_failed(&run, e)),

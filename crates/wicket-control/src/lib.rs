@@ -4,7 +4,7 @@
 //! the authority roots and the feed ([`roots`]), and what a run needs of the rest: nodes'
 //! enrolment, placement and leases ([`enrol`], [`localnode`], [`node`],
 //! [`nodecreate`], [`capacity`]), grants and their effects ([`grant`], [`effect`]), operators
-//! ([`operators`]), policy ([`policy`]) and images ([`image`]).
+//! ([`operators`]), policy ([`policy`]) and images ([`image`], [`imagetrust`]).
 //!
 //! A library split from wicket-cli, which imports its modules under their old names. These were
 //! one cycle of modules there, and still are here; what they needed of the CLI's other modules
@@ -32,6 +32,7 @@ pub mod gitguard;
 pub mod grant;
 pub mod hibernate;
 pub mod image;
+pub mod imagetrust;
 pub mod links;
 pub mod localnode;
 pub mod names;

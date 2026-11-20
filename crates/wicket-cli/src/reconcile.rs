@@ -1118,6 +1118,10 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     // Triggers (#578) first: the schedules' minutes and the timers that came due since the last
     // pass, whatever the nodes and machines below make of this one.
     let mut done = triggers_pass(&ledger, now, dry_run, &wicket_control::hibernate::trigger_wake, &trigger_owner_may);
+    // Webhook intake (#578 step 4): what the intake nodes verified since the last pass.
+    if !dry_run {
+        done.extend(intake_pass(&ledger, now).await);
+    }
     let asked = node_runs(&ledger, dry_run).await?;
     let local = Docker::from_env();
     done.extend(machines_pass(&mut ledger, asked, &local, now, dry_run).await?);
@@ -1201,7 +1205,23 @@ async fn names_pass(ledger: &Ledger, now: i64, dry_run: bool) -> Vec<Done> {
         Ok(n) => n,
         Err(e) => return vec![Done { kind: "error", target: "names".into(), detail: e }],
     };
-    let Some(public) = names.public else { return vec![] };
+    let Some(public) = names.public else {
+        // Records this installation made stay where they are until names.public is back to
+        // withdraw them (#748, F3): said each pass.
+        return match ledger.owned_zones() {
+            Ok(z) => z
+                .into_iter()
+                .map(|(zone, provider, n)| Done {
+                    kind: "name_stranded",
+                    target: format!("{n} record(s) in {zone}"),
+                    detail: format!(
+                        "made by provider {provider}; names.public is gone from wicket.yaml, so nothing withdraws them: put it back"
+                    ),
+                })
+                .collect(),
+            Err(e) => vec![Done { kind: "error", target: "names".into(), detail: format!("reading its records: {e:#}") }],
+        };
+    };
     let pass = match public.provider {
         wicket_names::ProviderKind::Noop => {
             wicket_control::namesync::pass(ledger, &public, &wicket_names::NoopProvider::new(), now, dry_run).await
@@ -1225,6 +1245,20 @@ fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done
         target: format!("host port {port} on {node}"),
         detail: "its name's records are gone: free again after twice the TTL".into(),
     }));
+    // Said each pass, recorded or not: something needs a person.
+    done.extend(r.errors().map(|(zone, e)| Done { kind: "error", target: format!("names in {zone}"), detail: e.to_string() }));
+    done.extend(r.stranded.iter().map(|s| Done {
+        kind: "name_stranded",
+        target: format!("{} record(s) in {}", s.records, s.zone),
+        detail: format!("made by provider {}: {}", s.provider, s.why),
+    }));
+    for z in &r.zones {
+        done.extend(z.forgotten.iter().map(|rec| Done {
+            kind: "name_forgotten",
+            target: format!("{} {}", rec.name, rec.rtype),
+            detail: format!("gone from {}'s listing: no longer counted as this installation's", z.zone),
+        }));
+    }
     if !(r.recorded || dry_run) {
         return done;
     }
@@ -1233,7 +1267,7 @@ fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done
         (false, true) => format!("applied by {}", r.provider),
         (false, false) => format!("provider {}: not applied, only recorded", r.provider),
     };
-    for c in &r.plan.changes {
+    for c in r.zones.iter().flat_map(|z| z.plan.changes.iter()) {
         let (op, rec) = match c {
             wicket_names::Change::Create(x) => ("create", x),
             wicket_names::Change::Update { to, .. } => ("update", to),
@@ -1245,7 +1279,7 @@ fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done
             detail: format!("{op} {} ({how})", rec.value),
         });
     }
-    for c in &r.plan.conflicts {
+    for c in r.zones.iter().flat_map(|z| z.plan.conflicts.iter()) {
         done.push(Done {
             kind: "name_conflict",
             target: c.name.clone(),
@@ -1285,6 +1319,33 @@ fn triggers_pass(
             })
             .collect(),
         Err(e) => vec![Done { kind: "error", target: "triggers".into(), detail: format!("{e:#}") }],
+    }
+}
+
+/// Webhook intake's pass ([`wicket_control::triggers::intake::pass`]), as the pass's report.
+async fn intake_pass(ledger: &Ledger, now: i64) -> Vec<Done> {
+    let link_ledger = match Ledger::open(&crate::ledger_path()) {
+        Ok(l) => std::sync::Arc::new(std::sync::Mutex::new(l)),
+        Err(e) => return vec![Done { kind: "error", target: "intake".into(), detail: format!("{e:#}") }],
+    };
+    match wicket_control::triggers::intake::pass(ledger, &link_ledger, now, &wicket_control::hibernate::trigger_wake, &trigger_owner_may)
+        .await
+    {
+        Ok(fired) => fired
+            .into_iter()
+            .map(|f| Done {
+                kind: match f.status.as_str() {
+                    "started" => "trigger_fired",
+                    "queued" => "trigger_queued",
+                    "skipped" => "trigger_skipped",
+                    "paused" => "trigger_paused",
+                    _ => "trigger_failed",
+                },
+                target: if f.trigger.is_empty() { f.name } else { format!("trigger {} ({})", f.name, f.trigger) },
+                detail: f.detail,
+            })
+            .collect(),
+        Err(e) => vec![Done { kind: "error", target: "intake".into(), detail: format!("{e:#}") }],
     }
 }
 
@@ -2162,6 +2223,32 @@ mod tests {
         assert!(kinds(&d).contains(&"destroyed"), "{d:?}");
         assert!(w.placer.provider().list_tagged(&Owner::new("example").tag()).await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #731: a capacity ask's region is a region's name, or the ask is refused before anything is
+    /// reserved or filed; the region and the agent's reason are kept as its claims, apart from the
+    /// request's own words.
+    #[test]
+    fn a_capacity_region_is_a_region_name_and_the_agents_words_are_its_claims() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_a", "alive:1");
+        let c = cfg("vultr");
+        let (t, run) = (TenantId::single(), RunId("run_a".into()));
+        for bad in ["lhr, for 1 minute at no cost", "LHR", "", "-lhr", &"a".repeat(33)] {
+            let ask = CapacityAsk { region: Some(bad.into()), ..capacity_ask(30, "0.02") };
+            let e = capacity::ask(&mut l, &c, &t, &run, "z", &ask).err().unwrap().to_string();
+            assert!(e.contains("region must be a provider's region name"), "{bad:?}: {e}");
+        }
+        assert!(l.leases(&[]).unwrap().is_empty(), "nothing reserved for a refused ask");
+        assert!(l.pending(&t).unwrap().is_empty(), "nor filed");
+        for good in ["lhr", "us-east-1", "1"] {
+            assert!(wicket_proxy::check_region(good).is_ok(), "{good}");
+        }
+        capacity::ask(&mut l, &c, &t, &run, "z", &capacity_ask(30, "0.02")).unwrap();
+        let r = l.pending(&t).unwrap().pop().unwrap();
+        assert!(r.reason.contains(", region lhr preferred,"), "{}", r.reason);
+        let claims = l.request_claims(&r.id).unwrap().unwrap();
+        assert_eq!((claims["reason"].as_str(), claims["region"].as_str()), (Some("a bigger build"), Some("lhr")));
     }
 
     #[tokio::test]

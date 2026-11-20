@@ -6,7 +6,7 @@
 //! the highest risk: a public name lets anyone on the internet connect to the box's port and read
 //! what it serves, an outbound channel as much as an inbound one. No agent's `decide` reaches it.
 
-use crate::grant::Granter;
+use crate::grant::{merged, refused_as as refused, Granter};
 use anyhow::{bail, Result};
 use std::time::Duration;
 use wicket_core::TenantId;
@@ -22,24 +22,9 @@ pub const WARNING: &str =
     "anyone on the internet can connect to this box's port and read whatever it serves: it is a way out for the box's data, not only a way in";
 
 fn may_decide(by: &Granter) -> Result<crate::operators::Operator> {
-    let Granter::Human(o) = by else { bail!("public names are decided by a human operator, not {}", by.label()) };
+    let o = crate::grant::human(by, "a public name")?;
     o.may_decide(&crate::operators::Asked { kind: "name".into(), host: String::new(), risk: Some(4) }).map_err(anyhow::Error::msg)?;
     Ok(o.clone())
-}
-
-fn refused(l: &Ledger, by: &Granter, id: &str, decision: &str, why: anyhow::Error) -> anyhow::Error {
-    let record = serde_json::json!({ "target": id, "decision": decision, "by": by.label(), "why": format!("{why:#}") });
-    match l.audit(&TenantId::single(), None, "decision.refused", &record) {
-        Ok(_) => why.context("refused (the refusal is on the audit record)"),
-        Err(e) => why.context(format!("refused (the refusal could not be recorded: {e})")),
-    }
-}
-
-fn merged(mut record: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
-    if let (Some(r), serde_json::Value::Object(x)) = (record.as_object_mut(), extra) {
-        r.extend(x);
-    }
-    record
 }
 
 /// The terms of an approval: for a standing name, who it is for and how long; a run-scoped one

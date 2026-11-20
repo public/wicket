@@ -1,0 +1,82 @@
+name: Pull request checks
+
+# The small checks on a pull request's own text and files, beside ci.yml's build and tests:
+# - No AI attribution: commit messages, and the pull request's title and body, carry no AI
+#   attribution (no assistant Co-Authored-By trailers, "Generated with" footers or session links):
+#   ci/no-attribution.py.
+# - Changelog fragment (#220): every fragment under changes/ parses, and a pull request that changes
+#   more than docs, CI or notes adds one, or carries the `no changelog` label.
+# Its own workflow, so editing the body or a label reruns these two, not ci.yml.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+
+permissions:
+  contents: read
+
+# A newer event for the same pull request (a push, an edit, a label) supersedes a run still going:
+# only the latest state matters, and each run reads it whole.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  attribution:
+    name: No AI attribution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: the checker's own tests
+        run: python3 -I ci/no-attribution_test.py
+      - name: commit messages
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: python3 -I ci/no-attribution.py --range "$BASE..$HEAD"
+      - name: the pull request's title and body
+        if: github.event_name == 'pull_request'
+        # Read from the event payload file, never interpolated into the script.
+        run: python3 -I ci/no-attribution.py --event "$GITHUB_EVENT_PATH"
+
+  fragment:
+    name: Changelog fragment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Reading the pull request's labels (#246).
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: the fragments tool's own tests
+        run: python3 -I ci/changelog_test.py
+      - name: fragments parse, and this pull request adds one if it needs one
+        # The `no changelog` label as the pull request has it now (#246): a run for an earlier event
+        # that finishes after the label was added (or removed) decides as the label is, not as its
+        # payload had it. If the labels can't be read, the payload's answer stands.
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PAYLOAD_NO_CHANGELOG: ${{ contains(github.event.pull_request.labels.*.name, 'no changelog') && '1' || '' }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NO_CHANGELOG=$PAYLOAD_NO_CHANGELOG
+          if [ "$EVENT" = pull_request ]; then
+            if has=$(ci/pr-has-label.sh "no changelog"); then
+              NO_CHANGELOG=$([ "$has" = true ] && echo 1 || true)
+            else
+              echo "::warning::couldn't read the pull request's labels: using the event's (no changelog: ${PAYLOAD_NO_CHANGELOG:-0})"
+            fi
+          fi
+          export NO_CHANGELOG
+          python3 -I ci/changelog.py check ${BASE:+--base "$BASE"}
