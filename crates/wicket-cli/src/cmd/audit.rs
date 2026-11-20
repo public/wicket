@@ -139,8 +139,10 @@ fn compact(yes: bool) -> Result<()> {
     if std::os::unix::net::UnixStream::connect(crate::daemon::SOCKET_PATH).is_ok() {
         bail!("wicketd is listening on {}: stop it first (sudo systemctl stop wicketd)", crate::daemon::SOCKET_PATH);
     }
-    // No reconcile pass meanwhile, on this host.
-    let _lock = crate::reconcile::Lock::take()?;
+    // No reconcile pass meanwhile, on this host: one running now is a reason to stop, not wait.
+    let Some(_lock) = crate::reconcile::Lock::try_take()? else {
+        bail!("a reconcile pass is running (it holds reconcile.lock): stop wicket-reconcile, or try again once it ends");
+    };
     let path = ledger_path();
     let dir = path.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
     // SQLite's temporary copy goes beside the ledger, not in a small /tmp. Set before any
@@ -170,17 +172,34 @@ fn compact(yes: bool) -> Result<()> {
         bail!("not compacted");
     }
     let t = std::time::Instant::now();
-    l.compact_exclusively()?;
+    // The exclusive lock is asked for without waiting: another writer (a run, a `wicket` command)
+    // refuses it at once. (Opening the ledger above waited at most its 5 s busy timeout.)
+    l.compact_exclusively().map_err(|e| {
+        anyhow::anyhow!("{e}: another process has the ledger open for writing (a run or a wicket command): stop it and try again")
+    })?;
     println!("compacted in {:.1} s: {} MB now", t.elapsed().as_secs_f64(), l.file_bytes()? / 1_000_000);
     Ok(())
 }
 
-/// Whether the process a pid file names is running.
+/// Whether the process a pid file names is running, and is wicket: a pid a stale file names may
+/// have been reused by something else since.
 fn pid_alive(pidfile: &std::path::Path) -> bool {
-    std::fs::read_to_string(pidfile)
+    std::fs::read_to_string(pidfile).ok().and_then(|s| s.trim().parse::<i32>().ok()).is_some_and(is_wicket)
+}
+
+/// Whether process `pid` runs a wicket binary: its executable's name, or failing that (another
+/// user's process, whose `exe` can't be read) its command line's first word.
+fn is_wicket(pid: i32) -> bool {
+    let named = |p: &std::path::Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("wicket"));
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        // A binary replaced by an update reads as "<path> (deleted)".
+        let exe = std::path::PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)").to_string());
+        return named(&exe);
+    }
+    std::fs::read(format!("/proc/{pid}/cmdline"))
         .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+        .and_then(|c| c.split(|b| *b == 0).next().map(|a| std::path::PathBuf::from(String::from_utf8_lossy(a).into_owned())))
+        .is_some_and(|a| named(&a))
 }
 
 /// Bytes free on the file system holding `dir`.
@@ -358,4 +377,29 @@ pub(crate) fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
         }
     }
     Ok((ok, bad))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #677 third check: a pid file names a running wicket only if the pid runs a wicket binary
+    /// (a stale file's pid may be something else's now).
+    #[test]
+    fn a_pid_counts_only_if_it_is_wickets() {
+        assert!(is_wicket(std::process::id() as i32), "this test binary is wicket_cli-…");
+        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(!is_wicket(other.id() as i32), "sleep isn't wicket");
+        let _ = other.kill();
+        let _ = other.wait();
+        let dir = std::env::temp_dir().join(format!("wicket-pid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.pid");
+        std::fs::write(&f, std::process::id().to_string()).unwrap();
+        assert!(pid_alive(&f));
+        std::fs::write(&f, "1").unwrap();
+        assert_eq!(pid_alive(&f), is_wicket(1));
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }

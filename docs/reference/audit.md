@@ -196,7 +196,10 @@ store it never prunes, however big the table.
 
 **What it keeps.** Records the host reads for itself stay: a run's Remote Control session
 (`run.remote_session`) and restores (`state.restored`). Below the anchor they aren't part of the
-verified chain; the sinks have them whole.
+verified chain; the sinks have them whole. The prune's `audit.pruned` record, which is chained,
+lists each restore it kept below the cut by seq and hash. `--verify --against` excuses a mismatch
+by a restore only if the restore is chained or listed there (with its fields still hashing to the
+listed hash), so a restore inserted below the anchor excuses nothing.
 
 **The anchor.** The checkpoint a prune cuts back to becomes the chain's anchor. The prune runs in
 steps:
@@ -225,12 +228,18 @@ anchor:
 not as mismatches.
 
 **A sink's target.** Each sink's cursor is kept with what it was made against: a file's path, a
-Collector's endpoint, the state store's bucket. If that changes under the same name, the sink
-starts again from the first record (the export status says why), rather than claiming records
-the new target never got. Each checkpoint is kept with its target too. A prune counts a sink only
-while both still match where the sink points now, checked in the prune's own transaction. If
-the state store's file doesn't read, a store sink's target can't be told: its cursor is kept and
-nothing is pruned.
+Collector's endpoint (and a hash of its headers), the state store's endpoint, bucket and prefix.
+If that changes under the same name, the sink starts again from the first record (the export
+status says why), rather than claiming records the new target never got. A cursor kept before
+targets were recorded starts again the same way. Each checkpoint is kept with the target it was
+delivered through. A prune counts a sink only while both still match where the sink points now,
+checked in the prune's own transaction. If the state store's file doesn't read, a store sink's
+target can't be told: its cursor is kept, the sink isn't fed, and nothing is pruned.
+
+Every wicket process that exports reads `audit-sinks.yaml` when it starts. When a newer process
+points a sink elsewhere, the sink's lease is freed for it. A process still running with the old
+configuration then stops feeding the sink: it can't take the lease, move the cursor or record a
+checkpoint for a target the sink has left, and its export status says to restart it.
 
 **Space.** Ledgers made by this build use SQLite's `auto_vacuum = incremental`. After each prune
 they give the freed pages back in steps of 2,000 pages (8 MB) a transaction, so the file shrinks.
@@ -248,7 +257,11 @@ sudo systemctl start wicketd wicket-console wicket-reconcile
 ```
 
 It keeps SQLite's temporary copy beside the ledger (not in `/tmp`), checks that twice the file's
-size is free there, and fails at once if anything else has the ledger open for writing.
+size is free there, and fails at once if a reconcile pass is running or anything else has the
+ledger open for writing (opening the ledger waits at most 5 seconds for a writer first).
+
+After a prune, `wicket doctor --invariants` checks only what the chain still holds: it says where
+the chain starts, and the sinks hold what came before.
 
 **Why 2 GB by default.** That is about two months of the small installation above. It's well
 within what SQLite handles quickly, and under 5% of a typical 40 to 80 GB control host disk. The

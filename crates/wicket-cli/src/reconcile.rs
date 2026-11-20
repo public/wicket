@@ -849,6 +849,23 @@ impl Lock {
         }
         Ok(Lock(f))
     }
+
+    /// [`Lock::take`] without waiting: None if another process holds it now.
+    pub fn try_take() -> Result<Option<Lock>> {
+        use std::os::fd::AsRawFd;
+        let p = crate::data_dir().join("reconcile.lock");
+        std::fs::create_dir_all(crate::data_dir())?;
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&p)?;
+        // SAFETY: flock on a file descriptor this function owns.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            return Err(e).context("locking reconcile.lock");
+        }
+        Ok(Some(Lock(f)))
+    }
 }
 
 /// Docker on an enrolled node, over its pinned ssh.

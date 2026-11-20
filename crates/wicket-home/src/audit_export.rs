@@ -355,18 +355,16 @@ pub fn retention_with(l: &Ledger, cfg: std::result::Result<&SinksConfig, &str>, 
         compact_needed: !l.auto_vacuum_incremental()?,
     };
     let (Ok(cfg), Some(synced)) = (cfg, synced_ms) else { return Ok(r) };
+    // At most PRUNE_CHUNKS deletes a pass, what an earlier pass left of its prune and a new one
+    // together: a long backlog goes over several passes, the chain verifying from the anchor
+    // throughout.
+    let mut chunks = PRUNE_CHUNKS;
     if prune {
-        // What an earlier pass left of its prune (it stops after PRUNE_CHUNKS), first.
-        for _ in 0..PRUNE_CHUNKS {
-            let n = l.prune_chunk(PRUNE_ROWS)?;
-            if n == 0 {
-                break;
-            }
-            r.pruned += n;
-        }
+        // What an earlier pass left of its prune, first.
+        prune_chunks(l, &mut chunks, &mut r)?;
     }
-    if r.usage.bytes <= limit_bytes || r.usage.rows == 0 {
-        return Ok(r);
+    if r.usage.bytes <= limit_bytes || r.usage.rows == 0 || chunks == 0 {
+        return settle(l, r);
     }
     let per_row = (r.usage.bytes / r.usage.rows).max(1);
     let keep = ((limit_bytes as f64 * PRUNE_TO) as i64 / per_row).max(1);
@@ -391,7 +389,7 @@ pub fn retention_with(l: &Ledger, cfg: std::result::Result<&SinksConfig, &str>, 
             "over its limit: waiting for a checkpoint at or before seq {target} that every durable sink ({}) has exported past and the state store has synced",
             durable.join(", ")
         ));
-        return Ok(r);
+        return settle(l, r);
     };
     if !prune {
         r.waiting = Some(format!("over its limit: the records before seq {} are due to be pruned", cp.seq));
@@ -399,19 +397,33 @@ pub fn retention_with(l: &Ledger, cfg: std::result::Result<&SinksConfig, &str>, 
     }
     // Chosen again and begun in one transaction: nothing it read (cursors, targets) changes in
     // between.
-    let Some(cp) = l.begin_prune_at(&pairs, target, synced)? else { return Ok(r) };
+    let Some(cp) = l.begin_prune_at(&pairs, target, synced)? else { return settle(l, r) };
     if cp.seq < target {
         // Short of the cut: this prune goes as far as it may, and the next goes the rest.
         l.want_checkpoint(target)?;
     }
-    // At most PRUNE_CHUNKS a pass: a long backlog goes over several passes, the chain verifying
-    // from the anchor throughout.
-    for _ in 0..PRUNE_CHUNKS {
+    prune_chunks(l, &mut chunks, &mut r)?;
+    settle(l, r)
+}
+
+/// Deletes pruned records a chunk at a time while `chunks` lasts (taking from it).
+fn prune_chunks(l: &Ledger, chunks: &mut usize, r: &mut Retention) -> Result<()> {
+    while *chunks > 0 {
+        *chunks -= 1;
         let n = l.prune_chunk(PRUNE_ROWS)?;
         if n == 0 {
             break;
         }
         r.pruned += n;
+    }
+    Ok(())
+}
+
+/// After a pass's deletes, whether it resumed an earlier prune or began one: freed pages back to
+/// the file system (a bounded number), and the figures read again.
+fn settle(l: &Ledger, mut r: Retention) -> Result<Retention> {
+    if r.pruned == 0 {
+        return Ok(r);
     }
     for _ in 0..VACUUM_STEPS {
         if l.vacuum_step(VACUUM_PAGES)? == 0 {
@@ -1195,8 +1207,10 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
     let head = l.audit_head()?.map(|h| h.0).unwrap_or(0);
     let mut newest = 0;
     // Restores that went back to an earlier point: (the last record kept, when the restore was).
+    // Only those the chain vouches for: one forged below the anchor, where nothing chains it,
+    // doesn't excuse a mismatch.
     let rollbacks: Vec<(i64, i64)> = l
-        .audit_of_kind("state.restored")?
+        .trusted_restores()?
         .iter()
         .filter_map(|r| Some((serde_json::from_str::<Value>(&r.body).ok()?["rolled_back_after"].as_i64()?, r.ts)))
         .collect();
