@@ -185,8 +185,29 @@ fn owner_failed(l: &Ledger, t: &Trigger, e: NotOwner) -> Result<Fired> {
         NotOwner::No(why) => pause_for(l, t, &format!("its owner may no longer have it fire: {why}")),
         NotOwner::Unknown(why) => {
             let why = format!("its owner couldn't be checked, so it didn't fire this time: {why}");
-            audit(l, "trigger.skipped", &json!({ "trigger": t.id, "name": t.name, "owner": t.owner, "status": "skipped", "detail": why }))?;
+            // Audited once an hour a trigger, however long the lookup keeps failing.
+            if unknown_audit_due(&t.id, wicket_store::now()) {
+                audit(
+                    l,
+                    "trigger.skipped",
+                    &json!({ "trigger": t.id, "name": t.name, "owner": t.owner, "status": "skipped", "detail": why }),
+                )?;
+            }
             Ok(Fired { trigger: t.id.clone(), name: t.name.clone(), status: "skipped".into(), detail: why })
+        }
+    }
+}
+
+/// Whether a skip for an owner that couldn't be checked is due its audit record: once an hour per
+/// trigger, in this process (the reconciler's, which runs every pass).
+fn unknown_audit_due(trigger: &str, now: i64) -> bool {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> = std::sync::OnceLock::new();
+    let mut m = LAST.get_or_init(Default::default).lock().expect("owner audits");
+    match m.get(trigger) {
+        Some(&at) if now - at < 3600 => false,
+        _ => {
+            m.insert(trigger.to_string(), now);
+            true
         }
     }
 }
@@ -659,7 +680,7 @@ fn fire(l: &Ledger, t: &Trigger, slot: i64, missed: usize, wake: Waker<'_>) -> R
         if !fresh {
             return Ok((None, None));
         }
-        fire_event(l, t, &Ev { id: event, source, at: slot, fields: fields.clone(), chain: vec![] })
+        fire_event(l, t, &Ev { id: event, source, at: slot, fields: fields.clone(), chain: Default::default() })
     })?;
     if let Some(agent) = woken {
         wake(&agent, &format!("trigger {}", t.name));
@@ -720,7 +741,7 @@ struct Ev<'a> {
     at: i64,
     fields: Value,
     /// The triggers whose firings led to it (their ids), as the turns they queued record.
-    chain: Vec<String>,
+    chain: wicket_store::TriggerChain,
 }
 
 /// Fires `t` on `ev`, inside the caller's transaction, if its filter admits it and `t` hasn't
@@ -735,17 +756,17 @@ fn fire_event(l: &Ledger, t: &Trigger, ev: &Ev<'_>) -> Result<(Option<Fired>, Op
     let record = |status: &str, detail: &str, firing: &str| {
         json!({
             "trigger": t.id, "name": t.name, "owner": t.owner, "event": event, "firing": firing,
-            "source": source, "at": fields["at"], "status": status, "detail": detail, "chain": ev.chain,
+            "source": source, "at": fields["at"], "status": status, "detail": detail, "chain": ev.chain.ids, "depth": ev.chain.depth,
         })
     };
     // A trigger never fires on what its own firing led to, however many triggers between; nor
     // past MAX_CHAIN triggers in a row.
-    let looped = ev.chain.contains(&t.id);
-    if looped || ev.chain.len() >= MAX_CHAIN {
+    let looped = ev.chain.ids.contains(&t.id);
+    if looped || ev.chain.depth >= MAX_CHAIN {
         let why = if looped {
-            format!("a loop: this event came of its own firing (through triggers {})", ev.chain.join(", "))
+            format!("a loop: this event came of its own firing (through triggers {})", ev.chain.ids.join(", "))
         } else {
-            format!("{} triggers in a row led to this event, the most allowed ({})", ev.chain.len(), ev.chain.join(", "))
+            format!("{} triggers in a row led to this event, the most allowed ({})", ev.chain.depth, ev.chain.ids.join(", "))
         };
         let (f, fresh) = l.record_firing(&t.id, event, "skipped", Some(&why))?;
         if !fresh {
@@ -778,6 +799,9 @@ fn fire_event(l: &Ledger, t: &Trigger, ev: &Ev<'_>) -> Result<(Option<Fired>, Op
         return Ok((done("skipped", why), None));
     }
     if t.spec.action.start.is_some() {
+        // When the engine (step 5) starts this run, its first turn must carry `ev.chain` (as a
+        // message's does, through `record_trigger_cause`), or a started run's records would fire
+        // the triggers that led to it again.
         let (f, fresh) = l.record_firing(&t.id, event, "queued", Some("waiting for the engine to start it"))?;
         if !fresh {
             return Ok((None, None));
@@ -887,8 +911,13 @@ pub fn wicket_event(l: &Ledger, r: &wicket_store::AuditRecord) -> Result<Option<
         Some(run) => l.run_scope(run)?,
         None => None,
     };
+    // A new run's wake comes before its runs row (M1): its agent's zone and name then, and the
+    // principal they make.
     let (zone, agent, principal) = match scope {
-        Some((z, a, p)) => (json!(z), json!(a), json!(p)),
+        Some((z, a, p)) => {
+            let p = p.unwrap_or_else(|| wicket_identity::spiffe_id(&crate::operators::trust_domain(), &r.tenant, &z, &a));
+            (json!(z), json!(a), json!(p))
+        }
         None => (Value::Null, Value::Null, Value::Null),
     };
     let agent_id = match r.run.as_deref() {
@@ -981,23 +1010,37 @@ fn wicket_pass(l: &Ledger, now: i64, dry_run: bool, wake: Waker<'_>, owner: Owne
             }
             let mut firing = vec![];
             for t in hearing {
-                let ok = *checked.entry(t.id.clone()).or_insert_with(|| match owner(&t) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        match owner_failed(l, &t, e) {
-                            Ok(f) => out.push(f),
-                            Err(e) => out.push(failed(&t, &e)),
+                if !checked.contains_key(&t.id) {
+                    match owner(&t) {
+                        Ok(()) => {
+                            checked.insert(t.id.clone(), true);
                         }
-                        false
+                        // Couldn't tell: stop before this record, so the trigger hears it on a
+                        // later pass (within EVENT_STALE_SECS) rather than losing what follows.
+                        Err(e @ NotOwner::Unknown(_)) => {
+                            match owner_failed(l, &t, e) {
+                                Ok(f) => out.push(f),
+                                Err(e) => out.push(failed(&t, &e)),
+                            }
+                            move_to(r.seq - 1)?;
+                            return Ok(out);
+                        }
+                        Err(e) => {
+                            match owner_failed(l, &t, e) {
+                                Ok(f) => out.push(f),
+                                Err(e) => out.push(failed(&t, &e)),
+                            }
+                            checked.insert(t.id.clone(), false);
+                        }
                     }
-                });
-                if ok {
+                }
+                if checked.get(&t.id) == Some(&true) {
                     firing.push(t);
                 }
             }
             let chain = match r.run.as_deref() {
                 Some(run) => l.trigger_chain(run, r.ts)?,
-                None => vec![],
+                None => Default::default(),
             };
             let delivery = format!("audit:{}", r.seq);
             // A store error here leaves the cursor before this record, for the next pass.
@@ -1076,7 +1119,7 @@ struct Delivered {
 /// hibernating (a run that hibernates with a turn waiting wakes it again, so a wake on its own
 /// queues a short turn saying so); to the agent itself when it is hibernated, which is woken for
 /// it after the transaction.
-fn deliver(l: &Ledger, t: &Trigger, fields: &Value, chain: &[String]) -> Result<Delivered> {
+fn deliver(l: &Ledger, t: &Trigger, fields: &Value, chain: &wicket_store::TriggerChain) -> Result<Delivered> {
     let a = &t.spec.action;
     let who = a.wake.as_deref().or(a.message.as_ref().map(|m| m.to.as_str())).context("the trigger wakes or messages no one")?;
     let agent = target_agent(l, t, who)?;
@@ -1116,9 +1159,7 @@ fn deliver(l: &Ledger, t: &Trigger, fields: &Value, chain: &[String]) -> Result<
         s => bail!("agent {} is {s}: it can't be woken", agent.id),
     }
     if let Some((id, _)) = &d.prompt {
-        let mut next = chain.to_vec();
-        next.push(t.id.clone());
-        l.record_trigger_cause(id, &t.id, &next)?;
+        l.record_trigger_cause(id, &t.id, chain)?;
     }
     Ok(d)
 }
@@ -1749,6 +1790,31 @@ mod tests {
         let got = pass(&l, wicket_store::now(), false, &no_wake, &gone).unwrap();
         assert_eq!(got.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(), ["paused"], "{got:?}");
         assert!(l.firings(&id, None).unwrap().is_empty());
+    }
+
+    /// Review 2: an owner that can't be checked stops the pass before the record its trigger would
+    /// hear, so nothing behind it is lost: once the check works, the trigger fires on it. A new
+    /// run's wake, recorded before its runs row, is scoped from its agent: a zone filter hears it.
+    #[test]
+    fn an_unknown_owner_holds_the_cursor_and_wakes_are_scoped() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let agent = hibernated_agent(&mut l, "captain");
+        hibernated_agent_in(&mut l, "other", "run_o");
+        assert!(pass(&l, wicket_store::now(), false, &no_wake, &anyone).unwrap().is_empty());
+        let s = spec(
+            "trigger: wakes\nsource: { wicket: { kinds: [agent.wake] } }\nfilter: { zone: rel, agent: captain }\naction: { wake: other }\n",
+        );
+        let (id, _) = create(&l, &operator(), &s, None, "test").unwrap();
+        wake_for_test(&mut l, &agent, "run_new");
+        l.audit(&TenantId::single(), Some(&wicket_core::RunId("run_new".into())), "agent.wake", &json!({ "by": "x" })).unwrap();
+        let nss = |_: &Trigger| -> std::result::Result<(), NotOwner> { Err(NotOwner::Unknown("timed out".into())) };
+        let wake_seq = l.audit_head().unwrap().unwrap().0;
+        let got = pass(&l, wicket_store::now(), false, &no_wake, &nss).unwrap();
+        assert_eq!(got.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(), ["skipped"], "{got:?}");
+        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), Some(wake_seq - 1), "held just before the record");
+        assert_eq!(l.trigger(&id).unwrap().unwrap().status, "active");
+        let got = pass(&l, wicket_store::now(), false, &no_wake, &anyone).unwrap();
+        assert_eq!(got.iter().map(|f| (f.trigger.as_str(), f.status.as_str())).collect::<Vec<_>>(), [(id.as_str(), "started")], "{got:?}");
     }
 
     /// #662 follow-ups: an owner check that can't be made (the user database didn't answer)

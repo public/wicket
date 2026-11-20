@@ -61,6 +61,34 @@ pub const TRIGGER_RETENTION_SECS: i64 = 14 * 86400;
 /// The most live triggers one owner may keep.
 pub const MAX_TRIGGERS_PER_OWNER: usize = 100;
 
+/// What led to an event, as the turns triggers queued record it (#578): every trigger in any chain
+/// that reached the run (`ids`, what a trigger may not fire again on), and the longest single chain
+/// (`depth`, what the cap counts: four unrelated schedules messaging one agent are four chains of
+/// one, not one of four).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Chain {
+    pub ids: Vec<String>,
+    pub depth: usize,
+}
+
+impl Chain {
+    /// A stored chain: `{"ids": [...], "depth": n}`, or (as the first version kept them) a list
+    /// of ids, as deep as it is long.
+    fn parse(s: &str) -> Chain {
+        match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(serde_json::Value::Array(a)) => {
+                let ids: Vec<String> = a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                Chain { depth: ids.len(), ids }
+            }
+            Ok(v) => Chain {
+                ids: v["ids"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+                depth: v["depth"].as_u64().unwrap_or(0) as usize,
+            },
+            Err(_) => Chain::default(),
+        }
+    }
+}
+
 /// A firing's states.
 pub const FIRING_STATES: &[&str] = &["queued", "started", "skipped", "failed", "dead"];
 
@@ -246,8 +274,13 @@ impl Ledger {
     /// Moves a live trigger's lapse to `until` (None: until removed). Not a change to when it
     /// fires: `updated_at` (the floor a schedule fires after) stays.
     pub fn renew_trigger(&self, id: &str, until: Option<i64>) -> Result<()> {
-        let n =
-            self.conn.execute("UPDATE triggers SET until = ?2 WHERE id = ?1 AND status NOT IN ('deleted', 'done')", params![id, until])?;
+        // A trigger that had lapsed comes back as a resumed one does: from now, not caught up on
+        // the time it was lapsed (its floor, `updated_at`, moves). A live one's floor stays.
+        let n = self.conn.execute(
+            "UPDATE triggers SET until = ?2, updated_at = CASE WHEN until IS NOT NULL AND until <= ?3 THEN ?3 ELSE updated_at END
+             WHERE id = ?1 AND status NOT IN ('deleted', 'done')",
+            params![id, until, now()],
+        )?;
         if n != 1 {
             return Err(StoreError::Refused(format!("no trigger {id}, or it is deleted")));
         }
@@ -355,31 +388,55 @@ impl Ledger {
             .is_some())
     }
 
-    /// Records the chain of triggers (ids) that queued `message`, this trigger last.
-    pub fn record_trigger_cause(&self, message: &str, trigger: &str, chain: &[String]) -> Result<()> {
+    /// Records what led to `message`, queued by `trigger`: `chain` with `trigger` added, one deeper.
+    pub fn record_trigger_cause(&self, message: &str, trigger: &str, chain: &Chain) -> Result<()> {
+        let mut next = chain.clone();
+        if !next.ids.iter().any(|t| t == trigger) {
+            next.ids.push(trigger.to_string());
+        }
+        next.depth += 1;
+        let v = serde_json::json!({ "ids": next.ids, "depth": next.depth });
         self.conn.execute(
             "INSERT OR REPLACE INTO trigger_causes (message, trigger, chain, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![message, trigger, serde_json::to_string(chain)?, now()],
+            params![message, trigger, v.to_string(), now()],
         )?;
         Ok(())
     }
 
     /// The triggers that led to what `run` did up to `at`: every trigger in the chains of the
     /// turns triggers queued for it (or for its agent, moved to it when it woke) by then, sorted.
-    pub fn trigger_chain(&self, run: &str, at: i64) -> Result<Vec<String>> {
+    pub fn trigger_chain(&self, run: &str, at: i64) -> Result<Chain> {
         let mut st = self.conn.prepare(
             "SELECT c.chain FROM trigger_causes c JOIN messages m ON m.id = c.message WHERE m.to_run = ?1 AND c.created_at <= ?2",
         )?;
         let rows = st.query_map(params![run, at], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut all: Vec<String> = rows.iter().flat_map(|c| serde_json::from_str::<Vec<String>>(c).unwrap_or_default()).collect();
-        all.sort();
-        all.dedup();
-        Ok(all)
+        let mut out = Chain::default();
+        for c in rows.iter().map(|c| Chain::parse(c)) {
+            out.ids.extend(c.ids);
+            out.depth = out.depth.max(c.depth);
+        }
+        out.ids.sort();
+        out.ids.dedup();
+        Ok(out)
     }
 
     /// Who a run is, as a trigger may filter on it: its zone, its agent's name, and its principal
-    /// (None for a run with no identity), from the ledger, not from anything the run wrote.
+    /// (None for a run with no identity), from the ledger, not from anything the run wrote. A
+    /// long-lived agent's new run is recorded (`agent.wake`) before its `runs` row exists: then
+    /// its agent's zone and name, from the agent's row (its principal is the caller's to make).
     pub fn run_scope(&self, run: &str) -> Result<Option<(String, String, Option<String>)>> {
+        if let Some(s) = self.run_row_scope(run)? {
+            return Ok(Some(s));
+        }
+        Ok(self
+            .conn
+            .query_row("SELECT a.zone, a.name FROM agent_runs r JOIN agents a ON a.id = r.agent WHERE r.run = ?1", params![run], |r| {
+                Ok((r.get(0)?, r.get(1)?, None))
+            })
+            .optional()?)
+    }
+
+    fn run_row_scope(&self, run: &str) -> Result<Option<(String, String, Option<String>)>> {
         Ok(self
             .conn
             .query_row(
@@ -726,6 +783,51 @@ mod tests {
         let b = l.create_trigger("t0", "op", &s, "x", false, None).unwrap();
         assert_eq!(l.trigger(&a).unwrap().unwrap().status, "deleted");
         assert_eq!(l.triggers("t0", None).unwrap().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [b.as_str()]);
+    }
+
+    /// A run recorded before its runs row (a long-lived agent's wake) is scoped from its agent; a
+    /// chain's cap counts the longest single chain, while every trigger in any chain stays out;
+    /// a lapsed trigger renewed starts from now, a live one's floor stays.
+    #[test]
+    fn scopes_chains_and_renewals() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        l.create_agent(&crate::NewAgent {
+            id: "agt_x",
+            tenant: "t0",
+            zone: "rel",
+            name: "captain",
+            run: "run_1",
+            session_id: "s",
+            manifest: "m",
+            image: "i",
+            workspace: None,
+            claim_until: 0,
+        })
+        .unwrap();
+        assert_eq!(l.run_scope("run_1").unwrap(), Some(("rel".into(), "captain".into(), None)), "from the agent's row");
+        assert_eq!(l.run_scope("run_none").unwrap(), None);
+        // Four chains of one (four schedules), queued for one run: depth 1, four members.
+        for (i, t) in ["t-a", "t-b", "t-c", "t-d"].iter().enumerate() {
+            let m = l.add_prompt("run_1", "hi", "trigger:x", "op").unwrap();
+            l.record_trigger_cause(&m, t, &Chain::default()).unwrap();
+            assert_eq!(l.trigger_chain("run_1", now() + 10).unwrap().ids.len(), i + 1);
+        }
+        let c = l.trigger_chain("run_1", now() + 10).unwrap();
+        assert_eq!((c.ids.len(), c.depth), (4, 1));
+        // A chain grown by one is one deeper; the first version's list form reads as deep as long.
+        let m = l.add_prompt("run_1", "hi", "trigger:x", "op").unwrap();
+        l.record_trigger_cause(&m, "t-e", &c).unwrap();
+        assert_eq!(l.trigger_chain("run_1", now() + 10).unwrap().depth, 2);
+        assert_eq!(Chain::parse(r#"["a","b","c"]"#), Chain { ids: vec!["a".into(), "b".into(), "c".into()], depth: 3 });
+        let id = l
+            .create_trigger("t0", "op", &spec("trigger: t\nsource: { timer: { after: 1h } }\naction: { wake: self }\n"), "x", false, None)
+            .unwrap();
+        l.conn.execute("UPDATE triggers SET updated_at = 100 WHERE id = ?1", params![id]).unwrap();
+        l.renew_trigger(&id, Some(now() + 3600)).unwrap();
+        assert_eq!(l.trigger(&id).unwrap().unwrap().updated_at, 100, "live: the floor stays");
+        l.conn.execute("UPDATE triggers SET until = 50 WHERE id = ?1", params![id]).unwrap();
+        l.renew_trigger(&id, Some(now() + 3600)).unwrap();
+        assert!(l.trigger(&id).unwrap().unwrap().updated_at >= now() - 5, "lapsed: from now");
     }
 
     /// Work is claimed by one live run at a time, released by it (or all of a run's at its end),

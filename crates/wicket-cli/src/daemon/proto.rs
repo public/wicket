@@ -283,7 +283,13 @@ pub fn user_as_peer(name: &str) -> Result<Option<Peer>, String> {
     gids.push(gid);
     gids.sort_unstable();
     gids.dedup();
-    let groups = gids.into_iter().map(|g| (g, group_name(g).unwrap_or_default())).collect();
+    // A group the database can't name because it failed is an error, not "no name" (a policy names
+    // groups by name: an outage would read as not being in them). `getgrouplist` itself can't
+    // report an NSS failure: it may list fewer groups, which reads as a definite no.
+    let mut groups = Vec::with_capacity(gids.len());
+    for g in gids {
+        groups.push((g, group_name_checked(g)?.unwrap_or_default()));
+    }
     Ok(Some(Peer { pid: 0, uid, gid, user: name.to_string(), groups }))
 }
 
@@ -299,6 +305,24 @@ pub fn user_name(uid: u32) -> Option<String> {
     }
     // SAFETY: pw_name is a NUL-terminated string in `buf`.
     Some(unsafe { std::ffi::CStr::from_ptr(pw.pw_name) }.to_string_lossy().into_owned())
+}
+
+/// The name of `gid` in the group database: Ok(None) if it has none, Err if the database
+/// couldn't answer.
+pub fn group_name_checked(gid: u32) -> Result<Option<String>, String> {
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 65536];
+    let mut out: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: as user_name.
+    let r = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r != 0 {
+        return Err(format!("looking up group {gid}: {}", std::io::Error::from_raw_os_error(r)));
+    }
+    if out.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: gr_name is a NUL-terminated string in `buf`.
+    Ok(Some(unsafe { std::ffi::CStr::from_ptr(gr.gr_name) }.to_string_lossy().into_owned()))
 }
 
 /// The name of `gid` in the group database.
