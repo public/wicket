@@ -164,6 +164,7 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
                 public.provider.as_str(),
                 match public.provider {
                     wicket_names::ProviderKind::Noop => " (noop: the plan is only recorded, nothing is published)",
+                    wicket_names::ProviderKind::Vultr => "",
                 }
             );
             Ok(())
