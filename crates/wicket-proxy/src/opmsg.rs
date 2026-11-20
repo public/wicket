@@ -115,6 +115,9 @@ pub struct OperatorSender<'a> {
     pub tenant: &'a TenantId,
     pub via: &'a str,
     pub name: &'a str,
+    /// What the operator signed to send it, if anything (the console's passkey assertion): kept
+    /// on the message's audit record.
+    pub signed: Option<&'a serde_json::Value>,
 }
 
 impl OperatorSender<'_> {
@@ -193,15 +196,15 @@ pub fn send_as_operator(
     let env = wicket_identity::sign_operator_envelope(&key, &doc, &payload);
     let meta = wicket_store::MessageMeta { from_principal: Some(&me), priority: opts.priority, in_reply_to: opts.in_reply_to };
     let routed = l.post_message(&id, tenant, "", to, to_run.as_deref(), &env, &meta).map_err(|e| e.to_string())?;
-    let audited = l.audit(
-        tenant,
-        None,
-        "message",
-        &json!({
-            "id": id, "kind": kind, "from": me, "to": to, "to_run": routed, "relation": relation, "bytes": size,
-            "wakes": wake, "held": routed.is_none(), "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
-        }),
-    );
+    let mut rec = json!({
+        "id": id, "kind": kind, "from": me, "to": to, "to_run": routed, "relation": relation, "bytes": size,
+        "wakes": wake, "held": routed.is_none(), "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
+        "via": op.via,
+    });
+    if let Some(s) = op.signed {
+        rec["signed"] = s.clone();
+    }
+    let audited = l.audit(tenant, None, "message", &rec);
     if let Err(e) = audited {
         let _ = l.withdraw_message(&id);
         return Err(format!("not sent: the audit record could not be written ({e})").into());

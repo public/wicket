@@ -1160,8 +1160,8 @@ mod tests {
         let t0 = TenantId("t0".into());
         let lead = w.agent("t0", "research", "lead", "run_lead", None, &[]);
         let ops = w.agent("t0", "ops", "watcher", "run_ops", None, &["spiffe://test.local/t/t0/op/unix/bob"]);
-        let alice = OperatorSender { tenant: &t0, via: "unix", name: "alice" };
-        let bob = OperatorSender { tenant: &t0, via: "unix", name: "bob" };
+        let alice = OperatorSender { tenant: &t0, via: "unix", name: "alice", signed: None };
+        let bob = OperatorSender { tenant: &t0, via: "unix", name: "bob", signed: None };
         let (alice_id, bob_id) = (alice.id(&w.issuer), bob.id(&w.issuer));
 
         // The agent writes to its operator: in alice's inbox, delivered on its receipt.
@@ -1216,7 +1216,7 @@ mod tests {
         assert!(wicket_identity::verify_any_envelope(env, &w.issuer.verifying_key(), *at).is_ok());
         // Another tenant's operator, or one of another trust domain, reaches nobody here.
         let other = TenantId("t1".into());
-        let mallory = OperatorSender { tenant: &other, via: "unix", name: "alice" };
+        let mallory = OperatorSender { tenant: &other, via: "unix", name: "alice", signed: None };
         assert!(send_as_operator(&w.ledger, &w.issuer, mallory, &id_of(&lead), "message", json!("x"), Default::default(), None).is_err());
         assert!(lead.send_message(&to("spiffe://other.domain/t/t0/op/unix/alice"), "message", json!("x")).is_err());
     }
