@@ -1,0 +1,48 @@
+# Webhook intake on a node (#578; docs/how-to/trigger-from-a-webhook.md): `wicket node intake`, as
+# its own user, `wicket-intake`, which can't read the node's keys, runs or spool. It faces the
+# internet, so it gets nothing else: no home, no devices, no privileges, a read-only system, and only
+# the network families it needs. It reaches the node's `wicket node serve` only through
+# /run/wicket-intake/intake.sock, which that `serve` checks by peer uid (node.json's intake_uid).
+#
+# Install (as root, on the node): see the how-to's "Run intake as its own user".
+[Unit]
+Description=wicket webhook intake
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=wicket-intake
+Group=wicket-intake
+# The node's wicket binary, bound read-only where this user can run it (it can't enter the wicket
+# user's home). A self update moves the link it resolves: restart this unit after one.
+BindReadOnlyPaths=/home/wicket/.local/bin/wicket:/usr/local/lib/wicket-intake/wicket
+ExecStart=/usr/local/lib/wicket-intake/wicket node intake --listen 0.0.0.0:8443 --socket /run/wicket-intake/intake.sock --tls-cert /etc/wicket-intake/cert.pem --tls-key /etc/wicket-intake/key.pem
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+ReadWritePaths=/run/wicket-intake
+MemoryMax=256M
+TasksMax=256
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

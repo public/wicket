@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 wicket-core.workspace = true
+wicket-names.workspace = true
+wicket-sources.workspace = true
 wicket-store.workspace = true
 wicket-proxy.workspace = true
 wicket-chan.workspace = true

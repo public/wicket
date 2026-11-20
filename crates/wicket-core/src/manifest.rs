@@ -375,8 +375,9 @@ impl Escalation {
 
 impl ZoneSpec {
     /// Drops the optional injections whose secret `is_set` says isn't set, and returns them (#175).
-    /// Such a rule behaves as if it weren't there: requests to its host go without the credential,
-    /// and a host with no injection left is spliced when its reach rule allows it wholesale.
+    /// Only for a node below protocol 23 (#415), which would take such a rule's host as having no
+    /// credential until its first fetch: there, requests to its host go without it for the run's
+    /// whole life, as before. A node at 23 is sent every rule, and reads the secret per request.
     pub fn drop_unset_optional_injections(&mut self, is_set: impl Fn(&str) -> bool) -> Vec<InjectRule> {
         let (dropped, kept) = std::mem::take(&mut self.inject).into_iter().partition(|i| i.optional && !is_set(&i.secret));
         self.inject = kept;
@@ -936,6 +937,10 @@ impl Manifest {
         for u in &self.zone.uses {
             crate::service::check_name(u).map_err(|e| ManifestError::Invalid(format!("zone.uses: {e}")))?;
         }
+        // An empty entry would name the zone of a sender that has none: an operator (#252 review).
+        if self.zone.accept_from.iter().any(|a| a.trim().is_empty()) {
+            return Err(ManifestError::Invalid("zone.accept_from: an entry is empty (name a zone, or a principal by its id)".into()));
+        }
         // Affinity names what this box has: a service its zone uses, a volume its zone declares.
         for a in &self.placement.affinity {
             match a.near() {
@@ -1367,6 +1372,19 @@ mod tests {
         };
         assert!(spec("a**").check_models().is_err());
         assert!(spec("a*").check_models().is_ok() && spec("ab").check_models().is_ok());
+    }
+
+    /// #252 review: an empty accept_from entry is refused (it would name an operator's empty zone).
+    #[test]
+    fn an_empty_accept_from_entry_is_refused() {
+        let m = |af: &str| {
+            Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, accept_from: {af} }}\n"))
+                .and_then(|m| m.validate().map(|_| m))
+        };
+        assert!(m("[ops]").is_ok());
+        for bad in ["['']", "[' ']", "[ops, '']"] {
+            assert!(m(bad).unwrap_err().to_string().contains("accept_from"), "{bad}");
+        }
     }
 
     /// #250: accept_from names zones (every agent in one) or principals (one agent, or an operator).

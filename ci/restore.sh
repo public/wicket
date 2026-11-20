@@ -161,7 +161,7 @@ for _ in $(seq 50); do [ -S "$nodehome/.local/share/wicket-node/ctl/ctl.sock" ] 
 check "a box runs on the enrolled node" 'hello HA'
 
 echo "== the control host: an agent's first run (hibernates after its turn)"
-timeout 240 "${HA[@]}" "$WICKET" run "$work/agent.yaml" --workdir "$work/ws" ${IMAGE:+--image "$IMAGE"} >"$work/a1.log" 2>&1 || true
+timeout 240 "${HA[@]}" "$WICKET" run "$work/agent.yaml" --workdir "$work/ws" --node local ${IMAGE:+--image "$IMAGE"} >"$work/a1.log" 2>&1 || true
 A=$(grep -o "agent agt_[a-z0-9]*" "$work/a1.log" | head -1 | cut -d" " -f2 || true)
 check "the agent hibernated" '[ -n "$A" ] && [ "$(agent_field HA "$A" state)" = hibernated ]'
 sealed=$(find "$work/s3/wicket-rst/ci/sealed" -type f 2>/dev/null | wc -l)

@@ -372,9 +372,15 @@ impl Ledger {
         Ok(self.conn.execute("UPDATE runs SET uncollected = NULL WHERE uncollected = ?1", params![node])?)
     }
 
-    /// Runs whose files node `node` (by its enrolled name) keeps uncollected, oldest first.
+    /// Runs whose files node `node` (by its enrolled name) keeps uncollected, oldest first. A run
+    /// whose files came to this host (`run_collected` `fetched` or `bundled`) isn't one, whatever a
+    /// later fetch said: a supervisor that took the run over after the fetch fetches again, and its
+    /// failure doesn't make the node hold, and bill for, work this host has (#590). A taken result
+    /// (`outbox`) or an allowed push (`pushed`) doesn't count: the files are still on the node (#324).
     pub fn uncollected_runs_on_node(&self, node: &str) -> Result<Vec<String>> {
-        let mut st = self.conn.prepare("SELECT id FROM runs WHERE uncollected = ?1 ORDER BY started_at, id")?;
+        let mut st = self
+            .conn
+            .prepare("SELECT id FROM runs WHERE uncollected = ?1 AND id NOT IN (SELECT run FROM run_collected WHERE how IN ('fetched', 'bundled')) ORDER BY started_at, id")?;
         let rows = st.query_map(params![node], |r| r.get(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }

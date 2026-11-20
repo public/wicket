@@ -22,6 +22,9 @@ pub use ed25519_dalek::{SigningKey, VerifyingKey};
 
 pub mod jws;
 pub mod node;
+mod operator;
+
+pub use operator::{sign_operator_envelope, verify_any_envelope, verify_operator, OperatorClaims, Sender, OPERATOR_TYP};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdError {
@@ -148,6 +151,10 @@ pub struct AgentClaims {
     /// parent, … down to the principal. None for an agent started directly by its principal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<Value>,
+    /// What kind of workload it is (#252, #255): `program` for a program (an agent without a
+    /// model); None for an agent, and in documents issued before kinds were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// The facts an identity document asserts, besides issuer, subject, times and key.
@@ -163,9 +170,22 @@ pub struct IdentitySpec {
     pub node: String,
     pub principal: Value,
     pub act: Option<Value>,
+    /// `program` for a program; None for an agent ([`AgentClaims::kind`]).
+    pub kind: Option<String>,
 }
 
+/// [`AgentClaims::kind`] of a program.
+pub const KIND_PROGRAM: &str = "program";
+
 impl AgentClaims {
+    /// What discovery calls this principal: `program` or `agent`.
+    pub fn workload_kind(&self) -> &str {
+        match self.kind.as_deref() {
+            Some(KIND_PROGRAM) => KIND_PROGRAM,
+            _ => "agent",
+        }
+    }
+
     /// The `act` value a child of this agent should carry: this agent, then whatever it acts for.
     pub fn act_for_child(&self) -> Value {
         let mut a = json!({ "sub": self.sub, "run": self.run });
@@ -322,6 +342,7 @@ impl Issuer {
             cnf: json!({ "jwk": { "kty": "OKP", "crv": "Ed25519", "x": B64.encode(agent.to_bytes()) } }),
             principal: spec.principal.clone(),
             act: spec.act.clone(),
+            kind: spec.kind.clone(),
         };
         jws_sign(
             &self.key,
@@ -525,11 +546,29 @@ mod tests {
             node: "local".into(),
             principal: json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}),
             act,
+            kind: None,
         }
     }
 
     fn issue(i: &Issuer, k: &AgentKey, zone: &str, agent: &str) -> String {
         i.issue(&spec(zone, agent, None), 1000, 3600, &k.public())
+    }
+
+    /// #252, #255: a program's identity says so, signed; an agent's, and older documents without
+    /// the claim, read as agents.
+    #[test]
+    fn a_programs_identity_names_its_kind() {
+        let i = Issuer::generate("test.local");
+        let mut s = spec("jobs", "nightly", None);
+        s.kind = Some(KIND_PROGRAM.into());
+        let p = verify_identity(&i.issue(&s, 1000, 600, &AgentKey::generate().public()), &i.verifying_key(), 1000).unwrap();
+        assert_eq!((p.kind.as_deref(), p.workload_kind()), (Some("program"), "program"));
+        let a = verify_identity(&issue(&i, &AgentKey::generate(), "research", "lead"), &i.verifying_key(), 1000).unwrap();
+        assert_eq!((a.kind.as_deref(), a.workload_kind()), (None, "agent"));
+        let mut old = serde_json::to_value(&p).unwrap();
+        old.as_object_mut().unwrap().remove("kind");
+        assert_eq!(serde_json::from_value::<AgentClaims>(old).unwrap().workload_kind(), "agent");
+        assert!(!serde_json::to_string(&a).unwrap().contains("\"kind\""), "an agent's document is unchanged");
     }
 
     #[test]

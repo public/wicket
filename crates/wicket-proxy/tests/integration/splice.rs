@@ -139,6 +139,7 @@ impl World {
             fence: node.is_none().then(|| wicket_proxy::Fence { agent: agent.clone(), generation: 1 }),
             waker: None,
             lifecycle: None,
+            names: None,
         };
         let mut up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), ..Default::default() };
         // Not pinned: checked like a real DNS answer (#116), and refused.

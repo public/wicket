@@ -27,14 +27,16 @@ mod lifecycle_props;
 mod links;
 mod names;
 mod services;
-pub use names::{name_effect, new_name_id, NameAsk, NameKind, NameRow, NameScope, NameTerms, MAX_PENDING_NAMES};
+pub use names::{name_effect, new_name_id, Forgot as ForgotRecords, NameAsk, NameKind, NameRow, NameScope, NameTerms, MAX_PENDING_NAMES};
 pub use services::{Instance, ServiceRow, SHARED_TENANT};
 mod nodeca;
 mod nodelabels;
+pub use nodelabels::{AddressChange, NodeAddresses};
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
-pub use placements::{Placement, RunningBox, RESERVE_SECS, WAIT_SEEN_MS};
+pub use placements::{BoxTerms, Placement, PreemptMark, RunningBox, PREEMPTED_SEEN_MS, RESERVE_SECS, WAIT_SEEN_MS};
 mod changes;
+mod inbox;
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -48,13 +50,15 @@ pub use changes::{ChangeWatch, Topic};
 mod retention;
 mod standing;
 mod triggers;
+pub use inbox::InboxMessage;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use retention::{Anchor as AuditAnchor, AuditUsage, Checkpoint as AuditCheckpoint};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
 pub use standing::{
     new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
-    Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
+    OnNode as StandingOnNode, Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS,
+    MAX_PENDING as STANDING_MAX_PENDING,
 };
 pub use triggers::{
     Chain as TriggerChain, Firing as TriggerFiring, Trigger, TriggerEvent, FIRING_STATES as TRIGGER_FIRING_STATES, MAX_TRIGGERS_PER_OWNER,
@@ -214,11 +218,27 @@ impl StoreError {
 /// starts once retention has pruned its front, which target each sink's cursor is for, and the
 /// checkpoints retention asked the exporter to sign. Older builds don't read them; a prune raises
 /// the floor to 32, so a build that would walk a pruned chain from seq 1 refuses the ledger.
+/// Version 33 (expand, after #677's 32) adds `run_terms` (#579 step 4): each box's limits, priority
+/// and whether it may be preempted, recorded at its start, which preemption chooses from. Older
+/// builds don't read it (a box they start has no terms, and is never preempted); it raises no floor.
+/// Version 34 (expand, #575 step 4b; 33 is #637's) adds `node_addresses`: each node's public
+/// addresses as its operator set them, where its boxes' public names point, and `names.domain`, the
+/// boxes domain a public name was approved under. Older builds don't read them; the floor stays 17.
+/// Version 35 (expand, #578 step 4; 33 and 34 are other features') adds `trigger_intake`: each
+/// webhook trigger's intake node and the sha256 of its URL's token. Older builds don't read it;
+/// the floor stays where it was.
 /// Version 36 (expand, after 35; 33 to 35 are #637's, #716's and #714's) adds `request_claims`
 /// (#715 review): what the agent claimed when it asked (an update's reason and commit), kept apart
 /// from the request's reason so the console can show the agent's words as the agent's. Older builds
 /// don't read it; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 36;
+/// Version 37 (expand, after 36) adds `standing_on_node` (#572): which standing rules are on
+/// their way into a run's token on its node, and which the node confirmed, so `await_grant` on a
+/// standing ask answers once the box's node can honour it. Older builds don't read it; the floor
+/// stays 17.
+/// Version 43 (expand, #748; 38 to 42 are others' in flight) adds `name_records.missing_since`:
+/// when a listing of its zone first lacked the record, so one listing alone forgets none. Older
+/// builds don't read it; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 43;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -233,13 +253,17 @@ const _: () = assert!(SCHEMA_FLOOR <= SCHEMA_VERSION);
 /// `messages.kind` (#253): a peer's message (pulled with `await_message`, signed by its sender),
 /// an operator's prompt, or a notice from wicket (each pushed as the agent's next turn).
 pub const KIND_MESSAGE: &str = "message";
+/// A message an operator signed (#252): delivered as a peer's message is, but a kind of its own, so
+/// a previous build (whose queries read `kind = 'message'` and verify only agents' envelopes)
+/// leaves it alone rather than taking it and refusing it ([`previous_build`]).
+pub const KIND_OPERATOR_MESSAGE: &str = "operator-message";
 pub const KIND_PROMPT: &str = "prompt";
 pub const KIND_NOTICE: &str = "notice";
 /// Who a notice is from, as shown.
 pub const NOTICE_LABEL: &str = "wicket";
 /// The SQL condition for a row that is a turn (a prompt or a notice), and for a peer's message.
 pub(crate) const TURNS: &str = "kind IN ('prompt', 'notice')";
-pub(crate) const PEER: &str = "kind = 'message'";
+pub(crate) const PEER: &str = "kind IN ('message', 'operator-message')";
 
 /// A prompt or notice taken for a run: its message id, text, who it shows as, and the operator's
 /// principal id (None for a notice, and for prompts recorded before #253).
@@ -626,6 +650,7 @@ impl Ledger {
         conn.execute_batch(triggers::SCHEMA)?;
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
+        names::migrate(&conn)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -684,6 +709,7 @@ impl Ledger {
         conn.execute_batch(triggers::SCHEMA)?;
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
+        names::migrate(&conn)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
@@ -758,6 +784,8 @@ impl Ledger {
         self.close_links_of(&run.0)?;
         // And its names (#575): run-scoped ones end, standing ones wait for the next run.
         self.release_run_names(run)?;
+        // And where its standing rules were on their way to its node (#572).
+        self.conn.execute("DELETE FROM standing_on_node WHERE run = ?1", params![run.0])?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
             "UPDATE leases SET status = 'withdrawn', detail = 'its run ended before a decision', ended_at = ?2 WHERE run = ?1 AND status = 'pending'",
@@ -1235,8 +1263,8 @@ impl Ledger {
                 .optional()?,
         };
         tx.execute(
-            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 tenant.0,
@@ -1247,7 +1275,8 @@ impl Ledger {
                 to,
                 meta.from_principal,
                 meta.priority.as_str(),
-                meta.in_reply_to
+                meta.in_reply_to,
+                if meta.operator { KIND_OPERATOR_MESSAGE } else { KIND_MESSAGE }
             ],
         )?;
         tx.commit()?;
@@ -1328,7 +1357,7 @@ impl Ledger {
     /// `run` (already read, or someone else's).
     pub fn message_read(&self, run: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE messages SET delivered_at = ?3 WHERE id = ?1 AND to_run = ?2 AND kind = 'message' AND delivered_at IS NULL",
+            &format!("UPDATE messages SET delivered_at = ?3 WHERE id = ?1 AND to_run = ?2 AND {PEER} AND delivered_at IS NULL"),
             params![id, run, now()],
         )?;
         Ok(n == 1)
@@ -1339,7 +1368,7 @@ impl Ledger {
     /// has had. How many.
     pub fn requeue_in_flight(&self, run: &str) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE messages SET taken_at = NULL WHERE to_run = ?1 AND kind = 'message' AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            &format!("UPDATE messages SET taken_at = NULL WHERE to_run = ?1 AND {PEER} AND delivered_at IS NULL AND taken_at IS NOT NULL"),
             params![run],
         )?)
     }
@@ -1348,7 +1377,7 @@ impl Ledger {
     /// node (the link dropped first). False if it wasn't in flight for `run`.
     pub fn requeue_message(&self, run: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE messages SET taken_at = NULL WHERE id = ?1 AND to_run = ?2 AND kind = 'message' AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            &format!("UPDATE messages SET taken_at = NULL WHERE id = ?1 AND to_run = ?2 AND {PEER} AND delivered_at IS NULL AND taken_at IS NOT NULL"),
             params![id, run],
         )?;
         Ok(n == 1)
@@ -1356,7 +1385,7 @@ impl Ledger {
 
     /// Every stored envelope (id, envelope, created_at), for offline verification.
     pub fn envelopes(&self) -> Result<Vec<(String, String, i64)>> {
-        let mut st = self.conn.prepare("SELECT id, envelope, created_at FROM messages WHERE kind = 'message' ORDER BY created_at")?;
+        let mut st = self.conn.prepare(&format!("SELECT id, envelope, created_at FROM messages WHERE {PEER} ORDER BY created_at"))?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -1839,6 +1868,15 @@ impl Ledger {
         Ok(self
             .conn
             .query_row("SELECT body FROM audit WHERE run = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1", params![run, kind], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The body of the newest audit record of `kind` that names no run (an installation's own,
+    /// such as the names reconciler's `name.plan`), if any.
+    pub fn audit_latest_unscoped(&self, kind: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT body FROM audit WHERE run IS NULL AND kind = ?1 ORDER BY seq DESC LIMIT 1", params![kind], |r| r.get(0))
             .optional()?)
     }
 
@@ -2407,6 +2445,66 @@ mod node_tests {
             hosts: vec!["api.example.com".into()],
             status: "active".into(),
         }
+    }
+
+    /// #575: a node's public addresses are its operator's to set, public ones only, audited.
+    #[test]
+    fn a_nodes_public_addresses() {
+        use crate::{AddressChange as A, NodeAddresses};
+        let mut l = Ledger::open_in_memory().unwrap();
+        let (v4, v6): (std::net::Ipv4Addr, std::net::Ipv6Addr) = ("1.1.1.1".parse().unwrap(), "2a00::1".parse().unwrap());
+        assert!(
+            matches!(l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("not enrolled"))
+        );
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "01")).unwrap();
+        assert!(l.node_addresses("n1").unwrap().is_empty());
+        for private in ["10.0.0.1", "127.0.0.1", "203.0.113.7", "100.64.0.1"] {
+            assert!(
+                matches!(l.set_node_addresses("n1", A::Set(private.parse().unwrap()), A::Keep, "ann"), Err(StoreError::Refused(_))),
+                "{private}"
+            );
+        }
+        assert!(l.set_node_addresses("n1", A::Keep, A::Set("fd00::1".parse().unwrap()), "ann").is_err());
+        assert_eq!(l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann").unwrap(), NodeAddresses { ipv4: Some(v4), ipv6: None });
+        assert_eq!(l.set_node_addresses("n1", A::Keep, A::Set(v6), "ann").unwrap(), NodeAddresses { ipv4: Some(v4), ipv6: Some(v6) });
+        assert_eq!(l.set_node_addresses("n1", A::Clear, A::Keep, "ann").unwrap(), NodeAddresses { ipv4: None, ipv6: Some(v6) });
+        assert_eq!(l.node_addresses("n1").unwrap(), NodeAddresses { ipv4: None, ipv6: Some(v6) });
+        // Each change is on the record; one that changes nothing isn't.
+        l.set_node_addresses("n1", A::Keep, A::Set(v6), "ann").unwrap();
+        let rec = l.audit_of_kind("node.addresses").unwrap();
+        assert_eq!(rec.len(), 3);
+        let last: serde_json::Value = serde_json::from_str(&rec[2].body).unwrap();
+        assert_eq!(
+            (last["ipv4"].clone(), last["was_ipv4"].as_str(), last["by"].as_str()),
+            (serde_json::Value::Null, Some("1.1.1.1"), Some("ann"))
+        );
+    }
+
+    /// #716 review, F2 and F4: a node's addresses go with its enrolment, a revoked node gets none,
+    /// and no two active nodes share one.
+    #[test]
+    fn node_addresses_follow_the_enrolment_and_are_one_nodes() {
+        use crate::AddressChange as A;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let v4: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
+        for (n, serial) in [("n1", "01"), ("n2", "02")] {
+            let t = l.create_node_token(&TenantId::single(), n, 3600).unwrap();
+            l.enrol_node(&t, &node(n), &ca(n, serial)).unwrap();
+        }
+        l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann").unwrap();
+        assert!(
+            matches!(l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("n1")),
+            "another active node has it"
+        );
+        l.revoke_node("n1").unwrap();
+        assert!(l.node_addresses("n1").unwrap().is_empty(), "revoked: no address");
+        assert!(matches!(l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("not active")));
+        // n1's address is free for n2 now, and a machine enrolled again as n1 starts with none.
+        l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann").unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "03")).unwrap();
+        assert!(l.node_addresses("n1").unwrap().is_empty());
     }
 
     #[test]

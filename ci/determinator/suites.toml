@@ -32,6 +32,18 @@ paths = [
 packages = ["wicket-policy", "wicket-policy-diff"]
 paths = ["examples/policy/**", "ci/policy-diff.sh"]
 
+# The cheap checks that read only a few files (#219): each runs when one of those changes, and in
+# every full run (the nightly run, a push to main without a green base, full-ci).
+[suite.deny]
+packages = []
+# Every manifest too: deny.toml forbids wildcard versions, and the licences are in the manifests.
+paths = ["**/Cargo.toml", "**/Cargo.lock", "deny.toml"]
+
+[suite.dep-age]
+packages = []
+# Every lockfile, as ci/dep-age.py checks every one (a new lockfile included).
+paths = ["**/Cargo.lock", "**/package-lock.json", "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml"]
+
 [suite.lean]
 packages = ["wicket-authz"]
 paths = ["ci/lean.sh"]

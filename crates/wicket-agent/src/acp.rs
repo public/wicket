@@ -94,7 +94,8 @@ pub struct ClaudeAdapterSettings {
 }
 
 /// The installation settings file (`wicket.yaml`): `/etc/wicket/wicket.yaml` (root's, like the
-/// daemon's policy), or `$WICKET_CONFIG` (development and tests). Its one section is this adapter's.
+/// daemon's policy), or `$WICKET_CONFIG` (development and tests). Its sections are this adapter's
+/// (`acp`) and box names' (`names`, #575).
 pub const SETTINGS_PATH: &str = "/etc/wicket/wicket.yaml";
 
 /// Where the installation settings are read from.
@@ -107,20 +108,40 @@ pub fn settings_path() -> std::path::PathBuf {
 struct InstallationSettings {
     #[serde(default)]
     acp: ClaudeAdapterSettings,
+    #[serde(default)]
+    names: wicket_names::NamesConfig,
 }
 
-/// The adapter's installation settings from `p`. A missing or empty file means every default; a
-/// file that can't be read or parsed is an error (it stops the run), so a setting meant to allow
-/// something never silently allows it, nor the reverse.
-pub fn load_settings(p: &std::path::Path) -> Result<ClaudeAdapterSettings, String> {
+/// The whole settings file at `p`. A missing or empty file means every default; a file that can't
+/// be read or parsed is an error (it stops the run), so a setting meant to allow something never
+/// silently allows it, nor the reverse.
+fn load_installation(p: &std::path::Path) -> Result<InstallationSettings, String> {
     match std::fs::read_to_string(p) {
-        Ok(s) if s.trim().is_empty() => Ok(ClaudeAdapterSettings::default()),
-        Ok(s) => wicket_core::yaml::from_str::<InstallationSettings>(&s)
-            .map(|i| i.acp)
-            .map_err(|e| format!("the installation settings {}: {e}", p.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClaudeAdapterSettings::default()),
+        Ok(s) if s.trim().is_empty() => Ok(InstallationSettings::default()),
+        Ok(s) => {
+            wicket_core::yaml::from_str::<InstallationSettings>(&s).map_err(|e| format!("the installation settings {}: {e}", p.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(InstallationSettings::default()),
         Err(e) => Err(format!("reading the installation settings {}: {e}", p.display())),
     }
+}
+
+/// The adapter's installation settings from `p` ([`load_installation`]).
+pub fn load_settings(p: &std::path::Path) -> Result<ClaudeAdapterSettings, String> {
+    load_installation(p).map(|i| i.acp)
+}
+
+/// The installation's `names:` settings from `p` (#575), checked: one that can't work is an error,
+/// as an unreadable file is.
+pub fn load_names(p: &std::path::Path) -> Result<wicket_names::NamesConfig, String> {
+    let n = load_installation(p)?.names;
+    n.check().map_err(|e| format!("the installation settings {}: {e}", p.display()))?;
+    Ok(n)
+}
+
+/// [`load_names`] from [`settings_path`].
+pub fn names_settings() -> Result<wicket_names::NamesConfig, String> {
+    load_names(&settings_path())
 }
 
 /// Refuses, at run start, a manifest that the installation's settings ([`settings_path`]) don't
@@ -816,6 +837,20 @@ mod tests {
         assert!(read(Some("acp:\n  allow_subscription_backed_claude_adapter: true\n")).unwrap().allow_subscription_backed_claude_adapter);
         assert!(read(Some("acp:\n  allow_subscription_backed_claude_adaptor: true\n")).is_err(), "a misspelt key is an error, not a no");
         assert!(read(Some("acp: yes\n")).is_err());
+        // The names section (#575) sits beside it, read and checked on its own.
+        let names = |body: &str| {
+            std::fs::write(&f, body).unwrap();
+            load_names(&f)
+        };
+        let both = "acp:\n  allow_subscription_backed_claude_adapter: true\nnames:\n  internal: { per_workload: 5 }\n  public:\n    provider: noop\n    zone: boxes.example.com\n    owner: a1b2c3d4\n    reserved: [status]\n    ports: 21000-21099\n";
+        assert!(read(Some(both)).unwrap().allow_subscription_backed_claude_adapter);
+        let n = names(both).unwrap();
+        assert_eq!((n.internal.per_workload, n.public.as_ref().unwrap().ports), (5, wicket_names::PortRange(21000, 21099)));
+        assert_eq!(names("acp: {}\n").unwrap(), wicket_names::NamesConfig::default());
+        assert!(names("names:\n  public: { provider: noop, zone: boxes.example.com, owner: xyz }\n").unwrap_err().contains("owner"));
+        assert!(names("names:\n  pubic: {}\n").is_err(), "a misspelt key");
+        let _ = std::fs::remove_file(&f);
+        assert_eq!(load_names(&f).unwrap(), wicket_names::NamesConfig::default());
         let _ = std::fs::remove_dir_all(d);
     }
     use super::*;

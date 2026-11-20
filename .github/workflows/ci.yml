@@ -2,8 +2,9 @@ name: CI
 
 on:
   pull_request:
-    # `labeled`: adding the full-ci label runs everything (#218).
-    types: [opened, synchronize, reopened, labeled]
+    # `labeled`: adding the full-ci label runs everything (#218). `ready_for_review`: a draft runs
+    # the fast checks only, and marking it ready runs the heavy suites too.
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
   push:
     branches: [main]
   # GitHub's merge queue (#220): each queued PR is tested on top of the latest main, and of the PRs
@@ -17,8 +18,11 @@ on:
 permissions:
   contents: read
 
+# One group per pull request and one for main's pushes; the nightly full run has a group of its own.
+# A group holds one running and one pending run, and a newer pending one replaces the older: the
+# nightly run, waiting behind a push to main, would otherwise be replaced by the next push.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -27,17 +31,20 @@ env:
 
 jobs:
   # #218: what a pull request can affect (ci/determinator: guppy's determinator with its rules.toml,
-  # and suites.toml): its crates and their reverse dependencies, and the end-to-end suites. Pushes to
-  # main, the merge queue, the nightly run and a PR labelled full-ci select everything. Every job
-  # below runs in full when this job fails or says nothing: an empty output means run.
+  # and suites.toml): its crates and their reverse dependencies, and the end-to-end suites. A push to
+  # main selects what changed since the last green run of main (its pull request tested its own change;
+  # this tests what merged since, together), or everything if there is none.
+  # The merge queue, the nightly run and a PR labelled full-ci select everything. Every job below
+  # runs in full when this job fails or says nothing: an empty output means run.
   select:
     name: What this change can affect
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    # Reading the pull request's labels (#246).
+    # Reading the pull request's labels (#246), and main's earlier runs.
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     outputs:
       crates: ${{ steps.select.outputs.crates }}
       all_crates: ${{ steps.select.outputs.all_crates }}
@@ -48,6 +55,9 @@ jobs:
       suites: ${{ steps.select.outputs.suites }}
       fuzz: ${{ steps.select.outputs.fuzz }}
       fuzz_matrix: ${{ steps.select.outputs.fuzz_matrix }}
+      # `false` for a draft pull request: the heavy suites (fuzz, Lean, TLA+, Kani, gVisor) wait
+      # until it is marked ready. Empty, as every output here, means run.
+      heavy: ${{ steps.draft.outputs.heavy }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -59,6 +69,24 @@ jobs:
           # select-tests saves this cache (its build has what `cargo run` needs).
           shared-key: select
           save-if: false
+      - id: draft
+        name: Draft or ready
+        # A draft runs the fast checks only, unless it has the full-ci label (read from the API as
+        # the selection reads it, #246): then everything, as for any pull request with the label.
+        env:
+          DRAFT: ${{ github.event.pull_request.draft }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$DRAFT" = true ]; then
+            if [ "$(ci/pr-has-label.sh full-ci 2>/dev/null || true)" = true ]; then
+              echo "a draft with the full-ci label: everything" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "heavy=false" >>"$GITHUB_OUTPUT"
+              echo "a draft: the fast checks only; marking it ready for review (or the full-ci label) runs the heavy suites" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
       - id: select
         name: Select
         # The full-ci label as the pull request has it now, from the API (#246), not as this event's
@@ -70,14 +98,27 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           affected() { cargo run -q --locked --manifest-path ci/determinator/Cargo.toml -- "$@"; }
+          # The commit of main's newest successful run of this workflow (a push's or the nightly
+          # run's) before this one, if it is an ancestor of this commit: what is known green.
+          last_green() {
+            local sha
+            sha=$(curl -sSf --max-time 30 -H "authorization: Bearer $GH_TOKEN" -H 'accept: application/vnd.github+json' \
+              "https://api.github.com/repos/$GH_REPO/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" |
+              jq -r --argjson me "$RUN_ID" '[.workflow_runs[] | select(.id != $me and (.event == "push" or .event == "schedule"))][0].head_sha // empty') || return 1
+            [ -n "$sha" ] && git merge-base --is-ancestor "$sha" HEAD && echo "$sha"
+          }
           FULL=
           if [ "$EVENT" = pull_request ]; then
             FULL=$(ci/pr-has-label.sh full-ci) || FULL="unknown (the labels couldn't be read)"
           fi
           if [ "$EVENT" = pull_request ] && [ "$FULL" = false ]; then
             affected --base "origin/$BASE" --github-output "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = push ] && green=$(last_green); then
+            echo "what changed since the last green run of main, at $green"
+            affected --base "$green" --github-output "$GITHUB_OUTPUT"
           else
             echo "the full set ($EVENT; full-ci label: ${FULL:-n/a})"
             affected --files /dev/null --github-output "$GITHUB_OUTPUT"
@@ -119,6 +160,8 @@ jobs:
         run: cargo test --locked --manifest-path ci/determinator/Cargo.toml
       - name: The label check's own test
         run: ci/pr-has-label_test.sh
+      - name: The verdict waits for every job
+        run: ci/verdict-needs.sh
 
   # The repository is public: no secrets or details of real machines, in any commit.
   public:
@@ -150,12 +193,14 @@ jobs:
           # Every commit reachable from the one under test (not other branches, which have their own runs).
           ./gitleaks git --redact --no-banner --log-opts="HEAD" --config .gitleaks.toml .
 
-  # Supply chain (#326): cargo deny (deny.toml) on every pull request, push and nightly run:
-  # RustSec advisories (vulnerable, unsound or yanked crates), licences, banned crates and sources.
-  # Nightly too, so an advisory published against an unchanged lockfile is seen. Duplicate
-  # versions are reported, not failed (#219).
+  # Supply chain (#326): cargo deny (deny.toml): RustSec advisories (vulnerable, unsound or yanked
+  # crates), licences, banned crates and sources. When Cargo.lock or deny.toml changes (the `deny`
+  # suite, #219), and in every full run, so nightly an advisory published against an unchanged
+  # lockfile is seen. Duplicate versions are reported, not failed (#219).
   deny:
     name: Supply chain (cargo deny)
+    needs: select
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' deny ')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -176,10 +221,12 @@ jobs:
 
   # Dependency cooldown (design §2, principle 21): every crates.io or npm version a change adds to a
   # lockfile was published at least 7 days ago, or ci/dep-age-exceptions.toml lists it with the
-  # actively exploited vulnerability it fixes. Pull requests and the merge queue (a push has no base).
+  # actively exploited vulnerability it fixes. Pull requests and the merge queue (a push has no base),
+  # when a lockfile or the check changes (the `dep-age` suite, #219).
   dep-age:
     name: Dependency cooldown (7 days)
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    needs: select
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' dep-age ')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -257,8 +304,8 @@ jobs:
         if: ${{ steps.pkgs.outputs.doc_args != '' }}
         run: cargo test ${{ steps.pkgs.outputs.doc_args }} --locked --doc
 
-  # #323: the fuzz targets a change selects (ci/determinator/suites.toml's fuzz targets; none selected
-  # says `none`, no selection says nothing: every target), 60 s each. In groups of up to three, one
+  # #323: the fuzz targets, in the nightly run only (#219: pull requests, pushes and the merge queue
+  # run no fuzz jobs; the nightly run's selection is every target), 60 s each. In groups of up to three, one
   # job each (#462): a group's targets share its build, and a full run's jobs fit the runners it
   # gets at once; the corpora are replayed once, in a job of their own. Coverage only (no ASan): the optimized build that also
   # fits a 4 GiB box. The jobs share the nightly run's build cache (fuzz.yml, the same job id and
@@ -267,7 +314,7 @@ jobs:
   fuzz-replay:
     name: Fuzz corpora and past findings (stable)
     needs: select
-    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' }}
+    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' && needs.select.outputs.heavy != 'false' && github.event_name == 'schedule' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -285,7 +332,7 @@ jobs:
     # the matrix exists leaves no check named after an unexpanded expression.
     name: Fuzz targets
     needs: select
-    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' && needs.select.outputs.fuzz_matrix != '[]' }}
+    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' && needs.select.outputs.fuzz_matrix != '[]' && needs.select.outputs.heavy != 'false' && github.event_name == 'schedule' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -322,7 +369,7 @@ jobs:
   fuzz:
     name: Fuzz (short)
     needs: [select, fuzz-replay, fuzz-target]
-    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' }}
+    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' && needs.select.outputs.heavy != 'false' && github.event_name == 'schedule' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -388,6 +435,9 @@ jobs:
   # change touches: narrows or widens. A solver timeout or `unknown` fails.
   policy:
     name: SymCC policy diffs
+    # When an org policy, the policy crates or the script change (the `policy` suite, #219).
+    needs: select
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' policy ')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -408,7 +458,7 @@ jobs:
   lean:
     name: Lean spec and oracle
     needs: select
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' lean ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' lean ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -429,7 +479,7 @@ jobs:
   tla-shard:
     name: TLA+ models (TLC) ${{ matrix.shard }}/2
     needs: select
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -445,7 +495,7 @@ jobs:
   tla:
     name: TLA+ models (TLC)
     needs: [select, tla-shard]
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -466,7 +516,7 @@ jobs:
   kani-shard:
     name: Kani proofs and loom ${{ matrix.shard }}/4
     needs: select
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -500,7 +550,7 @@ jobs:
   kani:
     name: Kani proofs and loom
     needs: [select, kani-shard]
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -543,7 +593,7 @@ jobs:
     name: gVisor smoke test
     needs: select
     # Any of its suites selected (or no selection: everything).
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') || contains(needs.select.outputs.suites, ' hibernate ') || contains(needs.select.outputs.suites, ' restore ') || contains(needs.select.outputs.suites, ' services ') || contains(needs.select.outputs.suites, ' daemon-uids ') || contains(needs.select.outputs.suites, ' install-test ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') || contains(needs.select.outputs.suites, ' hibernate ') || contains(needs.select.outputs.suites, ' restore ') || contains(needs.select.outputs.suites, ' services ') || contains(needs.select.outputs.suites, ' daemon-uids ') || contains(needs.select.outputs.suites, ' install-test ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -591,7 +641,7 @@ jobs:
   acceptance:
     name: gVisor acceptance
     needs: select
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' acceptance ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' acceptance ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -603,3 +653,33 @@ jobs:
         run: target/debug/wicket image
       - name: Acceptance
         run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:poc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh
+
+  # The one check a merge waits for (#219): every job above passed or was skipped by the selection,
+  # and the run is a full one. A draft's run, which leaves the heavy suites out, fails here, so only
+  # a ready head's run (what it runs today) can pass. A job added to this workflow goes in `needs`.
+  verdict:
+    name: CI verdict (full)
+    needs: [select, select-tests, public, deny, dep-age, rust, fuzz-replay, fuzz-target, fuzz, session-view, policy, lean, tla-shard, tla, kani-shard, kani, simulation, smoke, acceptance]
+    # Not for a run that was cancelled (a newer push superseded it): its verdict is skipped, which
+    # doesn't pass either.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed or was not selected, in a full run
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          HEAVY: ${{ needs.select.outputs.heavy }}
+        run: |
+          set -euo pipefail
+          bad=$(jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | "\(.key): \(.value.result)"' <<<"$NEEDS")
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -n "$bad" ]; then
+            echo "::error::not every job passed: $(tr '\n' ' ' <<<"$bad")"
+            exit 1
+          fi
+          if [ "$HEAVY" = false ]; then
+            echo "::error::a draft's run leaves out the heavy suites: mark the pull request ready for review for a full verdict"
+            exit 1
+          fi
+          echo "verdict: pass" | tee -a "$GITHUB_STEP_SUMMARY"

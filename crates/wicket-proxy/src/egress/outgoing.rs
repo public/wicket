@@ -4,33 +4,53 @@
 
 use super::*;
 
+/// What became of an inject rule's credential on a request (#415).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Injection {
+    /// The request carried it.
+    Carried,
+    /// The request went without it: an optional rule whose secret isn't set.
+    Skipped,
+    /// The request was refused for want of it: a required rule's secret isn't set, can't be had, or
+    /// isn't bound to the host.
+    Failed,
+}
+
 impl Egress {
-    /// Whether the zone injects a credential into requests for `host`, or swaps one in.
+    /// Whether the zone injects a credential into requests for `host`, or swaps one in. What the
+    /// zone declares, whether or not its secret is set now (#415): it may be set while the run lasts.
     pub(super) fn credentials_for(&self, host: &str) -> bool {
-        self.ctx.zone.inject.iter().any(|r| host_matches(&r.host, host) && !self.unset_optional(r))
-            || self.ctx.swaps.iter().any(|s| host_matches(&s.host, host))
+        self.ctx.zone.inject.iter().any(|r| host_matches(&r.host, host)) || self.ctx.swaps.iter().any(|s| host_matches(&s.host, host))
     }
 
-    /// Whether `rule` is optional and its secret isn't in the vault: then it is skipped, as if the
-    /// zone didn't have it (#175). The run drops such rules from its zone at start; this covers a
-    /// secret removed while the run lasts. Noted in the audit log once per rule, not per request.
-    pub(super) fn unset_optional(&self, rule: &wicket_core::manifest::InjectRule) -> bool {
-        if !rule.optional || self.ctx.vault.has(&rule.secret) {
-            return false;
+    /// Notes what became of `rule`'s credential on a request for its host (#415). The secret is read
+    /// at each request, so one set, rotated or removed while the run lasts is used, or left out, from
+    /// the next. Audited when that changes, not per request: the first request left without it
+    /// (`inject.skipped`, the request going without it, #175; `inject.unavailable`, the request
+    /// failing), and the first carrying it again (`inject.available`).
+    pub(super) fn note_injection(&self, rule: &wicket_core::manifest::InjectRule, now: Injection, why: &str) {
+        let before = self.carried.lock().expect("carried").insert(format!("{}\n{}", rule.host, rule.secret), now);
+        let kind = match (before, now) {
+            (Some(b), n) if b == n => return,
+            (None, Injection::Carried) => return,
+            (_, Injection::Carried) => "inject.available",
+            (_, Injection::Skipped) => "inject.skipped",
+            (_, Injection::Failed) => "inject.unavailable",
+        };
+        let why = match (before, now) {
+            (_, Injection::Carried) => "its secret is set".to_string(),
+            (Some(Injection::Carried), _) => format!("its secret was removed or is unusable: {why}"),
+            _ => why.to_string(),
+        };
+        tracing::info!(host = %rule.host, secret = %rule.secret, %why, "{kind}");
+        if let Ok(l) = self.ctx.ledger.lock() {
+            let _ = l.audit_deferred(
+                &self.ctx.tenant,
+                Some(&self.ctx.run),
+                kind,
+                &serde_json::json!({ "host": rule.host, "secret": rule.secret, "optional": rule.optional, "why": why }),
+            );
         }
-        let first = self.skipped.lock().expect("skipped").insert(format!("{}\n{}", rule.host, rule.secret));
-        if first {
-            tracing::info!(host = %rule.host, secret = %rule.secret, "optional secret not set: requests go without it");
-            if let Ok(l) = self.ctx.ledger.lock() {
-                let _ = l.audit_deferred(
-                    &self.ctx.tenant,
-                    Some(&self.ctx.run),
-                    "inject.skipped",
-                    &serde_json::json!({ "host": rule.host, "secret": rule.secret, "why": "optional secret not set" }),
-                );
-            }
-        }
-        true
     }
 
     pub(crate) async fn forward<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
@@ -233,8 +253,14 @@ impl Egress {
         // Inject the zone's credential for this host into its one declared slot. An optional rule
         // whose secret isn't set sends the request without it (e.g. anonymous reads).
         let mut injected: Vec<String> = Vec::new();
+        // No credential ever goes over plain HTTP (#129), whatever the check before the decision found
+        // (#415: a node that took an optional rule as no credential would have let it through).
+        let cleartext = |what: &str| anyhow::anyhow!("refused: wicket never sends {what} for {host} over plain HTTP; use https://{host}/");
         for rule in &self.ctx.zone.inject {
             if host_matches(&rule.host, host) {
+                if scheme != "https" {
+                    return Err(cleartext("a credential"));
+                }
                 // The org policy may refuse a credential the zone names (#51): the request is refused.
                 if let Some(org) = &self.ctx.org {
                     let key = format!("{}|{}|{}", rule.host.to_ascii_lowercase(), rule.header, rule.secret);
@@ -247,24 +273,37 @@ impl Egress {
                         );
                     }
                 }
-                // On a node, the secret is fetched from the control host on its first use (#152). A
-                // required rule fails if it can't be had; an optional one falls through to the check below.
+                // The secret is looked up now, not at the run's start (#415): on a node it is fetched
+                // from the control host on its first use (#152), and again once that says it changed.
+                // A required rule fails if it can't be had; an optional one falls through to the check below.
                 if let Err(e) = self.ctx.vault.ensure(&rule.secret).await {
                     if !rule.optional {
+                        self.note_injection(rule, Injection::Failed, &e.to_string());
                         return Err(e);
                     }
                 }
                 // An optional rule whose secret isn't set (after any fetch) is as if it weren't there (#175).
-                if self.unset_optional(rule) {
+                if rule.optional && !self.ctx.vault.has(&rule.secret) {
+                    self.note_injection(rule, Injection::Skipped, "optional secret not set");
                     continue;
                 }
                 // Whatever the zone says, a secret goes only to the hosts it is bound to in the vault.
-                self.ctx.vault.check(&rule.secret, host)?;
+                if let Err(e) = self.ctx.vault.check(&rule.secret, host) {
+                    self.note_injection(rule, Injection::Failed, &e.to_string());
+                    return Err(e);
+                }
                 let secret = match self.ctx.vault.get(&rule.secret) {
                     Ok(s) => s,
-                    Err(_) if rule.optional => break,
-                    Err(e) => return Err(e),
+                    Err(e) if rule.optional => {
+                        self.note_injection(rule, Injection::Skipped, &e.to_string());
+                        break;
+                    }
+                    Err(e) => {
+                        self.note_injection(rule, Injection::Failed, &e.to_string());
+                        return Err(e);
+                    }
                 };
+                self.note_injection(rule, Injection::Carried, "");
                 let value = render_credential(&rule.format, &secret);
                 headers.insert(http::HeaderName::from_bytes(rule.header.as_bytes())?, http::HeaderValue::from_str(&value)?);
                 injected.push(secret);
@@ -276,6 +315,7 @@ impl Egress {
             if let Some(auth) = &box_auth {
                 let presented = auth.strip_prefix("Bearer ").unwrap_or("");
                 match self.ctx.swaps.iter().find(|s| host_matches(&s.host, host) && !presented.is_empty() && s.placeholder == presented) {
+                    Some(_) if scheme != "https" => return Err(cleartext("a swapped credential")),
                     Some(sw) => {
                         // On a node, the credential is fetched from the control host on its first use
                         // (#257), as an injected one is.
