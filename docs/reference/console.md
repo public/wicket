@@ -333,7 +333,12 @@ when `state-store.yaml` or `audit-sinks.yaml` exists. `wicket top` shows the sam
 - The console reads all of this every 3 seconds in the background, whether or not notifications are
   on, and the page shows what it last read: a request never waits on Litestream.
 
-The data is under `health.state_store` in `/api/state`: `stream`, `audit` and `errors`.
+The data is under `health.state_store` in `/api/state`:
+- `stream`, `audit` and `errors`: what the last read found;
+- `read_ms`: when that read was (Unix ms), or null before the first;
+- `stale`: true once the last read is more than 30 seconds old;
+- `not_read_yet`: true when the console has run for more than 30 seconds without a first read;
+- `alerts`: the texts of the alerts the section raises, as listed above its rows.
 
 ## Notifications
 

@@ -1839,10 +1839,11 @@ fn spawn_notifier(state: Arc<State>) {
     tokio::spawn(async move {
         let mut n = push::Notifier::default();
         let mut h = push::HealthNotifier::default();
+        let mut known = Vec::new();
         loop {
             tokio::time::sleep(NOTIFY_EVERY).await;
             notify_once(&state, &mut n, wicket_store::now()).await;
-            notify_health(&state, &mut h, wicket_feed::now_ms()).await;
+            notify_health(&state, &mut h, &mut known, wicket_feed::now_ms()).await;
         }
     });
 }
@@ -1879,7 +1880,11 @@ fn health_view(state: &State, now_ms: i64) -> Result<(Value, Vec<crate::health::
     let mut nodes = Vec::new();
     match state.ledger() {
         Ok(l) => {
-            for (node, received_ms, j) in l.node_health()? {
+            let reports = l.node_health().unwrap_or_else(|e| {
+                tracing::warn!("health: reading node reports: {e:#}");
+                vec![]
+            });
+            for (node, received_ms, j) in reports {
                 let Ok(h) = serde_json::from_str::<crate::health::NodeHealth>(&j) else { continue };
                 let mine = crate::health::alerts(&node, &h, now_ms);
                 nodes.push(json!({
@@ -1922,22 +1927,41 @@ fn state_store_view(state: &State, now_ms: i64) -> (Value, Vec<crate::health::Al
     (v, mine)
 }
 
-/// Pushes health alerts (nodes, #377; the state store, #635) as they appear, to devices of passkeys still enrolled.
-async fn notify_health(state: &State, h: &mut push::HealthNotifier, now_ms: i64) -> Vec<(String, u16)> {
+/// Pushes health alerts (nodes, #377; the state store, #635) as they appear, to devices of passkeys
+/// still enrolled. `known` keeps the passkeys of the last read of the ledger: with the ledger gone
+/// (one way the state store's reads stop), its alerts still reach the devices enrolled then.
+async fn notify_health(state: &State, h: &mut push::HealthNotifier, known: &mut Vec<String>, now_ms: i64) -> Vec<(String, u16)> {
     let Some(p) = &state.push else { return Vec::new() };
-    let (alerts, creds) = match (health_view(state, now_ms), creds(state)) {
-        (Ok((_, a)), Ok(c)) => (a, c),
-        (Err(e), _) | (_, Err(e)) => {
-            tracing::warn!("health notifier: reading the ledger: {e:#}");
+    let alerts = match health_view(state, now_ms) {
+        Ok((_, a)) => a,
+        Err(e) => {
+            tracing::warn!("health notifier: {e:#}");
             return Vec::new();
         }
     };
-    let subs: Vec<push::Subscription> = p.store.all().into_iter().filter(|s| creds.iter().any(|c| c.id == s.operator)).collect();
+    match creds(state) {
+        Ok(c) => *known = c.into_iter().map(|c| c.id).collect(),
+        Err(e) => tracing::warn!("health notifier: reading the passkeys (using the last {} known): {e:#}", known.len()),
+    }
+    let subs: Vec<push::Subscription> = p.store.all().into_iter().filter(|s| known.contains(&s.operator)).collect();
     p.deliver(h.tick(&alerts, &subs), wicket_store::now()).await
 }
 
 fn dashboard(state: &State) -> Result<Value> {
-    let l = state.ledger()?;
+    let l = match state.ledger() {
+        Ok(l) => l,
+        // Sessions are in the ledger, so a page rarely gets here with it gone; when it does (it
+        // went between the session's check and this), the health section still says what it can.
+        Err(e) => {
+            tracing::warn!("dashboard: reading the ledger: {e:#}");
+            return Ok(json!({
+                "now": wicket_store::now(), "tenant": state.tenant.0, "ledger_error": "the ledger can't be read",
+                "pending": [], "decided": [], "runs": [], "manifests": list_manifests(state), "secrets": secrets::view(state),
+                "passkeys": [], "placed": [], "health": health_view(state, wicket_feed::now_ms())?.0, "capacity": [],
+                "standing": { "asks": [], "rules": [] }, "audit": [],
+            }));
+        }
+    };
     let t = &state.tenant;
     let audit: Vec<Value> = l
         .audit_tail(40)?

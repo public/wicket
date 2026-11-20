@@ -190,11 +190,11 @@ pub fn status_of(s: &StateStore, db: &Path, now_ms: i64) -> Result<StreamStatus>
         Ok(v) => v,
         Err(e) => {
             if st.error.is_none() || log.error_ms < log.started_ms {
-                let what = match e.downcast_ref::<NoAnswer>() {
-                    Some(_) => "Litestream isn't answering",
-                    None => "Litestream isn't running",
+                let said = match e.downcast_ref::<NoAnswer>() {
+                    Some(n) => format!("Litestream isn't answering: {n}"),
+                    None => format!("Litestream isn't running (its control socket: {e:#})"),
                 };
-                st.error = Some(wicket_core::text::redact_urls(&format!("{what} (its control socket: {e:#})")));
+                st.error = Some(wicket_core::text::redact_urls(&said));
                 st.error_ms = None;
             }
             return Ok(st);
@@ -274,31 +274,44 @@ fn ask_within(sock: &Path, path: &str, deadline: Duration) -> Result<serde_json:
     if !asking().lock().unwrap_or_else(|e| e.into_inner()).insert(sock.to_path_buf()) {
         return Err(NoAnswer("Litestream hasn't answered an earlier question on its control socket yet".into()).into());
     }
+    // Takes `sock` out of [`asking`] however the question ends, a panic included.
+    struct Asked(PathBuf);
+    impl Drop for Asked {
+        fn drop(&mut self) {
+            asking().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        }
+    }
+    let asked = Asked(sock.to_path_buf());
     let (tx, rx) = std::sync::mpsc::channel();
     let (sock, path) = (sock.to_path_buf(), path.to_string());
+    // The thread's own timeouts are the deadline: a question left waiting ends about when it is
+    // given up on.
     let spawned = std::thread::Builder::new().name("litestream-ask".into()).spawn(move || {
-        let r = ask_now(&sock, &path);
-        asking().lock().unwrap_or_else(|e| e.into_inner()).remove(&sock);
-        let _ = tx.send(r);
+        let _asked = asked;
+        let _ = tx.send(ask_now(&sock, &path, deadline));
     });
     if let Err(e) = spawned {
-        // No thread: nothing is waiting on the socket.
-        asking().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        return Err(e.into());
+        return Err(e.into()); // the closure, and `asked` with it, was dropped
     }
-    rx.recv_timeout(deadline).unwrap_or_else(|_| {
-        Err(NoAnswer(format!("Litestream didn't answer on its control socket within {} s", deadline.as_secs_f32())).into())
-    })
+    rx.recv_timeout(deadline).unwrap_or_else(|_| Err(no_answer(deadline)))
 }
 
-fn ask_now(sock: &Path, path: &str) -> Result<serde_json::Value> {
+fn no_answer(deadline: Duration) -> anyhow::Error {
+    NoAnswer(format!("Litestream didn't answer on its control socket within {} s", deadline.as_secs_f32())).into()
+}
+
+fn ask_now(sock: &Path, path: &str, deadline: Duration) -> Result<serde_json::Value> {
     let mut s = std::os::unix::net::UnixStream::connect(sock).with_context(|| format!("{}", sock.display()))?;
-    s.set_read_timeout(Some(Duration::from_secs(2)))?;
-    s.set_write_timeout(Some(Duration::from_secs(2)))?;
+    s.set_read_timeout(Some(deadline))?;
+    s.set_write_timeout(Some(deadline))?;
+    let timed_out = |e: &std::io::Error| matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut);
     // HTTP/1.0: the reply is the whole body, then the connection closes (no chunking).
-    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: litestream\r\n\r\n").as_bytes())?;
     let mut resp = Vec::new();
-    s.take(1 << 20).read_to_end(&mut resp)?;
+    let asked = s.write_all(format!("GET {path} HTTP/1.0\r\nHost: litestream\r\n\r\n").as_bytes());
+    match asked.and_then(|_| s.take(1 << 20).read_to_end(&mut resp)) {
+        Err(e) if timed_out(&e) => return Err(no_answer(deadline)),
+        r => r?,
+    };
     let resp = String::from_utf8_lossy(&resp);
     let (head, body) = resp.split_once("\r\n\r\n").context("Litestream's reply has no body")?;
     let status = head.lines().next().unwrap_or("");
@@ -777,6 +790,25 @@ mod tests {
         let gone = std::time::Instant::now();
         while asking().lock().unwrap().contains(&sock) {
             assert!(gone.elapsed() < Duration::from_secs(5), "the waiting question never ended");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A Litestream that takes the connection and never replies reads as not answering, not as
+    /// not running.
+    #[test]
+    fn a_litestream_that_doesnt_reply_isnt_answering() {
+        let d = Dir::new();
+        let db = d.0.join("ledger.db");
+        let _held = std::os::unix::net::UnixListener::bind(socket_path(&db)).unwrap();
+        let st = status_of(&store(), &db, 1_763_200_000_000).unwrap();
+        assert_eq!(st.state, StreamState::Stopped);
+        let e = st.error.unwrap();
+        assert_eq!(e, "Litestream isn't answering: Litestream didn't answer on its control socket within 3 s", "{e}");
+        // The question's own read timed out at the deadline too: nothing is left waiting for long.
+        let t = std::time::Instant::now();
+        while asking().lock().unwrap().contains(&socket_path(&db)) {
+            assert!(t.elapsed() < Duration::from_secs(2), "the question left waiting outlived the deadline");
             std::thread::sleep(Duration::from_millis(20));
         }
     }
