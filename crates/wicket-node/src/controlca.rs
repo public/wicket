@@ -249,8 +249,10 @@ impl CaRenewal {
                     .filter(|w| added.iter().any(|a| **a == w.host))
                     .map(|w| serde_json::json!({ "host": w.host, "run": w.run, "why": w.why }))
                     .collect();
+                // Under the node's tenant, so its view shows only its own (#762 review).
+                let tenant = l.node(node).ok().flatten().map(|n| TenantId(n.tenant)).unwrap_or_else(TenantId::single);
                 l.audit(
-                    &TenantId::single(),
+                    &tenant,
                     None,
                     "node.ca_widened",
                     &serde_json::json!({ "name": node, "ca_serial": cert.serial, "added": added, "removed": removed, "wanted_by": by }),

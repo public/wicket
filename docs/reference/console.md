@@ -291,6 +291,11 @@ that stays a signed action.
   whether `org.cedar` still matches what was applied (a hand edit refuses every mint), every kept
   version with when and by whom it was applied, and each running run with the version it was minted
   under: current, older, or revoked by a later `wicket policy apply`.
+- **A node's CA** (`GET /api/nodes/<node>/ca`, #573): the hosts its active CA is constrained to and
+  those it was enrolled with, how it may be widened at runtime, what live runs want of it and whether
+  its CA covers each, what the next renewal signs, and its last 20 widenings (`node.ca_widened`). The
+  same view as `wicket node ca <node> --json`. Another tenant's node is not found. The policy itself is
+  set on the host (`wicket node set --ca-hosts`).
 - **Applying an org policy** (#712): `POST /api/policy/preview` with `cedar`, `entities` and
   `keep_runs` (at most 60 KiB together) shows what `wicket policy apply --dry-run` prints: its
   version and its sources' sha256, the one it replaces, what it changes against the applied policy
