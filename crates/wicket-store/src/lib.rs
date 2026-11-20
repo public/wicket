@@ -34,7 +34,7 @@ mod nodelabels;
 pub use nodelabels::{AddressChange, NodeAddresses};
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
-pub use placements::{Placement, RunningBox, RESERVE_SECS, WAIT_SEEN_MS};
+pub use placements::{BoxTerms, Placement, PreemptMark, RunningBox, PREEMPTED_SEEN_MS, RESERVE_SECS, WAIT_SEEN_MS};
 mod changes;
 pub mod money;
 mod node;
@@ -221,6 +221,9 @@ impl StoreError {
 /// starts once retention has pruned its front, which target each sink's cursor is for, and the
 /// checkpoints retention asked the exporter to sign. Older builds don't read them; a prune raises
 /// the floor to 32, so a build that would walk a pruned chain from seq 1 refuses the ledger.
+/// Version 33 (expand, after #677's 32) adds `run_terms` (#579 step 4): each box's limits, priority
+/// and whether it may be preempted, recorded at its start, which preemption chooses from. Older
+/// builds don't read it (a box they start has no terms, and is never preempted); it raises no floor.
 /// Version 34 (expand, #575 step 4b; 33 is #637's) adds `node_addresses`: each node's public
 /// addresses as its operator set them, where its boxes' public names point, and `names.domain`, the
 /// boxes domain a public name was approved under. Older builds don't read them; the floor stays 17.
@@ -1859,6 +1862,15 @@ impl Ledger {
         Ok(self
             .conn
             .query_row("SELECT body FROM audit WHERE run = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1", params![run, kind], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The body of the newest audit record of `kind` that names no run (an installation's own,
+    /// such as the names reconciler's `name.plan`), if any.
+    pub fn audit_latest_unscoped(&self, kind: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT body FROM audit WHERE run IS NULL AND kind = ?1 ORDER BY seq DESC LIMIT 1", params![kind], |r| r.get(0))
             .optional()?)
     }
 
