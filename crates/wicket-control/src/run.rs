@@ -212,18 +212,29 @@ fn save_timings(dir: &Path, t: &wicket_core::timing::Timings) -> Result<()> {
     let p = dir.join("ctl/run.json");
     let Some(mut r) = read_json::<RunRecord>(&p) else { return Ok(()) };
     r.timings = t.spans();
-    write_json(&p, &r)
+    write_json_durable(&p, &r)
 }
 
 pub(crate) fn write_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
+    write_json_as(p, v, false)
+}
+
+/// [`write_json`], synced to the disk with its directory: for the records fencing reads (#676), the
+/// run record and the failed takeovers, which a crash mustn't leave truncated or lose.
+pub(crate) fn write_json_durable<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
+    write_json_as(p, v, true)
+}
+
+fn write_json_as<T: serde::Serialize>(p: &Path, v: &T, durable: bool) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = p.with_extension("json.new");
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
     std::io::Write::write_all(&mut f, &serde_json::to_vec(v)?)?;
-    // Durably (#676): a crash mustn't leave a truncated run record, which fencing reads.
-    f.sync_all()?;
+    if durable {
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, p)?;
-    if let Some(dir) = p.parent() {
+    if let (true, Some(dir)) = (durable, p.parent()) {
         std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
@@ -1183,7 +1194,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     let lap = std::time::Instant::now();
     // What another supervisor needs to take this run over (#151).
     if record.is_none() {
-        write_json(
+        write_json_durable(
             &dir.join("ctl/run.json"),
             &RunRecord {
                 manifest: text.clone(),
@@ -1409,9 +1420,17 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
             };
         }
         let nb = nb?;
-        // A takeover that has its box clears its run's failed ones (#676).
+        // A takeover that has its box, and still holds it one backoff interval later, clears its
+        // run's failed ones (#676). One that loses it before then (this process ends) counts on.
         if record.is_some() {
-            attach_recovered(&ledger.lock().expect("ledger"), &m.tenant, &run.0, &dir);
+            let held = known_attach_failures(&ledger.lock().expect("ledger"), &run.0, &dir).map(|f| attach_backoff_secs(f.count));
+            if let Some(secs) = held {
+                let (ledger, tenant, run, dir) = (ledger.clone(), m.tenant.clone(), run.0.clone(), dir.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(secs.unsigned_abs())).await;
+                    attach_recovered(&ledger.lock().expect("ledger"), &tenant, &run, &dir);
+                });
+            }
         }
         timings.since("box_start", box_lap);
         // #579 step 3: a per-node service offers its port, under its name, to the boxes that use it;
@@ -1426,7 +1445,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
             if let Some(mut r) = read_json::<RunRecord>(&dir.join("ctl/run.json")) {
                 if r.image_digest.as_deref() != Some(d.as_str()) {
                     r.image_digest = Some(d.clone());
-                    write_json(&dir.join("ctl/run.json"), &r)?;
+                    write_json_durable(&dir.join("ctl/run.json"), &r)?;
                 }
             }
             if nb.image_digest.is_some() {
@@ -2727,13 +2746,14 @@ pub fn known_attach_failures(l: &Ledger, run: &str, run_dir: &Path) -> Option<At
 pub fn record_attach_failure(l: &Ledger, run: &str, run_dir: &Path, why: &str, at: i64) -> (AttachFailures, bool) {
     let before = known_attach_failures(l, run, run_dir).unwrap_or_default();
     let now = AttachFailures { count: before.count.saturating_add(1), last_at: at, why: why.to_string() };
-    let written = write_json(&attach_file(run_dir), &now).is_ok();
+    let written = write_json_durable(&attach_file(run_dir), &now).is_ok();
     let audit = before.why != why || (!written && at >= before.last_at.saturating_add(attach_backoff_secs(before.count)));
     (now, audit)
 }
 
-/// A takeover of `run` (in `run_dir`) has its box (#676): its failed ones, if any, are cleared and
-/// audited as over (`run.attach_recovered`), so the reconciler no longer backs off from it.
+/// A takeover of `run` (in `run_dir`) has held its box for one backoff interval (#676): its failed
+/// ones, if any, are cleared and audited as over (`run.attach_recovered`), so the reconciler no
+/// longer backs off from it.
 fn attach_recovered(l: &Ledger, tenant: &wicket_core::TenantId, run: &str, run_dir: &Path) {
     if let Some(f) = known_attach_failures(l, run, run_dir) {
         let _ = std::fs::remove_file(attach_file(run_dir));
@@ -2757,36 +2777,46 @@ pub fn attach_failed(run: &str, e: &anyhow::Error) {
         return;
     }
     if let Ok(l) = Ledger::open(&ledger_path()) {
-        if l.run_status(run).ok().flatten().as_deref() == Some("running") {
-            let tenant = l.run_tenant(run).ok().flatten().unwrap_or_else(wicket_core::TenantId::single);
-            let clipped = wicket_agent::clip(&why, 300);
-            // Its box may still run on its node (#676: a manifest a later version no longer loads
-            // fails the takeover, not the box): not ended while fenced, or the ledger's fence on
-            // its agent would lift with the box still running. The reconciler tries again, backing
-            // off, and stops the box through its node after MAX_ATTACH_FAILURES.
-            if let Some((node, until)) = crate::noderun::fenced_until(&l, run, wicket_feed::now_ms()) {
-                let dir = data_dir().join("runs").join(run);
-                let (failures, audit) = record_attach_failure(&l, run, &dir, &clipped, wicket_store::now());
-                if audit {
-                    let fenced = match until {
-                        crate::noderun::UNKNOWN_END => "until the node confirms the box stopped".to_string(),
-                        u => crate::noderun::fmt_ms(u),
-                    };
-                    let _ = l.audit(
-                        &tenant,
-                        Some(&RunId(run.to_string())),
-                        "run.attach_failed",
-                        &serde_json::json!({ "why": clipped, "node": node, "fenced": fenced, "failures": failures.count }),
-                    );
-                }
-                return;
-            }
-            let reason = format!("its supervisor is gone and it could not be taken over: {clipped}");
-            // And its agent, if it was the agent's activation (#474).
-            let _ = l.run_lost(run, &reason);
-            let _ = l.audit(&tenant, Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
-        }
+        attach_failed_in(&l, run, &data_dir().join("runs").join(run), &why, wicket_feed::now_ms());
     }
+}
+
+/// [`attach_failed`] with the ledger `l` and the run's directory `run_dir`, at `now_ms`.
+fn attach_failed_in(l: &Ledger, run: &str, run_dir: &Path, why: &str, now_ms: i64) {
+    if l.run_status(run).ok().flatten().as_deref() != Some("running") {
+        return;
+    }
+    let tenant = l.run_tenant(run).ok().flatten().unwrap_or_else(wicket_core::TenantId::single);
+    let clipped = wicket_agent::clip(why, 300);
+    // Its box may still run on its node (#676: a manifest a later version no longer loads fails the
+    // takeover, not the box; a standby restored from the state store has no run record to take it
+    // over from, #154): not ended while held, or the ledger's fence on its agent would lift with
+    // the box still running. The reconciler tries again, backing off, and stops the box through its
+    // node after MAX_ATTACH_FAILURES.
+    let cap_ms = l.run_authority(run).ok().flatten().map(|(_, cap)| cap.saturating_mul(1000));
+    let fenced = crate::noderun::fenced_in(run_dir, now_ms, cap_ms);
+    if let Some(h) = crate::noderun::held_until(l, run, now_ms, fenced, crate::noderun::has_run_record(run_dir)) {
+        let (failures, audit) = record_attach_failure(l, run, run_dir, &clipped, now_ms / 1000);
+        if audit {
+            let _ = l.audit(
+                &tenant,
+                Some(&RunId(run.to_string())),
+                "run.attach_failed",
+                &serde_json::json!({
+                    "why": clipped,
+                    "node": h.node,
+                    "fenced": crate::noderun::held_for(h.until_ms),
+                    "held_by": if h.by_ledger { "ledger" } else { "run records" },
+                    "failures": failures.count,
+                }),
+            );
+        }
+        return;
+    }
+    let reason = format!("its supervisor is gone and it could not be taken over: {clipped}");
+    // And its agent, if it was the agent's activation (#474).
+    let _ = l.run_lost(run, &reason);
+    let _ = l.audit(&tenant, Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
 }
 
 /// Starts a new supervisor for `run` (`wicket attach <run>`), detached, its output in
@@ -2939,6 +2969,8 @@ fn same_remote_session(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
+    use super::*;
+
     /// #676: failed takeovers are counted across tries, a new reason is told apart from a repeat
     /// (the audit records only a change), and the wait between tries doubles from a minute to at
     /// most an hour. A record that can't be written is carried by the audit instead, once per wait;
@@ -2988,7 +3020,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    use super::*;
+    /// #676, #154: a takeover that fails for a run this host has no record of (a standby restored
+    /// from the state store) leaves it running while the ledger has its box authorized, so the
+    /// ledger's fence on its agent stays; past that, or with no authority recorded, it is lost.
+    #[test]
+    fn a_failed_takeover_with_no_run_record_is_held_by_the_ledger() {
+        let d = std::env::temp_dir().join(format!("wicket-attach-norecord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        let l = Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId::single();
+        for run in ["run_held", "run_bare"] {
+            l.run_started(&t, &RunId(run.into()), "z", "a").unwrap();
+            l.set_run_node(run, "n1").unwrap();
+        }
+        let now = wicket_store::now();
+        l.set_run_authority("run_held", now + 60, now + 600).unwrap();
+        let ms = now * 1000;
+        attach_failed_in(&l, "run_held", &d, "run run_held has no record to re-attach from", ms);
+        assert_eq!(l.run_status("run_held").unwrap().as_deref(), Some("running"), "held by the ledger's cap");
+        let (_, _, body) = l.last_run_audit("run_held", &["run.attach_failed"]).unwrap().unwrap();
+        assert_eq!((body["held_by"].as_str(), body["node"].as_str(), body["failures"].as_u64()), (Some("ledger"), Some("n1"), Some(1)));
+        // Past the cap, 1 s and the skew: lost.
+        attach_failed_in(&l, "run_held", &d, "run run_held has no record to re-attach from", (now + 600 + 31) * 1000);
+        assert_eq!(l.run_status("run_held").unwrap().as_deref(), Some("lost"));
+        // No authority recorded at all: lost at once.
+        attach_failed_in(&l, "run_bare", &d, "no record", ms);
+        assert_eq!(l.run_status("run_bare").unwrap().as_deref(), Some("lost"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn a_woken_remote_session_is_the_same_one_whichever_form_its_id_takes() {

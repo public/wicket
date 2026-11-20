@@ -255,9 +255,10 @@ reconciler only once its Docker no longer lists it after the kill. A run with no
 host (a standby restored from the state store, #154) is held by the ledger instead: the agent's
 fence (`Ledger::agent_fenced_until`) and, on a node that can't be asked, or a lease that ends while
 its node's boxes can't be listed, the hard end of its box's authority plus the same skew
-(`reconcile.rs` `may_still_run`, `runs.authority_cap`: a standby's copy may lag a renewal). So the
-model's `Lost` doesn't come before the authority end the code can tell, except where root released a
-fence it couldn't.
+(`noderun::held_until`, `runs.authority_cap`: a standby's copy may lag a renewal). A takeover that
+fails holds by the same rule (`run.rs` `attach_failed`), so it never loses a run whose box may still
+run; nor does a lease end whose kill didn't stop its box. So the model's `Lost` doesn't come before
+the authority end the code can tell, except where root released a fence it couldn't.
 
 Every switch is now the code (#444, #445, #446, #453, #474), so `RunLifecycle.cfg` is main, and each
 `fail_lifecycle_*` variant is the code before one fix. `NoMessageTwice` holds in every variant: with
