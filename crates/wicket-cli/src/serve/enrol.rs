@@ -28,7 +28,10 @@ const MIN_TTL: u64 = 60;
 
 /// `enrol_link`, at begin: what the passkey will sign.
 pub(super) fn build(state: &State, oc: &OperatorCredential, body: &Value) -> Result<(Action, Value), Reply> {
-    let ttl_secs = body.get("ttl_secs").and_then(Value::as_u64).unwrap_or(DEFAULT_TTL);
+    let ttl_secs = match body.get("ttl_secs") {
+        None | Some(Value::Null) => DEFAULT_TTL,
+        Some(v) => v.as_u64().ok_or_else(|| err(StatusCode::BAD_REQUEST, "ttl_secs is a whole number of seconds"))?,
+    };
     if !(MIN_TTL..=MAX_TTL).contains(&ttl_secs) {
         return Err(err(StatusCode::BAD_REQUEST, format!("an enrolment link lasts {MIN_TTL} to {MAX_TTL} seconds")));
     }
@@ -55,14 +58,19 @@ pub(super) fn apply(state: &State, l: &Ledger, oc: &OperatorCredential, ttl_secs
 }
 
 /// The name a passkey enrolled with link `link` takes: for a console link, its maker's (refused if
-/// the maker's passkey is no longer enrolled); for a host link, what the new device asked for.
+/// the maker's passkey is no longer enrolled); for a host link, what the new device asked for. A
+/// link with no record enrols nothing. A refusal is audited (`operator.enrol_failed`).
 pub(super) fn enrolled_name(state: &State, l: &Ledger, link: &str, asked: &str) -> Result<(String, Option<String>), Reply> {
-    let by = l.enrol_link_by(&state.tenant, link).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let Some(cred) = by.as_deref().and_then(|b| b.strip_prefix(CONSOLE_LINK)) else { return Ok((asked.to_string(), None)) };
+    let refuse = |why: &str| {
+        let _ = l.audit(&state.tenant, None, "operator.enrol_failed", &json!({ "link": &link[..16.min(link.len())], "reason": why }));
+        err(StatusCode::FORBIDDEN, why)
+    };
+    let Some(by) = l.enrol_link_by(&state.tenant, link).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))? else {
+        return Err(refuse("this enrolment link has no record, so it enrols nothing"));
+    };
+    let Some(cred) = by.strip_prefix(CONSOLE_LINK) else { return Ok((asked.to_string(), None)) };
     match super::creds(state).unwrap_or_default().into_iter().find(|c| c.id == cred) {
         Some(maker) => Ok((maker.name, Some(maker.id))),
-        None => {
-            Err(err(StatusCode::FORBIDDEN, "the passkey that made this enrolment link is no longer enrolled, so the link enrols nothing"))
-        }
+        None => Err(refuse("the passkey that made this enrolment link is no longer enrolled, so the link enrols nothing")),
     }
 }

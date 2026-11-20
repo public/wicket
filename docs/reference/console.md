@@ -18,7 +18,13 @@ It uses **passkeys**:
   signed assertion, never the token). The passkey it enrols takes its maker's name, whatever name the new
   device asks for: it is the same operator, with the same authority in
   [`operators.yaml`](configuration.md#operatorsyaml), never more. A link whose maker's passkey was revoked
-  before it was used enrols nothing. A signed-in session can't register a passkey itself;
+  before it was used enrols nothing, and neither does a link with no record: the refusal is audited
+  (`operator.enrol_failed`) and the link's session ends. **Add a device** in the passkeys card makes
+  one and shows it there until it expires; `ttl_secs` is a whole number of seconds. A signed-in
+  session can't register a passkey itself;
+- **every action is signed by the session's own passkey**: the challenge offers only it, and a
+  signature by any other enrolled passkey is refused (403) and audited (`operator.action_refused`),
+  whatever the action;
 - sign-in is a passkey with user verification;
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision
   (request, method, host, path, decision, uses, lifetime). The server checks it, uses it once, and stores the

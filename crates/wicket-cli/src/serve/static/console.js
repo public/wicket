@@ -245,6 +245,9 @@ function describe(a) {
     (a.fenced_until_ms ? "until " + whenMs(a.fenced_until_ms) : "until its node confirms the box stopped") +
     ": its agent can be woken while its box may still be running there \u00b7 " + s(a.why) + " \u00b7 reason: " + s(a.reason) +
     (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
+  // #711: a link for another device of the operator's, as the same passkey operator.
+  if (a.action === "enrol_link") return "Make a one-time link that enrols another device as " + s(a.name) + " (" + s(a.enrols_as) + ", the same operator and authority)\n" +
+    "It works once, for " + Math.round((a.ttl_secs || 0) / 60) + " minutes, and is shown only now. Open it on the new device.";
   if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
@@ -326,7 +329,7 @@ async function openSheet(body, extra) {
     clearInterval(expiryTimer);
     state.textContent = "Waiting for your passkey\u2026";
     announce(state.textContent);
-    try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
+    try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); if (j.link) showEnrolLink(j); }
     catch (e) { toastError(e, null, true); }
     closeConfirm();
   };
@@ -1242,13 +1245,24 @@ function renderStart(s) {
   box.append(sel, hosts, task, b, el("div", "meta", "The run's principal is you (this passkey), not the host user."));
 }
 
+// #711: the enrolment link a signed enrol_link returned, shown in the passkeys card until it expires
+// (it lives only in this page: reloading drops it).
+let enrolLink = null;
+function showEnrolLink(j) { enrolLink = { link: String(j.link), until: Date.now() + (Number(j.expires_in_secs) || 0) * 1000 }; }
 function renderOperator(s) {
   const box = document.getElementById("operator"); box.replaceChildren();
   for (const k of s.passkeys) { const d = el("div", "row"); d.append(el("span", "", "passkey: " + strip(k.name)), el("span", "mono", String(k.id).slice(0, 16) + "…")); box.append(d); }
   const b = el("div", "buttons");
   const out = el("button", "", "Sign out"); out.onclick = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
-  b.append(out); box.append(b);
-  box.append(codeText("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device.", ["wicket operator enrol-link"]));
+  const add = el("button", "", "Add a device"); add.onclick = () => signed({ action: "enrol_link" });
+  b.append(add, out); box.append(b);
+  if (enrolLink && enrolLink.until > Date.now()) {
+    const d = el("div", "callout");
+    d.append(el("div", "", "Open this on the new device (once, until " + new Date(enrolLink.until).toLocaleTimeString() + "):"),
+      el("code", "block", enrolLink.link), copyButton(enrolLink.link));
+    box.append(d);
+  } else enrolLink = null;
+  box.append(codeText("div", "note", "Adding a device makes a one-time link, signed with your passkey; the new device is you, with your authority. Or on the host: `wicket operator enrol-link`.", ["wicket operator enrol-link"]));
 }
 
 // ---- notifications (Web Push) ----

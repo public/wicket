@@ -840,6 +840,23 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(ids.fenced.textContent.startsWith("None: no agent's box is held"), ids.fenced.textContent);
   console.log("console fenced runs: ok");
 
+  // #711: Add a device signs an enrol_link; the sheet says who the device is enrolled as, and the
+  // link the server returns is shown once in the passkeys card.
+  state = { ...base, pending: [], passkeys: [{ id: "cred-1", name: "laptop" }] };
+  await run("refresh()"); await flush();
+  await advance(1000);
+  assert.ok(!ids.operator.textContent.includes("run `wicket operator enrol-link` on the host and open"), ids.operator.textContent);
+  nextAction = { v: 1, action: "enrol_link", tenant: "t0", credential: "cred-1", name: "laptop", enrols_as: "passkey/laptop", ttl_secs: 300, uses: 1 };
+  ids.operator.all(n => n.tagName === "button" && n.textContent === "Add a device")[0].click(); await flush();
+  assert.strictEqual(began().pop().body.action, "enrol_link");
+  const ew = ids["confirm-what"].textContent;
+  assert.ok(ew.startsWith("Make a one-time link that enrols another device as laptop (passkey/laptop, the same operator and authority)") && ew.includes("for 5 minutes"), ew);
+  run("showEnrolLink({ link: 'https://c.example/enrol?t=abc', expires_in_secs: 300 })");
+  ids["confirm-cancel"].listeners.click(); await flush();
+  await run("refresh()"); await flush();
+  assert.ok(ids.operator.textContent.includes("https://c.example/enrol?t=abc"), ids.operator.textContent);
+  console.log("console enrol a device: ok");
+
   // The service worker: a replaced subscription is subscribed again with the same key, any open
   // console is told, and one notification says so; tapping it opens the console's notifications.
   const sw = { listeners: {}, shown: [], posted: [], opened: [], subscribedWith: null, wins: [] };

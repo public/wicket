@@ -758,8 +758,11 @@ fn field_b64(v: &Value, k: &str) -> Option<Vec<u8>> {
 }
 
 /// Options for an action's assertion: any of the operator's passkeys may sign.
-fn assertion_options(state: &State, key: &str) -> Value {
-    let allow: Vec<Value> = creds(state).unwrap_or_default().iter().map(|c| json!({ "type": "public-key", "id": c.id })).collect();
+/// The options for an action's passkey assertion: only the session's own passkey may sign it
+/// ([`action_finish`] refuses any other).
+fn assertion_options(state: &State, key: &str, cred: &str) -> Value {
+    let allow: Vec<Value> =
+        creds(state).unwrap_or_default().iter().filter(|c| c.id == cred).map(|c| json!({ "type": "public-key", "id": c.id })).collect();
     json!({ "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": allow, "userVerification": "required", "timeout": 120000 })
 }
 
@@ -1085,7 +1088,11 @@ fn register_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &V
             // A console link enrols its maker's operator again, on this device (#711).
             let (name, made_by) = match enrol::enrolled_name(state, &l, link, &asked) {
                 Ok(x) => x,
-                Err(r) => return r,
+                Err(r) => {
+                    // The link was used: its session has nothing left to do.
+                    let _ = l.end_console_session(sid, "enrolment refused");
+                    return r;
+                }
             };
             let oc = OperatorCredential { id: b64u(&c.id), name, x: c.x, y: c.y, sign_count: c.sign_count };
             if let Err(e) = l.add_operator_credential(&state.tenant, &oc) {
@@ -1515,7 +1522,7 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
     };
     // How long the challenge has left (#574 review), not when it ends: the page counts from when
     // this arrives, so a phone whose clock is minutes out still counts the server's two minutes.
-    ok(json!({ "action": v, "publicKey": assertion_options(state, &key), "expires_in_ms": CHALLENGE_TTL.as_millis() as u64 }))
+    ok(json!({ "action": v, "publicKey": assertion_options(state, &key, &cred), "expires_in_ms": CHALLENGE_TTL.as_millis() as u64 }))
 }
 
 fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Value) -> Reply {
@@ -1526,9 +1533,9 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     let Purpose::Action { action_json, nonce, action } = p.purpose else {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
     };
-    if !same_session || !matches!(sess, Some((_, SessionKind::Operator { .. }))) {
+    let Some((_, SessionKind::Operator { cred: session_cred })) = sess.as_ref().filter(|_| same_session) else {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
-    }
+    };
     let a = match verify_assertion(state, ch, body) {
         Ok(a) => a,
         Err(r) => {
@@ -1545,6 +1552,21 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
             return r;
         }
     };
+    // Every signed action is the session's operator's (#777 review): another enrolled passkey's
+    // signature, on this session's challenge, would act as that passkey while the page and the
+    // signed JSON name the session's. Refused, and audited.
+    if a.oc.id != *session_cred {
+        if let Ok(l) = state.ledger() {
+            let _ = l.audit(
+                &state.tenant,
+                None,
+                "operator.action_refused",
+                &json!({ "credential": a.oc.id, "session_credential": session_cred, "action": action_json,
+                         "reason": "signed with another passkey than the session's" }),
+            );
+        }
+        return err(StatusCode::FORBIDDEN, "sign with the passkey you signed in with");
+    }
     let mut signed = json!({
         "credential": a.oc.id, "rp_id": state.rp.rp_id, "origin": state.rp.origin,
         "nonce": b64u(&nonce), "client_data_json": b64u(&a.cdj), "authenticator_data": b64u(&a.ad), "signature": b64u(&a.sig),
