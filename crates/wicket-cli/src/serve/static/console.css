@@ -296,3 +296,9 @@ code.block { display: block; margin-top: var(--s2); padding: var(--s2); user-sel
   .logline .text { grid-column: 1 / -1; }
 }
 .decided { padding: var(--s3) 0; border-bottom: 1px solid var(--line); } .decided:first-child { padding-top: var(--s1); } .decided:last-child { border-bottom: 0; }
+/* A principal's short name, its full identity a tap away (#707 review). */
+button.idname { font: 650 var(--t-md)/1.3 var(--sans); padding: 0; min-height: 0; border: 0; border-radius: 4px; background: none; color: var(--ink);
+  text-decoration: underline dotted; text-underline-offset: 3px; }
+button.idname:hover { background: none; }
+.principal .idline { color: var(--quiet); font: var(--t-xs)/1.4 var(--mono); margin-top: 2px; overflow-wrap: anywhere; }
+@media (pointer: coarse) { button.idname { min-height: 32px; } }

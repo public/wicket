@@ -558,6 +558,31 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     ["capacity_grant", "unix/alex", "vc2-1c-2gb", "lhr", "0.05", "1", 2, 14400]);
   assert.ok(ids["confirm-what"].textContent.startsWith("Grant spiffe://x/t/t0/op/unix/alex 2 node(s) at once"), ids["confirm-what"].textContent);
   ids["confirm-cancel"].listeners.click(); await flush();
+  // #707 review: the rows' words, each kind of activity line, a past lease, a decided request.
+  const T = s => run(s).textContent;
+  for (const [op, want] of [
+    [{ kind: "standing.revoked", body: { standing: "s-3", by: "passkey:laptop", rule: { host: "h", methods: ["GET"], paths: ["/**"] } } }, "standing reach s-3 ({ host: h, methods: [GET], paths: ['/**'] }) revoked by passkey:laptop"],
+    [{ kind: "decision.refused", body: { target: "r-1", decision: "approve", by: "passkey:tablet", why: "above its risk" } }, "a decision (approve) on r-1 was refused for passkey:tablet: above its risk"],
+    [{ kind: "grant.revoked", body: { grant: "g-41", by: "unix/alex" } }, "grant g-41 revoked by unix/alex"],
+    [{ kind: "capacity.requested", body: { request: "r-9", principal: "spiffe://x/t/t0/op/unix/alex", ask: "1 \u00d7 vc2 in lhr", lifetime_secs: 3600 } }, "capacity asked for by unix/alex: 1 \u00d7 vc2 in lhr for 1 hour (r-9)"],
+    [{ kind: "lease.requested", run: "run_s", body: { lease: "l-1", request: "r-9", spec: { plan: "vc2", region: "lhr" }, hourly_cap_usd_micros: 36000, duration_secs: 7200 } }, "lease l-1 asked for: vc2 in lhr, at most $0.036/h for 2 hours (r-9) \u00b7 run_s"],
+    [{ kind: "op", run: "run_m", body: { kind: "llm", requests: 3, model: "m", status: 200, input_tokens: 12345, output_tokens: 56 } }, "m request #3 \u2192 200 \u00b7 12,345 in / 56 out tokens \u00b7 run_m"],
+    [{ kind: "node.audit", body: { node: "n1", body: JSON.stringify({ kind: "box.restart" }) } }, "node n1: box.restart"],
+    [{ kind: "something.new", run: "run_z", body: {} }, "something.new \u00b7 run_z"],
+  ]) { const t = T("line(" + JSON.stringify({ seq: 1, ...op }) + ")"); assert.ok(t.endsWith(want), want + " in " + t); }
+  const rr = T('renderRun({ now: 1000 }, ' + JSON.stringify({ id: "run_x", zone: "z", agent: "builder", status: "exited", started_at: 1000 - 7200, ended_at: 1000 - 3600, has_identity: true, revoked: false, acp: false }) + ')');
+  assert.ok(rr.startsWith("builder \u00b7 zone zexited") && rr.includes("started 2 h ago") && rr.includes("ended 60 min ago") && rr.includes("run_x") && rr.includes("Authority"), rr);
+  const lease = run('placedRow(' + JSON.stringify({ id: "uuid-1", name: "runner", past_lease: true, held_by: "run_h", lease_until: 1 }) + ')');
+  assert.ok(lease.textContent.includes("still billing: run run_h holds it") && lease.all(n => n.tagName === "code")[0].textContent === "wicket node release uuid-1", lease.textContent);
+  const dec = run('decidedRow(' + JSON.stringify({ id: "r-5", zone: "z", method: "GET", host: "h", path: "/p", status: "expired", created_at: 1 }) + ')');
+  assert.strictEqual(dec.all(n => (n.className || "").startsWith("pill"))[0].className, "pill ", "no \"undefined\" class");
+  // The full principal is a tap away, not only a hover.
+  const pe = run('principalEl("spiffe://x/t/t0/z/build/a/sched")');
+  const peBtn = pe.all(n => n.tagName === "button")[0], peLine = pe.all(n => n.className === "idline")[0];
+  assert.deepStrictEqual([peBtn.textContent, peLine.hidden, peLine.textContent], ["sched (zone build)", true, "spiffe://x/t/t0/z/build/a/sched"]);
+  peBtn.click(); assert.strictEqual(peLine.hidden, false);
+  // Server text's UTC times read as the rows' local times.
+  assert.ok(!/T\d\d:\d\d:\d\dZ/.test(run('localTimes("disk 40%, CA until 2023-11-14T22:13:20Z")')), "localised");
   console.log("console capacity: ok");
 
   // Health alerts are lines under their node's row, not items squeezed into it (B7).
