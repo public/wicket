@@ -52,6 +52,13 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
         k => return Err(format!("`kind` is internal or public, not {k:?}")),
     }
     wicket_names::check_shape(label, false).map_err(|e| e.to_string())?;
+    // An internal name is always its run's, and has no SRV record.
+    if args.get("scope").and_then(Value::as_str).is_some_and(|s| s != "run") {
+        return Err("an internal name is this run's: `scope` is for public names".into());
+    }
+    if args.get("service").is_some() {
+        return Err("`service` is for public names".into());
+    }
     let reason: String = args.get("reason").and_then(Value::as_str).unwrap_or("").chars().take(MAX_REASON).collect();
     let spec = ctx.zone.spec();
     // The one DNS form of the zone's name (#575 review, M3): what the name is registered, looked
@@ -157,7 +164,9 @@ fn ask_public(ctx: &RunCtx, args: &Value) -> Result<String, String> {
         "standing" => NameScope::Standing,
         s => return Err(format!("`scope` is run or standing, not {s:?}")),
     };
-    let reason: String = args.get("reason").and_then(Value::as_str).unwrap_or("").chars().take(MAX_REASON).collect();
+    // The agent's words, marked as such for the human who decides (#680 review, L3).
+    let said: String = args.get("reason").and_then(Value::as_str).unwrap_or("").chars().take(MAX_REASON).collect();
+    let reason = format!("{}{said}", wicket_store::AGENT_ASKS_PREFIX);
     let spec = ctx.zone.spec();
     let digest = wicket_store::zone_digest(spec);
     let l = ctx.ledger.lock().expect("ledger");
@@ -195,7 +204,10 @@ fn ask_public(ctx: &RunCtx, args: &Value) -> Result<String, String> {
     });
     let lasting = match scope {
         NameScope::Run => "for this run",
-        NameScope::Standing => "for every later run of your workload",
+        // Later runs don't take a standing name up yet (#575 step 4b): said, not promised.
+        NameScope::Standing => {
+            "for your workload: this run holds it once approved, and later runs will once wicket gives standing names to them (not yet)"
+        }
     };
     Ok(format!(
         "needs approval: request {id} asks a human for the public name {label} (port {port}, {lasting}). Call await_grant with {id}. Until wicket publishes public records (not yet), an approved name is a record only."

@@ -94,7 +94,13 @@ and Docker on a node has no bridge), so a socket from outside can reach a box on
 something on the node. wicket doesn't terminate TLS on it, read HTTP, route by host name or pass
 anything through the control host. The record points at the node the box runs on, so traffic goes
 straight there. This is the one reading of "not proxied" that works with boxes without a network,
-and the coordinator should confirm it.
+and it is the rule step 4c is held to:
+
+- **Layer 4 only.** The node's listener is a pure byte relay into the box (or, for a box with a
+  network device, a DNAT rule to it). It never terminates TLS, never parses HTTP or any other
+  protocol, never routes by host name or SNI, and never passes a connection through the control
+  host. What it decides is only whether to accept a connection (the name live, the box running, a
+  connection limit) and whether to keep it.
 
 ## Asking and approving
 
@@ -310,8 +316,9 @@ doesn't) can get one by DNS-01: a gateway tool, `dns_challenge(name, value)`, ma
 
 ## Audit and console
 
-Audit records: `name.requested`, `name.approved`, `name.denied`, `name.registered` (internal),
-`name.revoked`, `name.lapsed`, `name.released`, `name.port.opened`, `name.port.closed`,
+Audit records, as written so far: `name.requested` (an ask), `decision` and `decision.refused` (a
+human's approval or denial, or a refused one, as for other asks), `name.registered` (internal),
+`name.revoked`, `name.released`. Still to come with 4b and 4c: `name.lapsed`, `name.port.opened`, `name.port.closed`,
 `name.conn` (per connection, on the node), `name.plan` (each reconcile's plan, applied or not),
 `name.record` (each create, update or delete), `name.conflict` and `name.challenge`.
 
