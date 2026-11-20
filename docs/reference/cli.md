@@ -335,7 +335,7 @@ Commands:
   resume  Resume a paused trigger: only its owner (or root), since it fires as its owner
   renew   Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root)
   rm      Remove a trigger: it fires nothing again
-  fire    Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now
+  fire    Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now, or for wicket's own events, one of the first kind it listens to
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -441,7 +441,7 @@ Options:
 ### `wicket trigger fire`
 
 ```text
-Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now
+Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now, or for wicket's own events, one of the first kind it listens to
 
 Usage: wicket trigger fire [OPTIONS] --dry-run <TRIGGER>
 
