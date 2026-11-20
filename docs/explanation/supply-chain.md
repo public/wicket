@@ -26,6 +26,8 @@ then, by hand, and commits the value.
 | Litestream, versitygw | `docker pull` | Docker Hub | digest in `deploy/install.sh`, `ci/restore.sh`, `ci/update/snapshot-store.sh` |
 | Claude Code (in the agent image) | `docker build` | registry.npmjs.org | sha512 of the wrapper and platform tarballs in the Dockerfile; no install scripts run ([#721](https://github.com/public/wicket/issues/721)) |
 | Session view's npm packages (126, compiled into the binary) | `ci/session-view.sh` | registry.npmjs.org | `web/session/package-lock.json` integrity hashes, `npm ci --ignore-scripts`; the bundle must rebuild byte for byte |
+| Oxc (the console's minifier, run by `crates/wicket-cli/build.rs`) | cargo | crates.io | `Cargo.lock` checksums; versions pinned exactly (`=0.158.0`) in the workspace's `Cargo.toml` |
+| Playwright and its browsers (the console's browser tests; nothing ships) | `ci/console-browsers.sh --install` | registry.npmjs.org, Playwright's browser downloads | `ci/console-browsers/package-lock.json` integrity hashes, `npm ci --ignore-scripts`; the browsers as Playwright's own installer fetches and checks them |
 | Node.js (for the session view) | `ci/install-node.sh` | nodejs.org | sha256 in each workflow; required, no fallback to the runner's Node ([#722](https://github.com/public/wicket/issues/722)) |
 | gitleaks | `ci.yml` | GitHub releases | sha256 in `ci.yml` |
 | cargo-nextest | `ci.yml` | GitHub releases | sha256 in `ci.yml` |

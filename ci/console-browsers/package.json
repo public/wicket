@@ -1,0 +1,10 @@
+{
+  "name": "wicket-console-browsers",
+  "private": true,
+  "description": "The console's browser tests (ci/console-browsers.sh): Playwright only, for CI and local runs; nothing here ships.",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "playwright": "1.63.0"
+  }
+}

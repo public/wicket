@@ -605,6 +605,24 @@ from the control host first (#191):
     (`node.secret_fetch`, with `image_pull`); it isn't among the secrets the node keeps for the run.
 - **Recorded.** The node's audit records `image.received` (digest, name, bytes, `via` `channel` or
   `registry`) or `image.refused` (why).
+- **Removed once unused** (#191). An image the node was given (sent or pulled) that hasn't been used for
+  7 days of the node serving is removed from its runtime, hourly. Used means imported, started from, or
+  reported present when the control host asks before placing a box with it. Time the node wasn't
+  serving doesn't count, so a node back after a week away doesn't remove everything at once.
+  - **The keep** is `image_keep_days` in the node's `node.json`. `0`, or more than 100 years, keeps every
+    image. So does a value that isn't a whole number of days, which the node logs.
+  - **Only images the node imported itself** are touched: never one built or loaded there by other means,
+    and nothing on the control host's own node, which shares its runtime.
+  - **Never while it may be started from.** Removal is never forced, so an image is kept while any
+    container (running or not) was made from it. A box start holds its image from resolving it until the
+    box is live, and a start that comes while the image is being removed waits. A live box keeps its own
+    image and the pinned entries of its zone's `images`, which it may start children from on the node
+    itself (#164).
+  - **Recorded** in the node's audit as `image.removed` (digest, when it was last used, the keep),
+    `image.kept` (the runtime's reason) or `image.remove_failed` (tried again at the next sweep). The node
+    keeps what it knows in `image-uses.json` under its directory.
+  - **A removed image a later box needs is sent or pulled again.** If the node, the control host and the
+    registries all lack it (a hibernated agent whose image went, say), the start fails saying so.
 - **What it needs.** Both ends talking protocol 7 (8 to pull), and a runtime that ids images by their manifest digest
   (Docker's containerd image store): a pin that is a config digest is refused with that reason. An image
   of at most 64 GiB, with room for it under the node's data directory (`images/`, cleared when `serve`

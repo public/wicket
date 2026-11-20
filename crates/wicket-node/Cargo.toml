@@ -39,6 +39,7 @@ bytes.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
+wicket-sandbox = { workspace = true, features = ["testkit"] }
 wicket-chan = { workspace = true, features = ["testkit"] }
 wicket-home = { workspace = true, features = ["testkit"] }
 getrandom = { workspace = true, features = ["sys_rng"] }

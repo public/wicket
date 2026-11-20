@@ -14,7 +14,7 @@
 //! operators:
 //!   unix/alice: anything
 //!   passkey/laptop:
-//!     kinds: [http]            # http, spawn, link, capacity, update, tool, name, authority, fence, node
+//!     kinds: [http]            # http, spawn, link, capacity, update, tool, name, authority, fence, policy, node
 //!     hosts: ["*.example.com"] # an http request's host; empty or absent: any host
 //!     max_risk: R2             # the highest risk it may decide; absent: any
 //!   unix/auditor: nothing      # sees requests, decides none
@@ -55,8 +55,8 @@ pub struct Scope {
     /// The request kinds it may decide: `http`, `spawn`, `link`, `capacity`, `update`, `tool` (a
     /// driven agent's prompt before a tool call, #363), `name` (a public name, #575), `authority`
     /// (renewing a running box's authority), `fence` (releasing a run's fence from the console,
-    /// #690, at R4), and `node` (setting a node's public addresses from the console, #575 step 4d,
-    /// at R4). Empty: none.
+    /// #690, at R4), `policy` (applying the org policy from the console, #712, at R4), and `node`
+    /// (setting a node's public addresses from the console, #575 step 4d, at R4). Empty: none.
     #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     pub kinds: Vec<String>,
     /// The hosts (`*.example.com` patterns) of the http requests it may decide. Empty: any.
@@ -67,7 +67,7 @@ pub struct Scope {
     pub max_risk: Option<String>,
 }
 
-const KINDS: &[&str] = &["http", "spawn", "link", "capacity", "update", "tool", "name", "authority", "fence", "node"];
+const KINDS: &[&str] = &["http", "spawn", "link", "capacity", "update", "tool", "name", "authority", "fence", "policy", "node"];
 
 #[derive(Deserialize)]
 #[serde(untagged)]

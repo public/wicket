@@ -77,7 +77,7 @@ default: anything            # for operators not listed: anything (the default),
 operators:
   unix/alice: anything
   passkey/laptop:
-    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority, fence, node
+    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority, fence, policy, node
     hosts: ["*.example.com"] # for http requests: these hosts only (absent: any)
     max_risk: R2             # the highest risk it may decide (absent: any)
   unix/auditor: nothing      # may list requests, decides none
@@ -91,6 +91,11 @@ to narrow it.
 
 `capacity` covers a CAPACITY request and, at R4, releasing a placed server past its lease from the console
 (#710): it stops the boxes still running there and loses the files it keeps.
+
+`policy` covers applying the org policy from the console (#712), at R4: it changes what every box may do,
+and revokes the runs minted under another version. `anything`, the default for an operator the file doesn't
+list (and for every operator without the file), covers it: to keep a passkey from applying policy, give it a
+scope without `policy`.
 
 An operator is named by `<via>/<name>` or by its full identity. A file that doesn't parse stops every
 operator's decision until it is fixed: an authority is never guessed. Roles, several operators with their

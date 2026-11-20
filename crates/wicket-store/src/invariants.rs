@@ -462,7 +462,9 @@ pub fn check_end_state(l: &Ledger) -> Result<EndState> {
         }
     }
     for (run, node) in &failed {
-        if !l.collected(run)?.is_empty() {
+        // Only files on this host count (#590 review): a taken result or an allowed push leaves
+        // them on the node, which must still hold the run.
+        if l.files_collected(run)? {
             continue;
         }
         let held: Option<String> =
@@ -576,6 +578,11 @@ mod tests {
         fetch_failed(&l, "r_fetched", "n1");
         l.record_collected("r_fetched", "fetched").unwrap();
         l.set_run_uncollected("r_fetched", None).unwrap();
+        // A taken result, before the fetch that failed: the files are still on the node (#590 review).
+        run_on(&l, "r_outbox", "n1");
+        l.record_collected("r_outbox", "outbox").unwrap();
+        fetch_failed(&l, "r_outbox", "n1");
+        l.run_ended(&RunId("r_outbox".into()), "succeeded", "").unwrap();
         l.run_ended(&RunId("r_files".into()), "failed", "").unwrap();
         l.run_ended(&RunId("r_fetched".into()), "succeeded", "").unwrap();
         // Held, not released: nothing broken.
@@ -587,6 +594,7 @@ mod tests {
             vec![
                 "collected r_box: node n1 was released while the run's box was running on it".to_string(),
                 "collected r_files: node n1 was released with the run's files on it uncollected".to_string(),
+                "collected r_outbox: node n1 was released with the run's files on it uncollected".to_string(),
             ]
         );
     }
