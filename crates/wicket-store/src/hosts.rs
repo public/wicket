@@ -34,11 +34,27 @@ CREATE TABLE IF NOT EXISTS shard_nodes (node TEXT PRIMARY KEY, host TEXT NOT NUL
 CREATE INDEX IF NOT EXISTS shard_nodes_host ON shard_nodes (host);
 "#;
 
-/// `runs.host` (schema 42), added to an existing ledger once.
+/// `runs.host` (schema 42), added to an existing ledger once. Several processes may open an old
+/// ledger at once: the check and the change are one write, checked again under its lock, as
+/// `names::migrate` does.
 pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
-    let n: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'host'", [], |r| r.get(0))?;
-    if n == 0 {
-        conn.execute_batch("ALTER TABLE runs ADD COLUMN host TEXT")?;
+    let has = |c: &rusqlite::Connection| -> Result<bool> {
+        let n: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'host'", [], |r| r.get(0))?;
+        Ok(n > 0)
+    };
+    if !has(conn)? {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let r = has(conn).and_then(|h| match h {
+            true => Ok(()),
+            false => conn.execute_batch("ALTER TABLE runs ADD COLUMN host TEXT").map_err(Into::into),
+        });
+        match r {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS runs_host ON runs (host) WHERE host IS NOT NULL")?;
     Ok(())
@@ -67,17 +83,22 @@ pub struct Taken {
     pub runs: usize,
 }
 
-/// Which hosts wicketd may fence at `now` (§3.1): those whose lease has lapsed while another host's
-/// lease is live, so the cause is that host, not the ledger. When every held lease has lapsed
-/// together, none is: the ledger stalled, and killing hosts would only make it worse. A shard with
-/// no holder, or one that stopped cleanly, isn't fenced; it is simply free to take.
+/// The hosts whose lease has lapsed at `now` while another held lease is live (§3.1). When every
+/// held lease has lapsed, none is: the ledger stalled. A shard with no holder, or one that stopped
+/// cleanly, is free to take, not fenced, and doesn't count as live.
+///
+/// One instant is not enough to fence on: when a ledger stall ends, the first host to renew makes
+/// every other one look lapsed alone until it renews too, and no timestamp in a snapshot tells that
+/// from a host that stopped renewing while the others went on. So wicketd fences a host only once
+/// it has been lapsed alone continuously for a window that gives it several renewals
+/// (`wicket_control::supervise::Fencer`).
+///
+/// Leases are wall-clock times from one machine's clock: every host and wicketd run on the control
+/// host in this version (note 25, §9).
 pub fn lapsed_alone(hosts: &[SupervisorHost], now: i64) -> Vec<String> {
     let held: Vec<&SupervisorHost> = hosts.iter().filter(|h| h.owner.is_some() && !h.stopping).collect();
-    let lapsed: Vec<&SupervisorHost> = held.iter().copied().filter(|h| h.lease_until <= now).collect();
-    if lapsed.len() == held.len() {
-        return Vec::new();
-    }
-    lapsed.into_iter().map(|h| h.host.clone()).collect()
+    let live = held.iter().any(|h| h.lease_until > now);
+    held.iter().filter(|h| live && h.lease_until <= now).map(|h| h.host.clone()).collect()
 }
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisorHost> {
@@ -105,6 +126,16 @@ impl Ledger {
             let cur = l.supervisor_host(host)?;
             if let Some(c) = cur.as_ref().filter(|c| c.owner.as_deref().is_some_and(|o| o != owner) && !c.stopping && c.lease_until > now) {
                 return Err(StoreError::ShardHeld(host.to_string(), c.lease_until - now));
+            }
+            // A node held by another shard's live holder isn't moved: that holder would go on
+            // passing `as_shard` for the node's runs. It moves once that shard is fenced, stopped or
+            // lapsed.
+            for node in nodes {
+                if let Some(other) = l.shard_of_node(node)?.filter(|o| o != host) {
+                    if let Some(o) = l.supervisor_host(&other)?.filter(|o| o.owner.is_some() && !o.stopping && o.lease_until > now) {
+                        return Err(StoreError::ShardHeld(other, o.lease_until - now));
+                    }
+                }
             }
             let epoch = cur.as_ref().map_or(0, |c| c.epoch) + 1;
             l.conn.execute(
@@ -211,37 +242,42 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Runs `f` in one immediate transaction only while `owner` holds shard `host` at `epoch`
-    /// (§3.1: every ledger write a host makes carries its epoch). Refused with
-    /// [`StoreError::ShardLost`] otherwise, writing nothing; the host must then stop.
+    /// Runs `f` in one immediate transaction only while `owner` holds shard `host` at `epoch` and
+    /// every one of `runs` (the runs `f` writes for) is the shard's (`runs.host`), as note 25 §3.1
+    /// says every ledger write a host makes is. Refused with [`StoreError::ShardLost`] otherwise,
+    /// writing nothing; the host must then stop (or, for a run moved away, stop that run's task).
+    ///
+    /// `f` must not open a transaction of its own: methods that do (`immediate`, `run_ended`'s own)
+    /// can't nest in it, and the audit writer writes on its own connection, outside it (note 25
+    /// §5.1, conditions).
     pub fn as_shard<T, E: From<StoreError>>(
         &self,
         host: &str,
         owner: &str,
         epoch: i64,
+        runs: &[&str],
         f: impl FnOnce(&Ledger) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
         self.immediate(|l| {
-            let held: bool = l
-                .conn
-                .query_row(
-                    "SELECT count(*) FROM supervisor_hosts WHERE host = ?1 AND owner = ?2 AND epoch = ?3",
-                    params![host, owner, epoch],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map_err(StoreError::from)?
-                > 0;
-            if !held {
+            let held = l.shard_held(host, owner, epoch).map_err(E::from)?;
+            let mut ours = true;
+            for run in runs {
+                ours &= l.run_host(run).map_err(E::from)?.as_deref() == Some(host);
+            }
+            if !held || !ours {
                 return Err(E::from(StoreError::ShardLost(host.to_string(), epoch)));
             }
             f(l)
         })
     }
 
-    /// Whether a run's writes may be made by shard `host` at `epoch`, inside [`Ledger::as_shard`]:
-    /// the run names that shard. (The shard's epoch and holder are `as_shard`'s check.)
-    pub fn run_in_shard(&self, run: &str, host: &str) -> Result<bool> {
-        Ok(self.run_host(run)?.as_deref() == Some(host))
+    fn shard_held(&self, host: &str, owner: &str, epoch: i64) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM supervisor_hosts WHERE host = ?1 AND owner = ?2 AND epoch = ?3",
+            params![host, owner, epoch],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 }
 
@@ -253,13 +289,24 @@ mod tests {
     const A: &str = "m:1:1";
     const B: &str = "m:2:2";
 
-    fn ledger_with_runs() -> Ledger {
-        let l = Ledger::open_in_memory().unwrap();
+    fn add_runs(l: &Ledger) {
         for (run, node) in [("run_1", "n1"), ("run_2", "n2"), ("run_3", "n1")] {
             l.run_started(&TenantId("t".into()), &RunId(run.into()), "z", "w").unwrap();
             l.conn.execute("UPDATE runs SET node = ?2 WHERE id = ?1", params![run, node]).unwrap();
         }
+    }
+
+    fn ledger_with_runs() -> Ledger {
+        let l = Ledger::open_in_memory().unwrap();
+        add_runs(&l);
         l
+    }
+
+    fn file_ledger(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wicket-hosts-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("ledger.db")
     }
 
     #[test]
@@ -270,10 +317,28 @@ mod tests {
         assert_eq!(l.shard_runs("0").unwrap(), ["run_1", "run_3"]);
         assert_eq!(l.run_host("run_2").unwrap(), None);
         assert_eq!(l.shard_of_node("n1").unwrap().as_deref(), Some("0"));
-        // A node moves between shards whole.
-        l.take_shard("1", B, &["n1", "n2"], 30, 100).unwrap();
+    }
+
+    #[test]
+    fn a_node_moves_out_of_a_shard_only_once_its_holder_is_gone() {
+        let l = ledger_with_runs();
+        l.take_shard("0", A, &["n1"], 30, 100).unwrap();
+        // Shard 0's holder is live and hasn't stopped: n1 stays where it is.
+        assert!(matches!(l.take_shard("1", B, &["n1", "n2"], 30, 110), Err(StoreError::ShardHeld(s, 20)) if s == "0"));
+        assert_eq!(l.shard_runs("0").unwrap(), ["run_1", "run_3"]);
+        assert!(l.supervisor_host("1").unwrap().is_none(), "nothing of the refused take was written");
+        // Once shard 0 is fenced, it moves, and A's writes for its runs are refused.
+        assert_eq!(l.fence_shard("0", A, true, 111).unwrap(), Some(2));
+        l.take_shard("1", B, &["n1", "n2"], 30, 111).unwrap();
         assert_eq!(l.shard_nodes("0").unwrap(), Vec::<String>::new());
         assert_eq!(l.shard_runs("1").unwrap(), ["run_1", "run_2", "run_3"]);
+        let w: Result<()> = l.as_shard("0", A, 1, &["run_1"], |_| Ok(()));
+        assert!(matches!(w, Err(StoreError::ShardLost(..))));
+        // A shard re-taken by a fresh host keeps nothing it no longer names: its runs moved.
+        let t = l.take_shard("0", A, &[], 30, 112).unwrap();
+        assert_eq!(t.runs, 0);
+        let w: Result<()> = l.as_shard("0", A, t.epoch, &["run_1"], |_| Ok(()));
+        assert!(matches!(w, Err(StoreError::ShardLost(..))), "the shard is held, but run_1 is shard 1's");
     }
 
     #[test]
@@ -288,12 +353,17 @@ mod tests {
         // The old holder can no longer renew, mark or write.
         assert!(!l.renew_shard_lease("0", A, 1, 30, 156).unwrap());
         assert!(!l.mark_shard_stopping("0", A, 1, 156).unwrap());
-        let w: Result<()> = l.as_shard("0", A, 1, |l| {
+        let w: Result<()> = l.as_shard("0", A, 1, &["run_1"], |l| {
             l.set_run_owner("run_1", "x")?;
             Ok(())
         });
         assert!(matches!(w, Err(StoreError::ShardLost(_, 1))));
-        assert!(l.as_shard::<_, StoreError>("0", B, 2, |l| l.run_in_shard("run_1", "0")).unwrap());
+        let owner: Option<String> = l.conn.query_row("SELECT owner FROM runs WHERE id = 'run_1'", [], |r| r.get(0)).unwrap();
+        assert_ne!(owner.as_deref(), Some("x"), "the refused write wrote nothing");
+        l.as_shard::<_, StoreError>("0", B, 2, &["run_1", "run_3"], |l| l.set_run_owner("run_1", "host:0:2")).unwrap();
+        // A run that isn't the shard's is refused even to its live holder.
+        let w: Result<()> = l.as_shard("0", B, 2, &["run_2"], |_| Ok(()));
+        assert!(matches!(w, Err(StoreError::ShardLost(..))));
     }
 
     #[test]
@@ -302,7 +372,7 @@ mod tests {
         l.take_shard("0", A, &["n1"], 30, 100).unwrap();
         // Live lease, process not seen to exit: no fence.
         assert_eq!(l.fence_shard("0", A, false, 110).unwrap(), None);
-        // Not the holder wicketd thought: no fence.
+        // Not the holder wicketd thought (a late reap of an older holder): no fence.
         assert_eq!(l.fence_shard("0", B, true, 110).unwrap(), None);
         // Seen to exit: fenced at once, whatever the lease.
         assert_eq!(l.fence_shard("0", A, true, 110).unwrap(), Some(2));
@@ -345,20 +415,19 @@ mod tests {
             lease_until,
             stopping: false,
             adopting: vec![],
-            updated_at: 0,
+            updated_at: lease_until - 30,
         }
     }
 
     #[test]
-    fn only_a_lease_that_lapsed_alone_is_fenced() {
-        // One lapsed while the other renewed: that host.
+    fn a_lease_lapsed_while_another_is_live_is_alone_at_that_instant() {
         assert_eq!(lapsed_alone(&[host("0", 99), host("1", 130)], 100), ["0"]);
-        // Every lease lapsed together: the ledger stalled, so no one.
+        // Every lease lapsed: the ledger stalled, so no one.
         assert!(lapsed_alone(&[host("0", 99), host("1", 95)], 100).is_empty());
         // A single host: its lapse can't be told from a stall.
         assert!(lapsed_alone(&[host("0", 99)], 100).is_empty());
         // A stopped or unheld shard is free, not fenced, and doesn't count as live.
-        let mut stopped = host("1", 99);
+        let mut stopped = host("1", 130);
         stopped.stopping = true;
         let mut free = host("2", 0);
         free.owner = None;
@@ -368,9 +437,76 @@ mod tests {
 
     #[test]
     fn an_existing_ledger_gains_runs_host_once() {
-        let l = Ledger::open_in_memory().unwrap();
-        migrate(&l.conn).unwrap();
+        let path = file_ledger("migrate");
+        {
+            let l = Ledger::open(&path).unwrap();
+            l.conn.execute_batch("DROP INDEX runs_host; ALTER TABLE runs DROP COLUMN host").unwrap();
+        }
+        // Two openers of the old ledger at once: both open, one adds the column.
+        let opened: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Ledger::open(&path).map(|_| ()))
+            })
+            .collect();
+        for t in opened {
+            t.join().unwrap().unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
         let n: i64 = l.conn.query_row("SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'host'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+        add_runs(&l);
+        assert_eq!(l.take_shard("0", A, &["n1"], 30, 100).unwrap().runs, 2);
+    }
+
+    #[test]
+    fn racing_takers_renewers_and_fencers_on_one_file_leave_one_holder() {
+        let path = file_ledger("race");
+        {
+            let l = Ledger::open(&path).unwrap();
+            add_runs(&l);
+        }
+        for round in 0..10i64 {
+            let now = 1_000 * (round + 1);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+            let handles: Vec<_> = (0..6)
+                .map(|i| {
+                    let (path, barrier) = (path.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        let l = Ledger::open(&path).unwrap();
+                        let me = format!("m:{i}:{round}");
+                        barrier.wait();
+                        match i % 3 {
+                            // Takers: at most one wins a free (or lapsed) shard.
+                            0 | 1 => l.take_shard("0", &me, &["n1"], 30, now).ok().map(|t| (me, t.epoch)),
+                            // A fencer of whoever held it last round.
+                            _ => {
+                                if let Some(h) = l.supervisor_host("0").unwrap().and_then(|h| h.owner) {
+                                    let _ = l.fence_shard("0", &h, false, now);
+                                }
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let wins: Vec<(String, i64)> = handles.into_iter().filter_map(|h| h.join().unwrap()).collect();
+            let l = Ledger::open(&path).unwrap();
+            let rec = l.supervisor_host("0").unwrap().unwrap();
+            // The holder on record is one that won, at the epoch it won, and only it can renew.
+            if let Some(owner) = rec.owner.as_deref() {
+                let (w, e) = wins.iter().find(|(w, _)| w == owner).expect("the holder won a take");
+                assert_eq!(*e, rec.epoch, "round {round}: {wins:?}");
+                assert!(l.renew_shard_lease("0", w, *e, 30, now).unwrap());
+                for (other, oe) in wins.iter().filter(|(o, _)| o != owner) {
+                    assert!(!l.renew_shard_lease("0", other, *oe, 30, now).unwrap(), "round {round}: a superseded taker renewed");
+                }
+            }
+            // Epochs never repeat: each win had its own.
+            let mut epochs: Vec<i64> = wins.iter().map(|(_, e)| *e).collect();
+            epochs.sort();
+            epochs.dedup();
+            assert_eq!(epochs.len(), wins.len());
+        }
     }
 }
