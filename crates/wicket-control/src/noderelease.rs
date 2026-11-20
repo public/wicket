@@ -15,13 +15,13 @@
 //! 2. [`release`], with the node's own placer (its owner and API key, as the reconciler's):
 //!    - the node must still be what was decided on, and still active, just before the provider is
 //!      asked (another release, or the reconciler, may have ended it);
-//!    - its service instances are stopped as the reconciler stops them (`service.instance_stopped`);
 //!    - the provider destroys the machine. A failure is audited `placement.node_release_failed`, and
-//!      the node is as it was;
+//!      the node and its services are as they were;
+//!    - its service instances are stopped as the reconciler stops them (`service.instance_stopped`);
 //!    - then the node is marked released. If something else ended it first, that is audited
 //!      (`placement.node_release_already_ended`) and nothing more is done;
 //!    - only on a confirmed destroy are the run files that went with it forgotten; the runs still on
-//!      it are revoked either way (their boxes went with the machine);
+//!      it are ended as lost, and revoked, either way (their boxes went with the machine);
 //!    - `placement.node_released` (with `by`, the decision's sequence, what was stopped, revoked
 //!      and lost), and its enrolment is revoked. A failure after the destroy is audited
 //!      `placement.node_release_incomplete`.
@@ -225,13 +225,8 @@ pub async fn release<Q: Provider, A: SpendApprover>(
             bail!("{} was already released or ended", n.name);
         }
     }
-    // Drained first, as the reconciler does (#579): its service instances are stopped, audited.
-    let why = format!("its node {} is being released", n.name);
-    let mut stopped = vec![];
-    for i in l.live_service_instances()?.into_iter().filter(|i| i.node == n.name) {
-        crate::services::stop(l, &i, &why)?;
-        stopped.push(i.run);
-    }
+    // Its service instances are stopped once the provider has answered (in `finish`), not before: a
+    // release the provider refuses leaves the node, and them, as they were.
     let id = NodeId(n.id.clone());
     let r = async {
         let node = p.get(&id).await?;
@@ -246,7 +241,7 @@ pub async fn release<Q: Provider, A: SpendApprover>(
             bail!("releasing {}: {e} (it is as it was)", n.name);
         }
     };
-    let done = finish(l, n, by, seq, node, r, stopped, retire);
+    let done = finish(l, n, by, seq, node, r, retire);
     if let Err(e) = &done {
         failed(l, "placement.node_release_incomplete", &format!("{e:#}"));
     }
@@ -262,7 +257,6 @@ fn finish(
     seq: i64,
     node: Option<wicket_placement::NodeHandle>,
     r: Released,
-    stopped: Vec<String>,
     retire: fn(&mut Ledger, &wicket_placement::NodeHandle) -> Result<bool>,
 ) -> Result<String> {
     let id = &n.id;
@@ -281,15 +275,23 @@ fn finish(
         return Ok(said);
     }
     let name = node.as_ref().map(|h| h.name.clone()).unwrap_or_else(|| n.name.clone());
+    // Its service instances went with it: stopped as the reconciler stops them (#579), audited.
+    let why = format!("its node {name} was released");
+    let mut stopped = vec![];
+    for i in l.live_service_instances()?.into_iter().filter(|i| i.node == n.name) {
+        crate::services::stop(l, &i, &why)?;
+        stopped.push(i.run);
+    }
     // Files of runs a fetch didn't bring back went with it (#300): a human chose that. Only when
     // this release destroyed it: a machine the provider says is gone may be another account's.
     let lost = if destroyed { l.forget_uncollected_on_node(&name)? } else { 0 };
     if lost > 0 {
         said.push_str(&format!("; {lost} run(s)' uncollected files went with it"));
     }
-    // Its runs' boxes went with the machine: their authority goes too, so nothing waits on them.
+    // Its runs' boxes went with the machine: each run is ended as lost (its agent handed back, as a
+    // lost run's is), and a run with an identity has it revoked, so nothing waits on them.
     let reason = format!("its node {name} was released");
-    let mut revoked = vec![];
+    let (mut revoked, mut ended) = (vec![], vec![]);
     for run in &n.running {
         if l.identity(run)?.is_some() {
             l.revoke(run, by, &reason)?;
@@ -301,16 +303,18 @@ fn finish(
             )?;
             revoked.push(run.clone());
         }
+        l.run_lost(run, &reason)?;
+        ended.push(run.clone());
     }
-    if !revoked.is_empty() {
-        said.push_str(&format!("; revoked run {}", revoked.join(", ")));
+    if !ended.is_empty() {
+        said.push_str(&format!("; ended run {} as lost", ended.join(", ")));
     }
     l.audit(
         &TenantId::single(),
         None,
         "placement.node_released",
         &json!({ "id": id, "name": name, "uncollected_runs_lost": lost, "by": by, "decision": seq, "destroyed": destroyed,
-                 "services_stopped": stopped, "runs_revoked": revoked }),
+                 "services_stopped": stopped, "runs_revoked": revoked, "runs_ended": ended }),
     )?;
     if let Some(h) = &node {
         if retire(l, h)? {
@@ -412,17 +416,29 @@ mod tests {
         running(&l, "run_busy", "placed-a");
         running(&l, "run_svc", "placed-a");
         l.record_service_instance("run_svc", "cache", "placed-a", &TenantId::single().0, "sha", NOW).unwrap();
+        // A run with no identity (a program's, say) is on it too.
+        l.run_started(&TenantId::single(), &wicket_core::RunId("run_anon".into()), "z", "p").unwrap();
+        l.set_run_node("run_anon", "placed-a").unwrap();
+        // And a service instance on the machine whose release will fail.
+        running(&l, "run_svc_b", "placed-b");
+        l.record_service_instance("run_svc_b", "cache", "placed-b", &TenantId::single().0, "sha", NOW).unwrap();
         let by = human("default: anything\n");
 
         let n = view(&l, "i-1", NOW).unwrap().unwrap();
-        assert_eq!((n.running.clone(), n.services.clone()), (vec!["run_busy".to_string()], vec!["cache:run_svc".to_string()]));
+        assert_eq!(
+            (n.running.clone(), n.services.clone()),
+            (vec!["run_anon".to_string(), "run_busy".to_string()], vec!["cache:run_svc".to_string()])
+        );
         assert!(n.consequence().contains("stops the service instances cache:run_svc"), "{}", n.consequence());
         let (n, seq) = decide(&l, "i-1", &console(&by, &n.effect_sha256()), NOW).unwrap();
         let said = release(&mut l, &p, &n, "passkey:laptop", seq, no_retire, NOW).await.unwrap();
-        assert!(said.contains("i-1") && said.contains("revoked run run_busy"), "{said}");
+        assert!(said.contains("i-1") && said.contains("ended run run_anon, run_busy as lost"), "{said}");
         assert!(deleted(&st, "i-1"));
         assert_eq!(l.placed_node("i-1").unwrap().unwrap().status, "released");
         assert!(l.revoked("run_busy").unwrap().is_some() && l.revoked("run_svc").unwrap().is_some());
+        for run in ["run_busy", "run_anon"] {
+            assert_eq!(l.run_status(run).unwrap().as_deref(), Some("lost"), "{run} is ended, identity or not");
+        }
         let ks = kinds(&l);
         let stop = ks.iter().position(|k| k == "service.instance_stopped").expect("the instance is stopped");
         assert!(stop < ks.iter().position(|k| k == "placement.node_released").unwrap());
@@ -434,7 +450,10 @@ mod tests {
             (Some(seq), Some("passkey:laptop"), Some(true)),
             "{b}"
         );
-        assert_eq!((b["services_stopped"].clone(), b["runs_revoked"].clone()), (json!(["run_svc"]), json!(["run_busy"])));
+        assert_eq!(
+            (b["services_stopped"].clone(), b["runs_revoked"].clone(), b["runs_ended"].clone()),
+            (json!(["run_svc"]), json!(["run_busy"]), json!(["run_anon", "run_busy"]))
+        );
 
         // A second release of the same node (another tab): it is no longer an active placed node.
         let e = release(&mut l, &p, &n, "passkey:laptop", seq, no_retire, NOW).await.unwrap_err();
@@ -446,6 +465,7 @@ mod tests {
         assert!(release(&mut l, &p, &n, "passkey:laptop", seq, no_retire, NOW).await.is_err(), "not this installation's machine");
         assert!(!deleted(&st, "i-2"));
         assert_eq!(l.placed_node("i-2").unwrap().unwrap().status, "active", "it is as it was");
+        assert!(l.revoked("run_svc_b").unwrap().is_none(), "its service instance too: stopped only after a release");
         let rec = l.audit_tail(1).unwrap().pop().unwrap();
         assert_eq!(rec.2, "placement.node_release_failed");
         assert_eq!(serde_json::from_str::<Value>(&rec.4).unwrap()["decision"].as_i64(), Some(seq));

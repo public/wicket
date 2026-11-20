@@ -45,7 +45,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             NodeCmd::Create(args) => nodecreate::create(*args).await,
-            NodeCmd::Release { common, id, reason } => nodecreate::release(common, id, reason, wicket_home::cli_is_root()).await,
+            NodeCmd::Release { common, id, reason, yes } => nodecreate::release(common, id, reason, wicket_home::cli_is_root(), yes).await,
             NodeCmd::Plans { common, region, plan_type } => nodecreate::plans(common, region, plan_type).await,
             NodeCmd::Revoke { name } => {
                 let mut l = Ledger::open(&ledger_path())?;
@@ -278,6 +278,9 @@ pub enum NodeCmd {
         /// Why: it goes on the audit record.
         #[arg(long)]
         reason: Option<String>,
+        /// Don't ask before releasing it (a terminal is asked, as shown, first).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// List a provider's (Vultr's) plans in a region, with their hourly price.
     Plans {
