@@ -41,8 +41,6 @@ const calls = [];
 let state = null;
 // A hostile string an agent chose (a grant's path): it must stay text.
 const HOSTILE = "/x<img src=x onerror=alert(1)>";
-const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
-  against_token_now: { available: true, decision: "forbidden", why: "block 0: check if " + HOSTILE, zone_says: "Forbidden" } };
 let nextAction = null, begun = null;
 // Web Push: a fake browser (permission, service worker, push manager) and server (devices).
 let permAsked = 0, permAskedAt = -1, swRegistered = null, swListener = null, subscribed = null, pushDevices = [];
@@ -86,7 +84,6 @@ const fetch = async (path, opts) => {
   if (path === "/api/push/remove") { const b = JSON.parse(opts.body); pushDevices = pushDevices.filter(d => d.id !== b.id); return reply({ ok: "device removed" }); }
   if (path === "/api/push/details") { const b = JSON.parse(opts.body); for (const d of pushDevices) if (d.id === b.id) d.details = b.details; return reply({ ok: "ok" }); }
   if (path === "/api/policy") return reply({ installed: null, current: null, versions: [], runs: [] });
-  if (path.startsWith("/api/explain/")) return reply(explained);
   return reply({}, false);
 };
 let ceremonies = 0;
@@ -349,9 +346,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual([idl.hidden, toggle.getAttribute("aria-expanded")], [true, "false"]);
   console.log("console approval flow: ok");
 
-  // #173: an explained decision opens read-only in the detail card, an agent's strings in it as
-  // text (the fake DOM has no innerHTML: only textContent exists). A run's authority is drawn by
-  // agents.js, checked in browsers (ci/console-browsers/agents.mjs).
+  // #173: a run's authority and an explained decision are drawn by agents.js and activity.js,
+  // checked in browsers (ci/console-browsers/agents.mjs and activity.mjs).
   // #621: wicket's own kinds as sentences, the raw op apart; an HTTP request as it is.
   const asked = p => JSON.parse(run("JSON.stringify(asks(" + JSON.stringify({ host: "wicket.internal", reason: "r", ...p }) + "))"));
   assert.deepStrictEqual([asked({ method: "SPAWN", path: "/zones/research/reader" }).what, asked({ method: "LINK", path: "/links/run_a/run_b/8080" }).what,
@@ -385,11 +381,6 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     isolation: "runc", region: "", duration_secs: 3600, hourly_cap_usd: "$0.1000", reserved_usd: "$0.1000", reason: "nightly build" } });
   assert.deepStrictEqual([capWhy.said, capWhy.mixed], [[["Why", "nightly build"]], null]);
   assert.deepStrictEqual(JSON.parse(run('JSON.stringify(asks({ method: "GET", host: "h", path: "/x", reason: "y", scope_prefix: false }))')), { what: "GET h/x", raw: "", said: [["Why", "y"]], wicket: null, mixed: null, internal: false });
-  run("showExplain(7)"); await flush(); await flush();
-  assert.ok(ids["detail-body"].textContent.includes("block 0: check if " + HOSTILE), ids["detail-body"].textContent);
-  assert.ok(calls.some(c => c.path === "/api/explain/7"));
-  ids["detail-close"].listeners.click();
-  assert.strictEqual(ids.detail.hidden, true);
   console.log("console authority views: ok");
 
   // #715 review: a Stop form opened for one agent never stops another. Leaving the page closes it,
@@ -599,11 +590,13 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     // #715 review: who decided is named; a parent agent isn't "you".
     [{ kind: "decision", body: { request: "r-7", decision: "approve", by: "agent:run_p" } }, "allowedr-7 by run_p (a parent agent)"],
     [{ kind: "something.new", run: "run_z", body: {} }, "something.new \u00b7 run_z"],
-  ]) { const t = T("line(" + JSON.stringify({ seq: 1, ...op }) + ")"); assert.ok(t.endsWith(want), want + " in " + t); }
+  ]) { const l = JSON.parse(run("JSON.stringify(sentence(" + JSON.stringify({ seq: 1, ...op }) + "))")); assert.ok((l.tag + l.text).endsWith(want), want + " in " + l.tag + l.text); }
+  // A decision on a run's request can be explained (activity.js draws its "why?"); others can't.
+  const eg = { seq: 2, kind: "op", run: "run_a", body: { kind: "egress", outcome: "forbidden", method: "GET", host: "h", path: "/p" } };
+  assert.deepStrictEqual(JSON.parse(run("JSON.stringify(sentence(" + JSON.stringify(eg) + "))")), { cat: "blocked", tag: "blocked", tone: "blocked", text: "run_a: read h/p", why: true });
+  assert.strictEqual(JSON.parse(run("JSON.stringify(sentence(" + JSON.stringify({ ...eg, run: null }) + "))")).why, false);
   const lease = run('placedRow(' + JSON.stringify({ id: "uuid-1", name: "runner", past_lease: true, held_by: "run_h", lease_until: 1 }) + ')');
   assert.ok(lease.textContent.includes("still billing: run run_h holds it") && lease.all(n => n.tagName === "code")[0].textContent === "wicket node release uuid-1", lease.textContent);
-  const dec = run('decidedRow(' + JSON.stringify({ id: "r-5", zone: "z", method: "GET", host: "h", path: "/p", status: "expired", created_at: 1 }) + ')');
-  assert.strictEqual(dec.all(n => (n.className || "").startsWith("pill"))[0].className, "pill ", "no \"undefined\" class");
   // The full principal is a tap away, not only a hover.
   const pe = run('principalEl("spiffe://x/t/t0/z/build/a/sched")');
   const peBtn = pe.all(n => n.tagName === "button")[0], peLine = pe.all(n => n.className === "idline")[0];

@@ -680,20 +680,18 @@ function decider(label) {
   return s ? byName(s) : "?";
 }
 const by = b => b.by ? " by " + decider(b.by) + (b.signed ? ", signed with a passkey" : "") : "";
-function logLine(op, tag, tone, text, extra) {
-  const d = el("div", "logline");
-  d.dataset.cat = /^(decision|standing|grant|capacity|lease)/.test(op.kind) ? "decisions" : /^(run|identity|session|operator\.message)/.test(op.kind) || (op.body || {}).kind === "llm" || (op.body || {}).kind === "box" ? "agents" : /^node/.test(op.kind) ? "servers" : "other";
-  const t = el("span", "text", text);
-  d.append(op.ts ? timeEl(op.ts, clock(op.ts)) : el("span"), el("span", "tag " + (tone || ""), tag), t);
-  if (extra) t.append(document.createTextNode(" "), extra);
-  return d;
+// A line as data (activity.js draws it): which filter shows it, its tag and tone, its words, and
+// whether it has a "why?" (a decision on a run's request, which can be explained).
+function logLine(op, tag, tone, text) {
+  const cat = /^(decision|standing|grant|capacity|lease)/.test(op.kind) ? "decisions" : /^(run|identity|session|operator\.message)/.test(op.kind) || (op.body || {}).kind === "llm" || (op.body || {}).kind === "box" ? "agents" : /^node/.test(op.kind) ? "servers" : "other";
+  return { cat, tag, tone: tone || "", text, why: false };
 }
 // An agent run by its agent's name where the latest list knows it; its id otherwise.
 function runName(id) {
   const x = ((lastState && lastState.runs) || []).find(r => r.id === id);
   return x ? (x.agent ? strip(x.agent) : "a program") : strip(id);
 }
-function line(op) {
+function sentence(op) {
   const b = op.body || {};
   const r = op.run ? runName(op.run) : "";
   const eg = egressOf(op);
@@ -701,15 +699,10 @@ function line(op) {
     const [x, where] = eg;
     const outcome = String(x.outcome || "?");
     const tone = outcome === "allow" || outcome === "spliced" ? "ok" : outcome === "pending" ? "pend" : "blocked";
-    let why = null;
-    if (op.run) {
-      why = el("button", "link", "why?");
-      why.onclick = () => { const box = why.parentNode.parentNode.nextSibling; if (box && box.className === "explained") { box.hidden = !box.hidden; return; }
-        const nb = el("div", "explained"); why.parentNode.parentNode.after ? why.parentNode.parentNode.after(nb) : null; showExplain(op.seq, nb); };
-    }
     const said = ({ allow: "allowed", spliced: "allowed", pending: "waiting", forbidden: "blocked", denied: "blocked", deny: "blocked" })[outcome] || outcome;
-    const ln = logLine(op, said, tone, (r ? r + ": " : "") + verb(x) + " " + strip(x.host + x.path + where), why);
-    ln.dataset.cat = outcome === "allow" || outcome === "spliced" ? "allowed" : "blocked";
+    const ln = logLine(op, said, tone, (r ? r + ": " : "") + verb(x) + " " + strip(x.host + x.path + where));
+    ln.cat = outcome === "allow" || outcome === "spliced" ? "allowed" : "blocked";
+    ln.why = !!op.run;
     return ln;
   }
   switch (op.kind === "op" ? "op." + b.kind : op.kind) {
@@ -1252,24 +1245,6 @@ const kv = (k, v) => { const d = el("div", "row"); d.append(el("span", "meta", k
 const when = t => at(t);
 const whenMs = ms => ms ? at(ms / 1000) : "\u2014";
 
-async function showExplain(seq, into) {
-  const body = into || openDetail("decision #" + seq);
-  if (into) { into.hidden = false; into.replaceChildren(el("div", "meta", "loading\u2026")); }
-  try {
-    const x = await getJson("/api/explain/" + encodeURIComponent(seq));
-    const r = x.recorded, n = x.against_token_now;
-    const out = [
-      kv("request", r.method + " " + r.host + r.path + " (" + (r.risk || "?") + ")"),
-      kv("recorded", String(r.outcome) + " on " + r.decided_on + " at " + when(r.at) + ": " + localTimes(r.detail)),
-      kv("run", x.run + " · policy " + (x.policy || "none")),
-    ];
-    if (n.available) {
-      out.push(kv("token now", n.decision), el("pre", "src", n.why), kv("zone says", n.zone_says));
-      out.push(el("div", "note", "Against the run's token as its node's feed holds it now: grants and policy may have changed since it was decided."));
-    } else out.push(el("div", "note", "Can't evaluate it now: " + localTimes(n.why)));
-    body.replaceChildren(...out);
-  } catch (e) { body.replaceChildren(el("div", "blocked", strip(e.message))); }
-}
 
 let policyShown = 0;
 async function renderPolicy() {
@@ -1558,35 +1533,6 @@ async function submitSecret(ev) {
 }
 
 // A decided request: its outcome as a pill, what it was for, and when it was asked (#645).
-function decidedRow(x) {
-  const d = el("div", "decided");
-  const head = el("div", "run-head");
-  head.append(el("span", "pill " + (({ granted: "good", denied: "bad" })[x.status] || ""), ({ granted: "allowed", denied: "refused" })[x.status] || strip(x.status)),
-    el("span", "", runName(x.run) + ": " + verb(x) + " "), wrapped("mono inline", strip(x.host + x.path)));
-  const meta = el("div", "meta");
-  meta.append(document.createTextNode(strip(x.id) + " \u00b7 zone " + strip(x.zone) + " \u00b7 asked "), timeEl(x.created_at, rel(x.created_at)));
-  d.append(head, meta);
-  return d;
-}
-
-// The activity log's filters: everything, or one kind of line (docs/explanation/console-design.md).
-let logFilter = "all";
-function renderFilters() {
-  const box = document.getElementById("filters");
-  if (!box || box.dataset.built) return;
-  box.dataset.built = "1";
-  for (const [k, label] of [["all", "Everything"], ["blocked", "Blocked"], ["decisions", "Decisions"], ["agents", "Agents"], ["servers", "Servers"]]) {
-    const b = el("button", "chip", label); b.type = "button"; b.setAttribute("aria-pressed", String(k === logFilter));
-    b.onclick = () => { logFilter = k; for (const c of box.children) c.setAttribute("aria-pressed", String(c === b)); applyFilter(); };
-    box.append(b);
-  }
-}
-function applyFilter() {
-  const box = document.getElementById("audit");
-  if (!box) return;
-  for (const n of box.children) if (n.dataset && n.dataset.cat) n.hidden = logFilter !== "all" && n.dataset.cat !== logFilter;
-}
-
 // The Inbox's first line: how things are, each part a link to where it is (#574 redesign).
 function renderStatus(s) {
   inbox("renderStatus", s);
@@ -1678,9 +1624,7 @@ async function refreshOnce() {
     drawn("wicketAgents", "renderStart", s);
     renderManifests(s);
     renderSecrets(s);
-    renderRows("decided", s.decided, decidedRow, "No decisions yet.");
-    renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
-    renderFilters(); applyFilter();
+    drawn("wicketActivity", "renderActivity", s);
     refreshRel();
     if (view === "agent") { drawn("wicketAgents", "renderAgentHead", s, agentRun); drawn("wicketAgents", "renderAgentLog", s, agentRun); }
     const ar = document.getElementById("audit-retention");
