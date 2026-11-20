@@ -328,7 +328,7 @@ Proposed:
 
 ### 3.1 Host leases, epochs and fencing
 
-**Tables** (expand steps; schema 33 is the next free number):
+**Tables** (expand steps, at the next free schema number when it is built: 33 to 35 are taken):
 - `supervisor_hosts`: `host`, `owner` (`machine:pid:start`), `lease_until`, `updated_at`;
 - `shard_nodes`: `node` → `host`, `epoch`;
 - `runs.host`.
