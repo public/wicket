@@ -161,9 +161,11 @@ timeout 240 "$WICKET" wake "$A" >"$work/w1.log" 2>&1 & p1=$!
 timeout 240 "$WICKET" wake "$A" >"$work/w2.log" 2>&1 & p2=$!
 s1=0; s2=0; wait $p1 || s1=$?; wait $p2 || s2=$?
 echo "   exits: $s1 $s2"
-# The loser is refused (exit 3, docs/reference/cli.md#exit-codes): another wake has the agent.
+# The loser is refused (exit 3, docs/reference/cli.md#exit-codes) in one of two ways, by timing:
+# before the winner claims the agent, by the claim ("not woken: it is …"); once the winner has
+# started its run, by the wake fence ("not woken yet: its last activation …"). Either is a loss.
 check "exactly one wake won" '[ $(( (s1 == 0) + (s2 == 0) )) = 1 ] && [ $(( (s1 == 3) + (s2 == 3) )) = 1 ]'
-check "the loser was told it lost" 'grep -q "not woken" "$work/w1.log" "$work/w2.log"'
+check "the loser was told it lost" 'grep -qE "not woken(:| yet:)" "$work/w1.log" "$work/w2.log"'
 check "the generation went up by exactly one" '[ "$(agent_field "$A" generation)" = $((gen2 + 1)) ]'
 check "A hibernated again after the winner's turn" '[ "$(agent_field "$A" state)" = hibernated ]'
 

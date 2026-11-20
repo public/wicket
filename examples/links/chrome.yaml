@@ -13,7 +13,7 @@ task: |
   Then call connect with box "chrome" and port 9222, and use the address it returns.
   Chromium only answers DevTools HTTP requests whose Host header is an IP address or localhost, so send
   "Host: localhost:9222" (e.g. curl -H 'Host: localhost:9222' http://chrome.wicket.internal:9222/json/version).
-  Write a small Node.js script (Node 22 has a global WebSocket) that opens a page target, navigates it to
+  Write a small Node.js script (Node 22 and later have a global WebSocket) that opens a page target, navigates it to
   https://example.com/ and reads document.title over the DevTools protocol. Put the title in
   /workspace/out/result.json as {"title": "..."}.
 agent:

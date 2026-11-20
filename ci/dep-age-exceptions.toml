@@ -1,0 +1,11 @@
+# Package versions allowed into a lockfile before they are 7 days old (ci/dep-age.py; design §2,
+# principle 21). The only reason is a fix for a serious, actively exploited vulnerability that can't
+# wait. Each entry names the advisory, and a maintainer approves it in review. Remove an entry once
+# the version is 7 days old: it is no longer needed.
+#
+# [[exception]]
+# ecosystem = "crates.io"            # or "npm"
+# name = "example"
+# version = "1.2.4"
+# advisory = "https://github.com/advisories/GHSA-xxxx-xxxx-xxxx"
+# reason = "fixes remote code execution exploited in the wild; no older fixed release"

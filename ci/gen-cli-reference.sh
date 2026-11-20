@@ -135,7 +135,8 @@ out of turns (`agent.max_turns`) has failed: Claude Code exits non-zero then, an
 code when the program ended by itself with a non-zero one (a crash or an outside signal included),
 and otherwise as `wicket run` does: a box wicket or its node stopped (a timeout, an expired
 authority, out of memory) is 1. `wicket wake`, which wicket runs itself, exits 3 when the agent is
-already being woken or is running.
+already being woken or is running, or its last activation may still be running on a node this host
+can't confirm stopped (until that activation's authority ends).
 
 A command the daemon runs passes its code back through it; one a signal ended exits 128 + the
 signal's number, as a shell reports it. If the daemon restarts while a command
