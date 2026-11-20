@@ -2,13 +2,15 @@
 #
 #   docker build -t wicket/claude-code-acp:poc --build-arg BASE=wicket/claude-code:poc examples/acp-claude
 #
-# The adapter's version and its registry integrity are pinned together; the build fails if the
-# registry serves anything else. Never `latest`.
+# The adapter and every package it needs come from ./package-lock.json, each checked against the
+# integrity recorded there, with no package's install script run (#721). Never `latest`: a new
+# version is a new lockfile (`npm install --package-lock-only --ignore-scripts` after changing
+# package.json).
 ARG BASE=wicket/claude-code:poc
 FROM ${BASE}
-ARG CLAUDE_AGENT_ACP_VERSION=0.104.1
-ARG CLAUDE_AGENT_ACP_INTEGRITY=sha512-wokBSGBEpYWgewoK1xeg/hiNg6KDFw9yY5QD+jYjDu3oVfALJGVCsc+sIHAA2hVcflJsqxRrYv+6AnCRAwRyFQ==
-RUN test "$(npm view "@agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION}" dist.integrity)" = "${CLAUDE_AGENT_ACP_INTEGRITY}" \
- && npm install -g --ignore-scripts "@agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION}" \
+COPY package.json package-lock.json /opt/claude-agent-acp/
+RUN cd /opt/claude-agent-acp \
+ && npm ci --ignore-scripts --omit=dev --no-audit --no-fund \
  && npm cache clean --force \
+ && ln -s /opt/claude-agent-acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js /usr/local/bin/claude-agent-acp \
  && command -v claude-agent-acp
