@@ -158,9 +158,13 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
             let names = settings()?;
             nm::approve(&l, &human()?, &id, &terms, &shown, &names, serde_json::json!({ "via": "cli" }))?;
             println!(
-                "approved {id}: the public name {} (port {}). wicket doesn't publish public records yet: it is a record only.",
+                "approved {id}: the public name {} (port {}). `wicket reconcile` publishes its records through provider {} once a run holds it on a node with a public address{}.",
                 c(&public.fqdn(&n.label), 253),
-                n.port
+                n.port,
+                public.provider.as_str(),
+                match public.provider {
+                    wicket_names::ProviderKind::Noop => " (noop: the plan is only recorded, nothing is published)",
+                }
             );
             Ok(())
         }

@@ -61,6 +61,12 @@ pub trait DnsProvider: Send + Sync {
     /// Its name in the config (`names.public.provider`).
     fn id(&self) -> &str;
     fn caps(&self) -> Caps;
+    /// Whether `apply` changes the zone. False for a provider that only reports (the no-op one):
+    /// the reconciler then records nothing as created, so the ledger never claims a record that
+    /// isn't there.
+    fn writes(&self) -> bool {
+        true
+    }
     /// Every record in the zone.
     fn list(&self, zone: &Zone) -> impl Future<Output = Result<Vec<Record>, ProviderError>> + Send;
     /// Applies a plan wicket computed, in its order.
@@ -88,6 +94,10 @@ impl NoopProvider {
 impl DnsProvider for NoopProvider {
     fn id(&self) -> &str {
         "noop"
+    }
+
+    fn writes(&self) -> bool {
+        false
     }
 
     fn caps(&self) -> Caps {
