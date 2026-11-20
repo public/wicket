@@ -89,12 +89,14 @@ impl Ledger {
         )? > 0)
     }
 
-    /// `node`'s public addresses (none if its operator set none, or it isn't an active node).
+    /// `node`'s public addresses: none if its operator set none, it isn't an active node, or they
+    /// were set before it was last enrolled (a machine enrolled again under its name, perhaps by a
+    /// build that doesn't know the table, is another machine).
     pub fn node_addresses(&self, node: &str) -> Result<NodeAddresses> {
         let row: Option<(Option<String>, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT a.ipv4, a.ipv6 FROM node_addresses a JOIN nodes n ON n.name = a.node WHERE a.node = ?1 AND n.status = 'active'",
+                "SELECT a.ipv4, a.ipv6 FROM node_addresses a JOIN nodes n ON n.name = a.node WHERE a.node = ?1 AND n.status = 'active' AND a.set_at >= n.enrolled_at",
                 params![node],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -142,7 +144,7 @@ impl Ledger {
                 .conn
                 .query_row(
                     "SELECT a.node FROM node_addresses a JOIN nodes n ON n.name = a.node
-                     WHERE n.status = 'active' AND a.node != ?1 AND ((?2 IS NOT NULL AND a.ipv4 = ?2) OR (?3 IS NOT NULL AND a.ipv6 = ?3))
+                     WHERE n.status = 'active' AND a.set_at >= n.enrolled_at AND a.node != ?1 AND ((?2 IS NOT NULL AND a.ipv4 = ?2) OR (?3 IS NOT NULL AND a.ipv6 = ?3))
                      LIMIT 1",
                     params![node, new.ipv4.map(|a| a.to_string()), new.ipv6.map(|a| a.to_string())],
                     |r| r.get(0),
