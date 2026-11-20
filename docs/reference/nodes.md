@@ -594,6 +594,15 @@ from the control host first (#191):
     (`node.secret_fetch`, with `image_pull`); it isn't among the secrets the node keeps for the run.
 - **Recorded.** The node's audit records `image.received` (digest, name, bytes, `via` `channel` or
   `registry`) or `image.refused` (why).
+- **Removed once unused** (#191). An image the node was given (sent or pulled) that no box has started
+  from for 7 days is removed from its runtime, hourly, and audited as `image.removed` (digest, when it
+  was last used, the keep). Set the keep with `image_keep_days` in the node's `node.json`; `0` keeps
+  every image. Only images the node imported itself are touched: never one built or loaded there by
+  other means, and nothing on the control host's own node, which shares its runtime. It is never
+  forced, so an image is kept while any container (running or not) was made from it, and while a live
+  box may still start from it: its own, and the pinned entries of its zone's `images`, which it may start
+  children from on the node itself (#164). A removed image a later box needs is sent or pulled again.
+  The node keeps what it knows in `image-uses.json` under its directory.
 - **What it needs.** Both ends talking protocol 7 (8 to pull), and a runtime that ids images by their manifest digest
   (Docker's containerd image store): a pin that is a config digest is refused with that reason. An image
   of at most 64 GiB, with room for it under the node's data directory (`images/`, cleared when `serve`
