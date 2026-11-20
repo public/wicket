@@ -308,6 +308,16 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// Every tenant's live public names that a run holds, by label: what the reconciler publishes
+    /// (it checks each one's lifetime and holder itself).
+    pub fn held_public_names(&self) -> Result<Vec<NameRow>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM names WHERE kind = 'public' AND status = 'live' AND holder IS NOT NULL ORDER BY label, id"
+        ))?;
+        let rows = st.query_map([], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// The live internal name `label` in `zone`, if any.
     pub fn internal_name(&self, tenant: &TenantId, zone: &str, label: &str) -> Result<Option<NameRow>> {
         Ok(self

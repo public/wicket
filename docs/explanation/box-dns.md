@@ -249,14 +249,20 @@ wicket owns records the way external-dns does: it reconciles the records it owns
 one it doesn't.
 
 - **The desired state is the ledger's:** for each live public name held by a running box, its A,
-  AAAA and SRV records for that box's node, and its owner record.
+  AAAA and SRV records for that box's node, and its owner record. The node must carry the labels
+  `names.public.nodes` asks for and have public addresses; until then the name is *waiting*, with
+  why, and has no records. The SRV record needs the name's host port on that node, so it comes with
+  step 4c.
+- **What the noop provider does:** it lists an empty zone and applies nothing, so the reconciler
+  records nothing in `name_records` (the ledger never claims a record that isn't there), and audits
+  each new plan as `name.plan` with `applied: false`. The same plan pass after pass is recorded once.
 - **The owner record** is a TXT at `_wicket.<label>.<zone>`:
   `"wicket-owner=<owner id>;name=<grant id>"`. It sits beside the name, not on it, so the name can
   later be a CNAME. The owner id is random, made at install: no host name or other detail in it.
 - **A record is wicket's only if both** the ledger lists it as created by this installation
   (`name_records`) and its owner TXT carries this installation's owner id. A record either side
   doesn't vouch for is never changed or deleted.
-- **The reconciler** (`wicket reconcile`, and after each name change) lists the zone, compares it
+- **The reconciler** (`wicket reconcile`; `wicket_control::namesync`) lists the zone, compares it
   with the desired state, and applies the difference: create, update or delete owned records. A name
   that exists in the zone without wicket's owner record is a conflict: wicket leaves it, the name's
   grant shows "taken in the zone", and the conflict is audited. It is never adopted on its own.
@@ -324,10 +330,13 @@ doesn't) can get one by DNS-01: a gateway tool, `dns_challenge(name, value)`, ma
 
 Audit records, as written so far: `name.requested` (an ask), `decision` and `decision.refused` (a
 human's approval or denial, or a refused one, as for other asks), `name.registered` (internal),
-`name.revoked`, `name.released`, `name.claimed` (a later run took up a standing name), and
-`node.addresses` (an operator set a node's public addresses). Still to come with 4b and 4c: `name.lapsed`, `name.port.opened`, `name.port.closed`,
-`name.conn` (per connection, on the node), `name.plan` (each reconcile's plan, applied or not),
-`name.record` (each create, update or delete), `name.conflict` and `name.challenge`.
+`name.revoked`, `name.released`, `name.claimed` (a later run took up a standing name),
+`node.addresses` (an operator set a node's public addresses), and the reconciler's (step 4b):
+`name.lapsed` (a name's lifetime ended), `name.plan` (a reconcile's plan, applied or not, recorded
+when it differs from the last one, with the names waiting and why), `name.record` (each create,
+update or delete a provider made) and `name.conflict`. Still to come with 4c and 6:
+`name.port.opened`, `name.port.closed`, `name.conn` (per connection, on the node) and
+`name.challenge`.
 
 `wicket names list` and the console's **Names** card list every name: kind, full name, owner (the
 principal, zone and run), target (node, address, host port and box port), state (pending, live,
