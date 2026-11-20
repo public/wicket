@@ -119,6 +119,13 @@ wicket.
 
 - **A pull request** runs what its change selects. The `select` job prints the selection in its
   summary.
+- **A draft pull request** runs the fast checks only: the selection and its tests, the public and
+  supply-chain checks, the dependency cooldown, format, clippy and tests, the session view and the
+  policy diffs. The heavy suites (fuzz, Lean, TLA+, Kani, the gVisor smoke test and acceptance) run
+  once it is marked **ready for review**, which starts a run, or on a draft with the `full-ci` label.
+- **`CI verdict (full)`** is the one check a merge waits for. It passes only if every job in `ci.yml`
+  passed or wasn't selected, in a run that isn't a draft's, so a draft never has a passing verdict.
+  `ci/verdict-needs.sh` (in the selection's tests) fails if a job is missing from its `needs`.
 - **The `full-ci` label** on a pull request runs everything. Adding the label starts a run. The
   `select` job reads the pull request's labels from the API when it runs, not from the event that
   started it, so a label added just after a push counts whichever of the two runs survives (#246). If
