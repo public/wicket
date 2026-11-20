@@ -366,6 +366,7 @@ Options:
       --file <FILE>                
       --lasts <LASTS>              How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew` [default: 30d]
       --intake-node <INTAKE_NODE>  A webhook or GitHub trigger's intake node (a node labelled wicket.intake=true): needed only when there are several
+      --allow-local-intake         Let the intake node be this host's own (`local`): deliveries from the internet then reach the machine with the ledger and the vault. Off unless asked for
   -h, --help                       Print help
 ```
 
@@ -1229,7 +1230,8 @@ Options:
       --listen <LISTEN>      Where to listen (e.g. `0.0.0.0:8443`)
       --tls-cert <TLS_CERT>  A certificate chain (PEM) to serve TLS with; without it, plain HTTP behind a reverse proxy that has TLS
       --tls-key <TLS_KEY>    The certificate's private key (PEM)
-      --dir <DIR>            The node's directory (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node)
+      --socket <SOCKET>      The node's intake socket, which `wicket node serve` listens on for intake (default: `<node dir>/ctl/intake.sock`, for intake run as the node's own user). Run as its own user, intake is given the socket the node's `intake_socket` names
+      --dir <DIR>            The node's directory, for the default socket (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node)
   -h, --help                 Print help
 ```
 

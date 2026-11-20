@@ -199,6 +199,9 @@ pub async fn dispatch(c: TriggerCmd) -> Result<()> {
             if let Some((node, path)) = c.hook {
                 print_url(&node, &path);
             }
+            for w in &c.warnings {
+                eprintln!("warning: {w}");
+            }
             Ok(())
         }
         TriggerCmd::RotateUrl { trigger } => {

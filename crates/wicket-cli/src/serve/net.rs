@@ -292,7 +292,7 @@ impl PerIp {
 /// Accepts connections until the listener fails: over-limit connections are closed at once, TLS
 /// (if any) is negotiated within the handshake timeout, and ACME validation handshakes are closed
 /// after the handshake (they carry no HTTP).
-pub async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, state: Arc<State>) -> Result<()> {
+pub(super) async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, state: Arc<State>) -> Result<()> {
     let limits = state.limits.clone();
     let slots = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip = Arc::new(PerIp::default());

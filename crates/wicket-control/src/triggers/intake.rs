@@ -98,6 +98,10 @@ pub fn rotate_url(l: &Ledger, by: &Operator, root: bool, id: &str) -> Result<(Tr
 }
 
 /// The verify secret a hook trigger names.
+pub fn verify_name(s: &TriggerSpec) -> Option<&str> {
+    verify_secret(s)
+}
+
 fn verify_secret(s: &TriggerSpec) -> Option<&str> {
     match &s.source {
         Source::Webhook { verify } | Source::Github { verify, .. } => Some(&verify.hmac_sha256),
@@ -318,7 +322,11 @@ pub(super) fn ingest_checked(
 /// When each node's refusals were last audited, and what it refused (and what the control host
 /// dropped of what it sent) since. In this process's memory: a reconciler is long-lived, and one
 /// that restarts audits its first refusals at once.
-static REFUSED_AT: std::sync::LazyLock<Mutex<HashMap<String, (i64, IntakeRefused, u64)>>> = std::sync::LazyLock::new(Default::default);
+/// A node's counts since its last audit: when that was, what intake refused, what the control
+/// host dropped.
+type RefusedSince = (i64, IntakeRefused, u64);
+
+static REFUSED_AT: std::sync::LazyLock<Mutex<HashMap<String, RefusedSince>>> = std::sync::LazyLock::new(Default::default);
 
 /// Counts an event from `node` the control host dropped (fields outside intake's shape, another
 /// trigger's kind): audited with the node's refusals.

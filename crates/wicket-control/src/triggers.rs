@@ -282,6 +282,9 @@ pub struct Created {
     pub id: String,
     pub agent: Option<AgentRow>,
     pub hook: Option<(String, String)>,
+    /// What the operator should know: a verify secret another trigger checks deliveries with too
+    /// (a delivery signed for one would pass for the other, at its own URL).
+    pub warnings: Vec<String>,
 }
 
 /// Where a webhook trigger's deliveries arrive: its intake node (`node`; the only one if None), and
@@ -348,7 +351,22 @@ pub fn create_with(
         let _ = l.set_trigger_status(&id, "deleted");
         return Err(e.context("auditing the trigger"));
     }
-    Ok(Created { id, agent, hook })
+    let mut warnings = vec![];
+    if let Some(name) = intake::verify_name(&spec) {
+        let shared: Vec<String> = l
+            .triggers(&t.0, None)?
+            .into_iter()
+            .filter(|x| x.id != id && x.status != "deleted" && intake::verify_name(&x.spec) == Some(name))
+            .map(|x| x.name)
+            .collect();
+        if !shared.is_empty() {
+            warnings.push(format!(
+                "secret {name} also verifies {}: a delivery signed for one passes for the others, at their own URLs; give each trigger its own secret",
+                shared.join(", ")
+            ));
+        }
+    }
+    Ok(Created { id, agent, hook, warnings })
 }
 
 fn get(l: &Ledger, id: &str) -> Result<Trigger> {

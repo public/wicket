@@ -364,12 +364,19 @@ control host assigns to it, with `wicket node intake` beside its `wicket node se
 ([fire a trigger from a webhook](../how-to/trigger-from-a-webhook.md),
 [why it runs on a node](../explanation/trigger-intake.md)).
 
-- **What it keeps.** `node serve` keeps intake's table (each trigger's URL token sha256 and verify
-  secret) in memory only, as the control host last sent it.
+- **Intake runs as its own user**, `wicket-intake`, under `deploy/node/wicket-intake.service`.
+  - It reaches `serve` only through `node.json`'s `intake_socket` (`/run/wicket-intake/intake.sock`).
+  - `serve` answers only the uid in `node.json`'s `intake_uid`, checked on every connection
+    (`SO_PEERCRED`).
+  - Without them (a test node), `serve` takes intake as its own user, on `ctl/intake.sock`.
+- **What `serve` keeps.** Intake's table (each trigger's URL token sha256 and verify secret) is in
+  memory only, as the control host last sent it.
+  - Until it has one, intake answers 503.
   - It spools verified deliveries in `intake/spool/`, at most 10,000 or 64 MiB, each for 24 h at
     most, until the control host has recorded them.
-  - Intake reaches it over `ctl/intake.sock`, in the 0700 control directory.
-- **Protocol 21.** It must talk protocol 21 or later to be chosen.
+- **Protocol 21.** The node must talk protocol 21 or later to be chosen.
+- **The local node** (the control host's own machine) is chosen only with
+  `wicket trigger create --allow-local-intake`.
 
 ## Health, admission and disk ([#377](https://github.com/public/wicket/issues/377))
 

@@ -74,7 +74,8 @@ pub const NAMES: u32 = 18;
 pub const DECODE_SLASH: u32 = 19;
 /// The first protocol version with webhook intake (#578 step 4): the control host sends a node
 /// [`Msg::IntakeSync`] and the node answers [`Msg::IntakeEvents`]. Only a node at this version is
-/// chosen for a webhook trigger's intake. (20 is #651's DNS host ports.)
+/// chosen for a webhook trigger's intake. (20 is held for #651's DNS host ports, in review beside
+/// this: whichever lands first takes the lower number, and the other moves up.)
 pub const INTAKE: u32 = 21;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
