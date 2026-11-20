@@ -598,6 +598,21 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(ids.health.children.length, 2, "the sink's row, then the nodes");
   assert.ok(ids.health.children[0].children[0].textContent.startsWith("Audit export stdout (jsonl)6 records behind (oldest 66 min) (manual: fed only by `wicket audit export`)"), ids.health.children[0].textContent);
   assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
+  // The rows' alerts come first, then a stale read says so, then the rows.
+  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, errors: [], stale: true, read_ms: (nowS - 400) * 1000,
+    alerts: ["audit sink store: 24 records behind (oldest 6 min)"],
+    audit: [{ sink: "store", kind: "store", seq: 1, head: 25, behind: 24, behind_secs: 400, checkpoint_at: 0, error: null, manual: false }] } } };
+  await run("refresh()"); await flush();
+  assert.strictEqual(ids.health.children[0].textContent, "! audit sink store: 24 records behind (oldest 6 min)");
+  assert.strictEqual(ids.health.children[0].className, "blocked");
+  assert.strictEqual(ids.health.children[1].textContent, "! not checked for 6 min: these rows may be out of date");
+  assert.ok(ids.health.children[2].textContent.startsWith("Audit export store (store)24 records behind"));
+  // An error the config alert already quotes is said once; a first read that is overdue says so.
+  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, audit: [], stale: true, read_ms: null, not_read_yet: true,
+    errors: ["audit-sinks.yaml can't be read: x"], alerts: ["audit-sinks.yaml can't be read: x (for 5 min)"] } } };
+  await run("refresh()"); await flush();
+  assert.deepStrictEqual(ids.health.children.map(c => c.textContent),
+    ["! audit-sinks.yaml can't be read: x (for 5 min)", "! not read yet: the console hasn't managed a first read of the state store", "No node has reported its health yet."]);
   // One poll at a time (B9): a second asked for while one is in flight runs after it, not beside it.
   let inFlight = 0, most = 0;
   const realFetch = sandbox.fetch;

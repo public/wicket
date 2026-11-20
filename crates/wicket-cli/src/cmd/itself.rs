@@ -12,13 +12,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             SelfCmd::Status => update::status(),
             SelfCmd::Follow => ci_update::follow().await,
             SelfCmd::Update { artifact, from_ci, sig, nodes, only_nodes, window, interval, check, canary, image, no_prune } => {
-                let gate = update::Gate {
-                    window: wicket_core::time::parse_duration(&window).context("bad --window")?,
-                    interval: wicket_core::time::parse_duration(&interval).context("bad --interval")?.max(Duration::from_secs(1)),
-                    checks: check,
-                    canary,
-                    image,
-                };
+                let gate = update::Gate { window, interval: interval.max(Duration::from_secs(1)), checks: check, canary, image };
                 match (from_ci, artifact) {
                     (Some(target), _) => ci_update::update_from_ci(&target, nodes, only_nodes, gate, !no_prune).await,
                     (None, Some(artifact)) => {
@@ -83,11 +77,11 @@ pub enum SelfCmd {
         #[arg(long, requires = "nodes")]
         only_nodes: bool,
         /// How long each new build is watched after its switch.
-        #[arg(long, default_value = "30s")]
-        window: String,
+        #[arg(long, default_value = "30s", value_parser = wicket_core::time::duration_arg)]
+        window: std::time::Duration,
         /// How often within the window.
-        #[arg(long, default_value = "10s")]
-        interval: String,
+        #[arg(long, default_value = "10s", value_parser = wicket_core::time::duration_arg)]
+        interval: std::time::Duration,
         /// A command (sh -c) that must succeed each time; $WICKET is the new build's binary and
         /// $WICKET_UPDATE_TARGET `control` or `node:<name>`. Repeatable.
         #[arg(long)]
