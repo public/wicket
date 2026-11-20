@@ -105,6 +105,17 @@ pub enum StoreError {
     TooOld { version: u32 },
 }
 
+impl StoreError {
+    /// Whether SQLite said another connection holds the database (busy or locked): worth trying
+    /// again.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Sql(e) if matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+        )
+    }
+}
+
 /// The ledger's schema version (#162). Every migration bumps it, and records what kind it is:
 /// - **expand** (a new table, a new column with a default, a new index): older binaries ignore it,
 ///   so a rollback across it is safe. [`SCHEMA_FLOOR`] stays.

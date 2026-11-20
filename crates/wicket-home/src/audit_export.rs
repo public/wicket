@@ -1178,16 +1178,7 @@ pub fn spawn_background() {
 /// Whether `e` is SQLite saying another connection holds the database (busy or locked): worth
 /// trying again.
 fn is_busy(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| {
-        let sql = c.downcast_ref::<rusqlite::Error>().or_else(|| match c.downcast_ref::<wicket_store::StoreError>() {
-            Some(wicket_store::StoreError::Sql(s)) => Some(s),
-            _ => None,
-        });
-        matches!(
-            sql.and_then(rusqlite::Error::sqlite_error_code),
-            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-        )
-    })
+    e.chain().any(|c| c.downcast_ref::<wicket_store::StoreError>().is_some_and(wicket_store::StoreError::is_busy))
 }
 
 static BACKGROUND: Mutex<Option<std::sync::mpsc::Sender<std::sync::mpsc::SyncSender<()>>>> = Mutex::new(None);
@@ -1394,8 +1385,8 @@ mod tests {
         let sql = |code| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
         let busy = anyhow::Error::from(wicket_store::StoreError::Sql(sql(rusqlite::ffi::SQLITE_BUSY))).context("opening the ledger");
         assert!(is_busy(&busy));
-        assert!(is_busy(&anyhow::Error::from(sql(rusqlite::ffi::SQLITE_LOCKED))));
-        assert!(!is_busy(&anyhow::Error::from(sql(rusqlite::ffi::SQLITE_CORRUPT))));
+        assert!(is_busy(&anyhow::Error::from(wicket_store::StoreError::Sql(sql(rusqlite::ffi::SQLITE_LOCKED)))));
+        assert!(!is_busy(&anyhow::Error::from(wicket_store::StoreError::Sql(sql(rusqlite::ffi::SQLITE_CORRUPT)))));
         assert!(!is_busy(&anyhow::anyhow!("database is busy, said someone")));
     }
 
