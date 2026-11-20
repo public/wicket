@@ -7,7 +7,8 @@
 //! set): an A record for the node's IPv4 address, an AAAA record for its IPv6 one, and, once the
 //! name has a host port on that node (step 4c), an SRV record naming it. The plan adds each name's
 //! owner record (`_wicket.<name>` TXT). A name that can't be published yet is *waiting*, with why;
-//! it has no records, as any name without a live holder.
+//! it has no records, as any name without a live holder. So is a name whose label the settings as
+//! they are now don't allow, or that was approved under another boxes domain than the zone's now.
 //!
 //! **One pass.**
 //! 1. Names whose lifetime is over end (`Ledger::lapse_names`), each audited `name.lapsed`.
@@ -83,6 +84,13 @@ pub fn desired(l: &Ledger, public: &PublicConfig, now: i64) -> Result<(Vec<Desir
             wait(format!("its label is not allowed here now: {e}"));
             continue;
         }
+        // Published only in the domain it was approved under (#716 review, F3): a change of
+        // names.public.zone doesn't move it into one nobody approved.
+        if n.domain.as_deref() != Some(public.domain().as_str()) {
+            let was = n.domain.as_deref().unwrap_or("no recorded domain");
+            wait(format!("it was approved under {was}, not {}: a human approves it again there", public.domain()));
+            continue;
+        }
         let Some(holder) = n.holder.as_deref() else { continue };
         if l.run_status(holder)?.as_deref() != Some("running") {
             wait(format!("its run {holder} isn't running"));
@@ -129,15 +137,8 @@ fn tenant_of(l: &Ledger, base: &str, wanted: &BTreeMap<String, String>, owned: &
 pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &P, now: i64, dry_run: bool) -> Result<Report> {
     let owner = OwnerId::parse(&public.owner).ok_or_else(|| anyhow!("names.public.owner {:?} is not an owner id", public.owner))?;
     let zone = Zone::new(&public.domain());
-    let mut lapsed = vec![];
-    if !dry_run {
-        for n in l.lapse_names(now)? {
-            let body =
-                serde_json::json!({ "name": n.id, "label": n.label, "kind": n.kind.as_str(), "zone": n.zone, "expired_at": n.expires_at });
-            l.audit(&TenantId(n.tenant.clone()), None, "name.lapsed", &body)?;
-            lapsed.push(n);
-        }
-    }
+    // Each audited `name.lapsed` by the ledger.
+    let lapsed = if dry_run { vec![] } else { l.lapse_names(now)? };
     let (want, waiting) = desired(l, public, now)?;
     let listed = provider.list(&zone).await.with_context(|| format!("listing zone {} with provider {}", zone.apex(), provider.id()))?;
     let owned_records = l.owned_records(&zone)?;
@@ -338,6 +339,10 @@ mod tests {
         p.reserved.push("demo".into());
         let (_, waiting) = desired(&l, &p, now).unwrap();
         assert!(waiting[0].why.contains("not allowed"), "{waiting:?}");
+        let mut p = public();
+        p.zone = "other.example.com".into();
+        let (want, waiting) = desired(&l, &p, now).unwrap();
+        assert!(want.is_empty() && waiting[0].why.contains("approved under boxes.example.com"), "{waiting:?}");
         l.run_ended(&run, "succeeded", "").unwrap();
         l.release_run_names(&run).unwrap();
         let (want, waiting) = desired(&l, &public(), now).unwrap();
