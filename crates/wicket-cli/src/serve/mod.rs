@@ -1789,7 +1789,11 @@ fn waiting(state: &State) -> Result<Vec<push::Waiting>> {
         let agent = s.principal.rsplit("/a/").next().unwrap_or(&s.principal).to_string();
         out.push(push::Waiting { id: s.id, summary: format!("{agent} asks for standing reach on {}", s.rule.host) });
     }
-    // Asks for public names (#575): only a human decides them.
+    // Asks for public names (#575): only a human decides them. Those past their time, or of runs
+    // that are gone, are swept first, so they aren't pushed (#696 review).
+    if let Err(e) = l.sweep_stale_names() {
+        tracing::warn!("notifier: sweeping stale names: {e:#}");
+    }
     for n in l.names_with_status(&state.tenant, "pending")? {
         let agent = n.principal.rsplit("/a/").next().unwrap_or(&n.principal).to_string();
         out.push(push::Waiting { id: n.id, summary: format!("{agent} asks for the public name {} (port {})", n.label, n.port) });

@@ -27,11 +27,12 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | --- | --- |
 | `wicket pending --json`, a request | `kind` (`request`), `id`, `run`, `zone`, `method`, `host`, `path`, `prefix` (the whole path prefix asked for), `risk`, `reason`, `created_at`, `attribution` (who in the box asked, as the agent reported it: untrusted) |
 | `wicket pending --json`, a standing ask | `kind` (`standing`), `id`, `run`, `zone`, `principal`, `rule`, `reason`, `created_at` |
+| `wicket pending --json`, an ask for a public name | `kind` (`name`), `id`, `run` (the asking run), `zone`, `principal`, `label`, `port` (the box's own), `service`, `scope` (`run`, `standing`), `reason` (the agent's, prefixed `asked by the agent: `), `created_at` |
 | a standing `rule` | `host`, `methods`, `paths`, `allow_dangerous` |
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
-| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
+| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
 | `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
 | `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
@@ -856,7 +857,7 @@ Usage: wicket names <COMMAND>
 Commands:
   list     Names: pending asks for public names, and live names (internal and public). --all adds denied, withdrawn and ended ones
   show     One name or ask: the label, port, who asked, and, for a public name, what approving it means
-  approve  Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it), or --for zone (every agent of its zone), for --lasts
+  approve  Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it takes it up when it starts), or --for zone (every agent of its zone), for --lasts
   deny     Deny an ask for a public name
   revoke   Revoke a live name, public or internal: it ends now, whoever holds it
   help     Print this message or the help of the given subcommand(s)
@@ -895,7 +896,7 @@ Options:
 ### `wicket names approve`
 
 ```text
-Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it), or --for zone (every agent of its zone), for --lasts
+Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it takes it up when it starts), or --for zone (every agent of its zone), for --lasts
 
 Usage: wicket names approve [OPTIONS] <ID>
 
@@ -1005,7 +1006,7 @@ Commands:
   serve     On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
   top       On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
   forget    Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
-  set       Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`
+  set       Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`. Its public addresses (#575) are where its boxes' public names point: only you set them, never the node
   renew-ca  Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
   help      Print this message or the help of the given subcommand(s)
 
@@ -1230,7 +1231,7 @@ Options:
 ### `wicket node set`
 
 ```text
-Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`
+Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`. Its public addresses (#575) are where its boxes' public names point: only you set them, never the node
 
 Usage: wicket node set [OPTIONS] <NAME>
 
@@ -1238,10 +1239,12 @@ Arguments:
   <NAME>  
 
 Options:
-      --ca-hosts <CA_HOSTS>  `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need), or a comma-separated list of hosts it may be widened to (`api.example.com,*.example.org`)
-      --label <LABELS>       `key=value` sets a label, `key-` removes it. Repeatable
-      --taint <TAINTS>       `key` or `key=value` taints the node (one taint per key), `key-` removes it. Repeatable
-  -h, --help                 Print help
+      --ca-hosts <CA_HOSTS>        `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need), or a comma-separated list of hosts it may be widened to (`api.example.com,*.example.org`)
+      --label <LABELS>             `key=value` sets a label, `key-` removes it. Repeatable
+      --taint <TAINTS>             `key` or `key=value` taints the node (one taint per key), `key-` removes it. Repeatable
+      --public-ipv4 <PUBLIC_IPV4>  The node's public IPv4 address (an address on the public internet: the router's, for a node behind NAT that forwards its port range), or `none`
+      --public-ipv6 <PUBLIC_IPV6>  The node's public IPv6 address, or `none`
+  -h, --help                       Print help
 ```
 
 ### `wicket node renew-ca`

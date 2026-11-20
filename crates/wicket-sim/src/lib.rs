@@ -364,6 +364,7 @@ pub fn run_ctx(run: &str, zone: &ZoneSpec) -> wicket_proxy::RunCtx {
         fence: None,
         waker: None,
         lifecycle: None,
+        names: None,
     }
 }
 

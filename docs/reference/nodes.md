@@ -452,6 +452,12 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
   its manifest's [`placement.node_selector`](manifest.md#placement) names, with that value, and the box
   tolerates every taint the node has (`placement.tolerations`: `key` for any value, or `key=value`). A
   taint keeps a node for the boxes that say they belong there.
+- **Public addresses** (#575). `wicket node set <node> --public-ipv4 <address> --public-ipv6 <address>`
+  records where a public name of a box on the node points (`none` clears one; audited `node.addresses`,
+  ledger schema 33). Only addresses on the public internet are taken: for a node behind NAT that forwards
+  its port range one to one, the router's. They are the operator's alone: a node never sets its own, since
+  a node that could name its address could point a name at someone else's server. A node with neither
+  can't publish.
 - **Filter.** Out are: a node that starts no box (`full`); one without the vCPUs and memory the box's limits
   ask for, by its report and its admission's room ([above](#health-admission-and-disk-377)); a label or
   taint mismatch; and a node whose CA doesn't cover the box's inspected hosts and whose policy keeps them

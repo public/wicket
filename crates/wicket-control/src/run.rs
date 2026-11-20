@@ -458,6 +458,16 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     if record.is_none() {
         wicket_agent::acp::check_installation(&m).map_err(anyhow::Error::msg)?;
     }
+    // The installation's names settings (#575): ones that can't work stop a start, as above. A
+    // supervisor re-attaching keeps the box going without public names rather than stop it.
+    let names_settings = match wicket_agent::acp::names_settings() {
+        Ok(n) => Some(Arc::new(n)),
+        Err(e) if record.is_none() => bail!(e),
+        Err(e) => {
+            say!("[wicket] {e}: this run asks for no public names until it is started again");
+            None
+        }
+    };
     // A program runs only the source it was approved as (its digest), copied into the box.
     let program_src = match &m.program {
         Some(_) if record.is_some() => None,
@@ -828,6 +838,11 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     "issuer_kid": wicket_identity::key_id(&issuer.verifying_key()), "manifest_sha256": claims.manifest_sha256, "image": image, "node": node_name,
                     "acting_for": claims.chain(), "expires_at": claims.exp,
                 }))?;
+                // Standing names (#575): the run holds the live ones bound to its agent or zone
+                // that no run holds, under the zone's name as the ask stored it.
+                for n in crate::names::claim_for_run(&l, &m.tenant, &run, &claims.sub, &m.zone) {
+                    say!("[wicket] {run} holds its standing name {} ({}, port {})", n.label, n.id, n.port);
+                }
             }
             Some(Arc::new(wicket_proxy::IdentityCell::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() })))
         }
@@ -1043,6 +1058,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         fence: fence.clone(),
         waker: long_lived.then(|| Arc::new(|agent: &str, by: &str| crate::hibernate::trigger_wake(agent, by)) as wicket_proxy::Waker),
         lifecycle: m.program.is_none().then(|| want_tx.clone()),
+        names: names_settings.clone(),
     };
     let proxies_lap = std::time::Instant::now();
     // The run's model budget and spend: its node's model proxy is the box's only one and the counter
