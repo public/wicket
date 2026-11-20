@@ -349,19 +349,73 @@ deletes a record wicket doesn't own, and applying it makes the owned records the
 - **`noop` first:** it lists nothing, applies nothing and reports the plan it was given, audited as
   `name.plan` with `applied: false`. It lets an operator see what wicket would do before giving it a
   credential, and is what tests and the simulation use.
-- **Then `vultr`** (its DNS API; most nodes run on Vultr now) **and `rfc2136`** (dynamic update with
-  TSIG, for self-hosted servers such as BIND, Knot or PowerDNS, and the static hosts).
+- **`vultr`** (built, #575 step 5a; `wicket_control::vultrdns`): Vultr's DNS API v2, through the
+  placement crate's Vultr client (bearer key, paging, backoff). It lists the zone's records
+  (`GET /domains/<zone>/records`, every page, or an error: never part of the zone), and applies a
+  plan's changes in order, one request each (`POST` a create, `PATCH` an update, `DELETE` a
+  delete, a `404` on delete counting as done), with the record ids from a listing taken at the
+  start of the apply. It isn't atomic: it stops at the first failure and says how many changes it
+  made, which are all that count as made. A create isn't retried after a `5xx` (it may have
+  happened); the next pass lists the zone and plans from there. A zone the account doesn't serve
+  is an error, not an empty zone. Vultr names records relative to the zone, an SRV's priority
+  apart from its `weight port target`, and TXT data in quotes; it reads and writes those as
+  wicket's absolute names and `priority weight port target`. Its record types: A, AAAA, SRV, TXT;
+  its lowest TTL 30 s. Its id is `vultr:<the first 12 hex digits of the key's SHA-256>`: it names
+  the account without the key. So a rotated key is another provider to the ledger: the records the
+  old key made are stranded (and their names conflicts) until it is back to withdraw them, so
+  withdraw them first (remove the names, or let a pass with the old key run) or keep the key.
+  Give it a zone of its own: a subzone delegated to Vultr's name servers (`ns1.vultr.com`,
+  `ns2.vultr.com`), such as `boxes.example.com`, so the key's reach over DNS is the boxes and
+  nothing else; Vultr's API keys aren't scoped to one zone.
+- **Then `rfc2136`** (dynamic update with TSIG, for self-hosted servers such as BIND, Knot or
+  PowerDNS, and the static hosts).
 - **Later:** Cloudflare and Route 53, each one more implementation of the trait.
 
 A provider runs on the control host, in the reconciler. Nodes never hold a DNS credential.
 
 ## Credentials
 
-The provider's credential is a vault secret like any other (`wicket secret set dns-boxes`), its
-`.hosts` file limited to the provider's API host. The reconciler fetches it from the vault when it
-runs. It never goes to a node or a box, and never on the feed. Use a credential scoped to the
+The provider's credential is a vault secret like any other (`wicket secret set dns-boxes`),
+named by `names.public.credential`; bind it to the provider's API host too (`--hosts
+api.vultr.com`), so nothing else that reads secrets by host would send it elsewhere. The
+reconciler reads it from the vault at each pass, on the control host; a missing secret is an
+`error` line of the pass. It goes only into the API's `Authorization` header: never to a node or a
+box, on the feed, in a URL, an error, a log or an audit record. Use a credential scoped to the
 boxes zone where the provider has them (a TSIG key allowed only that zone, a Cloudflare token for
-one zone).
+one zone); a Vultr API key reaches the whole account, so give it its own account or subaccount if
+you can, and limit it to the control host's address (Vultr's API access control).
+
+### Trying the Vultr provider against a test zone
+
+An opt-in manual check, not run by CI (the tests use a local mock of the API). With a throwaway
+zone delegated to Vultr (`test-boxes.example.com` here), on the control host:
+
+1. In Vultr's console, add the zone (DNS, Add Domain) and delegate it from its parent to
+   `ns1.vultr.com` and `ns2.vultr.com`. Make an API key and allow the control host's address.
+2. `wicket secret set dns-boxes --hosts api.vultr.com` (the key is read from the terminal).
+3. In `/etc/wicket/wicket.yaml`:
+
+   ```yaml
+   names:
+     public:
+       provider: vultr
+       zone: test-boxes.example.com
+       credential: dns-boxes
+       owner: <openssl rand -hex 8>
+       nodes: { publish: "true" }
+   ```
+
+4. `wicket reconcile --dry-run`: it lists the zone (an error here means the key, its allowed
+   addresses or the zone) and shows the plan; it writes nothing.
+5. Ask for and approve a public name on a node with the label and a public address, then
+   `wicket reconcile`: the zone gains `_wicket.<label>` TXT, `<label>` A (and AAAA, SRV), each
+   `name_record` line saying `applied by vultr:<id>`. Check them with `dig @ns1.vultr.com`.
+6. Revoke the name (`wicket names revoke`) and `wicket reconcile` again: its records go, the owner
+   record last. Delete the zone when done.
+
+Check against the real API what the mock assumes (`crates/wicket-control/src/vultrdns.rs` lists it):
+the apex as an empty name, TXT data quoted, an SRV's `data` as `weight port target`, and that a 30 s
+TTL is accepted.
 
 ## Certificates the box gets itself
 
@@ -436,7 +490,7 @@ has a name's records as the zone last listed them, and its last connections.
      `noop` provider;
    - 4c: host ports, published on the feed, and the node's listener (built: below);
    - 4d: the console's Names card.
-5. The `vultr` and `rfc2136` providers.
+5. The `vultr` (5a, built) and `rfc2136` providers.
 6. DNS-01 challenges.
 
 Done when (from the issue): a box asks for `demo.<boxes domain>` → its port 3000, the operator

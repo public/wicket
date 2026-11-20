@@ -54,4 +54,5 @@ pub mod standing;
 pub mod storegc;
 pub mod transcript;
 pub mod triggers;
+pub mod vultrdns;
 pub mod whyhere;

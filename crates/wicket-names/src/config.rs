@@ -102,12 +102,15 @@ fn default_ports() -> PortRange {
 pub enum ProviderKind {
     /// Publishes nothing: each reconcile's plan is only recorded (`name.plan`, `applied: false`).
     Noop,
+    /// Vultr's DNS API (#575 step 5a), with the API key in the vault secret `credential` names.
+    Vultr,
 }
 
 impl ProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             ProviderKind::Noop => "noop",
+            ProviderKind::Vultr => "vultr",
         }
     }
 }
@@ -116,13 +119,13 @@ impl ProviderKind {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicConfig {
-    /// `noop` for now; `vultr` and `rfc2136` come with #575 step 5.
+    /// `noop` or `vultr`; `rfc2136` comes with #575 step 5.
     pub provider: ProviderKind,
     /// The boxes domain: public names are `<label>.<zone>`. A delegated subzone is recommended, so
     /// the provider's credential touches nothing else.
     pub zone: String,
     /// The vault secret holding the provider's credential: its name, never its value. The `noop`
-    /// provider needs none.
+    /// provider takes none; `vultr` needs one (an API key).
     #[serde(default)]
     pub credential: Option<String>,
     /// This installation's owner id, written in its owner records (`_wicket.<name>` TXT): random,
@@ -265,8 +268,16 @@ impl PublicConfig {
         if let Some(p) = own.iter().find(|p| (lo..=hi).contains(*p)) {
             bad.push(format!("names.public.ports {lo}-{hi} holds port {p}, which wicket itself listens on"));
         }
-        if let (ProviderKind::Noop, Some(_)) = (self.provider, &self.credential) {
-            bad.push("names.public.credential: the noop provider takes none".into());
+        match (self.provider, self.credential.as_deref()) {
+            (ProviderKind::Noop, Some(_)) => bad.push("names.public.credential: the noop provider takes none".into()),
+            (ProviderKind::Vultr, None) => {
+                bad.push("names.public.credential: the vultr provider needs one, the name of the vault secret holding its API key".into())
+            }
+            // A name the vault would refuse, caught here rather than at the first pass.
+            (ProviderKind::Vultr, Some(c)) if c.is_empty() || !c.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => {
+                bad.push(format!("names.public.credential {c:?} is not a vault secret name (letters, digits, - and _)"))
+            }
+            _ => {}
         }
         bad
     }
@@ -358,6 +369,16 @@ mod tests {
             r#"{ "public": { "provider": "noop", "zone": "b.example", "owner": "a1b2c3d4", "ports": "x" } }"#
         )
         .is_err());
+        // vultr needs a credential, a vault secret's name (#575 step 5a).
+        let vultr = |cred: serde_json::Value| -> Result<(), String> {
+            let mut v: serde_json::Value = serde_json::from_str(OK).unwrap();
+            v["public"]["provider"] = "vultr".into();
+            v["public"]["credential"] = cred;
+            serde_json::from_value::<NamesConfig>(v).unwrap().check_with(&[CONSOLE_PORT, INTAKE_PORT])
+        };
+        assert!(vultr(serde_json::Value::Null).unwrap_err().contains("needs one"));
+        assert!(vultr("dns/boxes".into()).unwrap_err().contains("not a vault secret name"));
+        assert_eq!(vultr("dns-boxes".into()), Ok(()));
         assert!(serde_json::from_str::<NamesConfig>(
             r#"{ "public": { "provider": "route53", "zone": "b.example", "owner": "a1b2c3d4" } }"#
         )

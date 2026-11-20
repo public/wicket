@@ -43,6 +43,22 @@ impl ApiKey {
     pub fn new(s: impl Into<String>) -> ApiKey {
         ApiKey(s.into().trim().to_string())
     }
+
+    /// The first 12 hex digits of the key's SHA-256: names the account it writes with (the DNS
+    /// provider's id, #575 step 5a) without revealing the key.
+    pub fn fingerprint(&self) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(self.0.as_bytes()))[..12].to_string()
+    }
+
+    /// `text` with the key, if it appears, replaced by `[redacted]`: for an error message built from
+    /// what the API returned, which should never hold the key but is checked anyway.
+    pub fn redact(&self, text: &str) -> String {
+        if self.0.is_empty() {
+            return text.to_string();
+        }
+        text.replace(&self.0, "[redacted]")
+    }
 }
 
 impl std::fmt::Debug for ApiKey {
@@ -216,8 +232,15 @@ impl Client {
         self
     }
 
-    /// One request, retried on 429 and 5xx. Returns None for 404 (the caller decides what that means).
-    async fn call(
+    /// The key the client sends.
+    pub fn key(&self) -> &ApiKey {
+        &self.key
+    }
+
+    /// One request, retried on 429 and 5xx (not a 5xx after a POST). Returns None for 404 (the
+    /// caller decides what that means). Shared with the DNS provider (`wicket_control::vultrdns`,
+    /// #575 step 5a); a failure with a status is an [`ApiError`] (`downcast_ref`).
+    pub async fn call(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -261,8 +284,9 @@ impl Client {
         }
     }
 
-    /// Every page of a listing: `field` from each, following `meta.links.next`.
-    async fn paged<T: for<'de> Deserialize<'de>>(&self, path: &str, field: &str, query: &[(&str, String)]) -> anyhow::Result<Vec<T>> {
+    /// Every page of a listing: `field` from each, following `meta.links.next`. Any page failing
+    /// (a 404 too) fails the whole listing.
+    pub async fn paged<T: for<'de> Deserialize<'de>>(&self, path: &str, field: &str, query: &[(&str, String)]) -> anyhow::Result<Vec<T>> {
         let mut out = vec![];
         let mut cursor = String::new();
         for _ in 0..1000 {
