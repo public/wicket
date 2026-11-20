@@ -4,8 +4,9 @@
 #
 # The adapter and every package it needs come from ./package-lock.json, each checked against the
 # integrity recorded there, with no package's install script run (#721). Never `latest`: a new
-# version is a new lockfile (`npm install --package-lock-only --ignore-scripts` after changing
-# package.json).
+# version is a new lockfile: `npm install --package-lock-only` after changing package.json, with npm
+# 11.10+ so that ./.npmrc's min-release-age keeps out versions younger than 7 days (design §2,
+# principle 21; CI's ci/dep-age.py checks it either way).
 ARG BASE=wicket/claude-code:poc
 FROM ${BASE}
 COPY package.json package-lock.json /opt/claude-agent-acp/

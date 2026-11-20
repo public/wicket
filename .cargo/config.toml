@@ -1,0 +1,7 @@
+# No crate version younger than 7 days when Cargo resolves (`cargo update`, `cargo add`, a new
+# dependency): design §2, principle 21. Cargo 1.100+ applies it; older Cargo ignores it, and CI's
+# ci/dep-age.py checks Cargo.lock either way. For a fix to an actively exploited vulnerability,
+# resolve once with CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow and record the exception in
+# ci/dep-age-exceptions.toml.
+[registry]
+global-min-publish-age = "7 days"
