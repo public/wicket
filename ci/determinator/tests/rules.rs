@@ -320,7 +320,9 @@ fn inputs_from_outside_the_crates() {
     assert!(s.suites.contains("lean") && s.suites.contains("policy"));
     let s = select(&["images/claude-code/wicket-entry"]);
     assert!(set(&["wicket-cli", "wicket-fwd"]).is_subset(&s.affected) && s.suites.contains("smoke"));
-    check(&["web/session/src/main.ts"], &["wicket-cli"], CLI);
+    // The session view is embedded by wicket-cli and mounted in the browsers (#739).
+    let with_browsers: Vec<&str> = CLI.iter().copied().chain(["console-browsers"]).collect();
+    check(&["web/session/src/main.ts"], &["wicket-cli"], &with_browsers);
     let s = select(&["crates/wicket-authz/tests/common/mod.rs"]);
     assert!(s.affected.contains("wicket-feed") && s.suites.contains("lean"));
     let s = select(&["crates/wicket-core/tests/integration/subset_cases.rs"]);

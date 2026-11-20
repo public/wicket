@@ -21,10 +21,12 @@ paths = [
 ]
 
 # The console in real browsers (#574, ci/console-browsers.sh): what `wicket serve` sends, minified by
-# build.rs, under its CSP and Trusted Types report-only policy, in Chromium, Firefox and WebKit.
+# build.rs, under its CSP with Trusted Types enforced, in Chromium, Firefox and WebKit; and a run's
+# session view (web/session) mounted under the same policy.
 [suite.console-browsers]
 paths = [
   "crates/wicket-cli/src/serve/static/**", "crates/wicket-cli/src/serve/web.rs", "crates/wicket-cli/build.rs",
+  "web/session/**", "ci/session-view.sh",
   "ci/console-browsers.sh", "ci/console-browsers/**", "ci/console-preview/**",
 ]
 
