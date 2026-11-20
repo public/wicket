@@ -145,7 +145,8 @@ enum Cmd {
         #[arg(long)]
         image: Option<String>,
         /// Run the box on an enrolled node (its name; its host key is pinned), through its `wicket
-        /// node serve`. Default: this host's own node, `local`.
+        /// node serve`. Default: where the scheduler places it among the enrolled nodes, this host's
+        /// own (`local`) among them; with --workspace-dir, this host's own.
         #[arg(long)]
         node: Option<String>,
         /// ssh identity for --node (default: the one it was enrolled with).
@@ -154,6 +155,10 @@ enum Cmd {
         /// Internal: the run id to use (set by the console starting a run).
         #[arg(long, hide = true)]
         run_id: Option<String>,
+        /// Without --node: how long to wait in the queue when no node may take it now (#579); 0:
+        /// fail at once.
+        #[arg(long, default_value = "0", value_parser = wicket_core::time::duration_arg)]
+        wait: Duration,
     },
     /// Open a running agent's session in this terminal: watch it, and send it prompts.
     ///

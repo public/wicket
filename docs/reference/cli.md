@@ -241,8 +241,9 @@ Options:
       --workspace-dir <WORKSPACE_DIR>  Mount this directory as the box's /workspace, read-write and in place (local runs only)
       --task <TASK>                    Use this task text instead of the manifest's
       --image <IMAGE>                  Agent image, overriding the manifest's agent.image (default: that, or the installation's agent image)
-      --node <NODE>                    Run the box on an enrolled node (its name; its host key is pinned), through its `wicket node serve`. Default: this host's own node, `local`
+      --node <NODE>                    Run the box on an enrolled node (its name; its host key is pinned), through its `wicket node serve`. Default: where the scheduler places it among the enrolled nodes, this host's own (`local`) among them; with --workspace-dir, this host's own
       --ssh-key <SSH_KEY>              ssh identity for --node (default: the one it was enrolled with)
+      --wait <WAIT>                    Without --node: how long to wait in the queue when no node may take it now (#579); 0: fail at once [default: 0]
   -h, --help                           Print help
 ```
 

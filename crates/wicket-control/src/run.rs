@@ -159,6 +159,10 @@ pub struct RunOpts<'a> {
     /// A child's supervisor, run in its parent's process (#257 slice 4c): its parent asks it to stop
     /// its box and end, as an operator's ^C does.
     pub stop: Option<Arc<tokio::sync::Notify>>,
+    /// Place a fresh run with no node named through the scheduler (#579), waiting in its queue up to
+    /// this long (`wicket run --wait`). Only a fresh, top-level run is placed ([`placed_by_scheduler`]);
+    /// None: this host's own node, as a spawn or a re-attach is.
+    pub place_wait: Option<std::time::Duration>,
 }
 
 /// What a run's supervisor keeps in `<run dir>/ctl/run.json` so another can take over (#151).
@@ -356,6 +360,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         attach,
         adopt,
         stop,
+        place_wait,
     } = o;
     // Where the box start's time goes (#287), from here: in the run's record, and printed with
     // WICKET_TIMINGS=1.
@@ -563,6 +568,49 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
     // its pinned ssh (a revoked one is refused), or this host's own built-in node over its unix socket.
     timings.since("checks", lap);
+    let run = match run_id {
+        Some(id) => {
+            check_run_id(&id).with_context(|| "--run-id".to_string())?;
+            RunId(id)
+        }
+        None => RunId::new(),
+    };
+    // #579: a fresh run with no node named goes where the scheduler places it, as a woken agent
+    // does: this host's own node is one candidate among the enrolled ones.
+    let fresh = Fresh {
+        named_node: node.is_some(),
+        reattach: record.is_some(),
+        wrapped: wrap.is_some(),
+        wake: wake.is_some(),
+        adopted: adopt.is_some(),
+        child: parent_run.is_some(),
+        lease: lease.is_some(),
+        in_place_workspace: workspace_dir.is_some(),
+    };
+    let scheduled: Option<String> = match place_wait.filter(|_| placed_by_scheduler(&fresh)) {
+        None => None,
+        Some(wait) => {
+            let who = crate::hibernate::Placing { what: format!("run {run}"), claim: None, wait_flag: "wicket run --wait" };
+            match crate::hibernate::place_box(&who, &m, None, &run, None, wait).await {
+                Ok(n) => n.filter(|n| n != crate::localnode::NAME),
+                Err(e) => {
+                    // Boxes it asked to hibernate for room are asked no more, and room it held goes
+                    // back.
+                    if let Ok(l) = Ledger::open(&ledger_path()) {
+                        let _ = crate::hibernate::withdraw_preemptions_for(
+                            &l,
+                            &run,
+                            &m.tenant,
+                            wicket_feed::now_ms(),
+                            "the run failed to start",
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    };
+    let node = node.or(scheduled.as_deref());
     let lap = std::time::Instant::now();
     let node: Option<Node> = node.map(|n| crate::enrol::resolve_installed(n, ssh_key)).transpose()?;
     timings.since("node.resolve", lap);
@@ -580,13 +628,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // or wrapped). Its proxies are its own, as on any node.
     let shares_host = node.is_none();
 
-    let run = match run_id {
-        Some(id) => {
-            check_run_id(&id).with_context(|| "--run-id".to_string())?;
-            RunId(id)
-        }
-        None => RunId::new(),
-    };
     // A long-lived agent (#70): one wicket launches itself, here, so it can be hibernated and
     // rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
@@ -3008,6 +3049,27 @@ impl tokio::io::AsyncWrite for Counted {
     }
 }
 
+/// What a run is, for whether the scheduler places it ([`placed_by_scheduler`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Fresh {
+    pub named_node: bool,
+    pub reattach: bool,
+    pub wrapped: bool,
+    pub wake: bool,
+    pub adopted: bool,
+    pub child: bool,
+    pub lease: bool,
+    pub in_place_workspace: bool,
+}
+
+/// Whether the scheduler places a run (#579): a fresh, top-level run with no node named. A node named
+/// (`--node`, a lease's), a re-attach and an adopted child keep their node; a wake is placed by its
+/// own wait; a spawn goes where its parent runs or its hint says; a wrapped session and an in-place
+/// `--workspace-dir` use this host's own directories and stay on its node.
+pub(crate) fn placed_by_scheduler(f: &Fresh) -> bool {
+    !(f.named_node || f.reattach || f.wrapped || f.wake || f.adopted || f.child || f.lease || f.in_place_workspace)
+}
+
 /// Whether a hibernate asked only to make room is declined now (#579 step 4), and why
 /// (`hibernate::preempted_hibernate`). Declined, preemption's mark is cleared (so the wake gives up on
 /// this agent at once) and it is audited as `placement.preempt_declined`, once: with no mark (given
@@ -3085,6 +3147,27 @@ fn same_remote_session(a: &str, b: &str) -> bool {
 mod tests {
 
     use super::*;
+
+    /// #579: the scheduler places a fresh, top-level run with no node named, and nothing else.
+    #[test]
+    fn only_a_fresh_top_level_run_is_placed_by_the_scheduler() {
+        assert!(placed_by_scheduler(&Fresh::default()));
+        let kept: [fn(&mut Fresh); 8] = [
+            |f| f.named_node = true,
+            |f| f.reattach = true,
+            |f| f.wrapped = true,
+            |f| f.wake = true,
+            |f| f.adopted = true,
+            |f| f.child = true,
+            |f| f.lease = true,
+            |f| f.in_place_workspace = true,
+        ];
+        for set in kept {
+            let mut f = Fresh::default();
+            set(&mut f);
+            assert!(!placed_by_scheduler(&f), "{f:?} keeps its node");
+        }
+    }
 
     /// #676: failed takeovers are counted across tries, a new reason is told apart from a repeat
     /// (the audit records only a change), and the wait between tries doubles from a minute to at
