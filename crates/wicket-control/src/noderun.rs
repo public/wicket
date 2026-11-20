@@ -805,6 +805,9 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         publisher.commit(changes, now).context("publishing the box's token")?;
         publisher.epoch()
     };
+    // That token carries grants only: a re-attached run's standing rules aren't in it until its
+    // first sync puts them back, so none reads as on the node meanwhile (#752 review, F1).
+    s.ledger.lock().expect("ledger").standing_requeued(&s.run.0).context("recording the box's standing rules")?;
     published.end();
     let recording = t.span("authority.record");
     let token_root = (token_issuer.block_ids()[0].clone(), until_s.saturating_mul(1000));
@@ -2581,8 +2584,14 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     let (handed_rules, gone_rules) = standing_moves(&before, &p.standing);
     {
         let l = sh.ledger.lock().expect("ledger");
-        let _ = l.standing_withdrawn(&sh.run.0, &gone_rules);
-        let _ = l.standing_handed(&sh.run.0, &sh.node, &handed_rules);
+        if p.standing.is_empty() {
+            // None in its token (none bind it, or its node is below protocol 17): none is on its
+            // way, whatever an earlier supervisor recorded (#752 review, F2).
+            let _ = l.standing_none(&sh.run.0);
+        } else {
+            let _ = l.standing_withdrawn(&sh.run.0, &gone_rules);
+            let _ = l.standing_handed(&sh.run.0, &sh.node, &handed_rules);
+        }
     }
     if !rebuild {
         return vec![];
@@ -2603,11 +2612,12 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     let n = p.live.len();
     let revokes: Vec<Change<BoxAuthority>> = changes.iter().filter(|c| matches!(c, Change::Revoke { .. })).cloned().collect();
     // Whether the rebuilt token went out (not only its revocations): a renewal counts only then.
+    let has_token = changes.iter().any(|c| matches!(c, Change::PutZone { .. }));
     let token_out;
     let committed = {
         let Ok(mut p) = sh.ctl.publisher.lock() else { return vec![] };
         let mut r = p.commit(changes, wicket_feed::now_ms());
-        token_out = r.is_ok();
+        token_out = r.is_ok() && has_token;
         if r.is_err() && !revokes.is_empty() {
             // The rebuilt token was refused: the revocations must still go out.
             say!(
@@ -2622,8 +2632,10 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     if let Ok((_, epoch)) = &committed {
         let l = sh.ledger.lock().expect("ledger");
         let _ = l.grants_published(&handed, *epoch as i64);
+        // Every rule handed and not yet published went with the token, this tick's or one whose
+        // commit failed before (#752 review, F2).
         if token_out {
-            let _ = l.standing_published(&sh.run.0, &handed_rules, *epoch as i64);
+            let _ = l.standing_published(&sh.run.0, *epoch as i64);
         }
         drop(l);
         if let Some((i, until)) = renewing.filter(|_| token_out) {
