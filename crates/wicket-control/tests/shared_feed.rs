@@ -88,6 +88,21 @@ fn runs_in_a_process_share_a_publisher_that_follows_other_processes() {
         let mut g = again.lock().expect("a failed renewal doesn't fail the lock");
         g.commit(vec![revoke("run_f")], wicket_feed::now_ms()).unwrap();
     }
+
+    // But not when the certificate on disk is of another version (a new generation made
+    // elsewhere): publishing under the old one would be refused by the node, and hide it.
+    let newer = {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let text = String::from_utf8(cert.clone()).unwrap();
+        let parts: Vec<&str> = text.trim().split('.').collect();
+        let mut c: serde_json::Value = serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+        c["version"] = serde_json::json!(c["version"].as_u64().unwrap() + 1);
+        format!("{}.{}.{}", parts[0], b64.encode(c.to_string()), parts[2])
+    };
+    std::fs::write(&cert_path, newer).unwrap();
+    let e = again.lock().map(|_| ()).expect_err("a newer generation on disk that can't be opened fails the lock");
+    assert!(format!("{e:#}").contains("another version"), "{e:#}");
     std::fs::write(&key, &key_text).unwrap();
     std::fs::write(&cert_path, cert).unwrap();
     assert_eq!(again.lock().unwrap().epoch(), 5);
