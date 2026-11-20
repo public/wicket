@@ -211,7 +211,11 @@ pub fn pass(l: &Ledger, dry_run: bool) -> Result<Passed> {
 /// `wicket service remove`: the service's live instances stop (their runs are revoked), then its
 /// row goes, audited under its tenant with what was stopped. Returns how many were stopped.
 pub fn remove(l: &Ledger, name: &str, by: &str) -> Result<usize> {
-    let row = l.services()?.into_iter().find(|s| s.name == name).with_context(|| format!("no service {name} is installed"))?;
+    let row = l
+        .services()?
+        .into_iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| wicket_home::exit::not_found(format!("no service {name} is installed")))?;
     let live: Vec<_> = l.live_service_instances()?.into_iter().filter(|i| i.service == name).collect();
     for i in &live {
         stop(l, i, "its service was removed")?;

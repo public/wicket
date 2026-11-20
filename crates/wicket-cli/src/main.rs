@@ -197,8 +197,8 @@ enum Cmd {
         #[arg(long, hide = true)]
         by: Option<String>,
         /// How long to wait in the queue when no node may take it now (#579); 0: fail at once.
-        #[arg(long, default_value = "30m")]
-        wait: String,
+        #[arg(long, default_value = "30m", value_parser = seconds_or_duration)]
+        wait: Duration,
     },
     /// A live view of nodes, runs, pending requests and leases (read-only).
     ///
@@ -517,7 +517,21 @@ fn seconds_or_duration(s: &str) -> std::result::Result<Duration, String> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        // As a `main` returning the error would print it, then the code for its kind (#574).
+        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("Error: {e:?}\n"));
+        std::process::exit(exit_code(&e));
+    }
+}
+
+/// The exit code for `e` (#574; docs/reference/cli.md lists them): [`wicket_home::exit::code_of`],
+/// the one classifier, else 1.
+fn exit_code(e: &anyhow::Error) -> i32 {
+    wicket_home::exit::code_of(e).unwrap_or(wicket_home::exit::Code::Failed) as i32
+}
+
+async fn run() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("WICKET_LOG").unwrap_or_else(|_| "warn".into()))
@@ -544,7 +558,7 @@ async fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            daemon::policy::Route::Refuse(why) => bail!("{why}"),
+            daemon::policy::Route::Refuse(why) => return Err(wicket_home::exit::refused(why)),
             daemon::policy::Route::Local => {}
         },
         daemon::client::Mode::Missing(why) if matches!(route, daemon::policy::Route::Forward(_)) => bail!("{why}"),
@@ -611,6 +625,14 @@ mod tests {
         assert_eq!(wait(&["wicket", "hibernate", "a", "--wait", "90"]), std::time::Duration::from_secs(90));
         assert_eq!(wait(&["wicket", "hibernate", "a", "--wait", "5m"]), std::time::Duration::from_secs(300));
         assert!(<crate::Cli as clap::Parser>::try_parse_from(["wicket", "hibernate", "a", "--wait", "5q"]).is_err());
+        // wake's --wait too: 0 still means don't wait.
+        let wake = |args: &[&str]| match <crate::Cli as clap::Parser>::try_parse_from(args).unwrap().cmd {
+            crate::Cmd::Wake { wait, .. } => wait,
+            _ => unreachable!(),
+        };
+        assert_eq!(wake(&["wicket", "wake", "a"]), std::time::Duration::from_secs(1800));
+        assert_eq!(wake(&["wicket", "wake", "a", "--wait", "0"]), std::time::Duration::ZERO);
+        assert_eq!(wake(&["wicket", "wake", "a", "--wait", "90"]), std::time::Duration::from_secs(90));
     }
 
     /// #574: one name for one thing, the old one kept as an alias.
@@ -643,6 +665,34 @@ mod tests {
             "standing renew s-1 ttl=5d"
         );
     }
+
+    /// #574: each kind of failure has its code, whichever crate it comes from.
+    #[test]
+    fn errors_exit_with_the_code_for_their_kind() {
+        use wicket_home::exit;
+        let code = |e: anyhow::Error| crate::exit_code(&e);
+        assert_eq!(code(anyhow::anyhow!("anything")), 1);
+        assert_eq!(code(exit::usage("x")), 2);
+        assert_eq!(code(exit::refused("x")), 3);
+        assert_eq!(code(exit::not_found("x")), 4);
+        assert_eq!(code(exit::needs_approval("x")), 5);
+        assert_eq!(code(exit::Exit { code: exit::Code::TryAgain, msg: "moving".into() }.into()), 75);
+        assert_eq!(code(wicket_store::StoreError::NoSuchRequest("r-1".into()).into()), 4);
+        assert_eq!(code(anyhow::Error::from(wicket_store::StoreError::NotPending("r-1".into(), "denied".into())).context("deciding")), 3);
+        assert_eq!(code(wicket_store::StoreError::Refused("x".into()).into()), 3);
+        assert_eq!(code(wicket_placement::PlacementError::Undecided("nobody decided".into()).into()), 5);
+        assert_eq!(code(wicket_placement::PlacementError::NotApproved("request r-1 is denied".into()).into()), 3);
+        assert_eq!(code(wicket_placement::PlacementError::ApprovalFailed("the ledger".into()).into()), 1);
+        // The innermost says: a decision refused (3) because there was no such request (4) is 4.
+        let refused_unknown = anyhow::Error::from(wicket_store::StoreError::NoSuchRequest("r-nope".into()))
+            .context(exit::Exit::refused("refused (the refusal is on the audit record)"));
+        assert_eq!(code(refused_unknown), 4);
+        assert_eq!(code(anyhow::anyhow!("outside its authority").context(exit::Exit::refused("refused"))), 3);
+        // A tag over a store error that says otherwise: the store's, innermost.
+        assert_eq!(code(anyhow::Error::from(wicket_store::StoreError::NoSuchRequest("r-1".into())).context("x")), 4);
+        assert_eq!(code(wicket_placement::PlacementError::NoCapacity("none".into()).into()), 1);
+    }
+
     /// `wicket run --image` is parsed, and without it nothing is named: no default that would hide
     /// the manifest's agent.image (wicket-control's `run::box_image` applies it).
     #[test]

@@ -68,14 +68,14 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 }
                 SecretCmd::Hosts { name, hosts } => {
                     if !v.has(&name) {
-                        bail!("no secret {name}");
+                        return Err(wicket_home::exit::not_found(format!("no secret {name}")));
                     }
                     v.set_hosts(&name, &hosts)?;
                     println!("secret {name}: {}", secret_hosts_line(&v, &name));
                 }
                 SecretCmd::Rm { name } => {
                     if !v.has(&name) {
-                        bail!("no secret {name}");
+                        return Err(wicket_home::exit::not_found(format!("no secret {name}")));
                     }
                     v.remove(&name)?;
                     println!("secret {name} removed");

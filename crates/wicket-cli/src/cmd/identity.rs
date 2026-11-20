@@ -24,7 +24,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 IdentityCmd::Show { run } => println!("{}", serde_json::to_string_pretty(&verified_identity(&l, &run, None))?),
                 IdentityCmd::Revoke { run, reason } => {
                     if l.identity(&run)?.is_none() {
-                        bail!("no identity was issued for {run}");
+                        return Err(wicket_home::exit::not_found(format!("no identity was issued for {run}")));
                     }
                     let fresh = l.revoke(&run, &operator(), &reason)?;
                     l.audit(

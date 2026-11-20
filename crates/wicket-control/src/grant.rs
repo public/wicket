@@ -294,7 +294,7 @@ fn capacity_use(l: &mut Ledger, grant: &str, ask: &wicket_store::CapacityAsk, id
     if req.method != capacity::METHOD || req.host != capacity::HOST || req.path != node_request_path(&ask.node) {
         bail!("request {id} is not a request for node {}", ask.node);
     }
-    let g = l.capacity_grant(grant)?.ok_or_else(|| anyhow::anyhow!("no capacity grant {grant}"))?;
+    let g = l.capacity_grant(grant)?.ok_or_else(|| wicket_home::exit::not_found(format!("no capacity grant {grant}")))?;
     if g.tenant != req.tenant {
         bail!("capacity grant {grant} is not in the request's tenant");
     }
@@ -382,9 +382,12 @@ pub fn issue_capacity_grant(
 /// Revokes capacity grant `id` as `by` (an operator), audited. Nothing more is approved under it;
 /// nodes already made under it keep their own leases.
 pub fn revoke_capacity_grant(l: &Ledger, by: &str, tenant: &TenantId, id: &str, extra: serde_json::Value) -> Result<()> {
-    let g = l.capacity_grant(id)?.filter(|g| g.tenant == tenant.0).ok_or_else(|| anyhow::anyhow!("no capacity grant {id}"))?;
+    let g = l
+        .capacity_grant(id)?
+        .filter(|g| g.tenant == tenant.0)
+        .ok_or_else(|| wicket_home::exit::not_found(format!("no capacity grant {id}")))?;
     if g.revoked {
-        bail!("capacity grant {id} is already revoked");
+        return Err(wicket_home::exit::refused(format!("capacity grant {id} is already revoked")));
     }
     l.revoke_grant(id)?;
     let mut record = serde_json::json!({ "decision": "revoke", "grant": id, "kind": "capacity", "principal": g.principal, "by": by });
@@ -461,8 +464,9 @@ fn refused(l: &Ledger, by: &Granter, id: &str, v: &Verdict, why: anyhow::Error) 
         "why": format!("{why:#}"),
     });
     match l.audit(&TenantId::single(), None, "decision.refused", &record) {
-        Ok(_) => why.context("refused (the refusal is on the audit record)"),
-        Err(e) => why.context(format!("refused (the refusal could not be recorded: {e})")),
+        // Exit code 3 (#574), unless what it names wasn't there (4: the cause says so).
+        Ok(_) => why.context(wicket_home::exit::Exit::refused("refused (the refusal is on the audit record)")),
+        Err(e) => why.context(wicket_home::exit::Exit::refused(format!("refused (the refusal could not be recorded: {e})"))),
     }
 }
 
@@ -486,14 +490,16 @@ enum Target {
 
 fn target(l: &Ledger, id: &str) -> Result<Target> {
     if id.starts_with("g-") {
-        return Ok(Target::Grant(Box::new(l.grant(id)?.ok_or_else(|| anyhow::anyhow!("no grant {id}"))?)));
+        return Ok(Target::Grant(Box::new(l.grant(id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no grant {id}")))?)));
     }
     if id.starts_with("r-") {
-        return Ok(Target::Grant(Box::new(l.grant_for_request(id)?.ok_or_else(|| anyhow::anyhow!("request {id} has no live grant"))?)));
+        return Ok(Target::Grant(Box::new(
+            l.grant_for_request(id)?.ok_or_else(|| wicket_home::exit::not_found(format!("request {id} has no live grant")))?,
+        )));
     }
     match l.run_authority(id)? {
         Some((until, cap)) => Ok(Target::Authority { run: id.to_string(), until, cap }),
-        None => bail!("no grant, request or box authority {id}"),
+        None => Err(wicket_home::exit::not_found(format!("no grant, request or box authority {id}"))),
     }
 }
 

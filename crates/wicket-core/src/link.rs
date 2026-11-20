@@ -175,15 +175,22 @@ pub struct Named {
 /// target keeps its name and address (several ports share them); another target with the same
 /// wanted name gets `-2`, `-3`, … Err when the box's address pool is used up.
 pub fn allocate(used: &[Named], to_run: &str, wanted: &str) -> Result<(String, Ipv4Addr), String> {
-    if let Some(n) = used.iter().find(|n| n.to_run == to_run) {
+    // A target keeps its name and address; never the dotted name of a by-name link (#575), which
+    // means "the holder of that name", so a link to another port takes a label of its own, at the
+    // target's address (#668 review).
+    if let Some(n) = used.iter().find(|n| n.to_run == to_run && !n.name.contains('.')) {
         return Ok((n.name.clone(), n.addr));
     }
+    let shared = used.iter().find(|n| n.to_run == to_run).map(|n| n.addr);
     let base = label(wanted);
     let mut name = base.clone();
     let mut i = 2;
     while used.iter().any(|n| n.name == name) {
         name = format!("{base}-{i}");
         i += 1;
+    }
+    if let Some(addr) = shared {
+        return Ok((name, addr));
     }
     let start = u32::from(POOL_START);
     let addr = (start..start + POOL_SIZE)
@@ -265,6 +272,10 @@ mod tests {
         // The same name to the same box: kept.
         let same = n("api.build", 4, "run_b");
         assert_eq!(allocate_exact(std::slice::from_ref(&same), &[], "run_b", "api.build").unwrap().1, Ipv4Addr::new(198, 18, 1, 4));
+        // connect(box) to a box this one reaches by name: the target's address, its own label
+        // (#668 review), never the by-name link's dotted name.
+        let by_name = n("two.build", 5, "run_api");
+        assert_eq!(allocate(std::slice::from_ref(&by_name), "run_api", "api").unwrap(), ("api".to_string(), Ipv4Addr::new(198, 18, 1, 5)));
         // And connect(box) still labels a dotted wanted name (#575 review, M2).
         assert_eq!(allocate(&[], "run_c", "api.build").unwrap().0, "api-build");
     }
