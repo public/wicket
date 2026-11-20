@@ -37,7 +37,7 @@ use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf, RunState, Tunne
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use nodeca::LiveCa;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -250,6 +250,9 @@ struct Node {
     links: Mutex<HashMap<u64, Link>>,
     boxes: Mutex<HashMap<String, BoxState>>,
     asks: Mutex<HashMap<u64, oneshot::Sender<Msg>>>,
+    /// Secrets a run couldn't get from an unreachable control host, by run and name (#415): audited
+    /// once per outage, until a fetch succeeds.
+    unreachable: Mutex<HashSet<(String, String)>>,
     /// The control host's tools asked for a box (#257 slice 4b), waiting on their [`Msg::Called`]:
     /// by call id, with the connection each went out on (dropped with it).
     calls: Mutex<HashMap<u64, PendingCall>>,
@@ -875,13 +878,31 @@ impl Node {
                 n.asks.lock().expect("asks").remove(&id);
                 let why = match reply {
                     Some(Msg::SecretFetched { secret: Some(f), .. }) => {
+                        n.unreachable.lock().expect("unreachable").remove(&(run.clone(), name.clone()));
                         n.audit_note(&run, "node.secret_fetched", serde_json::json!({ "secret": name }));
                         return Ok(*f);
                     }
-                    Some(Msg::SecretFetched { error: Some(e), .. }) => format!("credential {name} refused by the control host: {e}"),
-                    _ => format!("credential {name} not cached on this node; control host unreachable"),
+                    Some(Msg::SecretFetched { error: Some(e), .. }) => {
+                        crate::nodesecrets::Unfetched::Refused(format!("credential {name} refused by the control host: {e}"))
+                    }
+                    _ => crate::nodesecrets::Unfetched::Unreachable(format!(
+                        "credential {name} not cached on this node; control host unreachable"
+                    )),
                 };
-                n.audit_note(&run, "node.secret_unavailable", serde_json::json!({ "secret": name, "why": why }));
+                // Unreachable: once per run, secret and outage (#415), not at each of the box's requests.
+                let first = match &why {
+                    crate::nodesecrets::Unfetched::Unreachable(_) => {
+                        n.unreachable.lock().expect("unreachable").insert((run.clone(), name.clone()))
+                    }
+                    // The control host answered: the outage, if any, is over (#415).
+                    crate::nodesecrets::Unfetched::Refused(_) => {
+                        n.unreachable.lock().expect("unreachable").remove(&(run.clone(), name.clone()));
+                        true
+                    }
+                };
+                if first {
+                    n.audit_note(&run, "node.secret_unavailable", serde_json::json!({ "secret": name, "why": why.to_string() }));
+                }
                 Err(why)
             })
         })
@@ -1048,6 +1069,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         links: Mutex::new(HashMap::new()),
         boxes: Mutex::new(HashMap::new()),
         asks: Mutex::new(HashMap::new()),
+        unreachable: Mutex::new(HashSet::new()),
         calls: Mutex::new(HashMap::new()),
         opens: Mutex::new(HashMap::new()),
         next: AtomicU64::new(0),
@@ -2351,6 +2373,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     }
     // What was sent for the run (secrets, its budget slice) goes with its box (#152, #153).
     n.secrets.release(run);
+    n.unreachable.lock().expect("unreachable").retain(|(r, _)| r != run);
     n.slices.drop_run(run);
     n.queue.drop_run(run);
     n.edge.drop_run(run);
@@ -2878,6 +2901,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             links: Mutex::new(HashMap::new()),
             boxes: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
+            unreachable: Mutex::new(HashSet::new()),
             calls: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
             next: AtomicU64::new(0),
@@ -4953,6 +4977,57 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         bs.start_by = Some(now_s + 3600);
         let e = start_box_steps(&node, None, bs, Arc::new(Timings::new())).await.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(!e.contains("past its lease"), "{e}");
+    }
+
+    /// #415: a secret a run can't get while its control host is unreachable is audited once per
+    /// outage, not per request; an answer from the control host (a refusal too) ends the outage, so
+    /// the next one is audited again.
+    #[tokio::test]
+    async fn an_unreachable_control_host_is_audited_once_per_outage() {
+        const RUN: &str = "run_uuuuuuuuuuuuuuuuuuuuuuuuuu";
+        let inst = Install::new("nodesrv-unreachable");
+        let node = test_node(&inst);
+        fed_box(&node, &inst, RUN, "name: z\n");
+        let unavailable =
+            || node.audit.lock().unwrap().audit_tail(100).unwrap().iter().filter(|r| r.2 == "node.secret_unavailable").count();
+        let fetch = node.fetcher();
+        // No connection for the run: unreachable, audited once however often it is asked.
+        for _ in 0..3 {
+            assert!(matches!(fetch(RUN.into(), "gh".into()).await, Err(crate::nodesecrets::Unfetched::Unreachable(_))));
+        }
+        assert_eq!(unavailable(), 1);
+        // Connected: the control host answers, refusing it, which is audited and ends the outage.
+        let mut c = connect_run(&node, 2, &inst, RUN).await;
+        c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        for _ in 0..500 {
+            if node.owner(RUN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let answering = tokio::spawn(async move {
+            loop {
+                if let Frame::Msg(Msg::SecretFetch { id, .. }) = next_msg(&mut c).await {
+                    let refused = Msg::SecretFetched { id, secret: None, error: Some("not set".into()) };
+                    c.write_all(&Frame::Msg(refused).encode()).await.unwrap();
+                    return c;
+                }
+            }
+        });
+        assert!(matches!(fetch(RUN.into(), "gh".into()).await, Err(crate::nodesecrets::Unfetched::Refused(_))));
+        assert_eq!(unavailable(), 2, "the refusal");
+        // Cut off again: a new outage, audited again.
+        drop(answering.await.unwrap());
+        for _ in 0..500 {
+            if node.owner(RUN).is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        for _ in 0..3 {
+            assert!(fetch(RUN.into(), "gh".into()).await.is_err());
+        }
+        assert_eq!(unavailable(), 3, "one more for the new outage");
     }
 
     #[tokio::test]
