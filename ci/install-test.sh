@@ -42,7 +42,9 @@ if [ "${1:-}" = --host-mirror ]; then
 fi
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 bin=$(realpath "${1:-$repo/target/release/wicket}")
-image=${2:-ubuntu:24.04}
+# shellcheck source=ci/base-images.sh
+. "$repo/ci/base-images.sh"
+image=$(pinned_base "${2:-ubuntu:24.04}")
 docker=${DOCKER:-docker}
 name=wicket-install-test-$$
 pkg=$(mktemp -d)

@@ -122,7 +122,7 @@ globs = [
   "ci/changelog.py", "ci/changelog_test.py", "ci/preflight.sh",
   "deny.toml", "ci/mutants.sh", "ci/mutants.accepted", "ci/package.sh", "ci/sim.sh",
   "ci/smoke.sh", "ci/smoke.yaml", "ci/attack-matrix.sh", "ci/attack/**", "ci/h3get/**", "ci/hibernate.sh", "ci/hibernate.yaml", "ci/restore.sh", "ci/service-e2e.sh",
-  "ci/acceptance.sh", "ci/acceptance/**", "ci/install-acceptance.sh", "ci/install-test.sh", "ci/daemon-uids.sh",
+  "ci/acceptance.sh", "ci/acceptance/**", "ci/install-acceptance.sh", "ci/install-test.sh", "ci/base-images.sh", "ci/daemon-uids.sh",
   "ci/node-e2e.sh", "ci/node-e2e/**", "ci/update.sh", "ci/update/**", "ci/policy-diff.sh", "ci/kani.sh",
   "ci/lean.sh", "ci/tla.sh", "ci/tla-trail.py", "ci/shard.awk", "ci/fuzz.sh", "fuzz/**", "verification/**", "deploy/**", "programs/**",
 ]
