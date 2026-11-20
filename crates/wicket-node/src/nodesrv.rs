@@ -58,6 +58,7 @@ mod conn;
 mod gateway;
 #[path = "nodegw.rs"]
 mod gw;
+mod imagegc;
 mod images;
 pub mod intake;
 mod links;
@@ -1251,6 +1252,18 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             }
         });
     }
+    // The images it was given and no box has used for a while are removed (#191).
+    if let Some(days) = imagegc::keep_days(&node.paths) {
+        say_err!("[node] removes the images it was given once unused for {days} days");
+        let n = node.clone();
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(imagegc::SWEEP_EVERY);
+            loop {
+                t.tick().await;
+                imagegc::sweep(&n).await;
+            }
+        });
+    }
     // Its boxes' public names' host ports (#575 step 4c), from its replica alone.
     {
         let n = node.clone();
@@ -1501,6 +1514,11 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     // What an image reference is comes from the node's cache while no image has changed since it
     // was inspected (#287); the pin is checked against it all the same.
     checks.end();
+    // Held from here until the box is live (`wire`), so no image sweep removes it meanwhile (#191).
+    let _image_held = match &bs.image_pin {
+        Some(pin) => Some(imagegc::hold(&node.paths.root, pin, (node.clock)()).await),
+        None => None,
+    };
     let ident = match &bs.image_pin {
         Some(pin) => {
             let by_ref = docker.image_identity_cached(&node.idents, &bs.image).await?.filter(|i| i.is(pin));
