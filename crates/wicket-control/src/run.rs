@@ -2492,8 +2492,12 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 // Loudly (#300): the box's work isn't here. Its node keeps it (not forgotten).
                 let msg = format!("fetching the box's files from node {node_name} failed: {e:#} (the node keeps them)");
                 // The run holds its node until they are collected: the reconciler doesn't release
-                // it with them (#324).
-                let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
+                // it with them (#324). Unless a supervisor before this one fetched them already
+                // (this one took the run over after its fetch, #590): then the files are here.
+                let here = ledger.lock().expect("ledger").files_collected(&run.0).unwrap_or(false);
+                if !here {
+                    let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
+                }
                 say!("[wicket] {msg}");
                 say_err!("[wicket] {msg}");
                 let _ = ledger.lock().expect("ledger").audit(
