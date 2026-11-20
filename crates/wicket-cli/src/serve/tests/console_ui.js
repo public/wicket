@@ -607,6 +607,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(ids.health.children[0].className, "blocked");
   assert.strictEqual(ids.health.children[1].textContent, "! not checked for 6 min: these rows may be out of date");
   assert.ok(ids.health.children[2].textContent.startsWith("Audit export store (store)24 records behind"));
+  // An error the config alert already quotes is said once; a first read that is overdue says so.
+  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, audit: [], stale: true, read_ms: null, not_read_yet: true,
+    errors: ["audit-sinks.yaml can't be read: x"], alerts: ["audit-sinks.yaml can't be read: x (for 5 min)"] } } };
+  await run("refresh()"); await flush();
+  assert.deepStrictEqual(ids.health.children.map(c => c.textContent),
+    ["! audit-sinks.yaml can't be read: x (for 5 min)", "! not read yet: the console hasn't managed a first read of the state store", "No node has reported its health yet."]);
   // One poll at a time (B9): a second asked for while one is in flight runs after it, not beside it.
   let inFlight = 0, most = 0;
   const realFetch = sandbox.fetch;

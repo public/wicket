@@ -190,7 +190,11 @@ pub fn status_of(s: &StateStore, db: &Path, now_ms: i64) -> Result<StreamStatus>
         Ok(v) => v,
         Err(e) => {
             if st.error.is_none() || log.error_ms < log.started_ms {
-                st.error = Some(wicket_core::text::redact_urls(&format!("Litestream isn't running (its control socket: {e:#})")));
+                let what = match e.downcast_ref::<NoAnswer>() {
+                    Some(_) => "Litestream isn't answering",
+                    None => "Litestream isn't running",
+                };
+                st.error = Some(wicket_core::text::redact_urls(&format!("{what} (its control socket: {e:#})")));
                 st.error_ms = None;
             }
             return Ok(st);
@@ -243,18 +247,48 @@ const ASK_DEADLINE: Duration = Duration::from_secs(3);
 
 /// A GET on Litestream's control socket (HTTP over a unix socket), its JSON body, within
 /// [`ASK_DEADLINE`]. std has no connect timeout for unix sockets (a listener with a full backlog
-/// blocks it), so the question runs on a thread of its own, left behind if it doesn't answer.
+/// blocks it), so the question runs on a thread of its own, left behind if it doesn't answer. One
+/// question per socket at a time: while one is left waiting, the next is refused at once, so a
+/// frozen Litestream holds one thread and one descriptor, not one per read.
 fn ask(sock: &Path, path: &str) -> Result<serde_json::Value> {
     ask_within(sock, path, ASK_DEADLINE)
 }
 
+/// Litestream didn't answer in time, or a question left waiting before hasn't been answered yet.
+#[derive(Debug)]
+struct NoAnswer(String);
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for NoAnswer {}
+
+/// The sockets with a question still waiting.
+fn asking() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static ASKING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    ASKING.get_or_init(Default::default)
+}
+
 fn ask_within(sock: &Path, path: &str, deadline: Duration) -> Result<serde_json::Value> {
+    if !asking().lock().unwrap_or_else(|e| e.into_inner()).insert(sock.to_path_buf()) {
+        return Err(NoAnswer("Litestream hasn't answered an earlier question on its control socket yet".into()).into());
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let (sock, path) = (sock.to_path_buf(), path.to_string());
-    std::thread::Builder::new().name("litestream-ask".into()).spawn(move || {
-        let _ = tx.send(ask_now(&sock, &path));
-    })?;
-    rx.recv_timeout(deadline).unwrap_or_else(|_| bail!("Litestream didn't answer on its control socket within {} s", deadline.as_secs()))
+    let spawned = std::thread::Builder::new().name("litestream-ask".into()).spawn(move || {
+        let r = ask_now(&sock, &path);
+        asking().lock().unwrap_or_else(|e| e.into_inner()).remove(&sock);
+        let _ = tx.send(r);
+    });
+    if let Err(e) = spawned {
+        // No thread: nothing is waiting on the socket.
+        asking().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        return Err(e.into());
+    }
+    rx.recv_timeout(deadline).unwrap_or_else(|_| {
+        Err(NoAnswer(format!("Litestream didn't answer on its control socket within {} s", deadline.as_secs_f32())).into())
+    })
 }
 
 fn ask_now(sock: &Path, path: &str) -> Result<serde_json::Value> {
@@ -262,7 +296,7 @@ fn ask_now(sock: &Path, path: &str) -> Result<serde_json::Value> {
     s.set_read_timeout(Some(Duration::from_secs(2)))?;
     s.set_write_timeout(Some(Duration::from_secs(2)))?;
     // HTTP/1.0: the reply is the whole body, then the connection closes (no chunking).
-    write!(s, "GET {path} HTTP/1.0\r\nHost: litestream\r\n\r\n")?;
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: litestream\r\n\r\n").as_bytes())?;
     let mut resp = Vec::new();
     s.take(1 << 20).read_to_end(&mut resp)?;
     let resp = String::from_utf8_lossy(&resp);
@@ -270,7 +304,7 @@ fn ask_now(sock: &Path, path: &str) -> Result<serde_json::Value> {
     let status = head.lines().next().unwrap_or("");
     if status.split_whitespace().nth(1) != Some("200") {
         // Shown in the console: cut, and any URL in it without its user info or query.
-        let body = wicket_core::text::redact_urls(&wicket_core::text::clip(body.trim(), 200));
+        let body = wicket_core::text::clip(&wicket_core::text::redact_urls(body.trim()), 200);
         bail!("Litestream said {:?}: {body}", wicket_core::text::clip(status, 60));
     }
     serde_json::from_str(body).context("Litestream's reply")
@@ -469,15 +503,25 @@ mod tests {
         }
     }
 
+    /// A request read whole (to its blank line), however it was split into writes.
+    fn read_request(c: &mut std::os::unix::net::UnixStream) -> String {
+        let mut req = Vec::new();
+        let mut b = [0u8; 256];
+        while !req.ends_with(b"\r\n\r\n") {
+            let n = c.read(&mut b).unwrap();
+            assert!(n > 0, "the request ended early: {:?}", String::from_utf8_lossy(&req));
+            req.extend_from_slice(&b[..n]);
+        }
+        String::from_utf8(req).unwrap()
+    }
+
     /// A stand-in for Litestream's control socket: answers each connection with `body` (v0.5.18's
     /// `GET /list` shape) until dropped.
     fn litestream(db: &Path, body: String) -> std::thread::JoinHandle<()> {
         let l = std::os::unix::net::UnixListener::bind(socket_path(db)).unwrap();
         std::thread::spawn(move || {
             if let Ok((mut c, _)) = l.accept() {
-                let mut req = [0u8; 512];
-                let n = c.read(&mut req).unwrap();
-                assert!(String::from_utf8_lossy(&req[..n]).starts_with("GET /list HTTP/1.0\r\n"));
+                assert!(read_request(&mut c).starts_with("GET /list HTTP/1.0\r\n"));
                 write!(c, "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{body}").unwrap();
             }
         })
@@ -679,17 +723,62 @@ mod tests {
         let e = ask_within(&socket_path(&db), "/list", Duration::from_millis(300)).unwrap_err().to_string();
         assert!(t.elapsed() < Duration::from_secs(2) && e.contains("didn't answer"), "{e}");
         drop(_held);
-        std::fs::remove_file(socket_path(&db)).unwrap();
+        // Another socket: the question left waiting on this one holds it until its read times out.
+        let d2 = Dir::new();
+        let db = d2.0.join("ledger.db");
         let l = std::os::unix::net::UnixListener::bind(socket_path(&db)).unwrap();
         let h = std::thread::spawn(move || {
             let (mut c, _) = l.accept().unwrap();
-            let mut req = [0u8; 512];
-            let _ = c.read(&mut req).unwrap();
+            read_request(&mut c);
             write!(c, "HTTP/1.0 500 Internal Server Error\r\n\r\nfailed: https://k:s3cr3t@s3.example.com/b?sig=abc").unwrap();
         });
         let e = ask(&socket_path(&db), "/list").unwrap_err().to_string();
         h.join().unwrap();
         assert!(e.contains("https://s3.example.com/b?…") && !e.contains("s3cr3t") && !e.contains("sig=abc"), "{e}");
+    }
+
+    /// A listener whose backlog is full blocks `connect` itself: the question is given up on at the
+    /// deadline, the next is refused at once rather than leaving another thread behind, and once
+    /// the socket goes away the one left waiting ends.
+    #[test]
+    fn a_connect_that_hangs_leaves_one_question_waiting() {
+        use std::os::fd::AsRawFd;
+        let d = Dir::new();
+        let db = d.0.join("ledger.db");
+        let sock = socket_path(&db);
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 0) }, 0);
+        // Fill the backlog without blocking this thread.
+        let filler: Vec<_> = (0..2)
+            .filter_map(|_| {
+                let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+                let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+                addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                for (i, b) in sock.as_os_str().as_encoded_bytes().iter().enumerate() {
+                    addr.sun_path[i] = *b as libc::c_char;
+                }
+                let ok = unsafe {
+                    libc::connect(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_un>() as u32)
+                };
+                (ok == 0).then_some(fd)
+            })
+            .collect();
+        assert!(!filler.is_empty(), "the backlog took a connection");
+        let t = std::time::Instant::now();
+        let e = ask_within(&sock, "/list", Duration::from_millis(300)).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(2) && e.to_string().contains("didn't answer"), "{e}");
+        let e = ask_within(&sock, "/list", Duration::from_millis(300)).unwrap_err();
+        assert!(e.to_string().contains("hasn't answered an earlier question"), "refused at once: {e}");
+        assert!(e.downcast_ref::<NoAnswer>().is_some());
+        drop(l);
+        for fd in filler {
+            unsafe { libc::close(fd) };
+        }
+        let gone = std::time::Instant::now();
+        while asking().lock().unwrap().contains(&sock) {
+            assert!(gone.elapsed() < Duration::from_secs(5), "the waiting question never ended");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

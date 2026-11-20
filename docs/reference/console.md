@@ -313,9 +313,10 @@ when `state-store.yaml` or `audit-sinks.yaml` exists. `wicket top` shows the sam
   the sink is behind the chain head and how long the oldest of them has waited, where its cursor
   is, how long ago its last signed checkpoint was, and its last error.
 - A config that can't be read is a line of its own. It doesn't stop the rest of the page.
-- **Alerts.** Three conditions are health alerts, pushed like a node's: once when one appears, and
+- **Alerts.** Four conditions are health alerts, pushed like a node's: once when one appears, and
   again only after it has cleared, under the `wicket-health` tag. Their text names the condition,
-  never an error (that stays in the rows, as it can quote a collector's reply).
+  never a sink's or Litestream's error message (those stay in the rows, as they can quote a
+  collector's reply).
   - **The ledger stream** is in any state but streaming, and its last sync was more than 5 minutes
     ago (or 10 sync intervals, if that is longer: with `sync_interval` over 30 s, the stream isn't
     lagging before then). When Litestream doesn't report a last sync (it is stopped, or restarting), that counts from

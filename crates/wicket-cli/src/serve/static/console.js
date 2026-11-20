@@ -470,7 +470,8 @@ function stateStoreRows(p, nowMs) {
   // What is alerted (and pushed, if notifications are on) first, so a sink past its threshold
   // doesn't look like one a few records behind; then whether these rows are current.
   for (const a of p.alerts || []) out.push(el("div", "blocked", "! " + strip(a)));
-  if (p.stale) out.push(el("div", "pend", "! not checked for " + secs((nowMs - (p.read_ms || 0)) / 1000) + ": these rows may be out of date"));
+  if (p.not_read_yet) out.push(el("div", "pend", "! not read yet: the console hasn't managed a first read of the state store"));
+  else if (p.stale) out.push(el("div", "pend", "! not checked for " + secs((nowMs - (p.read_ms || 0)) / 1000) + ": these rows may be out of date"));
   const st = p.stream;
   if (st) {
     let text = strip(st.endpoint) + " (" + strip(st.bucket) + ") \u00b7 ledger " + strip(st.state);
@@ -490,7 +491,8 @@ function stateStoreRows(p, nowMs) {
     text += " at " + a.seq + " of " + a.head + " \u00b7 last checkpoint " + (a.checkpoint_at ? secs(nowMs / 1000 - a.checkpoint_at) + " ago" : "never");
     out.push(row("Audit export " + strip(a.sink) + " (" + strip(a.kind) + ")", a.error ? "blocked" : a.behind && !a.manual ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
   }
-  for (const e of p.errors || []) out.push(el("div", "blocked", "! " + strip(e)));
+  // An error already alerted on (the config alert quotes it) isn't said twice.
+  for (const e of p.errors || []) if (!(p.alerts || []).some(a => a.startsWith(e))) out.push(el("div", "blocked", "! " + strip(e)));
   return out;
 }
 

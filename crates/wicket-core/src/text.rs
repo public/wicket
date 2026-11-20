@@ -42,21 +42,44 @@ pub fn redact_urls(s: &str) -> String {
         let end =
             rest[i + 3..].find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')).map_or(rest.len(), |j| i + 3 + j);
         out.push_str(&rest[..i + 3]);
-        // User info ends at the last '@' (a secret can hold '/', '?' or '#'), so the host starts
-        // after it; with none, at once. Over-redacting a path that holds '@' is the safe mistake.
         let url = &rest[i + 3..end];
-        let url = url.rsplit_once('@').map_or(url, |(_, after)| after);
-        let auth_end = url.find(['/', '?', '#']).unwrap_or(url.len());
-        out.push_str(&url[..auth_end]);
-        let tail = &url[auth_end..];
-        let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
-        out.push_str(&tail[..path_end]);
-        if path_end < tail.len() {
-            out.push_str("?…");
-        }
+        out.push_str(&redact_one(url));
         rest = &rest[end..];
     }
     out.push_str(rest);
+    out
+}
+
+/// One URL after its `scheme://`, as [`redact_urls`] shows it.
+fn redact_one(url: &str) -> String {
+    // The authority runs to the first '/', '?' or '#'. User info in it ends at its last '@'.
+    let seg_end = url.find(['/', '?', '#']).unwrap_or(url.len());
+    let seg = &url[..seg_end];
+    let (host, tail) = if let Some((_, h)) = seg.rsplit_once('@') {
+        (h, &url[seg_end..])
+    } else if seg.rsplit_once(':').is_some_and(|(_, p)| !p.is_empty() && !p.bytes().all(|b| b.is_ascii_digit())) {
+        // `user:secret` with no '@' yet: the secret holds a '/', '?' or '#', and the user info
+        // runs to the last '@' before whitespace. A '?' or '#' in it leaves nothing past the host
+        // that can be told from the secret: the host only, the rest elided.
+        match url.rsplit_once('@') {
+            Some((info, after)) => {
+                let h_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+                if info.contains(['?', '#']) {
+                    return format!("{}…", &after[..h_end]);
+                }
+                (&after[..h_end], &after[h_end..])
+            }
+            None => (seg, &url[seg_end..]),
+        }
+    } else {
+        (seg, &url[seg_end..])
+    };
+    // The path stays; the query and fragment go (an '@' in them is theirs, never user info).
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let mut out = format!("{host}{}", &tail[..path_end]);
+    if path_end < tail.len() {
+        out.push_str("?…");
+    }
     out
 }
 
@@ -72,7 +95,20 @@ mod tests {
         );
         assert_eq!(redact_urls("get \"http://h/a?X-Amz-Signature=abc\": refused"), "get \"http://h/a?…\": refused");
         assert_eq!(redact_urls("no url here"), "no url here");
-        assert_eq!(redact_urls("PUT https://AKIA:wJal/K7?x#y@host/x failed"), "PUT https://host/x failed", "a secret holding '/'");
+        for (url, shown) in [
+            ("https://AKIA:wJal/K7x@host/x", "https://host/x"),
+            ("https://AKIA:wJal/K7?x#y@host/x", "https://host…"),
+            ("https://u:p@host:9000/b/k?X-Amz-Signature=s", "https://host:9000/b/k?…"),
+            ("https://h/p?token=sec@ret", "https://h/p?…"),
+            ("https://h/p?sig=AbC/dEf@x.y&q=1", "https://h/p?…"),
+            ("https://registry.npmjs.org/@types/node", "https://registry.npmjs.org/@types/node"),
+            ("https://h/x?email=a@b.com", "https://h/x?…"),
+            ("s3://bucket/key@v1", "s3://bucket/key@v1"),
+            ("http://localhost:7070/list", "http://localhost:7070/list"),
+            ("http://[::1]/x", "http://[::1]/x"),
+        ] {
+            assert_eq!(redact_urls(url), shown, "{url}");
+        }
         assert_eq!(redact_urls("dial tcp 10.0.0.1:443: refused; s3://b/k"), "dial tcp 10.0.0.1:443: refused; s3://b/k");
     }
 
