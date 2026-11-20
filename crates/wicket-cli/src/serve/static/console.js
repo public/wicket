@@ -384,8 +384,15 @@ function renderAgent(c, id, more) {
 // Which call in the box asked, as the agent's event stream reports it (#574, item 5): helpful, not
 // proof. Labelled apart from "On behalf of" above, and always with the note that anything in the
 // box could use the grant.
-function renderWho(list) {
+function renderWho(list, part) {
   const w = el("div", "who");
+  // What stays on the card (#709 review): whether more than one agent asked, and that anything in
+  // the box could use the grant, are about how far a grant reaches, not detail.
+  if (part === "warnings") {
+    if (list.length > 1) w.append(el("div", "warn", "Asked by more than one agent: one grant would serve all of them."));
+    w.append(el("div", "note", (list.length ? "As the agent reports it, not proven: anything" : "Anything") + " in this box could use the grant."));
+    return w;
+  }
   const line = r => strip(r.agent) + " \u2014 " + strip(r.tool) + ": " + strip(r.call).slice(0, 120);
   if (!list.length) w.append(el("div", "", "Asked by (in the box): unknown (no agent event stream)"));
   for (const a of list) {
@@ -396,16 +403,20 @@ function renderWho(list) {
     if (a.basis === "ambiguous") { w.append(el("div", "", "Asked by (in the box): one of " + rs.length + " concurrent calls:")); for (const r of rs) w.append(el("div", "cand", "\u2022 " + line(r))); }
     else w.append(el("div", "", "Asked by (in the box): " + line(r0(rs))));
   }
-  if (list.length > 1) w.append(el("div", "warn", "Asked by more than one agent: one grant would serve all of them."));
-  // Always: whoever asked, the grant is the box's.
-  w.append(el("div", "note", (list.length ? "As the agent reports it, not proven: anything" : "Anything") + " in this box could use the grant."));
+  if (part !== "list") {
+    if (list.length > 1) w.append(el("div", "warn", "Asked by more than one agent: one grant would serve all of them."));
+    // Always: whoever asked, the grant is the box's.
+    w.append(el("div", "note", (list.length ? "As the agent reports it, not proven: anything" : "Anything") + " in this box could use the grant."));
+  }
   return w;
 }
 const r0 = rs => rs[0];
 
 // What a request asks for, in words (#621): an HTTP request as its method and URL; wicket's own kinds
 // (on wicket.internal) as a sentence, with the raw op on a small line under it. A capacity lease's
-// terms are in the reason wicket wrote for it ("capacity lease <id>: <terms>. Asked by the agent: <why>").
+// sentence is built from its terms as the server sends them (`lease`), never parsed out of the
+// reason, which quotes agent-chosen text (#709 review). The region the agent asked for is its own
+// value (`asked`), shown quoted.
 // A long id in a sentence: its head and tail (the whole op is on the raw line under Details).
 const shortText = id => id.length > 18 ? id.slice(0, 10) + "\u2026" + id.slice(-6) : id;
 function asks(p) {
@@ -413,14 +424,18 @@ function asks(p) {
   if (p.host !== "wicket.internal") return { what: raw + (p.scope_prefix ? "\u2026  (every path under it)" : ""), raw: "", why: strip(p.reason), internal: false };
   const seg = String(p.path || "").split("/").filter(Boolean).map(strip);
   let what = raw, why = strip(p.reason);
+  let asked = null;
   if (p.method === "CAPACITY") {
-    const m = /^capacity lease ([^:]+): ([\s\S]*?)\. Asked by the agent: ([\s\S]*)$/.exec(String(p.reason || ""));
-    what = m ? "Lease a node: " + strip(m[2]) : "Lease a node (" + seg.slice(1).join("/") + ")";
-    if (m) why = strip(m[3]);
+    const x = p.lease;
+    if (x) {
+      what = "Lease a node: " + plural(Number(x.vcpus) || 0, "vCPU", "vCPUs") + ", " + (Number(x.memory_mib) || 0) + " MiB, for " + span(Number(x.duration_secs) || 0) +
+        " on " + strip(x.provider) + ", at most " + money(x.hourly_cap_usd) + "/h, " + money(x.reserved_usd) + " reserved";
+      if (x.region) asked = ["region", strip(x.region)];
+    } else what = "Lease a node (" + seg.slice(1).join("/") + ")";
   } else if (p.method === "SPAWN" && seg[0] === "zones") what = "Start a child agent" + (seg[2] ? " named " + seg[2] : "") + " in zone " + seg[1];
   else if (p.method === "LINK" && seg[0] === "links") what = "Link " + shortText(seg[1]) + " \u2192 " + shortText(seg[2]) + (seg[3] ? ", port " + seg[3] : "");
   else if (p.method === "UPDATE" && seg[0] === "self") what = "Install wicket build " + String(seg[1] || "").slice(0, 12) + "\u2026";
-  return { what, raw, why, internal: true };
+  return { what, raw, why, internal: true, asked };
 }
 
 // Pending cards are kept by request id: a card whose content hasn't changed is the same element
@@ -429,13 +444,22 @@ function asks(p) {
 const cards = new Map();
 // A long id shortened in the middle, its head and tail kept (#574 review): what is copied is the
 // whole id, and the whole id is its title.
+// Inline text (so a copy is one line), shortened in the middle; a tap or click shows it whole, to
+// read or select and copy on a phone (#709 review).
 function idEl(id) {
   id = strip(id);
-  const e = el("span", "id-short");
-  e.title = id;
-  if (id.length <= 18) { e.textContent = id; return e; }
-  e.append(el("span", "id-head", id.slice(0, -6)), el("span", "id-tail", id.slice(-6)));
-  return e;
+  if (id.length <= 18) { const e = el("span", "id-short mono", id); e.title = id; return e; }
+  const short = id.slice(0, 10) + "\u2026" + id.slice(-6);
+  const b = el("button", "id-short link", short);
+  b.type = "button"; b.title = id;
+  if (b.setAttribute) { b.setAttribute("aria-label", id + " (tap to show it whole)"); b.setAttribute("aria-expanded", "false"); }
+  b.onclick = () => {
+    const whole = b.textContent === short;
+    b.textContent = whole ? id : short;
+    if (b.setAttribute) b.setAttribute("aria-expanded", String(whole));
+    layoutAt = performance.now();
+  };
+  return b;
 }
 // A URL broken only after its slashes and dots, so it wraps at a segment, not mid-word.
 function wrapped(cls, text) {
@@ -456,12 +480,16 @@ function pendingCard(s, p) {
   head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)), age);
   const a = asks(p);
   c.append(head, a.internal ? el("div", "what said", a.what) : wrapped("what", a.what));
-  c.append(el("div", "why", a.why));
+  // What the agent chose, quoted as its own, apart from wicket's sentence.
+  if (a.asked) c.append(el("div", "meta asked", a.asked[0] + ", as the agent asked: \u201c" + a.asked[1] + "\u201d"));
+  // wicket writes the reason of its own kinds (they quote the agent's inside): said as wicket's.
+  c.append(el("div", "why", a.internal ? "wicket says: " + a.why : a.why));
   const more = el("details", "more req-more");
   more.append(el("summary", "", "Details"));
   const idOk = renderAgent(c, p.identity || {}, more);
+  c.append(renderWho(p.attribution || [], "warnings"));
   if (a.raw) more.append(el("div", "mono quiet raw", a.raw));
-  more.append(renderWho(p.attribution || []));
+  more.append(renderWho(p.attribution || [], "list"));
   const meta = el("div", "meta");
   fillMeta(meta, p);
   more.append(meta);
