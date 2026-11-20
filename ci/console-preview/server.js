@@ -39,6 +39,8 @@ function page(res) {
   // As serve/web.rs builds it, without the content hashes (the files are read fresh on each load).
   const html = fs.readFileSync(path.join(STATIC, "console.html"), "utf8")
     .replace("{{css}}", "/static/console.css").replace("{{js}}", "/static/console.js")
+    // The modules as written (#574): the entry; it imports lit-html from static/vendor/ itself.
+    .replace("{{modules}}", '<script type="module" src="/static/inbox.js"></script>')
     .replace(/ integrity="\{\{(css|js)_sri\}\}"/g, "");
   send(res, 200, "text/html; charset=utf-8", html);
 }
@@ -81,8 +83,10 @@ http.createServer((req, res) => {
     return page(res);
   }
   if (p.startsWith("/static/") || p === "/sw.js" || p === "/manifest.webmanifest") {
-    // With --assets, the file at its served path (the dump holds nothing else); else the source.
-    const f = ASSETS ? path.join(ASSETS, path.normalize(p).replace(/^([/\\]|\.\.[/\\])+/, "")) : path.join(STATIC, path.basename(p));
+    // With --assets, the file at its served path (the dump holds nothing else); else the source, by
+    // its path under static/ (the modules import lit-html from static/vendor/).
+    const rel = path.normalize(p).replace(/^([/\\]|\.\.[/\\])+/, "");
+    const f = ASSETS ? path.join(ASSETS, rel) : path.join(STATIC, rel.replace(/^static[/\\]/, ""));
     if (!fs.existsSync(f)) return send(res, 404, "text/plain", "not found");
     return send(res, 200, types[path.extname(f)] || "application/octet-stream", fs.readFileSync(f));
   }

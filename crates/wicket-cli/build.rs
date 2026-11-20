@@ -56,28 +56,59 @@ fn write(p: &Path, b: &[u8]) {
 /// The console's script, minified into `OUT_DIR/console.js` (or copied as written, with
 /// `WICKET_CONSOLE_UNMINIFIED=1`). A parse error fails the build: the page would not run.
 fn console(out: &Path) {
-    let src_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/serve/static/console.js");
-    println!("cargo:rerun-if-changed={}", src_path.display());
+    let static_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/serve/static");
     println!("cargo:rerun-if-env-changed=WICKET_CONSOLE_UNMINIFIED");
-    let src = std::fs::read_to_string(&src_path).unwrap_or_else(|e| panic!("{}: {e}", src_path.display()));
-    let js = if std::env::var_os("WICKET_CONSOLE_UNMINIFIED").is_some_and(|v| v == "1") { src } else { minify(&src, &src_path) };
+    let plain = std::env::var_os("WICKET_CONSOLE_UNMINIFIED").is_some_and(|v| v == "1");
+    let read = |rel: &str| {
+        let p = static_dir.join(rel);
+        println!("cargo:rerun-if-changed={}", p.display());
+        (std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())), p)
+    };
+    let (src, path) = read("console.js");
+    let js = if plain { src } else { minify(&src, &path, false) };
     write(&out.join("console.js"), js.as_bytes());
+    // The console's ES modules (#574): its own, minified as modules, and lit-html's, copied byte for
+    // byte as vendored (static/vendor/lit-html/VENDOR.toml holds their hashes). web.rs serves them
+    // under one content-hashed directory, so their relative imports work as written; modules.rs
+    // lists them for it, in this order.
+    let modules = std::fs::create_dir_all(out.join("modules").join("vendor/lit-html/directives"));
+    modules.unwrap_or_else(|e| panic!("{}: {e}", out.display()));
+    let mut list = String::from("&[\n");
+    for (rel, own) in MODULES {
+        let (src, path) = read(rel);
+        let js = if *own && !plain { minify(&src, &path, true) } else { src };
+        write(&out.join("modules").join(rel), js.as_bytes());
+        list.push_str(&format!("    ({rel:?}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/modules/{rel}\"))),\n"));
+    }
+    list.push(']');
+    write(&out.join("modules.rs"), list.as_bytes());
 }
 
-fn minify(src: &str, path: &Path) -> String {
+/// The console's modules, relative to static/: the console's own (true: minified), then the
+/// vendored lit-html files they import (false: copied as they are).
+const MODULES: &[(&str, bool)] = &[
+    ("inbox.js", true),
+    ("vendor/lit-html/lit-html.js", false),
+    ("vendor/lit-html/directive.js", false),
+    ("vendor/lit-html/directive-helpers.js", false),
+    ("vendor/lit-html/directives/repeat.js", false),
+];
+
+fn minify(src: &str, path: &Path, module: bool) -> String {
     use oxc_allocator::Allocator;
     use oxc_codegen::{Codegen, CodegenOptions};
     use oxc_minifier::{CompressOptions, MangleOptions, Minifier, MinifierOptions};
     use oxc_parser::Parser;
     use oxc_span::SourceType;
     let alloc = Allocator::default();
-    let parsed = Parser::new(&alloc, src, SourceType::script()).parse();
+    let parsed = Parser::new(&alloc, src, if module { SourceType::mjs() } else { SourceType::script() }).parse();
     if !parsed.diagnostics.is_empty() {
         panic!("{}: {:?}", path.display(), parsed.diagnostics);
     }
     let mut program = parsed.program;
     let opts = MinifierOptions {
-        mangle: Some(MangleOptions { top_level: Some(false), ..MangleOptions::default() }),
+        // A module's top level is its own, so its names are shortened too (its exports keep theirs).
+        mangle: Some(MangleOptions { top_level: Some(module), ..MangleOptions::default() }),
         mangle_properties: None,
         compress: Some(CompressOptions::default()),
     };

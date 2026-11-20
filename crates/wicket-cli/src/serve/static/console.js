@@ -496,10 +496,6 @@ function asks(p) {
   return { what, raw, said, wicket, mixed, internal: true };
 }
 
-// Pending cards are kept by request id: a card whose content hasn't changed is the same element
-// from one poll to the next, so its buttons don't move or get replaced under the cursor. When the
-// cards do move, `layoutAt` is set and taps are ignored for a moment.
-const cards = new Map();
 // A long id shortened in the middle, its head and tail kept (#574 review): what is copied is the
 // whole id, and the whole id is its title.
 // Inline text (so a copy is one line), shortened in the middle; a tap or click shows it whole, to
@@ -525,7 +521,6 @@ function wrapped(cls, text) {
   for (const part of String(text).split(/(?<=[/.?&])/)) { e.append(document.createTextNode(part)); e.append(el("wbr")); }
   return e;
 }
-function fillMeta(meta, p) { meta.replaceChildren(document.createTextNode(p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 run "), idEl(p.run)); }
 // What a request wants to do, as a verb (docs/explanation/console-design.md): from its method, or
 // git's service for a push or a fetch.
 function verb(p) {
@@ -579,67 +574,6 @@ function whoAsks(id) {
   w.append(el("span", "bad", "We can't confirm which agent this is (" + strip(id.error || "unknown") + "). Only Don't allow is offered."));
   return [w, false];
 }
-function fillMeta(meta, p) { meta.replaceChildren(document.createTextNode(p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 run "), idEl(p.run)); }
-function pendingCard(s, p) {
-  const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run, p.lease, p.claims, p.once_terms]);
-  const had = cards.get(p.id);
-  if (had && had.key === key) { had.age.textContent = rel(p.created_at, s.now); return had.node; }
-  // Labelled fields (docs/explanation/console-design.md): who, wants to, where, why, risk; then the
-  // choices; the rest (on whose behalf, who in the box asked, the exact request, the ids) under Details.
-  const c = el("div", "card req"); c.dataset.id = p.id;
-  const tone = riskClass(p.risk);
-  const head = el("div", "req-head");
-  const age = timeEl(p.created_at, rel(p.created_at, s.now)); age.className = "age";
-  head.append(el("span", "risk " + tone, riskWords(p.risk)), age);
-  c.append(head);
-  const a = asks(p);
-  const dl = el("dl", "fields");
-  const [who, idOk] = whoAsks(p.identity || {});
-  field(dl, "Who", who);
-  // The verb, and always the exact method beside it (#715 review): a verb alone could mislead.
-  if (a.internal) field(dl, "Wants to", a.what.charAt(0).toLowerCase() + a.what.slice(1), "said");
-  else { field(dl, "Wants to", verb(p) + " (" + strip(p.method) + ")", "said"); field(dl, "Where", where(p)); }
-  // What the agent chose, quoted and labelled as its words (#709, #715 review); text wicket wrote
-  // whole, labelled as wicket's.
-  for (const [label, text] of a.said) field(dl, label + (label === "Why" ? "" : ", as the agent says"), "\u201c" + text + "\u201d", label === "Why" ? "why" : "asked");
-  if (a.wicket) field(dl, "wicket says", a.wicket, "why");
-  c.append(dl);
-  // How far a grant reaches stays on the card (#709 review); who in the box asked is detail.
-  c.append(renderWho(p.attribution || [], "warnings"));
-  const more = el("details", "more req-more");
-  more.append(el("summary", "", "Details"));
-  const id = p.identity || {};
-  if (id.verified) more.append(el("div", "chain", "On behalf of: " + (id.acting_for || []).map(strip).join(" \u2192 ")));
-  more.append(el("div", "mono raw", strip(p.method + " " + p.host + p.path) + " \u00b7 risk class " + riskCode(p.risk)));
-  if (a.mixed) more.append(el("div", "meta", "The request's text, with the agent's words in it: \u201c" + a.mixed + "\u201d"));
-  more.append(renderWho(p.attribution || [], "list"));
-  const meta = el("div", "meta");
-  fillMeta(meta, p);
-  more.append(meta);
-  const b = el("div", "buttons ladder");
-  // The first button's words are the server's terms for it (`once_terms`): a git push is granted
-  // as a window whatever is picked, and the card mustn't say otherwise.
-  const ot = p.once_terms || { uses: 1, ttl_secs: 600 };
-  const window_ = ot.uses !== 1;
-  const onceLabel = window_ ? "Allow for " + span(ot.ttl_secs) + " (any number of uses)" : a.internal ? "Allow" : "Allow once (expires in " + span(ot.ttl_secs) + ")";
-  const once = el("button", "approve", onceLabel); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
-  const hour = el("button", "", "Allow for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
-  const deny = el("button", "deny apart", "Don't allow"); deny.onclick = () => act("deny", { id: p.id });
-  if (!idOk) { once.disabled = true; hour.disabled = true; }
-  // Only the steps the server grants: a push is one window, R3 and R4 one use, wicket's own kinds one
-  // decision (#597 re-review, #621). A push to a host that isn't github.com can be R2, but it is still
-  // granted as the window: no hour button, which would promise what the grant doesn't give.
-  if (!idOk) b.append(deny);
-  else if (a.internal) b.append(once, deny);
-  else if (window_ || p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
-    b.append(once, deny);
-    more.append(el("div", "note", window_ ? "A push is allowed as one window: any number of requests for " + span(ot.ttl_secs) + ", for its ref discovery and upload." :
-      "This kind is allowed one request at a time."));
-  } else b.append(once, hour, deny);
-  c.append(b, more);
-  cards.set(p.id, { key, node: c, meta, age });
-  return c;
-}
 
 // How many decisions wait (#650): in the tab's title, the heading, the section nav and, where the
 // browser has one, the installed app's badge; and how many health alerts, beside Health in the nav.
@@ -665,20 +599,21 @@ function renderCounts(waiting, alerts) {
   } catch (e) { /* no badge here */ }
 }
 
+// The Inbox is drawn by inbox.js, with lit-html (#574): the request cards, the status line and the
+// problems. These hand it the state; before the module has loaded (or where it can't run, as in the
+// fake DOM of console_ui.js) they draw nothing.
 function renderPending(s) {
   pendingLoaded = true;
-  const box = document.getElementById("pending");
-  const live = new Set(s.pending.map(p => p.id));
-  for (const id of [...cards.keys()]) if (!live.has(id)) cards.delete(id);
-  const nodes = s.pending.length ? s.pending.map(p => pendingCard(s, p)) : [el("div", "empty", "Nothing is waiting for you.")];
-  const same = nodes.length === box.children.length && nodes.every((n, i) => n === box.children[i]);
-  if (same) return;
-  const empty = !s.pending.length && box.children.length === 1 && box.children[0].className === "empty";
-  if (empty) return;
-  box.replaceChildren(...nodes);
-  layoutAt = performance.now();
-  if (openId) for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
+  inbox("renderPending", s);
 }
+// A failure drawing the Inbox is logged (the browser tests fail on it) and doesn't stop the rest of
+// the page from being drawn.
+function inbox(f, s) {
+  try { if (globalThis.wicketInbox) globalThis.wicketInbox[f](s); } catch (e) { console.error("the Inbox couldn't be drawn:", e); }
+}
+// The cards moved: taps are ignored for a moment (`settled`), so one can't land on a card that just
+// moved under it. inbox.js calls it.
+function layoutMoved() { layoutAt = performance.now(); }
 
 // Rows kept across polls (#574): each by its id and content, rebuilt only when it changed, and the
 // list replaced only when something did. Then the layout moved: taps are ignored for a moment, as
@@ -1325,9 +1260,8 @@ let openId = "";
 let pendingLoaded = false;
 function openPending(id) {
   openId = id || "";
-  for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
-  const card = openId && cards.get(openId);
-  const target = card ? card.node : document.getElementById("waiting") || document.getElementById("pending");
+  const card = globalThis.wicketInbox ? globalThis.wicketInbox.setOpen(openId, lastState) : null;
+  const target = card || document.getElementById("waiting") || document.getElementById("pending");
   if (target && target.scrollIntoView) target.scrollIntoView({ block: "start" });
   if (openId && !card && pendingLoaded) {
     toast(strip(openId) + " is no longer waiting: it was decided or expired. Activity has what became of it.", false, true);
@@ -1848,18 +1782,7 @@ function applyFilter() {
 
 // The Inbox's first line: how things are, each part a link to where it is (#574 redesign).
 function renderStatus(s) {
-  const box = document.getElementById("status");
-  if (!box) return;
-  const runs = s.runs || [];
-  const working = runs.filter(r => r.status === "running" && !r.revoked).length;
-  const waiting = (s.pending || []).length + (((s.standing || {}).asks) || []).length;
-  const problems = problemList(s).length;
-  const part = (n, one, many, href, cls) => { const a = el("a", cls || "", plural(n, one, many)); a.href = href; return a; };
-  const parts = [part(working, "agent working", "agents working", "#agents")];
-  if (waiting) parts.push(part(waiting, "request waiting for you", "requests waiting for you", "#inbox", "warn"));
-  parts.push(problems ? part(problems, "problem", "problems", "#health", "bad") : el("span", "ok", "no problems"));
-  box.replaceChildren();
-  parts.forEach((x, i) => { if (i) box.append(document.createTextNode(" \u00b7 ")); box.append(x); });
+  inbox("renderStatus", s);
 }
 // What is wrong, in plain words, each with where to act: health alerts, the record backup, servers
 // still billing past their rental, keys a task setup needs that aren't set.
@@ -1877,16 +1800,8 @@ function problemList(s) {
   for (const m of ((s.secrets || {}).missing) || []) out.push(["warn", "Key " + strip(m.name) + " isn't set, and a task setup needs it", "#settings"]);
   return out;
 }
-let problemsKey = "";
 function renderProblems(s) {
-  const box = document.getElementById("problems");
-  if (!box) return;
-  const list = problemList(s);
-  const key = JSON.stringify(list);
-  if (key === problemsKey) return;
-  problemsKey = key;
-  if (!list.length) { box.replaceChildren(el("div", "empty", "Nothing is wrong.")); return; }
-  box.replaceChildren(...list.map(([tone, text, href]) => { const a = el("a", "problem " + tone, text); a.href = href; return a; }));
+  inbox("renderProblems", s);
 }
 
 // When the console last heard from wicket, and a line saying so while it can't (#574): what is on
