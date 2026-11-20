@@ -40,9 +40,30 @@ pub fn redact_urls(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find("://") {
-        let start = rest[..i].rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))).map_or(0, |j| j + 1);
-        let end =
+        // The scheme: the ASCII letters, digits, '+', '-' and '.' just before `://` (whatever comes
+        // before them, non-ASCII included, is text).
+        let start = rest[..i]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |(j, c)| j + c.len_utf8());
+        let mut end =
             rest[i + 3..].find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')).map_or(rest.len(), |j| i + 3 + j);
+        // A closing bracket or quote the URL didn't open is the text's: `(see https://h/x)`.
+        while let Some(c) = rest[i + 3..end].chars().last() {
+            let open = match c {
+                ')' => Some('('),
+                ']' => Some('['),
+                '}' => Some('{'),
+                '\u{201d}' | '\u{2019}' | '\u{bb}' | '\u{203a}' => None,
+                _ => break,
+            };
+            let token = &rest[start..end];
+            if open.is_some_and(|o| token.matches(o).count() >= token.matches(c).count()) {
+                break;
+            }
+            end -= c.len_utf8();
+        }
         out.push_str(&rest[..start]);
         if start == i {
             // No scheme: not a URL, nothing to redact.
@@ -61,17 +82,15 @@ pub fn redact_urls(s: &str) -> String {
 fn redact_one(scheme: &str, token: &str) -> String {
     let opaque = format!("{scheme}://…");
     let Ok(u) = url::Url::parse(token) else { return opaque };
-    // Split the raw token as the url crate would, '\\' standing for '/' (it does for http(s)).
+    // The user info ends at an '@' in the authority (up to the first '/', '\\', '?' or '#', as the
+    // url crate splits it; '\\' is '/' for http(s)). Any other '@' anywhere, or more than one, and
+    // which part is a secret can't be told: nothing past the scheme is shown. An npm scoped path
+    // (`/@types/node`) is cut too; for error text, redacting more is the right mistake.
     let after = &token[scheme.len() + 3..];
-    let auth_end = after.find(['/', '\\', '?', '#']).unwrap_or(after.len());
-    let (auth, rest) = after.split_at(auth_end);
-    let before_query = &after[..after.find(['?', '#']).unwrap_or(after.len())];
-    // Which '@' ends the user info must be plain, or nothing is shown: more than one before the
-    // query, or none in the authority but one later (`to?ken@host`, `u:1234#56@host`), unless that
-    // one starts a path segment (`/@types/node`). When unsure, redact more.
-    let later_at = rest.char_indices().any(|(i, c)| c == '@' && !matches!(rest[..i].chars().last(), Some('/')));
-    if before_query.matches('@').count() > 1 || (!auth.contains('@') && later_at) {
-        return opaque;
+    let auth = &after[..after.find(['/', '\\', '?', '#']).unwrap_or(after.len())];
+    match (after.matches('@').count(), auth.contains('@')) {
+        (0, _) | (1, true) => {}
+        _ => return opaque,
     }
     let Some(host) = u.host_str() else { return opaque };
     let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
@@ -103,7 +122,10 @@ mod tests {
             ("https://u:p@host:9000/b/k?X-Amz-Signature=s", "https://host:9000/b/k?…"),
             ("https://h/p?token=sec@ret", "https://…"),
             ("https://h/p?sig=AbC/dEf@x.y&q=1", "https://…"),
-            ("https://registry.npmjs.org/@types/node", "https://registry.npmjs.org/@types/node"),
+            ("https://registry.npmjs.org/@types/node", "https://…"),
+            ("https://tokn?k/@host/", "https://…"),
+            ("https://ghp_tokn/en/@github.com/x", "https://…"),
+            ("https://u:1234/56/@host/x", "https://…"),
             ("https://h/x?email=a@b.com", "https://…"),
             ("s3://bucket/key@v1", "s3://…"),
             ("http://localhost:7070/list", "http://localhost:7070/list"),
@@ -121,6 +143,14 @@ mod tests {
         ] {
             assert_eq!(redact_urls(url), shown, "{url}");
         }
+        // Text before the scheme, non-ASCII included, stays text; a bracket the URL didn't open is
+        // the text's.
+        assert_eq!(redact_urls("éhttps://us:pw@host/"), "éhttps://host/");
+        assert_eq!(redact_urls("\u{201c}https://us:pw@host/\u{201d}"), "\u{201c}https://host/\u{201d}");
+        assert_eq!(redact_urls("错误https://us:pw@host/"), "错误https://host/");
+        assert_eq!(redact_urls("→ws://us:pw@host/"), "→ws://host/");
+        assert_eq!(redact_urls("(see https://usr:pwd@host)"), "(see https://host/)");
+        assert_eq!(redact_urls("[https://h/a_(b)]"), "[https://h/a_(b)]");
         assert_eq!(redact_urls("dial tcp 10.0.0.1:443: refused; s3://b/k"), "dial tcp 10.0.0.1:443: refused; s3://b/k");
     }
 
@@ -135,5 +165,92 @@ mod tests {
         assert_eq!(clip("abcdef", 3), "abc…");
         // Ordinary text, accents and other scripts are kept.
         assert_eq!(strip("café 東京 — ok"), "café 東京 — ok");
+    }
+
+    /// A small deterministic generator (xorshift): the crate has no property-test framework, and
+    /// the same seeds run everywhere.
+    struct Gen(u64);
+    impl Gen {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        /// A character from all over Unicode, weighted towards the ones URLs and their parsing
+        /// care about.
+        fn char(&mut self) -> char {
+            const SPECIAL: &[char] = &[
+                ':',
+                '/',
+                '\\',
+                '@',
+                '?',
+                '#',
+                '(',
+                ')',
+                '[',
+                ']',
+                '{',
+                '}',
+                '"',
+                '\'',
+                '<',
+                '>',
+                '`',
+                '%',
+                '.',
+                '+',
+                '-',
+                ' ',
+                '\n',
+                'é',
+                '错',
+                '→',
+                '\u{201c}',
+                '\u{201d}',
+                '\u{200b}',
+                '\u{202e}',
+                '\u{1f600}',
+            ];
+            match self.below(4) {
+                0 => SPECIAL[self.below(SPECIAL.len())],
+                1 => (b'a' + self.below(26) as u8) as char,
+                2 => char::from_u32(self.below(0x11_0000) as u32).unwrap_or('x'),
+                _ => (b'0' + self.below(10) as u8) as char,
+            }
+        }
+        fn text(&mut self, max: usize) -> String {
+            (0..self.below(max + 1)).map(|_| self.char()).collect()
+        }
+        /// A secret-looking word: at least 4 characters, none that ends a URL or its user info.
+        fn word(&mut self) -> String {
+            const A: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+            (0..4 + self.below(12)).map(|_| A[self.below(A.len())] as char).collect()
+        }
+    }
+
+    /// On arbitrary text, redact_urls never panics; and a `scheme://USER:PASS@HOST/...` URL put
+    /// anywhere in it never comes out with its user or password in it.
+    #[test]
+    fn redact_urls_never_panics_and_never_shows_user_info() {
+        let mut g = Gen(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..20_000 {
+            let s = g.text(40);
+            let _ = redact_urls(&s);
+            let _ = redact_urls(&format!("{s}https://{s}"));
+        }
+        for _ in 0..20_000 {
+            let (user, pass) = (format!("U{}", g.word()), format!("P{}", g.word()));
+            let scheme = ["https", "http", "s3", "ws", "git+ssh"][g.below(5)];
+            let tail = g.text(12);
+            let url = format!("{scheme}://{user}:{pass}@host{}.example/{tail}", g.below(100));
+            let text = format!("{}{url}{}", g.text(10), g.text(10));
+            let out = redact_urls(&text);
+            assert!(!out.contains(&user) && !out.contains(&pass), "{text:?} came out as {out:?}");
+        }
     }
 }
