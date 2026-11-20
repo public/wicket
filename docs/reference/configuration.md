@@ -84,7 +84,9 @@ operators:
 ```
 
 `policy` covers applying the org policy from the console (#712), at R4: it changes what every box may do,
-and revokes the runs minted under another version.
+and revokes the runs minted under another version. `anything`, the default for an operator the file doesn't
+list (and for every operator without the file), covers it: to keep a passkey from applying policy, give it a
+scope without `policy`.
 
 An operator is named by `<via>/<name>` or by its full identity. A file that doesn't parse stops every
 operator's decision until it is fixed: an authority is never guessed. Roles, several operators with their

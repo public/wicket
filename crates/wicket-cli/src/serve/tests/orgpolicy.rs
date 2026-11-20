@@ -29,20 +29,28 @@ fn an_org_policy_is_previewed_then_applied_with_a_passkey_on_that_preview() {
     assert!(t.audit_kinds().iter().all(|(k, _)| k != "policy.apply_decided"), "a preview decides nothing");
 
     // Begin: refused before a passkey for a scope without `policy`, and for what doesn't parse.
-    let begin = |t: &T| t.begin(json!({ "action": "policy_apply", "cedar": ORG, "entities": ENTITIES }));
+    let begin = |t: &T| t.begin(json!({ "action": "policy_apply", "cedar": ORG, "entities": ENTITIES, "reason": "quarterly review" }));
     fence::AUTHORITY.with(|a| {
         *a.borrow_mut() =
             Some(crate::operators::Authority::Scoped(crate::operators::Scope { kinds: vec!["http".into()], ..Default::default() }))
     });
     assert_refused(&begin(&t), StatusCode::FORBIDDEN, "may not decide policy");
     fence::AUTHORITY.with(|a| *a.borrow_mut() = None);
-    assert_refused(&t.begin(json!({ "action": "policy_apply", "cedar": "nope" })), StatusCode::BAD_REQUEST, "doesn't parse");
+    assert_refused(&t.begin(json!({ "action": "policy_apply", "cedar": "nope", "reason": "x" })), StatusCode::BAD_REQUEST, "doesn't parse");
+    assert_refused(&t.begin(json!({ "action": "policy_apply", "cedar": ORG })), StatusCode::BAD_REQUEST, "say why");
+    let big = "x".repeat(61 * 1024);
+    assert_refused(&t.post("/api/policy/preview", json!({ "cedar": big })), StatusCode::BAD_REQUEST, "60 KiB together");
 
     // A run started between begin and signing: the preview signed is stale, so nothing is applied.
     let b = begin(&t);
     assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
     assert_eq!(b.body["action"]["version"], version.as_str());
     assert_eq!(b.body["action"]["revokes"][0]["run"], "run_old");
+    let a = &b.body["action"];
+    assert_eq!(a["cedar_sha256"].as_str().map(str::len), Some(64), "{a}");
+    assert_eq!(a["entities_sha256"].as_str().map(str::len), Some(64));
+    assert_eq!((a["widens"].as_bool(), a["reason"].as_str()), (Some(false), Some("quarterly review")), "a first policy only narrows: {a}");
+    assert!(!a["changes"].as_array().unwrap().is_empty(), "{a}");
     t.running("run_new", "lead");
     let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
     let signed = t.sign(&ch);
@@ -50,7 +58,7 @@ fn an_org_policy_is_previewed_then_applied_with_a_passkey_on_that_preview() {
     assert!(applied.lock().unwrap().is_empty());
 
     // Signed on what it does now: decided, audited first, then applied by `wicket policy apply`.
-    let r = t.act(json!({ "action": "policy_apply", "cedar": ORG, "entities": ENTITIES, "keep_runs": true }));
+    let r = t.act(json!({ "action": "policy_apply", "cedar": ORG, "entities": ENTITIES, "keep_runs": true, "reason": "quarterly review" }));
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     let a = applied.lock().unwrap().clone();
     assert_eq!(a.len(), 1);
@@ -59,6 +67,10 @@ fn an_org_policy_is_previewed_then_applied_with_a_passkey_on_that_preview() {
     assert_eq!((seq, kind.as_str()), (a[0].2, "policy.apply_decided"));
     let d: Value = serde_json::from_str(&body).unwrap();
     assert_eq!((d["version"].as_str(), d["keep_runs"].as_bool(), d["via"].as_str()), (Some(version.as_str()), Some(true), Some("console")));
+    assert_eq!(
+        (d["why"].as_str(), d["cedar_sha256"].clone(), d["widens"].as_bool()),
+        (Some("quarterly review"), b.body["action"]["cedar_sha256"].clone(), Some(false))
+    );
     assert_eq!(d["revokes"], json!([]), "kept until they end");
     assert!(d["granter_identity"].as_str().unwrap().ends_with("/op/passkey/laptop"), "{d}");
     assert_eq!(a[0].3, t.dir.join("policy").join(format!("apply-{seq}.log")));
@@ -66,8 +78,10 @@ fn an_org_policy_is_previewed_then_applied_with_a_passkey_on_that_preview() {
 
     // An apply that can't start is audited, and nothing changed.
     t.state.policy_applier = Box::new(|_| anyhow::bail!("no binary"));
-    let r = t.act(json!({ "action": "policy_apply", "cedar": ORG, "entities": ENTITIES }));
+    let r = t.act(json!({ "action": "policy_apply", "cedar": ORG, "entities": ENTITIES, "reason": "quarterly review" }));
     assert_refused(&r, StatusCode::CONFLICT, "no binary");
     assert!(t.audit_kinds().iter().any(|(k, b)| k == "policy.apply_failed" && b["version"] == version.as_str()));
     assert!(!t.dir.join("policy/installed").exists());
+    let staged: Vec<_> = std::fs::read_dir(t.dir.join("policy/staged")).unwrap().collect();
+    assert_eq!(staged.len(), 2, "the decided apply's files stay for its apply; the failed one's are removed");
 }

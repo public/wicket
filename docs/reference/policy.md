@@ -128,23 +128,41 @@ wicket policy zone manifest.yaml                             # a zone's own poli
 - A re-attached run is minted again under the version it was first minted under (kept in
   `versions/`).
 - The recovery kit (`wicket state kit`) carries `policy/`.
-- It revokes the running runs minted under an older version: their boxes stop, and their tokens are
+- It revokes the running runs minted under an older version, as they are once it is installed (a
+  run started while the nodes were asked is one of them): their boxes stop, and their tokens are
   revoked on their nodes. `--keep-runs` leaves them on the policy they were minted under until they
-  end.
+  end. One apply runs at a time (`policy/apply.lock`), from the last check to the last revocation, and
+  ends with `policy.apply_finished` (what it revoked, and any beyond what its preview listed). A
+  failure after the policy was installed is `policy.apply_incomplete`, never "nothing changed".
 - A run's version is in the ledger, and in its token's `policy` fact.
-- `--dry-run` changes nothing. It prints the version and the one it replaces, what the policy holds
-  in a line, the zones it doesn't mint for, the running runs it would revoke (or keep, with
-  `--keep-runs`), and the effect's sha256: what the console signs.
+- `--dry-run` changes nothing. It prints:
+  - the version, the one it replaces, and the sha256 of its Cedar text and of its entities;
+  - what it changes against the applied policy, from the layers each compiles to: for each running
+    zone (with its groups under the old entities and the new, so moving a zone into a group shows),
+    for a zone in each group alone (the first 32 groups) and for a zone in no group. Each change is
+    a permit, forbid, spawn, message or injection rule added or removed, marked as widening (`+`)
+    or narrowing (`-`). An added alternative reads as widening even where another covered it. With
+    no policy applied, every constraint narrows;
+  - what it couldn't compare (a running zone whose record can't be read, groups over the cap, an
+    applied policy that doesn't parse), never skipped silently;
+  - the zones it doesn't mint for, the running runs it would revoke (or keep, with `--keep-runs`),
+    and the effect's sha256, over all of that: what the console signs.
+
+  It compares compiled layers, which are what tokens enforce. The SymCC check CI runs on policy
+  changes (below) is not run here.
 
 **From the console** (#712). An operator pastes or uploads a policy and its entities and sees the
-same preview (`POST /api/policy/preview`). Applying it is a passkey-signed action (`policy_apply`)
-on that preview, allowed to an operator whose `operators.yaml` authority covers `policy` at R4. The
-decision is audited first (`policy.apply_decided`). Then the console runs `wicket policy apply`
+same preview (`POST /api/policy/preview`; the policy and its entities at most 60 KiB together, the
+console's request limit; apply a larger one on the host). Applying it is a passkey-signed action
+(`policy_apply`, with a reason) on that preview, allowed to an operator whose `operators.yaml`
+authority covers `policy` at R4. The decision is audited first (`policy.apply_decided`, with the
+preview's changes and the sha256 of the Cedar and entities). Then the console runs `wicket policy apply`
 itself on the policy it staged under `policy/staged/`, with the decision's sequence. That apply
 asks every node as root's does, and applies only if the decision is under 10 minutes old, unused,
-and its effect is still what was signed: no run started or ended in between, and no other apply
-came first. `policy.applied` then names the decision and the passkey; a failure is
-`policy.apply_failed`. Its output is in `policy/apply-<seq>.log`.
+its Cedar and entities are the ones signed, and its effect is still what was signed: no run started
+or ended in between, and no other apply came first. `policy.applied` then names the decision and the
+passkey; a failure before anything is installed is `policy.apply_failed`. Its output is in
+`policy/apply-<seq>.log`, and its staged files are removed when it ends.
 
 ## SymCC in CI
 

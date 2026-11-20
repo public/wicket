@@ -70,8 +70,9 @@ pub enum PolicyCmd {
         #[arg(long)]
         keep_runs: bool,
         /// Change nothing: print what applying it would do (its version and the one it replaces,
-        /// whether it mints for every running run's zone, and the runs it would revoke) and the
-        /// effect the console signs.
+        /// what it changes against the applied policy for each running zone and group, whether it
+        /// mints for every running run's zone, and the runs it would revoke) and the effect the
+        /// console signs.
         #[arg(long)]
         dry_run: bool,
         /// The console's signed decision to apply it (its audit sequence): applied only if it is

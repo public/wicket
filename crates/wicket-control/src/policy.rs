@@ -142,9 +142,37 @@ pub struct Preview {
     /// The running runs minted under another version.
     pub runs: Vec<RunChange>,
     pub keep_runs: bool,
-    /// What the human decides on: the version, the one it replaces, and which runs it revokes.
+    /// The sha256 of its Cedar text and of its entities JSON: what the version (64 bits) names.
+    pub cedar_sha256: String,
+    pub entities_sha256: String,
+    /// What it changes against the applied policy, per context: each running zone with its groups
+    /// (under the old entities and the new), each group alone, and a zone in no group. Only the
+    /// contexts where the compiled layers differ.
+    pub changes: Vec<LayerChange>,
+    /// Whether any change may widen what a box may do.
+    pub widens: bool,
+    /// What couldn't be compared, and why (a run's zone that couldn't be read, groups over the cap,
+    /// an applied policy that doesn't parse).
+    pub unchecked: Vec<String>,
+    /// What the human decides on: the version and its sources' digests, the one it replaces, the
+    /// changes, and which runs it revokes.
     pub effect_sha256: String,
 }
+
+/// How the compiled org layer for one context differs between the applied policy and the new one.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LayerChange {
+    /// Which box it is for: `zone z (groups …)`, `a zone in group g`, `a zone in no group`.
+    pub context: String,
+    /// What the new policy may allow that the applied one didn't: a permit added, a forbid removed,
+    /// a constraint lifted. An added alternative is shown as widening even where another covered it.
+    pub widens: Vec<String>,
+    /// What it no longer allows.
+    pub narrows: Vec<String>,
+}
+
+/// The most groups compared alone, and minted for alone: more are listed as unchecked.
+pub const MAX_GROUPS: usize = 32;
 
 impl Preview {
     /// The runs it revokes: none with `keep_runs`.
@@ -157,10 +185,55 @@ impl Preview {
     }
 }
 
+/// The applied org policy in the installation's `policy/` directory `pdir`, if one was applied.
+fn applied_in(pdir: &Path) -> Result<Option<OrgPolicy>> {
+    let Some(v) = installed_in(pdir) else { return Ok(None) };
+    let text = std::fs::read_to_string(pdir.join("org.cedar")).with_context(|| format!("the applied policy {v}'s org.cedar"))?;
+    Ok(Some(OrgPolicy::parse(&text, &entities_in(pdir)).with_context(|| format!("the applied policy {v}"))?))
+}
+
+/// The groups a policy's entities name.
+fn groups_in(org: &OrgPolicy) -> BTreeSet<String> {
+    org.entities().iter().filter(|e| e.uid().type_name().to_string() == "Group").map(|e| e.uid().id().unescaped().to_string()).collect()
+}
+
+/// One op kind's alternatives (None: unconstrained), old against new.
+fn alts<T: serde::Serialize>(what: &str, old: Option<&Option<Vec<T>>>, new: &Option<Vec<T>>, out: &mut LayerChange) {
+    let show = |xs: &[T]| -> BTreeSet<String> { xs.iter().map(|x| serde_json::to_string(x).unwrap_or_default()).collect() };
+    // No policy applied: nothing was constrained.
+    let old = old.unwrap_or(&None);
+    match (old, new) {
+        (None, None) => {}
+        (None, Some(b)) => out.narrows.push(format!("{what}: constrained to {} alternative(s), where it was unconstrained", b.len())),
+        (Some(a), None) => out.widens.push(format!("{what}: unconstrained, where it was constrained to {} alternative(s)", a.len())),
+        (Some(a), Some(b)) => {
+            let (a, b) = (show(a), show(b));
+            out.widens.extend(b.difference(&a).map(|x| format!("{what}: allows {x}")));
+            out.narrows.extend(a.difference(&b).map(|x| format!("{what}: no longer allows {x}")));
+        }
+    }
+}
+
+/// How `new`'s layer differs from `old`'s (None: no policy applied) for one context.
+fn layer_diff(context: String, old: Option<&wicket_authz::OrgLayer>, new: &wicket_authz::OrgLayer) -> LayerChange {
+    let mut c = LayerChange { context, widens: vec![], narrows: vec![] };
+    alts("http", old.map(|o| &o.http), &new.http, &mut c);
+    alts("spawn", old.map(|o| &o.spawn), &new.spawn, &mut c);
+    alts("messages from", old.map(|o| &o.msg_from), &new.msg_from, &mut c);
+    alts("injections", old.map(|o| &o.inject), &new.inject, &mut c);
+    let show =
+        |xs: &[wicket_authz::HttpMatch]| -> BTreeSet<String> { xs.iter().map(|x| serde_json::to_string(x).unwrap_or_default()).collect() };
+    let (a, b) = (old.map(|o| show(&o.forbid)).unwrap_or_default(), show(&new.forbid));
+    c.narrows.extend(b.difference(&a).map(|x| format!("forbid: {x}")));
+    c.widens.extend(a.difference(&b).map(|x| format!("forbid removed: {x}")));
+    c
+}
+
 /// [`Preview`] of `org` against the installation in `data` (its `policy/` and its runs' records) and
 /// its ledger `l`.
 pub fn preview_in(org: &OrgPolicy, data: &Path, l: &wicket_store::Ledger, keep_runs: bool) -> Result<Preview> {
     use sha2::Digest;
+    let sha = |s: &str| hex::encode(sha2::Sha256::digest(s.as_bytes()));
     let version = org.version();
     let pdir = data.join("policy");
     let previous = installed_in(&pdir);
@@ -172,18 +245,73 @@ pub fn preview_in(org: &OrgPolicy, data: &Path, l: &wicket_store::Ledger, keep_r
         }
         runs.push(RunChange { run, zone, policy: pv });
     }
+    // What it changes, against what is applied now, for each context a box can be minted in.
+    let (zones, mut unchecked) = zones_to_check(data, Some(l));
+    let old = match applied_in(&pdir) {
+        Ok(o) => o,
+        Err(e) => {
+            unchecked.push(format!("the applied policy can't be read, so nothing is compared with it: {e:#}"));
+            None
+        }
+    };
+    let old_groups = old.as_ref().map(groups_in).unwrap_or_default();
+    let groups: Vec<String> = old_groups.union(&groups_in(org)).cloned().collect();
+    if groups.len() > MAX_GROUPS {
+        unchecked.push(format!("groups beyond the first {MAX_GROUPS}, not compared alone: {}", groups[MAX_GROUPS..].join(", ")));
+    }
+    let mut contexts: Vec<(String, String, BTreeSet<String>, BTreeSet<String>)> = vec![];
+    for (what, z) in &zones {
+        let (og, ng) = (old.as_ref().map(|o| o.groups_of(&z.name)).unwrap_or_default(), org.groups_of(&z.name));
+        contexts.push((format!("{what} (groups {og:?} → {ng:?})"), z.name.clone(), og, ng));
+    }
+    contexts.push(("a zone in no group".into(), "policy-check".into(), BTreeSet::new(), BTreeSet::new()));
+    for g in groups.iter().take(MAX_GROUPS) {
+        let one = BTreeSet::from([g.clone()]);
+        contexts.push((format!("a zone in group {g}"), "policy-check".into(), one.clone(), one));
+    }
+    let mut changes = vec![];
+    for (context, zone, og, ng) in contexts {
+        let ctx = |groups| MintCtx { zone: zone.clone(), tenant: "t".into(), principal: "human:check".into(), depth: 0, groups };
+        let new_layer = match org.layer(&ctx(ng)) {
+            Ok(x) => x,
+            Err(e) => {
+                unchecked.push(format!("{context}: the new policy doesn't compile for it: {e}"));
+                continue;
+            }
+        };
+        let old_layer = match old.as_ref().map(|o| o.layer(&ctx(og))).transpose() {
+            Ok(x) => x,
+            Err(e) => {
+                unchecked.push(format!("{context}: the applied policy doesn't compile for it: {e}"));
+                continue;
+            }
+        };
+        let c = layer_diff(context, old_layer.as_ref(), &new_layer);
+        if !c.widens.is_empty() || !c.narrows.is_empty() {
+            changes.push(c);
+        }
+    }
+    let widens = changes.iter().any(|c| !c.widens.is_empty());
+    let (cedar_sha256, entities_sha256) = (sha(&org.text), sha(&org.entities));
+    let diff_sha256 = sha(&serde_json::json!({ "changes": changes, "unchecked": unchecked }).to_string());
     let revoked: Vec<&str> = if keep_runs { vec![] } else { runs.iter().map(|r| r.run.as_str()).collect() };
-    let effect = serde_json::json!({ "v": 1, "kind": "policy_apply", "version": version, "previous": previous,
-                                     "keep_runs": keep_runs, "revokes": revoked });
+    let effect = serde_json::json!({ "v": 2, "kind": "policy_apply", "version": version, "cedar_sha256": cedar_sha256,
+                                     "entities_sha256": entities_sha256, "previous": previous, "keep_runs": keep_runs,
+                                     "diff_sha256": diff_sha256, "revokes": revoked });
     Ok(Preview {
         summary: summary(org)?,
         refused: trial_in(org, data, Some(l)),
-        effect_sha256: hex::encode(sha2::Sha256::digest(effect.to_string().as_bytes())),
+        effect_sha256: sha(&effect.to_string()),
         version,
         previous,
         already,
         runs,
         keep_runs,
+        cedar_sha256,
+        entities_sha256,
+        changes,
+        widens,
+        unchecked,
     })
 }
 
@@ -206,6 +334,27 @@ pub fn preview_text(p: &Preview) -> String {
             }
         }
     }
+    if p.changes.is_empty() {
+        o.push_str("  it changes nothing a box may do, against the applied policy\n");
+    } else {
+        o.push_str(&format!(
+            "  against the applied policy it {}:\n",
+            if p.widens { "WIDENS what boxes may do" } else { "only narrows what boxes may do" }
+        ));
+        for c in &p.changes {
+            o.push_str(&format!("    {}\n", c.context));
+            for w in &c.widens {
+                o.push_str(&format!("      + {w}\n"));
+            }
+            for n in &c.narrows {
+                o.push_str(&format!("      - {n}\n"));
+            }
+        }
+    }
+    if !p.unchecked.is_empty() {
+        o.push_str(&format!("  not compared:\n    - {}\n", p.unchecked.join("\n    - ")));
+    }
+    o.push_str(&format!("  cedar sha256 {}, entities sha256 {}\n", p.cedar_sha256, p.entities_sha256));
     o.push_str(&format!("  effect {}\n", p.effect_sha256));
     o
 }
@@ -248,11 +397,12 @@ pub fn decide(
     }
     if pre.effect_sha256 != shown {
         return Err(refused(anyhow::anyhow!(
-            "what applying it does changed after you were shown it (the runs it revokes, or the applied version): look again"
+            "what applying it does changed after you were shown it (what it changes, the runs it revokes, or the applied version): look again"
         )));
     }
     let mut rec = serde_json::json!({
-        "action": "policy_apply", "version": pre.version, "previous": pre.previous, "keep_runs": keep_runs,
+        "action": "policy_apply", "version": pre.version, "cedar_sha256": pre.cedar_sha256, "entities_sha256": pre.entities_sha256,
+        "previous": pre.previous, "keep_runs": keep_runs, "widens": pre.widens, "changes": pre.changes, "unchecked": pre.unchecked,
         "revokes": pre.revokes(), "effect_sha256": pre.effect_sha256,
         "by": o.label, "granter": "human", "granter_identity": o.id,
     });
@@ -277,13 +427,17 @@ fn decided(l: &wicket_store::Ledger, seq: i64, p: &Preview) -> Result<String> {
         .filter(|r| r.kind == "policy.apply_decided")
         .with_context(|| format!("no decision {seq} to apply a policy"))?;
     let b: serde_json::Value = serde_json::from_str(&r.body)?;
-    if b["version"].as_str() != Some(p.version.as_str()) || b["keep_runs"].as_bool() != Some(p.keep_runs) {
-        bail!("decision {seq} is for another policy or --keep-runs");
+    if b["version"].as_str() != Some(p.version.as_str())
+        || b["cedar_sha256"].as_str() != Some(p.cedar_sha256.as_str())
+        || b["entities_sha256"].as_str() != Some(p.entities_sha256.as_str())
+        || b["keep_runs"].as_bool() != Some(p.keep_runs)
+    {
+        bail!("decision {seq} is for another policy (its Cedar or entities) or --keep-runs");
     }
     if wicket_store::now() - r.ts > DECISION_TTL_SECS {
         bail!("decision {seq} is older than {} minutes: decide again", DECISION_TTL_SECS / 60);
     }
-    for kind in ["policy.applied", "policy.apply_failed"] {
+    for kind in ["policy.applied", "policy.apply_failed", "policy.apply_incomplete"] {
         if l.audit_of_kind(kind)?
             .iter()
             .any(|x| serde_json::from_str::<serde_json::Value>(&x.body).is_ok_and(|v| v["decision"].as_i64() == Some(seq)))
@@ -292,7 +446,7 @@ fn decided(l: &wicket_store::Ledger, seq: i64, p: &Preview) -> Result<String> {
         }
     }
     if b["effect_sha256"].as_str() != Some(p.effect_sha256.as_str()) {
-        bail!("what applying it does changed since it was decided (the runs it revokes, or the applied version): decide again");
+        bail!("what applying it does changed since it was decided (what it changes, the runs it revokes, or the applied version): decide again");
     }
     Ok(b["by"].as_str().unwrap_or("console").to_string())
 }
@@ -309,10 +463,12 @@ fn mints(org: &OrgPolicy, zone: &wicket_core::ZoneSpec, groups: BTreeSet<String>
     Ok(())
 }
 
-/// The zones the check mints for: every running run's (from its record under `data`), and a bare one.
-fn zones_to_check(data: &Path, l: Option<&wicket_store::Ledger>) -> Vec<(String, wicket_core::ZoneSpec)> {
+/// The zones the check mints for: every running run's (from its record under `data`, once per
+/// zone), and a bare one; and the runs whose zone couldn't be read.
+fn zones_to_check(data: &Path, l: Option<&wicket_store::Ledger>) -> (Vec<(String, wicket_core::ZoneSpec)>, Vec<String>) {
     let bare: wicket_core::ZoneSpec = wicket_core::yaml::from_str("name: policy-check\n").expect("a bare zone");
     let mut out = vec![("a zone with no rules".to_string(), bare)];
+    let mut unread = vec![];
     let opened = if l.is_none() { wicket_store::Ledger::open(&ledger_path()).ok() } else { None };
     if let Some(l) = l.or(opened.as_ref()) {
         for (run, _, _) in l.running_policies().unwrap_or_default() {
@@ -321,12 +477,14 @@ fn zones_to_check(data: &Path, l: Option<&wicket_store::Ledger>) -> Vec<(String,
                 .ok()
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .and_then(|v| v["manifest"].as_str().and_then(|y| wicket_agent::load(y).ok()));
-            if let Some(m) = m {
-                out.push((format!("run {run}'s zone {}", m.zone.name), m.zone));
+            match m {
+                Some(m) if out.iter().any(|(_, z)| z.name == m.zone.name) => {}
+                Some(m) => out.push((format!("run {run}'s zone {}", m.zone.name), m.zone)),
+                None => unread.push(format!("run {run}'s zone: its record ({}) can't be read", rec.display())),
             }
         }
     }
-    out
+    (out, unread)
 }
 
 /// Compiles and mints `org` for each zone to check, as a member of no group, of every group, and of
@@ -337,16 +495,11 @@ fn trial(org: &OrgPolicy) -> Vec<String> {
 
 /// [`trial`] against the installation in `data` and its ledger (None: the installation's).
 fn trial_in(org: &OrgPolicy, data: &Path, l: Option<&wicket_store::Ledger>) -> Vec<String> {
-    let all: BTreeSet<String> = org
-        .entities()
-        .iter()
-        .filter(|e| e.uid().type_name().to_string() == "Group")
-        .map(|e| e.uid().id().unescaped().to_string())
-        .collect();
+    let all = groups_in(org);
     let mut sets = vec![BTreeSet::new(), all.clone()];
-    sets.extend(all.iter().map(|g| BTreeSet::from([g.clone()])));
+    sets.extend(all.iter().take(MAX_GROUPS).map(|g| BTreeSet::from([g.clone()])));
     let mut bad = vec![];
-    for (what, z) in zones_to_check(data, l) {
+    for (what, z) in zones_to_check(data, l).0 {
         let mut ss = sets.clone();
         ss.push(org.groups_of(&z.name));
         for groups in ss {
@@ -413,35 +566,69 @@ fn write_replace(p: &Path, body: &str) -> Result<()> {
 }
 
 /// `wicket policy apply FILE [--entities F] [--keep-runs] [--dry-run]`. With `decision` (the
-/// console's, #712), only what that signed decision previewed is applied, once, and an apply that
-/// fails is audited (`policy.apply_failed`).
+/// console's, #712), only what that signed decision previewed is applied, once; an apply that fails
+/// before it installs anything is audited `policy.apply_failed`, and the policy files the console
+/// staged for it are removed afterwards.
 pub async fn apply(file: &Path, entities: Option<&Path>, keep_runs: bool, dry_run: bool, decision: Option<i64>) -> Result<()> {
-    let p = load(file, entities)?;
-    let l = wicket_store::Ledger::open(&ledger_path())?;
-    let pre = preview_in(&p, &data_dir(), &l, keep_runs)?;
     if dry_run {
-        print!("{}", preview_text(&pre));
+        let p = load(file, entities)?;
+        let l = wicket_store::Ledger::open(&ledger_path())?;
+        print!("{}", preview_text(&preview_in(&p, &data_dir(), &l, keep_runs)?));
         return Ok(());
     }
-    let Some(seq) = decision else { return install(&p, &pre, &crate::operator(), None).await };
-    let r = match decided(&l, seq, &pre) {
-        Ok(by) => install(&p, &pre, &by, Some(seq)).await,
-        Err(e) => Err(e),
-    };
-    if let Err(e) = &r {
-        let _ = l.audit(
-            &wicket_core::TenantId::single(),
-            None,
-            "policy.apply_failed",
-            &serde_json::json!({ "version": pre.version, "decision": seq, "error": format!("{e:#}") }),
-        );
+    let mut installed = false;
+    let mut version = None;
+    let r = async {
+        let p = load(file, entities)?;
+        version = Some(p.version());
+        let l = wicket_store::Ledger::open(&ledger_path())?;
+        let pre = preview_in(&p, &data_dir(), &l, keep_runs)?;
+        install(&p, &pre, decision, &mut installed).await
+    }
+    .await;
+    if let (Err(e), Some(seq), false) = (&r, decision, installed) {
+        if let Ok(l) = wicket_store::Ledger::open(&ledger_path()) {
+            let _ = l.audit(
+                &wicket_core::TenantId::single(),
+                None,
+                "policy.apply_failed",
+                &serde_json::json!({ "version": version, "decision": seq, "error": format!("{e:#}") }),
+            );
+        }
+    }
+    if decision.is_some() {
+        let staged = dir().join("staged");
+        for f in [Some(file), entities].into_iter().flatten() {
+            if f.parent() == Some(staged.as_path()) {
+                let _ = std::fs::remove_file(f);
+            }
+        }
     }
     r
 }
 
-/// Installs `p`, previewed as `pre`, as `by`, and revokes the runs minted under another version
-/// unless `pre.keep_runs`.
-async fn install(p: &OrgPolicy, pre: &Preview, by: &str, decision: Option<i64>) -> Result<()> {
+/// Held while an apply checks, installs and revokes: one apply at a time.
+struct ApplyLock(#[allow(dead_code)] std::fs::File);
+
+impl ApplyLock {
+    fn take() -> Result<ApplyLock> {
+        use std::os::fd::AsRawFd;
+        let d = dir();
+        std::fs::create_dir_all(&d)?;
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(d.join("apply.lock"))?;
+        // SAFETY: flock on a file descriptor this function owns.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("locking policy/apply.lock");
+        }
+        Ok(ApplyLock(f))
+    }
+}
+
+/// Installs `p`, previewed as `pre`, and revokes the runs minted under another version unless
+/// `pre.keep_runs`. With `decision`, as the console's decision says and only if it holds. Sets
+/// `installed` once the policy is the installation's; a failure after that is audited
+/// `policy.apply_incomplete`, and the end `policy.apply_finished`.
+async fn install(p: &OrgPolicy, pre: &Preview, decision: Option<i64>, installed: &mut bool) -> Result<()> {
     let v = p.version();
     // Nothing changes unless it mints for every running run's zone, and every node reads it.
     if !pre.refused.is_empty() {
@@ -454,13 +641,17 @@ async fn install(p: &OrgPolicy, pre: &Preview, by: &str, decision: Option<i64>) 
             lacking.iter().map(|(n, why)| format!("  - node {n}: {why}")).collect::<Vec<_>>().join("\n")
         );
     }
+    // From here to the end, one apply at a time.
+    let _lock = ApplyLock::take()?;
     let l = wicket_store::Ledger::open(&ledger_path())?;
-    // A decided apply is of what was shown: the runs it revokes are checked again after the nodes'.
-    if decision.is_some() && preview_in(p, &data_dir(), &l, pre.keep_runs)?.effect_sha256 != pre.effect_sha256 {
-        bail!("what applying it does changed while the nodes were asked (a run started or ended): decide again");
-    }
-    let prev = installed();
-    if pre.already && prev.as_deref() == Some(v.as_str()) {
+    let now = preview_in(p, &data_dir(), &l, pre.keep_runs)?;
+    let by = match decision {
+        // A decided apply is of what was shown, checked again now the nodes have answered.
+        Some(seq) => decided(&l, seq, &now)?,
+        None => crate::operator(),
+    };
+    let prev = installed_in(&dir());
+    if now.already {
         println!("org policy {v} is already the installation's");
     } else {
         let d = dir();
@@ -471,35 +662,77 @@ async fn install(p: &OrgPolicy, pre: &Preview, by: &str, decision: Option<i64>) 
         write_replace(&d.join("org-entities.json"), &p.entities)?;
         write_replace(&d.join("org.cedar"), &p.text)?;
         write_replace(&d.join("installed"), &v)?;
-        l.audit(
+        *installed = true;
+        let r = l.audit(
             &wicket_core::TenantId::single(),
             None,
             "policy.applied",
-            &serde_json::json!({ "version": v, "previous": prev, "by": by, "decision": decision, "effect_sha256": pre.effect_sha256 }),
-        )?;
+            &serde_json::json!({ "version": v, "previous": prev, "by": by, "decision": decision, "effect_sha256": now.effect_sha256,
+                                 "cedar_sha256": now.cedar_sha256, "entities_sha256": now.entities_sha256, "widens": now.widens }),
+        );
+        if let Err(e) = r {
+            return Err(incomplete(&l, &v, decision, anyhow::Error::from(e).context("recording policy.applied")));
+        }
         println!("org policy {v} applied (was {})", prev.as_deref().unwrap_or("none"));
     }
-    // Runs minted under another version: revoked (their supervisors stop the boxes and publish the
-    // revocation of their tokens to the nodes), unless kept until they end.
-    if pre.runs.is_empty() {
-        return Ok(());
+    *installed = true;
+    match revoke_older(&l, &v, &now, &by, decision) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(incomplete(&l, &v, decision, e)),
     }
+}
+
+/// Audits an apply that installed its policy and then failed (`policy.apply_incomplete`).
+fn incomplete(l: &wicket_store::Ledger, v: &str, decision: Option<i64>, e: anyhow::Error) -> anyhow::Error {
+    let _ = l.audit(
+        &wicket_core::TenantId::single(),
+        None,
+        "policy.apply_incomplete",
+        &serde_json::json!({ "version": v, "decision": decision, "installed": true, "error": format!("{e:#}") }),
+    );
+    e.context(format!("org policy {v} is installed, but the apply didn't finish (policy.apply_incomplete)"))
+}
+
+/// Revokes the runs minted under another version than `v`, as they are once `v` is installed (a run
+/// started while the nodes were asked is one of them), unless `--keep-runs`; then
+/// `policy.apply_finished`, with any revoked beyond what was previewed.
+fn revoke_older(l: &wicket_store::Ledger, v: &str, pre: &Preview, by: &str, decision: Option<i64>) -> Result<()> {
+    let mut runs = vec![];
+    for (run, zone, pv) in l.running_policies()? {
+        if pv.as_deref() != Some(v) && l.identity(&run)?.is_some() {
+            runs.push(RunChange { run, zone, policy: pv });
+        }
+    }
+    let mut revoked = vec![];
     if pre.keep_runs {
-        println!("{} running run(s) keep the policy they were minted under until they end (--keep-runs)", pre.runs.len());
-        return Ok(());
+        if !runs.is_empty() {
+            println!("{} running run(s) keep the policy they were minted under until they end (--keep-runs)", runs.len());
+        }
+    } else {
+        let reason = format!("org policy {v} applied; this run was minted under an older version");
+        for r in &runs {
+            let fresh = l.revoke(&r.run, by, &reason)?;
+            l.audit(
+                &wicket_core::TenantId::single(),
+                Some(&wicket_core::RunId(r.run.clone())),
+                "identity.revoked",
+                &serde_json::json!({ "run": r.run, "by": by, "reason": reason, "policy": r.policy, "decision": decision }),
+            )?;
+            println!("{} {} (policy {})", if fresh { "revoked" } else { "already revoked" }, r.run, r.policy.as_deref().unwrap_or("none"));
+            revoked.push(r.run.clone());
+        }
+        if !revoked.is_empty() {
+            println!("their runners stop the boxes within seconds, and publish the revocation of their tokens to the nodes");
+        }
     }
-    let reason = format!("org policy {v} applied; this run was minted under an older version");
-    for r in pre.revokes() {
-        let fresh = l.revoke(&r.run, by, &reason)?;
-        l.audit(
-            &wicket_core::TenantId::single(),
-            Some(&wicket_core::RunId(r.run.clone())),
-            "identity.revoked",
-            &serde_json::json!({ "run": r.run, "by": by, "reason": reason, "policy": r.policy, "decision": decision }),
-        )?;
-        println!("{} {} (policy {})", if fresh { "revoked" } else { "already revoked" }, r.run, r.policy.as_deref().unwrap_or("none"));
-    }
-    println!("their runners stop the boxes within seconds, and publish the revocation of their tokens to the nodes");
+    let beyond: Vec<&String> = revoked.iter().filter(|r| !pre.runs.iter().any(|x| &x.run == *r)).collect();
+    l.audit(
+        &wicket_core::TenantId::single(),
+        None,
+        "policy.apply_finished",
+        &serde_json::json!({ "version": v, "decision": decision, "already": pre.already, "revoked": revoked,
+                             "revoked_beyond_preview": beyond, "kept": if pre.keep_runs { runs.len() } else { 0 }, "by": by }),
+    )?;
     Ok(())
 }
 
@@ -606,13 +839,65 @@ mod tests {
 
         // The apply it starts: this decision, for this version and keep_runs, on this effect, once.
         assert_eq!(decided(&l, seq, &pre).unwrap(), "passkey:laptop");
-        assert!(format!("{:#}", decided(&l, seq, &kept).unwrap_err()).contains("another policy or --keep-runs"));
+        assert!(format!("{:#}", decided(&l, seq, &kept).unwrap_err()).contains("or --keep-runs"));
+        let mut other = pre.clone();
+        other.cedar_sha256 = "0".repeat(64);
+        assert!(format!("{:#}", decided(&l, seq, &other).unwrap_err()).contains("its Cedar or entities"));
         assert!(decided(&l, seq + 99, &pre).is_err(), "no such decision");
         l.run_ended(&RunId("run_new".into()), "ok", "done").unwrap();
         let moved = preview_in(&org, &data, &l, false).unwrap();
         assert!(format!("{:#}", decided(&l, seq, &moved).unwrap_err()).contains("changed since it was decided"));
         l.audit(&TenantId::single(), None, "policy.applied", &serde_json::json!({ "version": pre.version, "decision": seq })).unwrap();
         assert!(format!("{:#}", decided(&l, seq, &pre).unwrap_err()).contains("used already"));
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    /// #782 review: the preview says what changes against the applied policy, per context. A policy
+    /// that drops one group's forbid widens for that group alone, and the change is in the effect.
+    #[test]
+    fn the_preview_diffs_the_compiled_layers_against_the_applied_policy() {
+        let data = tmp("diff");
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        let pdir = data.join("policy");
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(pdir.join("org.cedar"), ORG).unwrap();
+        std::fs::write(pdir.join("org-entities.json"), ENTITIES).unwrap();
+        std::fs::write(pdir.join("installed"), wicket_policy::version(ORG, ENTITIES)).unwrap();
+
+        let same = preview_in(&parse(ORG, ENTITIES).unwrap(), &data, &l, false).unwrap();
+        assert!(same.already && same.changes.is_empty() && !same.widens, "{:?}", same.changes);
+        assert!(preview_text(&same).contains("changes nothing a box may do"));
+
+        // The development zones' write forbid, removed.
+        let start = ORG.find("// Development zones").unwrap();
+        let end = ORG[start..].find("\n\n").unwrap() + start;
+        let wider = format!("{}{}", &ORG[..start], &ORG[end..]);
+        let p = preview_in(&parse(&wider, ENTITIES).unwrap(), &data, &l, false).unwrap();
+        assert!(p.widens, "{p:?}");
+        let ctx: Vec<&str> = p.changes.iter().map(|c| c.context.as_str()).collect();
+        assert_eq!(ctx, ["a zone in group dev"], "only that group's boxes: {:?}", p.changes);
+        assert!(p.changes[0].widens.iter().all(|w| w.starts_with("forbid removed")), "{:?}", p.changes[0]);
+        assert!(preview_text(&p).contains("WIDENS"));
+        assert_ne!(p.effect_sha256, preview_in(&parse(ORG, "[]").unwrap(), &data, &l, false).unwrap().effect_sha256);
+
+        // Entities that move a running zone into `dev`: that zone's boxes lose the forbid.
+        running(&l, "run_api", None);
+        let rec = data.join("runs/run_api/ctl");
+        std::fs::create_dir_all(&rec).unwrap();
+        let manifest = "task: t\nprogram: { name: p, command: [x] }\nzone: { name: api }\n";
+        std::fs::write(rec.join("run.json"), serde_json::to_vec(&serde_json::json!({ "manifest": manifest })).unwrap()).unwrap();
+        // Another running run whose record can't be read is said, not skipped.
+        running(&l, "run_lost", None);
+        let moved = ENTITIES.replace("\"id\": \"dev-api\"", "\"id\": \"api\"");
+        let p = preview_in(&parse(ORG, &moved).unwrap(), &data, &l, false).unwrap();
+        let api = p.changes.iter().find(|c| c.context.contains("zone api")).expect("the moved zone's change");
+        assert!(api.narrows.iter().any(|n| n.starts_with("forbid:")), "moving into dev adds its forbid: {api:?}");
+        assert!(p.unchecked.iter().any(|u| u.contains("run run_lost's zone")), "{:?}", p.unchecked);
+
+        // No policy applied: a first policy only narrows.
+        std::fs::remove_file(pdir.join("installed")).unwrap();
+        let first = preview_in(&parse(ORG, ENTITIES).unwrap(), &data, &l, false).unwrap();
+        assert!(!first.widens && !first.changes.is_empty(), "{:?}", first.changes);
         std::fs::remove_dir_all(&data).unwrap();
     }
 

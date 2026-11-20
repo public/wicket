@@ -247,6 +247,15 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         let (s, _, body) = get(&f.t, &p).await;
         assert!(leaks(&body, &n).is_empty(), "{p} ({s}) leaks {:?}", leaks(&body, &n));
     }
+    // The org policy preview (#712), of the applied policy and of another.
+    let org = include_str!("../../../../../examples/policy/org.cedar");
+    for body in
+        [json!({ "cedar": org }), json!({ "cedar": org, "entities": include_str!("../../../../../examples/policy/org-entities.json") })]
+    {
+        let r = f.t.post("/api/policy/preview", body);
+        let text = r.body.to_string();
+        assert!(leaks(&text, &n).is_empty(), "/api/policy/preview ({}) leaks {:?}", r.status, leaks(&text, &n));
+    }
     // Signed out: the same views refuse, and say nothing.
     for p in ["/api/policy", "/api/runs/run_01authz0000000000000000000/authority", "/api/explain/1"] {
         let (s, _, body) = super::http::call(&f.t.state, "GET", p, &[], b"").await;

@@ -1830,7 +1830,7 @@ Arguments:
 Options:
       --entities <ENTITIES>  
       --keep-runs            Leave running runs on the policy they were minted under until they end
-      --dry-run              Change nothing: print what applying it would do (its version and the one it replaces, whether it mints for every running run's zone, and the runs it would revoke) and the effect the console signs
+      --dry-run              Change nothing: print what applying it would do (its version and the one it replaces, what it changes against the applied policy for each running zone and group, whether it mints for every running run's zone, and the runs it would revoke) and the effect the console signs
   -h, --help                 Print help
 ```
 
