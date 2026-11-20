@@ -56,10 +56,24 @@ pub fn terms(bound: StandingBound, ttl: Option<Duration>) -> Result<NameTerms> {
     Ok(NameTerms { bound, ttl_secs: ttl.map(|t| t.as_secs()) })
 }
 
+/// This installation's public-names settings, or why it publishes no names.
+pub fn public_settings(names: &wicket_names::NamesConfig) -> Result<&wicket_names::PublicConfig> {
+    names.public.as_ref().ok_or_else(|| anyhow::anyhow!("this installation publishes no public names (names.public in wicket.yaml)"))
+}
+
 /// Approves public-name ask `id` as `by` with `terms`, on the effect `shown`: the one the decider
-/// was shown, always (#680 review, L6: a caller can't approve what it didn't show). `extra` goes on
-/// the decision's audit record. The effect approved.
-pub fn approve(l: &Ledger, by: &Granter, id: &str, terms: &NameTerms, shown: &str, extra: serde_json::Value) -> Result<String> {
+/// was shown, always (#680 review, L6: a caller can't approve what it didn't show), under the
+/// installation's `names` settings as they are now (#575 review, M1: its boxes domain, reserved
+/// labels and per-workload limit). `extra` goes on the decision's audit record. The effect approved.
+pub fn approve(
+    l: &Ledger,
+    by: &Granter,
+    id: &str,
+    terms: &NameTerms,
+    shown: &str,
+    names: &wicket_names::NamesConfig,
+    extra: serde_json::Value,
+) -> Result<String> {
     let n = l.name(id)?;
     if n.kind != wicket_store::NameKind::Public {
         return Err(refused(l, by, id, "approve", anyhow::anyhow!("{id} is an internal name, which needs no approval")));
@@ -68,7 +82,11 @@ pub fn approve(l: &Ledger, by: &Granter, id: &str, terms: &NameTerms, shown: &st
         Ok(o) => o,
         Err(why) => return Err(refused(l, by, id, "approve", why)),
     };
-    let effect = match l.approve_name(id, terms, &o.label, Some(shown)) {
+    let public = match public_settings(names) {
+        Ok(p) => p,
+        Err(why) => return Err(refused(l, by, id, "approve", why)),
+    };
+    let effect = match l.approve_name(id, terms, &o.label, Some(shown), public) {
         Ok(e) => e,
         Err(e @ (wicket_store::StoreError::EffectChanged(..) | wicket_store::StoreError::Refused(_))) => {
             return Err(refused(l, by, id, "approve", e.into()))
@@ -77,7 +95,7 @@ pub fn approve(l: &Ledger, by: &Granter, id: &str, terms: &NameTerms, shown: &st
     };
     let standing = n.scope == NameScope::Standing;
     let record = serde_json::json!({
-        "decision": "approve", "name": id, "label": n.label, "kind": "public", "port": n.port, "service": n.service,
+        "decision": "approve", "name": id, "label": n.label, "fqdn": public.fqdn(&n.label), "kind": "public", "port": n.port, "service": n.service,
         "by": o.label, "granter": "human", "granter_identity": o.id, "principal": n.principal, "zone": n.zone, "run": n.asked_run,
         "scope": n.scope.as_str(), "bound": standing.then(|| terms.bound.as_str()), "ttl_secs": standing.then_some(terms.ttl_secs),
         "effect_sha256": effect,
@@ -107,6 +125,26 @@ pub fn deny(l: &Ledger, by: &Granter, id: &str, extra: serde_json::Value) -> Res
     Ok(())
 }
 
+/// A run of `principal` in `zone` started: it takes up the live standing names bound to its agent
+/// or zone that no run holds (#575 review, M2), under the zone's name and digest as the ask stored
+/// them, each audited `name.claimed` (`Ledger::claim_standing_names`). A run starts without them if
+/// the ledger refuses, and says so.
+pub fn claim_for_run(
+    l: &Ledger,
+    tenant: &TenantId,
+    run: &wicket_core::RunId,
+    principal: &str,
+    zone: &wicket_core::ZoneSpec,
+) -> Vec<NameRow> {
+    match l.claim_standing_names(tenant, run, principal, &zone.name, &wicket_store::zone_digest(zone)) {
+        Ok(c) => c,
+        Err(e) => {
+            wicket_home::say_err!("[wicket] {run}: its standing names could not be taken up: {e}");
+            vec![]
+        }
+    }
+}
+
 /// Revokes live name `id` (public or internal): it ends now, whoever holds it.
 pub fn revoke(l: &Ledger, by: &str, id: &str) -> Result<NameRow> {
     let n = l.revoke_name(id, by)?;
@@ -124,6 +162,11 @@ mod tests {
     use super::*;
     use wicket_core::RunId;
     use wicket_store::{NameAsk, NameScope};
+
+    fn cfg() -> wicket_names::NamesConfig {
+        serde_json::from_value(serde_json::json!({ "public": { "provider": "noop", "zone": "boxes.example.com", "owner": "a1b2c3d4" } }))
+            .unwrap()
+    }
 
     fn op(policy: &str) -> Granter {
         let p: crate::operators::Policy = crate::operators::Policy::parse(policy).unwrap();
@@ -154,14 +197,14 @@ mod tests {
         let l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "demo", NameScope::Standing);
         let t = terms(StandingBound::Agent, Some(DEFAULT_NAME_TTL)).unwrap();
-        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t);
+        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t, "boxes.example.com");
         // An operator whose kinds leave out `name` can't.
         let narrow = op("default: { kinds: [http] }\n");
-        assert!(approve(&l, &narrow, &id, &t, &shown, serde_json::json!({})).unwrap_err().to_string().contains("refused"));
+        assert!(approve(&l, &narrow, &id, &t, &shown, &cfg(), serde_json::json!({})).unwrap_err().to_string().contains("refused"));
         // Another effect than the one shown is refused.
         let wide = terms(StandingBound::Zone, None).unwrap();
-        assert!(approve(&l, &op("default: anything\n"), &id, &wide, &shown, serde_json::json!({})).is_err());
-        let effect = approve(&l, &op("default: anything\n"), &id, &t, &shown, serde_json::json!({ "via": "cli" })).unwrap();
+        assert!(approve(&l, &op("default: anything\n"), &id, &wide, &shown, &cfg(), serde_json::json!({})).is_err());
+        let effect = approve(&l, &op("default: anything\n"), &id, &t, &shown, &cfg(), serde_json::json!({ "via": "cli" })).unwrap();
         assert_eq!(effect, shown);
         assert_eq!(l.name(&id).unwrap().status, "live");
         let audit = l.audit_tail(10).unwrap();
@@ -180,8 +223,8 @@ mod tests {
         let t = terms(StandingBound::Agent, None).unwrap();
         assert!(deny(&l, &op("default: nothing\n"), &id, serde_json::json!({})).is_err());
         l.fail_audit_inserts_for_tests().unwrap();
-        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t);
-        assert!(approve(&l, &op("default: anything\n"), &id, &t, &shown, serde_json::json!({})).is_err());
+        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t, "boxes.example.com");
+        assert!(approve(&l, &op("default: anything\n"), &id, &t, &shown, &cfg(), serde_json::json!({})).is_err());
         assert_eq!(l.name(&id).unwrap().status, "ended", "undone");
         assert!(terms(StandingBound::Agent, Some(Duration::ZERO)).is_err());
         assert!(terms(StandingBound::Agent, Some(MAX_NAME_TTL * 2)).is_err());
@@ -194,18 +237,61 @@ mod tests {
         let l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "demo", NameScope::Run);
         let t = terms(StandingBound::Agent, None).unwrap();
-        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t);
+        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t, "boxes.example.com");
         let r2 = op("default: { kinds: [name], max_risk: R2 }\n");
-        assert!(format!("{:#}", approve(&l, &r2, &id, &t, &shown, serde_json::json!({})).unwrap_err()).contains("risk"));
+        assert!(format!("{:#}", approve(&l, &r2, &id, &t, &shown, &cfg(), serde_json::json!({})).unwrap_err()).contains("risk"));
         assert!(deny(&l, &r2, &id, serde_json::json!({})).is_err());
         let capacity = Granter::Capacity {
             grant: "g-1".into(),
             ask: wicket_store::CapacityAsk { node: "n1".into(), plan: "p".into(), region: "r".into(), hourly: 1, worst: 1 },
         };
-        assert!(format!("{:#}", approve(&l, &capacity, &id, &t, &shown, serde_json::json!({})).unwrap_err()).contains("human"));
+        assert!(format!("{:#}", approve(&l, &capacity, &id, &t, &shown, &cfg(), serde_json::json!({})).unwrap_err()).contains("human"));
         assert!(deny(&l, &capacity, &id, serde_json::json!({})).is_err());
         assert_eq!(l.name(&id).unwrap().status, "pending");
+        // Without names.public, nothing is approved, and the refusal is on the record.
+        let none = wicket_names::NamesConfig::default();
+        let e = approve(&l, &op("default: { kinds: [name] }\n"), &id, &t, &shown, &none, serde_json::json!({})).unwrap_err();
+        assert!(format!("{e:#}").contains("names.public"), "{e:#}");
         // The kind at R4 (no ceiling) decides.
-        approve(&l, &op("default: { kinds: [name] }\n"), &id, &t, &shown, serde_json::json!({})).unwrap();
+        approve(&l, &op("default: { kinds: [name] }\n"), &id, &t, &shown, &cfg(), serde_json::json!({})).unwrap();
+    }
+
+    /// #575 review, M2: a later run of the agent takes up its standing name when it starts, under
+    /// the zone's name and digest as the ask stored them; a run of another zone definition doesn't.
+    #[test]
+    fn a_later_run_takes_up_its_standing_name() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let zone: wicket_core::ZoneSpec = wicket_core::yaml::from_str("name: work\n").unwrap();
+        let r1 = RunId("run_w".into());
+        l.run_started(&t, &r1, "work", "worker").unwrap();
+        let digest = wicket_store::zone_digest(&zone);
+        let ask = NameAsk {
+            tenant: &t,
+            run: &r1,
+            zone: "work",
+            zone_digest: &digest,
+            principal: "spiffe://x/worker",
+            label: "demo",
+            port: 3000,
+            service: Some("http"),
+            reason: "the demo",
+            scope: NameScope::Standing,
+        };
+        let id = l.ask_public(&ask).unwrap().0;
+        let tm = terms(StandingBound::Agent, Some(DEFAULT_NAME_TTL)).unwrap();
+        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &tm, "boxes.example.com");
+        approve(&l, &op("default: anything\n"), &id, &tm, &shown, &cfg(), serde_json::json!({})).unwrap();
+        assert_eq!(l.name(&id).unwrap().holder.as_deref(), Some("run_w"));
+        l.run_ended(&r1, "done", "").unwrap();
+        assert_eq!(l.name(&id).unwrap().holder, None);
+        let r2 = RunId("run_x".into());
+        l.run_started(&t, &r2, "work", "worker").unwrap();
+        let other: wicket_core::ZoneSpec = wicket_core::yaml::from_str("name: work\nreach: [{ host: api.example.com }]\n").unwrap();
+        assert!(claim_for_run(&l, &t, &r2, "spiffe://x/worker", &other).is_empty());
+        let got = claim_for_run(&l, &t, &r2, "spiffe://x/worker", &zone);
+        assert_eq!(got.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec![id.as_str()]);
+        assert_eq!(l.name(&id).unwrap().holder.as_deref(), Some("run_x"));
+        assert!(l.audit_tail(10).unwrap().iter().any(|a| a.2 == "name.claimed" && a.4.contains(&id)));
     }
 }

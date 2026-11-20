@@ -542,6 +542,7 @@ mod tests {
             fence: None,
             waker: None,
             lifecycle: None,
+            names: None,
         };
         (c, dir)
     }

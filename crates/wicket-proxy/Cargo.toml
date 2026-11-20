@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 wicket-core.workspace = true
 wicket-store.workspace = true
+wicket-names.workspace = true
 wicket-identity.workspace = true
 wicket-feed.workspace = true
 base64 = "0.22"
