@@ -49,7 +49,7 @@ fn main() {
 
 /// Every file `wicket serve` sends from its own bytes (#574), as it sends them, into `assets.rs` for
 /// web.rs: each with its path, content type, whether it may be cached for good, its bytes and, for a
-/// text file a Brotli copy is smaller for, that copy.
+/// file a Brotli copy is smaller for, that copy.
 ///
 /// - **Named by content hash:** every file under `/static/` (`console.<hash>.js`, `icon-192.<hash>.png`,
 ///   `manifest.<hash>.webmanifest`, and the modules' `/static/m.<hash>/` directory), so a browser may
@@ -161,14 +161,14 @@ fn assets(out: &Path) {
         let dest = out.join("assets").join(i.to_string());
         std::fs::create_dir_all(out.join("assets")).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
         write(&dest, body);
-        let text = ctype.starts_with("text/") || ctype.contains("json") || ctype.contains("svg");
+        // Every file, images too: the icons are small PNGs a copy is half the size of.
         let mut br = Vec::new();
-        if text {
+        {
             use std::io::Write;
             let mut w = brotli::CompressorWriter::new(&mut br, 4096, 11, 24);
             w.write_all(body).unwrap_or_else(|e| panic!("brotli {path}: {e}"));
         }
-        let br_expr = if text && br.len() < body.len() {
+        let br_expr = if br.len() < body.len() {
             write(&out.join("assets").join(format!("{i}.br")), &br);
             format!("Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/assets/{i}.br\")))")
         } else {

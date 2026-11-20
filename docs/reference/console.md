@@ -209,12 +209,13 @@ writes those names into what refers to them: the pages, the manifest (its icons)
 worker (its notification icon). Only the pages (`/`, `/session`) and `/sw.js` keep fixed names and
 are asked for anew each time.
 
-**Text files are Brotli-compressed when wicket is built** (quality 11, window 24) and embedded next to
+**The files are Brotli-compressed when wicket is built** (quality 11, window 24) and embedded next to
 the originals. A browser that sends `Accept-Encoding: br` (current Chrome, Firefox and Safari all do,
 over HTTPS and on loopback) gets the compressed copy with `Content-Encoding: br`; any other gets the
 original. Responses with a copy carry `Vary: accept-encoding`. The page and its files go from about
-136 KB to 39 KB (the script alone from 76 KB to 21 KB; gzip -9 would give 24 KB). Images, which are
-already compressed, have no copy. zstd isn't used: Safari decodes it only from macOS and iOS 26.3.
+136 KB to 39 KB (the script alone from 76 KB to 21 KB; gzip -9 would give 24 KB). The icons get a
+copy too (they are small PNGs that compress by half); a file gets none when it isn't smaller. zstd
+isn't used: Safari decodes it only from macOS and iOS 26.3.
 
 Not yet: answering the agent's own permission requests from the page (wicket's policy answers
 them, #67), images and resources in prompts, and the box tree, budgets and hibernate controls
