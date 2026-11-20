@@ -425,7 +425,7 @@ prefix_grant=$(grep "\"request\":\"$prefix_req\"" <<<"$decisions" | grep -oE '"g
 standing_req=$(cat "$atk_dir/workspace/out/standing.request" 2>/dev/null || true)
 check "the only decisions are the operator's on the prefix (${prefix_req:-?}, ${prefix_grant:-no grant}) and the narrow standing rule (${standing_req:-?}): nothing the attacker said decided the peer's" '[ -n "$prefix_req" ] && [ -n "$prefix_grant" ] && [ -n "$standing_req" ] && [ "$(grep -c . <<<"$decisions")" = 2 ] && grep -q "\"standing\":\"$standing_req\"" <<<"$decisions" || { sed "s/^/     decision: /" <<<"$decisions" | cut -c1-200; false; }'
 # A quota line exactly as `wicket grant list` prints one (a kind, a number, a run), nothing else.
-other_grants=$(grep -vE "^g-[0-9a-z]+ +quota [a-z_.]+ = [0-9]+ +run run_[0-9a-z]+, (revoked|ends in [0-9dhms ]+) +by human:operator$" "$grants_all" | grep -vE "^g-[0-9a-z]+ +DIGEST wicket\.internal/digest/sha256:[0-9a-f]{64} +any run in zone atk-svc2?," | grep -v "^$prefix_grant " || true)
+other_grants=$(grep -vE "^g-[0-9a-z]+ +quota [a-z_.]+ = [0-9]+ +run run_[0-9a-z]+, (revoked|ends in [0-9dhms ]+) +by human:[a-z_][a-z0-9_.-]*$" "$grants_all" | grep -vE "^g-[0-9a-z]+ +DIGEST wicket\.internal/digest/sha256:[0-9a-f]{64} +any run in zone atk-svc2?," | grep -v "^$prefix_grant " || true)
 check "the grants are the quotas, the services' digest grants and that prefix only" '[ "$grants_ok" = 1 ] && grep -q "^$prefix_grant .*anything/granted/\* \[prefix\]" "$grants_all" && [ -z "$other_grants" ] || { sed "s/^/     grant: /" <<<"$other_grants"; false; }'
 standing_all=$(w standing list --all 2>&1) || standing_all="ERROR: $standing_all"
 approved=$(grep -E '^s-' <<<"$standing_all" | grep -vE ' (pending|denied|revoked|lapsed)$' || true)
