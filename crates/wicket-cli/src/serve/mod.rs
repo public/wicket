@@ -3074,6 +3074,18 @@ mod tests {
         let r = t.act(json!({ "action": "standing_renew", "id": id, "forever": true }));
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
         assert_eq!(t.ledger().standing(&id).unwrap().expires_at, None);
+        // Another ask, denied (signed).
+        let other = {
+            let l = t.ledger();
+            let rule: wicket_core::manifest::ReachRule =
+                wicket_core::yaml::from_str("{ host: other.example, methods: [GET], paths: ['/x'] }").unwrap();
+            let s = l.standing(&id).unwrap();
+            l.ask_standing(&TenantId::single(), &RunId(s.run), "work", "zone-digest", &s.principal, &rule, "other").unwrap().0
+        };
+        let r = t.act(json!({ "action": "standing_deny", "id": other }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        // #799: the approval, the renewal and the denial re-verify offline.
+        assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (3, 0), "re-verifies offline");
         assert_eq!(post(&t.state, "/api/standing/revoke", &anon(), &json!({ "id": id })).unwrap().status, StatusCode::UNAUTHORIZED);
         let r = t.post("/api/standing/revoke", json!({ "id": id }));
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
@@ -3127,6 +3139,8 @@ mod tests {
         );
         assert!(rec["granter_identity"].as_str().unwrap().ends_with("/op/passkey/laptop"), "{rec}");
         assert!(rec["signed"].is_object(), "{rec}");
+        // #799: the release re-verifies offline.
+        assert_eq!(crate::verify_signed_decisions(&l).unwrap(), (1, 0), "re-verifies offline");
         drop(l);
         assert!(dashboard(&t.state).unwrap()["fenced"].as_array().unwrap().is_empty(), "released");
         assert_refused(
@@ -3245,6 +3259,8 @@ mod tests {
         let r = t.act(json!({ "action": "capacity_renew", "id": g.id, "ttl_secs": 7200 }));
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
         assert!(l.capacity_grant(&g.id).unwrap().unwrap().expires_at > g.expires_at);
+        // #799: the issue and the renewal re-verify offline.
+        assert_eq!(crate::verify_signed_decisions(&l).unwrap(), (2, 0), "re-verifies offline");
         // Revoked with the session only; then it's gone from the card and can't be renewed.
         let r = t.post("/api/capacity/revoke", json!({ "id": g.id }));
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);

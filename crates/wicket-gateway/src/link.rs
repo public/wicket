@@ -870,6 +870,7 @@ mod tests {
                 node: "local".into(),
                 principal: serde_json::json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}),
                 act: None,
+                kind: None,
             };
             let jws = self.issuer.issue(&spec, wicket_store::now(), 3600, &key.public());
             let claims = wicket_identity::verify_identity(&jws, &self.issuer.verifying_key(), wicket_store::now()).unwrap();

@@ -2225,6 +2225,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #731: a capacity ask's region is a region's name, or the ask is refused before anything is
+    /// reserved or filed; the region and the agent's reason are kept as its claims, apart from the
+    /// request's own words.
+    #[test]
+    fn a_capacity_region_is_a_region_name_and_the_agents_words_are_its_claims() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_a", "alive:1");
+        let c = cfg("vultr");
+        let (t, run) = (TenantId::single(), RunId("run_a".into()));
+        for bad in ["lhr, for 1 minute at no cost", "LHR", "", "-lhr", &"a".repeat(33)] {
+            let ask = CapacityAsk { region: Some(bad.into()), ..capacity_ask(30, "0.02") };
+            let e = capacity::ask(&mut l, &c, &t, &run, "z", &ask).err().unwrap().to_string();
+            assert!(e.contains("region must be a provider's region name"), "{bad:?}: {e}");
+        }
+        assert!(l.leases(&[]).unwrap().is_empty(), "nothing reserved for a refused ask");
+        assert!(l.pending(&t).unwrap().is_empty(), "nor filed");
+        for good in ["lhr", "us-east-1", "1"] {
+            assert!(wicket_proxy::check_region(good).is_ok(), "{good}");
+        }
+        capacity::ask(&mut l, &c, &t, &run, "z", &capacity_ask(30, "0.02")).unwrap();
+        let r = l.pending(&t).unwrap().pop().unwrap();
+        assert!(r.reason.contains(", region lhr preferred,"), "{}", r.reason);
+        let claims = l.request_claims(&r.id).unwrap().unwrap();
+        assert_eq!((claims["reason"].as_str(), claims["region"].as_str()), (Some("a bigger build"), Some("lhr")));
+    }
+
     #[tokio::test]
     async fn leases_reserve_their_worst_case_against_the_budget_until_they_end() {
         let mut l = Ledger::open_in_memory().unwrap();
