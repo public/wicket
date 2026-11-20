@@ -130,6 +130,10 @@ fn block_kind(i: usize, external: bool) -> &'static str {
 fn run_authority(state: &State, run: &str) -> Result<Value> {
     crate::run::check_run_id(run)?;
     let l = state.ledger()?;
+    // The console's tenant only: another tenant's run is not found, as one that doesn't exist.
+    if l.run_tenant(run)?.as_ref() != Some(&state.tenant) {
+        bail!("no run {run}");
+    }
     let status = l.run_status(run)?.with_context(|| format!("no run {run}"))?;
     let node = l.run_node(run)?.unwrap_or_else(|| crate::localnode::NAME.to_string());
     let policy = l.run_policy(run)?;

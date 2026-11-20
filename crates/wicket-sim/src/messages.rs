@@ -474,6 +474,7 @@ fn identity(env: &Env, run: &str, p: &str) -> (String, wicket_identity::AgentCla
         node: "node".into(),
         principal: json!({ "type": "human", "id": "sim", "via": "cli", "assurance": "unix-user" }),
         act: None,
+        kind: None,
     };
     let now = wicket_store::now();
     let jws = env.issuer.issue(&spec, now, 3_600, &key.public());

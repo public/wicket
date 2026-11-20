@@ -1006,8 +1006,11 @@ async fn supervise(env: Rc<Env>, run: String, attach: bool) {
                 "run.fetch_failed",
                 &serde_json::json!({ "node": node_name(&env, &host), "error": "unreachable" }),
             );
-            // The run holds its node until they are collected (#324).
-            let _ = l.set_run_uncollected(&run, Some(&node_name(&env, &host)));
+            // The run holds its node until they are collected (#324), unless a supervisor before
+            // this one fetched them already (#590, `run.rs`).
+            if !l.files_collected(&run).unwrap_or(false) {
+                let _ = l.set_run_uncollected(&run, Some(&node_name(&env, &host)));
+            }
             env.note(format!("{run}: fetching its files from {host} failed (the node keeps them)"));
             end_run(&env, &run, "failed", &format!("failed (fetching its files from node {host})"))
         }

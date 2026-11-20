@@ -109,7 +109,7 @@ serve_runs() {
 # A new box with the default image: which image its run got.
 new_box_image() {
   local log=$work/newbox-$1.log r
-  w run ci/update/canary.yaml >"$log" 2>&1 || true
+  w run ci/update/canary.yaml --node local >"$log" 2>&1 || true
   r=$(run_id_of "$log")
   w audit --tail 300 | grep run.start | grep "$r" | grep -o '"image":"[^"]*"' | head -1 | cut -d'"' -f4
 }
@@ -185,7 +185,7 @@ start_agent() {   # $1: label, then wicket run options
   echo "$r"
 }
 log "two long-lived agents"
-r_local=$(start_agent local)
+r_local=$(start_agent local --node local)
 r_node=$(start_agent n1 --node n1)
 runs=("$r_local" "$r_node") labels=(local n1)
 boxes=("$(box_of "$r_local")" "$(box_of "$r_node")")
@@ -212,7 +212,7 @@ log "1. refused: unsigned, and an agent's own request"
 check "an unsigned artifact is refused" '! w self update "$work/C" >"$work/u-unsigned.log" 2>&1 && grep -q "not signed by a release key" "$work/u-unsigned.log"'
 echo "$C_SHA" >"$work/ws-asker.sha"
 mkdir -p "$work/ws-asker" && cp ci/update/asker.sh "$work/ws-asker/drive.sh" && cp "$work/ws-asker.sha" "$work/ws-asker/sha256"
-w run "$work/agent.yaml" --workdir "$work/ws-asker" --image "$IMAGE_TAG" >"$work/agent-asker.log" 2>&1 &
+w run "$work/agent.yaml" --workdir "$work/ws-asker" --image "$IMAGE_TAG" --node local >"$work/agent-asker.log" 2>&1 &
 pids+=("$!")
 wait_for 90 '[ -n "$(run_id_of "$work/agent-asker.log")" ]' || true
 r_asker=$(run_id_of "$work/agent-asker.log")

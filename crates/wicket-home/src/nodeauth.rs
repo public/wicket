@@ -145,10 +145,18 @@ where
     match next_msg(rd, node).await? {
         m @ Msg::Welcome { proto, .. } => match chan::negotiate(chan::PROTOCOL, proto) {
             Ok(proto) => Ok(Authenticated { welcome: m, cert, proto }),
+            Err(e) if proto < chan::PROTOCOL => Err(refused(format!(
+                "node {node} can't talk to this control host: {e}; update this node first (`wicket node install {node}`, or `wicket self update --only-nodes --nodes {node}`)"
+            ))),
             Err(e) => Err(refused(format!(
-                "node {node} can't talk to this control host: {e}; update the older of the two (`wicket self update --nodes {node}`)"
+                "node {node} can't talk to this control host: {e}; this control host is the older: update it (`wicket self update`)"
             ))),
         },
+        // A node too old (or too new) for this control host says so in its own words, which may
+        // be an older build's: the hint is this host's (#575 step 4c, protocol 21).
+        Msg::Refused { why } if why.contains("protocol") => Err(refused(format!(
+            "node {node} refused this control host: {why}; if the node is the older, update this node first (`wicket node install {node}`, or `wicket self update --only-nodes --nodes {node}`)"
+        ))),
         Msg::Refused { why } => Err(refused(format!("node {node} refused this control host: {why}"))),
         other => Err(refused(format!("unexpected answer from node {node}: {}", short(&other)))),
     }

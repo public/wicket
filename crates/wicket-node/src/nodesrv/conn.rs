@@ -333,7 +333,8 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     l.set_slice(Some(slice));
                 }
             }
-            Msg::SecretRevoke { run, name } => node.secrets.revoke(&run, &name),
+            Msg::SecretRevoke { run, name, resend: false } => node.secrets.revoke(&run, &name),
+            Msg::SecretRevoke { run, name, resend: true } => node.secrets.revoke_resent(&run, &name),
             m @ Msg::SecretFetched { .. } => {
                 let Msg::SecretFetched { id, .. } = &m else { unreachable!() };
                 if let Some(tx) = node.asks.lock().expect("asks").remove(id) {
@@ -439,6 +440,9 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
             }
             Msg::PutTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, true),
             Msg::ImageHave { id, digest } => images::have(node, gen, id, digest),
+            Msg::IntakeSync { id, triggers, ack, serving, hold } => {
+                super::intake::sync(node.clone(), gen, id, triggers, ack, serving, hold)
+            }
             Msg::PutImage { stream, digest, name } => images::put(node, gen, stream, digest, name),
             Msg::PullImage { id, run, digest, name, from } => images::pull(node, gen, id, run, digest, name, from),
             Msg::GetTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, false),

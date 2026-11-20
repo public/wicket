@@ -64,9 +64,37 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             }
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
+            NodeCmd::Intake { listen, tls_cert, tls_key, socket, dir, trusted_proxy } => {
+                let trusted = trusted_proxy.iter().map(|c| c.parse::<crate::serve::limits::Cidr>()).collect::<Result<Vec<_>>>()?;
+                let sock = socket
+                    .unwrap_or_else(|| dir.unwrap_or_else(wicket_node::nodesrv::NodePaths::default_root).join("ctl").join("intake.sock"));
+                crate::intake::serve(listen, crate::intake::tls_pair(tls_cert, tls_key)?, sock, std::sync::Arc::new(trusted)).await
+            }
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
             NodeCmd::Forget { run, force } => noderun::forget_command(&run, force, &operator()).await,
+            NodeCmd::FeedCheckpoint { name } => {
+                // An enrolled node's name only: it names a directory (#796 re-review).
+                if Ledger::open(&ledger_path())?.node(&name)?.is_none() {
+                    return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
+                }
+                let epoch = noderun::checkpoint_feed(&name)?;
+                let held = noderun::node_feed_holds_ports(&name)?;
+                Ledger::open(&ledger_path())?.audit(
+                    &TenantId::single(),
+                    None,
+                    "feed.checkpointed",
+                    &serde_json::json!({ "node": name, "epoch": epoch, "holds_ports": held, "by": operator() }),
+                )?;
+                println!(
+                    "node {name}: feed checkpointed at epoch {epoch}; {}",
+                    match held {
+                        true => "it still holds a box's record with host ports (revoke the public names published there first)",
+                        false => "no box's record in it holds host ports: a build before protocol 21 can open it",
+                    }
+                );
+                Ok(())
+            }
             NodeCmd::ReleaseFence { run, reason } => noderun::release_fence_command(&run, &reason, &operator(), wicket_home::cli_is_root()),
         },
         _ => unreachable!("dispatched to the wrong command group"),
@@ -314,6 +342,35 @@ pub enum NodeCmd {
         #[arg(long, hide = true)]
         idle_exit: Option<u64>,
     },
+    /// On the node: webhook intake for triggers (#578; docs/explanation/trigger-intake.md). Takes
+    /// deliveries for the triggers the control host assigned to this node, checks their token and
+    /// signature, and hands what it verified to this node's `wicket node serve`, which the control
+    /// host pulls from. It holds no ledger and no authority (the `wicket-intake` service runs this).
+    Intake {
+        /// Where to listen (e.g. `0.0.0.0:8443`).
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        /// A certificate chain (PEM) to serve TLS with; without it, plain HTTP behind a reverse
+        /// proxy that has TLS.
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        /// The certificate's private key (PEM).
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+        /// The node's intake socket, which `wicket node serve` listens on for intake (default:
+        /// `<node dir>/ctl/intake.sock`, for intake run as the node's own user). Run as its own
+        /// user, intake is given the socket the node's `intake_socket` names.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// The node's directory, for the default socket (default: $WICKET_NODE_HOME or
+        /// ~/.local/share/wicket-node).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// A reverse proxy in front of intake (an address or a CIDR range; repeatable), whose
+        /// `X-Forwarded-For` names the client. Without one, the client is the peer.
+        #[arg(long = "trusted-proxy")]
+        trusted_proxy: Vec<String>,
+    },
     /// On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA,
     /// its control connections, feed, load, memory and disk; each box's state, uptime, CPU and
     /// memory, model use and budget slice left, egress counts and queued asks; and the last egress
@@ -328,6 +385,13 @@ pub enum NodeCmd {
         /// Print the node's status once, as JSON.
         #[arg(long, conflicts_with = "once")]
         json: bool,
+    },
+    /// Write a checkpoint of a node's feed now (#575 step 4c): of the state as it is, so a build
+    /// before protocol 21 can open the feed once no box's record there holds host ports any more
+    /// (`wicket self rollback` says when that is needed). Audited as `feed.checkpointed`.
+    FeedCheckpoint {
+        /// The node.
+        name: String,
     },
     /// Let a run's node delete the run's files, its workspace among them. Refused while the run's
     /// work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation

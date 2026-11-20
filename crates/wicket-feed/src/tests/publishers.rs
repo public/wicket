@@ -136,3 +136,53 @@ fn a_late_statement_older_than_the_nodes_history_is_superseded() {
     let forged = Frame::new(FrameKind::Fresh, sign(&cp.feed_key, TYP_FRESH, &f));
     assert_eq!(r.accept(&forged, T0 + 12).unwrap_err().kind(), "rollback");
 }
+
+/// #589 (sim seed 32300607): two runs say hello to a node at one epoch and both catch it up. The
+/// one whose frames land second brings a snapshot below the epoch the other's frames took the node
+/// to, signed before the statement it holds: superseded, never applied, not a rollback. Before any
+/// statement is held, an old snapshot is still a rollback (`a03_old_signed_snapshot`), and so is one
+/// signed after the newest statement (`restored_backup_is_refused_until_regenesis`).
+#[test]
+fn an_overtaken_snapshot_is_superseded() {
+    let (mut cp, mut r) = setup();
+    let base = r.state().unwrap().epoch;
+    // A's catch-up, built on the node's hello, is on its way...
+    let a_snapshot = cp.p.snapshot(T0 + 100);
+    // ...when B, under the shared lock after it, commits and catches the node up faster.
+    let mut b = other(&cp, cp.p.last_issued());
+    let d = b.commit(vec![add(grant("g-b", &read(), T0 + 3_600_000))], T0 + 200).unwrap();
+    let statement = b.statement(T0 + 300);
+    r.accept(&d, T0 + 300).unwrap();
+    r.accept(&statement, T0 + 300).unwrap();
+    let held = (r.state().unwrap().epoch, r.state().unwrap().head.clone());
+    assert_eq!(held.0, base + 1);
+    r.accept(&a_snapshot, T0 + 301).expect("an overtaken snapshot is superseded, not refused");
+    assert_eq!((r.state().unwrap().epoch, r.state().unwrap().head.clone()), held, "nothing moved back");
+    assert_eq!(r.stats.superseded, 1);
+    assert!(r.stats.refused.is_empty(), "{:?}", r.stats.refused);
+    assert_eq!(r.mode(T0 + 301), Mode::Fresh);
+}
+
+/// The review of #589: an overtaken snapshot is superseded only if it is on the node's own chain.
+/// One whose head differs from the head the node recorded at its epoch is a fork, whenever it was
+/// signed.
+#[test]
+fn an_overtaken_snapshot_off_the_nodes_chain_is_a_fork() {
+    let (mut cp, mut r) = setup();
+    let base = r.state().unwrap().epoch;
+    let a_snapshot = cp.p.snapshot(T0 + 100);
+    let mut forked: Snapshot<BoxAuthority> = jws::payload_unverified(&a_snapshot.jws).unwrap();
+    assert_eq!(forked.epoch, base);
+    forked.head = "forked".into();
+    let forked = Frame::new(FrameKind::Snap, jws::sign(&cp.feed_key, TYP_SNAP, &forked));
+    let mut b = other(&cp, cp.p.last_issued());
+    let d = b.commit(vec![add(grant("g-b", &read(), T0 + 3_600_000))], T0 + 200).unwrap();
+    r.accept(&d, T0 + 300).unwrap();
+    r.accept(&b.statement(T0 + 300), T0 + 300).unwrap();
+    let held = (r.state().unwrap().epoch, r.state().unwrap().head.clone());
+    assert_eq!(r.accept(&forked, T0 + 301).unwrap_err().kind(), "fork");
+    assert_eq!((r.state().unwrap().epoch, r.state().unwrap().head.clone()), held, "nothing moved");
+    // The honest one is still superseded.
+    r.accept(&a_snapshot, T0 + 302).expect("superseded");
+    assert_eq!(r.stats.superseded, 1);
+}

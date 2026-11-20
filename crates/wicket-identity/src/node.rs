@@ -399,6 +399,7 @@ mod tests {
                 node: "n1".into(),
                 principal: json!({}),
                 act: None,
+                kind: None,
             },
             NOW,
             600,

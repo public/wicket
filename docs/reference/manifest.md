@@ -60,7 +60,7 @@ An instance wicket started offers its `port` under the service's name once its b
 
 ## `placement`
 
-What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. Today it decides where a woken agent goes ([nodes](nodes.md#placement)); `wicket run --node` and a spawn's placement hint name the node themselves.
+What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. It decides where a fresh `wicket run` without `--node` and a woken agent go ([nodes](nodes.md#placement)), when another node than this host's own is enrolled; `wicket run --node` (`local` included) and a spawn's placement hint name the node themselves.
 
 | field | type | default | meaning |
 |---|---|---|---|
@@ -217,7 +217,7 @@ rulesets or branch protection).
 | `header` | string | required | The one header it goes in (`Authorization`). |
 | `format` | string | `{secret}` | The header's value. `{secret}` is the secret; `{basic:USER}` is `base64(USER:secret)`, so `Basic {basic:x-access-token}` is HTTP Basic with a token as password. Must contain one of the two. |
 | `secret` | string | required | The vault secret's name. Its host binding must cover `host`, or the run is refused. |
-| `optional` | boolean | `false` | If the secret isn't in the vault, send requests to the host without it instead of refusing to start. |
+| `optional` | boolean | `false` | If the secret isn't in the vault, send requests to the host without it instead of refusing to start. The secret is read at each request, so one set later is used from the next (#415). |
 
 A credential is only ever sent over HTTPS: plain HTTP to a host with an inject rule is refused.
 

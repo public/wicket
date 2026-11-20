@@ -123,8 +123,7 @@ fn check_runnable(s: &TriggerSpec, now: i64) -> Result<()> {
             zone(tz)?;
         }
         Source::Timer { .. } if timer_due(s, now)?.is_some_and(|d| d <= now) => bail!("the timer's time has passed"),
-        Source::Timer { .. } | Source::Wicket { .. } => {}
-        _ => bail!("this version fires schedules, timers and wicket's own events only: {} comes later (#578)", source_text(s)),
+        Source::Timer { .. } | Source::Wicket { .. } | Source::Webhook { .. } | Source::Github { .. } => {}
     }
     if s.limits.concurrency != 1 {
         bail!("limits.concurrency isn't enforced yet (#578): leave it out");
@@ -265,9 +264,59 @@ fn pin_target(l: &Ledger, tenant: &str, owner: &str, spec: &mut TriggerSpec) -> 
 /// Keeps `spec` as `op`'s trigger, until `until` if given. `via`: where it was made (`cli`). The
 /// trigger's id, and the agent it reaches (resolved now; a `wake` is kept as the agent's id).
 pub fn create(l: &Ledger, op: &Operator, spec: &TriggerSpec, until: Option<i64>, via: &str) -> Result<(String, Option<AgentRow>)> {
+    let c = create_with(
+        l,
+        op,
+        spec,
+        until,
+        via,
+        Intake::default(),
+        &wicket_proxy::vault::Vault::new(wicket_proxy::vault::Vault::default_dir()),
+    )?;
+    Ok((c.id, c.agent))
+}
+
+/// A trigger made: its id, the agent it reaches, and for a webhook trigger its intake node and URL
+/// path (`/hook/<id>/<token>`, shown once: the token is kept only as its sha256).
+pub struct Created {
+    pub id: String,
+    pub agent: Option<AgentRow>,
+    pub hook: Option<(String, String)>,
+    /// What the operator should know: a verify secret another trigger checks deliveries with too
+    /// (a delivery signed for one would pass for the other, at its own URL).
+    pub warnings: Vec<String>,
+}
+
+/// Where a webhook trigger's deliveries arrive: its intake node (`node`; the only one if None), and
+/// whether that may be the control host's own machine (`allow_local`).
+#[derive(Clone, Debug, Default)]
+pub struct Intake {
+    pub node: Option<String>,
+    pub allow_local: bool,
+}
+
+/// [`create`], with where a webhook trigger's deliveries arrive (`intake`) and the vault its verify
+/// secret is in.
+pub fn create_with(
+    l: &Ledger,
+    op: &Operator,
+    spec: &TriggerSpec,
+    until: Option<i64>,
+    via: &str,
+    intake_at: Intake,
+    vault: &wicket_proxy::vault::Vault,
+) -> Result<Created> {
     spec.check().map_err(anyhow::Error::msg)?;
     let now = wicket_store::now();
     check_runnable(spec, now)?;
+    let node = match intake::is_hook(&spec.source) {
+        true => {
+            intake::check_verify(spec, vault)?;
+            Some(intake::intake_node(l, &TenantId::single().0, intake_at.node.as_deref(), intake_at.allow_local)?)
+        }
+        false if intake_at.node.is_some() => bail!("--intake-node is for a webhook or GitHub trigger"),
+        false => None,
+    };
     let t = TenantId::single();
     let mine = l.triggers(&t.0, Some(&op.id))?;
     if mine.iter().filter(|x| x.status != "done").count() >= wicket_store::MAX_TRIGGERS_PER_OWNER {
@@ -277,6 +326,16 @@ pub fn create(l: &Ledger, op: &Operator, spec: &TriggerSpec, until: Option<i64>,
     let agent = pin_target(l, &t.0, &op.id, &mut spec)?;
     let replaced = mine.into_iter().find(|x| x.status == "done" && x.name == spec.trigger);
     let id = l.create_trigger(&t.0, &op.id, &spec, &op.label, false, until)?;
+    let hook = match &node {
+        Some(n) => match intake::assign(l, &id, n) {
+            Ok(token) => Some((n.clone(), format!("/hook/{id}/{token}"))),
+            Err(e) => {
+                let _ = l.set_trigger_status(&id, "deleted");
+                return Err(e.context("giving the trigger its URL"));
+            }
+        },
+        None => None,
+    };
     if let Some(old) = replaced {
         let body = json!({ "trigger": old.id, "name": old.name, "owner": old.owner, "by": op.label, "principal": op.id, "why": format!("replaced by {id}, a new trigger of its name") });
         audit(l, "trigger.deleted", &body)?;
@@ -285,13 +344,29 @@ pub fn create(l: &Ledger, op: &Operator, spec: &TriggerSpec, until: Option<i64>,
         "trigger": id, "name": spec.trigger, "owner": op.id, "by": op.label, "via": via,
         "source": source_text(&spec), "action": action_text(&spec), "until": until, "approval": "none",
         "agent": agent.as_ref().map(|a| json!({ "id": a.id, "name": a.name, "zone": a.zone })),
+        "intake_node": node,
     });
     if let Err(e) = audit(l, "trigger.created", &record) {
         // Not kept without its record.
         let _ = l.set_trigger_status(&id, "deleted");
         return Err(e.context("auditing the trigger"));
     }
-    Ok((id, agent))
+    let mut warnings = vec![];
+    if let Some(name) = intake::verify_name(&spec) {
+        let shared: Vec<String> = l
+            .triggers(&t.0, None)?
+            .into_iter()
+            .filter(|x| x.id != id && x.status != "deleted" && intake::verify_name(&x.spec) == Some(name))
+            .map(|x| x.name)
+            .collect();
+        if !shared.is_empty() {
+            warnings.push(format!(
+                "secret {name} also verifies {}: a delivery signed for one passes for the others, at their own URLs; give each trigger its own secret",
+                shared.join(", ")
+            ));
+        }
+    }
+    Ok(Created { id, agent, hook, warnings })
 }
 
 fn get(l: &Ledger, id: &str) -> Result<Trigger> {
@@ -367,6 +442,9 @@ fn pause_for(l: &Ledger, t: &Trigger, why: &str) -> Result<Fired> {
     audit(l, "trigger.paused", &json!({ "trigger": t.id, "name": t.name, "owner": t.owner, "by": "wicket", "why": why }))?;
     Ok(Fired { trigger: t.id.clone(), name: t.name.clone(), status: "paused".into(), detail: format!("paused: {why}") })
 }
+
+#[path = "triggers/intake.rs"]
+pub mod intake;
 
 /// What a pass did with one trigger's event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2111,13 +2189,241 @@ mod tests {
         let mut l = Ledger::open_in_memory().unwrap();
         hibernated_agent(&mut l, "captain");
         for (y, why) in [
-            ("source: { webhook: { verify: { hmac_sha256: k } } }\naction: { wake: captain }\n", "comes later"),
             ("source: { schedule: { cron: '* * * * *' } }\naction: { wake: captain }\nlimits: { concurrency: 2 }\n", "concurrency"),
             ("source: { schedule: { cron: '* * * * *' } }\naction: { wake: captain }\nlimits: { debounce: 10m }\n", "debounce"),
         ] {
             let e = create(&l, &operator(), &spec(&format!("trigger: t\n{y}")), None, "t").unwrap_err().to_string();
             assert!(e.contains(why), "{y}: {e}");
         }
+    }
+
+    /// #578 step 4: a webhook trigger needs a verify secret and an intake node, or isn't kept.
+    #[test]
+    fn a_webhook_trigger_needs_a_verify_secret_and_an_intake_node() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        let dir = std::env::temp_dir().join(format!("wicket-intake-vault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = wicket_proxy::vault::Vault::new(dir.clone());
+        let s = spec("trigger: hook\nsource: { webhook: { verify: { hmac_sha256: hook-key } } }\naction: { wake: captain }\n");
+        let mk = |v: &wicket_proxy::vault::Vault, node: Option<&str>| {
+            create_with(&l, &operator(), &s, None, "t", Intake { node: node.map(String::from), allow_local: false }, v)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        assert!(mk(&vault, None).contains("no secret hook-key"), "{}", mk(&vault, None));
+        vault.set("hook-key", "k3y-k3y-k3y-k3y-k3y").unwrap();
+        assert!(mk(&vault, None).contains("isn't a verify secret"));
+        vault.set_verify("hook-key").unwrap();
+        assert!(mk(&vault, None).contains("no intake node"), "{}", mk(&vault, None));
+        assert!(mk(&vault, Some("edge")).contains("isn't an intake node"));
+        let plain = spec("trigger: p\nsource: { schedule: { cron: '* * * * *' } }\naction: { wake: captain }\n");
+        let e = create_with(&l, &operator(), &plain, None, "t", Intake { node: Some("edge".into()), allow_local: false }, &vault)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("--intake-node is for a webhook"), "{e}");
+        assert!(l.triggers("t0", None).unwrap().is_empty(), "nothing kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #578 step 4's "CI failed on PR": a verified GitHub delivery fires its own trigger once, as its
+    /// owner, with its fields as quoted event input. What a node can't be trusted for is dropped;
+    /// a redelivery, a filtered event or a stale one doesn't fire; an owner who can't be checked
+    /// holds the event in the node's spool.
+    #[test]
+    fn an_intake_event_fires_its_own_trigger_once() {
+        use wicket_core::intake::IntakeEvent;
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        let mut s = spec(
+            "trigger: ci\nsource: { github: { repo: acme/app, events: [check_suite], verify: { hmac_sha256: gh } } }\nfilter: { check.conclusion: failure }\naction: { wake: captain, message: { body: 'CI failed on PR {{ event.pr.number }}: {{ event.check.url }}' } }\n",
+        );
+        pin_target(&l, "t0", &operator().id, &mut s).unwrap();
+        let id = l.create_trigger("t0", &operator().id, &s, "unix:alex", false, None).unwrap();
+        l.set_trigger_intake(&id, "edge", "x").unwrap();
+        let now = wicket_store::now();
+        let ev = |n: &str, conclusion: &str, at: i64| {
+            let body = serde_json::json!({
+                "action": "completed",
+                "check_suite": { "conclusion": conclusion, "html_url": "https://github.com/acme/app/runs/1", "pull_requests": [{ "number": 42 }] },
+                "repository": { "full_name": "acme/app" }
+            });
+            IntakeEvent {
+                id: format!("s-{n}"),
+                trigger: id.clone(),
+                kind: "check_suite".into(),
+                delivery: format!("g-{n}"),
+                received_at: at,
+                fields: wicket_sources::github::github_fields("check_suite", &body),
+                raw_sha256: wicket_core::intake::body_sha256(format!("sha-{n}").as_bytes()),
+                bytes: 1,
+            }
+        };
+        let (fired, ack) = intake::ingest(&l, "edge", &[ev("1", "failure", now)], now, &no_wake, &anyone).unwrap();
+        assert_eq!(fired.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(), ["started"], "{fired:?}");
+        assert_eq!(ack, ["s-1"]);
+        let prompt = l.audit_of_kind("trigger.fired").unwrap().pop().unwrap();
+        assert!(prompt.body.contains(&id), "{}", prompt.body);
+        // A redelivery: recorded once, fired once.
+        let (fired, ack) = intake::ingest(&l, "edge", &[ev("1", "failure", now)], now, &no_wake, &anyone).unwrap();
+        assert!(fired.is_empty() && ack == ["s-1"], "{fired:?}");
+        // Filtered out: recorded, not fired.
+        let (fired, _) = intake::ingest(&l, "edge", &[ev("2", "success", now)], now, &no_wake, &anyone).unwrap();
+        assert!(fired.is_empty());
+        // Stale when read: passed over, once.
+        let (fired, _) = intake::ingest(&l, "edge", &[ev("3", "failure", now - EVENT_STALE_SECS - 10)], now, &no_wake, &anyone).unwrap();
+        assert_eq!(fired[0].status, "skipped");
+        assert!(fired[0].detail.contains("passed over"));
+        // From another node, another kind, or with fields intake never makes: dropped, unrecorded.
+        let mut wrong_kind = ev("4", "failure", now);
+        wrong_kind.kind = "push".into();
+        let mut odd = ev("5", "failure", now);
+        odd.fields = serde_json::json!({ "x": "\u{1b}[2J" });
+        let (fired, ack) = intake::ingest(&l, "evil", &[ev("6", "failure", now)], now, &no_wake, &anyone).unwrap();
+        assert!(fired.is_empty() && ack == ["s-6"]);
+        let (fired, ack) = intake::ingest(&l, "edge", &[wrong_kind, odd], now, &no_wake, &anyone).unwrap();
+        assert!(fired.is_empty() && ack == ["s-4", "s-5"]);
+        assert!(!l.trigger_event_known("t0", &format!("hook:{id}"), "g-6").unwrap(), "not recorded");
+        // An owner who can't be checked: nothing acked, so the node keeps it.
+        let unknown = |_: &Trigger| -> std::result::Result<(), NotOwner> { Err(NotOwner::Unknown("ldap timed out".into())) };
+        let (fired, ack) = intake::ingest(&l, "edge", &[ev("7", "failure", now)], now, &no_wake, &unknown).unwrap();
+        assert!(ack.is_empty(), "held");
+        assert!(fired[0].detail.contains("held"));
+        assert!(!l.trigger_event_known("t0", &format!("hook:{id}"), "g-7").unwrap());
+        // Once it can, it fires.
+        let (fired, ack) = intake::ingest(&l, "edge", &[ev("7", "failure", now)], now, &no_wake, &anyone).unwrap();
+        assert_eq!((fired[0].status.as_str(), ack.as_slice()), ("started", ["s-7".to_string()].as_slice()));
+        // Paused: recorded, not fired.
+        l.set_trigger_status(&id, "paused").unwrap();
+        let (fired, ack) = intake::ingest(&l, "edge", &[ev("8", "failure", now)], now, &no_wake, &anyone).unwrap();
+        assert!(fired.is_empty() && ack == ["s-8"]);
+        assert!(l.trigger_event_known("t0", &format!("hook:{id}"), "g-8").unwrap());
+    }
+
+    /// #714 review H2 and H3: a signed body replayed under a new delivery id doesn't fire again; a
+    /// node's time from the future counts as now, so it neither escapes the hourly limit nor the
+    /// staleness check, and wicket's own fields win over a body's.
+    #[test]
+    fn a_node_cant_replay_or_move_time() {
+        use wicket_core::intake::IntakeEvent;
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        let mut s = spec(
+            "trigger: hook\nsource: { webhook: { verify: { hmac_sha256: k } } }\naction: { wake: captain }\nlimits: { per_hour: 2 }\n",
+        );
+        pin_target(&l, "t0", &operator().id, &mut s).unwrap();
+        let id = l.create_trigger("t0", &operator().id, &s, "unix:alex", false, None).unwrap();
+        l.set_trigger_intake(&id, "edge", "x").unwrap();
+        let now = wicket_store::now();
+        let ev = |n: &str, body: &str, at: i64| IntakeEvent {
+            id: format!("s-{n}"),
+            trigger: id.clone(),
+            kind: "webhook".into(),
+            delivery: format!("d-{n}"),
+            received_at: at,
+            fields: serde_json::json!({ "delivery": "spoofed", "at": 1 }),
+            raw_sha256: wicket_core::intake::body_sha256(body.as_bytes()),
+            bytes: 1,
+        };
+        let (fired, _) = intake::ingest(&l, "edge", &[ev("1", "body-a", now)], now, &no_wake, &anyone).unwrap();
+        assert_eq!(fired[0].status, "started");
+        // The same body under a new delivery id: a replay.
+        let (fired, ack) = intake::ingest(&l, "edge", &[ev("2", "body-a", now)], now, &no_wake, &anyone).unwrap();
+        assert!(fired.is_empty() && ack == ["s-2"], "{fired:?}");
+        // Far in the future: counted as now, so the hourly limit (2) holds.
+        let future = now + 10 * 86_400;
+        let (fired, _) = intake::ingest(&l, "edge", &[ev("3", "body-b", future)], now, &no_wake, &anyone).unwrap();
+        assert_eq!(fired[0].status, "started");
+        let (fired, _) = intake::ingest(&l, "edge", &[ev("4", "body-c", future)], now, &no_wake, &anyone).unwrap();
+        assert_eq!(fired[0].status, "skipped", "over the hour's limit though its time was the future: {fired:?}");
+        // wicket's fields won over the body's.
+        let e = l.trigger_event_known("t0", &format!("hook:{id}"), "d-3").unwrap();
+        assert!(e);
+        let fired = l.audit_of_kind("trigger.fired").unwrap();
+        assert!(fired.iter().all(|r| !r.body.contains("spoofed")), "the body's delivery didn't replace wicket's");
+    }
+
+    /// #714 review F4: when a node's oldest events all belong to a trigger whose owner can't be
+    /// checked, the next sync holds that trigger's events back, so another trigger's behind them are
+    /// still fetched and fired in the same pass.
+    #[tokio::test]
+    async fn a_held_trigger_doesnt_block_the_others() {
+        use wicket_core::intake::{IntakeEvent, IntakeRefused};
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        let mk = |l: &Ledger, owner: &Operator, name: &str| {
+            let mut s =
+                spec(&format!("trigger: {name}\nsource: {{ webhook: {{ verify: {{ hmac_sha256: k }} }} }}\naction: {{ wake: captain }}\n"));
+            pin_target(l, "t0", &owner.id, &mut s).unwrap();
+            let id = l.create_trigger("t0", &owner.id, &s, &owner.label, false, None).unwrap();
+            l.set_trigger_intake(&id, "edge", "x").unwrap();
+            id
+        };
+        let (stuck, fine) = (mk(&l, &operator(), "stuck"), mk(&l, &other(), "fine"));
+        let more: Vec<String> = (1..4).map(|k| mk(&l, &operator(), &format!("stuck-{k}"))).collect();
+        let stuck_owner = l.trigger(&stuck).unwrap().unwrap().owner;
+        let owner = move |t: &Trigger| -> std::result::Result<(), NotOwner> {
+            if t.owner == stuck_owner {
+                Err(NotOwner::Unknown("ldap timed out".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let now = wicket_store::now();
+        let ev = |n: usize, trigger: &str| IntakeEvent {
+            id: format!("s-{n:02}"),
+            trigger: trigger.into(),
+            kind: "webhook".into(),
+            delivery: format!("d-{n}"),
+            received_at: now,
+            fields: serde_json::json!({}),
+            raw_sha256: wicket_core::intake::body_sha256(format!("b-{n}").as_bytes()),
+            bytes: 1,
+        };
+        // The node's spool, oldest first: three of the stuck trigger's, then the fine one's. It
+        // sends at most three a sync, and none of a held trigger's.
+        // #714 review N2: four such triggers with 500 events each ahead of the fine one.
+        let mut first = vec![ev(0, &stuck), ev(1, &stuck), ev(2, &stuck)];
+        for (k, t) in more.iter().enumerate() {
+            first.extend((0..500).map(|n| ev(10_000 * (k + 1) + n, t)));
+        }
+        first.push(ev(3, &fine));
+        let spool = std::sync::Mutex::new(first);
+        let mut out = vec![];
+        let syncs = std::sync::atomic::AtomicUsize::new(0);
+        let synced =
+            intake::drain(&l, "edge", now, &no_wake, &owner, &mut out, Default::default(), |ack: Vec<String>, hold: Vec<String>| {
+                syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut sp = spool.lock().unwrap();
+                sp.retain(|e| !ack.contains(&e.id));
+                let send: Vec<IntakeEvent> = sp.iter().filter(|e| !hold.contains(&e.trigger)).take(500).cloned().collect();
+                std::future::ready(Ok((send, IntakeRefused::default())))
+            })
+            .await
+            .unwrap();
+        assert!(synced);
+        let fired: Vec<(&str, &str)> = out.iter().map(|f| (f.trigger.as_str(), f.status.as_str())).collect();
+        assert!(fired.contains(&(fine.as_str(), "started")), "{fired:?}");
+        let left = spool.lock().unwrap();
+        assert!(left.iter().all(|e| e.trigger != fine), "the other's acked; the held ones stay in the spool");
+        assert_eq!(left.len(), 3 + 3 * 500);
+        assert!(syncs.load(std::sync::atomic::Ordering::Relaxed) <= 10, "held batches didn't run the pass out");
+    }
+
+    /// A node's refusals are audited at most once an hour, counted.
+    #[test]
+    fn intake_refusals_are_audited_once_an_hour() {
+        let l = Ledger::open_in_memory().unwrap();
+        let r = wicket_core::intake::IntakeRefused { signature: 3, ..Default::default() };
+        let t0 = 1_000_000_000;
+        intake::note_refused(&l, "refusing-node", &r, t0).unwrap();
+        intake::note_refused(&l, "refusing-node", &r, t0 + 60).unwrap();
+        intake::note_refused(&l, "refusing-node", &r, t0 + 3600).unwrap();
+        let recs = l.audit_of_kind("trigger.intake_refused").unwrap();
+        assert_eq!(recs.len(), 2, "the first, then an hour later");
+        assert!(recs[1].body.contains("\"signature\":6"), "{}", recs[1].body);
     }
 
     /// One trigger that can't be fired is its own failure: the others in the pass still fire.
