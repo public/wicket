@@ -136,16 +136,28 @@ ok "the boxes made no request to registry.npmjs.org: the cache did"
 
 # Using a service is having its reach: a box that doesn't reach what the cache does isn't linked.
 user offline no
-W run "$work/offline.yaml" >"$work/o.log" 2>&1 &
+# wicket itself in the background, not through W, so $off_pid is wicket's and a SIGTERM reaches it.
+"$WICKET" run "$work/offline.yaml" >"$work/o.log" 2>&1 &
 off_pid=$!
-# While the box runs: its link is a pending request (a run that ends withdraws its requests).
-pending_link=
+# While the box runs: its link is a pending request (a run that ends withdraws its requests), and the
+# run says so. Both show within seconds of the box starting.
+pending_link= asked=
 for _ in $(seq 60); do
-  if W pending | grep -q "LINK"; then pending_link=1; break; fi
+  if [ -z "$pending_link" ] && W pending | grep -q "LINK"; then pending_link=1; fi
+  if [ -z "$asked" ] && grep -q "npm-cache on node local: needs approval" "$work/o.log"; then asked=1; fi
+  if [ -n "$pending_link" ] && [ -n "$asked" ]; then break; fi
+  if ! kill -0 "$off_pid" 2>/dev/null; then break; fi
   sleep 1
 done
-wait "$off_pid" || true
+# Then stop the box: left alone, it would wait out its link wait (150 s), its ping loop and npm's
+# timeouts, about 12 minutes with nothing left to check. A SIGTERM ends the run as interrupted, and
+# wicket stops the box before it exits: given a minute for that, then killed.
+kill -TERM "$off_pid" 2>/dev/null || true
+for _ in $(seq 600); do kill -0 "$off_pid" 2>/dev/null || break; sleep 0.1; done
+kill -9 "$off_pid" 2>/dev/null || true
+wait "$off_pid" 2>/dev/null || true
 [ -n "$pending_link" ] || { cat "$work/o.log"; fail "the link's request was never pending"; }
-grep -q "npm-cache on node local: needs approval" "$work/o.log" || { cat "$work/o.log"; fail "a box without the cache's reach was linked, or not asked for"; }
+[ -n "$asked" ] || { cat "$work/o.log"; fail "a box without the cache's reach was linked, or not asked for"; }
+if grep -q "npm-cache on node local: linked" "$work/o.log"; then cat "$work/o.log"; fail "a box without the cache's reach was linked"; fi
 ok "a box without the cache's reach needs a human to be linked to it"
 echo "service-e2e.sh: all checks passed"
