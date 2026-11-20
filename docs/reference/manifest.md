@@ -66,12 +66,12 @@ What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)
 |---|---|---|---|
 | `node_selector` | map of string to string | none | Labels the node must have, each with this value (`gpu: a100`). |
 | `tolerations` | list of strings | none | Node taints the box may go on despite: `key` (any value) or `key=value`. A node's taint keeps off every box that doesn't tolerate it. |
-| `priority` | integer, -1000 to 1000 | `0` | Where the box waits for a node, and which boxes it may displace: higher first. A spawned box's is at most its parent's, approved or not. |
+| `priority` | integer, -1000 to 1000 | `0` | Where the box waits for a node among its own tenant's boxes, and which boxes it may displace: higher first. It never moves another tenant's boxes. A spawned box's is at most its parent's, approved or not. |
 | `preemptible` | boolean | `false` | The box may be stopped to make room for a box of higher priority. A spawned box of a preemptible parent is preemptible too. |
 | `affinity` | list | none | What the box wants on its node: `{ service: <name> }` (a service its `zone.uses` names, whose instance runs there) or `{ volume: <name> }` (a volume its `zone.volumes` declares with `keep: true`, which the node holds). Preferred, unless `required: true`. |
 | `anti_affinity` | list | none | What the box wants off its node: `{ zone: <name> }` (any box of that zone) or `{ principal: spiffe://… }` (that agent's boxes). Preferred, unless `required: true`. |
 
-A node that lacks a required affinity, or runs a box a required anti-affinity names, is out; of the nodes left, the one meeting the most preferences goes first, then bin-packing decides. Placement decides where a box goes and nothing more: its authority is issued as for any run, and the node's own admission still decides. In this release the scheduler's functions take `priority`, `preemptible` and affinity, and a manifest may set them; the wake queue and the ledger's view of what runs on each node use them in the next step of [#579](https://github.com/public/wicket/issues/579) (until then a node is seen with no services, volumes or boxes, so a required affinity keeps a woken agent off every node).
+A node that lacks a required affinity, or runs a box a required anti-affinity names, is out; of the nodes left, the one meeting the most preferences goes first, then bin-packing decides. Placement decides where a box goes and nothing more: its authority is issued as for any run, and the node's own admission still decides. A node is seen with the boxes of the box's own tenant running there, the service instances it may use there, and, for a kept volume, whether a box of the box's zone runs there or ran there within the volume's retention; never another tenant's boxes. Waiting wakes are served first come, first served across tenants, and by `priority` within one ([nodes](nodes.md#placement)). Preemption by `preemptible` comes in the next step of [#579](https://github.com/public/wicket/issues/579).
 
 Keys are lowercase letters and digits with `.`, `_`, `-` or `/` inside, at most 63; values are letters, digits, `.`, `_` and `-`, at most 63. A manifest without `placement` reads the same to a node that doesn't know it; one with it needs its node on this release or later when it spawns there.
 
@@ -180,7 +180,7 @@ ordered list.
 |---|---|---|---|
 | `host` | string | required | A host name, exact (`api.github.com`) or `*.example.com` for one or more labels under `example.com` (not `example.com` itself). Matched ignoring case and a trailing dot. No `/`. |
 | `methods` | list of strings | `[GET, HEAD]` | The methods allowed. The proxy forwards only GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS. |
-| `paths` | list of globs | `["/**"]` | Path globs: `*` matches within one segment, `**` across segments. Case-sensitive. The query string isn't matched. |
+| `paths` | list of globs | `["/**"]` | Path globs, each starting with `/` (a request's path always does; a manifest with one that doesn't is refused): `*` matches within one segment, `**` across segments. Case-sensitive. The query string isn't matched. |
 | `allow_dangerous` | boolean | `false` | Allow requests the dangerous-pattern list rates R3 or R4 without a grant. |
 
 A host allowed wholesale (every forwarded method, `/**`, `allow_dangerous` where the host can be
@@ -193,7 +193,7 @@ inspected: see [performance](../explanation/performance.md#splice-through-for-ho
 | field | type | default | meaning |
 |---|---|---|---|
 | `host` | string | required | As in `reach`. |
-| `paths` | list of globs | `["/**"]` | As in `reach`, but matched ignoring ASCII case, since many upstreams fold case. `/**` forbids the whole host, which then can't be connected to at all. A glob that doesn't compile forbids everything on the host. |
+| `paths` | list of globs | `["/**"]` | As in `reach` (each starting with `/`), but matched ignoring ASCII case, since many upstreams fold case. `/**` forbids the whole host, which then can't be connected to at all. A glob that doesn't compile forbids everything on the host. |
 
 #### Git pushes
 

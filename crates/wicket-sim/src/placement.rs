@@ -57,7 +57,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 use wicket_core::{RunId, TenantId, ZoneSpec};
-use wicket_feed::{BoxAuthority, Change, Issuer, Publisher, PublisherConfig, Replica, ReplicaConfig};
+use wicket_feed::{BoxAuthority, Change, Issuer, Publisher, PublisherConfig, Refreshed, Replica, ReplicaConfig};
 use wicket_placement::billing::PoolRules;
 use wicket_placement::model::{NodeState, PROTECTED_TAG};
 use wicket_placement::reconcile as plan;
@@ -887,13 +887,12 @@ async fn runs(env: Rc<Env>) {
     }
 }
 
-/// A run's feed publisher on its node's feed (`noderun::SharedFeed`): one per run, each use
-/// under the feed's lock, reloading the delta log first if another run appended to it, and sharing
-/// the last statement time (`feed/issued`) with every other run on the same node.
+/// A run's feed publisher on its node's feed (`noderun::SharedFeed`): one per run (each its own
+/// process), each use under the feed's lock, first applying what another run appended
+/// (`Publisher::refresh`), and sharing the last statement time (`feed/issued`) with every other run
+/// on the same node.
 struct Feed {
     p: Publisher<BoxAuthority>,
-    /// The delta log's length when last loaded or written.
-    len: u64,
     host: String,
 }
 
@@ -916,25 +915,19 @@ impl Feed {
         .expect("the node's feed")
     }
 
-    fn len(p: &Publisher<BoxAuthority>) -> u64 {
-        std::fs::metadata(p.log_path()).map(|m| m.len()).unwrap_or(0)
-    }
-
     fn open(env: &Env, host: &str) -> Feed {
-        let p = Feed::load(env, host);
-        Feed { len: Feed::len(&p), p, host: host.to_string() }
+        Feed { p: Feed::load(env, host), host: host.to_string() }
     }
 
     /// `SharedFeed::lock`, then `f`, then the guard's drop: current, with the shared time noted
     /// first and saved after.
     fn with<T>(&mut self, env: &Env, f: impl FnOnce(&mut Publisher<BoxAuthority>) -> T) -> T {
-        if Feed::len(&self.p) != self.len {
+        if !matches!(self.p.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_))) {
             self.p = Feed::load(env, &self.host);
         }
         let last = env.ctl.borrow().feed_issued.get(&self.host).copied().unwrap_or(i64::MIN);
         self.p.note_issued(last);
         let out = f(&mut self.p);
-        self.len = Feed::len(&self.p);
         env.ctl.borrow_mut().feed_issued.insert(self.host.clone(), self.p.last_issued());
         out
     }

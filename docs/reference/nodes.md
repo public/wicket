@@ -324,7 +324,8 @@ wicket node revoke n1
   node's status socket show the same report. The console shows it under Nodes.
 - **Alerts.** The console pushes to every registered device when a node's disk or inodes pass 85%
   used, its feed has been stale for more than 5 min, a box was killed for memory, or it couldn't persist
-  its state. The control host's own disk past 85% alerts too. Each condition is pushed once when it
+  its state. The control host's own disk past 85% alerts too, and so does a state store or audit sink that
+  lags ([console](console.md#the-state-store-and-the-audit-export)). Each condition is pushed once when it
   appears, and again only after it has cleared, under its own notification tag (`wicket-health`).
   A device registered without details is told how many alerts there are, not what they say. A report
   older than 10 min raises no disk or feed alert, and nothing is reported by a node with no
@@ -381,8 +382,12 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
 - **The queue.** A wake that no node may take now waits instead of failing: `queued: no node may take agent
   … now (n1: …; n2: …)`, then it tries again every 2 s, asking the nodes with no fresh report every 30 s,
   for up to `wicket wake --wait` (default 30 minutes; `--wait 0` fails at once, as before). Waiting wakes
-  are served first come, first served (`placement_waits`): one is placed only when no wake waiting longer
-  fits a node now, so a wake that fits nowhere doesn't hold up the ones behind it. A waiting wake keeps its
+  are served first come, first served across tenants (`placement_waits`); within a tenant, its own wakes
+  fill the places in line it took by their manifest's [`placement.priority`](manifest.md#placement),
+  highest first, and first come, first served within one. A priority is the manifest's own word, so it
+  never moves another tenant's wakes. One is placed only when no wake ahead of it fits a node now, so a
+  wake that fits nowhere doesn't hold up the ones behind it. A wake behind another tenant's says so
+  without naming that run. A waiting wake keeps its
   claim on the agent, and holds its place only while its process is alive. The queue never creates
   capacity: `request_capacity` and `wicket node create` stay the only ways.
 - **Why here.** Every decision is recorded (`placement_decisions`, a run's latest, kept a week): what the box
@@ -407,7 +412,17 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
   ask for, by its report and its admission's room ([above](#health-admission-and-disk-377)); a label or
   taint mismatch; and a node whose CA doesn't cover the box's inspected hosts and whose policy keeps them
   out ([#573](https://github.com/public/wicket/issues/573); a node it may be widened to is in).
-- **Score.** Of the nodes left, bin-pack: the one left with the least memory, then the fewest vCPUs, once
+- **Affinity.** A box's [`placement.affinity`](manifest.md#placement) names a service its zone uses or a
+  kept volume; its `anti_affinity` a zone or a principal. A node is seen with the boxes of the box's own
+  tenant running there (their zones and principals), the live instances of the services it may use there
+  (its tenant's, or a shared one), and, for a kept volume, whether a box of the box's zone runs there or
+  ran there within the volume's retention. A box being started counts from its reservation (whose box it
+  is is recorded with it, `placement_owners`, ledger schema 30), so two wakes placed at once see each
+  other. Another tenant's boxes are never seen. A box's tenant is its manifest's, which an operator vouches
+  for. A required term that fails puts a node out (`no service npm-cache here,
+  which the box requires`, `runs a box of zone research, which the box requires to be away from`); a
+  preferred one ranks the nodes meeting the most first.
+- **Score.** Of the nodes left, those meeting the most preferences first; then bin-pack: the one left with the least memory, then the fewest vCPUs, once
   the box is on it. Where the agent ran before breaks a tie, then the name, so the same inputs always give
   the same node. A spread strategy exists in the function for later.
 - **Refusal.** With no node left the wake is refused, naming every node and every reason it was out

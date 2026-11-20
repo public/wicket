@@ -94,6 +94,9 @@ pub fn check_shape(label: &str, allow_idn: bool) -> Result<(), LabelError> {
     Ok(())
 }
 
+/// The domain internal names live under (`wicket_core::link::DOMAIN`, which a test holds this to).
+pub const INTERNAL_DOMAIN: &str = "wicket.internal";
+
 /// The longest zone part of an internal name: with a 63-character label, a dot and
 /// `.wicket.internal`, the whole name stays within DNS's 253.
 pub const MAX_ZONE_PART: usize = 170;
@@ -108,6 +111,14 @@ pub const MAX_ZONE_PART: usize = 170;
 pub fn zone_part(zone: &str) -> Result<String, LabelError> {
     if zone.len() > MAX_ZONE_PART {
         return Err(LabelError::TooLong(zone.len()));
+    }
+    // A zone named like wicket's own domain would make `<label>.<zone>.wicket.internal` read as a
+    // name of another zone once a lookup strips the suffix (#668 review).
+    // Compared in any case and without a trailing dot, so the refusal doesn't rest on the shape
+    // check below.
+    let folded = zone.trim_end_matches('.').to_ascii_lowercase();
+    if folded == INTERNAL_DOMAIN || folded.ends_with(&format!(".{INTERNAL_DOMAIN}")) {
+        return Err(LabelError::Reserved(INTERNAL_DOMAIN.to_string()));
     }
     for part in zone.split('.') {
         check_shape(part, false)?;
@@ -185,6 +196,14 @@ mod tests {
         assert!(zone_part("-x").is_err());
         assert!(zone_part("caf\u{e9}").is_err());
         assert!(zone_part(&"a.".repeat(100)).is_err());
+        // Nor a zone named like wicket's own domain (#668 review).
+        assert!(zone_part("wicket.internal").is_err());
+        assert!(zone_part("build.wicket.internal").is_err());
+        assert!(zone_part("wicket.internals").is_ok());
+        // In any case, or with a trailing dot, refused as wicket's domain, not only by its shape.
+        for z in ["Build.Wicket.Internal", "build.wicket.internal.", "build.WICKET.INTERNAL", "BUILD.wicket.internal", "wicket.internal."] {
+            assert_eq!(zone_part(z), Err(LabelError::Reserved(INTERNAL_DOMAIN.into())), "{z}");
+        }
     }
 
     #[test]
