@@ -159,6 +159,16 @@ enters the context window, so compaction can't erode it.
     point straight at the node that runs them, as in Kubernetes. wicket manages the records through
     pluggable providers; it doesn't proxy public traffic, terminate TLS or route by name. A node's
     listener for a box's port is a byte relay or DNAT (#575, [box DNS](box-dns.md)).
+21. **Dependencies wait a week** (owner, 2026-11-20). No dependency version is used until it is 7 days
+    old by its registry's publish time: crates, npm packages, actions, images and downloaded tools.
+    Most malicious releases are found and pulled within hours to days: 8 of 10 notable attacks were
+    live for under a week, and 7 days would have kept out all of them but Kong's Ingress Controller
+    (about 10 days) and xz-utils (about 5 weeks). 14 days would add only Kong, for twice the wait. The one
+    exception is a fix for a serious, actively exploited vulnerability that can't wait. It is
+    recorded with its advisory in `ci/dep-age-exceptions.toml` and approved in review. CI's
+    `ci/dep-age.py` checks every version a change adds to a lockfile, since locked installs never
+    consult the package managers' own settings (`.cargo/config.toml`, `.npmrc`, which guard resolving).
+    Renovate waits the same 7 days before it proposes anything.
 
 ### 2.1 Build versus reuse (owner, 2026-11-10)
 
