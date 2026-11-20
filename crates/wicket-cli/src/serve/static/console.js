@@ -735,7 +735,11 @@ const byName = x => strip(String(x || "").replace(/^passkey:/, ""));
 // agent (`agent:<run>`) or a standing capacity grant (`capacity-grant:<id>`) may have.
 function decider(label) {
   const s = String(label || "");
-  if (s.startsWith("agent:")) return runName(s.slice(6)) + " (a parent agent)";
+  if (s.startsWith("agent:")) {
+    // An agent run names itself by its agent; a program run, which has none, by its run id.
+    const run = s.slice(6), n = runName(run);
+    return (n === "a program" ? "run " + shortText(strip(run)) : n) + " (a parent agent)";
+  }
   if (s.startsWith("capacity-grant:")) return "capacity grant " + strip(s.slice(15));
   return s ? byName(s) : "?";
 }
@@ -959,7 +963,7 @@ function standingAskRow(a) {
   const w = el("div", "where"); w.append(el("span", "host", strip(r.host)), el("div", "path", (r.paths || []).map(strip).join("  ")));
   field(dl, "Where", w);
   field(dl, "Why", "\u201c" + strip(a.reason) + "\u201d", "why");
-  field(dl, "So far", plural(e.requests || 0, "request") + " like this in " + plural(e.days || 0, "day") + "; you allowed " + (e.granted || 0) +
+  field(dl, "So far", plural(e.requests || 0, "request") + " like this in " + plural(e.days || 0, "day") + "; allowed " + (e.granted || 0) +
     (e.denied ? ", refused " + e.denied : "") + (e.undecided ? ", " + e.undecided + " not decided" : ""));
   d.append(dl);
   for (const x of (a.beyond || [])) d.append(el("div", "callout warn", "Wider than what it used: " + strip(x)));
@@ -1000,7 +1004,7 @@ function standingRuleRow(r) {
   const to = r.for === "zone" ? "every agent in zone " + strip(r.zone) : principalName(r.principal);
   head.append(r.for === "zone" ? el("span", "run-name", to) : principalEl(r.principal), el("span", "", " may " + verbsOf(rr.methods) + " "), el("span", "mono", strip(rr.host)));
   // On the row, not only in its title (#715 review): this rule allows requests that can't be undone.
-  if (rr.allow_dangerous) head.append(document.createTextNode(" "), el("span", "risk r4", "including requests that can't be undone (R3, R4)"));
+  if (rr.allow_dangerous) head.append(document.createTextNode(" "), el("span", "risk r4", "including requests that can't be undone"));
   head.title = "standing reach " + strip(r.id) + ": " + ruleText(r.rule);
   const until = r.expires_at ? (r.live ? "ends " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
   const b = el("div", "buttons");
@@ -1059,7 +1063,7 @@ function renderRun(s, x, page) {
   const status = x.revoked ? "revoked" : String(x.status || "");
   const tone = ({ running: "good", revoked: "bad", failed: "bad", hibernated: "info" })[status] || "";
   const waiting = x.waiting !== undefined ? x.waiting : ((s && s.pending) || []).some(p => p.run === x.id);
-  head.append(el("span", "pill " + (waiting ? "warn" : tone), waiting ? "waiting for you" : ({ running: "working", exited: "finished", revoked: "stopped by you", hibernated: "asleep" })[status] || strip(status)));
+  head.append(el("span", "pill " + (waiting ? "warn" : tone), waiting ? "waiting for you" : ({ running: "working", exited: "finished", revoked: "stopped", hibernated: "asleep" })[status] || strip(status)));
   left.append(head);
   const meta = el("div", "meta");
   meta.append(relEl(x.started_at, "started ", s.now));

@@ -806,7 +806,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // #715 review: a rule that allows dangerous requests says so on its row.
   assert.ok(!sr.textContent.includes("can't be undone"), sr.textContent);
   const dangerRow = run("standingRuleRow(" + JSON.stringify({ ...rule, rule: { ...rule.rule, allow_dangerous: true } }) + ")");
-  assert.ok(dangerRow.textContent.includes("including requests that can't be undone (R3, R4)"), dangerRow.textContent);
+  assert.ok(dangerRow.textContent.includes("including requests that can't be undone"), dangerRow.textContent);
   console.log("console standing reach: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open
