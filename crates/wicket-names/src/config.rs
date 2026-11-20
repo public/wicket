@@ -165,6 +165,16 @@ impl PublicConfig {
         self.zone.trim_end_matches('.').to_ascii_lowercase()
     }
 
+    /// This installation's owner id, as owner records carry it (None if `owner` isn't one).
+    pub fn owner_id(&self) -> Option<crate::OwnerId> {
+        crate::OwnerId::parse(&self.owner)
+    }
+
+    /// The zone, as the plan and providers take it.
+    pub fn dns_zone(&self) -> crate::Zone {
+        crate::Zone::new(&self.domain())
+    }
+
     /// `label`'s public name here.
     pub fn fqdn(&self, label: &str) -> String {
         format!("{label}.{}", self.domain())
@@ -181,8 +191,8 @@ impl PublicConfig {
         if d == crate::label::INTERNAL_DOMAIN || d.ends_with(&format!(".{}", crate::label::INTERNAL_DOMAIN)) {
             bad.push(format!("names.public.zone can't be under {}", crate::label::INTERNAL_DOMAIN));
         }
-        if !(8..=32).contains(&self.owner.len()) || !self.owner.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
-            bad.push("names.public.owner must be 8 to 32 lower-case hex characters (random, made once: openssl rand -hex 8)".into());
+        if self.owner_id().is_none() {
+            bad.push("names.public.owner must be 8 to 32 lower-case letters and digits (random, made once: openssl rand -hex 8)".into());
         }
         if !TTL_RANGE.contains(&self.ttl) {
             bad.push(format!("names.public.ttl must be {}-{} seconds, not {}", TTL_RANGE.start(), TTL_RANGE.end(), self.ttl));
@@ -258,8 +268,8 @@ mod tests {
             ("zone", r#""com""#, "two or more labels"),
             ("zone", r#""a..b""#, "not a DNS domain"),
             ("zone", r#""x.wicket.internal""#, "wicket.internal"),
-            ("owner", r#""web-01.example""#, "hex"),
-            ("owner", r#""abc""#, "hex"),
+            ("owner", r#""web-01.example""#, "letters and digits"),
+            ("owner", r#""abc""#, "letters and digits"),
             ("ttl", "5", "30-3600"),
             ("per_workload", "0", "at least 1"),
             ("reserved", r#"["a.b"]"#, "not a DNS label"),

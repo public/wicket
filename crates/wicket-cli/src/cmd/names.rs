@@ -155,10 +155,12 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
             }
             nm::approve(&l, &human()?, &id, &terms, &shown, &names, serde_json::json!({ "via": "cli" }))?;
             println!(
-                "approved {id}: the public name {} (port {}). wicket doesn't publish public records yet: it is a record only.",
+                "approved {id}: the public name {} (port {}). Nothing on its node listens for it yet: its records are all there is.",
                 c(&public.fqdn(&n.label), 253),
                 n.port
             );
+            // Its records now, rather than at the reconciler's next pass.
+            crate::reconcile::print(&crate::reconcile::names_pass(&l, false).await, false);
             Ok(())
         }
         NamesCmd::Deny { id } => {
@@ -169,8 +171,11 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
         }
         NamesCmd::Revoke { id } => {
             let l = Ledger::open(&ledger_path())?;
-            nm::revoke(&l, &operator(), &id)?;
+            let n = nm::revoke(&l, &operator(), &id)?;
             println!("revoked {id}");
+            if n.kind == wicket_store::NameKind::Public {
+                crate::reconcile::print(&crate::reconcile::names_pass(&l, false).await, false);
+            }
             Ok(())
         }
     }

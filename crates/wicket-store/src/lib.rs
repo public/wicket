@@ -1741,6 +1741,14 @@ impl Ledger {
 
     /// Appends a hash-chained audit record: hash = sha256(prev || kind || body). Durable when it
     /// returns: with a writer it waits for its batch's commit (a shared flush).
+    /// The body of the newest audit record of `kind`, if there is one.
+    pub fn last_audit_body(&self, kind: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT body FROM audit WHERE kind = ?1 ORDER BY seq DESC LIMIT 1", params![kind], |r| r.get(0))
+            .optional()?)
+    }
+
     pub fn audit(&self, tenant: &TenantId, run: Option<&RunId>, kind: &str, body: &serde_json::Value) -> Result<i64> {
         let body = serde_json::to_string(body)?;
         let own = self.conn.is_autocommit();

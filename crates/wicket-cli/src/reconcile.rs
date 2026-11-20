@@ -962,6 +962,8 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
         }
         Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
     }
+    // Box names (#575): the public records the ledger wants, through the configured provider.
+    done.extend(names_pass(&ledger, dry_run).await);
     // Audit retention on the host (#582): over its size limit, the audit table's oldest records
     // (ones every sink has, behind a checkpoint one acknowledged) are pruned and the space given
     // back. Never without a sink and the state store.
@@ -1105,10 +1107,67 @@ pub fn print(done: &[Done], dry_run: bool) {
     let changed = done
         .iter()
         .filter(|d| {
-            !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held" | "store_gc" | "audit_retention")
+            !matches!(
+                d.kind,
+                "ignored"
+                    | "kept_warm"
+                    | "left_alone"
+                    | "unreachable"
+                    | "placed_held"
+                    | "store_gc"
+                    | "audit_retention"
+                    | "names_planned"
+                    | "name_unpublished"
+            )
         })
         .count();
     say!("reconcile: {changed} change(s){}", if dry_run { " (dry run: nothing changed)" } else { "" });
+}
+
+/// The names step of a pass: [`wicket_control::names::reconcile`] with the provider
+/// `names.public.provider` names. Nothing where the installation publishes no names.
+pub async fn names_pass(ledger: &Ledger, dry_run: bool) -> Vec<Done> {
+    let names = match wicket_agent::acp::names_settings() {
+        Ok(n) => n,
+        Err(e) => return vec![Done { kind: "error", target: "names".into(), detail: e }],
+    };
+    let r = match names.public.as_ref().map(|p| p.provider) {
+        None => return vec![],
+        Some(wicket_names::ProviderKind::Noop) => {
+            wicket_control::names::reconcile(ledger, &names, &wicket_names::NoopProvider::new(), dry_run).await
+        }
+    };
+    match r {
+        Ok(Some(r)) => names_done(&r, names.public.as_ref().map(|p| p.domain()).unwrap_or_default(), dry_run),
+        Ok(None) => vec![],
+        Err(e) => vec![Done { kind: "error", target: "names".into(), detail: format!("{e:#}") }],
+    }
+}
+
+/// What a names pass did, as lines of `wicket reconcile`.
+fn names_done(r: &wicket_control::names::Reconciled, zone: String, dry_run: bool) -> Vec<Done> {
+    let mut out = vec![];
+    if !r.plan.is_empty() || !r.plan.conflicts.is_empty() {
+        out.push(Done {
+            kind: if r.applied { "names_applied" } else { "names_planned" },
+            target: zone.clone(),
+            detail: format!(
+                "{} change(s), {} name(s) taken in the zone{}",
+                r.plan.changes.len(),
+                r.plan.conflicts.len(),
+                match (r.applied, dry_run) {
+                    (_, true) => " (dry run)",
+                    (false, false) => " (provider noop: nothing published)",
+                    (true, false) => "",
+                }
+            ),
+        });
+    }
+    out.extend(r.skipped.iter().map(|(id, why)| Done { kind: "name_unpublished", target: id.clone(), detail: why.clone() }));
+    if r.freed > 0 {
+        out.push(Done { kind: "ports_freed", target: zone, detail: format!("{} host port(s) free again after twice the TTL", r.freed) });
+    }
+    out
 }
 
 /// `wicket reconcile [--dry-run] [--every <interval>]`.

@@ -204,7 +204,7 @@ Nodes and placement:
   lease      Capacity leases: the nodes agents asked for
   service    Per-node services: programs kept running on every node whose boxes use them
   why-here   Why a run's box went on the node it did, or why it went nowhere
-  reconcile  Make what exists agree with the ledger: runs, leases, machines and boxes
+  reconcile  Make what exists agree with the ledger: runs, leases, machines, boxes and box names
 
 The installation:
   serve      Serve the operator console
@@ -1392,9 +1392,9 @@ Options:
 ## `wicket reconcile`
 
 ```text
-Make what exists agree with the ledger: runs, leases, machines and boxes.
+Make what exists agree with the ledger: runs, leases, machines, boxes and box names.
 
-Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Records every change in the audit log.
+Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Plans and applies the public names' records through the installation's DNS provider (#575; `noop` only records the plan). Records every change in the audit log.
 
 Usage: wicket reconcile [OPTIONS]
 

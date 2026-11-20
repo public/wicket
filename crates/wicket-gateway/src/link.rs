@@ -987,6 +987,15 @@ mod tests {
         let audit = w.ledger.lock().unwrap().audit_tail(30).unwrap();
         assert!(audit.iter().any(|a| a.2 == "name.registered" && a.4.contains("api.build.wicket.internal")));
 
+        // Revoked: the link made by the name closes, its socket and hosts line go (#575 step 4b).
+        let nid = w.ledger.lock().unwrap().internal_name(&TenantId::single(), "build", "api").unwrap().unwrap().id;
+        w.ledger.lock().unwrap().revoke_name(&nid, "ann").unwrap();
+        let r = wait_closed(&w, &id).await;
+        assert!(r.close_reason.as_deref().is_some_and(|c| c.contains("was revoked")), "{r:?}");
+        assert!(!std::fs::read_to_string(w.root.join("run_web/hosts")).unwrap().contains("api.build.wicket.internal"));
+        let (text, _) = crate::names::request_name(&api, &serde_json::json!({ "name": "api", "port": 3000 }));
+        assert!(text.contains("registered"), "{text}");
+
         // The run ends: so does the name, and the label is free.
         w.ledger.lock().unwrap().run_ended(&RunId("run_api".into()), "succeeded", "").unwrap();
         let (text, err) = connect_name(&other, "api.build", None).await;

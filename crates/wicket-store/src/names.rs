@@ -575,8 +575,32 @@ impl Ledger {
                 self.unexpose(holder, before.port)?;
                 self.drop_name_exposure(&run, before.port)?;
             }
+            // The links made to it by name close too: their relays stop at their next look at the
+            // ledger, as for an unlink (#575 step 4b).
+            self.conn.execute(
+                "UPDATE links SET status = 'closed', closed_at = ?4, closed_by = ?5, close_reason = 'the name ' || ?3 || ' was revoked'
+                 WHERE status = 'open' AND tenant = ?1 AND to_run = ?2 AND name = ?3",
+                params![before.tenant, holder, format!("{}.{}", before.label, before.zone), now(), by],
+            )?;
         }
         self.name(id)
+    }
+
+    /// Every live public name, of every tenant: the reconciler's desired state starts from them.
+    pub fn live_public_names_all(&self) -> Result<Vec<NameRow>> {
+        let mut st = self.conn.prepare(&format!("SELECT {COLS} FROM names WHERE kind = 'public' AND status = 'live' ORDER BY label"))?;
+        let rows = st.query_map([], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Host ports released and not yet free again: (node, protocol, port, the name that last held
+    /// it). The reconciler frees each once its name's records are gone.
+    pub fn quarantined_ports(&self) -> Result<Vec<(String, String, u16, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT node, proto, port, last_name FROM host_ports WHERE name IS NULL AND free_after IS NULL ORDER BY node, proto, port",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// `run` ended: its run-scoped names end, and its standing ones are let go for the next run they
@@ -1201,6 +1225,41 @@ mod tests {
     /// #680 review, L1 and L5: revoking an internal name stops offering the port its name exposed;
     /// an agent a human denied can't ask for the same public name again at once; and a standing ask
     /// nobody decides is withdrawn in time.
+    /// #575 step 4b: revoking an internal name closes the open links made to it by that name, and
+    /// only those.
+    #[test]
+    fn revoking_an_internal_name_closes_its_links() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let web = l.register_internal(&ask(&t, &r1, P1, "web", NameScope::Run), 3, 3600).unwrap();
+        let link = |id: &str, name: &str, tenant: &str| crate::LinkRow {
+            id: id.into(),
+            tenant: tenant.into(),
+            from_run: "run-2".into(),
+            to_run: "run-1".into(),
+            port: 3000,
+            name: name.into(),
+            addr: "198.18.1.1".into(),
+            by_run: "run-2".into(),
+            basis: "accept_from".into(),
+            status: "open".into(),
+            created_at: now(),
+            closed_at: None,
+            closed_by: None,
+            close_reason: None,
+        };
+        l.add_link(&link("lk-named", "web.build", "t")).unwrap();
+        l.add_link(&link("lk-other", "web", "t")).unwrap();
+        l.add_link(&link("lk-tenant", "web.build", "u")).unwrap();
+        l.revoke_name(&web.id, "ann").unwrap();
+        let named = l.link("lk-named").unwrap().unwrap();
+        assert_eq!((named.status.as_str(), named.closed_by.as_deref()), ("closed", Some("ann")));
+        assert!(named.close_reason.unwrap().contains("web.build was revoked"));
+        assert_eq!(l.link("lk-other").unwrap().unwrap().status, "open", "a link by another name");
+        assert_eq!(l.link("lk-tenant").unwrap().unwrap().status, "open", "another tenant's");
+    }
+
     #[test]
     fn revokes_denials_and_old_asks() {
         let l = ledger();

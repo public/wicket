@@ -415,12 +415,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: KeysCmd,
     },
-    /// Make what exists agree with the ledger: runs, leases, machines and boxes.
+    /// Make what exists agree with the ledger: runs, leases, machines, boxes and box names.
     ///
     /// Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past
     /// their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again
     /// right before each destroy), adopt or create the ones leases need, and stop boxes whose run has
-    /// ended, here and on enrolled nodes. Records every change in the audit log.
+    /// ended, here and on enrolled nodes. Plans and applies the public names' records through the
+    /// installation's DNS provider (#575; `noop` only records the plan). Records every change in the
+    /// audit log.
     Reconcile {
         /// Only report what would change.
         #[arg(long)]

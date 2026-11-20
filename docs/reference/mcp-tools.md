@@ -425,7 +425,7 @@ added beside it.
 It is held by the run that asked, and ends with it (audited as `name.released`). Asking again from
 the same run moves the name to another port. The old port stays offered while the box itself, or
 another of the run's names, offers it; otherwise it is no longer offered. Audited as
-`name.registered`.
+`name.registered`. If an operator revokes the name, the links other boxes opened by it close.
 
 **`kind: public`** asks for a name on the internet, `<name>.<boxes domain>`. Only a human decides it
 (`wicket names approve`), since anyone could then connect to the port and read what the box serves.

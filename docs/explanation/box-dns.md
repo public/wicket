@@ -57,6 +57,8 @@ Resolving it goes through `connect`, as built (step 3):
   unchanged: it never answers a `.wicket.internal` name itself.
 - **No name, or its holder isn't running:** `connect` says so. A box that never connected doesn't
   resolve the name.
+- **Revoked** (`wicket names revoke`): the links opened by the name close as an unlink does, and the
+  connecting boxes stop resolving it. A link opened to the box by its run id stays.
 
 So a name saves an agent finding the box's run id; whether it may connect is the link's decision, as
 NetworkPolicy is to Service DNS in Kubernetes. A link across nodes still passes through the control
@@ -209,7 +211,8 @@ its own address could point a name at someone else's server.
 - **Sticky:** a name keeps its port while it is granted, and a box that moves gets the same port on
   the new node if it is free there. Otherwise a new one, and the SRV record follows.
 - **Quarantined after release.** A port a name gave up isn't handed out again on that node until its
-  records are gone and twice the TTL has passed. Otherwise a cached record for the old name would
+  records are gone and twice the TTL has passed (the reconciler sets when, once no record of the
+  name is left). Otherwise a cached record for the old name would
   reach the new box.
 - **Ports below 1024** (80, 443) only where the operator allows them on a node, for one name each,
   since a node has one port 443. Sharing 443 between boxes needs routing by TLS server name, which
@@ -249,15 +252,20 @@ wicket owns records the way external-dns does: it reconciles the records it owns
 one it doesn't.
 
 - **The desired state is the ledger's:** for each live public name held by a running box, its A,
-  AAAA and SRV records for that box's node, and its owner record.
+  AAAA and SRV records for that box's node, and its owner record. A name whose label the settings
+  no longer allow (reserved since it was approved), whose node has no public address or lacks the
+  `names.public.nodes` labels, gets none, and the plan says why. The SRV record comes with the
+  name's host port (step 4c); until then a name has its A and AAAA records.
 - **The owner record** is a TXT at `_wicket.<label>.<zone>`:
   `"wicket-owner=<owner id>;name=<grant id>"`. It sits beside the name, not on it, so the name can
   later be a CNAME. The owner id is random, made at install: no host name or other detail in it.
 - **A record is wicket's only if both** the ledger lists it as created by this installation
   (`name_records`) and its owner TXT carries this installation's owner id. A record either side
   doesn't vouch for is never changed or deleted.
-- **The reconciler** (`wicket reconcile`, and after each name change) lists the zone, compares it
-  with the desired state, and applies the difference: create, update or delete owned records. A name
+- **The reconciler** (each pass of `wicket reconcile`, which the reconciler service runs every
+  interval, and right after `wicket names approve` and `revoke`) lists the zone, compares it with
+  the desired state, and applies the difference: create, update or delete owned records. Its plan
+  is audited `name.plan` when it differs from the last one, so a quiet pass adds nothing. A name
   that exists in the zone without wicket's owner record is a conflict: wicket leaves it, the name's
   grant shows "taken in the zone", and the conflict is audited. It is never adopted on its own.
 - **Order:** an owner record is written before the records it owns, and deleted after them, so a
@@ -292,7 +300,8 @@ owned set, and it is what the property tests check: whatever the zone holds, a p
 deletes a record wicket doesn't own, and applying it makes the owned records the desired ones.
 
 - **`noop` first:** it lists nothing, applies nothing and reports the plan it was given, audited as
-  `name.plan` with `applied: false`. It lets an operator see what wicket would do before giving it a
+  `name.plan` with `applied: false`. Nothing it plans is listed as this installation's
+  (`name_records`), since the ledger lists only records that exist. It lets an operator see what wicket would do before giving it a
   credential, and is what tests and the simulation use.
 - **Then `vultr`** (its DNS API; most nodes run on Vultr now) **and `rfc2136`** (dynamic update with
   TSIG, for self-hosted servers such as BIND, Knot or PowerDNS, and the static hosts).
@@ -324,10 +333,11 @@ doesn't) can get one by DNS-01: a gateway tool, `dns_challenge(name, value)`, ma
 
 Audit records, as written so far: `name.requested` (an ask), `decision` and `decision.refused` (a
 human's approval or denial, or a refused one, as for other asks), `name.registered` (internal),
-`name.revoked`, `name.released`, `name.claimed` (a later run took up a standing name), and
-`node.addresses` (an operator set a node's public addresses). Still to come with 4b and 4c: `name.lapsed`, `name.port.opened`, `name.port.closed`,
-`name.conn` (per connection, on the node), `name.plan` (each reconcile's plan, applied or not),
-`name.record` (each create, update or delete), `name.conflict` and `name.challenge`.
+`name.revoked`, `name.released`, `name.claimed` (a later run took up a standing name),
+`node.addresses` (an operator set a node's public addresses), `name.plan` (a reconcile's plan,
+applied or not, when it differs from the last), `name.record` (each create, update or delete) and
+`name.conflict`. Still to come with 4c and later: `name.lapsed`, `name.port.opened`,
+`name.port.closed`, `name.conn` (per connection, on the node) and `name.challenge`.
 
 `wicket names list` and the console's **Names** card list every name: kind, full name, owner (the
 principal, zone and run), target (node, address, host port and box port), state (pending, live,
