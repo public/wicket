@@ -134,7 +134,7 @@ pub struct Pass<'a, P, S, B, F> {
     /// Starts a new supervisor for a run (`wicket attach <run>`, detached).
     pub adopt: fn(&str) -> Result<()>,
     /// Whether a run's box may still run on its node at a time (Unix ms), and until when (#153).
-    pub fenced: fn(&str, i64) -> Option<(String, i64)>,
+    pub fenced: fn(&Ledger, &str, i64) -> Option<(String, i64)>,
     pub now: i64,
     pub dry_run: bool,
     done: Vec<Done>,
@@ -282,7 +282,7 @@ where
                     let overdue = run_deadline(&run).is_some_and(|d| d < self.now);
                     // Still authorized on its node (#153): the box may be running there, so the run
                     // isn't lost yet, whatever the node's status, until its authority has ended.
-                    if let Some((_, until)) = (self.fenced)(&run, self.now.saturating_mul(1000)) {
+                    if let Some((_, until)) = (self.fenced)(self.ledger, &run, self.now.saturating_mul(1000)) {
                         let left = if until == crate::noderun::UNKNOWN_END {
                             // #676: its record doesn't say when its authority ends, so it is kept
                             // until its node can be asked.
@@ -686,6 +686,10 @@ where
             if let Err(e) = r {
                 self.note("error", &b.name, &format!("stopping it{at}: {e:#}"));
                 return Ok(());
+            }
+            // Its box is stopped: nothing left to fence (#676).
+            if let Some(run) = b.run.as_deref().filter(|r| crate::run::check_run_id(r).is_ok()) {
+                crate::noderun::confirm_stopped(&crate::data_dir().join("runs").join(run));
             }
         }
         self.did("box_stopped", &b.name, &format!("{why}{at}"), b.run.as_deref());
@@ -1465,19 +1469,28 @@ mod tests {
         asked.insert("n3".to_string(), None);
         /// #153: run_fenced's box is still authorized on its (revoked, unreachable) node until
         /// NOW + 60 s, so it may still run there.
-        /// #676: run_unknown's record doesn't say when its authority ends (its manifest can't be
-        /// read), so it is fenced until its node confirms the box stopped.
-        fn fenced(run: &str, now_ms: i64) -> Option<(String, i64)> {
-            if run == "run_unknown" {
-                return Some(("n3".to_string(), crate::noderun::UNKNOWN_END));
+        /// #676: run_unknown's run directory is real: no authority record, and a run record that
+        /// can't be read, so its fence is the real `fenced_in`'s: the ledger's hard end of its
+        /// authority (NOW + 600 s) if recorded, else until its node confirms the box stopped.
+        fn unknown_dir() -> std::path::PathBuf {
+            std::env::temp_dir().join(format!("wicket-reconcile-676-{}", std::process::id()))
+        }
+        fn fenced(l: &Ledger, run: &str, now_ms: i64) -> Option<(String, i64)> {
+            if run.starts_with("run_unknown") {
+                let cap_ms = l.run_authority(run).ok().flatten().map(|(_, cap)| cap * 1000);
+                return crate::noderun::fenced_in(&unknown_dir(), now_ms, cap_ms);
             }
             (run == "run_fenced" && now_ms < (NOW + 60) * 1000).then(|| ("n3".to_string(), (NOW + 60) * 1000))
         }
-        for run in ["run_fenced", "run_unknown"] {
+        let _ = std::fs::remove_dir_all(unknown_dir());
+        std::fs::create_dir_all(unknown_dir().join("ctl")).unwrap();
+        std::fs::write(unknown_dir().join("ctl/run.json"), b"{ truncated").unwrap();
+        for run in ["run_fenced", "run_unknown", "run_unknown_capped"] {
             l.run_started(&TenantId::single(), &RunId(run.into()), "z", "a").unwrap();
             l.set_run_owner(run, "dead:1:1").unwrap();
             l.set_run_node(run, "n3").unwrap();
         }
+        l.set_run_authority("run_unknown_capped", NOW + 300, NOW + 600).unwrap();
         async fn pass_at(
             w: &World<Fake>,
             l: &mut Ledger,
@@ -1524,9 +1537,18 @@ mod tests {
         );
         pass_at(&w, &mut l, &asked, false, NOW + 61).await;
         assert_eq!(l.run_status("run_fenced").unwrap().as_deref(), Some(LOST));
-        // A year on, its node still unreachable and revoked: never ended without the fence (#676).
+        // With the ledger's hard end of its authority: kept until then, then ended (#676).
+        assert_eq!(l.run_status("run_unknown_capped").unwrap().as_deref(), Some("running"));
+        pass_at(&w, &mut l, &asked, false, NOW + 600 + 31).await;
+        assert_eq!(l.run_status("run_unknown_capped").unwrap().as_deref(), Some(LOST));
+        // Without one, kept, its node still unreachable and revoked, until the node confirms or an
+        // operator releases the fence: then it ends.
         pass_at(&w, &mut l, &asked, false, NOW + 366 * 86_400).await;
         assert_eq!(l.run_status("run_unknown").unwrap().as_deref(), Some("running"));
+        crate::noderun::release_fence(&unknown_dir(), "root@cli").unwrap();
+        pass_at(&w, &mut l, &asked, false, NOW + 366 * 86_400).await;
+        assert_eq!(l.run_status("run_unknown").unwrap().as_deref(), Some(LOST));
+        let _ = std::fs::remove_dir_all(unknown_dir());
     }
 
     /// #474: a long-lived agent's first box never starts on its node, so its run is lost straight

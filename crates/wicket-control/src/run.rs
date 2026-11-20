@@ -220,7 +220,12 @@ pub(crate) fn write_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
     let tmp = p.with_extension("json.new");
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
     std::io::Write::write_all(&mut f, &serde_json::to_vec(v)?)?;
+    // Durably (#676): a crash mustn't leave a truncated run record, which fencing reads.
+    f.sync_all()?;
     std::fs::rename(&tmp, p)?;
+    if let Some(dir) = p.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -2649,6 +2654,19 @@ pub fn attach_failed(run: &str, e: &anyhow::Error) {
     }
     if let Ok(l) = Ledger::open(&ledger_path()) {
         if l.run_status(run).ok().flatten().as_deref() == Some("running") {
+            // Its box may still run on its node (#676: a manifest a later version no longer loads
+            // fails the takeover, not the box): not ended while fenced, or the ledger's fence on
+            // its agent would lift with the box still running. The reconciler tries again, and
+            // ends it once its node says the box is gone or the fence ends.
+            if let Some((node, until)) = crate::noderun::fenced_until(&l, run, wicket_feed::now_ms()) {
+                let _ = l.audit(
+                    &wicket_core::TenantId::single(),
+                    Some(&RunId(run.to_string())),
+                    "run.attach_failed",
+                    &serde_json::json!({ "why": wicket_agent::clip(&why, 300), "node": node, "fenced_until_ms": until }),
+                );
+                return;
+            }
             let reason = format!("its supervisor is gone and it could not be taken over: {}", wicket_agent::clip(&why, 300));
             // And its agent, if it was the agent's activation (#474).
             let _ = l.run_lost(run, &reason);

@@ -242,13 +242,15 @@ fix, which TLC refuses:
 | `EndAgentOnLost = TRUE` (done, #474) | before #474, the reconciler ended a run as `lost` (its supervisor gone, its node with no box for it: a box that never started, say, `BoxFails`) but left its agent `active`, its claim lapsed, with nothing to renew it or read its messages. Now `Ledger::run_lost` ends the run and, if it was the agent's current activation, the agent: back to `hibernated` (restorable from its last head) if it has one, else `ended` | `fail_lifecycle_agent_left_active`: `ActiveHasRun` |
 
 The model reads each box's authority end as known (`AuthTtl` from its start, renewed). In the code
-the reconciler reads it from the run's authority record, or when that is missing from the run's
-record (`noderun.rs` `fenced_in`, `timeout_end`; `reconcile.rs` `run_deadline`). Where neither
-says it, the run is fenced until its node confirms the box stopped, never ended unfenced (#676):
-the stored manifest's timeout is read leniently (`manifest::stored_timeout`, so a manifest a later
-version refuses still gives it), and a record that can't be read at all fences forever
-(`UNKNOWN_END`). That keeps the model's assumption true: `Lost` never happens before the authority
-it would have read has ended.
+the reconciler and wake read it from the run's authority record, or when that is missing from its
+timeout in the run's record (`noderun.rs` `fenced_in`, `timeout_end`; `reconcile.rs`
+`run_deadline`), read leniently (`manifest::stored_timeout`: a manifest a later version refuses
+still gives it), then from the ledger's hard end of the box's authority (`runs.authority_cap`,
+written before the box starts). With none of them, the run is fenced until its node confirms the
+box stopped, or root releases the fence (`wicket node release-fence`, audited), never ended
+unfenced (#676); a takeover that fails on such a run (`run.rs` `attach_failed`) leaves it to the
+reconciler while it is fenced. So the model's `Lost` doesn't come before the authority end the code
+can tell, except where root released a fence it couldn't.
 
 Every switch is now the code (#444, #445, #446, #453, #474), so `RunLifecycle.cfg` is main, and each
 `fail_lifecycle_*` variant is the code before one fix. `NoMessageTwice` holds in every variant: with
