@@ -55,9 +55,11 @@ set -euo pipefail
 # A command that fails outside a check (under `set -e`, it ends the run) names its line and
 # command, and in GitHub Actions is an annotation too. The 11-18 nightly's installed run ended with
 # neither. Written to fd 3, this script's own stdout, so a command substitution doesn't capture it.
+# Only the script's own shell aborts: a command failing in a subshell (a check's, or a command
+# substitution's) is that subshell's to answer for, and said "ABORTED" where nothing was (#753).
 exec 3>&1
 set -E
-trap 'rc=$?; echo "ABORTED (exit $rc) at line $LINENO: $BASH_COMMAND" >&3; [ -z "${GITHUB_ACTIONS:-}" ] || echo "::error title=acceptance (${mode:-?}) aborted::line $LINENO: $(sed "s/%/%25/g" <<<"$BASH_COMMAND")" >&3' ERR
+trap 'rc=$?; if [ "$BASH_SUBSHELL" = 0 ]; then echo "ABORTED (exit $rc) at line $LINENO: $BASH_COMMAND" >&3; [ -z "${GITHUB_ACTIONS:-}" ] || echo "::error title=acceptance (${mode:-?}) aborted::line $LINENO: $(sed "s/%/%25/g" <<<"$BASH_COMMAND")" >&3; fi' ERR
 cd "$(dirname "$0")/.."
 
 mode=dev nodes=
@@ -159,7 +161,8 @@ all_descendants() {
 teardown() {
   local status=$?
   set +e
-  trap - EXIT INT TERM
+  # Teardown removes what may not be there: none of its failures is an abort.
+  trap - ERR EXIT INT TERM
   if [ "$nodes" = vultr ]; then vultr_teardown; fi
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
   sleep 1
@@ -614,7 +617,7 @@ restart_start() {   # $1: label, then wicket run options
 restart_flow() {
   log "a control-host restart: boxes survive, reconcile adopts their runs"
   local runs=() labels=() boxes=() r l b
-  r=$(restart_start local); runs+=("$r"); labels+=(local)
+  r=$(restart_start local --node local); runs+=("$r"); labels+=(local)
   if [ "$nodes" = local ]; then r=$(restart_start node --node "$NODE"); runs+=("$r"); labels+=("$NODE"); fi
   for r in "${runs[@]}"; do boxes+=("$(box_of "$r")"); done
   restart_runs=("${runs[@]}")
@@ -805,7 +808,8 @@ install_flow() {
   p=$(data pids/daemon.pid 2>/dev/null | head -1 || true)
   starts() { grep -c "wicketd: /run/wicket/wicketd.sock as" /tmp/wicketd.log 2>/dev/null || true; }
   before=$(starts)
-  attach0=$(data "runs/$r/ctl/attach.log" 2>/dev/null | wc -l)
+  # Missing until a takeover writes it: none read as no lines, not an abort (#753).
+  attach0=$({ data "runs/$r/ctl/attach.log" 2>/dev/null || true; } | wc -l)
   sudo -n "$sh" --binary "$d/wicket" --operator "$(id -un)" --skip-gvisor --skip-image --trust-domain acc.wicket.test >"$work/install.log" 2>&1 || true
   check "  install.sh installed the new build" '[ "$(basename "$(readlink /var/lib/wicket-versions/current)")" = "$id" ]'
   if [ ! -d /run/systemd/system ]; then
@@ -817,7 +821,7 @@ install_flow() {
   wait_for 40 'grep -qE "runs: [0-9]+ handed over" /tmp/wicketd.log' || true
   check "  the new wicketd moved this host's node's serve to the new build" \
     'grep -q "wicketd: this host'"'"'s node: serve (pid [0-9]*) re-executed as the new build" /tmp/wicketd.log'
-  serve=$(data local-node/serve/serve.exe 2>/dev/null | sed -n 2p)
+  serve=$({ data local-node/serve/serve.exe 2>/dev/null || true; } | sed -n 2p)
   check "  and the serve runs it" '[ "$serve" = "$(readlink -f /var/lib/wicket-versions/current/wicket)" ]'
   check "  and handed the run over, adopted by the new build" \
     'grep -oE "runs: [0-9]+ handed over, [0-9]+ adopted" /tmp/wicketd.log | tail -1 | awk "{ exit !(\$2 >= 1 && \$2 == \$5) }"'
@@ -846,7 +850,7 @@ CEDAR
   wroot policy apply "$work/org.cedar" >"$work/policy-apply.log" 2>&1 || cat "$work/policy-apply.log"
   v1=$(sed -n 's/^org policy \([0-9a-f]*\) applied.*/\1/p' "$work/policy-apply.log")
   check "wicket policy apply installs the org policy" '[ -n "$v1" ] && w policy show | grep -q "org policy $v1"'
-  HOME=$HOMEW "$W" run "$(manifest org)" --image "$IMAGE_TAG" >"$work/org.log" 2>&1 &
+  HOME=$HOMEW "$W" run "$(manifest org)" --image "$IMAGE_TAG" --node local >"$work/org.log" 2>&1 &
   org_pid=$!
   pids+=("$org_pid")
   wait_for 90 'grep -q acc-org-done "$work/org.log" 2>/dev/null' || true

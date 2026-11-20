@@ -210,17 +210,50 @@ its own address could point a name at someone else's server.
   the new node if it is free there. Otherwise a new one, and the SRV record follows.
 - **Quarantined after release.** A port a name gave up isn't handed out again on that node until its
   records are gone and twice the TTL has passed. Otherwise a cached record for the old name would
-  reach the new box.
+  reach the new box. The reconciler frees it: once the ledger lists none of the name's records, the
+  port is free twice the TTL from then.
 - **Ports below 1024** (80, 443) only where the operator allows them on a node, for one name each,
   since a node has one port 443. Sharing 443 between boxes needs routing by TLS server name, which
   is ingress: not in this design. See [open questions](#open-questions).
 
+**As built (step 4c).** The run's supervisor allocates a port for each live public name its box
+holds that may be published on its node (the same check as the reconciler's: labels, addresses,
+domain, label rules), from `names.public.ports`, keeping the port the name had on another node if it
+is free here and releasing that one. It puts them in the box's record (`ports`) for a node at
+protocol 21. The node publishes from its replica alone, every 2 s, so it works offline and across
+restarts: a port in its range (`publish.json` in its directory, written by `wicket node install` for
+a node with the `names.public.nodes` labels; without it the node publishes nothing), unexpired,
+claimed by one box, whose authority holds on the node. It listens on one IPv6 socket that takes
+IPv4 too (IPv4 alone where IPv6 is off), and dials each connection into the box (`wicket-fwd`)
+once its first byte has come (within 10 s; until then a connection costs only its socket, and at
+most 16 per name, 6 per peer, wait so: a newcomer to a full pool evicts the oldest waiter rather
+than being refused, so silent sockets can't keep speaking clients out). Per name it holds at most 32 relays, 8 per peer (an IPv6
+/64 counts as one peer), and takes 128 new per 2 s; per node, 256 at once (so 8 names at their cap
+fill it), 32 per peer across all its ports, and 256 new per 2 s. A relay ends after 5 minutes
+without a byte, 30 s after the peer has closed its side and nothing more has gone to it, or after
+an hour; the box's `wicket-fwd` is given the same idle and after-close
+limits (as environment variables, which an older one ignores), so a service that ignores
+half-close doesn't keep it. **In a box whose image is older than this,** its `wicket-fwd` ignores
+them: a relay the node has cut may linger in the box, unbounded until the box image is rebuilt.
+The node's slots free faster than such leftovers end, so they can pile up in the box up to its
+process limit. The limits are checked before anything else, refusals are counted per
+kind, not recorded one by one, and each connection is recorded as it starts and as it ends
+(`name.conn`, `phase`), aggregated per tick under load. It publishes only while its feed is fresh,
+or offline within its grace, and the box's authority holds there as for any other decision (not
+revoked, its issuing key certified). A port
+that stops being published closes within 2 s of the node's feed saying so, with its connections,
+before DNS catches up; a node cut off from its control host can't hear of a revoke, and closes the
+port when the box's authority or the name's end passes. **Layer 4
+only:** the node never terminates TLS, reads a protocol, or routes by name; nothing passes through
+the control host.
+
 ## The node firewall
 
 A node's firewall is the operator's. wicket asks it for one thing: admit the node's port range from
-anywhere (`deploy/vultr/node-setup.sh` adds a rule for it on a node that publishes). Inside the
+anywhere. Inside the
 range a port is open only while wicket listens on it, so a revoked name is closed by the node
-itself, not by a firewall change that might fail. `wicket node serve` runs unprivileged and changes
+itself, not by a firewall change that might fail. `node-setup.sh` adds the rule when given the range
+(`WICKET_PUBLISH_PORTS=20000-20999`, the same as `names.public.ports`). `wicket node serve` runs unprivileged and changes
 no firewall rules.
 
 Each connection to a published port is checked as it is accepted (grant live, box running, the
@@ -249,20 +282,42 @@ wicket owns records the way external-dns does: it reconciles the records it owns
 one it doesn't.
 
 - **The desired state is the ledger's:** for each live public name held by a running box, its A,
-  AAAA and SRV records for that box's node, and its owner record.
+  AAAA and SRV records for that box's node, and its owner record. The node must carry the labels
+  `names.public.nodes` asks for and have public addresses; until then the name is *waiting*, with
+  why, and has no records. So does a name without a host port on that node (step 4c: its run's
+  supervisor gives it one, on a node at protocol 21): an address with nothing listening would reach
+  nobody, or, once the port is someone else's, the wrong box.
+- **What the noop provider does:** it lists an empty zone and applies nothing, so the reconciler
+  records nothing in `name_records` (the ledger never claims a record that isn't there), and audits
+  each new plan as `name.plan` with `applied: false`. The same plan pass after pass is recorded once.
 - **The owner record** is a TXT at `_wicket.<label>.<zone>`:
   `"wicket-owner=<owner id>;name=<grant id>"`. It sits beside the name, not on it, so the name can
   later be a CNAME. The owner id is random, made at install: no host name or other detail in it.
 - **A record is wicket's only if both** the ledger lists it as created by this installation
   (`name_records`) and its owner TXT carries this installation's owner id. A record either side
   doesn't vouch for is never changed or deleted.
-- **The reconciler** (`wicket reconcile`, and after each name change) lists the zone, compares it
+- **The reconciler** (`wicket reconcile`; `wicket_control::namesync`) lists the zone, compares it
   with the desired state, and applies the difference: create, update or delete owned records. A name
   that exists in the zone without wicket's owner record is a conflict: wicket leaves it, the name's
   grant shows "taken in the zone", and the conflict is audited. It is never adopted on its own.
 - **Order:** an owner record is written before the records it owns, and deleted after them, so a
   crash between the two leaves an owner record for nothing (cleaned on the next pass), never an
-  unowned A record.
+  unowned A record. The ledger records a plan's new records, and an intent per change, in one write
+  before the provider applies it; a provider whose apply isn't atomic says how far it got, and only
+  those changes count as made.
+- **Every zone with records** (#748): a pass also withdraws the records of a zone that isn't the
+  configured one (after a zone change), with the provider that made them. Records another provider
+  made (after a provider change, or with `names.public` removed) are *stranded*: the pass says so
+  each time until the setting is put back, and never forgets them.
+- **Records gone from the zone** (deleted by hand, or never made because of a crash) are forgotten
+  once listings by the provider that made them have lacked them for 10 minutes or more (the first
+  such listing notes when; one that has them again clears it), so they hold no name's port. A
+  listing that lacks every record the provider made in the zone forgets none, and the pass says so.
+  A provider's `Ok` listing is the whole zone; its id names its account, and each provider's rows
+  are its own: none writes over, plans on or forgets another's.
+- **Links by name:** a name that ends closes the links other boxes opened with `connect` by it.
+- **One address, one node:** names on two nodes that share a public address wait, since host ports
+  are allocated per node.
 - **Lifecycle:** a name's records go when its grant ends, is revoked or lapses, or its run stops.
   A standing name's come back when its workload runs again. A box moving to another node has its A
   and AAAA updated to that node's addresses (and its SRV if the port changed).
@@ -324,10 +379,20 @@ doesn't) can get one by DNS-01: a gateway tool, `dns_challenge(name, value)`, ma
 
 Audit records, as written so far: `name.requested` (an ask), `decision` and `decision.refused` (a
 human's approval or denial, or a refused one, as for other asks), `name.registered` (internal),
-`name.revoked`, `name.released`, `name.claimed` (a later run took up a standing name), and
-`node.addresses` (an operator set a node's public addresses). Still to come with 4b and 4c: `name.lapsed`, `name.port.opened`, `name.port.closed`,
-`name.conn` (per connection, on the node), `name.plan` (each reconcile's plan, applied or not),
-`name.record` (each create, update or delete), `name.conflict` and `name.challenge`.
+`name.revoked`, `name.released`, `name.claimed` (a later run took up a standing name),
+`node.addresses` (an operator set a node's public addresses), and the reconciler's (step 4b):
+`name.lapsed` (a name's lifetime ended), `name.plan` (a reconcile's plans for every zone, applied or
+not, with the stranded records and the names waiting, recorded when it differs from the last one),
+`name.record` (each create, update or delete a provider is about to make, `state: intended`, and
+each record forgotten, `state: forgotten`), `name.applied` (how a provider's apply ended, and how
+many changes it made) and `name.conflict`. The node's (step 4c, shipped as node audit records):
+`name.port.opened`, `name.port.closed` (with why), `name.port.failed` (a port it couldn't bind, one
+two boxes claim, or one outside its range, recorded once, under the claiming run), `name.conn` (per
+connection, `phase: start` and `phase: end` with one `conn` id: the peer, bytes each way, how long,
+and `cut` with `why` when the node ended it; per tick, one aggregate record under load) and
+`name.conn.refused` (counted each tick, by limit: per port, peer, node, a peer over the node,
+waiting, evicted, silent, failed). Still to
+come with step 6: `name.challenge`.
 
 `wicket names list` and the console's **Names** card list every name: kind, full name, owner (the
 principal, zone and run), target (node, address, host port and box port), state (pending, live,
@@ -351,9 +416,12 @@ has a name's records as the zone last listed them, and its last connections.
   node. Also `names.domain`: the boxes domain a public name was approved under, so a change of
   `names.public.zone` doesn't move live names into a zone nobody approved them in.
 - **Protocol 18:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
-  node only of a control host at 18. Public names will add the feed's published ports (name, run,
-  node, host port, box port, until) for the nodes that listen on them, and a node's report of a
-  listener it couldn't bind.
+  node only of a control host at 18.
+- **Protocol 21** (step 4c): a box's record in the feed carries its public names' host ports
+  (`BoxAuthority.ports`: the name, its label, the host port, the box's port, until), omitted when
+  there are none, and sent only to a node at 21. A port the node can't bind is a node audit record
+  (`name.port.failed`), not a message of its own.
+- **Ledger schema 43** (#748): `name_records.missing_since`, when a listing first lacked a record.
 
 ## Steps
 
@@ -366,7 +434,7 @@ has a name's records as the zone last listed them, and its last connections.
      operators' `name` kind) and `await_grant` on it;
    - 4b: the installation's `names:` config, node public addresses, and the reconciler with the
      `noop` provider;
-   - 4c: host ports, published on the feed, and the node's listener;
+   - 4c: host ports, published on the feed, and the node's listener (built: below);
    - 4d: the console's Names card.
 5. The `vultr` and `rfc2136` providers.
 6. DNS-01 challenges.

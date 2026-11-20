@@ -41,6 +41,10 @@
 //! - *Stores*: once an hour ([`crate::storegc::EVERY_SECS`]), the content-addressed stores'
 //!   collection (#258, `wicket state gc`): the local store and the state store's, then the local
 //!   store's cache cap. Audited as `store.gc` and `store.deleted`, not `reconcile.*`.
+//! - *Names* (#575): the boxes zone's records that wicket owns are made to agree with the live
+//!   public names ([`wicket_control::namesync`]): names whose lifetime is over end (`name.lapsed`),
+//!   and the plan goes through the `names.public.provider`. Audited as `name.plan` (when it changed),
+//!   `name.record` and `name.conflict`, not `reconcile.*`. Nothing without `names.public`.
 //! - *Triggers* (#578): each pass fires the schedules' minutes and the timers that came due since
 //!   the last one (at most `wicket_control::triggers::CATCH_UP_SECS` back), once each: waking or
 //!   messaging the agent a trigger names, or queueing the run it starts. Audited as `trigger.*`.
@@ -1114,6 +1118,10 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     // Triggers (#578) first: the schedules' minutes and the timers that came due since the last
     // pass, whatever the nodes and machines below make of this one.
     let mut done = triggers_pass(&ledger, now, dry_run, &wicket_control::hibernate::trigger_wake, &trigger_owner_may);
+    // Webhook intake (#578 step 4): what the intake nodes verified since the last pass.
+    if !dry_run {
+        done.extend(intake_pass(&ledger, now).await);
+    }
     let asked = node_runs(&ledger, dry_run).await?;
     let local = Docker::from_env();
     done.extend(machines_pass(&mut ledger, asked, &local, now, dry_run).await?);
@@ -1143,6 +1151,8 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
         }
         Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
     }
+    // Public names (#575): the boxes zone's owned records made to agree with the live names.
+    done.extend(names_pass(&ledger, now, dry_run).await);
     // Audit retention on the host (#582): over its size limit, the audit table's oldest records
     // (ones every sink has, behind a checkpoint one acknowledged) are pruned and the space given
     // back. Never without a sink and the state store.
@@ -1186,6 +1196,102 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     Ok(done)
 }
 
+/// The names reconciler's pass ([`wicket_control::namesync::pass`]) with the installation's
+/// `names.public` settings and provider, as the pass's report. Nothing without `names.public`. The
+/// plan and the names waiting are reported when the plan changed (it is then recorded), or in a dry
+/// run: the `noop` provider plans the same each pass.
+async fn names_pass(ledger: &Ledger, now: i64, dry_run: bool) -> Vec<Done> {
+    let names = match wicket_agent::acp::names_settings() {
+        Ok(n) => n,
+        Err(e) => return vec![Done { kind: "error", target: "names".into(), detail: e }],
+    };
+    let Some(public) = names.public else {
+        // Records this installation made stay where they are until names.public is back to
+        // withdraw them (#748, F3): said each pass.
+        return match ledger.owned_zones() {
+            Ok(z) => z
+                .into_iter()
+                .map(|(zone, provider, n)| Done {
+                    kind: "name_stranded",
+                    target: format!("{n} record(s) in {zone}"),
+                    detail: format!(
+                        "made by provider {provider}; names.public is gone from wicket.yaml, so nothing withdraws them: put it back"
+                    ),
+                })
+                .collect(),
+            Err(e) => vec![Done { kind: "error", target: "names".into(), detail: format!("reading its records: {e:#}") }],
+        };
+    };
+    let pass = match public.provider {
+        wicket_names::ProviderKind::Noop => {
+            wicket_control::namesync::pass(ledger, &public, &wicket_names::NoopProvider::new(), now, dry_run).await
+        }
+    };
+    let r = match pass {
+        Ok(r) => r,
+        Err(e) => return vec![Done { kind: "error", target: format!("names in {}", public.domain()), detail: format!("{e:#}") }],
+    };
+    names_report(&r, dry_run)
+}
+
+fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done> {
+    let mut done: Vec<Done> = r
+        .lapsed
+        .iter()
+        .map(|n| Done { kind: "name_lapsed", target: format!("{} ({})", n.label, n.id), detail: "its lifetime is over".into() })
+        .collect();
+    done.extend(r.freed.iter().map(|(node, port)| Done {
+        kind: "port_freed",
+        target: format!("host port {port} on {node}"),
+        detail: "its name's records are gone: free again after twice the TTL".into(),
+    }));
+    // Said each pass, recorded or not: something needs a person.
+    done.extend(r.errors().map(|(zone, e)| Done { kind: "error", target: format!("names in {zone}"), detail: e.to_string() }));
+    done.extend(r.stranded.iter().map(|s| Done {
+        kind: "name_stranded",
+        target: format!("{} record(s) in {}", s.records, s.zone),
+        detail: format!("made by provider {}: {}", s.provider, s.why),
+    }));
+    for z in &r.zones {
+        done.extend(z.forgotten.iter().map(|rec| Done {
+            kind: "name_forgotten",
+            target: format!("{} {}", rec.name, rec.rtype),
+            detail: format!("gone from {}'s listing: no longer counted as this installation's", z.zone),
+        }));
+    }
+    if !(r.recorded || dry_run) {
+        return done;
+    }
+    let how = match (dry_run, r.applied) {
+        (true, _) => "dry run".to_string(),
+        (false, true) => format!("applied by {}", r.provider),
+        (false, false) => format!("provider {}: not applied, only recorded", r.provider),
+    };
+    for c in r.zones.iter().flat_map(|z| z.plan.changes.iter()) {
+        let (op, rec) = match c {
+            wicket_names::Change::Create(x) => ("create", x),
+            wicket_names::Change::Update { to, .. } => ("update", to),
+            wicket_names::Change::Delete(x) => ("delete", x),
+        };
+        done.push(Done {
+            kind: "name_record",
+            target: format!("{} {}", rec.name, rec.rtype),
+            detail: format!("{op} {} ({how})", rec.value),
+        });
+    }
+    for c in r.zones.iter().flat_map(|z| z.plan.conflicts.iter()) {
+        done.push(Done {
+            kind: "name_conflict",
+            target: c.name.clone(),
+            detail: format!("the zone holds {} record(s) there that wicket doesn't own: left alone", c.records.len()),
+        });
+    }
+    for w in &r.waiting {
+        done.push(Done { kind: "name_waiting", target: format!("{} ({})", w.name, w.id), detail: w.why.clone() });
+    }
+    done
+}
+
 /// The triggers' scheduler pass ([`wicket_control::triggers::pass`]), as the pass's report: one
 /// line per firing, skip or failure (each already audited as `trigger.*`), and per due one in a
 /// dry run.
@@ -1213,6 +1319,33 @@ fn triggers_pass(
             })
             .collect(),
         Err(e) => vec![Done { kind: "error", target: "triggers".into(), detail: format!("{e:#}") }],
+    }
+}
+
+/// Webhook intake's pass ([`wicket_control::triggers::intake::pass`]), as the pass's report.
+async fn intake_pass(ledger: &Ledger, now: i64) -> Vec<Done> {
+    let link_ledger = match Ledger::open(&crate::ledger_path()) {
+        Ok(l) => std::sync::Arc::new(std::sync::Mutex::new(l)),
+        Err(e) => return vec![Done { kind: "error", target: "intake".into(), detail: format!("{e:#}") }],
+    };
+    match wicket_control::triggers::intake::pass(ledger, &link_ledger, now, &wicket_control::hibernate::trigger_wake, &trigger_owner_may)
+        .await
+    {
+        Ok(fired) => fired
+            .into_iter()
+            .map(|f| Done {
+                kind: match f.status.as_str() {
+                    "started" => "trigger_fired",
+                    "queued" => "trigger_queued",
+                    "skipped" => "trigger_skipped",
+                    "paused" => "trigger_paused",
+                    _ => "trigger_failed",
+                },
+                target: if f.trigger.is_empty() { f.name } else { format!("trigger {} ({})", f.name, f.trigger) },
+                detail: f.detail,
+            })
+            .collect(),
+        Err(e) => vec![Done { kind: "error", target: "intake".into(), detail: format!("{e:#}") }],
     }
 }
 
@@ -2092,6 +2225,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #731: a capacity ask's region is a region's name, or the ask is refused before anything is
+    /// reserved or filed; the region and the agent's reason are kept as its claims, apart from the
+    /// request's own words.
+    #[test]
+    fn a_capacity_region_is_a_region_name_and_the_agents_words_are_its_claims() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_a", "alive:1");
+        let c = cfg("vultr");
+        let (t, run) = (TenantId::single(), RunId("run_a".into()));
+        for bad in ["lhr, for 1 minute at no cost", "LHR", "", "-lhr", &"a".repeat(33)] {
+            let ask = CapacityAsk { region: Some(bad.into()), ..capacity_ask(30, "0.02") };
+            let e = capacity::ask(&mut l, &c, &t, &run, "z", &ask).err().unwrap().to_string();
+            assert!(e.contains("region must be a provider's region name"), "{bad:?}: {e}");
+        }
+        assert!(l.leases(&[]).unwrap().is_empty(), "nothing reserved for a refused ask");
+        assert!(l.pending(&t).unwrap().is_empty(), "nor filed");
+        for good in ["lhr", "us-east-1", "1"] {
+            assert!(wicket_proxy::check_region(good).is_ok(), "{good}");
+        }
+        capacity::ask(&mut l, &c, &t, &run, "z", &capacity_ask(30, "0.02")).unwrap();
+        let r = l.pending(&t).unwrap().pop().unwrap();
+        assert!(r.reason.contains(", region lhr preferred,"), "{}", r.reason);
+        let claims = l.request_claims(&r.id).unwrap().unwrap();
+        assert_eq!((claims["reason"].as_str(), claims["region"].as_str()), (Some("a bigger build"), Some("lhr")));
+    }
+
     #[tokio::test]
     async fn leases_reserve_their_worst_case_against_the_budget_until_they_end() {
         let mut l = Ledger::open_in_memory().unwrap();
@@ -2503,6 +2662,50 @@ mod tests {
         l.set_run_uncollected("run_done", None).unwrap();
         full_pass(&w, &mut l, end + 60, false).await;
         assert_eq!(deletes(&st), vec!["placed-files"]);
+    }
+
+    /// #590 (sim seed 32300777): a run whose work one supervisor collected, and whose next
+    /// supervisor (it took the run over after a control host crash) failed to fetch it again, holds
+    /// no node: the work is on this host, so the node is released at its lease end, not billed on.
+    #[tokio::test]
+    async fn a_collected_run_holds_no_node_whatever_a_later_fetch_said() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-done", "done-node", end);
+        started(&l, "run_done", "alive:1");
+        l.set_run_node("run_done", "done-node").unwrap();
+        l.record_collected("run_done", "fetched").unwrap();
+        l.run_ended(&RunId("run_done".into()), "failed", "fetching its files failed").unwrap();
+        l.set_run_uncollected("run_done", Some("done-node")).unwrap();
+        assert!(l.uncollected_runs_on_node("done-node").unwrap().is_empty());
+        let w = World::new(vultr(&base));
+        let d = full_pass(&w, &mut l, end + 1, false).await;
+        assert_eq!(deletes(&st), vec!["placed-done"], "{d:?}");
+    }
+
+    /// The review of #590: a taken result (`outbox`, written when the box exits, before its files
+    /// are fetched) or an allowed push (`pushed`, mid-run) leaves the files on the node, so a run
+    /// whose fetch then failed still holds it (#324).
+    #[tokio::test]
+    async fn a_taken_result_or_push_leaves_the_run_holding_its_node() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-kept", "kept-node", end);
+        started(&l, "run_kept", "alive:1");
+        l.set_run_node("run_kept", "kept-node").unwrap();
+        l.record_collected("run_kept", "outbox").unwrap();
+        l.record_collected("run_kept", "pushed").unwrap();
+        l.run_ended(&RunId("run_kept".into()), "failed", "fetching its files failed").unwrap();
+        l.set_run_uncollected("run_kept", Some("kept-node")).unwrap();
+        assert_eq!(l.uncollected_runs_on_node("kept-node").unwrap(), vec!["run_kept"]);
+        let w = World::new(vultr(&base));
+        let d = full_pass(&w, &mut l, end + 1, false).await;
+        assert!(deletes(&st).is_empty(), "{d:?}");
+        // Once its files are fetched, it doesn't.
+        l.record_collected("run_kept", "fetched").unwrap();
+        assert!(l.uncollected_runs_on_node("kept-node").unwrap().is_empty());
     }
 
     /// #494, #495: a node held past its lease bills hours its worst case didn't reserve. The pass

@@ -100,7 +100,9 @@ fn with3(a: &[&'static str], b: &[&'static str], c: &[&'static str]) -> Vec<&'st
 #[test]
 fn documentation_selects_nothing() {
     check(&["docs/reference/agents.md", "README.md", "experiments/x/RESULTS.md", "changes/1.md"], &[], &[]);
-    check(&["fuzz/README.md", "refs/x.txt", "LICENSE", "deny.toml"], &[], &[]);
+    check(&["fuzz/README.md", "refs/x.txt", "LICENSE"], &[], &[]);
+    // cargo deny's configuration selects only cargo deny (#219).
+    check(&["deny.toml"], &[], &["deny"]);
 }
 
 #[test]
@@ -137,10 +139,11 @@ fn wicket_core_is_nearly_everything_but_not_everything() {
     }
     assert!(s.affected.len() >= 10);
     assert_eq!(nextest_selects(&s.filter()), s.affected);
-    // Every suite but tla (its models only), install-test (its install path only) and the
-    // agent_rules fuzz target (operators.rs and the YAML reader only): kani and lean through
-    // wicket-core and wicket-authz, every other fuzz target.
-    let skip = ["tla", "install-test", "fuzz-agent_rules"];
+    // Every suite but tla (its models only), install-test (its install path only), the
+    // agent_rules fuzz target (operators.rs and the YAML reader only) and the cheap checks of a
+    // few files (deny, dep-age, #219): kani and lean through wicket-core and
+    // wicket-authz, every other fuzz target.
+    let skip = ["tla", "install-test", "fuzz-agent_rules", "deny", "dep-age"];
     let all: BTreeSet<String> = Suites::parse(SUITES).unwrap().names().filter(|n| !skip.contains(n)).map(String::from).collect();
     assert_eq!(s.suites, all);
 }
@@ -282,14 +285,14 @@ fn the_toolchain_cargo_and_ci_select_everything() {
 #[test]
 fn the_lockfile_selects_what_its_change_rebuilds() {
     // Compared with itself, the lockfile changes no crate's build; wicket-policy's test reads it.
-    check(&["Cargo.lock"], &["wicket-policy", "wicket-policy-diff", "wicket-control", "wicket-cli"], &with(CLI, &["policy", "fuzz-manifest"]));
+    check(&["Cargo.lock"], &["wicket-policy", "wicket-policy-diff", "wicket-control", "wicket-cli"], &with(CLI, &["policy", "fuzz-manifest", "deny", "dep-age"]));
     // A crate's manifest is its crate's (and its simulated build's).
     // wicket-home classifies placement's errors into exit codes (#574), so it and wicket-node (and
     // the node suites) come with it.
     check(
         &["crates/wicket-placement/Cargo.toml"],
         &["wicket-placement", "wicket-home", "wicket-node", "wicket-control", "wicket-cli", "wicket-sim"],
-        &with(CLI, NODES),
+        &with3(CLI, NODES, &["deny"]),
     );
 }
 
@@ -301,9 +304,13 @@ fn fuzz_targets() {
     check(&["fuzz/src/node_chan.rs"], &[], &["fuzz-chan"]);
     let every = every_fuzz();
     let every: Vec<&str> = every.iter().map(String::as_str).collect();
-    for f in ["fuzz/src/lib.rs", "fuzz/Cargo.toml", "fuzz/Cargo.lock", "ci/fuzz.sh", "fuzz/tests/corpus.rs"] {
+    for f in ["fuzz/src/lib.rs", "ci/fuzz.sh", "fuzz/tests/corpus.rs"] {
         check(&[f], &[], &every);
     }
+    // The fuzz workspace's manifest also selects cargo deny (#219: every manifest does).
+    check(&["fuzz/Cargo.toml"], &[], &[every.as_slice(), &["deny"]].concat());
+    // The fuzz workspace's lockfile also selects the dependency cooldown and cargo deny (#219).
+    check(&["fuzz/Cargo.lock"], &[], &[every.as_slice(), &["dep-age", "deny"]].concat());
     // The code a target fuzzes, through its crate.
     let s = select(&["crates/wicket-store/src/cas.rs"]);
     for t in ["fuzz-store", "fuzz-egress", "fuzz-gateway", "fuzz-chan"] {

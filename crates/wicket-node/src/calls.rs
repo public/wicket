@@ -105,6 +105,13 @@ impl Calls {
                 }
                 None
             }
+            Frame::Msg(m @ Msg::IntakeEvents { .. }) => {
+                let Msg::IntakeEvents { id, .. } = &m else { unreachable!() };
+                if let Some(tx) = self.pending.lock().expect("pending").remove(id) {
+                    let _ = tx.send(m);
+                }
+                None
+            }
             Frame::Msg(m @ Msg::ImagePulled { .. }) => {
                 let Msg::ImagePulled { id, .. } = &m else { unreachable!() };
                 if let Some(tx) = self.pending.lock().expect("pending").remove(id) {
@@ -277,6 +284,24 @@ impl Calls {
             Ok(Ok(0)) => Ok(()),
             Ok(Ok(c)) => bail!("the node could not archive {tree} (tar exited {c})"),
             _ => bail!("the node did not finish archiving {tree}"),
+        }
+    }
+
+    /// Webhook intake (#578 step 4, protocol 20): sends the node the triggers its intake serves and
+    /// the events recorded since the last sync, and returns what it has spooled (oldest first,
+    /// bounded) and what intake refused since.
+    pub async fn intake_sync(
+        &self,
+        triggers: Vec<wicket_core::intake::IntakeTrigger>,
+        ack: Vec<String>,
+        serving: Vec<String>,
+        hold: Vec<String>,
+    ) -> Result<(Vec<wicket_core::intake::IntakeEvent>, wicket_core::intake::IntakeRefused)> {
+        let id = self.id();
+        match self.answer(id, Frame::Msg(Msg::IntakeSync { id, triggers, ack, serving, hold }), "an intake sync").await? {
+            Msg::IntakeEvents { error: Some(e), .. } => bail!("{e}"),
+            Msg::IntakeEvents { events, refused, .. } => Ok((events, refused)),
+            _ => bail!("an unexpected answer to an intake sync"),
         }
     }
 

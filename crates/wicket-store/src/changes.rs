@@ -39,8 +39,9 @@ impl Topic {
     fn tables(self) -> &'static [&'static str] {
         match self {
             // Everything a supervisor's grant sync reads: its grants, the standing reach (#572)
-            // published with them, and (below) its box's authority end.
-            Topic::Grants => &["grants", "standing"],
+            // published with them, what decides its public names' host ports (#575 step 4c: the
+            // names, and its node's labels and addresses), and (below) its box's authority end.
+            Topic::Grants => &["grants", "standing", "names", "node_labels", "node_addresses"],
             Topic::Asks => &["turn_cancels", "mode_changes"],
             Topic::Revocations => &["revocations", "nodes", "node_certs"],
             Topic::NodeCa => &["node_cas", "node_ca_policy", "node_ca_wants"],
