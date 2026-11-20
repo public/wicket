@@ -82,6 +82,50 @@ fn a_captured_generic_delivery_cant_be_replayed() {
     assert_eq!(replay("d-1", 1000 + ik::GENERIC_WINDOW_SECS + 1), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"), "later");
 }
 
+/// #714 fifth review: a delivery's reservation is given back if its hand-over to the node is
+/// dropped (the sender hung up), so the retry is taken; one the node took stays; one slowed down by
+/// the trigger's rate doesn't keep it either.
+#[test]
+fn a_dropped_hand_over_gives_its_delivery_back() {
+    let token = ik::new_token().unwrap();
+    let i = ready(vec![trig("webhook", &token)]);
+    let t = i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()).unwrap();
+    let at = Instant::now();
+    let Outcome::Spool(e) = i.verify(&t, &generic(1, "d-1", b"{}"), b"{}", 1, at) else { panic!("refused") };
+    assert_eq!(i.verify(&t, &generic(1, "d-1", b"{}"), b"{}", 1, at), Outcome::Answer(StatusCode::ACCEPTED, "already had it"));
+    drop(super::Handing { i: &i, e: &e, taken: false });
+    let Outcome::Spool(e) = i.verify(&t, &generic(1, "d-1", b"{}"), b"{}", 1, at) else { panic!("the retry is taken") };
+    drop(super::Handing { i: &i, e: &e, taken: true });
+    assert_eq!(i.verify(&t, &generic(1, "d-1", b"{}"), b"{}", 1, at), Outcome::Answer(StatusCode::ACCEPTED, "already had it"));
+    // Past the burst: a slowed-down delivery isn't reserved, so it can come again.
+    let mut slowed = None;
+    for n in 0..40 {
+        let id = format!("r-{n}");
+        if let Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, _) = i.verify(&t, &generic(1, &id, b"{}"), b"{}", 1, at) {
+            slowed = Some(id);
+            break;
+        }
+    }
+    let id = slowed.expect("slowed down");
+    assert_eq!(i.verify(&t, &generic(1, &id, b"{}"), b"{}", 1, at), Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down"), "not had");
+}
+
+/// #714 fifth review: concurrent copies of one delivery spool once.
+#[test]
+fn concurrent_copies_spool_once() {
+    let token = ik::new_token().unwrap();
+    let i = std::sync::Arc::new(ready(vec![trig("webhook", &token)]));
+    let t = i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()).unwrap();
+    let body = vec![b' '; 400 * 1024];
+    let spooled = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..16)
+            .map(|_| sc.spawn(|| matches!(i.verify(&t, &generic(1, "d-1", &body), &body, 1, Instant::now()), Outcome::Spool(_))))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap() as u32).sum::<u32>()
+    });
+    assert_eq!(spooled, 1);
+}
+
 /// GitHub: its own signature header; events and repositories it doesn't listen to are 202 and
 /// dropped; repository names ignore case; the fields are the normalised ones.
 #[test]

@@ -217,28 +217,31 @@ impl Intake {
         }
     }
 
-    /// Whether `t` has had this delivery (its body's hash, or its id) handed over recently.
-    fn seen(&self, t: &str, raw: &str, delivery: &str, at: Instant) -> bool {
+    /// Whether `t` has had this delivery (its body's hash, or its id) recently; if not, it is
+    /// reserved, in the same lock, so of concurrent copies only one goes on (#714 fifth review). A
+    /// reservation is kept for one dropped or handed over, and given back (`forget_keys`) for one
+    /// slowed down or refused by the node, or whose request went away.
+    fn reserve(&self, t: &str, raw: &str, delivery: &str, at: Instant) -> bool {
         let mut m = self.seen.lock().expect("seen");
-        let fresh = |k: &(String, String), m: &HashMap<(String, String), Instant>| {
-            m.get(k).is_some_and(|when| at.saturating_duration_since(*when) < Duration::from_secs(SEEN_SECS))
-        };
-        let (a, b) = ((t.to_string(), format!("b:{raw}")), (t.to_string(), format!("d:{delivery}")));
-        let hit = fresh(&a, &m) || fresh(&b, &m);
         m.retain(|_, when| at.saturating_duration_since(*when) < Duration::from_secs(SEEN_SECS));
-        hit
-    }
-
-    /// Remembers a verified delivery by its trigger, hash and id: one going to the node, or one
-    /// intake dropped (an event or repository not listened to), so that its replays cost nothing.
-    fn remember_keys(&self, trigger: &str, raw: &str, delivery: &str, at: Instant) {
-        let mut m = self.seen.lock().expect("seen");
+        let (a, b) = ((t.to_string(), format!("b:{raw}")), (t.to_string(), format!("d:{delivery}")));
+        if m.contains_key(&a) || m.contains_key(&b) {
+            return true;
+        }
         while m.len() + 2 > SEEN_MAX {
             let Some(oldest) = m.iter().min_by_key(|(_, w)| **w).map(|(k, _)| k.clone()) else { break };
             m.remove(&oldest);
         }
-        m.insert((trigger.to_string(), format!("b:{raw}")), at);
-        m.insert((trigger.to_string(), format!("d:{delivery}")), at);
+        m.insert(a, at);
+        m.insert(b, at);
+        false
+    }
+
+    /// Gives back a reservation.
+    fn forget_keys(&self, trigger: &str, raw: &str, delivery: &str) {
+        let mut m = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        m.remove(&(trigger.to_string(), format!("b:{raw}")));
+        m.remove(&(trigger.to_string(), format!("d:{delivery}")));
     }
 
     /// With the body: the signature, a delivery seen before, GitHub's event, body shape and
@@ -291,7 +294,7 @@ impl Intake {
         // as a new delivery isn't taken for a resend (#714 review F12).
         let raw = ik::body_sha256(signed_message.as_deref().unwrap_or(body));
         // Sent again (a replay, or a resend): 202, nothing spooled, nothing charged (#714 review F2).
-        if self.seen(&t.trigger, &raw, &delivery, at) {
+        if self.reserve(&t.trigger, &raw, &delivery, at) {
             return Outcome::Answer(StatusCode::ACCEPTED, "already had it");
         }
         // What wicket will never fire on is answered 202 (so GitHub doesn't send it again) and
@@ -315,7 +318,6 @@ impl Intake {
                 if why != "not listened to" {
                     self.refused.lock().expect("refused").other += 1;
                 }
-                self.remember_keys(&t.trigger, &raw, &delivery, at);
                 return Outcome::Answer(if why == "not json" { StatusCode::BAD_REQUEST } else { StatusCode::ACCEPTED }, why);
             }
             let v = v.expect("checked");
@@ -330,12 +332,11 @@ impl Intake {
             let mine = b.entry(t.trigger.clone()).or_insert_with(|| Bucket::full(PER_TRIGGER_BURST, at));
             if !mine.take(PER_TRIGGER_PER_MIN, PER_TRIGGER_BURST, at) || !self.all.lock().expect("all").take(ALL_PER_MIN, ALL_BURST, at) {
                 drop(b);
+                self.forget_keys(&t.trigger, &raw, &delivery);
                 self.refused.lock().expect("refused").rate += 1;
                 return Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down");
             }
         }
-        // Reserved now: a concurrent replay of it is "already had it" (forgotten if the node refuses).
-        self.remember_keys(&t.trigger, &raw, &delivery, at);
         Outcome::Spool(Box::new(IntakeEvent {
             id: String::new(),
             trigger: t.trigger.clone(),
@@ -350,9 +351,25 @@ impl Intake {
 
     /// Forgets a delivery reserved at verify that the node didn't take.
     pub fn forget(&self, e: &IntakeEvent) {
-        let mut m = self.seen.lock().expect("seen");
-        m.remove(&(e.trigger.clone(), format!("b:{}", e.raw_sha256)));
-        m.remove(&(e.trigger.clone(), format!("d:{}", e.delivery)));
+        self.forget_keys(&e.trigger, &e.raw_sha256, &e.delivery);
+    }
+}
+
+/// A delivery's reservation while it is handed to the node: given back when dropped unless the
+/// node took it, so a request that goes away mid-hand-over (the sender hangs up, or the connection's
+/// lifetime ends) doesn't leave its retry "already had it" (#714 fifth review). A double spool is
+/// caught by the control host's dedup.
+struct Handing<'a> {
+    i: &'a Intake,
+    e: &'a IntakeEvent,
+    taken: bool,
+}
+
+impl Drop for Handing<'_> {
+    fn drop(&mut self) {
+        if !self.taken {
+            self.i.forget(self.e);
+        }
     }
 }
 
@@ -576,16 +593,19 @@ async fn handle(
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     Ok(match i.verify(&t, &header, &body, now, at) {
         Outcome::Answer(code, word) => answer(code, word),
-        Outcome::Spool(e) => match ask(&sock, &serde_json::json!({ "op": "deliver", "event": e })).await {
-            // Remembered at verify, so concurrent replays don't each charge the bucket (#714 fourth
-            // review, R2).
-            Ok(v) if v["ok"] == true => answer(StatusCode::ACCEPTED, "accepted"),
-            // Full, or the node not up: forgotten again, so the sender's retry is taken.
-            _ => {
-                i.forget(&e);
-                answer(StatusCode::SERVICE_UNAVAILABLE, "try later")
+        Outcome::Spool(e) => {
+            // Reserved at verify, so concurrent replays don't each charge the bucket (#714 fourth
+            // review, R2); given back unless the node takes it.
+            let mut handing = Handing { i: &i, e: &e, taken: false };
+            match ask(&sock, &serde_json::json!({ "op": "deliver", "event": e })).await {
+                Ok(v) if v["ok"] == true => {
+                    handing.taken = true;
+                    answer(StatusCode::ACCEPTED, "accepted")
+                }
+                // Full, or the node not up: forgotten again, so the sender's retry is taken.
+                _ => answer(StatusCode::SERVICE_UNAVAILABLE, "try later"),
             }
-        },
+        }
     })
 }
 
