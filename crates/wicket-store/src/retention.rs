@@ -827,6 +827,9 @@ mod tests {
         let l = Ledger::open(&path).unwrap();
         assert!(l.auto_vacuum_incremental().unwrap(), "a new ledger is incremental");
         assert!(!l.make_auto_vacuum_incremental().unwrap());
+        // What an empty ledger takes (its tables and indexes), which no prune gives back: the check
+        // below is on what the chain added, so it holds however many tables the schema grows.
+        let empty = l.file_bytes().unwrap();
         chain(&l, 2000);
         let cp = Checkpoint {
             sink: "a".into(),
@@ -844,7 +847,8 @@ mod tests {
             steps += 1;
             assert!(steps < 100);
         }
-        assert!(l.file_bytes().unwrap() < big / 2, "{} of {big}", l.file_bytes().unwrap());
+        let after = l.file_bytes().unwrap();
+        assert!(after - empty < (big - empty) / 2, "{after} of {big}, {empty} of each for an empty ledger");
         let mem = Ledger::open_in_memory().unwrap();
         assert_eq!(mem.vacuum_step(10).unwrap(), 0, "not incremental: nothing");
         // Compacting needs the ledger to itself: another connection's write fails it at once.

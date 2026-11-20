@@ -6,6 +6,13 @@
 //! The owner label is `<machine>:<pid>:<start>`: the host's machine id, the process id, and the
 //! process's start time (field 22 of /proc/<pid>/stat), so a reused pid isn't mistaken for the owner.
 //! A box owned by a process on another machine is left alone: only that machine can tell.
+//!
+//! A run supervised as a task in a supervisor host (#582 step 5, `wicket supervise`) is owned by
+//! `host:<shard>:<epoch>` instead ([`host_label`]). No process of this build vouches for one, so a
+//! run's owner in that form is read as gone ([`owner_alive`]): a build that rolls back from hosts to
+//! processes adopts those runs with a process, as on any update (each run's `ctl/supervisor.lock`
+//! still keeps out a second supervisor while a host holds it). A box, though, is never stopped for
+//! it ([`judge`]): only the ledger can say whether a host holds it.
 
 use wicket_sandbox::BoxInfo;
 
@@ -38,9 +45,30 @@ pub fn owner_label_of(pid: u32) -> Option<String> {
     Some(format!("{}:{pid}:{}", machine_id(), start_time(pid)?))
 }
 
+/// The owner label of a run a supervisor host holds (#582 step 5): its shard and the epoch it holds
+/// the shard at.
+pub fn host_label(shard: &str, epoch: i64) -> String {
+    format!("{HOST_PREFIX}{shard}:{epoch}")
+}
+
+const HOST_PREFIX: &str = "host:";
+
+/// Whether an owner label names a supervisor host (`host:<shard>:<epoch>`), not a process. A machine
+/// id is hex, so it never reads `host`.
+pub fn is_host_label(label: &str) -> bool {
+    label
+        .strip_prefix(HOST_PREFIX)
+        .and_then(|r| r.rsplit_once(':'))
+        .is_some_and(|(shard, epoch)| !shard.is_empty() && epoch.parse::<i64>().is_ok())
+}
+
 /// Whether the process an owner label names is still running: None if it's on another machine (or
-/// the label is unreadable), so this machine can't tell.
+/// the label is unreadable), so this machine can't tell. A supervisor host's label is `Some(false)`:
+/// see the module's documentation.
 pub fn owner_alive(label: &str) -> Option<bool> {
+    if is_host_label(label) {
+        return Some(false);
+    }
     let mut f = label.splitn(3, ':');
     let (machine, pid, start) = (f.next()?, f.next()?.parse::<u32>().ok()?, f.next()?.parse::<u64>().ok()?);
     if machine != machine_id() {
@@ -62,6 +90,9 @@ pub enum Verdict {
 /// What to do with one box, by its owner label: a box without one is left alone (a node has no
 /// ledger to ask about its run).
 pub fn judge(b: &BoxInfo) -> Verdict {
+    if b.owner.as_deref().is_some_and(is_host_label) {
+        return Verdict::Unknown("supervised by a supervisor host: only the ledger can tell".into());
+    }
     match b.owner.as_deref().map(owner_alive) {
         Some(Some(true)) => Verdict::Live,
         Some(Some(false)) => Verdict::Orphan("its wicket process has exited".into()),
@@ -101,5 +132,20 @@ mod tests {
         assert!(matches!(judge(&boxed(Some("another-host:1:1".into()))), Verdict::Unknown(_)));
         assert!(matches!(judge(&boxed(Some("garbage".into()))), Verdict::Unknown(_)));
         assert!(matches!(judge(&boxed(None)), Verdict::Unknown(_)));
+    }
+
+    #[test]
+    fn a_host_label_reads_as_gone_for_a_run_and_unknown_for_a_box() {
+        let l = host_label("2", 7);
+        assert_eq!(l, "host:2:7");
+        assert!(is_host_label(&l));
+        // An older build's reconciler adopts the run with a process (#582 step 5, rollback).
+        assert_eq!(owner_alive(&l), Some(false));
+        // A node never stops a box for it.
+        assert!(matches!(judge(&boxed(Some(l))), Verdict::Unknown(_)));
+        for not in ["host:", "host:2", "host::7", "host:2:x", "hostx:2:7"] {
+            assert!(!is_host_label(not), "{not}");
+        }
+        assert!(!is_host_label(&owner_label()));
     }
 }
