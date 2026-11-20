@@ -125,7 +125,8 @@ function describe(a) {
       " \u00b7 for " + to + " \u00b7 " + days + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
   }
   if (a.action === "standing_deny") return "Deny standing reach " + s(a.standing) + ": " + ruleText(a.rule);
-  if (a.action === "release_fence") return "Release run " + s(a.run) + "'s fence on node " + s(a.node) + " (" + s(a.node_status) + "), fenced " +
+  if (a.action === "release_fence") return "Release run " + s(a.run) + "'s fence on node " + s(a.node) + " (" + s(a.node_status) +
+    (a.node_seen_ms ? ", last reported " + whenMs(a.node_seen_ms) : ", never reported") + "), fenced " +
     (a.fenced_until_ms ? "until " + whenMs(a.fenced_until_ms) : "until its node confirms the box stopped") +
     ": its agent can be woken while its box may still be running there \u00b7 " + s(a.why) + " \u00b7 reason: " + s(a.reason) +
     (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
@@ -1302,7 +1303,7 @@ async function refreshOnce() {
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
-    renderRows("fenced", s.fenced || [], fencedRow, "No run is fenced: every box this host started has stopped, or its node can say.");
+    renderRows("fenced", s.fenced || [], fencedRow, "No fence to release: no box is held by a node that is revoked, gone or silent. A reporting node's boxes are released by the node itself.");
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};

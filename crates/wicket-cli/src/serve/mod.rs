@@ -2905,7 +2905,7 @@ mod tests {
             (Some("n1"), Some("n1 was destroyed"), Some("unknown")),
             "{a}"
         );
-        assert_eq!(a["effect_sha256"].as_str(), Some(wicket_control::fence::effect(run, "n1", None).as_str()));
+        assert_eq!(a["effect_sha256"].as_str(), Some(wicket_control::fence::effect(run, "n1", None, "unknown", None).as_str()));
         let r = t.act(json!({ "action": "release_fence", "run": run, "reason": "n1 was destroyed" }));
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
         assert!(r.body["ok"].as_str().unwrap_or("").contains("released run"), "{:?}", r.body);
@@ -2924,6 +2924,71 @@ mod tests {
             StatusCode::NOT_FOUND,
             "isn't fenced",
         );
+    }
+
+    /// The review of #690: a healthy node's box (an enrolled node that reported just now, its
+    /// authority record live, as every node box has) isn't listed and its fence isn't released,
+    /// whoever asks; an operator whose authority doesn't cover `fence` is refused before the passkey;
+    /// another tenant's fenced run isn't found.
+    #[test]
+    fn only_a_fence_its_node_cant_end_is_released_and_only_by_an_operator_it_covers() {
+        let t = setup("fence-healthy");
+        let (healthy, lost, theirs) =
+            ("run_0000000000000000000healthy", "run_0000000000000000000000lost", "run_00000000000000000000theirs");
+        let mut l = t.ledger();
+        let tok = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        let now = wicket_store::now();
+        let node = wicket_store::NodeRow {
+            name: "n1".into(),
+            tenant: TenantId::single().0,
+            target: "wicket@203.0.113.7".into(),
+            host_key: "ssh-ed25519 AAAA".into(),
+            host_key_fp: "SHA256:x".into(),
+            node_key: "00".repeat(32),
+            ssh_key: None,
+            hosts: vec![],
+            enrolled_at: now,
+            status: "active".into(),
+            revoked_at: None,
+        };
+        let ca = wicket_store::NodeCaRow {
+            serial: "01".into(),
+            node: "n1".into(),
+            issued_at: now,
+            not_after: now + 3600,
+            hosts: vec![],
+            status: "active".into(),
+        };
+        l.enrol_node(&tok, &node, &ca).unwrap();
+        l.set_node_health("n1", wicket_feed::now_ms(), "{}").unwrap();
+        for (run, tenant, node) in
+            [(healthy, TenantId::single(), "n1"), (lost, TenantId::single(), "gone"), (theirs, TenantId("t9".into()), "gone")]
+        {
+            std::fs::create_dir_all(t.dir.join("runs").join(run).join("ctl")).unwrap();
+            std::fs::write(t.dir.join("runs").join(run).join("ctl/run.json"), b"not json").unwrap();
+            l.run_started(&tenant, &RunId(run.into()), "z", "lead").unwrap();
+            l.set_run_node(run, node).unwrap();
+        }
+        // What every node box has while it runs: its authority, live for another hour.
+        let until = wicket_feed::now_ms() + 3_600_000;
+        std::fs::write(t.dir.join("runs").join(healthy).join("ctl/authority.json"), json!({ "node": "n1", "until_ms": until }).to_string())
+            .unwrap();
+        drop(l);
+        let listed: Vec<String> =
+            dashboard(&t.state).unwrap()["fenced"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(listed, [lost], "the healthy node's box and the other tenant's aren't listed");
+        let begin = |run: &str| t.begin(json!({ "action": "release_fence", "run": run, "reason": "x" }));
+        assert_refused(&begin(healthy), StatusCode::CONFLICT, "node n1 is enrolled and reported");
+        assert_refused(&begin(theirs), StatusCode::NOT_FOUND, "isn't fenced");
+        fence::AUTHORITY.with(|a| {
+            *a.borrow_mut() =
+                Some(crate::operators::Authority::Scoped(crate::operators::Scope { kinds: vec!["http".into()], ..Default::default() }))
+        });
+        assert_refused(&begin(lost), StatusCode::FORBIDDEN, "may not decide fence requests");
+        assert_refused(&begin(healthy), StatusCode::FORBIDDEN, "may not decide fence requests");
+        fence::AUTHORITY.with(|a| *a.borrow_mut() = None);
+        assert_eq!(begin(lost).status, StatusCode::OK);
+        assert!(t.ledger().audit_latest(healthy, "run.fence_released").unwrap().is_none());
     }
 
     /// #256: the Capacity card issues and renews a standing capacity grant with signed actions,

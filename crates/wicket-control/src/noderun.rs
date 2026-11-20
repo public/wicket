@@ -72,7 +72,7 @@ fn changed(sh: &Shared, p: &mut Progress, topic: wicket_store::Topic) -> bool {
 
 /// A node's health is written to the ledger at most this often (ms), whichever of its runs'
 /// connections has it first: each reports the same, every 30 s.
-const HEALTH_WRITE_MS: i64 = 20_000;
+pub(crate) const HEALTH_WRITE_MS: i64 = 20_000;
 
 /// A node feed's directory holds this file when its feed must start a new generation the next time
 /// it is opened (after a restore, #154: its delta log stayed behind).
@@ -1838,7 +1838,7 @@ pub struct AuthorityRecord {
 /// The ledger's fence on a lapsed claim allows the same (#446).
 pub const WAKE_SKEW_MS: i64 = wicket_store::WAKE_SKEW_SECS * 1000;
 
-fn authority_file(run_dir: &Path) -> PathBuf {
+pub(crate) fn authority_file(run_dir: &Path) -> PathBuf {
     run_dir.join("ctl").join("authority.json")
 }
 
@@ -3131,18 +3131,17 @@ pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> a
     anyhow::ensure!(root, "only root releases a run's fence (its box may still be running on its node)");
     anyhow::ensure!(!reason.trim().is_empty(), "say why with --reason: it goes on the audit record");
     let l = wicket_store::Ledger::open(&crate::ledger_path())?;
-    let Some((node, until)) = fenced_until(&l, run, wicket_feed::now_ms()) else {
+    let runs = crate::data_dir().join("runs");
+    let now = wicket_feed::now_ms();
+    let Some(f) = crate::fence::fence_of(&l, &runs, run, now)? else {
         anyhow::bail!("run {run} isn't fenced: its node confirmed its box stopped, or its authority has ended");
     };
-    release_fence(&crate::data_dir().join("runs").join(run), by)?;
-    let until_ms = (until != UNKNOWN_END).then_some(until);
-    l.audit(
-        &l.run_tenant(run)?.unwrap_or_else(wicket_core::TenantId::single),
-        Some(&wicket_core::RunId(run.into())),
-        "run.fence_released",
-        &serde_json::json!({ "node": node, "by": by, "why": reason, "fenced_until_ms": until_ms }),
-    )?;
-    say!("released run {run}'s fence on node {node}; its box may still be running there");
+    // The same decision and record as the console's (#690), as root: any fence, whatever its node says.
+    let identity = crate::operators::Operator::cli(&f.tenant).ok().map(|o| o.id);
+    let by = crate::fence::Decider::Root { label: by.to_string(), identity };
+    let r = crate::fence::Release { run, reason, shown: &f.effect_sha256, now_ms: now, extra: serde_json::json!({ "via": "cli" }) };
+    let f = crate::fence::release(&l, &runs, &by, r)?;
+    say!("released run {run}'s fence on node {}; its box may still be running there", f.node);
     Ok(())
 }
 

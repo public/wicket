@@ -677,9 +677,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   run("submitRunForm({ preventDefault() {} })"); await flush();
   assert.deepStrictEqual((({ action, run, reason }) => [action, run, reason])(began().pop().body), ["release_fence", "run_f", "n1 was destroyed"]);
   const fw = ids["confirm-what"].textContent;
-  assert.ok(fw.startsWith("Release run run_f's fence on node n1 (revoked), fenced until its node confirms the box stopped") && fw.includes("reason: n1 was destroyed") && fw.includes("effect cdcdcdcd"), fw);
+  assert.ok(fw.startsWith("Release run run_f's fence on node n1 (revoked, never reported), fenced until its node confirms the box stopped") && fw.includes("reason: n1 was destroyed") && fw.includes("effect cdcdcdcd"), fw);
   assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: release"]);
   ids["confirm-cancel"].listeners.click(); await flush();
+  state = { ...base, pending: [], fenced: [] };
+  await run("refresh()"); await flush();
+  assert.ok(ids.fenced.textContent.startsWith("No fence to release"), ids.fenced.textContent);
   console.log("console fenced runs: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open
