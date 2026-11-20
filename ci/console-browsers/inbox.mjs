@@ -32,10 +32,7 @@ async function check(engine) {
   const page = await (await browser.newContext({ viewport: { width: 1280, height: 900 } })).newPage();
   const problems = [];
   page.on("pageerror", e => problems.push("error: " + (e.stack || e.message).split("\n").slice(0, 3).join(" ")));
-  // WebKit ignores a report-only policy without a `report-to`, and logs that as an error: a note
-  // about the header, not a problem of the page's (as in test.mjs).
-  const reportOnly = /delivered in report-only mode, but does not specify a 'report-to'/;
-  page.on("console", m => { if (m.type() === "error" && !reportOnly.test(m.text())) problems.push("console: " + m.text()); });
+  page.on("console", m => { if (m.type() === "error") problems.push("console: " + m.text()); });
   let state = { ...base, pending: [X, A, B] };
   const begun = [], finished = [];
   await page.route("**/api/**", async route => {
