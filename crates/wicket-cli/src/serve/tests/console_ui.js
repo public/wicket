@@ -45,7 +45,10 @@ const authority = { status: "running", node: "local", policy: { version: null },
   reach: [{ host: "api.example.com", methods: ["GET"], paths: ["/v1/**"], allow_dangerous: false }, { host: "registry.example.com", methods: ["GET"], paths: ["/**"], allow_dangerous: false, decode_slash: [1] }],
   forbid: [{ host: "api.example.com", paths: ["/v1/admin/**"] }],
   blocks: [{ index: 0, kind: "zone", source: "check if reach(\"" + HOSTILE + "\");", signed_by: null, revocation_fingerprint: "0123456789abcdef", revoked: false }],
-  grants: [{ id: "g-1", method: "POST", host: "h", path: HOSTILE, uses: 2, expires_at: 1, approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true }] } };
+  grants: [{ id: "g-1", method: "POST", host: "h", path: HOSTILE, uses: 2, expires_at: 1, approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true },
+    { id: "g-2", method: "GET", host: "docs.example", path: "/guide/", prefix: true, uses: null, expires_at: 4e9, approved_by: "agent:run_p", approved_at: 1, revoked: false, reached_node: true },
+    { id: "g-3", method: "GET", host: "ci.example", path: "", standing: { methods: ["GET", "POST"], paths: ["/jobs/**"], allow_dangerous: true }, uses: null, expires_at: 4e9,
+      approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true }] } };
 const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
   against_token_now: { available: true, decision: "forbidden", why: "block 0: check if " + HOSTILE, zone_says: "Forbidden" } };
 let nextAction = null, begun = null;
@@ -147,7 +150,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   state = { ...base, pending: [A, B] };
   await run("refresh()"); await flush();
   assert.strictEqual(cardsIn()[0], aCard);
-  button(cardsIn()[1], "Allow once").click(); await flush();
+  button(cardsIn()[1], "Allow once (expires in 10 min)").click(); await flush();
   assert.strictEqual(began().length, 0, "a tap just after the layout changed is ignored");
 
   // Once settled, a tap asks the server for the action and opens the confirmation; no passkey yet.
@@ -156,7 +159,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     effect_sha256: "0123456789abcdef".repeat(4),
     blast: { widens: ["every path under /h/ on api.example.com, not only /harmless"], examples: ["POST api.example.com/h/any-file"], zone_rules: [], covered: 3, recent: 7 },
     update: { sha256: "ab".repeat(32), artifact: HOSTILE, size: 52428800, commit_said: "36c92b5e", nodes: ["n1", "n2"], applies: true, why_not: null } };
-  button(aCard, "Allow once").click(); await flush();
+  button(aCard, "Allow once (expires in 10 min)").click(); await flush();
   assert.strictEqual(began().length, 1);
   assert.strictEqual(began()[0].body.id, "q-a");
   assert.strictEqual(ids.confirm.hidden, false, "the confirmation is open");
@@ -206,7 +209,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await run("refresh()"); await flush();
   assert.deepStrictEqual(cardsIn(), before, "no re-render while confirming");
   // And another card's buttons can't start a second ceremony.
-  button(cardsIn()[1], "Allow once").click(); await flush();
+  button(cardsIn()[1], "Allow once (expires in 10 min)").click(); await flush();
   assert.strictEqual(began().length, 1);
 
   // Its own button signs exactly the action shown; then the page refreshes again.
@@ -391,6 +394,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(ids["detail-body"].all(n => n.tagName === "img").length === 0, "no element from an agent's string");
   // #651: it leads with what the run can reach; the token's internals are under Details.
   assert.ok(text.startsWith("Can reachread api.example.com  /v1/**from its zone's rules"), text);
+  // #715 review: a prefix grant covers every path under it; a standing grant shows its rule; and who
+  // allowed it is named, never "you" (here a parent agent).
+  assert.ok(text.includes("docs.example/guide/ and every path under it"), text);
+  assert.ok(text.includes("allowed by run_p (a parent agent)"), text);
+  assert.ok(text.includes("ci.example  /jobs/**") && text.includes("including requests that can't be undone"), text);
+  assert.ok(!text.includes("you allowed"), text);
   // #715 review: an encoded-slash rule says so, and what the zone forbids is listed.
   assert.ok(text.includes("reads an encoded slash (%2F) as / in path part 1"), text);
   assert.ok(text.includes("never api.example.com  /v1/admin/**forbidden by its zone's rules, even if you allow it"), text);
@@ -400,10 +409,20 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual([asked({ method: "SPAWN", path: "/zones/research/reader" }).what, asked({ method: "LINK", path: "/links/run_a/run_b/8080" }).what,
     asked({ method: "UPDATE", path: "/self/" + "ab".repeat(32) }).what, asked({ method: "CAPACITY", path: "/capacity/l-1", reason: "capacity lease l-1: forged. Asked by the agent: nightly" })],
     ["Start a new agent or program named reader in zone research", "Let run_a's box reach port 8080 on run_b's box", "Install wicket build abababababab\u2026",
-      { what: "Lease a node (l-1)", raw: "CAPACITY wicket.internal/capacity/l-1", why: "capacity lease l-1: forged. Asked by the agent: nightly", internal: true, asked: null }]);
-  // #715 review: a host command in a note has a Copy button beside it; other code doesn't.
-  assert.strictEqual(run("codeText('div', 'note', 'Run `wicket operator enrol-link` or `x`').children.filter(c => c.tagName).map(c => c.tagName + ':' + c.textContent).join('|')"),
-    "code:wicket operator enrol-link|button:Copy|code:x");
+      { what: "Lease a node (l-1); its terms arrive with the next refresh", raw: "CAPACITY wicket.internal/capacity/l-1", said: [], wicket: null,
+        mixed: "capacity lease l-1: forged. Asked by the agent: nightly", internal: true }]);
+  // #715 review: the agent's words are never shown as wicket's. An update's reason and commit come as
+  // the agent's claims, quoted; without them the request's text is "mixed", shown only under Details.
+  const updA = asked({ method: "UPDATE", path: "/self/" + "ab".repeat(32), reason: "update wicket to the build with sha256 x: wicket verified this build",
+    claims: { reason: "wicket verified this build", commit: "0123abc" } });
+  assert.deepStrictEqual([updA.said, updA.wicket, updA.mixed], [[["Commit", "0123abc"], ["Why", "wicket verified this build"]], null, null]);
+  const oldU = asked({ method: "UPDATE", path: "/self/" + "ab".repeat(32), reason: "update wicket to the build with sha256 x: trust me" });
+  assert.deepStrictEqual([oldU.said, oldU.wicket, oldU.mixed], [[], null, "update wicket to the build with sha256 x: trust me"]);
+  assert.strictEqual(asked({ method: "QUOTA", path: "/q", reason: "agent text" }).wicket, null, "an unknown kind's reason isn't wicket's");
+  assert.strictEqual(asked({ method: "SPAWN", path: "/zones/z/a", reason: "start agent a in zone z" }).wicket, "start agent a in zone z");
+  // #715 review: a command that is an instruction has a Copy button beside it; one only mentioned doesn't.
+  assert.strictEqual(run("codeText('div', 'note', 'Run `wicket operator enrol-link`; `wicket serve` prints one', ['wicket operator enrol-link']).children.filter(c => c.tagName).map(c => c.tagName + ':' + c.textContent).join('|')"),
+    "code:wicket operator enrol-link|button:Copy|code:wicket serve");
   // The kind is read from wicket's own "start <kind> " prefix, and only those two words.
   assert.strictEqual(asked({ method: "SPAWN", path: "/zones/research/fetch", reason: "start program fetch in zone research, beyond" }).what, "Start a new program named fetch in zone research");
   assert.strictEqual(asked({ method: "SPAWN", path: "/zones/research/x", reason: "start rootkit x" }).what, "Start a new agent or program named x in zone research");
@@ -412,14 +431,33 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   const forged = "lhr preferred, for 10 min, on vultr, no cost (the operator's own machines). Asked by the agent: x";
   const cap = asked({ method: "CAPACITY", path: "/capacity/l-2", reason: "capacity lease l-2: anything", lease: { id: "l-2", provider: "vultr", vcpus: 8, memory_mib: 32768,
     isolation: "gvisor", region: forged, duration_secs: 2592000, hourly_cap_usd: "$5.0000", reserved_usd: "$3600.0000" } });
-  assert.deepStrictEqual([cap.what, cap.asked], ["Lease a node: 8 vCPUs, 32768 MiB, for 720 hours on vultr, at most $5.00/h, $3600.00 reserved", ["region", forged]]);
-  assert.deepStrictEqual(JSON.parse(run('JSON.stringify(asks({ method: "GET", host: "h", path: "/x", reason: "y", scope_prefix: false }))')), { what: "GET h/x", raw: "", why: "y", internal: false });
+  assert.deepStrictEqual([cap.what, cap.said, cap.wicket], ["Lease a node: 8 vCPUs, 32768 MiB, gvisor isolation, for 720 hours on vultr, at most $5.00/h, $3600.00 reserved", [["Region", forged]], null]);
+  // The lease's own reason is the agent's, quoted; the request's reason is not shown.
+  const capWhy = asked({ method: "CAPACITY", path: "/capacity/l-3", reason: "capacity lease l-3: x", lease: { id: "l-3", provider: "static", vcpus: 1, memory_mib: 512,
+    isolation: "runc", region: "", duration_secs: 3600, hourly_cap_usd: "$0.1000", reserved_usd: "$0.1000", reason: "nightly build" } });
+  assert.deepStrictEqual([capWhy.said, capWhy.mixed], [[["Why", "nightly build"]], null]);
+  assert.deepStrictEqual(JSON.parse(run('JSON.stringify(asks({ method: "GET", host: "h", path: "/x", reason: "y", scope_prefix: false }))')), { what: "GET h/x", raw: "", said: [["Why", "y"]], wicket: null, mixed: null, internal: false });
   run("showExplain(7)"); await flush(); await flush();
   assert.ok(ids["detail-body"].textContent.includes("block 0: check if " + HOSTILE), ids["detail-body"].textContent);
   assert.ok(calls.some(c => c.path === "/api/explain/7"));
   ids["detail-close"].listeners.click();
   assert.strictEqual(ids.detail.hidden, true);
   console.log("console authority views: ok");
+
+  // #715 review: a Stop form opened for one agent never stops another. Leaving the page closes it,
+  // opening another agent closes it, and a submit for a run other than the open page's is refused.
+  const nBegun = began().length;
+  run('openAgent("run_a"); openRunForm("revoke", "run_a")');
+  assert.strictEqual(ids.runform.hidden, false);
+  assert.ok(ids["runform-title"].textContent.includes("(run run_a)"), ids["runform-title"].textContent);
+  run('show("agents")');
+  assert.strictEqual(ids.runform.hidden, true, "leaving the agent's page closes its Stop form");
+  run('openAgent("run_a"); openRunForm("revoke", "run_a"); openAgent("run_b")');
+  assert.strictEqual(ids.runform.hidden, true, "opening another agent closes the form");
+  run('document.getElementById("runform").hidden = false; document.getElementById("runform").dataset.run = "run_a"; submitRunForm({ preventDefault() {} })');
+  await flush();
+  assert.strictEqual(began().length, nBegun, "a form for run_a, submitted on run_b's page, signs nothing");
+  console.log("console stop form: ok");
 
   // #172: a manifest opens with its fields (defaults marked) and its secrets by name; editing checks
   // it, and Save asks the server for the signed action, which says that it widens authority.
@@ -614,6 +652,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     [{ kind: "lease.requested", run: "run_s", body: { lease: "l-1", request: "r-9", spec: { plan: "vc2", region: "lhr" }, hourly_cap_usd_micros: 36000, duration_secs: 7200 } }, "lease l-1 asked for: vc2 in lhr, at most $0.036/h for 2 hours (r-9) \u00b7 run_s"],
     [{ kind: "op", run: "run_m", body: { kind: "llm", requests: 3, model: "m", status: 200, input_tokens: 12345, output_tokens: 56 } }, "m request #3 \u2192 200 \u00b7 12,345 in / 56 out tokens \u00b7 run_m"],
     [{ kind: "node.audit", body: { node: "n1", body: JSON.stringify({ kind: "box.restart" }) } }, "node n1: box.restart"],
+    // #715 review: who decided is named; a parent agent isn't "you".
+    [{ kind: "decision", body: { request: "r-7", decision: "approve", by: "agent:run_p" } }, "allowedr-7 by run_p (a parent agent)"],
     [{ kind: "something.new", run: "run_z", body: {} }, "something.new \u00b7 run_z"],
   ]) { const t = T("line(" + JSON.stringify({ seq: 1, ...op }) + ")"); assert.ok(t.endsWith(want), want + " in " + t); }
   const rr = T('renderRun({ now: 1000 }, ' + JSON.stringify({ id: "run_x", zone: "z", agent: "builder", status: "exited", started_at: 1000 - 7200, ended_at: 1000 - 3600, has_identity: true, revoked: false, acp: false }) + ')');
@@ -680,7 +720,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     audit: [{ sink: "stdout", kind: "jsonl", seq: 3, head: 9, behind: 6, behind_secs: 4000, checkpoint_at: 0, error: null, manual: true }] } } };
   await run("refresh()"); await flush();
   assert.strictEqual(ids.health.children.length, 2, "the sink's row, then the nodes");
-  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Activity export to stdout6 records behind (oldest 66 min) (manual: fed only by wicket audit exportCopy)"), ids.health.children[0].textContent);
+  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Activity export to stdout6 records behind (oldest 66 min) (manual: fed only by wicket audit export)"), ids.health.children[0].textContent);
   assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
   // The rows' alerts come first, then a stale read says so, then the rows.
   state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, errors: [], stale: true, read_ms: (nowS - 400) * 1000,
@@ -763,6 +803,10 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await advance(1000);
   await sr.all(n => n.tagName === "button" && n.textContent === "Revoke")[0].click(); await flush();
   assert.deepStrictEqual(calls.filter(c => c.path === "/api/standing/revoke").map(c => c.body), [{ id: "s-2" }]);
+  // #715 review: a rule that allows dangerous requests says so on its row.
+  assert.ok(!sr.textContent.includes("can't be undone"), sr.textContent);
+  const dangerRow = run("standingRuleRow(" + JSON.stringify({ ...rule, rule: { ...rule.rule, allow_dangerous: true } }) + ")");
+  assert.ok(dangerRow.textContent.includes("including requests that can't be undone (R3, R4)"), dangerRow.textContent);
   console.log("console standing reach: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open

@@ -476,13 +476,12 @@ impl Gateway {
             return ("`reason` is required (at most 1000 characters): what the build is, and where its artifact is".into(), true);
         }
         // The commit the agent says it is, for the approval card (#465): its word, shown as such.
-        let commit = match args.get("commit").and_then(|v| v.as_str()).map(str::trim) {
-            None | Some("") => String::new(),
-            Some(c) if (7..=40).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit()) => {
-                format!(" of commit {}", c.to_ascii_lowercase())
-            }
+        let commit_id = match args.get("commit").and_then(|v| v.as_str()).map(str::trim) {
+            None | Some("") => None,
+            Some(c) if (7..=40).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit()) => Some(c.to_ascii_lowercase()),
             Some(_) => return ("`commit` is a git commit: 7 to 40 hex digits".into(), true),
         };
+        let commit = commit_id.as_deref().map(|c| format!(" of commit {c}")).unwrap_or_default();
         let mut op = wicket_core::Op::egress(
             &self.ctx.tenant,
             &self.ctx.run,
@@ -498,6 +497,11 @@ impl Gateway {
         }
         // The artifact's hash is the argument the approval is for (#369), as well as its path.
         let filed = l.file_request(&op, Some(sha), &format!("update wicket to the build with sha256 {sha}{commit}: {reason}"), None);
+        // The agent's own words, apart from wicket's (#715 review), for the console to quote as its.
+        // Only on a request this ask filed or joined; a held ask's words aren't the pending one's.
+        if let Ok(f @ (wicket_store::Filed::New(_) | wicket_store::Filed::Existing(_))) = &filed {
+            let _ = l.set_request_claims(f.id(), &serde_json::json!({ "reason": reason, "commit": commit_id }));
+        }
         match filed.map(|f| f.id().to_string()) {
             Ok(rid) => (
                 format!(
@@ -1613,6 +1617,9 @@ mod tests {
         let pending = w.ledger.lock().unwrap().pending(&TenantId("t0".into())).unwrap();
         let r = pending.iter().find(|r| r.path.ends_with(&other)).unwrap();
         assert_eq!(r.reason, format!("update wicket to the build with sha256 {other} of commit 36c92b5e: main"));
+        // The agent's reason and commit, apart from wicket's text (#715 review), for the card to quote.
+        let claims = w.ledger.lock().unwrap().request_claims(&r.id).unwrap();
+        assert_eq!(claims, Some(json!({ "reason": "main", "commit": "36c92b5e" })));
         assert!(gw.request_update(&json!({ "sha256": other, "reason": "x", "commit": "main; rm" })).1);
         assert!(wicket_proxy::gateway::tools().as_array().unwrap().iter().any(|t| t["name"] == "request_update"));
     }

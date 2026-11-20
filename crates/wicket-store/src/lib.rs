@@ -203,7 +203,10 @@ pub enum StoreError {
 /// starts once retention has pruned its front, which target each sink's cursor is for, and the
 /// checkpoints retention asked the exporter to sign. Older builds don't read them; a prune raises
 /// the floor to 32, so a build that would walk a pruned chain from seq 1 refuses the ledger.
-pub const SCHEMA_VERSION: u32 = 32;
+/// Version 33 (expand, after 32) adds `request_claims` (#715 review): what the agent claimed when it
+/// asked (an update's reason and commit), kept apart from the request's reason so the console can
+/// show the agent's words as the agent's. Older builds don't read it; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 33;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -423,6 +426,7 @@ CREATE TABLE IF NOT EXISTS requests (
   attribution TEXT NOT NULL DEFAULT '[]', scope_prefix INTEGER NOT NULL DEFAULT 0, args_sha256 TEXT
 );
 CREATE INDEX IF NOT EXISTS requests_pending ON requests (tenant, zone, digest, status);
+CREATE TABLE IF NOT EXISTS request_claims (request_id TEXT PRIMARY KEY, claims TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS requests_run ON requests (run, status);
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,

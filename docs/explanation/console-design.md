@@ -116,8 +116,9 @@ Allow:  [ Once ]  [ For 1 hour ]  [ Always… ]      [ Don't allow ]
 - An agent whose identity doesn't check out: the card says "We can't confirm this is release-bot"
   and offers only Don't allow.
 
-The signing sheet that opens on a choice says the same thing the card does, in the same words. Under
-it, unchanged, are what the passkey signs: the effect the server sent and its hash.
+The signing sheet that opens on a choice is to say the same thing the card does, in the same words
+(not yet: see Open). Under it, unchanged, are what the passkey signs: the effect the server sent and
+its hash.
 
 ## Words
 

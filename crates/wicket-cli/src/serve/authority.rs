@@ -194,6 +194,10 @@ fn run_authority(state: &State, run: &str) -> Result<Value> {
             "method": g.method,
             "host": g.host,
             "path": g.path,
+            // A prefix grant covers every path under `path`; a standing grant is a rule on the host
+            // (its methods, path globs and allow_dangerous), not the one `method`/`path` (#715 review).
+            "prefix": g.prefix,
+            "standing": g.standing.as_ref().map(|r| json!({ "methods": r.methods, "paths": r.paths, "allow_dangerous": r.allow_dangerous })),
             "uses": g.uses,
             "uses_left_on_control_host": row.as_ref().and_then(|r| r.uses_left),
             "expires_at": row.as_ref().map(|r| r.expires_at),

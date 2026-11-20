@@ -112,13 +112,15 @@ function copyButton(cmd) {
   };
   return b;
 }
-function codeText(tag, cls, text) {
+// `copy`: the commands in `text` that are instructions to run, each given a Copy button (#715
+// review); a command only mentioned gets none.
+function codeText(tag, cls, text, copy = []) {
   const e = el(tag, cls);
   String(text).split("`").forEach((part, i) => {
     if (!part) return;
     if (i % 2 === 0) { e.append(document.createTextNode(part)); return; }
     e.append(el("code", "", part));
-    if (/^wicket [a-z]/.test(part)) e.append(copyButton(part));
+    if (copy.includes(part)) e.append(copyButton(part));
   });
   return e;
 }
@@ -458,28 +460,40 @@ const r0 = rs => rs[0];
 const shortText = id => id.length > 18 ? id.slice(0, 10) + "\u2026" + id.slice(-6) : id;
 function asks(p) {
   const raw = strip(p.method + " " + p.host + p.path);
-  if (p.host !== "wicket.internal") return { what: raw + (p.scope_prefix ? "\u2026  (every path under it)" : ""), raw: "", why: strip(p.reason), internal: false };
+  if (p.host !== "wicket.internal") return { what: raw + (p.scope_prefix ? "\u2026  (every path under it)" : ""), raw: "", said: [["Why", strip(p.reason)]], wicket: null, mixed: null, internal: false };
   const seg = String(p.path || "").split("/").filter(Boolean).map(strip);
-  let what = raw, why = strip(p.reason);
-  let asked = null;
+  // Three kinds of text, kept apart (#715 review): `what`, wicket's sentence from fields it checked;
+  // `said`, what the agent chose (quoted, as its words); `wicket`, a reason wicket wrote whole (a
+  // spawn's limits, a link's policy). A reason that mixes wicket's words with the agent's is never
+  // shown as wicket's: when its parts aren't sent apart, it is `mixed`, shown under Details as such.
+  let what = raw, said = [], wicket = null, mixed = null;
   if (p.method === "CAPACITY") {
     const x = p.lease;
     if (x) {
-      what = "Lease a node: " + plural(Number(x.vcpus) || 0, "vCPU", "vCPUs") + ", " + (Number(x.memory_mib) || 0) + " MiB, for " + span(Number(x.duration_secs) || 0) +
-        " on " + strip(x.provider) + ", at most " + money(x.hourly_cap_usd) + "/h, " + money(x.reserved_usd) + " reserved";
-      if (x.region) asked = ["region", strip(x.region)];
-    } else what = "Lease a node (" + seg.slice(1).join("/") + ")";
+      what = "Lease a node: " + plural(Number(x.vcpus) || 0, "vCPU", "vCPUs") + ", " + (Number(x.memory_mib) || 0) + " MiB, " + strip(x.isolation || "default") + " isolation, for " +
+        span(Number(x.duration_secs) || 0) + " on " + strip(x.provider) + ", at most " + money(x.hourly_cap_usd) + "/h, " + money(x.reserved_usd) + " reserved";
+      if (x.region) said.push(["Region", strip(x.region)]);
+      if (x.reason) said.push(["Why", strip(x.reason)]);
+    } else { what = "Lease a node (" + seg.slice(1).join("/") + "); its terms arrive with the next refresh"; mixed = strip(p.reason); }
   } else if (p.method === "SPAWN" && seg[0] === "zones") {
     // wicket writes the reason as "start <kind> …"; only its two kinds are read from it, nothing else.
     const k = /^start (agent|program) /.exec(String(p.reason || ""));
     what = "Start " + (k ? "a new " + k[1] : "a new agent or program") + (seg[2] ? " named " + seg[2] : "") + " in zone " + seg[1];
+    wicket = strip(p.reason);
   } else if (p.method === "LINK" && seg[0] === "links") {
     // The path is /links/<from run>/<to run>/<port>: the port is on the second box, the one linked to.
     const nm = id => { const n = runName(id); return n === id ? shortText(n) : n; };
     what = "Let " + nm(seg[1]) + "'s box reach port " + (seg[3] || "?") + " on " + nm(seg[2]) + "'s box";
-  }
-  else if (p.method === "UPDATE" && seg[0] === "self") what = "Install wicket build " + String(seg[1] || "").slice(0, 12) + "\u2026";
-  return { what, raw, why, internal: true, asked };
+    wicket = strip(p.reason);
+  } else if (p.method === "UPDATE" && seg[0] === "self") {
+    what = "Install wicket build " + String(seg[1] || "").slice(0, 12) + "\u2026";
+    const c = p.claims;
+    if (c) {
+      if (c.commit) said.push(["Commit", strip(c.commit)]);
+      if (c.reason) said.push(["Why", strip(c.reason)]);
+    } else mixed = strip(p.reason);
+  } else mixed = strip(p.reason);
+  return { what, raw, said, wicket, mixed, internal: true };
 }
 
 // Pending cards are kept by request id: a card whose content hasn't changed is the same element
@@ -567,7 +581,7 @@ function whoAsks(id) {
 }
 function fillMeta(meta, p) { meta.replaceChildren(document.createTextNode(p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 run "), idEl(p.run)); }
 function pendingCard(s, p) {
-  const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run, p.lease]);
+  const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run, p.lease, p.claims, p.once_terms]);
   const had = cards.get(p.id);
   if (had && had.key === key) { had.age.textContent = rel(p.created_at, s.now); return had.node; }
   // Labelled fields (docs/explanation/console-design.md): who, wants to, where, why, risk; then the
@@ -585,12 +599,10 @@ function pendingCard(s, p) {
   // The verb, and always the exact method beside it (#715 review): a verb alone could mislead.
   if (a.internal) field(dl, "Wants to", a.what.charAt(0).toLowerCase() + a.what.slice(1), "said");
   else { field(dl, "Wants to", verb(p) + " (" + strip(p.method) + ")", "said"); field(dl, "Where", where(p)); }
-  // What the agent chose, as its own value, out of wicket's sentence (#709 review).
-  if (a.asked) field(dl, a.asked[0].charAt(0).toUpperCase() + a.asked[0].slice(1), "\u201c" + a.asked[1] + "\u201d", "asked");
-  // An agent's reason is quoted as its words; wicket's own kinds carry wicket's text, labelled so
-  // (#715 review), with what it says in full (a spawn's limits beyond its parent, say).
-  if (a.internal) field(dl, "wicket says", a.why, "why");
-  else field(dl, "Why", "\u201c" + a.why + "\u201d", "why");
+  // What the agent chose, quoted and labelled as its words (#709, #715 review); text wicket wrote
+  // whole, labelled as wicket's.
+  for (const [label, text] of a.said) field(dl, label + (label === "Why" ? "" : ", as the agent says"), "\u201c" + text + "\u201d", label === "Why" ? "why" : "asked");
+  if (a.wicket) field(dl, "wicket says", a.wicket, "why");
   c.append(dl);
   // How far a grant reaches stays on the card (#709 review); who in the box asked is detail.
   c.append(renderWho(p.attribution || [], "warnings"));
@@ -599,6 +611,7 @@ function pendingCard(s, p) {
   const id = p.identity || {};
   if (id.verified) more.append(el("div", "chain", "On behalf of: " + (id.acting_for || []).map(strip).join(" \u2192 ")));
   more.append(el("div", "mono raw", strip(p.method + " " + p.host + p.path) + " \u00b7 risk class " + riskCode(p.risk)));
+  if (a.mixed) more.append(el("div", "meta", "The request's text, with the agent's words in it: \u201c" + a.mixed + "\u201d"));
   more.append(renderWho(p.attribution || [], "list"));
   const meta = el("div", "meta");
   fillMeta(meta, p);
@@ -608,7 +621,7 @@ function pendingCard(s, p) {
   // as a window whatever is picked, and the card mustn't say otherwise.
   const ot = p.once_terms || { uses: 1, ttl_secs: 600 };
   const window_ = ot.uses !== 1;
-  const onceLabel = window_ ? "Allow for " + span(ot.ttl_secs) + " (any number of uses)" : a.internal ? "Allow" : "Allow once";
+  const onceLabel = window_ ? "Allow for " + span(ot.ttl_secs) + " (any number of uses)" : a.internal ? "Allow" : "Allow once (expires in " + span(ot.ttl_secs) + ")";
   const once = el("button", "approve", onceLabel); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
   const hour = el("button", "", "Allow for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
   const deny = el("button", "deny apart", "Don't allow"); deny.onclick = () => act("deny", { id: p.id });
@@ -718,7 +731,15 @@ function egressOf(op) {
 const num = n => Number(n || 0).toLocaleString("en-US");
 // Who did it: an operator by their passkey's name ("passkey:phone" is "phone"), signed or not.
 const byName = x => strip(String(x || "").replace(/^passkey:/, ""));
-const by = b => b.by ? " by " + byName(b.by) + (b.signed ? ", signed with a passkey" : "") : "";
+// Who decided, from the decider's label (#715 review): never "you", since another operator, a parent
+// agent (`agent:<run>`) or a standing capacity grant (`capacity-grant:<id>`) may have.
+function decider(label) {
+  const s = String(label || "");
+  if (s.startsWith("agent:")) return runName(s.slice(6)) + " (a parent agent)";
+  if (s.startsWith("capacity-grant:")) return "capacity grant " + strip(s.slice(15));
+  return s ? byName(s) : "?";
+}
+const by = b => b.by ? " by " + decider(b.by) + (b.signed ? ", signed with a passkey" : "") : "";
 function logLine(op, tag, tone, text, extra) {
   const d = el("div", "logline");
   d.dataset.cat = /^(decision|standing|grant|capacity|lease)/.test(op.kind) ? "decisions" : /^(run|identity|session|operator\.message)/.test(op.kind) || (op.body || {}).kind === "llm" || (op.body || {}).kind === "box" ? "agents" : /^node/.test(op.kind) ? "servers" : "other";
@@ -755,7 +776,7 @@ function line(op) {
     case "op.llm": return logLine(op, "model", "", strip(b.model || "?") + " request #" + num(b.requests) + " \u2192 " + strip(b.status) +
       " \u00b7 " + num(b.input_tokens) + " in / " + num(b.output_tokens) + " out tokens" + (r ? " \u00b7 " + r : ""));
     case "op.box": return logLine(op, "box", "pend", strip(b.what) + ": " + strip(b.detail) + (r ? " \u00b7 " + r : ""));
-    case "decision": return logLine(op, b.decision === "approve" ? "you allowed" : "you refused", b.decision === "approve" ? "ok" : "blocked", strip(b.request) + by(b));
+    case "decision": return logLine(op, b.decision === "approve" ? "allowed" : "refused", b.decision === "approve" ? "ok" : "blocked", strip(b.request) + by(b));
     case "decision.refused": return logLine(op, "refused", "blocked", "a decision (" + strip(b.decision) + ") on " + strip(b.target) + " was refused" +
       (b.by ? " for " + strip(b.by) : "") + ": " + strip(b.why));
     case "grant.revoked": return logLine(op, "revoked", "", "grant " + strip(b.grant) + " revoked" + by(b));
@@ -976,9 +997,10 @@ function standingRuleRow(r) {
   const d = el("div", "row cap");
   const head = el("div");
   const rr = r.rule || {};
-  const reads = (rr.methods || []).every(m => /^(GET|HEAD|OPTIONS)$/i.test(m));
   const to = r.for === "zone" ? "every agent in zone " + strip(r.zone) : principalName(r.principal);
   head.append(r.for === "zone" ? el("span", "run-name", to) : principalEl(r.principal), el("span", "", " may " + verbsOf(rr.methods) + " "), el("span", "mono", strip(rr.host)));
+  // On the row, not only in its title (#715 review): this rule allows requests that can't be undone.
+  if (rr.allow_dangerous) head.append(document.createTextNode(" "), el("span", "risk r4", "including requests that can't be undone (R3, R4)"));
   head.title = "standing reach " + strip(r.id) + ": " + ruleText(r.rule);
   const until = r.expires_at ? (r.live ? "ends " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
   const b = el("div", "buttons");
@@ -1073,6 +1095,8 @@ function renderRun(s, x, page) {
 // An agent's page: its name, state and links, what it can reach (the authority view, #651), and what
 // it did. Stop is the signed revoke, from here only.
 function openAgent(run) {
+  // A Stop form left open for another agent goes (#715 review): its submit would revoke that one.
+  if (agentRun !== run) closeRunForm();
   agentRun = run;
   show("agent");
   renderAgentHead();
@@ -1108,18 +1132,25 @@ function openRunForm(kind, run) {
   const f = document.getElementById("runform"), text = document.getElementById("runform-text");
   f.dataset.kind = kind; f.dataset.run = run;
   f.className = "card " + kind;
+  // Named in the question, with its run, so the operator sees which agent they stop (#715 review).
   document.getElementById("runform-title").textContent =
-    "Stop this agent? Its identity is revoked: its box stops and nothing it asks can be allowed. Say why (it goes in the activity log):";
+    "Stop " + runName(run) + " (run " + strip(run) + ")? Its identity is revoked: its box stops and nothing it asks can be allowed. Say why (it goes in the activity log):";
   const go = document.getElementById("runform-go");
   go.textContent = "Stop agent";
   go.className = "deny";
   text.value = "revoked by the operator";
   f.hidden = false; text.focus();
 }
-function closeRunForm() { const f = document.getElementById("runform"); f.hidden = true; document.getElementById("runform-text").value = ""; }
+function closeRunForm() {
+  const f = document.getElementById("runform");
+  if (!f) return;
+  f.hidden = true; f.dataset.run = ""; document.getElementById("runform-text").value = "";
+}
 function submitRunForm(ev) {
   ev.preventDefault();
   const f = document.getElementById("runform"), text = document.getElementById("runform-text").value;
+  // Only the agent whose page is open (#715 review): a form for another run is refused, not sent.
+  if (!f.dataset.run || view !== "agent" || f.dataset.run !== agentRun) { closeRunForm(); toast("That form was for another agent; nothing was stopped. Open Stop agent… again.", true); return; }
   signed({ action: "revoke", run: f.dataset.run, reason: text });
   closeRunForm();
 }
@@ -1169,7 +1200,7 @@ function renderOperator(s) {
   const b = el("div", "buttons");
   const out = el("button", "", "Sign out"); out.onclick = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
   b.append(out); box.append(b);
-  box.append(codeText("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device."));
+  box.append(codeText("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device.", ["wicket operator enrol-link"]));
 }
 
 // ---- notifications (Web Push) ----
@@ -1304,6 +1335,8 @@ function openPending(id) {
 // #pending/<id> opens the Inbox at that card; #health the Inbox's problems; #notifications Settings.
 let view = "inbox", agentRun = "";
 function show(v) {
+  // Leaving the agent's page closes its Stop form (#715 review).
+  if (v !== "agent") closeRunForm();
   view = v;
   for (const n of ["inbox", "agents", "agent", "activity", "settings"]) {
     const e = document.getElementById("view-" + n);
@@ -1362,7 +1395,7 @@ async function boot() {
   } else {
     auth.append(el("div", "", "Sign in to approve or deny what your agents are waiting on, start runs and steer them."));
     const b = el("div", "buttons"); const go = el("button", "approve", "Sign in with passkey"); go.onclick = signIn; b.append(go); auth.append(b);
-    auth.append(codeText("div", "note", "No passkey yet? Open a one-time enrolment link from the host (`wicket serve` prints one at first start; `wicket operator enrol-link` makes another)."));
+    auth.append(codeText("div", "note", "No passkey yet? Open a one-time enrolment link from the host (`wicket serve` prints one at first start; `wicket operator enrol-link` makes another).", ["wicket operator enrol-link"]));
   }
 }
 
@@ -1416,16 +1449,23 @@ async function showAuthority(run) {
       "from its zone's rules" + (r.allow_dangerous ? "; including requests that can't be undone" : "") +
       ((r.decode_slash || []).length ? "; reads an encoded slash (%2F) as / in path part " + r.decode_slash.map(Number).join(", ") : "")));
     for (const g of (t.grants || []).filter(g => !g.revoked && (!g.expires_at || g.expires_at > now))) {
-      const end = el("span"); end.append(document.createTextNode("you allowed it; ends "), timeEl(g.expires_at));
-      reach.push(reachLine(verb(g) + " " + strip(g.host + g.path), end,
-        (g.uses == null ? "any number of times" : plural(g.uses, "more time", "more times")) + " \u00b7 allowed by " + strip(g.approved_by || "?") +
+      const end = el("span"); end.append(document.createTextNode("allowed by " + decider(g.approved_by) + "; ends "), timeEl(g.expires_at));
+      // All that the grant reaches (#715 review): a standing grant is a rule on the host (its methods,
+      // path globs and allow_dangerous); a prefix grant covers every path under its path.
+      const sr = g.standing;
+      const what = sr ? verbsOf(sr.methods) + " " + strip(g.host) + "  " + pathsText(sr.paths)
+        : verb(g) + " " + strip(g.host + g.path) + (g.prefix ? " and every path under it" : "");
+      reach.push(reachLine(what, end,
+        (g.uses == null ? "any number of times" : plural(g.uses, "more time", "more times")) +
+        (sr && sr.allow_dangerous ? " \u00b7 including requests that can't be undone" : "") +
         (g.reached_node === false ? " \u00b7 not yet on its server" : "")));
     }
     const st = (lastState && lastState.standing && lastState.standing.rules) || [];
     const row = ((lastState && lastState.runs) || []).find(x => x.id === run) || {};
     for (const r of st.filter(r => r.live && (r.for === "zone" ? r.zone === t.zone : row.agent && String(r.principal || "").endsWith("/z/" + row.zone + "/a/" + row.agent)))) {
       const end = el("span"); end.append(document.createTextNode("always allowed, "), r.expires_at ? timeEl(r.expires_at, "ends " + at(r.expires_at)) : document.createTextNode("until removed"));
-      reach.push(reachLine(verbsOf(r.rule.methods) + " " + strip(r.rule.host) + "  " + pathsText(r.rule.paths), end, r.for === "zone" ? "for every agent in its zone" : "for this agent"));
+      reach.push(reachLine(verbsOf(r.rule.methods) + " " + strip(r.rule.host) + "  " + pathsText(r.rule.paths), end, (r.for === "zone" ? "for every agent in its zone" : "for this agent") +
+        (r.rule.allow_dangerous ? "; including requests that can't be undone" : "") + " \u00b7 allowed by " + decider(r.decided_by)));
     }
     // What its zone forbids beats everything above, a grant included.
     for (const f of t.forbid || []) reach.push(reachLine("never " + strip(f.host) + "  " + pathsText(f.paths), undefined, "forbidden by its zone's rules, even if you allow it"));
