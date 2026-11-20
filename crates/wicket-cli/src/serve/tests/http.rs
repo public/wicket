@@ -705,6 +705,59 @@ async fn a_host_link_enrols_one_passkey_audited_with_the_link_and_client() {
     assert!(open_link(&t, PEER, &link).await.is_none());
 }
 
+/// #711: a signed-in operator makes a link for another device with a passkey signature; it is
+/// single use, short-lived, shown once, audited, and enrols the same operator, never another.
+#[tokio::test]
+async fn a_signed_in_operator_makes_a_link_that_enrols_the_same_operator_on_another_device() {
+    let mut t = setup("enrol-console");
+    for ttl in [0, 59, 601] {
+        let r = t.begin(json!({ "action": "enrol_link", "ttl_secs": ttl }));
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{ttl}: {:?}", r.body);
+    }
+    let b = t.begin(json!({ "action": "enrol_link" }));
+    assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+    assert_eq!(b.body["action"]["enrols_as"], "passkey/laptop");
+    assert_eq!(b.body["action"]["ttl_secs"], 300);
+    assert_eq!(b.body["action"]["uses"], 1);
+    assert!(audits(&t, "operator.enrol_link_issued").is_empty(), "nothing is made before it is signed");
+
+    let r = t.act(json!({ "action": "enrol_link", "ttl_secs": 120 }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let path = r.body["path"].as_str().unwrap().to_string();
+    assert_eq!(r.body["link"].as_str().unwrap(), format!("{ORIGIN}{path}"));
+    assert_eq!(r.body["expires_in_secs"], 120);
+    let issued = audits(&t, "operator.enrol_link_issued");
+    assert_eq!(issued.len(), 1);
+    let token = path.strip_prefix("/enrol?t=").unwrap();
+    assert!(!issued[0].to_string().contains(token), "the token is never on the record");
+    assert_eq!((issued[0]["via"].as_str(), issued[0]["name"].as_str()), (Some("console"), Some("laptop")));
+    assert!(issued[0]["signed"]["signature"].is_string());
+    assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (1, 0), "re-verifies offline");
+
+    // The new device asks to be "second phone"; it is enrolled as laptop, the operator who made it.
+    let boot = open_link(&t, PEER, &path).await.expect("the link works once");
+    let ch = register_begin_as(&t, &boot).await.1.unwrap();
+    let key = SigningKey::generate();
+    let (status, _, body) = post_json(&t.state, "/api/register/finish", Some(&boot), &attestation(&ch, &key, b"cred-2")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let creds = t.ledger().operator_credentials(&TenantId::single()).unwrap();
+    assert!(creds.iter().any(|c| c.id == b64u(b"cred-2") && c.name == "laptop"), "{creds:?}");
+    let added = audits(&t, "operator.passkey_added");
+    assert_eq!((added[0]["made_by"].as_str(), added[0]["asked_name"].as_str()), (Some(t.cred.as_str()), Some("second phone")));
+    assert!(open_link(&t, PEER, &path).await.is_none(), "single use");
+
+    // A link whose maker is revoked before it is used enrols nothing.
+    let r = t.act(json!({ "action": "enrol_link" }));
+    let path = r.body["path"].as_str().unwrap().to_string();
+    t.ledger().reset_operator_credentials(&TenantId::single()).unwrap();
+    let boot = open_link(&t, PEER, &path).await.unwrap();
+    let ch = register_begin_as(&t, &boot).await.1.unwrap();
+    let (status, _, body) = post_json(&t.state, "/api/register/finish", Some(&boot), &attestation(&ch, &key, b"cred-3")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("no longer enrolled"), "{body}");
+    assert!(!t.ledger().operator_credentials_all(&TenantId::single()).unwrap().iter().any(|c| c.id == b64u(b"cred-3")));
+}
+
 #[tokio::test]
 async fn a_signed_in_operator_session_cannot_enrol_a_passkey() {
     let t = setup("enrol-op");

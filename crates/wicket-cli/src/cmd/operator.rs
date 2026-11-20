@@ -97,8 +97,9 @@ pub enum OperatorCmd {
     /// Host-only break-glass: revoke every passkey (and every console session), so `wicket serve`
     /// prints a fresh enrolment link.
     Reset,
-    /// Print a fresh single-use link that enrols one passkey in the console (another device, or a
-    /// replacement after `reset`). The only way to add a passkey: a signed-in console session can't.
+    /// Print a fresh single-use link that enrols one passkey in the console (the first, another
+    /// device, or a replacement after `reset`). A signed-in operator can also make one for another
+    /// device of theirs in the console, signed with their passkey (#711).
     EnrolLink {
         /// How long the link stays usable (at most 1h).
         #[arg(long, default_value = "10m", value_parser = wicket_core::time::duration_arg)]

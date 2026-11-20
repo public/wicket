@@ -7,11 +7,18 @@ internet](../how-to/put-the-console-on-the-internet.md) sets it up behind TLS.
 ## Passkeys
 
 It uses **passkeys**:
-- passkeys are enrolled only through one-time links from the host: `wicket serve` prints one at start-up while no
+- passkeys are enrolled only through one-time links: `wicket serve` prints one at start-up while no
   passkey exists, and `wicket operator enrol-link [--ttl 10m] [--origin URL]` prints a fresh one at any time
   (single use, 10 minutes by default and at most 1 hour; the session it opens can only enrol one passkey).
-  An installed console runs with `--no-bootstrap-link`, so there you use `sudo wicket operator enrol-link`. A
-  signed-in console session can't add a passkey, so a stolen cookie can't either;
+  An installed console runs with `--no-bootstrap-link`, so there you use `sudo wicket operator enrol-link`
+  for the first passkey and for recovery;
+- **a signed-in operator can enrol another device of theirs** (`enrol_link`, #711): the action is signed with
+  their passkey, so a stolen cookie can't make a link. The link is single use, lasts 5 minutes by default (60
+  seconds to 10 minutes), is shown once in the answer, and is audited (`operator.enrol_link_issued` with the
+  signed assertion, never the token). The passkey it enrols takes its maker's name, whatever name the new
+  device asks for: it is the same operator, with the same authority in
+  [`operators.yaml`](configuration.md#operatorsyaml), never more. A link whose maker's passkey was revoked
+  before it was used enrols nothing. A signed-in session can't register a passkey itself;
 - sign-in is a passkey with user verification;
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision
   (request, method, host, path, decision, uses, lifetime). The server checks it, uses it once, and stores the
@@ -456,7 +463,7 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
 - **Before sign-in** a client can fetch only the page and the session page (`/session`, the same
   for every run, with no data in it), their static files (scripts, stylesheets, service worker, manifest, icons)
   and the passkey sign-in endpoints. Everything else, whatever the method or path, gets the same 401 and body:
-  no runs, counts, passkey ids or version. Enrolment is only via a one-time link issued on the host (`wicket operator enrol-link`).
+  no runs, counts, passkey ids or version. Enrolment is only via a one-time link, issued on the host (`wicket operator enrol-link`) or by a signed-in operator with a passkey signature (`enrol_link`).
 - **Sign-in** needs user verification; there is no password or fallback. Attempts are limited per client
   address (IPv4, or IPv6 /64; `X-Forwarded-For` is honoured only from a `--trusted-proxy`) and per passkey:
   20 a minute, and 5 failures lock out for 15 minutes, doubling up to a day. Pending challenges expire after 2

@@ -1497,7 +1497,7 @@ Usage: wicket operator <COMMAND>
 Commands:
   list            List enrolled passkeys
   reset           Host-only break-glass: revoke every passkey (and every console session), so `wicket serve` prints a fresh enrolment link
-  enrol-link      Print a fresh single-use link that enrols one passkey in the console (another device, or a replacement after `reset`). The only way to add a passkey: a signed-in console session can't
+  enrol-link      Print a fresh single-use link that enrols one passkey in the console (the first, another device, or a replacement after `reset`). A signed-in operator can also make one for another device of theirs in the console, signed with their passkey (#711)
   sessions        List live console sessions (id, passkey, client address, times)
   revoke-session  End console sessions now: one by its id (or a unique prefix of it), or all with --all
   help            Print this message or the help of the given subcommand(s)
@@ -1531,7 +1531,7 @@ Options:
 ### `wicket operator enrol-link`
 
 ```text
-Print a fresh single-use link that enrols one passkey in the console (another device, or a replacement after `reset`). The only way to add a passkey: a signed-in console session can't
+Print a fresh single-use link that enrols one passkey in the console (the first, another device, or a replacement after `reset`). A signed-in operator can also make one for another device of theirs in the console, signed with their passkey (#711)
 
 Usage: wicket operator enrol-link [OPTIONS]
 
