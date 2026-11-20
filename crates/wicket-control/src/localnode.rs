@@ -76,19 +76,37 @@ pub async fn ensure(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
     }
     let sock = socket()?;
     if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        note_if_this_build();
         return Ok(());
     }
     start_serve(&dir)?;
     for _ in 0..200 {
         if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-            // This build's serve: it talks this build's protocol (until a connection says).
-            crate::noderun::note_protocol(NAME, crate::chan::PROTOCOL);
+            note_if_this_build();
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     let log = std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default();
     bail!("the local node did not start: {}", log.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output"))
+}
+
+/// Notes the local node's protocol as this build's if its running `serve` is this very binary
+/// (the one this process runs, not one an update has since replaced): whether this process started
+/// it or found it running (#691). Otherwise the note waits for a connection's welcome.
+fn note_if_this_build() {
+    if serve_is_this_build() {
+        crate::noderun::note_protocol(NAME, crate::chan::PROTOCOL);
+    }
+}
+
+fn serve_is_this_build() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(pid) = pidfile().ok().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| s.trim().parse::<u32>().ok()) else {
+        return false;
+    };
+    let (Ok(serve), Ok(me)) = (std::fs::metadata(format!("/proc/{pid}/exe")), std::fs::metadata("/proc/self/exe")) else { return false };
+    (serve.dev(), serve.ino()) == (me.dev(), me.ino())
 }
 
 fn lock(path: &std::path::Path) -> Result<std::fs::File> {

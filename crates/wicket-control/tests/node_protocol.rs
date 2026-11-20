@@ -3,7 +3,9 @@
 //! every session to the node carries: an 18 node's strict parse would refuse the record and stall
 //! its whole feed, its other boxes' included. Its own test binary: it sets the data directory.
 
-use wicket_control::noderun::{check_protocol, feed_config, known_protocol, note_protocol, protocol_needed, SharedFeed};
+use wicket_control::noderun::{
+    check_protocol, feed_config, forget_protocol, known_protocol, live_protocols, note_protocol, note_session, protocol_needed, SharedFeed,
+};
 use wicket_feed::{Change, RevokeKind};
 
 fn zone(rule: &str) -> wicket_core::ZoneSpec {
@@ -51,5 +53,31 @@ fn a_decoding_zone_is_never_published_to_a_node_that_cant_read_it() {
     // Once the node talks 19 (a connection's welcome notes it), the zone may go there.
     note_protocol("old", wicket_chan::chan::DECODE_SLASH);
     check_protocol("old", &decoding).unwrap();
+
+    // #691: the node goes back to 18. A live session (of any process) that connected at 18 refuses
+    // the zone though the note still says 19; once it ends, the note decides again.
+    let at_18 = note_session("old", 18);
+    assert_eq!(live_protocols("old"), [18]);
+    let e = check_protocol("old", &decoding).unwrap_err().to_string();
+    assert!(e.contains("talks 18"), "{e}");
+    drop(at_18);
+    assert!(live_protocols("old").is_empty(), "the session's note goes with it");
+    note_protocol("old", wicket_chan::chan::DECODE_SLASH);
+    let at_19 = note_session("old", wicket_chan::chan::DECODE_SLASH);
+    check_protocol("old", &decoding).unwrap();
+    drop(at_19);
+    // A connection that drops (or is refused) forgets the note: the node may come back on another
+    // build, so nothing that needs 19 goes there until a connection says what it talks.
+    forget_protocol("old");
+    assert_eq!(known_protocol("old"), None);
+    let e = check_protocol("old", &decoding).unwrap_err().to_string();
+    assert!(e.contains("last cut off"), "{e}");
+    check_protocol("old", &plain).unwrap();
+    // A session note left by a process that has gone counts for nothing.
+    let sessions = home.join("nodes/old/sessions");
+    std::fs::write(sessions.join("999999999-0"), "18").unwrap();
+    note_protocol("old", wicket_chan::chan::DECODE_SLASH);
+    check_protocol("old", &decoding).unwrap();
+    assert!(!sessions.join("999999999-0").exists(), "removed");
     let _ = std::fs::remove_dir_all(&home);
 }
