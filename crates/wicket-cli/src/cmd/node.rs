@@ -57,6 +57,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Set { name, ca_hosts, labels, taints } => set(&name, ca_hosts.as_deref(), &labels, &taints),
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
+            NodeCmd::Intake { listen, tls_cert, tls_key, dir } => {
+                let dir = dir.unwrap_or_else(wicket_node::nodesrv::NodePaths::default_root);
+                crate::intake::serve(listen, crate::intake::tls_pair(tls_cert, tls_key)?, dir).await
+            }
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
             NodeCmd::Forget { run, force } => noderun::forget_command(&run, force, &operator()).await,
@@ -283,6 +287,25 @@ pub enum NodeCmd {
         /// local node's `serve`, started on demand).
         #[arg(long, hide = true)]
         idle_exit: Option<u64>,
+    },
+    /// On the node: webhook intake for triggers (#578; docs/explanation/trigger-intake.md). Takes
+    /// deliveries for the triggers the control host assigned to this node, checks their token and
+    /// signature, and hands what it verified to this node's `wicket node serve`, which the control
+    /// host pulls from. It holds no ledger and no authority (the `wicket-intake` service runs this).
+    Intake {
+        /// Where to listen (e.g. `0.0.0.0:8443`).
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        /// A certificate chain (PEM) to serve TLS with; without it, plain HTTP behind a reverse
+        /// proxy that has TLS.
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        /// The certificate's private key (PEM).
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+        /// The node's directory (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node).
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA,
     /// its control connections, feed, load, memory and disk; each box's state, uptime, CPU and

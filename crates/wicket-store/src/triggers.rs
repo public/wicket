@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS trigger_causes (
 CREATE TABLE IF NOT EXISTS trigger_cursors (
   tenant TEXT NOT NULL, source TEXT NOT NULL, seq INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (tenant, source)
 );
+CREATE TABLE IF NOT EXISTS trigger_intake (
+  trigger TEXT PRIMARY KEY, node TEXT NOT NULL, token_sha256 TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS trigger_intake_node ON trigger_intake (node);
 "#;
 
 /// How long triggers' settled firings and the events they fired on are kept (as the design keeps
@@ -538,6 +542,45 @@ impl Ledger {
     /// Holds `trigger` at `seq` (it has heard up to there), or moves its hold on.
     pub fn hold_trigger(&self, tenant: &str, trigger: &str, seq: i64) -> Result<()> {
         self.set_trigger_cursor(tenant, &format!("held:{trigger}"), seq)
+    }
+
+    /// Where a webhook trigger's deliveries arrive (#578 step 4): the intake node, and the sha256
+    /// of its URL's token (the token itself is shown once, at create, and kept nowhere).
+    pub fn set_trigger_intake(&self, trigger: &str, node: &str, token_sha256: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO trigger_intake (trigger, node, token_sha256, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (trigger) DO UPDATE SET node = excluded.node, token_sha256 = excluded.token_sha256, created_at = excluded.created_at",
+            params![trigger, node, token_sha256, now()],
+        )?;
+        Ok(())
+    }
+
+    /// A webhook trigger's intake node and token sha256, if it has them.
+    pub fn trigger_intake(&self, trigger: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT node, token_sha256 FROM trigger_intake WHERE trigger = ?1", params![trigger], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
+    /// The triggers node `node`'s intake serves: every one assigned to it that isn't deleted, with
+    /// its token's sha256 (paused ones included: their deliveries are recorded and not fired).
+    pub fn intake_triggers(&self, node: &str) -> Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT i.trigger, i.token_sha256 FROM trigger_intake i JOIN triggers t ON t.id = i.trigger
+             WHERE i.node = ?1 AND t.status != 'deleted' ORDER BY i.trigger",
+        )?;
+        let rows = st.query_map(params![node], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The nodes some trigger's intake is assigned to.
+    pub fn intake_nodes(&self) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT i.node FROM trigger_intake i JOIN triggers t ON t.id = i.trigger WHERE t.status != 'deleted' ORDER BY i.node",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Ends `trigger`'s hold: it has caught up.

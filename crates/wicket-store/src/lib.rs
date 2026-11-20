@@ -203,7 +203,10 @@ pub enum StoreError {
 /// starts once retention has pruned its front, which target each sink's cursor is for, and the
 /// checkpoints retention asked the exporter to sign. Older builds don't read them; a prune raises
 /// the floor to 32, so a build that would walk a pruned chain from seq 1 refuses the ledger.
-pub const SCHEMA_VERSION: u32 = 32;
+/// Version 35 (expand, #578 step 4; 33 and 34 are other features') adds `trigger_intake`: each
+/// webhook trigger's intake node and the sha256 of its URL's token. Older builds don't read it;
+/// the floor stays where it was.
+pub const SCHEMA_VERSION: u32 = 35;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is

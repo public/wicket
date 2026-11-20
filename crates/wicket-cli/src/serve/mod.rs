@@ -65,7 +65,7 @@ mod push;
 mod secrets;
 pub mod session;
 mod standing;
-mod tls;
+pub(crate) mod tls;
 mod web;
 
 pub use net::ServeOpts;

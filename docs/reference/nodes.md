@@ -357,6 +357,20 @@ these on its own:
 Once supervisors are tasks in a few processes, with one channel per node (step 5), the session
 count stops growing with boxes.
 
+## Webhook intake ([#578](https://github.com/public/wicket/issues/578))
+
+A node labelled `wicket.intake=true` takes webhook and GitHub deliveries for the triggers the
+control host assigns to it, with `wicket node intake` beside its `wicket node serve`
+([fire a trigger from a webhook](../how-to/trigger-from-a-webhook.md),
+[why it runs on a node](../explanation/trigger-intake.md)).
+
+- **What it keeps.** `node serve` keeps intake's table (each trigger's URL token sha256 and verify
+  secret) in memory only, as the control host last sent it.
+  - It spools verified deliveries in `intake/spool/`, at most 10,000 or 64 MiB, each for 24 h at
+    most, until the control host has recorded them.
+  - Intake reaches it over `ctl/intake.sock`, in the 0700 control directory.
+- **Protocol 21.** It must talk protocol 21 or later to be chosen.
+
 ## Health, admission and disk ([#377](https://github.com/public/wicket/issues/377))
 
 - **Health.** Every 30 s, on each control connection that speaks protocol 12 or later, a node reports its

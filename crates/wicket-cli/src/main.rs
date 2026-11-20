@@ -39,6 +39,7 @@ mod cli_reference;
 mod cmd;
 mod daemon;
 mod doctor;
+mod intake;
 mod invariants;
 mod mock;
 mod pin;
