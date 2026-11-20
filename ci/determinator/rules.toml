@@ -120,7 +120,7 @@ globs = [
   ".gitleaks.toml", ".gitignore", ".claude-plugin/**", "plugins/**",
   "ci/check-public.py", "ci/check-doc-links.sh", "ci/check-terms.sh", "ci/check-terms.allow", "ci/check-plugin.py",
   "ci/changelog.py", "ci/changelog_test.py", "ci/preflight.sh", "ci/no-attribution.py", "ci/no-attribution_test.py", ".githooks/**",
-  "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml",
+  "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml", "ci/verdict-needs.sh",
   # The console preview (#574): it serves the console's static files, but nothing builds or tests it.
   "ci/console-preview.sh", "ci/console-preview/**",
   "deny.toml", "ci/mutants.sh", "ci/mutants.accepted", "ci/package.sh", "ci/sim.sh",

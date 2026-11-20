@@ -33,23 +33,33 @@ where
     R: Read + AsFd,
     W: Write + AsFd,
 {
+    copy_with(mode, from, to, buf_size, &|_| {})
+}
+
+/// As [`copy`], calling `moved` with each chunk's size once it is written (`--dial`'s idle limit
+/// watches it, #796 re-review, H2).
+pub fn copy_with<R, W>(mode: CopyMode, from: &mut R, to: &mut W, buf_size: usize, moved: &dyn Fn(usize)) -> io::Result<u64>
+where
+    R: Read + AsFd,
+    W: Write + AsFd,
+{
     if mode == CopyMode::Splice {
-        return match splice(from, to, buf_size) {
+        return match splice(from, to, buf_size, moved) {
             Splice::Done(r) => r,
             // splice can't serve these sockets: read/write the rest (all of it, normally).
-            Splice::Refused(moved) => {
+            Splice::Refused(done) => {
                 static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     crate::log(format_args!("splice(2) refused here; copying with read/write instead"));
                 }
-                Ok(moved + read_write(from, to, buf_size)?)
+                Ok(done + read_write(from, to, buf_size, moved)?)
             }
         };
     }
-    read_write(from, to, buf_size)
+    read_write(from, to, buf_size, moved)
 }
 
-fn read_write<R: Read, W: Write>(from: &mut R, to: &mut W, buf_size: usize) -> io::Result<u64> {
+fn read_write<R: Read, W: Write>(from: &mut R, to: &mut W, buf_size: usize, moved: &dyn Fn(usize)) -> io::Result<u64> {
     let mut buf = vec![0u8; buf_size];
     let mut total = 0u64;
     loop {
@@ -60,6 +70,7 @@ fn read_write<R: Read, W: Write>(from: &mut R, to: &mut W, buf_size: usize) -> i
             Err(e) => return Err(e),
         };
         to.write_all(&buf[..n])?;
+        moved(n);
         total += n as u64;
     }
 }
@@ -77,7 +88,7 @@ fn refused(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(22 | 38 | 95))
 }
 
-fn splice<R: AsFd, W: Write + AsFd>(from: &R, to: &mut W, buf_size: usize) -> Splice {
+fn splice<R: AsFd, W: Write + AsFd>(from: &R, to: &mut W, buf_size: usize, moved: &dyn Fn(usize)) -> Splice {
     let Ok((pr, pw)) = sys::pipe(buf_size) else { return Splice::Refused(0) };
     let src = from.as_fd().as_raw_fd();
     let mut total = 0u64;
@@ -92,7 +103,10 @@ fn splice<R: AsFd, W: Write + AsFd>(from: &R, to: &mut W, buf_size: usize) -> Sp
         while left > 0 {
             match sys::splice_once(pr.as_raw_fd(), to.as_fd().as_raw_fd(), left, sys::SPLICE_F_MOVE) {
                 Ok(0) => return Splice::Done(Err(io::ErrorKind::WriteZero.into())),
-                Ok(m) => left -= m,
+                Ok(m) => {
+                    left -= m;
+                    moved(m);
+                }
                 Err(e) if refused(&e) => {
                     // The bytes are in the pipe: write them out the ordinary way, then give up on splice.
                     let mut rest = vec![0u8; left];
@@ -100,6 +114,7 @@ fn splice<R: AsFd, W: Write + AsFd>(from: &R, to: &mut W, buf_size: usize) -> Sp
                     if let Err(e) = pipe.read_exact(&mut rest).and_then(|()| to.write_all(&rest)) {
                         return Splice::Done(Err(e));
                     }
+                    moved(left);
                     return Splice::Refused(total + n as u64);
                 }
                 Err(e) => return Splice::Done(Err(e)),

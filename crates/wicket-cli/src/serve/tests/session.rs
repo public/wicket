@@ -231,6 +231,16 @@ fn escalations_are_prompted_inline_and_only_a_passkey_decision_decides_them() {
     // A late answer is audited with what the ledger says.
     b.on_client(&answer.to_string());
     assert_eq!(t.audit_kinds().iter().filter(|(k, _)| k == "session.escalation_answered").count(), 1, "each prompt answers once");
+    // An approval reads as one: the ledger says `granted`, and the tool call completes (#647).
+    let op = wicket_core::Op::egress(&TenantId::single(), &RunId(RUN.into()), "z", "GET", "api.example.com", "/v1/more");
+    let (rid2, _) = t.ledger().pending_for(&op, "needs approval", None).unwrap();
+    assert_eq!(kinds(&b.poll()), ["tool_call", "session/request_permission"]);
+    let r = t.act(json!({ "action": "decide", "id": rid2, "decision": "approve", "uses": 1, "ttl_secs": 600 }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let out = b.poll();
+    assert_eq!(kinds(&out), ["tool_call_update"]);
+    assert_eq!(out[0]["params"]["update"]["_meta"]["wicket"]["escalation"]["status"], "granted");
+    assert_eq!(out[0]["params"]["update"]["status"], "completed", "an approved request's tool call completes");
 }
 
 #[test]

@@ -108,7 +108,7 @@ multihost() {
   log "multi-host ($nodes): a lease, a box on the node, the node e2e flow, then revoke"
   if [ "$nodes" = local ]; then node_local_setup; else node_vultr_setup; fi
   cap_ws=$(workdir cap)
-  HOME=$HOMEW "$W" run "$(manifest cap)" --workdir "$cap_ws" --image "$IMAGE_TAG" >"$work/cap.log" 2>&1 &
+  HOME=$HOMEW "$W" run "$(manifest cap)" --workdir "$cap_ws" --image "$IMAGE_TAG" --node local >"$work/cap.log" 2>&1 &
   cap_pid=$!
   pids+=("$cap_pid")
   wait_for 60 '[ -n "$(run_id_of "$work/cap.log")" ]' || true

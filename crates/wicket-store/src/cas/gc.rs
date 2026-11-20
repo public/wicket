@@ -109,7 +109,13 @@ impl Cas {
     /// Begins a push: writes its lock, and returns it without waiting ([`Writing::ready`] says
     /// whether a collection is still under way). [`Cas::writing`] is this and the wait.
     pub fn begin_writing(&self, by: &str, now: i64) -> io::Result<Writing<'_>> {
-        let key = format!("{PUSH_LOCKS}{}", wicket_core::new_ulid().to_string().to_ascii_lowercase());
+        self.begin_writing_as(&wicket_core::new_ulid().to_string().to_ascii_lowercase(), by, now)
+    }
+
+    /// [`Cas::begin_writing`] with the lock's id given: a ULID in use, so locks list in the order
+    /// they were taken; a fixed one in tests, so a collection reads them in the same order each run.
+    fn begin_writing_as(&self, id: &str, by: &str, now: i64) -> io::Result<Writing<'_>> {
+        let key = format!("{PUSH_LOCKS}{id}");
         if !put_lock(self, &key, by, now)? {
             return Err(io::Error::other(format!("push lock {key} already exists")));
         }
@@ -582,6 +588,8 @@ mod tests {
         /// Pushes that don't wait for a collection (to show the check finds what that breaks).
         careless: bool,
         turns: u64,
+        /// Push locks taken so far (their names).
+        locks: u64,
     }
 
     const CONTENTS: [&[u8]; 6] = [b"a", b"bb", b"ccc", b"dddd", b"eeeee", b"ffffff"];
@@ -634,10 +642,17 @@ mod tests {
             let i = self.rng.below(self.pushes.len() as u64) as usize;
             let now = self.now;
             let careless = self.careless;
+            // A push lock is named in the order taken, as a ULID would be, but the same each run:
+            // a collection reads the locks in name order, and each read is a turn (#663).
+            let lock_id = (self.pushes[i].stage == 0).then(|| {
+                self.locks += 1;
+                format!("{:020}", self.locks)
+            });
             let p = &mut self.pushes[i];
             match p.stage {
                 0 => {
-                    p.lock = Some(cas.begin_writing(&format!("push {}", p.agent), now).unwrap());
+                    let id = lock_id.expect("a lock id for a push's first step");
+                    p.lock = Some(cas.begin_writing_as(&id, &format!("push {}", p.agent), now).unwrap());
                     p.stage = 1;
                 }
                 1 => {
@@ -713,6 +728,7 @@ mod tests {
             violations: vec![],
             careless,
             turns: 0,
+            locks: 0,
         }));
         {
             let w = world.clone();

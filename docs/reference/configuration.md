@@ -35,7 +35,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `names.public.console_host` | host name | none | The console's host name: its first label is reserved too, and, for a host under the boxes zone, the label directly under the zone. |
 | `names.public.allow_idn` | boolean | `false` | Whether `xn--` labels are allowed. The lookalike check reads a label as written, `xn--` form and all, not as the Unicode it shows: with this on, a name can look like a reserved one in a browser. |
 | `names.public.nodes` | mapping of node labels | `{}` | The labels a node needs to publish public ports. |
-| `names.public.ports` | `low-high`, from 1024 | `20000-20999` | The host ports wicket allocates on each node. |
+| `names.public.ports` | `low-high`, from 1024 | `20000-20999` | The host ports wicket allocates on each node. `wicket node install` writes them to the node's `publish.json` (for a node with the `names.public.nodes` labels), the only ports it listens on; its firewall must admit them. |
 
 The `names` settings are checked as a whole when a run starts: one that can't work (a zone that
 isn't a domain, a malformed owner id, a TTL out of range) stops it, as an invalid file does. A
@@ -77,7 +77,7 @@ default: anything            # for operators not listed: anything (the default),
 operators:
   unix/alice: anything
   passkey/laptop:
-    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority
+    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority, fence
     hosts: ["*.example.com"] # for http requests: these hosts only (absent: any)
     max_risk: R2             # the highest risk it may decide (absent: any)
   unix/auditor: nothing      # may list requests, decides none

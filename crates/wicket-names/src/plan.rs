@@ -140,6 +140,12 @@ impl Plan {
         self.changes.is_empty()
     }
 
+    /// The plan's first `n` changes (and its conflicts): what a provider that stopped after `n`
+    /// made.
+    pub fn prefix(&self, n: usize) -> Plan {
+        Plan { changes: self.changes.iter().take(n).cloned().collect(), conflicts: self.conflicts.clone() }
+    }
+
     /// Applies the changes to a list of records, in order. Fails, changing nothing, if a record
     /// to update or delete isn't there.
     pub fn apply_to(&self, records: &mut Vec<Record>) -> Result<(), String> {

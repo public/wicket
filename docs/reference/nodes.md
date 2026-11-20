@@ -20,9 +20,9 @@ operators' approvals, and reconciles counts and audit afterwards; it isn't asked
 
 ## The control host is a node too
 
-Every box runs on a node through `wicket node serve` (#146). `wicket run` without `--node` places the box on
-the control host's own built-in node, `local`, which is served by the same runtime and reached over its unix
-socket instead of ssh. The control host makes and enrols it the first time a run needs it
+Every box runs on a node through `wicket node serve` (#146). The control host's own built-in node, `local`,
+is served by the same runtime and reached over its unix socket instead of ssh; `wicket run` without `--node`
+places a box there when it is the only node, or when the scheduler chooses it ([placement](#placement)). The control host makes and enrols it the first time a run needs it
 (`<data dir>/local-node/`: its own node key, an identity certificate, and a node CA, each renewed by the
 control host itself), and starts its `serve` on demand: one, detached, exiting after 10 minutes with no boxes
 and no connections (`WICKET_LOCAL_NODE_IDLE_SECS`); `wicket self update` has it re-execute itself as the new
@@ -357,6 +357,27 @@ these on its own:
 Once supervisors are tasks in a few processes, with one channel per node (step 5), the session
 count stops growing with boxes.
 
+## Webhook intake ([#578](https://github.com/public/wicket/issues/578))
+
+A node labelled `wicket.intake=true` takes webhook and GitHub deliveries for the triggers the
+control host assigns to it, with `wicket node intake` beside its `wicket node serve`
+([fire a trigger from a webhook](../how-to/trigger-from-a-webhook.md),
+[why it runs on a node](../explanation/trigger-intake.md)).
+
+- **Intake runs as its own user**, `wicket-intake`, under `deploy/node/wicket-intake.service`.
+  - It reaches `serve` only through `node.json`'s `intake_socket` (`/run/wicket-intake/intake.sock`).
+  - `serve` answers only the uid in `node.json`'s `intake_uid`, checked on every connection
+    (`SO_PEERCRED`).
+  - Without them (a test node), `serve` takes intake as its own user, on `ctl/intake.sock`.
+- **What `serve` keeps.** Intake's table (each trigger's URL token sha256 and verify secret) is in
+  memory only, as the control host last sent it.
+  - Until it has one, intake answers 503.
+  - It spools verified deliveries in `intake/spool/`, at most 10,000 or 64 MiB, each for 24 h at
+    most, until the control host has recorded them.
+- **Protocol 20.** The node must talk protocol 20 or later to be chosen.
+- **The local node** (the control host's own machine) is chosen only with
+  `wicket trigger create --allow-local-intake`.
+
 ## Health, admission and disk ([#377](https://github.com/public/wicket/issues/377))
 
 - **Health.** Every 30 s, on each control connection that speaks protocol 12 or later, a node reports its
@@ -407,8 +428,22 @@ count stops growing with boxes.
 ## Placement
 
 Where a box goes ([#579](https://github.com/public/wicket/issues/579)): `wicket run --node` or a spawn's
-placement hint names a node; otherwise a run goes on this host's own node. A woken agent is placed by the
-scheduler, `wicket-placement::schedule`, a pure function of what the control host knows when it decides:
+placement hint names a node. Otherwise a fresh run (`wicket run`, a run the console starts) and a woken
+agent are placed by the scheduler, `wicket-placement::schedule`, a pure function of what the control host
+knows when it decides, among every enrolled, active node not held by a capacity lease, this host's own
+(`local`) among them:
+
+- **Which runs are placed.** That's a decision: every fresh, top-level run with no node named goes through
+  the scheduler, as a wake does, so its manifest's requests, labels, taints, CA coverage, affinity and
+  priority decide where it goes the same way wherever it was started. What keeps its node: a node named
+  (`--node`, a lease's); a re-attach (its box is there); a spawn, which goes where its parent runs unless its
+  placement hint says otherwise; and the two that use this host's own directories, a wrapped session
+  (`wicket wrap`) and an in-place `--workspace-dir`, which stay on `local`. With no other enrolled, active node
+  but `local`, the scheduler isn't asked: every fresh run goes there, as before, whatever its placement
+  terms. A placed (paid) node is a candidate only while its lease outlasts the box's timeout, so a run
+  never holds one past its lease. A fresh run doesn't wait by default: `wicket run` fails at once,
+  saying why each node is out, when no node may take its box now; `wicket run --wait 10m` waits in the queue
+  as a wake does (and may preempt, by its priority).
 
 - **Capacity, from the ledger.** Each node's latest health report (every 30 s, on every connection to it;
   stored once per node at most every 20 s) carries its capacity, and a wake reads it there. A node with no
@@ -472,10 +507,49 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
   for. A required term that fails puts a node out (`no service npm-cache here,
   which the box requires`, `runs a box of zone research, which the box requires to be away from`); a
   preferred one ranks the nodes meeting the most first.
+- **Preemption.** A waiting wake which no node may take now may stop long-lived agents to make room. It
+  defers to a wake ahead of it in the queue only if that one fits a node now or could make room this way
+  itself, so a wake that can't be served doesn't hold preemption up. It stops only active long-lived agents
+  of its own tenant whose manifest marks them [`placement.preemptible`](manifest.md#placement), whose
+  priority is below its own, and **which have no live child**: on one node, each one needed to make the
+  room, the lowest priority first.
+  - **How.** Each agent is stopped the normal way an agent stops: it is asked to hibernate at its next
+    quiet point, as `wicket hibernate` asks, so it keeps its work and can be woken again. Nothing is
+    revoked. Hibernating ends the agent's run, which stops its children, so an agent with a child still
+    running is never chosen. Each is audited as `placement.preempted` (the run, its agent, node and
+    priority, and the run it made room for). An operator's own `wicket hibernate` request stands; the
+    preemption's request is tagged, so it alone is ever withdrawn.
+  - **The room.** The wake reserves the room on that node while they hibernate, renewing the reservation,
+    so another start doesn't take it. Room is all it makes: a node out for a label, a taint, its CA or an
+    affinity stays out. The wake is placed once the node's report shows the room, and the node's admission
+    still decides. An agent that has hibernated counts as gone until a node report from after its end
+    arrives, so a second agent isn't stopped for the same room.
+  - **The deadline.** An agent asked counts as gone for 5 minutes, so nothing more is stopped for the same
+    room. One that hasn't hibernated by then (a hibernate request can be declined) is left alone for the
+    rest of that wait: preemption's request is withdrawn (and its supervisor, if it has taken the request
+    already, drops it before hibernating), the room released, and it is audited as
+    `placement.preempt_abandoned`. A wake that is placed, gives up waiting or fails, while agents it asked
+    still run asks them no more in the same way, and releases any room it held.
+  - **The agent's side.** Before it hibernates for preemption (at its quiet point, and again before it
+    stops what lingers in its box), the agent's supervisor checks the request is still wanted. It declines
+    if preemption gave up, the request is older than the deadline, the wake that asked no longer waits or
+    holds a reservation (it ended, failed or was killed), or the agent has started a child since (which
+    hibernating would stop). A decline is audited as `placement.preempt_declined`, and the wake gives up
+    on that agent at once. An operator's own `wicket hibernate`, and the agent's own request, always go
+    ahead.
+  - **Cost.** The wake works out what it would stop from the nodes' last reports first, without a write
+    lock; only then does it ask every node for its room (a report may still count a box that has ended),
+    at most every 30 s, and always after a preemption completes. It doesn't preempt with under 30 s of its
+    wait left.
+  - **Programs are never preempted.** That's a decision: a program has no stop that keeps its work, so
+    stopping one for room would lose it.
+  - Each box's limits and priority are recorded at its start (`run_terms`, ledger schema 33); a box
+    started by an older build has none and is never preempted. A named node (`--node`) and a spawn never
+    preempt; a fresh run preempts only while it waits (`wicket run --wait`).
 - **Score.** Of the nodes left, those meeting the most preferences first; then bin-pack: the one left with the least memory, then the fewest vCPUs, once
   the box is on it. Where the agent ran before breaks a tie, then the name, so the same inputs always give
   the same node. A spread strategy exists in the function for later.
-- **Refusal.** With no node left the wake is refused, naming every node and every reason it was out
+- **Refusal.** With no node left the run or wake is refused, naming every node and every reason it was out
   (`n1 (tainted dedicated=ci, not tolerated), n2 (0.5 vCPU, 512 MiB free)`). The node's own admission
   stays the last word: it may still refuse the box it was given.
 

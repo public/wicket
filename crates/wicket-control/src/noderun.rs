@@ -643,6 +643,9 @@ pub struct Start {
     /// Where the box start's time goes (#287): this host's steps, the node's (`node.start.*`), and
     /// the box's first output and first model request when they come.
     pub timings: Arc<Timings>,
+    /// The installation's `names:` settings as the run read them when it started (#575): the host
+    /// ports its public names are published on come from them. None: no public names.
+    pub names: Option<Arc<wicket_names::NamesConfig>>,
 }
 
 struct Shared {
@@ -671,6 +674,8 @@ struct Shared {
     /// Re-attaching to a box already on the node (#151), and the grants its token carries already.
     attach: bool,
     carried: Vec<LiveGrant>,
+    /// The host ports the box's first record carried (#575 step 4c).
+    ports_at_start: Vec<wicket_feed::PublishedPort>,
     /// Who in the box made a request, as the run reads the agent's event stream (for asks the node
     /// didn't attribute).
     attribute: Option<wicket_proxy::Attributor>,
@@ -694,6 +699,8 @@ struct Shared {
     timings: Arc<Timings>,
     /// The box's first output has been seen (#287: `box.first_output`).
     first_output: AtomicBool,
+    /// The installation's `names:` settings (#575 step 4c).
+    names: Option<Arc<wicket_names::NamesConfig>>,
 }
 
 /// Mints box `run`'s block 0, until `not_after` (Unix seconds): by the authority root, or by its
@@ -773,7 +780,13 @@ pub async fn start(s: Start) -> Result<NodeBox> {
                 .collect()
         }
     };
-    let authority = token_issuer.publish(&approver, &carried).context("the box's token")?;
+    let mut authority = token_issuer.publish(&approver, &carried).context("the box's token")?;
+    // And, for a node that reads them, the host ports its public names have already (#575 step 4c):
+    // a re-attach's token without them would close the node's listeners until the first sync.
+    authority.ports = match (s.names.as_ref().and_then(|n| n.public.as_ref()), reads_ports(&name)) {
+        (Some(public), true) => ports_for(&s.ledger.lock().expect("ledger"), public, &s.run, &name, wicket_store::now()),
+        _ => vec![],
+    };
     // What the node attenuates a child's token from, deciding its spawns (#164).
     let mut s = s;
     if let Some(sp) = s.start.edge.as_mut().and_then(|e| e.spawn.as_mut()) {
@@ -785,7 +798,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     // drop them: a run killed hard) go in the same delta, so the feed and the node's snapshot don't
     // grow with every run.
     let published = t.span("feed.publish");
-    let target_epoch = {
+    let (target_epoch, ports_at_start) = {
         let mut publisher = feed.lock()?;
         let ended: Vec<String> = {
             let l = s.ledger.lock().expect("ledger");
@@ -802,9 +815,21 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         // Again under the feed's lock, just before the record goes in: the node's live sessions
         // (any process's) may have connected at an older protocol since the check above (#691).
         check_protocol(&name, &s.zone)?;
+        gate_ports(&mut changes, node_protocol_now(&name));
+        // What the node's record carries, as committed (#796 review, L2).
+        let carried_ports = changes
+            .iter()
+            .find_map(|c| match c {
+                Change::PutZone { zone } => Some(zone.ports.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
         publisher.commit(changes, now).context("publishing the box's token")?;
-        publisher.epoch()
+        (publisher.epoch(), carried_ports)
     };
+    // That token carries grants only: a re-attached run's standing rules aren't in it until its
+    // first sync puts them back, so none reads as on the node meanwhile (#752 review, F1).
+    s.ledger.lock().expect("ledger").standing_requeued(&s.run.0).context("recording the box's standing rules")?;
     published.end();
     let recording = t.span("authority.record");
     let token_root = (token_issuer.block_ids()[0].clone(), until_s.saturating_mul(1000));
@@ -858,6 +883,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         adopt: s.adopt.clone(),
         attach: s.attach,
         carried,
+        ports_at_start,
         pull: match &s.start.image_pin {
             Some(_) => crate::images_policy::load()?.registry_for(&s.start.image).map(|(r, repository)| crate::registry::Source {
                 host: r.host,
@@ -871,6 +897,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         pulling: AtomicBool::new(false),
         timings: t.clone(),
         first_output: AtomicBool::new(false),
+        names: s.names.clone(),
     });
     let (stdin_ours, stdin_theirs) = tokio::io::duplex(256 * 1024);
     let (stdout_theirs, stdout_ours) = tokio::io::duplex(1 << 20);
@@ -1176,6 +1203,8 @@ struct Progress {
     /// The standing rules (#572) the box's token carries now, by id, with the end each was
     /// published with.
     standing: std::collections::HashMap<String, u64>,
+    /// The host ports the box's token carries now (#575 step 4c).
+    ports: Vec<wicket_feed::PublishedPort>,
 }
 
 async fn manage(
@@ -1210,6 +1239,7 @@ async fn manage(
         ident_full: std::time::Instant::now(),
         link: wicket_node::status::LinkRecord { node: sh.node.clone(), ..Default::default() },
         standing: std::collections::HashMap::new(),
+        ports: sh.ports_at_start.clone(),
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
@@ -2046,7 +2076,7 @@ pub fn record_authority(run_dir: &Path, node: &str, until_ms: i64) -> Result<()>
     write_authority(run_dir, &AuthorityRecord { node: node.into(), until_ms, stopped, released_by: None })
 }
 
-fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
+pub(crate) fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
     use std::io::Write;
     let p = authority_file(run_dir);
     let dir = p.parent().expect("ctl");
@@ -2079,8 +2109,20 @@ pub fn confirm_stopped(run_dir: &Path) {
 /// An operator releases run `run_dir`'s fence without its node (#676): for a run its node can't
 /// confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end. Marked as if the
 /// node had confirmed, with who did it; the caller audits it (`run.fence_released`).
-pub fn release_fence(run_dir: &Path, by: &str) -> Result<()> {
-    let mut a = read_authority(run_dir).unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
+///
+/// `expected` is the authority record the decision was made on: its node and `until_ms`, or None
+/// if the run had none (#708). Refused if the record is no longer that (renewed, confirmed, or
+/// written since), so a renewal between the decision and this write isn't overwritten.
+pub fn release_fence(run_dir: &Path, by: &str, expected: Option<(&str, i64)>) -> Result<()> {
+    let now = read_authority(run_dir);
+    let current = now.as_ref().filter(|a| !a.stopped).map(|a| (a.node.as_str(), a.until_ms));
+    if now.as_ref().is_some_and(|a| a.stopped) || current != expected {
+        anyhow::bail!(
+            "{}'s authority record changed since the fence was shown (renewed, or its node confirmed the box stopped): look again",
+            run_dir.display()
+        );
+    }
+    let mut a = now.unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
     a.stopped = true;
     a.released_by = Some(by.to_string());
     write_authority(run_dir, &a)
@@ -2569,17 +2611,36 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         false => Ok(vec![]),
     };
     let (node, run) = (sh.node.clone(), sh.run.0.clone());
+    let before = p.standing.clone();
     let (more, changed) =
         sync_standing(&mut p.standing, &mut p.live, &mut p.waiting, rules, p.proto, top_level, now_s, &issuer, &loads, &mut |m| {
             say!("[wicket] {run} on node {node}: {m}")
         });
     changes.extend(more);
     rebuild |= changed;
+    // The host ports of the box's public names (#575 step 4c), for a node that reads them.
+    let ports = if p.proto >= wicket_chan::chan::PORTS && reads_ports(&sh.node) { wanted_ports(sh, now_s) } else { vec![] };
+    rebuild |= ports != p.ports;
+    // Where each rule is on its way to the node (#572), for `await_grant` on it: the ones put in
+    // (or renewed) are handed now and published with this delta; the ones taken out are gone.
+    let (handed_rules, gone_rules) = standing_moves(&before, &p.standing);
+    {
+        let l = sh.ledger.lock().expect("ledger");
+        if p.standing.is_empty() {
+            // None in its token (none bind it, or its node is below protocol 17): none is on its
+            // way, whatever an earlier supervisor recorded (#752 review, F2).
+            let _ = l.standing_none(&sh.run.0);
+        } else {
+            let _ = l.standing_withdrawn(&sh.run.0, &gone_rules);
+            let _ = l.standing_handed(&sh.run.0, &sh.node, &handed_rules);
+        }
+    }
     if !rebuild {
         return vec![];
     }
     let renewing = match issuer.publish(&sh.approver, &p.live) {
-        Ok(a) => {
+        Ok(mut a) => {
+            a.ports = ports.clone();
             changes.push(Change::PutZone { zone: a });
             reminted
         }
@@ -2594,11 +2655,21 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     let n = p.live.len();
     let revokes: Vec<Change<BoxAuthority>> = changes.iter().filter(|c| matches!(c, Change::Revoke { .. })).cloned().collect();
     // Whether the rebuilt token went out (not only its revocations): a renewal counts only then.
+    let has_token = changes.iter().any(|c| matches!(c, Change::PutZone { .. }));
     let token_out;
+    let ports_out;
     let committed = {
         let Ok(mut p) = sh.ctl.publisher.lock() else { return vec![] };
+        // Again under the feed's lock (#691): every live session to the node reads ports, or none
+        // go (an older node's strict parse would refuse the record, and its whole feed with it).
+        let mut changes = changes;
+        gate_ports(&mut changes, node_protocol_now(&sh.node));
+        ports_out = changes.iter().find_map(|c| match c {
+            Change::PutZone { zone } => Some(zone.ports.clone()),
+            _ => None,
+        });
         let mut r = p.commit(changes, wicket_feed::now_ms());
-        token_out = r.is_ok();
+        token_out = r.is_ok() && has_token;
         if r.is_err() && !revokes.is_empty() {
             // The rebuilt token was refused: the revocations must still go out.
             say!(
@@ -2611,7 +2682,18 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         r.map(|f| (f, p.epoch()))
     };
     if let Ok((_, epoch)) = &committed {
-        let _ = sh.ledger.lock().expect("ledger").grants_published(&handed, *epoch as i64);
+        let l = sh.ledger.lock().expect("ledger");
+        let _ = l.grants_published(&handed, *epoch as i64);
+        // Every rule handed and not yet published went with the token, this tick's or one whose
+        // commit failed before (#752 review, F2).
+        if token_out {
+            let _ = l.standing_published(&sh.run.0, *epoch as i64);
+        }
+        drop(l);
+        // What the node's record carries now: the ports, or none if they were held back.
+        if let (true, Some(out)) = (token_out, ports_out) {
+            p.ports = out;
+        }
         if let Some((i, until)) = renewing.filter(|_| token_out) {
             renewed(sh, i, until);
         }
@@ -2830,6 +2912,185 @@ fn sync_standing(
     (changes, rebuild)
 }
 
+/// The nodes whose feed a control-host build before protocol 21 couldn't open (#575 step 4c): its
+/// checkpoint, or a record after it, carries host ports, which that build's strict parse of a box's
+/// record refuses (#475: rows an older build mishandles block going back to it). Such a build loads
+/// the checkpoint and parses in full only the records after it; the ones before it it reads for
+/// their chain alone.
+pub fn feeds_holding_ports() -> Result<Vec<String>> {
+    let mut out = vec![];
+    for e in std::fs::read_dir(crate::data_dir().join("nodes")).into_iter().flatten().flatten() {
+        let dir = e.path().join("feed");
+        if dir.join("deltas.jsonl").exists() && feed_holds_ports(&dir)? {
+            out.push(e.file_name().to_string_lossy().to_string());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Writes a checkpoint of node `name`'s feed now, under its lock (#575 step 4c): the state as it is,
+/// so records with host ports that no box's record holds any more are behind it. Its epoch.
+pub fn checkpoint_feed(name: &str) -> Result<u64> {
+    let _lock = feed_lock(&crate::data_dir().join("nodes").join(name))?;
+    let mut p = open_feed(name, feed_config())?;
+    p.checkpoint(wicket_feed::now_ms()).map_err(|e| anyhow::anyhow!("checkpointing node {name}'s feed: {e}"))?;
+    Ok(p.epoch())
+}
+
+/// Whether node `name`'s feed holds a box record with host ports where a build before protocol 21
+/// parses it (see [`feeds_holding_ports`]): for a node going back to such a build.
+pub fn node_feed_holds_ports(name: &str) -> Result<bool> {
+    let dir = crate::data_dir().join("nodes").join(name).join("feed");
+    Ok(dir.join("deltas.jsonl").exists() && feed_holds_ports(&dir)?)
+}
+
+/// Whether the feed in `dir` holds a box record with host ports where an older build parses it.
+fn feed_holds_ports(dir: &Path) -> Result<bool> {
+    use base64::Engine;
+    let with_ports = |v: &serde_json::Value| v.get("ports").and_then(|p| p.as_array()).is_some_and(|a| !a.is_empty());
+    // The checkpoint's state, and where the records it doesn't cover start.
+    let mut from = 0u64;
+    if let Ok(text) = std::fs::read_to_string(dir.join(wicket_feed::CHECKPOINT)) {
+        if let Ok(c) = serde_json::from_str::<serde_json::Value>(&text) {
+            let snap: Option<serde_json::Value> = c.get("snap").and_then(|s| s.as_str()).and_then(|s| serde_json::from_str(s).ok());
+            if let (Some(snap), Some(end)) = (snap, c.get("end").and_then(|e| e.as_u64())) {
+                if snap.get("zones").and_then(|z| z.as_array()).is_some_and(|zs| zs.iter().any(with_ports)) {
+                    return Ok(true);
+                }
+                from = end;
+            }
+        }
+    }
+    let log = std::fs::read(dir.join("deltas.jsonl")).with_context(|| format!("reading {}", dir.display()))?;
+    let rest = log.get(usize::try_from(from).unwrap_or(usize::MAX)..).unwrap_or_default();
+    for line in rest.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let Some(payload) = line.split(|b| *b == b'.').nth(1) else { continue };
+        let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else { continue };
+        let Ok(d) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
+        let puts = d.get("changes").and_then(|c| c.as_array()).into_iter().flatten();
+        if puts.filter(|c| c.get("op").and_then(|o| o.as_str()) == Some("put_zone")).any(|c| c.get("zone").is_some_and(with_ports)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// While this file is in the data directory (written by `wicket self update` for an update of the
+/// control host from a build before protocol 21, removed once its health gate has ended), no
+/// supervisor puts ports in a box's record (#796 review, M3); in a node's directory
+/// (`nodes/<node>/update-gating`, for that node's update), none for boxes on that node. The build
+/// a failed gate would roll back to couldn't read a feed holding them. The file holds when it stops
+/// holding ports back (Unix seconds: the gate's window and a margin), so an update that died
+/// mid-gate doesn't hold them for ever; one that can't be read counts for [`GATING_MAX_SECS`] from
+/// its writing.
+pub const UPDATE_GATING: &str = "update-gating";
+/// How long an [`UPDATE_GATING`] file whose end can't be read holds ports back.
+pub const GATING_MAX_SECS: u64 = 30 * 60;
+
+/// Whether the [`UPDATE_GATING`] file at `p` holds ports back now.
+pub fn gating_at(p: &Path) -> bool {
+    if let Some(until) = std::fs::read_to_string(p).ok().and_then(|t| t.trim().parse::<i64>().ok()) {
+        return wicket_store::now() < until;
+    }
+    std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() < GATING_MAX_SECS)
+}
+
+/// Whether an update's health gate holds back ports for boxes on `node` now: the control host's or
+/// that node's ([`UPDATE_GATING`]).
+fn update_gating(node: &str) -> bool {
+    let data = crate::data_dir();
+    gating_at(&data.join(UPDATE_GATING)) || gating_at(&data.join("nodes").join(node).join(UPDATE_GATING))
+}
+
+/// Whether node `node` reads published ports (#575 step 4c): every live session to it talks
+/// [`wicket_chan::chan::PORTS`] or later (or, with none live, the one last noted did), and no
+/// update's health gate holds them back ([`UPDATE_GATING`]).
+fn reads_ports(node: &str) -> bool {
+    node_protocol_now(node).is_some_and(|p| p >= wicket_chan::chan::PORTS) && !update_gating(node)
+}
+
+/// Holds back the host ports of the records in `changes` unless the node talks
+/// [`wicket_chan::chan::PORTS`] (`node_proto`, as [`node_protocol_now`] says now): an older node's
+/// strict parse would refuse the record, and its whole feed with it. Whether it held any back.
+fn gate_ports(changes: &mut [Change<BoxAuthority>], node_proto: Option<u32>) -> bool {
+    if node_proto.is_some_and(|p| p >= wicket_chan::chan::PORTS) {
+        return false;
+    }
+    let mut held = false;
+    for c in changes.iter_mut() {
+        if let Change::PutZone { zone } = c {
+            held |= !zone.ports.is_empty();
+            zone.ports.clear();
+        }
+    }
+    held
+}
+
+/// The host ports the box's public names are published on now (#575 step 4c): each live public
+/// name it holds that may be published on its node ([`crate::namesync::may_publish`], as the
+/// names reconciler decides it), with the port allocated to it there (the one it had on another
+/// node if that is free here; its rows on other nodes released). None without `names.public`.
+fn wanted_ports(sh: &Shared, now_s: i64) -> Vec<wicket_feed::PublishedPort> {
+    let Some(public) = sh.names.as_ref().and_then(|n| n.public.as_ref()) else { return vec![] };
+    let l = sh.ledger.lock().expect("ledger");
+    ports_for(&l, public, &sh.run, &sh.node, now_s)
+}
+
+/// [`wanted_ports`] for run `run` on node `node`, under `public`.
+fn ports_for(l: &Ledger, public: &wicket_names::PublicConfig, run: &RunId, node: &str, now_s: i64) -> Vec<wicket_feed::PublishedPort> {
+    let held = match l.names_held_by(run) {
+        Ok(h) => h,
+        Err(e) => {
+            say!("[wicket] {run}: could not read its names ({e}); its token keeps no ports");
+            return vec![];
+        }
+    };
+    let mut out = vec![];
+    for n in held.into_iter().filter(|n| n.kind == wicket_store::NameKind::Public) {
+        match crate::namesync::may_publish(l, public, &n, now_s) {
+            Ok(crate::namesync::Publish::On { node: on, .. }) if on == node => {}
+            Ok(_) => continue,
+            Err(e) => {
+                say!("[wicket] {}: could not tell whether {} may be published ({e:#})", run, n.label);
+                continue;
+            }
+        }
+        let proto = crate::namesync::PROTO;
+        let prefer = l.port_elsewhere(&n.id, node, proto).ok().flatten();
+        let port = match l.allocate_port(node, proto, &n.id, public.ports.range(), prefer) {
+            Ok(p) => p,
+            Err(e) => {
+                say!("[wicket] {}: no host port for {} on node {}: {e}", run, n.label, node);
+                continue;
+            }
+        };
+        let _ = l.release_ports_elsewhere(&n.id, node);
+        out.push(wicket_feed::PublishedPort {
+            name: n.id.clone(),
+            label: n.label.clone(),
+            host_port: port,
+            box_port: n.port,
+            until_ms: n.expires_at.map(|e| e.saturating_mul(1000)).unwrap_or(i64::MAX),
+        });
+    }
+    out.sort_by_key(|p| p.host_port);
+    out
+}
+
+/// The standing rules a sync put into a run's token or changed (renewed), and the ones it took
+/// out: from the published rules (id → end) before and after it.
+fn standing_moves(
+    before: &std::collections::HashMap<String, u64>,
+    after: &std::collections::HashMap<String, u64>,
+) -> (Vec<String>, Vec<String>) {
+    let mut handed: Vec<String> = after.iter().filter(|(id, end)| before.get(*id) != Some(end)).map(|(id, _)| id.clone()).collect();
+    let mut gone: Vec<String> = before.keys().filter(|id| !after.contains_key(*id)).cloned().collect();
+    handed.sort();
+    gone.sort();
+    (handed, gone)
+}
+
 /// The installation CA, for renewing nodes' CAs over their channels (#416, wicket-node's
 /// `controlca`), if this control host has one (never created here).
 fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
@@ -2841,6 +3102,150 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #575 step 4c: a run's published ports are its public names that may be published on its
+    /// node, each with a port from the range, kept when asked again, the same port on a node the
+    /// box moves to (the old node's released), and none once the name is revoked.
+    #[test]
+    fn a_runs_public_names_get_host_ports_on_its_node() {
+        use wicket_store::{AddressChange, NameAsk, NameScope, NameTerms, StandingBound};
+        let l = Ledger::open_in_memory().unwrap();
+        let public: wicket_names::PublicConfig = serde_json::from_value(serde_json::json!({
+            "provider": "noop", "zone": "boxes.example.com", "owner": "a1b2c3d4", "ports": "20000-20009"
+        }))
+        .unwrap();
+        for (n, ip) in [("n1", [8, 8, 4, 4]), ("n2", [8, 8, 8, 8])] {
+            l.enrol_builtin_node(&wicket_store::NodeRow {
+                name: n.into(),
+                tenant: "t0".into(),
+                target: "unix:/x/ctl.sock".into(),
+                host_key: String::new(),
+                host_key_fp: String::new(),
+                node_key: "00".into(),
+                ssh_key: None,
+                hosts: vec![],
+                enrolled_at: 1,
+                status: "active".into(),
+                revoked_at: None,
+            })
+            .unwrap();
+            l.set_node_addresses(n, AddressChange::Set(std::net::Ipv4Addr::from(ip)), AddressChange::Keep, "op").unwrap();
+        }
+        let t = TenantId::single();
+        let run = RunId("run_web".into());
+        l.run_started(&t, &run, "web", "demo").unwrap();
+        l.set_run_node(&run.0, "n1").unwrap();
+        let ask = NameAsk {
+            tenant: &t,
+            run: &run,
+            zone: "web",
+            zone_digest: "zd",
+            principal: "spiffe://t/z/web/a/demo",
+            label: "demo",
+            port: 3000,
+            service: Some("http"),
+            reason: "the demo",
+            scope: NameScope::Run,
+        };
+        let (id, _) = l.ask_public(&ask).unwrap();
+        let terms = NameTerms { bound: StandingBound::Agent, ttl_secs: None };
+        let effect = wicket_store::name_effect(&l.name(&id).unwrap(), &terms, "boxes.example.com");
+        l.approve_name(&id, &terms, "op", Some(&effect), &public).unwrap();
+        let now = wicket_store::now();
+        let ports = ports_for(&l, &public, &run, "n1", now);
+        assert_eq!(ports.len(), 1);
+        let p = ports[0].clone();
+        assert!((20000..=20009).contains(&p.host_port) && p.box_port == 3000 && p.label == "demo" && p.until_ms == i64::MAX, "{p:?}");
+        assert_eq!(ports_for(&l, &public, &run, "n1", now), ports, "kept");
+        // Not on a node it isn't on.
+        assert!(ports_for(&l, &public, &run, "n2", now).is_empty());
+        // The box moves to n2: the same port there, n1's released (quarantined).
+        l.set_run_node(&run.0, "n2").unwrap();
+        let moved = ports_for(&l, &public, &run, "n2", now);
+        assert_eq!(moved[0].host_port, p.host_port);
+        assert!(l.quarantined_ports().unwrap().iter().any(|(n, _, port, _)| n == "n1" && *port == p.host_port));
+        // Revoked: none.
+        l.revoke_name(&id, "op").unwrap();
+        assert!(ports_for(&l, &public, &run, "n2", now).is_empty());
+    }
+
+    /// #575 step 4c, #475: a feed whose checkpoint, or a record after it, carries host ports is
+    /// one an older control-host build couldn't open; once a checkpoint covers a state without
+    /// them, it can.
+    #[test]
+    fn a_feed_holding_ports_blocks_going_back() {
+        use wicket_feed::{Issuer, KeyCert, Publisher, PublisherConfig};
+        let dir = std::env::temp_dir().join(format!("wicket-feed-ports-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = wicket_identity::SigningKey::from_bytes(&[7; 32]);
+        let key = wicket_identity::SigningKey::from_bytes(&[8; 32]);
+        let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+        let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
+        let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
+        let cfg = PublisherConfig { ttl_ms: 30_000, refresh_ms: 100, retain: 100 };
+        let mut p = Publisher::open_with(&dir, "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
+        let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str("{ name: web }").unwrap();
+        let issuer = Issuer::root(&authz_root, "t0", "run:r", "r", 0, &z, &[], 4_000_000_000, vec![approver.public()]).unwrap();
+        let plain = issuer.publish(&approver, &[]).unwrap();
+        let mut with = plain.clone();
+        with.ports =
+            vec![wicket_feed::PublishedPort { name: "n-1".into(), label: "demo".into(), host_port: 20001, box_port: 3000, until_ms: 9 }];
+        let now = 1_000;
+        p.commit(vec![Change::PutZone { zone: plain.clone() }], now).unwrap();
+        assert!(!feed_holds_ports(&dir).unwrap());
+        let with2 = with.clone();
+        p.commit(vec![Change::PutZone { zone: with }], now + 1).unwrap();
+        assert!(feed_holds_ports(&dir).unwrap(), "a record with ports after the checkpoint");
+        // Its name revoked: the record without them, and a checkpoint covering that state.
+        p.set_checkpoint_every(1);
+        p.commit(vec![Change::PutZone { zone: plain }], now + 2).unwrap();
+        assert!(!feed_holds_ports(&dir).unwrap(), "the checkpoint covers a state without ports");
+        // A checkpoint whose state holds ports (a box published with them as it was written).
+        p.commit(vec![Change::PutZone { zone: with2 }], now + 3).unwrap();
+        assert!(feed_holds_ports(&dir).unwrap(), "the checkpoint's state holds ports");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #575 step 4c: ports go in a record only for a node every live session of which talks 21;
+    /// otherwise they are held back (an older node would refuse the record, and its whole feed),
+    /// and a record without any is untouched.
+    #[test]
+    fn ports_are_held_back_from_a_node_that_cant_read_them() {
+        let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str("{ name: web }").unwrap();
+        let root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+        let issuer = wicket_feed::Issuer::root(&root, "t0", "run:r", "r", 0, &z, &[], 4_000_000_000, vec![approver.public()]).unwrap();
+        let mut a = issuer.publish(&approver, &[]).unwrap();
+        a.ports =
+            vec![wicket_feed::PublishedPort { name: "n-1".into(), label: "demo".into(), host_port: 20001, box_port: 3000, until_ms: 9 }];
+        let record = |a: &BoxAuthority| vec![Change::DropZone { name: "old".into() }, Change::PutZone { zone: a.clone() }];
+        let ports_of = |c: &[Change<BoxAuthority>]| match &c[1] {
+            Change::PutZone { zone } => zone.ports.len(),
+            _ => unreachable!(),
+        };
+        for (proto, kept) in
+            [(Some(wicket_chan::chan::PORTS), true), (Some(wicket_chan::chan::PORTS + 1), true), (Some(20), false), (None, false)]
+        {
+            let mut c = record(&a);
+            assert_eq!(gate_ports(&mut c, proto), !kept, "{proto:?}");
+            assert_eq!(ports_of(&c), usize::from(kept), "{proto:?}");
+        }
+        let mut none = a.clone();
+        none.ports.clear();
+        let mut c = record(&none);
+        assert!(!gate_ports(&mut c, Some(19)), "nothing to hold back");
+    }
+
+    /// #572: what a sync put into a run's token or renewed, and what it took out.
+    #[test]
+    fn standing_moves_are_what_a_sync_changed() {
+        let m = |v: &[(&str, u64)]| v.iter().map(|(k, e)| (k.to_string(), *e)).collect::<std::collections::HashMap<_, _>>();
+        let (handed, gone) = super::standing_moves(&m(&[("s-a", 1), ("s-b", 1), ("s-c", 1)]), &m(&[("s-a", 1), ("s-b", 2), ("s-d", 1)]));
+        assert_eq!(handed, vec!["s-b".to_string(), "s-d".to_string()]);
+        assert_eq!(gone, vec!["s-c".to_string()]);
+    }
 
     /// A failed renewal keeps the publisher only on a valid certificate of the version on disk.
     #[test]
@@ -3255,7 +3660,7 @@ mod tests {
         assert!(fenced_in(&d, 2_000, None).is_none(), "no record of either kind: no box was started");
         std::fs::write(d.join("ctl/run.json"), b"not json").unwrap();
         // An operator releases it (#676): the fence lifts, the record says who.
-        release_fence(&d, "root@cli").unwrap();
+        release_fence(&d, "root@cli", None).unwrap();
         assert!(fenced_in(&d, 2_000, None).is_none(), "released");
         assert_eq!(read_authority(&d).unwrap().released_by.as_deref(), Some("root@cli"));
         std::fs::remove_file(d.join("ctl/authority.json")).unwrap();
@@ -3394,18 +3799,17 @@ pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> a
     anyhow::ensure!(root, "only root releases a run's fence (its box may still be running on its node)");
     anyhow::ensure!(!reason.trim().is_empty(), "say why with --reason: it goes on the audit record");
     let l = wicket_store::Ledger::open(&crate::ledger_path())?;
-    let Some((node, until)) = fenced_until(&l, run, wicket_feed::now_ms()) else {
+    let runs = crate::data_dir().join("runs");
+    let now = wicket_feed::now_ms();
+    let Some(f) = crate::fence::fence_of(&l, &runs, run, now)? else {
         anyhow::bail!("run {run} isn't fenced: its node confirmed its box stopped, or its authority has ended");
     };
-    release_fence(&crate::data_dir().join("runs").join(run), by)?;
-    let until_ms = (until != UNKNOWN_END).then_some(until);
-    l.audit(
-        &l.run_tenant(run)?.unwrap_or_else(wicket_core::TenantId::single),
-        Some(&wicket_core::RunId(run.into())),
-        "run.fence_released",
-        &serde_json::json!({ "node": node, "by": by, "why": reason, "fenced_until_ms": until_ms }),
-    )?;
-    say!("released run {run}'s fence on node {node}; its box may still be running there");
+    // The same decision and record as the console's (#690), as root: any fence, whatever its node says.
+    let identity = crate::operators::Operator::cli(&f.tenant).ok().map(|o| o.id);
+    let by = crate::fence::Decider::Root { label: by.to_string(), identity };
+    let r = crate::fence::Release { run, reason, shown: &f.effect_sha256, now_ms: now, extra: serde_json::json!({ "via": "cli" }) };
+    let f = crate::fence::release(&l, &runs, &by, r)?;
+    say!("released run {run}'s fence on node {}; its box may still be running there", f.node);
     Ok(())
 }
 
