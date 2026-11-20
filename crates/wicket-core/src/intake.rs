@@ -1,4 +1,4 @@
-//! Webhook intake (#578 step 4; docs/explanation/trigger-intake.md): what `wicket intake serve`
+//! Webhook intake (#578 step 4; docs/explanation/trigger-intake.md): what `wicket node intake`
 //! checks of a delivery and what it keeps of one. Everything here reads attacker-written bytes: a
 //! verified signature says the sender had the secret, not that the content is safe. So a delivery
 //! becomes a small, capped set of fields, stripped of control characters, and nothing else of the
@@ -19,8 +19,9 @@ pub const MAX_GITHUB_TEXT: usize = 256;
 pub const MAX_LABELS: usize = 20;
 /// The longest delivery id kept (a sender's header; longer is refused).
 pub const MAX_DELIVERY: usize = 128;
-/// GitHub's signature header, and the generic webhook's (the same scheme: `sha256=<hex>` of the
-/// HMAC-SHA256 of the raw body).
+/// GitHub's signature header (`sha256=<hex>` of the HMAC-SHA256 of the raw body), and the generic
+/// webhook's (`sha256=<hex>` of the HMAC-SHA256 of [`generic_signed`]: the time, the delivery id
+/// and the body).
 pub const GITHUB_SIGNATURE: &str = "x-hub-signature-256";
 pub const GENERIC_SIGNATURE: &str = "x-wicket-signature-256";
 /// GitHub's event and delivery headers; the generic webhook's delivery header.
@@ -28,8 +29,8 @@ pub const GITHUB_EVENT: &str = "x-github-event";
 pub const GITHUB_DELIVERY: &str = "x-github-delivery";
 pub const GENERIC_DELIVERY: &str = "x-wicket-delivery";
 
-/// One trigger a node's intake serves, as the control host sends it (protocol 21's `IntakeSync`).
-/// The secret is held in memory only, on the node and in `wicket intake serve`.
+/// One trigger a node's intake serves, as the control host sends it (protocol 20's `IntakeSync`).
+/// The secret is held in memory only, on the node and in `wicket node intake`.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IntakeTrigger {
     pub trigger: String,
@@ -43,6 +44,10 @@ pub struct IntakeTrigger {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<String>,
+    /// Served here, but its secret couldn't be read this time: its deliveries are answered 503
+    /// (try later), not 404, and nothing counts as a failure (#714 review F5).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unavailable: bool,
 }
 
 impl std::fmt::Debug for IntakeTrigger {
@@ -121,11 +126,12 @@ pub const GENERIC_TIMESTAMP: &str = "x-wicket-timestamp";
 /// How far a generic delivery's timestamp may be from intake's clock (s), either way.
 pub const GENERIC_WINDOW_SECS: i64 = 300;
 
-/// What a generic webhook's sender signs: `v1:<timestamp>:<delivery id>:` then the raw body (the
-/// delivery id empty if it sends none). The timestamp and the id are under the MAC, so a captured
-/// delivery can't be sent again later, or under another id.
+/// What a generic webhook's sender signs: `v1:<timestamp>:<length of the delivery id>:<delivery
+/// id>:` then the raw body (the id empty, length 0, if it sends none). The timestamp and the id are
+/// under the MAC, so a captured delivery can't be sent again later, or under another id; the id's
+/// length is too, so a capture can't be split differently between id and body (#714 review F1).
 pub fn generic_signed(timestamp: i64, delivery: &str, body: &[u8]) -> Vec<u8> {
-    let mut m = format!("v1:{timestamp}:{delivery}:").into_bytes();
+    let mut m = format!("v1:{timestamp}:{}:{delivery}:", delivery.len()).into_bytes();
     m.extend_from_slice(body);
     m
 }
@@ -270,9 +276,10 @@ pub fn github_repo(body: &Value) -> Option<String> {
 /// - `push`: `branch` (a branch's ref without its one `refs/heads/`; none for a tag), `ref`, `sha`
 ///   (after), `pusher`;
 /// - and `fork` on every event: whether `head_repo` (a pull request's or workflow run's head
-///   repository) is another repository than `repo`. A check suite or run doesn't say, and GitHub
-///   lists no pull request on one from a fork: `fork` is false there, so don't rely on `branch`
-///   alone to mean the repository's own branch.
+///   repository) is another repository than `repo`, or, for a pull request event, that its head
+///   repository is gone (a deleted fork). A check suite or run, an issue comment or a push doesn't
+///   say (GitHub lists no pull request on a check from a fork): `fork` is false there, so don't rely
+///   on `branch` alone to mean the repository's own branch.
 pub fn github_fields(event: &str, body: &Value) -> Value {
     let mut f = Map::new();
     let s = |p: &str| body.pointer(p).and_then(Value::as_str).map(|v| Value::String(keep_text(v, MAX_GITHUB_TEXT)));
@@ -372,9 +379,13 @@ pub fn github_fields(event: &str, body: &Value) -> Value {
         }
         _ => {}
     }
-    // `fork`: the change comes from another repository than the one the trigger listens to.
+    // `fork`: the change comes from another repository than the one the trigger listens to. A pull
+    // request whose head repository is gone (a deleted fork: GitHub sends null) counts as a fork
+    // (#714 review F6); events that don't say (a check, a comment) read false.
+    let pr_event = matches!(event, "pull_request" | "pull_request_review" | "pull_request_review_comment");
     let fork = match (f.get("head_repo").and_then(Value::as_str), f.get("repo").and_then(Value::as_str)) {
         (Some(h), Some(r)) => !h.eq_ignore_ascii_case(r),
+        (None, _) if pr_event && body.pointer("/pull_request").is_some() => true,
         _ => false,
     };
     f.insert("fork".into(), Value::Bool(fork));
@@ -455,6 +466,17 @@ mod tests {
         assert_eq!(ok("1000", None, b"{}", 1000), Err("bad signature"), "the id dropped");
         assert_eq!(generic_check(b"k", None, Some("d-1"), b"{}", Some(&sig), 1000), Err("no timestamp"));
         assert_eq!(generic_check(b"k", Some("x"), Some("d-1"), b"{}", Some(&sig), 1000), Err("no timestamp"));
+    }
+
+    /// #714 review F1: a capture can't be replayed by moving the boundary between its id and its
+    /// body (an id with a `:` and the body's start).
+    #[test]
+    fn a_capture_cant_be_split_differently() {
+        let sig = generic_signature(b"k", 1000, "d-1", br#"{"a":1}"#);
+        let split = |id: &str, body: &[u8]| generic_check(b"k", Some("1000"), Some(id), body, Some(&sig), 1000);
+        assert_eq!(split("d-1", br#"{"a":1}"#), Ok(()));
+        assert_eq!(split(r#"d-1:{"a""#, b"1}"), Err("bad signature"));
+        assert_eq!(split("d", br#"1:{"a":1}"#), Err("bad signature"));
     }
 
     #[test]
@@ -549,7 +571,9 @@ mod tests {
         });
         let f = github_fields("pull_request", &fork);
         assert_eq!((f["branch"].as_str(), f["head_repo"].as_str(), f["fork"].as_bool()), (Some("main"), Some("evil/app"), Some(true)));
-        assert_eq!(github_fields("pull_request", &pr)["fork"], false, "no head repo given: not a fork");
+        assert_eq!(github_fields("pull_request", &pr)["fork"], true, "a pull request with no head repository (a deleted fork): a fork");
+        let own = serde_json::json!({ "pull_request": { "number": 9, "head": { "ref": "x", "repo": { "full_name": "acme/app" } } }, "repository": { "full_name": "acme/app" } });
+        assert_eq!(github_fields("pull_request", &own)["fork"], false);
         // #714 review M6: many long labels still fit what a node may send.
         let many = serde_json::json!({
             "issue": { "number": 1, "labels": (0..20).map(|i| serde_json::json!({ "name": format!("{i:02}-{}", "l".repeat(60)) })).collect::<Vec<_>>() },

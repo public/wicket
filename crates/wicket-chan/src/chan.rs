@@ -45,12 +45,12 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 2, a connection talks
-/// 19, 20 or 21; checks for the versions from 15 to 19 remain until changes of their own take
+/// 18, 19 or 20; checks for the versions from 15 to 19 remain until changes of their own take
 /// them out. The checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
-pub const PROTOCOL: u32 = 21;
+pub const PROTOCOL: u32 = 20;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -74,9 +74,8 @@ pub const NAMES: u32 = 18;
 pub const DECODE_SLASH: u32 = 19;
 /// The first protocol version with webhook intake (#578 step 4): the control host sends a node
 /// [`Msg::IntakeSync`] and the node answers [`Msg::IntakeEvents`]. Only a node at this version is
-/// chosen for a webhook trigger's intake. (20 is held for #651's DNS host ports, in review beside
-/// this: whichever lands first takes the lower number, and the other moves up.)
-pub const INTAKE: u32 = 21;
+/// chosen for a webhook trigger's intake.
+pub const INTAKE: u32 = 20;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -1312,26 +1311,27 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// With [`PROTOCOL_SKEW`] 2 and protocol 21 (#578's intake; 20 is #651's DNS host ports),
-    /// every connection talks 19, 20 or 21. 17's standing reach, 18's names and 19's decoded
-    /// slashes are on every connection now (their checks go in changes of their own); 21's intake
-    /// keeps its check while a peer at 19 or 20 can connect.
+    /// With [`PROTOCOL_SKEW`] 2 and protocol 20 (#578's intake), every connection talks 18, 19 or
+    /// 20. 17's standing reach is on every connection now (its check goes in a change of its own);
+    /// 18's names, 19's decoded slashes and 20's intake keep theirs while a peer below them can
+    /// connect.
     #[test]
-    fn no_connection_talks_below_protocol_19() {
+    fn no_connection_talks_below_protocol_18() {
         assert_eq!(
             (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, INTAKE),
-            (21, 2, 15, 16, 17, 18, 19, 21)
+            (20, 2, 15, 16, 17, 18, 19, 20)
         );
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((19..=21).contains(&at) && (19..=23).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(19..=23).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((18..=20).contains(&at) && (18..=22).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(18..=22).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 22 or 23 talking to a control host at 21 from the other side.
-        assert_eq!((negotiate(22, PROTOCOL), negotiate(23, PROTOCOL)), (Ok(21), Ok(21)));
+        // And a node at 21 or 22 talking to a control host at 20 from the other side.
+        assert_eq!((negotiate(21, PROTOCOL), negotiate(22, PROTOCOL)), (Ok(20), Ok(20)));
+        assert!(negotiate(18, PROTOCOL).unwrap() < DECODE_SLASH, "a node at 18 gets no zone that decodes a slash");
         assert!(negotiate(19, PROTOCOL).unwrap() < INTAKE, "a node at 19 is no intake node");
-        assert!(negotiate(PROTOCOL, 18).is_err() && negotiate(18, PROTOCOL).is_err());
+        assert!(negotiate(PROTOCOL, 17).is_err() && negotiate(17, PROTOCOL).is_err());
     }
 
     /// #578 step 4: an intake trigger's secret never shows in a debug print.
@@ -1344,6 +1344,7 @@ mod tests {
             secret: "hunter2".into(),
             repo: Some("acme/app".into()),
             events: vec!["check_suite".into()],
+            unavailable: false,
         };
         assert!(!format!("{t:?}").contains("hunter2"));
         let m = Msg::IntakeSync { id: 1, triggers: vec![t.clone()], ack: vec!["s1".into()], serving: vec!["trg_1".into()], hold: vec![] };

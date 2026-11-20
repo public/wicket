@@ -57,10 +57,11 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Set { name, ca_hosts, labels, taints } => set(&name, ca_hosts.as_deref(), &labels, &taints),
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
-            NodeCmd::Intake { listen, tls_cert, tls_key, socket, dir } => {
+            NodeCmd::Intake { listen, tls_cert, tls_key, socket, dir, trusted_proxy } => {
+                let trusted = trusted_proxy.iter().map(|c| c.parse::<crate::serve::limits::Cidr>()).collect::<Result<Vec<_>>>()?;
                 let sock = socket
                     .unwrap_or_else(|| dir.unwrap_or_else(wicket_node::nodesrv::NodePaths::default_root).join("ctl").join("intake.sock"));
-                crate::intake::serve(listen, crate::intake::tls_pair(tls_cert, tls_key)?, sock).await
+                crate::intake::serve(listen, crate::intake::tls_pair(tls_cert, tls_key)?, sock, std::sync::Arc::new(trusted)).await
             }
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
@@ -313,6 +314,10 @@ pub enum NodeCmd {
         /// ~/.local/share/wicket-node).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// A reverse proxy in front of intake (an address or a CIDR range; repeatable), whose
+        /// `X-Forwarded-For` names the client. Without one, the client is the peer.
+        #[arg(long = "trusted-proxy")]
+        trusted_proxy: Vec<String>,
     },
     /// On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA,
     /// its control connections, feed, load, memory and disk; each box's state, uptime, CPU and

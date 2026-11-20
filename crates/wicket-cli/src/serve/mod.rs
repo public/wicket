@@ -58,7 +58,7 @@
 mod acme;
 mod authority;
 mod capacity;
-mod limits;
+pub(crate) mod limits;
 mod manifests;
 pub(crate) mod net;
 mod push;

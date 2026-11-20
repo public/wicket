@@ -16,7 +16,7 @@ Use a node with a public address. Mark it:
 wicket node set edge-1 --label wicket.intake=true
 ```
 
-The node must talk protocol 21 or later (`wicket node list` shows it), so update it first if it
+The node must talk protocol 20 or later (`wicket node list` shows it), so update it first if it
 doesn't. The local node, `local`, is the control host's own machine: a trigger takes it only with
 `wicket trigger create --allow-local-intake`. Inbound internet traffic would then reach the machine
 with the ledger, the vault and the keys, so use a separate node if you can.

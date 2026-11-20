@@ -2,7 +2,7 @@
 //!
 //! The control host never terminates a webhook: `wicket node intake` on an intake node does, and its
 //! `node serve` spools what it verified. This side assigns a webhook trigger to an intake node
-//! (minting its URL's token), tells each intake node which triggers it serves (protocol 21's
+//! (minting its URL's token), tells each intake node which triggers it serves (protocol 20's
 //! `IntakeSync`), and records and fires what the nodes hand back, each event only for the trigger
 //! its URL named, with that trigger's owner's authority and limits.
 
@@ -123,25 +123,27 @@ pub fn check_verify(s: &TriggerSpec, vault: &wicket_proxy::vault::Vault) -> Resu
 }
 
 /// The table node `node`'s intake serves: each of its triggers that isn't deleted, with its
-/// token's sha256 and verify secret. A trigger whose secret doesn't read now is left out, and said.
+/// token's sha256 and verify secret. A trigger whose secret doesn't read now is sent marked
+/// unavailable, with no secret, so intake answers its deliveries 503 (try later) and counts no
+/// failure (#714 review F5); and said.
 pub fn table(l: &Ledger, node: &str, vault: &wicket_proxy::vault::Vault) -> Result<(Vec<IntakeTrigger>, Vec<String>)> {
     let mut out = vec![];
     let mut problems = vec![];
     for (id, token_sha256) in l.intake_triggers(node)? {
         let Some(t) = l.trigger(&id)? else { continue };
         let Some(name) = verify_secret(&t.spec) else { continue };
-        let secret = match vault.get_verify(name) {
-            Ok(s) => s,
+        let (secret, unavailable) = match vault.get_verify(name) {
+            Ok(s) => (s, false),
             Err(e) => {
                 problems.push(format!("trigger {} ({id}): {e:#}", t.name));
-                continue;
+                (String::new(), true)
             }
         };
         let (kind, repo, events) = match &t.spec.source {
             Source::Github { repo, events, .. } => ("github", Some(repo.clone()), events.clone()),
             _ => ("webhook", None, vec![]),
         };
-        out.push(IntakeTrigger { trigger: id, kind: kind.into(), token_sha256, secret, repo, events });
+        out.push(IntakeTrigger { trigger: id, kind: kind.into(), token_sha256, secret, repo, events, unavailable });
     }
     Ok((out, problems))
 }
@@ -412,11 +414,43 @@ async fn sync_node(
     if link.proto < wicket_chan::chan::INTAKE {
         bail!("node {node} talks protocol {} now: intake needs {}", link.proto, wicket_chan::chan::INTAKE);
     }
+    let calls = link.calls.clone();
+    let synced = drain(ledger, node, now, wake, owner, out, |ack, hold| {
+        let (calls, triggers, serving) = (calls.clone(), triggers.clone(), serving.clone());
+        async move { calls.intake_sync(triggers, ack, serving, hold).await }
+    })
+    .await?;
+    // The node has the table without its deleted or done triggers now: their rows go, and a node
+    // left with none stops being synced (#714 review F9).
+    if synced {
+        ledger.forget_finished_intake(node)?;
+    }
+    Ok(())
+}
+
+/// Takes node `node`'s spooled events through `sync` (one sync: its acks and its hold list in, its
+/// events and refusals out), recording and firing them, until the spool is empty or the pass's
+/// caps are reached. Whether any sync was made.
+pub(super) async fn drain<F, Fut>(
+    ledger: &Ledger,
+    node: &str,
+    now: i64,
+    wake: Waker<'_>,
+    owner: OwnerCheck<'_>,
+    out: &mut Vec<Fired>,
+    mut sync: F,
+) -> Result<bool>
+where
+    F: FnMut(Vec<String>, Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<IntakeEvent>, IntakeRefused)>>,
+{
     let (mut ack, mut read) = (vec![], 0usize);
     let mut checked: HashMap<String, bool> = HashMap::new();
+    let mut synced = false;
     for round in 0..PASS_MAX_ROUNDS {
         let hold: Vec<String> = checked.iter().filter(|(_, ok)| !**ok).map(|(id, _)| id.clone()).collect();
-        let (events, refused) = link.calls.intake_sync(triggers.clone(), std::mem::take(&mut ack), serving.clone(), hold).await?;
+        let (events, refused) = sync(std::mem::take(&mut ack), hold).await?;
+        synced = true;
         if let Err(e) = note_refused(ledger, node, &refused, now) {
             out.push(Fired {
                 trigger: String::new(),
@@ -429,18 +463,21 @@ async fn sync_node(
             break;
         }
         read += events.len();
+        let held_before = checked.values().filter(|ok| !**ok).count();
         let (fired, acked) = ingest_checked(ledger, node, &events, now, wake, owner, &mut checked)?;
         out.extend(fired);
         ack = acked;
-        // Every event of this batch was held (owners that can't be checked): the next sync would
-        // hand the same ones over again.
-        let progressed = !ack.is_empty();
+        // Nothing acked and no trigger newly held: the next sync would hand the same ones over
+        // again. A trigger newly held goes in the next sync's hold list, so its events step aside
+        // for the others' (#714 review F4).
+        let newly_held = checked.values().filter(|ok| !**ok).count() > held_before;
+        let progressed = !ack.is_empty() || newly_held;
         if read >= PASS_MAX_EVENTS || round + 1 == PASS_MAX_ROUNDS || !progressed {
             if !ack.is_empty() {
-                link.calls.intake_sync(triggers.clone(), std::mem::take(&mut ack), serving.clone(), vec![]).await?;
+                sync(std::mem::take(&mut ack), vec![]).await?;
             }
             break;
         }
     }
-    Ok(())
+    Ok(synced)
 }

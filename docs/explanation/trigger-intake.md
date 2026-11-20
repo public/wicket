@@ -32,7 +32,7 @@ beside that node's `wicket node serve`.**
 
 ```
 GitHub / a sender ──HTTPS──▶ wicket node intake ──unix socket──▶ wicket node serve ◀──node channel (pull)── control host
-   POST /hook/<trigger>/<token>   token, signature, normalise        spool (bounded)        IntakeSync, protocol 21
+   POST /hook/<trigger>/<token>   token, signature, normalise        spool (bounded)        IntakeSync, protocol 20
 ```
 
 ### 1. Creating a webhook trigger
@@ -40,7 +40,7 @@ GitHub / a sender ──HTTPS──▶ wicket node intake ──unix socket─�
 - `wicket trigger create` with a `webhook` or `github` source names an **intake node**: a node
   labelled `wicket.intake=true` (`wicket node set <node> --label wicket.intake=true`). With one such node it is chosen; with several,
   `--intake-node` picks.
-- **Protocol 21.** The node must talk protocol 21 or later, as last noted (#691's notes). Otherwise
+- **Protocol 20.** The node must talk protocol 20 or later, as last noted (#691's notes). Otherwise
   the trigger is refused, saying so.
 - **The URL's token.** Create mints a random 32-byte token for the trigger. It shows the URL once,
   `https://<intake host>/hook/<trigger id>/<token>`, and keeps only the token's sha256 (ledger schema
@@ -116,7 +116,7 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
     retries later.
   - An event older than 24 h is dropped from the spool, counted.
 
-### 3. The hand-off: protocol 21
+### 3. The hand-off: protocol 20
 
 - **`IntakeSync { id, triggers, ack, serving, hold }`** (control host to node), answered with
   **`IntakeEvents { id, events, refused }`**.

@@ -29,6 +29,10 @@ pub const SPOOL_MAX_AGE_SECS: i64 = 86_400;
 pub const SYNC_MAX_EVENTS: usize = 500;
 /// … and bytes of them.
 pub const SYNC_MAX_BYTES: usize = 4 << 20;
+/// The most intake connections served at once.
+pub const SOCKET_CONNECTIONS: usize = 16;
+/// How long intake may take to send one request line.
+pub const SOCKET_LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Where intake reaches this node, and which uid may: `node.json`'s `intake_socket` and
 /// `intake_uid`, else `ctl/intake.sock` beside the control socket and this process's own uid.
@@ -236,6 +240,9 @@ pub(super) fn serve_socket(node: Arc<super::Node>, sock: PathBuf, uid: u32) -> a
     // The intake user reaches it through the socket's directory and group (the node's setup makes
     // them); the peer check below is what decides.
     let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660));
+    // A few connections at a time, each line read within a deadline: a compromised intake can't use
+    // up this process's file descriptors or hold connections open (#714 review F8).
+    let slots = Arc::new(tokio::sync::Semaphore::new(SOCKET_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             let Ok((c, _)) = listener.accept().await else {
@@ -246,11 +253,13 @@ pub(super) fn serve_socket(node: Arc<super::Node>, sock: PathBuf, uid: u32) -> a
             if c.peer_cred().map(|p| p.uid()).ok() != Some(uid) {
                 continue;
             }
+            let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
             let n = node.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let (rd, mut wr) = c.into_split();
                 let mut lines = tokio::io::BufReader::new(rd.take(2 * wicket_core::intake::MAX_BODY as u64 + 4096)).lines();
-                while let Ok(Some(l)) = lines.next_line().await {
+                while let Ok(Ok(Some(l))) = tokio::time::timeout(SOCKET_LINE_TIMEOUT, lines.next_line()).await {
                     let n2 = n.clone();
                     let a = match serde_json::from_str::<Request>(&l) {
                         Ok(req) => tokio::task::spawn_blocking(move || n2.intake.answer(&n2.paths.root, req, (n2.clock)() / 1000))
@@ -295,6 +304,7 @@ mod tests {
             secret: "s".into(),
             repo: None,
             events: vec![],
+            unavailable: false,
         }
     }
 

@@ -374,7 +374,7 @@ control host assigns to it, with `wicket node intake` beside its `wicket node se
   - Until it has one, intake answers 503.
   - It spools verified deliveries in `intake/spool/`, at most 10,000 or 64 MiB, each for 24 h at
     most, until the control host has recorded them.
-- **Protocol 21.** The node must talk protocol 21 or later to be chosen.
+- **Protocol 20.** The node must talk protocol 20 or later to be chosen.
 - **The local node** (the control host's own machine) is chosen only with
   `wicket trigger create --allow-local-intake`.
 

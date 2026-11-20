@@ -101,7 +101,14 @@ pub enum Outcome {
     Answer(StatusCode, &'static str),
 }
 
-/// Intake's state: the table, the rate buckets, and the refusals not yet reported.
+/// How long intake remembers a delivery it handed to its node (its body's hash and its id), to
+/// answer one sent again 202 without spooling it or charging its trigger (#714 review F2).
+pub const SEEN_SECS: u64 = 86_400;
+/// The most deliveries remembered (the oldest forgotten first).
+const SEEN_MAX: usize = 20_000;
+
+/// Intake's state: the table, the rate buckets, what it has recently handed over, and the
+/// refusals not yet reported.
 pub struct Intake {
     table: RwLock<Vec<IntakeTrigger>>,
     /// Whether `node serve` has had the control host's table since it started: until then, every
@@ -109,7 +116,12 @@ pub struct Intake {
     ready: std::sync::atomic::AtomicBool,
     buckets: Mutex<HashMap<String, Bucket>>,
     all: Mutex<Bucket>,
-    failures: Mutex<HashMap<IpAddr, Bucket>>,
+    /// Requests with no trigger's token, by client address (`ip_key`: an IPv6 address by its /64).
+    failures: Mutex<HashMap<String, Bucket>>,
+    /// Bad signatures, by trigger: they never slow down another address's delivery.
+    bad_signatures: Mutex<HashMap<String, Bucket>>,
+    /// Deliveries handed to the node, by (trigger, body hash) and (trigger, delivery id).
+    seen: Mutex<HashMap<(String, String), Instant>>,
     refused: Mutex<IntakeRefused>,
 }
 
@@ -121,9 +133,22 @@ impl Default for Intake {
             buckets: Default::default(),
             all: Mutex::new(Bucket::full(ALL_BURST, Instant::now())),
             failures: Default::default(),
+            bad_signatures: Default::default(),
+            seen: Default::default(),
             refused: Default::default(),
         }
     }
+}
+
+/// Takes a token from `key`'s failure bucket in `m` (bounded: the oldest forgotten first), and
+/// whether one was left.
+fn charge(m: &mut HashMap<String, Bucket>, key: &str, at: Instant) -> bool {
+    if m.len() >= FAILURE_ADDRESSES && !m.contains_key(key) {
+        if let Some(oldest) = m.iter().min_by_key(|(_, b)| b.at).map(|(k, _)| k.clone()) {
+            m.remove(&oldest);
+        }
+    }
+    m.entry(key.to_string()).or_insert_with(|| Bucket::full(FAILURES_BURST, at)).take(FAILURES_PER_MIN, FAILURES_BURST, at)
 }
 
 impl Intake {
@@ -131,20 +156,9 @@ impl Intake {
     pub fn set_table(&self, t: Vec<IntakeTrigger>, ready: bool) {
         let served: Vec<String> = t.iter().map(|x| x.trigger.clone()).collect();
         self.buckets.lock().expect("buckets").retain(|k, _| served.contains(k));
+        self.bad_signatures.lock().expect("bad").retain(|k, _| served.contains(k));
         *self.table.write().expect("table") = t;
         self.ready.store(ready, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn fail(&self, ip: IpAddr, f: impl FnOnce(&mut IntakeRefused), code: StatusCode, word: &'static str, at: Instant) -> Outcome {
-        f(&mut self.refused.lock().expect("refused"));
-        let mut m = self.failures.lock().expect("failures");
-        if m.len() >= FAILURE_ADDRESSES && !m.contains_key(&ip) {
-            if let Some(oldest) = m.iter().min_by_key(|(_, b)| b.at).map(|(k, _)| *k) {
-                m.remove(&oldest);
-            }
-        }
-        m.entry(ip).or_insert_with(|| Bucket::full(FAILURES_BURST, at)).take(FAILURES_PER_MIN, FAILURES_BURST, at);
-        Outcome::Answer(code, word)
     }
 
     /// The refusals counted since the last call.
@@ -152,56 +166,83 @@ impl Intake {
         std::mem::take(&mut *self.refused.lock().expect("refused"))
     }
 
-    /// Before any of the body is read: the path's shape and its trigger's token, from `ip`. An
-    /// address that keeps failing is answered 429 first. The trigger, or the answer.
+    /// Before any of the body is read: the path's shape and its trigger's token, from client
+    /// address `ip`. A request with a trigger's token goes on whatever its address did before; only
+    /// one without is charged to its address, and an address that keeps sending those is answered
+    /// 429 instead of 404 (#714 review F3). The trigger, or the answer.
     pub fn admit(&self, path: &str, ip: IpAddr, at: Instant) -> std::result::Result<IntakeTrigger, Outcome> {
-        if let Some(b) = self.failures.lock().expect("failures").get_mut(&ip) {
-            if !b.has(FAILURES_PER_MIN, FAILURES_BURST, at) {
-                self.refused.lock().expect("refused").rate += 1;
-                return Err(Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down"));
-            }
-        }
         if !self.ready.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later"));
         }
         let mut parts = path.trim_start_matches('/').split('/');
-        let (Some("hook"), Some(trigger), Some(token), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
-            return Err(self.fail(ip, |r| r.token += 1, StatusCode::NOT_FOUND, "not found", at));
+        let found = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            // The token's shape first: a path can't make intake hash much.
+            (Some("hook"), Some(trigger), Some(token), None) if ik::token_shape(token) => {
+                let h = ik::token_sha256(token);
+                self.table
+                    .read()
+                    .expect("table")
+                    .iter()
+                    .find(|t| t.trigger == trigger && ik::same(h.as_bytes(), t.token_sha256.as_bytes()))
+                    .cloned()
+            }
+            _ => None,
         };
-        // The token's shape first: a path can't make intake hash much.
-        let t = if ik::token_shape(token) {
-            let h = ik::token_sha256(token);
-            self.table
-                .read()
-                .expect("table")
-                .iter()
-                .find(|t| t.trigger == trigger && ik::same(h.as_bytes(), t.token_sha256.as_bytes()))
-                .cloned()
-        } else {
-            None
-        };
-        t.ok_or_else(|| self.fail(ip, |r| r.token += 1, StatusCode::NOT_FOUND, "not found", at))
+        match found {
+            // Served, but its secret didn't read this time: try later, and nobody's failure.
+            Some(t) if t.unavailable => Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later")),
+            Some(t) => Ok(t),
+            None => {
+                let key = crate::serve::limits::ip_key(ip);
+                let left = charge(&mut self.failures.lock().expect("failures"), &key, at);
+                let mut r = self.refused.lock().expect("refused");
+                if left {
+                    r.token += 1;
+                    Err(Outcome::Answer(StatusCode::NOT_FOUND, "not found"))
+                } else {
+                    r.rate += 1;
+                    Err(Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down"))
+                }
+            }
+        }
     }
 
-    /// With the body: the signature, then (verified) the trigger's rate, then GitHub's event and
-    /// repository. `header` gets a header by its lower-case name; `now` is Unix s.
-    pub fn verify(
-        &self,
-        t: &IntakeTrigger,
-        header: &dyn Fn(&str) -> Option<String>,
-        body: &[u8],
-        ip: IpAddr,
-        now: i64,
-        at: Instant,
-    ) -> Outcome {
+    /// Whether `t` has had this delivery (its body's hash, or its id) handed over recently.
+    fn seen(&self, t: &str, raw: &str, delivery: &str, at: Instant) -> bool {
+        let mut m = self.seen.lock().expect("seen");
+        let fresh = |k: &(String, String), m: &HashMap<(String, String), Instant>| {
+            m.get(k).is_some_and(|when| at.saturating_duration_since(*when) < Duration::from_secs(SEEN_SECS))
+        };
+        let (a, b) = ((t.to_string(), format!("b:{raw}")), (t.to_string(), format!("d:{delivery}")));
+        let hit = fresh(&a, &m) || fresh(&b, &m);
+        m.retain(|_, when| at.saturating_duration_since(*when) < Duration::from_secs(SEEN_SECS));
+        hit
+    }
+
+    /// Remembers a delivery the node took.
+    pub fn remember(&self, e: &IntakeEvent, at: Instant) {
+        let mut m = self.seen.lock().expect("seen");
+        while m.len() + 2 > SEEN_MAX {
+            let Some(oldest) = m.iter().min_by_key(|(_, w)| **w).map(|(k, _)| k.clone()) else { break };
+            m.remove(&oldest);
+        }
+        m.insert((e.trigger.clone(), format!("b:{}", e.raw_sha256)), at);
+        m.insert((e.trigger.clone(), format!("d:{}", e.delivery)), at);
+    }
+
+    /// With the body: the signature, a delivery seen before, then (verified and new) the trigger's
+    /// rate, then GitHub's event and repository. `header` gets a header by its lower-case name;
+    /// `now` is Unix s.
+    pub fn verify(&self, t: &IntakeTrigger, header: &dyn Fn(&str) -> Option<String>, body: &[u8], now: i64, at: Instant) -> Outcome {
         let github = t.kind == "github";
         let delivery_header = header(if github { ik::GITHUB_DELIVERY } else { ik::GENERIC_DELIVERY });
+        let timestamp = header(ik::GENERIC_TIMESTAMP);
         let signed = if github {
             ik::signature_ok(t.secret.as_bytes(), body, header(ik::GITHUB_SIGNATURE).as_deref())
         } else {
             ik::generic_check(
                 t.secret.as_bytes(),
-                header(ik::GENERIC_TIMESTAMP).as_deref(),
+                timestamp.as_deref(),
                 delivery_header.as_deref(),
                 body,
                 header(ik::GENERIC_SIGNATURE).as_deref(),
@@ -210,9 +251,34 @@ impl Intake {
             .is_ok()
         };
         if !signed {
-            return self.fail(ip, |r| r.signature += 1, StatusCode::UNAUTHORIZED, "bad signature", at);
+            // Charged to the trigger, never to an address another sender shares.
+            let left = charge(&mut self.bad_signatures.lock().expect("bad"), &t.trigger, at);
+            let mut r = self.refused.lock().expect("refused");
+            r.signature += 1;
+            return match left {
+                true => Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"),
+                false => Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down"),
+            };
         }
-        // Only a verified delivery counts against its trigger: a leaked URL alone can't starve it.
+        let Some(delivery) = ik::delivery_id(delivery_header.as_deref(), body) else {
+            self.refused.lock().expect("refused").other += 1;
+            return Outcome::Answer(StatusCode::BAD_REQUEST, "bad delivery id");
+        };
+        // What the event's dedup is keyed on: GitHub's body (its id and time aren't signed), or a
+        // generic delivery's whole signed message (time, id and body), so the same body sent again
+        // as a new delivery isn't taken for a resend (#714 review F12).
+        let raw = if github {
+            ik::body_sha256(body)
+        } else {
+            let ts = timestamp.as_deref().and_then(|t| t.trim().parse::<i64>().ok()).unwrap_or(0);
+            ik::body_sha256(&ik::generic_signed(ts, delivery_header.as_deref().map(str::trim).unwrap_or(""), body))
+        };
+        // Sent again (a replay, or a resend): 202, nothing spooled, nothing charged (#714 review F2).
+        if self.seen(&t.trigger, &raw, &delivery, at) {
+            return Outcome::Answer(StatusCode::ACCEPTED, "already had it");
+        }
+        // Only a verified, new delivery counts against its trigger: a leaked URL or a replayed body
+        // alone can't starve it.
         {
             let mut b = self.buckets.lock().expect("buckets");
             let mine = b.entry(t.trigger.clone()).or_insert_with(|| Bucket::full(PER_TRIGGER_BURST, at));
@@ -222,10 +288,6 @@ impl Intake {
                 return Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down");
             }
         }
-        let Some(delivery) = ik::delivery_id(delivery_header.as_deref(), body) else {
-            self.refused.lock().expect("refused").other += 1;
-            return Outcome::Answer(StatusCode::BAD_REQUEST, "bad delivery id");
-        };
         let (kind, fields) = if github {
             let event = header(ik::GITHUB_EVENT).unwrap_or_default();
             // What wicket will never fire on is answered 202, so GitHub doesn't send it again.
@@ -256,7 +318,7 @@ impl Intake {
             delivery,
             received_at: now,
             fields,
-            raw_sha256: ik::body_sha256(body),
+            raw_sha256: raw,
             bytes: body.len() as u64,
         }))
     }
@@ -276,9 +338,15 @@ async fn ask(sock: &std::path::Path, req: &serde_json::Value) -> Result<serde_js
     Ok(serde_json::from_str(&answer)?)
 }
 
+/// Who is in front of intake: reverse proxies whose `X-Forwarded-For` it believes (`--trusted-proxy`,
+/// as the console's, #123). A request from one is its client's, and no per-address connection cap
+/// applies to it.
+pub type Trusted = Arc<Vec<crate::serve::limits::Cidr>>;
+
 /// `wicket node intake`: listens on `listen` (with TLS from `tls`'s certificate and key files, or
-/// plain HTTP behind a reverse proxy that has them), and talks to its node over `sock`.
-pub async fn serve(listen: std::net::SocketAddr, tls: Option<(PathBuf, PathBuf)>, sock: PathBuf) -> Result<()> {
+/// plain HTTP behind a reverse proxy that has them, named in `trusted`), and talks to its node over
+/// `sock`.
+pub async fn serve(listen: std::net::SocketAddr, tls: Option<(PathBuf, PathBuf)>, sock: PathBuf, trusted: Trusted) -> Result<()> {
     let intake = Arc::new(Intake::default());
     // The table, and refusals reported, every TABLE_EVERY.
     {
@@ -316,7 +384,7 @@ pub async fn serve(listen: std::net::SocketAddr, tls: Option<(PathBuf, PathBuf)>
     };
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
     eprintln!("wicket intake: listening on {listen}{}", if acceptor.is_some() { " (TLS)" } else { " (plain HTTP: put TLS in front)" });
-    accept(listener, acceptor, intake, sock, limits()).await
+    accept(listener, acceptor, intake, sock, limits(), trusted).await
 }
 
 /// Accepts connections as the console does: over the cap (overall, or from one address) they are
@@ -327,6 +395,7 @@ async fn accept(
     intake: Arc<Intake>,
     sock: PathBuf,
     limits: crate::serve::net::Limits,
+    trusted: Trusted,
 ) -> Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
     let per_ip = Arc::new(crate::serve::net::PerIp::default());
@@ -339,18 +408,25 @@ async fn accept(
             }
         };
         let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
-        let Some(guard) = per_ip.enter(peer.ip(), limits.per_ip_connections) else { continue };
+        let guard = if trusted.iter().any(|c| c.contains(peer.ip())) {
+            None
+        } else {
+            match per_ip.enter(peer.ip(), limits.per_ip_connections) {
+                Some(g) => Some(g),
+                None => continue,
+            }
+        };
         let _ = tcp.set_nodelay(true);
-        let (i, s, acc, lim) = (intake.clone(), sock.clone(), acceptor.clone(), limits.clone());
+        let (i, s, acc, lim, tr) = (intake.clone(), sock.clone(), acceptor.clone(), limits.clone(), trusted.clone());
         tokio::spawn(async move {
             let _held = (permit, guard);
             match acc {
                 Some(a) => {
                     if let Ok(Ok(io)) = tokio::time::timeout(lim.handshake_timeout, a.accept(tcp)).await {
-                        serve_conn(io, peer.ip(), i, s, lim).await;
+                        serve_conn(io, peer.ip(), i, s, lim, tr).await;
                     }
                 }
-                None => serve_conn(tcp, peer.ip(), i, s, lim).await,
+                None => serve_conn(tcp, peer.ip(), i, s, lim, tr).await,
             }
         });
     }
@@ -362,9 +438,15 @@ async fn serve_conn<I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
     i: Arc<Intake>,
     sock: PathBuf,
     lim: crate::serve::net::Limits,
+    trusted: Trusted,
 ) {
     let body_timeout = lim.body_timeout;
-    let svc = hyper::service::service_fn(move |req| handle(i.clone(), sock.clone(), ip, body_timeout, req));
+    let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+        // The client's address: the peer's, or behind a trusted proxy, the one it forwards.
+        let lines: Vec<Option<&str>> = req.headers().get_all("x-forwarded-for").iter().map(|v| v.to_str().ok()).collect();
+        let client = crate::serve::limits::client_ip(ip, &lines, &trusted);
+        handle(i.clone(), sock.clone(), client, body_timeout, req)
+    });
     let mut b = hyper::server::conn::http1::Builder::new();
     b.timer(TokioTimer::new())
         .header_read_timeout(lim.header_timeout)
@@ -443,10 +525,14 @@ async fn handle(
     };
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(String::from);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    Ok(match i.verify(&t, &header, &body, ip, now, at) {
+    Ok(match i.verify(&t, &header, &body, now, at) {
         Outcome::Answer(code, word) => answer(code, word),
         Outcome::Spool(e) => match ask(&sock, &serde_json::json!({ "op": "deliver", "event": e })).await {
-            Ok(v) if v["ok"] == true => answer(StatusCode::ACCEPTED, "accepted"),
+            Ok(v) if v["ok"] == true => {
+                // Only once the node has it: one it refused may be sent again, and taken then.
+                i.remember(&e, at);
+                answer(StatusCode::ACCEPTED, "accepted")
+            }
             // Full, or the node not up: the sender tries again later.
             _ => answer(StatusCode::SERVICE_UNAVAILABLE, "try later"),
         },

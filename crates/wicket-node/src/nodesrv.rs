@@ -1210,7 +1210,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             }
         });
     }
-    // Webhook intake's socket (#578 step 4), in the same 0700 directory: `wicket intake serve`.
+    // Webhook intake's socket (#578 step 4): `wicket node intake` reaches this node through it,
+    // checked by peer uid (`node.json`'s `intake_socket` and `intake_uid`, else `ctl/intake.sock`).
     let (intake_sock, intake_uid) = intake::endpoint(&node.paths.root, &ctl);
     if let Err(e) = intake::serve_socket(node.clone(), intake_sock, intake_uid) {
         say_err!("[node] intake socket: {e:#}");

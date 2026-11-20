@@ -2342,6 +2342,61 @@ mod tests {
         assert!(fired.iter().all(|r| !r.body.contains("spoofed")), "the body's delivery didn't replace wicket's");
     }
 
+    /// #714 review F4: when a node's oldest events all belong to a trigger whose owner can't be
+    /// checked, the next sync holds that trigger's events back, so another trigger's behind them are
+    /// still fetched and fired in the same pass.
+    #[tokio::test]
+    async fn a_held_trigger_doesnt_block_the_others() {
+        use wicket_core::intake::{IntakeEvent, IntakeRefused};
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        let mk = |l: &Ledger, owner: &Operator, name: &str| {
+            let mut s =
+                spec(&format!("trigger: {name}\nsource: {{ webhook: {{ verify: {{ hmac_sha256: k }} }} }}\naction: {{ wake: captain }}\n"));
+            pin_target(l, "t0", &owner.id, &mut s).unwrap();
+            let id = l.create_trigger("t0", &owner.id, &s, &owner.label, false, None).unwrap();
+            l.set_trigger_intake(&id, "edge", "x").unwrap();
+            id
+        };
+        let (stuck, fine) = (mk(&l, &operator(), "stuck"), mk(&l, &other(), "fine"));
+        let stuck_owner = l.trigger(&stuck).unwrap().unwrap().owner;
+        let owner = move |t: &Trigger| -> std::result::Result<(), NotOwner> {
+            if t.owner == stuck_owner {
+                Err(NotOwner::Unknown("ldap timed out".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let now = wicket_store::now();
+        let ev = |n: usize, trigger: &str| IntakeEvent {
+            id: format!("s-{n:02}"),
+            trigger: trigger.into(),
+            kind: "webhook".into(),
+            delivery: format!("d-{n}"),
+            received_at: now,
+            fields: serde_json::json!({}),
+            raw_sha256: format!("b-{n}"),
+            bytes: 1,
+        };
+        // The node's spool, oldest first: three of the stuck trigger's, then the fine one's. It
+        // sends at most three a sync, and none of a held trigger's.
+        let spool = std::sync::Mutex::new(vec![ev(0, &stuck), ev(1, &stuck), ev(2, &stuck), ev(3, &fine)]);
+        let mut out = vec![];
+        let synced = intake::drain(&l, "edge", now, &no_wake, &owner, &mut out, |ack: Vec<String>, hold: Vec<String>| {
+            let mut sp = spool.lock().unwrap();
+            sp.retain(|e| !ack.contains(&e.id));
+            let send: Vec<IntakeEvent> = sp.iter().filter(|e| !hold.contains(&e.trigger)).take(3).cloned().collect();
+            std::future::ready(Ok((send, IntakeRefused::default())))
+        })
+        .await
+        .unwrap();
+        assert!(synced);
+        let fired: Vec<(&str, &str)> = out.iter().map(|f| (f.trigger.as_str(), f.status.as_str())).collect();
+        assert!(fired.contains(&(fine.as_str(), "started")), "{fired:?}");
+        let left: Vec<String> = spool.lock().unwrap().iter().map(|e| e.trigger.clone()).collect();
+        assert_eq!(left, [stuck.clone(), stuck.clone(), stuck.clone()], "the held ones stay in the spool, the other's acked");
+    }
+
     /// A node's refusals are audited at most once an hour, counted.
     #[test]
     fn intake_refusals_are_audited_once_an_hour() {

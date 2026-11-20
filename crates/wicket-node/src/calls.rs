@@ -288,7 +288,7 @@ impl Calls {
     }
 
     /// Whether the node has the image `digest` names (#191).
-    /// Webhook intake (#578 step 4, protocol 21): sends the node the triggers its intake serves and
+    /// Webhook intake (#578 step 4, protocol 20): sends the node the triggers its intake serves and
     /// the events recorded since the last sync, and returns what it has spooled (oldest first,
     /// bounded) and what intake refused since.
     pub async fn intake_sync(

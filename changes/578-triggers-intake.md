@@ -18,7 +18,7 @@ type: Added
       event and repository.
     - It hands what it verified to `wicket node serve`, which spools it.
     - The control host's own machine takes intake only with `--allow-local-intake`.
-  - **Collected each reconcile pass** over the node channel (protocol 21), and fired once per
+  - **Collected each reconcile pass** over the node channel (protocol 20), and fired once per
     delivery id.
   - **Fields, not the body.** A delivery is a short list of fields, capped and stripped of control
     characters, quoted to the agent as event input. Its raw body is kept only as a sha256.
@@ -33,7 +33,7 @@ type: Added
     - A delivery read more than 15 minutes late is passed over.
     - The same body under a new delivery id fires once.
     - Refusals are audited at most once an hour per node.
-  - **Protocol 21.** wicket now speaks protocol 21 with a skew of 2: nodes at 17 or 18 must be
-    updated with or before their control host. Ledger schema 35 adds `trigger_intake`.
+  - **Protocol 20.** wicket now speaks protocol 20 with a skew of 2: nodes at 17 must be updated
+    with or before their control host. Ledger schema 35 adds `trigger_intake`.
   - [Fire a trigger from a webhook](../docs/how-to/trigger-from-a-webhook.md),
     [webhook intake](../docs/explanation/trigger-intake.md).

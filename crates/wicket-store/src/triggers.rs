@@ -589,11 +589,19 @@ impl Ledger {
             .is_some())
     }
 
-    /// The nodes some trigger's intake is assigned to.
+    /// Forgets node `node`'s intake rows for triggers deleted or done: once the node has been sent a
+    /// table without them (#714 review F9).
+    pub fn forget_finished_intake(&self, node: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM trigger_intake WHERE node = ?1 AND trigger IN (SELECT id FROM triggers WHERE status IN ('deleted', 'done'))",
+            params![node],
+        )?)
+    }
+
+    /// The nodes some trigger's intake is assigned to, finished triggers' included until their node
+    /// has been told ([`Ledger::forget_finished_intake`]).
     pub fn intake_nodes(&self) -> Result<Vec<String>> {
-        let mut st = self.conn.prepare(
-            "SELECT DISTINCT i.node FROM trigger_intake i JOIN triggers t ON t.id = i.trigger WHERE t.status != 'deleted' ORDER BY i.node",
-        )?;
+        let mut st = self.conn.prepare("SELECT DISTINCT node FROM trigger_intake ORDER BY node")?;
         let rows = st.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }

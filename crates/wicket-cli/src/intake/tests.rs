@@ -12,6 +12,7 @@ fn trig(kind: &str, token: &str) -> IntakeTrigger {
         secret: "s3cret".into(),
         repo: (kind == "github").then(|| "acme/app".to_string()),
         events: if kind == "github" { vec!["check_suite".into()] } else { vec![] },
+        unavailable: false,
     }
 }
 
@@ -48,7 +49,7 @@ fn a_generic_delivery_is_checked_in_order() {
     let at = Instant::now();
     let path = format!("/hook/trg_1/{token}");
     let t = i.admit(&path, IP, at).unwrap();
-    let Outcome::Spool(e) = i.verify(&t, &generic(1000, "d-1", body), body, IP, 1000, at) else { panic!("refused") };
+    let Outcome::Spool(e) = i.verify(&t, &generic(1000, "d-1", body), body, 1000, at) else { panic!("refused") };
     assert_eq!((e.trigger.as_str(), e.delivery.as_str(), e.kind.as_str()), ("trg_1", "d-1", "webhook"));
     assert_eq!(e.fields, serde_json::json!({ "status": "failed", "n": 3 }));
     let other = ik::new_token().unwrap();
@@ -57,7 +58,7 @@ fn a_generic_delivery_is_checked_in_order() {
     assert_eq!(i.admit("/hook/trg_1", IP, at), Err(Outcome::Answer(StatusCode::NOT_FOUND, "not found")));
     let forged =
         headers(&[(ik::GENERIC_SIGNATURE, ik::generic_signature(b"other", 1000, "d-1", body)), (ik::GENERIC_TIMESTAMP, "1000".into())]);
-    assert_eq!(i.verify(&t, &forged, body, IP, 1000, at), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"));
+    assert_eq!(i.verify(&t, &forged, body, 1000, at), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"));
     let r = i.take_refused();
     assert_eq!((r.token, r.signature), (3, 1));
     assert_eq!(i.take_refused().total(), 0, "reported once");
@@ -74,7 +75,7 @@ fn a_captured_generic_delivery_cant_be_replayed() {
     let sig = ik::generic_signature(b"s3cret", 1000, "d-1", body);
     let replay = |id: &str, now: i64| {
         let h = headers(&[(ik::GENERIC_SIGNATURE, sig.clone()), (ik::GENERIC_TIMESTAMP, "1000".into()), (ik::GENERIC_DELIVERY, id.into())]);
-        i.verify(&t, &h, body, IP, now, Instant::now())
+        i.verify(&t, &h, body, now, Instant::now())
     };
     assert!(matches!(replay("d-1", 1000), Outcome::Spool(_)));
     assert_eq!(replay("d-2", 1000), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"), "a new id");
@@ -99,49 +100,97 @@ fn a_github_delivery_keeps_its_fields() {
     };
     let at = Instant::now();
     let t = i.admit(&path, IP, at).unwrap();
-    let Outcome::Spool(e) = i.verify(&t, &h("check_suite", &body), &body, IP, 5, at) else { panic!("refused") };
+    let Outcome::Spool(e) = i.verify(&t, &h("check_suite", &body), &body, 5, at) else { panic!("refused") };
     assert_eq!((e.kind.as_str(), e.fields["pr"]["number"].as_i64()), ("check_suite", Some(9)));
-    assert_eq!(i.verify(&t, &h("push", &body), &body, IP, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not listened to"));
+    assert_eq!(i.verify(&t, &h("push", &body), &body, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not listened to"));
     let elsewhere = serde_json::to_vec(&serde_json::json!({ "repository": { "full_name": "evil/app" } })).unwrap();
-    assert_eq!(
-        i.verify(&t, &h("check_suite", &elsewhere), &elsewhere, IP, 5, at),
-        Outcome::Answer(StatusCode::ACCEPTED, "another repository")
-    );
+    assert_eq!(i.verify(&t, &h("check_suite", &elsewhere), &elsewhere, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "another repository"));
     // The generic header doesn't sign a GitHub delivery.
     let generic = headers(&[(ik::GENERIC_SIGNATURE, github_sig(&body)), (ik::GITHUB_EVENT, "check_suite".into())]);
-    assert_eq!(i.verify(&t, &generic, &body, IP, 5, at), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"));
+    assert_eq!(i.verify(&t, &generic, &body, 5, at), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"));
 }
 
-/// #714 review M1: only verified deliveries count against a trigger, so a leaked URL can't starve
-/// it; an address that keeps failing is slowed down before anything else is looked at; verified
-/// deliveries past the trigger's burst are slowed down too.
+/// #714 reviews M1 and F3: only verified deliveries count against a trigger, so a leaked URL can't
+/// starve it; bad tokens are charged to their address (an IPv6 address by its /64) and slow down
+/// only its bad-token requests, never a delivery with a trigger's token; bad signatures are charged
+/// to their trigger and slow down only bad signatures.
 #[test]
 fn rates_count_what_they_should() {
     let token = ik::new_token().unwrap();
     let i = ready(vec![trig("webhook", &token)]);
     let path = format!("/hook/trg_1/{token}");
     let at = Instant::now();
-    let t = i.admit(&path, IP, at).unwrap();
-    let attacker = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
-    for _ in 0..100 {
-        let _ = i.verify(&t, &headers(&[]), b"{}", attacker, 1, at);
+    let shared: IpAddr = "2001:db8:1:2::7".parse().unwrap();
+    let neighbour: IpAddr = "2001:db8:1:2::9".parse().unwrap();
+    let bad = format!("/hook/trg_1/{}", ik::new_token().unwrap());
+    for _ in 0..30 {
+        let _ = i.admit(&bad, shared, at);
     }
-    assert_eq!(i.admit(&path, attacker, at), Err(Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down")), "the failing address");
+    assert_eq!(i.admit(&bad, neighbour, at), Err(Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down")), "the same /64");
+    let t = i.admit(&path, shared, at).expect("a delivery with the token isn't slowed down by its address's bad tokens");
+    // Bad signatures: charged to the trigger, past its burst answered 429, but a signed one goes on.
+    for _ in 0..30 {
+        let _ = i.verify(&t, &headers(&[]), b"{}", 1, at);
+    }
+    assert_eq!(i.verify(&t, &headers(&[]), b"{}", 1, at), Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down"));
     let mut ok = 0;
     for n in 0..30 {
         let id = format!("d-{n}");
-        if matches!(i.verify(&t, &generic(1, &id, b"{}"), b"{}", IP, 1, at), Outcome::Spool(_)) {
+        if let Outcome::Spool(e) = i.verify(&t, &generic(1, &id, b"{}"), b"{}", 1, at) {
+            i.remember(&e, at);
             ok += 1;
         }
     }
-    assert_eq!(ok, PER_TRIGGER_BURST as usize, "the sender still gets its burst, the attacker's failures not counted against it");
+    assert_eq!(ok, PER_TRIGGER_BURST as usize, "the sender still gets its burst");
     assert!(
-        matches!(i.verify(&t, &generic(1, "late", b"{}"), b"{}", IP, 1, at + Duration::from_secs(2)), Outcome::Spool(_)),
+        matches!(i.verify(&t, &generic(1, "late", b"{}"), b"{}", 1, at + Duration::from_secs(2)), Outcome::Spool(_)),
         "a token a second comes back"
     );
     // A trigger no longer served loses its bucket, and its deliveries are not found.
     i.set_table(vec![], true);
     assert_eq!(i.admit(&path, IP, at), Err(Outcome::Answer(StatusCode::NOT_FOUND, "not found")));
+}
+
+/// #714 review F2: a captured GitHub body sent again under new delivery ids is answered 202 and
+/// neither spooled nor charged, so the real deliveries still go through.
+#[test]
+fn a_replayed_body_doesnt_use_up_the_trigger() {
+    let token = ik::new_token().unwrap();
+    let i = ready(vec![trig("github", &token)]);
+    let t = i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()).unwrap();
+    let at = Instant::now();
+    let body = |n: u32| serde_json::to_vec(&serde_json::json!({ "n": n, "repository": { "full_name": "acme/app" } })).unwrap();
+    let h = |b: &[u8], id: &str| {
+        headers(&[(ik::GITHUB_SIGNATURE, github_sig(b)), (ik::GITHUB_EVENT, "check_suite".into()), (ik::GITHUB_DELIVERY, id.into())])
+    };
+    let captured = body(0);
+    let Outcome::Spool(e) = i.verify(&t, &h(&captured, "g-0"), &captured, 5, at) else { panic!("refused") };
+    i.remember(&e, at);
+    for n in 1..50 {
+        assert_eq!(
+            i.verify(&t, &h(&captured, &format!("replay-{n}")), &captured, 5, at),
+            Outcome::Answer(StatusCode::ACCEPTED, "already had it")
+        );
+    }
+    let real = body(1);
+    assert!(matches!(i.verify(&t, &h(&real, "g-1"), &real, 5, at), Outcome::Spool(_)), "the real delivery still goes through");
+}
+
+/// #714 review F5: a trigger whose secret didn't read is answered 503, and counts as nobody's failure.
+#[test]
+fn an_unavailable_trigger_says_try_later() {
+    let token = ik::new_token().unwrap();
+    let mut t = trig("webhook", &token);
+    t.unavailable = true;
+    t.secret = String::new();
+    let i = ready(vec![t]);
+    for _ in 0..30 {
+        assert_eq!(
+            i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()),
+            Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later"))
+        );
+    }
+    assert_eq!(i.take_refused().total(), 0);
 }
 
 /// #714 review M4: until `node serve` has the control host's table, deliveries are answered 503
@@ -209,7 +258,7 @@ async fn served(name: &str, token: &str, lim: crate::serve::net::Limits) -> Serv
     intake.set_table(serde_json::from_value(v["triggers"].clone()).unwrap(), true);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(accept(listener, None, intake, sock, lim));
+    tokio::spawn(accept(listener, None, intake, sock, lim, Arc::new(vec![])));
     Served { addr, delivered, dir }
 }
 
