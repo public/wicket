@@ -22,13 +22,13 @@ It uses **passkeys**:
   (`operator.enrol_failed`) and the link's session ends. **Add a device** in the passkeys card makes
   one and shows it there until it expires; `ttl_secs` is a whole number of seconds. A signed-in
   session can't register a passkey itself;
-- **every action is signed by the session's own passkey**: the challenge offers only it, and a
-  signature by any other enrolled passkey is refused (403) and audited (`operator.action_refused`),
-  whatever the action;
 - sign-in is a passkey with user verification;
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision
   (request, method, host, path, decision, uses, lifetime). The server checks it, uses it once, and stores the
   signed record, so `wicket audit --verify` re-verifies every decision offline;
+- **every action is signed by the session's own passkey** (#802): the challenge offers only the passkey
+  you signed in with, and a signature by any other enrolled passkey is refused (403) and audited
+  (`operator.action_refused`), whatever the action, before anything is done;
 - **signing takes two steps.** A tap on Approve, Deny, Send, Revoke or Start asks the server for the exact
   action. The page then shows that action in a confirmation pinned to the top of the screen, above where a
   phone's passkey sheet opens, and only its own button starts the passkey ceremony. The authenticator's sheet
@@ -109,6 +109,25 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   `run.fence_released` record with the fence not lifted: the run is still on the card, and can be
   released again. The box may still be
   running: release a fence only for a node that will never run it again.
+- **release a server past its lease** (`node_release`, #710), the console's path beside root's
+  `wicket node release`. A server `wicket node create` made is released by the reconciler once its
+  lease ends, unless a run still runs on it or keeps files a fetch didn't bring back: then it is kept,
+  and billing, until someone releases it. The action takes its instance id (or name) and a reason;
+  begin refuses no reason (400), a server that isn't an active placed server here (404), one whose
+  lease hasn't ended (409: the reconciler releases it then), and an operator whose authority in
+  [`operators.yaml`](configuration.md#operatorsyaml) doesn't cover `capacity` at R4 (403), before
+  the passkey is asked for. The passkey signs the server, its lease's end, the runs still running
+  there, its service instances, the runs whose files go with it, what releasing does in words, the reason and the effect's
+  sha256; a server whose runs or lease changed since you were shown it is refused (audited
+  `decision.refused`). The decision is audited first (`placement.node_release_decided`, with your
+  passkey and operator identity, the record root's command writes too, `granter` `human` or `root`,
+  `via` `console` or `cli`); if it can't be written, nothing is released. Then, in the background, with the server's own provider key: if it is still what you signed and still
+  active, its service instances are stopped, the provider destroys it, the runs on it are revoked,
+  and `placement.node_released` (with the decision's sequence) is written and its enrolment revoked.
+  Otherwise `placement.node_release_failed` (it is as it was) or
+  `placement.node_release_already_ended` (another release got there first). Files it keeps are
+  forgotten only when this release destroyed it. The page's button waits for the Lit servers card
+  (#758); until then the action is there for the page and for scripts.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
@@ -220,6 +239,16 @@ ci/session-view.sh                                  # needs Node 20.19+ or 22.12
 WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
 ```
 
+**The console's own script** (`crates/wicket-cli/src/serve/static/console.js`) is minified when wicket
+is built, by `crates/wicket-cli/build.rs` with [Oxc](https://oxc.rs)'s minifier (Rust crates, pinned
+exactly in the workspace's `Cargo.toml`), so a plain `cargo build` needs no Node: about 25 KB gzipped
+instead of 38 KB. Local names are shortened and top-level names kept. `WICKET_CONSOLE_UNMINIFIED=1
+cargo build` embeds it as written, to read in a browser's debugger. The page's tests run on both
+(`serve/tests/console_ui.js`), and `ci/console-browsers.sh` runs it as served in Chromium, Firefox and
+WebKit: it writes what `wicket serve` sends (`wicket dev console-assets DIR`: the page, its files and
+its headers) and serves that against the preview's mock API, failing on any error, CSP violation or
+Trusted Types report, a card replaced by an unchanged poll, or a page that scrolls sideways.
+
 Not yet: answering the agent's own permission requests from the page (wicket's policy answers
 them, #67), images and resources in prompts, and the box tree, budgets and hibernate controls
 next to the session (#327's later slices).
@@ -254,11 +283,35 @@ that stays a signed action.
   whether `org.cedar` still matches what was applied (a hand edit refuses every mint), every kept
   version with when and by whom it was applied, and each running run with the version it was minted
   under: current, older, or revoked by a later `wicket policy apply`.
+- **Applying an org policy** (#712): `POST /api/policy/preview` with `cedar`, `entities` and
+  `keep_runs` (at most 60 KiB together) shows what `wicket policy apply --dry-run` prints: its
+  version and its sources' sha256, the one it replaces, what it changes against the applied policy
+  for each running zone and group (widens or narrows), what couldn't be compared, the zones it
+  doesn't mint for and the running runs it revokes. That is read-only, so it needs only the session;
+  one runs at a time (429). Applying it is the signed action `policy_apply`, with a `reason`, on that
+  preview; see [the org policy](policy.md). Begin refuses no reason (400) and an operator whose
+  authority doesn't cover `policy` at R4 (403) before any preview work, then a policy that doesn't
+  parse (400) or doesn't mint (409). A preview that changed before you signed is refused (audited
+  `decision.refused`). The page's form waits for the Lit Settings screen (#758/#759).
 
 **Never shown:** a serialized token, any signature (a block's or a JWS's), a secret's value, a private
 key. Each view is built from named fields, never by serializing a stored record, and a test fetches
 every console endpoint and scans each answer for the token, any 24-byte run of its bytes (base64url,
 base64 and hex, except runs inside a public key), identity JWSs and private keys.
+## Placement view
+
+Why a run went where it did ([#579](https://github.com/public/wicket/issues/579)), read-only and behind
+an operator's session: `GET /api/runs/<run>/placement` returns the run's `status` and `node` (`local` for
+this host's own), the placement decision recorded when its node was chosen, and `text`, the explanation
+`wicket why-here` prints. `decision` is built from named fields of placement's record, never the record
+whole: `at_ms`, `node` (or `behind`, the waiting run it went behind), `candidates`, the `request`
+(`vcpus`, `memory_mib`, `priority`, `preemptible`, `node_selector`, `tolerations`, `affinity`,
+`anti_affinity`), `ca_hosts`, `ranked` (the nodes it may go on, best first) and `refused` (each other
+node with every reason it was out), at most 10 of each (`ranked_more`, `refused_more`). A run with no
+decision recorded (on a node named for it whose room wasn't known from a report, or decided over a week
+ago) has `decision: null` and `why`. A run that doesn't exist, or another tenant's, is not found, as for
+its authority view. [Nodes: placement](nodes.md#placement) says how a node is chosen.
+
 ## Manifests
 
 The **Manifests** section lists the manifests runs can be started from (#172). The installation's
@@ -485,6 +538,8 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
   'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+  and Trusted Types reported but not yet enforced (`Content-Security-Policy-Report-Only:
+  require-trusted-types-for 'script'; trusted-types lit-html`, [#739](https://github.com/public/wicket/issues/739)),
   no CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
   `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
 - **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS

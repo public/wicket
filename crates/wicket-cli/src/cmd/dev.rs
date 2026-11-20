@@ -15,6 +15,11 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Dev { cmd: DevCmd::ConsoleAssets { dir } } => {
+            serve::write_console_assets(&dir)?;
+            println!("{}", dir.display());
+            Ok(())
+        }
         _ => unreachable!("dispatched to the wrong command group"),
     }
 }
@@ -27,6 +32,9 @@ pub enum DevCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Write the console as `wicket serve` sends it (the page, its files at their paths, and the
+    /// security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh).
+    ConsoleAssets { dir: PathBuf },
     /// A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then
     /// calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a
     /// `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without

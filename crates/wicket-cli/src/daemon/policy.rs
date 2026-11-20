@@ -67,6 +67,10 @@ pub fn route(cmd: &Cmd) -> Route {
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
         Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } => Forward(Read),
+        // A message reaches an agent as a session's prompt would (it can wake one); reading your
+        // own inbox, receipts and who you may write to touches only your own messages (#252).
+        Cmd::Message { cmd: crate::MessageCmd::Send { .. } } => Forward(Run),
+        Cmd::Message { .. } => Forward(Read),
         // Rewriting the ledger (#582) needs wicketd stopped: never through it.
         Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(
             "`wicket audit compact` runs with wicketd stopped, as the wicket user: sudo systemctl stop wicketd wicket-console wicket-reconcile; sudo -u wicket WICKET_HOME=/var/lib/wicket wicket audit compact",
@@ -196,6 +200,8 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Dev { cmd } => match cmd {
             DevCmd::MockLlm { .. } => Local,
             DevCmd::NodeFeedProbe { .. } => Local,
+            // Writes the embedded console files to a directory the caller names: no state, no daemon.
+            DevCmd::ConsoleAssets { .. } => Local,
         },
     }
 }

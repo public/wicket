@@ -72,8 +72,10 @@ const ROUTES: &[&str] = &[
     "/api/runs",
     "/api/manifests/manifests/a.yaml",
     "/api/manifests/check",
+    "/api/policy/preview",
     "/api/policy",
     "/api/runs/run_01authz0000000000000000000/authority",
+    "/api/runs/run_01authz0000000000000000000/placement",
     "/api/explain/1",
     "/api/push",
     "/api/push/subscribe",
@@ -1157,15 +1159,24 @@ async fn random_bytes_on_the_wire_never_take_the_server_down() {
 #[test]
 fn the_console_page_confirms_what_it_signs_and_holds_still() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/serve");
-    let out = std::process::Command::new("node").arg(dir.join("tests/console_ui.js")).arg(dir.join("static/console.js")).output();
-    match out {
-        Ok(o) => assert!(
-            o.status.success(),
-            "console_ui.js failed:\n{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        ),
-        Err(e) if std::env::var_os("CI").is_none() => eprintln!("skipped: no node ({e})"),
-        Err(e) => panic!("node is needed for the console page test in CI: {e}"),
+    // Twice: on the source, and on the script as embedded, minified by build.rs (#574), so a
+    // minifier change that breaks the page fails here. The test reads sw.js beside the script.
+    let embedded = std::env::temp_dir().join(format!("wicket-console-embedded-{}", std::process::id()));
+    std::fs::create_dir_all(&embedded).unwrap();
+    std::fs::write(embedded.join("console.js"), crate::serve::web::console_js()).unwrap();
+    std::fs::copy(dir.join("static/sw.js"), embedded.join("sw.js")).unwrap();
+    for script in [dir.join("static/console.js"), embedded.join("console.js")] {
+        let out = std::process::Command::new("node").arg(dir.join("tests/console_ui.js")).arg(&script).output();
+        match out {
+            Ok(o) => assert!(
+                o.status.success(),
+                "console_ui.js failed on {}:\n{}{}",
+                script.display(),
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) if std::env::var_os("CI").is_none() => return eprintln!("skipped: no node ({e})"),
+            Err(e) => panic!("node is needed for the console page test in CI: {e}"),
+        }
     }
 }

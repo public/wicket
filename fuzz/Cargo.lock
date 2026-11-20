@@ -3464,9 +3464,11 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "ed25519-dalek",
  "futures-util",
  "hex",
  "libc",
+ "p256",
  "reqwest",
  "serde",
  "serde_json",
@@ -3519,6 +3521,7 @@ dependencies = [
  "wicket-sandbox",
  "wicket-sources",
  "wicket-store",
+ "zeroize",
 ]
 
 [[package]]

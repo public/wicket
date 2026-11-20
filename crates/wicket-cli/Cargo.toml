@@ -76,3 +76,11 @@ wicket-chan = { workspace = true, features = ["testkit"] }
 wicket-home = { workspace = true, features = ["testkit"] }
 wicket-placement = { workspace = true, features = ["mock"] }
 getrandom = { workspace = true, features = ["sys_rng"] }
+
+[build-dependencies]
+oxc_allocator.workspace = true
+oxc_codegen.workspace = true
+oxc_diagnostics.workspace = true
+oxc_minifier.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true

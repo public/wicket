@@ -28,6 +28,14 @@
 //!   at most the newer one's), so dropping it loses nothing, and refusing it would report an honest
 //!   interleaving as a replay. A replayed statement gets the same treatment: it can never take
 //!   effect, which is what replay protection is for. Counted in [`Stats::superseded`].
+//! - **A snapshot already overtaken** (#589): a snapshot below the epoch held that was signed
+//!   before the newest statement held, or no later than the snapshot and deltas the node's state
+//!   was built from, is superseded too. Two runs that said hello to a node at the same epoch both
+//!   catch it up; the second to arrive finds the node moved on by the other's frames, signed after
+//!   its own, whether or not that run's statement has landed yet. It is never applied, so a
+//!   replayed old snapshot is dropped the same way, as a replayed statement is. Its head must be the
+//!   node's own at its epoch, where the node still holds that epoch's head; a different one is a
+//!   `fork`. One signed after both (a restored control plane's, say) is a `rollback`.
 //! - **A delta already held** (#300, #324): each run commits its own deltas and sends them over its
 //!   own connection, but another run's catch-up may carry them first. A delta at an epoch the node
 //!   holds whose hash is the head it recorded at that epoch (the ring of [`crate::HEADS_KEPT`]) is
@@ -220,6 +228,9 @@ pub struct Replica<P: Policy> {
     vouched: Option<Statement>,
     /// Every later statement's `issued_at` must be above this.
     issued_floor: i64,
+    /// The latest `issued_at` of the snapshot and deltas the state held was built from (#589): a
+    /// snapshot below the epoch held, signed no later, was overtaken on its way.
+    state_issued: i64,
     /// Uses of counted grants on this node.
     used: HashMap<String, u32>,
     /// Entries this node derived itself, not from the feed (#164: a child's token, attenuated from
@@ -264,6 +275,7 @@ impl<P: Policy> Replica<P> {
             fresh: None,
             vouched: None,
             issued_floor: i64::MIN,
+            state_issued: i64::MIN,
             used: HashMap::new(),
             local: BTreeMap::new(),
             dir: None,
@@ -341,6 +353,7 @@ impl<P: Policy> Replica<P> {
             return Err(LoadError::Corrupt { file: SNAPSHOT, why: "wrong feed or version".into() });
         }
         self.heads = BTreeMap::from([(s.epoch, s.head.clone())]);
+        self.state_issued = s.issued_at;
         self.state = Some(State::from_snapshot(&s, self.ctx.clone()));
 
         let text = deltas.unwrap_or_default();
@@ -524,6 +537,20 @@ impl<P: Policy> Replica<P> {
         if let Some(st) = &self.state {
             if s.version == st.version {
                 if s.epoch < st.epoch {
+                    // Signed before the newest statement held, or no later than the snapshot and
+                    // deltas the state held was built from (#589): another run's frames, signed
+                    // after it, reached the node first (each run has its own connection), before
+                    // or after that run's statement. It carries nothing the node lacks:
+                    // superseded, never applied, as a statement signed before the floor is. One
+                    // signed after both (a restored control plane's) is a rollback.
+                    // Its head must be the node's own at that epoch where the node still holds
+                    // it, as a held delta's must (#589 review): a different one is a fork.
+                    if s.issued_at < self.issued_floor || s.issued_at <= self.state_issued {
+                        return match self.heads.get(&s.epoch) {
+                            Some(h) if *h != s.head => Err(Refusal::Fork(format!("snapshot head differs at epoch {}", s.epoch))),
+                            _ => Ok(Plan::Superseded),
+                        };
+                    }
                     return Err(Refusal::Rollback(format!("snapshot epoch {} < held {}", s.epoch, st.epoch)));
                 }
                 if s.epoch == st.epoch {
@@ -687,6 +714,7 @@ impl<P: Policy> Replica<P> {
                 if regenesis {
                     self.vouched = None;
                 }
+                self.state_issued = if regenesis { s.issued_at } else { self.state_issued.max(s.issued_at) };
                 self.state = Some(State::from_snapshot(&s, self.ctx.clone()));
                 self.recheck_local();
                 self.revouch();
@@ -726,6 +754,7 @@ impl<P: Policy> Replica<P> {
     fn apply_delta(&mut self, d: &Delta<P>, head: String) {
         let st = self.state.as_mut().expect("checked");
         st.apply(d, head.clone());
+        self.state_issued = self.state_issued.max(d.issued_at);
         self.heads.insert(d.epoch, head);
         while self.heads.len() > HEADS_KEPT {
             self.heads.pop_first();
