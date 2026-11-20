@@ -3,8 +3,9 @@
 # (`wicket dev console-assets`: minified, content-hashed, under its CSP with Trusted Types enforced),
 # serves that against the preview's mock API (ci/console-preview), and runs
 # ci/console-browsers/test.mjs (the whole page, and a run's session view), inbox.mjs (the request
-# cards, with the API answered in the page), agents.mjs (the Agents view and an agent's page) and
-# activity.mjs (the Activity view) in each browser named (default: chromium firefox webkit).
+# cards, with the API answered in the page), agents.mjs (the Agents view and an agent's page),
+# activity.mjs (the Activity view) and settings.mjs (Settings) in each browser named (default:
+# chromium firefox webkit).
 # With WICKET_SESSION_VIEW set (ci/session-view.sh prints it), wicket embeds the built session view
 # and that is what is checked; WICKET_SESSION_VIEW_REQUIRED=1 fails on the placeholder.
 #
@@ -46,3 +47,5 @@ node ci/console-browsers/inbox.mjs "http://127.0.0.1:$port/" "${browsers[@]}"
 node ci/console-browsers/agents.mjs "http://127.0.0.1:$port/" "${browsers[@]}"
 # The Activity view, the same way (activity.mjs).
 node ci/console-browsers/activity.mjs "http://127.0.0.1:$port/" "${browsers[@]}"
+# Settings' rules, spending limits and servers, and the Inbox's asks to be always allowed (settings.mjs).
+node ci/console-browsers/settings.mjs "http://127.0.0.1:$port/" "${browsers[@]}"

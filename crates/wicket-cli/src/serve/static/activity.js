@@ -5,19 +5,11 @@
 //
 // What a record says is console.js's `sentence(op)` (tested under node, serve/tests/console_ui.js);
 // this draws it. As inbox.js, it uses console.js's helpers by their bare names.
-import { html, render, nothing } from "lit-html";
+import { html, nothing } from "lit-html";
 import { repeat } from "lit-html/directives/repeat.js";
+import { draw, time, kv, wrapped } from "./ui.js";
 
 const g = globalThis;
-
-// lit-html renders after what a container already holds: the first time, it is emptied.
-const owned = new WeakSet();
-function draw(value, box) {
-  if (!owned.has(box)) { box.replaceChildren(); owned.add(box); }
-  render(value, box);
-}
-
-const time = (t, text) => html`<time title=${t ? iso(t) : nothing} datetime=${t ? iso(t) : nothing}>${text === undefined ? at(t) : text}</time>`;
 
 // ---- a line, and its "why?" (#173) ----
 
@@ -42,7 +34,6 @@ async function explain(seq) {
 }
 
 // A decision explained: what was recorded, then the run's token as its node holds it now.
-const kv = (k, v) => html`<div class="row"><span class="meta">${k}</span><span class="mono">${strip(v)}</span></div>`;
 function explainView(x) {
   const r = x.recorded, n = x.against_token_now;
   return html`${kv("request", r.method + " " + r.host + r.path + " (" + (r.risk || "?") + ")")}${kv("recorded", String(r.outcome) + " on " + r.decided_on + " at " + at(r.at) + ": " + localTimes(r.detail))}${kv("run", x.run + " · policy " + (x.policy || "none"))}${n.available
@@ -69,7 +60,7 @@ let last = null;
 // A recent decision on a request: allowed or refused, by whom, for what.
 function decidedView(x) {
   const pill = "pill " + (({ granted: "good", denied: "bad" })[x.status] || "");
-  return html`<div class="decided"><div class="run-head"><span class=${pill}>${({ granted: "allowed", denied: "refused" })[x.status] || strip(x.status)}</span><span>${runName(x.run) + ": " + verb(x) + " "}</span><div class="mono inline">${strip(x.host + x.path).split(/(?<=[/.?&])/).map(part => html`${part}<wbr>`)}</div></div><div class="meta">${strip(x.id) + " · zone " + strip(x.zone) + " · asked "}${time(x.created_at, rel(x.created_at))}</div></div>`;
+  return html`<div class="decided"><div class="run-head"><span class=${pill}>${({ granted: "allowed", denied: "refused" })[x.status] || strip(x.status)}</span><span>${runName(x.run) + ": " + verb(x) + " "}</span>${wrapped("mono inline", strip(x.host + x.path))}</div><div class="meta">${strip(x.id) + " · zone " + strip(x.zone) + " · asked "}${time(x.created_at, rel(x.created_at))}</div></div>`;
 }
 
 function renderActivity(s) {

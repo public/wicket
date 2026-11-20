@@ -98,7 +98,6 @@ function principalEl(p) {
 // time; the original stays in the element's title (#707 review).
 const UTC_TIME = /\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?Z\b/g;
 const localTimes = text => strip(text).replace(UTC_TIME, m => { const t = Date.parse(m) / 1000; return isNaN(t) ? m : clock(t); });
-function serverText(tag, cls, text) { const e = el(tag, cls, localTimes(text)); if (UTC_TIME.test(String(text))) e.title = strip(text); UTC_TIME.lastIndex = 0; return e; }
 // A sentence with `commands` in backticks as code spans (#648): the rest stays text.
 // A command to run on the host, with a Copy button (#715 review): the console's own controls come
 // first, and a command is the secondary way, so it is small, but one tap copies it whole.
@@ -616,39 +615,11 @@ const inbox = (f, s) => drawn("wicketInbox", f, s);
 // moved under it. inbox.js calls it.
 function layoutMoved() { layoutAt = performance.now(); }
 
-// Rows kept across polls (#574): each by its id and content, rebuilt only when it changed, and the
-// list replaced only when something did. Then the layout moved: taps are ignored for a moment, as
-// on the pending cards (`settled`), so a tap can't land on a row that just moved under it.
-const keyed = new Map();
-function renderKeyed(id, rows, f, emptyText) {
-  const box = document.getElementById(id);
-  const had = keyed.get(id) || new Map(), now = new Map();
-  const nodes = rows.map(r => {
-    const key = JSON.stringify(r), old = had.get(r.id);
-    const node = old && old.key === key ? old.node : f(r);
-    now.set(r.id, { key, node });
-    return node;
-  });
-  keyed.set(id, now);
-  if (!rows.length) {
-    if (!(box.children.length === 1 && box.children[0].className === "empty")) box.replaceChildren(codeText("div", "empty", emptyText));
-    return;
-  }
-  if (nodes.length === box.children.length && nodes.every((n, i) => n === box.children[i])) return;
-  box.replaceChildren(...nodes);
-  layoutAt = performance.now();
-}
-// A signed action from a row's button, once the layout has settled.
+// A signed action from a row's button, once the layout has settled (the views' rows use it).
 const signedSettled = body => {
   if (!settled()) { toast("The list just changed: check the row and tap again."); return; }
   signed(body);
 };
-
-function renderRows(id, rows, f, emptyText) {
-  const box = document.getElementById(id); box.replaceChildren();
-  if (!rows.length) { box.append(codeText("div", "empty", emptyText)); return; }
-  for (const r of rows) box.append(f(r));
-}
 
 // A decision on a request, from the control host (`op`) or shipped by a node (`node.audit`, its
 // record as a JSON string), with a link to explain it (#173).
@@ -736,248 +707,12 @@ function sentence(op) {
   return logLine(op, "record", "", strip(op.kind) + (r ? " \u00b7 " + r : ""));
 }
 
-// A node's latest health report (#377): disk, memory, what went wrong, and what is alerted.
-function healthRow(n) {
-  // The row (name, summary) and its alerts under it, each a line of its own (#574, B7): inside the
-  // flex row they were squeezed into side columns.
-  const w = el("div", "hrow");
-  const d = el("div", "row");
-  d.append(el("span", "mono", strip(n.node)));
-  d.append(serverText("span", (n.alerts || []).length ? "blocked" : "", n.summary + " · reported " + whenMs(n.received_ms)));
-  w.append(d);
-  for (const a of n.alerts || []) w.append(serverText("div", "blocked", "! " + a));
-  return w;
-}
-
-// The state store's sync and the audit export's progress (#635), as `wicket state check` and
-// `wicket audit export --status` compute them: a row for the ledger's stream, one per audit sink,
-// each with its last error under it. A span in seconds, short.
-const secs = s => { s = Math.max(0, Math.round(s || 0)); return s < 120 ? s + " s" : s < 7200 ? Math.floor(s / 60) + " min" : s < 172800 ? Math.floor(s / 3600) + " h" : Math.floor(s / 86400) + " d"; };
-function stateStoreRows(p, nowMs) {
-  const out = [];
-  const row = (name, cls, text, err) => {
-    const w = el("div", "hrow");
-    const d = el("div", "row");
-    d.append(el("span", "mono", name));
-    d.append(codeText("span", cls, text));
-    w.append(d);
-    if (err) w.append(el("div", "blocked", "! " + err));
-    return w;
-  };
-  // What is alerted (and pushed, if notifications are on) first, so a sink past its threshold
-  // doesn't look like one a few records behind; then whether these rows are current.
-  for (const a of p.alerts || []) out.push(serverText("div", "blocked", "! " + a));
-  if (p.not_read_yet) out.push(el("div", "pend", "! not read yet: the console hasn't managed a first read of the state store"));
-  else if (p.stale) out.push(el("div", "pend", "! not checked for " + secs((nowMs - (p.read_ms || 0)) / 1000) + ": these rows may be out of date"));
-  const st = p.stream;
-  if (st) {
-    let text = strip(st.endpoint) + " (" + strip(st.bucket) + ") \u00b7 ledger " + strip(st.state);
-    if (st.last_sync_ms) text += " \u00b7 last sync " + secs((nowMs - st.last_sync_ms) / 1000) + " ago";
-    else if (st.behind_secs !== null && st.behind_secs !== undefined) text += " \u00b7 no sync yet in " + secs(st.behind_secs);
-    const cls = st.state === "streaming" ? "" : st.state === "starting" ? "pend" : "blocked";
-    // An error is shown while the stream isn't streaming, or if it came after the last sync: an
-    // old one, recovered from, isn't news.
-    const live = st.error && (st.state !== "streaming" || (st.error_ms || 0) > (st.last_sync_ms || 0));
-    const err = live ? "last error" + (st.error_ms ? " " + secs((nowMs - st.error_ms) / 1000) + " ago" : "") + ": " + strip(st.error) : null;
-    out.push(row("Record backup", cls, text, err));
-  }
-  for (const a of p.audit || []) {
-    let text = a.behind ? a.behind + " record" + (a.behind === 1 ? "" : "s") + " behind (oldest " + secs(a.behind_secs) + ")" : "caught up";
-    // A jsonl sink to stdout is fed only by `wicket audit export` in the foreground: behind is expected.
-    if (a.manual) text += " (manual: fed only by `wicket audit export`)";
-    text += " at " + a.seq + " of " + a.head + " \u00b7 last checkpoint " + (a.checkpoint_at ? secs(nowMs / 1000 - a.checkpoint_at) + " ago" : "never");
-    out.push(row("Activity export to " + strip(a.sink), a.error ? "blocked" : a.behind && !a.manual ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
-  }
-  // An error already alerted on (the config alert quotes it) isn't said twice.
-  for (const e of p.errors || []) if (!(p.alerts || []).some(a => a.startsWith(e))) out.push(serverText("div", "blocked", "! " + e));
-  return out;
-}
-
-// A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
-// a run still holds it, which is a warning until renewals exist (#56).
-function placedRow(p) {
-  // The name and when its lease ends; the UUID quiet on a line of its own (#649).
-  const d = el("div", "lease");
-  const head = el("div", "run-head");
-  head.append(el("span", "run-name mono", strip(p.name)));
-  if (!p.past_lease) { const e = el("span", "meta"); e.append(document.createTextNode("lease ends "), timeEl(p.lease_until)); head.append(e); }
-  d.append(head, el("div", "meta mono quiet", strip(p.id)));
-  if (p.past_lease && p.held_by) {
-    const w = el("div", "callout warn");
-    w.append(document.createTextNode("Lease ended "), timeEl(p.lease_until), document.createTextNode("; still billing: run " + strip(p.held_by) + " holds it. Release it on the host:"));
-    w.append(el("code", "block", "wicket node release " + strip(p.id)), copyButton("wicket node release " + strip(p.id)));
-    d.append(w);
-  } else if (p.past_lease) {
-    const w = el("div", "meta");
-    w.append(document.createTextNode("Lease ended "), timeEl(p.lease_until), document.createTextNode("; released at the reconciler's next pass."));
-    d.append(w);
-  }
-  return d;
-}
-
-// Standing capacity grants (#256): a principal's `wicket node create` within one is approved at once
-// and audited against it; beyond every one, it waits here as a request. Issuing and renewing a grant
-// widen what may be spent, so each is signed with the passkey; revoking one only narrows, so it needs
-// only the session.
-function capacityRow(g) {
-  const t = g.terms || {}, u = g.used || {}, left = g.left || {};
-  const d = el("div", "row cap");
-  const head = el("div", "run-head");
-  const who = principalEl(g.principal);
-  head.append(who, el("span", "mono quiet", strip(g.id)));
-  const nodes = n => plural(Number(n) || 0, "node");
-  const what = el("div", "meta", "Allows: " + nodes(t.nodes) + " at once of " + (t.plans || []).map(strip).join(" or ") + " in " + (t.regions || []).map(strip).join(", ") +
-    ", up to " + money(t.hourly_usd) + "/h and " + money(t.daily_usd) + " a day");
-  const used = el("div", "meta", "Used today: " + nodes(u.nodes) + ", " + money(u.hourly_usd) + "/h, " + money(u.daily_usd));
-  const rest = el("div", "meta", "Left today: " + nodes(left.nodes) + ", " + money(left.hourly_usd) + "/h, " + money(left.daily_usd));
-  const ends = el("div", "meta");
-  ends.append(document.createTextNode("Ends "), timeEl(g.expires_at), document.createTextNode(" \u00b7 granted by " + strip(g.decided_by)));
-  const b = el("div", "buttons");
-  const renew = el("button", "approve", "Renew");
-  renew.onclick = () => signed({ action: "capacity_renew", id: g.id, ttl_secs: capacityTtl() });
-  const revoke = revokeButton(b, "Revoke capacity grant " + strip(g.id) + "? Nothing more is approved under it, from now.", async () => {
-    try { toast((await post("/api/capacity/revoke", { id: g.id })).ok); } catch (e) { toastError(e); }
-    refresh();
-  });
-  b.append(renew, revoke);
-  d.append(head, what, used, rest, ends, b);
-  return d;
-}
-// Revoke on a capacity grant or a standing rule (#640): unsigned, since it only narrows, but asked in
-// the page first, and set apart from Renew. The question replaces the row's buttons until answered.
-function revokeButton(box, question, go) {
-  const revoke = el("button", "deny apart", "Revoke\u2026");
-  revoke.onclick = () => {
-    if (!settled()) { toast("The list just changed: check the row and tap again."); return; }
-    const keep = [...box.children];
-    const q = el("div", "callout warn ask", question);
-    const yes = el("button", "deny", "Revoke");
-    const no = el("button", "", "Cancel");
-    // The question moved the row: a second tap of a double tap mustn't land on its Revoke.
-    yes.onclick = async () => { if (!settled()) return; yes.disabled = true; await go(); };
-    no.onclick = () => { box.replaceChildren(...keep); };
-    box.replaceChildren(q, yes, no);
-    layoutAt = performance.now();
-  };
-  return revoke;
-}
-
 // Standing reach (#572). A rule as a manifest would carry it.
 function ruleText(r) {
   r = r || {};
   return "{ host: " + strip(r.host) + ", methods: [" + (r.methods || []).map(strip).join(", ") + "], paths: [" +
     (r.paths || []).map(p => "'" + strip(p) + "'").join(", ") + "]" + (r.allow_dangerous ? ", allow_dangerous: true" : "") + " }";
 }
-// An agent's ask: the rule, who asked and why, the ledger's evidence, and what it allows beyond it.
-// Approved once (signed): as asked or narrowed to the evidence, for the agent or its zone, 30 days.
-function standingAskRow(a) {
-  // An agent's ask to be always allowed something (#572): the same card as a request, with its
-  // evidence, and the Always choices narrowest first.
-  const d = el("div", "card req always");
-  const e = a.evidence || {};
-  const r = a.rule || {};
-  const agent = String(a.principal || "").split("/a/").pop();
-  const head = el("div", "req-head");
-  // The pill says only what the rule says (#715 review): dangerous requests included or not, and its
-  // methods. Whether a POST changes data depends on the API, so it isn't guessed here.
-  head.append(el("span", "risk " + (r.allow_dangerous ? "r4" : ""),
-    (r.allow_dangerous ? "Includes requests that can't be undone: " : "") + (r.methods || []).map(strip).join(", ")),
-    timeEl(a.created_at, rel(a.created_at)));
-  head.children[head.children.length - 1].className = "age";
-  d.append(head);
-  const dl = el("dl", "fields");
-  const who = el("span"); who.append(el("strong", "", strip(agent)), document.createTextNode(" \u00b7 zone " + strip(a.zone))); who.title = strip(a.principal);
-  field(dl, "Who", who);
-  field(dl, "Wants to", "always be allowed to " + verbsOf(r.methods), "said");
-  const w = el("div", "where"); w.append(el("span", "host", strip(r.host)), el("div", "path", (r.paths || []).map(strip).join("  ")));
-  field(dl, "Where", w);
-  field(dl, "Why", "\u201c" + strip(a.reason) + "\u201d", "why");
-  field(dl, "So far", plural(e.requests || 0, "request") + " like this in " + plural(e.days || 0, "day") + "; allowed " + (e.granted || 0) +
-    (e.denied ? ", refused " + e.denied : "") + (e.undecided ? ", " + e.undecided + " not decided" : ""));
-  d.append(dl);
-  for (const x of (a.beyond || [])) d.append(el("div", "callout warn", "Wider than what it used: " + strip(x)));
-  const b = el("div", "buttons ladder");
-  // The narrowest choice first, and the default; the widest (a whole zone) marked as such.
-  const narrow = el("button", a.narrowed ? "approve" : "", a.narrowed ? "Always: only what it used" : "Always: only what it used (nothing to narrow to)");
-  narrow.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent", narrow: true });
-  narrow.disabled = !a.narrowed;
-  const asAsked = el("button", a.narrowed ? "" : "approve", "Always: as asked");
-  asAsked.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent" });
-  const zone = el("button", "deny", "Always, for every agent in zone " + strip(a.zone));
-  zone.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "zone" });
-  const deny = el("button", "deny apart", "Don't allow");
-  deny.onclick = () => signedSettled({ action: "standing_deny", id: a.id });
-  b.append(narrow, asAsked, zone, deny);
-  d.append(b, el("div", "meta", "\u201cAlways\u201d lasts 30 days, and you can remove it in Settings."));
-  const more = el("details", "more req-more");
-  more.append(el("summary", "", "Details"));
-  if (a.narrowed) more.append(el("div", "meta", "Only what it used: methods " + (a.narrowed.methods || []).map(strip).join(", ") + ", paths " + (a.narrowed.paths || []).map(strip).join(", ")));
-  more.append(el("div", "meta", "Methods: " + (r.methods || []).map(strip).join(", ") + (r.allow_dangerous ? " \u00b7 dangerous requests too (R3, R4)" : "")));
-  more.append(el("div", "meta", "Paths: " + (r.paths || []).map(strip).join(", ")));
-  more.append(el("div", "meta", "Asked by " + strip(agent) + " (zone " + strip(a.zone) + ") \u00b7 for its later runs with this zone definition" +
-    (a.zone_digest ? " (" + strip(a.zone_digest).slice(0, 12) + "\u2026)" : "")));
-  more.append(el("div", "meta", "Evidence: " + e.granted + " granted of " + e.requests + " blocked request(s) it covers in the last 14 days (" +
-    e.denied + " denied, " + e.undecided + " undecided), in " + e.runs + " run(s) on " + e.days + " day(s)" +
-    ((e.ops || []).length >= 10 ? ", the 10 most asked:" : (e.ops || []).length ? ":" : "")));
-  for (const o of (e.ops || [])) more.append(el("div", "meta mono", o.count + " \u00d7 " + strip(o.method) + " " + strip(o.path) + " (" + o.granted + " granted)"));
-  if (e.own_asks) more.append(el("div", "meta", "and " + e.own_asks + " ask(s) ahead of its own, not counted as evidence"));
-  more.append(el("div", "meta", "standing reach " + strip(a.id) + " \u00b7 asked " + when(a.created_at)));
-  d.append(more);
-  return d;
-}
-// An approved rule: who it is for, when it lapses; renewed (signed, 30 days) or revoked (session).
-function standingRuleRow(r) {
-  const d = el("div", "row cap");
-  const head = el("div");
-  const rr = r.rule || {};
-  const to = r.for === "zone" ? "every agent in zone " + strip(r.zone) : principalName(r.principal);
-  head.append(r.for === "zone" ? el("span", "run-name", to) : principalEl(r.principal), el("span", "", " may " + verbsOf(rr.methods) + " "), el("span", "mono", strip(rr.host)));
-  // On the row, not only in its title (#715 review): this rule allows requests that can't be undone.
-  if (rr.allow_dangerous) head.append(document.createTextNode(" "), el("span", "risk r4", "including requests that can't be undone"));
-  head.title = "standing reach " + strip(r.id) + ": " + ruleText(r.rule);
-  const until = r.expires_at ? (r.live ? "ends " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
-  const b = el("div", "buttons");
-  const renew = el("button", "approve", "Renew (30 days)");
-  renew.onclick = () => signedSettled({ action: "standing_renew", id: r.id });
-  renew.disabled = !r.live;
-  const revoke = revokeButton(b, "Revoke standing reach " + strip(r.id) + "? Runs it allows lose it at once.", async () => {
-    try { toast((await post("/api/standing/revoke", { id: r.id })).ok); } catch (e) { toastError(e); }
-    refresh();
-  });
-  b.append(renew, revoke);
-  d.append(head, el("div", "meta", (rr.paths || []).map(strip).join("  ") + " \u00b7 " + until + " \u00b7 allowed by " + strip(r.decided_by)), b);
-  return d;
-}
-// The form's inputs, by name; built once, so what the operator types survives the poll.
-const capInputs = {};
-// The lifetime the form asks for (hours, at most 24): also what Renew renews for.
-function capacityTtl() {
-  const h = Number((capInputs.hours && capInputs.hours.value) || 8);
-  return Math.round(Math.min(24, Math.max(0.1, h)) * 3600);
-}
-function renderCapacityForm() {
-  const box = document.getElementById("capacity-form");
-  if (!box || box.dataset.built) return;
-  box.dataset.built = "1";
-  const field = (name, label, placeholder, type) => {
-    const l = el("label", "field"); const i = el("input"); i.placeholder = placeholder; if (type) i.type = type;
-    capInputs[name] = i; l.append(el("span", "meta", label), i); return l;
-  };
-  const go = el("button", "approve", "Grant (sign with passkey)");
-  go.onclick = () => {
-    const v = k => capInputs[k].value;
-    signed({ action: "capacity_grant", principal: v("principal"), plans: v("plans"), regions: v("regions"),
-      max_hourly_usd: v("hourly"), max_daily_usd: v("daily"), nodes: Number(v("nodes") || 0), ttl_secs: capacityTtl() });
-  };
-  const b = el("div", "buttons"); b.append(go);
-  box.append(codeText("div", "note", "Issue a capacity grant: what a principal may lease with `wicket node create` without asking each time."),
-    field("principal", "To", "unix/alex, passkey/laptop or spiffe://…"),
-    field("plans", "Plans", "vc2-1c-2gb, vc2-2c-4gb"), field("regions", "Regions", "lhr"),
-    field("hourly", "Most per hour, all its nodes ($)", "0.05"), field("daily", "Most a day ($)", "1.00"),
-    field("nodes", "Nodes at once", "2", "number"), field("hours", "Hours (at most 24)", "8", "number"), b);
-  capInputs.hours.value = "8";
-}
-
 // An agent's page: its name, state and links, what it can reach (the authority view, #651), and what
 // it did. Stop is the signed revoke, from here only.
 function openAgent(run) {
@@ -1607,20 +1342,14 @@ async function refreshOnce() {
     // Kept across polls, as the pending cards are (#715 review): a row is rebuilt only when its run, or
     // whether it waits for you, changed.
     drawn("wicketAgents", "renderRuns", s);
-    renderRows("health", ((s.health || {}).nodes) || [], healthRow, "No node has reported its health yet.");
-    if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
-    if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
-    renderRows("placed", s.placed || [], placedRow, "No leased nodes.");
-    renderKeyed("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
-    renderCapacityForm();
+    drawn("wicketSettings", "renderSettings", s);
     const st = s.standing || {};
     // Standing asks wait with the requests, under a heading of their own, shown only when there are some.
     const ptr = document.getElementById("standing-pointer");
     const n = (st.asks || []).length;
     if (ptr) { ptr.textContent = n ? "Asking to be always allowed (" + n + ")" : ""; ptr.hidden = !n; }
     renderCounts(s.pending.length + n, problemList(s).length);
-    renderKeyed("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
-    renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: each request waits for a decision.");
+    inbox("renderStandingAsks", s);
     drawn("wicketAgents", "renderStart", s);
     renderManifests(s);
     renderSecrets(s);
