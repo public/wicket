@@ -915,7 +915,15 @@ pub fn wicket_event(l: &Ledger, r: &wicket_store::AuditRecord) -> Result<Option<
     // principal they make.
     let (zone, agent, principal) = match scope {
         Some((z, a, p)) => {
-            let p = p.unwrap_or_else(|| wicket_identity::spiffe_id(&crate::operators::trust_domain(), &r.tenant, &z, &a));
+            // Made only for a long-lived agent's new run that has no runs row yet (its scope came
+            // from the agent's row); a run with a row but no identity has no principal.
+            let p = match (p, r.run.as_deref()) {
+                (Some(p), _) => Some(p),
+                (None, Some(run)) if !l.run_exists(run)? => {
+                    Some(wicket_identity::spiffe_id(&crate::operators::trust_domain(), &r.tenant, &z, &a))
+                }
+                (None, _) => None,
+            };
             (json!(z), json!(a), json!(p))
         }
         None => (Value::Null, Value::Null, Value::Null),
@@ -966,127 +974,64 @@ fn wicket_pass(l: &Ledger, now: i64, dry_run: bool, wake: Waker<'_>, owner: Owne
         }
         Ok(())
     };
-    let mut raw: Vec<&str> = vec![];
-    for t in &listening {
-        if let Source::Wicket { kinds } = &t.spec.source {
-            raw.extend(kinds.iter().flat_map(|k| audit_kinds(k).iter().copied()));
+    let mut out = vec![];
+    // Triggers held back by an owner that couldn't be checked: each catches up on its own records
+    // once the check works, while the shared cursor moves on for every other trigger.
+    if !dry_run {
+        for (id, held) in l.trigger_holds(&tenant)? {
+            let Some(t) = listening.iter().find(|t| t.id == id).cloned() else {
+                l.release_trigger_hold(&tenant, &id)?;
+                continue;
+            };
+            match owner(&t) {
+                Ok(()) => {
+                    out.extend(hear(l, &tenant, std::slice::from_ref(&t), held, seq, now, wake, None)?);
+                    l.release_trigger_hold(&tenant, &id)?;
+                }
+                Err(e @ NotOwner::Unknown(_)) => {
+                    // What passed the cutoff meanwhile is passed over for this trigger alone.
+                    if let Some(stale) = l.audit_seq_before(now - EVENT_STALE_SECS)?.filter(|s| *s > held) {
+                        l.hold_trigger(&tenant, &id, stale.min(seq))?;
+                    }
+                    match owner_failed(l, &t, e) {
+                        Ok(f) => out.push(f),
+                        Err(e) => out.push(failed(&t, &e)),
+                    }
+                    listening.retain(|x| x.id != id);
+                }
+                Err(e) => {
+                    match owner_failed(l, &t, e) {
+                        Ok(f) => out.push(f),
+                        Err(e) => out.push(failed(&t, &e)),
+                    }
+                    l.release_trigger_hold(&tenant, &id)?;
+                    listening.retain(|x| x.id != id);
+                }
+            }
         }
     }
-    raw.sort_unstable();
-    raw.dedup();
+    let raw = raw_kinds(&listening);
     if raw.is_empty() {
         move_to(head)?;
-        return Ok(vec![]);
+        return Ok(out);
     }
-    let mut out = vec![];
-    // Each trigger's owner, checked once a pass, when a record would first fire it.
-    let mut checked: std::collections::HashMap<String, bool> = Default::default();
+    if dry_run {
+        out.extend(hear(l, &tenant, &listening, seq, head, now, wake, Some(owner))?.into_iter().map(|mut f| {
+            f.status = "due".into();
+            f
+        }));
+        return Ok(out);
+    }
     let mut read = 0;
     while read < AUDIT_PER_PASS {
         let recs = l.audit_records_of_kinds(seq, head, &raw, AUDIT_BATCH)?;
         read += recs.len().max(1);
-        for r in &recs {
-            if r.tenant != tenant || r.ts < now - EVENT_STALE_SECS {
-                continue;
-            }
-            let Some((kind, fields)) = wicket_event(l, r)? else { continue };
-            let hearing: Vec<Trigger> = listening
-                .iter()
-                .filter(|t| matches!(&t.spec.source, Source::Wicket { kinds } if kinds.iter().any(|k| k == kind)))
-                .filter(|t| r.ts >= t.updated_at && t.spec.admits(&fields))
-                .cloned()
-                .collect();
-            if hearing.is_empty() {
-                continue;
-            }
-            if dry_run {
-                out.extend(hearing.iter().map(|t| Fired {
-                    trigger: t.id.clone(),
-                    name: t.name.clone(),
-                    status: "due".into(),
-                    detail: format!("{} on {kind} (record {}) (dry run)", action_text(&t.spec), r.seq),
-                }));
-                continue;
-            }
-            let mut firing = vec![];
-            for t in hearing {
-                if !checked.contains_key(&t.id) {
-                    match owner(&t) {
-                        Ok(()) => {
-                            checked.insert(t.id.clone(), true);
-                        }
-                        // Couldn't tell: stop before this record, so the trigger hears it on a
-                        // later pass (within EVENT_STALE_SECS) rather than losing what follows.
-                        Err(e @ NotOwner::Unknown(_)) => {
-                            match owner_failed(l, &t, e) {
-                                Ok(f) => out.push(f),
-                                Err(e) => out.push(failed(&t, &e)),
-                            }
-                            move_to(r.seq - 1)?;
-                            return Ok(out);
-                        }
-                        Err(e) => {
-                            match owner_failed(l, &t, e) {
-                                Ok(f) => out.push(f),
-                                Err(e) => out.push(failed(&t, &e)),
-                            }
-                            checked.insert(t.id.clone(), false);
-                        }
-                    }
-                }
-                if checked.get(&t.id) == Some(&true) {
-                    firing.push(t);
-                }
-            }
-            let chain = match r.run.as_deref() {
-                Some(run) => l.trigger_chain(run, r.ts)?,
-                None => Default::default(),
-            };
-            let delivery = format!("audit:{}", r.seq);
-            // A store error here leaves the cursor before this record, for the next pass.
-            let results = l.immediate(|l| -> Result<Vec<Outcome>> {
-                let (event, _) = l.record_trigger_event(&tenant, "wicket", kind, &delivery, &fields, &r.hash, "audit chain")?;
-                let ev = Ev { id: event.clone(), source: "wicket", at: r.ts, fields: fields.clone(), chain: chain.clone() };
-                let mut v = vec![];
-                for t in &firing {
-                    match l.savepoint(|l| fire_event(l, t, &ev)) {
-                        Ok((f, w)) => v.push((t.clone(), f, w)),
-                        Err(e) => {
-                            let why = format!("{e:#}");
-                            // Recorded if the ledger lets it be; reported either way.
-                            let _ = l.savepoint(|l| -> Result<()> {
-                                let (f, _) = l.record_firing(&t.id, &event, "failed", Some(&why))?;
-                                let body = json!({ "trigger": t.id, "name": t.name, "owner": t.owner, "event": event, "firing": f, "source": "wicket", "status": "failed", "detail": why });
-                                audit(l, "trigger.failed", &body)
-                            });
-                            v.push((t.clone(), Some(failed(t, &e)), None));
-                        }
-                    }
-                }
-                l.set_trigger_cursor(&tenant, "wicket", r.seq)?;
-                Ok(v)
-            })?;
-            for (t, f, w) in results {
-                if let Some(agent) = w {
-                    wake(&agent, &format!("trigger {}", t.name));
-                }
-                if let Some(f) = f {
-                    let was_failed = f.status == "failed";
-                    out.push(f);
-                    if was_failed {
-                        if let Err(e) = pause_if_failing(l, &t) {
-                            out.push(failed(&t, &e));
-                        }
-                    }
-                }
-            }
-            // A trigger paused here hears nothing more this pass.
-            listening
-                .retain(|t| checked.get(&t.id) != Some(&false) && l.trigger(&t.id).ok().flatten().is_some_and(|x| x.status == "active"));
-        }
-        match recs.last() {
-            Some(last) if recs.len() == AUDIT_BATCH => {
-                seq = last.seq;
+        let last = recs.last().map(|r| r.seq);
+        let full = recs.len() == AUDIT_BATCH;
+        out.extend(hear_records(l, &tenant, &mut listening, &recs, now, wake, Some(owner), true)?);
+        match last {
+            Some(last) if full => {
+                seq = last;
                 move_to(seq)?;
             }
             // Read to the head: nothing of these kinds is left before it.
@@ -1095,6 +1040,179 @@ fn wicket_pass(l: &Ledger, now: i64, dry_run: bool, wake: Waker<'_>, owner: Owne
                 break;
             }
         }
+    }
+    Ok(out)
+}
+
+/// The audit kinds the triggers listen to.
+fn raw_kinds(listening: &[Trigger]) -> Vec<&'static str> {
+    let mut raw: Vec<&'static str> = vec![];
+    for t in listening {
+        if let Source::Wicket { kinds } = &t.spec.source {
+            raw.extend(kinds.iter().flat_map(|k| audit_kinds(k).iter().copied()));
+        }
+    }
+    raw.sort_unstable();
+    raw.dedup();
+    raw
+}
+
+/// `triggers` hear the records of their kinds in `(from, to]`, without the shared cursor: a held
+/// trigger catching up (`owner` None: already checked), or a dry run's report.
+#[allow(clippy::too_many_arguments)]
+fn hear(
+    l: &Ledger,
+    tenant: &str,
+    triggers: &[Trigger],
+    from: i64,
+    to: i64,
+    now: i64,
+    wake: Waker<'_>,
+    owner: Option<OwnerCheck<'_>>,
+) -> Result<Vec<Fired>> {
+    let mut listening = triggers.to_vec();
+    let raw = raw_kinds(&listening);
+    let mut out = vec![];
+    let mut at = from;
+    let dry = owner.is_some();
+    while !raw.is_empty() && at < to {
+        let recs = l.audit_records_of_kinds(at, to, &raw, AUDIT_BATCH)?;
+        let Some(last) = recs.last().map(|r| r.seq) else { break };
+        if dry {
+            for r in &recs {
+                let Some((kind, fields)) = wicket_event(l, r)? else { continue };
+                for t in heard_by(&listening, r, kind, &fields, now) {
+                    out.push(Fired {
+                        trigger: t.id.clone(),
+                        name: t.name.clone(),
+                        status: "due".into(),
+                        detail: format!("{} on {kind} (record {}) (dry run)", action_text(&t.spec), r.seq),
+                    });
+                }
+            }
+        } else {
+            out.extend(hear_records(l, tenant, &mut listening, &recs, now, wake, None, false)?);
+        }
+        at = last;
+        if recs.len() < AUDIT_BATCH {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// The triggers among `listening` that hear record `r`: of its kind, live when it was written,
+/// their filter passing, and not older than the cutoff.
+fn heard_by<'a>(listening: &'a [Trigger], r: &wicket_store::AuditRecord, kind: &str, fields: &Value, now: i64) -> Vec<&'a Trigger> {
+    if r.ts < now - EVENT_STALE_SECS {
+        return vec![];
+    }
+    listening
+        .iter()
+        .filter(|t| matches!(&t.spec.source, Source::Wicket { kinds } if kinds.iter().any(|k| k == kind)))
+        .filter(|t| r.ts >= t.updated_at && t.spec.admits(fields))
+        .collect()
+}
+
+/// Fires `listening` on `recs`, each record's event, firings, messages and audit records one
+/// transaction (with `shared`, the shared cursor's move past it too), each trigger's part in a
+/// savepoint of its own. With `owner`, each trigger's owner is checked when a record would first
+/// fire it: a definite no pauses it; one that can't be checked is held at the record before (its
+/// own cursor, released once it has caught up), while the others go on.
+#[allow(clippy::too_many_arguments)]
+fn hear_records(
+    l: &Ledger,
+    tenant: &str,
+    listening: &mut Vec<Trigger>,
+    recs: &[wicket_store::AuditRecord],
+    now: i64,
+    wake: Waker<'_>,
+    owner: Option<OwnerCheck<'_>>,
+    shared: bool,
+) -> Result<Vec<Fired>> {
+    let mut out = vec![];
+    let mut checked: std::collections::HashMap<String, bool> = Default::default();
+    for r in recs.iter().filter(|r| r.tenant == tenant) {
+        let Some((kind, fields)) = wicket_event(l, r)? else { continue };
+        let hearing: Vec<Trigger> = heard_by(listening, r, kind, &fields, now).into_iter().cloned().collect();
+        if hearing.is_empty() {
+            continue;
+        }
+        let mut firing = vec![];
+        for t in hearing {
+            if let Some(owner) = owner {
+                if !checked.contains_key(&t.id) {
+                    let ok = match owner(&t) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            if matches!(e, NotOwner::Unknown(_)) {
+                                // Held at the record before this one, for this trigger alone.
+                                l.hold_trigger(tenant, &t.id, r.seq - 1)?;
+                            }
+                            match owner_failed(l, &t, e) {
+                                Ok(f) => out.push(f),
+                                Err(e) => out.push(failed(&t, &e)),
+                            }
+                            false
+                        }
+                    };
+                    checked.insert(t.id.clone(), ok);
+                }
+                if checked.get(&t.id) != Some(&true) {
+                    continue;
+                }
+            }
+            firing.push(t);
+        }
+        if firing.is_empty() {
+            continue;
+        }
+        let chain = match r.run.as_deref() {
+            Some(run) => l.trigger_chain(run, r.ts)?,
+            None => Default::default(),
+        };
+        let delivery = format!("audit:{}", r.seq);
+        // A store error here leaves the cursor before this record, for the next pass.
+        let results = l.immediate(|l| -> Result<Vec<Outcome>> {
+            let (event, _) = l.record_trigger_event(tenant, "wicket", kind, &delivery, &fields, &r.hash, "audit chain")?;
+            let ev = Ev { id: event.clone(), source: "wicket", at: r.ts, fields: fields.clone(), chain: chain.clone() };
+            let mut v = vec![];
+            for t in &firing {
+                match l.savepoint(|l| fire_event(l, t, &ev)) {
+                    Ok((f, w)) => v.push((t.clone(), f, w)),
+                    Err(e) => {
+                        let why = format!("{e:#}");
+                        // Recorded if the ledger lets it be; reported either way.
+                        let _ = l.savepoint(|l| -> Result<()> {
+                            let (f, _) = l.record_firing(&t.id, &event, "failed", Some(&why))?;
+                            let body = json!({ "trigger": t.id, "name": t.name, "owner": t.owner, "event": event, "firing": f, "source": "wicket", "status": "failed", "detail": why });
+                            audit(l, "trigger.failed", &body)
+                        });
+                        v.push((t.clone(), Some(failed(t, &e)), None));
+                    }
+                }
+            }
+            if shared {
+                l.set_trigger_cursor(tenant, "wicket", r.seq)?;
+            }
+            Ok(v)
+        })?;
+        for (t, f, w) in results {
+            if let Some(agent) = w {
+                wake(&agent, &format!("trigger {}", t.name));
+            }
+            if let Some(f) = f {
+                let was_failed = f.status == "failed";
+                out.push(f);
+                if was_failed {
+                    if let Err(e) = pause_if_failing(l, &t) {
+                        out.push(failed(&t, &e));
+                    }
+                }
+            }
+        }
+        // A trigger paused or held here hears nothing more this pass.
+        listening.retain(|t| checked.get(&t.id) != Some(&false) && l.trigger(&t.id).ok().flatten().is_some_and(|x| x.status == "active"));
     }
     Ok(out)
 }
@@ -1811,10 +1929,48 @@ mod tests {
         let wake_seq = l.audit_head().unwrap().unwrap().0;
         let got = pass(&l, wicket_store::now(), false, &no_wake, &nss).unwrap();
         assert_eq!(got.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(), ["skipped"], "{got:?}");
-        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), Some(wake_seq - 1), "held just before the record");
+        assert_eq!(l.trigger_holds("t0").unwrap(), [(id.clone(), wake_seq - 1)], "this trigger held just before the record");
+        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), Some(wake_seq), "the shared cursor moves on");
         assert_eq!(l.trigger(&id).unwrap().unwrap().status, "active");
         let got = pass(&l, wicket_store::now(), false, &no_wake, &anyone).unwrap();
         assert_eq!(got.iter().map(|f| (f.trigger.as_str(), f.status.as_str())).collect::<Vec<_>>(), [(id.as_str(), "started")], "{got:?}");
+        assert!(l.trigger_holds("t0").unwrap().is_empty(), "caught up: released");
+    }
+
+    /// #683 review: one trigger whose owner can't be checked holds only itself: another trigger
+    /// on the same record fires, and records after it go on being heard.
+    #[test]
+    fn an_unknown_owner_holds_only_its_trigger() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        assert!(pass(&l, wicket_store::now(), false, &no_wake, &anyone).unwrap().is_empty());
+        let s = |n: &str| {
+            spec(&format!(
+                "trigger: {n}\nsource: {{ wicket: {{ kinds: [run.end] }} }}\naction: {{ wake: captain }}\nlimits: {{ per_hour: 60 }}\n"
+            ))
+        };
+        let (stuck, _) = create(&l, &operator(), &s("stuck"), None, "t").unwrap();
+        let (fine, _) = create(&l, &other(), &s("fine"), None, "t").unwrap();
+        let stuck_owner = l.trigger(&stuck).unwrap().unwrap().owner;
+        let half = move |t: &Trigger| -> std::result::Result<(), NotOwner> {
+            if t.owner == stuck_owner {
+                Err(NotOwner::Unknown("ldap timed out".into()))
+            } else {
+                Ok(())
+            }
+        };
+        l.audit(&TenantId::single(), None, "run.end", &json!({})).unwrap();
+        let got = pass(&l, wicket_store::now(), false, &no_wake, &half).unwrap();
+        let by = |id: &str, got: &[Fired]| got.iter().filter(|f| f.trigger == id).map(|f| f.status.clone()).collect::<Vec<_>>();
+        assert_eq!(by(&fine, &got), ["started"], "{got:?}");
+        assert_eq!(by(&stuck, &got), ["skipped"], "{got:?}");
+        l.audit(&TenantId::single(), None, "run.end", &json!({})).unwrap();
+        let got = pass(&l, wicket_store::now(), false, &no_wake, &half).unwrap();
+        assert_eq!(by(&fine, &got), ["started"], "later records still heard: {got:?}");
+        // Once its owner checks out, the held trigger hears both records it missed.
+        let got = pass(&l, wicket_store::now(), false, &no_wake, &anyone).unwrap();
+        assert_eq!(by(&stuck, &got), ["started", "started"], "{got:?}");
+        assert!(by(&fine, &got).is_empty(), "nothing twice for the other");
     }
 
     /// #662 follow-ups: an owner check that can't be made (the user database didn't answer)

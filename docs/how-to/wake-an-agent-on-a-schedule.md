@@ -124,8 +124,9 @@ class for your unix user. If you can't, the trigger is paused, with the reason a
 
 If wicket can't tell (the user database or a group lookup fails, or a policy file doesn't read),
 that firing is skipped, audited at most once an hour, and the trigger stays active. For wicket's
-own events the pass stops before that record, so the trigger hears it on a later pass, within 15
-minutes. One limit: the system call that lists a user's groups can't report a failed lookup, and
+own events that trigger alone is held at the record before: other triggers go on hearing what
+follows, and once its owner checks out it hears the records it missed (except those that are
+more than 15 minutes old by then, which it passes over). One limit: the system call that lists a user's groups can't report a failed lookup, and
 a short list reads as not being in a group, which pauses the trigger.
 
 One owner may keep at most 100 live triggers (done timers aren't counted). Renewing a live trigger

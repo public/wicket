@@ -436,6 +436,11 @@ impl Ledger {
             .optional()?)
     }
 
+    /// Whether `run` has a runs row.
+    pub fn run_exists(&self, run: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT 1 FROM runs WHERE id = ?1", params![run], |_| Ok(())).optional()?.is_some())
+    }
+
     fn run_row_scope(&self, run: &str) -> Result<Option<(String, String, Option<String>)>> {
         Ok(self
             .conn
@@ -514,6 +519,34 @@ impl Ledger {
             params![tenant, source, seq, now()],
         )?;
         Ok(())
+    }
+
+    /// Triggers held back on wicket's own events (an owner that couldn't be checked, #578): each
+    /// one's id and the seq it has heard up to, while the shared cursor moves on.
+    pub fn trigger_holds(&self, tenant: &str) -> Result<Vec<(String, i64)>> {
+        let mut st = self.conn.prepare("SELECT source, seq FROM trigger_cursors WHERE tenant = ?1 AND source LIKE 'held:%'")?;
+        let rows = st.query_map(params![tenant], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(s, seq)| s.strip_prefix("held:").map(|id| (id.to_string(), seq)))
+            .collect())
+    }
+
+    /// Holds `trigger` at `seq` (it has heard up to there), or moves its hold on.
+    pub fn hold_trigger(&self, tenant: &str, trigger: &str, seq: i64) -> Result<()> {
+        self.set_trigger_cursor(tenant, &format!("held:{trigger}"), seq)
+    }
+
+    /// Ends `trigger`'s hold: it has caught up.
+    pub fn release_trigger_hold(&self, tenant: &str, trigger: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM trigger_cursors WHERE tenant = ?1 AND source = ?2", params![tenant, format!("held:{trigger}")])?;
+        Ok(())
+    }
+
+    /// The newest audit record written before `ts`, if any.
+    pub fn audit_seq_before(&self, ts: i64) -> Result<Option<i64>> {
+        Ok(self.conn.query_row("SELECT MAX(seq) FROM audit WHERE ts < ?1", params![ts], |r| r.get(0))?)
     }
 
     pub fn trigger_event(&self, id: &str) -> Result<Option<TriggerEvent>> {

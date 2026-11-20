@@ -310,19 +310,24 @@ pub fn user_name(uid: u32) -> Option<String> {
 /// The name of `gid` in the group database: Ok(None) if it has none, Err if the database
 /// couldn't answer.
 pub fn group_name_checked(gid: u32) -> Result<Option<String>, String> {
-    let mut gr: libc::group = unsafe { std::mem::zeroed() };
-    let mut buf = vec![0 as libc::c_char; 65536];
-    let mut out: *mut libc::group = std::ptr::null_mut();
-    // SAFETY: as user_name.
-    let r = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
-    if r != 0 {
-        return Err(format!("looking up group {gid}: {}", std::io::Error::from_raw_os_error(r)));
+    // A large group (many members, in LDAP) needs a larger buffer: grown on ERANGE, to 16 MiB.
+    let mut size = 64 * 1024;
+    loop {
+        let mut gr: libc::group = unsafe { std::mem::zeroed() };
+        let mut buf = vec![0 as libc::c_char; size];
+        let mut out: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: as user_name.
+        let r = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
+        match r {
+            0 if out.is_null() => return Ok(None),
+            // SAFETY: gr_name is a NUL-terminated string in `buf`.
+            0 => return Ok(Some(unsafe { std::ffi::CStr::from_ptr(gr.gr_name) }.to_string_lossy().into_owned())),
+            libc::ERANGE if size < 16 << 20 => size *= 4,
+            // "Not found", as some NSS modules say it.
+            libc::ENOENT | libc::ESRCH => return Ok(None),
+            r => return Err(format!("looking up group {gid}: {}", std::io::Error::from_raw_os_error(r))),
+        }
     }
-    if out.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: gr_name is a NUL-terminated string in `buf`.
-    Ok(Some(unsafe { std::ffi::CStr::from_ptr(gr.gr_name) }.to_string_lossy().into_owned()))
 }
 
 /// The name of `gid` in the group database.

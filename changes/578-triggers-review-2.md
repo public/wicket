@@ -8,7 +8,8 @@ type: Fixed
   - **The chain cap counts single chains.** It counts the longest single chain, not every trigger
     that ever messaged the run, so four schedules messaging one agent no longer stop its other
     triggers.
-  - **An owner that can't be checked holds the pass.** When a user, group or policy lookup fails,
-    the pass stops before the record that trigger would hear, rather than skipping what follows,
-    and the skip is audited at most once an hour.
+  - **An owner that can't be checked holds only its trigger.** When a user, group or policy
+    lookup fails, that trigger is held at the record before, rather than skipping what follows.
+    Other triggers go on, the held one catches up once its owner checks out, and the skip is
+    audited at most once an hour.
   - **Renewing a lapsed trigger** brings it back from now, as resuming does.
