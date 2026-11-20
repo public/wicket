@@ -135,8 +135,8 @@ wicket.
   request and push (#726). A finding fails the job; an accepted one is listed, with its reason, in
   `.github/zizmor.yml`. Run it locally with `zizmor .` (the version is `ZIZMOR_VERSION` in `ci.yml`).
 - **Pin updates**: Renovate (`.github/renovate.json`) proposes new action SHAs, image digests, tool
-  versions and lockfiles weekly, and security fixes at once, each as a pull request for review; none is
-  merged automatically. Where a pin has a hash beside its version, the pull request is labelled
+  versions and lockfiles weekly, once a release is 7 days old (design §2, principle 21), and security
+  fixes at once, each as a pull request for review; none is merged automatically. Where a pin has a hash beside its version, the pull request is labelled
   `needs hash`: record the new hash, compared with what the project publishes, or CI fails.
 - **Mutation testing** of the decision code (`ci/mutants.sh`) runs weekly in `mutants.yml`, not on
   pull requests: a mutant the tests don't catch fails it unless `ci/mutants.accepted` says why it is

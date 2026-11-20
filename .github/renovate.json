@@ -17,7 +17,7 @@
   ],
   "prConcurrentLimit": 6,
   "prHourlyLimit": 2,
-  "minimumReleaseAge": "3 days",
+  "minimumReleaseAge": "7 days",
   "labels": [
     "dependencies"
   ],
@@ -28,7 +28,7 @@
     "refs/**"
   ],
   "vulnerabilityAlerts": {
-    "description": "Security fixes are proposed as soon as they are known, still for review.",
+    "description": "Security fixes are proposed as soon as they are known, still for review. A version younger than 7 days also fails ci/dep-age.py until it is recorded as an exception (design \u00a72, principle 21: only for actively exploited vulnerabilities).",
     "schedule": [
       "at any time"
     ],
