@@ -5,7 +5,7 @@
 //! A quota grant is `QUOTA wicket.internal /quota/<resource>`, bound to the run it was carved for,
 //! with an `amount` (the column is NULL for every other grant) and a lifetime: at most
 //! [`MAX_QUOTA_TTL_SECS`], never past the run's own end, and renewable as any grant is (`wicket
-//! grant renew`). It answers no request, and decides no op: [`crate::Ledger::consume_grant`] and
+//! grant renew`). It answers no request, and decides no op: [`crate::Ledger::grant_covering`] and
 //! every other lookup skip it, it is never handed to a node (only grants answering a run's requests
 //! are, [`crate::Ledger::grants_for_run`]), and the reserved method keeps agents from asking for one.
 //! It is revoked with the rest of its run's grants when the run ends.
@@ -303,7 +303,7 @@ mod tests {
         l.record_quota_grants(&t, "z", &run, "wicket", &[Quota { resource: "children", amount: 2 }], 600).unwrap();
         let op = Op::egress(&t, &run, "z", "QUOTA", "wicket.internal", "/quota/children");
         assert!(op.refused_for_agents().is_some(), "nobody may ask for one");
-        assert_eq!(l.consume_grant(&op).unwrap(), None);
+        assert_eq!(l.grant_covering(&op).unwrap(), None);
         // Nor is it handed to a node: it answers no request of the run's.
         assert!(l.grants_for_run(&run.0).unwrap().is_empty());
         // An ordinary approval is still found by the same lookup.

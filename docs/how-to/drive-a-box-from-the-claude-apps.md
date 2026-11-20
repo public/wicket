@@ -130,11 +130,13 @@ How it works, and what differs from a Remote Control session:
   (with `zone.llm`'s budget and accounting), not to wicket's model proxy with an inference token.
 - **Permission mode.** `agent.remote.permission_mode` defaults to `bypassPermissions`, as in any
   driven box; any mode is passed to `--permission-mode`. In `claude -p`, an action that needs
-  approval is asked of its stdin host (wicket), not the app (#363). wicket refuses at once a write to
-  a control file (`.claude`, `.git/hooks`, CI workflows and the like), a mode change and a question;
-  anything else becomes a request, `TOOL wicket.internal /tools/<tool>/<digest>`, decided like any
-  other (`wicket approve`, `wicket deny`, the console), while the session waits. A prefix approval
-  (`--prefix /tools/Bash/`) lets one tool run for the grant's life. `wicket session RUN` takes
+  approval is asked of its stdin host (wicket, on the box's node), not the app (#363). wicket refuses
+  at once a write to a control file (`.claude`, `.git/hooks`, CI workflows and the like), a mode
+  change and a question. In `bypassPermissions` anything else is allowed at once, as the mode says;
+  in any other mode it becomes a request, `TOOL wicket.internal /tools/<tool>/<digest>`, decided like
+  any other (`wicket approve`, `wicket deny`, the console), while the session waits. A prefix
+  approval (`--prefix /tools/Bash/`) lets one tool run for the grant's life. While the box's node
+  can't reach the control host, a call that needs a request is refused after 2 minutes. `wicket session RUN` takes
   `/mode MODE` to change the mode while the session runs, and `/stop` to interrupt its turn.
   wicket's proxies decide what the box can reach whatever the mode.
 - **Hibernation.** It hibernates and wakes as a driven agent: a wake resumes the same conversation

@@ -157,6 +157,20 @@ impl Loaded {
         self.classify(self.compiled.authorize(&request_facts(r), &self.limits))
     }
 
+    /// A driven harness's tool prompt (#257 step 8): `TOOL` on wicket's own host, which
+    /// [`Loaded::decide`] refuses before Datalog (it is never an egress target). Decided by the same
+    /// Datalog as any request, so only a grant block signed by a key the token trusts allows it;
+    /// any other request is forbidden here. The caller allows a prompt only by a grant (a ceiling
+    /// that allowed it on its own would be a zone allowing wicket's host, which none may).
+    pub fn decide_tool(&self, r: &Request) -> Decision {
+        match &r.action {
+            Action::Http { host, method, decoded, .. } if host == wicket_core::link::DOMAIN && method == "TOOL" && decoded.is_empty() => {
+                self.classify(self.compiled.authorize(&request_facts(r), &self.limits))
+            }
+            _ => Decision::Forbidden("not a tool prompt".into()),
+        }
+    }
+
     /// Every block's revocation id, in block order.
     /// When the token stops allowing anything (Unix seconds): the earliest expiry of its first-party
     /// blocks (block 0 and spawn links), read from the verified token (#153).

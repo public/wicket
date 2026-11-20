@@ -226,7 +226,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use wicket_core::{Manifest, RunId, TenantId, ZoneSpec};
-    use wicket_feed::{Change, Issuer, KeyCert, LiveGrant, Publisher, PublisherConfig, ReplicaConfig};
+    use wicket_feed::{Change, Decision, Issuer, KeyCert, LiveGrant, Publisher, PublisherConfig, ReplicaConfig};
 
     fn zone() -> ZoneSpec {
         Manifest::from_yaml(
@@ -442,6 +442,71 @@ mod tests {
         link.up.store(true, Ordering::SeqCst);
         assert!(matches!(d.decide(&c, &op("GET", "/other"), None).await, Outcome::Pending { .. }));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #257 step 8: a tool prompt is decided on the node from a TOOL grant's block in the box's
+    /// token, its uses counted there; never from the record's listing alone, never by the zone,
+    /// and the grant allows no egress request to wicket's host.
+    #[test]
+    fn a_tool_prompt_is_allowed_only_by_its_grants_block_and_once_per_use() {
+        for unlisted in ["", "  unlisted_hosts: hide\n"] {
+            let (mut p, replica, dir, authz_root) = feed();
+            let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+            let t0 = 1_000_000;
+            let z = Manifest::from_yaml(&format!(
+                "task: t\nprogram: {{ name: p, command: [x] }}\nzone:\n  name: z\n  escalation: {{ request: true }}\n{unlisted}  reach:\n    - {{ host: api.example.com, methods: [GET], paths: [\"/v1/**\"] }}\n"
+            ))
+            .unwrap()
+            .zone;
+            let tenant = TenantId::single().0;
+            let issuer = Issuer::root(&authz_root, &tenant, "run:run_a", "run_a", 0, &z, &[], 3_600, vec![approver.public()]).unwrap();
+            p.commit(vec![Change::PutZone { zone: issuer.publish(&approver, &[]).unwrap() }], t0).unwrap();
+            let hello = replica.lock().unwrap().hello();
+            for f in p.catch_up(&hello, t0).unwrap() {
+                replica.lock().unwrap().accept(&f, t0).unwrap();
+            }
+            let tool = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "TOOL", "wicket.internal", "/tools/Bash/abcd");
+            let decide = |t: i64| replica.lock().unwrap().decide_tool(&tool, t);
+            assert!(matches!(decide(t0), Decision::NeedsGrant(_)), "{unlisted}");
+            // Forged: listed in the record with no block in the token.
+            let mut forged = issuer.publish(&approver, &[]).unwrap();
+            forged.grants.push(wicket_feed::TokenGrant {
+                id: "g-9".into(),
+                host: "wicket.internal".into(),
+                method: "TOOL".into(),
+                path: "/tools/Bash/abcd".into(),
+                uses: None,
+                prefix: false,
+                standing: None,
+            });
+            replica.lock().unwrap().accept(&p.commit(vec![Change::PutZone { zone: forged }], t0 + 1).unwrap(), t0 + 1).unwrap();
+            assert!(matches!(decide(t0 + 1), Decision::NeedsGrant(_)), "a listing alone allows nothing");
+            // A single-use grant: one prompt, then asked again.
+            let g = wicket_authz::Grant {
+                gid: "g-1".into(),
+                box_id: String::new(),
+                epoch: 0,
+                host: "wicket.internal".into(),
+                method: "TOOL".into(),
+                path: "/tools/Bash/abcd".into(),
+                not_after: 3_600,
+                approver: "human:test".into(),
+                digest: vec![],
+            };
+            let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: Some(1), prefix: false, standing: None }]).unwrap();
+            replica.lock().unwrap().accept(&p.commit(vec![Change::PutZone { zone: a }], t0 + 2).unwrap(), t0 + 2).unwrap();
+            assert_eq!(decide(t0 + 2), Decision::Allow(wicket_feed::Allowed::Grant("g-1".into())), "{unlisted}");
+            assert!(matches!(decide(t0 + 3), Decision::NeedsGrant(_)), "used once");
+            assert_eq!(replica.lock().unwrap().uses("g-1"), 1);
+            // Its block allows no request: wicket's host is refused before any grant is tried.
+            assert!(
+                matches!(replica.lock().unwrap().decide(&tool, t0 + 3), Decision::Forbidden(w) if w.contains("never an egress target"))
+            );
+            // Not a tool prompt: forbidden here.
+            let get = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "GET", "api.example.com", "/v1/a");
+            assert!(matches!(replica.lock().unwrap().decide_tool(&get, t0 + 3), Decision::Forbidden(_)));
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// #26 at the edge: on a node, from the box's token, a push is one op (its discovery and upload

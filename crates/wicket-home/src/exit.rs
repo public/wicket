@@ -116,7 +116,7 @@ fn says(c: &(dyn std::error::Error + 'static)) -> Option<Code> {
     if let Some(s) = c.downcast_ref::<S>() {
         return match s {
             S::NoSuchRequest(_) => Some(Code::NotFound),
-            S::NotPending(..) | S::Refused(_) | S::EffectChanged(..) | S::EgressGrant(_) => Some(Code::Refused),
+            S::NotPending(..) | S::Refused(_) | S::EffectChanged(..) => Some(Code::Refused),
             _ => None,
         };
     }

@@ -285,7 +285,79 @@ enum Found {
     Grant { id: String, counted: bool },
 }
 
+/// The method of a driven harness's tool prompt's op (#363): `TOOL wicket.internal /tools/…`.
+pub const TOOL_METHOD: &str = "TOOL";
+
 impl Replica<BoxAuthority> {
+    /// A driven harness's tool prompt on this node (#257 step 8): allowed only by a live TOOL grant
+    /// for the box, whose block in its token is signed by a key the token trusts (as any grant's;
+    /// the record's listing only picks the candidates and counts uses), with uses left. Its use is
+    /// recorded on disk first, so a single-use grant answers one prompt, across reconnects and
+    /// restarts. Otherwise NeedsGrant; any op but a tool prompt's is forbidden. A ceiling that
+    /// allowed the prompt by itself allows nothing here. Closed and lagging refuse, as for every
+    /// decision.
+    pub fn decide_tool(&mut self, op: &Op, now: i64) -> Decision {
+        if !op.method.eq_ignore_ascii_case(TOOL_METHOD) || op.host != wicket_core::link::DOMAIN || !op.path.starts_with("/tools/") {
+            return Decision::Forbidden(format!("{} {}{} is not a tool prompt", op.method, op.host, op.path));
+        }
+        let hit = match self.gate(op, now) {
+            Err(d) => return d,
+            Ok((_, st)) => match self.entry(&op.run.0) {
+                None => return Decision::Forbidden(format!("no authority for box {} on this node", op.run)),
+                Some(entry) => match &entry.compiled {
+                    Err(e) => return Decision::Forbidden(format!("this box's authority is invalid: {e}")),
+                    Ok(_) if entry.spec.zone.name != op.zone => {
+                        return Decision::Forbidden(format!(
+                            "op for zone {}, but box {} holds authority for zone {}",
+                            op.zone, op.run, entry.spec.zone.name
+                        ))
+                    }
+                    Ok(c) if c.issuer_until.is_some_and(|u| now >= u) => {
+                        return Decision::Forbidden(
+                            "the authority issuing key that minted this box's token is no longer certified (wicket keys certify)".into(),
+                        )
+                    }
+                    Ok(c) => {
+                        let mut req = request(&entry.spec, op, now);
+                        match c.loaded.decide_tool(&req) {
+                            authz::Decision::Forbidden(r) => return Decision::Forbidden(r),
+                            authz::Decision::Allow => {
+                                return Decision::NeedsGrant("the token allows wicket's host by itself, which no zone may: ask".into())
+                            }
+                            authz::Decision::NeedsGrant(_) => {}
+                        }
+                        let mut hit = None;
+                        for g in entry.spec.grants.iter().filter(|g| {
+                            g.standing.is_none()
+                                && grant_matches(g, op)
+                                && !st.is_revoked(RevokeKind::Grant, &g.id)
+                                && g.uses.is_none_or(|max| self.uses(&g.id) < max)
+                        }) {
+                            let left = g.uses.map_or(i64::MAX, |max| i64::from(max - self.uses(&g.id)));
+                            req.uses_left = vec![(g.id.clone(), left)];
+                            if c.loaded.decide_tool(&req) == authz::Decision::Allow {
+                                hit = Some((g.id.clone(), g.uses.is_some()));
+                                break;
+                            }
+                        }
+                        hit
+                    }
+                },
+            },
+        };
+        match hit {
+            None => Decision::NeedsGrant("no grant covers this call".into()),
+            Some((id, counted)) => {
+                if counted {
+                    if let Err(e) = self.record_use(&id) {
+                        return Decision::Refused { mode: Mode::Fresh, why: e };
+                    }
+                }
+                Decision::Allow(Allowed::Grant(id))
+            }
+        }
+    }
+
     /// The decision for one op at `now`, from the box's token:
     ///
     /// | token says | fresh or offline |

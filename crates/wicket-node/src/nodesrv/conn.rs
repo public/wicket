@@ -208,10 +208,8 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
             let mut boxes = node.boxes.lock().expect("boxes");
             if let Some(b) = boxes.values_mut().find(|b| b.owner == Some(gen) && b.streams[0] == stream) {
                 let (fresh, _) = accept_at(&mut b.stdin_next, offset, &bytes);
-                if let (Some(s), false) = (&b.stdin, fresh.is_empty()) {
-                    s.push(&fresh);
-                    b.record.stdin_received = b.stdin_next;
-                    let _ = b.record.save(&b.dir);
+                if !fresh.is_empty() {
+                    super::prompts::push_host_stdin(b, &fresh);
                 }
             }
         }
@@ -287,6 +285,11 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                             b.out[i].ack(upto);
                         }
                     }
+                }
+            }
+            Msg::PromptMode { run, mode } => {
+                if let Some(b) = node.boxes.lock().expect("boxes").get_mut(&run).filter(|b| b.owner == Some(gen)) {
+                    super::prompts::set_mode(b, mode);
                 }
             }
             Msg::StdinClose { run } => {
