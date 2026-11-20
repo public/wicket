@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 wicket-core.workspace = true
+wicket-names.workspace = true
+wicket-sources.workspace = true
 wicket-store.workspace = true
 wicket-proxy.workspace = true
 wicket-chan.workspace = true
@@ -37,6 +39,8 @@ futures-util.workspace = true
 tracing.workspace = true
 # `wicket node create`'s options (nodecreate.rs), flattened into the CLI's.
 clap.workspace = true
+
+zeroize = "1"
 
 [dev-dependencies]
 wicket-chan = { workspace = true, features = ["testkit"] }

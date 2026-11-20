@@ -1096,6 +1096,7 @@ mod tests {
             fence,
             waker: None,
             lifecycle: None,
+            names: None,
         }
     }
 

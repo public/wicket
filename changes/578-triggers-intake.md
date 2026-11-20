@@ -1,0 +1,48 @@
+---
+area: Long-lived agents
+type: Added
+---
+- Webhook and GitHub triggers ([#578](https://github.com/public/wicket/issues/578) step 4). A
+  `webhook` or `github` trigger wakes or messages an agent when a signed delivery arrives at its own
+  URL, with its owner's authority and never more.
+  - **Where deliveries arrive.** `wicket node intake`, a small service on a node you label
+    `wicket.intake=true`, takes deliveries, never the control host.
+    - It runs as its own user (`deploy/node/wicket-intake.service`, hardened), and reaches the
+      node's `wicket node serve` only through a socket checked by peer uid.
+    - It holds no ledger, no vault and no authority: only its triggers' URL token hashes and verify
+      secrets, in memory.
+    - It is bounded as the console's server is (connections, addresses, header and body timeouts),
+      and checks the URL's token before it reads a body.
+    - It checks each delivery's signature (HMAC-SHA256: GitHub's `X-Hub-Signature-256`, or
+      `X-Wicket-Signature-256` over a timestamp, the delivery id's length, the id and the body), and
+      for GitHub the event and repository.
+    - It hands what it verified to `wicket node serve`, which spools it.
+    - The control host's own machine takes intake only with `--allow-local-intake`.
+  - **Collected each reconcile pass** over the node channel (protocol 20), and fired once per
+    delivery id.
+  - **Fields, not the body.** A delivery is a short list of fields, capped and stripped of control
+    characters, quoted to the agent as event input. Its raw body is kept only as a sha256.
+  - **Verify secrets.** `wicket secret verify <name>` makes a vault secret a webhook's HMAC key. It
+    is sent to no host, and can't be bound to one.
+  - **Its URL.** `wicket trigger create` shows a trigger's URL once (`--intake-node` picks among
+    several intake nodes). `wicket trigger rotate-url` replaces it.
+  - **Limits.**
+    - Only verified, new deliveries the trigger listens to count against its 60 a minute and the
+      node's 600. A resend, and an event or repository the trigger doesn't listen to, is answered
+      202 without counting.
+    - Bodies in flight share a 32 MiB budget, so held connections can't exhaust intake's memory.
+    - A body takes room as its bytes arrive, within 8 MiB for one trigger and for one address. An
+      address whose bodies to a trigger keep timing out or finding no room gets
+      429 before its body is read. A leaked URL can still slow its own trigger: rotate its URL.
+    - Requests with no trigger's token are counted by address, and bad signatures by trigger. A
+      delivery with a valid token isn't slowed down for its address's bad tokens or signatures, only
+      for its own bodies to that trigger timing out or finding no room. `--trusted-proxy` names a
+      reverse proxy in front.
+    - The trigger's `per_hour` still holds, counted on the control host's clock.
+    - A delivery read more than 15 minutes late is passed over.
+    - The same body under a new delivery id fires once.
+    - Refusals are audited at most once an hour per node.
+  - **Protocol 20.** wicket now speaks protocol 20 with a skew of 2: nodes at 17 must be updated
+    with or before their control host. Ledger schema 35 adds `trigger_intake`.
+  - [Fire a trigger from a webhook](../docs/how-to/trigger-from-a-webhook.md),
+    [webhook intake](../docs/explanation/trigger-intake.md).

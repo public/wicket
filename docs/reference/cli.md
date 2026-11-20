@@ -11,8 +11,9 @@ reference](manifest.md)).
 
 ## Output for scripts
 
-The commands that list things take `--json`: `pending`, `top`, `agents`, `links`, `grant list`,
-`standing list`, `node list`, `service list` and `audit`. With it, stdout holds one JSON document
+The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
+`agents`, `links`, `grant list`, `standing list`, `node list`, `lease list`, `service list`, `audit`,
+`message inbox`, `message receipts` and `message principals`. With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -27,12 +28,18 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | --- | --- |
 | `wicket pending --json`, a request | `kind` (`request`), `id`, `run`, `zone`, `method`, `host`, `path`, `prefix` (the whole path prefix asked for), `risk`, `reason`, `created_at`, `attribution` (who in the box asked, as the agent reported it: untrusted) |
 | `wicket pending --json`, a standing ask | `kind` (`standing`), `id`, `run`, `zone`, `principal`, `rule`, `reason`, `created_at` |
+| `wicket pending --json`, an ask for a public name | `kind` (`name`), `id`, `run` (the asking run), `zone`, `principal`, `label`, `port` (the box's own), `service`, `scope` (`run`, `standing`), `reason` (the agent's, prefixed `asked by the agent: `), `created_at` |
 | a standing `rule` | `host`, `methods`, `paths`, `allow_dangerous` |
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
-| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
+| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
+| `wicket lease list --json` | `id`, `status` (`pending`, `approved`, `active`, `ended`, `denied`, `withdrawn`, `failed`), `run` (the run that holds it), `provider`, `request` (the request a person decides; null: none yet), `node` (the enrolled node's name; null: none yet), `node_id` (the provider's id for it), `hourly_cap_micro_usd`, `reserved_micro_usd`, `billed_micro_usd` (null: not ended), `duration_secs`, `created_at`, `not_after` (null: no node yet), `ended_at`, `detail` |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
+| `wicket message inbox --json` | `message_id`, `kind`, `from` (the sender's principal id, as its envelope verified), `agent`, `zone` and `run` (an agent sender's; null for an operator), `acting_for` (the chain the sender acts for), `reply_to`, `priority` (`now`, `next`, `later`), `in_reply_to`, `sent_at`, `read_at` (null: unread until now), `body` (the sender's data) |
+| `wicket message inbox --json`, a message that doesn't verify | `message_id`, `dropped` (why) |
+| `wicket message receipts --json` | `message_id`, `to`, `state` (`delivered`, `read`, `held`, `refused`, `expired`), `why`, `release` (a held message: who can release it), `run`, `sent_at`, `read_at`, `expires_at`, `priority`, `in_reply_to` |
+| `wicket message principals --json` | `id`, `kind` (`agent`, `program`), `agent`, `zone`, `relation` (`acts for you`, `accepts you`), `state` (`running`, `busy`, `idle`, `waiting`, `hibernated`, `offline`) |
 | `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
 | `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
 | an agent's `used` | `requests`, `input_tokens`, `output_tokens`, `secs` |
@@ -46,11 +53,17 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 
 - [`wicket run`](#wicket-run)
 - [`wicket session`](#wicket-session)
+- [`wicket message`](#wicket-message)
+  - [`wicket message send`](#wicket-message-send)
+  - [`wicket message inbox`](#wicket-message-inbox)
+  - [`wicket message receipts`](#wicket-message-receipts)
+  - [`wicket message principals`](#wicket-message-principals)
 - [`wicket top`](#wicket-top)
 - [`wicket agents`](#wicket-agents)
 - [`wicket hibernate`](#wicket-hibernate)
 - [`wicket trigger`](#wicket-trigger)
   - [`wicket trigger create`](#wicket-trigger-create)
+  - [`wicket trigger rotate-url`](#wicket-trigger-rotate-url)
   - [`wicket trigger list`](#wicket-trigger-list)
   - [`wicket trigger show`](#wicket-trigger-show)
   - [`wicket trigger pause`](#wicket-trigger-pause)
@@ -68,6 +81,8 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 - [`wicket image`](#wicket-image)
   - [`wicket image digest`](#wicket-image-digest)
 - [`wicket pending`](#wicket-pending)
+- [`wicket request`](#wicket-request)
+  - [`wicket request list`](#wicket-request-list)
 - [`wicket approve`](#wicket-approve)
 - [`wicket deny`](#wicket-deny)
 - [`wicket grant`](#wicket-grant)
@@ -100,7 +115,9 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket node revoke`](#wicket-node-revoke)
   - [`wicket node install`](#wicket-node-install)
   - [`wicket node serve`](#wicket-node-serve)
+  - [`wicket node intake`](#wicket-node-intake)
   - [`wicket node top`](#wicket-node-top)
+  - [`wicket node feed-checkpoint`](#wicket-node-feed-checkpoint)
   - [`wicket node forget`](#wicket-node-forget)
   - [`wicket node release-fence`](#wicket-node-release-fence)
   - [`wicket node set`](#wicket-node-set)
@@ -125,6 +142,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket secret set`](#wicket-secret-set)
   - [`wicket secret list`](#wicket-secret-list)
   - [`wicket secret remove`](#wicket-secret-remove)
+  - [`wicket secret verify`](#wicket-secret-verify)
   - [`wicket secret hosts`](#wicket-secret-hosts)
   - [`wicket secret link`](#wicket-secret-link)
   - [`wicket secret serve`](#wicket-secret-serve)
@@ -180,6 +198,7 @@ Usage: wicket <COMMAND>
 Runs and agents:
   run        Run a task manifest: one workload (an agent, or a program) in one zone
   session    Open a running agent's session in this terminal: watch it, and send it prompts
+  message    Messages with agents: send, read your inbox, follow receipts
   top        A live view of nodes, runs, pending requests and leases (read-only)
   agents     Long-lived agents: state, generation, current run and bundle size
   hibernate  Hibernate a long-lived agent at its next quiet point
@@ -193,6 +212,7 @@ Runs and agents:
 
 Approvals and grants:
   pending    List pending requests: what boxes asked for, waiting for a decision
+  request    Pending requests: `wicket request list` is `wicket pending`
   approve    Approve a pending request. The grant is never wider than the request
   deny       Deny a pending request
   grant      Grants made by approvals
@@ -205,7 +225,7 @@ Nodes and placement:
   lease      Capacity leases: the nodes agents asked for
   service    Per-node services: programs kept running on every node whose boxes use them
   why-here   Why a run's box went on the node it did, or why it went nowhere
-  reconcile  Make what exists agree with the ledger: runs, leases, machines and boxes
+  reconcile  Make what exists agree with the ledger: runs, leases, machines, boxes and public names
 
 The installation:
   serve      Serve the operator console
@@ -241,8 +261,9 @@ Options:
       --workspace-dir <WORKSPACE_DIR>  Mount this directory as the box's /workspace, read-write and in place (local runs only)
       --task <TASK>                    Use this task text instead of the manifest's
       --image <IMAGE>                  Agent image, overriding the manifest's agent.image (default: that, or the installation's agent image)
-      --node <NODE>                    Run the box on an enrolled node (its name; its host key is pinned), through its `wicket node serve`. Default: this host's own node, `local`
+      --node <NODE>                    Run the box on an enrolled node (its name; its host key is pinned), through its `wicket node serve`. Default: where the scheduler places it among the enrolled nodes, this host's own (`local`) among them; with --workspace-dir, this host's own
       --ssh-key <SSH_KEY>              ssh identity for --node (default: the one it was enrolled with)
+      --wait <WAIT>                    Without --node: how long to wait in the queue when no node may take it now (#579); 0: fail at once [default: 0]
   -h, --help                           Print help
 ```
 
@@ -271,6 +292,85 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+```
+
+## `wicket message`
+
+```text
+Messages with agents: send, read your inbox, follow receipts.
+
+Messages with agents (#252), as an operator: the same signed envelopes, rules and receipts agents have with each other. You may write to an agent that acts for you, whose accept_from names you, or that wrote to you; an agent may write to you if it acts for you. A message is data and grants nothing: `wicket session` prompts an agent.
+
+Usage: wicket message <COMMAND>
+
+Commands:
+  send        Send a signed message to an agent: one that acts for you, whose accept_from names you, or that wrote to you (--in-reply-to). Prints its id and receipt
+  inbox       Messages agents sent you, verified, unread first by priority. They are marked read (their senders' receipts say so) unless --peek
+  receipts    The receipts of the messages you sent, newest first: delivered, read, held (why, and who can release it), refused (why) or expired
+  principals  The agents you may write to, with their state: those that act for you or whose accept_from names you
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `wicket message send`
+
+```text
+Send a signed message to an agent: one that acts for you, whose accept_from names you, or that wrote to you (--in-reply-to). Prints its id and receipt
+
+Usage: wicket message send [OPTIONS] <TO> <TEXT>...
+
+Arguments:
+  <TO>       The agent's principal id (`spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>`, as `wicket message principals` lists it)
+  <TEXT>...  The message: its words, as one string body
+
+Options:
+      --priority <PRIORITY>        How soon you want it read: now, next or later [default: next]
+      --in-reply-to <IN_REPLY_TO>  The id of the agent's message this answers
+      --json                       JSON instead of text
+  -h, --help                       Print help
+```
+
+### `wicket message inbox`
+
+```text
+Messages agents sent you, verified, unread first by priority. They are marked read (their senders' receipts say so) unless --peek
+
+Usage: wicket message inbox [OPTIONS]
+
+Options:
+      --all            Also list the ones you have read
+      --peek           Don't mark them read
+      --limit <LIMIT>  [default: 50]
+      --json           JSON instead of text
+  -h, --help           Print help
+```
+
+### `wicket message receipts`
+
+```text
+The receipts of the messages you sent, newest first: delivered, read, held (why, and who can release it), refused (why) or expired
+
+Usage: wicket message receipts [OPTIONS]
+
+Options:
+      --limit <LIMIT>  [default: 40]
+      --json           JSON instead of text
+  -h, --help           Print help
+```
+
+### `wicket message principals`
+
+```text
+The agents you may write to, with their state: those that act for you or whose accept_from names you
+
+Usage: wicket message principals [OPTIONS]
+
+Options:
+      --json  JSON instead of text
+  -h, --help  Print help
 ```
 
 ## `wicket top`
@@ -338,15 +438,16 @@ Triggers (#578): when a schedule or timer comes due, wake or message an agent.
 Usage: wicket trigger <COMMAND>
 
 Commands:
-  create  Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`). The agent it wakes or messages is resolved now (a live agent; a `wake` is kept as the agent's id)
-  list    Triggers that aren't removed: each with its state, source, action and next firing
-  show    One trigger (its id, or its name): its document, agent, state, next firing and last firings
-  pause   Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up)
-  resume  Resume a paused trigger: only its owner (or root), since it fires as its owner
-  renew   Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root)
-  rm      Remove a trigger: it fires nothing again
-  fire    Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now, or for wicket's own events, one of the first kind it listens to
-  help    Print this message or the help of the given subcommand(s)
+  create      Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`). The agent it wakes or messages is resolved now (a live agent; a `wake` is kept as the agent's id)
+  rotate-url  A webhook or GitHub trigger's new URL: its old one stops working. Only its owner (or root)
+  list        Triggers that aren't removed: each with its state, source, action and next firing
+  show        One trigger (its id, or its name): its document, agent, state, next firing and last firings
+  pause       Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up)
+  resume      Resume a paused trigger: only its owner (or root), since it fires as its owner
+  renew       Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root)
+  rm          Remove a trigger: it fires nothing again
+  fire        Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now, or for wicket's own events, one of the first kind it listens to
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -361,9 +462,25 @@ Keep a trigger document (YAML) as yours. It fires with your authority, so it ask
 Usage: wicket trigger create [OPTIONS] --file <FILE>
 
 Options:
-      --file <FILE>    
-      --lasts <LASTS>  How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew` [default: 30d]
-  -h, --help           Print help
+      --file <FILE>                
+      --lasts <LASTS>              How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew` [default: 30d]
+      --intake-node <INTAKE_NODE>  A webhook or GitHub trigger's intake node (a node labelled wicket.intake=true): needed only when there are several
+      --allow-local-intake         Let the intake node be this host's own (`local`): deliveries from the internet then reach the machine with the ledger and the vault. Off unless asked for
+  -h, --help                       Print help
+```
+
+### `wicket trigger rotate-url`
+
+```text
+A webhook or GitHub trigger's new URL: its old one stops working. Only its owner (or root)
+
+Usage: wicket trigger rotate-url <TRIGGER>
+
+Arguments:
+  <TRIGGER>  
+
+Options:
+  -h, --help  Print help
 ```
 
 ### `wicket trigger list`
@@ -641,6 +758,33 @@ Options:
           Print help (see a summary with '-h')
 ```
 
+## `wicket request`
+
+```text
+Pending requests: `wicket request list` is `wicket pending`
+
+Usage: wicket request <COMMAND>
+
+Commands:
+  list  List pending requests: the same as `wicket pending`
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket request list`
+
+```text
+List pending requests: the same as `wicket pending`
+
+Usage: wicket request list [OPTIONS]
+
+Options:
+      --json  JSON instead of text
+  -h, --help  Print help
+```
+
 ## `wicket approve`
 
 ```text
@@ -858,7 +1002,7 @@ Usage: wicket names <COMMAND>
 Commands:
   list     Names: pending asks for public names, and live names (internal and public). --all adds denied, withdrawn and ended ones
   show     One name or ask: the label, port, who asked, and, for a public name, what approving it means
-  approve  Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it), or --for zone (every agent of its zone), for --lasts
+  approve  Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it takes it up when it starts), or --for zone (every agent of its zone), for --lasts
   deny     Deny an ask for a public name
   revoke   Revoke a live name, public or internal: it ends now, whoever holds it
   help     Print this message or the help of the given subcommand(s)
@@ -897,7 +1041,7 @@ Options:
 ### `wicket names approve`
 
 ```text
-Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it), or --for zone (every agent of its zone), for --lasts
+Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it takes it up when it starts), or --for zone (every agent of its zone), for --lasts
 
 Usage: wicket names approve [OPTIONS] <ID>
 
@@ -996,21 +1140,23 @@ Nodes (#16, #37), machines that run boxes: leased from a provider (create, relea
 Usage: wicket node <COMMAND>
 
 Commands:
-  token          Print a one-time join token for a node (stored hashed; single use)
-  enrol          Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
-  list           List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a node from `wicket node create` or a capacity lease), with any leased node not enrolled
-  create         Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Its money is reserved first against placement.yaml's limits (with every lease's); then its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
-  release        Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
-  plans          List a provider's (Vultr's) plans in a region, with their hourly price
-  revoke         Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
-  install        Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node` systemd user service that runs `wicket node serve` there
-  serve          On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
-  top            On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
-  forget         Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
-  release-fence  Release a run's fence without its node (root only, audited as `run.fence_released`): for a run whose node can't confirm its box stopped (unreachable or revoked) and whose fence wouldn't otherwise end, as when its records don't say when its authority ends. Its agent can then be woken. The box may still be running on its node
-  set            Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`
-  renew-ca       Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
-  help           Print this message or the help of the given subcommand(s)
+  token            Print a one-time join token for a node (stored hashed; single use)
+  enrol            Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
+  list             List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a node from `wicket node create` or a capacity lease), with any leased node not enrolled
+  create           Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Its money is reserved first against placement.yaml's limits (with every lease's); then its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
+  release          Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the provider is asked, then `placement.node_released` or `placement.node_release_failed`, the records the console's release of a node past its lease writes too
+  plans            List a provider's (Vultr's) plans in a region, with their hourly price
+  revoke           Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
+  install          Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node` systemd user service that runs `wicket node serve` there
+  serve            On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
+  intake           On the node: webhook intake for triggers (#578; docs/explanation/trigger-intake.md). Takes deliveries for the triggers the control host assigned to this node, checks their token and signature, and hands what it verified to this node's `wicket node serve`, which the control host pulls from. It holds no ledger and no authority (the `wicket-intake` service runs this)
+  top              On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
+  feed-checkpoint  Write a checkpoint of a node's feed now (#575 step 4c): of the state as it is, so a build before protocol 21 can open the feed once no box's record there holds host ports any more (`wicket self rollback` says when that is needed). Audited as `feed.checkpointed`
+  forget           Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
+  release-fence    Release a run's fence without its node (root only, audited as `run.fence_released`): for a run whose node can't confirm its box stopped (unreachable or revoked) and whose fence wouldn't otherwise end, as when its records don't say when its authority ends. Its agent can then be woken. The box may still be running on its node
+  set              Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`. Its public addresses (#575) are where its boxes' public names point: only you set them, never the node
+  renew-ca         Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
+  help             Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -1123,7 +1269,7 @@ Options:
 ### `wicket node release`
 
 ```text
-Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
+Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the provider is asked, then `placement.node_released` or `placement.node_release_failed`, the records the console's release of a node past its lease writes too
 
 Usage: wicket node release [OPTIONS] <ID>
 
@@ -1135,6 +1281,8 @@ Options:
           The vault secret holding the Vultr API key [default: vultr-api-key]
       --owner <OWNER>
           The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
+      --reason <REASON>
+          Why: it goes on the audit record
   -h, --help
           Print help
 ```
@@ -1201,6 +1349,23 @@ Options:
   -h, --help       Print help
 ```
 
+### `wicket node intake`
+
+```text
+On the node: webhook intake for triggers (#578; docs/explanation/trigger-intake.md). Takes deliveries for the triggers the control host assigned to this node, checks their token and signature, and hands what it verified to this node's `wicket node serve`, which the control host pulls from. It holds no ledger and no authority (the `wicket-intake` service runs this)
+
+Usage: wicket node intake [OPTIONS] --listen <LISTEN>
+
+Options:
+      --listen <LISTEN>                Where to listen (e.g. `0.0.0.0:8443`)
+      --tls-cert <TLS_CERT>            A certificate chain (PEM) to serve TLS with; without it, plain HTTP behind a reverse proxy that has TLS
+      --tls-key <TLS_KEY>              The certificate's private key (PEM)
+      --socket <SOCKET>                The node's intake socket, which `wicket node serve` listens on for intake (default: `<node dir>/ctl/intake.sock`, for intake run as the node's own user). Run as its own user, intake is given the socket the node's `intake_socket` names
+      --dir <DIR>                      The node's directory, for the default socket (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node)
+      --trusted-proxy <TRUSTED_PROXY>  A reverse proxy in front of intake (an address or a CIDR range; repeatable), whose `X-Forwarded-For` names the client. Without one, the client is the peer
+  -h, --help                           Print help
+```
+
 ### `wicket node top`
 
 ```text
@@ -1213,6 +1378,20 @@ Options:
       --once       Print one frame and exit (also what a stdout that isn't a terminal gets, every 2 s, without it)
       --json       Print the node's status once, as JSON
   -h, --help       Print help
+```
+
+### `wicket node feed-checkpoint`
+
+```text
+Write a checkpoint of a node's feed now (#575 step 4c): of the state as it is, so a build before protocol 21 can open the feed once no box's record there holds host ports any more (`wicket self rollback` says when that is needed). Audited as `feed.checkpointed`
+
+Usage: wicket node feed-checkpoint <NAME>
+
+Arguments:
+  <NAME>  The node
+
+Options:
+  -h, --help  Print help
 ```
 
 ### `wicket node forget`
@@ -1248,7 +1427,7 @@ Options:
 ### `wicket node set`
 
 ```text
-Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`
+Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`. Its public addresses (#575) are where its boxes' public names point: only you set them, never the node
 
 Usage: wicket node set [OPTIONS] <NAME>
 
@@ -1256,10 +1435,12 @@ Arguments:
   <NAME>  
 
 Options:
-      --ca-hosts <CA_HOSTS>  `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need), or a comma-separated list of hosts it may be widened to (`api.example.com,*.example.org`)
-      --label <LABELS>       `key=value` sets a label, `key-` removes it. Repeatable
-      --taint <TAINTS>       `key` or `key=value` taints the node (one taint per key), `key-` removes it. Repeatable
-  -h, --help                 Print help
+      --ca-hosts <CA_HOSTS>        `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its boxes' reach or grants need), or a comma-separated list of hosts it may be widened to (`api.example.com,*.example.org`)
+      --label <LABELS>             `key=value` sets a label, `key-` removes it. Repeatable
+      --taint <TAINTS>             `key` or `key=value` taints the node (one taint per key), `key-` removes it. Repeatable
+      --public-ipv4 <PUBLIC_IPV4>  The node's public IPv4 address (an address on the public internet: the router's, for a node behind NAT that forwards its port range), or `none`
+      --public-ipv6 <PUBLIC_IPV6>  The node's public IPv6 address, or `none`
+  -h, --help                       Print help
 ```
 
 ### `wicket node renew-ca`
@@ -1303,9 +1484,10 @@ Options:
 ```text
 Every lease: status, holder run, node, money reserved, end
 
-Usage: wicket lease list
+Usage: wicket lease list [OPTIONS]
 
 Options:
+      --json  JSON instead of text
   -h, --help  Print help
 ```
 
@@ -1407,9 +1589,9 @@ Options:
 ## `wicket reconcile`
 
 ```text
-Make what exists agree with the ledger: runs, leases, machines and boxes.
+Make what exists agree with the ledger: runs, leases, machines, boxes and public names.
 
-Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Records every change in the audit log.
+Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. With `names.public` in wicket.yaml, also make the boxes zone's records that wicket owns agree with the live public names, through its DNS provider (#575; the noop provider only records the plan). Records every change in the audit log.
 
 Usage: wicket reconcile [OPTIONS]
 
@@ -1576,6 +1758,7 @@ Commands:
   set     Store a secret. Prompts without echo, or reads stdin when it isn't a terminal
   list    List secret names and the host names each may be sent to (never values)
   remove  Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it when the control host next checks that run's secrets, within seconds while connected (#152)
+  verify  Make a secret a verify secret (#578): a webhook trigger's HMAC key, used only to check its deliveries' signatures. It is sent to no host, and can't be bound to one
   hosts   Bind a secret to the only host names it may be sent to, replacing its list
   link    Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
   serve   Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd-user/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
@@ -1617,6 +1800,20 @@ Options:
 Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it when the control host next checks that run's secrets, within seconds while connected (#152)
 
 Usage: wicket secret remove <NAME>
+
+Arguments:
+  <NAME>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket secret verify`
+
+```text
+Make a secret a verify secret (#578): a webhook trigger's HMAC key, used only to check its deliveries' signatures. It is sent to no host, and can't be bound to one
+
+Usage: wicket secret verify <NAME>
 
 Arguments:
   <NAME>  
@@ -2245,8 +2442,8 @@ Usage: wicket dev <COMMAND>
 
 Commands:
   node-feed-probe  On a node: send `node serve` its own last freshness statement, tampered and then replayed, and print how each was refused (a check for ci/node-e2e.sh). The control connection stays up
-  console-assets   A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without an API key. Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
-  mock-llm         
+  console-assets   Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
+  mock-llm         A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without an API key
   help             Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2268,7 +2465,7 @@ Options:
 ### `wicket dev console-assets`
 
 ```text
-A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without an API key. Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
+Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
 
 Usage: wicket dev console-assets <DIR>
 
@@ -2282,6 +2479,8 @@ Options:
 ### `wicket dev mock-llm`
 
 ```text
+A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without an API key
+
 Usage: wicket dev mock-llm [OPTIONS] --command <COMMAND>
 
 Options:

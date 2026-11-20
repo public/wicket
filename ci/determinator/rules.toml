@@ -120,7 +120,8 @@ globs = [
   ".gitleaks.toml", ".gitignore", ".claude-plugin/**", "plugins/**",
   "ci/check-public.py", "ci/check-doc-links.sh", "ci/check-terms.sh", "ci/check-terms.allow", "ci/check-plugin.py",
   "ci/changelog.py", "ci/changelog_test.py", "ci/preflight.sh", "ci/no-attribution.py", "ci/no-attribution_test.py", ".githooks/**",
-  "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml", "ci/vendor-check.py", "ci/vendor-check_test.py", "ci/vendor-lit.sh",
+  "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml", "ci/verdict-needs.sh",
+  "ci/vendor-check.py", "ci/vendor-check_test.py", "ci/vendor-lit.sh",
   # The console preview and its browser tests (#574): no crate reads them; the browser tests are a
   # suite of their own (suites.toml, console-browsers).
   "ci/console-preview.sh", "ci/console-preview/**", "ci/console-browsers.sh", "ci/console-browsers/**",

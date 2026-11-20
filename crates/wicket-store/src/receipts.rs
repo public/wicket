@@ -81,6 +81,8 @@ pub struct MessageMeta<'a> {
     pub from_principal: Option<&'a str>,
     pub priority: Priority,
     pub in_reply_to: Option<&'a str>,
+    /// Signed by an operator (#252): recorded as [`crate::KIND_OPERATOR_MESSAGE`].
+    pub operator: bool,
 }
 
 /// A recorded message's addressing, without its envelope: what a reply is checked against.
@@ -241,6 +243,9 @@ impl Ledger {
             ("expired", Some(format!("no run of {to} read it within {} days", MESSAGE_HOLD_SECS / 86_400)), None, None, None)
         } else if running(&to_run)? {
             ("delivered", None, None, Some(to_run), None)
+        } else if crate::inbox::is_operator(&to) {
+            // In the operator's inbox (#252): it has no run to wait for.
+            ("delivered", None, None, None, None)
         } else {
             let (why, release) = self.held_why(&tenant, &to)?;
             ("held", Some(why), Some(release), None, Some(at + MESSAGE_HOLD_SECS))

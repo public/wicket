@@ -58,14 +58,17 @@
 mod acme;
 mod authority;
 mod capacity;
-mod limits;
+mod fence;
+pub(crate) mod limits;
 mod manifests;
-mod net;
+pub(crate) mod net;
+mod placed;
+mod placement;
 mod push;
 mod secrets;
 pub mod session;
 mod standing;
-mod tls;
+pub(crate) mod tls;
 mod web;
 pub(crate) use web::write_console_assets;
 
@@ -212,6 +215,18 @@ enum Action {
         id: String,
         ttl_secs: Option<u64>,
     },
+    /// Release a run's fence without its node (#690), on the effect the passkey signed.
+    ReleaseFence {
+        run: String,
+        reason: String,
+        effect: String,
+    },
+    /// Release a placed node past its lease (#710), on the effect the passkey signed.
+    NodeRelease {
+        id: String,
+        reason: String,
+        effect_sha256: String,
+    },
 }
 
 enum Purpose {
@@ -237,6 +252,9 @@ type Launcher = Box<dyn Fn(&Launch) -> Result<()> + Send + Sync>;
 /// Applies an approved update request (#465): the real one runs `wicket self apply-update`
 /// detached; tests record instead. Given the request and the log to write.
 type Updater = Box<dyn Fn(&str, &std::path::Path) -> Result<()> + Send + Sync>;
+/// Releases a placed node the console decided to release (#710): the real one asks the provider
+/// in the background ([`placed::release_in_background`]); tests record instead.
+type Releaser = Box<dyn Fn(placed::Release) -> Result<()> + Send + Sync>;
 /// The verified identity of a run's agent (crate::verified_identity; replaceable in tests, which
 /// have no issuer key).
 type IdentityCheck = fn(&Ledger, &str) -> Value;
@@ -262,6 +280,7 @@ struct State {
     roots: Vec<(String, PathBuf)>,
     launcher: Launcher,
     updater: Updater,
+    releaser: Releaser,
     identity: IdentityCheck,
     challenges: Mutex<HashMap<String, Pending>>,
     limiter: Limiter,
@@ -322,6 +341,7 @@ impl State {
             roots,
             launcher,
             updater: Box::new(|_, _| bail!("this console doesn't apply updates")),
+            releaser: Box::new(|_| bail!("this console doesn't release nodes")),
             identity,
             challenges: Mutex::new(HashMap::new()),
             limiter: Limiter::default(),
@@ -394,6 +414,8 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         |l, run| crate::verified_identity(l, run, None),
     );
     state.updater = Box::new(move |request, log| apply_update_detached(&update_exe, request, log));
+    let release_ledger = ledger_path();
+    state.releaser = Box::new(move |r| placed::release_in_background(release_ledger.clone(), r));
     state.trusted = plan.trusted.clone();
     state.authority = plan.authority.clone();
     state.hsts = plan.hsts;
@@ -828,8 +850,9 @@ where
                 },
                 _ => denied(),
             },
-            // Read-only views of authority (#173): an operator's session only.
-            p => match (authority::get(state, p), &sess) {
+            // Read-only views of authority (#173), and why a run went where it did (#579): an
+            // operator's session only.
+            p => match (authority::get(state, p).or_else(|| placement::get(state, p)), &sess) {
                 (Some(r), Some((_, SessionKind::Operator { .. }))) => match r {
                     Ok(v) => to_response(ok(v)),
                     Err(e) => to_response(err(StatusCode::NOT_FOUND, e)),
@@ -1432,8 +1455,10 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         Some("standing_approve") => standing::build_approve(state, &l, body),
         Some("standing_deny") => standing::build_deny(state, &l, body),
         Some("standing_renew") => standing::build_renew(state, &l, body),
+        Some("release_fence") => fence::build_release(state, oc, &l, body),
+        Some("node_release") => placed::build(state, &l, oc, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny or standing_renew",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence or node_release",
         )),
     }
 }
@@ -1704,6 +1729,8 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         }
         Action::StandingDeny { id } => standing::apply_deny(state, &l, oc, id, signed),
         Action::StandingRenew { id, ttl_secs } => standing::apply_renew(state, &l, oc, id, *ttl_secs, signed),
+        Action::ReleaseFence { run, reason, effect } => fence::apply_release(state, &l, oc, run, reason, effect, signed),
+        Action::NodeRelease { id, reason, effect_sha256 } => placed::apply(state, &l, oc, id, reason, effect_sha256, signed),
     }
 }
 
@@ -1790,7 +1817,11 @@ fn waiting(state: &State) -> Result<Vec<push::Waiting>> {
         let agent = s.principal.rsplit("/a/").next().unwrap_or(&s.principal).to_string();
         out.push(push::Waiting { id: s.id, summary: format!("{agent} asks for standing reach on {}", s.rule.host) });
     }
-    // Asks for public names (#575): only a human decides them.
+    // Asks for public names (#575): only a human decides them. Those past their time, or of runs
+    // that are gone, are swept first, so they aren't pushed (#696 review).
+    if let Err(e) = l.sweep_stale_names() {
+        tracing::warn!("notifier: sweeping stale names: {e:#}");
+    }
     for n in l.names_with_status(&state.tenant, "pending")? {
         let agent = n.principal.rsplit("/a/").next().unwrap_or(&n.principal).to_string();
         out.push(push::Waiting { id: n.id, summary: format!("{agent} asks for the public name {} (port {})", n.label, n.port) });
@@ -1966,7 +1997,7 @@ fn dashboard(state: &State) -> Result<Value> {
                 "now": wicket_store::now(), "tenant": state.tenant.0, "ledger_error": "the ledger can't be read",
                 "pending": [], "decided": [], "runs": [], "manifests": list_manifests(state), "secrets": secrets::view(state),
                 "passkeys": [], "placed": [], "health": health_view(state, wicket_feed::now_ms())?.0, "capacity": [],
-                "standing": { "asks": [], "rules": [] }, "audit": [],
+                "standing": { "asks": [], "rules": [] }, "fenced": [], "audit": [],
             }));
         }
     };
@@ -2002,6 +2033,7 @@ fn dashboard(state: &State) -> Result<Value> {
             v
         })
         .collect();
+    let recent: Vec<String> = runs.iter().filter_map(|r| r["id"].as_str().map(String::from)).collect();
     Ok(json!({
         "now": wicket_store::now(),
         "tenant": t.0,
@@ -2034,6 +2066,7 @@ fn dashboard(state: &State) -> Result<Value> {
         "health": health_view(state, wicket_feed::now_ms())?.0,
         "capacity": capacity::view(&l, &t.0)?,
         "standing": standing::view(&l, &t.0)?,
+        "fenced": fence::view(state, &l, &recent)?,
         "audit": audit,
         // The audit table against its limit on this host, and the prune checkpoint (#582).
         "audit_retention": crate::statesync::audit_retention(&l, false).ok().map(|r| json!({
@@ -2238,6 +2271,8 @@ mod tests {
     mod https;
     mod manifests;
     mod notify;
+    mod placed;
+    mod placement;
     mod secrets;
     mod session;
 
@@ -2989,11 +3024,151 @@ mod tests {
         let r = t.act(json!({ "action": "standing_renew", "id": id, "forever": true }));
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
         assert_eq!(t.ledger().standing(&id).unwrap().expires_at, None);
+        // Another ask, denied (signed).
+        let other = {
+            let l = t.ledger();
+            let rule: wicket_core::manifest::ReachRule =
+                wicket_core::yaml::from_str("{ host: other.example, methods: [GET], paths: ['/x'] }").unwrap();
+            let s = l.standing(&id).unwrap();
+            l.ask_standing(&TenantId::single(), &RunId(s.run), "work", "zone-digest", &s.principal, &rule, "other").unwrap().0
+        };
+        let r = t.act(json!({ "action": "standing_deny", "id": other }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        // #799: the approval, the renewal and the denial re-verify offline.
+        assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (3, 0), "re-verifies offline");
         assert_eq!(post(&t.state, "/api/standing/revoke", &anon(), &json!({ "id": id })).unwrap().status, StatusCode::UNAUTHORIZED);
         let r = t.post("/api/standing/revoke", json!({ "id": id }));
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
         assert_eq!(t.ledger().standing(&id).unwrap().status, "revoked");
         assert_eq!(t.begin(json!({ "action": "standing_renew", "id": id })).status, StatusCode::CONFLICT);
+    }
+
+    /// #690: a run fenced until its node confirms is listed on the Fenced runs card with its node and
+    /// why; releasing it is signed (with a reason, the fence's end and its effect), lifts the fence,
+    /// and is audited as `run.fence_released` with the operator's principal.
+    #[test]
+    fn a_fenced_run_is_shown_and_released_with_a_passkey() {
+        let mut t = setup("fence");
+        let run = "run_00000000000000000000fenced";
+        std::fs::create_dir_all(t.dir.join("runs").join(run).join("ctl")).unwrap();
+        // Its run record can't say when its authority ends, and the ledger has no hard end: fenced
+        // until node n1 confirms the box stopped.
+        std::fs::write(t.dir.join("runs").join(run).join("ctl/run.json"), b"not json").unwrap();
+        {
+            let l = t.ledger();
+            l.run_started(&TenantId::single(), &RunId(run.into()), "z", "lead").unwrap();
+            l.set_run_node(run, "n1").unwrap();
+        }
+        let d = dashboard(&t.state).unwrap();
+        let f = &d["fenced"][0];
+        assert_eq!((f["id"].as_str(), f["fence"]["node"].as_str()), (Some(run), Some("n1")), "{d}");
+        assert!(f["fence"]["fenced_until_ms"].is_null(), "{f}");
+        assert!(f["fence"]["why"].as_str().unwrap().contains("until its node confirms the box stopped"), "{f}");
+        // Refused before the passkey: no reason, or a run that isn't fenced.
+        assert_refused(&t.begin(json!({ "action": "release_fence", "run": run })), StatusCode::BAD_REQUEST, "say why");
+        let other = "run_0000000000000000000000none";
+        assert_refused(&t.begin(json!({ "action": "release_fence", "run": other, "reason": "x" })), StatusCode::NOT_FOUND, "isn't fenced");
+        // What the passkey signs: the run, its node, the fence's end, the reason and the effect.
+        let b = t.begin(json!({ "action": "release_fence", "run": run, "reason": "n1 was destroyed" }));
+        assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+        let a = &b.body["action"];
+        assert_eq!(
+            (a["node"].as_str(), a["reason"].as_str(), a["source"].as_str()),
+            (Some("n1"), Some("n1 was destroyed"), Some("unknown")),
+            "{a}"
+        );
+        assert_eq!(a["effect_sha256"].as_str(), Some(wicket_control::fence::effect(run, "n1", None, "unknown", None).as_str()));
+        let r = t.act(json!({ "action": "release_fence", "run": run, "reason": "n1 was destroyed" }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        assert!(r.body["ok"].as_str().unwrap_or("").contains("released run"), "{:?}", r.body);
+        let l = t.ledger();
+        let rec: Value = serde_json::from_str(&l.audit_latest(run, "run.fence_released").unwrap().expect("audited")).unwrap();
+        assert_eq!(
+            (rec["by"].as_str(), rec["via"].as_str(), rec["why"].as_str()),
+            (Some("passkey:laptop"), Some("console"), Some("n1 was destroyed"))
+        );
+        assert!(rec["granter_identity"].as_str().unwrap().ends_with("/op/passkey/laptop"), "{rec}");
+        assert!(rec["signed"].is_object(), "{rec}");
+        // #799: the release re-verifies offline.
+        assert_eq!(crate::verify_signed_decisions(&l).unwrap(), (1, 0), "re-verifies offline");
+        drop(l);
+        assert!(dashboard(&t.state).unwrap()["fenced"].as_array().unwrap().is_empty(), "released");
+        assert_refused(
+            &t.begin(json!({ "action": "release_fence", "run": run, "reason": "again" })),
+            StatusCode::NOT_FOUND,
+            "isn't fenced",
+        );
+    }
+
+    /// The review of #690: an enrolled node's box (it reported just now, its authority record live,
+    /// as every node box has) and a run still starting (no node or authority on record) aren't
+    /// listed and their fences aren't released, whoever asks; an operator whose authority doesn't
+    /// cover `fence` is refused before the passkey; another tenant's fenced run isn't found.
+    #[test]
+    fn only_a_fence_its_node_cant_end_is_released_and_only_by_an_operator_it_covers() {
+        let t = setup("fence-healthy");
+        let (healthy, lost, theirs) =
+            ("run_0000000000000000000healthy", "run_0000000000000000000000lost", "run_00000000000000000000theirs");
+        let starting = "run_000000000000000000starting";
+        let mut l = t.ledger();
+        let tok = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        let now = wicket_store::now();
+        let node = wicket_store::NodeRow {
+            name: "n1".into(),
+            tenant: TenantId::single().0,
+            target: "wicket@203.0.113.7".into(),
+            host_key: "ssh-ed25519 AAAA".into(),
+            host_key_fp: "SHA256:x".into(),
+            node_key: "00".repeat(32),
+            ssh_key: None,
+            hosts: vec![],
+            enrolled_at: now,
+            status: "active".into(),
+            revoked_at: None,
+        };
+        let ca = wicket_store::NodeCaRow {
+            serial: "01".into(),
+            node: "n1".into(),
+            issued_at: now,
+            not_after: now + 3600,
+            hosts: vec![],
+            status: "active".into(),
+        };
+        l.enrol_node(&tok, &node, &ca).unwrap();
+        l.set_node_health("n1", wicket_feed::now_ms(), "{}").unwrap();
+        for (run, tenant, node) in
+            [(healthy, TenantId::single(), "n1"), (lost, TenantId::single(), "gone"), (theirs, TenantId("t9".into()), "gone")]
+        {
+            std::fs::create_dir_all(t.dir.join("runs").join(run).join("ctl")).unwrap();
+            std::fs::write(t.dir.join("runs").join(run).join("ctl/run.json"), b"not json").unwrap();
+            l.run_started(&tenant, &RunId(run.into()), "z", "lead").unwrap();
+            l.set_run_node(run, node).unwrap();
+        }
+        // A run still starting: its run record written, its node and authority not yet.
+        std::fs::create_dir_all(t.dir.join("runs").join(starting).join("ctl")).unwrap();
+        std::fs::write(t.dir.join("runs").join(starting).join("ctl/run.json"), b"not json").unwrap();
+        l.run_started(&TenantId::single(), &RunId(starting.into()), "z", "lead").unwrap();
+        // What every node box has while it runs: its authority, live for another hour.
+        let until = wicket_feed::now_ms() + 3_600_000;
+        std::fs::write(t.dir.join("runs").join(healthy).join("ctl/authority.json"), json!({ "node": "n1", "until_ms": until }).to_string())
+            .unwrap();
+        drop(l);
+        let listed: Vec<String> =
+            dashboard(&t.state).unwrap()["fenced"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(listed, [lost], "the enrolled node's box, the starting run and the other tenant's aren't listed");
+        let begin = |run: &str| t.begin(json!({ "action": "release_fence", "run": run, "reason": "x" }));
+        assert_refused(&begin(healthy), StatusCode::CONFLICT, "node n1 is enrolled");
+        assert_refused(&begin(starting), StatusCode::CONFLICT, "still starting");
+        assert_refused(&begin(theirs), StatusCode::NOT_FOUND, "isn't fenced");
+        fence::AUTHORITY.with(|a| {
+            *a.borrow_mut() =
+                Some(crate::operators::Authority::Scoped(crate::operators::Scope { kinds: vec!["http".into()], ..Default::default() }))
+        });
+        assert_refused(&begin(lost), StatusCode::FORBIDDEN, "may not decide fence requests");
+        assert_refused(&begin(healthy), StatusCode::FORBIDDEN, "may not decide fence requests");
+        fence::AUTHORITY.with(|a| *a.borrow_mut() = None);
+        assert_eq!(begin(lost).status, StatusCode::OK);
+        assert!(t.ledger().audit_latest(healthy, "run.fence_released").unwrap().is_none());
     }
 
     /// #256: the Capacity card issues and renews a standing capacity grant with signed actions,
@@ -3034,6 +3209,8 @@ mod tests {
         let r = t.act(json!({ "action": "capacity_renew", "id": g.id, "ttl_secs": 7200 }));
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
         assert!(l.capacity_grant(&g.id).unwrap().unwrap().expires_at > g.expires_at);
+        // #799: the issue and the renewal re-verify offline.
+        assert_eq!(crate::verify_signed_decisions(&l).unwrap(), (2, 0), "re-verifies offline");
         // Revoked with the session only; then it's gone from the card and can't be renewed.
         let r = t.post("/api/capacity/revoke", json!({ "id": g.id }));
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);

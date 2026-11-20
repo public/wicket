@@ -11,7 +11,7 @@ import ToolCallCard from './components/ToolCallCard.vue';
 import PermissionDialog from './components/PermissionDialog.vue';
 import SignSheet from './components/SignSheet.vue';
 import { addUser, handleSessionUpdate, messages, reset } from './session';
-import { riskLabel, runFromLocation, socket } from './lib/wicket';
+import { requestState, riskLabel, runFromLocation, socket } from './lib/wicket';
 import { sheet, signed } from './lib/sign';
 import type { PermissionRequest } from './lib/types';
 
@@ -101,7 +101,7 @@ async function stop() {
   }
 }
 
-// An escalation decided elsewhere (the console's front page, another device, its expiry) withdraws
+// A request decided elsewhere (the console's front page, another device, its expiry) withdraws
 // its prompt here: answered "cancelled", which the endpoint audits next to the ledger's status.
 watch(
   () => messages.value.flatMap((m) => m.toolCalls ?? []).filter((t) => t.escalation && t.escalation.status !== 'pending').map((t) => t.toolCallId),
@@ -145,7 +145,7 @@ function onKey(e: KeyboardEvent) {
   <main>
     <div v-if="!run" class="card">This page shows a run's session: open it from a running run in the console's Runs list.</div>
     <div v-else-if="state !== 'open' && !messages.length" class="card intro">
-      <div>Open <span class="mono">{{ run }}</span>'s session: the agent's messages, tool calls and plans as they stream, wicket's escalations to decide, and prompts from you. Your passkey signs the open.</div>
+      <div>Open <span class="mono">{{ run }}</span>'s session: the agent's messages, tool calls and plans as they stream, wicket's requests waiting for your decision, and prompts from you. Your passkey signs the open.</div>
       <div class="buttons"><button type="button" class="approve" :disabled="state === 'opening' || state === 'connecting'" @click="open">Open session</button></div>
     </div>
     <div v-if="error" class="card err" role="status">{{ error }}<div v-if="state === 'closed'" class="buttons"><button type="button" @click="open">Reopen</button></div></div>
@@ -162,10 +162,10 @@ function onKey(e: KeyboardEvent) {
           </ol>
         </div>
         <template v-for="tc in m.toolCalls ?? []" :key="tc.toolCallId">
-          <div v-if="tc.escalation" class="escalation" :class="tc.escalation.status">
-            <span class="label">wicket escalation</span>
+          <div v-if="tc.escalation" class="escalation" :class="requestState(tc.escalation.status).cls">
+            <span class="label">wicket request · {{ requestState(tc.escalation.status).word }}</span>
             <span class="mono">{{ tc.escalation.method }} {{ tc.escalation.host }}{{ tc.escalation.path }}</span>
-            <span class="meta">{{ riskLabel(tc.escalation.risk) }} · {{ tc.escalation.id }} · <b>{{ tc.escalation.status }}</b></span>
+            <span class="meta">{{ riskLabel(tc.escalation.risk) }} · request {{ tc.escalation.id }}</span>
           </div>
           <ToolCallCard v-else :tool-call="tc" />
           <PermissionDialog

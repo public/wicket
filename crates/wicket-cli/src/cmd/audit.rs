@@ -188,8 +188,16 @@ fn pid_alive(pidfile: &std::path::Path) -> bool {
 }
 
 /// Whether process `pid` runs a wicket binary: its executable's name, or failing that (another
-/// user's process, whose `exe` can't be read) its command line's first word.
+/// user's process, whose `exe` can't be read) its command line's first word. A thread's id isn't a
+/// process: `/proc` answers for it too, with its process's executable, but a pid file never names
+/// one (a stale file's number may have gone to a thread of some wicket since, #663).
 fn is_wicket(pid: i32) -> bool {
+    let tgid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Tgid:").and_then(|v| v.trim().parse::<i32>().ok())));
+    if tgid != Some(pid) {
+        return false;
+    }
     let named = |p: &std::path::Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("wicket"));
     if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
         // A binary replaced by an update reads as "<path> (deleted)".
@@ -311,7 +319,7 @@ pub(crate) fn verify_identities_and_messages(l: &Ledger) -> Result<(usize, usize
     }
     for (id, env, at) in l.envelopes()? {
         // Each message at the time wicket recorded it: the sender's identity must have been valid then.
-        match wicket_identity::verify_envelope(&env, &key, at) {
+        match wicket_identity::verify_any_envelope(&env, &key, at) {
             Ok((_, p)) if p.get("jti").and_then(|j| j.as_str()) == Some(id.as_str()) => ok += 1,
             Ok(_) => {
                 println!("  message {id}: FAILED: id does not match its envelope");
@@ -339,24 +347,14 @@ pub(crate) fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
         let result = (|| -> Result<()> {
             let key = keys.iter().find(|k| k.id == get("credential")).ok_or_else(|| anyhow::anyhow!("unknown credential"))?;
             let rp = RelyingParty { rp_id: get("rp_id").into(), origin: get("origin").into() };
-            let signed_json = if kind == "decision" { get("decision_json") } else { get("action_json") };
+            // A decision on a request keeps `decision_json`; the console's other signed actions,
+            // decisions among them (standing reach, capacity grants), keep `action_json` (#799).
+            let as_decision = s.get("decision_json").is_some();
+            let signed_json = if as_decision { get("decision_json") } else { get("action_json") };
             let challenge = decision_challenge(&unb64u(get("nonce"))?, signed_json);
             let decided: serde_json::Value = serde_json::from_str(signed_json)?;
-            // The record must say what was signed: the same request and decision, or the same action
-            // on the same run (and, for a started run, the same manifest bytes).
-            let same = |k: &str| decided.get(k) == v.get(k);
-            let matches = if kind == "decision" {
-                same("request") && same("decision")
-            } else {
-                same("action")
-                    && same("run")
-                    && run.as_deref() == decided.get("run").and_then(|r| r.as_str())
-                    && (kind != "run.console_start" || (same("manifest_sha256") && same("principal") && same("task")))
-                    && (kind != "manifest.saved" || (same("name") && same("sha256") && same("previous_sha256")))
-                    && (!kind.starts_with("operator.push_") || (same("device") && same("details") && same("credential")))
-            };
-            if !matches {
-                bail!("record does not match the signed {}", if kind == "decision" { "decision" } else { "action" });
+            if let Err(what) = says_what_was_signed(&kind, as_decision, run.as_deref(), &v, &decided) {
+                bail!("record does not match the signed {what}");
             }
             let cred = Credential { id: unb64u(&key.id)?, x: key.x, y: key.y, sign_count: 0 };
             rp.verify_assertion(
@@ -379,6 +377,80 @@ pub(crate) fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
     Ok((ok, bad))
 }
 
+/// Whether audit record `v` (of `kind`, on `run`) says what was signed (`decided`, kept as
+/// `decision_json` if `as_decision`): the same request and decision, or the same action with each
+/// kind's own fields. What didn't match, if not.
+fn says_what_was_signed(
+    kind: &str,
+    as_decision: bool,
+    run: Option<&str>,
+    v: &serde_json::Value,
+    decided: &serde_json::Value,
+) -> Result<(), &'static str> {
+    let same = |k: &str| decided.get(k) == v.get(k);
+    let field = |k: &str| decided.get(k).unwrap_or(&serde_json::Value::Null);
+    let says = |k: &str, x: &str| v.get(k).and_then(|d| d.as_str()) == Some(x);
+    let action = decided.get("action").and_then(|a| a.as_str());
+    let ok = match (kind, action) {
+        // A request decided on the console.
+        ("decision", _) if as_decision => same("request") && same("decision"),
+        // A capacity grant has no id until it is made: its record says the signed principal, terms
+        // and lifetime.
+        ("decision", Some("capacity_grant")) => {
+            let (t, r) = (field("terms"), v.get("terms").unwrap_or(&serde_json::Value::Null));
+            says("action", "capacity_grant")
+                && says("decision", "issue")
+                && same("principal")
+                && same("ttl_secs")
+                && t.get("plans") == r.get("plans")
+                && t.get("regions") == r.get("regions")
+                && t.get("nodes") == r.get("nodes")
+                && t.get("hourly_micros") == r.get("hourly")
+                && t.get("daily_micros") == r.get("daily")
+        }
+        ("decision", Some("capacity_renew")) => {
+            says("action", "capacity_renew") && says("decision", "renew") && same("grant") && same("ttl_secs") && same("previous_until")
+        }
+        ("decision", Some("standing_approve")) => {
+            says("decision", "approve")
+                && same("standing")
+                && same("principal")
+                && same("zone")
+                && same("rule")
+                && same("ttl_secs")
+                && same("effect_sha256")
+                && decided.get("for") == v.get("bound")
+        }
+        ("decision", Some("standing_deny")) => says("decision", "deny") && same("standing"),
+        // A renewal's record says its new end, from when it was made; the signed JSON its lifetime.
+        ("decision", Some("standing_renew")) => says("decision", "renew") && same("standing") && same("previous_until"),
+        ("decision", Some(_)) => false,
+        // A fence release's run is the record's run; its reason is the record's `why`.
+        ("run.fence_released", _) => {
+            action == Some("release_fence")
+                && run.is_some()
+                && run == decided.get("run").and_then(|r| r.as_str())
+                && decided.get("reason") == v.get("why")
+                && ["node", "node_status", "node_seen_ms", "fenced_until_ms", "source", "effect_sha256"].iter().all(|k| same(k))
+        }
+        // The same action on the same run (and, for a started run, the same manifest bytes).
+        _ => {
+            same("action")
+                && same("run")
+                && run == decided.get("run").and_then(|r| r.as_str())
+                && (kind != "run.console_start" || (same("manifest_sha256") && same("principal") && same("task")))
+                && (kind != "manifest.saved" || (same("name") && same("sha256") && same("previous_sha256")))
+                && (!kind.starts_with("operator.push_") || (same("device") && same("details") && same("credential")))
+                && (kind != "placement.node_release_decided" || (same("id") && same("effect_sha256")))
+        }
+    };
+    match (ok, kind) {
+        (true, _) => Ok(()),
+        (false, "decision") => Err("decision"),
+        (false, _) => Err("action"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,9 +461,37 @@ mod tests {
     fn a_pid_counts_only_if_it_is_wickets() {
         assert!(is_wicket(std::process::id() as i32), "this test binary is wicket_cli-…");
         let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        assert!(!is_wicket(other.id() as i32), "sleep isn't wicket");
+        let pid = other.id() as i32;
+        // Once it runs sleep (its name says so), whatever the machine's timing.
+        let comm = || std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        for _ in 0..250 {
+            if comm().trim() == "sleep" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let seen = format!(
+            "exe {:?}, cmdline {:?}, comm {:?}",
+            std::fs::read_link(format!("/proc/{pid}/exe")),
+            std::fs::read(format!("/proc/{pid}/cmdline")).map(|c| String::from_utf8_lossy(&c).into_owned()),
+            comm()
+        );
+        assert!(!is_wicket(pid), "sleep isn't wicket: {seen}");
         let _ = other.kill();
         let _ = other.wait();
+        // A thread of this process answers in /proc with this binary, but isn't a process.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            // SAFETY: a plain syscall.
+            tx.send(unsafe { libc::gettid() }).unwrap();
+            let _ = wait.recv();
+        });
+        let tid = rx.recv().unwrap();
+        assert!(std::fs::read_link(format!("/proc/{tid}/exe")).is_ok(), "a thread's id answers in /proc");
+        assert!(!is_wicket(tid), "a thread of wicket isn't a wicket process");
+        go.send(()).unwrap();
+        t.join().unwrap();
         let dir = std::env::temp_dir().join(format!("wicket-pid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("x.pid");
@@ -401,5 +501,65 @@ mod tests {
         assert_eq!(pid_alive(&f), is_wicket(1));
         let _ = std::fs::remove_file(&f);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// #799: a console-signed standing, capacity or fence decision's record matches what was
+    /// signed, and a record changed in any field the signature covers doesn't.
+    #[test]
+    fn a_console_decision_record_says_what_was_signed() {
+        use serde_json::json;
+        let run = Some("run_1");
+        let fence = (
+            json!({ "action": "release_fence", "run": "run_1", "node": "n1", "node_status": "gone", "node_seen_ms": 1,
+                    "fenced_until_ms": null, "source": "unknown", "reason": "why", "effect_sha256": "e" }),
+            json!({ "node": "n1", "node_status": "gone", "node_seen_ms": 1, "fenced_until_ms": null, "source": "unknown",
+                    "why": "why", "effect_sha256": "e" }),
+        );
+        let cases = [
+            (
+                "decision",
+                None,
+                json!({ "action": "capacity_grant", "principal": "p", "ttl_secs": 3600,
+                        "terms": { "plans": ["a"], "regions": ["lhr"], "hourly_micros": 5, "daily_micros": 9, "nodes": 2 } }),
+                json!({ "action": "capacity_grant", "decision": "issue", "grant": "g1", "principal": "p", "ttl_secs": 3600,
+                        "terms": { "plans": ["a"], "regions": ["lhr"], "hourly": 5, "daily": 9, "nodes": 2 } }),
+            ),
+            (
+                "decision",
+                None,
+                json!({ "action": "capacity_renew", "grant": "g1", "ttl_secs": 60, "previous_until": 10 }),
+                json!({ "action": "capacity_renew", "decision": "renew", "grant": "g1", "ttl_secs": 60, "previous_until": 10 }),
+            ),
+            (
+                "decision",
+                run,
+                json!({ "action": "standing_approve", "standing": "s1", "principal": "p", "zone": "z", "rule": { "host": "h" },
+                        "for": "agent", "ttl_secs": 60, "effect_sha256": "e" }),
+                json!({ "decision": "approve", "standing": "s1", "principal": "p", "zone": "z", "rule": { "host": "h" },
+                        "bound": "agent", "ttl_secs": 60, "effect_sha256": "e" }),
+            ),
+            ("decision", run, json!({ "action": "standing_deny", "standing": "s1" }), json!({ "decision": "deny", "standing": "s1" })),
+            (
+                "decision",
+                None,
+                json!({ "action": "standing_renew", "standing": "s1", "ttl_secs": 60, "previous_until": 10 }),
+                json!({ "decision": "renew", "standing": "s1", "until": 70, "previous_until": 10 }),
+            ),
+            ("run.fence_released", run, fence.0.clone(), fence.1.clone()),
+        ];
+        for (kind, run, signed, record) in &cases {
+            assert_eq!(says_what_was_signed(kind, false, *run, record, signed), Ok(()), "{record}");
+            // Each field the signature covers, changed (a grant's id and a renewal's new end it doesn't).
+            for k in
+                record.as_object().unwrap().keys().filter(|k| !["grant", "until"].contains(&k.as_str()) || signed.get(k.as_str()).is_some())
+            {
+                let mut r = record.clone();
+                r[k] = json!("changed");
+                assert!(says_what_was_signed(kind, false, *run, &r, signed).is_err(), "{kind} with {k} changed passed");
+            }
+        }
+        // A release recorded on another run; a decision whose signed action decides nothing.
+        assert!(says_what_was_signed("run.fence_released", false, Some("run_2"), &fence.1, &fence.0).is_err());
+        assert!(says_what_was_signed("decision", false, None, &json!({ "decision": "deny" }), &json!({ "action": "revoke" })).is_err());
     }
 }

@@ -43,25 +43,74 @@ fn pending_request(l: &mut wicket_store::Ledger, run: &str, path: &str) -> Strin
     rid
 }
 
+/// A pending ask for the public name `label`, of a running run.
+pub(super) fn ask_name(l: &wicket_store::Ledger, label: &str) -> String {
+    let t = TenantId::single();
+    let r = RunId("run_n".into());
+    l.run_started(&t, &r, "work", "worker").unwrap();
+    let ask = wicket_store::NameAsk {
+        tenant: &t,
+        run: &r,
+        zone: "work",
+        zone_digest: "zd",
+        principal: "spiffe://w.test/t/t0/z/work/a/worker",
+        label,
+        port: 3000,
+        service: Some("http"),
+        reason: "asked by the agent: the demo",
+        scope: wicket_store::NameScope::Run,
+    };
+    l.ask_public(&ask).unwrap().0
+}
+
 #[test]
-fn pending_json_lists_requests_and_standing_asks() {
+fn pending_json_lists_requests_standing_asks_and_names() {
     let (_d, mut l) = super::test_ledger("pending");
     let t = TenantId::single();
     pending_request(&mut l, "run_a", "/v1/data");
     let rule: wicket_core::manifest::ReachRule =
         wicket_core::yaml::from_str("{ host: ci.example, methods: [GET], paths: ['/jobs/**'] }").unwrap();
     l.ask_standing(&t, &RunId("run_a".into()), "work", "zd", "spiffe://w.test/t/t0/z/work/a/worker", &rule, "logs").unwrap();
+    let nid = ask_name(&l, "demo");
     let v = crate::cmd::approve::pending_json(&l).unwrap();
     let a = v.as_array().unwrap();
-    assert_eq!(a.len(), 2, "{v:#}");
-    assert_eq!((a[0]["kind"].as_str(), a[1]["kind"].as_str()), (Some("request"), Some("standing")));
+    assert_eq!(a.len(), 3, "{v:#}");
+    assert_eq!((a[0]["kind"].as_str(), a[1]["kind"].as_str(), a[2]["kind"].as_str()), (Some("request"), Some("standing"), Some("name")));
     assert_eq!(a[0]["host"], "api.example.com");
+    assert_eq!((a[2]["id"].as_str(), a[2]["label"].as_str(), a[2]["port"].as_u64()), (Some(nid.as_str()), Some("demo"), Some(3000)));
     documented_as("`wicket pending --json`, a request", &a[0]);
     documented_as("`wicket pending --json`, a standing ask", &a[1]);
     documented_as("a standing `rule`", &a[1]["rule"]);
+    documented_as("`wicket pending --json`, an ask for a public name", &a[2]);
+    // The text listing has it too, with the commands that decide it.
+    let text = crate::cmd::approve::pending_text(&l).unwrap();
+    assert!(text.contains(&format!("{nid}  public demo  port 3000")), "{text}");
+    assert!(text.contains(&format!("decide: wicket names show {nid}; wicket names approve {nid}; wicket names deny {nid}")), "{text}");
+    assert!(!text.contains("no pending requests"), "{text}");
     // Nothing pending is an empty array, not a sentence.
     let (_d, l) = super::test_ledger("pending-empty");
     assert_eq!(crate::cmd::approve::pending_json(&l).unwrap(), serde_json::json!([]));
+    assert_eq!(crate::cmd::approve::pending_text(&l).unwrap(), "no pending requests\n");
+}
+
+/// `wicket approve` and `deny` send an `n-` or `s-` id to the command that decides it (#696
+/// review), as a usage error; any other id is theirs.
+#[test]
+fn approve_and_deny_redirect_names_and_standing_asks() {
+    let msg = |id: &str, verb: &str| crate::cmd::approve::elsewhere(id, verb).map(|e| format!("{e:#}"));
+    assert_eq!(
+        msg("n-01abc", "approve").as_deref(),
+        Some("n-01abc is an ask for a public name: wicket names show n-01abc, then wicket names approve n-01abc")
+    );
+    assert_eq!(msg("n-01abc", "deny").as_deref(), Some("n-01abc is an ask for a public name: wicket names deny n-01abc"));
+    assert_eq!(
+        msg("s-01abc", "approve").as_deref(),
+        Some("s-01abc is a standing ask: wicket standing show s-01abc, then wicket standing approve s-01abc")
+    );
+    assert_eq!(msg("s-01abc", "deny").as_deref(), Some("s-01abc is a standing ask: wicket standing deny s-01abc"));
+    assert!(msg("r-01abc", "approve").is_none());
+    let e = crate::cmd::approve::elsewhere("n-1", "deny").unwrap();
+    assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::Usage as i32);
 }
 
 #[test]
@@ -153,9 +202,44 @@ fn node_list_json() {
         revoked_at: None,
     })
     .unwrap();
+    let v4: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
+    l.set_node_addresses("local", wicket_store::AddressChange::Set(v4), wicket_store::AddressChange::Keep, "ann").unwrap();
     let v = wicket_control::enrol::list_json(&l).unwrap();
     assert_eq!((v[0]["name"].as_str(), v[0]["ca"].is_null()), (Some("local"), true), "{v:#}");
+    assert_eq!((v[0]["public_ipv4"].as_str(), v[0]["public_ipv6"].is_null()), (Some("1.1.1.1"), true), "{v:#}");
     documented_as("`wicket node list --json`", &v);
+}
+
+#[test]
+fn lease_list_json() {
+    let (_d, mut l) = super::test_ledger("leases");
+    let row = wicket_store::LeaseRow {
+        id: "l-1".into(),
+        tenant: TenantId::single().0,
+        run: "run_l".into(),
+        request_id: None,
+        provider: "static".into(),
+        spec: serde_json::json!({}),
+        hourly_cap: 0,
+        reserved: 0,
+        duration_secs: 1800,
+        created_at: 0,
+        not_after: None,
+        status: "pending".into(),
+        node_id: None,
+        node_name: None,
+        ssh_target: None,
+        host_key: None,
+        billed: None,
+        ended_at: None,
+        detail: None,
+    };
+    l.create_lease(&row, wicket_store::LeaseBudget { max_hourly: 0, max_total: 0 }).unwrap().unwrap();
+    let v = wicket_control::capacity::list_json(&l).unwrap();
+    assert_eq!((v[0]["id"].as_str(), v[0]["status"].as_str(), v[0]["node"].is_null()), (Some("l-1"), Some("pending"), true), "{v:#}");
+    let at = v[0]["created_at"].as_i64().unwrap();
+    assert!((wicket_store::now() - 60..=wicket_store::now()).contains(&at), "Unix seconds, not ms: {at}");
+    documented_as("`wicket lease list --json`", &v);
 }
 
 #[test]
@@ -218,4 +302,84 @@ fn top_json() {
     assert_eq!(keys(&n["health"]["disk"]), ["avail_bytes", "reserve_bytes", "total_bytes"]);
     assert_eq!(keys(&n["health"]["memory"]), ["available_mib", "committed_mib", "total_mib"]);
     documented_as("`wicket top --json`, a run's `spent`", &v["runs"][0]["spent"]);
+}
+
+/// #252: an agent acting for operator alice, with a wicket-issued identity, and a message from it
+/// in alice's inbox.
+fn agent_writes_to_alice(l: &mut wicket_store::Ledger, issuer: &wicket_identity::Issuer) -> (String, String) {
+    let t = TenantId::single();
+    let alice = wicket_identity::operator_id(&issuer.trust_domain, &t.0, "unix", "alice");
+    let key = wicket_identity::AgentKey::generate();
+    let spec = wicket_identity::IdentitySpec {
+        tenant: t.0.clone(),
+        zone: "work".into(),
+        agent: "worker".into(),
+        run: "run_w".into(),
+        parent_run: None,
+        manifest_sha256: "m".into(),
+        image: "img".into(),
+        node: "local".into(),
+        principal: serde_json::json!({ "type": "human", "id": "alice", "via": "cli", "sub": alice }),
+        act: None,
+        kind: None,
+    };
+    let now = wicket_store::now();
+    let jws = issuer.issue(&spec, now, 600, &key.public());
+    let claims = wicket_identity::verify_identity(&jws, &issuer.verifying_key(), now).unwrap();
+    l.run_started(&t, &RunId("run_w".into()), "work", "worker").unwrap();
+    l.put_identity(&wicket_store::IdentityRow {
+        run: "run_w".into(),
+        tenant: t.0.clone(),
+        spiffe_id: claims.sub.clone(),
+        zone: "work".into(),
+        agent: "worker".into(),
+        parent_run: None,
+        accept_from: vec![],
+        jws: jws.clone(),
+        issued_at: now,
+    })
+    .unwrap();
+    let payload = serde_json::json!({ "jti": "m-1", "iat": now, "kind": "message", "to": alice, "body": "done", "reply_to": claims.sub, "priority": "next" });
+    let env = wicket_identity::sign_envelope(&key, &jws, &payload);
+    let meta = wicket_store::MessageMeta { from_principal: Some(&claims.sub), ..Default::default() };
+    l.post_message("m-1", &t, "run_w", &alice, None, &env, &meta).unwrap();
+    (alice, claims.sub)
+}
+
+#[test]
+fn message_inbox_receipts_and_principals_json() {
+    let (_d, mut l) = super::test_ledger("message");
+    let issuer = wicket_identity::Issuer::generate("w.test");
+    let (alice, worker) = agent_writes_to_alice(&mut l, &issuer);
+    let t = TenantId::single();
+    let m = &l.operator_inbox(&t.0, &alice, false, 10).unwrap()[0];
+    let got = vec![wicket_proxy::opmsg::verify_received(m, &alice, &issuer.verifying_key(), false).map_err(|e| (m.id.clone(), e))];
+    let v = super::message::inbox_json(&got);
+    assert_eq!((v[0]["from"].as_str(), v[0]["body"].as_str()), (Some(worker.as_str()), Some("done")), "{v:#}");
+    documented_as("`wicket message inbox --json`", &v);
+    let bad = super::message::inbox_json(&[Err(("m-2".into(), "its signature does not verify".into()))]);
+    documented_as("`wicket message inbox --json`, a message that doesn't verify", &bad);
+    // The agent's receipt for it, as the agent reads it; an operator's own read the same way.
+    let v = super::message::receipts_json(&l.receipts_from(&t.0, &worker, &[], 10).unwrap());
+    assert_eq!(v[0]["state"], "delivered", "{v:#}");
+    documented_as("`wicket message receipts --json`", &v);
+    let v = super::message::principals_json(&l, &t, &alice, &issuer.verifying_key()).unwrap();
+    assert_eq!((v[0]["id"].as_str(), v[0]["relation"].as_str()), (Some(worker.as_str()), Some("acts for you")), "{v:#}");
+    documented_as("`wicket message principals --json`", &v);
+    let bob = wicket_identity::operator_id("w.test", &t.0, "unix", "bob");
+    assert_eq!(super::message::principals_json(&l, &t, &bob, &issuer.verifying_key()).unwrap(), serde_json::json!([]));
+    // An empty accept_from entry (from before manifests refused one) lists no operator: as send decides.
+    l.put_identity(&wicket_store::IdentityRow {
+        run: "run_e".into(),
+        tenant: t.0.clone(),
+        spiffe_id: "spiffe://w.test/t/default/z/work/a/empty".into(),
+        zone: "work".into(),
+        agent: "empty".into(),
+        parent_run: None,
+        accept_from: vec![String::new()],
+        jws: "x.y.z".into(),
+        issued_at: wicket_store::now(),
+    })
+    .unwrap();
+    assert_eq!(super::message::principals_json(&l, &t, &bob, &issuer.verifying_key()).unwrap(), serde_json::json!([]));
 }

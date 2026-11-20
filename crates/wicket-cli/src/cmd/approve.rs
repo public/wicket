@@ -13,37 +13,12 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             if json {
                 return crate::cmd::print_json(&pending_json(&l)?);
             }
-            let p = l.pending(&TenantId::single())?;
-            if p.is_empty() {
-                println!("no pending requests");
-            }
-            for r in p {
-                print!("{}", show_request(&l, &r));
-            }
-            // Standing asks (#572), decided with `wicket standing approve|deny`.
-            let now = wicket_store::now();
-            for s in l.standing_with_status(&TenantId::single(), "pending")? {
-                println!("{}\n  decide: wicket standing show {id}; wicket standing approve {id} [--narrow] [--for zone]; wicket standing deny {id}", crate::cmd::standing::line(&s, now), id = s.id);
-            }
-            for n in l.names_with_status(&TenantId::single(), "pending")? {
-                println!(
-                    "{}\n  decide: wicket names show {id}; wicket names approve {id}; wicket names deny {id}",
-                    crate::cmd::names::line(&n, now),
-                    id = n.id
-                );
-            }
+            print!("{}", pending_text(&l)?);
             Ok(())
         }
         Cmd::Approve { id, uses, unlimited, ttl, prefix, yes, zone_wide } => {
-            if id.starts_with("s-") {
-                return Err(wicket_home::exit::usage(format!(
-                    "{id} is a standing ask: wicket standing show {id}, then wicket standing approve {id}"
-                )));
-            }
-            if id.starts_with("n-") {
-                return Err(wicket_home::exit::usage(format!(
-                    "{id} is an ask for a public name: wicket names show {id}, then wicket names approve {id}"
-                )));
+            if let Some(e) = elsewhere(&id, "approve") {
+                return Err(e);
             }
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
@@ -139,11 +114,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Deny { id } => {
-            if id.starts_with("s-") {
-                return Err(wicket_home::exit::usage(format!("{id} is a standing ask: wicket standing deny {id}")));
-            }
-            if id.starts_with("n-") {
-                return Err(wicket_home::exit::usage(format!("{id} is an ask for a public name: wicket names deny {id}")));
+            if let Some(e) = elsewhere(&id, "deny") {
+                return Err(e);
             }
             let mut l = Ledger::open(&ledger_path())?;
             if let grant::Decided::Denied { lease: Some(lease) } = grant::decide(
@@ -214,8 +186,59 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
     }
 }
 
+/// `wicket pending` as text: the pending requests, then standing asks (#572, decided with `wicket
+/// standing`), then asks for public names (#575, decided with `wicket names`).
+pub(crate) fn pending_text(l: &Ledger) -> Result<String> {
+    use std::fmt::Write;
+    let t = TenantId::single();
+    let mut out = String::new();
+    let p = l.pending(&t)?;
+    let standing = l.standing_with_status(&t, "pending")?;
+    let names = l.names_with_status(&t, "pending")?;
+    if p.is_empty() && standing.is_empty() && names.is_empty() {
+        out.push_str("no pending requests\n");
+    }
+    for r in p {
+        out.push_str(&show_request(l, &r));
+    }
+    let now = wicket_store::now();
+    for s in standing {
+        let _ = writeln!(
+            out,
+            "{}\n  decide: wicket standing show {id}; wicket standing approve {id} [--narrow] [--for zone]; wicket standing deny {id}",
+            crate::cmd::standing::line(&s, now),
+            id = s.id
+        );
+    }
+    for n in names {
+        let _ = writeln!(
+            out,
+            "{}\n  decide: wicket names show {id}; wicket names approve {id}; wicket names deny {id}",
+            crate::cmd::names::line(&n, now),
+            id = n.id
+        );
+    }
+    Ok(out)
+}
+
+/// A usage error for `wicket approve|deny` (`verb`) on an id another command decides: a standing
+/// ask (`s-…`, `wicket standing`) or an ask for a public name (`n-…`, `wicket names`).
+pub(crate) fn elsewhere(id: &str, verb: &str) -> Option<anyhow::Error> {
+    let (what, cmd) = match id {
+        i if i.starts_with("s-") => ("a standing ask", "standing"),
+        i if i.starts_with("n-") => ("an ask for a public name", "names"),
+        _ => return None,
+    };
+    let how = match verb {
+        "approve" => format!("wicket {cmd} show {id}, then wicket {cmd} approve {id}"),
+        v => format!("wicket {cmd} {v} {id}"),
+    };
+    Some(wicket_home::exit::usage(format!("{id} is {what}: {how}")))
+}
+
 /// `wicket pending --json`: the pending requests (`"kind": "request"`), then the pending standing
-/// asks (`"kind": "standing"`), as `wicket pending` lists them.
+/// asks (`"kind": "standing"`), then asks for public names (`"kind": "name"`), as `wicket pending`
+/// lists them.
 pub(crate) fn pending_json(l: &Ledger) -> Result<serde_json::Value> {
     let t = TenantId::single();
     let mut out: Vec<serde_json::Value> = l
@@ -334,6 +357,17 @@ fn show_grant(r: &wicket_store::GrantListing, now: i64) -> String {
     };
     let node = g.node.as_deref().map(|n| format!(", on node {n}")).unwrap_or_default();
     format!("{}  {what}  {to}{uses}, {state}{node}  by {}", g.id, wicket_agent::clip(&r.decided_by, 80))
+}
+
+/// `wicket request`: the requests `wicket pending` lists, named as `grant list` names grants (#654).
+#[derive(Subcommand)]
+pub enum RequestCmd {
+    /// List pending requests: the same as `wicket pending`.
+    List {
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
