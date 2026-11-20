@@ -303,6 +303,20 @@ that stays a signed action.
 key. Each view is built from named fields, never by serializing a stored record, and a test fetches
 every console endpoint and scans each answer for the token, any 24-byte run of its bytes (base64url,
 base64 and hex, except runs inside a public key), identity JWSs and private keys.
+## Placement view
+
+Why a run went where it did ([#579](https://github.com/public/wicket/issues/579)), read-only and behind
+an operator's session: `GET /api/runs/<run>/placement` returns the run's `status` and `node` (`local` for
+this host's own), the placement decision recorded when its node was chosen, and `text`, the explanation
+`wicket why-here` prints. `decision` is built from named fields of placement's record, never the record
+whole: `at_ms`, `node` (or `behind`, the waiting run it went behind), `candidates`, the `request`
+(`vcpus`, `memory_mib`, `priority`, `preemptible`, `node_selector`, `tolerations`, `affinity`,
+`anti_affinity`), `ca_hosts`, `ranked` (the nodes it may go on, best first) and `refused` (each other
+node with every reason it was out), at most 10 of each (`ranked_more`, `refused_more`). A run with no
+decision recorded (on a node named for it whose room wasn't known from a report, or decided over a week
+ago) has `decision: null` and `why`. A run that doesn't exist, or another tenant's, is not found, as for
+its authority view. [Nodes: placement](nodes.md#placement) says how a node is chosen.
+
 ## Manifests
 
 The **Manifests** section lists the manifests runs can be started from (#172). The installation's

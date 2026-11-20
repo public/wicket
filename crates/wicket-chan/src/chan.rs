@@ -45,11 +45,13 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 2, a connection talks
-/// 19, 20 or 21; the checks of versions 15 to 19 stay until changes of their own take them out; the checks for features of 14 and
+/// 21, 22 or 23, so only the versions above 20 have a check here (22 is reserved for the #257
+/// session's work in flight); the checks of versions 15 to 19 stay until changes of their own take
+/// them out; the checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
-pub const PROTOCOL: u32 = 21;
+pub const PROTOCOL: u32 = 23;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -80,6 +82,12 @@ pub const INTAKE: u32 = 20;
 /// with any (and its whole feed with it), so the control host puts ports in a box's record only for
 /// a node at this version or later.
 pub const PORTS: u32 = 21;
+/// The first protocol version whose nodes take a zone's optional `inject` rule while its secret
+/// isn't set (#415): such a node treats the rule's host as credentialed (plain HTTP to it refused)
+/// and injects only over HTTPS, holds a refusal of the secret for the run, and takes a
+/// [`Msg::SecretRevoke`] for a secret it doesn't hold as "ask again". To a node below it the control
+/// host sends the zone without an optional rule whose secret isn't set at start, as before.
+pub const LIVE_SECRETS: u32 = 23;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -146,6 +154,7 @@ const _: () = {
     assert!(DECODE_SLASH <= PROTOCOL);
     assert!(INTAKE <= PROTOCOL);
     assert!(PORTS <= PROTOCOL);
+    assert!(LIVE_SECRETS <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -511,10 +520,19 @@ pub enum Msg {
         error: Option<String>,
     },
     /// A secret the node fetched for `run` changed or was removed on the control host: the node
-    /// drops the run's use of it (the next use fetches it again).
+    /// drops the run's use of it (the next use fetches it again). From [`LIVE_SECRETS`], also sent
+    /// for a secret the node was refused that can now be released, and for every secret released to
+    /// the run when a connection (re)starts (one sent on a link that died may never have arrived):
+    /// the node forgets the refusal or drops its copy, and the next use asks again. A node that
+    /// holds neither does nothing.
     SecretRevoke {
         run: String,
         name: String,
+        /// Resent by a new connection, not because the secret changed (#415): the node drops the
+        /// run's own copy only, not the uses it shared with children the node started while cut
+        /// off (they can't fetch until the control host takes them over). An older node ignores it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resend: bool,
     },
     Kill {
         run: String,
@@ -1318,29 +1336,27 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// With [`PROTOCOL_SKEW`] 2 and protocol 21 (#575 step 4c), every connection talks 19, 20 or
-    /// 21. 15's message reads (#445)
-    /// and 16's prefix grants (#257 4a) are on every connection (15's keeps its check until it goes
-    /// in a change of its own); 21's published ports (#575 step 4c) keep theirs while a peer at
-    /// 19 or 20 can connect. A node below 19 is refused: it updates before the control host.
+    /// With [`PROTOCOL_SKEW`] 2 and protocol 23 (#415), every connection talks 21, 22 or 23 (22 is
+    /// reserved for the #257 session). The checks for 15 to 21 stay until changes of their own take
+    /// them out; 23's live secrets keep theirs while a peer at 21 or 22 can connect. A node below
+    /// 21 is refused: it updates before the control host.
     #[test]
-    fn no_connection_talks_below_protocol_19() {
+    fn no_connection_talks_below_protocol_21() {
         assert_eq!(
-            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, INTAKE, PORTS),
-            (21, 2, 15, 16, 17, 18, 19, 20, 21)
+            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, INTAKE, PORTS, LIVE_SECRETS),
+            (23, 2, 15, 16, 17, 18, 19, 20, 21, 23)
         );
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((19..=21).contains(&at) && (19..=23).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(19..=23).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((21..=23).contains(&at) && (21..=25).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(21..=25).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 22 or 23 talking to a control host at 21 from the other side.
-        assert_eq!((negotiate(22, PROTOCOL), negotiate(23, PROTOCOL)), (Ok(21), Ok(21)));
-        assert!(negotiate(19, PROTOCOL).unwrap() < PORTS, "a node at 19 gets no published ports");
-        assert!(negotiate(20, PROTOCOL).unwrap() < PORTS, "nor one at 20");
-        assert!(negotiate(19, PROTOCOL).unwrap() < INTAKE, "a node at 19 is no intake node");
-        assert!(negotiate(PROTOCOL, 18).is_err() && negotiate(18, PROTOCOL).is_err());
+        // And a node at 24 or 25 talking to a control host at 23 from the other side.
+        assert_eq!((negotiate(24, PROTOCOL), negotiate(25, PROTOCOL)), (Ok(23), Ok(23)));
+        assert!(negotiate(21, PROTOCOL).unwrap() < LIVE_SECRETS, "a node at 21 gets no unset optional rule");
+        assert!(negotiate(22, PROTOCOL).unwrap() < LIVE_SECRETS, "nor one at 22");
+        assert!(negotiate(PROTOCOL, 20).is_err() && negotiate(20, PROTOCOL).is_err());
     }
 
     /// #578 step 4: an intake trigger's secret never shows in a debug print.

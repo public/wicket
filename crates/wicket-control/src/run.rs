@@ -537,40 +537,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // starts it by its id.
     let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
     let image_name = image.to_string();
-    if record.is_none() && wake.is_none() {
-        // The operator's policy first (`images.yaml`'s `require_digests`): a tag is refused before
-        // anything is asked of a grant.
-        crate::images_policy::require_pinned(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
-        // The one "may this digest run" check (#258): a pinned image is accepted by a grant on its
-        // digest, which the operator running the manifest records. A child's image is pinned to
-        // its parent's, as its parent's zone allows (decided where it is spawned): not regranted.
-        if let (Some(pin), None) = (&image_pin, &parent_run) {
-            let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
-            let u = crate::digest::accept_image(&Ledger::open(&ledger_path())?, &m.tenant, &m.zone.name, image, pin, &by)?;
-            say!("[wicket] image {image} accepted by grant {} from {}", u.grant, u.decided_by);
-        }
-    }
-    // The workload's name, and what runs it: an agent's harness, or a program's command.
-    let (workload, workload_runs) = match (&m.agent, &m.program) {
-        (Some(a), _) => (a.name.clone(), a.harness.to_string()),
-        (_, Some(p)) => (p.name.clone(), "program".to_string()),
-        _ => unreachable!("validated"),
-    };
-    // An optional injection whose secret isn't set is as if it weren't there (#175): dropped from
-    // the zone every enforcement point sees (this run's proxies, the node's feed and routing), so
-    // its host's requests go without it, and the host is spliced if reach allows it wholesale.
-    let unset_injections = m.zone.drop_unset_optional_injections(|s| vault.get(s).is_ok());
-    for i in &unset_injections {
-        say!("[wicket] optional secret {:?} is not set: requests to {} go without it", i.secret, i.host);
-    }
-    for i in &m.zone.inject {
-        if let Err(e) = vault.get(&i.secret) {
-            return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host));
-        }
-    }
-    // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
-    // its pinned ssh (a revoked one is refused), or this host's own built-in node over its unix socket.
-    timings.since("checks", lap);
+    // The run's id, before anything is admitted, so what admitting it audits names it.
     let run = match run_id {
         Some(id) => {
             check_run_id(&id).with_context(|| "--run-id".to_string())?;
@@ -578,6 +545,56 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         }
         None => RunId::new(),
     };
+    // The image, admitted before anything is asked of a grant or a node (`imagetrust::admit`): the
+    // operator's `require_digests`, then the `trust` policy's signatures (#191), then the grant on
+    // its digest (#258). The signature that verified it is what `run.image` records.
+    let mut signed: Option<wicket_chan::signature::Verified> = None;
+    if crate::imagetrust::admits(record.is_some(), wake.is_some()) {
+        let default_image = crate::image::effective(crate::image::DEFAULT);
+        let policy = crate::images_policy::load_with_keys()?;
+        let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
+        let ledger = Ledger::open(&ledger_path())?;
+        let cache = crate::imagetrust::cache_dir();
+        let admit = crate::imagetrust::Admit {
+            policy: &policy,
+            ledger: &ledger,
+            manifest: &m,
+            run: &run,
+            image,
+            default_image: &default_image,
+            parent: parent_run.as_deref(),
+            by: &by,
+            cache: Some(&cache),
+        };
+        signed = crate::imagetrust::admit(admit, |name, hosts| {
+            for h in hosts {
+                vault.get_for(name, h)?;
+            }
+            vault.get(name)
+        })
+        .await?;
+    }
+    // The workload's name, and what runs it: an agent's harness, or a program's command.
+    let (workload, workload_runs) = match (&m.agent, &m.program) {
+        (Some(a), _) => (a.name.clone(), a.harness.to_string()),
+        (_, Some(p)) => (p.name.clone(), "program".to_string()),
+        _ => unreachable!("validated"),
+    };
+    // The zone's injections are fixed at start, their secrets looked up at each request (#415): an
+    // optional one whose secret isn't set yet stays in the zone, and its host's requests go without
+    // it until it is set (#175). A required one must be set to start.
+    for i in &m.zone.inject {
+        match vault.get(&i.secret) {
+            Err(_) if i.optional => {
+                say!("[wicket] optional secret {:?} is not set: requests to {} go without it until it is", i.secret, i.host)
+            }
+            Err(e) => return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host)),
+            Ok(_) => {}
+        }
+    }
+    // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
+    // its pinned ssh (a revoked one is refused), or this host's own built-in node over its unix socket.
+    timings.since("checks", lap);
     // #579: a fresh run with no node named goes where the scheduler places it, as a woken agent
     // does: this host's own node is one candidate among the enrolled ones. With no other node
     // enrolled, it goes on this host's own, as before, whatever its placement terms.
@@ -769,15 +786,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 "session_id": long_lived.then(|| session.id.clone()), "resumed": session.resume,
             }),
         )?;
-        // One note per run for each optional injection left out (#175), not one per request.
-        for i in &unset_injections {
-            l.audit(
-                &m.tenant,
-                Some(&run),
-                "inject.skipped",
-                &serde_json::json!({ "host": i.host, "secret": i.secret, "why": "optional secret not set" }),
-            )?;
-        }
     }
 
     // No CA of the run's (#257 slice 5): the control host terminates no TLS, so a box trusts only
@@ -1533,7 +1541,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     &m.tenant,
                     Some(&run),
                     "run.image",
-                    &serde_json::json!({ "image": image_name, "digest": d, "pinned": image_pin }),
+                    &crate::imagetrust::run_image_body(&image_name, d, image_pin.as_deref(), signed.as_ref()),
                 )?;
                 say!("  image {image_name} started as {d}");
             }
@@ -2475,8 +2483,12 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 // Loudly (#300): the box's work isn't here. Its node keeps it (not forgotten).
                 let msg = format!("fetching the box's files from node {node_name} failed: {e:#} (the node keeps them)");
                 // The run holds its node until they are collected: the reconciler doesn't release
-                // it with them (#324).
-                let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
+                // it with them (#324). Unless a supervisor before this one fetched them already
+                // (this one took the run over after its fetch, #590): then the files are here.
+                let here = ledger.lock().expect("ledger").files_collected(&run.0).unwrap_or(false);
+                if !here {
+                    let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
+                }
                 say!("[wicket] {msg}");
                 say_err!("[wicket] {msg}");
                 let _ = ledger.lock().expect("ledger").audit(

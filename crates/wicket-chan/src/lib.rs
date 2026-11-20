@@ -11,6 +11,7 @@ pub mod health;
 pub mod nodesecrets;
 pub mod oci;
 pub mod registry;
+pub mod signature;
 
 /// Whether `id` is a run id wicket made (`run_` and 26 lowercase letters or digits).
 pub fn check_run_id(id: &str) -> anyhow::Result<()> {

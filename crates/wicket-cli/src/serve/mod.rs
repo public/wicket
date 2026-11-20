@@ -63,6 +63,7 @@ pub(crate) mod limits;
 mod manifests;
 mod names;
 pub(crate) mod net;
+mod placement;
 mod push;
 mod secrets;
 pub mod session;
@@ -880,8 +881,9 @@ where
                 },
                 _ => denied(),
             },
-            // Read-only views of authority (#173): an operator's session only.
-            p => match (authority::get(state, p), &sess) {
+            // Read-only views of authority (#173), and why a run went where it did (#579): an
+            // operator's session only.
+            p => match (authority::get(state, p).or_else(|| placement::get(state, p)), &sess) {
                 (Some(r), Some((_, SessionKind::Operator { .. }))) => match r {
                     Ok(v) => to_response(ok(v)),
                     Err(e) => to_response(err(StatusCode::NOT_FOUND, e)),
@@ -2323,6 +2325,7 @@ mod tests {
     mod manifests;
     mod names_card;
     mod notify;
+    mod placement;
     mod secrets;
     mod session;
 
