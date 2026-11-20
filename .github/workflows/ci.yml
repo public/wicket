@@ -65,12 +65,21 @@ jobs:
           save-if: false
       - id: draft
         name: Draft or ready
+        # A draft runs the fast checks only, unless it has the full-ci label (read from the API as
+        # the selection reads it, #246): then everything, as for any pull request with the label.
         env:
           DRAFT: ${{ github.event.pull_request.draft }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$DRAFT" = true ]; then
-            echo "heavy=false" >>"$GITHUB_OUTPUT"
-            echo "a draft: the fast checks only; marking it ready for review runs the heavy suites" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ "$(ci/pr-has-label.sh full-ci 2>/dev/null || true)" = true ]; then
+              echo "a draft with the full-ci label: everything" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "heavy=false" >>"$GITHUB_OUTPUT"
+              echo "a draft: the fast checks only; marking it ready for review (or the full-ci label) runs the heavy suites" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
           fi
       - id: select
         name: Select
