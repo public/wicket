@@ -11,8 +11,8 @@ reference](manifest.md)).
 
 ## Output for scripts
 
-The commands that list things take `--json`: `pending`, `top`, `agents`, `links`, `grant list`,
-`standing list`, `node list`, `service list` and `audit`. With it, stdout holds one JSON document
+The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
+`agents`, `links`, `grant list`, `standing list`, `node list`, `lease list`, `service list` and `audit`. With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -33,6 +33,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
 | `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
+| `wicket lease list --json` | `id`, `status` (`pending`, `approved`, `active`, `ended`, `denied`, `withdrawn`, `failed`), `run` (the run that holds it), `provider`, `request` (the request a person decides; null: none yet), `node` (the enrolled node's name; null: none yet), `node_id` (the provider's id for it), `hourly_cap_micro_usd`, `reserved_micro_usd`, `billed_micro_usd` (null: not ended), `duration_secs`, `created_at`, `not_after` (null: no node yet), `ended_at`, `detail` |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
 | `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
 | `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
@@ -69,6 +70,8 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 - [`wicket image`](#wicket-image)
   - [`wicket image digest`](#wicket-image-digest)
 - [`wicket pending`](#wicket-pending)
+- [`wicket request`](#wicket-request)
+  - [`wicket request list`](#wicket-request-list)
 - [`wicket approve`](#wicket-approve)
 - [`wicket deny`](#wicket-deny)
 - [`wicket grant`](#wicket-grant)
@@ -193,6 +196,7 @@ Runs and agents:
 
 Approvals and grants:
   pending    List pending requests: what boxes asked for, waiting for a decision
+  request    Pending requests: `wicket request list` is `wicket pending`
   approve    Approve a pending request. The grant is never wider than the request
   deny       Deny a pending request
   grant      Grants made by approvals
@@ -205,7 +209,7 @@ Nodes and placement:
   lease      Capacity leases: the nodes agents asked for
   service    Per-node services: programs kept running on every node whose boxes use them
   why-here   Why a run's box went on the node it did, or why it went nowhere
-  reconcile  Make what exists agree with the ledger: runs, leases, machines and boxes
+  reconcile  Make what exists agree with the ledger: runs, leases, machines, boxes and public names
 
 The installation:
   serve      Serve the operator console
@@ -640,6 +644,33 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+```
+
+## `wicket request`
+
+```text
+Pending requests: `wicket request list` is `wicket pending`
+
+Usage: wicket request <COMMAND>
+
+Commands:
+  list  List pending requests: the same as `wicket pending`
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket request list`
+
+```text
+List pending requests: the same as `wicket pending`
+
+Usage: wicket request list [OPTIONS]
+
+Options:
+      --json  JSON instead of text
+  -h, --help  Print help
 ```
 
 ## `wicket approve`
@@ -1306,9 +1337,10 @@ Options:
 ```text
 Every lease: status, holder run, node, money reserved, end
 
-Usage: wicket lease list
+Usage: wicket lease list [OPTIONS]
 
 Options:
+      --json  JSON instead of text
   -h, --help  Print help
 ```
 
@@ -1410,9 +1442,9 @@ Options:
 ## `wicket reconcile`
 
 ```text
-Make what exists agree with the ledger: runs, leases, machines and boxes.
+Make what exists agree with the ledger: runs, leases, machines, boxes and public names.
 
-Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Records every change in the audit log.
+Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. With `names.public` in wicket.yaml, also make the boxes zone's records that wicket owns agree with the live public names, through its DNS provider (#575; the noop provider only records the plan). Records every change in the audit log.
 
 Usage: wicket reconcile [OPTIONS]
 

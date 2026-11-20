@@ -68,8 +68,8 @@ reference](manifest.md)).
 
 ## Output for scripts
 
-The commands that list things take `--json`: `pending`, `top`, `agents`, `links`, `grant list`,
-`standing list`, `node list`, `service list` and `audit`. With it, stdout holds one JSON document
+The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
+`agents`, `links`, `grant list`, `standing list`, `node list`, `lease list`, `service list` and `audit`. With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -90,6 +90,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
 | `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
+| `wicket lease list --json` | `id`, `status` (`pending`, `approved`, `active`, `ended`, `denied`, `withdrawn`, `failed`), `run` (the run that holds it), `provider`, `request` (the request a person decides; null: none yet), `node` (the enrolled node's name; null: none yet), `node_id` (the provider's id for it), `hourly_cap_micro_usd`, `reserved_micro_usd`, `billed_micro_usd` (null: not ended), `duration_secs`, `created_at`, `not_after` (null: no node yet), `ended_at`, `detail` |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
 | `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
 | `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
