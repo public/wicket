@@ -608,9 +608,10 @@ function renderPending(s) {
 }
 // A failure drawing the Inbox is logged (the browser tests fail on it) and doesn't stop the rest of
 // the page from being drawn.
-function inbox(f, s) {
-  try { if (globalThis.wicketInbox) globalThis.wicketInbox[f](s); } catch (e) { console.error("the Inbox couldn't be drawn:", e); }
+function drawn(mod, f, ...args) {
+  try { if (globalThis[mod]) globalThis[mod][f](...args); } catch (e) { console.error(mod + "." + f + " failed:", e); }
 }
+const inbox = (f, s) => drawn("wicketInbox", f, s);
 // The cards moved: taps are ignored for a moment (`settled`), so one can't land on a card that just
 // moved under it. inbox.js calls it.
 function layoutMoved() { layoutAt = performance.now(); }
@@ -984,53 +985,6 @@ function renderCapacityForm() {
   capInputs.hours.value = "8";
 }
 
-// A run: who, where, its state and times, its pages; an ACP agent's session opens on its own page,
-// where prompts are sent (#198).
-function renderRun(s, x, page) {
-  // The agent first, its zone and state; the run id quieter under it (#641). A program run has no agent.
-  const d = el("div", "row run");
-  const left = el("div");
-  const head = el("div", "run-head");
-  const name = x.agent ? strip(x.agent) : "program run";
-  if (page) head.append(el("h2", "run-name", name));
-  else { const a = el("a", "run-name", name); a.href = "#agent/" + encodeURIComponent(x.id); head.append(a); }
-  head.append(el("span", "meta", " \u00b7 zone " + strip(x.zone)));
-  const status = x.revoked ? "revoked" : String(x.status || "");
-  const tone = ({ running: "good", revoked: "bad", failed: "bad", hibernated: "info" })[status] || "";
-  const waiting = x.waiting !== undefined ? x.waiting : ((s && s.pending) || []).some(p => p.run === x.id);
-  head.append(el("span", "pill " + (waiting ? "warn" : tone), waiting ? "waiting for you" : ({ running: "working", exited: "finished", revoked: "stopped", hibernated: "asleep" })[status] || strip(status)));
-  left.append(head);
-  const meta = el("div", "meta");
-  meta.append(relEl(x.started_at, "started ", s.now));
-  if (x.ended_at) meta.append(document.createTextNode(" \u00b7 "), relEl(x.ended_at, "ended ", s.now));
-  meta.append(document.createTextNode(" \u00b7 "), idEl(x.id));
-  left.append(meta);
-  const links = el("div", "links");
-  // An ACP run's live session (#327): its own page, opened with a passkey there.
-  if (x.acp && x.status === "running" && !x.revoked) {
-    const a = el("a", "session", "Live session");
-    a.href = "/session?run=" + encodeURIComponent(x.id);
-    links.append(a);
-  }
-  // A remote session (#169): where the owner drives it, in the vendor's app.
-  if (x.remote_url && x.remote_url.startsWith("https://")) {
-    const a = el("a", "session", "Remote Control session \u2197");
-    a.href = x.remote_url; a.target = "_blank"; a.rel = "noopener noreferrer";
-    links.append(a);
-  }
-  if (!page) { const auth = el("a", "", "What it can reach \u203a"); auth.href = "#agent/" + encodeURIComponent(x.id); links.append(auth); }
-  left.append(links);
-  d.append(left);
-  // A running agent can have its identity revoked, signed.
-  if (page && x.status === "running" && x.has_identity && !x.revoked) {
-    const acts = el("span", "acts");
-    const rev = el("button", "deny", "Stop agent\u2026");
-    rev.onclick = () => openRunForm("revoke", x.id);
-    acts.append(rev); d.append(acts);
-  }
-  return d;
-}
-
 // An agent's page: its name, state and links, what it can reach (the authority view, #651), and what
 // it did. Stop is the signed revoke, from here only.
 function openAgent(run) {
@@ -1038,33 +992,11 @@ function openAgent(run) {
   if (agentRun !== run) closeRunForm();
   agentRun = run;
   show("agent");
-  renderAgentHead();
-  showAuthority(run);
-  renderAgentLog();
+  drawn("wicketAgents", "renderAgentHead", lastState, run);
+  drawn("wicketAgents", "showAuthority", run);
+  drawn("wicketAgents", "renderAgentLog", lastState, run);
   if (typeof window !== "undefined" && window.scrollTo) window.scrollTo(0, 0);
 }
-function renderAgentHead() {
-  const box = document.getElementById("agent-head");
-  if (!box || view !== "agent") return;
-  const x = ((lastState && lastState.runs) || []).find(r => r.id === agentRun);
-  if (!x) { box.replaceChildren(el("h2", "", "Agent"), el("p", "note", "This agent run isn't in the latest list (only the 15 most recent are).")); return; }
-  const key = JSON.stringify(x);
-  if (box.dataset.key === key) return;
-  box.dataset.key = key;
-  const row = renderRun(lastState, x, true);
-  box.replaceChildren(row);
-}
-function renderAgentLog() {
-  const box = document.getElementById("agent-log");
-  if (!box || view !== "agent") return;
-  const mine = ((lastState && lastState.audit) || []).filter(op => op.run === agentRun).slice().reverse();
-  // Rebuilt only when its records changed, so a line (and its "why?") stays put across polls.
-  const key = agentRun + ":" + mine.map(op => op.seq).join(",");
-  if (box.dataset.key === key) return;
-  box.dataset.key = key;
-  box.replaceChildren(...(mine.length ? mine.map(line) : [el("div", "empty", "Nothing recorded for it in the latest activity.")]));
-}
-
 // The revoke form: an in-page form (no browser dialogs), kept outside the runs list
 // so the 2-second refresh doesn't wipe what the operator is typing.
 function openRunForm(kind, run) {
@@ -1092,45 +1024,6 @@ function submitRunForm(ev) {
   if (!f.dataset.run || view !== "agent" || f.dataset.run !== agentRun) { closeRunForm(); toast("That form was for another agent; nothing was stopped. Open Stop agent… again.", true); return; }
   signed({ action: "revoke", run: f.dataset.run, reason: text });
   closeRunForm();
-}
-
-// Runs start only from manifests the server lists (its allowlisted directories); the page sends a
-// root and a file name, never a path.
-function renderStart(s) {
-  const box = document.getElementById("start");
-  const ms = s.manifests || [];
-  // Rebuild only when the list changes, so what the operator is typing survives the poll.
-  const key = JSON.stringify(ms);
-  if (box.dataset.key === key) return;
-  box.dataset.key = key;
-  box.replaceChildren();
-  if (!ms.length) { box.append(el("div", "empty", "No manifests to start: put one in the installation's manifests directory.")); return; }
-  const sel = el("select");
-  for (const m of ms) {
-    const o = el("option", "", strip(m.root + "/" + m.name) + (m.valid ? " · " + strip(m.agent ? "agent " + m.agent : "program " + m.program) + " · zone " + strip(m.zone) : " · invalid"));
-    o.value = JSON.stringify([m.root, m.name]); o.disabled = !m.valid; sel.append(o);
-  }
-  // The zone view (#62): which hosts the egress proxy inspects and which it splices through.
-  const hosts = el("div", "meta");
-  const showHosts = () => {
-    const [root, name] = JSON.parse(sel.value || "[]");
-    const m = ms.find((x) => x.root === root && x.name === name);
-    hosts.replaceChildren();
-    // The image its box starts from (#171), or why it can't start.
-    if (m && m.valid) hosts.append(m.image ? el("div", "", "image " + strip(m.image)) : el("div", "pend", "image refused: " + strip(m.image_error)));
-    for (const h of (m && m.hosts) || []) {
-      const d = el("div");
-      d.append(el("span", h.mode === "spliced" ? "pend" : "ok", (h.mode === "spliced" ? "spliced" : "inspected").padEnd(10)),
-        document.createTextNode(strip(h.host) + (h.mode === "spliced" ? " (every method and path; not inspected)" : " (" + strip(h.why) + ")")));
-      hosts.append(d);
-    }
-  };
-  sel.onchange = showHosts; showHosts();
-  const task = el("textarea"); task.placeholder = "Task (optional; replaces the manifest's task, agents only)";
-  const b = el("div", "buttons"); const go = el("button", "approve", "Start run");
-  go.onclick = () => { const [root, manifest] = JSON.parse(sel.value); signed({ action: "start_run", root, manifest, task: task.value }); task.value = ""; };
-  b.append(go);
-  box.append(sel, hosts, task, b, el("div", "meta", "The run's principal is you (this passkey), not the host user."));
 }
 
 function renderOperator(s) {
@@ -1358,92 +1251,6 @@ function openDetail(title) {
 const kv = (k, v) => { const d = el("div", "row"); d.append(el("span", "meta", k), el("span", "mono", strip(v))); return d; };
 const when = t => at(t);
 const whenMs = ms => ms ? at(ms / 1000) : "\u2014";
-
-// A run's authority (#651): what it can reach first (its zone's rules, its live grants, the standing
-// rules that apply to it, each with when it ends), then what its node holds, and the token's
-// internals (blocks, every grant, the zone's Cedar) folded under Details. Every string is text.
-const methodsText = m => (m || []).map(strip).join(", ") || "GET, HEAD";
-const pathsText = p => (p || ["/**"]).map(strip).join(" ");
-function reachLine(text, end, note) {
-  const d = el("div", "reach");
-  d.append(el("div", "mono", text));
-  const m = el("div", "meta");
-  if (end !== undefined) m.append(end);
-  if (note) m.append(document.createTextNode((end !== undefined ? " \u00b7 " : "") + note));
-  if (m.children.length || m.textContent) d.append(m);
-  return d;
-}
-async function showAuthority(run) {
-  const body = openDetail("Permissions");
-  try {
-    const a = await getJson("/api/runs/" + encodeURIComponent(run) + "/authority");
-    const t = a.token || {};
-    const out = [];
-    const now = nowSecs();
-    // What it can reach.
-    out.push(el("h4", "", "Can reach"));
-    const reach = [];
-    for (const r of t.reach || []) reach.push(reachLine(verbsOf(r.methods) + " " + strip(r.host) + "  " + pathsText(r.paths), undefined,
-      "from its zone's rules" + (r.allow_dangerous ? "; including requests that can't be undone" : "") +
-      ((r.decode_slash || []).length ? "; reads an encoded slash (%2F) as / in path part " + r.decode_slash.map(Number).join(", ") : "")));
-    for (const g of (t.grants || []).filter(g => !g.revoked && (!g.expires_at || g.expires_at > now))) {
-      const end = el("span"); end.append(document.createTextNode("allowed by " + decider(g.approved_by) + "; ends "), timeEl(g.expires_at));
-      // All that the grant reaches (#715 review): a standing grant is a rule on the host (its methods,
-      // path globs and allow_dangerous); a prefix grant covers every path under its path.
-      const sr = g.standing;
-      const what = sr ? verbsOf(sr.methods) + " " + strip(g.host) + "  " + pathsText(sr.paths)
-        : verb(g) + " " + strip(g.host + g.path) + (g.prefix ? " and every path under it" : "");
-      reach.push(reachLine(what, end,
-        (g.uses == null ? "any number of times" : plural(g.uses, "more time", "more times")) +
-        (sr && sr.allow_dangerous ? " \u00b7 including requests that can't be undone" : "") +
-        (g.reached_node === false ? " \u00b7 not yet on its server" : "")));
-    }
-    const st = (lastState && lastState.standing && lastState.standing.rules) || [];
-    const row = ((lastState && lastState.runs) || []).find(x => x.id === run) || {};
-    for (const r of st.filter(r => r.live && (r.for === "zone" ? r.zone === t.zone : row.agent && String(r.principal || "").endsWith("/z/" + row.zone + "/a/" + row.agent)))) {
-      const end = el("span"); end.append(document.createTextNode("always allowed, "), r.expires_at ? timeEl(r.expires_at, "ends " + at(r.expires_at)) : document.createTextNode("until removed"));
-      reach.push(reachLine(verbsOf(r.rule.methods) + " " + strip(r.rule.host) + "  " + pathsText(r.rule.paths), end, (r.for === "zone" ? "for every agent in its zone" : "for this agent") +
-        (r.rule.allow_dangerous ? "; including requests that can't be undone" : "") + " \u00b7 allowed by " + decider(r.decided_by)));
-    }
-    // What its zone forbids beats everything above, a grant included.
-    for (const f of t.forbid || []) reach.push(reachLine("never " + strip(f.host) + "  " + pathsText(f.paths), undefined, "forbidden by its zone's rules, even if you allow it"));
-    if (!t.held) reach.push(el("div", "note", "No token now: " + strip(t.why)));
-    else if (!reach.length) reach.push(el("div", "empty", "Nothing: everything it asks for waits for you."));
-    out.push(...reach);
-    // The run, and what its node holds for it.
-    out.push(el("h4", "", "Where it runs"));
-    if (a.revoked) out.push(el("div", "callout warn", "Stopped by " + strip(a.revoked.by) + ": " + strip(a.revoked.reason)));
-    out.push(kv("server", strip(a.node)));
-    if (a.deadline) out.push(kv("its permissions end", whenMs(a.deadline.until_ms) + (a.deadline.stopped ? " (stopped)" : "")));
-    if (a.holdings) {
-      out.push(kv("keys it can use", a.holdings.secrets.length ? a.holdings.secrets.map(strip).join(", ") : "none"));
-      const sl = a.holdings.slice;
-      out.push(kv("model budget left on its server", sl ? num(sl.requests) + " requests, " + num(sl.output_tokens) + " output tokens" + (sl.input_tokens != null ? ", " + num(sl.input_tokens) + " input tokens" : "") : "none"));
-    }
-    out.push(kv("organisation rules", (a.policy.version ? strip(a.policy.version) + (a.policy.current ? " (current)" : " (not the installed " + strip(a.policy.installed || "none") + ")") : "none")));
-    if (t.held) {
-      const det = el("details", "more");
-      det.append(el("summary", "", "Technical details: its token, grants and zone policy"));
-      det.append(kv("status", strip(a.status) + (a.feed ? " \u00b7 node feed epoch " + strip(a.feed.epoch) : "")));
-      det.append(kv("token", "box " + strip(t.box_path) + " \u00b7 epoch " + strip(t.epoch) + " \u00b7 zone " + strip(t.zone) + " \u00b7 minted by " + strip(t.issued_by) +
-        (t.loads === true ? " \u00b7 loads" : " \u00b7 does NOT load: " + strip((t.loads || {}).error || ""))));
-      for (const b of t.blocks || []) {
-        const h = el("div", "row");
-        h.append(el("span", b.revoked ? "blocked" : "ok", "block " + b.index + " \u00b7 " + strip(b.kind) + (b.revoked ? " \u00b7 REVOKED" : "")),
-          el("span", "meta", "revocation " + strip(b.revocation_fingerprint) + (b.signed_by ? " \u00b7 signed by " + strip(b.signed_by) : "")));
-        det.append(h, el("pre", "src", b.source));
-      }
-      for (const g of t.grants || []) {
-        det.append(kv(g.id, g.method + " " + g.host + g.path + " \u00b7 " + (g.uses == null ? "unlimited uses" : g.uses + " uses (counted on the node)") +
-          " \u00b7 ends " + when(g.expires_at) + " \u00b7 approved by " + (g.approved_by || "?") + " at " + when(g.approved_at) +
-          (g.revoked ? " \u00b7 revoked" : "") + (g.reached_node === false ? " \u00b7 not yet on its node" : "")));
-      }
-      if (t.zone_cedar) det.append(el("div", "meta", "zone policy (Cedar, generated from the manifest)"), el("pre", "src", t.zone_cedar));
-      out.push(det);
-    }
-    body.replaceChildren(...out);
-  } catch (e) { body.replaceChildren(el("div", "blocked", strip(e.message))); }
-}
 
 async function showExplain(seq, into) {
   const body = into || openDetail("decision #" + seq);
@@ -1853,7 +1660,7 @@ async function refreshOnce() {
     renderProblems(s);
     // Kept across polls, as the pending cards are (#715 review): a row is rebuilt only when its run, or
     // whether it waits for you, changed.
-    renderKeyed("runs", s.runs.map(x => ({ ...x, waiting: s.pending.some(p => p.run === x.id) })), x => renderRun(s, x), "No runs yet.");
+    drawn("wicketAgents", "renderRuns", s);
     renderRows("health", ((s.health || {}).nodes) || [], healthRow, "No node has reported its health yet.");
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
@@ -1868,14 +1675,14 @@ async function refreshOnce() {
     renderCounts(s.pending.length + n, problemList(s).length);
     renderKeyed("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
     renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: each request waits for a decision.");
-    renderStart(s);
+    drawn("wicketAgents", "renderStart", s);
     renderManifests(s);
     renderSecrets(s);
     renderRows("decided", s.decided, decidedRow, "No decisions yet.");
     renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
     renderFilters(); applyFilter();
     refreshRel();
-    renderAgentHead(); renderAgentLog();
+    if (view === "agent") { drawn("wicketAgents", "renderAgentHead", s, agentRun); drawn("wicketAgents", "renderAgentLog", s, agentRun); }
     const ar = document.getElementById("audit-retention");
     if (ar) ar.textContent = s.audit_retention ? strip(s.audit_retention.line) : "";
     renderOperator(s);

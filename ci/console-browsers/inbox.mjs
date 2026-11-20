@@ -56,7 +56,9 @@ async function check(engine) {
   const ids = () => page.$$eval("#pending .req", cs => cs.map(c => c.dataset.id));
   const mark = id => page.evaluate(i => { document.querySelector(`#pending .req[data-id="${i}"]`).__mark = i; }, id);
   const marked = id => page.evaluate(i => { const c = document.querySelector(`#pending .req[data-id="${i}"]`); return !!c && c.__mark === i; }, id);
-  const poll = () => page.evaluate(() => refresh());
+  // One whole poll that starts after the state was set: if the page's own (every 2 s) is in flight,
+  // after it ends.
+  const poll = () => page.evaluate(async () => { while (polling) await new Promise(r => setTimeout(r, 20)); await refresh(); });
   const cardButton = (id, label) => page.locator(`#pending .req[data-id="${id}"] button`, { hasText: label }).first();
   try {
     await page.goto(url);

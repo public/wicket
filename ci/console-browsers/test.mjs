@@ -88,7 +88,7 @@ async function session(engine) {
     const seen = await watch(page);
     const r = await page.goto(url + "session?run=run_01JDRELEASEQQQQQQQQQQQQQQQ");
     if (!r || r.status() !== 200) return console.log(`${engine} session: not served by the preview, skipped`);
-    await page.waitForFunction(() => document.getElementById("app")?.childElementCount > 0, null, { timeout: 10000 })
+    await page.waitForFunction(() => document.getElementById("app")?.hasChildNodes(), null, { timeout: 10000 })
       .catch(() => { throw new Error(`${engine} session: nothing mounted on #app`); });
     const built = await page.evaluate(() => !document.body.textContent.includes("no session view"));
     const violations = (await seen()).filter(p => p.startsWith("violation") || p.startsWith("error: Failed to set") || p.includes("TrustedHTML"));

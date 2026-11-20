@@ -41,14 +41,6 @@ const calls = [];
 let state = null;
 // A hostile string an agent chose (a grant's path): it must stay text.
 const HOSTILE = "/x<img src=x onerror=alert(1)>";
-const authority = { status: "running", node: "local", policy: { version: null }, token: { held: true, box_path: "run_a", epoch: 0, zone: "z", issued_by: "the authority root", loads: true,
-  reach: [{ host: "api.example.com", methods: ["GET"], paths: ["/v1/**"], allow_dangerous: false }, { host: "registry.example.com", methods: ["GET"], paths: ["/**"], allow_dangerous: false, decode_slash: [1] }],
-  forbid: [{ host: "api.example.com", paths: ["/v1/admin/**"] }],
-  blocks: [{ index: 0, kind: "zone", source: "check if reach(\"" + HOSTILE + "\");", signed_by: null, revocation_fingerprint: "0123456789abcdef", revoked: false }],
-  grants: [{ id: "g-1", method: "POST", host: "h", path: HOSTILE, uses: 2, expires_at: 1, approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true },
-    { id: "g-2", method: "GET", host: "docs.example", path: "/guide/", prefix: true, uses: null, expires_at: 4e9, approved_by: "agent:run_p", approved_at: 1, revoked: false, reached_node: true },
-    { id: "g-3", method: "GET", host: "ci.example", path: "", standing: { methods: ["GET", "POST"], paths: ["/jobs/**"], allow_dangerous: true }, uses: null, expires_at: 4e9,
-      approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true }] } };
 const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
   against_token_now: { available: true, decision: "forbidden", why: "block 0: check if " + HOSTILE, zone_says: "Forbidden" } };
 let nextAction = null, begun = null;
@@ -94,7 +86,6 @@ const fetch = async (path, opts) => {
   if (path === "/api/push/remove") { const b = JSON.parse(opts.body); pushDevices = pushDevices.filter(d => d.id !== b.id); return reply({ ok: "device removed" }); }
   if (path === "/api/push/details") { const b = JSON.parse(opts.body); for (const d of pushDevices) if (d.id === b.id) d.details = b.details; return reply({ ok: "ok" }); }
   if (path === "/api/policy") return reply({ installed: null, current: null, versions: [], runs: [] });
-  if (path.endsWith("/authority")) return reply(authority);
   if (path.startsWith("/api/explain/")) return reply(explained);
   return reply({}, false);
 };
@@ -358,25 +349,9 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual([idl.hidden, toggle.getAttribute("aria-expanded")], [true, "false"]);
   console.log("console approval flow: ok");
 
-  // #173: a run's authority and an explained decision open read-only in the detail card, and an
-  // agent's strings in them stay text (the fake DOM has no innerHTML: only textContent exists).
-  run("showAuthority('run_a')"); await flush(); await flush();
-  assert.strictEqual(ids.detail.hidden, false);
-  const text = ids["detail-body"].textContent;
-  assert.ok(text.includes(HOSTILE) && text.includes("block 0 · zone") && text.includes("approved by passkey:laptop"), text);
-  assert.ok(ids["detail-body"].all(n => n.tagName === "img").length === 0, "no element from an agent's string");
-  // #651: it leads with what the run can reach; the token's internals are under Details.
-  assert.ok(text.startsWith("Can reachread api.example.com  /v1/**from its zone's rules"), text);
-  // #715 review: a prefix grant covers every path under it; a standing grant shows its rule; and who
-  // allowed it is named, never "you" (here a parent agent).
-  assert.ok(text.includes("docs.example/guide/ and every path under it"), text);
-  assert.ok(text.includes("allowed by run_p (a parent agent)"), text);
-  assert.ok(text.includes("ci.example  /jobs/**") && text.includes("including requests that can't be undone"), text);
-  assert.ok(!text.includes("you allowed"), text);
-  // #715 review: an encoded-slash rule says so, and what the zone forbids is listed.
-  assert.ok(text.includes("reads an encoded slash (%2F) as / in path part 1"), text);
-  assert.ok(text.includes("never api.example.com  /v1/admin/**forbidden by its zone's rules, even if you allow it"), text);
-  assert.ok(ids["detail-body"].all(n => n.tagName === "details").length === 1, "the token folded under Details");
+  // #173: an explained decision opens read-only in the detail card, an agent's strings in it as
+  // text (the fake DOM has no innerHTML: only textContent exists). A run's authority is drawn by
+  // agents.js, checked in browsers (ci/console-browsers/agents.mjs).
   // #621: wicket's own kinds as sentences, the raw op apart; an HTTP request as it is.
   const asked = p => JSON.parse(run("JSON.stringify(asks(" + JSON.stringify({ host: "wicket.internal", reason: "r", ...p }) + "))"));
   assert.deepStrictEqual([asked({ method: "SPAWN", path: "/zones/research/reader" }).what, asked({ method: "LINK", path: "/links/run_a/run_b/8080" }).what,
@@ -625,8 +600,6 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     [{ kind: "decision", body: { request: "r-7", decision: "approve", by: "agent:run_p" } }, "allowedr-7 by run_p (a parent agent)"],
     [{ kind: "something.new", run: "run_z", body: {} }, "something.new \u00b7 run_z"],
   ]) { const t = T("line(" + JSON.stringify({ seq: 1, ...op }) + ")"); assert.ok(t.endsWith(want), want + " in " + t); }
-  const rr = T('renderRun({ now: 1000 }, ' + JSON.stringify({ id: "run_x", zone: "z", agent: "builder", status: "exited", started_at: 1000 - 7200, ended_at: 1000 - 3600, has_identity: true, revoked: false, acp: false }) + ')');
-  assert.ok(rr.startsWith("builder \u00b7 zone zfinished") && rr.includes("started 2 h ago") && rr.includes("ended 60 min ago") && rr.includes("run_x") && rr.includes("What it can reach"), rr);
   const lease = run('placedRow(' + JSON.stringify({ id: "uuid-1", name: "runner", past_lease: true, held_by: "run_h", lease_until: 1 }) + ')');
   assert.ok(lease.textContent.includes("still billing: run run_h holds it") && lease.all(n => n.tagName === "code")[0].textContent === "wicket node release uuid-1", lease.textContent);
   const dec = run('decidedRow(' + JSON.stringify({ id: "r-5", zone: "z", method: "GET", host: "h", path: "/p", status: "expired", created_at: 1 }) + ')');
