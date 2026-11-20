@@ -25,6 +25,12 @@ reference](manifest.md)).
   - [`wicket grant list`](#wicket-grant-list)
   - [`wicket grant revoke`](#wicket-grant-revoke)
   - [`wicket grant renew`](#wicket-grant-renew)
+- [`wicket names`](#wicket-names)
+  - [`wicket names list`](#wicket-names-list)
+  - [`wicket names show`](#wicket-names-show)
+  - [`wicket names approve`](#wicket-names-approve)
+  - [`wicket names deny`](#wicket-names-deny)
+  - [`wicket names revoke`](#wicket-names-revoke)
 - [`wicket standing`](#wicket-standing)
   - [`wicket standing list`](#wicket-standing-list)
   - [`wicket standing show`](#wicket-standing-show)
@@ -147,6 +153,7 @@ Commands:
   links      Links between boxes (expose/connect/link), newest first
   unlink     Cut a link between boxes: its relay closes it and drops its connections within seconds
   grant      Grants made by approvals
+  names      Names for boxes (#575): internal names, and the public names a human approves
   standing   Standing reach (#572): a reach rule an agent asked for once, approved once for its later runs
   trigger    Triggers (#578): when a schedule or timer comes due, wake or message an agent
   audit      Show or verify the hash-chained audit log, or export it to the configured sinks
@@ -444,6 +451,96 @@ Arguments:
 Options:
       --ttl <TTL>  The new lifetime, from now [default: 10m]
   -h, --help       Print help
+```
+
+## `wicket names`
+
+```text
+Names for boxes (#575): internal names, and the public names a human approves
+
+Usage: wicket names <COMMAND>
+
+Commands:
+  list     Names: pending asks for public names, and live names (internal and public). --all adds denied, withdrawn and ended ones
+  show     One name or ask: the label, port, who asked, and, for a public name, what approving it means
+  approve  Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it), or --for zone (every agent of its zone), for --lasts
+  deny     Deny an ask for a public name
+  revoke   Revoke a live name, public or internal: it ends now, whoever holds it
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket names list`
+
+```text
+Names: pending asks for public names, and live names (internal and public). --all adds denied, withdrawn and ended ones
+
+Usage: wicket names list [OPTIONS]
+
+Options:
+      --all   
+  -h, --help  Print help
+```
+
+### `wicket names show`
+
+```text
+One name or ask: the label, port, who asked, and, for a public name, what approving it means
+
+Usage: wicket names show <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket names approve`
+
+```text
+Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it), or --for zone (every agent of its zone), for --lasts
+
+Usage: wicket names approve [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --for <BOUND>    A standing name's holder: `agent` (the asking agent's principal) or `zone` (its zone) [default: agent]
+      --lasts <LASTS>  A standing name's lifetime (at most 366d), or `forever`: until revoked [default: 30d]
+  -y, --yes            Don't ask for confirmation at a terminal (the ask is printed either way)
+  -h, --help           Print help
+```
+
+### `wicket names deny`
+
+```text
+Deny an ask for a public name
+
+Usage: wicket names deny <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket names revoke`
+
+```text
+Revoke a live name, public or internal: it ends now, whoever holds it
+
+Usage: wicket names revoke <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
 ```
 
 ## `wicket standing`

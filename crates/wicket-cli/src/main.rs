@@ -64,6 +64,7 @@ pub(crate) use cmd::dev::DevCmd;
 pub(crate) use cmd::identity::IdentityCmd;
 pub(crate) use cmd::image::ImageCmd;
 pub(crate) use cmd::itself::SelfCmd;
+pub(crate) use cmd::names::NamesCmd;
 pub(crate) use cmd::node::LeaseCmd;
 pub(crate) use cmd::node::NodeCmd;
 pub(crate) use cmd::operator::OperatorCmd;
@@ -246,6 +247,11 @@ enum Cmd {
     Grant {
         #[command(subcommand)]
         cmd: GrantCmd,
+    },
+    /// Names for boxes (#575): internal names, and the public names a human approves.
+    Names {
+        #[command(subcommand)]
+        cmd: NamesCmd,
     },
     /// Standing reach (#572): a reach rule an agent asked for once, approved once for its later runs.
     Standing {
@@ -497,6 +503,7 @@ async fn main() -> Result<()> {
         c @ (Cmd::Pending | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await
         }
+        Cmd::Names { cmd } => cmd::names::dispatch(cmd).await,
         Cmd::Standing { cmd } => cmd::standing::dispatch(cmd).await,
         Cmd::Trigger { cmd } => cmd::trigger::dispatch(cmd).await,
         c @ Cmd::Identity { .. } => cmd::identity::dispatch(c).await,
