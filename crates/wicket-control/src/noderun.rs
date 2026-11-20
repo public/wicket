@@ -1905,17 +1905,22 @@ pub fn fenced_until(l: &wicket_store::Ledger, run: &str, now_ms: i64) -> Option<
 /// if recorded.
 ///
 /// A run whose authority record is missing (lost) fences until its timeout, from its run record:
-/// its box may run that long on its node, and no longer. If that can't be read either (#676), until
-/// the ledger's hard end; and with none of them, until its node confirms the box stopped
-/// ([`UNKNOWN_END`]), or an operator releases it. A run with no record of either kind never started a box.
+/// its box may run that long on its node, and no longer. If the run record is there but that can't
+/// be read from it (#676), until the ledger's hard end; and with neither, until its node confirms the
+/// box stopped ([`UNKNOWN_END`]), or an operator releases it. A run with no record of either kind
+/// never started a box from this host's files: on a standby restored from the state store (#154),
+/// the ledger's fence on the agent (`Ledger::agent_fenced_until`) holds instead.
 pub fn fenced_in(run_dir: &Path, now_ms: i64, cap_ms: Option<i64>) -> Option<(String, i64)> {
     let a = match read_authority(run_dir) {
         Some(a) => a,
         None => {
-            let until_ms = match (timeout_end(run_dir), cap_ms) {
-                (Some(t), _) if t != UNKNOWN_END => t,
-                (_, Some(cap)) => cap,
-                (t, None) => t?,
+            // No run record: no box was started from this host's files (or, on a standby restored
+            // from the state store, #154, the lost host's files are gone and the ledger's own fence
+            // on the agent holds instead). A record whose end can't be read: the ledger's hard end,
+            // else until the node confirms.
+            let until_ms = match (timeout_end(run_dir)?, cap_ms) {
+                (UNKNOWN_END, Some(cap)) => cap,
+                (t, _) => t,
             };
             AuthorityRecord { node: "its node".into(), until_ms, ..Default::default() }
         }
@@ -2980,9 +2985,10 @@ mod tests {
         // With the ledger's hard end of its authority: fenced until that, not forever.
         assert_eq!(fenced_in(&d, 2_000, Some(900_000)).map(|f| f.1), Some(900_000 + WAKE_SKEW_MS));
         assert!(fenced_in(&d, 900_000 + WAKE_SKEW_MS, Some(900_000)).is_none(), "and no longer");
-        // No run record at all, but the ledger recorded an authority: fenced until its hard end.
+        // No run record at all: not fenced by this host's files, whatever the ledger says (a standby
+        // restored from the state store has the ledger's fence on the agent instead, #154).
         std::fs::remove_file(d.join("ctl/run.json")).unwrap();
-        assert_eq!(fenced_in(&d, 2_000, Some(900_000)).map(|f| f.1), Some(900_000 + WAKE_SKEW_MS));
+        assert!(fenced_in(&d, 2_000, Some(900_000)).is_none(), "no run record: the ledger's fence holds instead");
         assert!(fenced_in(&d, 2_000, None).is_none(), "no record of either kind: no box was started");
         std::fs::write(d.join("ctl/run.json"), b"not json").unwrap();
         // An operator releases it (#676): the fence lifts, the record says who.
