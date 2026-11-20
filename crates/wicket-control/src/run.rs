@@ -159,6 +159,10 @@ pub struct RunOpts<'a> {
     /// A child's supervisor, run in its parent's process (#257 slice 4c): its parent asks it to stop
     /// its box and end, as an operator's ^C does.
     pub stop: Option<Arc<tokio::sync::Notify>>,
+    /// Place a fresh run with no node named through the scheduler (#579), waiting in its queue up to
+    /// this long (`wicket run --wait`). Only a fresh, top-level run is placed ([`placed_by_scheduler`]);
+    /// None: this host's own node, as a spawn or a re-attach is.
+    pub place_wait: Option<std::time::Duration>,
 }
 
 /// What a run's supervisor keeps in `<run dir>/ctl/run.json` so another can take over (#151).
@@ -340,6 +344,9 @@ pub struct RunEnd {
 
 /// [`run`], returning how it ended.
 pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
+    // #579: which runs the scheduler places, from the options as given (`--node local` names this
+    // host's own node: it pins the run there).
+    let fresh = Fresh::of(&o);
     let RunOpts {
         manifest: manifest_path,
         workdir,
@@ -356,6 +363,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         attach,
         adopt,
         stop,
+        place_wait,
     } = o;
     // Where the box start's time goes (#287), from here: in the run's record, and printed with
     // WICKET_TIMINGS=1.
@@ -563,6 +571,50 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
     // its pinned ssh (a revoked one is refused), or this host's own built-in node over its unix socket.
     timings.since("checks", lap);
+    let run = match run_id {
+        Some(id) => {
+            check_run_id(&id).with_context(|| "--run-id".to_string())?;
+            RunId(id)
+        }
+        None => RunId::new(),
+    };
+    // #579: a fresh run with no node named goes where the scheduler places it, as a woken agent
+    // does: this host's own node is one candidate among the enrolled ones. With no other node
+    // enrolled, it goes on this host's own, as before, whatever its placement terms.
+    let others = || -> Result<bool> {
+        Ok(Ledger::open(&ledger_path())?.nodes()?.iter().any(|n| n.status == "active" && n.name != crate::localnode::NAME))
+    };
+    // The room the scheduler reserved for it is given back if the run fails before its start
+    // settles it (bound, or released below).
+    let mut held_room = HeldRoom(None);
+    let scheduled: Option<String> = match place_wait.filter(|_| placed_by_scheduler(&fresh)) {
+        Some(_) if !others()? => None,
+        None => None,
+        Some(wait) => {
+            let who = crate::hibernate::Placing { what: format!("run {run}"), claim: None, wait_flag: "wicket run --wait" };
+            match crate::hibernate::place_box(&who, &m, None, &run, None, wait).await {
+                Ok(n) => {
+                    held_room.0 = Some(run.0.clone());
+                    n.filter(|n| n != crate::localnode::NAME)
+                }
+                Err(e) => {
+                    // Boxes it asked to hibernate for room are asked no more, and room it held goes
+                    // back.
+                    if let Ok(l) = Ledger::open(&ledger_path()) {
+                        let _ = crate::hibernate::withdraw_preemptions_for(
+                            &l,
+                            &run,
+                            &m.tenant,
+                            wicket_feed::now_ms(),
+                            "the run failed to start",
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    };
+    let node = node.or(scheduled.as_deref());
     let lap = std::time::Instant::now();
     let node: Option<Node> = node.map(|n| crate::enrol::resolve_installed(n, ssh_key)).transpose()?;
     timings.since("node.resolve", lap);
@@ -580,13 +632,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // or wrapped). Its proxies are its own, as on any node.
     let shares_host = node.is_none();
 
-    let run = match run_id {
-        Some(id) => {
-            check_run_id(&id).with_context(|| "--run-id".to_string())?;
-            RunId(id)
-        }
-        None => RunId::new(),
-    };
     // A long-lived agent (#70): one wicket launches itself, here, so it can be hibernated and
     // rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
@@ -1439,6 +1484,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         })
         .await;
         // The room it reserved (#579): counted until the node reports the box, or given back.
+        held_room.0 = None;
         {
             let l = ledger.lock().expect("ledger");
             let _ = match &nb {
@@ -3012,6 +3058,59 @@ impl tokio::io::AsyncWrite for Counted {
     }
 }
 
+/// The room the scheduler reserved for a run (#579), given back when dropped while it holds the
+/// run: the run failed before its start settled the reservation.
+struct HeldRoom(Option<String>);
+
+impl Drop for HeldRoom {
+    fn drop(&mut self) {
+        if let Some(run) = self.0.take() {
+            if let Ok(l) = Ledger::open(&ledger_path()) {
+                let _ = l.placement_released(&run);
+            }
+        }
+    }
+}
+
+/// What a run is, for whether the scheduler places it ([`placed_by_scheduler`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Fresh {
+    pub named_node: bool,
+    pub reattach: bool,
+    pub wrapped: bool,
+    pub wake: bool,
+    pub adopted: bool,
+    pub child: bool,
+    pub lease: bool,
+    pub in_place_workspace: bool,
+}
+
+impl Fresh {
+    /// What `o` asks for: a node named (`local` included, which pins the run to this host's own), a
+    /// re-attach, a wrapped session, a wake, an adopted child, a spawn, a lease's run, an in-place
+    /// workspace.
+    pub(crate) fn of(o: &RunOpts<'_>) -> Fresh {
+        Fresh {
+            named_node: o.node.is_some(),
+            reattach: o.attach,
+            wrapped: o.wrap.is_some(),
+            wake: o.wake.is_some(),
+            adopted: o.adopt.is_some(),
+            child: o.parent_run.is_some(),
+            lease: o.lease.is_some(),
+            in_place_workspace: o.workspace_dir.is_some(),
+        }
+    }
+}
+
+/// Whether the scheduler places a run (#579): a fresh, top-level run with no node named. A node named
+/// (`--node`, a lease's), a re-attach and an adopted child keep their node; a wake is placed by its
+/// own wait; a spawn goes where its parent runs or its hint says; a wrapped session and an in-place
+/// `--workspace-dir` use this host's own directories and stay on its node.
+pub(crate) fn placed_by_scheduler(f: &Fresh) -> bool {
+    !(f.named_node || f.reattach || f.wrapped || f.wake || f.adopted || f.child || f.lease || f.in_place_workspace)
+}
+
 /// Whether a hibernate asked only to make room is declined now (#579 step 4), and why
 /// (`hibernate::preempted_hibernate`). Declined, preemption's mark is cleared (so the wake gives up on
 /// this agent at once) and it is audited as `placement.preempt_declined`, once: with no mark (given
@@ -3019,7 +3118,11 @@ impl tokio::io::AsyncWrite for Counted {
 fn preemption_declined(ledger: &Mutex<Ledger>, tenant: &wicket_core::TenantId, run: &RunId, live_children: usize) -> Option<String> {
     let now = wicket_feed::now_ms();
     let l = ledger.lock().ok()?;
-    let mark = l.preemption_mark(&run.0, now).ok().flatten();
+    // A ledger that can't be read declines (preemption can ask again), and says why.
+    let mark = l.preemption_mark(&run.0, now).unwrap_or_else(|e| {
+        say!("[wicket] couldn't read what preemption asks of this run: {e:#}");
+        None
+    });
     let why = crate::hibernate::preempted_hibernate(true, mark.as_ref(), live_children, now).err()?;
     // No mark: preemption gave up on it already (and audited that), or this supervisor declined it
     // already (a re-check out of a linger): it declines, with nothing more to record.
@@ -3089,6 +3192,59 @@ fn same_remote_session(a: &str, b: &str) -> bool {
 mod tests {
 
     use super::*;
+
+    /// #579 (review): built from the run options as given: `--node local` pins a run to this host's
+    /// own node; only a bare `wicket run` is placed.
+    #[test]
+    fn a_run_with_node_local_is_not_placed_by_the_scheduler() {
+        let opts = |node: Option<&'static str>, workspace_dir: Option<&'static Path>| RunOpts {
+            manifest: Path::new("m.yaml"),
+            workdir: None,
+            workspace_dir,
+            task: None,
+            image: None,
+            node,
+            ssh_key: None,
+            run_id: None,
+            parent_run: None,
+            lease: None,
+            wrap: None,
+            wake: None,
+            attach: false,
+            adopt: None,
+            stop: None,
+            place_wait: Some(std::time::Duration::ZERO),
+        };
+        assert!(placed_by_scheduler(&Fresh::of(&opts(None, None))), "a bare wicket run");
+        assert!(!placed_by_scheduler(&Fresh::of(&opts(Some(crate::localnode::NAME), None))), "--node local pins it");
+        assert!(!placed_by_scheduler(&Fresh::of(&opts(Some("n1"), None))));
+        assert!(!placed_by_scheduler(&Fresh::of(&opts(None, Some(Path::new("/w"))))), "an in-place workspace");
+        let child = RunOpts { parent_run: Some("run_p".into()), ..opts(None, None) };
+        assert!(!placed_by_scheduler(&Fresh::of(&child)), "a spawn");
+        let attach = RunOpts { attach: true, ..opts(None, None) };
+        assert!(!placed_by_scheduler(&Fresh::of(&attach)), "a re-attach");
+    }
+
+    /// #579: the scheduler places a fresh, top-level run with no node named, and nothing else.
+    #[test]
+    fn only_a_fresh_top_level_run_is_placed_by_the_scheduler() {
+        assert!(placed_by_scheduler(&Fresh::default()));
+        let kept: [fn(&mut Fresh); 8] = [
+            |f| f.named_node = true,
+            |f| f.reattach = true,
+            |f| f.wrapped = true,
+            |f| f.wake = true,
+            |f| f.adopted = true,
+            |f| f.child = true,
+            |f| f.lease = true,
+            |f| f.in_place_workspace = true,
+        ];
+        for set in kept {
+            let mut f = Fresh::default();
+            set(&mut f);
+            assert!(!placed_by_scheduler(&f), "{f:?} keeps its node");
+        }
+    }
 
     /// #676: failed takeovers are counted across tries, a new reason is told apart from a repeat
     /// (the audit records only a change), and the wait between tries doubles from a minute to at

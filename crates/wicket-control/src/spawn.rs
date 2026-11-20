@@ -138,6 +138,7 @@ pub fn supervise(o: ChildOpts) -> std::io::Result<std::thread::JoinHandle<()>> {
                 attach: false,
                 adopt,
                 stop: Some(stop),
+                place_wait: None,
             }))
         }));
         match r {
