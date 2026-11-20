@@ -609,6 +609,13 @@ function renderCounts(waiting, alerts) {
 // fake DOM of console_ui.js) they draw nothing.
 function renderPending(s) {
   pendingLoaded = true;
+  // The cards are inbox.js's: if it didn't load (a failed fetch, an old browser), say so where they
+  // would be, rather than show nothing waiting.
+  if (!globalThis.wicketInbox) {
+    const box = document.getElementById("pending");
+    if (box) box.replaceChildren(el("div", "blocked", "The requests can't be shown: part of this page didn't load. Reload the page; if it stays, check the browser's console."));
+    return;
+  }
   inbox("renderPending", s);
 }
 // A failure drawing the Inbox is logged (the browser tests fail on it) and doesn't stop the rest of

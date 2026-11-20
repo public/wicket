@@ -254,8 +254,19 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
         assert!(a.immutable);
         if !path.contains("/vendor/") {
             let js = std::str::from_utf8(&a.body).unwrap();
-            for bad in ["innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "new Function", "document.write", ".cssText", "unsafeHTML"]
-            {
+            for bad in [
+                "innerHTML",
+                "outerHTML",
+                "insertAdjacentHTML",
+                "eval(",
+                "new Function",
+                "document.write",
+                ".cssText",
+                "unsafeHTML",
+                "unsafeStatic",
+                "unsafeSVG",
+                "unsafeMathML",
+            ] {
                 assert!(!js.contains(bad), "{path} uses {bad}");
             }
         }

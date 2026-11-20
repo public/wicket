@@ -123,15 +123,24 @@ fn bare_imports(src: &str, path: &Path, rel: &str) -> String {
             _ => continue,
         };
         let Some(spec) = source.value.as_str() else { panic!("{}: an import path that isn't plain text", path.display()) };
-        let to = if spec.starts_with("./") || spec.starts_with("../") {
+        let file = if spec.starts_with("./") || spec.starts_with("../") {
             continue;
         } else if spec == "lit-html" {
-            format!("{up}vendor/lit-html/lit-html.js")
+            "lit-html.js"
         } else if let Some(sub) = spec.strip_prefix("lit-html/") {
-            format!("{up}vendor/lit-html/{sub}")
+            sub
         } else {
             panic!("{}: import from {spec:?}: only lit-html (vendored) or a relative path", path.display());
         };
+        // Only a file that is vendored and served (MODULES), so an import can't name one that isn't.
+        let vendored = format!("vendor/lit-html/{file}");
+        if !MODULES.iter().any(|(rel, own)| !own && *rel == vendored) {
+            panic!(
+                "{}: import from {spec:?}: static/{vendored} isn't among the vendored modules build.rs serves (MODULES)",
+                path.display()
+            );
+        }
+        let to = format!("{up}{vendored}");
         edits.push((source.span.start as usize, source.span.end as usize, format!("{to:?}")));
     }
     let mut out = src.to_string();

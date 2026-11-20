@@ -8,7 +8,9 @@
 // cards moved does nothing; a card's button asks the server for the action and opens the sheet, with
 // no passkey ceremony; while the sheet is open the cards don't move; each card offers only what the
 // server grants, says how far a grant reaches on the card itself, and keeps an agent's strings as
-// text; a request opened from a notification is outlined.
+// text; a request opened from a notification is outlined; taps wait after the first draw and after a
+// card changes in place, as after the cards move; and without inbox.js the page says the requests
+// can't be shown.
 import assert from "node:assert";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
@@ -59,12 +61,19 @@ async function check(engine) {
   const ids = () => page.$$eval("#pending .req", cs => cs.map(c => c.dataset.id));
   const mark = id => page.evaluate(i => { document.querySelector(`#pending .req[data-id="${i}"]`).__mark = i; }, id);
   const marked = id => page.evaluate(i => { const c = document.querySelector(`#pending .req[data-id="${i}"]`); return !!c && c.__mark === i; }, id);
-  const poll = () => page.evaluate(() => refresh());
+  // One whole poll that starts after the state was set: if the page's own (every 2 s) is in flight,
+  // after it ends.
+  const poll = () => page.evaluate(async () => { while (polling) await new Promise(r => setTimeout(r, 20)); await refresh(); });
+  // That a tap sent nothing: a request it sent would have arrived by now.
+  const sentNothing = async (n, why) => { await page.waitForTimeout(400); assert.strictEqual(begun.length, n, why); };
   const cardButton = (id, label) => page.locator(`#pending .req[data-id="${id}"] button`, { hasText: label }).first();
   try {
     await page.goto(url);
     await page.waitForSelector("#pending .req");
     assert.deepStrictEqual(await ids(), ["q-x", "q-a", "q-b"]);
+    // The cards were just drawn: a tap right then is ignored.
+    await cardButton("q-a", "Allow once").click();
+    await sentNothing(0, "a tap just after the first draw is ignored");
     // An unchanged card is the same element after a poll (its buttons don't get replaced under a tap).
     await mark("q-a");
     await poll();
@@ -76,7 +85,22 @@ async function check(engine) {
     assert.deepStrictEqual(await ids(), ["q-a", "q-b"]);
     assert.ok(await marked("q-a"), "A is the same element after the cards moved");
     await cardButton("q-b", "Allow once").click();
-    assert.strictEqual(begun.length, 0, "a tap just after the layout changed is ignored");
+    await sentNothing(0, "a tap just after the layout changed is ignored");
+
+    // A card that changes in place, under the same id, can grow or change its buttons (an agent
+    // confirmed: Don't allow alone becomes Allow once, Allow for 1 hour, Don't allow): taps wait then
+    // too, though no card came, went or moved.
+    await page.waitForTimeout(900);
+    state = { ...base, pending: [A, { ...B, risk: "R1ReadScoped", identity: { verified: false, error: "token signature invalid" } }] };
+    await poll();
+    await page.waitForTimeout(900);
+    state = { ...base, pending: [A, { ...B, risk: "R1ReadScoped" }] };
+    await poll();
+    assert.deepStrictEqual(await ids(), ["q-a", "q-b"]);
+    await cardButton("q-b", "Allow once").click();
+    await sentNothing(0, "a tap just after a card changed in place is ignored");
+    state = { ...base, pending: [A, B] };
+    await poll();
 
     // Once settled, a tap asks the server for the action and opens the sheet; no passkey yet.
     await page.waitForTimeout(900);
@@ -91,7 +115,7 @@ async function check(engine) {
     await poll();
     assert.deepStrictEqual(await ids(), ["q-a", "q-b"], "no redraw while the sheet is open");
     await cardButton("q-b", "Allow once").click({ force: true }).catch(() => {});
-    assert.strictEqual(begun.length, 1, "another card can't open a second sheet");
+    await sentNothing(1, "another card can't open a second sheet");
 
     // The sheet's own button signs; then the page draws the cards as they are now, A still kept.
     await page.waitForTimeout(900);
@@ -142,6 +166,15 @@ async function check(engine) {
     assert.strictEqual((await page.locator("#problems").innerText()).trim(), "Nothing is wrong.");
 
     if (problems.length) throw new Error(problems.join("\n  "));
+
+    // If inbox.js doesn't load, the cards' place says the requests can't be shown, rather than that
+    // nothing is waiting.
+    const bare = await (await browser.newContext()).newPage();
+    await bare.route("**/inbox.js", r => r.abort());
+    await bare.route("**/api/**", r => { const p = new URL(r.request().url()).pathname;
+      return r.fulfill({ contentType: "application/json", body: JSON.stringify(p === "/api/me" ? { who: { state: "operator", credential: "AbCd" } } : p === "/api/state" ? { ...base, pending: [A] } : p === "/api/push" ? { public_key: "BAEC", devices: [], min_interval_secs: 30 } : {}) }); });
+    await bare.goto(url);
+    await bare.waitForFunction(() => document.getElementById("pending").textContent.includes("can't be shown"), null, { timeout: 10000 });
     console.log(`${engine} inbox: ok`);
   } finally {
     await browser.close();
