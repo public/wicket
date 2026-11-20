@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>wicket</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to the page</a>
+<header class="top">
+  <div class="bar"><h1>wicket</h1><span id="tenant"></span></div>
+  <nav id="nav" aria-label="Views">
+    <a href="#inbox" data-view="inbox">Inbox<span class="count" id="nav-waiting" hidden></span></a>
+    <a href="#agents" data-view="agents">Agents</a>
+    <a href="#activity" data-view="activity">Activity</a>
+    <a href="#settings" data-view="settings">Settings<span class="count bad" id="nav-health" hidden></span></a>
+  </nav>
+</header>
+<div class="banner" id="stale" role="status" hidden></div>
+<main id="main"><div id="console" hidden>
+  <section class="view" id="view-inbox" aria-labelledby="inbox-h">
+    <h2 id="inbox-h" class="sr-only">Inbox</h2>
+    <p class="status" id="status" aria-live="polite"></p>
+    <div class="grid inbox">
+      <div><h3 class="sub" id="waiting-h">Needs you</h3><div id="pending" class="deck"></div></div>
+      <div><h3 class="sub">Problems</h3><div id="problems" class="card flush"></div></div>
+    </div>
+  </section>
+  <section class="view" id="view-agents" aria-labelledby="agents-h" hidden>
+    <div class="view-head"><h2 id="agents-h">Agents</h2><button type="button" class="approve" id="start-open">Start an agent…</button></div>
+    <div class="card flush" id="runs"></div>
+  </section>
+  <section class="view" id="view-agent" aria-labelledby="detail-title" hidden>
+    <a class="back" href="#agents">‹ Agents</a>
+    <div id="agent-head"></div>
+    <div class="card" id="detail"><div class="card-head"><h3 id="detail-title">Permissions</h3></div><div id="detail-body"></div></div>
+    <div class="card"><h3>Recent activity</h3><div class="log" id="agent-log"></div></div>
+  </section>
+  <section class="view" id="view-other" hidden><h2 id="other-h"></h2><p class="note">Not in this prototype.</p></section>
+</div></main>
+</body>
+</html>

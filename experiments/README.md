@@ -46,3 +46,4 @@ All five ran on 2026-11-11 on a shared 4 vCPU Vultr VPS, so expect ±30% noise o
 
 Each `RESULTS.md` ends with the exact commands. Build with `cargo build --release` in the experiment's
 directory. `symcc-zones` also needs cvc5 1.3.1 in `symcc-zones/tools/` (see its §10).
+| [`console-frameworks/`](console-frameworks/RESULTS.md) (#574) | Should the console redesign be built on a framework (Vue, Preact, Svelte, Solid, Lit) or stay plain JS? | **Recommended: stay plain JS**, with the prototype's `keyed()` and `h()` helpers. Plain JS, Lit and Preact tie to the first card on a throttled phone (1.14, 1.15, 1.20 s); Solid trails by 0.15 s, Vue and Svelte by 0.5 s. Plain JS is the smallest (8.4 KB gzip against 12–32 KB) and keeps the console buildable by `cargo build` alone. All nine builds show the same screens, checked by `parity.mjs`. Lit (lit-html only) is the pick if a library is wanted. |
