@@ -250,10 +250,36 @@ Tested with `@ui-sdk/web` (its web components, no framework), bundled and minifi
 
 Not a candidate for the console. Its behaviours might be worth reading for accessibility details.
 
+### Minified by Oxc from Rust: `cargo build` alone
+
+The operator accepted a build step but wants `cargo build` to fetch whatever it needs, as it fetches
+crates; Cargo can't fetch npm packages, and a `build.rs` that ran `npm ci` would use the network
+mid-build (breaking `cargo build --offline`, `cargo vendor` and sandboxed builders) and need Node on
+every build machine. Oxc, the JS toolchain under Vite 8, is published as Rust crates. `oxc-minify/`
+(20 lines, `oxc_minifier` 0.158.0, the newest at least 7 days old) minifies each ES module as a
+`build.rs` would; `lit-oxc/` is `lit-nobuild-paint` with its two modules minified so. It matches the
+reference (`parity.mjs`). Load-only, one run of the four (Pixel 8 Pro profile):
+
+| | first card (ms) | first paint (ms) | JS gzip | the build needs |
+|---|---|---|---|---|
+| Lit, Oxc from Rust | 1026 | 704 | 13.7 KB, 4 files | cargo |
+| Lit, esbuild | 1022 | 928* | 12.4 KB, 1 file | Node and 29 npm packages |
+| Lit, no build | 1071 | 740 | 15.7 KB, 5 files | nothing |
+| plain JS, esbuild | 1018 | 576 | 8.4 KB, 1 file | Node |
+
+\* without the draw-before-fetch fix.
+
+Oxc shrinks Lit's code less than a bundler might: the HTML inside `html` templates is left as written.
+It doesn't bundle, so the browser loads a few small modules (preloaded together), which a console split
+by view wants anyway. Its cost: about 60 crates new to wicket's lockfile, about 30 s on a clean build
+(then 18 ms a file, even in a debug build), and weekly 0.x releases whose API moves, so it is pinned
+exactly. **The operator chose this: Oxc in `build.rs`, lit-html committed with its hashes.**
+
 ## Verdict
 
-**Recommended: Lit (`lit-html` only), committed as files with no build** (about 60% confident).
-Plain JS without a build is a close second.
+**Chosen by the operator: Lit (`lit-html` only), its files committed, the console's modules minified
+by Oxc in `build.rs`** (see the section above). It had been recommended as committed files with no
+build; the operator accepted a build step as long as `cargo build` stays the only one.
 
 - On the target phone, speed doesn't separate them: both no-build variants show the first card in
   1.02–1.07 s, and on a desktop in 95 ms.
