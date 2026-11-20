@@ -277,8 +277,11 @@ one it doesn't.
   made (after a provider change, or with `names.public` removed) are *stranded*: the pass says so
   each time until the setting is put back, and never forgets them.
 - **Records gone from the zone** (deleted by hand, or never made because of a crash) are forgotten
-  once the provider that made them lists the zone without them, 10 minutes or more after they were
-  written, so they hold no name's port.
+  once listings by the provider that made them have lacked them for 10 minutes or more (the first
+  such listing notes when; one that has them again clears it), so they hold no name's port. A
+  listing that lacks every record the provider made in the zone forgets none, and the pass says so.
+  A provider's `Ok` listing is the whole zone; its id names its account, and each provider's rows
+  are its own: none writes over, plans on or forgets another's.
 - **Links by name:** a name that ends closes the links other boxes opened with `connect` by it.
 - **One address, one node:** names on two nodes that share a public address wait, since host ports
   are allocated per node.

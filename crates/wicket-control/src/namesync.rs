@@ -79,6 +79,12 @@ pub struct ZonePass {
     pub applied: bool,
     /// Why the plan wasn't (all) made, if it wasn't.
     pub error: Option<String>,
+    /// What kind of failure (`list`, `listing`, `caps`, `apply:failed`, `apply:partial`,
+    /// `apply:none`): what the recorded plan's digest counts, not the provider's words, which may
+    /// change from one try to the next.
+    pub error_kind: Option<String>,
+    /// Names the provider can't take a record of.
+    pub waiting: Vec<Waiting>,
     /// Records forgotten: gone from the zone's listing.
     pub forgotten: Vec<Record>,
 }
@@ -234,26 +240,62 @@ async fn zone_pass<P: DnsProvider>(
     dry_run: bool,
 ) -> Result<ZonePass> {
     let mut out = ZonePass { zone: zone.apex().to_string(), ..ZonePass::default() };
+    let fail = |out: &mut ZonePass, kind: &str, e: String| {
+        out.error_kind = Some(kind.to_string());
+        out.error = Some(e);
+    };
     let listed = match provider.list(zone).await {
         Ok(r) => r,
         Err(e) => {
-            out.error = Some(format!("listing the zone with provider {}: {e}", provider.id()));
+            fail(&mut out, "list", format!("listing the zone with provider {}: {e}", provider.id()));
             return Ok(out);
         }
     };
     let wanted: BTreeMap<String, String> = want.iter().map(|d| (d.name.clone(), d.grant.clone())).collect();
     let writes = provider.writes();
     if writes && !dry_run {
-        let before = l.owned_records(zone)?;
-        out.forgotten = l.forget_unlisted(zone, provider.id(), &listed, now - FORGET_AFTER_SECS)?;
-        for r in &out.forgotten {
-            let body = serde_json::json!({ "zone": zone.apex(), "provider": provider.id(), "state": "forgotten", "record": r });
-            l.audit(&tenant_of(l, r.base(), &wanted, &before), None, "name.record", &body)?;
+        // The forgetting and its audit records are one write (#778 review, S3).
+        let before = l.owned_records_by(zone, provider.id())?;
+        let forgot = l.immediate(|l| -> Result<wicket_store::ForgotRecords> {
+            let f = l.forget_unlisted(zone, provider.id(), &listed, now, FORGET_AFTER_SECS)?;
+            for r in &f.forgotten {
+                let body = serde_json::json!({ "zone": zone.apex(), "provider": provider.id(), "state": "forgotten", "record": r });
+                l.audit(&tenant_of(l, r.base(), &wanted, &before), None, "name.record", &body)?;
+            }
+            Ok(f)
+        })?;
+        out.forgotten = forgot.forgotten;
+        // A listing without any of the provider's records (R1): a bad listing, a zone emptied by
+        // hand, or a crash before they were first made. Nothing is forgotten, and it is said; the
+        // plan makes what the listing lacks, as for a record the zone never had.
+        if forgot.all_missing > 0 {
+            let e = format!(
+                "provider {}'s listing has none of the {} record(s) it made here: none is forgotten while that holds",
+                provider.id(),
+                forgot.all_missing
+            );
+            fail(&mut out, "listing", e);
         }
     }
-    let owned_records = l.owned_records(zone)?;
+    // A name the provider can't take a record of waits on its own (S4), rather than failing the
+    // whole plan, so the others' changes (a revoked name's deletes) still go.
+    let caps = provider.caps();
+    let mut fit = vec![];
+    for d in want {
+        let records = d.records.iter().cloned().chain([owner.owner_record(&d.name, &d.grant, d.ttl)]);
+        let one = Plan { changes: records.map(Change::Create).collect(), conflicts: vec![] };
+        match caps.check(&one) {
+            Ok(()) => fit.push(d.clone()),
+            Err(e) => out.waiting.push(Waiting {
+                id: d.grant.clone(),
+                name: d.name.clone(),
+                why: format!("provider {} can't take its records: {e}", provider.id()),
+            }),
+        }
+    }
+    let owned_records = l.owned_records_by(zone, provider.id())?;
     let owned = wicket_names::Owned::new(&owned_records);
-    out.plan = wicket_names::plan(zone, owner, want, &listed, &owned).map_err(|e| anyhow!("planning zone {}: {e}", zone.apex()))?;
+    out.plan = wicket_names::plan(zone, owner, &fit, &listed, &owned).map_err(|e| anyhow!("planning zone {}: {e}", zone.apex()))?;
     if dry_run {
         return Ok(out);
     }
@@ -261,19 +303,21 @@ async fn zone_pass<P: DnsProvider>(
         out.applied = writes;
         return Ok(out);
     }
-    if let Err(e) = provider.caps().check(&out.plan) {
-        out.error = Some(format!("provider {} can't take the plan: {e}", provider.id()));
+    if let Err(e) = caps.check(&out.plan) {
+        fail(&mut out, "caps", format!("provider {} can't take the plan: {e}", provider.id()));
         return Ok(out);
     }
+    let content = content_digest(zone, provider.id(), &out.plan);
     if writes {
         // The intents, with the records they create, in one write before the apply (F5); once per
-        // plan: not again while the same plan keeps failing.
-        let content = content_digest(zone, provider.id(), &out.plan);
-        let seen = last
-            .and_then(|b| b.get("zones"))
-            .and_then(|z| z.as_array())
-            .is_some_and(|zs| zs.iter().any(|z| z.get("content").and_then(|c| c.as_str()) == Some(content.as_str())));
-        l.immediate(|l| -> Result<()> {
+        // plan: not again while the same plan keeps failing, and again once one was applied (S1).
+        let seen = last.and_then(|b| b.get("zones")).and_then(|z| z.as_array()).is_some_and(|zs| {
+            zs.iter().any(|z| {
+                z.get("content").and_then(|c| c.as_str()) == Some(content.as_str())
+                    && z.get("applied").and_then(|a| a.as_bool()) == Some(false)
+            })
+        });
+        let recorded = l.immediate(|l| -> Result<()> {
             l.owned_before_apply(zone, provider.id(), &out.plan)?;
             if !seen {
                 for c in &out.plan.changes {
@@ -285,25 +329,38 @@ async fn zone_pass<P: DnsProvider>(
                 }
             }
             Ok(())
-        })?;
+        });
+        // Refused (another provider's record, R2): nothing is applied in this zone.
+        if let Err(e) = recorded {
+            fail(&mut out, "ledger", format!("recording the plan before applying it: {e:#}"));
+            return Ok(out);
+        }
     }
     let (made, error) = match provider.apply(zone, &out.plan).await {
-        Ok(a) => (a.applied.then_some(out.plan.changes.len()), None),
+        Ok(a) if a.applied => (out.plan.changes.len(), None),
+        Ok(_) => (0, writes.then(|| ("apply:none", "the provider says it applied nothing".to_string()))),
         Err(ProviderError::Partial { done, why }) => {
-            (Some(done.min(out.plan.changes.len())), Some(format!("stopped after {done} change(s): {why}")))
+            (done.min(out.plan.changes.len()), Some(("apply:partial", format!("stopped after {done} change(s): {why}"))))
         }
-        Err(e) => (None, Some(e.to_string())),
+        Err(e) => (0, Some(("apply:failed", e.to_string()))),
     };
-    if let (Some(done), true) = (made, writes) {
-        l.owned_after_apply(zone, &out.plan.prefix(done))?;
+    if writes {
+        // What was made, forgotten as replaced, with how the apply ended, in one write (S2, S3):
+        // on a failure too.
         let body = serde_json::json!({
-            "zone": zone.apex(), "provider": provider.id(), "plan": content_digest(zone, provider.id(), &out.plan),
-            "changes": out.plan.changes.len(), "made": done, "error": error,
+            "zone": zone.apex(), "provider": provider.id(), "plan": content,
+            "changes": out.plan.changes.len(), "made": made, "error": error.as_ref().map(|(_, e)| e),
         });
-        l.audit(&TenantId::single(), None, "name.applied", &body)?;
+        l.immediate(|l| -> Result<()> {
+            l.owned_after_apply(zone, provider.id(), &out.plan.prefix(made))?;
+            l.audit(&TenantId::single(), None, "name.applied", &body)?;
+            Ok(())
+        })?;
     }
-    out.applied = writes && made == Some(out.plan.changes.len());
-    out.error = error.map(|e| format!("applying the plan with provider {}: {e}", provider.id()));
+    out.applied = writes && made == out.plan.changes.len() && error.is_none();
+    if let Some((kind, e)) = error {
+        fail(&mut out, kind, format!("applying the plan with provider {}: {e}", provider.id()));
+    }
     Ok(out)
 }
 
@@ -340,6 +397,10 @@ pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &
         };
         stranded.push(Stranded { zone: z, provider: made_by, records: n, why });
     }
+    let mut waiting = waiting;
+    for z in &zones {
+        waiting.extend(z.waiting.iter().cloned());
+    }
     let main = &zones[0];
     let mut report = Report {
         provider: provider.id().to_string(),
@@ -361,7 +422,7 @@ pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &
         l.audit(&TenantId::single(), None, "name.plan", &body)?;
         let wanted: BTreeMap<String, String> = want.iter().map(|d| (d.name.clone(), d.grant.clone())).collect();
         for zp in &report.zones {
-            let owned = l.owned_records(&Zone::new(&zp.zone))?;
+            let owned = l.owned_records_by(&Zone::new(&zp.zone), provider.id())?;
             for c in &zp.plan.conflicts {
                 let body = serde_json::json!({ "zone": zp.zone, "name": c.name, "records": c.records, "grant": wanted.get(&c.name) });
                 l.audit(&tenant_of(l, &c.name, &wanted, &owned), None, "name.conflict", &body)?;
@@ -421,23 +482,26 @@ fn owner_grant(text: &str) -> Option<&str> {
 /// told from a new one, and a success after a failure is recorded (#742 review, F6). Each zone
 /// carries its plan's content digest, by which its intents are written once.
 fn plan_body(r: &Report) -> serde_json::Value {
-    let zones: Vec<serde_json::Value> = r
-        .zones
-        .iter()
-        .map(|z| {
-            serde_json::json!({
-                "zone": z.zone, "changes": z.plan.changes, "conflicts": z.plan.conflicts, "applied": z.applied, "error": z.error,
-                "forgotten": z.forgotten, "content": content_digest(&Zone::new(&z.zone), &r.provider, &z.plan),
-            })
+    let zone = |z: &ZonePass, texts: bool| {
+        serde_json::json!({
+            "zone": z.zone, "changes": z.plan.changes, "conflicts": z.plan.conflicts, "applied": z.applied,
+            "error": if texts { serde_json::json!(z.error) } else { serde_json::json!(z.error_kind) },
+            "forgotten": z.forgotten, "content": content_digest(&Zone::new(&z.zone), &r.provider, &z.plan),
         })
-        .collect();
-    let mut body = serde_json::json!({
-        "zone": r.zones.first().map(|z| z.zone.clone()), "provider": r.provider, "zones": zones, "stranded": r.stranded,
-        "waiting": r.waiting, "applied": r.applied, "error": r.zones.first().and_then(|z| z.error.clone()),
-    });
-    let digest = hex::encode(Sha256::digest(body.to_string().as_bytes()));
-    body["digest"] = serde_json::json!(digest);
-    body
+    };
+    let body = |texts: bool| {
+        serde_json::json!({
+            "zone": r.zones.first().map(|z| z.zone.clone()), "provider": r.provider,
+            "zones": r.zones.iter().map(|z| zone(z, texts)).collect::<Vec<_>>(), "stranded": r.stranded, "waiting": r.waiting,
+            "applied": r.applied,
+            "error": r.zones.first().and_then(|z| if texts { z.error.clone() } else { z.error_kind.clone() }),
+        })
+    };
+    // The digest counts each failure's kind, not the provider's words (S4).
+    let digest = hex::encode(Sha256::digest(body(false).to_string().as_bytes()));
+    let mut out = body(true);
+    out["digest"] = serde_json::json!(digest);
+    out
 }
 
 #[cfg(test)]
@@ -521,6 +585,30 @@ mod tests {
 
     fn kinds(l: &Ledger, kind: &str) -> usize {
         l.audit_of_kind(kind).unwrap().len()
+    }
+
+    /// A second live public name, `label`, held by another running run on n1.
+    fn second_name(l: &Ledger, label: &str) -> String {
+        let t = TenantId::single();
+        let run = RunId(format!("run_{label}"));
+        l.run_started(&t, &run, "web", label).unwrap();
+        l.set_run_node(&run.0, "n1").unwrap();
+        let principal = format!("spiffe://t.wicket.test/t/t0/z/web/a/{label}");
+        let ask = NameAsk {
+            tenant: &t,
+            run: &run,
+            zone: "web",
+            zone_digest: "zd",
+            principal: &principal,
+            label,
+            port: 3000,
+            service: None,
+            reason: "another",
+            scope: NameScope::Run,
+        };
+        let (id, _) = l.ask_public(&ask).unwrap();
+        approve(l, &id, &NameTerms { bound: StandingBound::Agent, ttl_secs: None });
+        id
     }
 
     #[test]
@@ -630,8 +718,9 @@ mod tests {
     struct Failing(Vec<Record>);
 
     impl DnsProvider for Failing {
+        /// The memory provider's account, down: its records are this one's.
         fn id(&self) -> &str {
-            "failing"
+            "memory"
         }
         fn caps(&self) -> wicket_names::Caps {
             wicket_names::Caps { types: vec![RecordType::A, RecordType::Aaaa, RecordType::Srv, RecordType::Txt], min_ttl: 1, atomic: true }
@@ -852,11 +941,17 @@ mod tests {
 
     /// A provider serving several zones, whose apply isn't atomic: it can be made to stop after a
     /// number of changes, and to take only some record types.
-    #[derive(Default)]
     struct Multi {
+        id: &'static str,
         zones: std::sync::Mutex<BTreeMap<String, Vec<Record>>>,
         stop_after: std::sync::Mutex<Option<usize>>,
         types: Vec<RecordType>,
+    }
+
+    impl Default for Multi {
+        fn default() -> Self {
+            Multi { id: "multi", zones: Default::default(), stop_after: Default::default(), types: vec![] }
+        }
     }
 
     impl Multi {
@@ -867,7 +962,7 @@ mod tests {
 
     impl DnsProvider for Multi {
         fn id(&self) -> &str {
-            "multi"
+            self.id
         }
         fn caps(&self) -> wicket_names::Caps {
             let types = match self.types.is_empty() {
@@ -939,28 +1034,86 @@ mod tests {
     async fn records_missing_from_the_zone_are_forgotten_after_the_guard() {
         let (l, _run, id) = ledger();
         let port = l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
+        second_name(&l, "shop");
         let p = Multi::default();
         pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
-        // Deleted by hand: within the guard, nothing is forgotten (a listing may lag).
-        p.zones.lock().unwrap().clear();
+        assert_eq!(p.records(BOXES).len(), 5);
+        // demo's records deleted by hand; shop's still there. The first listing without them notes
+        // it, and forgets nothing (#778 review, R1: one listing is not enough).
+        p.zones.lock().unwrap().get_mut(BOXES).unwrap().retain(|r| r.base() != "demo.boxes.example.com");
         crate::names::revoke(&l, "op", &id).unwrap();
-        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let t0 = wicket_store::now();
+        let r = pass(&l, &public(), &p, t0, false).await.unwrap();
         assert!(r.zones[0].forgotten.is_empty());
         assert!(r.freed.is_empty(), "the ledger still lists its records");
-        let r = pass(&l, &public(), &p, wicket_store::now() + FORGET_AFTER_SECS + 60, false).await.unwrap();
+        // Still within the guard: nothing yet.
+        let r = pass(&l, &public(), &p, t0 + FORGET_AFTER_SECS - 60, false).await.unwrap();
+        assert!(r.zones[0].forgotten.is_empty());
+        // Missing across listings spanning the guard: forgotten, audited, its port freed.
+        let r = pass(&l, &public(), &p, t0 + FORGET_AFTER_SECS + 60, false).await.unwrap();
         assert_eq!(r.zones[0].forgotten.len(), 3, "owner, A and SRV");
         assert_eq!(l.audit_of_kind("name.record").unwrap().iter().filter(|a| a.body.contains("\"forgotten\"")).count(), 3);
-        assert!(l.owned_records(&Zone::new(BOXES)).unwrap().is_empty());
+        assert_eq!(l.owned_records(&Zone::new(BOXES)).unwrap().len(), 2, "shop's stay");
         assert_eq!(r.freed, vec![("n1".to_string(), port)]);
     }
 
-    /// #748, F8: a plan the provider can't take is refused whole, recording nothing as created.
+    /// #778 review, R1: a record seen again before the guard ran out isn't forgotten later.
     #[tokio::test]
-    async fn a_plan_the_provider_cant_take_is_refused_whole() {
+    async fn a_record_seen_again_is_not_forgotten() {
+        let (l, _run, _) = ledger();
+        second_name(&l, "shop");
+        let p = Multi::default();
+        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let demo: Vec<Record> = p.records(BOXES).into_iter().filter(|r| r.base() == "demo.boxes.example.com").collect();
+        p.zones.lock().unwrap().get_mut(BOXES).unwrap().retain(|r| r.base() != "demo.boxes.example.com");
+        let t0 = wicket_store::now();
+        // Missing once (an eventually consistent read, or deleted by hand and put back).
+        let r = pass(&l, &public(), &p, t0, false).await.unwrap();
+        assert!(r.zones[0].forgotten.is_empty());
+        // The pass made them again (the zone lacked them); a later pass past the guard forgets none.
+        assert!(demo.iter().all(|d| p.records(BOXES).contains(d)), "{:?}", p.records(BOXES));
+        let r = pass(&l, &public(), &p, t0 + FORGET_AFTER_SECS + 60, false).await.unwrap();
+        assert!(r.zones[0].forgotten.is_empty(), "{:?}", r.zones[0].forgotten);
+    }
+
+    /// #778 review, R1: a listing with none of the provider's records forgets none, and says so.
+    #[tokio::test]
+    async fn a_listing_without_any_of_ours_forgets_nothing() {
+        let (l, _run, _) = ledger();
+        let p = Multi::default();
+        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        p.zones.lock().unwrap().clear();
+        let r = pass(&l, &public(), &p, wicket_store::now() + FORGET_AFTER_SECS + 60, false).await.unwrap();
+        assert!(r.zones[0].forgotten.is_empty());
+        assert!(r.errors().any(|(_, e)| e.contains("has none of the 2 record(s)")), "{:?}", r.zones);
+        assert_eq!(l.owned_records(&Zone::new(BOXES)).unwrap().len(), 2, "none forgotten");
+    }
+
+    /// #778 review, R2: a writing provider never takes over another's rows, and its plan, its
+    /// forgetting and what it replaces count only its own.
+    #[tokio::test]
+    async fn two_writing_providers_keep_their_own_records() {
+        let (l, _run, _) = ledger();
+        let a = Multi::default();
+        pass(&l, &public(), &a, wicket_store::now(), false).await.unwrap();
+        let b = Multi { id: "multi-b", ..Multi::default() };
+        let r = pass(&l, &public(), &b, wicket_store::now() + FORGET_AFTER_SECS + 60, false).await.unwrap();
+        assert!(r.errors().any(|(_, e)| e.contains("another provider's record")), "{:?}", r.zones);
+        let zone = Zone::new(BOXES);
+        assert_eq!(l.owned_records_by(&zone, "multi").unwrap().len(), 2, "a's rows are a's");
+        assert!(l.owned_records_by(&zone, "multi-b").unwrap().is_empty());
+        assert!(r.stranded.iter().any(|s| s.provider == "multi" && s.records == 2), "{:?}", r.stranded);
+    }
+
+    /// #748, F8 and #778 review, S4: a name the provider can't take a record of waits on its own,
+    /// recording nothing as created.
+    #[tokio::test]
+    async fn a_name_the_provider_cant_take_waits() {
         let (l, _run, _) = ledger();
         let p = Multi { types: vec![RecordType::A], ..Multi::default() };
         let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
-        assert!(r.errors().next().is_some_and(|(_, e)| e.contains("can't take")), "{:?}", r.zones);
+        assert!(r.waiting.iter().any(|w| w.why.contains("can't take its records")), "{:?}", r.waiting);
+        assert!(r.plan.is_empty());
         assert!(p.records(BOXES).is_empty());
         assert!(l.owned_records(&Zone::new(BOXES)).unwrap().is_empty());
         assert_eq!(kinds(&l, "name.record"), 0);

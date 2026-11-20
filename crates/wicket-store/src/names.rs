@@ -66,19 +66,29 @@ CREATE TABLE IF NOT EXISTS name_exposures (
 );
 CREATE TABLE IF NOT EXISTS name_records (
   zone TEXT NOT NULL, name TEXT NOT NULL, rtype TEXT NOT NULL, value TEXT NOT NULL, ttl INTEGER NOT NULL,
-  provider TEXT NOT NULL, created_at INTEGER NOT NULL,
+  provider TEXT NOT NULL, created_at INTEGER NOT NULL, missing_since INTEGER,
   PRIMARY KEY (zone, name, rtype, value)
 );
 "#;
 
 /// Schema 34 (expand, #716 review, F3): `names.domain`, the boxes domain a public name was
 /// approved under, added to a ledger made before. Older builds don't read it.
+/// Schema 43 (expand, #778 review, R1): `name_records.missing_since`, when a listing of its zone
+/// first lacked the record.
 /// Several processes may open an old ledger at once (after an update, the console and the
-/// re-attaching supervisors): the check and the change are one write, checked again under its lock,
+/// re-attaching supervisors): each check and change is one write, checked again under its lock,
 /// so the second sees the column the first added (#716 review).
 pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
+    for (table, column, ty) in [("names", "domain", "TEXT"), ("name_records", "missing_since", "INTEGER")] {
+        add_column(conn, table, column, ty)?;
+    }
+    Ok(())
+}
+
+fn add_column(conn: &rusqlite::Connection, table: &str, column: &str, ty: &str) -> Result<()> {
     let has = |c: &rusqlite::Connection| -> Result<bool> {
-        let n: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('names') WHERE name = 'domain'", [], |r| r.get(0))?;
+        let n: i64 =
+            c.query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?1"), params![column], |r| r.get(0))?;
         Ok(n > 0)
     };
     if has(conn)? {
@@ -87,7 +97,7 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let r = has(conn).and_then(|h| match h {
         true => Ok(()),
-        false => conn.execute_batch("ALTER TABLE names ADD COLUMN domain TEXT").map_err(Into::into),
+        false => conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}")).map_err(Into::into),
     });
     match r {
         Ok(()) => conn.execute_batch("COMMIT")?,
@@ -306,6 +316,15 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NameRow> {
         end_reason: r.get(22)?,
         domain: r.get(23)?,
     })
+}
+
+/// What [`Ledger::forget_unlisted`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Forgot {
+    pub forgotten: Vec<Record>,
+    /// The listing lacked every one of the provider's records in the zone (this many): nothing was
+    /// forgotten, or noted.
+    pub all_missing: usize,
 }
 
 fn is_unique_violation(e: &rusqlite::Error) -> bool {
@@ -609,6 +628,14 @@ impl Ledger {
 
     /// Revokes a live name: it ends now, whoever holds it.
     pub fn revoke_name(&self, id: &str, by: &str) -> Result<NameRow> {
+        // Its end, its ports, its exposure and its links in one write (#778 review, S3), as a lapse.
+        if self.conn.is_autocommit() {
+            return self.immediate(|l| l.revoke_name_in(id, by));
+        }
+        self.revoke_name_in(id, by)
+    }
+
+    fn revoke_name_in(&self, id: &str, by: &str) -> Result<NameRow> {
         let before = self.name(id)?;
         if !self.end_live_name(&before, now(), by, "revoked")? {
             return Err(StoreError::NotPending(id.into(), self.name(id)?.status));
@@ -971,6 +998,20 @@ impl Ledger {
             .collect())
     }
 
+    /// The records `provider` created in `zone` for this installation: the plan's ledger half for
+    /// that provider (#778 review, R2: another provider's rows are never its to change).
+    pub fn owned_records_by(&self, zone: &Zone, provider: &str) -> Result<Vec<Record>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT name, rtype, value, ttl FROM name_records WHERE zone = ?1 AND provider = ?2 ORDER BY name, rtype, value")?;
+        let rows = st
+            .query_map(params![zone.apex(), provider], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, u32>(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter_map(|(name, t, value, ttl)| Some(Record { name, rtype: rtype(&t)?, value, ttl })).collect())
+    }
+
     /// [`Ledger::owned_records`] as [`Owned`].
     pub fn owned(&self, zone: &Zone) -> Result<Owned> {
         Ok(Owned::new(&self.owned_records(zone)?))
@@ -985,11 +1026,22 @@ impl Ledger {
         let t = now();
         for c in &plan.changes {
             if let Change::Create(r) | Change::Update { to: r, .. } = c {
-                self.conn.execute(
-                    "INSERT INTO name_records (zone, name, rtype, value, ttl, provider, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT (zone, name, rtype, value) DO UPDATE SET ttl = ?5, provider = ?6, created_at = ?7",
+                // Never over another provider's row (#778 review, R2): it is that provider's record.
+                let n = self.conn.execute(
+                    "INSERT INTO name_records (zone, name, rtype, value, ttl, provider, created_at, missing_since) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                     ON CONFLICT (zone, name, rtype, value) DO UPDATE SET ttl = ?5, created_at = ?7, missing_since = NULL
+                     WHERE name_records.provider = ?6",
                     params![zone.apex(), r.name, r.rtype.to_string(), r.value, r.ttl, provider, t],
                 )?;
+                if n == 0 {
+                    return Err(StoreError::Refused(format!(
+                        "{} {} {:?} in {} is another provider's record: {provider} doesn't write it",
+                        r.name,
+                        r.rtype,
+                        r.value,
+                        zone.apex()
+                    )));
+                }
             }
         }
         if let Some(own) = own {
@@ -998,34 +1050,65 @@ impl Ledger {
         Ok(())
     }
 
-    /// Forgets the records of `zone` that `provider` created before `before` (Unix s) and that its
-    /// listing `listed` doesn't have (#748, F4): gone from the zone (deleted by hand, or never made
-    /// by a crash before the apply), so they hold no name's port. Only for a zone the provider
-    /// listed in full, and never one another provider made: its listing doesn't say. The ones
-    /// forgotten.
-    pub fn forget_unlisted(&self, zone: &Zone, provider: &str, listed: &[Record], before: i64) -> Result<Vec<Record>> {
+    /// Forgets the records of `zone` that `provider` created and that its listings have lacked for
+    /// `after_secs` or more (#748, F4; #778 review, R1): the first listing that lacks one notes
+    /// when, a later one at least `after_secs` after that forgets it, and one that has it again
+    /// clears the note. Gone from the zone (deleted by hand, or never made by a crash before the
+    /// apply), they hold no name's port. Never another provider's rows: its listing doesn't say. A
+    /// listing that lacks every record `provider` has in the zone forgets nothing ([`Forgot::all_missing`]):
+    /// more likely a bad listing than a zone emptied by hand. Inside a caller's transaction.
+    pub fn forget_unlisted(&self, zone: &Zone, provider: &str, listed: &[Record], at: i64, after_secs: i64) -> Result<Forgot> {
         let have: std::collections::BTreeSet<_> = listed.iter().map(|r| r.normalized().key()).collect();
         let mut st = self.conn.prepare(
-            "SELECT name, rtype, value, ttl FROM name_records WHERE zone = ?1 AND provider = ?2 AND created_at < ?3 ORDER BY name, rtype, value",
+            "SELECT name, rtype, value, ttl, missing_since FROM name_records WHERE zone = ?1 AND provider = ?2 ORDER BY name, rtype, value",
         )?;
         let rows = st
-            .query_map(params![zone.apex(), provider, before], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, u32>(3)?))
+            .query_map(params![zone.apex(), provider], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, u32>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut gone = vec![];
-        for (name, t, value, ttl) in rows {
-            let Some(rtype) = rtype(&t) else { continue };
-            let r = Record { name, rtype, value, ttl };
-            if !have.contains(&r.key()) {
-                self.conn.execute(
-                    "DELETE FROM name_records WHERE zone = ?1 AND name = ?2 AND rtype = ?3 AND value = ?4",
-                    params![zone.apex(), r.name, t, r.value],
-                )?;
-                gone.push(r);
+        let rows: Vec<(Record, String, Option<i64>)> = rows
+            .into_iter()
+            .filter_map(|(name, t, value, ttl, since)| Some((Record { name, rtype: rtype(&t)?, value, ttl }, t, since)))
+            .collect();
+        let missing = rows.iter().filter(|(r, _, _)| !have.contains(&r.normalized().key())).count();
+        let mut out = Forgot::default();
+        if !rows.is_empty() && missing == rows.len() {
+            out.all_missing = rows.len();
+            return Ok(out);
+        }
+        for (r, t, since) in rows {
+            let at_key = params![zone.apex(), r.name, t, r.value];
+            if have.contains(&r.normalized().key()) {
+                if since.is_some() {
+                    self.conn.execute(
+                        "UPDATE name_records SET missing_since = NULL WHERE zone = ?1 AND name = ?2 AND rtype = ?3 AND value = ?4",
+                        at_key,
+                    )?;
+                }
+                continue;
+            }
+            match since {
+                None => {
+                    self.conn.execute(
+                        "UPDATE name_records SET missing_since = ?5 WHERE zone = ?1 AND name = ?2 AND rtype = ?3 AND value = ?4",
+                        params![zone.apex(), r.name, t, r.value, at],
+                    )?;
+                }
+                Some(s) if at - s >= after_secs => {
+                    self.conn.execute("DELETE FROM name_records WHERE zone = ?1 AND name = ?2 AND rtype = ?3 AND value = ?4", at_key)?;
+                    out.forgotten.push(r);
+                }
+                Some(_) => {}
             }
         }
-        Ok(gone)
+        Ok(out)
     }
 
     /// The zones this installation has records in, each with the provider that made them and how
@@ -1039,7 +1122,7 @@ impl Ledger {
 
     /// Forgets the records a plan deleted or replaced, once it was applied (a value it also wrote
     /// stays).
-    pub fn owned_after_apply(&self, zone: &Zone, plan: &Plan) -> Result<()> {
+    pub fn owned_after_apply(&self, zone: &Zone, provider: &str, plan: &Plan) -> Result<()> {
         let written: std::collections::BTreeSet<_> = plan
             .changes
             .iter()
@@ -1053,8 +1136,8 @@ impl Ledger {
             if let Change::Delete(r) | Change::Update { from: r, .. } = c {
                 if !written.contains(&r.key()) {
                     self.conn.execute(
-                        "DELETE FROM name_records WHERE zone = ?1 AND name = ?2 AND rtype = ?3 AND value = ?4",
-                        params![zone.apex(), r.name, r.rtype.to_string(), r.value],
+                        "DELETE FROM name_records WHERE zone = ?1 AND name = ?2 AND rtype = ?3 AND value = ?4 AND provider = ?5",
+                        params![zone.apex(), r.name, r.rtype.to_string(), r.value, provider],
                     )?;
                 }
             }
@@ -1523,7 +1606,7 @@ mod tests {
             let p = plan(&zone, &owner, &desired, &dns.list(&zone).await.unwrap(), &l.owned(&zone).unwrap()).unwrap();
             l.owned_before_apply(&zone, "memory", &p).unwrap();
             dns.apply(&zone, &p).await.unwrap();
-            l.owned_after_apply(&zone, &p).unwrap();
+            l.owned_after_apply(&zone, "memory", &p).unwrap();
             let again = plan(&zone, &owner, &desired, &dns.list(&zone).await.unwrap(), &l.owned(&zone).unwrap()).unwrap();
             assert!(again.is_empty(), "{again:?}");
             assert!(dns.records().contains(&theirs));

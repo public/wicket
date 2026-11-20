@@ -62,7 +62,9 @@ pub enum ProviderError {
 
 /// A DNS provider: one implementation per DNS service (Vultr, RFC 2136, …).
 pub trait DnsProvider: Send + Sync {
-    /// Its name in the config (`names.public.provider`).
+    /// Its name, as the ledger records which provider made a record: the kind of provider and the
+    /// account or credential it writes with (`vultr:<account>`), so two accounts of one service
+    /// are two providers (#778 review, R1).
     fn id(&self) -> &str;
     fn caps(&self) -> Caps;
     /// Whether `apply` changes the zone. False for a provider that only reports (the no-op one):
@@ -71,7 +73,9 @@ pub trait DnsProvider: Send + Sync {
     fn writes(&self) -> bool {
         true
     }
-    /// Every record in the zone.
+    /// Every record in the zone. `Ok` means the whole zone (every page of it, as of one read): the
+    /// reconciler forgets records an `Ok` listing lacks. A zone the provider doesn't serve, or a
+    /// listing it couldn't finish, is an `Err`.
     fn list(&self, zone: &Zone) -> impl Future<Output = Result<Vec<Record>, ProviderError>> + Send;
     /// Applies a plan wicket computed, in its order.
     fn apply(&self, zone: &Zone, plan: &Plan) -> impl Future<Output = Result<Applied, ProviderError>> + Send;

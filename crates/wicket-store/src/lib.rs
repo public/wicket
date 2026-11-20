@@ -27,7 +27,7 @@ mod lifecycle_props;
 mod links;
 mod names;
 mod services;
-pub use names::{name_effect, new_name_id, NameAsk, NameKind, NameRow, NameScope, NameTerms, MAX_PENDING_NAMES};
+pub use names::{name_effect, new_name_id, Forgot as ForgotRecords, NameAsk, NameKind, NameRow, NameScope, NameTerms, MAX_PENDING_NAMES};
 pub use services::{Instance, ServiceRow, SHARED_TENANT};
 mod nodeca;
 mod nodelabels;
@@ -225,7 +225,10 @@ impl StoreError {
 /// (#715 review): what the agent claimed when it asked (an update's reason and commit), kept apart
 /// from the request's reason so the console can show the agent's words as the agent's. Older builds
 /// don't read it; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 36;
+/// Version 43 (expand, #748; 37 to 42 are #752's and others' in flight) adds `name_records.missing_since`:
+/// when a listing of its zone first lacked the record, so one listing alone forgets none. Older
+/// builds don't read it; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 43;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
