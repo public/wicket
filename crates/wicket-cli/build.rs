@@ -150,7 +150,7 @@ fn minify(src: &str, path: &Path, module: bool) -> String {
     let alloc = Allocator::default();
     let parsed = Parser::new(&alloc, src, if module { SourceType::mjs() } else { SourceType::script() }).parse();
     if !parsed.diagnostics.is_empty() {
-        panic!("{}: {:?}", path.display(), parsed.diagnostics);
+        panic!("{}", report(path, src, &parsed.diagnostics));
     }
     let mut program = parsed.program;
     let opts = MinifierOptions {
@@ -161,4 +161,19 @@ fn minify(src: &str, path: &Path, module: bool) -> String {
     };
     let min = Minifier::new(opts).minify(&alloc, &mut program);
     Codegen::new().with_options(CodegenOptions::minify()).with_scoping(min.scoping).build(&program).code
+}
+
+/// A parse error as `file:line:column: message`, with the line itself, one per error: the console's
+/// script doesn't parse, so the page wouldn't run, and the build stops saying where.
+fn report(path: &Path, src: &str, diags: &[oxc_diagnostics::OxcDiagnostic]) -> String {
+    let mut out = format!("the console's JavaScript doesn't parse ({} error(s)):", diags.len());
+    for d in diags {
+        let at = (d.labels.first().map_or(0, |l| l.offset() as usize)).min(src.len());
+        let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+        let line_no = src[..at].matches('\n').count() + 1;
+        let col = src[line_start..at].chars().count() + 1;
+        let text = src[line_start..].lines().next().unwrap_or("");
+        out.push_str(&format!("\n  {}:{line_no}:{col}: {}\n    {}", path.display(), d.message, text.trim_end()));
+    }
+    out
 }
