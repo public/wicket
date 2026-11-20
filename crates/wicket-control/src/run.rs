@@ -529,10 +529,45 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // starts it by its id.
     let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
     let image_name = image.to_string();
+    // The signature that verified the image, if the trust policy asked for one (#191).
+    let mut signed: Option<wicket_chan::signature::Verified> = None;
     if record.is_none() && wake.is_none() {
         // The operator's policy first (`images.yaml`'s `require_digests`): a tag is refused before
         // anything is asked of a grant.
-        crate::images_policy::require_pinned(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
+        let default_image = crate::image::effective(crate::image::DEFAULT);
+        crate::images_policy::require_pinned(&m, image, &default_image)?;
+        // Then the signatures the policy's `trust` asks for (#191), checked here before the box
+        // starts: its image's, and those of its zone's `images`, which a node may start children
+        // from itself (#164). The installation's own image is exempt, as from `require_digests`.
+        let policy = crate::images_policy::load()?;
+        if !policy.trust.is_empty() {
+            let mut checked = std::collections::BTreeSet::new();
+            for img in std::iter::once(image).chain(m.zone.images.iter().map(String::as_str)) {
+                if img == default_image || !checked.insert(img) {
+                    continue;
+                }
+                let pin = wicket_core::image::parse(img).map_err(anyhow::Error::msg)?.pin;
+                let r = crate::imagetrust::check(&policy, img, pin.as_deref(), &m.zone.name, |name, hosts| {
+                    for h in hosts {
+                        vault.get_for(name, h)?;
+                    }
+                    vault.get(name)
+                })
+                .await;
+                let body = match &r {
+                    Ok(v) => serde_json::json!({ "image": img, "digest": pin, "zone": m.zone.name, "verified": v }),
+                    Err(e) => serde_json::json!({ "image": img, "digest": pin, "zone": m.zone.name, "refused": format!("{e:#}") }),
+                };
+                Ledger::open(&ledger_path())?.audit(&m.tenant, None, "image.signature", &body)?;
+                let v = r?;
+                if let Some(v) = &v {
+                    say!("[wicket] image {img} signed by key {} ({} {})", v.key, v.scheme, v.signature);
+                }
+                if img == image {
+                    signed = v;
+                }
+            }
+        }
         // The one "may this digest run" check (#258): a pinned image is accepted by a grant on its
         // digest, which the operator running the manifest records. A child's image is pinned to
         // its parent's, as its parent's zone allows (decided where it is spawned): not regranted.
@@ -1478,7 +1513,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     &m.tenant,
                     Some(&run),
                     "run.image",
-                    &serde_json::json!({ "image": image_name, "digest": d, "pinned": image_pin }),
+                    &serde_json::json!({ "image": image_name, "digest": d, "pinned": image_pin, "signature": signed }),
                 )?;
                 say!("  image {image_name} started as {d}");
             }
