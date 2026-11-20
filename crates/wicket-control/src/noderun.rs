@@ -2569,12 +2569,21 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         false => Ok(vec![]),
     };
     let (node, run) = (sh.node.clone(), sh.run.0.clone());
+    let before = p.standing.clone();
     let (more, changed) =
         sync_standing(&mut p.standing, &mut p.live, &mut p.waiting, rules, p.proto, top_level, now_s, &issuer, &loads, &mut |m| {
             say!("[wicket] {run} on node {node}: {m}")
         });
     changes.extend(more);
     rebuild |= changed;
+    // Where each rule is on its way to the node (#572), for `await_grant` on it: the ones put in
+    // (or renewed) are handed now and published with this delta; the ones taken out are gone.
+    let (handed_rules, gone_rules) = standing_moves(&before, &p.standing);
+    {
+        let l = sh.ledger.lock().expect("ledger");
+        let _ = l.standing_withdrawn(&sh.run.0, &gone_rules);
+        let _ = l.standing_handed(&sh.run.0, &sh.node, &handed_rules);
+    }
     if !rebuild {
         return vec![];
     }
@@ -2611,7 +2620,12 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         r.map(|f| (f, p.epoch()))
     };
     if let Ok((_, epoch)) = &committed {
-        let _ = sh.ledger.lock().expect("ledger").grants_published(&handed, *epoch as i64);
+        let l = sh.ledger.lock().expect("ledger");
+        let _ = l.grants_published(&handed, *epoch as i64);
+        if token_out {
+            let _ = l.standing_published(&sh.run.0, &handed_rules, *epoch as i64);
+        }
+        drop(l);
         if let Some((i, until)) = renewing.filter(|_| token_out) {
             renewed(sh, i, until);
         }
@@ -2830,6 +2844,19 @@ fn sync_standing(
     (changes, rebuild)
 }
 
+/// The standing rules a sync put into a run's token or changed (renewed), and the ones it took
+/// out: from the published rules (id → end) before and after it.
+fn standing_moves(
+    before: &std::collections::HashMap<String, u64>,
+    after: &std::collections::HashMap<String, u64>,
+) -> (Vec<String>, Vec<String>) {
+    let mut handed: Vec<String> = after.iter().filter(|(id, end)| before.get(*id) != Some(end)).map(|(id, _)| id.clone()).collect();
+    let mut gone: Vec<String> = before.keys().filter(|id| !after.contains_key(*id)).cloned().collect();
+    handed.sort();
+    gone.sort();
+    (handed, gone)
+}
+
 /// The installation CA, for renewing nodes' CAs over their channels (#416, wicket-node's
 /// `controlca`), if this control host has one (never created here).
 fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
@@ -2841,6 +2868,15 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #572: what a sync put into a run's token or renewed, and what it took out.
+    #[test]
+    fn standing_moves_are_what_a_sync_changed() {
+        let m = |v: &[(&str, u64)]| v.iter().map(|(k, e)| (k.to_string(), *e)).collect::<std::collections::HashMap<_, _>>();
+        let (handed, gone) = super::standing_moves(&m(&[("s-a", 1), ("s-b", 1), ("s-c", 1)]), &m(&[("s-a", 1), ("s-b", 2), ("s-d", 1)]));
+        assert_eq!(handed, vec!["s-b".to_string(), "s-d".to_string()]);
+        assert_eq!(gone, vec!["s-c".to_string()]);
+    }
 
     /// A failed renewal keeps the publisher only on a valid certificate of the version on disk.
     #[test]

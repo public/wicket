@@ -596,6 +596,7 @@ impl Gateway {
     async fn await_standing(&self, id: &str, timeout: Duration) -> (String, bool) {
         let start = Instant::now();
         let _waiting = Waiting::start(&self.ctx);
+        let mut granted_at: Option<Instant> = None;
         loop {
             let (s, me) = {
                 let l = self.ctx.ledger.lock().expect("ledger");
@@ -621,6 +622,24 @@ impl Gateway {
                         format!("approved, not for this run: standing reach {id} was approved, for a zone definition this run's zone no longer has (its reach or forbids changed since). Ask again from this run if you still need it."),
                         false,
                     )
+                }
+                // The box's retry must find the rule on its node, as for a grant (`await_grant`):
+                // answer once the node has it (at most 15 s), or, if the run's process hasn't
+                // handed it over, after a few of its ticks (it may never: an older node, no room
+                // in the token).
+                "approved"
+                    if s.live(now) && {
+                        let since = granted_at.get_or_insert_with(Instant::now).elapsed();
+                        let at = self.ctx.ledger.lock().expect("ledger").standing_on_node(&self.ctx.run.0, id);
+                        match at {
+                            Ok(wicket_store::StandingOnNode::InFlight) => since < Duration::from_secs(15),
+                            Ok(wicket_store::StandingOnNode::NotHanded) => since < HAND_OFF,
+                            _ => false,
+                        }
+                    } =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
                 "approved" if s.live(now) => {
                     let until = s
@@ -1511,6 +1530,48 @@ mod tests {
         assert!(!err && text.starts_with("granted"), "{text}");
         assert!((HAND_OFF..Duration::from_secs(5)).contains(&t.elapsed()), "{:?}", t.elapsed());
         assert!(text.contains("for one use") && text.contains("Retry the same request now"), "{text}");
+    }
+
+    /// #572: `await_grant` on a standing ask answers "granted" once the run's node has the rule, not
+    /// as soon as a human approved it: the box's next request must find it there (the attack
+    /// matrix's `standing-below` met a node a feed epoch behind). Never handed over: after the
+    /// hand-off wait.
+    #[tokio::test]
+    async fn await_grant_on_a_standing_ask_answers_once_the_node_has_the_rule() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let gw = Gateway { ctx: w.agent("t0", "z", "worker", "run_s", None, &[]) };
+        let approved = |host: &str| {
+            let l = w.ledger.lock().unwrap();
+            let me = l.identity("run_s").unwrap().unwrap().spiffe_id;
+            let rule: wicket_core::manifest::ReachRule = wicket_core::yaml::from_str(&format!("{{ host: {host} }}")).unwrap();
+            let digest = wicket_store::zone_digest(gw.ctx.zone.spec());
+            let (id, _) = l.ask_standing(&TenantId("t0".into()), &RunId("run_s".into()), "z", &digest, &me, &rule, "x").unwrap();
+            let terms = wicket_store::StandingTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: Some(3600) };
+            l.approve_standing(&id, &rule, &terms, "ann", None).unwrap();
+            id
+        };
+        // Handed over after 400 ms and published; the node has it 400 ms later.
+        let id = approved("ci.example");
+        let (ledger, rule) = (w.ledger.clone(), id.clone());
+        let handing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            ledger.lock().unwrap().standing_handed("run_s", "n1", std::slice::from_ref(&rule)).unwrap();
+            ledger.lock().unwrap().standing_published("run_s", std::slice::from_ref(&rule), 3).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            ledger.lock().unwrap().node_feed_at("n1", 3).unwrap();
+        });
+        let t = Instant::now();
+        let (text, err) = gw.await_grant(&json!({ "request_id": id, "timeout_seconds": 10 })).await;
+        let took = t.elapsed();
+        handing.join().unwrap();
+        assert!(!err && text.starts_with("granted: standing reach"), "{text}");
+        assert!(took >= Duration::from_millis(800), "answered after {took:?}, before the node had the rule");
+        // Never handed over: answered after the hand-off wait.
+        let id = approved("other.example");
+        let t = Instant::now();
+        let (text, err) = gw.await_grant(&json!({ "request_id": id, "timeout_seconds": 10 })).await;
+        assert!(!err && text.starts_with("granted: standing reach"), "{text}");
+        assert!((HAND_OFF..Duration::from_secs(5)).contains(&t.elapsed()), "{:?}", t.elapsed());
     }
 
     /// `await_grant`'s answer names the grant's terms (a one-use grant isn't for probing) and says
