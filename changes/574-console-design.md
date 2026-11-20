@@ -21,10 +21,11 @@ type: Changed
 - An agent's words are never shown as wicket's (#715 review). An update request's reason and commit,
   and a capacity request's reason and region, are the agent's claims, quoted and labelled as the
   agent's; "wicket says" is kept for text wicket wrote. The ledger keeps an update's claims apart
-  (`request_claims`, schema 33, an expand step: older builds ignore it).
+  (`request_claims`, schema 36, an expand step: older builds ignore it).
 - A Stop form opened for one agent can't stop another: leaving the page or opening another agent
   closes it, a submit for another run is refused, and the question names the agent and its run.
 - An agent's permissions show all that a grant reaches: a prefix grant "and every path under it", a
   standing grant's methods, paths and whether it allows requests that can't be undone. Who allowed it
-  is named (an operator, a parent agent or a capacity grant), never "you"; so is who decided in Activity.
+  is named (an operator, a parent agent or a capacity grant), never "you"; so is who decided in Activity,
+  and a stopped agent's row says "stopped" (its page says who stopped it).
 - An "Always allowed" rule that allows requests that can't be undone says so on its row.

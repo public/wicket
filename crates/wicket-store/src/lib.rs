@@ -203,10 +203,11 @@ pub enum StoreError {
 /// starts once retention has pruned its front, which target each sink's cursor is for, and the
 /// checkpoints retention asked the exporter to sign. Older builds don't read them; a prune raises
 /// the floor to 32, so a build that would walk a pruned chain from seq 1 refuses the ledger.
-/// Version 33 (expand, after 32) adds `request_claims` (#715 review): what the agent claimed when it
-/// asked (an update's reason and commit), kept apart from the request's reason so the console can
-/// show the agent's words as the agent's. Older builds don't read it; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 33;
+/// Version 36 (expand, after 35; 33 to 35 are #637's, #716's and #714's) adds `request_claims`
+/// (#715 review): what the agent claimed when it asked (an update's reason and commit), kept apart
+/// from the request's reason so the console can show the agent's words as the agent's. Older builds
+/// don't read it; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 36;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
