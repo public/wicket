@@ -24,6 +24,7 @@ members = [
     "crates/wicket-policy-diff",
     "crates/wicket-sim",
     "crates/wicket-names",
+    "crates/wicket-sources",
 ]
 
 [workspace.package]
@@ -93,6 +94,7 @@ wicket-placement = { path = "crates/wicket-placement" }
 wicket-fwd = { path = "crates/wicket-fwd" }
 wicket-policy = { path = "crates/wicket-policy" }
 wicket-names = { path = "crates/wicket-names" }
+wicket-sources = { path = "crates/wicket-sources" }
 
 [profile.release]
 debug = 1

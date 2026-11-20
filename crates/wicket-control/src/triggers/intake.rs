@@ -23,9 +23,9 @@ const SYNC_EVENTS: usize = 500;
 /// A node's refusals are audited at most this often (s), counted.
 pub const REFUSED_AUDIT_SECS: i64 = 3600;
 
-/// Whether `s` is a source intake serves.
+/// Whether `s` is a source intake serves: one a source adapter (`wicket_sources`) serves.
 pub fn is_hook(s: &Source) -> bool {
-    matches!(s, Source::Webhook { .. } | Source::Github { .. })
+    wicket_sources::builtin().for_source(s).is_some()
 }
 
 /// Whether node `node` is labelled for intake.
@@ -105,10 +105,7 @@ pub fn verify_name(s: &TriggerSpec) -> Option<&str> {
 }
 
 fn verify_secret(s: &TriggerSpec) -> Option<&str> {
-    match &s.source {
-        Source::Webhook { verify } | Source::Github { verify, .. } => Some(&verify.hmac_sha256),
-        _ => None,
-    }
+    wicket_sources::builtin().for_source(&s.source).map(|(_, h)| h.verify)
 }
 
 /// Refuses a hook trigger whose verify secret isn't one (`wicket secret verify`).
@@ -150,10 +147,8 @@ pub fn table(l: &Ledger, node: &str, vault: &wicket_proxy::vault::Vault) -> Resu
                 (String::new(), true)
             }
         };
-        let (kind, repo, events) = match &t.spec.source {
-            Source::Github { repo, events, .. } => ("github", Some(repo.clone()), events.clone()),
-            _ => ("webhook", None, vec![]),
-        };
+        let Some((_, hook)) = wicket_sources::builtin().for_source(&t.spec.source) else { continue };
+        let wicket_sources::Hook { kind, repo, events, .. } = hook;
         out.push(IntakeTrigger { trigger: id, kind: kind.into(), token_sha256, secret, repo, events, unavailable });
     }
     Ok((out, problems))
@@ -191,20 +186,21 @@ pub(super) fn ingest_checked(
         // Only a trigger this node serves, and only fields within what intake makes: a node is
         // trusted as far as its own triggers, no further.
         let t = match (l.trigger(&e.trigger)?, l.trigger_intake(&e.trigger)?) {
-            (Some(t), Some((n, _))) if n == node && is_hook(&t.spec.source) && t.status != "deleted" => t,
+            (Some(t), Some((n, _))) if n == node && t.status != "deleted" => t,
             _ => {
                 ack.push(e.id.clone());
                 continue;
             }
         };
-        let source = match t.spec.source {
-            Source::Github { .. } => "github",
-            _ => "webhook",
+        // A hook trigger: one whose source an adapter serves (`is_hook`).
+        let Some((adapter, hook)) = wicket_sources::builtin().for_source(&t.spec.source) else {
+            ack.push(e.id.clone());
+            continue;
         };
-        let kind_ok = match &t.spec.source {
-            Source::Github { events, .. } => events.contains(&e.kind),
-            _ => e.kind == "webhook",
-        };
+        // The source's adapter's kind (the ledger's event source), and whether the trigger listens
+        // to the event's kind.
+        let source = adapter.kind();
+        let kind_ok = adapter.listens(&hook, &e.kind);
         if !kind_ok
             || !wicket_core::intake::fields_within(&e.fields)
             || e.delivery.is_empty()

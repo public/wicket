@@ -233,6 +233,29 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
   - The pass's per-node cap and the spool's bound mean a long outage comes back as a bounded backlog,
     most of it passed over as stale.
 
+## Sources are adapters
+
+What differs between the generic webhook and GitHub is behind a source adapter, outside core
+(`wicket-sources`, [#740](https://github.com/public/wicket/issues/740); design principle 14). An
+adapter says:
+
+- what the trigger document names: the verify secret, and a repository and events if the source has
+  them;
+- how a delivery is verified: its headers, and the message its MAC covers (the generic webhook's
+  framed `v1:` message with its timestamp, GitHub's raw body);
+- its delivery id, and the event kind it is;
+- what it never fires on (GitHub: an event not listened to, a body that isn't that event's, another
+  repository), and its fields.
+
+Everything else is the same for every source, in the order §2 gives: the token before the body, the
+body's cap and its budget shares, a bad signature charged to its trigger, the deliveries seen (keyed
+on what the signature covered), what is passed over remembered before the rate, the trigger's rate,
+and the reservation given back if the hand-off fails. `wicket_core::intake` keeps only what every
+source shares: HMAC and constant-time comparison, tokens, delivery ids, the caps on fields
+(`fields_within`) and `keep_text`. A new source (GitLab, Forgejo, a tracker) is a new adapter and its
+`Source` variant in the trigger document; nothing in `wicket_core::intake` changes. A table entry of
+a kind intake has no adapter for is answered 503, as one whose secret didn't read.
+
 ## What it doesn't do yet
 
 - **Latency is the reconciler's interval.** It's about a minute. A standing link per node, which
@@ -242,7 +265,3 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
 - **Routing** (`claim_work`, `owner_of`), `start`, debounce, concurrency, the queue, retries and
   dead letters are step 5. Until then a webhook trigger may `wake` or `message`, like the others.
 - **Polling GitHub** for installations with no inbound path is step 8.
-- **GitHub's specifics live in `wicket_core::intake` (a decision).** Its headers, its event fields
-  and its repository check are in core for now, beside the generic webhook's. Putting sources
-  behind an adapter trait outside core, so GitLab or Forgejo don't touch core, is
-  [#740](https://github.com/public/wicket/issues/740).

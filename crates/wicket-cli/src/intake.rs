@@ -10,8 +10,8 @@
 //!   failing is slowed down before it costs more ([`Intake::admit`]);
 //! - the body is capped, then its signature checked, and only a verified delivery counts against
 //!   its trigger's rate ([`Intake::verify`]);
-//! - it is normalised into a capped set of fields (`wicket_core::intake`) and handed to `node
-//!   serve`, which spools it until the control host takes it.
+//! - it is normalised into a capped set of fields (its source's adapter, `wicket_sources`, within
+//!   `wicket_core::intake`'s caps) and handed to `node serve`, which spools it until the control host takes it.
 //!
 //! The answer is a status and a fixed word: never anything of the payload.
 
@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use wicket_core::intake::{self as ik, IntakeEvent, IntakeRefused, IntakeTrigger};
+use wicket_sources::{Adapters, Unfit};
 
 /// How often the table is fetched again (and refusals reported).
 pub const TABLE_EVERY: Duration = Duration::from_secs(10);
@@ -143,6 +144,8 @@ pub struct Intake {
     /// Room for bodies being read, in KiB, and what each trigger's and address's requests hold of it.
     bodies: Arc<tokio::sync::Semaphore>,
     shares: Mutex<HashMap<String, usize>>,
+    /// The sources it knows, by the table's `kind`.
+    adapters: Adapters,
 }
 
 impl Default for Intake {
@@ -159,6 +162,7 @@ impl Default for Intake {
             refused: Default::default(),
             bodies: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET_KIB)),
             shares: Default::default(),
+            adapters: Adapters::builtin(),
         }
     }
 }
@@ -180,6 +184,12 @@ fn charge(m: &mut HashMap<String, Bucket>, key: &str, at: Instant) -> bool {
 }
 
 impl Intake {
+    /// Intake that knows these sources (the built-in ones by default, as `serve` uses).
+    #[cfg(test)]
+    pub fn with_adapters(adapters: Adapters) -> Intake {
+        Intake { adapters, ..Intake::default() }
+    }
+
     /// The node's table, and whether it has had the control host's.
     pub fn set_table(&self, t: Vec<IntakeTrigger>, ready: bool) {
         let served: Vec<String> = t.iter().map(|x| x.trigger.clone()).collect();
@@ -219,8 +229,11 @@ impl Intake {
         };
         match found {
             // Served, but its secret didn't read this time: try later, and nobody's failure.
-            // (A key too short to verify with is treated so too: #714 review E.)
-            Some(t) if t.unavailable || !ik::secret_ok(&t.secret) => Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later")),
+            // (A key too short to verify with is treated so too: #714 review E; and a kind no adapter
+            // knows.)
+            Some(t) if t.unavailable || !ik::secret_ok(&t.secret) || self.adapters.by_kind(&t.kind).is_none() => {
+                Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later"))
+            }
             Some(t) => Ok(t),
             None => {
                 let key = crate::serve::limits::ip_key(ip);
@@ -283,29 +296,18 @@ impl Intake {
         m.remove(&(trigger.to_string(), format!("d:{delivery}")));
     }
 
-    /// With the body: the signature, a delivery seen before, GitHub's event, body shape and
-    /// repository (one not listened to is remembered and dropped), then the trigger's rate. A
-    /// delivery to spool has its keys reserved here, so a concurrent replay is a duplicate; `forget`
-    /// gives them back if the node refuses it. `header` gets a header by its lower-case name; `now`
-    /// is Unix s.
+    /// With the body: the signature, a delivery seen before, the source's own checks (its event,
+    /// body shape and repository, for GitHub: one not listened to is remembered and dropped), then
+    /// the trigger's rate. What differs between sources is the trigger's adapter's
+    /// (`wicket_sources`); the order and the rules are the same for each. A delivery to spool has
+    /// its keys reserved here, so a concurrent replay is a duplicate; `forget` gives them back if the
+    /// node refuses it. `header` gets a header by its lower-case name; `now` is Unix s.
     pub fn verify(&self, t: &IntakeTrigger, header: &dyn Fn(&str) -> Option<String>, body: &[u8], now: i64, at: Instant) -> Outcome {
-        let github = t.kind == "github";
-        let delivery_header = header(if github { ik::GITHUB_DELIVERY } else { ik::GENERIC_DELIVERY });
-        let timestamp = header(ik::GENERIC_TIMESTAMP);
-        let signed = if github {
-            ik::signature_ok(t.secret.as_bytes(), body, header(ik::GITHUB_SIGNATURE).as_deref())
-        } else {
-            ik::generic_check(
-                t.secret.as_bytes(),
-                timestamp.as_deref(),
-                delivery_header.as_deref(),
-                body,
-                header(ik::GENERIC_SIGNATURE).as_deref(),
-                now,
-            )
-            .is_ok()
+        // A kind no adapter knows isn't served (`admit` answers it so too).
+        let Some(adapter) = self.adapters.by_kind(&t.kind) else {
+            return Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later");
         };
-        if !signed {
+        let Some(signed) = adapter.verify(t.secret.as_bytes(), header, body, now) else {
             // Charged to the trigger, never to an address another sender shares.
             let left = charge(&mut self.bad_signatures.lock().expect("bad"), &t.trigger, at);
             let mut r = self.refused.lock().expect("refused");
@@ -314,24 +316,18 @@ impl Intake {
                 true => Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"),
                 false => Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down"),
             };
-        }
-        // A generic delivery with no id is named by its whole signed message (time included), so the
-        // same body sent again later is a new delivery (#714 review C); GitHub's by its body.
-        let signed_message = (!github).then(|| {
-            ik::generic_signed(
-                timestamp.as_deref().and_then(|t| t.trim().parse::<i64>().ok()).unwrap_or(0),
-                delivery_header.as_deref().map(str::trim).unwrap_or(""),
-                body,
-            )
-        });
-        let Some(delivery) = ik::delivery_id(delivery_header.as_deref(), signed_message.as_deref().unwrap_or(body)) else {
+        };
+        // A delivery with no id is named by what its signature covered: a generic delivery's whole
+        // signed message (time included), so the same body sent again later is a new delivery
+        // (#714 review C); GitHub's by its body.
+        let Some(delivery) = ik::delivery_id(signed.delivery.as_deref(), &signed.message) else {
             self.refused.lock().expect("refused").other += 1;
             return Outcome::Answer(StatusCode::BAD_REQUEST, "bad delivery id");
         };
-        // What the event's dedup is keyed on: GitHub's body (its id and time aren't signed), or a
-        // generic delivery's whole signed message (time, id and body), so the same body sent again
-        // as a new delivery isn't taken for a resend (#714 review F12).
-        let raw = ik::body_sha256(signed_message.as_deref().unwrap_or(body));
+        // What the event's dedup is keyed on: what the signature covered. GitHub's body (its id and
+        // time aren't signed), or a generic delivery's whole signed message (time, id and body), so
+        // the same body sent again as a new delivery isn't taken for a resend (#714 review F12).
+        let raw = ik::body_sha256(&signed.message);
         // Sent again (a replay, or a resend): 202, nothing spooled, nothing charged (#714 review F2).
         if self.reserve(&t.trigger, &raw, &delivery, at) {
             return Outcome::Answer(StatusCode::ACCEPTED, "already had it");
@@ -339,30 +335,17 @@ impl Intake {
         // What wicket will never fire on is answered 202 (so GitHub doesn't send it again) and
         // remembered, before the trigger's rate: a delivery the trigger doesn't listen to, sent once
         // or replayed, never uses it up (#714 review N1).
-        let (kind, fields) = if github {
-            let event = header(ik::GITHUB_EVENT).unwrap_or_default();
-            let v = serde_json::from_slice::<serde_json::Value>(body).ok();
-            // The event header isn't signed: the body must be that event's (#714 review B).
-            let drop = match &v {
-                None => Some("not json"),
-                Some(_) if !t.events.contains(&event) => Some("not listened to"),
-                Some(v) if !ik::github_body_is(&event, v) => Some("not that event"),
-                // GitHub's repository names ignore case.
-                Some(v) => match (ik::github_repo(v), t.repo.as_deref()) {
-                    (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => None,
-                    _ => Some("another repository"),
-                },
-            };
-            if let Some(why) = drop {
-                if why != "not listened to" {
-                    self.refused.lock().expect("refused").other += 1;
-                }
-                return Outcome::Answer(if why == "not json" { StatusCode::BAD_REQUEST } else { StatusCode::ACCEPTED }, why);
+        let (kind, fields) = match adapter.normalise(t, header, body) {
+            Ok(x) => x,
+            Err(Unfit::NotListened(why)) => return Outcome::Answer(StatusCode::ACCEPTED, why),
+            Err(Unfit::Refused(why)) => {
+                self.refused.lock().expect("refused").other += 1;
+                return Outcome::Answer(StatusCode::ACCEPTED, why);
             }
-            let v = v.expect("checked");
-            (event.clone(), ik::github_fields(&event, &v))
-        } else {
-            ("webhook".to_string(), ik::generic_fields(body))
+            Err(Unfit::Malformed(why)) => {
+                self.refused.lock().expect("refused").other += 1;
+                return Outcome::Answer(StatusCode::BAD_REQUEST, why);
+            }
         };
         // Only a verified, new delivery its trigger listens to counts against it: a leaked URL or a
         // replayed body alone can't starve it.
