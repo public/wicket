@@ -72,7 +72,7 @@ async function check(engine) {
   });
   const poll = () => page.evaluate(async () => { while (polling) await new Promise(r => setTimeout(r, 20)); await refresh(); });
   const settle = () => page.waitForTimeout(900);
-  // What a tap posted (Revoke) has arrived: waited for, up to 5 s.
+  // What a tap posted (Revoke, Sign out) has arrived: waited for, up to 5 s.
   const until = async f => { for (let i = 0; i < 100 && !f(); i++) await page.waitForTimeout(50); };
   // A tap that asks the server to sign: its begin request has arrived before what it asked is read.
   const signs = async locator => {
@@ -287,7 +287,7 @@ async function check(engine) {
     assert.strictEqual(await page.locator("#operator code").textContent(), "wicket operator enrol-link");
     assert.strictEqual(await page.locator("#operator button.copy").count(), 1);
     await page.locator("#operator button", { hasText: "Sign out" }).click();
-    await page.waitForTimeout(300);
+    await until(() => posted.some(([p]) => p === "/api/logout"));
     assert.ok(posted.some(([p]) => p === "/api/logout"));
     await page.evaluate(() => { location.hash = "#settings"; });
 
