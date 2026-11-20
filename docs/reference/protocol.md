@@ -62,10 +62,10 @@ code is `crates/wicket-chan/src/chan.rs`.
 ## Versions and skew
 
 The control channel is versioned. `Hello` and `Welcome` carry the protocol version each end speaks;
-two ends talk if the versions are **at most one apart**, at the lower one. So:
+two ends talk if the versions are **at most two apart** (the skew), at the lower one. So:
 
-- a control host at N talks to nodes at N−1 and N (the rollout: control host first);
-- a node at N talks to a control host at N−1 (the control host rolled back) and N+1.
+- a control host at N talks to nodes at N−2 to N;
+- a node at N talks to a control host at N−2 to N+2.
 
 `wicket self update` takes a build more than one protocol version from the running one only as a
 jump that switches the control host and every active enrolled node together, and refuses it while
@@ -97,14 +97,15 @@ exchanged, for the logs and for the health gate.
 | 18 | Names for boxes (#575): `ControlTool::RequestName`, a box's `request_name`, which a control host below 18 can't read in a `Call`, and `connect` with a `name`, which it would read as `connect` with no box. A node sends either only over a connection that talks 18, and otherwise answers the box itself that its control host must be updated. |
 | 19 | Decoded slashes (#664): a reach rule's `decode_slash` in a box's record, which a node below 19 can't parse (its record and its whole feed would be refused). The control host decides this before anything goes in the node's feed (which every session to the node carries), from the protocol the node talks now (the lowest of its live connections', from any process on the host; with none live, the one noted at the last connection's welcome, which a connection that drops or is refused forgets), checked again under the feed's lock just before the record goes in: it publishes no zone using it to a node below 19 or one whose protocol it doesn't know yet, and placement doesn't choose such a node for the box; the run fails, naming the node and the version it needs. A token reads `decoded` only once one of its links decodes, so a plain box's token still loads on a node at 17 or 18. A node at 19 decodes only the segments the box's token allows for the host. |
 | 20 | Webhook intake (#578 step 4): `IntakeSync` (control host to node) and its answer `IntakeEvents` (node to control host). The sync carries the triggers the node's `wicket node intake` serves (each with its URL token's sha256 and verify secret, held in memory on the node, or marked `unavailable` with no secret when it didn't read), the spooled events the control host has recorded (`ack`), every trigger still assigned to the node (`serving`: events of others are dropped) and the triggers whose events it holds back this pass (`hold`: kept, not sent). The answer carries the node's spooled, verified deliveries, oldest first and bounded, and the counts of what intake refused. Only a node at 20 is chosen as a trigger's intake node. |
+| 21 | Published host ports (#575 step 4c): the `ports` of a box's record (its public names' host ports: the name, its label, the host port, the box's port and when it ends), which a node below 21 can't parse (its record and its whole feed would be refused). The control host puts ports in a box's record only over a connection that talks 21, and again under the feed's lock only if every live session to the node talks 21; a record without ports omits the field, so it is what an older node reads. A node at 21 listens on each port in its range (`publish.json`) while the box holds authority there, and copies each connection's bytes into the box's port: layer 4 only. |
 
-wicket speaks version 20 with a skew of 2: it talks only to peers at 18, 19 and 20, so a node at 17 must be updated with or before its control host. (Before #578's intake it spoke 19, with peers at 17, 18 and 19; before #664, 18; before #575, 17.) What the rows above say happens
+wicket speaks version 21 with a skew of 2: it talks only to peers at 19, 20 and 21, so a node at 17 or 18 must be updated before its control host (`wicket self update` refuses to switch the control host while a node it knows of is below the window, and a node it can't talk to is told "update this node first"). (Before #575 step 4c it spoke 20, with peers at 18, 19 and 20; before #578's intake, 19; before #664, 18; before #575, 17.) What the rows above say happens
 with an older peer (a node relaying every gateway tool before 5, a box refused by a node before 6,
 9, 10 or 11, an image not sent to a node before 7, a box on a node before 13) is history: no
 connection can negotiate below 18. Every connection has 12's health reports, 13's one gateway,
 14's CA renewal, 16's prefix grants and 17's standing reach. A check for a version's feature matters only while a peer below it can connect:
 15's message reads still has its check, which no connection needs now and which goes in a change of
-its own, as does 17's; 18's names, 19's decoded slashes and 20's intake keep theirs while a peer below them can connect. `BoxStart`'s `ca_pem` and
+its own, as do 17's standing reach, 18's names and 19's decoded slashes now that no peer below 19 can connect; 20's intake and 21's published ports keep theirs while a peer below them can connect. `BoxStart`'s `ca_pem` and
 `workspace_tar` are always empty and no node reads them; they are defaulted, and go once no peer
 from before that can connect.
 

@@ -26,7 +26,7 @@ pub mod record;
 #[cfg(test)]
 mod props;
 
-pub use config::{NamesConfig, PortRange, ProviderKind, PublicConfig};
+pub use config::{own_ports, own_ports_from, NamesConfig, PortRange, ProviderKind, PublicConfig};
 pub use label::{check_label, check_shape, zone_part, LabelError, Rules};
 pub use plan::{plan, Change, Conflict, Desired, Owned, Plan, PlanError};
 pub use provider::{Applied, Caps, DnsProvider, MemoryProvider, NoopProvider, ProviderError};

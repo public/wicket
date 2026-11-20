@@ -144,6 +144,8 @@ pub fn route(cmd: &Cmd) -> Route {
             | NodeCmd::Install { .. } => Forward(Privileged),
             // Deletes a run's files on its node, perhaps uncollected work.
             NodeCmd::Forget { .. } => Forward(Privileged),
+            // Writes the node's feed as the wicket user, under its lock (#575 step 4c).
+            NodeCmd::FeedCheckpoint { .. } => Forward(Privileged),
             // Lifts a run's fence while its box may still run (#676); the command itself also
             // refuses anyone but root.
             NodeCmd::ReleaseFence { .. } => Forward(Privileged),

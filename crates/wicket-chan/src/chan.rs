@@ -45,12 +45,11 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 2, a connection talks
-/// 18, 19 or 20; checks for the versions from 15 to 19 remain until changes of their own take
-/// them out. The checks for features of 14 and
+/// 19, 20 or 21; the checks of versions 15 to 19 stay until changes of their own take them out; the checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
-pub const PROTOCOL: u32 = 20;
+pub const PROTOCOL: u32 = 21;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -76,6 +75,11 @@ pub const DECODE_SLASH: u32 = 19;
 /// [`Msg::IntakeSync`] and the node answers [`Msg::IntakeEvents`]. Only a node at this version is
 /// chosen for a webhook trigger's intake.
 pub const INTAKE: u32 = 20;
+/// The first protocol version whose nodes read a box's published host ports (#575 step 4c: the
+/// `ports` of its `BoxAuthority`) and listen on them. An older node's strict parse refuses an entry
+/// with any (and its whole feed with it), so the control host puts ports in a box's record only for
+/// a node at this version or later.
+pub const PORTS: u32 = 21;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -139,6 +143,9 @@ const _: () = {
     assert!(PREFIX_GRANTS <= PROTOCOL);
     assert!(STANDING <= PROTOCOL);
     assert!(NAMES <= PROTOCOL);
+    assert!(DECODE_SLASH <= PROTOCOL);
+    assert!(INTAKE <= PROTOCOL);
+    assert!(PORTS <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -1311,27 +1318,29 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// With [`PROTOCOL_SKEW`] 2 and protocol 20 (#578's intake), every connection talks 18, 19 or
-    /// 20. 17's standing reach is on every connection now (its check goes in a change of its own);
-    /// 18's names, 19's decoded slashes and 20's intake keep theirs while a peer below them can
-    /// connect.
+    /// With [`PROTOCOL_SKEW`] 2 and protocol 21 (#575 step 4c), every connection talks 19, 20 or
+    /// 21. 15's message reads (#445)
+    /// and 16's prefix grants (#257 4a) are on every connection (15's keeps its check until it goes
+    /// in a change of its own); 21's published ports (#575 step 4c) keep theirs while a peer at
+    /// 19 or 20 can connect. A node below 19 is refused: it updates before the control host.
     #[test]
-    fn no_connection_talks_below_protocol_18() {
+    fn no_connection_talks_below_protocol_19() {
         assert_eq!(
-            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, INTAKE),
-            (20, 2, 15, 16, 17, 18, 19, 20)
+            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, INTAKE, PORTS),
+            (21, 2, 15, 16, 17, 18, 19, 20, 21)
         );
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((18..=20).contains(&at) && (18..=22).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(18..=22).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((19..=21).contains(&at) && (19..=23).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(19..=23).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 21 or 22 talking to a control host at 20 from the other side.
-        assert_eq!((negotiate(21, PROTOCOL), negotiate(22, PROTOCOL)), (Ok(20), Ok(20)));
-        assert!(negotiate(18, PROTOCOL).unwrap() < DECODE_SLASH, "a node at 18 gets no zone that decodes a slash");
+        // And a node at 22 or 23 talking to a control host at 21 from the other side.
+        assert_eq!((negotiate(22, PROTOCOL), negotiate(23, PROTOCOL)), (Ok(21), Ok(21)));
+        assert!(negotiate(19, PROTOCOL).unwrap() < PORTS, "a node at 19 gets no published ports");
+        assert!(negotiate(20, PROTOCOL).unwrap() < PORTS, "nor one at 20");
         assert!(negotiate(19, PROTOCOL).unwrap() < INTAKE, "a node at 19 is no intake node");
-        assert!(negotiate(PROTOCOL, 17).is_err() && negotiate(17, PROTOCOL).is_err());
+        assert!(negotiate(PROTOCOL, 18).is_err() && negotiate(18, PROTOCOL).is_err());
     }
 
     /// #578 step 4: an intake trigger's secret never shows in a debug print.

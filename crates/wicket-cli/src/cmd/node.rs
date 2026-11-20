@@ -73,6 +73,28 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
             NodeCmd::Forget { run, force } => noderun::forget_command(&run, force, &operator()).await,
+            NodeCmd::FeedCheckpoint { name } => {
+                // An enrolled node's name only: it names a directory (#796 re-review).
+                if Ledger::open(&ledger_path())?.node(&name)?.is_none() {
+                    return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
+                }
+                let epoch = noderun::checkpoint_feed(&name)?;
+                let held = noderun::node_feed_holds_ports(&name)?;
+                Ledger::open(&ledger_path())?.audit(
+                    &TenantId::single(),
+                    None,
+                    "feed.checkpointed",
+                    &serde_json::json!({ "node": name, "epoch": epoch, "holds_ports": held, "by": operator() }),
+                )?;
+                println!(
+                    "node {name}: feed checkpointed at epoch {epoch}; {}",
+                    match held {
+                        true => "it still holds a box's record with host ports (revoke the public names published there first)",
+                        false => "no box's record in it holds host ports: a build before protocol 21 can open it",
+                    }
+                );
+                Ok(())
+            }
             NodeCmd::ReleaseFence { run, reason } => noderun::release_fence_command(&run, &reason, &operator(), wicket_home::cli_is_root()),
         },
         _ => unreachable!("dispatched to the wrong command group"),
@@ -363,6 +385,13 @@ pub enum NodeCmd {
         /// Print the node's status once, as JSON.
         #[arg(long, conflicts_with = "once")]
         json: bool,
+    },
+    /// Write a checkpoint of a node's feed now (#575 step 4c): of the state as it is, so a build
+    /// before protocol 21 can open the feed once no box's record there holds host ports any more
+    /// (`wicket self rollback` says when that is needed). Audited as `feed.checkpointed`.
+    FeedCheckpoint {
+        /// The node.
+        name: String,
     },
     /// Let a run's node delete the run's files, its workspace among them. Refused while the run's
     /// work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation

@@ -125,6 +125,8 @@ pub struct Config {
     pub verbose: bool,
     /// `--dial`: instead of listening, connect here and relay stdin/stdout ([`dial`]).
     pub dial: Option<SocketAddr>,
+    /// `--dial`'s limits (`--idle-secs`, `--after-close-secs`; [`dial_bounded`]).
+    pub dial_limits: DialLimits,
 }
 
 impl Default for Config {
@@ -138,6 +140,7 @@ impl Default for Config {
             watch_every: Duration::from_secs(1),
             verbose: false,
             dial: None,
+            dial_limits: DialLimits::default(),
         }
     }
 }
@@ -382,23 +385,111 @@ fn end_down(r: &io::Result<u64>, from: &UnixStream, to: &TcpStream) {
 /// gVisor the host can't connect to a socket a box creates, so wicket runs this in the target box).
 ///
 /// End of file on stdin shuts down writing on the connection (half-close); the call returns when the
-/// connection's read side ends, without waiting for stdin. Returns (bytes in, bytes out).
+/// connection's read side ends, without waiting for stdin. Returns (bytes in, bytes out). With no
+/// [`DialLimits`], as links run it: a service that ignores the half-close keeps it running.
 pub fn dial(addr: SocketAddr, mode: CopyMode, buf_size: usize) -> io::Result<(u64, u64)> {
+    dial_bounded(addr, mode, buf_size, DialLimits::default())
+}
+
+/// How long a `--dial` relay may last (#796 re-review, H2), each off unless given: a node's host
+/// port (`--idle-secs`, `--after-close-secs`) gives both, so a peer on the internet that sends a
+/// byte and goes can't leave a `wicket-fwd` in the box for as long as the box's service keeps its
+/// side open. Links between boxes give neither: they are long-lived and rely on half-close.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DialLimits {
+    /// No bytes either way for this long: the relay ends.
+    pub idle: Option<Duration>,
+    /// This long after stdin's end of file, the relay ends even if the box's side stays open,
+    /// counted from the last byte written to stdout since (#796 review, N1): a peer that has
+    /// closed its side but is still being sent bytes keeps its relay.
+    pub after_close: Option<Duration>,
+}
+
+/// How long [`dial_bounded`] waits, after a limit shut its connection down, for its copy to see it,
+/// before it ends the process: a copy blocked writing to stdout (its reader stopped reading)
+/// doesn't see the connection's shutdown.
+const DIAL_GRACE: Duration = Duration::from_secs(2);
+
+/// [`dial`], ended by `limits`: when one passes, the connection is shut down both ways (which ends
+/// the copy reading it), and if the copy is stuck writing to stdout, the process exits
+/// ([`DIAL_GRACE`] later; `--dial` is the whole process).
+pub fn dial_bounded(addr: SocketAddr, mode: CopyMode, buf_size: usize, limits: DialLimits) -> io::Result<(u64, u64)> {
     use std::os::fd::AsFd;
+    use std::sync::mpsc;
     let tcp = TcpStream::connect(addr)?;
     let _ = tcp.set_nodelay(true);
     // Unbuffered handles on fds 0 and 1 (std's Stdin/Stdout buffer, and splice wants the fd).
     let mut stdin = std::fs::File::from(io::stdin().as_fd().try_clone_to_owned()?);
     let mut stdout = std::fs::File::from(io::stdout().as_fd().try_clone_to_owned()?);
+    let started = Instant::now();
+    let ms = move || started.elapsed().as_millis() as u64;
+    // When bytes last moved either way, and when stdin ended (u64::MAX: not yet), in ms since start.
+    let last = Arc::new(AtomicU64::new(0));
+    let closed = Arc::new(AtomicU64::new(u64::MAX));
+    // When a byte last went to stdout (the outside peer), in ms since start.
+    let last_out = Arc::new(AtomicU64::new(0));
+    // Wakes the watchdog when stdin ends or this call returns; `done` (set before the latter) ends
+    // it, so a watchdog never acts once the relay is over.
+    let (wake, woken) = mpsc::channel::<()>();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if limits != DialLimits::default() {
+        let (tcp, last, closed, done, last_out) = (tcp.try_clone()?, last.clone(), closed.clone(), done.clone(), last_out.clone());
+        let over = move || done.load(Ordering::SeqCst);
+        thread::Builder::new().stack_size(THREAD_STACK).spawn(move || {
+            let why = loop {
+                if over() {
+                    return;
+                }
+                let now = ms();
+                let idle = limits.idle.map(|d| (last.load(Ordering::SeqCst) + d.as_millis() as u64, "idle"));
+                let c = closed.load(Ordering::SeqCst);
+                let from = c.max(last_out.load(Ordering::SeqCst));
+                let after = limits.after_close.filter(|_| c != u64::MAX).map(|d| (from + d.as_millis() as u64, "stdin closed"));
+                let next = [idle, after].into_iter().flatten().min_by_key(|(at, _)| *at);
+                let got = match next {
+                    Some((at, why)) if at <= now => break why,
+                    Some((at, _)) => woken.recv_timeout(Duration::from_millis(at - now)),
+                    None => woken.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                };
+                if got == Err(mpsc::RecvTimeoutError::Disconnected) {
+                    return;
+                }
+            };
+            if over() {
+                return;
+            }
+            log!("dial {addr}: {why} past its limit; closing");
+            let _ = tcp.shutdown(Shutdown::Both);
+            // Still running after the grace: the copy is stuck on stdout.
+            let until = Instant::now() + DIAL_GRACE;
+            while let Some(left) = until.checked_duration_since(Instant::now()) {
+                if over() || woken.recv_timeout(left) == Err(mpsc::RecvTimeoutError::Disconnected) {
+                    return;
+                }
+            }
+            if !over() {
+                std::process::exit(0);
+            }
+        })?;
+    }
     let mut tcp_w = tcp.try_clone()?;
+    let (up_last, up_wake) = (last.clone(), wake.clone());
     let up = thread::Builder::new().stack_size(THREAD_STACK).spawn(move || {
-        let r = copy::copy(mode, &mut stdin, &mut tcp_w, buf_size);
+        let r = copy::copy_with(mode, &mut stdin, &mut tcp_w, buf_size, &|_| up_last.store(ms(), Ordering::SeqCst));
         let _ = tcp_w.shutdown(if r.is_ok() { Shutdown::Write } else { Shutdown::Both });
+        closed.store(ms(), Ordering::SeqCst);
+        let _ = up_wake.send(());
         r
     })?;
     let mut tcp_r = tcp;
-    let down = copy::copy(mode, &mut tcp_r, &mut stdout, buf_size);
+    let down = copy::copy_with(mode, &mut tcp_r, &mut stdout, buf_size, &|_| {
+        let t = ms();
+        last.store(t, Ordering::SeqCst);
+        last_out.store(t, Ordering::SeqCst);
+    });
     let _ = stdout.flush();
+    done.store(true, Ordering::SeqCst);
+    let _ = wake.send(());
     let up = if up.is_finished() { up.join().unwrap_or(Ok(0)).unwrap_or(0) } else { 0 };
     Ok((up, down?))
 }

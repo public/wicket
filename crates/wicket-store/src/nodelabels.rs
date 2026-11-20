@@ -167,6 +167,20 @@ impl Ledger {
         })
     }
 
+    /// The other active nodes that have one of `node`'s public addresses (each as read by
+    /// [`Ledger::node_addresses`]): none, unless the ledger was written around its checks.
+    pub fn nodes_sharing_addresses(&self, node: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT b.node FROM node_addresses a
+               JOIN nodes na ON na.name = a.node AND na.status = 'active' AND a.set_at >= na.enrolled_at
+               JOIN node_addresses b ON b.node != a.node AND ((a.ipv4 IS NOT NULL AND a.ipv4 = b.ipv4) OR (a.ipv6 IS NOT NULL AND a.ipv6 = b.ipv6))
+               JOIN nodes nb ON nb.name = b.node AND nb.status = 'active' AND b.set_at >= nb.enrolled_at
+             WHERE a.node = ?1 ORDER BY b.node",
+        )?;
+        let rows = st.query_map(params![node], |r| r.get(0))?.collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(rows)
+    }
+
     /// Test support: sets `node`'s public addresses without the checks of
     /// [`Ledger::set_node_addresses`] (one node per address among them), as a ledger written by
     /// hand or by an older build might have them. Not for production use.

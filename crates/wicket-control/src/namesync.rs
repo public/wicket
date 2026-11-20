@@ -49,14 +49,13 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::IpAddr;
+use std::collections::BTreeMap;
 use wicket_core::TenantId;
 use wicket_names::{Change, Desired, DnsProvider, OwnerId, Plan, ProviderError, PublicConfig, Record, Zone};
 use wicket_store::{Ledger, NameRow};
 
 /// The host port protocol public names are published on (TCP only for now).
-const PROTO: &str = "tcp";
+pub const PROTO: &str = "tcp";
 
 /// How long after it was written a record the zone's listing lacks is forgotten: a provider's
 /// listing may lag its writes.
@@ -126,84 +125,132 @@ impl Report {
     }
 }
 
-/// The records wanted for the live public names, and the names that can't be published yet.
-pub fn desired(l: &Ledger, public: &PublicConfig, now: i64) -> Result<(Vec<Desired>, Vec<Waiting>)> {
-    let rules = public.rules();
-    let mut found = vec![];
-    let mut waiting = vec![];
-    for n in l.held_public_names()? {
-        if !n.live(now) {
-            continue;
-        }
-        let name = public.fqdn(&n.label);
-        let mut wait = |why: String| waiting.push(Waiting { id: n.id.clone(), name: name.clone(), why });
-        // Checked when asked and when approved; checked again under the settings as they are now
-        // (an operator may have reserved it since), and so a bad row can't fail the whole plan.
-        if let Err(e) = wicket_names::check_label(&n.label, &rules) {
-            wait(format!("its label is not allowed here now: {e}"));
-            continue;
-        }
-        // Published only in the domain it was approved under (#716 review, F3): a change of
-        // names.public.zone doesn't move it into one nobody approved.
-        if n.domain.as_deref() != Some(public.domain().as_str()) {
-            let was = n.domain.as_deref().unwrap_or("no recorded domain");
-            wait(format!("it was approved under {was}, not {}: a human approves it again there", public.domain()));
-            continue;
-        }
-        let Some(holder) = n.holder.as_deref() else { continue };
-        if l.run_status(holder)?.as_deref() != Some("running") {
-            wait(format!("its run {holder} isn't running"));
-            continue;
-        }
-        let Some(node) = l.run_node(holder)? else {
-            wait(format!("its run {holder} isn't on a node yet"));
-            continue;
-        };
-        let labels = l.node_labels(&node)?;
-        if let Some((k, v)) = public.nodes.iter().find(|(k, v)| labels.get(*k) != Some(*v)) {
-            wait(format!("node {node} may not publish: it lacks the label {k}={v} (names.public.nodes)"));
-            continue;
-        }
-        let addrs = l.node_addresses(&node)?;
-        if addrs.is_empty() {
-            wait(format!("node {node} has no public address (wicket node set {node} --public-ipv4 …)"));
-            continue;
-        }
-        found.push((n, name, node, addrs));
+/// Whether a live public name can be published now, as the reconciler and the run's supervisor
+/// (its host port, #575 step 4c) both decide it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Publish {
+    /// On `node`, at its public addresses.
+    On { node: String, addrs: wicket_store::NodeAddresses },
+    /// Not yet, and why.
+    Wait(String),
+    /// Not live, or held by no run: nothing to say.
+    No,
+}
+
+/// Whether live public name `n` can be published now (see [`Publish`]).
+pub fn may_publish(l: &Ledger, public: &PublicConfig, n: &NameRow, now: i64) -> Result<Publish> {
+    if !n.live(now) {
+        return Ok(Publish::No);
+    }
+    // Checked when asked and when approved; checked again under the settings as they are now
+    // (an operator may have reserved it since), and so a bad row can't fail the whole plan.
+    if let Err(e) = wicket_names::check_label(&n.label, &public.rules()) {
+        return Ok(Publish::Wait(format!("its label is not allowed here now: {e}")));
+    }
+    // Published only in the domain it was approved under (#716 review, F3): a change of
+    // names.public.zone doesn't move it into one nobody approved.
+    if n.domain.as_deref() != Some(public.domain().as_str()) {
+        let was = n.domain.as_deref().unwrap_or("no recorded domain");
+        return Ok(Publish::Wait(format!("it was approved under {was}, not {}: a human approves it again there", public.domain())));
+    }
+    let Some(holder) = n.holder.as_deref() else { return Ok(Publish::No) };
+    if l.run_status(holder)?.as_deref() != Some("running") {
+        return Ok(Publish::Wait(format!("its run {holder} isn't running")));
+    }
+    let Some(node) = l.run_node(holder)? else {
+        return Ok(Publish::Wait(format!("its run {holder} isn't on a node yet")));
+    };
+    let labels = l.node_labels(&node)?;
+    if let Some((k, v)) = public.nodes.iter().find(|(k, v)| labels.get(*k) != Some(*v)) {
+        return Ok(Publish::Wait(format!("node {node} may not publish: it lacks the label {k}={v} (names.public.nodes)")));
+    }
+    let addrs = l.node_addresses(&node)?;
+    if addrs.is_empty() {
+        return Ok(Publish::Wait(format!("node {node} has no public address (wicket node set {node} --public-ipv4 …)")));
     }
     // One address, one node (#748, F9): host ports are allocated per node, so two nodes behind
     // one address would both hand out a port. The ledger refuses setting such addresses; if two
     // nodes have one anyway, the names on both wait.
-    let mut nodes_at: BTreeMap<IpAddr, BTreeSet<&str>> = BTreeMap::new();
-    for (_, _, node, a) in &found {
-        for ip in a.ipv4.map(IpAddr::V4).into_iter().chain(a.ipv6.map(IpAddr::V6)) {
-            nodes_at.entry(ip).or_default().insert(node.as_str());
-        }
+    let shared = l.nodes_sharing_addresses(&node)?;
+    if !shared.is_empty() {
+        return Ok(Publish::Wait(format!("node {node} shares a public address with {}: give each node its own", shared.join(", "))));
     }
-    let shared: BTreeMap<&str, (IpAddr, Vec<&str>)> = nodes_at
-        .iter()
-        .filter(|(_, ns)| ns.len() > 1)
-        .flat_map(|(ip, ns)| ns.iter().map(move |n| (*n, (*ip, ns.iter().filter(|o| *o != n).copied().collect()))))
-        .collect();
+    Ok(Publish::On { node, addrs })
+}
+
+/// Why node `node` doesn't listen on host port `port`, if it doesn't (#796 review, L3): it speaks a
+/// protocol before 21, or its publish.json (as `wicket node install` writes it) doesn't hold the
+/// port. What the control host knows; a bind the node failed is its own record (`name.port.failed`).
+pub type Listens = dyn Fn(&Ledger, &str, u16) -> Result<Option<String>>;
+
+/// [`Listens`] from the node's noted protocol and the installation's settings.
+pub fn node_listens(l: &Ledger, node: &str, port: u16) -> Result<Option<String>> {
+    let proto = crate::noderun::known_protocol(node);
+    if proto.is_none_or(|p| p < wicket_chan::chan::PORTS) {
+        let said = proto.map(|p| format!("speaks protocol {p}")).unwrap_or_else(|| "hasn't said its protocol yet".into());
+        return Ok(Some(format!("node {node} {said}: host ports need 21 (update it)")));
+    }
+    let in_range = publish_range_for(l, node)?
+        .and_then(|r| r.split_once('-').and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?))))
+        .is_some_and(|(a, b)| (a..=b).contains(&port));
+    Ok((!in_range)
+        .then(|| format!("node {node} doesn't publish host port {port}: its publish.json (wicket node install {node}) doesn't hold it")))
+}
+
+/// The records wanted for the live public names, and the names that can't be published yet.
+pub fn desired(l: &Ledger, public: &PublicConfig, now: i64) -> Result<(Vec<Desired>, Vec<Waiting>)> {
+    desired_with(l, public, now, &node_listens)
+}
+
+/// [`desired`], with what says whether a node listens on a port.
+pub fn desired_with(l: &Ledger, public: &PublicConfig, now: i64, listens: &Listens) -> Result<(Vec<Desired>, Vec<Waiting>)> {
     let mut want = vec![];
-    for (n, name, node, addrs) in &found {
-        if let Some((ip, others)) = shared.get(node.as_str()) {
-            waiting.push(Waiting {
-                id: n.id.clone(),
-                name: name.clone(),
-                why: format!("node {node} shares its public address {ip} with {}: give each node its own", others.join(", ")),
-            });
+    let mut waiting = vec![];
+    for n in l.held_public_names()? {
+        let name = public.fqdn(&n.label);
+        let (node, addrs) = match may_publish(l, public, &n, now)? {
+            Publish::On { node, addrs } => (node, addrs),
+            Publish::Wait(why) => {
+                waiting.push(Waiting { id: n.id.clone(), name, why });
+                continue;
+            }
+            Publish::No => continue,
+        };
+        // Records only once the node listens for it (step 4c): an address with nothing behind it
+        // would reach nobody, or, if the port is someone's later, the wrong box.
+        let Some(port) = l.port_of(&n.id, &node, PROTO)? else {
+            let why = format!("no host port on node {node} yet: its run's supervisor gives it one, on a node at protocol 21");
+            waiting.push(Waiting { id: n.id.clone(), name, why });
+            continue;
+        };
+        // Only where the node listens on it (#796 review, L3).
+        if let Some(why) = listens(l, &node, port)? {
+            waiting.push(Waiting { id: n.id.clone(), name, why });
             continue;
         }
         let mut records = vec![];
-        records.extend(addrs.ipv4.map(|a| Record::a(name, a, public.ttl)));
-        records.extend(addrs.ipv6.map(|a| Record::aaaa(name, a, public.ttl)));
-        if let (Some(service), Some(port)) = (n.service.as_deref(), l.port_of(&n.id, node, PROTO)?) {
-            records.push(Record::srv(name, service, port, public.ttl));
+        records.extend(addrs.ipv4.map(|a| Record::a(&name, a, public.ttl)));
+        records.extend(addrs.ipv6.map(|a| Record::aaaa(&name, a, public.ttl)));
+        if let Some(service) = n.service.as_deref() {
+            records.push(Record::srv(&name, service, port, public.ttl));
         }
-        want.push(Desired { name: name.clone(), grant: n.id.clone(), records, ttl: public.ttl });
+        want.push(Desired { name, grant: n.id.clone(), records, ttl: public.ttl });
     }
     Ok((want, waiting))
+}
+
+/// The host ports node `name` may publish (`low-high`, for its `publish.json`, #575 step 4c), from
+/// `names.public` in wicket.yaml as it is now: its range, for a node with every label
+/// `names.public.nodes` names. None without public names, or for a node without the labels.
+pub fn publish_range_for(l: &Ledger, name: &str) -> Result<Option<String>> {
+    let names = wicket_agent::acp::names_settings().map_err(anyhow::Error::msg)?;
+    let Some(public) = names.public else { return Ok(None) };
+    let labels = l.node_labels(name)?;
+    if public.nodes.iter().any(|(k, v)| labels.get(k) != Some(v)) {
+        return Ok(None);
+    }
+    let r = public.ports.range();
+    Ok(Some(format!("{}-{}", r.start(), r.end())))
 }
 
 /// The tenant a record of box name `base` is audited under: its name's, found by the wanted names
@@ -367,11 +414,23 @@ async fn zone_pass<P: DnsProvider>(
 /// One pass (see the module's documentation) for the zone of `public`, through `provider`, and for
 /// the other zones the ledger has records of.
 pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &P, now: i64, dry_run: bool) -> Result<Report> {
+    pass_with(l, public, provider, now, dry_run, &node_listens).await
+}
+
+/// [`pass`], with what says whether a node listens on a port.
+pub async fn pass_with<P: DnsProvider>(
+    l: &Ledger,
+    public: &PublicConfig,
+    provider: &P,
+    now: i64,
+    dry_run: bool,
+    listens: &Listens,
+) -> Result<Report> {
     let owner = OwnerId::parse(&public.owner).ok_or_else(|| anyhow!("names.public.owner {:?} is not an owner id", public.owner))?;
     let zone = Zone::new(&public.domain());
     // Each audited `name.lapsed` by the ledger.
     let lapsed = if dry_run { vec![] } else { l.lapse_names(now)? };
-    let (want, waiting) = desired(l, public, now)?;
+    let (want, waiting) = desired_with(l, public, now, listens)?;
     let last = last_plan(l)?;
     let mut zones = vec![zone_pass(l, &zone, &owner, &want, provider, last.as_ref(), now, dry_run).await?];
     // The other zones with records of this installation's (F3): withdrawn if the configured
@@ -450,7 +509,18 @@ pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &
                     .map(|(_, r)| r.base().to_string()),
             )
             .collect();
-        if left.iter().any(|(_, r)| bases.iter().any(|b| b == r.base())) {
+        // A name still live that holds a port on another node now moved there (#796 review, L7):
+        // this port is free once none of its address records points here any more, as if they
+        // were gone (its SRV names the name, which resolves to the new node). Not while a failing
+        // apply leaves the old ones in place, and not if this node's addresses can't be told.
+        let mine = |r: &Record, here: &wicket_store::NodeAddresses| {
+            here.ipv4.is_some_and(|a| r.value == a.to_string()) || here.ipv6.is_some_and(|a| r.value == a.to_string())
+        };
+        let here = l.node_addresses(&node)?;
+        let moved = n.live(now) && l.port_elsewhere(&n.id, &node, &proto)?.is_some() && !here.is_empty();
+        let pointing_here = left.iter().any(|(_, r)| bases.iter().any(|b| b == r.base()) && mine(r, &here));
+        let any_left = left.iter().any(|(_, r)| bases.iter().any(|b| b == r.base()));
+        if if moved { pointing_here } else { any_left } {
             continue;
         }
         let ttl = report
@@ -562,6 +632,15 @@ mod tests {
     /// A ledger with node n1 enrolled (labelled to publish, with a public IPv4 address), a running
     /// run on it, and a live public name `demo` that run holds.
     fn ledger() -> (Ledger, RunId, String) {
+        ledger_with(None)
+    }
+
+    /// As [`ledger`], with the name's SRV service.
+    fn ledger_srv() -> (Ledger, RunId, String) {
+        ledger_with(Some("http"))
+    }
+
+    fn ledger_with(service: Option<&str>) -> (Ledger, RunId, String) {
         let l = Ledger::open_in_memory().unwrap();
         let t = TenantId::single();
         enrol(&l, "n1");
@@ -574,13 +653,27 @@ mod tests {
             principal: P,
             label: "demo",
             port: 3000,
-            service: Some("http"),
+            service,
             reason: "the demo",
             scope: NameScope::Run,
         };
         let (id, _) = l.ask_public(&ask).unwrap();
         approve(&l, &id, &NameTerms { bound: StandingBound::Agent, ttl_secs: None });
+        l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
         (l, run, id)
+    }
+
+    /// Every node listens on every port (the test ledgers have no node protocol notes or settings).
+    fn listens_all(_: &Ledger, _: &str, _: u16) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn pass_t<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &P, now: i64, dry_run: bool) -> Result<Report> {
+        pass_with(l, public, provider, now, dry_run, &listens_all).await
+    }
+
+    fn desired_t(l: &Ledger, public: &PublicConfig, now: i64) -> Result<(Vec<Desired>, Vec<Waiting>)> {
+        desired_with(l, public, now, &listens_all)
     }
 
     fn kinds(l: &Ledger, kind: &str) -> usize {
@@ -608,23 +701,27 @@ mod tests {
         };
         let (id, _) = l.ask_public(&ask).unwrap();
         approve(l, &id, &NameTerms { bound: StandingBound::Agent, ttl_secs: None });
+        l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
         id
     }
 
     #[test]
     fn a_held_name_on_a_publishing_node_wants_its_addresses() {
-        let (l, _run, id) = ledger();
-        let (want, waiting) = desired(&l, &public(), wicket_store::now()).unwrap();
+        let (l, _run, id) = ledger_srv();
+        let (want, waiting) = desired_t(&l, &public(), wicket_store::now()).unwrap();
         assert!(waiting.is_empty(), "{waiting:?}");
         assert_eq!(want.len(), 1);
         assert_eq!(want[0].name, "demo.boxes.example.com");
         assert_eq!(want[0].grant, id);
-        assert_eq!(want[0].records, vec![Record::a("demo.boxes.example.com", V4, 60)]);
-        // With an IPv6 address and a host port (step 4c), AAAA and SRV too.
+        let port = l.port_of(&id, "n1", PROTO).unwrap().unwrap();
+        assert_eq!(
+            want[0].records,
+            vec![Record::a("demo.boxes.example.com", V4, 60), Record::srv("demo.boxes.example.com", "http", port, 60)]
+        );
+        // With an IPv6 address, AAAA too.
         let v6: Ipv6Addr = "2001:4860:4860::8888".parse().unwrap();
         l.set_node_addresses("n1", AddressChange::Keep, AddressChange::Set(v6), "op").unwrap();
-        let port = l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
-        let (want, _) = desired(&l, &public(), wicket_store::now()).unwrap();
+        let (want, _) = desired_t(&l, &public(), wicket_store::now()).unwrap();
         let types: Vec<RecordType> = want[0].records.iter().map(|r| r.rtype).collect();
         assert_eq!(types, vec![RecordType::A, RecordType::Aaaa, RecordType::Srv]);
         assert_eq!(want[0].records[2], Record::srv("demo.boxes.example.com", "http", port, 60));
@@ -632,28 +729,39 @@ mod tests {
 
     #[test]
     fn a_name_that_cant_be_published_waits_and_says_why() {
-        let (l, run, _) = ledger();
+        let (l, run, id) = ledger();
         let now = wicket_store::now();
+        // A node that doesn't listen on the port (#796 review, L3): no records, and it says why.
+        let deaf = |_: &Ledger, node: &str, port: u16| -> Result<Option<String>> {
+            Ok(Some(format!("node {node} speaks protocol 20, not {port}")))
+        };
+        let (want, waiting) = desired_with(&l, &public(), now, &deaf).unwrap();
+        assert!(want.is_empty() && waiting[0].why.contains("node n1 speaks protocol 20"), "{waiting:?}");
+        // No host port on its node yet (step 4c): no records, which would point at nothing.
+        l.release_ports(&id).unwrap();
+        let (want, waiting) = desired_t(&l, &public(), now).unwrap();
+        assert!(want.is_empty() && waiting[0].why.contains("no host port on node n1"), "{waiting:?}");
+        l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
         l.set_node_label("n1", "publish", None).unwrap();
-        let (want, waiting) = desired(&l, &public(), now).unwrap();
+        let (want, waiting) = desired_t(&l, &public(), now).unwrap();
         assert!(want.is_empty());
         assert!(waiting[0].why.contains("lacks the label publish=true"), "{waiting:?}");
         l.set_node_label("n1", "publish", Some("true")).unwrap();
         l.set_node_addresses("n1", AddressChange::Clear, AddressChange::Keep, "op").unwrap();
-        let (_, waiting) = desired(&l, &public(), now).unwrap();
+        let (_, waiting) = desired_t(&l, &public(), now).unwrap();
         assert!(waiting[0].why.contains("no public address"), "{waiting:?}");
         l.set_node_addresses("n1", AddressChange::Set(V4), AddressChange::Keep, "op").unwrap();
         let mut p = public();
         p.reserved.push("demo".into());
-        let (_, waiting) = desired(&l, &p, now).unwrap();
+        let (_, waiting) = desired_t(&l, &p, now).unwrap();
         assert!(waiting[0].why.contains("not allowed"), "{waiting:?}");
         let mut p = public();
         p.zone = "other.example.com".into();
-        let (want, waiting) = desired(&l, &p, now).unwrap();
+        let (want, waiting) = desired_t(&l, &p, now).unwrap();
         assert!(want.is_empty() && waiting[0].why.contains("approved under boxes.example.com"), "{waiting:?}");
         l.run_ended(&run, "succeeded", "").unwrap();
         l.release_run_names(&run).unwrap();
-        let (want, waiting) = desired(&l, &public(), now).unwrap();
+        let (want, waiting) = desired_t(&l, &public(), now).unwrap();
         assert!(want.is_empty() && waiting.is_empty(), "a name its run let go of has no records: {want:?} {waiting:?}");
     }
 
@@ -661,7 +769,7 @@ mod tests {
     async fn noop_records_the_plan_once_and_claims_no_record() {
         let (l, _run, _) = ledger();
         let p = NoopProvider::new();
-        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(!r.applied && r.recorded);
         // The owner record and the A record.
         assert_eq!(r.plan.changes.len(), 2, "{:?}", r.plan);
@@ -673,7 +781,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&plan.body).unwrap();
         assert_eq!(body["applied"], false);
         // The same plan next pass: not recorded again.
-        let again = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let again = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(!again.recorded);
         assert_eq!(kinds(&l, "name.plan"), 1);
     }
@@ -682,7 +790,7 @@ mod tests {
     async fn a_dry_run_changes_nothing() {
         let (l, _run, _) = ledger();
         let p = NoopProvider::new();
-        let r = pass(&l, &public(), &p, wicket_store::now(), true).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), true).await.unwrap();
         assert_eq!(r.plan.changes.len(), 2);
         assert!(p.plans().is_empty());
         assert_eq!(kinds(&l, "name.plan"), 0);
@@ -694,7 +802,7 @@ mod tests {
         let zone = Zone::new("boxes.example.com");
         let theirs = Record::a("www.boxes.example.com", Ipv4Addr::new(203, 0, 113, 1), 300);
         let p = MemoryProvider::new(zone.clone(), vec![theirs.clone()]);
-        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(r.applied && r.recorded);
         assert_eq!(kinds(&l, "name.record"), 2);
         let zr = p.records();
@@ -703,11 +811,11 @@ mod tests {
         assert!(zr.iter().any(|r| r.is_owner_record() && r.base() == "demo.boxes.example.com"));
         assert_eq!(l.owned_records(&zone).unwrap().len(), 2);
         // In sync: nothing to change.
-        let again = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let again = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(again.plan.is_empty(), "{:?}", again.plan);
         // Revoked: its records go, the owner record last, and someone else's stays.
         crate::names::revoke(&l, "op", &id).unwrap();
-        let gone = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let gone = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert_eq!(gone.plan.changes.len(), 2);
         assert!(matches!(gone.plan.changes.last(), Some(Change::Delete(r)) if r.is_owner_record()));
         assert_eq!(p.records(), vec![theirs]);
@@ -737,21 +845,21 @@ mod tests {
     /// recorded too, and only then is the port freed.
     #[tokio::test]
     async fn a_failing_provider_keeps_the_port_and_is_recorded_once() {
-        let (l, _run, id) = ledger();
+        let (l, _run, id) = ledger_srv();
         let port = l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
         let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         crate::names::revoke(&l, "op", &id).unwrap();
         let (plans, records) = (kinds(&l, "name.plan"), kinds(&l, "name.record"));
         let down = Failing(p.records());
         for _ in 0..3 {
-            let r = pass(&l, &public(), &down, wicket_store::now(), false).await.unwrap();
+            let r = pass_t(&l, &public(), &down, wicket_store::now(), false).await.unwrap();
             assert!(r.errors().next().is_some_and(|(_, e)| e.contains("down")), "{:?}", r.zones);
         }
         assert_eq!(kinds(&l, "name.plan"), plans + 1, "the same failure recorded once");
         assert_eq!(kinds(&l, "name.record"), records + 3, "its three intents (owner, A, SRV) written once, not on every pass (#748, F5)");
         assert_eq!(l.quarantined_ports().unwrap().len(), 1, "no port freed while its records may be there");
-        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(r.applied && r.recorded, "the success after a failure is recorded");
         let last: serde_json::Value = serde_json::from_str(&l.audit_of_kind("name.plan").unwrap().pop().unwrap().body).unwrap();
         assert_eq!((last["applied"].as_bool(), last["error"].is_null()), (Some(true), true));
@@ -795,10 +903,10 @@ mod tests {
             let (mut l, run, _) = ledger();
             let mut cfg = public();
             let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
-            pass(&l, &cfg, &p, wicket_store::now(), false).await.unwrap();
+            pass_t(&l, &cfg, &p, wicket_store::now(), false).await.unwrap();
             assert!(p.records().contains(&Record::a("demo.boxes.example.com", V4, 60)), "{case}");
             change(&mut l, &run, &mut cfg);
-            pass(&l, &cfg, &p, wicket_store::now(), false).await.unwrap();
+            pass_t(&l, &cfg, &p, wicket_store::now(), false).await.unwrap();
             let a: Vec<Record> = p.records().into_iter().filter(|r| r.rtype == RecordType::A).collect();
             match case {
                 "address changed" => assert_eq!(a, vec![Record::a("demo.boxes.example.com", other, 60)], "{case}"),
@@ -814,12 +922,12 @@ mod tests {
         let (l, _run, id) = ledger();
         l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
         let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         crate::names::revoke(&l, "op", &id).unwrap();
         let mut moved = public();
         moved.zone = "other.example.com".into();
         let q = MemoryProvider::new(Zone::new("other.example.com"), vec![]);
-        let r = pass(&l, &moved, &q, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &moved, &q, wicket_store::now(), false).await.unwrap();
         assert!(r.freed.is_empty(), "{:?}", r.freed);
         assert_eq!(l.quarantined_ports().unwrap().len(), 1);
     }
@@ -831,13 +939,13 @@ mod tests {
         let (l, _run, _) = ledger();
         let zone = Zone::new("boxes.example.com");
         let p = MemoryProvider::new(zone.clone(), vec![]);
-        let dry = pass(&l, &public(), &p, wicket_store::now(), true).await.unwrap();
+        let dry = pass_t(&l, &public(), &p, wicket_store::now(), true).await.unwrap();
         l.owned_before_apply(&zone, "memory", &dry.plan).unwrap();
-        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(r.applied);
         assert_eq!(p.records().len(), 2);
         assert_eq!(l.owned_records(&zone).unwrap().len(), 2);
-        assert!(pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap().plan.is_empty());
+        assert!(pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap().plan.is_empty());
     }
 
     /// Each record's audit is filed under its name's tenant, not the installation's.
@@ -863,8 +971,9 @@ mod tests {
         };
         let (id, _) = l.ask_public(&ask).unwrap();
         approve(&l, &id, &NameTerms { bound: StandingBound::Agent, ttl_secs: None });
+        l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
         let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         let recs = l.audit_of_kind("name.record").unwrap();
         let of = |name: &str| recs.iter().filter(|a| a.body.contains(name)).map(|a| a.tenant.clone()).collect::<Vec<_>>();
         assert_eq!(of("shop.boxes.example.com"), vec!["t1".to_string(); 2]);
@@ -877,32 +986,32 @@ mod tests {
         let zone = Zone::new("boxes.example.com");
         let theirs = Record::a("demo.boxes.example.com", Ipv4Addr::new(203, 0, 113, 9), 300);
         let p = MemoryProvider::new(zone, vec![theirs.clone()]);
-        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(r.plan.changes.is_empty());
         assert_eq!(r.plan.conflicts.len(), 1);
         assert_eq!(p.records(), vec![theirs]);
         assert_eq!(kinds(&l, "name.conflict"), 1);
         // The same conflict next pass isn't recorded again.
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert_eq!(kinds(&l, "name.conflict"), 1);
     }
 
     #[tokio::test]
     async fn a_released_port_is_freed_once_its_names_records_are_gone() {
-        let (l, _run, id) = ledger();
+        let (l, _run, id) = ledger_srv();
         let port = l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
         let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert_eq!(p.records().len(), 3, "owner, A and SRV");
         // Revoked: its port is released, and quarantined while its records are there.
         crate::names::revoke(&l, "op", &id).unwrap();
         assert_eq!(l.quarantined_ports().unwrap().len(), 1);
         let noop = NoopProvider::new();
-        let r = pass(&l, &public(), &noop, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &public(), &noop, wicket_store::now(), false).await.unwrap();
         assert!(r.freed.is_empty(), "the ledger still lists its records: {:?}", r.freed);
         // The records go: the port is freed for twice the TTL from now, not before.
         let now = wicket_store::now();
-        let r = pass(&l, &public(), &p, now, false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, now, false).await.unwrap();
         assert!(p.records().is_empty());
         assert_eq!(r.freed, vec![("n1".to_string(), port)]);
         assert!(l.quarantined_ports().unwrap().is_empty());
@@ -929,11 +1038,12 @@ mod tests {
         };
         let (id, _) = l.ask_public(&ask).unwrap();
         approve(&l, &id, &NameTerms { bound: StandingBound::Agent, ttl_secs: Some(60) });
+        l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
         let zone = Zone::new("boxes.example.com");
         let p = MemoryProvider::new(zone.clone(), vec![]);
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert_eq!(p.records().len(), 2);
-        let r = pass(&l, &public(), &p, wicket_store::now() + 120, false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now() + 120, false).await.unwrap();
         assert_eq!(r.lapsed.len(), 1);
         assert_eq!(kinds(&l, "name.lapsed"), 1);
         assert!(p.records().is_empty());
@@ -998,11 +1108,11 @@ mod tests {
     async fn a_zone_change_withdraws_the_old_zones_records() {
         let (l, _run, _) = ledger();
         let p = Multi::default();
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert_eq!(p.records(BOXES).len(), 2);
         let mut moved = public();
         moved.zone = "other.example.com".into();
-        let r = pass(&l, &moved, &p, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &moved, &p, wicket_store::now(), false).await.unwrap();
         assert!(p.records(BOXES).is_empty(), "{:?}", p.records(BOXES));
         assert!(r.stranded.is_empty() && r.errors().next().is_none(), "{:?} {:?}", r.stranded, r.zones);
         assert!(l.owned_zones().unwrap().is_empty());
@@ -1015,15 +1125,15 @@ mod tests {
     async fn another_providers_records_are_stranded_not_forgotten() {
         let (l, _run, _) = ledger();
         let p = Multi::default();
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         let noop = NoopProvider::new();
         let later = wicket_store::now() + FORGET_AFTER_SECS + 60;
-        let r = pass(&l, &public(), &noop, later, false).await.unwrap();
+        let r = pass_t(&l, &public(), &noop, later, false).await.unwrap();
         assert_eq!(r.stranded.len(), 1, "{:?}", r.stranded);
         assert!(r.stranded[0].provider == "multi" && r.stranded[0].records == 2 && r.stranded[0].why.contains("put it back"));
         assert!(r.recorded);
         assert_eq!(l.owned_records(&Zone::new(BOXES)).unwrap().len(), 2, "nothing forgotten");
-        let again = pass(&l, &public(), &noop, later, false).await.unwrap();
+        let again = pass_t(&l, &public(), &noop, later, false).await.unwrap();
         assert_eq!(again.stranded.len(), 1);
         assert!(!again.recorded, "the same stranding recorded once");
     }
@@ -1032,25 +1142,25 @@ mod tests {
     /// guard, audited, and made again; a forgotten one of a revoked name frees its port.
     #[tokio::test]
     async fn records_missing_from_the_zone_are_forgotten_after_the_guard() {
-        let (l, _run, id) = ledger();
+        let (l, _run, id) = ledger_srv();
         let port = l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
         second_name(&l, "shop");
         let p = Multi::default();
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert_eq!(p.records(BOXES).len(), 5);
         // demo's records deleted by hand; shop's still there. The first listing without them notes
         // it, and forgets nothing (#778 review, R1: one listing is not enough).
         p.zones.lock().unwrap().get_mut(BOXES).unwrap().retain(|r| r.base() != "demo.boxes.example.com");
         crate::names::revoke(&l, "op", &id).unwrap();
         let t0 = wicket_store::now();
-        let r = pass(&l, &public(), &p, t0, false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, t0, false).await.unwrap();
         assert!(r.zones[0].forgotten.is_empty());
         assert!(r.freed.is_empty(), "the ledger still lists its records");
         // Still within the guard: nothing yet.
-        let r = pass(&l, &public(), &p, t0 + FORGET_AFTER_SECS - 60, false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, t0 + FORGET_AFTER_SECS - 60, false).await.unwrap();
         assert!(r.zones[0].forgotten.is_empty());
         // Missing across listings spanning the guard: forgotten, audited, its port freed.
-        let r = pass(&l, &public(), &p, t0 + FORGET_AFTER_SECS + 60, false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, t0 + FORGET_AFTER_SECS + 60, false).await.unwrap();
         assert_eq!(r.zones[0].forgotten.len(), 3, "owner, A and SRV");
         assert_eq!(l.audit_of_kind("name.record").unwrap().iter().filter(|a| a.body.contains("\"forgotten\"")).count(), 3);
         assert_eq!(l.owned_records(&Zone::new(BOXES)).unwrap().len(), 2, "shop's stay");
@@ -1063,16 +1173,16 @@ mod tests {
         let (l, _run, _) = ledger();
         second_name(&l, "shop");
         let p = Multi::default();
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         let demo: Vec<Record> = p.records(BOXES).into_iter().filter(|r| r.base() == "demo.boxes.example.com").collect();
         p.zones.lock().unwrap().get_mut(BOXES).unwrap().retain(|r| r.base() != "demo.boxes.example.com");
         let t0 = wicket_store::now();
         // Missing once (an eventually consistent read, or deleted by hand and put back).
-        let r = pass(&l, &public(), &p, t0, false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, t0, false).await.unwrap();
         assert!(r.zones[0].forgotten.is_empty());
         // The pass made them again (the zone lacked them); a later pass past the guard forgets none.
         assert!(demo.iter().all(|d| p.records(BOXES).contains(d)), "{:?}", p.records(BOXES));
-        let r = pass(&l, &public(), &p, t0 + FORGET_AFTER_SECS + 60, false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, t0 + FORGET_AFTER_SECS + 60, false).await.unwrap();
         assert!(r.zones[0].forgotten.is_empty(), "{:?}", r.zones[0].forgotten);
     }
 
@@ -1081,9 +1191,9 @@ mod tests {
     async fn a_listing_without_any_of_ours_forgets_nothing() {
         let (l, _run, _) = ledger();
         let p = Multi::default();
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         p.zones.lock().unwrap().clear();
-        let r = pass(&l, &public(), &p, wicket_store::now() + FORGET_AFTER_SECS + 60, false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now() + FORGET_AFTER_SECS + 60, false).await.unwrap();
         assert!(r.zones[0].forgotten.is_empty());
         assert!(r.errors().any(|(_, e)| e.contains("has none of the 2 record(s)")), "{:?}", r.zones);
         assert_eq!(l.owned_records(&Zone::new(BOXES)).unwrap().len(), 2, "none forgotten");
@@ -1095,9 +1205,9 @@ mod tests {
     async fn two_writing_providers_keep_their_own_records() {
         let (l, _run, _) = ledger();
         let a = Multi::default();
-        pass(&l, &public(), &a, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &a, wicket_store::now(), false).await.unwrap();
         let b = Multi { id: "multi-b", ..Multi::default() };
-        let r = pass(&l, &public(), &b, wicket_store::now() + FORGET_AFTER_SECS + 60, false).await.unwrap();
+        let r = pass_t(&l, &public(), &b, wicket_store::now() + FORGET_AFTER_SECS + 60, false).await.unwrap();
         assert!(r.errors().any(|(_, e)| e.contains("another provider's record")), "{:?}", r.zones);
         let zone = Zone::new(BOXES);
         assert_eq!(l.owned_records_by(&zone, "multi").unwrap().len(), 2, "a's rows are a's");
@@ -1111,7 +1221,7 @@ mod tests {
     async fn a_name_the_provider_cant_take_waits() {
         let (l, _run, _) = ledger();
         let p = Multi { types: vec![RecordType::A], ..Multi::default() };
-        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(r.waiting.iter().any(|w| w.why.contains("can't take its records")), "{:?}", r.waiting);
         assert!(r.plan.is_empty());
         assert!(p.records(BOXES).is_empty());
@@ -1125,10 +1235,10 @@ mod tests {
     async fn a_partial_apply_counts_only_what_was_made() {
         let (l, _run, id) = ledger();
         let p = Multi::default();
-        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         crate::names::revoke(&l, "op", &id).unwrap();
         *p.stop_after.lock().unwrap() = Some(1);
-        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(r.errors().next().is_some_and(|(_, e)| e.contains("stopped after 1")), "{:?}", r.zones);
         // The A record went first; the owner record is still there, and still the ledger's.
         let left = l.owned_records(&Zone::new(BOXES)).unwrap();
@@ -1136,7 +1246,7 @@ mod tests {
         assert_eq!(p.records(BOXES), left);
         let applied: serde_json::Value = serde_json::from_str(&l.audit_of_kind("name.applied").unwrap().pop().unwrap().body).unwrap();
         assert_eq!((applied["made"].as_u64(), applied["changes"].as_u64()), (Some(1), Some(2)));
-        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert!(r.applied && r.errors().next().is_none());
         assert!(p.records(BOXES).is_empty() && l.owned_records(&Zone::new(BOXES)).unwrap().is_empty());
     }
@@ -1166,9 +1276,35 @@ mod tests {
         };
         let (id, _) = l.ask_public(&ask).unwrap();
         approve(&l, &id, &NameTerms { bound: StandingBound::Agent, ttl_secs: None });
-        let (want, waiting) = desired(&l, &public(), wicket_store::now()).unwrap();
+        let (want, waiting) = desired_t(&l, &public(), wicket_store::now()).unwrap();
         assert!(want.is_empty(), "{want:?}");
         assert_eq!(waiting.len(), 2);
-        assert!(waiting.iter().all(|w| w.why.contains("shares its public address")), "{waiting:?}");
+        assert!(waiting.iter().all(|w| w.why.contains("shares a public address with")), "{waiting:?}");
+    }
+
+    /// #796 review, L7: a name that moved to another node frees its old node's port once its
+    /// records point at the new one, though the name is live.
+    #[tokio::test]
+    async fn a_moved_names_old_port_is_freed() {
+        let (l, run, id) = ledger_srv();
+        let old = l.port_of(&id, "n1", PROTO).unwrap().unwrap();
+        let p = MemoryProvider::new(Zone::new(BOXES), vec![]);
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        assert!(p.records().iter().any(|r| r.value == V4.to_string()), "published on n1");
+        // The box moves to n2, as its supervisor's ports_for does it.
+        enrol_bare(&l, "n2");
+        let n2 = Ipv4Addr::new(8, 8, 8, 8);
+        l.set_node_addresses("n2", AddressChange::Set(n2), AddressChange::Keep, "op").unwrap();
+        l.set_run_node(&run.0, "n2").unwrap();
+        l.allocate_port("n2", PROTO, &id, 20000..=20999, Some(old)).unwrap();
+        l.release_ports_elsewhere(&id, "n2").unwrap();
+        // The provider fails to apply the move: n1's A record is still there, so its port isn't free.
+        let down = Failing(p.records());
+        let r = pass_t(&l, &public(), &down, wicket_store::now(), false).await.unwrap();
+        assert!(r.freed.is_empty(), "{:?}", r.freed);
+        // Applied: the records point at n2, and n1's port is free.
+        let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        assert_eq!(r.freed, vec![("n1".to_string(), old)]);
+        assert!(p.records().iter().any(|r| r.value == n2.to_string()) && !p.records().iter().any(|r| r.value == V4.to_string()));
     }
 }
