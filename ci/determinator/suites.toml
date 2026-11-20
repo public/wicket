@@ -24,6 +24,24 @@ paths = [
 packages = ["wicket-policy", "wicket-policy-diff"]
 paths = ["examples/policy/**", "ci/policy-diff.sh"]
 
+# The cheap checks that read only a few files (#219): each runs when one of those changes, and in
+# every full run (the nightly run, a push to main without a green base, full-ci).
+[suite.deny]
+packages = []
+paths = ["Cargo.lock", "deny.toml"]
+
+[suite.dep-age]
+packages = []
+paths = [
+  "Cargo.lock", "fuzz/Cargo.lock", "ci/*/Cargo.lock", "web/session/package-lock.json",
+  "examples/**/package-lock.json", "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml",
+]
+
+# The console's session view (#327): its sources and build, and the serve code that embeds it.
+[suite.session-view]
+packages = []
+paths = ["web/session/**", "ci/session-view.sh", "ci/install-node.sh", "crates/wicket-cli/build.rs", "crates/wicket-cli/src/serve/*.rs"]
+
 [suite.lean]
 packages = ["wicket-authz"]
 paths = ["ci/lean.sh"]
