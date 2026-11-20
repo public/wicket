@@ -1840,6 +1840,14 @@ impl Ledger {
         Ok(())
     }
 
+    /// Who made enrolment link `id` of `tenant` (`created_by`), used or not. None: no such link.
+    pub fn enrol_link_by(&self, tenant: &TenantId, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT created_by FROM console_enrol_links WHERE tenant = ?1 AND id = ?2", params![tenant.0, id], |r| r.get(0))
+            .optional()?)
+    }
+
     /// Uses the enrolment link `id` at `at` from `client`, atomically: true only if it exists for
     /// `tenant`, has not been used, and has not expired. A link works at most once.
     pub fn use_enrol_link(&self, tenant: &TenantId, id: &str, at: i64, client: &str) -> Result<bool> {
@@ -2822,6 +2830,8 @@ mod tests {
         l.add_enrol_link(&t, "l2", at + 600, "host").unwrap();
         l.add_enrol_link(&t, "old", at - 1, "host").unwrap();
         assert!(!l.use_enrol_link(&TenantId("other".into()), "l1", at, "192.0.2.1").unwrap(), "another tenant's");
+        assert_eq!(l.enrol_link_by(&t, "l1").unwrap().as_deref(), Some("host"));
+        assert_eq!(l.enrol_link_by(&TenantId("other".into()), "l1").unwrap(), None);
         assert!(!l.use_enrol_link(&t, "nope", at, "192.0.2.1").unwrap(), "unknown");
         assert!(!l.use_enrol_link(&t, "old", at, "192.0.2.1").unwrap(), "expired");
         assert!(!l.use_enrol_link(&t, "l2", at + 600, "192.0.2.1").unwrap(), "expired at its expiry");
