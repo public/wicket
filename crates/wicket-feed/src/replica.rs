@@ -31,9 +31,12 @@
 //! - **A snapshot already overtaken** (#589): a snapshot below the epoch held that was signed
 //!   before the newest statement held is superseded too. Two runs that said hello to a node at the
 //!   same epoch both catch it up; the second to arrive finds the node moved on by the other's frames,
-//!   signed after its own under the publishers' shared lock. One signed after the newest statement
-//!   (a restored control plane's, say) is a `rollback`, as is any older snapshot before a statement
-//!   is held.
+//!   signed after its own under the publishers' shared lock. Its head must be the node's own at its
+//!   epoch, where the node still holds that epoch's head; a different one is a `fork`. One signed
+//!   after the newest statement (a restored control plane's, say) is a `rollback`, as is any older
+//!   snapshot while no statement newer than it is held: the node can't yet tell it from a replay.
+//!   So an older snapshot that arrives between another run's snapshot and that run's statement is
+//!   still refused (#589).
 //! - **A delta already held** (#300, #324): each run commits its own deltas and sends them over its
 //!   own connection, but another run's catch-up may carry them first. A delta at an epoch the node
 //!   holds whose hash is the head it recorded at that epoch (the ring of [`crate::HEADS_KEPT`]) is
@@ -534,8 +537,13 @@ impl<P: Policy> Replica<P> {
                     // signed after it under the same lock, reached the node first (each run has
                     // its own connection). It carries nothing the node lacks: superseded, as a
                     // statement signed before the floor is. One signed after is a rollback.
+                    // Its head must be the node's own at that epoch where the node still holds
+                    // it, as a held delta's must (#589 review): a different one is a fork.
                     if s.issued_at < self.issued_floor {
-                        return Ok(Plan::Superseded);
+                        return match self.heads.get(&s.epoch) {
+                            Some(h) if *h != s.head => Err(Refusal::Fork(format!("snapshot head differs at epoch {}", s.epoch))),
+                            _ => Ok(Plan::Superseded),
+                        };
                     }
                     return Err(Refusal::Rollback(format!("snapshot epoch {} < held {}", s.epoch, st.epoch)));
                 }
