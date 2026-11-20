@@ -421,12 +421,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: KeysCmd,
     },
-    /// Make what exists agree with the ledger: runs, leases, machines and boxes.
+    /// Make what exists agree with the ledger: runs, leases, machines, boxes and public names.
     ///
     /// Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past
     /// their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again
     /// right before each destroy), adopt or create the ones leases need, and stop boxes whose run has
-    /// ended, here and on enrolled nodes. Records every change in the audit log.
+    /// ended, here and on enrolled nodes. With `names.public` in wicket.yaml, also make the boxes zone's
+    /// records that wicket owns agree with the live public names, through its DNS provider (#575; the
+    /// noop provider only records the plan). Records every change in the audit log.
     Reconcile {
         /// Only report what would change.
         #[arg(long)]
