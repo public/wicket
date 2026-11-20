@@ -344,7 +344,7 @@ has a name's records as the zone last listed them, and its last connections.
   released at).
 - **Ledger schema 31** (#668): `name_exposures`, the ports a run's names exposed (not the box
   itself), which a name's move may take away once no other name of the run names the port.
-- **Ledger schema 33** (step 4b): `node_addresses`, each node's public addresses as its operator set
+- **Ledger schema 34** (step 4b): `node_addresses`, each node's public addresses as its operator set
   them (`wicket node set --public-ipv4 … --public-ipv6 …`), audited `node.addresses`.
 - **Protocol 18:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
   node only of a control host at 18. Public names will add the feed's published ports (name, run,

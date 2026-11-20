@@ -204,10 +204,10 @@ pub enum StoreError {
 /// starts once retention has pruned its front, which target each sink's cursor is for, and the
 /// checkpoints retention asked the exporter to sign. Older builds don't read them; a prune raises
 /// the floor to 32, so a build that would walk a pruned chain from seq 1 refuses the ledger.
-/// Version 33 (expand, #575 step 4b, after 32) adds `node_addresses`: each node's public
+/// Version 34 (expand, #575 step 4b; 33 is #637's) adds `node_addresses`: each node's public
 /// addresses as its operator set them, where its boxes' public names point. Older builds don't read
 /// it; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 33;
+pub const SCHEMA_VERSION: u32 = 34;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is

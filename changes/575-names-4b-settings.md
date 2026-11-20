@@ -14,6 +14,6 @@ type: Added
     `wicket names show` and `approve` show the full name.
   - A standing name is taken up by each later run it is for when that run starts (`name.claimed`).
   - `wicket node set --public-ipv4 … --public-ipv6 …` records a node's public addresses (public
-    ones only, audited `node.addresses`; ledger schema 33). `wicket node list --json` shows them.
+    ones only, audited `node.addresses`; ledger schema 34). `wicket node list --json` shows them.
   - `wicket pending --json` documents its `kind: "name"` objects. `wicket pending` says "no pending
     requests" only when nothing at all waits.
