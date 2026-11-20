@@ -215,7 +215,11 @@ async fn every_response_carries_the_security_headers() {
         for (method, path, h) in &requests {
             let (status, headers, _) = call(&t.state, method, path, h, b"").await;
             let get = |k: &str| headers.get(k).map(|v| v.to_str().unwrap().to_string());
-            assert_eq!(get("content-security-policy").as_deref(), Some(CSP), "{method} {path} {status}");
+            // A run's session page has its own policy, which allows Vue's; everything else the
+            // console's (#739). Never a report-only one.
+            let csp = if path.starts_with("/session") { crate::serve::web::SESSION_CSP } else { CSP };
+            assert_eq!(get("content-security-policy").as_deref(), Some(csp), "{method} {path} {status}");
+            assert!(get("content-security-policy-report-only").is_none(), "{method} {path}");
             assert_eq!(get("x-content-type-options").as_deref(), Some("nosniff"));
             assert_eq!(get("referrer-policy").as_deref(), Some("no-referrer"));
             assert_eq!(get("cross-origin-opener-policy").as_deref(), Some("same-origin"));
@@ -230,6 +234,19 @@ async fn every_response_carries_the_security_headers() {
         }
     }
     assert!(CSP.contains("default-src 'none'") && CSP.contains("script-src 'self';") && !CSP.contains("unsafe"));
+    // Trusted Types (#739): required for scripts, and exactly these policies, each at most once
+    // (no 'allow-duplicates'), no wildcard and no default policy.
+    let tt = |csp: &str| -> Vec<String> {
+        assert!(csp.contains("require-trusted-types-for 'script'"), "{csp}");
+        let list = csp.split(';').map(str::trim).find_map(|d| d.strip_prefix("trusted-types ")).unwrap_or_else(|| panic!("{csp}"));
+        list.split_whitespace().map(String::from).collect()
+    };
+    assert_eq!(tt(CSP), ["lit-html", "wicket-sw"]);
+    assert_eq!(tt(crate::serve::web::SESSION_CSP), ["vue"]);
+    for csp in [CSP, crate::serve::web::SESSION_CSP] {
+        let list = tt(csp);
+        assert!(!list.iter().any(|p| p == "'allow-duplicates'" || p == "*" || p == "default"), "{csp}");
+    }
     assert!(HSTS.contains("max-age=63072000") && HSTS.contains("includeSubDomains") && HSTS.contains("preload"));
     // Hashed assets are immutable; everything with data is no-store.
     let (_, h, _) = call(&t.state, "GET", &js, &[], b"").await;
@@ -402,7 +419,7 @@ async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
     let (status, h, body) = call(&t.state, "GET", "/session?run=run_x", &[], b"").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h["content-type"], "text/html; charset=utf-8");
-    assert_eq!(h["content-security-policy"], CSP);
+    assert_eq!(h["content-security-policy"], crate::serve::web::SESSION_CSP, "the session page's own policy (#739)");
     assert_eq!(h["cache-control"], "no-store");
     assert_eq!(body, page, "the same page for every run: it reads the run from its URL");
     for (ext, ctype, bytes) in

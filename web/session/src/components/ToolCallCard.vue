@@ -1,7 +1,7 @@
 <!-- Upstream: formulahendry/acp-ui@cd9c3cb src/components/ToolCallCard.vue (MIT). wicket fork: the call's
      input, output and diffs (upstream showed title, kind, status and paths only), and wicket's answer to
      the agent's permission request; the console's colours, light and dark. Everything is text
-     interpolation: no v-html. -->
+     interpolation: no raw-HTML binding (ci/session-view.sh checks). -->
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { ToolCallInfo } from '../lib/types';

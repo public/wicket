@@ -14,15 +14,23 @@ use std::sync::LazyLock;
 /// The policy on every response. Nothing inline, nothing from elsewhere, no framing, no `<base>`;
 /// `manifest-src` lets the browser read the web app manifest (with `default-src 'none'` it couldn't).
 ///
-/// Trusted Types are enforced (#739): a page may write HTML or script only through a policy, and the
-/// only policies allowed are lit-html's (the console's views), Vue's (the session view's static
-/// nodes) and `wicket-sw`, console.js's, which makes the service worker's URL, "/sw.js", and nothing
-/// else. lit-html's and Vue's are created inside those libraries and pass their own templates; no
-/// code of ours can set `innerHTML` or the like from a string, and a browser with Trusted Types
-/// throws if it tries.
+/// Trusted Types are enforced (#739): a page may write HTML or script only through a policy it is
+/// allowed. The console's page allows two: lit-html's, which passes only lit-html's own templates
+/// (every value in them is set as text), and `wicket-sw`, console.js's, which makes the service
+/// worker's URL, "/sw.js", and nothing else. No code of the console's can set `innerHTML` or the like
+/// from a string: a browser with Trusted Types throws if it tries.
 pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; \
 manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; \
-require-trusted-types-for 'script'; trusted-types lit-html vue wicket-sw";
+require-trusted-types-for 'script'; trusted-types lit-html wicket-sw";
+
+/// A run's session page (#327, `/session`): the same policy, but its only Trusted Types policy is
+/// Vue's, the session view's framework. Vue's passes any string through (`createHTML: v => v`), for
+/// its static nodes and for any `v-html` or `innerHTML` binding, so here Trusted Types stop only code
+/// outside Vue: what keeps an agent's text out of HTML is that the view has no such binding, which
+/// ci/session-view.sh checks.
+pub const SESSION_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; \
+manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; \
+require-trusted-types-for 'script'; trusted-types vue";
 
 /// Strict-Transport-Security for HTTPS origins: two years, subdomains, and eligible for the browsers'
 /// preload lists (submitting the domain to hstspreload.org is the operator's step).
@@ -165,6 +173,7 @@ pub fn write_console_assets(dir: &std::path::Path) -> std::io::Result<()> {
             std::fs::write(p.with_file_name(format!("{}.br", p.file_name().and_then(|n| n.to_str()).unwrap_or_default())), br)?;
         }
     }
-    let headers = serde_json::json!({ "content-security-policy": CSP });
+    // The session page's policy apart, for a server of the dump to send with session.html.
+    let headers = serde_json::json!({ "content-security-policy": CSP, "session-content-security-policy": SESSION_CSP });
     std::fs::write(dir.join("headers.json"), serde_json::to_vec_pretty(&headers)?)
 }

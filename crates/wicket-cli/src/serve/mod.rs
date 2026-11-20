@@ -807,8 +807,13 @@ where
     B: hyper::body::Body,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let session_page = req.uri().path() == "/session";
     let mut r = dispatch(req, state, peer).await;
     web::secure_headers(r.headers_mut(), state.hsts);
+    // A run's session page allows Vue's Trusted Types policy, and only it (#739).
+    if session_page {
+        r.headers_mut().insert(http::header::CONTENT_SECURITY_POLICY, http::HeaderValue::from_static(web::SESSION_CSP));
+    }
     r
 }
 
