@@ -55,7 +55,8 @@ pub use retention::{Anchor as AuditAnchor, AuditUsage, Checkpoint as AuditCheckp
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
 pub use standing::{
     new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
-    Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
+    OnNode as StandingOnNode, Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS,
+    MAX_PENDING as STANDING_MAX_PENDING,
 };
 pub use triggers::{
     Chain as TriggerChain, Firing as TriggerFiring, Trigger, TriggerEvent, FIRING_STATES as TRIGGER_FIRING_STATES, MAX_TRIGGERS_PER_OWNER,
@@ -225,7 +226,11 @@ impl StoreError {
 /// (#715 review): what the agent claimed when it asked (an update's reason and commit), kept apart
 /// from the request's reason so the console can show the agent's words as the agent's. Older builds
 /// don't read it; the floor stays 17.
-/// Version 43 (expand, #748; 37 to 42 are #752's and others' in flight) adds `name_records.missing_since`:
+/// Version 37 (expand, after 36) adds `standing_on_node` (#572): which standing rules are on
+/// their way into a run's token on its node, and which the node confirmed, so `await_grant` on a
+/// standing ask answers once the box's node can honour it. Older builds don't read it; the floor
+/// stays 17.
+/// Version 43 (expand, #748; 38 to 42 are others' in flight) adds `name_records.missing_since`:
 /// when a listing of its zone first lacked the record, so one listing alone forgets none. Older
 /// builds don't read it; the floor stays 17.
 pub const SCHEMA_VERSION: u32 = 43;
@@ -770,6 +775,8 @@ impl Ledger {
         self.close_links_of(&run.0)?;
         // And its names (#575): run-scoped ones end, standing ones wait for the next run.
         self.release_run_names(run)?;
+        // And where its standing rules were on their way to its node (#572).
+        self.conn.execute("DELETE FROM standing_on_node WHERE run = ?1", params![run.0])?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
             "UPDATE leases SET status = 'withdrawn', detail = 'its run ended before a decision', ended_at = ?2 WHERE run = ?1 AND status = 'pending'",

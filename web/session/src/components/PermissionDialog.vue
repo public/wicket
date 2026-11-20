@@ -1,11 +1,11 @@
 <!-- Upstream: formulahendry/acp-ui@cd9c3cb src/components/PermissionDialog.vue (MIT). wicket fork: inline,
-     not a modal; once options only; and a wicket escalation is decided with the console's signed decide
+     not a modal; once options only; and a wicket request is decided with the console's signed decide
      action (`/api/decide/*`: the server's description in the signing sheet, then a passkey assertion)
      before the ACP answer goes back. The ACP answer itself decides nothing (the endpoint audits it). -->
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import type { PermissionRequest } from '../lib/types';
-import { decideBody, riskLabel } from '../lib/wicket';
+import { decideBody, reasonLine, riskLabel } from '../lib/wicket';
 import { signed } from '../lib/sign';
 
 const props = defineProps<{
@@ -43,11 +43,11 @@ async function choose(optionId: string, kind: string) {
 
 <template>
   <div class="ask" :class="{ escalation: request.escalation }">
-    <div class="label">{{ request.escalation ? 'wicket is asking you' : 'Permission requested' }}</div>
+    <div class="label">{{ request.escalation ? 'Request waiting for you' : 'The agent asks (not enforced by wicket)' }}</div>
     <template v-if="request.escalation">
       <div class="op">{{ request.escalation.method }} {{ request.escalation.host }}{{ request.escalation.path }}<template v-if="request.escalation.prefix">… (every path under it)</template></div>
       <div class="meta">{{ riskLabel(request.escalation.risk) }} · request {{ request.escalation.id }}</div>
-      <div v-if="request.escalation.reason" class="why">{{ request.escalation.reason }}</div>
+      <div v-if="request.escalation.reason" class="why">{{ reasonLine(request.escalation) }}</div>
     </template>
     <div v-else class="op">{{ request.toolCall.title }}</div>
     <div class="buttons">
@@ -61,7 +61,7 @@ async function choose(optionId: string, kind: string) {
       >{{ o.name }}</button>
       <button v-if="!request.escalation" type="button" :disabled="busy" @click="emit('cancel')">Cancel</button>
     </div>
-    <div v-if="request.escalation" class="note">Approving is once, for 10 minutes. Your passkey signs the decision; you can also decide it on the console's front page.</div>
+    <div v-if="request.escalation" class="note">wicket enforces this one: the box can't do it until it is approved. The sheet shows the terms your passkey signs: one use for 10 minutes, or a request's own (a git push: any number of uses for 5 minutes). You can also decide it on the console's front page.</div>
     <div v-if="state" class="state">{{ state }}</div>
   </div>
 </template>

@@ -22,7 +22,7 @@ What came from upstream, and what changed:
 | `src/lib/types.ts` | unchanged | tool calls keep their input, output, diffs, and wicket's permission answer and escalation; messages keep plans and senders |
 | `src/session.ts` | the update handler in `stores/session.ts` | no pinia; a tool call that starts a turn is shown; plans are shown; `_meta.wicket` is read; wicket's notices are their own messages |
 | `src/components/ToolCallCard.vue` | unchanged | shows arguments, results, diffs and the permission answer; the console's colours |
-| `src/components/PermissionDialog.vue` | unchanged | inline instead of a modal; once options only; wicket escalations decided with a passkey through the signing sheet |
+| `src/components/PermissionDialog.vue` | unchanged | inline instead of a modal; once options only; wicket requests decided with a passkey through the signing sheet |
 | `src/App.vue` | the layout of `ChatView.vue` | text interpolation instead of `marked` + `v-html`; opening with a passkey, reopening, Stop (`session/cancel`), following the stream, a phone layout |
 | `src/lib/wicket.ts`, `src/lib/sign.ts`, `src/components/SignSheet.vue`, `src/style.css` | none: wicket's | the console's API and signed actions (the decide path is `/api/decide/*`), the signing sheet pinned to the top (#124), the console's colours |
 | `check/check.ts`, `check/ui.ts` | none: wicket's | the client against the real endpoint; the App under jsdom |
