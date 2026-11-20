@@ -1,0 +1,4 @@
+#!/bin/sh
+# Refuses a commit message that carries AI attribution (ci/no-attribution.py). Enable once per clone:
+#   git config core.hooksPath .githooks
+exec python3 -I "$(git rev-parse --show-toplevel)/ci/no-attribution.py" --message "$1"

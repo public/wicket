@@ -20,7 +20,9 @@
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 bin=$(realpath "${1:-$repo/target/release/wicket}")
-base=${2:-ubuntu:24.04}
+# shellcheck source=ci/base-images.sh
+. "$repo/ci/base-images.sh"
+base=$(pinned_base "${2:-ubuntu:24.04}")
 docker=${DOCKER:-docker}
 name=acc-install-$$
 data=/var/lib/wicket

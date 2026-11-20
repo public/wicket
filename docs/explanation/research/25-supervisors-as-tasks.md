@@ -291,14 +291,19 @@ Proposed:
   - The same rules apply as now (`reconcile::runs`): adopt if the node lists the box, end as `lost`
     if it doesn't, wait while the node is unreachable and the run is fenced. Adoption is a new task in
     the same process, not a spawned `wicket attach`, and it is backed off per run (§3.4).
-- **Shard hand-off is on the fast path.** The global reconciler watches the hosts' leases and their
-  processes. When a host's process has died, or its lease has lapsed alone (§3.1), it starts a fresh,
-  isolated host for that shard at once, without waiting for a slow pass (§3.2 gives the timeline).
-  A live host never takes another's shard: shards aren't merged, so the 2,000-run bound holds.
+- **Shard hand-off is on the fast path, and wicketd alone does it.** wicketd starts every host
+  (§5.2), so it is the one starter for a dead shard too. When a host's process exits (wicketd reaps
+  its child), or its heartbeat has been silent and its lease has lapsed alone (§3.1), wicketd:
+  1. takes the shard in the ledger (a new epoch);
+  2. kills the old host, if it is still there;
+  3. starts a fresh, isolated host for the shard.
+  It does this at once, without waiting for a slow pass (§3.2 gives the timeline). A live host never
+  takes another's shard: shards aren't merged, so the 2,000-run bound holds.
 - **The global `wicket reconcile` keeps what isn't per shard**:
   - triggers, leases and machines (#579), placed nodes, signers, services;
   - the ledger's upkeep;
-  - fencing a host whose lease has lapsed alone, and handing its shard to a fresh host;
+  - a check that every shard has a live host, which it reports (`supervisor.unowned`) but doesn't
+    act on: wicketd is the one starter, so two never race for a shard;
   - a slower level-triggered pass (every 10 min) that checks every shard's runs as a backstop.
 - **Box listing moves off ssh.** The node link's welcome and the node's health report already say
   which boxes a node runs. Docker listing over ssh stays only in the backstop pass, for boxes with no
@@ -341,9 +346,14 @@ Proposed:
   renewal. A frozen process lapses its lease, and so does a wedged runtime whose lease thread is
   still alive. A long batch doesn't, since the ticking task is never behind the batch.
 - **The watchdog is wicketd's, not systemd's.** Hosts are started by wicketd (§5.2), not as units
-  of their own. So there is no `WatchdogSec`. The lease thread also answers wicketd's heartbeat on
-  the host's control socket, sent every 5 s. A host that doesn't answer for 20 s, or whose lease has
-  lapsed alone, is killed by wicketd (below).
+  of their own. So there is no `WatchdogSec`.
+  - **The heartbeat is off the ledger path.** A thread of its own in the host answers wicketd's
+    heartbeat on the host's control socket, sent every 5 s. It says whether the runtime's tick has
+    moved, and touches no ledger, so a ledger stall can't silence it.
+  - **wicketd kills only after it has taken the epoch.** A host whose heartbeat has been silent for
+    20 s, or says its runtime is stuck, is fenced only once wicketd has taken its shard in the ledger
+    (below). Taking it needs a ledger write, and only works while that host's lease has lapsed. So a
+    ledger stall, which stops every write at once, gets no host killed.
 
 **Epochs, as authority.**
 - Taking a shard (a fresh host, or the same host after a restart) increments its `epoch`. That
@@ -376,7 +386,7 @@ Proposed:
 
 **A shared stall isn't a host's.**
 - One ledger stall (a long checkpoint, a full disk) makes every host's renewal fail at once, and
-  every lease lapse together. The global reconciler then kills no one:
+  every lease lapse together. wicketd then kills no one:
   - **it fences only a host whose lease lapsed alone**, while other hosts renewed within the same
     window, or whose process is gone;
   - **when every lease lapsed together**, the cause is the ledger, not a host. It waits for renewals
@@ -578,8 +588,10 @@ rolled back by running the previous build.
 1. **Two hosts, static by node, opt-in.**
    - `wicket supervise` runs today's supervisor, `run_to_end`, as **a thread per run** with a
      current-thread runtime each, as child supervisors do. That is one thread a run, up to the host's
-     bound (2,000). It is safer than tasks on a shared runtime for a first step: `crate::out::to`
-     (the run's output sink) is `thread_local!`.
+     bound (2,000), plus each runtime's blocking threads while they're busy (ledger and file work).
+     Those are capped at 4 a run (`max_blocking_threads(4)`), so 2,000 runs make at most about
+     10,000 threads at a burst, and about 2,000 at rest. It is safer than tasks on a shared runtime
+     for a first step: `crate::out::to` (the run's output sink) is `thread_local!`.
    - There are two hosts, each holding a static half of the nodes (by a hash of the node's name).
      The local node goes with the first.
    - Each host holds at most 2,000 runs, so step 1 supervises at most 4,000. A run that would take
@@ -599,7 +611,8 @@ rolled back by running the previous build.
    - Tasks on a shared runtime, once `crate::out::to` and the other thread-locals are per task.
    - The protocol is unchanged.
 3. **One channel per node** (the node-link protocol, §2.2).
-   - A node link per node in the host, with today's per-run channel for nodes below 20.
+   - A node link per node in the host, with today's per-run channel for nodes below the node-link
+     version (22 or later, §2.2).
    - The node side demultiplexes.
    - Feed deltas are batched across runs on a node.
 4. **Dynamic shards.** Hand-off by lease, the shard reconciler, the global reconciler's slow pass, and

@@ -891,6 +891,11 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         ));
     }
     let together: &[String] = if jump { &nodes } else { &[] };
+    // An audit sink the sinks file leaves out (a relative jsonl path) is said here, before the
+    // switch: the gate's own output (`wicket self health`) isn't shown.
+    for w in skipped_sinks() {
+        say(format!("warning: audit sinks: {w}"));
+    }
     if !o.only_nodes {
         if blue == green {
             say(format!("the control host already runs {green}"));
@@ -1572,6 +1577,15 @@ async fn gate_round(bin: &Path, target: &str, nodes: &[String], g: &Gate, first:
     Ok(())
 }
 
+/// The audit sinks the sinks file leaves out, and why (#694): said before an update switches, and
+/// by `wicket doctor` and `wicket self health`.
+pub(crate) fn skipped_sinks() -> Vec<String> {
+    match wicket_home::audit_export::SinksConfig::load() {
+        Ok(Some(c)) => c.skipped,
+        _ => vec![],
+    }
+}
+
 // ---- `wicket self health` (run by the new build) ----
 
 /// `wicket self health`: this build opens the ledger (migrating it) and verifies its audit chain,
@@ -1583,6 +1597,12 @@ pub async fn health(nodes: Vec<String>, canary: Option<PathBuf>, image: String) 
     let n = ledger.lock().expect("ledger").verify_audit().context("the audit chain")?;
     wicket_home::audit_export::verify_local_anchor(&ledger.lock().expect("ledger")).context("the audit chain")?;
     println!("ledger: ok ({n} audit records verify)");
+    // An audit sink left out of the sinks file (a relative jsonl path) is said, not failed on.
+    if let Ok(Some(c)) = wicket_home::audit_export::SinksConfig::load() {
+        for w in &c.skipped {
+            println!("audit sinks: warning: {w}");
+        }
+    }
     let rt = wicket_sandbox::Docker::from_env().runtimes().await.context("docker")?;
     println!("docker: ok ({})", rt.join(", "));
     for n in &nodes {
