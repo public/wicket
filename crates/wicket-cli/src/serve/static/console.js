@@ -240,6 +240,11 @@ function describe(a) {
       " \u00b7 for " + to + " \u00b7 " + days + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
   }
   if (a.action === "standing_deny") return "Deny standing reach " + s(a.standing) + ": " + ruleText(a.rule);
+  if (a.action === "release_fence") return "Release run " + s(a.run) + "'s fence on node " + s(a.node) + " (" + s(a.node_status) +
+    (a.node_seen_ms ? ", last reported " + whenMs(a.node_seen_ms) : ", never reported") + "), fenced " +
+    (a.fenced_until_ms ? "until " + whenMs(a.fenced_until_ms) : "until its node confirms the box stopped") +
+    ": its agent can be woken while its box may still be running there \u00b7 " + s(a.why) + " \u00b7 reason: " + s(a.reason) +
+    (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
   if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
@@ -293,8 +298,8 @@ async function openSheet(body, extra) {
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   state.textContent = "";
   delete go.dataset.waiting;
-  const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny"].includes(begin.action.action);
-  go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
+  const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny", "release_fence"].includes(begin.action.action);
+  go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete", release_fence: "release" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
   go.disabled = true; setTimeout(() => { if (sheet === sheetToken) go.disabled = false; }, SETTLE_MS);
@@ -794,6 +799,8 @@ function line(op) {
     case "run.start": return logLine(op, "start", "", r + " started: agent " + strip(b.agent) + " in zone " + strip(b.zone));
     // operator.message is from before `wicket say` was removed (#198); prompts are session.prompt.
     case "operator.message": case "session.prompt": return logLine(op, "message", "", "a message of " + plural(b.chars || 0, "character") + " to " + r + by(b) + (b.via ? " in the " + strip(b.via) : ""));
+    case "run.fence_released": return logLine(op, "released", "blocked", r + " released from server " + strip(b.node) + by(b) + ", though its box may still be running there: " + strip(b.why));
+    case "run.fence_release_failed": return logLine(op, "still held", "blocked", r + " is still held: its release from server " + strip(b.node) + " couldn't be made: " + strip(b.error));
     case "identity.revoked": return logLine(op, "stopped", "blocked", r + " stopped" + by(b) + ": " + strip(b.reason));
     case "run.console_start": return logLine(op, "started", "", r + " started from " + strip(b.manifest) + " by " + byName(b.by) + ", signed with a passkey");
     case "run.exit_cause": return logLine(op, "failed", "blocked", r + " failed (exit status " + strip(b.code) + "): " + strip(b.cause));
@@ -862,6 +869,43 @@ function stateStoreRows(p, nowMs) {
   // An error already alerted on (the config alert quotes it) isn't said twice.
   for (const e of p.errors || []) if (!(p.alerts || []).some(a => a.startsWith(e))) out.push(serverText("div", "blocked", "! " + e));
   return out;
+}
+
+// A fenced run (#690): its box may still be running on a node that is revoked or no longer enrolled,
+// so its agent isn't woken. Released (signed, with a reason) from a form in its own row: kept across
+// polls while the row is unchanged, so what is typed survives, and it can only release this run.
+function fencedRow(x) {
+  const f = x.fence || {};
+  const d = el("div", "lease");
+  const head = el("div", "run-head");
+  head.append(el("span", "run-name mono", strip(x.id)));
+  const until = el("span", "meta");
+  if (f.fenced_until_ms) until.append(document.createTextNode("fenced until "), timeEl(f.fenced_until_ms / 1000));
+  else until.append(document.createTextNode("fenced until its node confirms the box stopped"));
+  head.append(until);
+  const node = el("div", "meta");
+  node.append(document.createTextNode("node " + strip(f.node) + " (" + strip(f.node_status) + ")"));
+  if (f.node_seen_ms) node.append(document.createTextNode(" \u00b7 last reported "), timeEl(f.node_seen_ms / 1000));
+  else node.append(document.createTextNode(" \u00b7 never reported"));
+  const form = el("div", "stack");
+  form.hidden = true;
+  const label = el("label", "meta", "Release " + strip(x.id) + "'s fence: its agent can be woken and the run ended, while its box may still be running on node " +
+    strip(f.node) + ". Only if that node will never run it again. Say why (it goes in the activity log):");
+  const text = el("textarea");
+  const go = el("button", "deny", "Release");
+  go.onclick = () => {
+    if (!text.value.trim()) { toast("Say why: the reason goes in the activity log."); return; }
+    signed({ action: "release_fence", run: x.id, reason: text.value }, () => { form.hidden = true; text.value = ""; });
+  };
+  const cancel = el("button", "", "Cancel");
+  cancel.onclick = () => { form.hidden = true; text.value = ""; };
+  const fb = el("div", "buttons"); fb.append(go, cancel);
+  form.append(label, text, fb);
+  const open = el("button", "deny", "Release\u2026");
+  open.onclick = () => { form.hidden = false; text.focus && text.focus(); };
+  const acts = el("div", "buttons"); acts.append(open);
+  d.append(head, node, el("div", "meta", strip(f.why)), acts, form);
+  return d;
 }
 
 // A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
@@ -1943,6 +1987,7 @@ async function refreshOnce() {
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
     renderRows("placed", s.placed || [], placedRow, "No leased nodes.");
+    renderKeyed("fenced", s.fenced || [], fencedRow, "None: no agent's box is held on a node that is revoked or no longer enrolled. An enrolled node's boxes are released by the node, or by revoking it first.");
     renderKeyed("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};

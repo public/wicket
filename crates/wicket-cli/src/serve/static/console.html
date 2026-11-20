@@ -98,6 +98,9 @@
         </div>
         <div class="card"><h3>Servers and the record backup</h3><div id="health"></div></div>
         <div class="card"><h3>Rented servers</h3><div id="placed"></div></div>
+        <!-- Fenced runs (#690): agents whose box may still run on a node that is revoked or no longer enrolled,
+             so it can never end their fence; released passkey-signed, by an operator whose authority covers fence. -->
+        <div class="card"><h3>Agents held on lost servers</h3><p class="note top-note">An agent whose box may still be running on a server that was revoked or removed isn't started again until its hold is released.</p><div id="fenced"></div></div>
         <div class="card"><h3>Notifications</h3><div id="push"></div></div>
       </div>
       <div class="stack">

@@ -213,6 +213,38 @@ fn node_list_json() {
 }
 
 #[test]
+fn lease_list_json() {
+    let (_d, mut l) = super::test_ledger("leases");
+    let row = wicket_store::LeaseRow {
+        id: "l-1".into(),
+        tenant: TenantId::single().0,
+        run: "run_l".into(),
+        request_id: None,
+        provider: "static".into(),
+        spec: serde_json::json!({}),
+        hourly_cap: 0,
+        reserved: 0,
+        duration_secs: 1800,
+        created_at: 0,
+        not_after: None,
+        status: "pending".into(),
+        node_id: None,
+        node_name: None,
+        ssh_target: None,
+        host_key: None,
+        billed: None,
+        ended_at: None,
+        detail: None,
+    };
+    l.create_lease(&row, wicket_store::LeaseBudget { max_hourly: 0, max_total: 0 }).unwrap().unwrap();
+    let v = wicket_control::capacity::list_json(&l).unwrap();
+    assert_eq!((v[0]["id"].as_str(), v[0]["status"].as_str(), v[0]["node"].is_null()), (Some("l-1"), Some("pending"), true), "{v:#}");
+    let at = v[0]["created_at"].as_i64().unwrap();
+    assert!((wicket_store::now() - 60..=wicket_store::now()).contains(&at), "Unix seconds, not ms: {at}");
+    documented_as("`wicket lease list --json`", &v);
+}
+
+#[test]
 fn agents_json() {
     let (_d, mut l) = super::test_ledger("agents");
     l.create_agent(&wicket_store::NewAgent {

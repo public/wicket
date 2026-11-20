@@ -56,6 +56,7 @@ mod webauthn;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 pub(crate) use cmd::approve::GrantCmd;
+pub(crate) use cmd::approve::RequestCmd;
 // Re-verifies signed console actions offline; the console's tests check their records with it.
 #[cfg(test)]
 pub(crate) use cmd::audit::verify_signed_decisions;
@@ -91,7 +92,7 @@ const AREAS: &[(&str, &[&str])] = &[
         "Runs and agents",
         &["run", "session", "top", "agents", "hibernate", "trigger", "wrap", "links", "unlink", "zone", "program", "image"],
     ),
-    ("Approvals and grants", &["pending", "approve", "deny", "grant", "standing", "names", "audit"]),
+    ("Approvals and grants", &["pending", "request", "approve", "deny", "grant", "standing", "names", "audit"]),
     ("Nodes and placement", &["node", "lease", "service", "why-here", "reconcile"]),
     (
         "The installation",
@@ -282,6 +283,11 @@ enum Cmd {
     },
     /// Deny a pending request.
     Deny { id: String },
+    /// Pending requests: `wicket request list` is `wicket pending`.
+    Request {
+        #[command(subcommand)]
+        cmd: RequestCmd,
+    },
     /// Links between boxes (expose/connect/link), newest first.
     Links {
         #[arg(long, default_value_t = 40)]
@@ -415,12 +421,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: KeysCmd,
     },
-    /// Make what exists agree with the ledger: runs, leases, machines and boxes.
+    /// Make what exists agree with the ledger: runs, leases, machines, boxes and public names.
     ///
     /// Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past
     /// their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again
     /// right before each destroy), adopt or create the ones leases need, and stop boxes whose run has
-    /// ended, here and on enrolled nodes. Records every change in the audit log.
+    /// ended, here and on enrolled nodes. With `names.public` in wicket.yaml, also make the boxes zone's
+    /// records that wicket owns agree with the live public names, through its DNS provider (#575; the
+    /// noop provider only records the plan). Records every change in the audit log.
     Reconcile {
         /// Only report what would change.
         #[arg(long)]
@@ -636,6 +644,7 @@ async fn run() -> Result<()> {
         c @ (Cmd::Pending { .. } | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await
         }
+        Cmd::Request { cmd: RequestCmd::List { json } } => cmd::approve::dispatch(Cmd::Pending { json }).await,
         Cmd::Names { cmd } => cmd::names::dispatch(cmd).await,
         Cmd::Standing { cmd } => cmd::standing::dispatch(cmd).await,
         Cmd::Trigger { cmd } => cmd::trigger::dispatch(cmd).await,
@@ -749,6 +758,8 @@ mod tests {
         use clap::Parser;
         for (old, new) in [
             (&["wicket", "secret", "rm", "x"][..], &["wicket", "secret", "remove", "x"][..]),
+            (&["wicket", "pending", "--json"], &["wicket", "request", "list", "--json"]),
+            (&["wicket", "pending"], &["wicket", "request", "list"]),
             (&["wicket", "standing", "approve", "s-1", "--lasts", "7d"], &["wicket", "standing", "approve", "s-1", "--ttl", "7d"]),
             (&["wicket", "standing", "renew", "s-1", "--lasts", "forever"], &["wicket", "standing", "renew", "s-1", "--ttl", "forever"]),
         ] {
@@ -758,8 +769,9 @@ mod tests {
         }
         // What each parsed to, field by field.
         fn fields(c: crate::Cmd) -> String {
-            use crate::{Cmd, SecretCmd, StandingCmd};
+            use crate::{Cmd, RequestCmd, SecretCmd, StandingCmd};
             match c {
+                Cmd::Pending { json } | Cmd::Request { cmd: RequestCmd::List { json } } => format!("pending json={json}"),
                 Cmd::Secret { cmd: SecretCmd::Rm { name } } => format!("secret remove {name}"),
                 Cmd::Standing { cmd: StandingCmd::Approve { id, bound, lasts, narrow, yes } } => {
                     format!("standing approve {id} for={bound} ttl={lasts} narrow={narrow} yes={yes}")

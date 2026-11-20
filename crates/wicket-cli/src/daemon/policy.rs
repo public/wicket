@@ -12,8 +12,8 @@
 
 use super::Peer;
 use crate::{
-    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd,
-    ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
+    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, RequestCmd, SecretCmd,
+    SelfCmd, ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -71,7 +71,7 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(
             "`wicket audit compact` runs with wicketd stopped, as the wicket user: sudo systemctl stop wicketd wicket-console wicket-reconcile; sudo -u wicket WICKET_HOME=/var/lib/wicket wicket audit compact",
         ),
-        Cmd::Pending { .. } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
+        Cmd::Pending { .. } | Cmd::Request { cmd: RequestCmd::List { .. } } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
         // Renewing a grant or a box's authority grants more time: a decision, as approving is.
@@ -124,7 +124,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // Both stop things, and a reconcile pass can create machines a lease needs.
         Cmd::Reconcile { .. } | Cmd::Attach { .. } => Forward(Privileged),
         Cmd::Lease { cmd } => match cmd {
-            LeaseCmd::List => Forward(Read),
+            LeaseCmd::List { .. } => Forward(Read),
             LeaseCmd::Release { .. } => Forward(Revoke),
         },
         Cmd::Node { cmd } => match cmd {

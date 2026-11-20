@@ -41,6 +41,10 @@
 //! - *Stores*: once an hour ([`crate::storegc::EVERY_SECS`]), the content-addressed stores'
 //!   collection (#258, `wicket state gc`): the local store and the state store's, then the local
 //!   store's cache cap. Audited as `store.gc` and `store.deleted`, not `reconcile.*`.
+//! - *Names* (#575): the boxes zone's records that wicket owns are made to agree with the live
+//!   public names ([`wicket_control::namesync`]): names whose lifetime is over end (`name.lapsed`),
+//!   and the plan goes through the `names.public.provider`. Audited as `name.plan` (when it changed),
+//!   `name.record` and `name.conflict`, not `reconcile.*`. Nothing without `names.public`.
 //! - *Triggers* (#578): each pass fires the schedules' minutes and the timers that came due since
 //!   the last one (at most `wicket_control::triggers::CATCH_UP_SECS` back), once each: waking or
 //!   messaging the agent a trigger names, or queueing the run it starts. Audited as `trigger.*`.
@@ -1143,6 +1147,8 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
         }
         Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
     }
+    // Public names (#575): the boxes zone's owned records made to agree with the live names.
+    done.extend(names_pass(&ledger, now, dry_run).await);
     // Audit retention on the host (#582): over its size limit, the audit table's oldest records
     // (ones every sink has, behind a checkpoint one acknowledged) are pruned and the space given
     // back. Never without a sink and the state store.
@@ -1184,6 +1190,72 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
         }
     }
     Ok(done)
+}
+
+/// The names reconciler's pass ([`wicket_control::namesync::pass`]) with the installation's
+/// `names.public` settings and provider, as the pass's report. Nothing without `names.public`. The
+/// plan and the names waiting are reported when the plan changed (it is then recorded), or in a dry
+/// run: the `noop` provider plans the same each pass.
+async fn names_pass(ledger: &Ledger, now: i64, dry_run: bool) -> Vec<Done> {
+    let names = match wicket_agent::acp::names_settings() {
+        Ok(n) => n,
+        Err(e) => return vec![Done { kind: "error", target: "names".into(), detail: e }],
+    };
+    let Some(public) = names.public else { return vec![] };
+    let pass = match public.provider {
+        wicket_names::ProviderKind::Noop => {
+            wicket_control::namesync::pass(ledger, &public, &wicket_names::NoopProvider::new(), now, dry_run).await
+        }
+    };
+    let r = match pass {
+        Ok(r) => r,
+        Err(e) => return vec![Done { kind: "error", target: format!("names in {}", public.domain()), detail: format!("{e:#}") }],
+    };
+    names_report(&r, dry_run)
+}
+
+fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done> {
+    let mut done: Vec<Done> = r
+        .lapsed
+        .iter()
+        .map(|n| Done { kind: "name_lapsed", target: format!("{} ({})", n.label, n.id), detail: "its lifetime is over".into() })
+        .collect();
+    done.extend(r.freed.iter().map(|(node, port)| Done {
+        kind: "port_freed",
+        target: format!("host port {port} on {node}"),
+        detail: "its name's records are gone: free again after twice the TTL".into(),
+    }));
+    if !(r.recorded || dry_run) {
+        return done;
+    }
+    let how = match (dry_run, r.applied) {
+        (true, _) => "dry run".to_string(),
+        (false, true) => format!("applied by {}", r.provider),
+        (false, false) => format!("provider {}: not applied, only recorded", r.provider),
+    };
+    for c in &r.plan.changes {
+        let (op, rec) = match c {
+            wicket_names::Change::Create(x) => ("create", x),
+            wicket_names::Change::Update { to, .. } => ("update", to),
+            wicket_names::Change::Delete(x) => ("delete", x),
+        };
+        done.push(Done {
+            kind: "name_record",
+            target: format!("{} {}", rec.name, rec.rtype),
+            detail: format!("{op} {} ({how})", rec.value),
+        });
+    }
+    for c in &r.plan.conflicts {
+        done.push(Done {
+            kind: "name_conflict",
+            target: c.name.clone(),
+            detail: format!("the zone holds {} record(s) there that wicket doesn't own: left alone", c.records.len()),
+        });
+    }
+    for w in &r.waiting {
+        done.push(Done { kind: "name_waiting", target: format!("{} ({})", w.name, w.id), detail: w.why.clone() });
+    }
+    done
 }
 
 /// The triggers' scheduler pass ([`wicket_control::triggers::pass`]), as the pass's report: one
@@ -1753,7 +1825,7 @@ mod tests {
         // operator releases the fence: then it ends.
         pass_at(&w, &mut l, &asked, false, NOW + 366 * 86_400).await;
         assert_eq!(l.run_status("run_unknown").unwrap().as_deref(), Some("running"));
-        crate::noderun::release_fence(&unknown_dir(), "root@cli").unwrap();
+        crate::noderun::release_fence(&unknown_dir(), "root@cli", None).unwrap();
         pass_at(&w, &mut l, &asked, false, NOW + 366 * 86_400).await;
         assert_eq!(l.run_status("run_unknown").unwrap().as_deref(), Some(LOST));
         let _ = std::fs::remove_dir_all(unknown_dir());

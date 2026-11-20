@@ -9,7 +9,12 @@ use crate::*;
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
         Cmd::Reconcile { dry_run, every } => reconcile::command(dry_run, every).await,
-        Cmd::Lease { cmd: LeaseCmd::List } => capacity::list(),
+        Cmd::Lease { cmd: LeaseCmd::List { json } } => {
+            if json {
+                return crate::cmd::print_json(&capacity::list_json(&Ledger::open(&ledger_path())?)?);
+            }
+            capacity::list()
+        }
         Cmd::Lease { cmd: LeaseCmd::Release { id } } => {
             let l = Ledger::open(&ledger_path())?;
             let x = l.lease(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no lease {id}")))?;
@@ -526,7 +531,11 @@ pub enum NodeCmd {
 #[derive(Subcommand)]
 pub enum LeaseCmd {
     /// Every lease: status, holder run, node, money reserved, end.
-    List,
+    List {
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// End a lease now: what runs on it stops and its node is destroyed (one reconcile pass).
     Release { id: String },
 }

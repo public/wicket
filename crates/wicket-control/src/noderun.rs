@@ -805,6 +805,9 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         publisher.commit(changes, now).context("publishing the box's token")?;
         publisher.epoch()
     };
+    // That token carries grants only: a re-attached run's standing rules aren't in it until its
+    // first sync puts them back, so none reads as on the node meanwhile (#752 review, F1).
+    s.ledger.lock().expect("ledger").standing_requeued(&s.run.0).context("recording the box's standing rules")?;
     published.end();
     let recording = t.span("authority.record");
     let token_root = (token_issuer.block_ids()[0].clone(), until_s.saturating_mul(1000));
@@ -2046,7 +2049,7 @@ pub fn record_authority(run_dir: &Path, node: &str, until_ms: i64) -> Result<()>
     write_authority(run_dir, &AuthorityRecord { node: node.into(), until_ms, stopped, released_by: None })
 }
 
-fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
+pub(crate) fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
     use std::io::Write;
     let p = authority_file(run_dir);
     let dir = p.parent().expect("ctl");
@@ -2079,8 +2082,20 @@ pub fn confirm_stopped(run_dir: &Path) {
 /// An operator releases run `run_dir`'s fence without its node (#676): for a run its node can't
 /// confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end. Marked as if the
 /// node had confirmed, with who did it; the caller audits it (`run.fence_released`).
-pub fn release_fence(run_dir: &Path, by: &str) -> Result<()> {
-    let mut a = read_authority(run_dir).unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
+///
+/// `expected` is the authority record the decision was made on: its node and `until_ms`, or None
+/// if the run had none (#708). Refused if the record is no longer that (renewed, confirmed, or
+/// written since), so a renewal between the decision and this write isn't overwritten.
+pub fn release_fence(run_dir: &Path, by: &str, expected: Option<(&str, i64)>) -> Result<()> {
+    let now = read_authority(run_dir);
+    let current = now.as_ref().filter(|a| !a.stopped).map(|a| (a.node.as_str(), a.until_ms));
+    if now.as_ref().is_some_and(|a| a.stopped) || current != expected {
+        anyhow::bail!(
+            "{}'s authority record changed since the fence was shown (renewed, or its node confirmed the box stopped): look again",
+            run_dir.display()
+        );
+    }
+    let mut a = now.unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
     a.stopped = true;
     a.released_by = Some(by.to_string());
     write_authority(run_dir, &a)
@@ -2569,12 +2584,27 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         false => Ok(vec![]),
     };
     let (node, run) = (sh.node.clone(), sh.run.0.clone());
+    let before = p.standing.clone();
     let (more, changed) =
         sync_standing(&mut p.standing, &mut p.live, &mut p.waiting, rules, p.proto, top_level, now_s, &issuer, &loads, &mut |m| {
             say!("[wicket] {run} on node {node}: {m}")
         });
     changes.extend(more);
     rebuild |= changed;
+    // Where each rule is on its way to the node (#572), for `await_grant` on it: the ones put in
+    // (or renewed) are handed now and published with this delta; the ones taken out are gone.
+    let (handed_rules, gone_rules) = standing_moves(&before, &p.standing);
+    {
+        let l = sh.ledger.lock().expect("ledger");
+        if p.standing.is_empty() {
+            // None in its token (none bind it, or its node is below protocol 17): none is on its
+            // way, whatever an earlier supervisor recorded (#752 review, F2).
+            let _ = l.standing_none(&sh.run.0);
+        } else {
+            let _ = l.standing_withdrawn(&sh.run.0, &gone_rules);
+            let _ = l.standing_handed(&sh.run.0, &sh.node, &handed_rules);
+        }
+    }
     if !rebuild {
         return vec![];
     }
@@ -2594,11 +2624,12 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     let n = p.live.len();
     let revokes: Vec<Change<BoxAuthority>> = changes.iter().filter(|c| matches!(c, Change::Revoke { .. })).cloned().collect();
     // Whether the rebuilt token went out (not only its revocations): a renewal counts only then.
+    let has_token = changes.iter().any(|c| matches!(c, Change::PutZone { .. }));
     let token_out;
     let committed = {
         let Ok(mut p) = sh.ctl.publisher.lock() else { return vec![] };
         let mut r = p.commit(changes, wicket_feed::now_ms());
-        token_out = r.is_ok();
+        token_out = r.is_ok() && has_token;
         if r.is_err() && !revokes.is_empty() {
             // The rebuilt token was refused: the revocations must still go out.
             say!(
@@ -2611,7 +2642,14 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         r.map(|f| (f, p.epoch()))
     };
     if let Ok((_, epoch)) = &committed {
-        let _ = sh.ledger.lock().expect("ledger").grants_published(&handed, *epoch as i64);
+        let l = sh.ledger.lock().expect("ledger");
+        let _ = l.grants_published(&handed, *epoch as i64);
+        // Every rule handed and not yet published went with the token, this tick's or one whose
+        // commit failed before (#752 review, F2).
+        if token_out {
+            let _ = l.standing_published(&sh.run.0, *epoch as i64);
+        }
+        drop(l);
         if let Some((i, until)) = renewing.filter(|_| token_out) {
             renewed(sh, i, until);
         }
@@ -2830,6 +2868,19 @@ fn sync_standing(
     (changes, rebuild)
 }
 
+/// The standing rules a sync put into a run's token or changed (renewed), and the ones it took
+/// out: from the published rules (id → end) before and after it.
+fn standing_moves(
+    before: &std::collections::HashMap<String, u64>,
+    after: &std::collections::HashMap<String, u64>,
+) -> (Vec<String>, Vec<String>) {
+    let mut handed: Vec<String> = after.iter().filter(|(id, end)| before.get(*id) != Some(end)).map(|(id, _)| id.clone()).collect();
+    let mut gone: Vec<String> = before.keys().filter(|id| !after.contains_key(*id)).cloned().collect();
+    handed.sort();
+    gone.sort();
+    (handed, gone)
+}
+
 /// The installation CA, for renewing nodes' CAs over their channels (#416, wicket-node's
 /// `controlca`), if this control host has one (never created here).
 fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
@@ -2841,6 +2892,15 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #572: what a sync put into a run's token or renewed, and what it took out.
+    #[test]
+    fn standing_moves_are_what_a_sync_changed() {
+        let m = |v: &[(&str, u64)]| v.iter().map(|(k, e)| (k.to_string(), *e)).collect::<std::collections::HashMap<_, _>>();
+        let (handed, gone) = super::standing_moves(&m(&[("s-a", 1), ("s-b", 1), ("s-c", 1)]), &m(&[("s-a", 1), ("s-b", 2), ("s-d", 1)]));
+        assert_eq!(handed, vec!["s-b".to_string(), "s-d".to_string()]);
+        assert_eq!(gone, vec!["s-c".to_string()]);
+    }
 
     /// A failed renewal keeps the publisher only on a valid certificate of the version on disk.
     #[test]
@@ -3255,7 +3315,7 @@ mod tests {
         assert!(fenced_in(&d, 2_000, None).is_none(), "no record of either kind: no box was started");
         std::fs::write(d.join("ctl/run.json"), b"not json").unwrap();
         // An operator releases it (#676): the fence lifts, the record says who.
-        release_fence(&d, "root@cli").unwrap();
+        release_fence(&d, "root@cli", None).unwrap();
         assert!(fenced_in(&d, 2_000, None).is_none(), "released");
         assert_eq!(read_authority(&d).unwrap().released_by.as_deref(), Some("root@cli"));
         std::fs::remove_file(d.join("ctl/authority.json")).unwrap();
@@ -3394,18 +3454,17 @@ pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> a
     anyhow::ensure!(root, "only root releases a run's fence (its box may still be running on its node)");
     anyhow::ensure!(!reason.trim().is_empty(), "say why with --reason: it goes on the audit record");
     let l = wicket_store::Ledger::open(&crate::ledger_path())?;
-    let Some((node, until)) = fenced_until(&l, run, wicket_feed::now_ms()) else {
+    let runs = crate::data_dir().join("runs");
+    let now = wicket_feed::now_ms();
+    let Some(f) = crate::fence::fence_of(&l, &runs, run, now)? else {
         anyhow::bail!("run {run} isn't fenced: its node confirmed its box stopped, or its authority has ended");
     };
-    release_fence(&crate::data_dir().join("runs").join(run), by)?;
-    let until_ms = (until != UNKNOWN_END).then_some(until);
-    l.audit(
-        &l.run_tenant(run)?.unwrap_or_else(wicket_core::TenantId::single),
-        Some(&wicket_core::RunId(run.into())),
-        "run.fence_released",
-        &serde_json::json!({ "node": node, "by": by, "why": reason, "fenced_until_ms": until_ms }),
-    )?;
-    say!("released run {run}'s fence on node {node}; its box may still be running there");
+    // The same decision and record as the console's (#690), as root: any fence, whatever its node says.
+    let identity = crate::operators::Operator::cli(&f.tenant).ok().map(|o| o.id);
+    let by = crate::fence::Decider::Root { label: by.to_string(), identity };
+    let r = crate::fence::Release { run, reason, shown: &f.effect_sha256, now_ms: now, extra: serde_json::json!({ "via": "cli" }) };
+    let f = crate::fence::release(&l, &runs, &by, r)?;
+    say!("released run {run}'s fence on node {}; its box may still be running there", f.node);
     Ok(())
 }
 
