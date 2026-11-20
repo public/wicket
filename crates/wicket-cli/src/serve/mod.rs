@@ -1772,7 +1772,8 @@ fn push_post(state: &State, cred: &str, path: &str, body: &Value) -> Reply {
 }
 
 /// What is waiting for a decision, for the notifier: every pending request (egress asks, and
-/// wicket's own capacity, update, spawn and link asks), oldest first, then standing asks (#572).
+/// wicket's own capacity, update, spawn and link asks), oldest first, then standing asks (#572),
+/// then asks for public names (#575).
 fn waiting(state: &State) -> Result<Vec<push::Waiting>> {
     let l = state.ledger()?;
     let mut out: Vec<push::Waiting> = l
@@ -1787,6 +1788,11 @@ fn waiting(state: &State) -> Result<Vec<push::Waiting>> {
     for s in l.standing_with_status(&state.tenant, "pending")? {
         let agent = s.principal.rsplit("/a/").next().unwrap_or(&s.principal).to_string();
         out.push(push::Waiting { id: s.id, summary: format!("{agent} asks for standing reach on {}", s.rule.host) });
+    }
+    // Asks for public names (#575): only a human decides them.
+    for n in l.names_with_status(&state.tenant, "pending")? {
+        let agent = n.principal.rsplit("/a/").next().unwrap_or(&n.principal).to_string();
+        out.push(push::Waiting { id: n.id, summary: format!("{agent} asks for the public name {} (port {})", n.label, n.port) });
     }
     Ok(out)
 }
