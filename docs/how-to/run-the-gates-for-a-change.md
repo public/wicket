@@ -124,8 +124,8 @@ wicket.
   started it, so a label added just after a push counts whichever of the two runs survives (#246). If
   the labels can't be read, it runs everything.
 - **A push to `main`** runs what changed since the last green run of `main` (a push's or the
-  nightly run's), since its pull request and the merge queue tested it already: this catches what
-  merging pull requests together changed. With no green run to compare with, or if that commit
+  nightly run's): its pull request tested its own change, and this tests what merged since then,
+  together. With no green run to compare with, or if that commit
   isn't an ancestor, it runs everything.
 - **The nightly run** runs the full set, as the signed build does (`build.yml`), which never uses
   a selection.
