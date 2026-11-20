@@ -274,6 +274,7 @@ mod tests {
             methods: vec!["GET\x1b[2K".into()],
             paths: vec!["/repos/o/r/actions/jobs/*/logs".into(), hidden.into(), "/a\u{202e}b".into()],
             allow_dangerous: false,
+            decode_slash: vec![],
         };
         let s = wicket_store::Standing {
             id: "s-1".into(),

@@ -243,6 +243,60 @@ fn feed_lock(dir: &Path) -> Result<std::fs::File> {
     Ok(f)
 }
 
+/// The protocol node `name` last talked to this control host (`<data dir>/nodes/<name>/protocol`,
+/// written at each connection's welcome), if one has connected: what decides, before anything is
+/// published to its feed or it is chosen for a box, whether it can read a record (#664).
+pub fn known_protocol(name: &str) -> Option<u32> {
+    let dir = crate::data_dir().join("nodes").join(name);
+    std::fs::read_to_string(dir.join("protocol")).ok()?.trim().parse().ok()
+}
+
+/// Notes the protocol a connection to node `name` talks (see [`known_protocol`]). Best effort: a
+/// note that can't be written leaves the last one (or none, which refuses what needs a newer node).
+pub fn note_protocol(name: &str, proto: u32) {
+    if known_protocol(name) == Some(proto) {
+        return;
+    }
+    let dir = crate::data_dir().join("nodes").join(name);
+    let tmp = dir.join(format!("protocol.{}", std::process::id()));
+    let ok = std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&tmp, proto.to_string()).is_ok();
+    if !ok || std::fs::rename(&tmp, dir.join("protocol")).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The protocol a node must talk to be sent `zone`'s record: [`wicket_chan::chan::DECODE_SLASH`]
+/// if it decides an encoded slash (a node before it parses the record strictly and refuses it,
+/// stalling its whole feed), otherwise any.
+pub fn protocol_needed(zone: &wicket_core::ZoneSpec) -> u32 {
+    if zone.reach.iter().any(|r| !r.decode_slash.is_empty()) {
+        wicket_chan::chan::DECODE_SLASH
+    } else {
+        0
+    }
+}
+
+/// Refuses to publish `zone`'s record to node `name` unless the node is known to read it: decided
+/// before the record goes in the node's feed, which every session to the node carries (#664).
+pub fn check_protocol(name: &str, zone: &wicket_core::ZoneSpec) -> Result<()> {
+    let need = protocol_needed(zone);
+    if need == 0 {
+        return Ok(());
+    }
+    match known_protocol(name) {
+        Some(p) if p >= need => Ok(()),
+        known => bail!(
+            "zone {} decides an encoded slash (decode_slash), which needs a node at protocol {need}, and node {name} {}: \
+             update the node (wicket self update --nodes), or place the box elsewhere",
+            zone.name,
+            match known {
+                Some(p) => format!("talks {p}"),
+                None => "hasn't connected yet (its protocol isn't known)".to_string(),
+            }
+        ),
+    }
+}
+
 fn last_issued(feed_dir: &Path) -> i64 {
     std::fs::read_to_string(feed_dir.join("issued")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(i64::MIN)
 }
@@ -620,6 +674,9 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let t = s.timings.clone();
     let keys = t.span("token.keys");
     let name = s.node.clone();
+    // Before anything is minted or published: the record goes in the node's feed, which every
+    // session to it carries, so a node that can't read it is never sent it (#664).
+    check_protocol(&name, &s.zone)?;
     let issuer = Arc::new(crate::issuer()?);
     let cfg = feed_config();
     let feed = SharedFeed::open(&name, cfg.clone())?;
@@ -1215,6 +1272,7 @@ async fn session(
             p.link.save(&sh.dir);
             p.proto = proto;
             sh.ctl.proto.store(proto, Ordering::SeqCst);
+            note_protocol(&sh.node, proto);
             (feed, runs)
         }
         _ => unreachable!("nodeauth::control returns a welcome"),
@@ -1246,6 +1304,19 @@ async fn session(
         let _ = out_tx.send(f);
     };
     let feed_frame = |f: wicket_feed::Frame| Frame::Feed(f.to_line().trim_end().as_bytes().to_vec());
+    // A node below protocol 19 can't read a record whose zone decodes a slash (#664). `start`
+    // refuses to publish one to a node not known to talk 19; this is for one that has gone back
+    // since (its feed may already carry it): this run's session ends rather than send it.
+    if p.proto < protocol_needed(&sh.zone) {
+        p.ever = false;
+        bail!(
+            "node {} talks protocol {}, and zone {} decides an encoded slash (decode_slash), which needs {}: update the node (wicket self update --nodes)",
+            sh.node,
+            p.proto,
+            sh.zone.name,
+            wicket_chan::chan::DECODE_SLASH
+        );
+    }
     let now = wicket_feed::now_ms();
     let catching = std::time::Instant::now();
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {

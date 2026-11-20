@@ -68,6 +68,11 @@ pub struct Reach {
     pub paths: Vec<String>,
     /// Requests rated R3 or higher are allowed by this rule without a grant.
     pub allow_dangerous: bool,
+    /// The path segments in which this link lets an encoded slash be decided as `/` for the
+    /// rule's host (#664, the manifest's `decode_slash`): bound here, so a node decodes only what
+    /// every link of the token allows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decode_slash: Vec<u8>,
 }
 
 /// Hosts or paths refused outright: no grant can open them.
@@ -321,6 +326,7 @@ impl Ceiling {
                     methods: r.methods.iter().map(|m| m.to_ascii_uppercase()).collect(),
                     paths: r.paths.clone(),
                     allow_dangerous: r.allow_dangerous,
+                    decode_slash: r.decode_slash.clone(),
                 })
                 .collect(),
             forbid: zone.forbid.iter().map(|f| Forbid { host: f.host.to_ascii_lowercase(), paths: f.paths.clone() }).collect(),
@@ -454,6 +460,9 @@ pub enum Action {
         risk: RiskClass,
         /// The credential the proxy would inject, as [`Inject::key`].
         inject: Option<String>,
+        /// The path segments in which the proxy decided an encoded slash as `/` (#664): each must
+        /// be one every link of the token allows for the host.
+        decoded: Vec<u8>,
     },
     Spawn {
         image: String,
@@ -488,7 +497,14 @@ impl Action {
 
     /// The HTTP action for a wicket-core op (host, method, path and risk as classified there).
     pub fn from_op(op: &wicket_core::Op, inject: Option<String>) -> Action {
-        Action::Http { host: op.host.clone(), method: op.method.clone(), path: op.path.clone(), risk: op.risk, inject }
+        Action::Http {
+            host: op.host.clone(),
+            method: op.method.clone(),
+            path: op.path.clone(),
+            risk: op.risk,
+            inject,
+            decoded: op.decoded.clone(),
+        }
     }
 }
 

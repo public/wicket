@@ -95,14 +95,15 @@ exchanged, for the logs and for the health gate.
 | 16 | Path-prefix grants on nodes (#257 4a): a prefix grant ("every path under `/repos/acme/app/`") goes in a box's token as the prefix it is, a block `approved(gid, host, method, $p) <- path($p), $p.starts_with(prefix), …` the node's structural check admits only with a canonical prefix ending in `/`, so it covers the directory and every path under it, whole segments only, as the ledger does. To a node talking 15 the control host sends it for its own path exactly, as before (that node's check would refuse the whole token). |
 | 17 | Standing reach (#572): `AskStanding` (node to control host), a box's `request_access` with scope `standing`, answered with `Asked` (which also carries `hint`, for an agent asking for the same thing again: an optional field, which an older node ignores). The control host publishes an approved standing rule to a node at 17 as a block of the box's token. A node at 15 or 16 neither asks for nor honours one: the box is told its control host or node must be updated, and asks as before. |
 | 18 | Names for boxes (#575): `ControlTool::RequestName`, a box's `request_name`, which a control host below 18 can't read in a `Call`, and `connect` with a `name`, which it would read as `connect` with no box. A node sends either only over a connection that talks 18, and otherwise answers the box itself that its control host must be updated. |
+| 19 | Decoded slashes (#664): a reach rule's `decode_slash` in a box's record, which a node below 19 can't parse (its record and its whole feed would be refused). The control host decides this before anything goes in the node's feed (which every session to the node carries), from the protocol the node last talked to it (noted at each connection's welcome): it publishes no zone using it to a node below 19 or one whose protocol it doesn't know yet, and placement doesn't choose such a node for the box; the run fails, naming the node and the version it needs. A token reads `decoded` only once one of its links decodes, so a plain box's token still loads on a node at 17 or 18. A node at 19 decodes only the segments the box's token allows for the host. |
 
-wicket speaks version 18 with a skew of 2: it talks only to peers at 16, 17 and 18, so a node at 15 must be updated with or before its control host. (Before #575 it spoke 17, with peers at 15, 16 and 17: #572 followed #568's 16 within a release.) What the rows above say happens
+wicket speaks version 19 with a skew of 2: it talks only to peers at 17, 18 and 19, so a node at 16 must be updated with or before its control host. (Before #664 it spoke 18, with peers at 16, 17 and 18; before #575, 17.) What the rows above say happens
 with an older peer (a node relaying every gateway tool before 5, a box refused by a node before 6,
 9, 10 or 11, an image not sent to a node before 7, a box on a node before 13) is history: no
-connection can negotiate below 16. Every connection has 12's health reports, 13's one gateway and
-14's CA renewal. A check for a version's feature matters only while a peer below it can connect:
+connection can negotiate below 17. Every connection has 12's health reports, 13's one gateway,
+14's CA renewal and 16's prefix grants. A check for a version's feature matters only while a peer below it can connect:
 15's message reads still has its check, which no connection needs now and which goes in a change of
-its own; 17's standing reach and 18's names keep theirs while a peer at 16 or 17 can connect. `BoxStart`'s `ca_pem` and
+its own; 17's standing reach, 18's names and 19's decoded slashes keep theirs while a peer at 17 or 18 can connect. `BoxStart`'s `ca_pem` and
 `workspace_tar` are always empty and no node reads them; they are defaulted, and go once no peer
 from before that can connect.
 

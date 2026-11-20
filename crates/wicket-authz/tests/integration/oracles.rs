@@ -125,7 +125,13 @@ fn an_oversized_zone_is_refused_at_mint() {
     let keys = Keys::new(1);
     let mut cs = ceilings(1, &keys);
     let globs: Vec<String> = (0..30).map(|i| format!("/v1/organizations/*/projects/*/environments/{i}/sessions/*/worker/**")).collect();
-    cs[0].reach.push(Reach { host: "big.example".into(), methods: vec!["GET".into()], paths: globs.clone(), allow_dangerous: false });
+    cs[0].reach.push(Reach {
+        host: "big.example".into(),
+        methods: vec!["GET".into()],
+        paths: globs.clone(),
+        allow_dangerous: false,
+        decode_slash: vec![],
+    });
     let err = match mint(&keys.root, TENANT, "trigger:t", &cs[0]) {
         Err(AuthzError::Cost(e)) => e,
         Err(e) => panic!("refused, but not for cost: {e}"),
@@ -144,6 +150,7 @@ fn an_oversized_zone_is_refused_at_mint() {
             methods: vec!["GET".into()],
             paths: chunk.to_vec(),
             allow_dangerous: false,
+            decode_slash: vec![],
         });
     }
     let t = mint(&keys.root, TENANT, "trigger:t", &spread).unwrap();
@@ -157,9 +164,16 @@ fn an_oversized_zone_is_refused_at_mint() {
         methods: vec!["GET".into()],
         paths: globs[..15].to_vec(),
         allow_dangerous: false,
+        decode_slash: vec![],
     });
     let mut child = cs[1].clone();
-    child.reach.push(Reach { host: "*.example".into(), methods: vec!["GET".into()], paths: globs[15..].to_vec(), allow_dangerous: false });
+    child.reach.push(Reach {
+        host: "*.example".into(),
+        methods: vec!["GET".into()],
+        paths: globs[15..].to_vec(),
+        allow_dangerous: false,
+        decode_slash: vec![],
+    });
     let t = mint(&keys.root, TENANT, "trigger:t", &parent).unwrap();
     match t.attenuate(&child) {
         Err(AuthzError::Cost(e)) => assert!(e.starts_with(&format!("zone {}: host big.example: ", child.zone)), "{e}"),
@@ -254,7 +268,7 @@ const GLOBS: [&str; 12] = [
 fn random_rule(rng: &mut Rng) -> wicket_core::ReachRule {
     let methods: Vec<String> = METHODS.iter().filter(|_| rng.chance(50)).map(|m| m.to_string()).collect();
     let paths: Vec<String> = (0..rng.below(3)).map(|_| rng.pick(&GLOBS).to_string()).collect();
-    wicket_core::ReachRule { host: rng.pick(&HOSTS).to_string(), methods, paths, allow_dangerous: rng.chance(30) }
+    wicket_core::ReachRule { host: rng.pick(&HOSTS).to_string(), methods, paths, allow_dangerous: rng.chance(30), decode_slash: vec![] }
 }
 
 fn random_forbid(rng: &mut Rng) -> wicket_core::manifest::ForbidRule {
@@ -395,6 +409,7 @@ fn random_request(rng: &mut Rng, leaf: usize) -> Request {
             method: rng.pick(&METHODS).to_string(),
             path: rng.pick(&paths).to_string(),
             risk: *rng.pick(&risks),
+            decoded: vec![],
             inject: match rng.below(4) {
                 0 => None,
                 1 => Some("api.github.com|Authorization|other".into()),
@@ -520,14 +535,73 @@ fn oracle3_compiled_equals_authorizer_builder_100k() {
     differential(100_000, 1);
 }
 
-/// #143: npm's scoped-package form (`/@scope%2fname`) is decided on its decoded path, and the
-/// zone, the compiled token and the generic engine agree on it, as on the unencoded spelling: a
-/// forbid on `/@scope/**` blocks both, a reach rule allows both.
+/// #664 review: the token is what allows a decoded slash. A request saying it decoded a segment
+/// (`decoded`) is refused unless every link of the token allows that segment for the host: so a
+/// node's zone record that decodes more than the token can only be refused, and a spawned link
+/// that doesn't decode narrows its parent's.
 #[test]
-fn npm_scoped_paths_decide_alike_in_every_oracle() {
+fn only_the_token_allows_a_decoded_slash() {
+    let keys = Keys::new(0);
+    let zone = |rules: &str| {
+        wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: pkgs\n  llm: {{}}\n  reach:\n{rules}"))
+            .unwrap()
+            .zone
+    };
+    let z = zone("    - { host: pkgs.example, methods: [GET], paths: [\"/**\"], decode_slash: [1] }\n    - { host: plain.example, methods: [GET], paths: [\"/**\"] }\n");
+    let c = Ceiling::from_zone(&z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap();
+    let token = mint(&keys.root, TENANT, "trigger:t", &c).unwrap();
+    let l = load_ok(&token, &keys);
+    let ask = |l: &Loaded, h: &str, segs: Vec<u8>| {
+        let mut o = op(&z.name, "GET", h, "/@types/node");
+        o.decoded = segs;
+        kind_of(&decide_compiled(l, &http_request("b0", &o)))
+    };
+    assert_eq!(ask(&l, "pkgs.example", vec![]), 0, "nothing decoded: allowed by reach");
+    assert_eq!(ask(&l, "pkgs.example", vec![1]), 0, "the first segment, as the token allows");
+    assert_ne!(ask(&l, "pkgs.example", vec![2]), 0, "a segment the token doesn't name");
+    assert_ne!(ask(&l, "plain.example", vec![1]), 0, "a host whose rule doesn't decode");
+    // A child link without the option: what its parent allowed decoded, it refuses.
+    let child_zone = zone("    - { host: pkgs.example, methods: [GET], paths: [\"/**\"] }\n");
+    let mut child = Ceiling::from_zone(&child_zone, "b0/b1", T0 + 3600, vec![keys.approver.public()]).unwrap();
+    child.zone = z.name.clone();
+    let l2 = load_ok(&token.attenuate(&child).unwrap(), &keys);
+    let ask_child = |segs: Vec<u8>| {
+        let mut o = op(&z.name, "GET", "pkgs.example", "/@types/node");
+        o.decoded = segs;
+        kind_of(&decide_compiled(&l2, &http_request("b0/b1", &o)))
+    };
+    assert_eq!(ask_child(vec![]), 0);
+    assert_ne!(ask_child(vec![1]), 0, "the spawned link narrows");
+    assert!(source(&token.attenuate(&child).unwrap())[1].contains("decoded("), "it says so: it allows no segment");
+    // #682 re-review: a token no link of which decodes reads no `decoded`, so a node before
+    // protocol 19 (whose vocabulary lacks it) loads it; a decoded request is refused all the same.
+    let plain = mint(&keys.root, TENANT, "trigger:t", &Ceiling::from_zone(&child_zone, "b0", T0 + 3600, vec![]).unwrap()).unwrap();
+    assert!(source(&plain).iter().all(|b| !b.contains("decoded")), "{:?}", source(&plain));
+    let lp = load_ok(&plain, &keys);
+    assert!(!lp.decodes());
+    assert_eq!(ask(&lp, "pkgs.example", vec![]), 0);
+    assert_ne!(ask(&lp, "pkgs.example", vec![1]), 0, "a plain token allows no decoded slash");
+    // A decoding link under a plain root narrows nothing open: the root allows no segment.
+    let mut deco = c.clone();
+    deco.box_prefix = "b0/b1".into();
+    let under_plain = load_ok(&plain.attenuate(&deco).unwrap(), &keys);
+    let mut o = op(&z.name, "GET", "pkgs.example", "/@types/node");
+    o.decoded = vec![1];
+    assert_ne!(kind_of(&decide_compiled(&under_plain, &http_request("b0/b1", &o))), 0, "the root decides no segment");
+}
+
+fn source(t: &Token) -> Vec<String> {
+    wicket_authz::describe(&t.to_bytes().unwrap()).unwrap().into_iter().map(|b| b.source).collect()
+}
+
+/// #664 (#143's guarantees): where a rule asks (`decode_slash: [1]`), `/@scope%2fname` is decided on
+/// its decoded path, and the zone, the compiled token and the generic engine agree on it, as on the
+/// unencoded spelling: a forbid on `/@scope/**` blocks both, a reach rule allows both.
+#[test]
+fn decoded_slash_paths_decide_alike_in_every_oracle() {
     let keys = Keys::new(0);
     let z = wicket_core::Manifest::from_yaml(
-        "task: t\nagent: { name: a }\nzone:\n  name: npm\n  llm: {}\n  reach:\n    - { host: registry.npmjs.org, methods: [GET], paths: [\"/**\"] }\n    - { host: npm.internal.example, methods: [GET], paths: [\"/@acme/**\"] }\n  forbid:\n    - { host: registry.npmjs.org, paths: [\"/@evil/**\", \"/@types/secret\"] }\n",
+        "task: t\nagent: { name: a }\nzone:\n  name: pkgs\n  llm: {}\n  reach:\n    - { host: pkgs.example, methods: [GET], paths: [\"/**\"], decode_slash: [1] }\n    - { host: internal.pkgs.example, methods: [GET], paths: [\"/@acme/**\"], decode_slash: [1] }\n  forbid:\n    - { host: pkgs.example, paths: [\"/@evil/**\", \"/@types/secret\"] }\n",
     )
     .unwrap()
     .zone;
@@ -537,15 +611,17 @@ fn npm_scoped_paths_decide_alike_in_every_oracle() {
     let mut generic = l.generic_session();
     let names = ["@types%2fnode", "@types%2Fsecret", "@evil%2fpkg", "@acme%2flib", "@babel%2fcore", "@eslint-community%2feslint-utils"];
     let mut kinds = [0usize; 3];
-    for h in ["registry.npmjs.org", "npm.internal.example"] {
+    for h in ["pkgs.example", "internal.pkgs.example"] {
         for name in names {
             for tail in ["", "/", "/1.0.0", "/-/x-1.0.0.tgz"] {
                 let raw = format!("/{name}{tail}");
-                let decoded = wicket_core::canonical_path(&raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+                let (decoded, segs) =
+                    wicket_core::canonical_path_decoded(&raw, &z.decode_slash_for(h)).unwrap_or_else(|e| panic!("{raw}: {e}"));
                 let plain = raw.replacen("%2f", "/", 1).replacen("%2F", "/", 1);
                 assert_eq!(decoded, plain.as_str(), "{raw}");
                 for m in METHODS {
-                    let o = op(&z.name, m, h, &decoded);
+                    let mut o = op(&z.name, m, h, &decoded);
+                    o.decoded = segs.clone();
                     let want = kind_of_verdict(&cz.evaluate(&o));
                     assert_eq!(want, kind_of_verdict(&cz.evaluate(&op(&z.name, m, h, &plain))), "{m} {h}{raw}");
                     let got = decide_compiled(&l, &http_request("b0", &o));

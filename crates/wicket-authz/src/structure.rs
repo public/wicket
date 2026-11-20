@@ -91,6 +91,8 @@ pub const AMBIENT: &[(&str, usize)] = &[
     ("spawn", 6),
     ("llm_used", 2),
     ("msg_from", 1),
+    // The path segments the proxy decided an encoded slash in (#664).
+    ("decoded", 1),
 ];
 
 /// How a failed check is reported.
@@ -110,6 +112,10 @@ pub struct Vetted {
     pub classes: Vec<Vec<CheckClass>>,
     /// Block 0 carries an org layer (its `policy` fact, #51).
     pub org: bool,
+    /// Block 0 reads `decoded` (#664): its zone decides encoded slashes. A token whose block 0
+    /// doesn't is decided as refusing every decoded request (decided before Datalog, so a plain
+    /// token carries no `decoded` rules, and stays loadable by a node that doesn't know them).
+    pub decodes: bool,
     /// The earliest hard expiry any first-party block sets (`check if time($t), $t <= <date>`, Unix
     /// seconds): the token allows nothing after it (#153). None if no block bounds time that way.
     pub not_after: Option<u64>,
@@ -393,6 +399,7 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
         return Err(format!("{n} blocks (cap {})", p.max_blocks));
     }
     let mut org = false;
+    let mut decodes = false;
     let mut trusted: Vec<PublicKeyData> = Vec::new();
     let mut third_party = Vec::new();
     let mut classes = Vec::with_capacity(n);
@@ -443,6 +450,7 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
             }
             for q in &c.queries {
                 query(q, p, &mut trusted, &mut regexes).map_err(at)?;
+                decodes |= i == 0 && q.body.iter().any(|pred| pred.name == "decoded");
             }
             cls.push(classify(&c.queries, &c.kind));
             if let Some(d) = expiry(c) {
@@ -478,5 +486,5 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
             grant_rule(r, p).map_err(at)?;
         }
     }
-    Ok(Vetted { classes, org, not_after })
+    Ok(Vetted { classes, org, decodes, not_after })
 }

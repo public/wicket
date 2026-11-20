@@ -50,6 +50,11 @@ pub struct Op {
     pub risk: RiskClass,
     /// Why the risk is what it is (dangerous-pattern ids).
     pub effects: Vec<String>,
+    /// The path segments (1 for the first) in which an encoded slash was decided as `/` (#664): a
+    /// fact the box's token must allow, so a zone record on a node can only refuse more than the
+    /// token. Not part of what a grant binds to (both spellings are one op).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoded: Vec<u8>,
 }
 
 impl Op {
@@ -74,6 +79,7 @@ impl Op {
             path: path.to_string(),
             risk,
             effects,
+            decoded: vec![],
         }
     }
 
@@ -461,6 +467,9 @@ impl crate::manifest::ReachRule {
     /// each), and path globs whose regexes fit a block's cap.
     pub fn check_standing(&self) -> Result<(), String> {
         self.check()?;
+        if !self.decode_slash.is_empty() {
+            return Err("standing reach can't set decode_slash: that is the zone's (a standing rule's paths are matched as decided, after the zone's decoding)".into());
+        }
         if self.host.starts_with("*.") {
             return Err(format!("standing reach names its host exactly, not {}", self.host));
         }
@@ -490,7 +499,13 @@ impl crate::manifest::ReachRule {
         let mut paths = self.paths.clone();
         paths.sort();
         paths.dedup();
-        crate::manifest::ReachRule { host: self.host.to_ascii_lowercase(), methods, paths, allow_dangerous: self.allow_dangerous }
+        crate::manifest::ReachRule {
+            host: self.host.to_ascii_lowercase(),
+            methods,
+            paths,
+            allow_dangerous: self.allow_dangerous,
+            decode_slash: vec![],
+        }
     }
 }
 
@@ -1028,31 +1043,42 @@ zone:
         assert!(matches!(evaluate(&m.zone, &op("api.example.com", "/v1/messages")), Verdict::AllowByReach(0)));
     }
 
-    /// #143: npm's `@scope%2fname` is decided as `/@scope/name`, so rules on the decoded path
-    /// apply to it as to the unencoded spelling, forbids included.
+    /// #664: a rule's `decode_slash` has the zone decide one encoded slash in the named segment as
+    /// `/`, so its forbids on the decoded path hold (#143's guarantee, now asked for by the zone);
+    /// a host whose rules don't ask refuses the encoded spelling.
     #[test]
-    fn npm_scoped_packages_are_decided_decoded() {
-        let m = Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach: [{ host: registry.npmjs.org, methods: [GET], paths: [\"/**\"] }]\n  forbid: [{ host: registry.npmjs.org, paths: [\"/@evil/**\", \"/@types/secret\"] }]\n").unwrap();
+    fn a_decoded_slash_is_decided_as_the_rules_say() {
+        let m = Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach:\n    - { host: pkgs.example, methods: [GET], paths: [\"/**\"], decode_slash: [1] }\n    - { host: plain.example, methods: [GET], paths: [\"/**\"] }\n  forbid: [{ host: pkgs.example, paths: [\"/@evil/**\", \"/@types/secret\"] }]\n").unwrap();
+        assert_eq!(m.zone.decode_slash_for("pkgs.example"), [1]);
+        assert!(m.zone.decode_slash_for("plain.example").is_empty());
         let t = TenantId::single();
         let r = RunId("run_x".into());
-        let decide = |raw: &str| {
-            let path = crate::canonical_path(raw).unwrap();
-            evaluate(&m.zone, &Op::egress(&t, &r, "z", "GET", "registry.npmjs.org", &path))
+        let decide = |host: &str, raw: &str| {
+            let path = crate::canonical_path_decoding(raw, &m.zone.decode_slash_for(host)).ok()?;
+            Some(evaluate(&m.zone, &Op::egress(&t, &r, "z", "GET", host, &path)))
         };
-        for p in ["/@evil%2fpkg", "/@evil%2Fpkg", "/@evil%2fpkg/1.0.0", "/@evil/pkg", "/@types%2fsecret", "/@EVIL%2fpkg"] {
-            match crate::canonical_path(p) {
-                Ok(_) => assert!(matches!(decide(p), Verdict::Forbidden(_)), "{p}"),
-                Err(_) => assert_eq!(p, "/@EVIL%2fpkg", "only the upper-case scope is refused outright"),
-            }
+        for p in ["/@evil%2fpkg", "/@evil%2Fpkg", "/@evil%2fpkg/1.0.0", "/@evil/pkg", "/@types%2fsecret"] {
+            assert!(matches!(decide("pkgs.example", p), Some(Verdict::Forbidden(_))), "{p}");
         }
         for p in ["/@types%2fnode", "/@types/node", "/@babel%2fcore/7.0.0"] {
-            assert!(matches!(decide(p), Verdict::AllowByReach(0)), "{p}");
+            assert!(matches!(decide("pkgs.example", p), Some(Verdict::AllowByReach(0))), "{p}");
         }
+        assert!(decide("plain.example", "/@types%2fnode").is_none(), "not asked for this host: refused");
+        assert!(matches!(decide("plain.example", "/@types/node"), Some(Verdict::AllowByReach(1))));
         assert_eq!(
-            Op::egress(&t, &r, "z", "GET", "registry.npmjs.org", &crate::canonical_path("/@types%2fnode").unwrap()).digest(),
-            Op::egress(&t, &r, "z", "GET", "registry.npmjs.org", "/@types/node").digest(),
+            Op::egress(&t, &r, "z", "GET", "pkgs.example", &crate::canonical_path_decoding("/@types%2fnode", &[1]).unwrap()).digest(),
+            Op::egress(&t, &r, "z", "GET", "pkgs.example", "/@types/node").digest(),
             "both spellings are one op, so one grant covers both"
         );
+        // Checked when kept: segments from 1, each once; standing reach never carries it.
+        for bad in ["[0]", "[1, 1]", "[17]"] {
+            let y = format!(
+                "task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{{ host: pkgs.example, decode_slash: {bad} }}]\n"
+            );
+            assert!(Manifest::from_yaml(&y).is_err(), "{bad}");
+        }
+        let rule = crate::manifest::ReachRule { decode_slash: vec![1], ..m.zone.reach[1].clone() };
+        assert!(rule.check_standing().unwrap_err().contains("decode_slash"));
     }
 
     #[test]

@@ -131,6 +131,7 @@ impl Link {
             .await
             .map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
         let proto = authed.proto;
+        crate::noderun::note_protocol(node, proto);
         let (capacity, runs, orphaned, build) = match authed.welcome {
             Msg::Welcome { capacity, runs, orphaned, build, .. } => (capacity, runs, orphaned.map(|o| *o).unwrap_or_default(), build),
             _ => (None, vec![], vec![], String::new()),
