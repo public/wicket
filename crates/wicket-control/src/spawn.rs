@@ -535,7 +535,7 @@ fn delegate(c: &SpawnCtx, child: &RunId, child_principal: &str, name: &str, brie
 /// limits, image and children. Agent-chosen strings are stripped and clipped, and the lists bounded,
 /// so nothing pushes a line out of view or rewrites it.
 fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String]) -> String {
-    use wicket_core::text::clip;
+    use wicket_core::text::{clip, shown};
     let z = &cm.zone;
     let list = |items: Vec<String>, max: usize| {
         let n = items.len();
@@ -548,16 +548,16 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
     let model = match &z.llm {
         Some(l) => format!(
             "model route {} via {} with secret {} (this zone's own), {} requests, {} output tokens, {} input tokens, {}{}",
-            clip(&l.provider, 40),
-            clip(&l.upstream, 200),
-            clip(&l.secret, 80),
+            shown(&l.provider, 40),
+            shown(&l.upstream, 200),
+            shown(&l.secret, 80),
             l.max_requests,
             l.max_output_tokens,
             l.max_input_tokens.map(|i| i.to_string()).unwrap_or_else(|| "uncapped".into()),
             match &l.models {
                 None => "any model".to_string(),
                 Some(ms) if ms.is_empty() => "no models".to_string(),
-                Some(ms) => format!("models {}", clip(&ms.join(", "), 200)),
+                Some(ms) => format!("models {}", ms.iter().map(|m| shown(m, 128)).collect::<Vec<_>>().join(", ")),
             },
             if l.allow_server_tools { ", server-side tools allowed" } else { "" }
         ),
@@ -571,7 +571,7 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
             list(
                 z.inject
                     .iter()
-                    .map(|i| format!("secret {} into {} {}", clip(&i.secret, 80), clip(&i.host, 120), clip(&i.header, 60)))
+                    .map(|i| format!("secret {} into {} {}", shown(&i.secret, 80), shown(&i.host, 120), shown(&i.header, 60)))
                     .collect(),
                 8
             )
@@ -581,8 +581,16 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
         z.reach
             .iter()
             .map(|r| {
-                let methods = if r.methods.is_empty() { "GET, HEAD".to_string() } else { r.methods.join(", ") };
-                let paths = if r.paths.is_empty() { "/**".to_string() } else { r.paths.join(", ") };
+                let methods = if r.methods.is_empty() {
+                    "GET, HEAD".to_string()
+                } else {
+                    r.methods.iter().map(|m| shown(m, 60)).collect::<Vec<_>>().join(", ")
+                };
+                let paths = if r.paths.is_empty() {
+                    "/**".to_string()
+                } else {
+                    r.paths.iter().map(|p| shown(p, 200)).collect::<Vec<_>>().join(", ")
+                };
                 let decode = if r.decode_slash.is_empty() {
                     String::new()
                 } else {
@@ -591,7 +599,7 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
                 format!(
                     "{} {} {}{}{decode}",
                     clip(&methods, 60),
-                    clip(&r.host, 120),
+                    shown(&r.host, 120),
                     clip(&paths, 200),
                     if r.allow_dangerous { " (allow_dangerous)" } else { "" }
                 )
@@ -601,10 +609,18 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
     );
     let l = &z.limits;
     let children = cm.agent.as_ref().map(|a| a.max_children).unwrap_or(0);
-    let forbid = list(z.forbid.iter().map(|f| format!("{} {}", clip(&f.host, 120), clip(&f.paths.join(", "), 200))).collect(), 12);
-    let accept = list(z.accept_from.iter().map(|a| clip(a, 120)).collect(), 8);
-    let images = list(z.images.iter().map(|i| clip(i, 120)).collect(), 8);
-    let volumes = list(z.volumes.iter().map(|v| format!("{} at {}", clip(&v.name, 60), clip(&v.path, 120))).collect(), 8);
+    let forbid = list(
+        z.forbid
+            .iter()
+            .map(|f| {
+                format!("{} {}", shown(&f.host, 120), clip(&f.paths.iter().map(|p| shown(p, 200)).collect::<Vec<_>>().join(", "), 200))
+            })
+            .collect(),
+        12,
+    );
+    let accept = list(z.accept_from.iter().map(|a| shown(a, 120)).collect(), 8);
+    let images = list(z.images.iter().map(|i| shown(i, 120)).collect(), 8);
+    let volumes = list(z.volumes.iter().map(|v| format!("{} at {}", shown(&v.name, 60), shown(&v.path, 120))).collect(), 8);
     let or_none = |s: String| if s.is_empty() { "none".to_string() } else { s };
     format!(
         "start {kind} {} in zone {}, beyond this agent's own. It exceeds: {}. It gets: {model}; {inject}; reach {}; forbid {}; unlisted hosts {:?}; isolation {:?}; image {}; may start images {}; accepts messages from {}; volumes {}; memory {}, cpus {}, pids {}, timeout {}; may start {children} box(es).",
@@ -615,14 +631,14 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
         or_none(forbid),
         z.unlisted_hosts,
         z.isolation,
-        clip(image, 120),
+        shown(image, 120),
         or_none(images),
         or_none(accept),
         or_none(volumes),
-        clip(&l.memory, 20),
+        shown(&l.memory, 20),
         l.cpus,
         l.pids,
-        clip(&l.timeout, 20),
+        shown(&l.timeout, 20),
     )
 }
 
@@ -1235,6 +1251,21 @@ mod tests {
             assert!(r.reason.contains(needle), "missing {needle:?} in {}", r.reason);
         }
         assert!(r.reason.chars().all(|c| !wicket_core::text::is_unsafe(c)), "{:?}", r.reason);
+        drop(l);
+        // #731: a value the agent chose that reads as words is quoted on the card, so it can't pass
+        // for the card's own terms; plain ones read as before (the needles above).
+        let p = parent(2, zone);
+        let prose = json!({
+            "reach": [
+                { "host": "api.example.com", "methods": ["GET"] },
+                { "host": "other.example.org", "methods": ["GET; no other reach, no model route"], "paths": ["/x, and nothing else/**"] },
+            ],
+        });
+        assert!(spawn(&p.ctx, agent(prose)).unwrap().starts_with("needs approval: request r-"));
+        let r = p.ctx.ledger.lock().unwrap().pending(&wicket_core::TenantId::single()).unwrap().pop().unwrap();
+        assert!(r.reason.contains(r#""GET; no other reach, no model route" other.example.org "/x, and nothing else/**""#), "{}", r.reason);
+        assert!(r.reason.contains("GET api.example.com /**"), "{}", r.reason);
+        assert!(r.reason.contains(r#"It exceeds: reach rule 1: "GET; no other reach, no model route" other.example.org"#), "{}", r.reason);
     }
 
     /// #369: a spawn beyond the parent is approved for exactly its arguments. While it is pending,

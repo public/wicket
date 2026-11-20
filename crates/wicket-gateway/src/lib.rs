@@ -972,7 +972,17 @@ fn capacity_ask(args: &Value) -> Result<wicket_proxy::CapacityAsk, String> {
         vcpus: args.get("vcpus").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 256) as u32,
         memory_mib: args.get("memory_mib").and_then(|v| v.as_u64()).unwrap_or(1024).clamp(128, 1 << 22),
         isolation: args.get("isolation").and_then(|v| v.as_str()).unwrap_or("gvisor").to_string(),
-        region: args.get("region").and_then(|v| v.as_str()).map(String::from),
+        region: match args.get("region") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(r)) => {
+                let r = r.trim().to_string();
+                // Checked again where the request is written (capacity::ask): here, early, so the
+                // agent hears why at once (#731).
+                wicket_proxy::check_region(&r)?;
+                Some(r)
+            }
+            Some(_) => return Err("`region` is a string: a provider's region name (e.g. ewr)".into()),
+        },
         duration_secs: minutes as i64 * 60,
         max_hourly_usd: max,
         reason,

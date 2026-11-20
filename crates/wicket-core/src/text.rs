@@ -32,6 +32,19 @@ pub fn clip(s: &str, n: usize) -> String {
     }
 }
 
+/// A value someone other than wicket chose (an agent's zone's host, glob, method, name), for a
+/// sentence wicket writes (#731): [`clip`]ped to `n`, and shown as is when it is one plain token,
+/// quoted (`{:?}`) when it has anything that could read as wicket's own words (spaces, commas,
+/// semicolons, quotes), so no value passes for the sentence's terms.
+pub fn shown(s: &str, n: usize) -> String {
+    let c = clip(s, n);
+    if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric() || "-._/*:@{}[]?=+~%!$&()#^|<>".contains(ch)) {
+        c
+    } else {
+        format!("{c:?}")
+    }
+}
+
 /// `s` with every URL in it cut to its scheme, host, port and path: user info (`user:pass@`), the
 /// query and the fragment dropped, as tokens and signed parameters travel there. A URL that doesn't
 /// parse, or where more than one '@' could end the user info, is cut to its scheme (`https://…`).
@@ -110,6 +123,19 @@ fn redact_one(scheme: &str, token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #731: a plain token reads as is; anything that could read as words is quoted, its own quotes
+    /// escaped, so it ends where it says.
+    #[test]
+    fn an_others_value_is_shown_bare_only_as_one_plain_token() {
+        for plain in ["api.example.com", "/repos/acme/**", "GET", "*.example.com", "img@sha256:ab", "1g", "us-east-1"] {
+            assert_eq!(shown(plain, 200), plain);
+        }
+        assert_eq!(shown("GET; no other reach", 200), r#""GET; no other reach""#);
+        assert_eq!(shown("a, b", 200), r#""a, b""#);
+        assert_eq!(shown(r#"x" and "y"#, 200), r#""x\" and \"y""#);
+        assert_eq!(shown("", 200), r#""""#);
+    }
 
     #[test]
     fn urls_lose_their_user_info_and_query() {

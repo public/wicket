@@ -251,6 +251,10 @@ pub fn hook(tenant: TenantId, run: RunId, zone: String, ledger: Arc<Mutex<Ledger
 
 /// Files a capacity ask: a pending lease with its money reserved, and the request a human decides.
 pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId, zone: &str, a: &CapacityAsk) -> Result<CapacityState> {
+    // Checked where the request is written, whoever asks (#731).
+    if let Some(r) = &a.region {
+        wicket_proxy::check_region(r).map_err(anyhow::Error::msg)?;
+    }
     let iso =
         IsolationTier::parse(&a.isolation).with_context(|| format!("isolation must be process, gvisor or vm, not {:?}", a.isolation))?;
     let max = MicroUsd::parse_dollars(&a.max_hourly_usd).with_context(|| format!("{:?} is not a dollar amount", a.max_hourly_usd))?;
@@ -316,7 +320,12 @@ pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId
     let reason = format!("capacity lease {id}: {what}, {money}. Asked by the agent: {}", a.reason);
     // The lease as asked is what the approval is for (#369): the reconciler provisions it only as
     // it was decided on.
-    let rid = l.file_request(&op, Some(&lease_args(&row)), &reason, None)?.id().to_string();
+    let filed = l.file_request(&op, Some(&lease_args(&row)), &reason, None)?;
+    let rid = filed.id().to_string();
+    // The agent's own words, apart from wicket's (#715, #731), for the console to quote as its.
+    if matches!(filed, wicket_store::Filed::New(_) | wicket_store::Filed::Existing(_)) {
+        l.set_request_claims(&rid, &serde_json::json!({ "reason": a.reason, "region": a.region }))?;
+    }
     l.set_lease_request(&id, &rid)?;
     l.audit(
         tenant,
