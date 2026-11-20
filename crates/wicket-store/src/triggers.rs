@@ -589,13 +589,22 @@ impl Ledger {
             .is_some())
     }
 
-    /// Forgets node `node`'s intake rows for triggers deleted or done: once the node has been sent a
-    /// table without them (#714 review F9).
-    pub fn forget_finished_intake(&self, node: &str) -> Result<usize> {
-        Ok(self.conn.execute(
-            "DELETE FROM trigger_intake WHERE node = ?1 AND trigger IN (SELECT id FROM triggers WHERE status IN ('deleted', 'done'))",
-            params![node],
-        )?)
+    /// Forgets node `node`'s intake rows for triggers deleted or done that weren't in the table it
+    /// was just sent (`sent`): it has been told (#714 review F9).
+    pub fn forget_finished_intake(&self, node: &str, sent: &[String]) -> Result<usize> {
+        let finished: Vec<String> = {
+            let mut st = self.conn.prepare(
+                "SELECT i.trigger FROM trigger_intake i JOIN triggers t ON t.id = i.trigger WHERE i.node = ?1 AND t.status IN ('deleted', 'done')",
+            )?;
+            let rows = st.query_map(params![node], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut n = 0;
+        // Not one the node was just sent (deleted during the sync): it's forgotten next pass.
+        for id in finished.iter().filter(|id| !sent.contains(id)) {
+            n += self.conn.execute("DELETE FROM trigger_intake WHERE node = ?1 AND trigger = ?2", params![node, id])?;
+        }
+        Ok(n)
     }
 
     /// The nodes some trigger's intake is assigned to, finished triggers' included until their node

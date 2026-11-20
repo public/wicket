@@ -2254,7 +2254,7 @@ mod tests {
                 delivery: format!("g-{n}"),
                 received_at: at,
                 fields: wicket_core::intake::github_fields("check_suite", &body),
-                raw_sha256: format!("sha-{n}"),
+                raw_sha256: wicket_core::intake::body_sha256(format!("sha-{n}").as_bytes()),
                 bytes: 1,
             }
         };
@@ -2321,7 +2321,7 @@ mod tests {
             delivery: format!("d-{n}"),
             received_at: at,
             fields: serde_json::json!({ "delivery": "spoofed", "at": 1 }),
-            raw_sha256: body.into(),
+            raw_sha256: wicket_core::intake::body_sha256(body.as_bytes()),
             bytes: 1,
         };
         let (fired, _) = intake::ingest(&l, "edge", &[ev("1", "body-a", now)], now, &no_wake, &anyone).unwrap();
@@ -2359,6 +2359,7 @@ mod tests {
             id
         };
         let (stuck, fine) = (mk(&l, &operator(), "stuck"), mk(&l, &other(), "fine"));
+        let more: Vec<String> = (1..4).map(|k| mk(&l, &operator(), &format!("stuck-{k}"))).collect();
         let stuck_owner = l.trigger(&stuck).unwrap().unwrap().owner;
         let owner = move |t: &Trigger| -> std::result::Result<(), NotOwner> {
             if t.owner == stuck_owner {
@@ -2375,26 +2376,37 @@ mod tests {
             delivery: format!("d-{n}"),
             received_at: now,
             fields: serde_json::json!({}),
-            raw_sha256: format!("b-{n}"),
+            raw_sha256: wicket_core::intake::body_sha256(format!("b-{n}").as_bytes()),
             bytes: 1,
         };
         // The node's spool, oldest first: three of the stuck trigger's, then the fine one's. It
         // sends at most three a sync, and none of a held trigger's.
-        let spool = std::sync::Mutex::new(vec![ev(0, &stuck), ev(1, &stuck), ev(2, &stuck), ev(3, &fine)]);
+        // #714 review N2: four such triggers with 500 events each ahead of the fine one.
+        let mut first = vec![ev(0, &stuck), ev(1, &stuck), ev(2, &stuck)];
+        for (k, t) in more.iter().enumerate() {
+            first.extend((0..500).map(|n| ev(10_000 * (k + 1) + n, t)));
+        }
+        first.push(ev(3, &fine));
+        let spool = std::sync::Mutex::new(first);
         let mut out = vec![];
-        let synced = intake::drain(&l, "edge", now, &no_wake, &owner, &mut out, |ack: Vec<String>, hold: Vec<String>| {
-            let mut sp = spool.lock().unwrap();
-            sp.retain(|e| !ack.contains(&e.id));
-            let send: Vec<IntakeEvent> = sp.iter().filter(|e| !hold.contains(&e.trigger)).take(3).cloned().collect();
-            std::future::ready(Ok((send, IntakeRefused::default())))
-        })
-        .await
-        .unwrap();
+        let syncs = std::sync::atomic::AtomicUsize::new(0);
+        let synced =
+            intake::drain(&l, "edge", now, &no_wake, &owner, &mut out, Default::default(), |ack: Vec<String>, hold: Vec<String>| {
+                syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut sp = spool.lock().unwrap();
+                sp.retain(|e| !ack.contains(&e.id));
+                let send: Vec<IntakeEvent> = sp.iter().filter(|e| !hold.contains(&e.trigger)).take(500).cloned().collect();
+                std::future::ready(Ok((send, IntakeRefused::default())))
+            })
+            .await
+            .unwrap();
         assert!(synced);
         let fired: Vec<(&str, &str)> = out.iter().map(|f| (f.trigger.as_str(), f.status.as_str())).collect();
         assert!(fired.contains(&(fine.as_str(), "started")), "{fired:?}");
-        let left: Vec<String> = spool.lock().unwrap().iter().map(|e| e.trigger.clone()).collect();
-        assert_eq!(left, [stuck.clone(), stuck.clone(), stuck.clone()], "the held ones stay in the spool, the other's acked");
+        let left = spool.lock().unwrap();
+        assert!(left.iter().all(|e| e.trigger != fine), "the other's acked; the held ones stay in the spool");
+        assert_eq!(left.len(), 3 + 3 * 500);
+        assert!(syncs.load(std::sync::atomic::Ordering::Relaxed) <= 10, "held batches didn't run the pass out");
     }
 
     /// A node's refusals are audited at most once an hour, counted.

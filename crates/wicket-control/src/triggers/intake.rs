@@ -18,6 +18,8 @@ pub const PASS_MAX_EVENTS: usize = 2000;
 /// … in at most this many syncs, and this long: a slow or hostile node can't stall the pass.
 pub const PASS_MAX_ROUNDS: usize = 10;
 pub const PASS_NODE_SECS: u64 = 20;
+/// The most events one sync's answer is taken for (the node's own cap).
+const SYNC_EVENTS: usize = 500;
 /// A node's refusals are audited at most this often (s), counted.
 pub const REFUSED_AUDIT_SECS: i64 = 3600;
 
@@ -133,7 +135,16 @@ pub fn table(l: &Ledger, node: &str, vault: &wicket_proxy::vault::Vault) -> Resu
         let Some(t) = l.trigger(&id)? else { continue };
         let Some(name) = verify_secret(&t.spec) else { continue };
         let (secret, unavailable) = match vault.get_verify(name) {
-            Ok(s) => (s, false),
+            // A key too short to verify with is no key (#714 review E).
+            Ok(s) if wicket_core::intake::secret_ok(&s) => (s, false),
+            Ok(_) => {
+                problems.push(format!(
+                    "trigger {} ({id}): its verify secret {name} is shorter than {} bytes: not served",
+                    t.name,
+                    wicket_core::intake::MIN_SECRET
+                ));
+                (String::new(), true)
+            }
             Err(e) => {
                 problems.push(format!("trigger {} ({id}): {e:#}", t.name));
                 (String::new(), true)
@@ -198,6 +209,9 @@ pub(super) fn ingest_checked(
             || !wicket_core::intake::fields_within(&e.fields)
             || e.delivery.is_empty()
             || e.delivery.len() > wicket_core::intake::MAX_DELIVERY
+            || !e.delivery.bytes().all(|b| b.is_ascii_graphic())
+            || e.raw_sha256.len() != 64
+            || !e.raw_sha256.bytes().all(|b| b.is_ascii_hexdigit())
         {
             // Counted, and audited with the node's refusals (#714 review M6).
             note_dropped(node);
@@ -334,7 +348,8 @@ static REFUSED_AT: std::sync::LazyLock<Mutex<HashMap<String, RefusedSince>>> = s
 /// trigger's kind): audited with the node's refusals.
 fn note_dropped(node: &str) {
     let mut m = REFUSED_AT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    m.entry(node.to_string()).or_insert((0, IntakeRefused::default(), 0)).2 += 1;
+    let e = m.entry(node.to_string()).or_insert((0, IntakeRefused::default(), 0));
+    e.2 = e.2.saturating_add(1);
 }
 
 /// Counts node `node`'s refusals, and audits them (`trigger.intake_refused`) at most once every
@@ -342,10 +357,10 @@ fn note_dropped(node: &str) {
 pub fn note_refused(l: &Ledger, node: &str, r: &IntakeRefused, now: i64) -> Result<()> {
     let mut m = REFUSED_AT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let e = m.entry(node.to_string()).or_insert((0, IntakeRefused::default(), 0));
-    e.1.token += r.token;
-    e.1.signature += r.signature;
-    e.1.rate += r.rate;
-    e.1.other += r.other;
+    e.1.token = e.1.token.saturating_add(r.token);
+    e.1.signature = e.1.signature.saturating_add(r.signature);
+    e.1.rate = e.1.rate.saturating_add(r.rate);
+    e.1.other = e.1.other.saturating_add(r.other);
     if (e.1.total() > 0 || e.2 > 0) && now - e.0 >= REFUSED_AUDIT_SECS {
         audit(
             l,
@@ -414,16 +429,29 @@ async fn sync_node(
     if link.proto < wicket_chan::chan::INTAKE {
         bail!("node {node} talks protocol {} now: intake needs {}", link.proto, wicket_chan::chan::INTAKE);
     }
+    // Owners checked before the first sync: a trigger whose owner can't be checked is held from the
+    // start, so its events never take the others' places (#714 review N2).
+    let mut checked: HashMap<String, bool> = HashMap::new();
+    for t in &triggers {
+        if let Some(tr) = ledger.trigger(&t.trigger)? {
+            if matches!(owner(&tr), Err(NotOwner::Unknown(_))) {
+                checked.insert(t.trigger.clone(), false);
+            }
+        }
+    }
+    let sent: Vec<String> = triggers.iter().map(|t| t.trigger.clone()).collect();
     let calls = link.calls.clone();
-    let synced = drain(ledger, node, now, wake, owner, out, |ack, hold| {
+    let synced = drain(ledger, node, now, wake, owner, out, checked, |ack, hold| {
         let (calls, triggers, serving) = (calls.clone(), triggers.clone(), serving.clone());
         async move { calls.intake_sync(triggers, ack, serving, hold).await }
     })
     .await?;
     // The node has the table without its deleted or done triggers now: their rows go, and a node
     // left with none stops being synced (#714 review F9).
+    // Only the ones the node was sent a table without: one deleted during the drain was still in
+    // the table it got.
     if synced {
-        ledger.forget_finished_intake(node)?;
+        ledger.forget_finished_intake(node, &sent)?;
     }
     Ok(())
 }
@@ -431,6 +459,7 @@ async fn sync_node(
 /// Takes node `node`'s spooled events through `sync` (one sync: its acks and its hold list in, its
 /// events and refusals out), recording and firing them, until the spool is empty or the pass's
 /// caps are reached. Whether any sync was made.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn drain<F, Fut>(
     ledger: &Ledger,
     node: &str,
@@ -438,6 +467,7 @@ pub(super) async fn drain<F, Fut>(
     wake: Waker<'_>,
     owner: OwnerCheck<'_>,
     out: &mut Vec<Fired>,
+    mut checked: HashMap<String, bool>,
     mut sync: F,
 ) -> Result<bool>
 where
@@ -445,9 +475,11 @@ where
     Fut: std::future::Future<Output = Result<(Vec<IntakeEvent>, IntakeRefused)>>,
 {
     let (mut ack, mut read) = (vec![], 0usize);
-    let mut checked: HashMap<String, bool> = HashMap::new();
     let mut synced = false;
-    for round in 0..PASS_MAX_ROUNDS {
+    // Rounds that acked something count toward the cap; one that only held a trigger doesn't, but
+    // each holds one more, so they are bounded too (with the pass's deadline).
+    let mut rounds = 0usize;
+    for _ in 0..PASS_MAX_ROUNDS * 2 {
         let hold: Vec<String> = checked.iter().filter(|(_, ok)| !**ok).map(|(id, _)| id.clone()).collect();
         let (events, refused) = sync(std::mem::take(&mut ack), hold).await?;
         synced = true;
@@ -462,7 +494,8 @@ where
         if events.is_empty() {
             break;
         }
-        read += events.len();
+        // A node sends at most a sync's worth: more is cut (a node is trusted as far as that).
+        let events: Vec<IntakeEvent> = events.into_iter().take(SYNC_EVENTS).collect();
         let held_before = checked.values().filter(|ok| !**ok).count();
         let (fired, acked) = ingest_checked(ledger, node, &events, now, wake, owner, &mut checked)?;
         out.extend(fired);
@@ -472,7 +505,12 @@ where
         // for the others' (#714 review F4).
         let newly_held = checked.values().filter(|ok| !**ok).count() > held_before;
         let progressed = !ack.is_empty() || newly_held;
-        if read >= PASS_MAX_EVENTS || round + 1 == PASS_MAX_ROUNDS || !progressed {
+        // Only events recorded count toward the pass's cap: held ones don't (#714 review N2).
+        read += ack.len();
+        if !ack.is_empty() {
+            rounds += 1;
+        }
+        if read >= PASS_MAX_EVENTS || rounds >= PASS_MAX_ROUNDS || !progressed {
             if !ack.is_empty() {
                 sync(std::mem::take(&mut ack), vec![]).await?;
             }

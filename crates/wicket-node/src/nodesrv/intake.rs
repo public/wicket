@@ -31,6 +31,8 @@ pub const SYNC_MAX_EVENTS: usize = 500;
 pub const SYNC_MAX_BYTES: usize = 4 << 20;
 /// The most intake connections served at once.
 pub const SOCKET_CONNECTIONS: usize = 16;
+/// How long a connection waits for one of the [`SOCKET_CONNECTIONS`] slots.
+pub const SOCKET_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long intake may take to send one request line.
 pub const SOCKET_LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -253,10 +255,12 @@ pub(super) fn serve_socket(node: Arc<super::Node>, sock: PathBuf, uid: u32) -> a
             if c.peer_cred().map(|p| p.uid()).ok() != Some(uid) {
                 continue;
             }
-            let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
             let n = node.clone();
+            let slots = slots.clone();
             tokio::spawn(async move {
-                let _permit = permit;
+                // A busy moment waits for a slot (a dropped deliver is a 503 the sender may not
+                // retry), up to a deadline: only a stuck intake is shut out (#714 review F8).
+                let Ok(Ok(_permit)) = tokio::time::timeout(SOCKET_SLOT_WAIT, slots.acquire_owned()).await else { return };
                 let (rd, mut wr) = c.into_split();
                 let mut lines = tokio::io::BufReader::new(rd.take(2 * wicket_core::intake::MAX_BODY as u64 + 4096)).lines();
                 while let Ok(Ok(Some(l))) = tokio::time::timeout(SOCKET_LINE_TIMEOUT, lines.next_line()).await {
