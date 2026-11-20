@@ -1,0 +1,16 @@
+[package]
+name = "oxc-minify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Minifies ES modules in place with Oxc, as the console's build.rs would (#574)"
+
+# Standalone: not part of wicket's workspace.
+[workspace]
+
+[dependencies]
+oxc_allocator = "=0.158.0"
+oxc_parser = "=0.158.0"
+oxc_span = "=0.158.0"
+oxc_minifier = "=0.158.0"
+oxc_codegen = "=0.158.0"

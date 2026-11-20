@@ -184,6 +184,9 @@ async fn a_runs_page_shows_its_token_decoded_and_its_holdings() {
         (Some(f.gid.as_str()), Some("POST"), Some("/v1/items"), Some(2))
     );
     assert_eq!(g["approved_by"], "passkey:laptop");
+    // An exact grant says so, and carries no standing rule (#715 review: the view shows what a prefix
+    // or standing grant reaches from these).
+    assert_eq!((&g["prefix"], &g["standing"]), (&json!(false), &Value::Null));
     assert!(tok["zone_cedar"].as_str().unwrap().contains("permit("));
     assert_eq!(a["holdings"]["secrets"], json!(["gh"]));
     assert_eq!(a["holdings"]["slice"]["requests"], 10);

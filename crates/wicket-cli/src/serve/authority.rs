@@ -194,6 +194,10 @@ fn run_authority(state: &State, run: &str) -> Result<Value> {
             "method": g.method,
             "host": g.host,
             "path": g.path,
+            // A prefix grant covers every path under `path`; a standing grant is a rule on the host
+            // (its methods, path globs and allow_dangerous), not the one `method`/`path` (#715 review).
+            "prefix": g.prefix,
+            "standing": g.standing.as_ref().map(|r| json!({ "methods": r.methods, "paths": r.paths, "allow_dangerous": r.allow_dangerous })),
             "uses": g.uses,
             "uses_left_on_control_host": row.as_ref().and_then(|r| r.uses_left),
             "expires_at": row.as_ref().map(|r| r.expires_at),
@@ -209,6 +213,10 @@ fn run_authority(state: &State, run: &str) -> Result<Value> {
         "box_path": spec.box_path,
         "epoch": spec.epoch,
         "zone": spec.zone.name,
+        // What the zone itself may reach (#651): the view leads with it, before the token's blocks.
+        "reach": spec.zone.reach,
+        // What it may never reach, whatever is allowed (#715 review): shown under it.
+        "forbid": spec.zone.forbid,
         "loads": entry.compiled.as_ref().err().map_or(Value::Bool(true), |e| json!({ "error": e })),
         "issued_by": if spec.issuer_cert.is_some() { "an online issuing key, certified by the authority root" } else { "the authority root" },
         "issuer_until_ms": entry.compiled.as_ref().ok().and_then(|c| c.issuer_until),

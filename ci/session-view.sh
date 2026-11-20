@@ -4,7 +4,8 @@
 #
 #   ci/session-view.sh [--test]
 #
-# Needs Node (>= 22.12, or 20.19+) and npm on PATH; CI installs a pinned, checksum-verified Node.
+# Needs Node (>= 22.12, or 20.19+) and npm on PATH; CI installs a pinned, checksum-verified Node 26 (the
+# Active LTS line, #732).
 # Steps:
 #   - `npm ci --ignore-scripts` (exact versions with integrity hashes; nothing from a package runs at
 #     install), `npm run build` (type-check, then vite) into web/session/dist;

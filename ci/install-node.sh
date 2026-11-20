@@ -4,7 +4,7 @@
 # on PATH (GITHUB_PATH in Actions). NODE_SHA256 is required (#722): the SHASUMS256.txt next to the
 # tarball has the value, to compare when updating, never to fetch at run time.
 #
-#   NODE_VERSION=22.23.5 NODE_SHA256=<hex> ci/install-node.sh
+#   NODE_VERSION=26.13.1 NODE_SHA256=<hex> ci/install-node.sh
 set -euo pipefail
 v=${NODE_VERSION:?NODE_VERSION}
 [ -n "${NODE_SHA256:-}" ] || { echo "::error::NODE_SHA256 is not set: pin node-v$v-linux-x64.tar.xz's sha256" >&2; exit 1; }

@@ -11,6 +11,7 @@ publish.workspace = true
 testkit = ["getrandom/sys_rng"]
 
 [dependencies]
+libc.workspace = true
 wicket-core.workspace = true
 wicket-store.workspace = true
 wicket-placement.workspace = true

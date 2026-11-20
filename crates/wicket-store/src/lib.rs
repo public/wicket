@@ -217,7 +217,11 @@ impl StoreError {
 /// Version 35 (expand, #578 step 4; 33 and 34 are other features') adds `trigger_intake`: each
 /// webhook trigger's intake node and the sha256 of its URL's token. Older builds don't read it;
 /// the floor stays where it was.
-pub const SCHEMA_VERSION: u32 = 35;
+/// Version 36 (expand, after 35; 33 to 35 are #637's, #716's and #714's) adds `request_claims`
+/// (#715 review): what the agent claimed when it asked (an update's reason and commit), kept apart
+/// from the request's reason so the console can show the agent's words as the agent's. Older builds
+/// don't read it; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 36;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -437,6 +441,7 @@ CREATE TABLE IF NOT EXISTS requests (
   attribution TEXT NOT NULL DEFAULT '[]', scope_prefix INTEGER NOT NULL DEFAULT 0, args_sha256 TEXT
 );
 CREATE INDEX IF NOT EXISTS requests_pending ON requests (tenant, zone, digest, status);
+CREATE TABLE IF NOT EXISTS request_claims (request_id TEXT PRIMARY KEY, claims TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS requests_run ON requests (run, status);
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
@@ -1166,6 +1171,34 @@ impl Ledger {
 
     pub fn run_status(&self, run: &str) -> Result<Option<String>> {
         Ok(self.conn.query_row("SELECT status FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?)
+    }
+
+    /// The tenant `run` belongs to, if it is in this ledger.
+    pub fn run_tenant(&self, run: &str) -> Result<Option<wicket_core::TenantId>> {
+        Ok(self
+            .conn
+            .query_row("SELECT tenant FROM runs WHERE id = ?1", params![run], |r| r.get::<_, String>(0))
+            .optional()?
+            .map(wicket_core::TenantId))
+    }
+
+    /// The latest audit record about `run` of one of `kinds`: its kind, when (Unix s) and its body.
+    pub fn last_run_audit(&self, run: &str, kinds: &[&str]) -> Result<Option<(String, i64, serde_json::Value)>> {
+        let mut best: Option<(i64, String, i64, String)> = None;
+        for k in kinds {
+            let row = self
+                .conn
+                .query_row("SELECT seq, ts, body FROM audit WHERE run = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1", params![run, k], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+                })
+                .optional()?;
+            if let Some((seq, ts, body)) = row {
+                if best.as_ref().is_none_or(|b| seq > b.0) {
+                    best = Some((seq, k.to_string(), ts, body));
+                }
+            }
+        }
+        Ok(best.map(|(_, k, ts, b)| (k, ts, serde_json::from_str(&b).unwrap_or_default())))
     }
 
     /// Children started by `run` (from their identity documents).

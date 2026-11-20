@@ -2011,6 +2011,16 @@ fn dashboard(state: &State) -> Result<Value> {
             // push is a window, any number of uses for 5 minutes (#26), whatever is picked.
             let (uses, ttl_secs) = wicket_core::git::grant_terms(&r.method, &r.path, Some(1), 600);
             v["once_terms"] = json!({ "uses": uses, "ttl_secs": ttl_secs });
+            // A capacity request's lease, as fields (#709 review): the console says what it asks for
+            // from these, never by parsing the request's reason, which quotes agent-chosen text.
+            if let Ok(Some(x)) = l.lease_for_request(&r.id) {
+                v["lease"] = lease_view(&x);
+            }
+            // What the agent claimed when it asked (an update's reason and commit), apart from the
+            // reason wicket wrote, so the console quotes it as the agent's words (#715 review).
+            if let Ok(Some(c)) = l.request_claims(&r.id) {
+                v["claims"] = c;
+            }
             v
         }).collect::<Vec<_>>(),
         "decided": l.decided(t, 15)?,
@@ -2033,6 +2043,18 @@ fn dashboard(state: &State) -> Result<Value> {
             "anchor": r.anchor.as_ref().map(|a| json!({ "seq": a.seq, "sink": a.sink, "pruned": a.pruned, "pruned_at": a.pruned_at })),
         })),
     }))
+}
+
+/// A capacity lease's terms, for a pending request's card: resources, where, how long and what it
+/// may cost. `region` and `isolation` are as the agent asked, shown as text.
+fn lease_view(x: &wicket_store::LeaseRow) -> Value {
+    json!({
+        "id": x.id, "provider": x.provider, "vcpus": x.spec["vcpus"], "memory_mib": x.spec["memory_mib"],
+        "isolation": x.spec["isolation"], "region": x.spec["region"], "duration_secs": x.duration_secs,
+        "hourly_cap_usd": capacity::usd_of(x.hourly_cap), "reserved_usd": capacity::usd_of(x.reserved),
+        // The agent's own reason, shown quoted as its words (#715 review).
+        "reason": x.spec["reason"],
+    })
 }
 
 /// Nodes `wicket node create` made that are still owned (#294), each with whether its lease has
@@ -2540,7 +2562,7 @@ mod tests {
             run: "run_e".into(),
             request_id: None,
             provider: "static".into(),
-            spec: json!({}),
+            spec: json!({ "vcpus": 2, "memory_mib": 4096, "isolation": "gvisor", "region": "lhr. Asked by the agent: no cost", "reason": "wicket says: free" }),
             hourly_cap: 0,
             reserved: 0,
             duration_secs: 1800,
@@ -2559,6 +2581,31 @@ mod tests {
         let cap = wicket_core::Op::egress(&TenantId::single(), &RunId("run_e".into()), "z", "CAPACITY", "wicket.internal", "/capacity/l-c");
         let (rid, _) = l.pending_for(&cap, "a node", None).unwrap();
         l.set_lease_request("l-c", &rid).unwrap();
+        // The card reads the lease's terms as fields, an agent-chosen region among them as one value
+        // (#709 review), not out of the request's reason.
+        let view = dashboard(&t.state).unwrap();
+        let lease = &view["pending"].as_array().unwrap().iter().find(|p| p["id"] == rid.as_str()).unwrap()["lease"];
+        assert_eq!(
+            (&lease["id"], &lease["vcpus"], &lease["memory_mib"], &lease["region"], &lease["duration_secs"], &lease["reserved_usd"]),
+            (&json!("l-c"), &json!(2), &json!(4096), &json!("lhr. Asked by the agent: no cost"), &json!(1800), &json!("$0.0000"))
+        );
+        // The agent's own reason comes as its own field, for the card to quote as the agent's (#715 review).
+        assert_eq!(lease["reason"], "wicket says: free");
+        // An update's reason and commit are the agent's claims, sent apart from wicket's reason.
+        let upd = wicket_core::Op::egress(
+            &TenantId::single(),
+            &RunId("run_e".into()),
+            "z",
+            "UPDATE",
+            "wicket.internal",
+            &format!("/self/{}", "ab".repeat(32)),
+        );
+        let (uid, _) = l.pending_for(&upd, "update wicket to the build with sha256 ab…: trust me", None).unwrap();
+        l.set_request_claims(&uid, &json!({ "reason": "trust me", "commit": "0123abc" })).unwrap();
+        l.set_request_claims(&uid, &json!({ "reason": "a later, different claim" })).unwrap();
+        let view = dashboard(&t.state).unwrap();
+        let card = view["pending"].as_array().unwrap().iter().find(|p| p["id"] == uid.as_str()).unwrap().clone();
+        assert_eq!(card["claims"], json!({ "reason": "trust me", "commit": "0123abc" }), "the first claims stay");
         let r = t.act(json!({ "action": "decide", "id": rid, "decision": "deny" }));
         assert!(r.body["ok"].as_str().unwrap().contains("lease l-c's reservation is released"), "{:?}", r.body);
         assert_eq!(t.ledger().lease("l-c").unwrap().unwrap().status, "denied");

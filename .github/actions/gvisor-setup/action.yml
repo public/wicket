@@ -70,7 +70,9 @@ runs:
         jq '.runtimes.runsc = {path: "/usr/bin/runsc", runtimeArgs: ["--host-uds=open"]} | ."registry-mirrors" = ((."registry-mirrors" // []) + ["https://mirror.gcr.io"] | unique)' "$cfg" | sudo tee "$cfg.new" >/dev/null
         sudo mv "$cfg.new" "$cfg"
         sudo systemctl restart docker
-        runsc --version | head -1
+        # sed reads all of it: with head, runsc could write after head exits and die of SIGPIPE,
+        # which pipefail turns into a failed step (exit 141).
+        runsc --version | sed -n 1p
         docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
         # A self-test before the suites, whose failure says why (#566: boxes didn't start on the
         # archive's runsc): runsc on its own, then a container through Docker. On a failure, what

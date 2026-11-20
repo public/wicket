@@ -172,12 +172,6 @@ fn find(l: &Ledger, op: &operators::Operator, which: &str) -> Result<wicket_stor
     }
 }
 
-/// Whether the caller is root: root over wicketd's socket (its peer credentials), or root itself.
-fn is_root() -> bool {
-    let p = wicket_home::cli_principal();
-    p["id"].as_str() == Some("root") && p["via"].as_str() == Some("cli")
-}
-
 pub async fn dispatch(c: TriggerCmd) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     let now = wicket_store::now();
@@ -237,13 +231,13 @@ pub async fn dispatch(c: TriggerCmd) -> Result<()> {
             Ok(())
         }
         TriggerCmd::Resume { trigger } => {
-            let t = tr::resume(&l, &op, is_root(), &find(&l, &op, &trigger)?.id)?;
+            let t = tr::resume(&l, &op, wicket_home::cli_is_root(), &find(&l, &op, &trigger)?.id)?;
             println!("resumed trigger {} ({}): it fires from its next due minute", t.name, t.id);
             Ok(())
         }
         TriggerCmd::Renew { trigger, lasts: d } => {
             let until = lasts(&d)?;
-            let t = tr::renew(&l, &op, is_root(), &find(&l, &op, &trigger)?.id, until)?;
+            let t = tr::renew(&l, &op, wicket_home::cli_is_root(), &find(&l, &op, &trigger)?.id, until)?;
             match until {
                 Some(u) => println!("renewed trigger {} ({}): until {}", t.name, t.id, when(u)),
                 None => println!("renewed trigger {} ({}): until removed", t.name, t.id),
