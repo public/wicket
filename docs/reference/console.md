@@ -182,6 +182,16 @@ ci/session-view.sh                                  # needs Node 20.19+ or 22.12
 WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
 ```
 
+**The console's own script** (`crates/wicket-cli/src/serve/static/console.js`) is minified when wicket
+is built, by `crates/wicket-cli/build.rs` with [Oxc](https://oxc.rs)'s minifier (Rust crates, pinned
+exactly in the workspace's `Cargo.toml`), so a plain `cargo build` needs no Node: about 25 KB gzipped
+instead of 38 KB. Local names are shortened and top-level names kept. `WICKET_CONSOLE_UNMINIFIED=1
+cargo build` embeds it as written, to read in a browser's debugger. The page's tests run on both
+(`serve/tests/console_ui.js`), and `ci/console-browsers.sh` runs it as served in Chromium, Firefox and
+WebKit: it writes what `wicket serve` sends (`wicket dev console-assets DIR`: the page, its files and
+its headers) and serves that against the preview's mock API, failing on any error, CSP violation or
+Trusted Types report, a card replaced by an unchanged poll, or a page that scrolls sideways.
+
 Not yet: answering the agent's own permission requests from the page (wicket's policy answers
 them, #67), images and resources in prompts, and the box tree, budgets and hibernate controls
 next to the session (#327's later slices).
@@ -447,6 +457,8 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
   'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+  and Trusted Types reported but not yet enforced (`Content-Security-Policy-Report-Only:
+  require-trusted-types-for 'script'; trusted-types lit-html`, [#739](https://github.com/public/wicket/issues/739)),
   no CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
   `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
 - **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS

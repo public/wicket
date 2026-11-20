@@ -339,6 +339,31 @@ jobs:
       - name: Build, reproduce, embed and test
         run: ci/session-view.sh --test
 
+  # #574: the console in Chromium, Firefox and WebKit (ci/console-browsers.sh): the page as `wicket
+  # serve` sends it (minified by build.rs, under its CSP and the Trusted Types report-only policy),
+  # against the preview's mock API. Playwright comes from ci/console-browsers' lockfile.
+  console-browsers:
+    name: Console in browsers
+    needs: select
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' console-browsers ')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # The same pinned Node as the session view's job (ci/install-node.sh).
+      NODE_VERSION: 26.13.1
+      NODE_SHA256: "5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864" # node-v26.13.1-linux-x64.tar.xz, from nodejs.org/dist/v26.13.1/SHASUMS256.txt (its signature checked against nodejs/release-keys)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
+      - name: Node (pinned)
+        run: ci/install-node.sh
+      - name: Build, serve and test in each browser
+        run: ci/console-browsers.sh --install
+
   # #51: SymCC (with cvc5, checksum-verified) on its fixtures, and on the example org policies a
   # change touches: narrows or widens. A solver timeout or `unknown` fails.
   policy:

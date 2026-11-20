@@ -108,6 +108,15 @@ fi
 if has tla; then
   hstep "TLA+ models (TLC)" ci/tla.sh
 fi
+if has console-browsers; then
+  # Locally Chromium only, with whatever Playwright is installed (ci/console-browsers' node_modules,
+  # or a global one); CI installs and runs Chromium, Firefox and WebKit.
+  if [ -d ci/console-browsers/node_modules ] || NODE_PATH=${NODE_PATH:-$(npm root -g 2>/dev/null)} node -e 'require("playwright")' 2>/dev/null; then
+    hstep "the console in Chromium (ci/console-browsers.sh)" ci/console-browsers.sh chromium
+  else
+    log "console-browsers: skipped, Playwright is not installed (ci/console-browsers.sh --install chromium); CI runs it"
+  fi
+fi
 if [ "$e2e" = 1 ]; then
   e2e_suites=()
   for s in smoke hibernate restore services acceptance daemon-uids install-test node-e2e acceptance-nodes update; do

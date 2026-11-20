@@ -188,6 +188,8 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Dev { cmd } => match cmd {
             DevCmd::MockLlm { .. } => Local,
             DevCmd::NodeFeedProbe { .. } => Local,
+            // Writes the embedded console files to a directory the caller names: no state, no daemon.
+            DevCmd::ConsoleAssets { .. } => Local,
         },
     }
 }

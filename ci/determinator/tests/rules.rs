@@ -137,10 +137,10 @@ fn wicket_core_is_nearly_everything_but_not_everything() {
     }
     assert!(s.affected.len() >= 10);
     assert_eq!(nextest_selects(&s.filter()), s.affected);
-    // Every suite but tla (its models only), install-test (its install path only) and the
-    // agent_rules fuzz target (operators.rs and the YAML reader only): kani and lean through
-    // wicket-core and wicket-authz, every other fuzz target.
-    let skip = ["tla", "install-test", "fuzz-agent_rules"];
+    // Every suite but tla (its models only), install-test (its install path only), console-browsers
+    // (the console's files and build only) and the agent_rules fuzz target (operators.rs and the YAML
+    // reader only): kani and lean through wicket-core and wicket-authz, every other fuzz target.
+    let skip = ["tla", "install-test", "console-browsers", "fuzz-agent_rules"];
     let all: BTreeSet<String> = Suites::parse(SUITES).unwrap().names().filter(|n| !skip.contains(n)).map(String::from).collect();
     assert_eq!(s.suites, all);
 }
@@ -220,7 +220,8 @@ fn wicket_node_selects_wicket_cli() {
 fn wicket_control_selects_wicket_cli() {
     check(&["crates/wicket-control/src/run.rs"], &["wicket-control", "wicket-sim", "wicket-cli"], CLI);
     assert_eq!(select(&["crates/wicket-control/src/grant.rs"]).filter(), "rdeps(=wicket-control)");
-    check(&["crates/wicket-cli/src/serve/web.rs"], &["wicket-cli"], CLI);
+    // The console's server code also runs the console's browser tests (#574).
+    check(&["crates/wicket-cli/src/serve/web.rs"], &["wicket-cli"], &with(CLI, &["console-browsers"]));
     let s = select(&["images/claude-code/Dockerfile"]);
     assert!(set(&["wicket-control", "wicket-cli"]).is_subset(&s.affected) && !s.affected.contains("wicket-sim") && s.suites.contains("smoke"));
 }
