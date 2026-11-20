@@ -132,11 +132,11 @@ fn concurrent_copies_spool_once() {
 async fn one_triggers_full_share_leaves_the_others_room() {
     let i = Intake::default();
     let room = |t: &str, a: &str| super::Room { i: &i, trigger: format!("t:{t}"), address: format!("a:{a}"), kib: 0, permits: vec![] };
-    let mut full = room("trg_1", "1.2.3.4");
+    let mut full = room("trg_1", "203.0.113.1");
     assert!(full.grow(super::BODY_SHARE_KIB as u32).await);
-    let mut other = room("trg_2", "5.6.7.8");
+    let mut other = room("trg_2", "203.0.113.9");
     assert!(other.grow(1024).await, "another trigger gets through");
-    let mut more = room("trg_1", "5.6.7.8");
+    let mut more = room("trg_1", "203.0.113.9");
     assert!(!more.grow(1).await, "the full trigger's share");
     drop(full);
     assert!(more.grow(1).await, "given back when dropped");
@@ -147,7 +147,7 @@ async fn one_triggers_full_share_leaves_the_others_room() {
 #[test]
 fn a_slow_address_is_refused_before_its_body() {
     let i = Intake::default();
-    let (a, b): (std::net::IpAddr, std::net::IpAddr) = ("1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap());
+    let (a, b): (std::net::IpAddr, std::net::IpAddr) = ("203.0.113.1".parse().unwrap(), "203.0.113.9".parse().unwrap());
     let at = Instant::now();
     for _ in 0..super::SLOW_BURST as usize {
         assert!(i.may_send("trg_1", a, at));
@@ -521,8 +521,9 @@ async fn the_server_is_bounded() {
     let chunk = vec![b'x'; ik::MAX_BODY - 1];
     for _ in 0..8 {
         let mut c = tokio::net::TcpStream::connect(s.addr).await.unwrap();
-        c.write_all(format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n", ik::MAX_BODY).as_bytes()).await.unwrap();
-        c.write_all(&chunk).await.unwrap();
+        // Intake may answer 429 and close early (this address's dropped bodies were charged).
+        let _ = c.write_all(format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n", ik::MAX_BODY).as_bytes()).await;
+        let _ = c.write_all(&chunk).await;
         sending.push(c);
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -530,8 +531,8 @@ async fn the_server_is_bounded() {
     ninth
         .write_all(format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", ik::MAX_BODY).as_bytes())
         .await
-        .unwrap();
-    ninth.write_all(&chunk[..64 * 1024]).await.unwrap();
+        .ok();
+    let _ = ninth.write_all(&chunk[..64 * 1024]).await;
     let mut out = String::new();
     let _ = tokio::time::timeout(Duration::from_secs(5), ninth.read_to_string(&mut out)).await;
     // 503 past the share; or 429 before the body, since the dropped half-sent bodies above were
