@@ -361,8 +361,12 @@ async fn static_files_are_sent_brotli_compressed_to_browsers_that_accept_it() {
             assert_eq!(body, if want.is_some() { br.clone() } else { original.body.clone() }, "{path} with {accept:?}");
         }
     }
-    // A PNG isn't made smaller: no copy, no Vary.
-    assert!(ASSETS.files[&served("/static/icon-192.")].br.is_none());
+    // Any file with a copy, images too, decodes to the original.
+    for (path, a) in ASSETS.files.iter().filter_map(|(p, a)| a.br.as_ref().map(|br| (p, (a, br)))) {
+        let mut decoded = vec![];
+        brotli_decompressor::BrotliDecompress(&mut &a.1[..], &mut decoded).unwrap();
+        assert_eq!(decoded, a.0.body, "{path}");
+    }
     assert!(crate::serve::web::accepts(Some("gzip;q=1.0, br;q=0.5"), "br") && !crate::serve::web::accepts(Some("*;q=0"), "br"));
 }
 
