@@ -1,0 +1,14 @@
+# A box that uses the second service (ci/attack-matrix.sh starts it once the attacker has exposed a
+# decoy under that service's name): its link must go to the instance wicket started for the service,
+# never to the attacker's port. Its reach covers the service's, so the link opens without a human.
+task: Use the service.
+program:
+  name: victim
+  command: [bash, /workspace/victim.sh]
+zone:
+  name: atk-victim
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  uses: [atk-svc2]
+  limits: { memory: 256m, cpus: 1, timeout: 5m }
