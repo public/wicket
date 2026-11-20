@@ -2137,6 +2137,49 @@ pub fn fenced_in(run_dir: &Path, now_ms: i64, cap_ms: Option<i64>) -> Option<(St
     (!a.stopped && now_ms < until).then_some((a.node, until))
 }
 
+/// Whether this host has the run record (`ctl/run.json`) of the run in `run_dir`.
+pub fn has_run_record(run_dir: &Path) -> bool {
+    run_dir.join("ctl/run.json").exists()
+}
+
+/// Why a run's box may still be running on its node: its node, until when (Unix ms), and whether
+/// the ledger holds it rather than this host's records ([`held_until`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub node: String,
+    pub until_ms: i64,
+    pub by_ledger: bool,
+}
+
+/// Whether run `run`'s box may still be running on its node at `now_ms` (#153, #676): the one rule
+/// the reconciler and a failed takeover share, so neither ends a run whose box may still run.
+/// `fenced` is its fence from this host's records ([`fenced_until`]). With none, and no run record
+/// here (`has_record`: a standby restored from the state store has none of the lost host's, #154),
+/// the ledger's hard end of its box's authority holds it, plus 1 s and the skew, as
+/// `Ledger::agent_fenced_until` has it. The cap rather than the latest renewal: a renewal the
+/// standby's copy hasn't caught up with may have moved the box's end on.
+pub fn held_until(l: &wicket_store::Ledger, run: &str, now_ms: i64, fenced: Option<(String, i64)>, has_record: bool) -> Option<Held> {
+    if let Some((node, until_ms)) = fenced {
+        return Some(Held { node, until_ms, by_ledger: false });
+    }
+    if has_record {
+        return None;
+    }
+    let (_, cap) = l.run_authority(run).ok().flatten()?;
+    let until_ms = cap.saturating_add(1 + wicket_store::WAKE_SKEW_SECS).saturating_mul(1000);
+    let node = l.run_node(run).ok().flatten().unwrap_or_else(|| "its node".into());
+    (now_ms < until_ms).then_some(Held { node, until_ms, by_ledger: true })
+}
+
+/// How long a hold lasts, in words: its end, or, for a fence this host can't bound, until its node
+/// confirms the box stopped.
+pub fn held_for(until_ms: i64) -> String {
+    match until_ms {
+        UNKNOWN_END => "until the node confirms the box stopped".to_string(),
+        u => fmt_ms(u),
+    }
+}
+
 /// Why a run's agent isn't woken while run `run`'s box may still run on `node` until `until` (Unix
 /// ms, from [`fenced_until`]): when it can be, and how, the same words wherever it is said.
 pub fn fence_refusal(run: &str, node: &str, until: i64) -> String {

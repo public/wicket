@@ -73,7 +73,7 @@ http.createServer((req, res) => {
     return send(res, 200, types[path.extname(f)] || "application/octet-stream", fs.readFileSync(f));
   }
   if (p === "/api/me") {
-    if (scenario === "signedout") return json(res, { error: "sign in" }, 401);
+    if (scenario === "signedout" || (scenario === "expired" && (polls.get(scenario) || 0) > 1)) return json(res, { error: "sign in" }, 401);
     return json(res, { who: scenario === "bootstrap" ? { state: "bootstrap" } : { state: "operator", credential: "AbCd" } });
   }
   if (p === "/api/state") {
