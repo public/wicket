@@ -1,0 +1,15 @@
+# lit-html's published browser modules, unchanged (#574), written by ci/vendor-lit.sh. Checked by
+# ci/vendor-check.py (each file's sha256) and ci/dep-age.py (the version's age). Don't edit by hand.
+ecosystem = "npm"
+name = "lit-html"
+version = "3.3.3"
+license = "BSD-3-Clause"
+tarball = "https://registry.npmjs.org/lit-html/-/lit-html-3.3.3.tgz"
+integrity = "sha512-el8M6jK2o3RXBnrSHX3ZKrsN8zEV63pSExTO1wYJz7QndGYZ8353e2a5PPX+qHe2aGayfnchQmkAojaWAREOIA=="
+
+[files]
+"LICENSE" = "2b66f9390afde29edfe4314daff93f01fb182e1178053e228120178987e5db75"
+"lit-html.js" = "b878e7f95dec8a9b6e9b217faca6b6a11bad82ebc44c0caa77419ed83edd81f2"
+"directive.js" = "3344c4f41c69cd0701d3937e8f9ef90bd845614bf6456d0b8314b7c51d415b9d"
+"directive-helpers.js" = "f7fb1154b8f72ed2cc08b05eaeed71c99270e9ad2d48620ed24688a1af4c2b62"
+"directives/repeat.js" = "083140026ecd8665fedd15b17769f9d516252a9f1502f1e91e6967686ee82626"

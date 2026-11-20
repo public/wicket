@@ -2,7 +2,8 @@
 # The console in real browsers (#574): builds wicket, writes the console as `wicket serve` sends it
 # (`wicket dev console-assets`: minified, content-hashed, with its CSP and Trusted Types report-only
 # headers), serves that against the preview's mock API (ci/console-preview), and runs
-# ci/console-browsers/test.mjs in each browser named (default: chromium firefox webkit).
+# ci/console-browsers/test.mjs (the whole page) and inbox.mjs (the request cards, with the API
+# answered in the page) in each browser named (default: chromium firefox webkit).
 #
 #   ci/console-browsers.sh [--install] [chromium] [firefox] [webkit]
 #
@@ -35,3 +36,6 @@ for _ in $(seq 50); do
   sleep 0.1
 done
 node ci/console-browsers/test.mjs "http://127.0.0.1:$port/" "${browsers[@]}"
+# The Inbox's cards, with the API answered in the page (inbox.mjs): the checks that moved from
+# console_ui.js's fake DOM when the Inbox moved to lit-html.
+node ci/console-browsers/inbox.mjs "http://127.0.0.1:$port/" "${browsers[@]}"

@@ -247,8 +247,18 @@ ci/session-view.sh                                  # needs Node 20.19+ or 22.12
 WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
 ```
 
+**Its views are moving to [lit-html](https://lit.dev/docs/libraries/standalone-templates/)** (#574),
+one at a time: the Inbox first (`static/inbox.js`). lit-html's published modules are committed under
+`static/vendor/lit-html/`, unchanged, with their version, licence and hashes in `VENDOR.toml`
+(`ci/vendor-lit.sh` updates them; `ci/vendor-check.py` checks them). The console's modules import it
+by name (`import { html } from "lit-html"`), and `build.rs` rewrites each such import to the vendored
+file's path, so the browser needs no import map and the CSP stays `script-src 'self'`; any other bare
+import fails the build. The console's modules and
+lit-html's are served from one directory named by their hash, `/static/m.<hash>/`, each with
+Subresource Integrity, so the browser loads them without a bundler.
+
 **The console's own script** (`crates/wicket-cli/src/serve/static/console.js`) is minified when wicket
-is built, by `crates/wicket-cli/build.rs` with [Oxc](https://oxc.rs)'s minifier (Rust crates, pinned
+is built, as are its modules, by `crates/wicket-cli/build.rs` with [Oxc](https://oxc.rs)'s minifier (Rust crates, pinned
 exactly in the workspace's `Cargo.toml`), so a plain `cargo build` needs no Node: about 25 KB gzipped
 instead of 38 KB. Local names are shortened and top-level names kept. `WICKET_CONSOLE_UNMINIFIED=1
 cargo build` embeds it as written, to read in a browser's debugger. The page's tests run on both
@@ -291,6 +301,11 @@ that stays a signed action.
   whether `org.cedar` still matches what was applied (a hand edit refuses every mint), every kept
   version with when and by whom it was applied, and each running run with the version it was minted
   under: current, older, or revoked by a later `wicket policy apply`.
+- **A node's CA** (`GET /api/nodes/<node>/ca`, #573): the hosts its active CA is constrained to and
+  those it was enrolled with, how it may be widened at runtime, what live runs want of it and whether
+  its CA covers each, what the next renewal signs, and its last 20 widenings (`node.ca_widened`). The
+  same view as `wicket node ca <node> --json`. Another tenant's node is not found. The policy itself is
+  set on the host (`wicket node set --ca-hosts`).
 - **Applying an org policy** (#712): `POST /api/policy/preview` with `cedar`, `entities` and
   `keep_runs` (at most 60 KiB together) shows what `wicket policy apply --dry-run` prints: its
   version and its sources' sha256, the one it replaces, what it changes against the applied policy

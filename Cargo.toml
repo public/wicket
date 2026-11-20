@@ -38,6 +38,7 @@ publish = false
 # Oxc toolchain as Rust crates, so `cargo build` needs no Node. Pinned exactly: 0.x releases weekly
 # and moves its API.
 oxc_allocator = "=0.158.0"
+oxc_ast = "=0.158.0"
 oxc_codegen = "=0.158.0"
 oxc_diagnostics = "=0.158.0"
 oxc_minifier = "=0.158.0"

@@ -42,6 +42,9 @@ function pending(now) {
       path: "/capacity/l-17", risk: "R3ExternalOrIrreversible", status: "pending",
       reason: "capacity lease l-17: 2 vCPU, 4096 MiB, isolation Gvisor or stronger, region lhr preferred, for 8h, on vultr, at most $0.036/h, worst case $0.288 (reserved now). Asked by the agent: Lease one more build node for the nightly matrix", created_at: now - 1500, attribution: [], scope_prefix: false,
       identity: verified("build-farm", "scheduler"), once_terms: { uses: 1, ttl_secs: 600 }, args_sha256: "c0ffee",
+      // The lease's terms as fields, as the server sends them (#709, #715 review).
+      lease: { id: "l-17", provider: "vultr", vcpus: 2, memory_mib: 4096, isolation: "gvisor", region: "lhr", duration_secs: 28800,
+        hourly_cap_usd: "$0.0360", reserved_usd: "$0.2880", reason: "Lease one more build node for the nightly matrix" },
     },
     {
       id: "r-a019", tenant: T, run: run("PLANNER"), zone: "planner", method: "SPAWN", host: "wicket.internal",
