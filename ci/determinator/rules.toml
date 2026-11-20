@@ -119,10 +119,13 @@ globs = [
   "**/*.md", "docs/**", "experiments/**", "refs/**", "changes/**", "LICENSE", "README.md", "CHANGELOG.md",
   ".gitleaks.toml", ".gitignore", ".claude-plugin/**", "plugins/**",
   "ci/check-public.py", "ci/check-doc-links.sh", "ci/check-terms.sh", "ci/check-terms.allow", "ci/check-plugin.py",
-  "ci/changelog.py", "ci/changelog_test.py", "ci/preflight.sh",
+  "ci/changelog.py", "ci/changelog_test.py", "ci/preflight.sh", "ci/no-attribution.py", "ci/no-attribution_test.py", ".githooks/**",
+  "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml",
+  # The console preview (#574): it serves the console's static files, but nothing builds or tests it.
+  "ci/console-preview.sh", "ci/console-preview/**",
   "deny.toml", "ci/mutants.sh", "ci/mutants.accepted", "ci/package.sh", "ci/sim.sh",
   "ci/smoke.sh", "ci/smoke.yaml", "ci/attack-matrix.sh", "ci/attack/**", "ci/h3get/**", "ci/hibernate.sh", "ci/hibernate.yaml", "ci/restore.sh", "ci/service-e2e.sh",
-  "ci/acceptance.sh", "ci/acceptance/**", "ci/install-acceptance.sh", "ci/install-test.sh", "ci/daemon-uids.sh",
+  "ci/acceptance.sh", "ci/acceptance/**", "ci/install-acceptance.sh", "ci/install-test.sh", "ci/base-images.sh", "ci/daemon-uids.sh",
   "ci/node-e2e.sh", "ci/node-e2e/**", "ci/update.sh", "ci/update/**", "ci/policy-diff.sh", "ci/kani.sh",
   "ci/lean.sh", "ci/tla.sh", "ci/tla-trail.py", "ci/shard.awk", "ci/fuzz.sh", "fuzz/**", "verification/**", "deploy/**", "programs/**",
 ]

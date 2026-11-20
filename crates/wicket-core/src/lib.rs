@@ -29,7 +29,7 @@ pub mod trigger;
 pub mod version;
 pub mod yaml;
 
-pub use canon::{canonical_host, canonical_path, prefix_covers, prefix_dir, CanonError};
+pub use canon::{canonical_host, canonical_path, canonical_path_decoded, canonical_path_decoding, prefix_covers, prefix_dir, CanonError};
 pub use manifest::{
     AcpSpec, AgentSpec, Escalation, Harness, InjectRule, Isolation, Limits, LlmSpec, Manifest, ManifestError, ModelRoute, Persist,
     ProgramSpec, ReachRule, RemotePermissionMode, RemoteSpec, VolumeSpec, WildcardSpec, ZoneSpec,

@@ -324,3 +324,31 @@ fn many_publishers_write_one_checkpoint_per_interval_between_them() {
     assert_eq!(last.epoch(), 200);
     assert_eq!(snap(&mut last, T0 + 300), snap(&mut ps[7], T0 + 300));
 }
+
+/// A publisher behind the log serves no catch-up and signs no statement on its tick, as it
+/// commits nothing: what it holds may be behind what nodes hold. And one whose log was set aside
+/// for a new one (a new generation) can't append to the old file no one reads.
+#[test]
+fn a_publisher_behind_the_log_serves_nothing_and_a_set_aside_log_takes_nothing() {
+    let (mut cp, r) = setup();
+    let mut b = cp.open_publisher(cfg());
+    let put = cp.put("from-a");
+    cp.p.commit(vec![put], T0 + 10).unwrap();
+    assert!(b.catch_up(&r.hello(), T0 + 20).unwrap_err().to_string().contains("refresh first"));
+    assert!(b.tick(T0 + 10_000).is_none(), "no statement for an epoch the log has moved past");
+    assert_eq!(b.refresh().unwrap(), Refreshed::Applied(1));
+    assert!(b.catch_up(&r.hello(), T0 + 20).is_ok());
+    assert!(b.tick(T0 + 10_000).is_some());
+
+    // The log set aside, as a new generation does, and a new one started by another publisher.
+    let log = cp.p.log_path().to_path_buf();
+    std::fs::rename(&log, log.with_extension("jsonl.old")).unwrap();
+    let put = cp.put("into-the-old-file");
+    let e = b.commit(vec![put.clone()], T0 + 30).unwrap_err();
+    assert!(e.to_string().contains("replaced") || e.to_string().contains("gone"), "{e}");
+    let mut c = cp.open_publisher(cfg());
+    c.commit(vec![put.clone()], T0 + 40).unwrap();
+    let e = b.commit(vec![put], T0 + 50).unwrap_err();
+    assert!(e.to_string().contains("replaced"), "{e}");
+    assert_eq!(b.refresh().unwrap(), Refreshed::Reopen);
+}

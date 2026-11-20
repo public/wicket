@@ -23,9 +23,12 @@ service:
   drain: drop
 zone:
   name: npm-cache
-  # What the cache fetches under: public packages, read only.
+  # What the cache fetches under: public packages, read only. npm asks for a scoped package as
+  # /@scope%2fname: `decode_slash: [1]` has wicket decide that one encoded slash in the first
+  # segment as /@scope/name, so a rule or forbid on /@scope/** holds it (#664). The request still
+  # goes upstream as npm wrote it.
   reach:
-    - { host: registry.npmjs.org, methods: [GET, HEAD], paths: ["/**"] }
+    - { host: registry.npmjs.org, methods: [GET, HEAD], paths: ["/**"], decode_slash: [1] }
   unlisted_hosts: hide
   volumes:
     - { name: storage, path: /volumes/storage, keep: true, retention: 7d }

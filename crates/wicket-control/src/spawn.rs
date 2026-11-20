@@ -583,8 +583,13 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
             .map(|r| {
                 let methods = if r.methods.is_empty() { "GET, HEAD".to_string() } else { r.methods.join(", ") };
                 let paths = if r.paths.is_empty() { "/**".to_string() } else { r.paths.join(", ") };
+                let decode = if r.decode_slash.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (decides an encoded slash as / in segment {:?})", r.decode_slash)
+                };
                 format!(
-                    "{} {} {}{}",
+                    "{} {} {}{}{decode}",
                     clip(&methods, 60),
                     clip(&r.host, 120),
                     clip(&paths, 200),

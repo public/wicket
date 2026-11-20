@@ -891,6 +891,11 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         ));
     }
     let together: &[String] = if jump { &nodes } else { &[] };
+    // An audit sink the sinks file leaves out (a relative jsonl path) is said here, before the
+    // switch: the gate's own output (`wicket self health`) isn't shown.
+    for w in skipped_sinks() {
+        say(format!("warning: audit sinks: {w}"));
+    }
     if !o.only_nodes {
         if blue == green {
             say(format!("the control host already runs {green}"));
@@ -1572,6 +1577,15 @@ async fn gate_round(bin: &Path, target: &str, nodes: &[String], g: &Gate, first:
     Ok(())
 }
 
+/// The audit sinks the sinks file leaves out, and why (#694): said before an update switches, and
+/// by `wicket doctor` and `wicket self health`.
+pub(crate) fn skipped_sinks() -> Vec<String> {
+    match wicket_home::audit_export::SinksConfig::load() {
+        Ok(Some(c)) => c.skipped,
+        _ => vec![],
+    }
+}
+
 // ---- `wicket self health` (run by the new build) ----
 
 /// `wicket self health`: this build opens the ledger (migrating it) and verifies its audit chain,
@@ -1581,7 +1595,14 @@ pub async fn health(nodes: Vec<String>, canary: Option<PathBuf>, image: String) 
     println!("build {} (wicket {}, protocol {}, schema {})", &d.build[..12], d.version, d.protocol, d.schema);
     let ledger = Arc::new(Mutex::new(Ledger::open(&crate::ledger_path())?));
     let n = ledger.lock().expect("ledger").verify_audit().context("the audit chain")?;
+    wicket_home::audit_export::verify_local_anchor(&ledger.lock().expect("ledger")).context("the audit chain")?;
     println!("ledger: ok ({n} audit records verify)");
+    // An audit sink left out of the sinks file (a relative jsonl path) is said, not failed on.
+    if let Ok(Some(c)) = wicket_home::audit_export::SinksConfig::load() {
+        for w in &c.skipped {
+            println!("audit sinks: warning: {w}");
+        }
+    }
     let rt = wicket_sandbox::Docker::from_env().runtimes().await.context("docker")?;
     println!("docker: ok ({})", rt.join(", "));
     for n in &nodes {
@@ -1900,6 +1921,22 @@ pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #574: an artifact no trusted key signed and no operator approved needs an approval (exit
+    /// 5); a signature that doesn't verify is refused (3).
+    #[test]
+    fn an_unapproved_update_needs_an_approval() {
+        use wicket_home::exit::{code_of, Code};
+        let dir = std::env::temp_dir().join(format!("wicket-unapproved-{}", wicket_core::new_ulid()));
+        std::fs::create_dir_all(dir.join("stage")).unwrap();
+        let artifact = dir.join("wicket");
+        std::fs::write(&artifact, b"not wicket").unwrap();
+        let ledger = Mutex::new(Ledger::open_in_memory().unwrap());
+        let e = accept(&ledger, &artifact, None, &dir.join("stage"), None).err().expect("not accepted");
+        assert_eq!(code_of(&e), Some(Code::NeedsApproval), "{e:#}");
+        assert!(format!("{e:#}").contains("no operator has approved"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// #487: a handed run counts as adopted when it runs under a live supervisor, whoever started
     /// it (the reconciler service, often, before the update's own pass): not by what that pass says.

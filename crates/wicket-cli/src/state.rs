@@ -407,12 +407,31 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     if !out.status.success() || !tmp.exists() {
         bail!("Litestream could not restore the ledger: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
+    // What the restore reads after the ledger is replaced, read first: a sinks file, an issuer key
+    // or a store that fails to read fails the restore before anything is replaced, never half-way
+    // (after the rename, the exports' rewind, the agents' fencing, the restore's record and the
+    // feeds' new generation must all happen).
+    let sinks = crate::audit_export::SinksConfig::load().context("the audit sinks file (nothing restored)")?;
+    let mut exported: Vec<Vec<serde_json::Value>> = vec![];
+    let mut issuer = None;
+    if let Some(cfg) = &sinks {
+        for sink in cfg.sinks.iter().filter(|k| matches!(k.kind, crate::audit_export::SinkKind::Store {})) {
+            exported.push(
+                crate::audit_export::stored_objects(&sink.name)
+                    .with_context(|| format!("sink {}'s objects (nothing restored)", sink.name))?,
+            );
+        }
+        if !exported.is_empty() {
+            issuer = Some(crate::issuer().context("the issuer key, to check exported checkpoints (nothing restored)")?.verifying_key());
+        }
+    }
     for ext in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{ext}", db.display()));
     }
     std::fs::rename(&tmp, &db)?;
     let l = wicket_store::Ledger::open(&db)?;
     l.verify_audit().context("the restored ledger's audit chain")?;
+    wicket_home::audit_export::verify_local_anchor(&l).context("the restored ledger's audit chain")?;
     let (head, _) = l.audit_head()?.unwrap_or((0, String::new()));
     println!("[wicket] the ledger is restored from lineage {}: its audit chain verifies, up to record {head}", from.id);
     // This host streams as a lineage of its own from now on; the one it came from is superseded.
@@ -423,10 +442,8 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     // could make records that chain; not ones a checkpoint signs).
     let mut imported = 0;
     let mut exported_beyond = 0i64;
-    if let Some(cfg) = crate::audit_export::SinksConfig::load()? {
-        let issuer = crate::issuer()?.verifying_key();
-        for sink in cfg.sinks.iter().filter(|k| matches!(k.kind, crate::audit_export::SinkKind::Store {})) {
-            let objs = crate::audit_export::stored_objects(&sink.name)?;
+    if let Some(issuer) = &issuer {
+        for objs in &exported {
             let mut recs: Vec<wicket_store::AuditRecord> =
                 objs.iter().filter(|o| o["type"] == "wicket.audit.record").filter_map(exported_record).collect();
             recs.sort_by_key(|r| r.seq);
@@ -435,7 +452,7 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
             if at.is_some() {
                 continue;
             }
-            let signed = signed_up_to(&objs, &recs, &issuer);
+            let signed = signed_up_to(objs, &recs, issuer);
             let trusted: Vec<_> = recs.into_iter().filter(|r| r.seq <= signed).collect();
             imported += l.import_exported_audit(&trusted)?;
         }

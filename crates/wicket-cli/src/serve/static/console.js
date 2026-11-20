@@ -4,11 +4,85 @@
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = String(text); return e; };
 // The same set as wicket_core::text::is_unsafe: C0, DEL, C1, bidi, zero-width, line separators (#128).
 const strip = s => String(s ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, " ");
-const ago = (now, t) => { const s = Math.max(0, now - t); return s < 90 ? s + "s ago" : s < 5400 ? Math.round(s / 60) + "m ago" : Math.round(s / 3600) + "h ago"; };
+// One time format (#645): how far off, for the near past and future ("in 8 h", "2 h ago"), with the
+// local wall-clock time ("19:20", "Wed 19:20", "21 Nov 19:20") and the exact UTC value as a tooltip.
+// Counted from the server's clock (`skewSecs`, from each poll), so a phone's wrong clock doesn't matter.
+let skewSecs = 0;
+const nowSecs = () => Date.now() / 1000 + skewSecs;
+const plural = (n, one, many) => n + " " + (n === 1 ? one : (many || one + "s"));
+function rel(t, now) {
+  const d = t - (now === undefined ? nowSecs() : now), a = Math.abs(d);
+  if (a < 5) return "just now";
+  const v = a < 90 ? Math.round(a) + " s" : a < 5400 ? Math.round(a / 60) + " min" : a < 172800 ? Math.round(a / 3600) + " h" : plural(Math.round(a / 86400), "day");
+  return d > 0 ? "in " + v : v + " ago";
+}
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function clock(t, now) {
+  const d = new Date(t * 1000), n = new Date((now === undefined ? nowSecs() : now) * 1000);
+  const hm = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  if (d.toDateString() === n.toDateString()) return hm;
+  if (Math.abs(d - n) < 6 * 86400000) return DAYS[d.getDay()] + " " + hm;
+  return d.getDate() + " " + MONTHS[d.getMonth()] + (d.getFullYear() !== n.getFullYear() ? " " + d.getFullYear() : "") + " " + hm;
+}
+const iso = t => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+// "19:20 (in 8 h)", or a dash for no time.
+const at = (t, now) => t ? clock(t, now) + " (" + rel(t, now) + ")" : "\u2014";
+// The same as an element, its exact time in `title` and `datetime`.
+function timeEl(t, text) {
+  const e = el("time", "", text === undefined ? at(t) : text);
+  if (t) { e.title = iso(t); if (e.setAttribute) e.setAttribute("datetime", iso(t)); }
+  return e;
+}
+const ago = (now, t) => rel(t, now);
 const riskClass = r => ({ R0Read: "r0", R1ReadScoped: "r1", R2WriteReversible: "r2", R3ExternalOrIrreversible: "r3", R4ExecOrPrivilege: "r4" })[r] || "r4";
 // What a risk class means to whoever decides, with its code (docs/reference/risk-classes.md, #574).
 const riskLabel = r => ({ R0Read: "R0 \u00b7 read", R1ReadScoped: "R1 \u00b7 read (scoped)", R2WriteReversible: "R2 \u00b7 changes data", R3ExternalOrIrreversible: "R3 \u00b7 visible to others, or can't be undone", R4ExecOrPrivilege: "R4 \u00b7 push, deploy or privilege" })[r] || r;
 // A lifetime as the card and the sheet both say it: whole hours as hours, else minutes.
+// Money as people write it (#639): "$0.05", "$1.00", and more places only where a value needs them
+// ("$0.014"). The server sends "$0.0500"; anything that isn't a dollar amount is shown as sent.
+function money(v) {
+  const m = /^\$(\d+)(?:\.(\d+))?$/.exec(String(v ?? "").trim());
+  if (!m) return strip(v);
+  const frac = (m[2] || "").replace(/0+$/, "").padEnd(2, "0");
+  return "$" + m[1] + "." + frac;
+}
+const microUsd = u => money("$" + (Number(u || 0) / 1e6).toFixed(6));
+// A principal by its short name (#639): an operator as unix/alex or passkey/laptop, an agent by its
+// name and zone; its full identity in the element's title where there is one.
+function principalName(p) {
+  const x = String(p || "");
+  const op = /\/op\/((?:unix|passkey)\/[^/]+)$/.exec(x);
+  if (op) return strip(op[1]);
+  const ag = /\/z\/([^/]+)\/a\/([^/]+)$/.exec(x);
+  if (ag) return strip(ag[2]) + " (zone " + strip(ag[1]) + ")";
+  return strip(x);
+}
+// A principal as an element (#707 review): the short name as a button that shows the full identity
+// under it on a tap (a phone has no hover), and as its title.
+function principalEl(p) {
+  const w = el("span", "principal");
+  const full = strip(p), short = principalName(p);
+  if (short === full) { w.append(el("span", "run-name", full)); return w; }
+  const b = el("button", "idname", short);
+  b.type = "button"; b.title = full;
+  if (b.setAttribute) b.setAttribute("aria-expanded", "false");
+  const line = el("div", "idline", full); line.hidden = true;
+  b.onclick = () => { line.hidden = !line.hidden; if (b.setAttribute) b.setAttribute("aria-expanded", String(!line.hidden)); layoutAt = performance.now(); };
+  w.append(b, line);
+  return w;
+}
+// Server text with RFC 3339 UTC times in it (a node's health, a refusal's reason) in the rows' local
+// time; the original stays in the element's title (#707 review).
+const UTC_TIME = /\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?Z\b/g;
+const localTimes = text => strip(text).replace(UTC_TIME, m => { const t = Date.parse(m) / 1000; return isNaN(t) ? m : clock(t); });
+function serverText(tag, cls, text) { const e = el(tag, cls, localTimes(text)); if (UTC_TIME.test(String(text))) e.title = strip(text); UTC_TIME.lastIndex = 0; return e; }
+// A sentence with `commands` in backticks as code spans (#648): the rest stays text.
+function codeText(tag, cls, text) {
+  const e = el(tag, cls);
+  String(text).split("`").forEach((part, i) => { if (part) e.append(i % 2 ? el("code", "", part) : document.createTextNode(part)); });
+  return e;
+}
 const span = secs => { const s = Math.round(secs || 0); return s >= 3600 && s % 3600 === 0 ? (s / 3600) + (s === 3600 ? " hour" : " hours") : Math.round(s / 60) + " min"; };
 
 // What happened, at the foot of the page (#574): long enough to read (3 to 8 s by length), and an
@@ -173,7 +247,12 @@ async function openSheet(body, extra) {
   if (sheet !== sheetToken) return;
   // An error that stays sits above the sheet (#597): it goes when the sheet opens.
   document.getElementById("msg").hidden = true;
-  document.getElementById("confirm-what").textContent = describe(begin.action);
+  // The decision (describe's first line) in an element of its own, styled strongly; the rest, the
+  // target among it, in full ink. The text, newline included, is describe's exactly (#698 review).
+  const said = describe(begin.action), cut = said.indexOf("\n");
+  const lead = el("div", "lead", cut < 0 ? said : said.slice(0, cut));
+  document.getElementById("confirm-what").replaceChildren(lead, ...(cut < 0 ? [] : [document.createTextNode("\n"), el("div", "rest", said.slice(cut + 1))]));
+  announce("");
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   state.textContent = "";
@@ -194,6 +273,7 @@ async function openSheet(body, extra) {
     if (left > 0) { state.textContent = "Expires in " + Math.floor(left / 60000) + ":" + String(Math.floor(left / 1000) % 60).padStart(2, "0"); return; }
     clearInterval(expiryTimer);
     state.textContent = "This expired before it was signed. Nothing was signed.";
+    announce(state.textContent);
     go.textContent = "Ask again"; go.className = "approve"; go.disabled = false;
     go.onclick = () => { go.disabled = true; state.textContent = "Preparing\u2026"; openSheet(body, extra); };
   };
@@ -204,6 +284,7 @@ async function openSheet(body, extra) {
     go.dataset.waiting = "1";
     clearInterval(expiryTimer);
     state.textContent = "Waiting for your passkey\u2026";
+    announce(state.textContent);
     try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
     catch (e) { toastError(e, null, true); }
     closeConfirm();
@@ -211,6 +292,8 @@ async function openSheet(body, extra) {
   document.getElementById("confirm").hidden = false;
   go.focus();
 }
+// What a screen reader is told about the sheet: state changes only, not the countdown's every second.
+function announce(t) { const a = document.getElementById("confirm-announce"); if (a) a.textContent = t; }
 // #369: what else an approval that widens would allow, shown before the passkey is asked for.
 function renderBlast(box, b) {
   box.replaceChildren();
@@ -360,6 +443,30 @@ function pendingCard(s, p) {
   return c;
 }
 
+// How many decisions wait (#650): in the tab's title, the heading, the section nav and, where the
+// browser has one, the installed app's badge; and how many health alerts, beside Health in the nav.
+let shownCount = -1;
+function renderCounts(waiting, alerts) {
+  // Each count with its link's accessible name: "Waiting, 10 items" (#698 review).
+  const set = (id, v) => {
+    const e = document.getElementById(id);
+    if (!e) return;
+    e.textContent = v ? String(v) : ""; e.hidden = !v;
+    const a = e.parentNode;
+    if (a && a.setAttribute && a.dataset) { if (v) a.setAttribute("aria-label", a.dataset.label + ", " + v + (v === 1 ? " item" : " items")); else a.removeAttribute("aria-label"); }
+  };
+  set("nav-waiting", waiting);
+  set("nav-health", alerts);
+  const h = document.getElementById("waiting-h");
+  if (h) h.textContent = waiting ? "Waiting for you (" + waiting + ")" : "Waiting for you";
+  document.title = waiting ? "(" + waiting + ") wicket" : "wicket";
+  if (waiting === shownCount) return;
+  shownCount = waiting;
+  try {
+    if (typeof navigator !== "undefined" && navigator.setAppBadge) (waiting ? navigator.setAppBadge(waiting) : navigator.clearAppBadge()).catch(() => {});
+  } catch (e) { /* no badge here */ }
+}
+
 function renderPending(s) {
   const box = document.getElementById("pending");
   const live = new Set(s.pending.map(p => p.id));
@@ -389,7 +496,7 @@ function renderKeyed(id, rows, f, emptyText) {
   });
   keyed.set(id, now);
   if (!rows.length) {
-    if (!(box.children.length === 1 && box.children[0].className === "empty")) box.replaceChildren(el("div", "empty", emptyText));
+    if (!(box.children.length === 1 && box.children[0].className === "empty")) box.replaceChildren(codeText("div", "empty", emptyText));
     return;
   }
   if (nodes.length === box.children.length && nodes.every((n, i) => n === box.children[i])) return;
@@ -404,7 +511,7 @@ const signedSettled = body => {
 
 function renderRows(id, rows, f, emptyText) {
   const box = document.getElementById(id); box.replaceChildren();
-  if (!rows.length) { box.append(el("div", "empty", emptyText)); return; }
+  if (!rows.length) { box.append(codeText("div", "empty", emptyText)); return; }
   for (const r of rows) box.append(f(r));
 }
 
@@ -419,30 +526,60 @@ function egressOf(op) {
   return null;
 }
 
+// One record of activity as a sentence (#646): its local time, a tag for its kind, then what
+// happened. Every kind wicket writes that an operator acts on has words; anything else is its kind
+// and run, so nothing is dropped.
+const num = n => Number(n || 0).toLocaleString("en-US");
+const by = b => b.by ? " by " + strip(b.by) + (b.signed ? " (passkey-signed)" : "") : "";
+function logLine(op, tag, tone, text, extra) {
+  const d = el("div", "logline");
+  d.append(op.ts ? timeEl(op.ts, clock(op.ts)) : el("span"), el("span", "tag " + (tone || ""), tag), el("span", "text", text));
+  if (extra) d.lastChild.append(document.createTextNode(" "), extra);
+  return d;
+}
 function line(op) {
   const b = op.body || {};
+  const r = op.run ? strip(op.run) : "";
   const eg = egressOf(op);
   if (eg) {
     const [x, where] = eg;
     const outcome = String(x.outcome || "?");
-    const cls = outcome === "allow" || outcome === "spliced" ? "ok" : outcome === "pending" ? "pend" : "blocked";
-    const d = el("div"); d.append(el("span", cls, outcome.toUpperCase().padEnd(9)), document.createTextNode(strip(x.method + " " + x.host + x.path + where) + " "));
-    if (op.run) { const why = el("button", "link", "explain"); why.onclick = () => showExplain(op.seq); d.append(why); }
-    return d;
+    const tone = outcome === "allow" || outcome === "spliced" ? "ok" : outcome === "pending" ? "pend" : "blocked";
+    let why = null;
+    if (op.run) { why = el("button", "link", "explain"); why.onclick = () => showExplain(op.seq); }
+    return logLine(op, outcome, tone, strip(x.method + " " + x.host + x.path + where), why);
   }
-  if (op.kind === "op" && b.kind === "llm") return el("div", "", "model  #" + b.requests + " " + strip(b.model || "?") + " → " + b.status + "  in " + b.input_tokens + " / out " + b.output_tokens);
-  if (op.kind === "decision") return el("div", b.decision === "approve" ? "ok" : "blocked", b.decision + " " + b.request + " by " + strip(b.by) + (b.signed ? " (passkey-signed)" : ""));
-  if (op.kind === "operator.passkey_added") return el("div", "", "passkey added: " + strip(b.name) + " via " + strip(b.via));
-  if (op.kind === "run.start") return el("div", "", "start  " + op.run + " zone " + strip(b.zone) + " agent " + strip(b.agent));
-  // operator.message is from before `wicket say` was removed (#198); prompts are session.prompt.
-  if (op.kind === "operator.message" || op.kind === "session.prompt") return el("div", "", "prompt " + op.run + " by " + strip(b.by) + " · " + b.chars + " chars" + (b.via ? " via " + strip(b.via) : "") + (b.signed ? " (passkey-signed)" : ""));
-  if (op.kind === "run.fence_released") return el("div", "blocked", "fence  " + op.run + " released on node " + strip(b.node) + " by " + strip(b.by) + ": " + strip(b.why) + (b.signed ? " (passkey-signed)" : ""));
-  if (op.kind === "identity.revoked") return el("div", "blocked", "revoke " + op.run + " by " + strip(b.by) + ": " + strip(b.reason) + (b.signed ? " (passkey-signed)" : ""));
-  if (op.kind === "run.console_start") return el("div", "", "launch " + op.run + " " + strip(b.root + "/" + b.manifest) + " by " + strip(b.by) + " (passkey-signed)");
-  if (op.kind === "op" && b.kind === "box") return el("div", "pend", "box    " + strip(b.what) + ": " + strip(b.detail));
-  if (op.kind === "run.exit_cause") return el("div", "blocked", "ended  " + op.run + " (exit status " + b.code + "): " + strip(b.cause));
-  if (op.kind === "run.end") return el("div", b.cause ? "blocked" : "", "end    " + op.run + " " + strip(b.status) + " · " + b.model_requests + " model calls");
-  return el("div", "", op.kind);
+  switch (op.kind === "op" ? "op." + b.kind : op.kind) {
+    case "op.llm": return logLine(op, "model", "", strip(b.model || "?") + " request #" + num(b.requests) + " \u2192 " + strip(b.status) +
+      " \u00b7 " + num(b.input_tokens) + " in / " + num(b.output_tokens) + " out tokens" + (r ? " \u00b7 " + r : ""));
+    case "op.box": return logLine(op, "box", "pend", strip(b.what) + ": " + strip(b.detail) + (r ? " \u00b7 " + r : ""));
+    case "decision": return logLine(op, b.decision === "approve" ? "approved" : "denied", b.decision === "approve" ? "ok" : "blocked", strip(b.request) + by(b));
+    case "decision.refused": return logLine(op, "refused", "blocked", "a decision (" + strip(b.decision) + ") on " + strip(b.target) + " was refused" +
+      (b.by ? " for " + strip(b.by) : "") + ": " + strip(b.why));
+    case "grant.revoked": return logLine(op, "revoked", "", "grant " + strip(b.grant) + " revoked" + by(b));
+    case "standing.revoked": return logLine(op, "revoked", "", "standing reach " + strip(b.standing) + (b.rule ? " (" + ruleText(b.rule) + ")" : "") + " revoked" + by(b));
+    case "capacity.requested": return logLine(op, "capacity", "pend", "capacity asked for" + (b.principal ? " by " + principalName(b.principal) : "") +
+      (b.ask ? ": " + strip(b.ask) : "") + (b.lifetime_secs ? " for " + span(b.lifetime_secs) : "") + (b.request ? " (" + strip(b.request) + ")" : ""));
+    case "lease.requested": return logLine(op, "lease", "pend", "lease " + strip(b.lease) + " asked for" + (b.spec && b.spec.plan ? ": " + strip(b.spec.plan) + " in " + strip(b.spec.region) : "") +
+      (b.hourly_cap_usd_micros ? ", at most " + microUsd(b.hourly_cap_usd_micros) + "/h" : "") + (b.duration_secs ? " for " + span(b.duration_secs) : "") +
+      (b.request ? " (" + strip(b.request) + ")" : "") + (r ? " \u00b7 " + r : ""));
+    case "operator.passkey_added": return logLine(op, "passkey", "", "passkey " + strip(b.name) + " added via " + strip(b.via));
+    case "run.start": return logLine(op, "start", "", r + " started: agent " + strip(b.agent) + " in zone " + strip(b.zone));
+    // operator.message is from before `wicket say` was removed (#198); prompts are session.prompt.
+    case "operator.message": case "session.prompt": return logLine(op, "prompt", "", plural(b.chars || 0, "character") + " to " + r + by(b) + (b.via ? " via " + strip(b.via) : ""));
+    case "run.fence_released": return logLine(op, "fence", "blocked", r + "'s fence on node " + strip(b.node) + " released" + by(b) + ": " + strip(b.why));
+    case "run.fence_release_failed": return logLine(op, "fence", "blocked", r + "'s fence on node " + strip(b.node) + " could not be lifted (it still holds): " + strip(b.error));
+    case "identity.revoked": return logLine(op, "revoked", "blocked", r + "'s identity revoked" + by(b) + ": " + strip(b.reason));
+    case "run.console_start": return logLine(op, "launch", "", r + " from " + strip(b.root + "/" + b.manifest) + " by " + strip(b.by) + " (passkey-signed)");
+    case "run.exit_cause": return logLine(op, "ended", "blocked", r + " exited with status " + strip(b.code) + ": " + strip(b.cause));
+    case "run.end": return logLine(op, "end", b.cause ? "blocked" : "", r + " " + strip(b.status) + " \u00b7 " + plural(b.model_requests || 0, "model call"));
+  }
+  if (op.kind === "node.audit") {
+    let inner = "";
+    try { inner = String((JSON.parse(b.body) || {}).kind || ""); } catch (e) { /* not JSON */ }
+    return logLine(op, "node", "", "node " + strip(b.node) + ": " + (inner ? strip(inner) : "a record") + (r ? " \u00b7 " + r : ""));
+  }
+  return logLine(op, "record", "", strip(op.kind) + (r ? " \u00b7 " + r : ""));
 }
 
 // A node's latest health report (#377): disk, memory, what went wrong, and what is alerted.
@@ -452,9 +589,9 @@ function healthRow(n) {
   const w = el("div", "hrow");
   const d = el("div", "row");
   d.append(el("span", "mono", strip(n.node)));
-  d.append(el("span", (n.alerts || []).length ? "blocked" : "", strip(n.summary) + " · reported " + whenMs(n.received_ms)));
+  d.append(serverText("span", (n.alerts || []).length ? "blocked" : "", n.summary + " · reported " + whenMs(n.received_ms)));
   w.append(d);
-  for (const a of n.alerts || []) w.append(el("div", "blocked", "! " + strip(a)));
+  for (const a of n.alerts || []) w.append(serverText("div", "blocked", "! " + a));
   return w;
 }
 
@@ -468,11 +605,16 @@ function stateStoreRows(p, nowMs) {
     const w = el("div", "hrow");
     const d = el("div", "row");
     d.append(el("span", "mono", name));
-    d.append(el("span", cls, text));
+    d.append(codeText("span", cls, text));
     w.append(d);
     if (err) w.append(el("div", "blocked", "! " + err));
     return w;
   };
+  // What is alerted (and pushed, if notifications are on) first, so a sink past its threshold
+  // doesn't look like one a few records behind; then whether these rows are current.
+  for (const a of p.alerts || []) out.push(serverText("div", "blocked", "! " + a));
+  if (p.not_read_yet) out.push(el("div", "pend", "! not read yet: the console hasn't managed a first read of the state store"));
+  else if (p.stale) out.push(el("div", "pend", "! not checked for " + secs((nowMs - (p.read_ms || 0)) / 1000) + ": these rows may be out of date"));
   const st = p.stream;
   if (st) {
     let text = strip(st.endpoint) + " (" + strip(st.bucket) + ") \u00b7 ledger " + strip(st.state);
@@ -492,18 +634,30 @@ function stateStoreRows(p, nowMs) {
     text += " at " + a.seq + " of " + a.head + " \u00b7 last checkpoint " + (a.checkpoint_at ? secs(nowMs / 1000 - a.checkpoint_at) + " ago" : "never");
     out.push(row("Audit export " + strip(a.sink) + " (" + strip(a.kind) + ")", a.error ? "blocked" : a.behind && !a.manual ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
   }
-  for (const e of p.errors || []) out.push(el("div", "blocked", "! " + strip(e)));
+  // An error already alerted on (the config alert quotes it) isn't said twice.
+  for (const e of p.errors || []) if (!(p.alerts || []).some(a => a.startsWith(e))) out.push(serverText("div", "blocked", "! " + e));
   return out;
 }
 
 // A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
 // a run still holds it, which is a warning until renewals exist (#56).
 function placedRow(p) {
-  const d = el("div", "row");
-  d.append(el("span", "mono", strip(p.name + " " + p.id)));
-  if (!p.past_lease) d.append(el("span", "", "lease until " + when(p.lease_until)));
-  else if (p.held_by) d.append(el("span", "blocked", "PAST ITS LEASE (" + when(p.lease_until) + "): still held by run " + strip(p.held_by) + ", billing until released (wicket node release " + strip(p.id) + ")"));
-  else d.append(el("span", "pend", "past its lease (" + when(p.lease_until) + "): released at the reconciler's next pass"));
+  // The name and when its lease ends; the UUID quiet on a line of its own (#649).
+  const d = el("div", "lease");
+  const head = el("div", "run-head");
+  head.append(el("span", "run-name mono", strip(p.name)));
+  if (!p.past_lease) { const e = el("span", "meta"); e.append(document.createTextNode("lease ends "), timeEl(p.lease_until)); head.append(e); }
+  d.append(head, el("div", "meta mono quiet", strip(p.id)));
+  if (p.past_lease && p.held_by) {
+    const w = el("div", "callout warn");
+    w.append(document.createTextNode("Lease ended "), timeEl(p.lease_until), document.createTextNode("; still billing: run " + strip(p.held_by) + " holds it. Release it on the host:"));
+    w.append(el("code", "block", "wicket node release " + strip(p.id)));
+    d.append(w);
+  } else if (p.past_lease) {
+    const w = el("div", "meta");
+    w.append(document.createTextNode("Lease ended "), timeEl(p.lease_until), document.createTextNode("; released at the reconciler's next pass."));
+    d.append(w);
+  }
   return d;
 }
 
@@ -514,19 +668,23 @@ function placedRow(p) {
 function capacityRow(g) {
   const t = g.terms || {}, u = g.used || {}, left = g.left || {};
   const d = el("div", "row cap");
-  const head = el("div");
-  head.append(el("span", "mono", strip(g.id) + " "), el("span", "", strip(g.principal)));
-  const what = el("div", "meta", (t.plans || []).map(strip).join(", ") + " in " + (t.regions || []).map(strip).join(", ") +
-    " · " + t.nodes + " node(s) at once, " + strip(t.hourly_usd) + "/h, " + strip(t.daily_usd) + " a day");
-  const use = el("div", "meta", "used " + u.nodes + " node(s), " + strip(u.hourly_usd) + "/h, " + strip(u.daily_usd) + " today · left " +
-    left.nodes + " node(s), " + strip(left.hourly_usd) + "/h, " + strip(left.daily_usd) + " · until " + when(g.expires_at) + " · by " + strip(g.decided_by));
+  const head = el("div", "run-head");
+  const who = principalEl(g.principal);
+  head.append(who, el("span", "mono quiet", strip(g.id)));
+  const nodes = n => plural(Number(n) || 0, "node");
+  const what = el("div", "meta", "Allows: " + nodes(t.nodes) + " at once of " + (t.plans || []).map(strip).join(" or ") + " in " + (t.regions || []).map(strip).join(", ") +
+    ", up to " + money(t.hourly_usd) + "/h and " + money(t.daily_usd) + " a day");
+  const used = el("div", "meta", "Used today: " + nodes(u.nodes) + ", " + money(u.hourly_usd) + "/h, " + money(u.daily_usd));
+  const rest = el("div", "meta", "Left today: " + nodes(left.nodes) + ", " + money(left.hourly_usd) + "/h, " + money(left.daily_usd));
+  const ends = el("div", "meta");
+  ends.append(document.createTextNode("Ends "), timeEl(g.expires_at), document.createTextNode(" \u00b7 granted by " + strip(g.decided_by)));
   const b = el("div", "buttons");
   const renew = el("button", "approve", "Renew");
   renew.onclick = () => signed({ action: "capacity_renew", id: g.id, ttl_secs: capacityTtl() });
   const revoke = el("button", "deny", "Revoke");
   revoke.onclick = async () => { try { toast((await post("/api/capacity/revoke", { id: g.id })).ok); } catch (e) { toastError(e); } refresh(); };
   b.append(renew, revoke);
-  d.append(head, what, use, b);
+  d.append(head, what, used, rest, ends, b);
   return d;
 }
 // Standing reach (#572). A rule as a manifest would carry it.
@@ -579,8 +737,8 @@ function standingRuleRow(r) {
   const d = el("div", "row cap");
   const head = el("div");
   head.append(el("span", "mono", strip(r.id) + " "), el("span", "", ruleText(r.rule)));
-  const to = r.for === "zone" ? "every agent of zone " + strip(r.zone) : strip(r.principal);
-  const until = r.expires_at ? (r.live ? "until " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
+  const to = r.for === "zone" ? "every agent of zone " + strip(r.zone) : principalName(r.principal);
+  const until = r.expires_at ? (r.live ? "ends " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
   const b = el("div", "buttons");
   const renew = el("button", "approve", "Renew (30 days)");
   renew.onclick = () => signedSettled({ action: "standing_renew", id: r.id });
@@ -592,7 +750,9 @@ function standingRuleRow(r) {
     refresh();
   };
   b.append(renew, revoke);
-  d.append(head, el("div", "meta", "for " + to + " · " + until + " · by " + strip(r.decided_by)), b);
+  const forWho = el("div", "meta");
+  forWho.append(document.createTextNode("for "), r.for === "zone" ? document.createTextNode(to) : principalEl(r.principal), document.createTextNode(" · " + until + " · by " + strip(r.decided_by)));
+  d.append(head, forWho, b);
   return d;
 }
 // The form's inputs, by name; built once, so what the operator types survives the poll.
@@ -617,7 +777,7 @@ function renderCapacityForm() {
       max_hourly_usd: v("hourly"), max_daily_usd: v("daily"), nodes: Number(v("nodes") || 0), ttl_secs: capacityTtl() });
   };
   const b = el("div", "buttons"); b.append(go);
-  box.append(el("div", "note", "Issue a capacity grant: what a principal may lease with `wicket node create` without asking each time."),
+  box.append(codeText("div", "note", "Issue a capacity grant: what a principal may lease with `wicket node create` without asking each time."),
     field("principal", "To", "unix/alex, passkey/laptop or spiffe://…"),
     field("plans", "Plans", "vc2-1c-2gb, vc2-2c-4gb"), field("regions", "Regions", "lhr"),
     field("hourly", "Most per hour, all its nodes ($)", "0.05"), field("daily", "Most a day ($)", "1.00"),
@@ -625,30 +785,45 @@ function renderCapacityForm() {
   capInputs.hours.value = "8";
 }
 
-// A running agent can have its identity revoked, signed. An ACP agent's session opens on its own
-// page, where prompts are sent (#198).
+// A run: who, where, its state and times, its pages; an ACP agent's session opens on its own page,
+// where prompts are sent (#198).
 function renderRun(s, x) {
-  const d = el("div", "row");
-  const left = el("span"); left.append(el("span", "mono", x.id), document.createTextNode(" " + strip(x.zone + " · " + (x.revoked ? "revoked" : x.status) + " · " + ago(s.now, x.started_at))));
-  d.append(left);
-  // A remote session (#169): where the owner drives it, in the vendor's app.
-  if (x.remote_url && x.remote_url.startsWith("https://")) {
-    const a = el("a", "mono", "open session");
-    a.href = x.remote_url; a.target = "_blank"; a.rel = "noopener noreferrer";
-    left.append(document.createTextNode(" · "), a);
-  }
+  // The agent first, its zone and state; the run id quieter under it (#641). A program run has no agent.
+  const d = el("div", "row run");
+  const left = el("div");
+  const head = el("div", "run-head");
+  head.append(el("span", "run-name", x.agent ? strip(x.agent) : "program run"), el("span", "meta", " \u00b7 zone " + strip(x.zone)));
+  const status = x.revoked ? "revoked" : String(x.status || "");
+  const tone = ({ running: "good", revoked: "bad", failed: "bad", hibernated: "info" })[status] || "";
+  head.append(el("span", "pill " + tone, strip(status)));
+  left.append(head);
+  const meta = el("div", "meta");
+  meta.append(timeEl(x.started_at, "started " + rel(x.started_at, s.now)));
+  if (x.ended_at) meta.append(document.createTextNode(" \u00b7 "), timeEl(x.ended_at, "ended " + rel(x.ended_at, s.now)));
+  meta.append(document.createTextNode(" \u00b7 "), el("span", "mono quiet", strip(x.id)));
+  left.append(meta);
+  const links = el("div", "links");
   // An ACP run's live session (#327): its own page, opened with a passkey there.
   if (x.acp && x.status === "running" && !x.revoked) {
-    const a = el("a", "mono session", "session");
+    const a = el("a", "session", "Live session");
     a.href = "/session?run=" + encodeURIComponent(x.id);
-    left.append(document.createTextNode(" · "), a);
+    links.append(a);
   }
-  const auth = el("button", "link", "authority");
+  // A remote session (#169): where the owner drives it, in the vendor's app.
+  if (x.remote_url && x.remote_url.startsWith("https://")) {
+    const a = el("a", "session", "Remote Control session \u2197");
+    a.href = x.remote_url; a.target = "_blank"; a.rel = "noopener noreferrer";
+    links.append(a);
+  }
+  const auth = el("button", "link", "Authority");
   auth.onclick = () => showAuthority(x.id);
-  left.append(document.createTextNode(" · "), auth);
+  links.append(auth);
+  left.append(links);
+  d.append(left);
+  // A running agent can have its identity revoked, signed.
   if (x.status === "running" && x.has_identity && !x.revoked) {
     const acts = el("span", "acts");
-    const rev = el("button", "deny", "Revoke…");
+    const rev = el("button", "deny", "Revoke\u2026");
     rev.onclick = () => openRunForm("revoke", x.id);
     acts.append(rev); d.append(acts);
   }
@@ -659,16 +834,22 @@ function renderRun(s, x) {
 // so its agent isn't woken. Released (signed, with a reason) when the node will never answer.
 function fencedRow(x) {
   const f = x.fence || {};
-  const d = el("div", "row");
-  const left = el("span");
-  left.append(el("span", "mono", strip(x.id)), document.createTextNode(" on node " + strip(f.node) + " (" + strip(f.node_status) +
-    (f.node_seen_ms ? ", last reported " + whenMs(f.node_seen_ms) : ", never reported") + ") \u00b7 fenced " +
-    (f.fenced_until_ms ? "until " + whenMs(f.fenced_until_ms) : "until its node confirms the box stopped")));
-  d.append(left, el("div", "meta", strip(f.why)));
-  const acts = el("span", "acts");
+  const d = el("div", "lease");
+  const head = el("div", "run-head");
+  head.append(el("span", "run-name mono", strip(x.id)));
+  const until = el("span", "meta");
+  if (f.fenced_until_ms) until.append(document.createTextNode("fenced until "), timeEl(f.fenced_until_ms / 1000));
+  else until.append(document.createTextNode("fenced until its node confirms the box stopped"));
+  head.append(until);
+  const node = el("div", "meta");
+  node.append(document.createTextNode("node " + strip(f.node) + " (" + strip(f.node_status) + ")"));
+  if (f.node_seen_ms) node.append(document.createTextNode(" \u00b7 last reported "), timeEl(f.node_seen_ms / 1000));
+  else node.append(document.createTextNode(" \u00b7 never reported"));
+  const acts = el("div", "buttons");
   const rel = el("button", "deny", "Release\u2026");
   rel.onclick = () => openRunForm("release_fence", x.id);
-  acts.append(rel); d.append(acts);
+  acts.append(rel);
+  d.append(head, node, el("div", "meta", strip(f.why)), acts);
   return d;
 }
 
@@ -741,7 +922,7 @@ function renderOperator(s) {
   const b = el("div", "buttons");
   const out = el("button", "", "Sign out"); out.onclick = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
   b.append(out); box.append(b);
-  box.append(el("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device."));
+  box.append(codeText("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device."));
 }
 
 // ---- notifications (Web Push) ----
@@ -892,8 +1073,10 @@ async function boot() {
   const me = r.ok ? await r.json() : { who: { state: "none" } };
   const auth = document.getElementById("auth"), con = document.getElementById("console");
   auth.replaceChildren();
-  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; await refresh(); fromHash(); renderPush(); return; }
+  const nav = document.getElementById("nav");
+  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; if (nav) nav.hidden = false; await refresh(); fromHash(); renderPush(); return; }
   con.hidden = true; auth.hidden = false;
+  if (nav) nav.hidden = true;
   document.getElementById("tenant").textContent = "";
   if (me.who.state === "bootstrap") {
     auth.append(el("div", "", "Enrol this device's passkey. It signs you in, and you will sign every approval with it."));
@@ -903,7 +1086,7 @@ async function boot() {
   } else {
     auth.append(el("div", "", "Sign in to approve or deny what your agents are waiting on, start runs and steer them."));
     const b = el("div", "buttons"); const go = el("button", "approve", "Sign in with passkey"); go.onclick = signIn; b.append(go); auth.append(b);
-    auth.append(el("div", "note", "No passkey yet? Open a one-time enrolment link from the host (`wicket serve` prints one at first start; `wicket operator enrol-link` makes another)."));
+    auth.append(codeText("div", "note", "No passkey yet? Open a one-time enrolment link from the host (`wicket serve` prints one at first start; `wicket operator enrol-link` makes another)."));
   }
 }
 
@@ -926,8 +1109,8 @@ function openDetail(title) {
 }
 
 const kv = (k, v) => { const d = el("div", "row"); d.append(el("span", "meta", k), el("span", "mono", strip(v))); return d; };
-const when = s => s ? new Date(s * 1000).toISOString().replace(".000", "") : "—";
-const whenMs = ms => ms ? new Date(ms).toISOString().replace(/\.\d+Z$/, "Z") : "—";
+const when = t => at(t);
+const whenMs = ms => ms ? at(ms / 1000) : "\u2014";
 
 async function showAuthority(run) {
   const body = openDetail("authority of " + run);
@@ -972,13 +1155,13 @@ async function showExplain(seq) {
     const r = x.recorded, n = x.against_token_now;
     const out = [
       kv("request", r.method + " " + r.host + r.path + " (" + (r.risk || "?") + ")"),
-      kv("recorded", String(r.outcome) + " on " + r.decided_on + " at " + when(r.at) + ": " + strip(r.detail)),
+      kv("recorded", String(r.outcome) + " on " + r.decided_on + " at " + when(r.at) + ": " + localTimes(r.detail)),
       kv("run", x.run + " · policy " + (x.policy || "none")),
     ];
     if (n.available) {
       out.push(kv("token now", n.decision), el("pre", "src", n.why), kv("zone says", n.zone_says));
       out.push(el("div", "note", "Against the run's token as its node's feed holds it now: grants and policy may have changed since it was decided."));
-    } else out.push(el("div", "note", "Can't evaluate it now: " + strip(n.why)));
+    } else out.push(el("div", "note", "Can't evaluate it now: " + localTimes(n.why)));
     body.replaceChildren(...out);
   } catch (e) { body.replaceChildren(el("div", "blocked", strip(e.message))); }
 }
@@ -1132,7 +1315,7 @@ async function saltedDigest(value) {
   buf.fill(0); v.fill(0);
   return { value_salt: hexOf(salt), value_sha256: hexOf(d) };
 }
-const utc = t => new Date(t * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+const utc = t => at(t);
 function secretUse(u) {
   const where = "zone " + u.zone + " (" + u.root + "/" + u.manifest + "): ";
   return strip(u.use === "llm" ? where + "model credential" + (u.provider ? " (" + u.provider + ")" : "")
@@ -1257,6 +1440,18 @@ async function submitSecret(ev) {
   else signed({ action: "delete_secret", name: m.name });
 }
 
+// A decided request: its outcome as a pill, what it was for, and when it was asked (#645).
+function decidedRow(x) {
+  const d = el("div", "decided");
+  const head = el("div", "run-head");
+  head.append(el("span", "pill " + (({ granted: "good", denied: "bad" })[x.status] || ""), ({ granted: "approved", denied: "denied" })[x.status] || strip(x.status)),
+    el("span", "mono", strip(x.method + " " + x.host + x.path)));
+  const meta = el("div", "meta");
+  meta.append(document.createTextNode(strip(x.id) + " \u00b7 zone " + strip(x.zone) + " \u00b7 asked "), timeEl(x.created_at, rel(x.created_at)));
+  d.append(head, meta);
+  return d;
+}
+
 // When the console last heard from wicket, and a line saying so while it can't (#574): what is on
 // the page is as of then, and the poll goes on.
 let lastHeard = 0;
@@ -1296,28 +1491,32 @@ async function refreshOnce() {
   try {
     const s = await r.json();
     if (ceremony || gen !== pollGen) return; // a sheet opened, or a decision was made, while this poll was in flight
+    if (typeof s.now === "number") skewSecs = s.now - Date.now() / 1000;
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
     renderPending(s);
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
     renderRows("health", ((s.health || {}).nodes) || [], healthRow, "No node has reported its health yet.");
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
-    renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
+    renderRows("placed", s.placed || [], placedRow, "No leased nodes.");
     renderRows("fenced", s.fenced || [], fencedRow, "No fence to release: no box is held by a node that is revoked or no longer enrolled. An enrolled node's boxes are released by the node, or by revoking it first.");
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};
-    // Standing asks wait below (their own section); said at the top, where decisions are made.
+    // Standing asks wait with the requests, under a heading of their own, shown only when there are some.
     const ptr = document.getElementById("standing-pointer");
     const n = (st.asks || []).length;
-    if (ptr) ptr.textContent = n ? n + " standing reach ask" + (n === 1 ? "" : "s") + " waiting, under Standing reach below" : "";
+    if (ptr) { ptr.textContent = n ? "Standing reach " + (n === 1 ? "ask" : "asks") + " (" + n + ")" : ""; ptr.hidden = !n; }
+    renderCounts(s.pending.length + n, ((s.health || {}).alerts || []).length + ((((s.health || {}).nodes) || []).filter(x => (x.alerts || []).length).length));
     renderKeyed("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
-    renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: every one-off ask waits for a decision.");
+    renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: each request waits for a decision.");
     renderStart(s);
     renderManifests(s);
     renderSecrets(s);
-    renderRows("decided", s.decided, x => { const d = el("div", "row"); d.append(el("span", "mono", strip(x.id + " " + x.method + " " + x.host + x.path)), el("span", x.status === "granted" ? "ok" : "blocked", ({ granted: "approved", denied: "denied" })[x.status] || x.status)); return d; }, "No decisions yet.");
+    renderRows("decided", s.decided, decidedRow, "No decisions yet.");
     renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
+    const ar = document.getElementById("audit-retention");
+    if (ar) ar.textContent = s.audit_retention ? strip(s.audit_retention.line) : "";
     renderOperator(s);
     renderPolicy();
   } catch (e) { /* keep polling */ }

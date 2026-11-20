@@ -66,6 +66,16 @@ pub fn doctor(lease_grace: i64) -> Result<()> {
     for k in &s.end.known_lost {
         println!("KNOWN messages: {k}");
     }
+    // Audit retention (#582): the checks read the audit chain, which starts at the anchor once
+    // records were pruned, so what happened before it isn't checked here (its sinks hold it).
+    if let Some(a) = l.audit_anchor()? {
+        println!(
+            "LIMITED: the audit chain starts at seq {} (records before it were pruned on {}, kept by sink {}): only what happened since is checked",
+            a.seq,
+            wicket_core::time::unix_rfc3339(a.pruned_at),
+            a.sink
+        );
+    }
     if s.findings.is_empty() {
         println!("invariants hold: every allowed egress request had a reach rule or a live grant, no run passed its model budget, no node ran past its lease, no node was released with work on it uncollected, no message was pushed twice or pushed though refused");
         return Ok(());

@@ -25,6 +25,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             for s in l.standing_with_status(&TenantId::single(), "pending")? {
                 println!("{}\n  decide: wicket standing show {id}; wicket standing approve {id} [--narrow] [--for zone]; wicket standing deny {id}", crate::cmd::standing::line(&s, now), id = s.id);
             }
+            for n in l.names_with_status(&TenantId::single(), "pending")? {
+                println!(
+                    "{}\n  decide: wicket names show {id}; wicket names approve {id}; wicket names deny {id}",
+                    crate::cmd::names::line(&n, now),
+                    id = n.id
+                );
+            }
             Ok(())
         }
         Cmd::Approve { id, uses, unlimited, ttl, prefix, yes, zone_wide } => {
@@ -33,7 +40,11 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     "{id} is a standing ask: wicket standing show {id}, then wicket standing approve {id}"
                 )));
             }
-            let ttl = wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
+            if id.starts_with("n-") {
+                return Err(wicket_home::exit::usage(format!(
+                    "{id} is an ask for a public name: wicket names show {id}, then wicket names approve {id}"
+                )));
+            }
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
             let t = grant::Terms { uses: if unlimited { None } else { Some(uses) }, ttl, prefix: prefix.clone(), zone_wide };
@@ -131,6 +142,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             if id.starts_with("s-") {
                 return Err(wicket_home::exit::usage(format!("{id} is a standing ask: wicket standing deny {id}")));
             }
+            if id.starts_with("n-") {
+                return Err(wicket_home::exit::usage(format!("{id} is an ask for a public name: wicket names deny {id}")));
+            }
             let mut l = Ledger::open(&ledger_path())?;
             if let grant::Decided::Denied { lease: Some(lease) } = grant::decide(
                 &mut l,
@@ -172,7 +186,6 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Grant { cmd: GrantCmd::Renew { id, ttl } } => {
-            let ttl = wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
             let mut l = Ledger::open(&ledger_path())?;
             let grant::Decided::Renewed { what, until } = grant::decide(
                 &mut l,
@@ -220,6 +233,12 @@ pub(crate) fn pending_json(l: &Ledger) -> Result<serde_json::Value> {
         out.push(serde_json::json!({
             "kind": "standing", "id": s.id, "run": s.run, "zone": s.zone, "principal": s.principal,
             "rule": crate::cmd::standing::rule_json(&s.rule), "reason": s.reason, "created_at": s.created_at,
+        }));
+    }
+    for n in l.names_with_status(&t, "pending")? {
+        out.push(serde_json::json!({
+            "kind": "name", "id": n.id, "run": n.asked_run, "zone": n.zone, "principal": n.principal, "label": n.label,
+            "port": n.port, "service": n.service, "scope": n.scope.as_str(), "reason": n.reason, "created_at": n.created_at,
         }));
     }
     Ok(serde_json::Value::Array(out))
@@ -344,7 +363,7 @@ pub enum GrantCmd {
         /// A grant id (`g-…`), a request id (`r-…`: the grant made for it), or a running box's run id.
         id: String,
         /// The new lifetime, from now.
-        #[arg(long, default_value = "10m")]
-        ttl: String,
+        #[arg(long, default_value = "10m", value_parser = wicket_core::time::duration_arg)]
+        ttl: std::time::Duration,
     },
 }

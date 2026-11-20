@@ -28,8 +28,10 @@ The delta log keeps its format and is still append-only, so an older build can s
    them; only the tokens those deltas put are compiled. A log that was replaced or truncated (a new
    generation, a restore), or a delta under a newer certificate, makes it open the feed again, as
    before. A torn last line under the lock is a crashed append and is dropped, as on open. A
-   publisher that hasn't read what was appended since refuses to commit (its delta would fork the
-   chain on a stale head), so a caller that skips `refresh` fails closed.
+   publisher that hasn't read what was appended since, or whose log was set aside for a new one,
+   refuses to commit (its delta would fork the chain on a stale head, or go to a file no one reads),
+   to serve a catch-up and to sign a statement on its tick, so a caller that skips `refresh` fails
+   closed.
 2. **Checkpoints: compaction while boxes live** (`checkpoint.json`). One is written, atomically
    and under the lock, at every epoch that is a multiple of 64, by whichever publisher commits that
    epoch: one per 64 deltas for the feed, however many publishers share it. A checkpoint is the
@@ -71,7 +73,7 @@ log grew under it) checks it against the log and, since the log only grew, still
 the rest. The log still grows on disk on a node that is never idle (an idle one starts a new
 generation past `WICKET_FEED_COMPACT_BYTES`, as before). Truncating it behind the checkpoint (to bound
 its disk use, not its replay) is a contract step for a later release, after this one has stopped
-anything from needing the whole log: a follow-up issue.
+anything from needing the whole log: [#673](https://github.com/public/wicket/issues/673).
 
 ## Numbers
 

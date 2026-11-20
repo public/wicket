@@ -314,9 +314,21 @@ pub fn box_failed(status: &str) -> bool {
     status.starts_with("failed") || status == "timeout"
 }
 
-/// [`run`], returning the run's final status: `succeeded`, `failed (…)`, `timeout`, `hibernated`,
-/// `interrupted`, `revoked`, `superseded`…, as the run's record has it.
-pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
+/// How a run ended, for `wicket run` and `wicket wrap` to exit by (#574).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunEnd {
+    /// `succeeded`, `failed (…)`, `timeout`, `hibernated`, `interrupted`, `revoked`, `superseded`…,
+    /// as the run's record has it.
+    pub status: String,
+    /// The signal that interrupted it, if one did: SIGINT (Ctrl-C) or SIGTERM (the supervisor's own,
+    /// or its parent stopping it).
+    pub signal: Option<i32>,
+    /// The box's own exit code, if it exited with one.
+    pub code: Option<i32>,
+}
+
+/// [`run`], returning how it ended.
+pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     let RunOpts {
         manifest: manifest_path,
         workdir,
@@ -1674,6 +1686,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
     // What the run's record says of how it ended, besides its status (what wicket stopped, #293).
     let mut end_note: Option<String> = None;
     let mut status = "unknown".to_string();
+    // The signal that interrupted the run, if one did (#574: `wicket run` exits 128 + it).
+    let mut signal: Option<i32> = None;
     // A program's last lines of output: its result, when it reports to a parent.
     let mut program_tail: Vec<String> = Vec::new();
     // Long-lived agents (#70) hibernate at a quiet point after their turn, when they or an operator
@@ -1730,6 +1744,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
                 say!("[wicket] terminated; stopping the box");
                 stopper.kill().await?;
                 status = "interrupted".into();
+                signal = Some(libc::SIGTERM);
                 if !stopping {
                     stopping = true;
                     give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
@@ -2249,6 +2264,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
                 say!("[wicket] stopped by its parent; stopping the box");
                 stopper.kill().await?;
                 status = "interrupted".into();
+                signal = Some(libc::SIGTERM);
                 if !stopping {
                     stopping = true;
                     give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
@@ -2258,6 +2274,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
                 say!("[wicket] interrupted; stopping the box");
                 stopper.kill().await?;
                 status = "interrupted".into();
+                signal = Some(libc::SIGINT);
                 if !stopping {
                     stopping = true;
                     give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
@@ -2346,7 +2363,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
                     hibernating = false;
                     set_state("failed", Some(&format!("hibernate failed: fetching its state from node {node_name}: {e:#}")));
                     status = format!("failed (hibernate: fetching its state: {e})");
-                } else {
+                } else if status != "revoked" {
+                    // A revoked run stays revoked (#574: exit 6); the failed fetch is audited above.
                     status = format!("failed (fetching its files from node {node_name}: {e})");
                 }
             }
@@ -2536,7 +2554,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
     if record.is_none() {
         let _ = save_timings(&dir, &timings);
     }
-    Ok(status)
+    Ok(RunEnd { status, signal, code: exit.code() })
 }
 
 /// Brings a kept box's files back from its node: its workspace (into the run's directory, or an

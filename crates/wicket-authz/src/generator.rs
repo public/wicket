@@ -157,8 +157,9 @@ pub(crate) struct AuthorityInfo<'a> {
     pub principal: &'a str,
 }
 
-/// The Datalog for one ceiling (see the module docs for the layout).
-pub(crate) fn ceiling_code(ceiling: &Ceiling, authority: Option<&AuthorityInfo<'_>>) -> Result<Code, AuthzError> {
+/// The Datalog for one ceiling (see the module docs for the layout). `decoding`: an earlier block
+/// of the token reads `decoded`, so this one must say what it allows too, even if nothing.
+pub(crate) fn ceiling_code(ceiling: &Ceiling, authority: Option<&AuthorityInfo<'_>>, decoding: bool) -> Result<Code, AuthzError> {
     ceiling.validate()?;
     let mut c = Code::default();
     if let Some(a) = authority {
@@ -189,6 +190,26 @@ pub(crate) fn ceiling_code(ceiling: &Ceiling, authority: Option<&AuthorityInfo<'
     let alts = reach_alternatives(&mut c, &dangerous)?;
     let esc = escape(&mut c, &ceiling.grant_keys);
     c.push(&format!("check if op($o), $o != {http}\n  or risk($r), $r <= {max}{alts}{esc};\n"));
+    // decoded slashes (#664): each segment the proxy decoded is one this link allows for the host.
+    // Every link of a token must pass, so a spawned link can only narrow what its parent allows.
+    // Hosts are named exactly (a manifest refuses `decode_slash` on a wildcard rule). Written only
+    // once some link decodes: a plain token reads no `decoded`, so a node before protocol 19 (which
+    // doesn't know it) still loads it, and `Loaded::decide` refuses a decoded request for it.
+    let mut by_seg: std::collections::BTreeMap<u8, BTreeSet<String>> = Default::default();
+    for r in ceiling.reach.iter().filter(|r| !r.host.starts_with("*.")) {
+        for n in &r.decode_slash {
+            by_seg.entry(*n).or_default().insert(r.host.clone());
+        }
+    }
+    if decoding || !by_seg.is_empty() {
+        let segs = c.p(Term::Set(by_seg.keys().map(|n| Term::Integer(i64::from(*n))).collect::<BTreeSet<_>>()));
+        c.push(&format!("reject if decoded($s), !{segs}.contains($s);\n"));
+        for (n, hosts) in &by_seg {
+            let n = c.i(i64::from(*n));
+            let hosts = c.set(hosts.iter().map(String::as_str));
+            c.push(&format!("reject if decoded({n}), host($h), !{hosts}.contains($h);\n"));
+        }
+    }
     // forbid
     for f in &ceiling.forbid {
         for glob in &f.paths {
@@ -343,7 +364,7 @@ fn org_code(c: &mut Code, org: &OrgLayer) -> Result<(), AuthzError> {
 /// refuses them).
 #[doc(hidden)]
 pub fn ceiling_block(ceiling: &Ceiling) -> Result<BlockBuilder, AuthzError> {
-    ceiling_code(ceiling, None)?.block()
+    ceiling_code(ceiling, None, false)?.block()
 }
 
 /// The Datalog for one grant (a third-party block).
@@ -439,7 +460,10 @@ pub fn request_facts(r: &Request) -> Vec<Fact> {
         fact("op", &[s(r.action.kind().as_str())]),
     ];
     match &r.action {
-        Action::Http { host, method, path, risk, inject } => {
+        Action::Http { host, method, path, risk, inject, decoded } => {
+            for seg in decoded {
+                f.push(fact("decoded", &[Term::Integer(i64::from(*seg))]));
+            }
             f.push(fact("host", &[s(host)]));
             f.push(fact("method", &[s(method)]));
             f.push(fact("path", &[s(&path_term(path))]));
@@ -490,7 +514,13 @@ mod tests {
             box_prefix: "b0".into(),
             not_after: 1,
             ops: vec![],
-            reach: vec![Reach { host: "*.evil\"".into(), methods: vec![], paths: vec!["/a/**".into()], allow_dangerous: true }],
+            reach: vec![Reach {
+                host: "*.evil\"".into(),
+                methods: vec![],
+                paths: vec!["/a/**".into()],
+                allow_dangerous: true,
+                decode_slash: vec![],
+            }],
             forbid: vec![],
             inject: vec![],
             spawn: SpawnLimits { images: vec![], min_isolation: 2, mem_bytes: 1, cpus_milli: 1, pids: 1, timeout_s: 1 },
@@ -499,7 +529,7 @@ mod tests {
             grant_keys: vec![PublicKey([7; 32])],
             org: None,
         };
-        let code = ceiling_code(&c, Some(&AuthorityInfo { tenant: "t", principal: "p" })).unwrap();
+        let code = ceiling_code(&c, Some(&AuthorityInfo { tenant: "t", principal: "p" }), false).unwrap();
         // Nothing but fixed fragments and placeholders: no quote, digit literal or brace other than
         // a placeholder.
         let stripped = regex::Regex::new(r"\{[pk][0-9]+\}").unwrap().replace_all(code.text(), "");

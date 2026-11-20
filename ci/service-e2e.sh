@@ -61,9 +61,11 @@ image=${IMAGE:-wicket/claude-code:poc}
 cp -r examples/services/npm-cache "$work/npm-cache"
 sed -i "s|^program:|program:\n  image: $image|" "$work/npm-cache/manifest.yaml"
 
-# A box that uses the cache: it waits for its link, then installs left-pad through it.
+# A box that uses the cache: it waits for its link, then installs left-pad and a scoped package
+# (@types/ms, which the cache asks the registry for as /@types%2fms: decided decoded, #664) through
+# it. Its reach covers the cache's, decode_slash included, so the link opens without a human.
 user() { # name, reach (yes|no)
-  local reach='reach: [{ host: registry.npmjs.org, methods: [GET, HEAD], paths: ["/**"] }]' wait_for=240
+  local reach='reach: [{ host: registry.npmjs.org, methods: [GET, HEAD], paths: ["/**"], decode_slash: [1] }]' wait_for=240
   [ "$2" = yes ] || { reach='reach: []'; wait_for=90; }
   cat >"$work/$1.yaml" <<EOF
 task: install left-pad through the node's npm cache
@@ -76,7 +78,7 @@ program:
     - |
       echo "registry=\$(npm config get registry)"
       for i in \$(seq $wait_for); do curl -sf -o /dev/null http://npm-cache.wicket.internal:4873/-/ping && break; sleep 1; done
-      cd /workspace && npm init -y >/dev/null && timeout 300 npm install left-pad --no-audit --no-fund --fetch-retries=1 --fetch-timeout=30000 && test -f node_modules/left-pad/package.json && echo installed-left-pad
+      cd /workspace && npm init -y >/dev/null && timeout 300 npm install left-pad @types/ms --no-audit --no-fund --fetch-retries=1 --fetch-timeout=30000 && test -f node_modules/left-pad/package.json && echo installed-left-pad && test -f node_modules/@types/ms/package.json && echo installed-scoped
 zone:
   name: $1
   uses: [npm-cache]
@@ -99,8 +101,9 @@ W run "$work/build-a.yaml" >"$work/a.log" 2>&1 || { cat "$work/a.log"; diag; fai
 grep -q "registry=http://npm-cache.wicket.internal:4873/" "$work/a.log" || { cat "$work/a.log"; fail "box A's npm_config_registry"; }
 grep -q "npm-cache on node local: linked" "$work/a.log" || { cat "$work/a.log"; diag; fail "box A not linked to the cache"; }
 grep -q installed-left-pad "$work/a.log" || { cat "$work/a.log"; diag; fail "box A's npm install"; }
+grep -q installed-scoped "$work/a.log" || { cat "$work/a.log"; diag; fail "box A's scoped package (@types/ms: the cache's /@types%2fms, decided decoded)"; }
 grep -q "service_started .*npm-cache on local" "$work/reconcile.log" || { cat "$work/reconcile.log"; fail "the reconciler didn't start the cache"; }
-ok "box A got the cache's registry, was linked to it, and installed left-pad through it"
+ok "box A got the cache's registry, was linked to it, and installed left-pad and @types/ms through it"
 
 slog=$(ls "$WICKET_HOME"/services/npm-cache/logs/*.log | head -1)
 # The cache's own upstream requests for left-pad (its packument and tarball), not every line that
