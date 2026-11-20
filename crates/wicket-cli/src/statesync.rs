@@ -493,6 +493,23 @@ pub fn line(st: &StreamStatus, now_ms: i64) -> String {
     out
 }
 
+/// Until when the state store has the ledger: the last sync of a stream that is streaming now,
+/// None if there is no stream or it isn't streaming. What audit retention may prune behind (#582).
+pub fn ledger_synced_ms(now_ms: i64) -> Option<i64> {
+    let s = wicket_home::statestore::StateStore::load().ok()??;
+    s.ledger.as_ref()?;
+    let st = status_of(&s, &crate::ledger_path(), now_ms).ok()?;
+    (st.state == StreamState::Streaming).then_some(st.last_sync_ms).flatten()
+}
+
+/// Audit retention (#582): a pass (`prune`) or where it stands, with this installation's sinks and
+/// its state store's stream.
+pub fn audit_retention(l: &wicket_store::Ledger, prune: bool) -> anyhow::Result<wicket_home::audit_export::Retention> {
+    let cfg = wicket_home::audit_export::retention_config()?;
+    let synced = ledger_synced_ms(wicket_feed::now_ms());
+    wicket_home::audit_export::retention_with(l, cfg.as_ref().map_err(|e| e.as_str()), synced, prune)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

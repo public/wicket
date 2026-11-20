@@ -1581,6 +1581,7 @@ pub async fn health(nodes: Vec<String>, canary: Option<PathBuf>, image: String) 
     println!("build {} (wicket {}, protocol {}, schema {})", &d.build[..12], d.version, d.protocol, d.schema);
     let ledger = Arc::new(Mutex::new(Ledger::open(&crate::ledger_path())?));
     let n = ledger.lock().expect("ledger").verify_audit().context("the audit chain")?;
+    wicket_home::audit_export::verify_local_anchor(&ledger.lock().expect("ledger")).context("the audit chain")?;
     println!("ledger: ok ({n} audit records verify)");
     let rt = wicket_sandbox::Docker::from_env().runtimes().await.context("docker")?;
     println!("docker: ok ({})", rt.join(", "));
