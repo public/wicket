@@ -1,0 +1,10 @@
+{
+  "name": "console-proto-preact-esbuild",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "../preact's source, built with esbuild alone instead of Vite",
+  "scripts": { "build": "node build.mjs" },
+  "dependencies": {"preact":"11.2.0"},
+  "devDependencies": { "esbuild": "0.28.2" }
+}

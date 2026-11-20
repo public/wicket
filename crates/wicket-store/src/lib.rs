@@ -1169,6 +1169,34 @@ impl Ledger {
         Ok(self.conn.query_row("SELECT status FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?)
     }
 
+    /// The tenant `run` belongs to, if it is in this ledger.
+    pub fn run_tenant(&self, run: &str) -> Result<Option<wicket_core::TenantId>> {
+        Ok(self
+            .conn
+            .query_row("SELECT tenant FROM runs WHERE id = ?1", params![run], |r| r.get::<_, String>(0))
+            .optional()?
+            .map(wicket_core::TenantId))
+    }
+
+    /// The latest audit record about `run` of one of `kinds`: its kind, when (Unix s) and its body.
+    pub fn last_run_audit(&self, run: &str, kinds: &[&str]) -> Result<Option<(String, i64, serde_json::Value)>> {
+        let mut best: Option<(i64, String, i64, String)> = None;
+        for k in kinds {
+            let row = self
+                .conn
+                .query_row("SELECT seq, ts, body FROM audit WHERE run = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1", params![run, k], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+                })
+                .optional()?;
+            if let Some((seq, ts, body)) = row {
+                if best.as_ref().is_none_or(|b| seq > b.0) {
+                    best = Some((seq, k.to_string(), ts, body));
+                }
+            }
+        }
+        Ok(best.map(|(_, k, ts, b)| (k, ts, serde_json::from_str(&b).unwrap_or_default())))
+    }
+
     /// Children started by `run` (from their identity documents).
     pub fn children(&self, run: &str) -> Result<Vec<IdentityRow>> {
         let mut st = self.conn.prepare("SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities WHERE parent_run = ?1 ORDER BY issued_at")?;

@@ -1,0 +1,65 @@
+{
+ "lit": {
+  "lines": 243,
+  "size": 3644,
+  "branches": 188,
+  "worst": 34,
+  "functions": 62,
+  "writes": 18,
+  "dom": 2
+ },
+ "preact": {
+  "lines": 371,
+  "size": 3932,
+  "branches": 189,
+  "worst": 37,
+  "functions": 64,
+  "writes": 16,
+  "dom": 0
+ },
+ "solid": {
+  "lines": 346,
+  "size": 3692,
+  "branches": 171,
+  "worst": 28,
+  "functions": 87,
+  "writes": 8,
+  "dom": 3
+ },
+ "svelte": {
+  "lines": 310,
+  "size": 4125,
+  "branches": 180,
+  "worst": 41,
+  "functions": 32,
+  "writes": 19,
+  "dom": 2
+ },
+ "vanilla": {
+  "lines": 285,
+  "size": 4439,
+  "branches": 223,
+  "worst": 37,
+  "functions": 71,
+  "writes": 35,
+  "dom": 39
+ },
+ "vue": {
+  "lines": 382,
+  "size": 4550,
+  "branches": 190,
+  "worst": 20,
+  "functions": 48,
+  "writes": 17,
+  "dom": 0
+ },
+ "vanilla, screens only (without h, keyed, live times)": {
+  "lines": 235,
+  "size": 3892,
+  "branches": 190,
+  "worst": 37,
+  "functions": 62,
+  "writes": 29,
+  "dom": 22
+ }
+}
