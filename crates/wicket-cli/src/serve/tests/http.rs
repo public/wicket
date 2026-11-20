@@ -75,6 +75,8 @@ const ROUTES: &[&str] = &[
     "/api/policy",
     "/api/runs/run_01authz0000000000000000000/authority",
     "/api/explain/1",
+    "/api/nodes/n1/ca",
+    "/api/nodes/nope/ca",
     "/api/push",
     "/api/push/subscribe",
     "/api/push/remove",

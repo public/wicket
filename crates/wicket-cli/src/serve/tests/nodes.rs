@@ -10,6 +10,10 @@ async fn get(t: &T, path: &str) -> (StatusCode, Value) {
 }
 
 pub(super) fn enrol(l: &mut Ledger, name: &str, tenant: &str, hosts: &[&str]) {
+    enrol_at(l, name, tenant, hosts, wicket_store::now())
+}
+
+fn enrol_at(l: &mut Ledger, name: &str, tenant: &str, hosts: &[&str], enrolled_at: i64) {
     let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
     let node = NodeRow {
         name: name.into(),
@@ -20,7 +24,7 @@ pub(super) fn enrol(l: &mut Ledger, name: &str, tenant: &str, hosts: &[&str]) {
         node_key: "00".repeat(32),
         ssh_key: None,
         hosts: hosts.clone(),
-        enrolled_at: wicket_store::now(),
+        enrolled_at,
         status: "active".into(),
         revoked_at: None,
     };
@@ -61,6 +65,18 @@ async fn a_nodes_ca_shows_its_hosts_policy_wants_and_widenings() {
     l.audit(&t1, None, "node.ca_widened", &json!({ "name": "n1", "ca_serial": "n1-02", "added": ["a.example.org"], "removed": [], "wanted_by": [{ "host": "a.example.org", "run": "run_a", "why": "reach" }] })).unwrap();
     l.audit(&t1, None, "node.ca_widened", &json!({ "name": "n2", "ca_serial": "n2-09", "added": ["z.example.org"], "removed": [] }))
         .unwrap();
+    // Another tenant's record under the same name isn't this node's.
+    l.audit(
+        &TenantId("other".into()),
+        None,
+        "node.ca_widened",
+        &json!({ "name": "n1", "ca_serial": "x-01", "added": ["y.example.org"], "removed": [] }),
+    )
+    .unwrap();
+    // A machine enrolled under a name after its widenings were recorded doesn't inherit them.
+    l.audit(&t1, None, "node.ca_widened", &json!({ "name": "n3", "ca_serial": "old-01", "added": ["o.example.org"], "removed": [] }))
+        .unwrap();
+    enrol_at(&mut l, "n3", &t1.0, &["api.example.com"], now + 60);
     drop(l);
 
     let (s, v) = get(&t, "/api/nodes/n1/ca").await;
@@ -79,15 +95,22 @@ async fn a_nodes_ca_shows_its_hosts_policy_wants_and_widenings() {
     assert_eq!(w[0]["added"], json!(["a.example.org"]));
     assert_eq!(w[0]["wanted_by"][0]["run"], "run_a");
 
-    // The same view as the CLI's.
+    let (_, v3) = get(&t, "/api/nodes/n3/ca").await;
+    assert_eq!(v3["widenings"], json!([]), "an earlier machine's widenings: {v3}");
+
+    // The same view as the CLI's, whole.
     let cli = crate::enrol::ca_view(&t.ledger(), "n1", wicket_store::now()).unwrap().unwrap();
-    assert_eq!(cli["wants"], v["wants"]);
+    assert_eq!(cli, v);
 
     // Another tenant's node, a node never enrolled and a name that isn't one are all not found.
     for p in ["/api/nodes/nx/ca", "/api/nodes/nope/ca", "/api/nodes/a%2Fb/ca", "/api/nodes//ca"] {
         assert_eq!(get(&t, p).await.0, StatusCode::NOT_FOUND, "{p}");
     }
-    // And nothing without a session.
+    // And nothing without an operator's session: none, or an enrolment link's.
     let (s, _, _) = super::http::call(&t.state, "GET", "/api/nodes/n1/ca", &[], b"").await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let boot = token_of(&set_session(&t.state, SessionKind::Bootstrap { link: "l".repeat(64) }, LOCAL).unwrap());
+    let c = format!("__Host-wicket_sid={boot}");
+    let (s, _, body) = super::http::call(&t.state, "GET", "/api/nodes/n1/ca", &[("cookie", &c)], b"").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "{body}");
 }

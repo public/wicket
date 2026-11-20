@@ -616,7 +616,8 @@ pub fn list() -> Result<()> {
             None => format!("hosts {}", n.hosts.join(",")),
         };
         say!("{}  {}  {}  host key {}  {}  {}  {}", n.name, n.status, n.target, n.host_key_fp, hosts, ca, id);
-        if n.status != "revoked" {
+        // A node with no CA (the built-in local node) has no CA policy to show.
+        if n.status != "revoked" && active.is_some() {
             let policy = l.node_ca_policy(&n.name)?;
             let wants = l.node_ca_wants(&n.name)?;
             let ca_hosts = active.map(|c| c.hosts).unwrap_or_default();
@@ -627,6 +628,8 @@ pub fn list() -> Result<()> {
                 .collect();
             let waiting = if waiting.is_empty() { String::new() } else { format!("; wanted, not in its CA yet: {}", waiting.join(", ")) };
             say!("  CA policy {}{waiting} (wicket node ca {})", ca_policy_line(&policy), n.name);
+        }
+        if n.status != "revoked" {
             if let Some(lease) = crate::nodecreate::lease_summary(&l, &n.name, now)? {
                 say!("  {lease}");
             }
@@ -711,7 +714,9 @@ pub fn ca_view(l: &Ledger, name: &str, now: i64) -> Result<Option<serde_json::Va
     let mut widenings = vec![];
     for r in l.audit_of_kind("node.ca_widened")?.into_iter().rev() {
         let b: serde_json::Value = serde_json::from_str(&r.body).unwrap_or_default();
-        if b["name"].as_str() != Some(name) {
+        // Only this machine's: a name can be enrolled again (another machine, perhaps another
+        // tenant's), and its earlier widenings aren't this one's.
+        if b["name"].as_str() != Some(name) || r.ts < n.enrolled_at || r.tenant != n.tenant {
             continue;
         }
         widenings.push(json!({ "seq": r.seq, "at": r.ts, "ca_serial": b["ca_serial"], "added": b["added"],

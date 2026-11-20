@@ -100,7 +100,14 @@ fn ca_text(v: &serde_json::Value) -> String {
         Some(_) => {
             let c = &v["ca"];
             let end = if c["expired"].as_bool() == Some(true) { "EXPIRED" } else { "until" };
-            let _ = writeln!(o, "CA {} {end} {}: hosts {}", s(&c["serial"]), time(&c["not_after"]), list(&c["hosts"]));
+            let _ = writeln!(
+                o,
+                "CA {} issued {}, {end} {}: hosts {}",
+                s(&c["serial"]),
+                time(&c["issued_at"]),
+                time(&c["not_after"]),
+                list(&c["hosts"])
+            );
         }
         None => {
             let _ = writeln!(o, "no active CA");
@@ -115,7 +122,7 @@ fn ca_text(v: &serde_json::Value) -> String {
     } else {
         let _ = writeln!(o, "wanted by live runs:");
         for w in wants {
-            let _ = writeln!(o, "  {}  {}  {}: {}", s(&w["host"]), s(&w["run"]), s(&w["state"]), s(&w["why"]));
+            let _ = writeln!(o, "  {}  {}  since {}  {}: {}", s(&w["host"]), s(&w["run"]), time(&w["at"]), s(&w["state"]), s(&w["why"]));
         }
     }
     if let Some(n) = v["next_renewal"].as_object() {
@@ -133,9 +140,16 @@ fn ca_text(v: &serde_json::Value) -> String {
     } else {
         let _ = writeln!(o, "widenings, newest first:");
         for w in widenings {
+            let by: Vec<String> = w["wanted_by"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|b| format!("{} for {} ({})", s(&b["host"]), s(&b["run"]), s(&b["why"])))
+                .collect();
+            let by = if by.is_empty() { String::new() } else { format!("; wanted by {}", by.join(", ")) };
             let _ = writeln!(
                 o,
-                "  {}  CA {}: added {}; removed {}",
+                "  {}  CA {}: added {}; removed {}{by}",
                 time(&w["at"]),
                 s(&w["ca_serial"]),
                 list(&w["added"]),
@@ -264,21 +278,22 @@ mod set_tests {
     fn a_nodes_ca_reads_as_text() {
         let v = serde_json::json!({
             "name": "n1", "status": "active",
-            "ca": { "serial": "ab12", "not_after": 0, "expired": true, "hosts": ["api.example.com", "a.example.org"] },
+            "ca": { "serial": "ab12", "issued_at": 0, "not_after": 0, "expired": true, "hosts": ["api.example.com", "a.example.org"] },
             "enrolled_hosts": ["api.example.com"], "policy": { "mode": "auto" },
-            "wants": [{ "host": "b.example.org", "run": "run_a", "why": "reach", "state": "at the next renewal" }],
+            "wants": [{ "host": "b.example.org", "run": "run_a", "why": "reach", "at": 0, "state": "at the next renewal" }],
             "next_renewal": { "hosts": ["api.example.com", "b.example.org"], "dropped": ["c.example.org"] },
-            "widenings": [{ "at": 0, "ca_serial": "ab12", "added": ["a.example.org"], "removed": [] }],
+            "widenings": [{ "at": 0, "ca_serial": "ab12", "added": ["a.example.org"], "removed": [],
+                            "wanted_by": [{ "host": "a.example.org", "run": "run_a", "why": "reach" }] }],
         });
         let t = ca_text(&v);
         for want in [
             "node n1 (active)",
-            "CA ab12 EXPIRED 1970-01-01T00:00:00Z: hosts api.example.com, a.example.org",
+            "CA ab12 issued 1970-01-01T00:00:00Z, EXPIRED 1970-01-01T00:00:00Z: hosts api.example.com, a.example.org",
             "enrolled with: api.example.com",
             "policy: auto (to every inspected host its boxes need)",
-            "  b.example.org  run_a  at the next renewal: reach",
+            "  b.example.org  run_a  since 1970-01-01T00:00:00Z  at the next renewal: reach",
             "next renewal signs: api.example.com, b.example.org (over the cap: c.example.org)",
-            "CA ab12: added a.example.org; removed none",
+            "CA ab12: added a.example.org; removed none; wanted by a.example.org for run_a (reach)",
         ] {
             assert!(t.contains(want), "{want:?} in:\n{t}");
         }
