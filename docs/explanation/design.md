@@ -133,6 +133,42 @@ enters the context window, so compaction can't erode it.
     The user's credentials never reach the agent. A separate mandate subsystem is deferred (§16, §22).
 13. **A program is an agent without a model** (#255). It gets the same sandbox, egress control and audit,
     and by default it may not ask for more. Approving one is a grant on its digest (§17).
+14. **The core stays general** (owner, 2026-11-09 and 2026-11-19). wicket runs any kind of software
+    process, so nothing for one use case is built into the core: no "dev" zones or images, and nothing
+    specific to one package manager or service (#664 replaced npm's special case with a general reach-rule
+    option). Use-case configuration (images, manifests, services such as a package cache) lives in
+    `examples/` or in the project that uses wicket.
+15. **Decide at the edge** (owner, 2026-11-12). Authorization decisions are made where the box runs, on
+    its node. The control plane issues authority (tokens, grants, the feed) and takes human approvals;
+    it doesn't decide requests in the path (#257).
+16. **Harness-agnostic** (owner, 2026-11-12). Claude Code is the first harness, not the only one: what is
+    specific to a harness lives in its adapter (§6.1), and model routes are per provider. Core features
+    don't assume one harness's event stream, tools or settings.
+17. **Defer to external access controls** (owner, 2026-11-14). Where the service a box calls can scope a
+    credential or enforce a rule itself (scoped tokens, a forge's branch rules), wicket uses that rather
+    than re-checking it in the proxy. Deep inspection of a request needs a strong reason.
+18. **Everything is a principal** (owner, 2026-11-14). Humans, agents and workloads follow the same rules:
+    they ask, are granted narrowly and are audited the same way. Agents ask each other, and a grant to
+    an agent is as narrow, timed and revocable as one to a human.
+19. **Every operator action in the console and the CLI** (owner, 2026-11-20). Whenever it makes sense, an
+    action an operator can take is available both in the web console (signed with a passkey and bound to
+    the effect it shows, §14.1) and in the CLI (with `--json` for scripts). Host-only actions are the
+    exception and say why: those that name files on the host, and bootstrapping the first passkey
+    (#713).
+20. **wicket manages names, not traffic** (owner, 2026-11-19). Boxes' public and internal DNS entries
+    point straight at the node that runs them, as in Kubernetes. wicket manages the records through
+    pluggable providers; it doesn't proxy public traffic, terminate TLS or route by name. A node's
+    listener for a box's port is a byte relay or DNAT (#575, [box DNS](box-dns.md)).
+21. **Dependencies wait a week** (owner, 2026-11-20). No dependency version is used until it is 7 days
+    old by its registry's publish time: crates, npm packages, actions, images and downloaded tools.
+    Most malicious releases are found and pulled within hours to days: 8 of 10 notable attacks were
+    live for under a week, and 7 days would have kept out all of them but Kong's Ingress Controller
+    (about 10 days) and xz-utils (about 5 weeks). 14 days would add only Kong, for twice the wait. The one
+    exception is a fix for a serious, actively exploited vulnerability that can't wait. It is
+    recorded with its advisory in `ci/dep-age-exceptions.toml` and approved in review. CI's
+    `ci/dep-age.py` checks every version a change adds to a lockfile, since locked installs never
+    consult the package managers' own settings (`.cargo/config.toml`, `.npmrc`, which guard resolving).
+    Renovate waits the same 7 days before it proposes anything.
 
 ### 2.1 Build versus reuse (owner, 2026-11-10)
 
@@ -1170,8 +1206,10 @@ Detail: [04 §7].
   2. **Canonicalize-or-reject:** dot segments (Codex `authorization_path.rs`), encoded slashes, duplicate
      query/JSON keys, method-override headers, `@` in the authority, Host ≠ SNI ≠ CONNECT target, unknown
      protocols after CONNECT, TRACE/TRACK, bodies on GET/HEAD. A truncated body gets the strict outcome.
-     One encoded slash is accepted: npm's scoped-package first segment `@scope%2fname` (npm's
-     characters only), decided as `/@scope/name` and forwarded as written (#143).
+     An encoded slash is accepted only where a reach rule for the host names its segment
+     (`decode_slash`, #664; npm's scoped `@scope%2fname` is the case): one per named segment,
+     decided as `/` and forwarded as written. Core decodes nothing on its own (#143's guarantees
+     kept: no dot segment, no double escape, nothing a rule didn't name).
   3. Adapter match → `Op` → decision.
   4. Rebuild the request from the `Op` and inject the credential, or SigV4 re-sign.
   5. Upstream; redirects are not followed.

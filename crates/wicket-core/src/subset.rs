@@ -227,6 +227,17 @@ fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
             }
         }
     }
+    // Deciding an encoded slash decoded reaches requests the parent refuses, and a zone decides it
+    // for a host from every rule that names the host (`decode_slash_for`), whatever its methods and
+    // paths. So per rule, not per method and path: each segment a child's rule decodes, some rule of
+    // the parent covering that host decodes too (#664 review).
+    for (i, r) in c.reach.iter().enumerate() {
+        let parent: Vec<u8> =
+            p.reach.iter().filter(|q| host_covers(&q.host, &r.host)).flat_map(|q| q.decode_slash.iter().copied()).collect();
+        if let Some(n) = r.decode_slash.iter().find(|n| !parent.contains(n)) {
+            v.push(format!("reach rule {i}: decode_slash segment {n} for {}: this zone doesn't decide an encoded slash there", r.host));
+        }
+    }
     // The parent's forbid rules bind the child too: each forbidden path must stay forbidden, by a child
     // forbid rule with the same or a wider host (the paths of one parent rule may be split across
     // several child rules).
@@ -388,6 +399,35 @@ pub(crate) mod tests {
         all
     }
 
+    /// #664: deciding an encoded slash decoded reaches requests a zone that doesn't would refuse, so
+    /// a child or linked zone may name only the segments its parent's rule names.
+    #[test]
+    fn decode_slash_is_within_only_where_the_parent_decodes() {
+        let z = |rule: &str| {
+            Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{rule}]\n")).unwrap().zone
+        };
+        let plain = z("{ host: pkgs.example }");
+        let first = z("{ host: pkgs.example, decode_slash: [1] }");
+        let both = z("{ host: pkgs.example, decode_slash: [1, 2] }");
+        assert!(reach_within(&plain, &first).unwrap_err()[0].contains("decode_slash"));
+        assert!(reach_within(&first, &first).is_ok());
+        assert!(reach_within(&both, &first).is_ok());
+        assert!(reach_within(&first, &both).is_err());
+        assert!(reach_within(&first, &plain).is_ok(), "deciding less is within");
+        // A rule of no methods or paths can't carry it past the check: refused when kept, in each
+        // spelling, and the check is per host whatever its methods and paths.
+        for empty in ["methods: []", "paths: []", "methods: null"] {
+            let y = format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{{ host: pkgs.example, {empty}, decode_slash: [1] }}]\n");
+            assert!(Manifest::from_yaml(&y).is_err(), "{empty}");
+        }
+        let parent = z("{ host: pkgs.example, paths: ['/a/**'] }");
+        let mut child = parent.clone();
+        let mut sneaky = first.reach[0].clone();
+        sneaky.paths = vec!["/a/**".into()];
+        child.reach.push(sneaky);
+        assert!(reach_within(&parent, &child).unwrap_err().iter().any(|e| e.contains("decode_slash")));
+    }
+
     /// #325 made `host_matches` and `host_covers` allocation-free for Kani: they agree with the
     /// previous (lowercase-and-`format!`) spellings on every pattern and host of up to 4 bytes over
     /// letters of both cases, `.` and `*`.
@@ -505,12 +545,12 @@ pub(crate) mod tests {
     /// parent uses, and no human approval widens that.
     #[test]
     fn a_child_uses_only_services_its_parent_uses() {
-        let p = zone("  uses: [npm-cache, oci-mirror]\n");
-        assert!(unapprovable(&zone("  uses: [npm-cache]\n"), &p).is_empty());
+        let p = zone("  uses: [pkg-cache, oci-mirror]\n");
+        assert!(unapprovable(&zone("  uses: [pkg-cache]\n"), &p).is_empty());
         assert!(unapprovable(&zone(""), &p).is_empty(), "none");
-        let v = unapprovable(&zone("  uses: [npm-cache, crates-mirror]\n"), &p);
+        let v = unapprovable(&zone("  uses: [pkg-cache, crates-mirror]\n"), &p);
         assert_eq!(v, vec!["use service crates-mirror: only the services this zone uses can be passed on".to_string()]);
-        assert_eq!(unapprovable(&zone("  uses: [npm-cache]\n"), &zone("")).len(), 1, "a parent that uses none");
+        assert_eq!(unapprovable(&zone("  uses: [pkg-cache]\n"), &zone("")).len(), 1, "a parent that uses none");
     }
 
     /// What no approval can give is named field by field: each of the route's three, and each of an

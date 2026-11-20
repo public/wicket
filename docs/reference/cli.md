@@ -88,6 +88,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket names deny`](#wicket-names-deny)
   - [`wicket names revoke`](#wicket-names-revoke)
 - [`wicket audit`](#wicket-audit)
+  - [`wicket audit compact`](#wicket-audit-compact)
   - [`wicket audit export`](#wicket-audit-export)
 - [`wicket node`](#wicket-node)
   - [`wicket node token`](#wicket-node-token)
@@ -945,8 +946,9 @@ Show or verify the hash-chained audit log, or export it to the configured sinks
 Usage: wicket audit [OPTIONS] [COMMAND]
 
 Commands:
-  export  Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which feed the sinks too; each sink is fed by one process at a time. The only process that writes to a `path: "-"` (stdout) sink
-  help    Print this message or the help of the given subcommand(s)
+  compact  Switch the ledger to giving pruned audit space back (`auto_vacuum = incremental`), with one VACUUM (#582). Run it as the wicket user with wicketd, the console and the reconciler stopped: the whole file is rewritten under an exclusive lock (about a minute per 2.5 GB), and it needs as much free space again beside the ledger. Ledgers made by this build don't need it
+  export   Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which feed the sinks too; each sink is fed by one process at a time. The only process that writes to a `path: "-"` (stdout) sink
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
       --tail <TAIL>              [default: 40]
@@ -955,6 +957,18 @@ Options:
       --issuer-jwk <ISSUER_JWK>  The issuer public key (JWK, as `wicket identity issuer` prints it) checkpoints must be signed with. Default: this installation's issuer key
       --json                     The records as JSON instead of text
   -h, --help                     Print help
+```
+
+### `wicket audit compact`
+
+```text
+Switch the ledger to giving pruned audit space back (`auto_vacuum = incremental`), with one VACUUM (#582). Run it as the wicket user with wicketd, the console and the reconciler stopped: the whole file is rewritten under an exclusive lock (about a minute per 2.5 GB), and it needs as much free space again beside the ledger. Ledgers made by this build don't need it
+
+Usage: wicket audit compact [OPTIONS]
+
+Options:
+  -y, --yes   Don't ask for confirmation at a terminal
+  -h, --help  Print help
 ```
 
 ### `wicket audit export`
@@ -2270,17 +2284,27 @@ without reading the message (which goes to stderr, after `Error: `).
 | Code | Means | For example |
 | --- | --- | --- |
 | 0 | Done. | |
-| 1 | Failed, for any reason the others don't name. | The ledger can't be opened; a node doesn't answer; the daemon's policy file can't be read; asking for a spend's approval failed; `wicket run` or `wicket wrap` whose box failed (a non-zero exit, out of memory, over a cap) or timed out. |
-| 2 | A usage error: the command line is wrong. Nothing was changed. | An unknown flag; `--ttl 5q`; `wicket approve s-…` (a standing ask: `wicket standing approve`). |
+| 1 | Failed, for any reason the others don't name. | The ledger can't be opened; a node doesn't answer; the daemon's policy file can't be read; asking for a spend's approval failed; `wicket run` whose box failed (a non-zero exit, out of memory, over a cap) or timed out (see below). |
+| 2 | A usage error: the command line is wrong. Nothing was changed. | An unknown flag; a duration that isn't one (`--ttl 5q`; every duration flag takes `90s`, `10m`, `1h 30m` or a number of seconds); `wicket approve s-…` (a standing ask: `wicket standing approve`). |
 | 3 | Refused: wicket won't do it as asked. | The daemon's policy doesn't allow this caller the command; a decision outside the decider's authority; deciding a request that is already decided; terms wider than the request; answering no at `approve`'s or `standing approve`'s confirmation; a spend an operator denied, or over the installation's money limit; a lease that is already ended; a session on a run that isn't running; `self update` of an artifact whose signature doesn't verify. |
-| 4 | Not found: what the command names doesn't exist. | `no such request r-…`; no grant, link, lease, run, agent, node, service or identity by that name; no placement decision for the run. |
+| 4 | Not found: what the command names doesn't exist. | `no such request r-…`; no grant, link, lease, run, agent, node, service, trigger or identity by that name; no placement decision for the run. |
 | 5 | It needs an approval nobody has given yet. | `wicket node create` whose spend no capacity grant covers and no operator decided within `--wait` (or `--wait 0`); `wicket self update` of an artifact no trusted key signed and no operator approved. |
+| 6 | The run was revoked. | `wicket run` whose run an operator revoked (`wicket grant renew` can't bring it back). |
 | 75 | Try again shortly: nothing was done. | wicketd is moving to a new build and took no command. |
+| 128 + N | Ended by signal N. | `wicket run` interrupted by Ctrl-C (130) or SIGTERM (143, also a run its parent stopped); a command the daemon ran that a signal ended. |
 
-`wicket wake`, which wicket runs itself, exits 3 when the agent is already being woken or is running.
+`wicket run` exits by how its run ended: 0 when its box succeeded or hibernated; 1 when it failed
+or timed out; 6 when it was revoked; 128 + the signal when it was interrupted. An agent that runs
+out of turns (`agent.max_turns`) has failed: Claude Code exits non-zero then, and the run's last
+`[agent] finished` line says `error_max_turns`. `wicket wrap` exits with the wrapped program's own
+code when the program ended by itself with a non-zero one (a crash or an outside signal included),
+and otherwise as `wicket run` does: a box wicket or its node stopped (a timeout, an expired
+authority, out of memory) is 1. `wicket wake`, which wicket runs itself, exits 3 when the agent is
+already being woken or is running, or its last activation may still be running on a node this host
+can't confirm stopped (until that activation's authority ends).
 
-A command the daemon runs passes its code back through it; one ended by a signal exits 128 + the
-signal's number (130 for Ctrl-C), as a shell reports it. If the daemon restarts while a command
+A command the daemon runs passes its code back through it; one a signal ended exits 128 + the
+signal's number, as a shell reports it. If the daemon restarts while a command
 runs, the connection drops and the caller exits 1 with "wicketd closed the connection before the
 command finished": the command may have done some or all of its work (a run it started goes on), so
 look (`wicket top`, `wicket audit`) before running it again.

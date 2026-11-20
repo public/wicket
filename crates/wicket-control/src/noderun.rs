@@ -78,6 +78,14 @@ const HEALTH_WRITE_MS: i64 = 20_000;
 /// it is opened (after a restore, #154: its delta log stayed behind).
 pub const REGENESIS: &str = "regenesis";
 
+/// [`open_feed`] under the node feed's lock (`<data dir>/nodes/<name>/feed.lock`), as every
+/// publisher on it holds it: for a caller outside [`SharedFeed`], such as `wicket keys certify`
+/// starting a new generation, which renames the log.
+pub fn open_feed_locked(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
+    let _lock = feed_lock(&crate::data_dir().join("nodes").join(name))?;
+    open_feed(name, cfg)
+}
+
 /// Opens node `name`'s feed: its key (created here on first use, 0600) and a certificate for it from
 /// the installation's feed root. A delta log that doesn't read is an error, not set aside.
 pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
@@ -174,6 +182,14 @@ fn renew_margin() -> Option<i64> {
     (!crate::roots::offline()).then_some(86_400_000)
 }
 
+/// Whether a publisher whose certificate couldn't be renewed may go on publishing with the one it
+/// holds: only while that is valid at `now` (Unix ms), and the certificate on disk (`cert.jws`) is
+/// of the same version. One on disk that is missing or doesn't read isn't the same version.
+fn keep_after_failed_renewal(held: &KeyCert, on_disk: Option<&str>, now: i64) -> bool {
+    let disk_version = on_disk.and_then(wicket_feed::jws::payload_unverified::<KeyCert>).map(|c| c.version);
+    held.not_after > now && disk_version == Some(held.version)
+}
+
 /// How often a feed's certificate is checked for nearing its end, to be renewed.
 const CERT_CHECK_MS: i64 = 3_600_000;
 
@@ -227,6 +243,116 @@ fn feed_lock(dir: &Path) -> Result<std::fs::File> {
     Ok(f)
 }
 
+/// The protocol node `name` last talked to this control host (`<data dir>/nodes/<name>/protocol`,
+/// written at each connection's welcome, and cleared when a connection drops or is refused), if
+/// known: with [`live_protocols`], what decides, before anything is published to its feed or it is
+/// chosen for a box, whether it can read a record (#664, #691).
+pub fn known_protocol(name: &str) -> Option<u32> {
+    let dir = crate::data_dir().join("nodes").join(name);
+    std::fs::read_to_string(dir.join("protocol")).ok()?.trim().parse().ok()
+}
+
+/// Notes the protocol a connection to node `name` talks (see [`known_protocol`]). Best effort: a
+/// note that can't be written leaves the last one (or none, which refuses what needs a newer node).
+pub fn note_protocol(name: &str, proto: u32) {
+    if known_protocol(name) == Some(proto) {
+        return;
+    }
+    let dir = crate::data_dir().join("nodes").join(name);
+    let tmp = dir.join(format!("protocol.{}", std::process::id()));
+    let ok = std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&tmp, proto.to_string()).is_ok();
+    if !ok || std::fs::rename(&tmp, dir.join("protocol")).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Forgets node `name`'s protocol: a connection to it dropped, or was refused, so what it talks
+/// now isn't known until one connects again (a node restarted on an older build, #691).
+pub fn forget_protocol(name: &str) {
+    let _ = std::fs::remove_file(crate::data_dir().join("nodes").join(name).join("protocol"));
+}
+
+/// One live connection to a node, noted while it lasts (`<data dir>/nodes/<name>/sessions/<pid>-<n>`,
+/// holding its protocol; removed when dropped): what [`live_protocols`] reads, in every process.
+pub struct LiveSession(PathBuf);
+
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Notes a connection to node `name` that talks `proto`: the node's protocol, and this live session.
+pub fn note_session(name: &str, proto: u32) -> LiveSession {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    note_protocol(name, proto);
+    let dir = crate::data_dir().join("nodes").join(name).join("sessions");
+    let path = dir.join(format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+    let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, proto.to_string()));
+    LiveSession(path)
+}
+
+/// The protocols node `name`'s live connections talk, from every process on this host (the notes
+/// of processes no longer running are removed).
+pub fn live_protocols(name: &str) -> Vec<u32> {
+    let dir = crate::data_dir().join("nodes").join(name).join("sessions");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
+    let mut out = vec![];
+    for e in rd.flatten() {
+        let file = e.file_name().to_string_lossy().into_owned();
+        let pid = file.split('-').next().and_then(|p| p.parse::<u32>().ok());
+        if pid.is_none_or(|p| !Path::new(&format!("/proc/{p}")).exists()) {
+            let _ = std::fs::remove_file(e.path());
+            continue;
+        }
+        if let Some(v) = std::fs::read_to_string(e.path()).ok().and_then(|v| v.trim().parse().ok()) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// What node `name` is known to talk now: the lowest of its live connections' protocols, or with
+/// none live its note.
+fn node_protocol_now(name: &str) -> Option<u32> {
+    live_protocols(name).into_iter().min().or_else(|| known_protocol(name))
+}
+
+/// The protocol a node must talk to be sent `zone`'s record: [`wicket_chan::chan::DECODE_SLASH`]
+/// if it decides an encoded slash (a node before it parses the record strictly and refuses it,
+/// stalling its whole feed), otherwise any.
+pub fn protocol_needed(zone: &wicket_core::ZoneSpec) -> u32 {
+    if zone.reach.iter().any(|r| !r.decode_slash.is_empty()) {
+        wicket_chan::chan::DECODE_SLASH
+    } else {
+        0
+    }
+}
+
+/// Refuses to publish `zone`'s record to node `name` unless the node is known to read it: decided
+/// before the record goes in the node's feed, which every session to the node carries (#664).
+pub fn check_protocol(name: &str, zone: &wicket_core::ZoneSpec) -> Result<()> {
+    let need = protocol_needed(zone);
+    if need == 0 {
+        return Ok(());
+    }
+    match node_protocol_now(name) {
+        Some(p) if p >= need => Ok(()),
+        known => bail!(
+            "zone {} decides an encoded slash (decode_slash), which needs a node at protocol {need}, and node {name} {}: \
+             update the node (wicket self update --nodes), or place the box elsewhere",
+            zone.name,
+            match known {
+                Some(p) => format!("talks {p}"),
+                None if name == crate::localnode::NAME => {
+                    "is running a build whose protocol isn't known yet (it is noted at its next connection: run a box without decode_slash there, or restart it with this build)".to_string()
+                }
+                None => "hasn't connected since it was last cut off (its protocol isn't known)".to_string(),
+            }
+        ),
+    }
+}
+
 fn last_issued(feed_dir: &Path) -> i64 {
     std::fs::read_to_string(feed_dir.join("issued")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(i64::MIN)
 }
@@ -235,11 +361,18 @@ impl SharedFeed {
     /// Node `name`'s feed for this process: the one its other runs on the node use, or opened now.
     pub fn open(name: &str, cfg: PublisherConfig) -> Result<Arc<SharedFeed>> {
         let dir = crate::data_dir().join("nodes").join(name);
-        let mut feeds = FEEDS.lock().expect("feeds");
-        if let Some(f) = feeds.get(&dir).and_then(std::sync::Weak::upgrade) {
+        // The map only holds handles, each insert or removal whole: one a panic left poisoned is
+        // still sound. It isn't held while a feed opens (the node's lock, the log read), so nodes
+        // open in parallel; two runs opening the same node at once keep the first one in.
+        let feeds = || FEEDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(f) = feeds().get(&dir).and_then(std::sync::Weak::upgrade) {
             return Ok(f);
         }
         let f = Arc::new(SharedFeed::open_new(name, cfg)?);
+        let mut feeds = feeds();
+        if let Some(first) = feeds.get(&dir).and_then(std::sync::Weak::upgrade) {
+            return Ok(first);
+        }
         feeds.retain(|_, w| w.strong_count() > 0);
         feeds.insert(dir, Arc::downgrade(&f));
         Ok(f)
@@ -269,30 +402,51 @@ impl SharedFeed {
     /// The feed, locked and current.
     pub fn lock(&self) -> Result<FeedGuard<'_>> {
         let lock = feed_lock(&self.dir)?;
-        // A run that panicked holding the feed may have left the publisher half-updated: it is
-        // opened again from the files, and the other runs on the node carry on.
+        // A run that panicked holding the feed may have left the publisher half-updated (a commit
+        // that wrote its delta but didn't apply it): it is opened again from the files, and the
+        // other runs on the node carry on. The poison is cleared only once that worked, so a
+        // reopen that fails leaves it for the next lock to try again, never trusting the old one.
         let (mut g, poisoned) = match self.inner.lock() {
             Ok(g) => (g, false),
-            Err(e) => {
-                self.inner.clear_poison();
-                (e.into_inner(), true)
-            }
+            Err(e) => (e.into_inner(), true),
         };
-        let now = wicket_feed::now_ms();
-        // Another process (or `wicket keys certify`) renewed the certificate, or it nears its end
-        // (`open_feed` renews it, with the roots at hand; checked hourly, as without them it can't).
-        let on_disk = std::fs::read_to_string(self.dir.join("feed/cert.jws")).ok();
-        let mut cert_due = on_disk.as_deref() != Some(g.0.key_frame().jws.as_str());
-        if now >= g.1.saturating_add(CERT_CHECK_MS) {
-            g.1 = now;
-            // The same window `open_feed` renews in, so the reopen does renew it.
-            cert_due |= renew_margin().is_some_and(|m| g.0.cert().not_after <= now + m);
-        }
-        let current = !poisoned && !cert_due && matches!(g.0.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_)));
-        if !current {
+        let reopen = |g: &mut (Publisher<BoxAuthority>, i64)| -> Result<()> {
             let issued = g.0.last_issued();
             g.0 = open_feed(&self.name, self.cfg.clone())?;
             g.0.note_issued(issued);
+            Ok(())
+        };
+        // What other processes appended first: a publisher that can't follow the log must be
+        // opened again, or nothing may be published.
+        if poisoned || !matches!(g.0.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_))) {
+            reopen(&mut g)?;
+            self.inner.clear_poison();
+        } else {
+            let now = wicket_feed::now_ms();
+            // Another process (or `wicket keys certify`) renewed the certificate, or it nears its
+            // end (`open_feed` renews it in the same window, with the roots at hand; checked
+            // hourly, as without them it can't).
+            let on_disk = std::fs::read_to_string(self.dir.join("feed/cert.jws")).ok();
+            let mut cert_due = on_disk.as_deref() != Some(g.0.key_frame().jws.as_str());
+            if now >= g.1.saturating_add(CERT_CHECK_MS) {
+                g.1 = now;
+                cert_due |= renew_margin().is_some_and(|m| g.0.cert().not_after <= now + m);
+            }
+            // A renewal that fails keeps the publisher as it is, current, so the commit or
+            // revocation this lock is for still goes out; but only while its certificate is still
+            // valid and the one on disk is of the same version. A higher version on disk is a new
+            // generation: publishing under the old one would be refused by the node, and hide it.
+            if cert_due {
+                if let Err(e) = reopen(&mut g) {
+                    if !keep_after_failed_renewal(g.0.cert(), on_disk.as_deref(), now) {
+                        return Err(e.context(format!(
+                            "node {}'s feed certificate can't be renewed, and the one held is past its end or of another version than the one on disk",
+                            self.name
+                        )));
+                    }
+                    say_err!("[wicket] could not renew node {}'s feed certificate ({e:#}); publishing with the current one", self.name);
+                }
+            }
         }
         g.0.note_issued(last_issued(&self.dir.join("feed")));
         let issued = g.0.last_issued();
@@ -576,6 +730,9 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let t = s.timings.clone();
     let keys = t.span("token.keys");
     let name = s.node.clone();
+    // Before anything is minted or published: the record goes in the node's feed, which every
+    // session to it carries, so a node that can't read it is never sent it (#664).
+    check_protocol(&name, &s.zone)?;
     let issuer = Arc::new(crate::issuer()?);
     let cfg = feed_config();
     let feed = SharedFeed::open(&name, cfg.clone())?;
@@ -642,6 +799,9 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         };
         let mut changes: Vec<Change<BoxAuthority>> = ended.into_iter().map(|name| Change::DropZone { name }).collect();
         changes.push(Change::PutZone { zone: authority });
+        // Again under the feed's lock, just before the record goes in: the node's live sessions
+        // (any process's) may have connected at an older protocol since the check above (#691).
+        check_protocol(&name, &s.zone)?;
         publisher.commit(changes, now).context("publishing the box's token")?;
         publisher.epoch()
     };
@@ -1055,6 +1215,12 @@ async fn manage(
     loop {
         let r = session(&sh, &mut io, &mut p, &mut ready, &mut started, target_epoch).await;
         *sh.ctl.link.lock().expect("link") = None;
+        // Cut off (not the box's end): the node may come back on another build, so its protocol is
+        // known again only from a new connection's welcome (#691).
+        // The local node whose serve is still this build's (checked, not assumed) is known still.
+        if !p.exited && !(sh.node == crate::localnode::NAME && crate::localnode::serve_is_this_build()) {
+            forget_protocol(&sh.node);
+        }
         // Cut off: since now, or since it was (a retry that fails again keeps the time).
         if p.link.connected || p.link.since_ms == 0 {
             let now = wicket_feed::now_ms();
@@ -1157,21 +1323,24 @@ async fn session(
             }
             Err(e @ HsError::Timeout(_)) => return Err(e.into()),
             Err(HsError::Refused(why)) => {
-                // Refused either way (identity, revocation, protocol): not worth retrying.
+                // Refused either way (identity, revocation, protocol): not worth retrying. What it
+                // talks isn't known now.
+                forget_protocol(&sh.node);
                 p.ever = false;
                 bail!("{why}")
             }
         };
         break (from, to, child, authed, shaking);
     };
-    let (feed, runs) = match authed.welcome {
+    // `_live` notes this connection's protocol until it drops (#691).
+    let (feed, runs, _live) = match authed.welcome {
         Msg::Welcome { feed, runs, proto, capacity, .. } => {
             let now = wicket_feed::now_ms();
             p.link = wicket_node::status::LinkRecord { connected: true, since_ms: now, updated_ms: now, capacity, ..p.link.clone() };
             p.link.save(&sh.dir);
             p.proto = proto;
             sh.ctl.proto.store(proto, Ordering::SeqCst);
-            (feed, runs)
+            (feed, runs, note_session(&sh.node, proto))
         }
         _ => unreachable!("nodeauth::control returns a welcome"),
     };
@@ -1202,6 +1371,19 @@ async fn session(
         let _ = out_tx.send(f);
     };
     let feed_frame = |f: wicket_feed::Frame| Frame::Feed(f.to_line().trim_end().as_bytes().to_vec());
+    // A node below protocol 19 can't read a record whose zone decodes a slash (#664). `start`
+    // refuses to publish one to a node not known to talk 19; this is for one that has gone back
+    // since (its feed may already carry it): this run's session ends rather than send it.
+    if p.proto < protocol_needed(&sh.zone) {
+        p.ever = false;
+        bail!(
+            "node {} talks protocol {}, and zone {} decides an encoded slash (decode_slash), which needs {}: update the node (wicket self update --nodes)",
+            sh.node,
+            p.proto,
+            sh.zone.name,
+            wicket_chan::chan::DECODE_SLASH
+        );
+    }
     let now = wicket_feed::now_ms();
     let catching = std::time::Instant::now();
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
@@ -1263,6 +1445,9 @@ async fn session(
     sh.ctl.calls.set_out(Some(out_tx.clone()));
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis((sh.cfg.refresh_ms / 2).clamp(50, 1000) as u64));
+    // When the statement tick last logged that it couldn't take the feed: at most once a minute,
+    // as it ticks up to twenty times a second.
+    let mut tick_failed_logged: Option<std::time::Instant> = None;
     let mut grants = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut ident = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut leases = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -1292,7 +1477,18 @@ async fn session(
                 }
             },
             _ = tick.tick() => {
-                let f = sh.ctl.publisher.lock().ok().and_then(|mut p| p.tick(wicket_feed::now_ms()));
+                let f = match sh.ctl.publisher.lock() {
+                    Ok(mut p) => p.tick(wicket_feed::now_ms()),
+                    Err(e) => {
+                        // No statement this tick: the node goes offline at its last one's end
+                        // unless a later lock works.
+                        if tick_failed_logged.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
+                            tick_failed_logged = Some(std::time::Instant::now());
+                            say_err!("[wicket] could not take node {}'s feed for a statement: {e:#}", sh.node);
+                        }
+                        None
+                    }
+                };
                 if let Some(f) = f {
                     send(feed_frame(f));
                 }
@@ -2592,6 +2788,20 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A failed renewal keeps the publisher only on a valid certificate of the version on disk.
+    #[test]
+    fn a_failed_renewal_keeps_the_publisher_only_on_a_valid_same_version_certificate() {
+        let key = wicket_identity::SigningKey::from_bytes(&[7; 32]);
+        let held = KeyCert::new(&key.verifying_key(), 3, 10_000, 30_000);
+        let on_disk =
+            |version: u64| wicket_feed::sign(&key, wicket_feed::TYP_KEY, &KeyCert::new(&key.verifying_key(), version, 20_000, 30_000));
+        assert!(keep_after_failed_renewal(&held, Some(&on_disk(3)), 9_999));
+        assert!(!keep_after_failed_renewal(&held, Some(&on_disk(3)), 10_000), "the held certificate is at its end");
+        assert!(!keep_after_failed_renewal(&held, Some(&on_disk(4)), 9_999), "a new generation on disk");
+        assert!(!keep_after_failed_renewal(&held, Some("not a certificate"), 9_999), "one that doesn't read");
+        assert!(!keep_after_failed_renewal(&held, None, 9_999), "none on disk");
+    }
     use super::*;
 
     /// #572: an approved standing rule goes in the box's token as its rule: its host, methods and

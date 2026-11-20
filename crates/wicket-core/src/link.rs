@@ -293,17 +293,16 @@ mod tests {
     /// the link on its use alone; one whose reach doesn't needs a human, for exactly that link.
     #[test]
     fn using_a_service_needs_the_services_reach() {
-        let cache = zone("{ name: npm-cache, reach: [{ host: registry.npmjs.org, methods: [GET, HEAD], paths: ['/**'] }] }");
-        let builder =
-            zone("{ name: build, uses: [npm-cache], reach: [{ host: registry.npmjs.org, methods: [GET, HEAD], paths: ['/**'] }] }");
-        let offline = zone("{ name: offline, uses: [npm-cache] }");
+        let cache = zone("{ name: pkg-cache, reach: [{ host: pkgs.example, methods: [GET, HEAD], paths: ['/**'] }] }");
+        let builder = zone("{ name: build, uses: [pkg-cache], reach: [{ host: pkgs.example, methods: [GET, HEAD], paths: ['/**'] }] }");
+        let offline = zone("{ name: offline, uses: [pkg-cache] }");
         let none: Vec<String> = vec![];
-        let svc = end("run_svc", None, "npm-cache", &none, Some(&cache));
+        let svc = end("run_svc", None, "pkg-cache", &none, Some(&cache));
         let d = connect_service(&end("run_b", None, "build", &none, Some(&builder)), &svc).unwrap();
         assert_eq!((d.basis, d.allowed()), (Some(Basis::Uses), true), "{d:?}");
         let d = connect_service(&end("run_o", None, "offline", &none, Some(&offline)), &svc).unwrap();
         assert_eq!(d.basis, Some(Basis::Uses));
-        assert!(!d.allowed() && d.needs_human[0].contains("zone npm-cache reaches beyond zone offline"), "{d:?}");
+        assert!(!d.allowed() && d.needs_human[0].contains("zone pkg-cache reaches beyond zone offline"), "{d:?}");
         assert!(connect_service(&svc, &svc).is_err());
     }
 

@@ -59,5 +59,58 @@ fn runs_in_a_process_share_a_publisher_that_follows_other_processes() {
     g.commit(vec![revoke("run_e")], wicket_feed::now_ms()).unwrap();
     drop(g);
     assert_eq!(again.lock().unwrap().epoch(), 4);
+
+    // A panic, then a reopen that fails (here the feed key doesn't read, while the log does, so
+    // a refresh alone would succeed): the poison stays, so every lock tries the reopen again and
+    // none trusts the half-updated publisher; once the key reads, the next one works.
+    let feed_dir = home.join("nodes/n1/feed");
+    let key = feed_dir.join("feed.key");
+    let key_text = std::fs::read(&key).unwrap();
+    let a = again.clone();
+    let _ = std::thread::spawn(move || {
+        let _g = a.lock().unwrap();
+        panic!("again");
+    })
+    .join();
+    std::fs::write(&key, "not a key").unwrap();
+    assert!(again.lock().is_err());
+    assert!(again.lock().is_err(), "still poisoned: the reopen is tried again, the old publisher not trusted");
+    std::fs::write(&key, &key_text).unwrap();
+    assert_eq!(again.lock().expect("the key reads again").epoch(), 4);
+
+    // A renewal that can't be made (here the feed key doesn't read) keeps the current publisher
+    // while the certificate on disk is of the same version (renewed elsewhere: other bytes): the
+    // revocation this lock is for still goes out.
+    let cert_path = feed_dir.join("cert.jws");
+    let cert = std::fs::read(&cert_path).unwrap();
+    let with = |bump: u64| {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let text = String::from_utf8(cert.clone()).unwrap();
+        let parts: Vec<&str> = text.trim().split('.').collect();
+        let mut c: serde_json::Value = serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+        c["version"] = serde_json::json!(c["version"].as_u64().unwrap() + bump);
+        c["not_after"] = serde_json::json!(c["not_after"].as_i64().unwrap() + 1);
+        format!("{}.{}.{}", parts[0], b64.encode(c.to_string()), parts[2])
+    };
+    std::fs::write(&key, "not a key").unwrap();
+    std::fs::write(&cert_path, with(0)).unwrap();
+    {
+        let mut g = again.lock().expect("a failed renewal doesn't fail the lock");
+        g.commit(vec![revoke("run_f")], wicket_feed::now_ms()).unwrap();
+    }
+    // Not when the one on disk doesn't read.
+    std::fs::write(&cert_path, "renewed elsewhere").unwrap();
+    assert!(again.lock().is_err(), "a certificate on disk that doesn't read isn't the same version");
+
+    // Nor when it is of another version (a new generation made elsewhere): publishing under the
+    // old one would be refused by the node, and hide it.
+    let newer = with(1);
+    std::fs::write(&cert_path, newer).unwrap();
+    let e = again.lock().map(|_| ()).expect_err("a newer generation on disk that can't be opened fails the lock");
+    assert!(format!("{e:#}").contains("another version"), "{e:#}");
+    std::fs::write(&key, &key_text).unwrap();
+    std::fs::write(&cert_path, cert).unwrap();
+    assert_eq!(again.lock().unwrap().epoch(), 5);
     let _ = std::fs::remove_dir_all(&home);
 }

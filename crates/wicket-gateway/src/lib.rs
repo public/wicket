@@ -557,16 +557,22 @@ impl Gateway {
                     let holder = match n.holder.as_deref() {
                         Some(h) if h == self.ctx.run.0 => "this run holds it".to_string(),
                         Some(h) => format!("run {h} holds it"),
-                        None => "the next run it binds will hold it".to_string(),
+                        // Later runs don't take a standing name up yet (#575 step 4b).
+                        None => "no run holds it now (later runs don't take up a standing name yet)".to_string(),
                     };
                     let until = n
                         .expires_at
                         .map(|e| format!("until {}", wicket_core::time::unix_rfc3339(e)))
                         .unwrap_or_else(|| "until revoked, or its run ends".into());
-                    return (
-                        format!("granted: {id} was approved: the public name {} for port {}, {until}; {holder}. Until wicket publishes public records (not yet), it is a record only.", n.label, n.port),
-                        false,
-                    );
+                    let what = match n.kind {
+                        wicket_store::NameKind::Public => "the public name",
+                        wicket_store::NameKind::Internal => "the internal name",
+                    };
+                    let only = match n.kind {
+                        wicket_store::NameKind::Public => " Until wicket publishes public records (not yet), it is a record only.",
+                        wicket_store::NameKind::Internal => "",
+                    };
+                    return (format!("granted: {id} is live: {what} {} for port {}, {until}; {holder}.{only}", n.label, n.port), false);
                 }
                 "denied" => return (format!("denied: {id} was denied. Do not ask for it again."), false),
                 "withdrawn" => return (format!("withdrawn: {id} is no longer pending."), false),
@@ -583,6 +589,8 @@ impl Gateway {
         }
     }
 
+    /// `await_grant` on a standing ask (#572): its human's decision, and whether the rule binds
+    /// this run.
     async fn await_standing(&self, id: &str, timeout: Duration) -> (String, bool) {
         let start = Instant::now();
         let _waiting = Waiting::start(&self.ctx);
@@ -737,6 +745,13 @@ impl Gateway {
     /// authority. The decision is this run's own tool call on its own gateway, signed here with the
     /// run's identity key; nothing another agent sends (a message) can make one.
     fn decide(&self, args: &Value) -> (String, bool) {
+        // A public name is a human's to decide, never an agent's (#575; #680 review, L4).
+        if args.get("request_id").and_then(|v| v.as_str()).is_some_and(|id| id.starts_with("n-")) {
+            return (
+                "not decided: an ask for a public name is decided by a human operator (wicket names approve), never by an agent".into(),
+                true,
+            );
+        }
         let Some(hook) = &self.ctx.decisions else {
             return (
                 "not decided: this run may not decide requests (its zone has escalation.grant: false, or it is not an agent)".into(),

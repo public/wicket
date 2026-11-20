@@ -993,6 +993,23 @@ impl Lock {
         }
         Ok(Lock(f))
     }
+
+    /// [`Lock::take`] without waiting: None if another process holds it now.
+    pub fn try_take() -> Result<Option<Lock>> {
+        use std::os::fd::AsRawFd;
+        let p = crate::data_dir().join("reconcile.lock");
+        std::fs::create_dir_all(crate::data_dir())?;
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&p)?;
+        // SAFETY: flock on a file descriptor this function owns.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            return Err(e).context("locking reconcile.lock");
+        }
+        Ok(Some(Lock(f)))
+    }
 }
 
 /// Docker on an enrolled node, over its pinned ssh.
@@ -1113,6 +1130,18 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
             }));
         }
         Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
+    }
+    // Audit retention on the host (#582): over its size limit, the audit table's oldest records
+    // (ones every sink has, behind a checkpoint one acknowledged) are pruned and the space given
+    // back. Never without a sink and the state store.
+    match crate::statesync::audit_retention(&ledger, !dry_run) {
+        Ok(r) if r.pruned > 0 || r.waiting.is_some() => done.push(Done {
+            kind: if r.pruned > 0 { "audit_pruned" } else { "audit_retention" },
+            target: "ledger".into(),
+            detail: wicket_home::audit_export::retention_line(&r),
+        }),
+        Ok(_) => {}
+        Err(e) => done.push(Done { kind: "error", target: "audit retention".into(), detail: format!("{e:#}") }),
     }
     // The ledger's own upkeep (#582): settled rows of runs long ended to the archive, planner
     // statistics, and a WAL checkpoint.
@@ -1238,7 +1267,9 @@ pub fn print(done: &[Done], dry_run: bool) {
     }
     let changed = done
         .iter()
-        .filter(|d| !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held" | "store_gc"))
+        .filter(|d| {
+            !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held" | "store_gc" | "audit_retention")
+        })
         .count();
     say!("reconcile: {changed} change(s){}", if dry_run { " (dry run: nothing changed)" } else { "" });
 }
