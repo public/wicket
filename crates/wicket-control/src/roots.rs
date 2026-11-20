@@ -310,7 +310,7 @@ pub fn certify() -> Result<()> {
     for n in &nodes {
         if data_dir().join("nodes").join(n).join("feed").join(crate::noderun::REGENESIS).exists() {
             // A new generation (after a restore): opened here, with the roots at hand.
-            crate::noderun::open_feed(n, crate::noderun::feed_config())?;
+            crate::noderun::open_feed_locked(n, crate::noderun::feed_config())?;
             regen.push(n.clone());
         } else {
             recertify_feed(n, &froot, ms)?;

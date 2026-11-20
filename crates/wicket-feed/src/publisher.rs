@@ -670,7 +670,10 @@ impl<P: Policy> Publisher<P> {
     }
 
     /// A signed snapshot of the current state (also worth sending now and then, so nodes can compact
-    /// their persisted deltas).
+    /// their persisted deltas). Like [`Publisher::statement`], it vouches for what this publisher
+    /// holds: call it on a current publisher ([`Publisher::check_current`]; [`Publisher::catch_up`]
+    /// checks). A snapshot from one behind the log is refused by a node that holds more
+    /// (a rollback), but would set back one that holds less.
     pub fn snapshot(&mut self, now: i64) -> Frame {
         self.state.prune(now);
         Frame::new(FrameKind::Snap, sign(&self.key, TYP_SNAP, &self.state.snapshot(&self.feed, now)))

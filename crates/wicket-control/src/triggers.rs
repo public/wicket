@@ -205,15 +205,15 @@ pub fn find_agent(l: &Ledger, tenant: &str, who: &str) -> Result<AgentRow> {
         }
         let mut named: Vec<AgentRow> = l.agents(tenant)?.into_iter().filter(|a| live(a) && a.zone == zone && a.name == agent).collect();
         named.sort_by_key(|a| a.created_at);
-        return named.pop().with_context(|| format!("no live long-lived agent {who}"));
+        return named.pop().ok_or_else(|| wicket_home::exit::not_found(format!("no live long-lived agent {who}")));
     }
     if wicket_store::valid_agent_id(who) {
-        let a = l.agent(who)?.filter(|a| a.tenant == tenant).with_context(|| format!("no agent {who}"))?;
+        let a = l.agent(who)?.filter(|a| a.tenant == tenant).ok_or_else(|| wicket_home::exit::not_found(format!("no agent {who}")))?;
         return Ok(a);
     }
     let mut named: Vec<AgentRow> = l.agents(tenant)?.into_iter().filter(|a| live(a) && a.name == who).collect();
     match named.len() {
-        0 => bail!("no live long-lived agent named {who}"),
+        0 => Err(wicket_home::exit::not_found(format!("no live long-lived agent named {who}"))),
         1 => Ok(named.remove(0)),
         n => bail!("{n} live agents are named {who} (in zones {}): name it by its id (wicket agents)", {
             named.iter().map(|a| a.zone.as_str()).collect::<Vec<_>>().join(", ")
@@ -274,7 +274,7 @@ pub fn create(l: &Ledger, op: &Operator, spec: &TriggerSpec, until: Option<i64>,
 }
 
 fn get(l: &Ledger, id: &str) -> Result<Trigger> {
-    l.trigger(id)?.filter(|t| t.status != "deleted").with_context(|| format!("no trigger {id}"))
+    l.trigger(id)?.filter(|t| t.status != "deleted").ok_or_else(|| wicket_home::exit::not_found(format!("no trigger {id}")))
 }
 
 /// A human's approval of a trigger that waits for one.

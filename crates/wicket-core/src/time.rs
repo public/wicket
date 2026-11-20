@@ -253,6 +253,23 @@ fn add_to(sec: u64, nsec: u64, out: &mut Duration) -> Result<(), DurationError> 
     Ok(())
 }
 
+/// A duration flag's value, as clap parses it (#574): a duration (`90s`, `10m`, `1h 30m`), or a whole
+/// number of seconds. Every duration flag of `wicket` takes it, so a bad value is a usage error.
+pub fn duration_arg(s: &str) -> Result<Duration, String> {
+    match s.parse::<u64>() {
+        Ok(n) => Ok(Duration::from_secs(n)),
+        Err(_) => parse_duration(s).map_err(|e| e.to_string()),
+    }
+}
+
+/// [`duration_arg`] for a flag that also takes `forever`: checked as clap parses it, kept as given.
+pub fn duration_or_forever_arg(s: &str) -> Result<String, String> {
+    match s {
+        "forever" => Ok(s.to_string()),
+        d => duration_arg(d).map(|_| s.to_string()).map_err(|e| format!("{e} (a duration such as 30d, or forever)")),
+    }
+}
+
 /// A duration: one or more `<number><unit>` terms (`30m`, `1h 30m`, `1.5h`, `250ms`), or `0`.
 pub fn parse_duration(s: &str) -> Result<Duration, DurationError> {
     if s == "0" {
