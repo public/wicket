@@ -58,6 +58,8 @@ unix socket families. Restart it after a self update of the node.
 - **TLS.** Give it a certificate and key in `/etc/wicket-intake`. Or drop `--tls-cert` and
   `--tls-key` from its command, and put a TLS-terminating reverse proxy in front.
   - It then listens on plain HTTP, so bind it to an address only the proxy reaches.
+  - The cap on connections from one address (16) applies before the token is checked. Without
+    `--trusted-proxy`, every client behind the proxy is one address, so name it.
   - Name the proxy with `--trusted-proxy <address or CIDR>`, so intake takes the client's address
     from its `X-Forwarded-For`. Otherwise every request looks like the proxy's.
 - **What it holds.** Its table of triggers (their URL tokens' hashes and verify secrets) comes from
@@ -80,7 +82,8 @@ wicket secret verify gh-hook-acme
 ```
 
 A verify secret only checks deliveries' signatures. It is sent to no host, and can't be bound to
-one, so no box's egress can ever read it.
+one, so no box's egress can ever read it. It must be at least 16 bytes: a trigger whose key is
+shorter isn't served (its deliveries get 503), since a short key is easy to forge with.
 
 ## 4. Make the trigger
 
@@ -113,8 +116,9 @@ with `--intake-node`.
 - **A generic webhook.** Use `webhook: { verify: { hmac_sha256: <secret> } }` as the source. The
   sender sends:
   - `X-Wicket-Timestamp`: the time, in Unix seconds;
-  - optionally `X-Wicket-Delivery`: an id for the delivery, which wicket uses to drop resends (the
-    body's sha256 otherwise);
+  - optionally `X-Wicket-Delivery`: an id for the delivery, which wicket uses to drop resends.
+    Without one, the delivery is named by the hash of what it signed, its time included, so the
+    same body sent again later is a new delivery;
   - `X-Wicket-Signature-256: sha256=<hex>`: the HMAC-SHA256, under the secret, of
     `v1:<timestamp>:<length of the delivery id>:<delivery id>:` followed by the raw body (the id
     empty, length 0, if it sends none). The id's length is signed, so a delivery can't be split

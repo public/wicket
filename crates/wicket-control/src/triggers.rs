@@ -2210,7 +2210,7 @@ mod tests {
                 .unwrap_or_default()
         };
         assert!(mk(&vault, None).contains("no secret hook-key"), "{}", mk(&vault, None));
-        vault.set("hook-key", "k3y").unwrap();
+        vault.set("hook-key", "k3y-k3y-k3y-k3y-k3y").unwrap();
         assert!(mk(&vault, None).contains("isn't a verify secret"));
         vault.set_verify("hook-key").unwrap();
         assert!(mk(&vault, None).contains("no intake node"), "{}", mk(&vault, None));

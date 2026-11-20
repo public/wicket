@@ -27,8 +27,10 @@ type: Added
   - **Its URL.** `wicket trigger create` shows a trigger's URL once (`--intake-node` picks among
     several intake nodes). `wicket trigger rotate-url` replaces it.
   - **Limits.**
-    - Only verified, new deliveries count against a trigger's 60 a minute and the node's 600. A
-      resend is answered 202 without counting.
+    - Only verified, new deliveries the trigger listens to count against its 60 a minute and the
+      node's 600. A resend, and an event or repository the trigger doesn't listen to, is answered
+      202 without counting.
+    - Bodies in flight share a 32 MiB budget, so held connections can't exhaust intake's memory.
     - Requests with no trigger's token are counted by address, and bad signatures by trigger. A
       delivery with a valid token is never slowed down for its address. `--trusted-proxy` names a
       reverse proxy in front.

@@ -310,12 +310,17 @@ impl Vault {
         Ok(())
     }
 
-    /// A `verify` secret's value, for checking a delivery's signature: refused for any other secret.
+    /// A `verify` secret's value, for checking a delivery's signature: refused for any other secret,
+    /// and for one too short to verify with (under 16 bytes, #714 review E).
     pub fn get_verify(&self, name: &str) -> Result<String> {
         if !self.is_verify(name) {
             bail!("secret {name:?} isn't a verify secret (as root: wicket secret verify {name})");
         }
-        self.get(name)
+        let v = self.get(name)?;
+        if v.len() < 16 {
+            bail!("secret {name:?} is shorter than 16 bytes: too short to verify deliveries with");
+        }
+        Ok(v)
     }
 
     /// Whether `name` may be sent to `host` (a host name, or a `*.` pattern: then every host it
@@ -700,18 +705,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wicket-vault-verify-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let v = super::Vault::new(dir.clone());
-        v.set("hook", "k3y").unwrap();
+        v.set("hook", "k3y-k3y-k3y-k3y-k3y").unwrap();
         v.set("gh", "t0k").unwrap();
         v.set_hosts("gh", &["api.github.com".into()]).unwrap();
         assert!(v.get_verify("hook").is_err(), "not yet a verify secret");
         v.set_verify("hook").unwrap();
         assert!(v.is_verify("hook"));
-        assert_eq!(v.get_verify("hook").unwrap(), "k3y");
+        assert_eq!(v.get_verify("hook").unwrap(), "k3y-k3y-k3y-k3y-k3y");
+        v.set("short", "k").unwrap();
+        v.set_verify("short").unwrap();
+        assert!(v.get_verify("short").unwrap_err().to_string().contains("shorter than 16"));
         assert!(v.get_for("hook", "api.github.com").is_err(), "egress never reads it");
         assert!(v.set_hosts("hook", &["api.github.com".into()]).unwrap_err().to_string().contains("sent nowhere"));
         assert!(v.set_verify("gh").unwrap_err().to_string().contains("api.github.com"), "a secret with hosts can't be one");
         assert!(v.set_verify("missing").is_err());
-        assert_eq!(v.names(), ["gh", "hook"], "the binding isn't listed as a secret");
+        assert_eq!(v.names(), ["gh", "hook", "short"], "the binding isn't listed as a secret");
         v.remove("hook").unwrap();
         assert!(!v.is_verify("hook"), "removed with its secret");
         let _ = std::fs::remove_dir_all(&dir);

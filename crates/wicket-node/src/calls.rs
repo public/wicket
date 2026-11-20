@@ -287,7 +287,6 @@ impl Calls {
         }
     }
 
-    /// Whether the node has the image `digest` names (#191).
     /// Webhook intake (#578 step 4, protocol 20): sends the node the triggers its intake serves and
     /// the events recorded since the last sync, and returns what it has spooled (oldest first,
     /// bounded) and what intake refused since.
@@ -306,6 +305,7 @@ impl Calls {
         }
     }
 
+    /// Whether the node has the image `digest` names (#191).
     pub async fn has_image(&self, digest: &str) -> Result<bool> {
         let id = self.id();
         match self.answer(id, Frame::Msg(Msg::ImageHave { id, digest: digest.into() }), "an image query").await? {
