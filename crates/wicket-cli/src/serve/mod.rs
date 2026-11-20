@@ -73,6 +73,7 @@ pub mod session;
 mod standing;
 pub(crate) mod tls;
 mod web;
+pub(crate) use web::write_console_assets;
 
 pub use net::ServeOpts;
 

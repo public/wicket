@@ -185,6 +185,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 - [`wicket daemon`](#wicket-daemon)
 - [`wicket dev`](#wicket-dev)
   - [`wicket dev node-feed-probe`](#wicket-dev-node-feed-probe)
+  - [`wicket dev console-assets`](#wicket-dev-console-assets)
   - [`wicket dev mock-llm`](#wicket-dev-mock-llm)
 
 ## `wicket`
@@ -2442,6 +2443,7 @@ Usage: wicket dev <COMMAND>
 
 Commands:
   node-feed-probe  On a node: send `node serve` its own last freshness statement, tampered and then replayed, and print how each was refused (a check for ci/node-e2e.sh). The control connection stays up
+  console-assets   Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
   mock-llm         A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without an API key
   help             Print this message or the help of the given subcommand(s)
 
@@ -2459,6 +2461,20 @@ Usage: wicket dev node-feed-probe [OPTIONS]
 Options:
       --dir <DIR>  
   -h, --help       Print help
+```
+
+### `wicket dev console-assets`
+
+```text
+Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
+
+Usage: wicket dev console-assets <DIR>
+
+Arguments:
+  <DIR>  
+
+Options:
+  -h, --help  Print help
 ```
 
 ### `wicket dev mock-llm`
