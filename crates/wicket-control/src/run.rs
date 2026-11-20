@@ -771,6 +771,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 node: old.node,
                 principal: old.principal,
                 act: old.act,
+                kind: old.kind,
             };
             let key = wicket_identity::AgentKey::generate();
             let now = wicket_store::now();
@@ -839,6 +840,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 node: node_name.clone(),
                 principal,
                 act,
+                // Signed, so discovery can say what a principal is (#252).
+                kind: m.program.is_some().then(|| wicket_identity::KIND_PROGRAM.to_string()),
             };
             let jws = issuer.issue(&spec, now, ttl, &key.public());
             id_spec = Some(spec);

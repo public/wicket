@@ -286,8 +286,12 @@ impl Gateway {
             if !may_send && !may_receive {
                 continue;
             }
+            // What it is, as its identity document says (#252, #255): an agent or a program.
+            let kind = wicket_identity::verify_identity(&r.jws, &me.issuer, r.issued_at)
+                .map(|c| c.workload_kind().to_string())
+                .unwrap_or_else(|_| "agent".into());
             out.push(json!({
-                "id": r.spiffe_id, "kind": "agent", "agent": r.agent, "zone": r.zone, "relation": relation,
+                "id": r.spiffe_id, "kind": kind, "agent": r.agent, "zone": r.zone, "relation": relation,
                 "state": l.presence(&self.tenant(), &r.spiffe_id).unwrap_or_else(|_| "offline".into()),
                 "may_send_to": may_send, "may_hear_from": may_receive,
             }));
@@ -928,7 +932,7 @@ fn deliver(
     let v = json!({
         "message_id": id,
         "kind": kind,
-        "from": { "agent": sender.agent, "zone": sender.zone, "run": sender.run, "id": sender.sub, "relation": relation,
+        "from": { "agent": sender.agent, "zone": sender.zone, "run": sender.run, "id": sender.sub, "relation": relation, "kind": sender.workload_kind(),
                   "acting_for": sender.chain(), "verified_by": "wicket" },
         // Where an answer goes (#252): send_message to it, with in_reply_to this message's id.
         "reply_to": payload.get("reply_to").cloned().unwrap_or_else(|| json!(sender.sub)),
@@ -1061,6 +1065,21 @@ mod tests {
     impl World {
         /// Starts an agent run with a wicket-issued identity and returns its context.
         fn agent(&self, tenant: &str, zone: &str, name: &str, run: &str, parent: Option<&str>, accept_from: &[&str]) -> RunCtx {
+            self.workload(tenant, zone, name, run, parent, accept_from, None)
+        }
+
+        /// [`World::agent`], or a program with `kind` `program` in its identity (#255).
+        #[allow(clippy::too_many_arguments)]
+        fn workload(
+            &self,
+            tenant: &str,
+            zone: &str,
+            name: &str,
+            run: &str,
+            parent: Option<&str>,
+            accept_from: &[&str],
+            kind: Option<&str>,
+        ) -> RunCtx {
             let yaml = format!(
                 "tenant: {tenant}\ntask: t\nagent: {{ name: {name} }}\nzone: {{ name: {zone}, llm: {{}}, accept_from: {accept_from:?} }}\n"
             );
@@ -1077,6 +1096,7 @@ mod tests {
                 node: "local".into(),
                 principal: serde_json::json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}),
                 act: None,
+                kind: kind.map(String::from),
             };
             let jws = self.issuer.issue(&spec, wicket_store::now(), 3600, &key.public());
             let claims = wicket_identity::verify_identity(&jws, &self.issuer.verifying_key(), wicket_store::now()).unwrap();
@@ -1140,6 +1160,21 @@ mod tests {
         let revoked = l.revoked(&m.from_run).unwrap().is_some();
         drop(l);
         deliver(&ctx.identity.as_ref().unwrap().current(), &ctx.run.0, &[], &m, revoked)
+    }
+
+    /// #252, #255: a program's message says it is a program, from its signed identity.
+    #[test]
+    fn a_programs_message_says_it_is_a_program() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let lead = w.agent("t0", "research", "lead", "run_lead", None, &[]);
+        let prog = w.workload("t0", "jobs", "nightly", "run_prog", None, &["research"], Some("program"));
+        let asked = lead.send_message(&to(&id_of(&prog)), "message", json!("status?")).unwrap();
+        let v: Value = serde_json::from_str(&take(&prog).0).unwrap();
+        assert_eq!(v["from"]["kind"], "agent");
+        let opts = wicket_proxy::SendOpts { in_reply_to: Some(&asked.id), ..Default::default() };
+        prog.send(&to(&id_of(&lead)), "message", json!("green"), opts).unwrap();
+        let v: Value = serde_json::from_str(&take(&lead).0).unwrap();
+        assert_eq!((v["from"]["kind"].as_str(), v["body"].as_str()), (Some("program"), Some("green")));
     }
 
     /// #70, #250: a message to a hibernated agent's principal wakes it, and its next activation
@@ -1312,6 +1347,8 @@ mod tests {
         let ops = w.agent("t0", "ops", "deployer", "run_ops", None, &["research"]);
         let _audit = w.agent("t0", "audit", "auditor", "run_audit", None, &[]);
         let _stranger = w.agent("t0", "elsewhere", "stranger", "run_x", None, &[]);
+        // A program is a principal too (#255), named by its signed identity's kind.
+        let prog = w.workload("t0", "jobs", "nightly", "run_prog", None, &["research"], Some("program"));
         let _other_tenant = w.agent("t1", "ops", "deployer", "run_t1", None, &["research"]);
         w.ledger.lock().unwrap().set_run_activity("run_child", Some("busy")).unwrap();
         w.ledger.lock().unwrap().run_ended(&RunId("run_audit".into()), "succeeded", "{}").unwrap();
@@ -1327,6 +1364,8 @@ mod tests {
             (o["may_send_to"].as_bool(), o["may_hear_from"].as_bool(), o["state"].as_str()),
             (Some(true), Some(false), Some("running"))
         );
+        let p = by(&id_of(&prog)).expect("a program that accepts research");
+        assert_eq!((p["kind"].as_str(), p["may_send_to"].as_bool()), (Some("program"), Some(true)), "{text}");
         let a = by("spiffe://test.local/t/t0/z/audit/a/auditor").expect("a zone its accept_from names");
         assert_eq!(
             (a["may_send_to"].as_bool(), a["may_hear_from"].as_bool(), a["state"].as_str()),
@@ -1439,6 +1478,7 @@ mod tests {
             node: "local".into(),
             principal: spec.claims.principal.clone(),
             act: None,
+            kind: None,
         };
         let fake_id = rogue.issue(&fake_spec, wicket_store::now(), 3600, &k.public());
         let env = wicket_identity::sign_envelope(
@@ -1477,6 +1517,7 @@ mod tests {
             node: "local".into(),
             principal: me.claims.principal.clone(),
             act: None,
+            kind: None,
         };
         let old_id = w.issuer.issue(&spec, now - 4200, 600, &old_key.public());
         let backdated = wicket_identity::sign_envelope(
