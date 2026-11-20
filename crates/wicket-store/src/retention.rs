@@ -327,8 +327,7 @@ impl Ledger {
         let listed: Vec<(i64, String)> = self
             .audit_of_kind("audit.pruned")?
             .iter()
-            .filter(|r| r.seq >= anchor)
-            .next_back()
+            .rfind(|r| r.seq >= anchor)
             .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
             .and_then(|v| serde_json::from_value(v["kept_restores"].clone()).ok())
             .unwrap_or_default();
