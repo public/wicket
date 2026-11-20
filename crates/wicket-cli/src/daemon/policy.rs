@@ -128,7 +128,7 @@ pub fn route(cmd: &Cmd) -> Route {
             LeaseCmd::Release { .. } => Forward(Revoke),
         },
         Cmd::Node { cmd } => match cmd {
-            NodeCmd::List { provider: false, .. } => Forward(Read),
+            NodeCmd::List { provider: false, .. } | NodeCmd::Ca { .. } => Forward(Read),
             // Uses the provider's API key from the vault.
             NodeCmd::List { provider: true, .. } | NodeCmd::Plans { .. } => Forward(Privileged),
             // Spends money (a CAPACITY request decided by a grant or an operator), or destroys a machine.

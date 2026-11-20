@@ -61,6 +61,7 @@ mod capacity;
 mod limits;
 mod manifests;
 mod net;
+mod nodes;
 mod push;
 mod secrets;
 pub mod session;
@@ -827,8 +828,8 @@ where
                 },
                 _ => denied(),
             },
-            // Read-only views of authority (#173): an operator's session only.
-            p => match (authority::get(state, p), &sess) {
+            // Read-only views of authority (#173) and of nodes (#573): an operator's session only.
+            p => match (authority::get(state, p).or_else(|| nodes::get(state, p)), &sess) {
                 (Some(r), Some((_, SessionKind::Operator { .. }))) => match r {
                     Ok(v) => to_response(ok(v)),
                     Err(e) => to_response(err(StatusCode::NOT_FOUND, e)),
@@ -2240,6 +2241,7 @@ mod tests {
     mod http;
     mod https;
     mod manifests;
+    mod nodes;
     mod notify;
     mod secrets;
     mod session;
