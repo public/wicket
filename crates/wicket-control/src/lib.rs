@@ -35,6 +35,7 @@ pub mod image;
 pub mod links;
 pub mod localnode;
 pub mod names;
+pub mod namesync;
 pub mod node;
 pub mod nodecall;
 pub mod nodecreate;

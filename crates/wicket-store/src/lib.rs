@@ -1851,6 +1851,15 @@ impl Ledger {
             .optional()?)
     }
 
+    /// The body of the newest audit record of `kind` that names no run (an installation's own,
+    /// such as the names reconciler's `name.plan`), if any.
+    pub fn audit_latest_unscoped(&self, kind: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT body FROM audit WHERE run IS NULL AND kind = ?1 ORDER BY seq DESC LIMIT 1", params![kind], |r| r.get(0))
+            .optional()?)
+    }
+
     /// Recomputes the whole chain: from seq 1, or after a prune (#582) from the anchor on (kinds
     /// the host keeps below it aren't chained), whose record must be the first and hash to what
     /// the anchor's checkpoint signed (its own `prev` is a deleted record's, taken as stored). An
