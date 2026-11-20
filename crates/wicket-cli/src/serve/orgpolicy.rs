@@ -34,25 +34,33 @@ use wicket_store::{Ledger, OperatorCredential};
 /// applied on the host.
 const MAX_POLICY: usize = 60 * 1024;
 
-/// One preview at a time on this console: each mints for every running zone and group.
-static PREVIEWING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Runs `f`, compile-and-mint work, off the async workers where the runtime allows (the console's
+/// is multi-threaded; tests' isn't).
+fn off_workers<T>(f: impl FnOnce() -> T) -> T {
+    let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
 
-/// Runs `f`, the preview's compile-and-mint work, off the async workers where the runtime allows
-/// (the console's is multi-threaded; tests' isn't), and only one at a time: Err if another runs.
-fn one_preview<T>(f: impl FnOnce() -> T) -> Result<T, Reply> {
+/// [`off_workers`], one unsigned preview at a time on this console (`State::previewing`): each
+/// mints for every running zone and group. Err (429) if another runs. A signed apply's finish is
+/// never refused for a preview.
+fn one_preview<T>(state: &State, f: impl FnOnce() -> T) -> Result<T, Reply> {
     use std::sync::atomic::Ordering;
-    if PREVIEWING.swap(true, Ordering::AcqRel) {
+    if state.previewing.swap(true, Ordering::AcqRel) {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "another org policy preview is running; try again in a moment"));
     }
-    struct Done;
-    impl Drop for Done {
+    struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Done<'_> {
         fn drop(&mut self) {
-            PREVIEWING.store(false, std::sync::atomic::Ordering::Release);
+            self.0.store(false, std::sync::atomic::Ordering::Release);
         }
     }
-    let _done = Done;
-    let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
-    Ok(if multi { tokio::task::block_in_place(f) } else { f() })
+    let _done = Done(&state.previewing);
+    Ok(off_workers(f))
 }
 
 /// What the console asks the applier to run: `wicket policy apply <cedar> --entities <entities>
@@ -86,7 +94,7 @@ fn preview_of(
     keep_runs: bool,
 ) -> Result<(wicket_policy::OrgPolicy, pol::Preview), Reply> {
     let org = pol::parse(&t.cedar, &t.entities).map_err(|e| err(StatusCode::BAD_REQUEST, format!("the policy doesn't parse: {e:#}")))?;
-    let p = one_preview(|| pol::preview_in(&org, &state.data, l, keep_runs))?
+    let p = one_preview(state, || pol::preview_in(&org, &state.data, l, keep_runs))?
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok((org, p))
 }
@@ -159,9 +167,7 @@ pub(super) fn apply(state: &State, l: &Ledger, oc: &OperatorCredential, a: &Poli
         let _ = std::fs::remove_file(&cedar);
         let _ = std::fs::remove_file(&entities);
     };
-    let decided = one_preview(|| pol::decide(l, &by, &org, &state.data, a.keep_runs, &a.effect_sha256, extra))
-        .map_err(|r| anyhow::anyhow!("{}", r.body["error"].as_str().unwrap_or("busy")))
-        .and_then(|d| d);
+    let decided = off_workers(|| pol::decide(l, &by, &org, &state.data, a.keep_runs, &a.effect_sha256, extra));
     let (p, seq) = match decided {
         Ok(x) => x,
         Err(e) => {

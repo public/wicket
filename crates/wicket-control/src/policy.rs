@@ -437,7 +437,7 @@ fn decided(l: &wicket_store::Ledger, seq: i64, p: &Preview) -> Result<String> {
     if wicket_store::now() - r.ts > DECISION_TTL_SECS {
         bail!("decision {seq} is older than {} minutes: decide again", DECISION_TTL_SECS / 60);
     }
-    for kind in ["policy.applied", "policy.apply_failed", "policy.apply_incomplete"] {
+    for kind in ["policy.applied", "policy.apply_failed", "policy.apply_incomplete", "policy.apply_finished"] {
         if l.audit_of_kind(kind)?
             .iter()
             .any(|x| serde_json::from_str::<serde_json::Value>(&x.body).is_ok_and(|v| v["decision"].as_i64() == Some(seq)))

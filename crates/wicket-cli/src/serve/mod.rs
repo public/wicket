@@ -275,6 +275,8 @@ struct State {
     launcher: Launcher,
     updater: Updater,
     policy_applier: PolicyApplier,
+    /// An unsigned org policy preview is running ([`orgpolicy`]): one at a time.
+    previewing: std::sync::atomic::AtomicBool,
     identity: IdentityCheck,
     challenges: Mutex<HashMap<String, Pending>>,
     limiter: Limiter,
@@ -336,6 +338,7 @@ impl State {
             launcher,
             updater: Box::new(|_, _| bail!("this console doesn't apply updates")),
             policy_applier: Box::new(|_| bail!("this console doesn't apply org policies")),
+            previewing: std::sync::atomic::AtomicBool::new(false),
             identity,
             challenges: Mutex::new(HashMap::new()),
             limiter: Limiter::default(),

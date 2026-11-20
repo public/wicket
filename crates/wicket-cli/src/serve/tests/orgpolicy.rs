@@ -58,6 +58,17 @@ fn an_org_policy_is_previewed_then_applied_with_a_passkey_on_that_preview() {
     assert!(applied.lock().unwrap().is_empty());
 
     // Signed on what it does now: decided, audited first, then applied by `wicket policy apply`.
+    // A preview running meanwhile refuses another preview, never the signed apply.
+    let b = begin(&t);
+    assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+    t.state.previewing.store(true, std::sync::atomic::Ordering::Release);
+    assert_refused(&t.post("/api/policy/preview", json!({ "cedar": ORG })), StatusCode::TOO_MANY_REQUESTS, "another org policy preview");
+    let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
+    let signed = t.sign(&ch);
+    let r = t.post("/api/action/finish", signed);
+    assert_eq!(r.status, StatusCode::OK, "a preview never refuses a signed apply: {:?}", r.body);
+    t.state.previewing.store(false, std::sync::atomic::Ordering::Release);
+    applied.lock().unwrap().clear();
     let r = t.act(json!({ "action": "policy_apply", "cedar": ORG, "entities": ENTITIES, "keep_runs": true, "reason": "quarterly review" }));
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     let a = applied.lock().unwrap().clone();
@@ -74,7 +85,7 @@ fn an_org_policy_is_previewed_then_applied_with_a_passkey_on_that_preview() {
     assert_eq!(d["revokes"], json!([]), "kept until they end");
     assert!(d["granter_identity"].as_str().unwrap().ends_with("/op/passkey/laptop"), "{d}");
     assert_eq!(a[0].3, t.dir.join("policy").join(format!("apply-{seq}.log")));
-    assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (1, 0), "re-verifies offline");
+    assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (2, 0), "both decisions re-verify offline");
 
     // An apply that can't start is audited, and nothing changed.
     t.state.policy_applier = Box::new(|_| anyhow::bail!("no binary"));
@@ -83,5 +94,5 @@ fn an_org_policy_is_previewed_then_applied_with_a_passkey_on_that_preview() {
     assert!(t.audit_kinds().iter().any(|(k, b)| k == "policy.apply_failed" && b["version"] == version.as_str()));
     assert!(!t.dir.join("policy/installed").exists());
     let staged: Vec<_> = std::fs::read_dir(t.dir.join("policy/staged")).unwrap().collect();
-    assert_eq!(staged.len(), 2, "the decided apply's files stay for its apply; the failed one's are removed");
+    assert_eq!(staged.len(), 4, "the two decided applies keep their files for their applies; the failed one's are removed");
 }

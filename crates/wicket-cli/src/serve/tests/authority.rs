@@ -253,6 +253,7 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         [json!({ "cedar": org }), json!({ "cedar": org, "entities": include_str!("../../../../../examples/policy/org-entities.json") })]
     {
         let r = f.t.post("/api/policy/preview", body);
+        assert_eq!(r.status, StatusCode::OK, "the preview answered: {:?}", r.body);
         let text = r.body.to_string();
         assert!(leaks(&text, &n).is_empty(), "/api/policy/preview ({}) leaks {:?}", r.status, leaks(&text, &n));
     }
