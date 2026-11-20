@@ -2385,6 +2385,7 @@ async fn serve_box(
         fence: None,
         waker: None,
         lifecycle: None,
+        names: None,
     };
     let ca = node.ca();
     let minter: Arc<dyn Minter> = ca.clone();

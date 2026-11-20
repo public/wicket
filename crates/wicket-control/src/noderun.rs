@@ -2024,6 +2024,10 @@ pub struct AuthorityRecord {
     pub until_ms: i64,
     #[serde(default)]
     pub stopped: bool,
+    /// An operator released the fence without the node (#676): who, and why. The box may still
+    /// run; the operator took that on, audited as `run.fence_released`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_by: Option<String>,
 }
 
 /// How far past a box's authority a wake still waits: clock skew between this host and the node.
@@ -2039,7 +2043,7 @@ fn authority_file(run_dir: &Path) -> PathBuf {
 /// start anything, so a crash can't leave a running box with no fence.
 pub fn record_authority(run_dir: &Path, node: &str, until_ms: i64) -> Result<()> {
     let stopped = read_authority(run_dir).is_some_and(|a| a.stopped && a.until_ms == until_ms);
-    write_authority(run_dir, &AuthorityRecord { node: node.into(), until_ms, stopped })
+    write_authority(run_dir, &AuthorityRecord { node: node.into(), until_ms, stopped, released_by: None })
 }
 
 fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
@@ -2072,36 +2076,143 @@ pub fn confirm_stopped(run_dir: &Path) {
     }
 }
 
-/// Whether run `run`'s box may still be running on its node at `now_ms`: its node, and when that
-/// ends for certain (its authority's end plus [`WAKE_SKEW_MS`]). None once the node confirmed the
-/// box stopped, or the authority has ended, or for a run without a record.
-pub fn fenced_until(run: &str, now_ms: i64) -> Option<(String, i64)> {
-    crate::run::check_run_id(run).ok()?;
-    fenced_in(&crate::data_dir().join("runs").join(run), now_ms)
+/// An operator releases run `run_dir`'s fence without its node (#676): for a run its node can't
+/// confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end. Marked as if the
+/// node had confirmed, with who did it; the caller audits it (`run.fence_released`).
+pub fn release_fence(run_dir: &Path, by: &str) -> Result<()> {
+    let mut a = read_authority(run_dir).unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
+    a.stopped = true;
+    a.released_by = Some(by.to_string());
+    write_authority(run_dir, &a)
 }
 
-/// [`fenced_until`] for the run in `run_dir`.
+/// Whether run `run`'s box may still be running on its node at `now_ms`: its node, and when that
+/// ends for certain (its authority's end plus [`WAKE_SKEW_MS`]). None once the node confirmed the
+/// box stopped (or an operator released it, [`release_fence`]), or the authority has ended, or for
+/// a run without a record. The ledger's record of its authority's hard end (`runs.authority_cap`,
+/// written before its box starts) bounds a fence its run's own records can't (#676).
+pub fn fenced_until(l: &wicket_store::Ledger, run: &str, now_ms: i64) -> Option<(String, i64)> {
+    crate::run::check_run_id(run).ok()?;
+    let cap_ms = l.run_authority(run).ok().flatten().map(|(_, cap)| cap.saturating_mul(1000));
+    fenced_in(&crate::data_dir().join("runs").join(run), now_ms, cap_ms)
+}
+
+/// [`fenced_until`] for the run in `run_dir`, with the ledger's hard end of its authority (Unix ms),
+/// if recorded.
 ///
-/// A run whose record is missing (lost) fences until its timeout, from its run
-/// record: its box may run that long on its node, and no longer. A run with neither record never
-/// started a box.
-pub fn fenced_in(run_dir: &Path, now_ms: i64) -> Option<(String, i64)> {
+/// A run whose authority record is missing (lost) fences until its timeout, from its run record:
+/// its box may run that long on its node, and no longer. If the run record is there but that can't
+/// be read from it (#676), until the ledger's hard end; and with neither, until its node confirms the
+/// box stopped ([`UNKNOWN_END`]), or an operator releases it. A run with no record of either kind
+/// never started a box from this host's files: on a standby restored from the state store (#154),
+/// the ledger's fence on the agent (`Ledger::agent_fenced_until`) holds instead.
+pub fn fenced_in(run_dir: &Path, now_ms: i64, cap_ms: Option<i64>) -> Option<(String, i64)> {
     let a = match read_authority(run_dir) {
         Some(a) => a,
-        None => AuthorityRecord { node: "its node".into(), until_ms: timeout_end(run_dir)?, stopped: false },
+        None => {
+            // No run record: no box was started from this host's files (or, on a standby restored
+            // from the state store, #154, the lost host's files are gone and the ledger's own fence
+            // on the agent holds instead). A record whose end can't be read: the ledger's hard end,
+            // else until the node confirms.
+            let until_ms = match (timeout_end(run_dir)?, cap_ms) {
+                (UNKNOWN_END, Some(cap)) => cap,
+                (t, _) => t,
+            };
+            AuthorityRecord { node: "its node".into(), until_ms, ..Default::default() }
+        }
     };
     let until = a.until_ms.saturating_add(WAKE_SKEW_MS);
     (!a.stopped && now_ms < until).then_some((a.node, until))
 }
 
-/// When a run's box must have stopped by its timeout (Unix ms), from its run record (`ctl/run.json`):
-/// its start, its zone's timeout, and a long-lived agent's node backstop (120 s).
-fn timeout_end(run_dir: &Path) -> Option<i64> {
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(run_dir.join("ctl/run.json")).ok()?).ok()?;
-    let m = wicket_agent::load(v["manifest"].as_str()?).ok()?;
-    let secs = i64::try_from(m.zone.limits.timeout().ok()?.as_secs()).ok()?;
-    Some(v["started_ms"].as_i64()? + secs * 1000 + 120_000)
+/// Whether this host has the run record (`ctl/run.json`) of the run in `run_dir`.
+pub fn has_run_record(run_dir: &Path) -> bool {
+    run_dir.join("ctl/run.json").exists()
 }
+
+/// Why a run's box may still be running on its node: its node, until when (Unix ms), and whether
+/// the ledger holds it rather than this host's records ([`held_until`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub node: String,
+    pub until_ms: i64,
+    pub by_ledger: bool,
+}
+
+/// Whether run `run`'s box may still be running on its node at `now_ms` (#153, #676): the one rule
+/// the reconciler and a failed takeover share, so neither ends a run whose box may still run.
+/// `fenced` is its fence from this host's records ([`fenced_until`]). With none, and no run record
+/// here (`has_record`: a standby restored from the state store has none of the lost host's, #154),
+/// the ledger's hard end of its box's authority holds it, plus 1 s and the skew, as
+/// `Ledger::agent_fenced_until` has it. The cap rather than the latest renewal: a renewal the
+/// standby's copy hasn't caught up with may have moved the box's end on.
+///
+/// A ledger that can't be read is an error, never "not held": the caller doesn't end a run whose
+/// box it couldn't rule out.
+pub fn held_until(
+    l: &wicket_store::Ledger,
+    run: &str,
+    now_ms: i64,
+    fenced: Option<(String, i64)>,
+    has_record: bool,
+) -> anyhow::Result<Option<Held>> {
+    if let Some((node, until_ms)) = fenced {
+        return Ok(Some(Held { node, until_ms, by_ledger: false }));
+    }
+    if has_record {
+        return Ok(None);
+    }
+    let Some((_, cap)) = l.run_authority(run)? else { return Ok(None) };
+    let until_ms = cap.saturating_add(1 + wicket_store::WAKE_SKEW_SECS).saturating_mul(1000);
+    // Only the hold's words: a node that can't be read is "its node".
+    let node = l.run_node(run).ok().flatten().unwrap_or_else(|| "its node".into());
+    Ok((now_ms < until_ms).then_some(Held { node, until_ms, by_ledger: true }))
+}
+
+/// How long a hold lasts, in words: its end, or, for a fence this host can't bound, until its node
+/// confirms the box stopped.
+pub fn held_for(until_ms: i64) -> String {
+    match until_ms {
+        UNKNOWN_END => "until the node confirms the box stopped".to_string(),
+        u => fmt_ms(u),
+    }
+}
+
+/// Why a run's agent isn't woken while run `run`'s box may still run on `node` until `until` (Unix
+/// ms, from [`fenced_until`]): when it can be, and how, the same words wherever it is said.
+pub fn fence_refusal(run: &str, node: &str, until: i64) -> String {
+    if until == UNKNOWN_END {
+        format!(
+            "its last activation (run {run}) may still be running on node {node}, and when its authority there ends can't be read from its records: it can be woken once node {node} reports the box stopped, or after an operator releases the fence (`wicket node release-fence {run}`, root, audited)"
+        )
+    } else {
+        format!(
+            "its last activation (run {run}) may still be running on node {node}, which this host can't confirm stopped, until its authority ends: it can be woken from {}, or as soon as node {node} reports the box stopped",
+            fmt_ms(until)
+        )
+    }
+}
+
+/// When a run's box must have stopped by its timeout (Unix ms), from its run record (`ctl/run.json`):
+/// its start, its zone's timeout, and a long-lived agent's node backstop (120 s). None if there is no
+/// run record (no box was started). If the record is there but its start or timeout can't be read
+/// (a stored manifest a later version no longer loads is read leniently, `stored_timeout`; one that
+/// doesn't parse at all isn't), [`UNKNOWN_END`]: the box may run for as long as it was given, which
+/// this host can't tell, so it is fenced until its node confirms it stopped (#676: fail closed).
+fn timeout_end(run_dir: &Path) -> Option<i64> {
+    let bytes = std::fs::read(run_dir.join("ctl/run.json")).ok()?;
+    Some(read_timeout_end(&bytes).unwrap_or(UNKNOWN_END))
+}
+
+fn read_timeout_end(run_json: &[u8]) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_slice(run_json).ok()?;
+    let secs = i64::try_from(wicket_core::manifest::stored_timeout(v["manifest"].as_str()?)?.as_secs()).ok()?;
+    v["started_ms"].as_i64()?.checked_add(secs.checked_mul(1000)?)?.checked_add(120_000)
+}
+
+/// A fence's end when this host can't tell when a box's authority ends (#676): never, until its node
+/// confirms the box stopped.
+pub const UNKNOWN_END: i64 = i64::MAX;
 
 /// What this host has released to a run's node, secrets and budget slices (#152), kept beside the run
 /// (`ctl/holdings.json`) for `wicket node list`: the secrets the node fetched for the run (by name,
@@ -3043,7 +3154,7 @@ mod tests {
             slice: Some(wicket_proxy::llm::Slice { requests: 75, output_tokens: 100_000, input_tokens: None }),
             updated_ms: 0,
         };
-        let a = AuthorityRecord { node: "n1".into(), until_ms: 1_794_500_000_000, stopped: false };
+        let a = AuthorityRecord { node: "n1".into(), until_ms: 1_794_500_000_000, stopped: false, released_by: None };
         let line = holdings_line("run_x", Some(&a), &h, 1_794_400_000_000);
         assert!(line.contains("authority until 2026-"), "{line}");
         assert!(line.contains("secrets claude-oauth,gh"), "{line}");
@@ -3061,7 +3172,7 @@ mod tests {
     fn a_box_fences_its_agent_until_its_authority_ends_or_its_node_confirms_it_stopped() {
         let d = std::env::temp_dir().join(format!("wicket-fence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        assert!(fenced_in(&d, 0).is_none(), "neither record: no box was started");
+        assert!(fenced_in(&d, 0, None).is_none(), "neither record: no box was started");
         // A run record, but no authority record: fenced until its timeout (5m) and the backstop.
         std::fs::create_dir_all(d.join("ctl")).unwrap();
         let manifest = "task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, limits: { timeout: 5m } }\n";
@@ -3071,22 +3182,86 @@ mod tests {
         )
         .unwrap();
         let end = 1_000 + 300_000 + 120_000 + WAKE_SKEW_MS;
-        assert_eq!(fenced_in(&d, 2_000).map(|f| f.1), Some(end), "a missing record fences, not opens");
-        assert!(fenced_in(&d, end).is_none());
+        assert_eq!(fenced_in(&d, 2_000, None).map(|f| f.1), Some(end), "a missing record fences, not opens");
+        assert!(fenced_in(&d, end, None).is_none());
         confirm_stopped(&d);
-        assert!(fenced_in(&d, 2_000).is_none(), "confirmed even without a record");
+        assert!(fenced_in(&d, 2_000, None).is_none(), "confirmed even without a record");
         std::fs::remove_file(d.join("ctl/authority.json")).unwrap();
         record_authority(&d, "n1", 100_000).unwrap();
-        assert_eq!(fenced_in(&d, 50_000), Some(("n1".to_string(), 100_000 + WAKE_SKEW_MS)));
-        assert!(fenced_in(&d, 100_000 + WAKE_SKEW_MS - 1).is_some(), "skew past the authority");
-        assert!(fenced_in(&d, 100_000 + WAKE_SKEW_MS).is_none(), "ended");
+        assert_eq!(fenced_in(&d, 50_000, None), Some(("n1".to_string(), 100_000 + WAKE_SKEW_MS)));
+        assert!(fenced_in(&d, 100_000 + WAKE_SKEW_MS - 1, None).is_some(), "skew past the authority");
+        assert!(fenced_in(&d, 100_000 + WAKE_SKEW_MS, None).is_none(), "ended");
         confirm_stopped(&d);
-        assert!(fenced_in(&d, 50_000).is_none(), "the node confirmed the box stopped");
+        assert!(fenced_in(&d, 50_000, None).is_none(), "the node confirmed the box stopped");
         record_authority(&d, "n1", 100_000).unwrap();
-        assert!(fenced_in(&d, 50_000).is_none(), "a re-attach keeps the confirmation");
+        assert!(fenced_in(&d, 50_000, None).is_none(), "a re-attach keeps the confirmation");
         record_authority(&d, "n1", 200_000).unwrap();
-        assert!(fenced_in(&d, 50_000).is_some(), "a new authority is fenced again");
+        assert!(fenced_in(&d, 50_000, None).is_some(), "a new authority is fenced again");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// #676: what wake says of a fence it can't see the end of, and of one bounded by the ledger:
+    /// the first names the operator's release, never a date at the end of time.
+    #[test]
+    fn wake_says_how_an_unbounded_fence_ends() {
+        let d = std::env::temp_dir().join(format!("wicket-fence-wake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        std::fs::write(d.join("ctl/run.json"), b"{ truncated").unwrap();
+        let (node, until) = fenced_in(&d, 2_000, None).expect("fenced");
+        let why = fence_refusal("run_x", &node, until);
+        assert!(why.contains("can't be read from its records") && why.contains("wicket node release-fence run_x"), "{why}");
+        assert!(!why.contains("9223372036854775807"), "{why}");
+        let (node, until) = fenced_in(&d, 2_000, Some(1_800_000_000_000)).expect("fenced");
+        let why = fence_refusal("run_x", &node, until);
+        assert!(why.contains("it can be woken from 2027-"), "{why}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #676: a run record whose manifest a later version no longer loads still fences until its
+    /// timeout (read leniently); one whose timeout can't be read at all fences until its node
+    /// confirms the box stopped, never not at all.
+    #[test]
+    fn a_run_record_that_no_longer_loads_still_fences() {
+        let d = std::env::temp_dir().join(format!("wicket-fence-676-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        let write = |manifest: &str| {
+            std::fs::write(
+                d.join("ctl/run.json"),
+                serde_json::to_vec(&serde_json::json!({ "manifest": manifest, "started_ms": 1_000 })).unwrap(),
+            )
+            .unwrap()
+        };
+        // A forbid glob without its leading `/`: refused since #674, accepted when the run started.
+        let old = "task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, limits: { timeout: 5m }, forbid: [{ host: a.test, paths: ['**/x'] }] }\n";
+        assert!(wicket_agent::load(old).is_err(), "the manifest no longer loads");
+        write(old);
+        let end = 1_000 + 300_000 + 120_000 + WAKE_SKEW_MS;
+        assert_eq!(fenced_in(&d, 2_000, None).map(|f| f.1), Some(end), "fenced until its timeout, read leniently");
+        assert!(fenced_in(&d, end, None).is_none());
+        // Not even YAML: when its authority ends can't be told, so the fence holds at any time.
+        write("{ not: [yaml");
+        assert_eq!(fenced_in(&d, i64::MAX - 1, None).map(|f| f.1), Some(UNKNOWN_END));
+        std::fs::write(d.join("ctl/run.json"), b"not json").unwrap();
+        assert_eq!(fenced_in(&d, 2_000, None).map(|f| f.1), Some(UNKNOWN_END), "an unreadable record fences too");
+        // With the ledger's hard end of its authority: fenced until that, not forever.
+        assert_eq!(fenced_in(&d, 2_000, Some(900_000)).map(|f| f.1), Some(900_000 + WAKE_SKEW_MS));
+        assert!(fenced_in(&d, 900_000 + WAKE_SKEW_MS, Some(900_000)).is_none(), "and no longer");
+        // No run record at all: not fenced by this host's files, whatever the ledger says (a standby
+        // restored from the state store has the ledger's fence on the agent instead, #154).
+        std::fs::remove_file(d.join("ctl/run.json")).unwrap();
+        assert!(fenced_in(&d, 2_000, Some(900_000)).is_none(), "no run record: the ledger's fence holds instead");
+        assert!(fenced_in(&d, 2_000, None).is_none(), "no record of either kind: no box was started");
+        std::fs::write(d.join("ctl/run.json"), b"not json").unwrap();
+        // An operator releases it (#676): the fence lifts, the record says who.
+        release_fence(&d, "root@cli").unwrap();
+        assert!(fenced_in(&d, 2_000, None).is_none(), "released");
+        assert_eq!(read_authority(&d).unwrap().released_by.as_deref(), Some("root@cli"));
+        std::fs::remove_file(d.join("ctl/authority.json")).unwrap();
+        confirm_stopped(&d);
+        assert!(fenced_in(&d, 2_000, None).is_none(), "until the node confirms the box stopped");
+        let _ = std::fs::remove_dir_all(&d);
     }
     use wicket_core::RiskClass;
 
@@ -3206,6 +3381,32 @@ pub fn forget_refused(l: &wicket_store::Ledger, node: &str, run: &str) -> Option
     Some(format!(
         "run {run}'s work hasn't been collected (no fetch, outbox, push or bundle is recorded): node {node} keeps its workspace; `wicket node forget {run} --force` deletes it"
     ))
+}
+
+/// `wicket node release-fence <run>` (#676): root releases a run's fence without its node, for a
+/// run its node can't confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end.
+/// Refused to anyone but root, and for a run that isn't fenced. Audited as `run.fence_released`
+/// with who, why and the fence it lifted; its agent can then be woken, and the reconciler ends the
+/// run on its next pass if its node is gone. The box may still be running there: whoever releases
+/// it takes that on.
+pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> anyhow::Result<()> {
+    crate::run::check_run_id(run)?;
+    anyhow::ensure!(root, "only root releases a run's fence (its box may still be running on its node)");
+    anyhow::ensure!(!reason.trim().is_empty(), "say why with --reason: it goes on the audit record");
+    let l = wicket_store::Ledger::open(&crate::ledger_path())?;
+    let Some((node, until)) = fenced_until(&l, run, wicket_feed::now_ms()) else {
+        anyhow::bail!("run {run} isn't fenced: its node confirmed its box stopped, or its authority has ended");
+    };
+    release_fence(&crate::data_dir().join("runs").join(run), by)?;
+    let until_ms = (until != UNKNOWN_END).then_some(until);
+    l.audit(
+        &l.run_tenant(run)?.unwrap_or_else(wicket_core::TenantId::single),
+        Some(&wicket_core::RunId(run.into())),
+        "run.fence_released",
+        &serde_json::json!({ "node": node, "by": by, "why": reason, "fenced_until_ms": until_ms }),
+    )?;
+    say!("released run {run}'s fence on node {node}; its box may still be running there");
+    Ok(())
 }
 
 /// `wicket node forget <run>`: lets the run's node delete its files, its workspace among them

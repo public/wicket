@@ -963,14 +963,64 @@ impl Docker {
         Ok(())
     }
 
+    /// Kills box `name` (SIGKILL). A box that has already stopped, or is gone, is no error; any other
+    /// failure is, Docker's or (for a node's Docker) ssh's, so a caller never takes a kill that
+    /// didn't happen for a stopped box (#676). A paused box (a hibernating agent's) is unpaused
+    /// first: Docker doesn't kill a paused one.
     pub async fn kill(&self, name: &str) -> Result<()> {
         let _t = self.span("kill");
-        if let Some(e) = self.engine().await {
-            let _ = e.call(Method::POST, &format!("/containers/{}/kill", engine::enc(name, false)), None).await?;
-            return Ok(());
+        let Some(paused) = self.kill_once(name).await? else { return Ok(()) };
+        if let Err(e) = self.unpause(name).await {
+            // It may have been unpaused, or gone, meanwhile: one more kill tells.
+            return match self.kill_once(name).await {
+                Ok(None) => Ok(()),
+                _ => Err(e.context(format!("unpausing it to kill it ({paused})"))),
+            };
         }
-        let _ = self.command_with(["kill".to_string(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
-        Ok(())
+        let e = match self.kill_once(name).await {
+            Ok(None) => return Ok(()),
+            Ok(Some(m)) => anyhow::anyhow!("docker kill failed: {m}"),
+            Err(e) => e,
+        };
+        // Not left running unpaused: paused again before the error.
+        match self.pause(name).await {
+            Ok(()) => Err(e.context("killing it after unpausing it (it is paused again)")),
+            Err(p) => Err(e.context(format!("killing it after unpausing it, and pausing it again failed too: {p:#}"))),
+        }
+    }
+
+    /// One kill: None if it was killed (or had already stopped, or is gone), Docker's message if the
+    /// box is paused, and an error for any other failure.
+    async fn kill_once(&self, name: &str) -> Result<Option<String>> {
+        if let Some(e) = self.engine().await {
+            let (status, body) = e.call(Method::POST, &format!("/containers/{}/kill", engine::enc(name, false)), None).await?;
+            // 404: no such box; 409 that it isn't running, or that it is paused.
+            let msg = engine::message(&body);
+            if status.is_success() || status == StatusCode::NOT_FOUND || (status == StatusCode::CONFLICT && msg.contains("is not running"))
+            {
+                return Ok(None);
+            }
+            if status == StatusCode::CONFLICT && msg.contains("is paused") {
+                return Ok(Some(msg));
+            }
+            bail!("docker kill failed: {msg} ({status})");
+        }
+        let out = self
+            .command_with(["kill".to_string(), name.into()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("docker kill")?;
+        let err = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() || err.contains("is not running") || err.contains("No such container") {
+            return Ok(None);
+        }
+        if err.contains("is paused") {
+            return Ok(Some(err.trim().to_string()));
+        }
+        bail!("docker kill failed ({}): {}", out.status, err.trim());
     }
 
     /// Writes image `image` (a reference or a digest) on stdout as an OCI image layout archive
@@ -1683,6 +1733,70 @@ mod tests {
         assert!(e.starts_with("docker run failed: Conflict."), "{e}");
         let e = fake.docker().wait("wicket-x").await.unwrap_err().to_string();
         assert!(e.contains("already in use"), "{e}");
+    }
+
+    /// #676: a kill Docker refused is an error, so it isn't taken for a stopped box; one of a box
+    /// that already stopped, or is gone, is not. A paused box is unpaused, then killed.
+    #[tokio::test]
+    async fn a_failed_kill_is_an_error() {
+        let paused = "Container abc is paused. Unpause the container before stopping or killing";
+        let fake = FakeEngine::start("kill-paused", {
+            let unpaused = std::sync::atomic::AtomicBool::new(false);
+            move |m, p, _| match (m, p.rsplit('/').next().unwrap_or_default()) {
+                ("POST", "unpause") => {
+                    unpaused.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Reply::Json(204, serde_json::json!({}))
+                }
+                ("POST", "kill") if unpaused.load(std::sync::atomic::Ordering::SeqCst) => Reply::Json(204, serde_json::json!({})),
+                _ => Reply::Json(409, serde_json::json!({ "message": paused })),
+            }
+        });
+        fake.docker().kill("wicket-x").await.unwrap();
+        assert!(fake.seen().contains(&("POST".into(), "/containers/wicket-x/unpause".into())), "{:?}", fake.seen());
+        // Unpaused, then the kill fails: paused again, and the kill's error returned.
+        let fake = FakeEngine::start("kill-repause", {
+            let unpaused = std::sync::atomic::AtomicBool::new(false);
+            move |m, p, _| match (m, p.rsplit('/').next().unwrap_or_default()) {
+                ("POST", "unpause") => {
+                    unpaused.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Reply::Json(204, serde_json::json!({}))
+                }
+                ("POST", "pause") => Reply::Json(204, serde_json::json!({})),
+                ("POST", "kill") if unpaused.load(std::sync::atomic::Ordering::SeqCst) => {
+                    Reply::Json(500, serde_json::json!({ "message": "the runtime went away" }))
+                }
+                _ => Reply::Json(409, serde_json::json!({ "message": paused })),
+            }
+        });
+        let e = fake.docker().kill("wicket-x").await.unwrap_err();
+        assert!(format!("{e:#}").contains("the runtime went away") && format!("{e:#}").contains("paused again"), "{e:#}");
+        assert!(fake.seen().contains(&("POST".into(), "/containers/wicket-x/pause".into())), "{:?}", fake.seen());
+        // The unpause fails, but the box is gone by then: one more kill says so.
+        let fake = FakeEngine::start("kill-gone", {
+            let tries = std::sync::atomic::AtomicU32::new(0);
+            move |m, p, _| match (m, p.rsplit('/').next().unwrap_or_default()) {
+                ("POST", "unpause") => Reply::Json(409, serde_json::json!({ "message": "Container wicket-x is not paused" })),
+                ("POST", "kill") if tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 => {
+                    Reply::Json(404, serde_json::json!({ "message": "No such container: wicket-x" }))
+                }
+                _ => Reply::Json(409, serde_json::json!({ "message": paused })),
+            }
+        });
+        fake.docker().kill("wicket-x").await.unwrap();
+        for (code, msg, ok) in [
+            (204, "", true),
+            (404, "No such container: wicket-x", true),
+            (409, "Container abc is not running", true),
+            (409, "Conflict: something else", false),
+            (500, "it went wrong", false),
+        ] {
+            let fake = FakeEngine::start("kill", move |_, _, _| Reply::Json(code, serde_json::json!({ "message": msg })));
+            let r = fake.docker().kill("wicket-x").await;
+            assert_eq!(r.is_ok(), ok, "{code}: {r:?}");
+            if let Err(e) = r {
+                assert!(e.to_string().contains(msg), "{e}");
+            }
+        }
     }
 
     #[tokio::test]

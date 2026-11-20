@@ -409,7 +409,8 @@ it needs no approval:
 - the name must be one DNS label (`a-z`, `0-9`, `-`, at most 63 characters, not starting or ending
   with `-`, no `xn--`);
 - it must not be held by another agent in the zone;
-- an agent holds at most 3 internal names at once.
+- an agent holds at most 3 internal names at once, unless the installation sets another limit
+  (`names.internal.per_workload` in [`wicket.yaml`](configuration.md#wicketyaml)).
 
 The zone part is the zone's name as it is, so only a zone whose name is already in DNS form can hold
 names: each dot-separated part lower case letters, digits and `-` (a spawned zone,
@@ -430,10 +431,15 @@ another of the run's names, offers it; otherwise it is no longer offered. Audite
 (`wicket names approve`), since anyone could then connect to the port and read what the box serves.
 The answer is a request id, `n-…`, for `await_grant`.
 
+- Refused where the installation publishes no public names (no `names.public` in
+  [`wicket.yaml`](configuration.md#wicketyaml)), and where the agent already holds as many as it
+  may (`names.public.per_workload`, 1 by default).
 - The label is checked as above, and also against reserved labels and their lookalikes (`console`,
-  `c0nsole`, `www`, `api`, `admin` and others).
+  `c0nsole`, `www`, `api`, `admin` and others, the installation's own list, and the first label of
+  the console's host name). A human's approval checks it again, against the list as it is then.
 - `scope: standing` asks for it for the workload, as standing reach does. The asking run holds it
-  once approved; later runs don't take it up yet (#575 step 4b).
+  once approved, and each later run of the agent (or of its zone, if approved for the zone) takes it
+  up when it starts, while no other run holds it.
 - `service` is the SRV record's service label (default `http`).
 - At most 3 asks of an agent wait at once.
 - The reason is recorded as the agent's (`asked by the agent: …`).

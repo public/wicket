@@ -21,9 +21,10 @@ use wicket_store::{NameAsk, NameScope};
 
 type Reply = (String, bool);
 
-/// The most live internal names one workload (an agent's principal) holds at once, until the
-/// installation's config sets it (`names.internal.per_workload`).
-pub const INTERNAL_PER_WORKLOAD: usize = 3;
+/// The installation's `names:` settings for this run (every default if it has none).
+fn settings(ctx: &RunCtx) -> wicket_names::NamesConfig {
+    ctx.names.as_deref().cloned().unwrap_or_default()
+}
 
 /// The longest reason kept.
 const MAX_REASON: usize = 200;
@@ -92,7 +93,8 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
     // it stays as it is (#668 review, F1 and F2). Only an exposure a name made is the names' to take
     // away (`name_exposures`).
     let exposed_before = l.exposed(&ctx.run.0, port).map_err(|e| e.to_string())?.is_some();
-    let n = l.register_internal(&ask, INTERNAL_PER_WORKLOAD, 0).map_err(|e| e.to_string())?;
+    let limit = settings(ctx).internal.per_workload;
+    let n = l.register_internal(&ask, limit, 0).map_err(|e| e.to_string())?;
     let fqdn = format!("{label}.{zone}.{}", policy::DOMAIN);
     // On a failure below: a new name goes, a name asked again keeps its old port, and an exposure
     // this call made goes.
@@ -102,7 +104,7 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
                 let _ = l.revoke_name(&n.id, "wicket");
             }
             Some(old) => {
-                let _ = l.register_internal(&NameAsk { port: old.port, ..ask.clone() }, INTERNAL_PER_WORKLOAD, 0);
+                let _ = l.register_internal(&NameAsk { port: old.port, ..ask.clone() }, limit, 0);
             }
         }
         if !exposed_before {
@@ -148,15 +150,19 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
 }
 
 /// A box's ask for a public name: filed for a human, never decided here. The label is checked
-/// against the reserved labels and their lookalikes (`wicket_names::check_label`), since a public
-/// name is in a real zone beside the console's.
+/// against the reserved labels and their lookalikes (`wicket_names::check_label`), the
+/// installation's and the console's included, since a public name is in a real zone beside the
+/// console's. Refused outright where the installation publishes no names, or the agent already
+/// holds as many as it may.
 fn ask_public(ctx: &RunCtx, args: &Value) -> Result<String, String> {
+    let names = settings(ctx);
+    let public = names.public.as_ref().ok_or("this installation publishes no public names")?;
     let label = args.get("name").and_then(Value::as_str).ok_or("`name` is required")?;
     let port = match args.get("port").and_then(Value::as_u64) {
         Some(p) if (1..=65535).contains(&p) => p as u16,
         _ => return Err("`port` is required: 1-65535".into()),
     };
-    wicket_names::check_label(label, &wicket_names::Rules::default()).map_err(|e| e.to_string())?;
+    wicket_names::check_label(label, &public.rules()).map_err(|e| e.to_string())?;
     let service = args.get("service").and_then(Value::as_str).unwrap_or("http");
     wicket_names::check_shape(service, false).map_err(|e| format!("`service`: {e}"))?;
     let scope = match args.get("scope").and_then(Value::as_str).unwrap_or("run") {
@@ -176,6 +182,11 @@ fn ask_public(ctx: &RunCtx, args: &Value) -> Result<String, String> {
         .filter(|i| i.tenant == ctx.tenant.0)
         .map(|i| i.spiffe_id)
         .ok_or("this box has no identity, so it can't hold a name")?;
+    // The limit is checked again when a human approves; here it saves an ask that can't be.
+    let held = l.live_public_names(&principal).map_err(|e| e.to_string())?;
+    if held >= public.per_workload {
+        return Err(format!("you already hold {held} public name(s), as many as this installation allows: revoke one first"));
+    }
     let ask = NameAsk {
         tenant: &ctx.tenant,
         run: &ctx.run,
@@ -189,8 +200,9 @@ fn ask_public(ctx: &RunCtx, args: &Value) -> Result<String, String> {
         scope,
     };
     let (id, fresh) = l.ask_public(&ask).map_err(|e| e.to_string())?;
+    let fqdn = public.fqdn(label);
     if fresh {
-        let body = serde_json::json!({ "id": id, "label": label, "kind": "public", "port": port, "service": service,
+        let body = serde_json::json!({ "id": id, "label": label, "fqdn": fqdn, "kind": "public", "port": port, "service": service,
             "scope": scope.as_str(), "reason": reason });
         if let Err(e) = l.audit(&ctx.tenant, Some(&ctx.run), "name.requested", &body) {
             let _ = l.deny_name(&id, "wicket:audit-failed");
@@ -200,17 +212,14 @@ fn ask_public(ctx: &RunCtx, args: &Value) -> Result<String, String> {
     drop(l);
     ctx.emit(wicket_proxy::Event::Tool {
         name: "request_name".into(),
-        detail: format!("asked for public name {label} (port {port}): {id}"),
+        detail: format!("asked for public name {fqdn} (port {port}): {id}"),
     });
     let lasting = match scope {
         NameScope::Run => "for this run",
-        // Later runs don't take a standing name up yet (#575 step 4b): said, not promised.
-        NameScope::Standing => {
-            "for your workload: this run holds it once approved, and later runs will once wicket gives standing names to them (not yet)"
-        }
+        NameScope::Standing => "for your workload: this run holds it once approved, and each later run of you takes it up when it starts, if no other run holds it",
     };
     Ok(format!(
-        "needs approval: request {id} asks a human for the public name {label} (port {port}, {lasting}). Call await_grant with {id}. Until wicket publishes public records (not yet), an approved name is a record only."
+        "needs approval: request {id} asks a human for the public name {fqdn} (port {port}, {lasting}). Call await_grant with {id}. Until wicket publishes public records (not yet), an approved name is a record only."
     ))
 }
 

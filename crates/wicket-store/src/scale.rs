@@ -146,6 +146,8 @@ impl Ledger {
         let cols = columns(&tx, "requests")?;
         tx.execute(&format!("INSERT INTO requests_archive ({cols}) SELECT {cols} FROM requests WHERE id IN (SELECT id FROM moving)"), [])?;
         tx.execute("DELETE FROM requests WHERE id IN (SELECT id FROM moving)", [])?;
+        // What an agent claimed is shown only while its request is pending; it goes with it.
+        tx.execute("DELETE FROM request_claims WHERE request_id IN (SELECT id FROM moving)", [])?;
         tx.execute("DELETE FROM moving", [])?;
         tx.commit()?;
         Ok((g, q))

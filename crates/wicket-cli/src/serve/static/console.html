@@ -2,8 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#2f6fde">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0f13" media="(prefers-color-scheme: dark)">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="wicket">
 <title>wicket</title>
@@ -15,75 +16,122 @@
 <script src="{{js}}" integrity="{{js_sri}}" defer></script>
 </head>
 <body>
-<header><h1>wicket</h1><span id="tenant"></span></header>
-<div class="blocked" id="stale" hidden></div>
-<main>
-  <div id="auth" class="card" hidden></div>
+<a class="skip" href="#main">Skip to the page</a>
+<!-- The console is organised by what the operator is there to do (docs/explanation/console-design.md):
+     decide what waits and see what is wrong (Inbox), follow agents (Agents), find out what happened
+     (Activity), and set things up (Settings). -->
+<header class="top">
+  <div class="bar"><h1>wicket</h1><span id="tenant"></span></div>
+  <nav id="nav" aria-label="Views" hidden>
+    <a href="#inbox" data-view="inbox" data-label="Inbox" data-noun="request">Inbox<span class="count" id="nav-waiting" hidden></span></a>
+    <a href="#agents" data-view="agents">Agents</a>
+    <a href="#activity" data-view="activity">Activity</a>
+    <a href="#settings" data-view="settings" data-label="Settings" data-noun="problem">Settings<span class="count bad" id="nav-health" hidden></span></a>
+  </nav>
+</header>
+<div class="banner" id="stale" role="status" hidden></div>
+<main id="main">
+  <div id="auth" class="card narrow" hidden></div>
   <div id="console" hidden>
-  <h2>Waiting for you</h2>
-  <div id="pending"></div>
-  <a class="meta" id="standing-pointer" href="#standing"></a>
-  <h2>Runs</h2>
-  <div class="card" id="runs"></div>
-  <!-- A run's authority, or an explained decision (#173): read-only, opened from a row. -->
-  <div class="card" id="detail" hidden>
-    <div class="buttons"><span id="detail-title" class="mono"></span><button type="button" id="detail-close">Close</button></div>
-    <div id="detail-body"></div>
-  </div>
-  <form class="card" id="runform" hidden>
-    <div id="runform-title"></div>
-    <textarea id="runform-text"></textarea>
-    <div class="buttons"><button type="submit" id="runform-go"></button><button type="button" id="runform-cancel">Cancel</button></div>
-  </form>
-  <h2>Nodes</h2>
-  <div class="card" id="health"></div>
-  <div class="card" id="placed"></div>
-  <!-- Standing capacity grants (#256): issuing and renewing one is passkey-signed; revoking isn't. -->
-  <h2>Capacity</h2>
-  <div class="card"><div id="capacity"></div><div id="capacity-form"></div></div>
-  <!-- Standing reach (#572): an agent's ask, decided once with the ledger's evidence (passkey-signed),
-       and the approved rules, renewed (signed) or revoked (session only). -->
-  <h2>Standing reach</h2>
-  <div class="card" id="standing"><div id="standing-asks"></div><div id="standing-rules"></div></div>
-  <h2>Manifests</h2>
-  <div class="card" id="manifests"></div>
-  <!-- A manifest, viewed and edited (#172): every save is passkey-signed. -->
-  <div class="card" id="mfedit" hidden>
-    <div class="buttons"><span id="mfedit-title" class="mono"></span><button type="button" id="mfedit-close">Close</button></div>
-    <div id="mfedit-body"></div>
-  </div>
-  <h2>Secrets</h2>
-  <div class="card" id="secrets"></div>
-  <!-- Store, rebind or delete a secret: every change is passkey-signed. Outside the list, so the refresh
-       doesn't wipe what is being typed; the value field is cleared as soon as it is submitted. -->
-  <form class="card" id="secret-edit" autocomplete="off" hidden>
-    <div id="secret-edit-title"></div>
-    <div id="secret-edit-body"></div>
-    <div class="buttons"><button type="submit" id="secret-edit-go"></button><button type="button" id="secret-edit-cancel">Cancel</button></div>
-  </form>
-  <h2>Start a run</h2>
-  <div class="card" id="start"></div>
-  <h2>Recent decisions</h2>
-  <div class="card" id="decided"></div>
-  <h2>Activity</h2>
-  <p class="note" id="audit-retention"></p>
-  <div class="card log" id="audit"></div>
-  <h2>Policy</h2>
-  <div class="card" id="policy"></div>
-  <h2>Notifications</h2>
-  <div class="card" id="push"></div>
-  <h2>Operator</h2>
-  <div class="card" id="operator"></div>
+
+  <!-- Inbox: one line of how things are, what needs a decision, and what is wrong. -->
+  <section class="view" id="view-inbox" aria-labelledby="inbox-h">
+    <h2 id="inbox-h" class="sr-only">Inbox</h2>
+    <p class="status" id="status" aria-live="polite"></p>
+    <div class="grid inbox">
+      <div>
+        <h3 class="sub" id="waiting-h">Needs you</h3>
+        <div id="pending" class="deck"></div>
+        <!-- An agent's ask to be always allowed something (#572): a request like the others. -->
+        <h3 class="sub" id="standing-pointer" hidden></h3>
+        <div id="standing-asks" class="deck"></div>
+      </div>
+      <div>
+        <h3 class="sub">Problems</h3>
+        <div id="problems" class="card flush"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Agents: who is working, waiting, finished or failed; each opens its own page. -->
+  <section class="view" id="view-agents" aria-labelledby="agents-h" hidden>
+    <div class="view-head"><h2 id="agents-h">Agents</h2><button type="button" class="approve" id="start-open">Start an agent…</button></div>
+    <div class="card" id="start-card" hidden><h3>Start an agent</h3><div id="start"></div></div>
+    <div class="card flush" id="runs"></div>
+  </section>
+
+  <!-- One agent: what it does, what it can reach, what it did; its session; stop it. -->
+  <section class="view" id="view-agent" aria-labelledby="detail-title" hidden>
+    <a class="back" href="#agents">‹ Agents</a>
+    <div id="agent-head"></div>
+    <form class="card" id="runform" hidden>
+      <label id="runform-title" for="runform-text"></label>
+      <textarea id="runform-text"></textarea>
+      <div class="buttons"><button type="submit" id="runform-go"></button><button type="button" id="runform-cancel">Cancel</button></div>
+    </form>
+    <!-- What it can reach, and the token behind it (#173, #651): read-only. Explained decisions open here too. -->
+    <div class="card" id="detail">
+      <div class="card-head"><h3 id="detail-title"></h3><button type="button" id="detail-close" hidden>Close</button></div>
+      <div id="detail-body"></div>
+    </div>
+    <div class="card"><h3>Recent activity</h3><div class="log" id="agent-log"></div></div>
+  </section>
+
+  <!-- Activity: what happened, newest first, in sentences, with what was decided. -->
+  <section class="view" id="view-activity" aria-labelledby="activity-h" hidden>
+    <h2 id="activity-h">Activity</h2>
+    <div class="filters" id="filters" role="group" aria-label="Show"></div>
+    <div class="grid main-side">
+      <div class="card"><p class="note top-note" id="audit-retention"></p><div class="log" id="audit"></div></div>
+      <div class="card"><h3>Recent decisions</h3><div id="decided"></div></div>
+    </div>
+  </section>
+
+  <!-- Settings: what is set up once and changed rarely. -->
+  <section class="view" id="view-settings" aria-labelledby="settings-h" hidden>
+    <h2 id="settings-h">Settings</h2>
+    <div class="grid two">
+      <div class="stack">
+        <div class="card" id="standing"><h3>Always allowed</h3><p class="note top-note">What agents may do without asking each time.</p><div id="standing-rules"></div></div>
+        <div class="card"><h3>Spending limits</h3><p class="note top-note">What may rent servers without asking each time, and how much it may spend.</p><div id="capacity"></div>
+          <details class="more"><summary>Add a spending limit</summary><div id="capacity-form"></div></details>
+        </div>
+        <div class="card"><h3>Servers and the record backup</h3><div id="health"></div></div>
+        <div class="card"><h3>Rented servers</h3><div id="placed"></div></div>
+        <div class="card"><h3>Notifications</h3><div id="push"></div></div>
+      </div>
+      <div class="stack">
+        <div class="card"><h3>API keys and passwords</h3><div id="secrets"></div></div>
+        <!-- Store, rebind or delete a secret: every change is passkey-signed. Outside the list, so the refresh
+             doesn't wipe what is being typed; the value field is cleared as soon as it is submitted. -->
+        <form class="card" id="secret-edit" autocomplete="off" hidden>
+          <h3 id="secret-edit-title"></h3>
+          <div id="secret-edit-body"></div>
+          <div class="buttons"><button type="submit" id="secret-edit-go"></button><button type="button" id="secret-edit-cancel">Cancel</button></div>
+        </form>
+        <div class="card"><h3>Task setups</h3><p class="note top-note">What an agent is started with: its task, what it may reach, its limits.</p><div id="manifests"></div></div>
+        <!-- A manifest, viewed and edited (#172): every save is passkey-signed. -->
+        <div class="card" id="mfedit" hidden>
+          <div class="card-head"><span id="mfedit-title" class="mono"></span><button type="button" id="mfedit-close">Close</button></div>
+          <div id="mfedit-body"></div>
+        </div>
+        <div class="card"><h3>Organisation rules</h3><div id="policy"></div></div>
+        <div class="card"><h3>Your passkeys</h3><div id="operator"></div></div>
+      </div>
+    </div>
+  </section>
   </div>
 </main>
 <!-- What the passkey is about to sign (#124): fixed at the top, and it blocks the page below. -->
 <div id="confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title" hidden>
-  <div class="card">
+  <div class="card sheet">
     <div id="confirm-title">Your passkey will sign exactly this:</div>
     <div id="confirm-what" class="what"></div>
     <div id="confirm-blast" class="blast" hidden></div>
     <div id="confirm-update" class="blast" hidden></div>
+    <!-- The countdown is shown, not announced; state changes are announced in the live region. -->
     <div id="confirm-state" class="meta"></div>
+    <div id="confirm-announce" class="sr-only" aria-live="polite"></div>
     <div class="buttons"><button type="button" id="confirm-go"></button><button type="button" id="confirm-cancel">Cancel</button></div>
   </div>
 </div>

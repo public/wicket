@@ -403,12 +403,8 @@ pub fn resolve(l: &Ledger, who: &str) -> Result<AgentRow> {
 /// or its budget is spent. The checks `wake` makes before it claims, without its records: what a
 /// trigger asks before it counts a wake as done (#578).
 pub fn would_refuse(l: &Ledger, a: &AgentRow) -> Result<Option<String>> {
-    if let Some((node, until)) = crate::noderun::fenced_until(&a.run, wicket_feed::now_ms()) {
-        return Ok(Some(format!(
-            "its last activation (run {}) may still be running on node {node}, until {}",
-            a.run,
-            crate::noderun::fmt_ms(until)
-        )));
+    if let Some((node, until)) = crate::noderun::fenced_until(l, &a.run, wicket_feed::now_ms()) {
+        return Ok(Some(crate::noderun::fence_refusal(&a.run, &node, until)));
     }
     for (r, _) in l.agent_runs(&a.id)? {
         if let Some((rv, _, rby, why)) = l.revoked_in_chain(&r)? {
@@ -485,19 +481,17 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
         // The wake fence (#153): its last activation's box may still be running on a node cut off
         // from this host, until that box's authority ends. Not woken elsewhere until then, unless
         // the node has confirmed the box stopped.
-        if let Some((node, until)) = crate::noderun::fenced_until(&a.run, wicket_feed::now_ms()) {
-            let why = format!(
-                "its last activation (run {}) may still be running on node {node}, which this host can't confirm stopped, until its authority ends: it can be woken from {}, or as soon as node {node} reports the box stopped",
-                a.run,
-                crate::noderun::fmt_ms(until)
-            );
+        if let Some((node, until)) = crate::noderun::fenced_until(&l, &a.run, wicket_feed::now_ms()) {
+            let why = crate::noderun::fence_refusal(&a.run, &node, until);
             l.audit(
                 &TenantId(a.tenant.clone()),
                 None,
                 "agent.wake_refused",
                 &serde_json::json!({ "agent": a.id, "by": by, "why": why, "until_ms": until }),
             )?;
-            bail!("agent {} can't be woken yet: {why}", a.id);
+            // Refused (#574), as when another wake holds the claim: of two wakes at once, the loser
+            // lands here instead once the winner has started its run.
+            return Err(wicket_home::exit::refused(format!("agent {} not woken yet: {why}", a.id)));
         }
         // The same fence in the ledger (#446), which `claim_wake` keeps: a run of the agent still
         // recorded running, its authority not ended. It holds where this host's run files don't,
@@ -514,7 +508,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
                     "agent.wake_refused",
                     &serde_json::json!({ "agent": a.id, "by": by, "why": why, "until_ms": until.saturating_mul(1000) }),
                 )?;
-                bail!("agent {} can't be woken yet: {why}", a.id);
+                return Err(wicket_home::exit::refused(format!("agent {} not woken yet: {why}", a.id)));
             }
         }
         // Where it last ran (its run before this wake): only a tie-break when placing it.

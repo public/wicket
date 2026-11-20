@@ -54,12 +54,15 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => enrol::renew_ca(&name, hosts, ca_ttl, cert_ttl).await,
-            NodeCmd::Set { name, ca_hosts, labels, taints } => set(&name, ca_hosts.as_deref(), &labels, &taints),
+            NodeCmd::Set { name, ca_hosts, labels, taints, public_ipv4, public_ipv6 } => {
+                set(&name, ca_hosts.as_deref(), &labels, &taints, public_ipv4.as_deref(), public_ipv6.as_deref())
+            }
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
             NodeCmd::Forget { run, force } => noderun::forget_command(&run, force, &operator()).await,
+            NodeCmd::ReleaseFence { run, reason } => noderun::release_fence_command(&run, &reason, &operator(), wicket_home::cli_is_root()),
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
@@ -106,13 +109,35 @@ fn marks(labels: &[String], taints: &[String]) -> Result<Vec<Mark>> {
 
 /// `wicket node set`: a node's CA policy, labels and taints, each change audited. Everything is
 /// parsed before anything is written.
-fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String]) -> Result<()> {
-    anyhow::ensure!(ca_hosts.is_some() || !labels.is_empty() || !taints.is_empty(), "say what to set: --ca-hosts, --label or --taint");
+/// A `--public-ipv4` or `--public-ipv6` value: an address, or `none` to clear it.
+fn address<T: std::str::FromStr>(flag: &str, v: Option<&str>) -> Result<wicket_store::AddressChange<T>> {
+    use wicket_store::AddressChange as A;
+    match v {
+        None => Ok(A::Keep),
+        Some("none") => Ok(A::Clear),
+        Some(a) => a.parse().map(A::Set).map_err(|_| wicket_home::exit::usage(format!("--{flag} {a:?}: an address, or none"))),
+    }
+}
+
+fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String], ipv4: Option<&str>, ipv6: Option<&str>) -> Result<()> {
+    anyhow::ensure!(
+        ca_hosts.is_some() || !labels.is_empty() || !taints.is_empty() || ipv4.is_some() || ipv6.is_some(),
+        "say what to set: --ca-hosts, --label, --taint, --public-ipv4 or --public-ipv6"
+    );
     let policy = ca_hosts.map(|c| wicket_store::CaHosts::parse(c).map_err(anyhow::Error::msg)).transpose()?;
     let marks = marks(labels, taints)?;
+    let (v4, v6) = (address::<std::net::Ipv4Addr>("public-ipv4", ipv4)?, address::<std::net::Ipv6Addr>("public-ipv6", ipv6)?);
     let l = Ledger::open(&ledger_path())?;
     if l.node(name)?.is_none() {
         return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
+    }
+    if ipv4.is_some() || ipv6.is_some() {
+        let a = l.set_node_addresses(name, v4, v6, &operator()).map_err(|e| match e {
+            wicket_store::StoreError::Refused(m) => wicket_home::exit::refused(m),
+            e => e.into(),
+        })?;
+        let show = |a: Option<String>| a.unwrap_or_else(|| "none".into());
+        println!("node {name}: public IPv4 {}, IPv6 {}", show(a.ipv4.map(|a| a.to_string())), show(a.ipv6.map(|a| a.to_string())));
     }
     let tenant = wicket_core::TenantId::single();
     if let Some(policy) = policy {
@@ -309,6 +334,17 @@ pub enum NodeCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Release a run's fence without its node (root only, audited as `run.fence_released`): for a
+    /// run whose node can't confirm its box stopped (unreachable or revoked) and whose fence
+    /// wouldn't otherwise end, as when its records don't say when its authority ends. Its agent
+    /// can then be woken. The box may still be running on its node.
+    ReleaseFence {
+        /// The run.
+        run: String,
+        /// Why: it goes on the audit record.
+        #[arg(long)]
+        reason: String,
+    },
     /// On the node: join stdin and stdout to `node serve`'s control socket (what the control host
     /// runs over ssh).
     #[command(hide = true)]
@@ -320,7 +356,8 @@ pub enum NodeCmd {
     /// (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the
     /// node has every label the box's `placement.node_selector` names, and the box tolerates every
     /// taint the node has. A CA widening is a renewal over the run's channel, audited as
-    /// `node.ca_widened`.
+    /// `node.ca_widened`. Its public addresses (#575) are where its boxes' public names point:
+    /// only you set them, never the node.
     Set {
         name: String,
         /// `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its
@@ -334,6 +371,13 @@ pub enum NodeCmd {
         /// `key` or `key=value` taints the node (one taint per key), `key-` removes it. Repeatable.
         #[arg(long = "taint")]
         taints: Vec<String>,
+        /// The node's public IPv4 address (an address on the public internet: the router's, for a
+        /// node behind NAT that forwards its port range), or `none`.
+        #[arg(long)]
+        public_ipv4: Option<String>,
+        /// The node's public IPv6 address, or `none`.
+        #[arg(long)]
+        public_ipv6: Option<String>,
     },
     /// Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity
     /// certificate for its node key, over its pinned ssh: also how a node whose identity certificate
