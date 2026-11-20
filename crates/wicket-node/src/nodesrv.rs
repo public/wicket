@@ -3938,6 +3938,308 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         }
     }
 
+    /// A node for the host-port tests (#575 step 4c, #796 review): a fake `docker exec` that echoes
+    /// and appends a line to `execs` each time it runs, a clock the test moves (`skew`, ms), and a
+    /// feed whose records the test publishes ([`PortsFeed::put`]) and revokes.
+    struct PortsFeed {
+        inst: Install,
+        node: Arc<Node>,
+        skew: Arc<AtomicI64>,
+        execs: PathBuf,
+        p: wicket_feed::Publisher<BoxAuthority>,
+        authz_root: wicket_authz::SigningKey,
+        approver: wicket_authz::SigningKey,
+    }
+
+    impl PortsFeed {
+        fn new(name: &str) -> PortsFeed {
+            use wicket_feed::{KeyCert, Publisher, PublisherConfig};
+            let inst = Install::new(name);
+            let execs = inst.dir.join("execs");
+            let docker = inst.dir.join("fake-docker");
+            std::fs::write(&docker, format!("#!/bin/sh\necho x >> '{}'\nexec cat\n", execs.display())).unwrap();
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut node = test_node(&inst);
+            let skew = Arc::new(AtomicI64::new(0));
+            {
+                let n = Arc::get_mut(&mut node).unwrap();
+                n.docker = Docker::with_command(vec![docker.display().to_string()]);
+                let (base, s) = (node_clock(), skew.clone());
+                n.clock = Arc::new(move || base() + s.load(Ordering::SeqCst));
+            }
+            let root = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let key = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+            let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+            let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+            let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
+            let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
+            let cfg = PublisherConfig { ttl_ms: 30_000, refresh_ms: 100, retain: 100 };
+            let p =
+                Publisher::open_with(&inst.dir.join("pub"), "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
+            *node.replica.lock().unwrap() = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
+            PortsFeed { inst, node, skew, execs, p, authz_root, approver }
+        }
+
+        fn now(&self) -> i64 {
+            (self.node.clock)()
+        }
+
+        /// Box `run`'s record (a running box on this node), publishing `ports` as `(host, until_ms)`:
+        /// the record and its block 0's revocation id.
+        fn put(&mut self, run: &str, ports: &[(u16, i64)]) -> (BoxAuthority, String) {
+            let zone = "{ name: web }";
+            let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
+            let not_after = u64::try_from(self.now() / 1000 + 3600).unwrap();
+            let who = format!("run:{run}");
+            let issuer =
+                wicket_feed::Issuer::root(&self.authz_root, "t0", &who, run, 0, &z, &[], not_after, vec![self.approver.public()]).unwrap();
+            let mut a = issuer.publish(&self.approver, &[]).unwrap();
+            a.ports = ports
+                .iter()
+                .enumerate()
+                .map(|(i, (host_port, until_ms))| wicket_feed::PublishedPort {
+                    name: format!("n-{i}"),
+                    label: "demo".into(),
+                    host_port: *host_port,
+                    box_port: 3000,
+                    until_ms: *until_ms,
+                })
+                .collect();
+            self.commit(vec![wicket_feed::Change::PutZone { zone: a.clone() }]);
+            if !self.node.boxes.lock().unwrap().contains_key(run) {
+                add_box(&self.node, &self.inst, run, zone);
+            }
+            (a, issuer.block_ids()[0].clone())
+        }
+
+        /// Revokes a token block, as `NodeCtl::revoke` publishes it.
+        fn revoke(&mut self, id: &str) {
+            let until = self.now() + 3_600_000;
+            self.commit(vec![wicket_feed::Change::Revoke { kind: wicket_feed::RevokeKind::Token, id: id.into(), until }]);
+        }
+
+        fn commit(&mut self, changes: Vec<wicket_feed::Change<BoxAuthority>>) {
+            let now = self.now();
+            let hello = self.node.replica.lock().unwrap().hello();
+            self.p.commit(changes, now).unwrap();
+            for f in self.p.catch_up(&hello, now).unwrap() {
+                self.node.replica.lock().unwrap().accept(&f, now).unwrap();
+            }
+        }
+
+        fn execs(&self) -> usize {
+            std::fs::read_to_string(&self.execs).map(|s| s.lines().count()).unwrap_or(0)
+        }
+
+        /// The audit records so far: `(kind, run, body)`.
+        fn audit(&self) -> Vec<(String, Option<String>, serde_json::Value)> {
+            let rows = self.node.audit.lock().unwrap().audit_tail(500).unwrap();
+            rows.into_iter().map(|r| (r.2, r.3, serde_json::from_str(&r.4).unwrap_or_default())).collect()
+        }
+
+        /// Waits (up to 5 s) for an audit record of `kind` that `f` accepts.
+        async fn await_audit(&self, kind: &str, f: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+            for _ in 0..100 {
+                if let Some((.., b)) = self.audit().into_iter().find(|(k, _, b)| k == kind && f(b)) {
+                    return b;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("no {kind} as wanted in {:?}", self.audit());
+        }
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A connection on `port` that has been relayed: `ping` sent and echoed back.
+    async fn relayed(port: u16) -> tokio::net::TcpStream {
+        use tokio::io::AsyncReadExt;
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf, b"ping");
+        c
+    }
+
+    /// Whether `c` is ended by the other side within 5 s (end of file or a reset).
+    async fn ends(c: &mut tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut rest = vec![];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut rest)).await.is_ok()
+    }
+
+    /// #796 review: a port whose own end passes closes, by the node's clock alone, and the
+    /// connection it cuts is still recorded (M4).
+    #[tokio::test]
+    async fn a_published_port_closes_when_its_end_passes() {
+        let mut f = PortsFeed::new("nodesrv-ports-expiry");
+        let port = free_port();
+        let until = f.now() + 3_000;
+        f.put("run_web", &[(port, until)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        f.skew.fetch_add(5_000, Ordering::SeqCst);
+        ports::tick(&f.node, Some(&range), &mut st);
+        assert!(ends(&mut c).await, "the live connection is cut");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "nothing listens past the port's end");
+        let a = f.audit();
+        assert!(a.iter().any(|(k, r, _)| k == "name.port.closed" && r.as_deref() == Some("run_web")), "{a:?}");
+        let cut = f.await_audit("name.conn", |b| b["cut"] == true).await;
+        assert_eq!(cut["bytes_in"], 4, "{cut}");
+    }
+
+    /// #796 review: revoking the box's token (block 0, as `NodeCtl::revoke` does) closes its port
+    /// and the connection on it, recorded as cut.
+    #[tokio::test]
+    async fn a_revoked_boxs_port_closes() {
+        let mut f = PortsFeed::new("nodesrv-ports-revoke");
+        let port = free_port();
+        let (_, block0) = f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        f.revoke(&block0);
+        ports::tick(&f.node, Some(&range), &mut st);
+        assert!(ends(&mut c).await, "the live connection is cut");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "nothing listens once revoked");
+        let closed = f.await_audit("name.port.closed", |_| true).await;
+        assert!(closed["why"].as_str().unwrap().contains("authority ended"), "{closed}");
+        f.await_audit("name.conn", |b| b["cut"] == true).await;
+    }
+
+    /// #796 review, M4: a port two boxes claim is opened for neither, and the failure is filed
+    /// under each claiming run, once.
+    #[tokio::test]
+    async fn a_contested_port_opens_for_neither_and_is_filed_under_both() {
+        let mut f = PortsFeed::new("nodesrv-ports-contested");
+        let port = free_port();
+        f.put("run_aaa", &[(port, i64::MAX)]);
+        f.put("run_bbb", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        ports::tick(&f.node, Some(&range), &mut st);
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "neither gets it");
+        let failed: Vec<Option<String>> =
+            f.audit().into_iter().filter(|(k, _, b)| k == "name.port.failed" && b["port"] == port).map(|(_, r, _)| r).collect();
+        assert_eq!(failed.len(), 2, "once for each: {failed:?}");
+        for run in ["run_aaa", "run_bbb"] {
+            assert!(failed.contains(&Some(run.into())), "{run} in {failed:?}");
+        }
+    }
+
+    /// #796 review, H2: a connection that sends nothing is closed after the first-byte timeout
+    /// without a `docker exec`, and counted; one that speaks is relayed.
+    #[tokio::test]
+    async fn a_silent_connection_is_closed_without_an_exec() {
+        let mut f = PortsFeed::new("nodesrv-ports-silent");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().first_byte = std::time::Duration::from_millis(300);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut quiet = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert!(ends(&mut quiet).await, "closed for saying nothing");
+        assert_eq!(f.execs(), 0, "no exec for a silent connection");
+        let _c = relayed(port).await;
+        assert_eq!(f.execs(), 1);
+        let r = f.await_audit("name.conn.refused", |b| b["silent"] == 1).await;
+        assert_eq!(r["refused"], 0, "{r}");
+    }
+
+    /// #796 review, H2: one peer address holds at most `per_peer` connections on a port; past it
+    /// a connection is refused before any exec, and counted. Connections ending past the
+    /// per-tick record count are recorded as one aggregate.
+    #[tokio::test]
+    async fn a_peer_over_its_cap_is_refused_and_many_ends_aggregate() {
+        let mut f = PortsFeed::new("nodesrv-ports-peer");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        {
+            let l = Arc::get_mut(&mut st.limits).unwrap();
+            l.per_peer = 2;
+            l.conn_records = 2;
+        }
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let (a, b) = (relayed(port).await, relayed(port).await);
+        let mut third = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let _ = third.write_all(b"ping").await;
+        assert!(ends(&mut third).await, "a third from the same address is refused");
+        assert_eq!(f.execs(), 2, "no exec for the refused one");
+        f.await_audit("name.conn.refused", |b| b["over_peer"] == 1).await;
+        // Once one ends, the address may connect again; three ending in a tick aggregate.
+        drop((a, b));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(relayed(port).await);
+        // (Whether they land in one serve tick is timing: ports' own test checks the aggregate.)
+        let n = f.await_audit("name.conn", |b| b["aggregate"] == true || b.get("peer").is_some()).await;
+        assert!(n["port"] == port, "{n}");
+    }
+
+    /// #796 review, M1: revoking the run itself (not a block of its token) closes its port, as
+    /// every other decision the node makes refuses it.
+    #[tokio::test]
+    async fn a_revoked_run_closes_its_port() {
+        let mut f = PortsFeed::new("nodesrv-ports-revoke-run");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        let until = f.now() + 3_600_000;
+        f.commit(vec![wicket_feed::Change::Revoke { kind: wicket_feed::RevokeKind::Run, id: "run_web".into(), until }]);
+        ports::tick(&f.node, Some(&range), &mut st);
+        assert!(ends(&mut c).await, "the live connection is cut");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "nothing listens for a revoked run");
+    }
+
+    /// #796 review, M1: offline (no live statement, the control host out of reach), the node
+    /// still publishes from what it holds, as it decides everything else then.
+    #[tokio::test]
+    async fn an_offline_node_keeps_its_ports() {
+        let mut f = PortsFeed::new("nodesrv-ports-offline");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        f.skew.fetch_add(40_000, Ordering::SeqCst);
+        let mode = f.node.replica.lock().unwrap().mode(f.now());
+        assert_eq!(mode, wicket_feed::Mode::Offline);
+        ports::tick(&f.node, Some(&range), &mut st);
+        drop(relayed(port).await);
+    }
+
+    /// #796 review, H2: a connection with no bytes either way for the idle timeout is closed,
+    /// and recorded.
+    #[tokio::test]
+    async fn an_idle_connection_is_closed() {
+        let mut f = PortsFeed::new("nodesrv-ports-idle");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().idle = std::time::Duration::from_millis(300);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        assert!(ends(&mut c).await, "closed for carrying nothing");
+        let rec = f.await_audit("name.conn", |b| b.get("peer").is_some()).await;
+        assert_eq!((rec["bytes_in"].clone(), rec["bytes_out"].clone()), (4.into(), 4.into()), "{rec}");
+    }
+
     fn add_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {
         let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
         let mut rec = fake_record(run);

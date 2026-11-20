@@ -12,7 +12,8 @@ type: Added
     own copy of the feed: it closes a port within 2 s of its feed saying the name is revoked, and
     when the box's authority or the name's end passes, the last also while the control host is
     out of reach (a node that can't hear of a revoke keeps the port until one of those ends). It copies each connection's bytes into the
-    box's port, at most 64 at once per name: layer 4 only, no TLS, no HTTP, no routing by name.
+    box's port once its first byte has come, at most 64 at once and 8 per peer per name and 256 per
+    node, closing idle ones after 5 minutes: layer 4 only, no TLS, no HTTP, no routing by name.
     Audited on the node as `name.port.opened`, `name.port.closed`, `name.port.failed`,
     `name.conn` and `name.conn.refused`.
   - A node publishes only the ports in its `publish.json`, which `wicket node install` writes for

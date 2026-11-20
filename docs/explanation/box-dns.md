@@ -224,7 +224,13 @@ protocol 21. The node publishes from its replica alone, every 2 s, so it works o
 restarts: a port in its range (`publish.json` in its directory, written by `wicket node install` for
 a node with the `names.public.nodes` labels; without it the node publishes nothing), unexpired,
 claimed by one box, whose authority holds on the node. It listens on one IPv6 socket that takes
-IPv4 too, and dials each connection into the box (`wicket-fwd`), at most 64 at once per name. A port
+IPv4 too (IPv4 alone where IPv6 is off), and dials each connection into the box (`wicket-fwd`)
+once its first byte has come (within 10 s), closing it after 5 minutes without a byte either way.
+Per name it holds at most 64 at once and takes 128 new per 2 s, 8 per peer address; per node, 256
+at once and 256 new per 2 s. The limits are checked before anything else, and refusals are counted,
+not recorded one by one; under load, a tick's ended connections are one `name.conn` record. It
+publishes only while its feed is fresh, or offline within its grace, and the box's authority holds
+there as for any other decision (not revoked, its issuing key certified). A port
 that stops being published closes within 2 s of the node's feed saying so, with its connections,
 before DNS catches up; a node cut off from its control host can't hear of a revoke, and closes the
 port when the box's authority or the name's end passes. **Layer 4
