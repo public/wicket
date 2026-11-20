@@ -2808,8 +2808,6 @@ fn attach_failed_in(l: &Ledger, run: &str, run_dir: &Path, why: &str, now_ms: i6
     if l.run_status(run).ok().flatten().as_deref() != Some("running") {
         return;
     }
-    let tenant = l.run_tenant(run).ok().flatten().unwrap_or_else(wicket_core::TenantId::single);
-    let clipped = wicket_agent::clip(why, 300);
     // Its box may still run on its node (#676: a manifest a later version no longer loads fails the
     // takeover, not the box; a standby restored from the state store has no run record to take it
     // over from, #154): not ended while held, or the ledger's fence on its agent would lift with
@@ -2817,33 +2815,44 @@ fn attach_failed_in(l: &Ledger, run: &str, run_dir: &Path, why: &str, now_ms: i6
     // node after MAX_ATTACH_FAILURES.
     let cap_ms = l.run_authority(run).ok().flatten().map(|(_, cap)| cap.saturating_mul(1000));
     let fenced = crate::noderun::fenced_in(run_dir, now_ms, cap_ms);
-    let held = match crate::noderun::held_until(l, run, now_ms, fenced, crate::noderun::has_run_record(run_dir)) {
-        Ok(h) => h,
-        // Not ended on a ledger it couldn't read: the reconciler tries again.
-        Err(_) => return,
-    };
-    if let Some(h) = held {
-        let (failures, audit) = record_attach_failure(l, run, run_dir, &clipped, now_ms / 1000);
-        if audit {
-            let _ = l.audit(
-                &tenant,
-                Some(&RunId(run.to_string())),
-                "run.attach_failed",
-                &serde_json::json!({
-                    "why": clipped,
-                    "node": h.node,
-                    "fenced": crate::noderun::held_for(h.until_ms),
-                    "held_by": if h.by_ledger { "ledger" } else { "run records" },
-                    "failures": failures.count,
-                }),
-            );
+    let held = crate::noderun::held_until(l, run, now_ms, fenced, crate::noderun::has_run_record(run_dir));
+    attach_failed_held(l, run, run_dir, why, now_ms, held);
+}
+
+/// [`attach_failed_in`] once whether the run's box may still run is known (`held`): held, its
+/// failure is recorded and the run left running; not held, it is lost. A ledger that couldn't be
+/// read to tell is said, and counts as held: the failure is recorded beside the run (no ledger
+/// needed), so the reconciler backs off and stops the box after MAX_ATTACH_FAILURES as for any other.
+fn attach_failed_held(l: &Ledger, run: &str, run_dir: &Path, why: &str, now_ms: i64, held: Result<Option<crate::noderun::Held>>) {
+    let tenant = l.run_tenant(run).ok().flatten().unwrap_or_else(wicket_core::TenantId::single);
+    let clipped = wicket_agent::clip(why, 300);
+    let (reason, node, fenced, held_by) = match held {
+        Ok(Some(h)) => (clipped.clone(), h.node, crate::noderun::held_for(h.until_ms), if h.by_ledger { "ledger" } else { "run records" }),
+        Ok(None) => {
+            let reason = format!("its supervisor is gone and it could not be taken over: {clipped}");
+            // And its agent, if it was the agent's activation (#474).
+            let _ = l.run_lost(run, &reason);
+            let _ = l.audit(&tenant, Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
+            return;
         }
-        return;
+        Err(e) => {
+            say_err!("[wicket] run {run}: the ledger couldn't be read to tell whether its box may still run, so it is kept: {e:#}");
+            let reason = wicket_agent::clip(
+                &format!("{clipped} (and the ledger couldn't be read to tell whether its box may still run: {e:#})"),
+                400,
+            );
+            (reason, "its node".to_string(), "until the ledger can be read".to_string(), "unreadable ledger")
+        }
+    };
+    let (failures, audit) = record_attach_failure(l, run, run_dir, &reason, now_ms / 1000);
+    if audit {
+        let _ = l.audit(
+            &tenant,
+            Some(&RunId(run.to_string())),
+            "run.attach_failed",
+            &serde_json::json!({ "why": reason, "node": node, "fenced": fenced, "held_by": held_by, "failures": failures.count }),
+        );
     }
-    let reason = format!("its supervisor is gone and it could not be taken over: {clipped}");
-    // And its agent, if it was the agent's activation (#474).
-    let _ = l.run_lost(run, &reason);
-    let _ = l.audit(&tenant, Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
 }
 
 /// Starts a new supervisor for `run` (`wicket attach <run>`), detached, its output in
@@ -3044,6 +3053,26 @@ mod tests {
         assert_eq!(known_attach_failures(&l, "run_a", &d), None);
         attach_recovered(&l, &t, "run_b", &e);
         assert_eq!(known_attach_failures(&l, "run_b", &e), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #676: a takeover that fails while the ledger can't be read to tell whether its box may still
+    /// run keeps the run and records the failure beside it, so the reconciler backs off from it.
+    #[test]
+    fn a_failed_takeover_on_an_unreadable_ledger_is_recorded_not_lost() {
+        let d = std::env::temp_dir().join(format!("wicket-attach-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        let l = Ledger::open_in_memory().unwrap();
+        l.run_started(&wicket_core::TenantId::single(), &RunId("run_u".into()), "z", "a").unwrap();
+        let now = wicket_store::now();
+        attach_failed_held(&l, "run_u", &d, "no node", now * 1000, Err(anyhow::anyhow!("disk I/O error")));
+        assert_eq!(l.run_status("run_u").unwrap().as_deref(), Some("running"));
+        let f = attach_failures(&d).expect("recorded beside the run");
+        assert_eq!(f.count, 1);
+        assert!(f.why.contains("disk I/O error"), "{}", f.why);
+        let (_, _, body) = l.last_run_audit("run_u", &["run.attach_failed"]).unwrap().unwrap();
+        assert_eq!(body["held_by"].as_str(), Some("unreadable ledger"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

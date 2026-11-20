@@ -2164,7 +2164,8 @@ pub fn held_until(
     }
     let Some((_, cap)) = l.run_authority(run)? else { return Ok(None) };
     let until_ms = cap.saturating_add(1 + wicket_store::WAKE_SKEW_SECS).saturating_mul(1000);
-    let node = l.run_node(run)?.unwrap_or_else(|| "its node".into());
+    // Only the hold's words: a node that can't be read is "its node".
+    let node = l.run_node(run).ok().flatten().unwrap_or_else(|| "its node".into());
     Ok((now_ms < until_ms).then_some(Held { node, until_ms, by_ledger: true }))
 }
 

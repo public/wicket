@@ -970,10 +970,22 @@ impl Docker {
     pub async fn kill(&self, name: &str) -> Result<()> {
         let _t = self.span("kill");
         let Some(paused) = self.kill_once(name).await? else { return Ok(()) };
-        self.unpause(name).await.with_context(|| format!("unpausing it to kill it ({paused})"))?;
-        match self.kill_once(name).await? {
-            None => Ok(()),
-            Some(m) => bail!("docker kill failed: {m}"),
+        if let Err(e) = self.unpause(name).await {
+            // It may have been unpaused, or gone, meanwhile: one more kill tells.
+            return match self.kill_once(name).await {
+                Ok(None) => Ok(()),
+                _ => Err(e.context(format!("unpausing it to kill it ({paused})"))),
+            };
+        }
+        let e = match self.kill_once(name).await {
+            Ok(None) => return Ok(()),
+            Ok(Some(m)) => anyhow::anyhow!("docker kill failed: {m}"),
+            Err(e) => e,
+        };
+        // Not left running unpaused: paused again before the error.
+        match self.pause(name).await {
+            Ok(()) => Err(e.context("killing it after unpausing it (it is paused again)")),
+            Err(p) => Err(e.context(format!("killing it after unpausing it, and pausing it again failed too: {p:#}"))),
         }
     }
 
@@ -1741,6 +1753,36 @@ mod tests {
         });
         fake.docker().kill("wicket-x").await.unwrap();
         assert!(fake.seen().contains(&("POST".into(), "/containers/wicket-x/unpause".into())), "{:?}", fake.seen());
+        // Unpaused, then the kill fails: paused again, and the kill's error returned.
+        let fake = FakeEngine::start("kill-repause", {
+            let unpaused = std::sync::atomic::AtomicBool::new(false);
+            move |m, p, _| match (m, p.rsplit('/').next().unwrap_or_default()) {
+                ("POST", "unpause") => {
+                    unpaused.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Reply::Json(204, serde_json::json!({}))
+                }
+                ("POST", "pause") => Reply::Json(204, serde_json::json!({})),
+                ("POST", "kill") if unpaused.load(std::sync::atomic::Ordering::SeqCst) => {
+                    Reply::Json(500, serde_json::json!({ "message": "the runtime went away" }))
+                }
+                _ => Reply::Json(409, serde_json::json!({ "message": paused })),
+            }
+        });
+        let e = fake.docker().kill("wicket-x").await.unwrap_err();
+        assert!(format!("{e:#}").contains("the runtime went away") && format!("{e:#}").contains("paused again"), "{e:#}");
+        assert!(fake.seen().contains(&("POST".into(), "/containers/wicket-x/pause".into())), "{:?}", fake.seen());
+        // The unpause fails, but the box is gone by then: one more kill says so.
+        let fake = FakeEngine::start("kill-gone", {
+            let tries = std::sync::atomic::AtomicU32::new(0);
+            move |m, p, _| match (m, p.rsplit('/').next().unwrap_or_default()) {
+                ("POST", "unpause") => Reply::Json(409, serde_json::json!({ "message": "Container wicket-x is not paused" })),
+                ("POST", "kill") if tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 => {
+                    Reply::Json(404, serde_json::json!({ "message": "No such container: wicket-x" }))
+                }
+                _ => Reply::Json(409, serde_json::json!({ "message": paused })),
+            }
+        });
+        fake.docker().kill("wicket-x").await.unwrap();
         for (code, msg, ok) in [
             (204, "", true),
             (404, "No such container: wicket-x", true),

@@ -365,7 +365,14 @@ where
     /// box's authority ([`crate::noderun::held_until`], the rule a failed takeover holds by too).
     fn may_still_run(&self, run: &str) -> Result<Option<String>> {
         let fenced = (self.fenced)(self.ledger, run, self.now.saturating_mul(1000));
-        let held = crate::noderun::held_until(self.ledger, run, self.now.saturating_mul(1000), fenced, (self.has_run_record)(run))?;
+        let held = match crate::noderun::held_until(self.ledger, run, self.now.saturating_mul(1000), fenced, (self.has_run_record)(run))
+            .with_context(|| format!("deciding whether run {run}'s box may still run"))
+        {
+            Ok(h) => h,
+            // Kept, and said so, rather than failing the whole pass: nothing is ended on a ledger
+            // that couldn't be read.
+            Err(e) => return Ok(Some(format!("{e:#}, so it is kept"))),
+        };
         Ok(held.map(|h| match (h.by_ledger, h.until_ms) {
             (true, u) => {
                 format!("it has no run record here, and the ledger has its box authorized there until {}", crate::noderun::fmt_ms(u))
@@ -1495,6 +1502,8 @@ mod tests {
         killed: Arc<Mutex<Vec<String>>>,
         /// A kill that says it worked but leaves the box running.
         ignores_kills: Arc<Mutex<bool>>,
+        /// A kill that fails (Docker or ssh refused it).
+        fails_kills: Arc<Mutex<bool>>,
     }
 
     impl FakeBoxes {
@@ -1516,6 +1525,9 @@ mod tests {
             Ok(self.boxes.lock().unwrap().clone())
         }
         async fn kill(&self, name: &str) -> Result<()> {
+            if *self.fails_kills.lock().unwrap() {
+                anyhow::bail!("docker kill failed: ssh: connection reset");
+            }
             if !*self.ignores_kills.lock().unwrap() {
                 self.boxes.lock().unwrap().retain(|b| b.name != name);
             }
@@ -1760,13 +1772,22 @@ mod tests {
         let sticky = FakeBoxes::with(&[("box_sticky", "run_sticky", "dead:1:1")]);
         *sticky.ignores_kills.lock().unwrap() = true;
         w.nodes.insert("n3".into(), sticky);
+        let failing = FakeBoxes::with(&[("box_fail", "run_fail", "dead:1:1")]);
+        *failing.fails_kills.lock().unwrap() = true;
+        w.nodes.insert("n4".into(), failing);
         // This host's own node runs its boxes on the Docker the pass lists (it has no node_boxes).
         let own = crate::localnode::NAME;
         w.local = FakeBoxes::with(&[("box_own", "run_own", "dead:1:1")]);
         let mut l = Ledger::open_in_memory().unwrap();
-        for (run, node) in
-            [("run_stuck", "n1"), ("run_back", "n1"), ("run_ghost", "n1"), ("run_ledger", "n2"), ("run_sticky", "n3"), ("run_own", own)]
-        {
+        for (run, node) in [
+            ("run_stuck", "n1"),
+            ("run_back", "n1"),
+            ("run_ghost", "n1"),
+            ("run_ledger", "n2"),
+            ("run_sticky", "n3"),
+            ("run_fail", "n4"),
+            ("run_own", own),
+        ] {
             l.run_started(&TenantId::single(), &RunId(run.into()), "z", "a").unwrap();
             l.set_run_owner(run, "dead:1:1").unwrap();
             l.set_run_node(run, node).unwrap();
@@ -1780,7 +1801,7 @@ mod tests {
         fn failures(_: &Ledger, run: &str) -> Option<crate::run::AttachFailures> {
             let f = |count, why: &str| crate::run::AttachFailures { count, last_at: NOW - 10, why: why.into() };
             match run {
-                "run_stuck" | "run_sticky" | "run_ghost" | "run_own" => {
+                "run_stuck" | "run_sticky" | "run_ghost" | "run_fail" | "run_own" => {
                     Some(f(crate::run::MAX_ATTACH_FAILURES, "its manifest no longer loads"))
                 }
                 "run_back" => Some(f(2, "its manifest no longer loads")),
@@ -1802,6 +1823,7 @@ mod tests {
         asked.insert("n1".to_string(), live(&["run_stuck", "run_back", "run_ghost"]));
         asked.insert("n2".to_string(), None);
         asked.insert("n3".to_string(), live(&["run_sticky"]));
+        asked.insert("n4".to_string(), live(&["run_fail"]));
         asked.insert(own.to_string(), live(&["run_own"]));
         let d = pass_at(&w, &mut l, &asked, NOW).await;
         // Backed off: its second failure was 10 s ago, and it waits 120 s.
@@ -1815,6 +1837,9 @@ mod tests {
         assert!(d.iter().any(|x| x.kind == "box_stopped" && x.target == "box_own"), "{d:?}");
         // Listed running by its node, with no box in its Docker: said so, nothing killed for it.
         assert!(d.iter().any(|x| x.kind == "error" && x.target == "run_ghost" && x.detail.contains("lists no box")), "{d:?}");
+        // A kill that failed: said so, and not taken for a stop.
+        assert!(d.iter().any(|x| x.kind == "error" && x.target == "box_fail" && x.detail.contains("connection reset")), "{d:?}");
+        assert!(!d.iter().any(|x| x.kind == "box_stopped" && x.target == "box_fail"), "{d:?}");
         // A kill that didn't stop its box: it is still listed, so it isn't taken for stopped.
         assert_eq!(w.nodes["n3"].killed(), vec!["box_sticky".to_string()]);
         assert!(d.iter().any(|x| x.kind == "error" && x.target == "box_sticky" && x.detail.contains("still runs")), "{d:?}");
@@ -1843,6 +1868,7 @@ mod tests {
         assert_eq!(w.nodes["n1"].killed(), vec!["box_stuck".to_string()], "not killed again");
         assert_eq!(l.run_status("run_sticky").unwrap().as_deref(), Some("running"), "its box still runs");
         assert_eq!(l.run_status("run_own").unwrap().as_deref(), Some(LOST));
+        assert_eq!(l.run_status("run_fail").unwrap().as_deref(), Some("running"), "its kill failed");
         // Past the ledger's hard end of its authority (and the skew), the unreachable run ends.
         pass_at(&w, &mut l, &asked, NOW + 600 + 30).await;
         assert_eq!(l.run_status("run_ledger").unwrap().as_deref(), Some("running"), "not before the skew has passed");
