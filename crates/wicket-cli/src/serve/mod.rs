@@ -62,6 +62,7 @@ mod fence;
 pub(crate) mod limits;
 mod manifests;
 pub(crate) mod net;
+mod placed;
 mod placement;
 mod push;
 mod secrets;
@@ -219,6 +220,12 @@ enum Action {
         reason: String,
         effect: String,
     },
+    /// Release a placed node past its lease (#710), on the effect the passkey signed.
+    NodeRelease {
+        id: String,
+        reason: String,
+        effect_sha256: String,
+    },
 }
 
 enum Purpose {
@@ -244,6 +251,9 @@ type Launcher = Box<dyn Fn(&Launch) -> Result<()> + Send + Sync>;
 /// Applies an approved update request (#465): the real one runs `wicket self apply-update`
 /// detached; tests record instead. Given the request and the log to write.
 type Updater = Box<dyn Fn(&str, &std::path::Path) -> Result<()> + Send + Sync>;
+/// Releases a placed node the console decided to release (#710): the real one asks the provider
+/// in the background ([`placed::release_in_background`]); tests record instead.
+type Releaser = Box<dyn Fn(placed::Release) -> Result<()> + Send + Sync>;
 /// The verified identity of a run's agent (crate::verified_identity; replaceable in tests, which
 /// have no issuer key).
 type IdentityCheck = fn(&Ledger, &str) -> Value;
@@ -269,6 +279,7 @@ struct State {
     roots: Vec<(String, PathBuf)>,
     launcher: Launcher,
     updater: Updater,
+    releaser: Releaser,
     identity: IdentityCheck,
     challenges: Mutex<HashMap<String, Pending>>,
     limiter: Limiter,
@@ -329,6 +340,7 @@ impl State {
             roots,
             launcher,
             updater: Box::new(|_, _| bail!("this console doesn't apply updates")),
+            releaser: Box::new(|_| bail!("this console doesn't release nodes")),
             identity,
             challenges: Mutex::new(HashMap::new()),
             limiter: Limiter::default(),
@@ -401,6 +413,8 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         |l, run| crate::verified_identity(l, run, None),
     );
     state.updater = Box::new(move |request, log| apply_update_detached(&update_exe, request, log));
+    let release_ledger = ledger_path();
+    state.releaser = Box::new(move |r| placed::release_in_background(release_ledger.clone(), r));
     state.trusted = plan.trusted.clone();
     state.authority = plan.authority.clone();
     state.hsts = plan.hsts;
@@ -1441,8 +1455,9 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         Some("standing_deny") => standing::build_deny(state, &l, body),
         Some("standing_renew") => standing::build_renew(state, &l, body),
         Some("release_fence") => fence::build_release(state, oc, &l, body),
+        Some("node_release") => placed::build(state, &l, oc, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew or release_fence",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence or node_release",
         )),
     }
 }
@@ -1714,6 +1729,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::StandingDeny { id } => standing::apply_deny(state, &l, oc, id, signed),
         Action::StandingRenew { id, ttl_secs } => standing::apply_renew(state, &l, oc, id, *ttl_secs, signed),
         Action::ReleaseFence { run, reason, effect } => fence::apply_release(state, &l, oc, run, reason, effect, signed),
+        Action::NodeRelease { id, reason, effect_sha256 } => placed::apply(state, &l, oc, id, reason, effect_sha256, signed),
     }
 }
 
@@ -2254,6 +2270,7 @@ mod tests {
     mod https;
     mod manifests;
     mod notify;
+    mod placed;
     mod placement;
     mod secrets;
     mod session;
