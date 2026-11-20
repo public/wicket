@@ -242,13 +242,17 @@ const _: () = assert!(SCHEMA_FLOOR <= SCHEMA_VERSION);
 /// `messages.kind` (#253): a peer's message (pulled with `await_message`, signed by its sender),
 /// an operator's prompt, or a notice from wicket (each pushed as the agent's next turn).
 pub const KIND_MESSAGE: &str = "message";
+/// A message an operator signed (#252): delivered as a peer's message is, but a kind of its own, so
+/// a previous build (whose queries read `kind = 'message'` and verify only agents' envelopes)
+/// leaves it alone rather than taking it and refusing it ([`previous_build`]).
+pub const KIND_OPERATOR_MESSAGE: &str = "operator-message";
 pub const KIND_PROMPT: &str = "prompt";
 pub const KIND_NOTICE: &str = "notice";
 /// Who a notice is from, as shown.
 pub const NOTICE_LABEL: &str = "wicket";
 /// The SQL condition for a row that is a turn (a prompt or a notice), and for a peer's message.
 pub(crate) const TURNS: &str = "kind IN ('prompt', 'notice')";
-pub(crate) const PEER: &str = "kind = 'message'";
+pub(crate) const PEER: &str = "kind IN ('message', 'operator-message')";
 
 /// A prompt or notice taken for a run: its message id, text, who it shows as, and the operator's
 /// principal id (None for a notice, and for prompts recorded before #253).
@@ -1246,8 +1250,8 @@ impl Ledger {
                 .optional()?,
         };
         tx.execute(
-            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 tenant.0,
@@ -1258,7 +1262,8 @@ impl Ledger {
                 to,
                 meta.from_principal,
                 meta.priority.as_str(),
-                meta.in_reply_to
+                meta.in_reply_to,
+                if meta.operator { KIND_OPERATOR_MESSAGE } else { KIND_MESSAGE }
             ],
         )?;
         tx.commit()?;
@@ -1339,7 +1344,7 @@ impl Ledger {
     /// `run` (already read, or someone else's).
     pub fn message_read(&self, run: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE messages SET delivered_at = ?3 WHERE id = ?1 AND to_run = ?2 AND kind = 'message' AND delivered_at IS NULL",
+            &format!("UPDATE messages SET delivered_at = ?3 WHERE id = ?1 AND to_run = ?2 AND {PEER} AND delivered_at IS NULL"),
             params![id, run, now()],
         )?;
         Ok(n == 1)
@@ -1350,7 +1355,7 @@ impl Ledger {
     /// has had. How many.
     pub fn requeue_in_flight(&self, run: &str) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE messages SET taken_at = NULL WHERE to_run = ?1 AND kind = 'message' AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            &format!("UPDATE messages SET taken_at = NULL WHERE to_run = ?1 AND {PEER} AND delivered_at IS NULL AND taken_at IS NOT NULL"),
             params![run],
         )?)
     }
@@ -1359,7 +1364,7 @@ impl Ledger {
     /// node (the link dropped first). False if it wasn't in flight for `run`.
     pub fn requeue_message(&self, run: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE messages SET taken_at = NULL WHERE id = ?1 AND to_run = ?2 AND kind = 'message' AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            &format!("UPDATE messages SET taken_at = NULL WHERE id = ?1 AND to_run = ?2 AND {PEER} AND delivered_at IS NULL AND taken_at IS NOT NULL"),
             params![id, run],
         )?;
         Ok(n == 1)
@@ -1367,7 +1372,7 @@ impl Ledger {
 
     /// Every stored envelope (id, envelope, created_at), for offline verification.
     pub fn envelopes(&self) -> Result<Vec<(String, String, i64)>> {
-        let mut st = self.conn.prepare("SELECT id, envelope, created_at FROM messages WHERE kind = 'message' ORDER BY created_at")?;
+        let mut st = self.conn.prepare(&format!("SELECT id, envelope, created_at FROM messages WHERE {PEER} ORDER BY created_at"))?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }

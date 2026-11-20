@@ -81,6 +81,8 @@ pub struct MessageMeta<'a> {
     pub from_principal: Option<&'a str>,
     pub priority: Priority,
     pub in_reply_to: Option<&'a str>,
+    /// Signed by an operator (#252): recorded as [`crate::KIND_OPERATOR_MESSAGE`].
+    pub operator: bool,
 }
 
 /// A recorded message's addressing, without its envelope: what a reply is checked against.

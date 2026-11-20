@@ -32,11 +32,24 @@ fn acts_for(jws: &str, issued_at: i64, issuer: &wicket_identity::VerifyingKey, o
         .is_ok_and(|c| c.principal.get("sub").and_then(|s| s.as_str()) == Some(operator))
 }
 
-/// Whether `in_reply_to` names a message `from` sent to `to` in `tenant`.
-fn answers(l: &Ledger, tenant: &str, m: &str, from: &str, to: &str) -> std::result::Result<bool, String> {
-    Ok(l.message_row(m)
-        .map_err(|e| e.to_string())?
-        .is_some_and(|r| r.tenant == tenant && r.to_principal.as_deref() == Some(to) && r.from_principal.as_deref() == Some(from)))
+/// The longest `in_reply_to` taken: a message id wicket makes (`m-` and a ULID) is 28 bytes.
+const MAX_REPLY_ID: usize = 64;
+
+/// Whether this message answers one (`in_reply_to`), checked whatever else lets it go (#252
+/// review): it must name a message `other` sent `me` in `tenant`. So the id a recipient is shown is
+/// one wicket recorded between those two, never text the sender chose. Err: it names none.
+fn reply(l: &Ledger, tenant: &str, in_reply_to: Option<&str>, other: &str, me: &str) -> std::result::Result<bool, SendError> {
+    let Some(m) = in_reply_to else { return Ok(false) };
+    let shaped = m.len() <= MAX_REPLY_ID && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let found = shaped
+        && l.message_row(m).map_err(|e| e.to_string())?.is_some_and(|r| {
+            r.tenant == tenant && r.to_principal.as_deref() == Some(me) && r.from_principal.as_deref() == Some(other)
+        });
+    if !found {
+        let shown = if shaped { m.to_string() } else { "(not a message id)".into() };
+        return Err(format!("in_reply_to {shown} is not a message {other} sent you").into());
+    }
+    Ok(true)
 }
 
 /// [`RunCtx::send`] to an operator: allowed to the one the agent acts for, or as a reply.
@@ -59,15 +72,21 @@ pub(crate) fn agent_to_operator(
     }
     let sub = me.claims.sub.as_str();
     let yours = me.claims.principal.get("sub").and_then(|s| s.as_str());
-    let relation = if yours == Some(to) {
-        "operator"
-    } else if let Some(m) = opts.in_reply_to {
-        if !answers(l, &ctx.tenant.0, m, to, sub)? {
-            return Err(format!("in_reply_to {m} is not a message {to} sent you").into());
-        }
-        "reply"
-    } else {
-        ""
+    // The one rule (`message::relation`): the operator it acts for stands where a parent does; an
+    // operator has no accept_from, so any other may only be answered.
+    let none: &[&str] = &[];
+    let facts = wicket_core::message::Facts {
+        to_child: false,
+        to_parent: yours == Some(to),
+        accept_from: none,
+        sender_zone: &ctx.zone.name,
+        sender: Some(sub),
+        reply: reply(l, &ctx.tenant.0, opts.in_reply_to, to, sub)?,
+    };
+    let relation = match wicket_core::message::relation(&facts) {
+        Some(wicket_core::message::Relation::Parent) => "operator",
+        Some(r) => r.as_str(),
+        None => "",
     };
     let id = format!("m-{}", wicket_core::new_ulid().to_string().to_lowercase());
     if relation.is_empty() {
@@ -90,7 +109,7 @@ pub(crate) fn agent_to_operator(
         "reply_to": sub, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
     });
     let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
-    let meta = wicket_store::MessageMeta { from_principal: Some(sub), priority: opts.priority, in_reply_to: opts.in_reply_to };
+    let meta = wicket_store::MessageMeta { from_principal: Some(sub), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: false };
     l.post_message(&id, &ctx.tenant, &ctx.run.0, to, None, &env, &meta).map_err(|e| e.to_string())?;
     let audited = l.audit(
         &ctx.tenant,
@@ -163,17 +182,22 @@ pub fn send_as_operator(
         Some(r) if r.tenant == tenant.0 => r,
         _ => return Err(format!("no agent {to}: none has run as it in this tenant").into()),
     };
-    let relation = if acts_for(&rec.jws, rec.issued_at, &issuer.verifying_key(), &me) {
-        "operator"
-    } else if wicket_core::manifest::accepts(&rec.accept_from, "", Some(&me)) {
-        "peer"
-    } else if let Some(m) = opts.in_reply_to {
-        if !answers(&l, &tenant.0, m, to, &me)? {
-            return Err(format!("in_reply_to {m} is not a message {to} sent you").into());
-        }
-        "reply"
-    } else {
-        ""
+    // The one rule (`message::relation`): an agent that acts for the operator is where a child is;
+    // else its accept_from must name the operator's principal (an operator has no zone, and an
+    // empty entry, which no manifest may have, names nothing), else it must be a reply.
+    let accept_from: Vec<&str> = rec.accept_from.iter().map(String::as_str).filter(|e| !e.is_empty()).collect();
+    let facts = wicket_core::message::Facts {
+        to_child: acts_for(&rec.jws, rec.issued_at, &issuer.verifying_key(), &me),
+        to_parent: false,
+        accept_from: &accept_from,
+        sender_zone: "",
+        sender: Some(&me),
+        reply: reply(&l, &tenant.0, opts.in_reply_to, to, &me)?,
+    };
+    let relation = match wicket_core::message::relation(&facts) {
+        Some(wicket_core::message::Relation::Child) => "operator",
+        Some(r) => r.as_str(),
+        None => "",
     };
     let id = format!("m-{}", wicket_core::new_ulid().to_string().to_lowercase());
     if relation.is_empty() {
@@ -191,7 +215,7 @@ pub fn send_as_operator(
         "reply_to": me, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
     });
     let env = wicket_identity::sign_operator_envelope(&key, &doc, &payload);
-    let meta = wicket_store::MessageMeta { from_principal: Some(&me), priority: opts.priority, in_reply_to: opts.in_reply_to };
+    let meta = wicket_store::MessageMeta { from_principal: Some(&me), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: true };
     let routed = l.post_message(&id, tenant, "", to, to_run.as_deref(), &env, &meta).map_err(|e| e.to_string())?;
     let audited = l.audit(
         tenant,

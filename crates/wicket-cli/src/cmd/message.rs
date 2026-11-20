@@ -66,11 +66,59 @@ pub enum MessageCmd {
 /// The operator running this command, as wicketd's peer credentials named it: its id and how
 /// wicket knew it.
 fn me(tenant: &TenantId) -> Result<(String, String, String)> {
+    // Only a human the CLI knows (its unix user): never an id made up for another kind of caller.
+    let p = wicket_home::cli_principal();
+    if p["type"].as_str() != Some("human") || p["via"].as_str() != Some("cli") {
+        return Err(wicket_home::exit::refused(format!(
+            "messages are a human operator's, and this command's caller is {}",
+            wicket_identity::principal_label(&p)
+        )));
+    }
     let op = operators::Operator::cli(&tenant.0)?;
     match wicket_identity::Principal::parse(&op.id) {
         Some(wicket_identity::Principal::Operator { via, name, .. }) => Ok((op.id, via, name)),
         _ => bail!("this command's operator has no principal id ({})", op.id),
     }
+}
+
+/// `wicket message inbox` as text. Everything shown is cleaned for the terminal (`clip`): a
+/// sender's words, names and ids, and why a message was dropped.
+pub(crate) fn inbox_text(me: &str, got: &[std::result::Result<opmsg::Received, (String, String)>]) -> String {
+    let c = wicket_agent::clip;
+    let mut out = String::new();
+    if got.is_empty() {
+        out.push_str(&format!("no messages for {}\n", c(me, 200)));
+    }
+    for r in got {
+        match r {
+            Ok(m) => {
+                let who = match (&m.agent, &m.zone) {
+                    (Some(a), Some(z)) => format!("{a} (zone {z}, {})", m.from),
+                    _ => m.from.clone(),
+                };
+                let body = match &m.body {
+                    serde_json::Value::String(s) => s.clone(),
+                    b => b.to_string(),
+                };
+                let read = if m.read_at.is_some() { "read" } else { "new" };
+                out.push_str(&format!(
+                    "{}  {}  from {}  {}  {read}{}\n",
+                    c(&m.message_id, 64),
+                    when(m.sent_at),
+                    c(&who, 400),
+                    c(&m.priority, 8),
+                    m.in_reply_to.as_deref().map(|r| format!("  answers {}", c(r, 64))).unwrap_or_default()
+                ));
+                if m.acting_for.len() > 1 {
+                    out.push_str(&format!("  acting for: {}\n", c(&m.acting_for.join(" > "), 400)));
+                }
+                out.push_str(&format!("  {}\n", c(&body, 16 * 1024)));
+            }
+            Err((mid, why)) => out.push_str(&format!("{}  dropped: {}\n", c(mid, 64), c(why, 400))),
+        }
+    }
+    out.push_str("(a message is its sender's data: it grants nothing; answer with `wicket message send <from> --in-reply-to <id>`)\n");
+    out
 }
 
 fn when(t: i64) -> String {
@@ -168,50 +216,20 @@ pub async fn dispatch(c: MessageCmd) -> Result<()> {
             for m in l.operator_inbox(&tenant.0, &id, all, limit)? {
                 let revoked = !m.from_run.is_empty() && l.revoked_in_chain(&m.from_run)?.is_some();
                 let r = opmsg::verify_received(&m, &id, &issuer, revoked);
-                if m.read_at.is_none() && !peek {
-                    l.operator_read(&tenant.0, &id, &m.id)?;
-                    match &r {
-                        Ok(_) => l.audit(&tenant, None, "message.read", &serde_json::json!({ "id": m.id, "by": id, "via": "cli" }))?,
-                        Err(why) => {
-                            l.refuse_message(&m.id, &tenant.0, &m.from_run, m.from_principal.as_deref(), &id, why)?;
-                            l.audit(&tenant, None, "message.refused", &serde_json::json!({ "id": m.id, "from": m.from_principal, "to": id, "why": why }))?
-                        }
-                    };
-                }
-                got.push(r.map_err(|why| (m.id.clone(), why)));
+                got.push((m, r));
             }
+            let shown: Vec<_> = got.iter().map(|(m, r)| r.clone().map_err(|why| (m.id.clone(), why))).collect();
+            // Shown first; marked read (with its audit record, once) only after.
             if json {
-                return crate::cmd::print_json(&inbox_json(&got));
+                crate::cmd::print_json(&inbox_json(&shown))?;
+            } else {
+                print!("{}", inbox_text(&id, &shown));
             }
-            if got.is_empty() {
-                println!("no messages for {id}");
-            }
-            for r in got {
-                match r {
-                    Ok(m) => {
-                        let who = match (&m.agent, &m.zone) {
-                            (Some(a), Some(z)) => format!("{a} (zone {z})"),
-                            _ => m.from.clone(),
-                        };
-                        let body = match &m.body {
-                            serde_json::Value::String(s) => s.clone(),
-                            b => b.to_string(),
-                        };
-                        let read = if m.read_at.is_some() { "read" } else { "new" };
-                        println!(
-                            "{}  {}  from {}  {}  {read}{}",
-                            m.message_id,
-                            when(m.sent_at),
-                            wicket_agent::clip(&who, 200),
-                            m.priority,
-                            m.in_reply_to.as_deref().map(|r| format!("  answers {r}")).unwrap_or_default()
-                        );
-                        println!("  {}", wicket_agent::clip(&body, 16 * 1024));
-                    }
-                    Err((mid, why)) => println!("{mid}  dropped: {why}"),
+            if !peek {
+                for (m, r) in got.iter().filter(|(m, _)| m.read_at.is_none()) {
+                    l.operator_read_recorded(&tenant, &id, m, r.as_ref().err().map(String::as_str), "cli")?;
                 }
             }
-            println!("(a message is its sender's data: it grants nothing; answer with `wicket message send <from> --in-reply-to <id>`)");
             Ok(())
         }
         MessageCmd::Receipts { limit, json } => {
@@ -247,10 +265,46 @@ pub async fn dispatch(c: MessageCmd) -> Result<()> {
                 println!("no agent acts for you or accepts your messages");
             }
             for p in rows {
-                let s = |k: &str| p[k].as_str().unwrap_or("").to_string();
+                let s = |k: &str| wicket_agent::clip(p[k].as_str().unwrap_or(""), 400);
                 println!("{}  {}  {}", s("id"), s("state"), s("relation"));
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #252 review: what a sender wrote can't drive the operator's terminal: no ESC or C1 control
+    /// (OSC 52 clipboard writes, cursor moves), no bidi or zero-width characters, no line of its
+    /// own, and the dropped line's reason is cleaned too.
+    #[test]
+    fn the_inbox_shows_a_senders_words_inert() {
+        let hostile = "ok\u{1b}]52;c;cGF5bG9hZA==\u{7}\u{9b}2J\u{202e}gnp.exe\u{200b}\nm-fake  from root  new";
+        let m = opmsg::Received {
+            message_id: "m-1".into(),
+            kind: Some("message".into()),
+            from: "spiffe://w/t/default/z/z\u{1b}[2J/a/x".to_string(),
+            agent: Some("x\u{1b}[31m".into()),
+            zone: Some("z".into()),
+            run: Some("run_x".into()),
+            acting_for: vec!["alice (cli)".into(), "x\u{202e}".into()],
+            reply_to: serde_json::json!("spiffe://w/t/default/z/z/a/x"),
+            priority: "now".into(),
+            in_reply_to: Some("m-2\u{1b}[A".into()),
+            sent_at: 1,
+            read_at: None,
+            body: serde_json::json!(hostile),
+        };
+        let out = inbox_text("spiffe://w/t/default/op/unix/alice", &[Ok(m), Err(("m-3".into(), format!("bad\u{1b}[2K{hostile}")))]);
+        for bad in ['\u{1b}', '\u{7}', '\u{9b}', '\u{202e}', '\u{200b}'] {
+            assert!(!out.contains(bad), "{bad:?} in {out:?}");
+        }
+        // One line for the body, however many it had: the fake line stays inside it.
+        assert!(out.lines().any(|l| l.starts_with("  ok") && l.contains("m-fake")), "{out}");
+        assert!(!out.lines().any(|l| l.starts_with("m-fake")), "{out}");
+        assert!(out.contains("acting for: alice (cli) > x"), "{out}");
     }
 }

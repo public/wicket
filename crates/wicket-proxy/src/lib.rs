@@ -466,7 +466,7 @@ impl RunCtx {
         });
         let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
         let meta =
-            wicket_store::MessageMeta { from_principal: Some(&me.claims.sub), priority: opts.priority, in_reply_to: opts.in_reply_to };
+            wicket_store::MessageMeta { from_principal: Some(&me.claims.sub), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: false };
         // A wake's claim moves the message to the new run, as the new run's identity does a held one.
         let routed =
             l.post_message(&id, &self.tenant, &self.run.0, &principal, to_run.as_deref(), &env, &meta).map_err(|e| e.to_string())?;

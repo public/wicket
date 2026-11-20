@@ -56,11 +56,14 @@ const SCHEMA_16_TAKE: &str = "SELECT id FROM messages WHERE to_run = ?1 AND deli
     ORDER BY CASE priority WHEN 'now' THEN 0 WHEN 'later' THEN 2 ELSE 1 END, created_at, rowid LIMIT 1";
 
 /// Every kind of row this build writes to `messages`, for one run: (id, kind).
-fn written(l: &Ledger, run: &str) -> Vec<(String, &'static str)> {
+fn written(l: &mut Ledger, run: &str) -> Vec<(String, &'static str)> {
     let notice = l.add_notice(run, "near its memory limit").unwrap();
     let prompt = l.add_prompt(run, "do the thing", "alex", "spiffe://t/op/alex").unwrap();
     l.add_message("m-1", &TenantId::single(), "run_from", run, "e.n.v").unwrap();
-    vec![(notice, KIND_NOTICE), (prompt, KIND_PROMPT), ("m-1".into(), KIND_MESSAGE)]
+    // An operator's message to the run (#252), signed with an envelope a previous build can't verify.
+    let meta = MessageMeta { from_principal: Some("spiffe://t/t/default/op/unix/alex"), operator: true, ..Default::default() };
+    l.post_message("m-op", &TenantId::single(), "", "spiffe://t/t/default/z/z/a/a", Some(run), "o.p.e", &meta).unwrap();
+    vec![(notice, KIND_NOTICE), (prompt, KIND_PROMPT), ("m-1".into(), KIND_MESSAGE), ("m-op".into(), KIND_OPERATOR_MESSAGE)]
 }
 
 /// What `sql` returns for `run`, read until it returns nothing new (a `LIMIT 1` take, marking each
@@ -92,8 +95,8 @@ fn read(l: &Ledger, sql: &str, run: &str) -> Vec<String> {
 #[test]
 fn the_previous_builds_queries_see_only_rows_they_handle() {
     for q in PREVIOUS {
-        let l = Ledger::open_in_memory().unwrap();
-        let rows = written(&l, "run_1");
+        let mut l = Ledger::open_in_memory().unwrap();
+        let rows = written(&mut l, "run_1");
         // `requeue_prompts` reads what was handed out: every row, delivered.
         l.conn.execute("UPDATE messages SET delivered_at = 1 WHERE ?1 = 'requeue_prompts'", rusqlite::params![q.what]).unwrap();
         for id in read(&l, q.sql, "run_1") {
@@ -103,12 +106,26 @@ fn the_previous_builds_queries_see_only_rows_they_handle() {
     }
 }
 
+/// #252 review: this build's own readers take an operator's message as a peer's, and a previous
+/// build's leave it alone (above).
+#[test]
+fn this_build_takes_an_operators_message_as_a_peers() {
+    let mut l = Ledger::open_in_memory().unwrap();
+    written(&mut l, "run_1");
+    let mut took = vec![];
+    while let Some(m) = l.take_message("run_1").unwrap() {
+        took.push(m.id);
+    }
+    assert_eq!(took, ["m-1", "m-op"]);
+    assert!(l.envelopes().unwrap().iter().any(|(id, ..)| id == "m-op"), "and audit --verify checks it");
+}
+
 /// #475's failure, as this test would have caught it: schema 16's `await_message` took schema 17's
 /// prompts and notices as peers' messages, and dropped them, unsigned.
 #[test]
 fn schema_16s_take_would_have_taken_a_prompt() {
-    let l = Ledger::open_in_memory().unwrap();
-    let rows = written(&l, "run_1");
+    let mut l = Ledger::open_in_memory().unwrap();
+    let rows = written(&mut l, "run_1");
     let taken = read(&l, SCHEMA_16_TAKE, "run_1");
     assert!(taken.iter().any(|id| rows.iter().any(|(i, k)| i == id && *k != KIND_MESSAGE)));
 }
