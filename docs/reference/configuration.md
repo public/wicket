@@ -83,6 +83,9 @@ operators:
   unix/auditor: nothing      # may list requests, decides none
 ```
 
+`capacity` covers a CAPACITY request and, at R4, releasing a placed server past its lease from the console
+(#710): it stops the boxes still running there and loses the files it keeps.
+
 `policy` covers applying the org policy from the console (#712), at R4: it changes what every box may do,
 and revokes the runs minted under another version. `anything`, the default for an operator the file doesn't
 list (and for every operator without the file), covers it: to keep a passkey from applying policy, give it a

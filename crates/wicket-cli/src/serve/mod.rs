@@ -63,6 +63,7 @@ pub(crate) mod limits;
 mod manifests;
 pub(crate) mod net;
 mod orgpolicy;
+mod placed;
 mod placement;
 mod push;
 mod secrets;
@@ -222,6 +223,12 @@ enum Action {
     },
     /// Apply an org policy (#712), on the preview the passkey signed.
     PolicyApply(Box<orgpolicy::PolicyApply>),
+    /// Release a placed node past its lease (#710), on the effect the passkey signed.
+    NodeRelease {
+        id: String,
+        reason: String,
+        effect_sha256: String,
+    },
 }
 
 enum Purpose {
@@ -250,6 +257,9 @@ type Updater = Box<dyn Fn(&str, &std::path::Path) -> Result<()> + Send + Sync>;
 /// Applies an org policy the console decided to apply (#712): the real one runs
 /// `wicket policy apply --decision` detached ([`orgpolicy::apply_detached`]); tests record instead.
 type PolicyApplier = Box<dyn Fn(&orgpolicy::Apply) -> Result<()> + Send + Sync>;
+/// Releases a placed node the console decided to release (#710): the real one asks the provider
+/// in the background ([`placed::release_in_background`]); tests record instead.
+type Releaser = Box<dyn Fn(placed::Release) -> Result<()> + Send + Sync>;
 /// The verified identity of a run's agent (crate::verified_identity; replaceable in tests, which
 /// have no issuer key).
 type IdentityCheck = fn(&Ledger, &str) -> Value;
@@ -278,6 +288,7 @@ struct State {
     policy_applier: PolicyApplier,
     /// An unsigned org policy preview is running ([`orgpolicy`]): one at a time.
     previewing: std::sync::atomic::AtomicBool,
+    releaser: Releaser,
     identity: IdentityCheck,
     challenges: Mutex<HashMap<String, Pending>>,
     limiter: Limiter,
@@ -340,6 +351,7 @@ impl State {
             updater: Box::new(|_, _| bail!("this console doesn't apply updates")),
             policy_applier: Box::new(|_| bail!("this console doesn't apply org policies")),
             previewing: std::sync::atomic::AtomicBool::new(false),
+            releaser: Box::new(|_| bail!("this console doesn't release nodes")),
             identity,
             challenges: Mutex::new(HashMap::new()),
             limiter: Limiter::default(),
@@ -414,6 +426,8 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     );
     state.updater = Box::new(move |request, log| apply_update_detached(&update_exe, request, log));
     state.policy_applier = Box::new(move |a| orgpolicy::apply_detached(&policy_exe, a));
+    let release_ledger = ledger_path();
+    state.releaser = Box::new(move |r| placed::release_in_background(release_ledger.clone(), r));
     state.trusted = plan.trusted.clone();
     state.authority = plan.authority.clone();
     state.hsts = plan.hsts;
@@ -1460,8 +1474,9 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         Some("standing_renew") => standing::build_renew(state, &l, body),
         Some("release_fence") => fence::build_release(state, oc, &l, body),
         Some("policy_apply") => orgpolicy::build(state, &l, oc, body),
+        Some("node_release") => placed::build(state, &l, oc, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence or policy_apply",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence, node_release or policy_apply",
         )),
     }
 }
@@ -1734,6 +1749,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::StandingRenew { id, ttl_secs } => standing::apply_renew(state, &l, oc, id, *ttl_secs, signed),
         Action::ReleaseFence { run, reason, effect } => fence::apply_release(state, &l, oc, run, reason, effect, signed),
         Action::PolicyApply(a) => orgpolicy::apply(state, &l, oc, a, signed),
+        Action::NodeRelease { id, reason, effect_sha256 } => placed::apply(state, &l, oc, id, reason, effect_sha256, signed),
     }
 }
 
@@ -2275,6 +2291,7 @@ mod tests {
     mod manifests;
     mod notify;
     mod orgpolicy;
+    mod placed;
     mod placement;
     mod secrets;
     mod session;

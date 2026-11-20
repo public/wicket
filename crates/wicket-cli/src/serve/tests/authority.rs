@@ -254,8 +254,20 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         "/api/explain/999999".into(),
         "/api/explain/x".into(),
     ];
+    // The views that answer must answer (an error page would scan clean and prove nothing).
+    let answers = [
+        "/api/me".to_string(),
+        "/api/state".into(),
+        "/api/policy".into(),
+        format!("/api/runs/{RUN}/authority"),
+        format!("/api/runs/{RUN}/placement"),
+        format!("/api/explain/{}", f.op_seq),
+    ];
     for p in paths {
         let (s, _, body) = get(&f.t, &p).await;
+        if answers.contains(&p) {
+            assert_eq!(s, StatusCode::OK, "{p}: {body}");
+        }
         assert!(leaks(&body, &n).is_empty(), "{p} ({s}) leaks {:?}", leaks(&body, &n));
     }
     // The org policy preview (#712), of the applied policy and of another.

@@ -50,7 +50,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             NodeCmd::Create(args) => nodecreate::create(*args).await,
-            NodeCmd::Release { common, id } => nodecreate::release(common, id).await,
+            NodeCmd::Release { common, id, reason } => nodecreate::release(common, id, reason, wicket_home::cli_is_root()).await,
             NodeCmd::Plans { common, region, plan_type } => nodecreate::plans(common, region, plan_type).await,
             NodeCmd::Revoke { name } => {
                 let mut l = Ledger::open(&ledger_path())?;
@@ -300,12 +300,17 @@ pub enum NodeCmd {
     /// of yours that covers it, otherwise waiting for an operator.
     Create(Box<nodecreate::CreateArgs>),
     /// Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and
-    /// revoke its enrolment.
+    /// revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the
+    /// provider is asked, then `placement.node_released` or `placement.node_release_failed`, the
+    /// records the console's release of a node past its lease writes too.
     Release {
         #[command(flatten)]
         common: nodecreate::Common,
         /// The provider's instance id, or the node's name.
         id: String,
+        /// Why: it goes on the audit record.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// List a provider's (Vultr's) plans in a region, with their hourly price.
     Plans {
