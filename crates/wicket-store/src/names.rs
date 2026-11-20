@@ -341,6 +341,16 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// Every tenant's live public names that a run holds, by label: what the reconciler publishes
+    /// (it checks each one's lifetime and holder itself).
+    pub fn held_public_names(&self) -> Result<Vec<NameRow>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM names WHERE kind = 'public' AND status = 'live' AND holder IS NOT NULL ORDER BY label, id"
+        ))?;
+        let rows = st.query_map([], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// The live internal name `label` in `zone`, if any.
     pub fn internal_name(&self, tenant: &TenantId, zone: &str, label: &str) -> Result<Option<NameRow>> {
         Ok(self
@@ -908,6 +918,16 @@ impl Ledger {
         Ok(held)
     }
 
+    /// The ports released and still quarantined with no time set to free them: `(node, proto,
+    /// port, the name that held it last)`.
+    pub fn quarantined_ports(&self) -> Result<Vec<(String, String, u16, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT node, proto, port, last_name FROM host_ports WHERE name IS NULL AND free_after IS NULL ORDER BY node, proto, port",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// A released port may be handed out again from `at`: what the reconciler sets once the
     /// records of the name that held it are gone (and twice their TTL has passed). A port held
     /// again since is left.
@@ -928,6 +948,20 @@ impl Ledger {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows.into_iter().filter_map(|(name, t, value, ttl)| Some(Record { name, rtype: rtype(&t)?, value, ttl })).collect())
+    }
+
+    /// The records this installation created in every zone it has rows for: `(zone, record)`.
+    pub fn owned_records_everywhere(&self) -> Result<Vec<(String, Record)>> {
+        let mut st = self.conn.prepare("SELECT zone, name, rtype, value, ttl FROM name_records ORDER BY zone, name, rtype, value")?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, u32>(4)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(zone, name, t, value, ttl)| Some((zone, Record { name, rtype: rtype(&t)?, value, ttl })))
+            .collect())
     }
 
     /// [`Ledger::owned_records`] as [`Owned`].
