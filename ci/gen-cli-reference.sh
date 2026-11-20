@@ -67,12 +67,14 @@ reference](manifest.md)).
 ## Output for scripts
 
 The commands that list things take `--json`: `pending`, `top`, `agents`, `links`, `grant list`,
-`standing list`, `node list`, `service list` and `audit` (and `why-here`, `zone` and `node top`,
-which print one record). With it, stdout holds one JSON document and nothing else: a list is an
-array, `[]` when there is nothing to list, and `top --json` is one frame, an object. Messages and
-warnings go to stderr. A field is never renamed or removed, and its meaning doesn't change; new
-fields may be added, so a script should ignore fields it doesn't know. A field with nothing in it
-is `null`, not left out. Times are Unix seconds (`…_at`, `expires_at`, `not_after`), except
+`standing list`, `node list`, `service list` and `audit`. With it, stdout holds one JSON document
+and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
+frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
+field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
+script should ignore fields it doesn't know. A field with nothing in it is `null`, not left out.
+`why-here --json`, `zone --json` and `node top --json` print a record as wicket keeps it (the
+placement decision, the zone view, the node's status report): JSON, but their shape isn't fixed
+yet, and a field with nothing in it may be left out. Times are Unix seconds (`…_at`, `expires_at`, `not_after`), except
 `top`'s, which are Unix milliseconds (`…_ms`). What an agent wrote (a reason, a rule, an
 attribution) is as it wrote it: shown to a person, it needs the cleaning the text output gives it.
 
