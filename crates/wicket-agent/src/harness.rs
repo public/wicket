@@ -153,7 +153,7 @@ pub trait Adapter: Send + Sync {
 
     /// The driven session's control channel (#363), for [`Mode::Driven`] and [`Mode::DrivenRemote`].
     /// None (the default): wicket only writes turns, and nothing can be interrupted.
-    fn controller(&self, _m: &Manifest) -> Option<Box<dyn Controller>> {
+    fn controller(&self) -> Option<Box<dyn Controller>> {
         None
     }
 
@@ -410,7 +410,7 @@ impl Adapter for ClaudeCode {
         crate::driven_remote_status(line)
     }
 
-    fn controller(&self, _m: &Manifest) -> Option<Box<dyn Controller>> {
+    fn controller(&self) -> Option<Box<dyn Controller>> {
         Some(Box::new(claude::control::Control::default()))
     }
 

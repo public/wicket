@@ -509,9 +509,23 @@ pub struct NodeCtl {
     /// 0 for a box it started, its node's count for one it re-attached to, once the node said
     /// (#445). Operator prompts are recorded by where they are in it.
     pub stdin_base: std::sync::OnceLock<u64>,
+    /// Whether the box's node answers its harness's tool prompts (#257 step 8), and the mode an
+    /// operator set since this supervisor took the run: sent on every reconnect. None, unchanged
+    /// here: the node keeps what it has (a re-attached supervisor doesn't undo an earlier change).
+    prompts: bool,
+    prompt_mode: Mutex<Option<wicket_core::RemotePermissionMode>>,
 }
 
 impl NodeCtl {
+    /// An operator changed the harness's permission mode: what its node answers its tool prompts
+    /// by from now on (#257 step 8). Sent now if connected, and again on every reconnect.
+    pub fn prompt_mode(&self, mode: wicket_core::RemotePermissionMode) {
+        if self.prompts {
+            *self.prompt_mode.lock().expect("prompt mode") = Some(mode);
+            self.send(Frame::Msg(Msg::PromptMode { run: self.run.clone(), mode }));
+        }
+    }
+
     /// When the box's authority ends now (Unix ms): its current token's block 0.
     fn authority_until(&self) -> i64 {
         self.token_roots.lock().expect("token roots").last().map_or(0, |r| r.1)
@@ -828,6 +842,8 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         proto: std::sync::atomic::AtomicU32::new(0),
         exit_cause: Mutex::new(None),
         stdin_base: std::sync::OnceLock::new(),
+        prompts: s.start.edge.as_ref().is_some_and(|e| e.prompts.is_some()),
+        prompt_mode: Mutex::new(None),
     });
     let shared = Arc::new(Shared {
         node: name.clone(),
@@ -1384,6 +1400,17 @@ async fn session(
             wicket_chan::chan::DECODE_SLASH
         );
     }
+    // A node below protocol 22 doesn't answer a driven harness's tool prompts (#257 step 8): the
+    // box would wait on them for ever.
+    if sh.ctl.prompts && p.proto < wicket_chan::chan::NODE_PROMPTS {
+        p.ever = false;
+        bail!(
+            "node {} talks protocol {}, and this box's harness asks before tool calls, which its node answers from protocol {}: update the node (wicket self update --nodes)",
+            sh.node,
+            p.proto,
+            wicket_chan::chan::NODE_PROMPTS
+        );
+    }
     let now = wicket_feed::now_ms();
     let catching = std::time::Instant::now();
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
@@ -1427,6 +1454,9 @@ async fn session(
         }
         say!("[wicket] node {} reconnected; resuming the box's output", sh.node);
         send(Frame::Msg(Msg::Resume { run: r.run.clone(), stdout_from: p.next[0], stderr_from: p.next[1] }));
+        if let Some(mode) = *sh.ctl.prompt_mode.lock().expect("prompt mode") {
+            send(Frame::Msg(Msg::PromptMode { run: r.run.clone(), mode }));
+        }
         p.stdin.ack(r.stdin_received);
         let (at, bytes) = p.stdin.since(r.stdin_received);
         if !bytes.is_empty() {
@@ -1762,6 +1792,7 @@ async fn on_frame(
             // by the run's own gateway here, on a task of its own (a wait may last minutes).
             Msg::Call { id, run, tool, args } => {
                 let (gw, spawn, out) = (sh.gateway.clone(), sh.spawn.clone(), out.clone());
+                let (ledger, tenant, own, zone) = (sh.ledger.clone(), sh.tenant.clone(), sh.run.clone(), sh.zone.clone());
                 let mine = run == sh.run.0;
                 // A node that says when its box has had a message (#445) gets it in flight.
                 let read_by_node = p.proto >= wicket_chan::chan::MESSAGE_READ;
@@ -1777,6 +1808,8 @@ async fn on_frame(
                                 .unwrap_or_else(|e| (format!("not started: {e}"), true)),
                             None => ("this agent may not start other boxes (max_children is 0)".into(), true),
                         },
+                        // A driven harness's tool prompt its node needs a human for (#257 step 8).
+                        (true, ControlTool::ToolPrompt, None) => tool_prompt(&ledger, &tenant, &own, &zone, &args).await,
                         // Its node says when the box has had a message it carries (`MessageRead`).
                         (true, ..) if read_by_node => {
                             let (text, is_error, in_flight) = gw.call_tool_read(&tool.name(), args).await;
@@ -2421,6 +2454,60 @@ fn check_node_ask(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &st
     }
 }
 
+/// A tool prompt's grant (#363): `TOOL wicket.internal`, which its node answers the prompt from.
+fn is_tool_grant(method: &str, host: &str) -> bool {
+    method == wicket_feed::token::TOOL_METHOD && host == wicket_core::link::DOMAIN
+}
+
+/// How long a [`ControlTool::ToolPrompt`] call waits on a human before it answers `pending` (the
+/// node asks again).
+const TOOL_PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A driven harness's tool prompt its node needs a human for (#257 step 8): its request raised
+/// (or found), then its state once it is decided (`granted`, `denied`, `expired`, …), or `pending`
+/// after a while. The node decides from its replica: a granted request's grant reaches it by the
+/// feed, and this answer allows nothing. The op and the card are built here, from the call's
+/// tool, kind and input digest (`wicket_home::control`), bound to this run.
+async fn tool_prompt(
+    ledger: &Arc<Mutex<Ledger>>,
+    tenant: &TenantId,
+    run: &RunId,
+    zone: &ZoneSpec,
+    args: &serde_json::Value,
+) -> (String, bool) {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let answer = |state: &str, request: Option<&str>, why: &str| {
+        (serde_json::json!({ "state": state, "request": request, "why": why }).to_string(), false)
+    };
+    if !zone.escalation.request {
+        return answer("refused", None, &format!("not requested: {}", wicket_proxy::NEVER_ASKS));
+    }
+    let op = crate::control::op(tenant, run, &zone.name, s("tool"), s("kind"), s("digest"));
+    let raised = {
+        let l = ledger.lock().expect("ledger");
+        match l.denied_recently(&op) {
+            Ok(Some(rid)) => return answer("denied", Some(&rid), &format!("exactly this call ({rid}) was denied a few minutes ago")),
+            Ok(None) => l.pending_for(&op, &crate::control::card(s("tool"), s("kind"), s("detail")), None),
+            Err(e) => return (format!("wicket couldn't raise its approval: {e}"), true),
+        }
+    };
+    let request = match raised {
+        Ok((r, _)) => r,
+        Err(e) => return (format!("wicket couldn't raise its approval: {e}"), true),
+    };
+    let start = std::time::Instant::now();
+    loop {
+        let status = ledger.lock().expect("ledger").request(&request).map(|r| r.status);
+        match status {
+            Ok(st) if st == "pending" && start.elapsed() < TOOL_PROMPT_WAIT => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+            Ok(st) if st == "pending" => return answer("pending", Some(&request), "still pending"),
+            Ok(st) if st == "granted" => return answer("granted", Some(&request), "approved"),
+            Ok(st) => return answer(&st, Some(&request), &format!("request {request} was {st}")),
+            Err(e) => return (format!("request {request}: {e}"), true),
+        }
+    }
+}
+
 /// Publishes grants approved for this run's requests to its node, and revocations of grants it
 /// published. It only publishes: since #257's slice 3 the node alone decides a box's egress and
 /// counts a grant's uses, and the ledger records issuance (the grant, its renewals and its
@@ -2496,8 +2583,10 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             continue;
         }
         // Grants in wicket's own namespace (spawn, capacity, links) are the control host's to use:
-        // it is wicket that asks for them, never a box's egress.
-        if Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path).refused_for_agents().is_some() {
+        // it is wicket that asks for them, never a box's egress. A tool prompt's is the node's
+        // (#257 step 8), which answers the prompt from it.
+        let tool = is_tool_grant(&g.method, &g.host);
+        if !tool && Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path).refused_for_agents().is_some() {
             continue;
         }
         // Every egress grant goes to the node, whatever its host (#257): one on a host the node's
@@ -2513,8 +2602,9 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         // only if no query makes that path riskier than the human approved (#119; a fetch's ref
         // discovery approved at R1 is a push's at R4). Otherwise it is never published: nothing else
         // decides egress, so the box's request is asked about again.
+        // A tool prompt has no query.
         let worst = Op::egress_with_query(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path, "any=query");
-        if worst.risk.rank() > g.max_risk.unwrap_or(0) {
+        if !tool && worst.risk.rank() > g.max_risk.unwrap_or(0) {
             if p.published.insert(g.id.clone()) {
                 say!(
                     "[wicket] grant {} is bounded below what {} {}{} can be, which a node can't honour: it isn't published",

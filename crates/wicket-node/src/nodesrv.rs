@@ -61,6 +61,7 @@ mod gw;
 mod images;
 mod links;
 mod nodeca;
+mod prompts;
 mod volumes;
 use conn::*;
 use gateway::*;
@@ -198,6 +199,8 @@ struct BoxState {
     /// The control connection that started or last resumed it: its stdio, events, asks and
     /// tunnels go there.
     owner: Option<u64>,
+    /// Its driven harness's tool prompts, which this node answers (#257 step 8).
+    prompts: Option<prompts::BoxPrompts>,
 }
 
 impl BoxState {
@@ -1611,6 +1614,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
         out_end: [0, 0],
         out_tail: [String::new(), String::new()],
         out_saved_ms: 0,
+        prompts: prompts::Kept::default(),
     };
     rec.save(&dir)?;
     saved.end();
@@ -1728,7 +1732,7 @@ fn child_start(
         output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
         output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
         swaps: vec![],
-        edge: Some(Box::new(chan::EdgeStart { who, spawn: None, push: None, ca_widen: None })),
+        edge: Some(Box::new(chan::EdgeStart { who, spawn: None, push: None, ca_widen: None, prompts: chan::EdgePrompts::of(m, false) })),
         image_pin: plan.image_pin.clone(),
         timings: parent.timings,
         memory_advice: m.zone.limits.memory_advice().map(str::to_string),
@@ -1743,10 +1747,8 @@ fn feed_stdin(node: &Node, run: &str, bytes: &[u8]) {
     if let Some(b) = boxes.get_mut(run) {
         let at = b.stdin_next;
         let (fresh, _) = accept_at(&mut b.stdin_next, at, bytes);
-        if let (Some(s), false) = (&b.stdin, fresh.is_empty()) {
-            s.push(&fresh);
-            b.record.stdin_received = b.stdin_next;
-            let _ = b.record.save(&b.dir);
+        if !fresh.is_empty() {
+            prompts::push_host_stdin(b, &fresh);
         }
     }
 }
@@ -1773,6 +1775,9 @@ struct BoxRecord {
     out_tail: [String; 2],
     #[serde(default)]
     out_saved_ms: i64,
+    /// What this node keeps of the box's tool prompts (#257 step 8).
+    #[serde(default)]
+    prompts: prompts::Kept,
 }
 
 /// How many of a stream's last bytes a box's record keeps, to find its place in a replay.
@@ -1877,7 +1882,12 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
     let mut tasks = tasks;
     // An interactive box's stdin: a feed the box's forwarder reads over `sock/stdin.sock`
     // (`wicket-fwd --stdin-from`), reconnecting if this `serve` goes away.
-    let feed = bs.interactive.then(|| Arc::new(StdinFeed::new(rec.stdin_received, rec.stdin_closed)));
+    // Its feed counts the node's own answers to the harness's prompts too (#257 step 8).
+    let feed = bs.interactive.then(|| Arc::new(StdinFeed::new(rec.stdin_received + rec.prompts.stdin_answered, rec.stdin_closed)));
+    let (box_prompts, restored) = match prompts::BoxPrompts::of(bs, &rec.prompts) {
+        Some((p, steps)) => (Some(p), steps),
+        None => (None, vec![]),
+    };
     if let Some(f) = &feed {
         match f.clone().serve(&dir.join("sock/stdin.sock")) {
             Ok(t) => tasks.push(t),
@@ -1926,8 +1936,10 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             listeners: HashMap::new(),
             owner,
             record: rec.clone(),
+            prompts: box_prompts,
         },
     );
+    prompts::apply(node, &bs.run, restored);
     // A box read before (adopted): Docker's logs since a little before the last save, lined up on
     // the last bytes read (rotation may have dropped their start).
     let since =
@@ -2075,11 +2087,19 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
             }
             continue;
         }
+        let mut prompt_steps = None;
         let (frame, over) = {
             let mut boxes = n.boxes.lock().expect("boxes");
             let Some(b) = boxes.get_mut(&run) else { break };
             let at = b.out[i].write(&data);
             b.record.out_end[i] = b.out[i].end();
+            // The harness's own requests are this node's to answer (#257 step 8).
+            if i == 0 {
+                let rest = prompts::on_stdout(b, &data);
+                if !rest.is_empty() {
+                    prompt_steps = Some((rest, b.record.start.tenant.clone()));
+                }
+            }
             if last_save.elapsed() > std::time::Duration::from_secs(2) {
                 save_output(b);
                 last_save = std::time::Instant::now();
@@ -2088,6 +2108,9 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
             (Frame::Data { stream: b.streams[i + 1], offset: at, bytes: data }, over)
         };
         n.send_run(&run, frame);
+        if let Some((steps, tenant)) = prompt_steps {
+            prompts::after(&n, &run, &tenant, steps);
+        }
         if over {
             stopped = true;
             let why =
@@ -2675,6 +2698,12 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
 /// a control host before #575's names ([`chan::NAMES`]) can't read or would misread. `request_name`
 /// isn't a tool it knows, and it would take `connect(name: …)` for `connect(box: "")` (#668).
 fn too_old_for(tool: chan::ControlTool, args: &serde_json::Value, proto: u32) -> Option<String> {
+    if tool == chan::ControlTool::ToolPrompt && proto < chan::NODE_PROMPTS {
+        return Some(format!(
+            "not asked: this box's control host speaks protocol {proto}, and tool prompts on a node need {}",
+            chan::NODE_PROMPTS
+        ));
+    }
     if proto >= chan::NAMES {
         return None;
     }
@@ -2958,6 +2987,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             out_end: [0, 0],
             out_tail: [String::new(), String::new()],
             out_saved_ms: 0,
+            prompts: prompts::Kept::default(),
         }
     }
 
@@ -3232,6 +3262,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 memory_mib: size,
                 listeners: HashMap::new(),
                 owner: Some(1),
+                prompts: None,
                 record: fake_record("run_old"),
             },
         );
@@ -3268,6 +3299,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             spawn: None,
             push: None,
             ca_widen: None,
+            prompts: None,
         }));
         node.boxes.lock().unwrap().insert(
             "run_a".into(),
@@ -3286,6 +3318,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 memory_mib: 2048,
                 listeners: HashMap::new(),
                 owner: Some(1),
+                prompts: None,
                 record: rec,
             },
         );
@@ -3373,6 +3406,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 memory_mib: 0,
                 listeners: HashMap::new(),
                 owner: Some(2),
+                prompts: None,
                 record: fake_record("run_a"),
             },
         );
@@ -3453,6 +3487,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             memory_mib: 0,
             listeners: HashMap::new(),
             owner: None,
+            prompts: None,
             record: fake_record(RUN),
         };
         st.record.start.run = RUN.into();
@@ -3626,6 +3661,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                     memory_mib: 0,
                     listeners: HashMap::new(),
                     owner: Some(gen),
+                    prompts: None,
                     record: fake_record(run),
                 },
             );
@@ -3823,6 +3859,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             spawn: None,
             push: None,
             ca_widen: None,
+            prompts: None,
         }));
         let st = BoxState {
             streams: [1, 2, 3],
@@ -3839,6 +3876,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             memory_mib: 0,
             listeners: HashMap::new(),
             owner: None,
+            prompts: None,
             record: rec,
         };
         node.boxes.lock().unwrap().insert(run.into(), st);

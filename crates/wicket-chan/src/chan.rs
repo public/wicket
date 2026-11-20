@@ -49,7 +49,7 @@ use wicket_proxy::llm::Slice;
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
-pub const PROTOCOL: u32 = 19;
+pub const PROTOCOL: u32 = 22;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -71,6 +71,10 @@ pub const NAMES: u32 = 18;
 /// record (an older node's strict parse refuses the record, and its whole feed with it). The
 /// control host never sends a zone using it over a connection below this.
 pub const DECODE_SLASH: u32 = 19;
+/// The first protocol version whose nodes answer a driven harness's tool prompts themselves (#257
+/// step 8): [`EdgeStart::prompts`], [`Msg::PromptMode`] and [`ControlTool::ToolPrompt`]. A run whose
+/// box has prompts takes no session with a node below it, which wouldn't answer them.
+pub const NODE_PROMPTS: u32 = 22;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -100,6 +104,12 @@ pub enum ControlTool {
     Hibernate,
     /// Names for boxes (#575): only over a connection that talks [`NAMES`].
     RequestName,
+    /// A driven harness's tool prompt the node needs a human for (#257 step 8): the node's own call,
+    /// never a box's ([`ControlTool::of`] doesn't name it). Its arguments are the call's `tool`,
+    /// `kind`, `detail` and `digest`; the control host raises (or finds) its request and answers
+    /// with its state when it is decided, or `pending` after a while. Only over a connection that
+    /// talks [`NODE_PROMPTS`].
+    ToolPrompt,
 }
 
 impl ControlTool {
@@ -108,9 +118,10 @@ impl ControlTool {
         serde_json::to_value(self).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
     }
 
-    /// The control host's tool of this name, if it is one.
+    /// The control host's tool of this name that a box may call, if it is one: never
+    /// [`ControlTool::ToolPrompt`], which only its node asks.
     pub fn of(name: &str) -> Option<ControlTool> {
-        serde_json::from_value(serde_json::Value::String(name.into())).ok()
+        serde_json::from_value(serde_json::Value::String(name.into())).ok().filter(|t| *t != ControlTool::ToolPrompt)
     }
 }
 /// How far apart two peers' versions may be.
@@ -134,6 +145,8 @@ const _: () = {
     assert!(PREFIX_GRANTS <= PROTOCOL);
     assert!(STANDING <= PROTOCOL);
     assert!(NAMES <= PROTOCOL);
+    assert!(DECODE_SLASH <= PROTOCOL);
+    assert!(NODE_PROMPTS <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -343,6 +356,41 @@ pub struct EdgeStart {
     /// widened to it. None (a control host from before it) is `fixed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_widen: Option<wicket_store::CaHosts>,
+    /// The driven harness's tool prompts, which the node answers (#257 step 8): None, the box
+    /// raises none (not driven, or its harness has no control channel). Sent only to a node that
+    /// talks [`NODE_PROMPTS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<EdgePrompts>,
+}
+
+/// What a node answers a driven harness's tool prompts from (#257 step 8).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EdgePrompts {
+    /// Whose control channel it is: the node runs that adapter's controller on the box's stdout.
+    pub harness: wicket_core::Harness,
+    /// The permission mode the manifest starts the harness in. Only wicket changes it, with
+    /// [`Msg::PromptMode`]: nothing the box writes does.
+    pub mode: wicket_core::RemotePermissionMode,
+}
+
+impl EdgePrompts {
+    /// A box's prompts, from its manifest: a driven agent (`wrapped`: `wicket wrap`'s, whose
+    /// launcher keeps its stdio) whose harness has a control channel, in the mode it starts in.
+    /// The driven mode runs in `bypassPermissions` (wicket-agent's driven plan); a driven remote
+    /// session in its `permission_mode`.
+    pub fn of(m: &wicket_core::Manifest, wrapped: bool) -> Option<EdgePrompts> {
+        use wicket_agent::harness::Mode;
+        let a = m.agent.as_ref()?;
+        let adapter = wicket_agent::harness::of(m)?;
+        adapter.controller()?;
+        let mode = match Mode::of(a, None).ok()? {
+            _ if wrapped => return None,
+            Mode::Driven => wicket_core::RemotePermissionMode::BypassPermissions,
+            Mode::DrivenRemote(r) => r.permission_mode(),
+            Mode::Remote(_) | Mode::Wrapped(_) => return None,
+        };
+        Some(EdgePrompts { harness: a.harness, mode })
+    }
 }
 
 /// What a node decides a box's spawns from (#164): a child within the box's authority starts on
@@ -485,6 +533,13 @@ pub enum Msg {
     },
     StdinClose {
         run: String,
+    },
+    /// An operator changed the permission mode of `run`'s harness (#257 step 8): what the node
+    /// answers its tool prompts by from now on. Sent with the line that asks the harness, and again
+    /// on every reconnect. Only over a connection that talks [`NODE_PROMPTS`].
+    PromptMode {
+        run: String,
+        mode: wicket_core::RemotePermissionMode,
     },
     /// A run's model budget slice (#152): what its node may spend of the run's model budget, offline
     /// too. Not a lease: that is a grant of capacity (#256).
@@ -1050,7 +1105,7 @@ mod tests {
     fn the_control_hosts_tools_are_typed_calls() {
         assert_eq!(ControlTool::of("await_grant"), Some(ControlTool::AwaitGrant));
         assert_eq!(ControlTool::RequestCapacity.name(), "request_capacity");
-        for local in ["whoami", "request_access", "spawn_agent", "anything", ""] {
+        for local in ["whoami", "request_access", "spawn_agent", "anything", "", "tool_prompt"] {
             assert_eq!(ControlTool::of(local), None, "{local}: answered on the node, never sent");
         }
         let m = Msg::Call { id: 3, run: "r".into(), tool: ControlTool::Links, args: serde_json::json!({}) };
@@ -1282,25 +1337,25 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build has no checks for features of protocol 16 or before: with [`PROTOCOL_SKEW`]
-    /// 2 and protocol 19 (#664), every connection talks 17, 18 or 19. 15's message reads (#445)
-    /// and 16's prefix grants (#257 4a) are on every connection (15's keeps its check until it goes
-    /// in a change of its own); 17's standing reach (#572), 18's names (#575) and 19's decoded
-    /// slashes keep theirs while a peer at 17 or 18 can connect.
+    /// What a connection talks with [`PROTOCOL_SKEW`] 2 and protocol 22 (#257 step 8): 20, 21 or
+    /// 22. Every feature up to 19 (message reads, prefix grants, standing reach, names, decoded
+    /// slashes) is on every connection, so their checks always pass (they go in a change of their
+    /// own); 22's tool prompts on the node keep theirs while a peer at 20 or 21 can connect.
     #[test]
-    fn no_connection_talks_below_protocol_17() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH), (19, 2, 15, 16, 17, 18, 19));
+    fn no_connection_talks_below_protocol_20() {
+        assert_eq!(
+            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, NODE_PROMPTS),
+            (22, 2, 15, 16, 17, 18, 19, 22)
+        );
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((17..=19).contains(&at) && (17..=21).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(17..=21).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((20..=22).contains(&at) && (20..=24).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(20..=24).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 20 or 21 talking to a control host at 19 from the other side.
-        assert_eq!((negotiate(20, PROTOCOL), negotiate(21, PROTOCOL)), (Ok(19), Ok(19)));
-        assert!(negotiate(17, PROTOCOL).unwrap() < NAMES, "a node at 17 sends no RequestName");
-        assert!(negotiate(18, PROTOCOL).unwrap() < DECODE_SLASH, "a node at 18 gets no zone that decodes a slash");
-        assert!(negotiate(PROTOCOL, 16).is_err() && negotiate(16, PROTOCOL).is_err());
+        // A node at 20 or 21 takes no box whose harness asks before tool calls.
+        assert!(negotiate(PROTOCOL, 21).unwrap() < NODE_PROMPTS && negotiate(21, PROTOCOL).unwrap() < NODE_PROMPTS);
+        assert!(negotiate(PROTOCOL, 19).is_err() && negotiate(19, PROTOCOL).is_err());
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start

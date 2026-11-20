@@ -975,7 +975,7 @@ mod tests {
             assert_eq!(permission_mode_of(&w), mode);
             assert!(w.plan.argv.windows(2).any(|p| p == ["--permission-prompt-tool", "stdio"]), "{mode}");
         }
-        assert!(a.controller(&driven_remote_manifest("")).is_some(), "a driven Claude Code has a control channel");
+        assert!(a.controller().is_some(), "a driven Claude Code has a control channel");
     }
 
     #[test]

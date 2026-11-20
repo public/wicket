@@ -1362,6 +1362,10 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 push: harness.and_then(|h| h.message_push(&m)),
                 // What the node may ask for beyond its CA (#573).
                 ca_widen: ledger.lock().ok().and_then(|l| l.node_ca_policy(&node_name).ok()),
+                // A driven harness's tool prompts, answered on the node (#257 step 8).
+                prompts: matches!(mode, Some(wicket_agent::harness::Mode::Driven | wicket_agent::harness::Mode::DrivenRemote(_)))
+                    .then(|| crate::chan::EdgePrompts::of(&m, false))
+                    .flatten(),
             })),
             image_pin: image_pin.clone(),
             timings: wicket_core::timing::enabled(),
@@ -1658,21 +1662,11 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
             acp = Some(c);
         }
     }
-    // A driven harness's control channel (#363): its running turn interrupted, its permission mode
-    // changed while it runs, and its prompts before a tool call raised as approvals.
+    // A driven harness's control channel (#363): its running turn interrupted and its permission
+    // mode changed while it runs. Its prompts before a tool call are its node's (#257 step 8).
     let mut control = match (mode, &acp, harness) {
         (Some(wicket_agent::harness::Mode::Driven | wicket_agent::harness::Mode::DrivenRemote(_)), None, Some(h)) => {
-            h.controller(&m).map(|c| {
-                crate::control::Supervised::new(
-                    c,
-                    crate::control::RunOf {
-                        tenant: m.tenant.clone(),
-                        run: run.clone(),
-                        zone: m.zone.name.clone(),
-                        may_ask: m.zone.escalation.request,
-                    },
-                )
-            })
+            h.controller().map(crate::control::Supervised::new)
         }
         _ => None,
     };
@@ -1883,11 +1877,9 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                             let _ = write_json(&acp_state, &*c);
                         }
                     } else {
-                        // The harness's control lines (#363): its prompts, and its answers to wicket's requests.
+                        // The harness's answers to wicket's requests (#363); what it asks is its node's.
                         if let Some(c) = control.as_mut() {
-                            let out = ledger.lock().map(|mut lg| c.on_line(&mut lg, &l)).unwrap_or_default();
-                            control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
-                            write_lines(&mut stdin, &out.write).await;
+                            control_said(&c.on_line(&l), &ledger, &m.tenant, &run, &mut acp_audits);
                         }
                         // A driven remote session's answer to wicket's Remote Control request: its
                         // address, recorded once as a remote session's is; or why there is none (the
@@ -2120,12 +2112,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                         let _ = l.audit(&m.tenant, Some(&run), "run.turn_cancel", &serde_json::json!({ "by": by, "asked": cancels.len(), "outcome": why }));
                     }
                 }
-                // Prompts whose approvals were decided (#363), and a live permission mode change.
-                if let Some(c) = control.as_mut() {
-                    let out = ledger.lock().map(|mut lg| c.poll(&mut lg)).unwrap_or_default();
-                    control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
-                    write_lines(&mut stdin, &out.write).await;
-                }
+                // A live permission mode change (#363).
                 let modes = if asks {
                     ledger.lock().ok().and_then(|mut l| l.take_mode_changes(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default()
                 } else {
@@ -2137,6 +2124,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                             say!("[operator] {by}: permission mode {mode}");
                             let out = c.set_mode(mode);
                             write_lines(&mut stdin, &out).await;
+                            // What the node answers the harness's prompts by from now (#257 step 8).
+                            stopper.0.prompt_mode(mode);
                             "asked"
                         }
                         (None, _) => "not a permission mode",

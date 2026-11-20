@@ -98,8 +98,6 @@ pub enum StoreError {
     Refused(String),
     #[error("request {0} is not the effect that was shown (shown {1}, now {2}): it changed since; look at it again and decide that")]
     EffectChanged(String, String, String),
-    #[error("{0}: an egress grant is decided and counted on the box's node, never consumed by the ledger (#257)")]
-    EgressGrant(String),
     #[error("this ledger was migrated by a newer wicket (schema {version}), past a step this build (schema {SCHEMA_VERSION}) can't read: roll forward, or restore the snapshot taken before that update")]
     TooNew { version: u32, floor: u32 },
     #[error("this ledger is schema {version}, older than schema {UPGRADES_FROM}, the oldest this build upgrades: open it once with a wicket build that still upgrades it (main at {STEP_THROUGH}), then with this one")]
@@ -544,8 +542,9 @@ pub fn granted_scope(req: &Request, path_prefix: Option<&str>) -> (String, bool)
 }
 
 /// What a request needs of a grant: the one lookup every request kind's grant is found by
-/// ([`Ledger::consume_grant`] for SPAWN and LINK asks, [`Ledger::use_update_approval`] for UPDATE,
-/// [`Ledger::grant_covering`] for what an egress grant covers). `None` matches any tenant, zone or
+/// ([`Ledger::use_update_approval`] for UPDATE, [`Ledger::grant_covering`] for what a grant
+/// covers; a SPAWN or LINK ask's is used by `use_effect_grant`, a TOOL prompt's and an egress
+/// grant's on the box's node). `None` matches any tenant, zone or
 /// run.
 struct GrantMatch<'a> {
     tenant: Option<&'a str>,
@@ -1532,33 +1531,8 @@ impl Ledger {
         Ok(())
     }
 
-    /// Finds a live grant covering an op in wicket's own approval namespace (a SPAWN or LINK ask, a
-    /// capacity request) and consumes one use, atomically. Returns the grant id. A grant bound to a
-    /// run covers only that run's ops (#127).
-    ///
-    /// Never an egress op (one a box makes itself, [`Op::refused_for_agents`] is `None`): since
-    /// #257's slice 3 the ledger records an egress grant's issuance, renewals and revocation, and
-    /// the run's process publishes it to the box's node, which alone decides and counts its uses.
-    /// Such an op is refused with [`StoreError::EgressGrant`].
-    pub fn consume_grant(&mut self, op: &Op) -> Result<Option<String>> {
-        if op.refused_for_agents().is_none() {
-            return Err(StoreError::EgressGrant(format!("{} {}{}", op.method, op.host, op.path)));
-        }
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let found = live_grant(&tx, &GrantMatch::for_op(op))?;
-        let Some((gid, uses)) = found else {
-            tx.commit()?;
-            return Ok(None);
-        };
-        if uses.is_some() {
-            tx.execute("UPDATE grants SET uses_left = uses_left - 1 WHERE id = ?1", params![gid])?;
-        }
-        tx.commit()?;
-        Ok(Some(gid))
-    }
-
-    /// The live grant that covers `op`, by the lookup [`Ledger::consume_grant`] uses, without
-    /// using it: for what an issued grant covers (the console, tests). A grant already handed to a
+    /// The live grant that covers `op`, by the one lookup every request kind's grant is found by,
+    /// without using it: for what an issued grant covers (the console, tests). A grant already handed to a
     /// node isn't found: its uses are counted there.
     pub fn grant_covering(&self, op: &Op) -> Result<Option<String>> {
         let tx = self.conn.unchecked_transaction()?;
@@ -1569,7 +1543,7 @@ impl Ledger {
 
     /// An operator's approval of an agent's `request_update` for the artifact with this sha256
     /// (#162): a live grant made for such a request, found by the same lookup as every other
-    /// request kind's ([`Ledger::consume_grant`]), for exactly `UPDATE wicket.internal
+    /// request kind's ([`Ledger::grant_covering`]), for exactly `UPDATE wicket.internal
     /// /self/<sha256>`, from any run. It is used up here (revoked, whatever uses it had left), so
     /// one approval accepts one update. Returns (request id, grant id). Not an acceptance of its
     /// own (#258): only [`Ledger::accept_update_approval`] calls it, which makes the approval the
@@ -3135,15 +3109,7 @@ mod tests {
         l.approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
         assert!(l.grant_covering(&o).unwrap().is_some());
         assert!(l.grant_covering(&o).unwrap().is_some(), "looking a grant up doesn't use it");
-        // #257: an egress grant's uses are the node's to count, never the ledger's.
-        assert!(matches!(l.consume_grant(&o), Err(StoreError::EgressGrant(_))));
         assert!(matches!(l.deny(&id, "owner"), Err(StoreError::NotPending(_, _))));
-        // wicket's own namespace (a spawn beyond its parent): consumed here, once.
-        let spawn = Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "SPAWN", "wicket.internal", "/zones/z.x/0123");
-        let (sid, _) = l.pending_for(&spawn, "spawn", None).unwrap();
-        l.approve(&sid, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
-        assert!(l.consume_grant(&spawn).unwrap().is_some());
-        assert_eq!(l.consume_grant(&spawn).unwrap(), None, "single use");
     }
 
     /// #26: one approval of a push covers its requests for a short window, whatever uses the human
