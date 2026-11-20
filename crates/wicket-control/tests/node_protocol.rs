@@ -79,5 +79,24 @@ fn a_decoding_zone_is_never_published_to_a_node_that_cant_read_it() {
     note_protocol("old", wicket_chan::chan::DECODE_SLASH);
     check_protocol("old", &decoding).unwrap();
     assert!(!sessions.join("999999999-0").exists(), "removed");
+
+    // #692 CI: the local node's serve is non-dumpable, so whether it is this build is read from
+    // `serve.exe` (its pid and binary), beside `serve.pid`.
+    use wicket_control::localnode::{pidfile, serve_is_this_build};
+    let pf = pidfile().unwrap();
+    std::fs::create_dir_all(pf.parent().unwrap()).unwrap();
+    let me = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let pid = std::process::id();
+    assert!(!serve_is_this_build(), "no serve recorded");
+    std::fs::write(&pf, format!("{pid}\n")).unwrap();
+    std::fs::write(pf.with_extension("exe"), format!("{pid}\n{}\n", me.display())).unwrap();
+    assert!(serve_is_this_build(), "this binary, running");
+    std::fs::write(pf.with_extension("exe"), format!("{pid}\n/bin/sh\n")).unwrap();
+    assert!(!serve_is_this_build(), "another binary");
+    std::fs::write(pf.with_extension("exe"), format!("1\n{}\n", me.display())).unwrap();
+    assert!(!serve_is_this_build(), "another pid than serve.pid's");
+    std::fs::write(&pf, "999999999\n").unwrap();
+    std::fs::write(pf.with_extension("exe"), format!("999999999\n{}\n", me.display())).unwrap();
+    assert!(!serve_is_this_build(), "not running");
     let _ = std::fs::remove_dir_all(&home);
 }

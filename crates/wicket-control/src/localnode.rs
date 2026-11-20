@@ -82,7 +82,8 @@ pub async fn ensure(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
     start_serve(&dir)?;
     for _ in 0..200 {
         if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-            note_if_this_build();
+            // The serve this process started (from `self_exe`): this build's protocol.
+            crate::noderun::note_protocol(NAME, crate::chan::PROTOCOL);
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -91,22 +92,31 @@ pub async fn ensure(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
     bail!("the local node did not start: {}", log.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output"))
 }
 
-/// Notes the local node's protocol as this build's if its running `serve` is this very binary
-/// (the one this process runs, not one an update has since replaced): whether this process started
-/// it or found it running (#691). Otherwise the note waits for a connection's welcome.
+/// Notes the local node's protocol as this build's if the `serve` found running is this build's
+/// binary (the one this process would start, `self_exe`, not one an update has since replaced),
+/// though another process started it (#691). Otherwise the note waits for a connection's welcome.
 fn note_if_this_build() {
     if serve_is_this_build() {
         crate::noderun::note_protocol(NAME, crate::chan::PROTOCOL);
     }
 }
 
-fn serve_is_this_build() -> bool {
+/// Whether the local node's running `serve` is this build's binary: the pid in `serve.exe` (which
+/// `serve` writes beside `serve.pid`, since it makes itself non-dumpable and its `/proc/<pid>/exe`
+/// can't be read) is running, is the one in `serve.pid`, and its binary is the file `self_exe` is.
+pub fn serve_is_this_build() -> bool {
     use std::os::unix::fs::MetadataExt;
-    let Some(pid) = pidfile().ok().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| s.trim().parse::<u32>().ok()) else {
+    let Ok(pidfile) = pidfile() else { return false };
+    let Some(pid) = std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse::<u32>().ok()) else { return false };
+    let Ok(rec) = std::fs::read_to_string(pidfile.with_extension("exe")) else { return false };
+    let mut lines = rec.lines();
+    let (Some(rec_pid), Some(exe)) = (lines.next().and_then(|l| l.trim().parse::<u32>().ok()), lines.next()) else { return false };
+    if rec_pid != pid || !std::path::Path::new(&format!("/proc/{pid}")).exists() {
         return false;
-    };
-    let (Ok(serve), Ok(me)) = (std::fs::metadata(format!("/proc/{pid}/exe")), std::fs::metadata("/proc/self/exe")) else { return false };
-    (serve.dev(), serve.ino()) == (me.dev(), me.ino())
+    }
+    let Ok(me) = wicket_node::reexec::self_exe().and_then(|p| std::fs::canonicalize(p).map_err(Into::into)) else { return false };
+    let (Ok(a), Ok(b)) = (std::fs::metadata(exe), std::fs::metadata(&me)) else { return false };
+    std::path::Path::new(exe) == me && (a.dev(), a.ino()) == (b.dev(), b.ino())
 }
 
 fn lock(path: &std::path::Path) -> Result<std::fs::File> {

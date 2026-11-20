@@ -1217,7 +1217,8 @@ async fn manage(
         *sh.ctl.link.lock().expect("link") = None;
         // Cut off (not the box's end): the node may come back on another build, so its protocol is
         // known again only from a new connection's welcome (#691).
-        if !p.exited {
+        // The local node whose serve is still this build's (checked, not assumed) is known still.
+        if !p.exited && !(sh.node == crate::localnode::NAME && crate::localnode::serve_is_this_build()) {
             forget_protocol(&sh.node);
         }
         // Cut off: since now, or since it was (a retry that fails again keeps the time).
