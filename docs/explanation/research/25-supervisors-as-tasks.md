@@ -610,6 +610,13 @@ rolled back by running the previous build.
    - **`runs.host` goes stale**: a run that ends keeps it, and a run started on a node after its
      shard was taken has none until the shard is taken again. The start must set it in its one
      transaction (from `shard_nodes`), and readers must treat it as meaningful only for running runs.
+   - **Only running runs are labelled**, and a run has no `runs.node` until its box is placed
+     (`set_run_node`, the local node included), so `take_shard` labels neither a run not yet placed
+     nor one that isn't `running`. The start (and an adoption) must set `runs.host` itself, and a
+     hibernated run woken later gets it from its new start.
+   - **A renewal doesn't need a live lease**, on purpose: after a ledger stall every lease has
+     lapsed, and a host must be able to renew its own. What stops a lapsed holder is its epoch moving:
+     `fence_shard`, or `take_shard` moving one of its nodes, which fences it in the same transaction.
    - **The first renewal needs progress too** (fixed here: `Lease::take` records the runtime's
      progress at the take, so a runtime that wedges right after taking its shard still lapses).
    - **One clock.** Leases, heartbeats and the stall window are wall-clock seconds from the control

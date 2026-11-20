@@ -130,12 +130,25 @@ impl Ledger {
             // A node held by another shard's live holder isn't moved: that holder would go on
             // passing `as_shard` for the node's runs. It moves once that shard is fenced, stopped or
             // lapsed.
+            // One whose holder has lapsed is fenced here, in the same transaction (a higher epoch, no
+            // holder), so that holder can't renew and go on writing for the shard's other runs.
+            let mut lapsed = Vec::new();
             for node in nodes {
                 if let Some(other) = l.shard_of_node(node)?.filter(|o| o != host) {
-                    if let Some(o) = l.supervisor_host(&other)?.filter(|o| o.owner.is_some() && !o.stopping && o.lease_until > now) {
-                        return Err(StoreError::ShardHeld(other, o.lease_until - now));
+                    if let Some(o) = l.supervisor_host(&other)?.filter(|o| o.owner.is_some() && !o.stopping) {
+                        if o.lease_until > now {
+                            return Err(StoreError::ShardHeld(other, o.lease_until - now));
+                        }
+                        lapsed.push(other);
                     }
                 }
+            }
+            for other in lapsed {
+                l.conn.execute(
+                    "UPDATE supervisor_hosts SET owner = NULL, epoch = epoch + 1, lease_until = 0, updated_at = ?2
+                     WHERE host = ?1 AND owner IS NOT NULL",
+                    params![other, now],
+                )?;
             }
             let epoch = cur.as_ref().map_or(0, |c| c.epoch) + 1;
             l.conn.execute(
@@ -330,6 +343,14 @@ mod tests {
         // Once shard 0 is fenced, it moves, and A's writes for its runs are refused.
         assert_eq!(l.fence_shard("0", A, true, 111).unwrap(), Some(2));
         l.take_shard("1", B, &["n1", "n2"], 30, 111).unwrap();
+        // A lapsed holder's node moves too, and that holder is fenced in the same take.
+        let l2 = ledger_with_runs();
+        l2.take_shard("0", A, &["n1", "n2"], 30, 100).unwrap();
+        l2.take_shard("1", B, &["n1"], 30, 130).unwrap();
+        let old = l2.supervisor_host("0").unwrap().unwrap();
+        assert_eq!((old.owner, old.epoch), (None, 2));
+        assert!(!l2.renew_shard_lease("0", A, 1, 30, 131).unwrap());
+        assert_eq!(l2.shard_nodes("0").unwrap(), ["n2"], "its other nodes stay, for its next holder");
         assert_eq!(l.shard_nodes("0").unwrap(), Vec::<String>::new());
         assert_eq!(l.shard_runs("1").unwrap(), ["run_1", "run_2", "run_3"]);
         let w: Result<()> = l.as_shard("0", A, 1, &["run_1"], |_| Ok(()));

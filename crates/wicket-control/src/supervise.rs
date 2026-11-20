@@ -8,14 +8,15 @@
 //!   [`Lease::renew`]): its runtime moves a counter every tick, and a renewal that sees the counter
 //!   where it left it doesn't renew. A frozen process lapses its lease, and so does a wedged runtime
 //!   whose lease thread is still alive.
-//! - **wicketd fences, and only after taking the epoch** ([`Fencer`]): it fences a holder whose
-//!   process it saw exit at once, and one whose heartbeat is silent (or stuck) only once its lease
-//!   has lapsed alone for [`STALL_WINDOW_SECS`], several renewals, so the end of a ledger stall
-//!   (when the first host to renew makes the rest look lapsed alone) fences no one. Each fence names
-//!   the holder it is for, so a late reap never fences that shard's next holder. A held shard whose
-//!   process wicketd doesn't know (wicketd itself restarted) is watched, not fenced, while its lease
-//!   is live. The ledger step is `Ledger::fence_shard`: a higher epoch, only for that holder; the
-//!   kill and the fresh start follow only if it worked.
+//! - **wicketd fences, and only after taking the epoch** ([`Fencer`]): a holder whose process is
+//!   gone (reaped, or after a restart or reboot, not running) at once; one whose heartbeat, which is
+//!   off the ledger, is silent or stuck and whose lease has lapsed for [`STALL_WINDOW_SECS`] (several
+//!   renewals). A ledger stall leaves heartbeats answering, so it fences no one, and the end of one
+//!   (the first host to renew makes the rest look lapsed alone for a moment) doesn't either. Each
+//!   fence names the holder it is for, so a late reap never fences that shard's next holder. A held
+//!   shard whose running process wicketd didn't start is watched, not fenced. The ledger step is
+//!   `Ledger::fence_shard`: a higher epoch, only for that holder; the kill and the fresh start
+//!   follow only if it worked.
 //! - Leases and heartbeats are wall-clock seconds from the control host's one clock: every host and
 //!   wicketd run there in this version.
 //!
@@ -160,38 +161,60 @@ pub enum Action {
     Watch(String),
 }
 
-/// wicketd's decisions over time. It remembers, per shard, since when its holder has been lapsed
-/// alone, so one instant of it (a stall ending) fences no one.
+/// wicketd's decisions over time. It remembers, per shard and holder, since when the holder's lease
+/// has been lapsed, and since when lapsed alone, so one instant of either (a stall ending) fences
+/// no one.
 #[derive(Debug, Default)]
 pub struct Fencer {
+    lapsed_since: BTreeMap<String, (String, i64)>,
     alone_since: BTreeMap<String, (String, i64)>,
 }
 
-impl Fencer {
-    /// What to do at `now` for `shards`, from the ledger's records (`hosts`) and the host processes
-    /// wicketd knows (`procs`, by shard):
-    /// - a shard with no live holder (none, or stopped and its process gone or unknown): start;
-    /// - its holder's process reaped: fence that holder, gone, at once;
-    /// - stopping for longer than [`STOP_SECS`] and still running: fence (its lease has lapsed by
-    ///   then, as a stopping host doesn't renew);
-    /// - its heartbeat silent or stuck for [`SILENT_SECS`], or its process unknown, and its lease
-    ///   lapsed alone continuously for [`STALL_WINDOW_SECS`]: fence;
-    /// - held, its lease live, its process unknown: watch.
-    pub fn decide(&mut self, shards: &[String], hosts: &[SupervisorHost], procs: &BTreeMap<String, Proc>, now: i64) -> Vec<Action> {
-        let alone = lapsed_alone(hosts, now);
-        self.alone_since.retain(|s, (holder, _)| {
-            alone.contains(s) && hosts.iter().any(|h| &h.host == s && h.owner.as_deref() == Some(holder.as_str()))
-        });
-        for s in &alone {
-            if let Some(holder) = hosts.iter().find(|h| &h.host == s).and_then(|h| h.owner.clone()) {
-                self.alone_since.entry(s.clone()).or_insert((holder, now));
-            }
+/// Keeps `since` to the shards in `now_in` whose holder is unchanged, and adds the new ones at `now`.
+fn track(since: &mut BTreeMap<String, (String, i64)>, now_in: &[String], hosts: &[SupervisorHost], now: i64) {
+    let holder = |s: &str| hosts.iter().find(|h| h.host == s).and_then(|h| h.owner.clone());
+    since.retain(|s, (h, _)| now_in.contains(s) && holder(s).as_deref() == Some(h.as_str()));
+    for s in now_in {
+        if let Some(h) = holder(s) {
+            since.entry(s.clone()).or_insert((h, now));
         }
+    }
+}
+
+impl Fencer {
+    /// What to do at `now` for `shards`, from the ledger's records (`hosts`), the host processes
+    /// wicketd started (`procs`, by shard), and whether a holder label's process runs
+    /// (`holder_alive`: `wicket_home::owner::owner_alive`, None when it can't tell):
+    /// - no holder (none recorded, fenced): start;
+    /// - stopping: left to exit; fenced if it still runs after [`STOP_SECS`]; started again once its
+    ///   process is gone;
+    /// - its process reaped by wicketd, or (a process wicketd didn't start, after wicketd or the
+    ///   control host restarted) not running: fence that holder, gone, at once. A reboot is this:
+    ///   every lease lapsed, every holder gone, every shard fenced and started;
+    /// - a process wicketd started whose heartbeat is silent or stuck for [`SILENT_SECS`], and whose
+    ///   lease has lapsed for [`STALL_WINDOW_SECS`]: fence. Its heartbeat is off the ledger, so a
+    ///   ledger stall alone (heartbeats answering) fences no one, and a single wedged host is fenced
+    ///   with no other host to compare it with;
+    /// - a process wicketd didn't start that runs, or that it can't tell about while its lease is
+    ///   live: watch; one it can't tell about whose lease lapsed alone for the window: fence.
+    pub fn decide(
+        &mut self,
+        shards: &[String],
+        hosts: &[SupervisorHost],
+        procs: &BTreeMap<String, Proc>,
+        holder_alive: &dyn Fn(&str) -> Option<bool>,
+        now: i64,
+    ) -> Vec<Action> {
+        let lapsed: Vec<String> =
+            hosts.iter().filter(|h| h.owner.is_some() && !h.stopping && h.lease_until <= now).map(|h| h.host.clone()).collect();
+        track(&mut self.lapsed_since, &lapsed, hosts, now);
+        track(&mut self.alone_since, &lapsed_alone(hosts, now), hosts, now);
+        let long = |m: &BTreeMap<String, (String, i64)>, s: &str| m.get(s).is_some_and(|(_, since)| since + STALL_WINDOW_SECS <= now);
         let mut out = Vec::new();
         for s in shards {
             let rec = hosts.iter().find(|h| &h.host == s);
             let holder = rec.and_then(|h| h.owner.clone());
-            // The process wicketd knows for this shard, if it is the holder on record.
+            // The process wicketd started for this shard, if it is the holder on record.
             let proc = procs.get(s).filter(|p| holder.as_deref() == Some(p.owner.as_str()));
             let Some(holder) = holder else {
                 out.push(Action::Start(s.clone()));
@@ -199,25 +222,30 @@ impl Fencer {
             };
             let rec = rec.expect("a holder has a record");
             let fence = |gone| Action::Fence { shard: s.clone(), holder: holder.clone(), gone };
+            let alive = match proc {
+                Some(p) => !p.exited,
+                None => holder_alive(&holder) != Some(false),
+            };
             if rec.stopping {
-                match proc {
-                    Some(p) if !p.exited && rec.updated_at + STOP_SECS <= now => out.push(fence(false)),
-                    Some(p) if !p.exited => {}
-                    _ => out.push(Action::Start(s.clone())),
+                if !alive {
+                    out.push(Action::Start(s.clone()));
+                } else if rec.updated_at + STOP_SECS <= now {
+                    out.push(fence(false));
                 }
                 continue;
             }
             match proc {
-                Some(p) if p.exited => out.push(fence(true)),
-                _ => {
-                    let lapsed_long = self.alone_since.get(s).is_some_and(|(_, since)| since + STALL_WINDOW_SECS <= now);
-                    let silent = proc.is_none_or(|p| p.ok_at + SILENT_SECS <= now);
-                    if silent && lapsed_long {
+                _ if !alive => out.push(fence(true)),
+                Some(p) => {
+                    if p.ok_at + SILENT_SECS <= now && long(&self.lapsed_since, s) {
                         out.push(fence(false));
-                    } else if proc.is_none() && rec.lease_until > now {
-                        out.push(Action::Watch(s.clone()));
                     }
                 }
+                None => match holder_alive(&holder) {
+                    None if long(&self.alone_since, s) => out.push(fence(false)),
+                    None if rec.lease_until <= now => {}
+                    _ => out.push(Action::Watch(s.clone())),
+                },
             }
         }
         out
@@ -292,12 +320,23 @@ mod tests {
         vec!["0".into(), "1".into()]
     }
 
+    /// What `owner_alive` says of a process wicketd didn't start.
+    fn alive(_: &str) -> Option<bool> {
+        Some(true)
+    }
+    fn dead(_: &str) -> Option<bool> {
+        Some(false)
+    }
+    fn unknown(_: &str) -> Option<bool> {
+        None
+    }
+
     #[test]
     fn wicketd_starts_missing_hosts_and_leaves_live_ones() {
         let mut f = Fencer::default();
-        assert_eq!(f.decide(&shards(), &[], &BTreeMap::new(), 100), [Action::Start("0".into()), Action::Start("1".into())]);
+        assert_eq!(f.decide(&shards(), &[], &BTreeMap::new(), &alive, 100), [Action::Start("0".into()), Action::Start("1".into())]);
         let procs = BTreeMap::from([("0".into(), proc("0", 100)), ("1".into(), proc("1", 100))]);
-        assert!(f.decide(&shards(), &[host("0", 130), host("1", 130)], &procs, 105).is_empty());
+        assert!(f.decide(&shards(), &[host("0", 130), host("1", 130)], &procs, &alive, 105).is_empty());
     }
 
     #[test]
@@ -305,65 +344,91 @@ mod tests {
         let mut f = Fencer::default();
         let mut procs = BTreeMap::from([("0".into(), proc("0", 100)), ("1".into(), proc("1", 100))]);
         procs.get_mut("0").unwrap().exited = true;
-        assert_eq!(f.decide(&shards(), &[host("0", 130), host("1", 130)], &procs, 101), [fence("0", true)]);
+        assert_eq!(f.decide(&shards(), &[host("0", 130), host("1", 130)], &procs, &alive, 101), [fence("0", true)]);
         // The shard was fenced and a fresh host (m:9:9) holds it; the old process is reaped only now:
-        // nothing, as the reaped process isn't the holder on record.
+        // the reap isn't the holder on record, so the fresh one is judged on its own process.
         let mut fresh = host("0", 140);
         fresh.owner = Some("m:9:9".into());
         procs.insert("0".into(), Proc { owner: "m:0:1".into(), ok_at: 100, exited: true });
-        assert_eq!(f.decide(&shards(), &[fresh, host("1", 140)], &procs, 111), [Action::Watch("0".into())]);
+        assert_eq!(f.decide(&shards(), &[fresh, host("1", 140)], &procs, &alive, 111), [Action::Watch("0".into())]);
     }
 
     #[test]
-    fn after_wicketd_restarts_held_shards_are_watched_not_fenced() {
+    fn after_wicketd_restarts_running_holders_are_watched_and_gone_ones_fenced() {
         let mut f = Fencer::default();
         let hosts = [host("0", 130), host("1", 130)];
-        // wicketd knows no process: both held, both live.
-        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), 101), [Action::Watch("0".into()), Action::Watch("1".into())]);
-        // One renews on (its process lives on, wicketd just doesn't know it), the other lapses:
-        // watched until it has been lapsed alone for the window, then fenced (not gone).
+        // Their processes live on; wicketd just didn't start them: watched, lapsed or not.
+        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), &alive, 101), [Action::Watch("0".into()), Action::Watch("1".into())]);
+        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), &alive, 200), [Action::Watch("0".into()), Action::Watch("1".into())]);
+        // Can't tell (an owner label from elsewhere): watched while live; fenced only once lapsed
+        // alone for the window.
+        let mut f = Fencer::default();
         let hosts = [host("0", 130), host("1", 150)];
-        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), 131), [Action::Watch("1".into())]);
-        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), 131 + STALL_WINDOW_SECS - 1), [Action::Watch("1".into())]);
+        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), &unknown, 131), [Action::Watch("1".into())]);
         let hosts = [host("0", 130), host("1", 170)];
-        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), 131 + STALL_WINDOW_SECS), [fence("0", false), Action::Watch("1".into())]);
+        assert_eq!(
+            f.decide(&shards(), &hosts, &BTreeMap::new(), &unknown, 131 + STALL_WINDOW_SECS),
+            [fence("0", false), Action::Watch("1".into())]
+        );
+    }
+
+    #[test]
+    fn after_a_reboot_every_lapsed_shard_of_a_gone_holder_is_fenced_and_started() {
+        let mut f = Fencer::default();
+        // Every lease lapsed long ago, no process known, every holder's process gone.
+        let hosts = [host("0", 100), host("1", 100)];
+        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), &dead, 5_000), [fence("0", true), fence("1", true)]);
+        // Once fenced (no holder), started.
+        let mut fenced = hosts.clone();
+        for h in &mut fenced {
+            h.owner = None;
+        }
+        assert_eq!(f.decide(&shards(), &fenced, &BTreeMap::new(), &dead, 5_001), [Action::Start("0".into()), Action::Start("1".into())]);
+    }
+
+    #[test]
+    fn a_single_wedged_host_is_fenced_without_another_to_compare() {
+        let one = vec!["0".to_string()];
+        let mut f = Fencer::default();
+        // Its heartbeat stopped at 100 and its lease lapsed at 130: no other lease is live.
+        let procs = BTreeMap::from([("0".into(), proc("0", 100))]);
+        assert!(f.decide(&one, &[host("0", 130)], &procs, &alive, 131).is_empty());
+        assert_eq!(f.decide(&one, &[host("0", 130)], &procs, &alive, 131 + STALL_WINDOW_SECS), [fence("0", false)]);
     }
 
     #[test]
     fn the_moment_a_ledger_stall_ends_fences_no_one() {
         let mut f = Fencer::default();
-        // A stall from 70 to 130: both leases (to 100) lapsed, both heartbeats are fine (they are
-        // off the ledger), and neither is fenced while both are lapsed.
-        let procs = BTreeMap::from([("0".into(), proc("0", 70)), ("1".into(), proc("1", 70))]);
-        assert!(f.decide(&shards(), &[host("0", 100), host("1", 100)], &procs, 120).is_empty());
-        // At 130 host 1 renews first: host 0 looks lapsed alone for a moment, silent heartbeat or not.
-        assert!(f.decide(&shards(), &[host("0", 100), host("1", 160)], &procs, 130).is_empty());
-        // Host 0 renews 4 s later: never fenced.
-        assert!(f.decide(&shards(), &[host("0", 164), host("1", 160)], &procs, 134).is_empty());
-        // Had it not renewed for the whole window, with its heartbeat silent, it would have been.
-        let mut f = Fencer::default();
-        assert!(f.decide(&shards(), &[host("0", 100), host("1", 160)], &procs, 130).is_empty());
-        assert_eq!(f.decide(&shards(), &[host("0", 100), host("1", 175)], &procs, 130 + STALL_WINDOW_SECS), [fence("0", false)]);
+        // A stall from 70 to 130: both leases (to 100) lapsed. The heartbeats are off the ledger and
+        // go on answering, so neither host is fenced, however long the stall.
+        let at = |t| BTreeMap::from([("0".into(), proc("0", t)), ("1".into(), proc("1", t))]);
+        assert!(f.decide(&shards(), &[host("0", 100), host("1", 100)], &at(119), &alive, 120).is_empty());
+        assert!(f.decide(&shards(), &[host("0", 100), host("1", 100)], &at(129), &alive, 129).is_empty());
+        // At 130 host 1 renews first: host 0 looks lapsed alone for a moment; still nothing.
+        assert!(f.decide(&shards(), &[host("0", 100), host("1", 160)], &at(130), &alive, 130).is_empty());
+        assert!(f.decide(&shards(), &[host("0", 164), host("1", 160)], &at(134), &alive, 134).is_empty());
     }
 
     #[test]
     fn a_heartbeating_host_is_not_fenced_for_a_lapse_and_a_stopping_one_has_a_time_limit() {
         let mut f = Fencer::default();
         // Lapsed alone for the window, but its heartbeat says its runtime moves: its renewals are
-        // failing for a reason of its own (not a stall); not fenced while it answers.
+        // failing for a reason of its own; not fenced while it answers.
         let procs = BTreeMap::from([("0".into(), proc("0", 150)), ("1".into(), proc("1", 150))]);
-        f.decide(&shards(), &[host("0", 100), host("1", 160)], &procs, 131);
-        assert!(f.decide(&shards(), &[host("0", 100), host("1", 175)], &procs, 150).is_empty());
+        f.decide(&shards(), &[host("0", 100), host("1", 160)], &procs, &alive, 131);
+        assert!(f.decide(&shards(), &[host("0", 100), host("1", 175)], &procs, &alive, 150).is_empty());
         // Stopping: left alone while it exits, fenced after STOP_SECS if it doesn't, started again
         // once it has.
         let mut stopping = host("0", 160);
         stopping.stopping = true;
         stopping.updated_at = 140;
         let hosts = [stopping.clone(), host("1", 175)];
-        assert!(f.decide(&shards(), &hosts, &procs, 150).is_empty());
-        assert_eq!(f.decide(&shards(), &hosts, &procs, 140 + STOP_SECS), [fence("0", false)]);
+        assert!(f.decide(&shards(), &hosts, &procs, &alive, 150).is_empty());
+        assert_eq!(f.decide(&shards(), &hosts, &procs, &alive, 140 + STOP_SECS), [fence("0", false)]);
         let mut gone = procs.clone();
         gone.get_mut("0").unwrap().exited = true;
-        assert_eq!(f.decide(&shards(), &hosts, &gone, 150), [Action::Start("0".into())]);
+        assert_eq!(f.decide(&shards(), &hosts, &gone, &alive, 150), [Action::Start("0".into())]);
+        // A stopping holder wicketd didn't start, gone: started.
+        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), &dead, 150)[0], Action::Start("0".into()));
     }
 }
