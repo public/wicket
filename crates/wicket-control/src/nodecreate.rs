@@ -64,8 +64,8 @@ pub struct CreateArgs {
     memory_mib: u64,
     /// How long the node is needed: its worst-case cost is reserved for this long, and its lease
     /// ends at minute 50 of the last hour.
-    #[arg(long, default_value = "1h")]
-    lifetime: String,
+    #[arg(long, default_value = "1h", value_parser = wicket_core::time::duration_arg)]
+    lifetime: std::time::Duration,
     /// Most this node may cost per hour, in dollars.
     #[arg(long)]
     max_node_hourly: Option<String>,
@@ -84,17 +84,17 @@ pub struct CreateArgs {
     /// Create and wait, but don't enrol.
     #[arg(long)]
     no_enrol: bool,
-    #[arg(long, default_value = "24h")]
-    ca_ttl: String,
+    #[arg(long, default_value = "24h", value_parser = wicket_core::time::duration_arg)]
+    ca_ttl: std::time::Duration,
     /// Give up on the node, and release it, if nothing answers on its ssh port for this long (every
     /// connect times out or is unreachable). Once the port answers (accepted or refused), wait up to
     /// 15 minutes for setup.
-    #[arg(long, default_value = "4m")]
-    give_up_silent: String,
+    #[arg(long, default_value = "4m", value_parser = wicket_core::time::duration_arg)]
+    give_up_silent: std::time::Duration,
     /// How long to wait for an operator when none of your capacity grants covers the node (the
     /// request is pending meanwhile, on the console and in `wicket pending`); 0: don't wait.
-    #[arg(long, default_value = "15m")]
-    wait: String,
+    #[arg(long, default_value = "15m", value_parser = wicket_core::time::duration_arg)]
+    wait: std::time::Duration,
 }
 
 fn owner_name(c: &Common) -> String {
@@ -347,7 +347,7 @@ impl CapacityApprover {
         };
         if self.wait.is_zero() {
             Ledger::open(&self.ledger)?.deny(&id, "wicket:no-wait")?;
-            return Ok(Approval::Denied(format!("no capacity grant covers it, and --wait 0 (request {id} withdrawn)")));
+            return Ok(Approval::Undecided(format!("no capacity grant covers it, and --wait 0 (request {id} withdrawn)")));
         }
         say!(
             "waiting up to {} for an operator to decide request {id} (wicket approve {id}, or the console)",
@@ -370,7 +370,7 @@ impl CapacityApprover {
                     "decision",
                     &serde_json::json!({ "request": id, "decision": "deny", "by": "wicket:timed-out" }),
                 )?;
-                return Ok(Approval::Denied(format!(
+                return Ok(Approval::Undecided(format!(
                     "nobody decided request {id} within {}",
                     wicket_core::time::format_duration(self.wait)
                 )));
@@ -388,11 +388,11 @@ impl SpendApprover for CapacityApprover {
         match self.reserve(r) {
             Ok(Ok(())) => {}
             Ok(Err(refused)) => return Approval::Denied(format!("over this installation's money limit: {refused}")),
-            Err(e) => return Approval::Denied(format!("reserving its money failed: {e:#}")),
+            Err(e) => return Approval::Failed(format!("reserving its money failed: {e:#}")),
         }
         let a = match self.decide(r).await {
             Ok(a) => a,
-            Err(e) => Approval::Denied(format!("the capacity request failed: {e:#}")),
+            Err(e) => Approval::Failed(format!("the capacity request failed: {e:#}")),
         };
         if a != Approval::Approved {
             if let Ok(l) = Ledger::open(&self.ledger) {
@@ -483,8 +483,6 @@ pub async fn create(args: CreateArgs) -> Result<()> {
             )
         })?;
     }
-    let lifetime = wicket_core::time::parse_duration(&lifetime)?;
-    let ca_ttl = wicket_core::time::parse_duration(&ca_ttl)?;
     let owner_name = owner_name(&common);
     let o = Owner::new(&owner_name);
     let config = VultrConfig { os_id, sshkey_ids: ssh_key_ids, default_region: region.clone(), ..VultrConfig::default() };
@@ -499,8 +497,7 @@ pub async fn create(args: CreateArgs) -> Result<()> {
         })?
         .budget()?;
     let principal = crate::operators::Operator::cli(&TenantId::single().0)?.id;
-    let approver =
-        CapacityApprover::new(crate::ledger_path(), TenantId::single(), principal, wicket_core::time::parse_duration(&wait)?, budget);
+    let approver = CapacityApprover::new(crate::ledger_path(), TenantId::single(), principal, wait, budget);
     let filed = approver.request.clone();
     let placer = Placer::new(provider(&common, config)?, approver, o.clone());
 
@@ -574,7 +571,7 @@ pub async fn create(args: CreateArgs) -> Result<()> {
                              "hourly_usd_micros": n.billing.hourly_rate().0, "lease_until": n.lease_until, "owner": o.tag() }),
     )?;
     let hosts = (!no_enrol).then_some(hosts);
-    let wait = boot::ReadyWait { silent_limit: wicket_core::time::parse_duration(&give_up_silent)?, ..boot::ReadyWait::default() };
+    let wait = boot::ReadyWait { silent_limit: give_up_silent, ..boot::ReadyWait::default() };
     let ready =
         bring_up_or_release::<_, boot::SshProbe>(&placer, &crate::ledger_path(), &n, &name, &pinned, ssh_key, hosts, ca_ttl, &wait, None)
             .await?;
@@ -1157,7 +1154,7 @@ mod tests {
         // A second node is beyond the grant (one at once): it waits for an operator, and nobody
         // deciding is a denial. Nothing is created.
         let e = p.acquire(&request("n2")).await.unwrap_err();
-        assert!(matches!(&e, PlacementError::NotApproved(w) if w.contains("nobody decided")), "{e:?}");
+        assert!(matches!(&e, PlacementError::Undecided(w) if w.contains("nobody decided")), "{e:?}");
         assert_eq!(st.lock().unwrap().instances.len(), 1);
         let r2 = requests(&path).into_iter().find(|r| r.path == "/capacity/node/n2").unwrap();
         assert_eq!(r2.status, "denied");

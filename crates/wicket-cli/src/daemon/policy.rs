@@ -12,8 +12,8 @@
 
 use super::Peer;
 use crate::{
-    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd, ServiceCmd,
-    StandingCmd, StateCmd, TriggerCmd,
+    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd,
+    ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -67,7 +67,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
         Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } => Forward(Read),
-        Cmd::Pending | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
+        Cmd::Pending { .. } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
         // Renewing a grant or a box's authority grants more time: a decision, as approving is.
@@ -76,6 +76,9 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Standing { cmd: StandingCmd::List { .. } | StandingCmd::Show { .. } } => Forward(Read),
         Cmd::Standing { cmd: StandingCmd::Approve { .. } | StandingCmd::Deny { .. } | StandingCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Standing { cmd: StandingCmd::Revoke { .. } } => Forward(Revoke),
+        Cmd::Names { cmd: NamesCmd::List { .. } | NamesCmd::Show { .. } } => Forward(Read),
+        Cmd::Names { cmd: NamesCmd::Approve { .. } | NamesCmd::Deny { .. } } => Forward(Privileged),
+        Cmd::Names { cmd: NamesCmd::Revoke { .. } } => Forward(Revoke),
         // A trigger wakes and messages agents later, as its owner (the caller): what `wake` and
         // `session` do now. Pausing and removing one only narrows.
         Cmd::Trigger { cmd } => match cmd {
@@ -102,7 +105,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // Reads a manifest the caller names, in the caller's own process.
         Cmd::Zone { .. } => Local,
         // Installing a service decides what runs on every node, under its reach (#579).
-        Cmd::Service { cmd: ServiceCmd::List } => Forward(Read),
+        Cmd::Service { cmd: ServiceCmd::List { .. } } => Forward(Read),
         Cmd::Service { .. } => Forward(Privileged),
         Cmd::Operator { cmd } => match cmd {
             OperatorCmd::List | OperatorCmd::Sessions => Forward(Read),

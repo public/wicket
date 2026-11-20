@@ -136,11 +136,13 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
         dir_fd: fds.len() > 3,
         manifest_name,
         program_source,
+        codes: true,
     };
     proto::write_json(&mut w, kind::HELLO, &hello)?;
     let welcome: Welcome = match proto::read_frame(&mut r)? {
         Some((kind::WELCOME, p)) => serde_json::from_slice(&p)?,
-        Some((kind::ERROR, p)) => bail!("wicketd: {}", String::from_utf8_lossy(&p)),
+        // Its policy refused the command (exit 3), or it failed otherwise (1).
+        Some((k @ (kind::REFUSE | kind::ERROR), p)) => return Err(daemon_error(k, &p)),
         _ => bail!("wicketd closed the connection"),
     };
     let mut client_ok = true;
@@ -159,7 +161,8 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
             loop {
                 match proto::read_frame(&mut r)? {
                     Some((kind::EXIT, p)) if p.len() == 4 => return Ok(i32::from_be_bytes(p[..4].try_into().expect("4 bytes"))),
-                    Some((kind::ERROR, p)) => bail!("wicketd: {}", String::from_utf8_lossy(&p)),
+                    // Its policy refused the command (exit 3), or it failed otherwise (1).
+                    Some((k @ (kind::REFUSE | kind::ERROR), p)) => return Err(daemon_error(k, &p)),
                     Some(_) => {}
                     // A restart by the service manager (#455): the command itself goes on.
                     None => bail!(
@@ -239,4 +242,43 @@ fn doctor(sock: &Path, w: &Welcome) -> bool {
         println!("docker: not reachable by you (good)");
     }
     ok
+}
+
+/// [`daemon_error`] for a `REFUSE` frame, for the daemon's tests.
+#[cfg(test)]
+pub(super) fn daemon_error_for_test(p: &[u8]) -> anyhow::Error {
+    daemon_error(kind::REFUSE, p)
+}
+
+/// The daemon turning the command away as this command's error: a `REFUSE` frame with the exit
+/// code it carries (#574), an `ERROR` frame (a daemon before it) as a failure, 1.
+fn daemon_error(kind: u8, p: &[u8]) -> anyhow::Error {
+    let (code, text) = match kind {
+        kind::REFUSE => proto::parse_refuse(p),
+        _ => (wicket_home::exit::Code::Failed, String::from_utf8_lossy(p).into_owned()),
+    };
+    wicket_home::exit::Exit { code, msg: format!("wicketd: {text}") }.into()
+}
+
+#[cfg(test)]
+mod tests {
+    /// #574: the daemon's policy refusal exits 3; its other errors (moving to a new build, fds or
+    /// uploads that didn't arrive) exit 1.
+    #[test]
+    fn only_the_policys_refusal_is_refused() {
+        use super::proto::{kind, refuse_frame};
+        use wicket_home::exit::{code_of, Code};
+        let refused = super::daemon_error(kind::REFUSE, &refuse_frame(Code::Refused, "needs root, or a passkey in the console"));
+        assert_eq!(code_of(&refused), Some(Code::Refused));
+        assert!(refused.to_string().contains("needs root"), "{refused}");
+        for code in [Code::Usage, Code::TryAgain, Code::Failed, Code::NotFound] {
+            assert_eq!(code_of(&super::daemon_error(kind::REFUSE, &refuse_frame(code, "x"))), Some(code));
+        }
+        // The text can't pass for a code: only the field says one.
+        let spoof = super::daemon_error(kind::REFUSE, &refuse_frame(Code::Failed, "refused: try again: usage:"));
+        assert_eq!(code_of(&spoof), Some(Code::Failed));
+        // A daemon before it: its ERROR frame is a failure, its text kept.
+        let old = super::daemon_error(kind::ERROR, b"refused: needs root");
+        assert_eq!((code_of(&old), old.to_string().contains("needs root")), (Some(Code::Failed), true));
+    }
 }

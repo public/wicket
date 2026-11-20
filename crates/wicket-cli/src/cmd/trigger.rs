@@ -1,7 +1,8 @@
 //! `wicket trigger`: triggers (#578), an operator's standing intent ("when this happens, do that"),
-//! kept in the ledger and fired by the reconciler's scheduler. This version keeps the ones that
-//! tell time (`schedule` and `timer` sources) and their `wake` and `message` actions; a `start`
-//! is queued for the engine, which comes later.
+//! kept in the ledger and fired by the reconciler. This version keeps the ones that tell time
+//! (`schedule` and `timer` sources) and the ones on wicket's own events (`wicket`: runs ending,
+//! agents waking, decisions), with their `wake` and `message` actions; a `start` is queued for the
+//! engine, which comes later.
 
 use crate::*;
 use wicket_control::triggers as tr;
@@ -15,7 +16,7 @@ pub enum TriggerCmd {
         #[arg(long)]
         file: PathBuf,
         /// How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew`.
-        #[arg(long, default_value = tr::DEFAULT_LASTS)]
+        #[arg(long, default_value = tr::DEFAULT_LASTS, value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
     },
     /// Triggers that aren't removed: each with its state, source, action and next firing.
@@ -29,13 +30,14 @@ pub enum TriggerCmd {
     /// Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root).
     Renew {
         trigger: String,
-        #[arg(long, default_value = tr::DEFAULT_LASTS)]
+        #[arg(long, default_value = tr::DEFAULT_LASTS, value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
     },
     /// Remove a trigger: it fires nothing again.
     Rm { trigger: String },
     /// Show what a trigger would do for an event, its templates filled in, changing nothing. The
-    /// event is a JSON object of the source's fields (--event); without one, a time-told event now.
+    /// event is a JSON object of the source's fields (--event); without one, a time-told event now,
+    /// or for wicket's own events, one of the first kind it listens to.
     Fire {
         trigger: String,
         /// A JSON file with the event's fields.
@@ -59,6 +61,7 @@ fn c(s: &str) -> String {
 fn state(t: &wicket_store::Trigger, now: i64) -> String {
     match (t.status.as_str(), t.approval.as_str(), t.until) {
         ("paused", _, _) => "paused".into(),
+        ("done", _, _) => "done (its timer has fired)".into(),
         (_, "pending", _) => "waiting for approval".into(),
         (_, _, Some(u)) if u <= now => format!("lapsed {}", when(u)),
         (_, _, Some(u)) => format!("active, until {}", when(u)),
@@ -131,7 +134,9 @@ fn lasts(s: &str) -> Result<Option<i64>> {
     match s {
         "forever" => Ok(None),
         d => {
-            let d = wicket_core::time::parse_duration(d).context("bad --lasts (a duration such as 30d, or forever)")?;
+            // As clap checked it (#574): a duration, or a number of seconds.
+            let d = wicket_core::time::duration_arg(d)
+                .map_err(|e| wicket_home::exit::usage(format!("bad --lasts {d:?} (a duration such as 30d, or forever): {e}")))?;
             Ok(Some(wicket_store::now() + d.as_secs() as i64))
         }
     }
@@ -148,7 +153,7 @@ fn find(l: &Ledger, op: &operators::Operator, which: &str) -> Result<wicket_stor
         return Ok(t.clone());
     }
     match named.len() {
-        0 => bail!("no trigger {which}"),
+        0 => Err(wicket_home::exit::not_found(format!("no trigger {which}"))),
         1 => Ok(named.into_iter().next().expect("one")),
         n => bail!("{n} triggers are named {which} (owners {}): name it by its id", {
             named.iter().map(|t| c(&t.owner)).collect::<Vec<_>>().join(", ")

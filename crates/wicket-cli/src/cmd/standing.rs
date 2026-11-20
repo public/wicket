@@ -11,6 +11,9 @@ pub enum StandingCmd {
     List {
         #[arg(long)]
         all: bool,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// One ask or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and
     /// what it would allow beyond them.
@@ -23,7 +26,7 @@ pub enum StandingCmd {
         #[arg(long = "for", default_value = "agent")]
         bound: String,
         /// How long it lasts (at most 366d), or `forever`: until revoked.
-        #[arg(long, default_value = "30d")]
+        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d", value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
         /// Approve only the methods and paths the evidence shows were asked for.
         #[arg(long)]
@@ -34,10 +37,11 @@ pub enum StandingCmd {
     },
     /// Deny a standing ask.
     Deny { id: String },
-    /// Move an approved rule's lapse to --lasts from now (or `forever`).
+    /// Move an approved rule's lapse to --ttl from now (or `forever`).
     Renew {
         id: String,
-        #[arg(long, default_value = "30d")]
+        /// How long it lasts from now (at most 366d), or `forever`: until revoked.
+        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d", value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
     },
     /// Revoke an approved rule: it allows nothing from now on (a box's node, once its run publishes
@@ -48,7 +52,11 @@ pub enum StandingCmd {
 fn lasts(s: &str) -> Result<Option<std::time::Duration>> {
     match s {
         "forever" => Ok(None),
-        d => Ok(Some(wicket_core::time::parse_duration(d).context("bad --lasts (a duration such as 30d, or forever)")?)),
+        d => Ok(Some(
+            // As clap checked it (#574): a duration, or a number of seconds.
+            wicket_core::time::duration_arg(d)
+                .map_err(|e| wicket_home::exit::usage(format!("bad --ttl {d:?} (a duration such as 30d, or forever): {e}")))?,
+        )),
     }
 }
 
@@ -56,7 +64,7 @@ fn bound(s: &str) -> Result<wicket_store::StandingBound> {
     match s {
         "agent" => Ok(wicket_store::StandingBound::Agent),
         "zone" => Ok(wicket_store::StandingBound::Zone),
-        x => bail!("--for is agent or zone, not {x:?}"),
+        x => Err(wicket_home::exit::usage(format!("--for is agent or zone, not {x:?}"))),
     }
 }
 
@@ -73,6 +81,31 @@ fn rule_text(r: &wicket_core::manifest::ReachRule) -> String {
         r.paths.iter().map(|p| format!("'{}'", wicket_agent::clip(p, 4096))).collect::<Vec<_>>().join(", "),
         if r.allow_dangerous { ", allow_dangerous: true" } else { "" }
     )
+}
+
+/// A rule as `--json` prints it: the manifest's reach rule fields.
+pub fn rule_json(r: &wicket_core::manifest::ReachRule) -> serde_json::Value {
+    serde_json::json!({ "host": r.host, "methods": r.methods, "paths": r.paths, "allow_dangerous": r.allow_dangerous })
+}
+
+/// `wicket standing list --json`.
+pub(crate) fn standing_list_json(rows: &[wicket_store::Standing], now: i64) -> serde_json::Value {
+    serde_json::Value::Array(rows.iter().map(|s| standing_json(s, now)).collect())
+}
+
+/// One rule of `wicket standing list --json`. `state` is `status`, except that an approved rule
+/// past its `expires_at` is `lapsed`; `for` is `agent`, `zone`, or null while undecided.
+fn standing_json(s: &wicket_store::Standing, now: i64) -> serde_json::Value {
+    let state = match (s.status.as_str(), s.expires_at) {
+        ("approved", Some(e)) if e <= now => "lapsed",
+        (st, _) => st,
+    };
+    serde_json::json!({
+        "id": s.id, "status": s.status, "state": state, "rule": rule_json(&s.rule),
+        "for": s.bound,
+        "principal": s.principal, "zone": s.zone, "run": s.run, "reason": s.reason, "created_at": s.created_at,
+        "decided_at": s.decided_at, "decided_by": s.decided_by, "expires_at": s.expires_at, "revoked_at": s.revoked_at,
+    })
 }
 
 fn when(t: i64) -> String {
@@ -145,7 +178,7 @@ pub fn show(s: &wicket_store::Standing, rule: &wicket_core::manifest::ReachRule)
 pub async fn dispatch(c: StandingCmd) -> Result<()> {
     let human = || -> Result<grant::Granter> { Ok(grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?)) };
     match c {
-        StandingCmd::List { all } => {
+        StandingCmd::List { all, json } => {
             let l = Ledger::open(&ledger_path())?;
             let t = TenantId::single();
             let now = wicket_store::now();
@@ -154,6 +187,9 @@ pub async fn dispatch(c: StandingCmd) -> Result<()> {
             if all {
                 rows.extend(l.standing_with_status(&t, "denied")?);
                 rows.extend(l.standing_with_status(&t, "revoked")?);
+            }
+            if json {
+                return crate::cmd::print_json(&standing_list_json(&rows, now));
             }
             if rows.is_empty() {
                 println!("no standing reach");
@@ -170,13 +206,15 @@ pub async fn dispatch(c: StandingCmd) -> Result<()> {
             Ok(())
         }
         StandingCmd::Approve { id, bound: b, lasts: d, narrow, yes } => {
+            // The command line first: a usage error is one whatever the ledger holds.
+            let (b, d) = (bound(&b)?, lasts(&d)?);
             let l = Ledger::open(&ledger_path())?;
             let s = l.standing(&id)?;
             let rule = match narrow {
                 true => Some(st::narrowed(&s).context("nothing to narrow to: the ask has no evidence (approve it as asked, or deny it)")?),
                 false => None,
             };
-            let a = st::Approve { rule, bound: bound(&b)?, ttl: lasts(&d)? };
+            let a = st::Approve { rule, bound: b, ttl: d };
             let shown_rule = a.rule.clone().unwrap_or_else(|| s.rule.clone());
             // What is approved is what wicket recorded, shown before it is decided (#121), and the
             // decision is made on that effect (#369).
@@ -192,7 +230,7 @@ pub async fn dispatch(c: StandingCmd) -> Result<()> {
                 a.ttl.map(|t| wicket_core::time::format_duration(t).to_string()).unwrap_or_else(|| "until revoked".into())
             );
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
-                bail!("not approved");
+                return Err(wicket_home::exit::refused("not approved: declined at the confirmation"));
             }
             st::approve(&l, &human()?, &id, &a, Some(&shown), serde_json::json!({ "via": "cli" }))?;
             println!("approved {id}: the agent's later runs are allowed {} without asking", rule_text(&shown_rule));

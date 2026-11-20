@@ -252,3 +252,42 @@ async fn new_requests_push_once_per_device_coalesced_and_gone_devices_are_droppe
     assert_eq!(body["body"], "4 requests waiting");
     assert_eq!(body["id"].as_str(), Some(r3.as_str()));
 }
+
+/// With the ledger gone, the state store's unread alert is still shown by the health view and the
+/// dashboard, and pushed to the devices of the passkeys enrolled at the last read (#635).
+#[tokio::test]
+async fn the_unread_alert_survives_a_ledger_that_cant_be_opened() {
+    let mut t = setup("pushunread");
+    let sent = recorder(&mut t, |_| 201);
+    let (p, a) = keys();
+    t.state
+        .push
+        .as_ref()
+        .unwrap()
+        .store
+        .add(
+            &t.cred,
+            &push::NewDevice { endpoint: "https://fcm.googleapis.com/fcm/send/x", p256dh: &p, auth: &a, label: "l", details: true },
+            0,
+        )
+        .unwrap();
+    let now = wicket_feed::now_ms();
+    let (mut h, mut known) = (push::HealthNotifier::default(), Vec::new());
+    notify_health(&t.state, &mut h, &mut known, now).await;
+    assert_eq!(known, [t.cred.clone()], "the enrolled passkeys, read while the ledger opens");
+    // The ledger goes (a directory where the file was), and the last read was 6 min ago.
+    let gone = t.dir.join("gone");
+    std::fs::create_dir_all(gone.join("ledger.db")).unwrap();
+    t.state.ledger = gone.join("ledger.db");
+    *t.state.progress.lock().unwrap() =
+        (now - 360_000, true, Some(crate::statesync::Progress { stream: None, audit: vec![], errors: vec![] }));
+    let (v, alerts) = health_view(&t.state, now).unwrap();
+    assert_eq!(alerts.iter().map(|a| a.key.as_str()).collect::<Vec<_>>(), ["control:state-store/unread"]);
+    assert_eq!(v["state_store"]["stale"], true);
+    let d = dashboard(&t.state).unwrap();
+    assert_eq!(d["ledger_error"], "the ledger can't be read");
+    assert!(d["health"]["state_store"]["alerts"][0].as_str().unwrap().contains("haven't been checked for 6 min"));
+    let out = notify_health(&t.state, &mut h, &mut known, now).await;
+    assert_eq!(out.len(), 1, "pushed to the device of the passkey known before");
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}

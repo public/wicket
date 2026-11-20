@@ -553,15 +553,17 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
     let copy = stage.join("artifact");
     std::fs::copy(artifact, &copy).with_context(|| format!("reading {}", artifact.display()))?;
     let sha = sha256_file(&copy)?;
-    let refuse = |why: String| -> anyhow::Error {
+    // Audited, and exit 3 (#574), or 5 where only an operator's approval is missing.
+    let refuse_as = |code: wicket_home::exit::Code, why: String| -> anyhow::Error {
         let _ = ledger.lock().expect("ledger").audit(
             &TenantId::single(),
             None,
             "self.update_refused",
             &serde_json::json!({ "artifact_sha256": sha, "why": why, "by": crate::operator() }),
         );
-        anyhow::anyhow!("refused: {why}")
+        wicket_home::exit::Exit { code, msg: format!("refused: {why}") }.into()
     };
+    let refuse = |why: String| refuse_as(wicket_home::exit::Code::Refused, why);
     let sig_path = sig.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(format!("{}.sig", artifact.display())));
     // A CI build (#190): only a CI signature whose claims are what was asked for. No other
     // signature, and no human approval of its sha256, stands in for it.
@@ -621,9 +623,12 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
             sha256: sha,
             source: serde_json::json!({ "approved": { "request": request, "grant": u.grant, "by": u.decided_by } }),
         }),
-        None => Err(refuse(format!(
-            "the artifact (sha256 {sha}) is not signed by a release key this installation trusts: {why_not_signed}; and no operator has approved an update to it (an agent's request_update, approved with `wicket approve`)"
-        ))),
+        None => Err(refuse_as(
+            wicket_home::exit::Code::NeedsApproval,
+            format!(
+                "the artifact (sha256 {sha}) is not signed by a release key this installation trusts: {why_not_signed}; and no operator has approved an update to it (an agent's request_update, approved with `wicket approve`)"
+            ),
+        )),
     }
 }
 
@@ -820,7 +825,7 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         None => vec![],
     };
     if o.only_nodes && nodes.is_empty() {
-        bail!("--only-nodes needs --nodes");
+        return Err(wicket_home::exit::usage("--only-nodes needs --nodes"));
     }
     let v = Versions::control();
     let stage = crate::data_dir().join(format!("self-stage-{}", std::process::id()));
@@ -982,7 +987,8 @@ async fn node_switch_together(
     bytes: Option<(&[u8], &str)>,
     why: &str,
 ) -> Result<Option<String>> {
-    let row = ledger.lock().expect("ledger").node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    let row =
+        ledger.lock().expect("ledger").node(name)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {name} is not enrolled")))?;
     let node = crate::enrol::resolve_installed(&row.name, None)?;
     let prev = match bytes {
         Some((b, sha)) => {
@@ -1367,7 +1373,8 @@ pub async fn prune(nodes: Option<String>, only_nodes: bool, keep: usize, dry_run
         }
     }
     for n in &nodes {
-        let row = ledger.lock().expect("ledger").node(n)?.with_context(|| format!("node {n} is not enrolled"))?;
+        let row =
+            ledger.lock().expect("ledger").node(n)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {n} is not enrolled")))?;
         let node = crate::enrol::resolve_installed(&row.name, None)?;
         let out = node.script("pruning versions", &format!("set -u\n{NODE_ROOT}\nD=docker\n{}", prune_sh(dry_run))).await?;
         report(&format!("node:{n}"), &out, vec![]);
@@ -1679,7 +1686,8 @@ async fn wait_node(ledger: &Arc<Mutex<Ledger>>, name: &str, sha: &str) -> std::r
 
 /// Updates one node to `green`, gated; on failure, switches it back and fails.
 async fn node_update(ledger: &Arc<Mutex<Ledger>>, v: &Versions, name: &str, green: &str, g: &Gate, canary: bool) -> Result<()> {
-    let row = ledger.lock().expect("ledger").node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    let row =
+        ledger.lock().expect("ledger").node(name)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {name} is not enrolled")))?;
     let node = crate::enrol::resolve_installed(&row.name, None)?;
     let bin = v.binary(green);
     let sha = v.manifest(green)?.describe.build;
@@ -1781,7 +1789,8 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
         }
     }
     for n in nodes.iter().filter(|_| !jumped) {
-        let row = ledger.lock().expect("ledger").node(n)?.with_context(|| format!("node {n} is not enrolled"))?;
+        let row =
+            ledger.lock().expect("ledger").node(n)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {n} is not enrolled")))?;
         let node = crate::enrol::resolve_installed(&row.name, None)?;
         let cur = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/current\" 2>/dev/null || true")).await?;
         let to = node_rollback(&ledger, &node, n).await?;
@@ -1848,7 +1857,7 @@ pub fn status() -> Result<()> {
 pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Result<()> {
     use sha2::Digest;
     let ledger = Ledger::open(&crate::ledger_path())?;
-    let row = ledger.node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    let row = ledger.node(name)?.ok_or_else(|| wicket_home::exit::not_found(format!("node {name} is not enrolled")))?;
     if row.status != "active" {
         bail!("node {name} is {}", row.status);
     }
@@ -1891,6 +1900,22 @@ pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #574: an artifact no trusted key signed and no operator approved needs an approval (exit
+    /// 5); a signature that doesn't verify is refused (3).
+    #[test]
+    fn an_unapproved_update_needs_an_approval() {
+        use wicket_home::exit::{code_of, Code};
+        let dir = std::env::temp_dir().join(format!("wicket-unapproved-{}", wicket_core::new_ulid()));
+        std::fs::create_dir_all(dir.join("stage")).unwrap();
+        let artifact = dir.join("wicket");
+        std::fs::write(&artifact, b"not wicket").unwrap();
+        let ledger = Mutex::new(Ledger::open_in_memory().unwrap());
+        let e = accept(&ledger, &artifact, None, &dir.join("stage"), None).err().expect("not accepted");
+        assert_eq!(code_of(&e), Some(Code::NeedsApproval), "{e:#}");
+        assert!(format!("{e:#}").contains("no operator has approved"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// #487: a handed run counts as adopted when it runs under a live supervisor, whoever started
     /// it (the reconciler service, often, before the update's own pass): not by what that pass says.

@@ -444,7 +444,7 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
     doesn't preempt with under 30 s of its wait left.
   - **Programs are never preempted.** That's a decision: a program has no stop that keeps its work, so
     stopping one for room would lose it.
-  - Each box's limits and priority are recorded at its start (`run_terms`, ledger schema 30); a box
+  - Each box's limits and priority are recorded at its start (`run_terms`, ledger schema 33); a box
     started by an older build has none and is never preempted. A named node (`--node`) and a spawn never
     preempt.
 - **Score.** Of the nodes left, those meeting the most preferences first; then bin-pack: the one left with the least memory, then the fewest vCPUs, once

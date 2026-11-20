@@ -42,4 +42,5 @@ clap.workspace = true
 wicket-chan = { workspace = true, features = ["testkit"] }
 wicket-home = { workspace = true, features = ["testkit"] }
 wicket-placement = { workspace = true, features = ["mock"] }
+wicket-store = { workspace = true, features = ["testkit"] }
 getrandom = { workspace = true, features = ["sys_rng"] }

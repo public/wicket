@@ -26,7 +26,24 @@ pub struct SpendRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Approval {
     Approved,
+    /// Refused: an operator said no, or it is over a limit.
     Denied(String),
+    /// Nobody decided in time (or there was no time to wait): it needs an approval it didn't get.
+    Undecided(String),
+    /// Asking failed (the ledger, the request): no decision was made.
+    Failed(String),
+}
+
+impl Approval {
+    /// The error a spend that wasn't approved is (None: it was).
+    pub fn refusal(self) -> Option<crate::PlacementError> {
+        match self {
+            Approval::Approved => None,
+            Approval::Denied(why) => Some(crate::PlacementError::NotApproved(why)),
+            Approval::Undecided(why) => Some(crate::PlacementError::Undecided(why)),
+            Approval::Failed(why) => Some(crate::PlacementError::ApprovalFailed(why)),
+        }
+    }
 }
 
 /// Who decides anything with a money effect, and checks its money (#256): a capacity lease's

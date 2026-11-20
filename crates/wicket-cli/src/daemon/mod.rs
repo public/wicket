@@ -33,6 +33,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use wicket_home::exit::Code;
 use wicket_store::Ledger;
 
 /// Where the daemon listens (systemd's RuntimeDirectory=wicket).
@@ -250,19 +251,16 @@ impl Daemon {
             Some((kind::HELLO, p)) => serde_json::from_slice(&p).context("bad hello")?,
             _ => bail!("uid {}: no hello", peer.uid),
         };
-        if DRAINING.load(Ordering::SeqCst) {
-            return refuse(&mut w, "wicketd is moving to a new build: try again in a few seconds");
-        }
-        if fds.len() < 3 || (hello.dir_fd && fds.len() < 4) {
-            return refuse(&mut w, "the caller's stdin, stdout and stderr did not arrive");
+        if let Some((code, why)) = turned_away(DRAINING.load(Ordering::SeqCst), fds.len(), hello.dir_fd) {
+            return fail_with(&mut w, hello.codes, code, why);
         }
         let dir_fd = if hello.dir_fd { fds.pop() } else { None };
         let (cmd, class, basis) = match self.admit(&peer, &hello) {
             Ok(x) => x,
-            Err(why) => {
+            Err((code, why)) => {
                 say_err!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
                 self.audit_refusal(&peer, &hello, &why);
-                return refuse(&mut w, &why);
+                return fail_with(&mut w, hello.codes, code, &why);
             }
         };
         let mut plan = match self.plan(&peer, &basis, &cmd, &hello, dir_fd) {
@@ -271,7 +269,7 @@ impl Daemon {
                 let why = format!("{e:#}");
                 say_err!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
                 self.audit_refusal(&peer, &hello, &why);
-                return refuse(&mut w, &why);
+                return refuse_or_fail(&mut w, hello.codes, &e, &why);
             }
         };
         proto::write_json(
@@ -297,7 +295,7 @@ impl Daemon {
                     let (e, data) = proto::parse_upload(&p)?;
                     let stage = plan.stage.as_mut().context("this command takes no uploads")?;
                     if let Err(e) = stage.add(&e, data) {
-                        return refuse(&mut w, &format!("{e:#}"));
+                        return fail(&mut w, hello.codes, &format!("{e:#}"));
                     }
                 }
                 Some((kind::GO, _)) => break,
@@ -310,7 +308,7 @@ impl Daemon {
                 let why = format!("{e:#}");
                 say_err!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
                 self.audit_refusal(&peer, &hello, &why);
-                return refuse(&mut w, &why);
+                return refuse_or_fail(&mut w, hello.codes, &e, &why);
             }
         }
         say_err!(
@@ -328,25 +326,35 @@ impl Daemon {
         Ok(())
     }
 
-    /// Parses, routes and authorizes a command line.
-    fn admit(&self, peer: &Peer, hello: &Hello) -> std::result::Result<(Cmd, Class, Basis), String> {
+    /// Parses, routes and authorizes a command line; what it won't run, with the caller's exit code
+    /// (#574): a command line that doesn't parse is a usage error (2), an unreadable policy a
+    /// failure (1), and the rest the policy's refusal (3).
+    fn admit(&self, peer: &Peer, hello: &Hello) -> std::result::Result<(Cmd, Class, Basis), (Code, String)> {
+        self.admit_inner(peer, hello).map_err(|(code, why)| (code.unwrap_or(Code::Refused), why))
+    }
+
+    fn admit_inner(&self, peer: &Peer, hello: &Hello) -> std::result::Result<(Cmd, Class, Basis), (Option<Code>, String)> {
         use clap::Parser;
         let cmd = crate::Cli::try_parse_from(std::iter::once("wicket".to_string()).chain(hello.argv.iter().cloned()))
-            .map_err(|e| e.to_string())?
+            .map_err(|e| (Some(Code::Usage), e.to_string()))?
             .cmd;
         let class = match policy::route(&cmd) {
             Route::Forward(c) => c,
-            Route::Local => return Err("this command runs in the caller's own process, not through wicketd".into()),
-            Route::Refuse(why) => return Err(why.into()),
+            Route::Local => return Err((None, "this command runs in the caller's own process, not through wicketd".into())),
+            Route::Refuse(why) => return Err((None, why.into())),
         };
-        let policy = Policy::load(&self.policy_path).map_err(|e| format!("the daemon's policy is unreadable: {e}"))?;
-        let basis = policy::authorize(peer, class, &policy, self.uid)?;
+        let policy =
+            Policy::load(&self.policy_path).map_err(|e| (Some(Code::Failed), format!("the daemon's policy is unreadable: {e}")))?;
+        let basis = policy::authorize(peer, class, &policy, self.uid).map_err(|why| (None, why))?;
         if policy::root_only(&cmd) && basis != Basis::Root {
-            return Err("updating wicket needs root on the host (sudo wicket self …): no other user, and nothing wicket runs, may".into());
+            return Err((
+                None,
+                "updating wicket needs root on the host (sudo wicket self …): no other user, and nothing wicket runs, may".into(),
+            ));
         }
         if basis != Basis::Daemon {
             if let Some(a) = policy::internal_args(&cmd) {
-                return Err(format!("{a} is for wicket's own use"));
+                return Err((None, format!("{a} is for wicket's own use")));
             }
         }
         Ok((cmd, class, basis))
@@ -377,14 +385,16 @@ impl Daemon {
         // root, which could read the data anyway, mounts in place through the daemon.
         if *basis == Basis::Policy {
             match cmd {
-                Cmd::Run { workspace_dir: Some(_), .. } => bail!(
-                    "--workspace-dir mounts a directory by its path, which its owner could swap for a link into wicket's data: \
-                     through wicketd only root mounts in place. Copy it in with --workdir"
-                ),
+                Cmd::Run { workspace_dir: Some(_), .. } => {
+                    return Err(wicket_home::exit::refused(
+                        "--workspace-dir mounts a directory by its path, which its owner could swap for a link into wicket's data: \
+                         through wicketd only root mounts in place. Copy it in with --workdir",
+                    ))
+                }
                 Cmd::Wrap { .. } => {
-                    bail!(
-                        "wrap mounts its launcher's directory in place, by its path: through wicketd only root can (sudo wicket wrap ...)"
-                    )
+                    return Err(wicket_home::exit::refused(
+                        "wrap mounts its launcher's directory in place, by its path: through wicketd only root can (sudo wicket wrap ...)",
+                    ))
                 }
                 _ => {}
             }
@@ -483,7 +493,13 @@ impl Daemon {
                 if *only_nodes {
                     argv.push("--only-nodes".into());
                 }
-                argv.extend(["--window".into(), window.clone(), "--interval".into(), interval.clone()]);
+                // Durations as clap parsed them, in ns: exact, and parsed again the same way.
+                argv.extend([
+                    "--window".into(),
+                    format!("{}ns", window.as_nanos()),
+                    "--interval".into(),
+                    format!("{}ns", interval.as_nanos()),
+                ]);
                 for c in check {
                     argv.extend(["--check".into(), c.clone()]);
                 }
@@ -528,15 +544,18 @@ impl Daemon {
             bail!("the directory passed has no path ({})", path.display());
         }
         if *basis == Basis::Policy && m.uid() != peer.uid {
-            bail!(
+            return Err(wicket_home::exit::refused(format!(
                 "{} is owned by uid {}, not by you (uid {}): only your own directories can be mounted into a box",
                 path.display(),
                 m.uid(),
                 peer.uid
-            );
+            )));
         }
         if path == Path::new("/") || path.starts_with(&self.data_dir) || self.data_dir.starts_with(&path) {
-            bail!("{} can't be mounted into a box: it is, or holds, wicket's data", path.display());
+            return Err(wicket_home::exit::refused(format!(
+                "{} can't be mounted into a box: it is, or holds, wicket's data",
+                path.display()
+            )));
         }
         Ok(path)
     }
@@ -615,7 +634,8 @@ fn check_staged(cmd: &Cmd, hello: &Hello, st: &upload::Stage, vault_dir: &Path) 
         bail!("the manifest's program source differs from the one announced");
     }
     // A caller writes its own manifest: it may not send a secret anywhere root didn't bind it to.
-    crate::run::check_secret_hosts(&m, &wicket_proxy::vault::Vault::new(vault_dir.to_path_buf()), matches!(cmd, Cmd::Wrap { .. }))?;
+    crate::run::check_secret_hosts(&m, &wicket_proxy::vault::Vault::new(vault_dir.to_path_buf()), matches!(cmd, Cmd::Wrap { .. }))
+        .map_err(|e| wicket_home::exit::refused(format!("{e:#}")))?;
     if let Some(p) = st.root("program") {
         if !p.is_dir() {
             bail!("the program's source did not arrive");
@@ -646,10 +666,39 @@ fn accessible(dir: &Path) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
 
-fn refuse(w: &mut UnixStream, why: &str) -> Result<()> {
-    let _ = proto::write_frame(w, kind::ERROR, why.as_bytes());
+/// Whether a command is turned away before it is looked at, and with what code (#574): while the
+/// daemon moves to a new build (75: nothing was done, try again), or without the caller's stdio (1).
+fn turned_away(draining: bool, fds: usize, dir_fd: bool) -> Option<(Code, &'static str)> {
+    if draining {
+        return Some((Code::TryAgain, "wicketd is moving to a new build: try again in a few seconds"));
+    }
+    if fds < 3 || (dir_fd && fds < 4) {
+        return Some((Code::Failed, "the caller's stdin, stdout and stderr did not arrive"));
+    }
+    None
+}
+
+/// The command can't go ahead for another reason (the caller's fds or uploads didn't arrive
+/// whole): the caller exits 1.
+fn fail(w: &mut UnixStream, coded: bool, why: &str) -> Result<()> {
+    fail_with(w, coded, Code::Failed, why)
+}
+
+/// Turns the command away with the caller's exit code (#574): in a `REFUSE` frame, the code a field
+/// of its own (nothing in the text can pass for one), to a client that reads it; else the text in
+/// an `ERROR` frame, as before.
+fn fail_with(w: &mut UnixStream, coded: bool, code: Code, why: &str) -> Result<()> {
+    let _ = match coded {
+        true => proto::write_frame(w, kind::REFUSE, &proto::refuse_frame(code, why)),
+        false => proto::write_frame(w, kind::ERROR, why.as_bytes()),
+    };
     let _ = w.flush();
     Ok(())
+}
+
+/// Turns the command away with the code `e` says (the policy's refusal 3, a usage error 2, …), or 1.
+fn refuse_or_fail(w: &mut UnixStream, coded: bool, e: &anyhow::Error, why: &str) -> Result<()> {
+    fail_with(w, coded, wicket_home::exit::code_of(e).unwrap_or(Code::Failed), why)
 }
 
 #[cfg(test)]

@@ -8,14 +8,11 @@ use crate::*;
 /// Runs one of this group's commands.
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
-        Cmd::Reconcile { dry_run, every } => {
-            let every = every.as_deref().map(wicket_core::time::parse_duration).transpose().context("bad --every")?;
-            reconcile::command(dry_run, every).await
-        }
+        Cmd::Reconcile { dry_run, every } => reconcile::command(dry_run, every).await,
         Cmd::Lease { cmd: LeaseCmd::List } => capacity::list(),
         Cmd::Lease { cmd: LeaseCmd::Release { id } } => {
             let l = Ledger::open(&ledger_path())?;
-            let x = l.lease(&id)?.with_context(|| format!("no lease {id}"))?;
+            let x = l.lease(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no lease {id}")))?;
             let why = format!("released by {}", operator());
             match x.status.as_str() {
                 "active" => {
@@ -24,7 +21,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 "pending" | "approved" => {
                     l.lease_ended(&id, "withdrawn", &why, None)?;
                 }
-                s => bail!("lease {id} is {s}"),
+                s => return Err(wicket_home::exit::refused(format!("lease {id} is {s}"))),
             }
             l.audit(&TenantId::single(), None, "lease.released", &serde_json::json!({ "lease": id, "by": operator() }))?;
             drop(l);
@@ -32,22 +29,14 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Node { cmd } => match cmd {
-            NodeCmd::Token { name, ttl } => enrol::token(name, wicket_core::time::parse_duration(&ttl)?),
+            NodeCmd::Token { name, ttl } => enrol::token(name, ttl),
             NodeCmd::Enrol { target, token, name, ssh_key, host_key, trust_first_use, hosts, ca_ttl, cert_ttl } => {
-                enrol::enrol(enrol::EnrolOpts {
-                    target,
-                    token,
-                    name,
-                    ssh_key,
-                    host_key,
-                    trust_first_use,
-                    hosts,
-                    ca_ttl: wicket_core::time::parse_duration(&ca_ttl)?,
-                    cert_ttl: wicket_core::time::parse_duration(&cert_ttl)?,
-                })
-                .await
+                enrol::enrol(enrol::EnrolOpts { target, token, name, ssh_key, host_key, trust_first_use, hosts, ca_ttl, cert_ttl }).await
             }
-            NodeCmd::List { provider, common } => {
+            NodeCmd::List { provider, common, json } => {
+                if json {
+                    return crate::cmd::print_json(&enrol::list_json(&Ledger::open(&ledger_path())?)?);
+                }
                 enrol::list()?;
                 if provider {
                     println!();
@@ -64,10 +53,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 println!("revoked node {name}; its CA serials {} go on the feed's revocation list", serials.join(", "));
                 Ok(())
             }
-            NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => {
-                enrol::renew_ca(&name, hosts, wicket_core::time::parse_duration(&ca_ttl)?, wicket_core::time::parse_duration(&cert_ttl)?)
-                    .await
-            }
+            NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => enrol::renew_ca(&name, hosts, ca_ttl, cert_ttl).await,
             NodeCmd::Set { name, ca_hosts, labels, taints } => set(&name, ca_hosts.as_deref(), &labels, &taints),
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
@@ -125,7 +111,9 @@ fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String])
     let policy = ca_hosts.map(|c| wicket_store::CaHosts::parse(c).map_err(anyhow::Error::msg)).transpose()?;
     let marks = marks(labels, taints)?;
     let l = Ledger::open(&ledger_path())?;
-    anyhow::ensure!(l.node(name)?.is_some(), "node {name} is not enrolled");
+    if l.node(name)?.is_none() {
+        return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
+    }
     let tenant = wicket_core::TenantId::single();
     if let Some(policy) = policy {
         l.set_node_ca_policy_audited(name, &policy, &operator())?;
@@ -200,8 +188,8 @@ pub enum NodeCmd {
         /// The node's name (default: a generated one, printed).
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, default_value = "1h")]
-        ttl: String,
+        #[arg(long, default_value = "1h", value_parser = wicket_core::time::duration_arg)]
+        ttl: std::time::Duration,
     },
     /// Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a
     /// short-lived identity certificate for its node key, a short-lived CA certificate constrained to
@@ -229,11 +217,11 @@ pub enum NodeCmd {
         #[arg(long, value_delimiter = ',', required = true)]
         hosts: Vec<String>,
         /// Node CA lifetime.
-        #[arg(long, default_value = "24h")]
-        ca_ttl: String,
+        #[arg(long, default_value = "24h", value_parser = wicket_core::time::duration_arg)]
+        ca_ttl: std::time::Duration,
         /// Node identity certificate lifetime (renewed over the control channel at half-life).
-        #[arg(long, default_value = "24h")]
-        cert_ttl: String,
+        #[arg(long, default_value = "24h", value_parser = wicket_core::time::duration_arg)]
+        cert_ttl: std::time::Duration,
     },
     /// List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a
     /// node from `wicket node create` or a capacity lease), with any leased node not enrolled.
@@ -244,6 +232,9 @@ pub enum NodeCmd {
         provider: bool,
         #[command(flatten)]
         common: nodecreate::Common,
+        /// The enrolled nodes as JSON instead of text (not with --provider).
+        #[arg(long, conflicts_with = "provider")]
+        json: bool,
     },
     /// Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and
     /// pinned at creation. Its money is reserved first against placement.yaml's limits (with every
@@ -352,11 +343,11 @@ pub enum NodeCmd {
         /// Replace the host names it is constrained to (default: keep them).
         #[arg(long, value_delimiter = ',')]
         hosts: Vec<String>,
-        #[arg(long, default_value = "24h")]
-        ca_ttl: String,
+        #[arg(long, default_value = "24h", value_parser = wicket_core::time::duration_arg)]
+        ca_ttl: std::time::Duration,
         /// Node identity certificate lifetime.
-        #[arg(long, default_value = "24h")]
-        cert_ttl: String,
+        #[arg(long, default_value = "24h", value_parser = wicket_core::time::duration_arg)]
+        cert_ttl: std::time::Duration,
     },
 }
 

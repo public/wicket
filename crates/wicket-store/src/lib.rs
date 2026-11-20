@@ -185,12 +185,21 @@ pub enum StoreError {
 /// Version 28 (expand, after #582 step 2's 27) adds `names`, `host_ports` and `name_records`
 /// (#575): the names boxes hold, the host ports public names are published on, and the DNS records
 /// this installation created. Older builds don't read them; the floor stays 17.
-/// Version 30 (expand, after #575's 28; 29 is #578 step 3's) adds `placement_owners` and `run_terms`
-/// (#579 step 4): whose box each reservation is for, so affinity counts a box being started; and each
-/// box's limits, priority and whether it may be preempted, recorded at its start, which preemption
-/// chooses from. Older builds don't read them (a box they start has no terms, and is never
-/// preempted); the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 30;
+/// Version 29 (expand, after #575's 28) adds `trigger_cursors` and `trigger_causes` (#578 step 3):
+/// how far through the audit chain the triggers engine has read wicket's own events, and the
+/// chain of triggers behind each turn a trigger queued. Older builds don't read them; the floor
+/// stays 17.
+/// Version 30 (expand, after #575's 28; 29 is #578 step 3's) adds `placement_owners` (#579 step 4):
+/// whose box each reservation is for, so affinity counts a box being started. Older builds don't read
+/// it; the floor stays 17.
+/// Version 31 (expand, #668, after 30) adds `name_exposures`: the ports a run's names exposed,
+/// which `request_name` may take away again, unlike an exposure the box made itself. Older builds
+/// don't read it; the floor stays 17.
+/// Version 33 (expand, after #668's 31; 32 is #677's) adds `run_terms` (#579 step 4): each box's
+/// limits, priority and whether it may be preempted, recorded at its start, which preemption chooses
+/// from. Older builds don't read it (a box they start has no terms, and is never preempted); the
+/// floor stays 17.
+pub const SCHEMA_VERSION: u32 = 33;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is

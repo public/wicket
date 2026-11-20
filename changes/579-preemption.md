@@ -14,5 +14,5 @@ type: Added
   or could make room itself; it probes nodes only when it has something to stop, at most every
   30 s; and it doesn't preempt with under 30 s of its wait left. Placement still decides placement
   only: the woken box's authority is issued as before, and the node's admission decides its start.
-  Ledger schema 30 also adds `run_terms`, each box's limits, priority and preemptibility recorded
+  Ledger schema 33 adds `run_terms`, each box's limits, priority and preemptibility recorded
   at its start (a box started by an older build has none and is never preempted).

@@ -31,6 +31,9 @@ pub mod kind {
     // daemon → client
     pub const WELCOME: u8 = b'W';
     pub const ERROR: u8 = b'E';
+    /// The command turned away with the caller's exit code (#574): 4 bytes, big-endian, then the
+    /// reason as text. Sent only to a client whose hello says it reads it (`codes`).
+    pub const REFUSE: u8 = b'R';
     pub const EXIT: u8 = b'X';
 }
 
@@ -54,6 +57,9 @@ pub struct Hello {
     pub manifest_name: Option<String>,
     #[serde(default)]
     pub program_source: Option<String>,
+    /// Whether the client reads a `REFUSE` frame (#574); one before it gets `ERROR`, the text only.
+    #[serde(default)]
+    pub codes: bool,
 }
 
 /// The daemon's answer once it has let the caller in.
@@ -252,17 +258,21 @@ pub fn peer(s: &UnixStream) -> Result<Peer> {
 }
 
 /// The user called `name` as the host knows them now: their uid, primary gid and groups, as a peer
-/// with those credentials would be seen (no process: `pid` 0). None if there is no such user.
-/// What a trigger's owner is checked as before it fires (#578).
-pub fn user_as_peer(name: &str) -> Option<Peer> {
-    let c = std::ffi::CString::new(name).ok()?;
+/// with those credentials would be seen (no process: `pid` 0). Ok(None) if there is no such user;
+/// Err if the user or group database couldn't answer (an NSS outage is not a missing user). What a
+/// trigger's owner is checked as before it fires (#578).
+pub fn user_as_peer(name: &str) -> Result<Option<Peer>, String> {
+    let Ok(c) = std::ffi::CString::new(name) else { return Ok(None) };
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 16384];
     let mut out: *mut libc::passwd = std::ptr::null_mut();
     // SAFETY: getpwnam_r fills `pw` with pointers into `buf`, which outlives their use here.
     let r = unsafe { libc::getpwnam_r(c.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
-    if r != 0 || out.is_null() {
-        return None;
+    if r != 0 {
+        return Err(format!("looking up user {name}: {}", std::io::Error::from_raw_os_error(r)));
+    }
+    if out.is_null() {
+        return Ok(None);
     }
     let (uid, gid) = (pw.pw_uid, pw.pw_gid);
     let mut n: libc::c_int = 256;
@@ -272,7 +282,7 @@ pub fn user_as_peer(name: &str) -> Option<Peer> {
         gids.resize(n.max(0) as usize, 0);
         // SAFETY: as above, with room for every group now.
         if unsafe { libc::getgrouplist(c.as_ptr(), gid, gids.as_mut_ptr(), &mut n) } < 0 {
-            return None;
+            return Err(format!("looking up user {name}'s groups"));
         }
     }
     gids.truncate(n.max(0) as usize);
@@ -280,7 +290,7 @@ pub fn user_as_peer(name: &str) -> Option<Peer> {
     gids.sort_unstable();
     gids.dedup();
     let groups = gids.into_iter().map(|g| (g, group_name(g).unwrap_or_default())).collect();
-    Some(Peer { pid: 0, uid, gid, user: name.to_string(), groups })
+    Ok(Some(Peer { pid: 0, uid, gid, user: name.to_string(), groups }))
 }
 
 /// The name of `uid` in the user database.
@@ -320,6 +330,25 @@ pub fn group_id(name: &str) -> Option<u32> {
     // SAFETY: as user_name.
     let r = unsafe { libc::getgrnam_r(c.as_ptr(), &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
     (r == 0 && !out.is_null()).then_some(gr.gr_gid)
+}
+
+/// A `REFUSE` frame's payload: `code`, then `why`.
+pub fn refuse_frame(code: wicket_home::exit::Code, why: &str) -> Vec<u8> {
+    let mut p = (code as i32).to_be_bytes().to_vec();
+    p.extend_from_slice(why.as_bytes());
+    p
+}
+
+/// A `REFUSE` frame's code and text (a code it doesn't know is `Failed`).
+pub fn parse_refuse(p: &[u8]) -> (wicket_home::exit::Code, String) {
+    use wicket_home::exit::Code;
+    let (head, text) = p.split_at(p.len().min(4));
+    let n = <[u8; 4]>::try_from(head).map(i32::from_be_bytes).unwrap_or(1);
+    let code = [Code::Usage, Code::Refused, Code::NotFound, Code::NeedsApproval, Code::Revoked, Code::TryAgain]
+        .into_iter()
+        .find(|c| *c as i32 == n)
+        .unwrap_or(Code::Failed);
+    (code, String::from_utf8_lossy(text).into_owned())
 }
 
 #[cfg(test)]
