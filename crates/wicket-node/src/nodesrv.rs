@@ -59,6 +59,7 @@ mod gateway;
 #[path = "nodegw.rs"]
 mod gw;
 mod images;
+pub mod intake;
 mod links;
 mod nodeca;
 mod volumes;
@@ -298,6 +299,8 @@ struct Node {
     /// renewal's new key waiting for its certificate.
     live_ca: Arc<LiveCa>,
     ca_pending: Mutex<Option<nodeca::Pending>>,
+    /// Webhook intake's table, spool and refusals (#578 step 4).
+    intake: intake::Intake,
 }
 
 impl Node {
@@ -1069,6 +1072,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         feed_stalled: Default::default(),
         live_ca: Default::default(),
         ca_pending: Default::default(),
+        intake: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -1205,6 +1209,12 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                 });
             }
         });
+    }
+    // Webhook intake's socket (#578 step 4): `wicket node intake` reaches this node through it,
+    // checked by peer uid (`node.json`'s `intake_socket` and `intake_uid`, else `ctl/intake.sock`).
+    let (intake_sock, intake_uid) = intake::endpoint(&node.paths.root, &ctl);
+    if let Err(e) = intake::serve_socket(node.clone(), intake_sock, intake_uid) {
+        say_err!("[node] intake socket: {e:#}");
     }
     let mode = node.replica.lock().expect("replica").mode((node.clock)());
     say_err!("[node] {name}: serving on {} (build {}, feed {mode:?})", ctl.display(), &node.build[..12]);
@@ -2870,6 +2880,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             feed_stalled: Default::default(),
             live_ca: Default::default(),
             ca_pending: Default::default(),
+            intake: Default::default(),
         })
     }
 
