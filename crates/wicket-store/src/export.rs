@@ -43,12 +43,16 @@ impl Ledger {
         Ok(())
     }
 
-    /// Takes or renews the lease on `sink` for `holder` at `at`. True if `holder` now feeds it.
-    pub fn lease_export(&self, sink: &str, holder: &str, at: i64) -> Result<bool> {
+    /// Takes or renews the lease on `sink` for `holder` at `at`, for an exporter whose
+    /// configuration points the sink at `target`. True if `holder` now feeds it. Only while the
+    /// ledger's target for the sink is `target` ([`Ledger::sink_target`]): an exporter started
+    /// with a configuration since replaced (another process) neither takes nor keeps it (#582).
+    pub fn lease_export(&self, sink: &str, target: &str, holder: &str, at: i64) -> Result<bool> {
         self.ensure_export_row(sink)?;
         Ok(self.conn.execute(
-            "UPDATE audit_export SET holder = ?2, lease_until = ?3 WHERE sink = ?1 AND (holder IS NULL OR holder = ?2 OR lease_until < ?4)",
-            params![sink, holder, at + EXPORT_LEASE_SECS, at],
+            "UPDATE audit_export SET holder = ?2, lease_until = ?3 WHERE sink = ?1 AND (holder IS NULL OR holder = ?2 OR lease_until < ?4)
+               AND EXISTS (SELECT 1 FROM audit_sink_targets t WHERE t.sink = ?1 AND t.target = ?5)",
+            params![sink, holder, at + EXPORT_LEASE_SECS, at, target],
         )? == 1)
     }
 
@@ -59,21 +63,27 @@ impl Ledger {
         Ok(())
     }
 
-    /// Records that `sink` acknowledged everything up to `seq`. Never moves a cursor back.
-    pub fn advance_export(&self, sink: &str, seq: i64) -> Result<()> {
+    /// Records that `sink`, pointed at `target`, acknowledged everything up to `seq`. Never moves
+    /// a cursor back. False, and nothing written, if the sink now points elsewhere: its cursor is
+    /// for the new target, which this delivery didn't reach (#582).
+    pub fn advance_export(&self, sink: &str, target: &str, seq: i64) -> Result<bool> {
         self.ensure_export_row(sink)?;
-        self.conn.execute(
-            "UPDATE audit_export SET seq = MAX(seq, ?2), error = NULL, updated_at = ?3 WHERE sink = ?1",
-            params![sink, seq, now()],
-        )?;
-        Ok(())
+        Ok(self.conn.execute(
+            "UPDATE audit_export SET seq = MAX(seq, ?2), error = NULL, updated_at = ?3 WHERE sink = ?1
+               AND EXISTS (SELECT 1 FROM audit_sink_targets t WHERE t.sink = ?1 AND t.target = ?4)",
+            params![sink, seq, now(), target],
+        )? == 1)
     }
 
-    /// Records that `sink` acknowledged a checkpoint made at `at`.
-    pub fn export_checkpointed(&self, sink: &str, at: i64) -> Result<()> {
+    /// Records that `sink`, pointed at `target`, acknowledged a checkpoint made at `at` (false,
+    /// and nothing written, if it now points elsewhere).
+    pub fn export_checkpointed(&self, sink: &str, target: &str, at: i64) -> Result<bool> {
         self.ensure_export_row(sink)?;
-        self.conn.execute("UPDATE audit_export SET checkpoint_at = MAX(checkpoint_at, ?2) WHERE sink = ?1", params![sink, at])?;
-        Ok(())
+        Ok(self.conn.execute(
+            "UPDATE audit_export SET checkpoint_at = MAX(checkpoint_at, ?2) WHERE sink = ?1
+               AND EXISTS (SELECT 1 FROM audit_sink_targets t WHERE t.sink = ?1 AND t.target = ?3)",
+            params![sink, at, target],
+        )? == 1)
     }
 
     /// Records a delivery failure for `sink`, for `wicket audit export --status`.
@@ -216,25 +226,48 @@ mod tests {
     #[test]
     fn one_holder_per_sink_until_its_lease_lapses() {
         let l = Ledger::open_in_memory().unwrap();
-        assert!(l.lease_export("otel", "a", 100).unwrap());
-        assert!(!l.lease_export("otel", "b", 100).unwrap(), "held by a");
-        assert!(l.lease_export("file", "b", 100).unwrap(), "leases are per sink");
-        assert!(l.lease_export("otel", "a", 110).unwrap(), "a renews");
-        assert!(!l.lease_export("otel", "b", 110 + EXPORT_LEASE_SECS).unwrap());
-        assert!(l.lease_export("otel", "b", 111 + EXPORT_LEASE_SECS).unwrap(), "lapsed: b takes over");
+        l.sink_target("otel", "t").unwrap();
+        l.sink_target("file", "f").unwrap();
+        assert!(l.lease_export("otel", "t", "a", 100).unwrap());
+        assert!(!l.lease_export("otel", "t", "b", 100).unwrap(), "held by a");
+        assert!(l.lease_export("file", "f", "b", 100).unwrap(), "leases are per sink");
+        assert!(l.lease_export("otel", "t", "a", 110).unwrap(), "a renews");
+        assert!(!l.lease_export("otel", "t", "b", 110 + EXPORT_LEASE_SECS).unwrap());
+        assert!(l.lease_export("otel", "t", "b", 111 + EXPORT_LEASE_SECS).unwrap(), "lapsed: b takes over");
         l.release_export("otel", "b").unwrap();
-        assert!(l.lease_export("otel", "a", 112 + EXPORT_LEASE_SECS).unwrap());
+        assert!(l.lease_export("otel", "t", "a", 112 + EXPORT_LEASE_SECS).unwrap());
+    }
+
+    /// #677 third check (N2): an exporter whose configuration points a sink at a target since
+    /// replaced neither leases nor moves its cursor, nor records its checkpoints: and the change
+    /// of target frees the lease for the new one at once.
+    #[test]
+    fn only_the_sinks_current_target_moves_it() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.sink_target("s", "jsonl:/a").unwrap();
+        assert!(l.lease_export("s", "jsonl:/a", "old", 100).unwrap());
+        assert!(l.advance_export("s", "jsonl:/a", 10).unwrap());
+        l.sink_target("s", "jsonl:/b").unwrap();
+        assert_eq!(l.export_cursor("s").unwrap().seq, 0, "started again for b");
+        assert!(!l.lease_export("s", "jsonl:/a", "old", 101).unwrap(), "the old target leases nothing");
+        assert!(l.lease_export("s", "jsonl:/b", "new", 101).unwrap(), "the new one takes it at once");
+        assert!(!l.advance_export("s", "jsonl:/a", 10).unwrap());
+        assert!(!l.export_checkpointed("s", "jsonl:/a", 5).unwrap());
+        assert_eq!(l.export_cursor("s").unwrap().seq, 0, "the old exporter moves nothing");
+        assert!(l.advance_export("s", "jsonl:/b", 3).unwrap());
+        assert_eq!(l.export_cursor("s").unwrap().seq, 3);
     }
 
     #[test]
     fn cursors_only_move_forward() {
         let l = Ledger::open_in_memory().unwrap();
-        l.advance_export("s", 10).unwrap();
-        l.advance_export("s", 4).unwrap();
+        l.sink_target("s", "t").unwrap();
+        l.advance_export("s", "t", 10).unwrap();
+        l.advance_export("s", "t", 4).unwrap();
         assert_eq!(l.export_cursor("s").unwrap().seq, 10);
         l.export_failed("s", "connection refused").unwrap();
         assert_eq!(l.export_cursor("s").unwrap().error.as_deref(), Some("connection refused"));
-        l.advance_export("s", 11).unwrap();
+        l.advance_export("s", "t", 11).unwrap();
         assert_eq!(l.export_cursor("s").unwrap().error, None);
     }
 
@@ -244,7 +277,8 @@ mod tests {
         assert_eq!(l.peek_export_cursor("new").unwrap().seq, 0);
         let rows: i64 = l.conn.query_row("SELECT COUNT(*) FROM audit_export", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 0, "no row made");
-        l.advance_export("new", 4).unwrap();
+        l.sink_target("new", "t").unwrap();
+        l.advance_export("new", "t", 4).unwrap();
         assert_eq!(l.peek_export_cursor("new").unwrap(), l.export_cursor("new").unwrap());
     }
 

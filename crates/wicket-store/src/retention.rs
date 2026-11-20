@@ -96,16 +96,22 @@ const ROW_OVERHEAD: i64 = 24;
 impl Ledger {
     /// Records that `sink` acknowledged a checkpoint of the chain at `seq` (head `head`), keeping
     /// the sink's newest [`CHECKPOINTS_KEPT`].
-    pub fn record_checkpoint(&self, sink: &str, target: &str, seq: i64, head: &str, ts: i64, jws: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO audit_checkpoints (sink, seq, head, ts, jws, target) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    pub fn record_checkpoint(&self, sink: &str, target: &str, seq: i64, head: &str, ts: i64, jws: &str) -> Result<bool> {
+        // Only for the sink's current target: one an exporter delivered to a target since
+        // replaced counts for nothing (#582).
+        let n = self.conn.execute(
+            "INSERT OR REPLACE INTO audit_checkpoints (sink, seq, head, ts, jws, target)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM audit_sink_targets t WHERE t.sink = ?1 AND t.target = ?6)",
             params![sink, seq, head, ts, jws, target],
         )?;
+        if n == 0 {
+            return Ok(false);
+        }
         self.conn.execute(
             "DELETE FROM audit_checkpoints WHERE sink = ?1 AND seq NOT IN (SELECT seq FROM audit_checkpoints WHERE sink = ?1 ORDER BY seq DESC LIMIT ?2)",
             params![sink, CHECKPOINTS_KEPT],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// The checkpoints recorded, newest first.
@@ -117,31 +123,41 @@ impl Ledger {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Whether `sink` has acknowledged a checkpoint at `seq`.
-    pub fn has_checkpoint(&self, sink: &str, seq: i64) -> Result<bool> {
+    /// Whether `sink` has acknowledged a checkpoint at `seq` while pointed at `target`.
+    pub fn has_checkpoint(&self, sink: &str, target: &str, seq: i64) -> Result<bool> {
         Ok(self
             .conn
-            .query_row("SELECT 1 FROM audit_checkpoints WHERE sink = ?1 AND seq = ?2", params![sink, seq], |_| Ok(()))
+            .query_row("SELECT 1 FROM audit_checkpoints WHERE sink = ?1 AND seq = ?2 AND target = ?3", params![sink, seq, target], |_| {
+                Ok(())
+            })
             .optional()?
             .is_some())
     }
 
     /// Notes that `sink`'s cursor is for `target`. If the sink's cursor was made against another
-    /// target, it starts again from 0 and its checkpoints are forgotten. Whether it started again.
+    /// target (or before targets were recorded), it starts again from 0 and its checkpoints are
+    /// forgotten; on any change its lease is given up, so an exporter for the old target (another
+    /// process, started with the configuration before) stops feeding it. Whether it started again.
     pub fn sink_target(&self, sink: &str, target: &str) -> Result<bool> {
         self.immediate::<_, StoreError>(|l| {
             let was: Option<String> =
                 l.conn.query_row("SELECT target FROM audit_sink_targets WHERE sink = ?1", params![sink], |r| r.get(0)).optional()?;
             let had_cursor = l.peek_export_cursor(sink)?.seq > 0;
-            // A sink kept before targets were is trusted as this one, once.
-            let moved = was.as_deref().is_some_and(|w| w != target);
+            // A sink kept before targets were isn't trusted: what its cursor counts may have gone
+            // anywhere, so it starts again too (at least once: a copy may get records twice).
+            let moved = was.as_deref() != Some(target);
             if moved && had_cursor {
                 l.ensure_export_row(sink)?;
-                l.conn.execute(
-                    "UPDATE audit_export SET seq = 0, checkpoint_at = 0, error = ?2 WHERE sink = ?1",
-                    params![sink, format!("its target changed (was {}): exporting from the start", was.as_deref().unwrap_or(""))],
-                )?;
+                let why = match was.as_deref() {
+                    Some(w) => format!("its target changed (was {w}): exporting from the start"),
+                    None => "its cursor was kept before sinks' targets were: exporting from the start".to_string(),
+                };
+                l.conn.execute("UPDATE audit_export SET seq = 0, checkpoint_at = 0, error = ?2 WHERE sink = ?1", params![sink, why])?;
                 l.conn.execute("DELETE FROM audit_checkpoints WHERE sink = ?1", params![sink])?;
+            }
+            if moved {
+                // Whoever fed the old target stops now, and an exporter for this one takes over.
+                l.conn.execute("UPDATE audit_export SET holder = NULL, lease_until = 0 WHERE sink = ?1", params![sink])?;
             }
             l.conn.execute(
                 "INSERT INTO audit_sink_targets (sink, target, updated_at) VALUES (?1, ?2, ?3)
@@ -399,13 +415,13 @@ mod tests {
         l.audit(&TenantId::single(), None, "run.remote_session", &serde_json::json!({ "url": "x" })).unwrap();
         chain(&l, 69);
         let hash = |s: i64| l.audit_hash_at(s).unwrap().unwrap();
-        l.record_checkpoint("a", "t", 40, &hash(40), 1, "jws40").unwrap();
-        l.record_checkpoint("a", "t", 70, &hash(70), 2, "jws70").unwrap();
-        l.advance_export("a", 80).unwrap();
-        l.advance_export("b", 50).unwrap();
-        let far = i64::MAX;
         l.sink_target("a", "t").unwrap();
         l.sink_target("b", "t").unwrap();
+        l.record_checkpoint("a", "t", 40, &hash(40), 1, "jws40").unwrap();
+        l.record_checkpoint("a", "t", 70, &hash(70), 2, "jws70").unwrap();
+        l.advance_export("a", "t", 80).unwrap();
+        l.advance_export("b", "t", 50).unwrap();
+        let far = i64::MAX;
         assert_eq!(l.prune_point(&[("a", "t")], 90, far).unwrap().map(|c| c.seq), Some(70));
         assert_eq!(l.prune_point(&[("a", "t"), ("b", "t")], 90, far).unwrap().map(|c| c.seq), Some(40), "b has only 50");
         assert_eq!(l.prune_point(&[("a", "t"), ("b", "t")], 30, far).unwrap(), None, "never deeper than asked");
@@ -437,10 +453,10 @@ mod tests {
     fn a_lagging_trigger_cursor_holds_the_prune() {
         let l = Ledger::open_in_memory().unwrap();
         chain(&l, 50);
+        l.sink_target("a", "t").unwrap();
         l.record_checkpoint("a", "t", 40, &l.audit_hash_at(40).unwrap().unwrap(), 1, "j").unwrap();
         l.record_checkpoint("a", "t", 20, &l.audit_hash_at(20).unwrap().unwrap(), 1, "j").unwrap();
-        l.advance_export("a", 50).unwrap();
-        l.sink_target("a", "t").unwrap();
+        l.advance_export("a", "t", 50).unwrap();
         l.conn
             .execute_batch("CREATE TABLE IF NOT EXISTS trigger_cursors (tenant TEXT, source TEXT, seq INTEGER, updated_at INTEGER)")
             .unwrap();
@@ -509,7 +525,8 @@ mod tests {
         let l = Ledger::open_in_memory().unwrap();
         chain(&l, 50);
         l.sink_target("a", "jsonl:/a").unwrap();
-        l.advance_export("a", 50).unwrap();
+        l.advance_export("a", "jsonl:/a", 50).unwrap();
+        assert!(!l.record_checkpoint("a", "jsonl:/b", 40, &l.audit_hash_at(40).unwrap().unwrap(), 1, "j").unwrap(), "not its target");
         l.record_checkpoint("a", "jsonl:/a", 40, &l.audit_hash_at(40).unwrap().unwrap(), 1, "j").unwrap();
         assert_eq!(l.prune_point(&[("a", "jsonl:/a")], 45, i64::MAX).unwrap().map(|c| c.seq), Some(40));
         assert_eq!(l.prune_point(&[("a", "jsonl:/b")], 45, i64::MAX).unwrap(), None, "the sink now points elsewhere");
@@ -527,14 +544,19 @@ mod tests {
         let l = Ledger::open_in_memory().unwrap();
         chain(&l, 5);
         assert!(!l.sink_target("s", "jsonl:/a").unwrap());
-        l.advance_export("s", 5).unwrap();
-        l.record_checkpoint("s", "t", 5, &l.audit_hash_at(5).unwrap().unwrap(), 1, "j").unwrap();
+        l.advance_export("s", "jsonl:/a", 5).unwrap();
+        assert!(l.record_checkpoint("s", "jsonl:/a", 5, &l.audit_hash_at(5).unwrap().unwrap(), 1, "j").unwrap());
         assert!(!l.sink_target("s", "jsonl:/a").unwrap(), "the same target");
         assert!(l.sink_target("s", "jsonl:/b").unwrap());
         let c = l.peek_export_cursor("s").unwrap();
         assert_eq!(c.seq, 0);
         assert!(c.error.unwrap().contains("target changed"));
         assert!(l.checkpoints().unwrap().is_empty());
+        // A cursor kept before targets were recorded isn't trusted either: it starts again.
+        l.ensure_export_row("old").unwrap();
+        l.conn.execute("UPDATE audit_export SET seq = 5 WHERE sink = 'old'", []).unwrap();
+        assert!(l.sink_target("old", "jsonl:/a").unwrap());
+        assert_eq!(l.peek_export_cursor("old").unwrap().seq, 0);
     }
 
     /// New ledgers give freed pages back, many a step; the step is bounded and does nothing on a

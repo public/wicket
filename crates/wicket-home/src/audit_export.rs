@@ -171,11 +171,26 @@ impl SinkSpec {
     /// it can't be told (the state store's file doesn't read): then nothing is reset, and nothing
     /// is pruned on that sink's word.
     pub fn target(&self) -> Result<String> {
+        match &self.kind {
+            SinkKind::Store {} => self.target_in(crate::statestore::StateStore::load()?.as_ref()),
+            _ => self.target_in(None),
+        }
+    }
+
+    /// [`SinkSpec::target`], a `store` sink's from `store` (the state store's configuration its
+    /// exporter delivers through): the endpoint, bucket and prefix its objects go under. An OTLP
+    /// sink's includes a hash of its headers, which may choose where a Collector puts what it gets.
+    pub fn target_in(&self, store: Option<&crate::statestore::StateStore>) -> Result<String> {
         Ok(match &self.kind {
             SinkKind::Jsonl { path } => format!("jsonl:{path}"),
-            SinkKind::Otlp { endpoint, .. } => format!("otlp:{endpoint}"),
-            SinkKind::Store {} => match crate::statestore::StateStore::load()? {
-                Some(crate::statestore::StateStore { s3: Some(c), .. }) => format!("store:{}/{}", c.endpoint, c.bucket),
+            SinkKind::Otlp { endpoint, headers, .. } if headers.is_empty() => format!("otlp:{endpoint}"),
+            SinkKind::Otlp { endpoint, headers, .. } => {
+                use sha2::Digest;
+                let h = sha2::Sha256::digest(serde_json::to_string(headers)?.as_bytes());
+                format!("otlp:{endpoint}#headers:{}", &hex::encode(h)[..16])
+            }
+            SinkKind::Store {} => match store {
+                Some(crate::statestore::StateStore { s3: Some(c), .. }) => format!("store:{}/{}/{}", c.endpoint, c.bucket, c.prefix),
                 _ => bail!("sink {}: state-store.yaml names no store", self.name),
             },
         })
@@ -726,6 +741,13 @@ pub fn otlp_body(items: &[Value], resource: &BTreeMap<String, String>) -> Value 
 
 struct Sink {
     spec: SinkSpec,
+    /// Where this exporter's configuration points it ([`SinkSpec::target_in`]); None until it can
+    /// be told. Its cursor, lease and checkpoints are written only while the ledger's target for
+    /// the sink is this one (#582).
+    target: Option<String>,
+    /// Another process has pointed the sink elsewhere since this one read its configuration: this
+    /// exporter no longer feeds it.
+    stale: bool,
     /// Not before this instant (backoff after a failure).
     next_try: Instant,
     backoff: Duration,
@@ -742,8 +764,11 @@ pub struct Exporter {
     issuer: Option<wicket_identity::Issuer>,
     http: reqwest::Client,
     rt: tokio::runtime::Runtime,
-    /// The state store, opened on first use by a `store` sink.
+    /// The state store, opened on first use by a `store` sink, from `store_cfg`.
     store: Option<crate::s3::S3Store>,
+    /// The state store's configuration as this exporter read it: what a `store` sink's target is
+    /// told from, and what its objects are delivered through.
+    store_cfg: Option<crate::statestore::StateStore>,
     /// Whether this process may write to standard output (only `wicket audit export`).
     pub stdout: bool,
 }
@@ -763,25 +788,35 @@ impl Exporter {
     pub fn new(ledger_path: &Path, cfg: SinksConfig, issuer: Option<wicket_identity::Issuer>) -> Result<Exporter> {
         let mut nonce = [0u8; 6];
         getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("random: {e}"))?;
-        let sinks = cfg
-            .sinks
-            .iter()
-            .map(|s| Sink { spec: s.clone(), next_try: Instant::now(), backoff: Duration::from_secs(1), held: false, renewed: None })
-            .collect();
+        let store_cfg = match cfg.sinks.iter().any(|s| matches!(s.kind, SinkKind::Store {})) {
+            true => crate::statestore::StateStore::load().ok().flatten(),
+            false => None,
+        };
         let ledger = Ledger::open(ledger_path)?;
-        // A sink whose target changed starts again (#582): its cursor was for records another
-        // target got.
+        let mut sinks = vec![];
         for s in &cfg.sinks {
-            // Can't tell (the state store's file doesn't read): the cursor is kept, and retention
-            // won't prune on this sink until it can.
-            if let Ok(t) = s.target() {
-                ledger.sink_target(&s.name, &t)?;
+            // A sink whose target changed starts again (#582): its cursor was for records another
+            // target got. Can't tell (the state store's file doesn't read): the cursor is kept,
+            // and the sink isn't fed (nor retention counting on it) until it can.
+            let target = s.target_in(store_cfg.as_ref()).ok();
+            if let Some(t) = &target {
+                ledger.sink_target(&s.name, t)?;
             }
+            sinks.push(Sink {
+                spec: s.clone(),
+                target,
+                stale: false,
+                next_try: Instant::now(),
+                backoff: Duration::from_secs(1),
+                held: false,
+                renewed: None,
+            });
         }
         Ok(Exporter {
             ledger,
             cfg,
             sinks,
+            store_cfg,
             holder: format!("{}-{}", std::process::id(), hex::encode(nonce)),
             issuer,
             http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?,
@@ -802,27 +837,45 @@ impl Exporter {
             if matches!(&self.sinks[i].spec.kind, SinkKind::Jsonl { path } if path == "-") && !self.stdout {
                 continue;
             }
+            if self.sinks[i].stale {
+                continue;
+            }
+            let target = match self.target(i) {
+                Ok(t) => t,
+                Err(e) => {
+                    out.failures.push((name, format!("{e:#}")));
+                    continue;
+                }
+            };
             // Renew the lease about three times per lease period; take it when it lapses.
             let s = &self.sinks[i];
             if !s.held || s.renewed.is_none_or(|r| now.duration_since(r) >= Duration::from_secs((EXPORT_LEASE_SECS / 3) as u64)) {
-                let held = self.ledger.lease_export(&name, &self.holder, at).unwrap_or(false);
+                let held = self.ledger.lease_export(&name, &target, &self.holder, at).unwrap_or(false);
                 let s = &mut self.sinks[i];
                 s.held = held;
                 s.renewed = held.then_some(now);
             }
             if !self.sinks[i].held {
-                out.busy.push(name);
+                if self.stale_now(i, &target) {
+                    out.failures.push((name, self.stale_message(i)));
+                } else {
+                    out.busy.push(name);
+                }
                 continue;
             }
             if now < self.sinks[i].next_try {
                 continue;
             }
-            match self.feed(i, force_checkpoint) {
+            match self.feed(i, &target, force_checkpoint) {
                 Ok((r, c)) => {
                     out.records += r;
                     out.checkpoints += c;
                     let s = &mut self.sinks[i];
                     s.backoff = Duration::from_secs(1);
+                }
+                Err(_) if self.stale_now(i, &target) => {
+                    self.sinks[i].held = false;
+                    out.failures.push((name, self.stale_message(i)));
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -846,17 +899,56 @@ impl Exporter {
         }
     }
 
-    fn feed(&mut self, i: usize, force_checkpoint: bool) -> Result<(usize, usize)> {
+    /// Sink `i`'s target, told now if it couldn't be before (the state store's file read again).
+    fn target(&mut self, i: usize) -> Result<String> {
+        if let Some(t) = &self.sinks[i].target {
+            return Ok(t.clone());
+        }
+        if matches!(self.sinks[i].spec.kind, SinkKind::Store {}) && self.store.is_none() {
+            self.store_cfg = crate::statestore::StateStore::load()?;
+        }
+        let t = self.sinks[i].spec.target_in(self.store_cfg.as_ref())?;
+        self.ledger.sink_target(&self.sinks[i].spec.name, &t)?;
+        self.sinks[i].target = Some(t.clone());
+        Ok(t)
+    }
+
+    /// Whether the ledger now points sink `i` somewhere other than `target` (another process,
+    /// with a newer configuration): then this exporter stops feeding it for good.
+    fn stale_now(&mut self, i: usize, target: &str) -> bool {
+        let now = self.ledger.sink_target_of(&self.sinks[i].spec.name).ok().flatten();
+        let stale = now.is_some_and(|t| t != target);
+        self.sinks[i].stale |= stale;
+        stale
+    }
+
+    fn stale_message(&self, i: usize) -> String {
+        let s = &self.sinks[i];
+        let now = self.ledger.sink_target_of(&s.spec.name).ok().flatten().unwrap_or_default();
+        format!(
+            "sink {} now points at {now} (another process read a newer configuration), not {}: this process no longer feeds it (restart it to read the new one)",
+            s.spec.name,
+            s.target.as_deref().unwrap_or("")
+        )
+    }
+
+    fn feed(&mut self, i: usize, target: &str, force_checkpoint: bool) -> Result<(usize, usize)> {
         let name = self.sinks[i].spec.name.clone();
         let mut cur = self.ledger.export_cursor(&name)?;
         let mut sent = 0;
         loop {
+            // Not to a target the sink has left (the cursor write below would be refused anyway).
+            if self.ledger.sink_target_of(&name)?.as_deref() != Some(target) {
+                bail!("sink {name}'s target changed under this process");
+            }
             let recs = self.ledger.audit_records_after(cur.seq, self.cfg.batch)?;
             let Some(last) = recs.last().map(|r| r.seq) else { break };
             let items: Vec<Value> = recs.iter().map(record_json).collect();
             self.deliver(i, &items)?;
-            // One cursor write per delivered batch.
-            self.ledger.advance_export(&name, last)?;
+            // One cursor write per delivered batch, only while the sink still points here.
+            if !self.ledger.advance_export(&name, target, last)? {
+                bail!("sink {name}'s target changed under this process");
+            }
             cur.seq = last;
             sent += recs.len();
             if recs.len() < self.cfg.batch {
@@ -871,25 +963,29 @@ impl Exporter {
             let cp = checkpoint_json(self.issuer.as_ref().expect("checked"), cur.seq, &head, at);
             let jws = cp["jws"].as_str().unwrap_or_default().to_string();
             self.deliver(i, &[cp])?;
-            self.ledger.export_checkpointed(&name, at)?;
-            // What retention may prune back to (#582): kept with what it signed, and where it went.
-            let target = self.sinks[i].spec.target().unwrap_or_default();
-            self.ledger.record_checkpoint(&name, &target, cur.seq, &head, at, &jws)?;
+            // What retention may prune back to (#582): kept with what it signed, and where it went
+            // (the target it was delivered through).
+            if !self.ledger.export_checkpointed(&name, target, at)?
+                || !self.ledger.record_checkpoint(&name, target, cur.seq, &head, at, &jws)?
+            {
+                bail!("sink {name}'s target changed under this process");
+            }
             cps = 1;
         }
         // Checkpoints retention asked for, where it wants to cut (#582): signed once each sink is
         // past them, at that seq.
         if self.issuer.is_some() {
             for seq in self.ledger.checkpoint_wants()? {
-                if seq > cur.seq || seq <= 0 || self.ledger.has_checkpoint(&name, seq)? {
+                if seq > cur.seq || seq <= 0 || self.ledger.has_checkpoint(&name, target, seq)? {
                     continue;
                 }
                 let Some(head) = self.ledger.audit_hash_at(seq)? else { continue };
                 let cp = checkpoint_json(self.issuer.as_ref().expect("checked"), seq, &head, at);
                 let jws = cp["jws"].as_str().unwrap_or_default().to_string();
                 self.deliver(i, &[cp])?;
-                let target = self.sinks[i].spec.target().unwrap_or_default();
-                self.ledger.record_checkpoint(&name, &target, seq, &head, at, &jws)?;
+                if !self.ledger.record_checkpoint(&name, target, seq, &head, at, &jws)? {
+                    bail!("sink {name}'s target changed under this process");
+                }
                 cps += 1;
             }
         }
@@ -901,7 +997,8 @@ impl Exporter {
             SinkKind::Store {} => {
                 use wicket_store::objects::ObjectStore;
                 if self.store.is_none() {
-                    let s = crate::statestore::StateStore::load()?.context("an audit sink of type store needs state-store.yaml")?;
+                    // Through the configuration its target was told from (`store_cfg`).
+                    let s = self.store_cfg.as_ref().context("an audit sink of type store needs state-store.yaml")?;
                     self.store = Some(s.open_s3()?);
                 }
                 let (Some(first), Some(last)) = (items.first(), items.last()) else { return Ok(()) };
@@ -1235,9 +1332,10 @@ mod tests {
         write_records(&l, 0, 5);
         let (head, _) = l.audit_head().unwrap().unwrap();
         let first = l.audit_record_at(1).unwrap().unwrap();
-        l.advance_export("a", head).unwrap();
-        l.export_checkpointed("a", 77).unwrap();
-        l.lease_export("a", "serve-1", first.ts + 80).unwrap();
+        l.sink_target("a", "jsonl:-").unwrap();
+        l.advance_export("a", "jsonl:-", head).unwrap();
+        l.export_checkpointed("a", "jsonl:-", 77).unwrap();
+        l.lease_export("a", "jsonl:-", "serve-1", first.ts + 80).unwrap();
         l.export_failed("s", "connection refused").unwrap();
         let st = status(&l, &cfg, first.ts + 90).unwrap();
         let a = &st[0];
@@ -1495,6 +1593,46 @@ mod tests {
         a.release();
         assert_eq!(b.pass(false).records, 3, "b takes over where a left off");
         assert_eq!(exported_objects(&std::fs::read_to_string(&out).unwrap()).len(), 13);
+    }
+
+    /// #677 third check (N2): a sink moved from a.jsonl to b.jsonl while a process started with
+    /// the old configuration still holds its lease. That process feeds a.jsonl no further and moves
+    /// nothing; the new one feeds b.jsonl from the start, and only its checkpoints, at what b.jsonl
+    /// got, count for retention.
+    #[test]
+    fn a_stale_exporter_in_another_process_moves_nothing() {
+        let d = TmpDir::new("stale");
+        let lp = d.0.join("ledger.db");
+        let (a_out, b_out) = (d.0.join("a.jsonl"), d.0.join("b.jsonl"));
+        let l = Ledger::open(&lp).unwrap();
+        write_records(&l, 0, 20);
+        let issuer = || Some(wicket_identity::Issuer::generate("test.local"));
+        let mut old = Exporter::new(&lp, jsonl_cfg(&a_out), issuer()).unwrap();
+        assert_eq!(old.pass(true).records, 20);
+        write_records(&l, 20, 10);
+        // The configuration moves the sink; a new process reads it.
+        let mut new = Exporter::new(&lp, jsonl_cfg(&b_out), issuer()).unwrap();
+        assert_eq!(l.peek_export_cursor("file").unwrap().seq, 0, "started again for b.jsonl");
+        // The old process goes on with its lease and its configuration: it feeds nothing more.
+        let p = old.pass(true);
+        assert_eq!((p.records, p.checkpoints), (0, 0), "{p:?}");
+        assert!(p.failures.iter().any(|(_, m)| m.contains("no longer feeds it")), "{p:?}");
+        assert_eq!(exported_objects(&std::fs::read_to_string(&a_out).unwrap()).len(), 21, "a.jsonl as it was: 20 and a checkpoint");
+        assert_eq!(l.peek_export_cursor("file").unwrap().seq, 0, "the cursor not pushed back to the head");
+        // The new one has the sink at once, from the start.
+        let p = new.pass(true);
+        assert_eq!((p.records, p.checkpoints), (30, 1), "{p:?}");
+        let b_objects = exported_objects(&std::fs::read_to_string(&b_out).unwrap());
+        assert_eq!(b_objects.len(), 31);
+        let target = format!("jsonl:{}", b_out.display());
+        let cps = l.checkpoints().unwrap();
+        assert!(!cps.is_empty() && cps.iter().all(|c| c.target == target), "{cps:?}");
+        assert_eq!(l.prune_point(&[("file", target.as_str())], 30, i64::MAX).unwrap().map(|c| c.seq), Some(30));
+        // And later passes of the old one still move nothing.
+        write_records(&l, 30, 2);
+        assert_eq!(old.pass(true).records, 0);
+        assert_eq!(new.pass(false).records, 2);
+        assert_eq!(l.peek_export_cursor("file").unwrap().seq, l.audit_head().unwrap().unwrap().0);
     }
 
     /// The child half of `sigterm_commits_what_is_queued`: queues records, then waits for SIGTERM.
