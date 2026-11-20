@@ -33,7 +33,8 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
-| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
+| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts` (what it was enrolled or renewed with), `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null; the CA's also its `hosts`, which a runtime widening may take past the enrolled ones), `ca_policy` (`mode`: `fixed`, `auto` or `allowed`, with its `allowed` hosts), `ca_wants` (what live runs want of its CA: `host`, `run`, `why`, `at`), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
+| `wicket node ca --json` | `name`, `status`, `tenant`, `ca` (the active CA's `serial`, `issued_at`, `not_after`, `expired` and `hosts`, or null), `enrolled_hosts`, `policy` (as `ca_policy`), `wants` (each `host`, `run`, `why`, `at`, `covered` and `state`: `covered`, `at the next renewal`, `refused by the node's CA policy` or `over the cap`), `next_renewal` (the `hosts` it signs and those `dropped` over the cap), `widenings` (the last 20 `node.ca_widened`: `seq`, `at`, `ca_serial`, `added`, `removed`, `wanted_by`) |
 | `wicket lease list --json` | `id`, `status` (`pending`, `approved`, `active`, `ended`, `denied`, `withdrawn`, `failed`), `run` (the run that holds it), `provider`, `request` (the request a person decides; null: none yet), `node` (the enrolled node's name; null: none yet), `node_id` (the provider's id for it), `hourly_cap_micro_usd`, `reserved_micro_usd`, `billed_micro_usd` (null: not ended), `duration_secs`, `created_at`, `not_after` (null: no node yet), `ended_at`, `detail` |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
 | `wicket message inbox --json` | `message_id`, `kind`, `from` (the sender's principal id, as its envelope verified), `agent`, `zone` and `run` (an agent sender's; null for an operator), `acting_for` (the chain the sender acts for), `reply_to`, `priority` (`now`, `next`, `later`), `in_reply_to`, `sent_at`, `read_at` (null: unread until now), `body` (the sender's data) |
@@ -121,6 +122,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket node forget`](#wicket-node-forget)
   - [`wicket node release-fence`](#wicket-node-release-fence)
   - [`wicket node set`](#wicket-node-set)
+  - [`wicket node ca`](#wicket-node-ca)
   - [`wicket node renew-ca`](#wicket-node-renew-ca)
 - [`wicket lease`](#wicket-lease)
   - [`wicket lease list`](#wicket-lease-list)
@@ -185,6 +187,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 - [`wicket daemon`](#wicket-daemon)
 - [`wicket dev`](#wicket-dev)
   - [`wicket dev node-feed-probe`](#wicket-dev-node-feed-probe)
+  - [`wicket dev console-assets`](#wicket-dev-console-assets)
   - [`wicket dev mock-llm`](#wicket-dev-mock-llm)
 
 ## `wicket`
@@ -1154,6 +1157,7 @@ Commands:
   forget           Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
   release-fence    Release a run's fence without its node (root only, audited as `run.fence_released`): for a run whose node can't confirm its box stopped (unreachable or revoked) and whose fence wouldn't otherwise end, as when its records don't say when its authority ends. Its agent can then be woken. The box may still be running on its node
   set              Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`. Its public addresses (#575) are where its boxes' public names point: only you set them, never the node
+  ca               A node's CA (#573): the hosts its active CA is constrained to and those it was enrolled with, how it may be widened at runtime (`wicket node set --ca-hosts`), what live runs want of it and whether its CA covers each, what the next renewal signs, and its last widenings (`node.ca_widened`). The console's node view shows the same
   renew-ca         Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
   help             Print this message or the help of the given subcommand(s)
 
@@ -1442,6 +1446,21 @@ Options:
       --public-ipv4 <PUBLIC_IPV4>  The node's public IPv4 address (an address on the public internet: the router's, for a node behind NAT that forwards its port range), or `none`
       --public-ipv6 <PUBLIC_IPV6>  The node's public IPv6 address, or `none`
   -h, --help                       Print help
+```
+
+### `wicket node ca`
+
+```text
+A node's CA (#573): the hosts its active CA is constrained to and those it was enrolled with, how it may be widened at runtime (`wicket node set --ca-hosts`), what live runs want of it and whether its CA covers each, what the next renewal signs, and its last widenings (`node.ca_widened`). The console's node view shows the same
+
+Usage: wicket node ca [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  
+
+Options:
+      --json  Print it as JSON
+  -h, --help  Print help
 ```
 
 ### `wicket node renew-ca`
@@ -2444,6 +2463,7 @@ Usage: wicket dev <COMMAND>
 
 Commands:
   node-feed-probe  On a node: send `node serve` its own last freshness statement, tampered and then replayed, and print how each was refused (a check for ci/node-e2e.sh). The control connection stays up
+  console-assets   Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
   mock-llm         A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without an API key
   help             Print this message or the help of the given subcommand(s)
 
@@ -2461,6 +2481,20 @@ Usage: wicket dev node-feed-probe [OPTIONS]
 Options:
       --dir <DIR>  
   -h, --help       Print help
+```
+
+### `wicket dev console-assets`
+
+```text
+Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
+
+Usage: wicket dev console-assets <DIR>
+
+Arguments:
+  <DIR>  
+
+Options:
+  -h, --help  Print help
 ```
 
 ### `wicket dev mock-llm`

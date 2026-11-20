@@ -229,6 +229,7 @@ async fn the_policy_page_shows_the_applied_cedar_its_versions_and_runs() {
 #[tokio::test]
 async fn authority_views_never_carry_a_token_signature_secret_or_key() {
     let f = fixture("leak");
+    super::nodes::enrol(&mut f.t.ledger(), "n1", &TenantId::single().0, &["api.example.com"]);
     let n = needles(&f);
     // The scanner finds them where they are: in the stored record itself.
     assert!(!leaks(&serde_json::to_string(&f.record).unwrap(), &n).is_empty(), "the scanner must catch the raw record");
@@ -246,6 +247,7 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         "/api/me".to_string(),
         "/api/state".into(),
         "/api/policy".into(),
+        "/api/messages".into(),
         format!("/api/runs/{RUN}/authority"),
         "/api/runs/run_nope/authority".into(),
         format!("/api/runs/{RUN}/placement"),
@@ -253,6 +255,8 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         format!("/api/explain/{}", f.op_seq + 1),
         "/api/explain/999999".into(),
         "/api/explain/x".into(),
+        "/api/nodes/n1/ca".into(),
+        "/api/nodes/nope/ca".into(),
     ];
     // The views that answer must answer (an error page would scan clean and prove nothing).
     let answers = [
@@ -270,6 +274,10 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         }
         assert!(leaks(&body, &n).is_empty(), "{p} ({s}) leaks {:?}", leaks(&body, &n));
     }
+    // The POST views too (#252): marking messages read answers with ids, never more.
+    let r = f.t.post("/api/messages/read", serde_json::json!({ "ids": ["m-1", f.gid] }));
+    let body = r.body.to_string();
+    assert!(leaks(&body, &n).is_empty(), "/api/messages/read ({}) leaks {:?}", r.status, leaks(&body, &n));
     // The org policy preview (#712), of the applied policy and of another.
     let org = include_str!("../../../../../examples/policy/org.cedar");
     for body in
@@ -286,6 +294,7 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         "/api/runs/run_01authz0000000000000000000/authority",
         "/api/runs/run_01authz0000000000000000000/placement",
         "/api/explain/1",
+        "/api/nodes/n1/ca",
     ] {
         let (s, _, body) = super::http::call(&f.t.state, "GET", p, &[], b"").await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{p}: {body}");

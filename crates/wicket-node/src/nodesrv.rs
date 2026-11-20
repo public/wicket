@@ -3207,6 +3207,25 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(node.feed_stalled.lock().unwrap().is_some());
     }
 
+    /// #589: a snapshot below the epoch held, signed before it, is dropped as superseded, never
+    /// applied; the node puts it on its audit record (shipped to the control host), so a replayed
+    /// old snapshot stays visible where it used to be refused as a rollback.
+    #[tokio::test]
+    async fn a_superseded_snapshot_is_on_the_nodes_record() {
+        let mut f = PortsFeed::new("nodesrv-superseded");
+        f.commit(vec![wicket_feed::Change::Revoke { kind: wicket_feed::RevokeKind::Token, id: "b0".into(), until: f.now() + 60_000 }]);
+        let old = f.p.snapshot(f.now());
+        f.commit(vec![wicket_feed::Change::Revoke { kind: wicket_feed::RevokeKind::Token, id: "b1".into(), until: f.now() + 60_000 }]);
+        let held = f.node.replica.lock().unwrap().state().unwrap().epoch;
+        super::conn::accept_feed(&f.node, old.to_line().trim_end().as_bytes()).expect("superseded, not refused");
+        assert_eq!(f.node.replica.lock().unwrap().state().unwrap().epoch, held, "never applied");
+        let recs: Vec<_> = f.audit().into_iter().filter(|(k, ..)| k == "feed.snapshot_superseded").collect();
+        assert_eq!(recs.len(), 1, "{:?}", f.audit());
+        let what = recs[0].2["what"].as_str().unwrap();
+        assert!(what.contains(&format!("held ({held})")), "{what}");
+        assert!(f.audit().iter().all(|(k, ..)| k != "feed.refused"));
+    }
+
     /// #377: a box is admitted only into memory that is actually free, counting what the boxes
     /// starting already took; refused, it says why.
     #[tokio::test]

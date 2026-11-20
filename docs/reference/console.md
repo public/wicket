@@ -74,6 +74,14 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   the value.
 - **issue and renew a capacity grant** (`capacity_grant`, `capacity_renew`): see
   [capacity grants](#capacity-grants). Revoking one needs only the session.
+- **send a message to an agent** (`send_message`, #252), as `wicket message send` does: the passkey
+  signs the recipient, the text, its priority and the message it answers, and wicket sends it as
+  `spiffe://<domain>/t/<tenant>/op/passkey/<name>`, signed with a short-lived operator identity. The
+  rules are the CLI's: an agent that acts for you, whose `accept_from` names you, or that wrote to
+  you. Anything else is refused (409), with a receipt. `GET /api/messages` is your inbox (verified,
+  unread first), your receipts and the agents you may write to; `POST /api/messages/read` with
+  `{"ids": [...]}` marks your own messages read, with the session alone. A message grants nothing:
+  prompting an agent is its session.
 - **release a run's fence** (`release_fence`, #690), the console's path beside root's `wicket node
   release-fence`. A run is fenced while its box may still be running on a node that hasn't confirmed
   it stopped (see [the wake fence](nodes.md)): its agent isn't woken and the run isn't ended. Every
@@ -235,6 +243,41 @@ ci/session-view.sh                                  # needs Node 20.19+ or 22.12
 WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
 ```
 
+**Its views are moving to [lit-html](https://lit.dev/docs/libraries/standalone-templates/)** (#574),
+one at a time: the Inbox first (`static/inbox.js`). lit-html's published modules are committed under
+`static/vendor/lit-html/`, unchanged, with their version, licence and hashes in `VENDOR.toml`
+(`ci/vendor-lit.sh` updates them; `ci/vendor-check.py` checks them). The console's modules import it
+by name (`import { html } from "lit-html"`), and `build.rs` rewrites each such import to the vendored
+file's path, so the browser needs no import map and the CSP stays `script-src 'self'`; any other bare
+import fails the build. The console's modules and
+lit-html's are served from one directory named by their hash, `/static/m.<hash>/`, each with
+Subresource Integrity, so the browser loads them without a bundler.
+
+**The console's own script** (`crates/wicket-cli/src/serve/static/console.js`) is minified when wicket
+is built, as are its modules, by `crates/wicket-cli/build.rs` with [Oxc](https://oxc.rs)'s minifier (Rust crates, pinned
+exactly in the workspace's `Cargo.toml`), so a plain `cargo build` needs no Node: about 25 KB gzipped
+instead of 38 KB. Local names are shortened and top-level names kept. `WICKET_CONSOLE_UNMINIFIED=1
+cargo build` embeds it as written, to read in a browser's debugger. The page's tests run on both
+(`serve/tests/console_ui.js`), and `ci/console-browsers.sh` runs it as served in Chromium, Firefox and
+WebKit: it writes what `wicket serve` sends (`wicket dev console-assets DIR`: the page, its files and
+its headers) and serves that against the preview's mock API, failing on any error, CSP violation or
+Trusted Types report, a card replaced by an unchanged poll, or a page that scrolls sideways.
+
+**Every file under `/static/` is named by its content's hash** (`console.<hash>.js`,
+`icon-192.<hash>.png`, `manifest.<hash>.webmanifest`, …) and sent with `Cache-Control: public,
+max-age=31536000, immutable`, so a browser keeps it until a new build names a new file. `build.rs`
+writes those names into what refers to them: the pages, the manifest (its icons) and the service
+worker (its notification icon). Only the pages (`/`, `/session`) and `/sw.js` keep fixed names and
+are asked for anew each time.
+
+**The files are Brotli-compressed when wicket is built** (quality 11, window 24) and embedded next to
+the originals. A browser that sends `Accept-Encoding: br` (current Chrome, Firefox and Safari all do,
+over HTTPS and on loopback) gets the compressed copy with `Content-Encoding: br`; any other gets the
+original. Responses with a copy carry `Vary: accept-encoding`. The page and its files go from about
+136 KB to 39 KB (the script alone from 76 KB to 21 KB; gzip -9 would give 24 KB). The icons get a
+copy too (they are small PNGs that compress by half); a file gets none when it isn't smaller. zstd
+isn't used: Safari decodes it only from macOS and iOS 26.3.
+
 Not yet: answering the agent's own permission requests from the page (wicket's policy answers
 them, #67), images and resources in prompts, and the box tree, budgets and hibernate controls
 next to the session (#327's later slices).
@@ -269,6 +312,11 @@ that stays a signed action.
   whether `org.cedar` still matches what was applied (a hand edit refuses every mint), every kept
   version with when and by whom it was applied, and each running run with the version it was minted
   under: current, older, or revoked by a later `wicket policy apply`.
+- **A node's CA** (`GET /api/nodes/<node>/ca`, #573): the hosts its active CA is constrained to and
+  those it was enrolled with, how it may be widened at runtime, what live runs want of it and whether
+  its CA covers each, what the next renewal signs, and its last 20 widenings (`node.ca_widened`). The
+  same view as `wicket node ca <node> --json`. Another tenant's node is not found. The policy itself is
+  set on the host (`wicket node set --ca-hosts`).
 - **Applying an org policy** (#712): `POST /api/policy/preview` with `cedar`, `entities` and
   `keep_runs` (at most 60 KiB together) shows what `wicket policy apply --dry-run` prints: its
   version and its sources' sha256, the one it replaces, what it changes against the applied policy
@@ -524,6 +572,8 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
   'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+  and Trusted Types reported but not yet enforced (`Content-Security-Policy-Report-Only:
+  require-trusted-types-for 'script'; trusted-types lit-html`, [#739](https://github.com/public/wicket/issues/739)),
   no CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
   `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
 - **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS

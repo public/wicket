@@ -69,6 +69,13 @@ class Parsing(unittest.TestCase):
     def test_empty_files(self):
         self.assertEqual(da.cargo_packages(""), set())
         self.assertEqual(da.npm_packages(""), set())
+        self.assertEqual(da.vendored_packages(""), set())
+
+    def test_vendored_package(self):
+        v = 'ecosystem = "npm"\nname = "lit-html"\nversion = "3.3.3"\n\n[files]\n"lit-html.js" = "ab"\n'
+        self.assertEqual(da.vendored_packages(v), {("npm", "lit-html", "3.3.3")})
+        with self.assertRaises(ValueError):
+            da.vendored_packages('ecosystem = "pypi"\nname = "x"\nversion = "1"\n')
 
 
 class Check(unittest.TestCase):

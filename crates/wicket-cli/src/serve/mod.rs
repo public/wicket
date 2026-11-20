@@ -63,7 +63,9 @@ mod capacity;
 mod fence;
 pub(crate) mod limits;
 mod manifests;
+mod messages;
 pub(crate) mod net;
+mod nodes;
 mod orgpolicy;
 mod placed;
 mod placement;
@@ -73,6 +75,7 @@ pub mod session;
 mod standing;
 pub(crate) mod tls;
 mod web;
+pub(crate) use web::write_console_assets;
 
 pub use net::ServeOpts;
 
@@ -217,6 +220,15 @@ enum Action {
         id: String,
         ttl_secs: Option<u64>,
     },
+    /// Send a message to an agent as the passkey's operator (#252), as `wicket message send` does.
+    SendMessage {
+        /// The passkey of the session it was begun in: the one it is from, which must sign it.
+        credential: String,
+        to: String,
+        text: String,
+        priority: wicket_store::Priority,
+        in_reply_to: Option<String>,
+    },
     /// Release a run's fence without its node (#690), on the effect the passkey signed.
     ReleaseFence {
         run: String,
@@ -319,6 +331,9 @@ struct State {
     progress: Mutex<(i64, bool, Option<crate::statesync::Progress>)>,
     /// What the alerts remember between reads, and the alerts the last read raised (#635).
     progress_alerts: Mutex<(crate::statesync::Watch, Vec<crate::health::Alert>)>,
+    /// The installation's issuer, which signs an operator's messages and verifies its inbox
+    /// ([`messages`], #252). None: messages are unavailable here.
+    issuer: Option<Arc<wicket_identity::Issuer>>,
 }
 
 impl State {
@@ -369,6 +384,7 @@ impl State {
             push,
             progress: Mutex::new((wicket_feed::now_ms(), false, None)),
             progress_alerts: Mutex::new((crate::statesync::Watch::new(wicket_feed::now_ms()), Vec::new())),
+            issuer: None,
         }
     }
 }
@@ -427,6 +443,13 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         |l, run| crate::verified_identity(l, run, None),
     );
     state.updater = Box::new(move |request, log| apply_update_detached(&update_exe, request, log));
+    state.issuer = match crate::issuer() {
+        Ok(i) => Some(Arc::new(i)),
+        Err(e) => {
+            tracing::warn!("console messages are off: {e:#}");
+            None
+        }
+    };
     state.policy_applier = Box::new(move |a| orgpolicy::apply_detached(&policy_exe, a));
     let release_ledger = ledger_path();
     state.releaser = Box::new(move |r| placed::release_in_background(release_ledger.clone(), r));
@@ -806,15 +829,29 @@ where
 
     // The pre-auth surface: the page, its static files, sign-in, the enrolment link.
     if method == Method::GET {
+        // The page, a run's session view (#327: a static page, as `/` is; it asks for a passkey to
+        // open), and the files they load: each as build.rs made it, Brotli-compressed for a browser
+        // that accepts it (#574).
+        let accept = req.headers().get(http::header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok());
+        let send = |a: &web::Asset| {
+            let (body, encoding) = a.for_encoding(accept);
+            let mut r = resp(StatusCode::OK, a.ctype, body);
+            if a.br.is_some() {
+                r.headers_mut().insert(http::header::VARY, http::HeaderValue::from_static("accept-encoding"));
+            }
+            if let Some(e) = encoding {
+                r.headers_mut().insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static(e));
+            }
+            r
+        };
         if path == "/" {
-            return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.page.clone());
+            return send(&web::ASSETS.page);
         }
-        // A run's session view (#327): a static page, as `/` is; it asks for a passkey to open.
         if path == "/session" {
-            return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.session_page.clone());
+            return send(&web::ASSETS.session_page);
         }
         if let Some(a) = web::ASSETS.files.get(&path) {
-            let mut r = resp(StatusCode::OK, a.ctype, a.body.clone());
+            let mut r = send(a);
             let cache = if a.immutable {
                 "public, max-age=31536000, immutable"
             } else if path == "/sw.js" {
@@ -851,6 +888,14 @@ where
                 },
                 _ => denied(),
             },
+            // Messages with agents (#252): this operator's inbox, receipts and who it may write to.
+            "/api/messages" => match &sess {
+                Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
+                    Some(oc) => to_response(messages::view(state, &oc)),
+                    None => denied(),
+                },
+                _ => denied(),
+            },
             // Notifications: the VAPID public key and this operator's devices.
             "/api/push" => match &sess {
                 Some((_, SessionKind::Operator { cred })) => to_response(push_view(state, cred)),
@@ -867,9 +912,9 @@ where
                 },
                 _ => denied(),
             },
-            // Read-only views of authority (#173), and why a run went where it did (#579): an
-            // operator's session only.
-            p => match (authority::get(state, p).or_else(|| placement::get(state, p)), &sess) {
+            // Read-only views of authority (#173), of nodes (#573), and why a run went where it did
+            // (#579): an operator's session only.
+            p => match (authority::get(state, p).or_else(|| nodes::get(state, p)).or_else(|| placement::get(state, p)), &sess) {
                 (Some(r), Some((_, SessionKind::Operator { .. }))) => match r {
                     Ok(v) => to_response(ok(v)),
                     Err(e) => to_response(err(StatusCode::NOT_FOUND, e)),
@@ -1036,6 +1081,13 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
         // Every change to a secret is signed: asked for with a session alone, it is refused and audited.
         p if p.starts_with("/api/secrets/") => match &sess {
             Some((_, SessionKind::Operator { cred })) => secrets::unsigned(state, cred, p, body),
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
+        "/api/messages/read" => match &sess {
+            Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
+                Some(oc) => messages::read(state, &oc, body),
+                None => err(StatusCode::UNAUTHORIZED, "the passkey you signed in with is no longer enrolled"),
+            },
             _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
         },
         "/api/standing/revoke" => match &sess {
@@ -1480,8 +1532,9 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         Some("release_fence") => fence::build_release(state, oc, &l, body),
         Some("policy_apply") => orgpolicy::build(state, &l, oc, body),
         Some("node_release") => placed::build(state, &l, oc, body),
+        Some("send_message") => messages::build_send(state, oc, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence, node_release or policy_apply",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence, node_release, policy_apply or send_message",
         )),
     }
 }
@@ -1606,6 +1659,16 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
             Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
         };
     }
+    if let Action::SendMessage { credential, to, text, priority, in_reply_to } = &*action {
+        // From the session's own passkey (#252 review): another one enrolled can't sign "from" it.
+        if &a.oc.id != credential {
+            return err(StatusCode::FORBIDDEN, "this message is from the passkey you signed in with: sign it with that one");
+        }
+        return match messages::apply_send(state, &a.oc, to, text, *priority, in_reply_to.as_deref(), signed) {
+            Ok(msg) => ok(json!({ "ok": msg })),
+            Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
+        };
+    }
     match apply(state, &action, &a.oc, signed) {
         Ok(msg) => ok(json!({ "ok": msg })),
         Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
@@ -1685,6 +1748,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         }
         Action::OpenSession { .. } => unreachable!("action_finish opens sessions"),
         Action::Secret(_) => unreachable!("action_finish applies secret actions"),
+        Action::SendMessage { .. } => unreachable!("action_finish sends messages"),
         Action::SaveManifest(save) => {
             manifests::apply(state, save)?;
             let signed_action: Value =
@@ -2309,6 +2373,8 @@ mod tests {
     mod http;
     mod https;
     mod manifests;
+    mod messages;
+    mod nodes;
     mod notify;
     mod orgpolicy;
     mod placed;

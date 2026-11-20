@@ -58,4 +58,5 @@ pub mod storegc;
 pub mod supervise;
 pub mod transcript;
 pub mod triggers;
+pub mod vultrdns;
 pub mod whyhere;

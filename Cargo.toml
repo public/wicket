@@ -34,6 +34,16 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+# The console's JavaScript is minified at build time by these (crates/wicket-cli/build.rs, #574): the
+# Oxc toolchain as Rust crates, so `cargo build` needs no Node. Pinned exactly: 0.x releases weekly
+# and moves its API.
+oxc_allocator = "=0.158.0"
+oxc_ast = "=0.158.0"
+oxc_codegen = "=0.158.0"
+oxc_diagnostics = "=0.158.0"
+oxc_minifier = "=0.158.0"
+oxc_parser = "=0.158.0"
+oxc_span = "=0.158.0"
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -160,12 +170,16 @@ jiff-static = { opt-level = 0 }
 jni-macros = { opt-level = 0 }
 jni-sys-macros = { opt-level = 0 }
 lalrpop = { opt-level = 0 }
+lazy-regex-proc_macros = { opt-level = 0 }
 logos-derive = { opt-level = 0 }
 miette-derive = { opt-level = 0 }
 multiversion_no_op = { opt-level = 0 }
+oxc_ast_macros = { opt-level = 0 }
+phf_macros = { opt-level = 0 }
 prost-derive = { opt-level = 0 }
 ref-cast-impl = { opt-level = 0 }
 rustversion = { opt-level = 0 }
+seq-macro = { opt-level = 0 }
 serde_derive = { opt-level = 0 }
 serde_with_macros = { opt-level = 0 }
 syn = { opt-level = 0 }

@@ -429,6 +429,22 @@ impl Ledger {
         )?)
     }
 
+    /// The peer messages waiting for `run` that ask to be read `now` (#252), oldest first, as
+    /// they would be delivered: whether one may interrupt a turn is the supervisor's call, after
+    /// the checks delivery makes ([`wicket_core::message::interrupts`]).
+    pub fn urgent_messages(&self, run: &str) -> Result<Vec<UrgentMessage>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, from_run, from_principal, envelope, created_at FROM messages
+              WHERE to_run = ?1 AND {} AND delivered_at IS NULL AND taken_at IS NULL AND priority = 'now'
+              ORDER BY created_at, rowid",
+            crate::PEER
+        ))?;
+        let rows = st.query_map(params![run], |r| {
+            Ok(UrgentMessage { id: r.get(0)?, from_run: r.get(1)?, from_principal: r.get(2)?, envelope: r.get(3)?, created_at: r.get(4)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Prompts and notices queued for `run` and not yet handed to it.
     pub fn waiting_prompts(&self, run: &str) -> Result<i64> {
         Ok(self.conn.query_row(
@@ -455,6 +471,16 @@ pub(crate) fn insert_agent(conn: &rusqlite::Connection, a: &NewAgent) -> Result<
     )?;
     conn.execute("INSERT INTO agent_runs (run, agent, generation, started_at) VALUES (?1, ?2, 1, ?3)", params![a.run, a.id, t])?;
     Ok(())
+}
+
+/// A waiting `now` message ([`Ledger::urgent_messages`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UrgentMessage {
+    pub id: String,
+    pub from_run: String,
+    pub from_principal: Option<String>,
+    pub envelope: String,
+    pub created_at: i64,
 }
 
 #[cfg(test)]

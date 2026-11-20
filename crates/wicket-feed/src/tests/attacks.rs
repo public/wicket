@@ -110,6 +110,10 @@ fn a03_old_signed_snapshot() {
     assert_eq!((r.state().unwrap().epoch, r.state().unwrap().head.clone()), held, "never applied");
     assert_eq!(r.stats.superseded, 1);
     assert!(r.stats.refused.is_empty(), "{:?}", r.stats.refused);
+    // Counted and said apart from superseded statements, so the replay stays visible.
+    assert_eq!(r.stats.superseded_snapshots, 1);
+    let what = r.stats.last_superseded_snapshot.clone().unwrap();
+    assert!(what.contains(&format!("signed at {T0} ms")) && what.ends_with(&format!("held ({})", held.0)), "{what}");
 }
 
 #[test]
