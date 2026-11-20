@@ -26,7 +26,7 @@ pub enum StandingCmd {
         #[arg(long = "for", default_value = "agent")]
         bound: String,
         /// How long it lasts (at most 366d), or `forever`: until revoked.
-        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d")]
+        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d", value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
         /// Approve only the methods and paths the evidence shows were asked for.
         #[arg(long)]
@@ -41,7 +41,7 @@ pub enum StandingCmd {
     Renew {
         id: String,
         /// How long it lasts from now (at most 366d), or `forever`: until revoked.
-        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d")]
+        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d", value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
     },
     /// Revoke an approved rule: it allows nothing from now on (a box's node, once its run publishes

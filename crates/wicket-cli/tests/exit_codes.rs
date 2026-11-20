@@ -65,6 +65,8 @@ fn every_kind_of_outcome_has_its_code() {
         (&["reconcile", "--every", "5q"], 2),
         (&["trigger", "renew", "t-nope", "--lasts", "5q"], 2),
         (&["self", "update", "x", "--window", "5q"], 2),
+        (&["standing", "renew", "s-nope", "--ttl", "5q"], 2),
+        (&["hibernate", "x", "--wait", "5q"], 2),
         (&["trigger", "show", "nope"], 4),
         (&["unlink", "lk-nope"], 4),
         (&["lease", "release", "lease_nope"], 4),

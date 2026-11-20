@@ -171,7 +171,7 @@ enum Cmd {
         no_wait: bool,
         /// With TEXT: stop following its turn after this long (it stays queued). Seconds, or a
         /// duration (`90s`, `5m`).
-        #[arg(long, value_parser = seconds_or_duration)]
+        #[arg(long, value_parser = wicket_core::time::duration_arg)]
         timeout: Option<Duration>,
     },
     /// Hibernate a long-lived agent at its next quiet point.
@@ -182,7 +182,7 @@ enum Cmd {
     Hibernate {
         run: String,
         /// How long to wait for the outcome: seconds, or a duration (`90s`, `5m`).
-        #[arg(long, default_value = "120s", value_parser = seconds_or_duration)]
+        #[arg(long, default_value = "120s", value_parser = wicket_core::time::duration_arg)]
         wait: Duration,
     },
     /// Internal: wake a hibernated agent (rebuild its box, restore its state, resume its harness
@@ -197,7 +197,7 @@ enum Cmd {
         #[arg(long, hide = true)]
         by: Option<String>,
         /// How long to wait in the queue when no node may take it now (#579); 0: fail at once.
-        #[arg(long, default_value = "30m", value_parser = seconds_or_duration)]
+        #[arg(long, default_value = "30m", value_parser = wicket_core::time::duration_arg)]
         wait: Duration,
     },
     /// A live view of nodes, runs, pending requests and leases (read-only).
@@ -505,15 +505,6 @@ enum Cmd {
         #[arg(long, default_value = daemon::policy::POLICY_PATH)]
         policy: PathBuf,
     },
-}
-
-/// A flag that took a number of seconds and takes a duration too (#574), so it reads as the
-/// others do: `120` is still 120 seconds.
-fn seconds_or_duration(s: &str) -> std::result::Result<Duration, String> {
-    match s.parse::<u64>() {
-        Ok(n) => Ok(Duration::from_secs(n)),
-        Err(_) => wicket_core::time::parse_duration(s).map_err(|e| e.to_string()),
-    }
 }
 
 #[tokio::main]
