@@ -216,12 +216,26 @@ its own address could point a name at someone else's server.
   since a node has one port 443. Sharing 443 between boxes needs routing by TLS server name, which
   is ingress: not in this design. See [open questions](#open-questions).
 
+**As built (step 4c).** The run's supervisor allocates a port for each live public name its box
+holds that may be published on its node (the same check as the reconciler's: labels, addresses,
+domain, label rules), from `names.public.ports`, keeping the port the name had on another node if it
+is free here and releasing that one. It puts them in the box's record (`ports`) for a node at
+protocol 21. The node publishes from its replica alone, every 2 s, so it works offline and across
+restarts: a port in its range (`publish.json` in its directory, written by `wicket node install` for
+a node with the `names.public.nodes` labels; without it the node publishes nothing), unexpired,
+claimed by one box, whose authority holds on the node. It listens on one IPv6 socket that takes
+IPv4 too, and dials each connection into the box (`wicket-fwd`), at most 64 at once per name. A port
+that stops being published closes at once with its connections, before DNS catches up. **Layer 4
+only:** the node never terminates TLS, reads a protocol, or routes by name; nothing passes through
+the control host.
+
 ## The node firewall
 
 A node's firewall is the operator's. wicket asks it for one thing: admit the node's port range from
-anywhere (`deploy/vultr/node-setup.sh` adds a rule for it on a node that publishes). Inside the
+anywhere. Inside the
 range a port is open only while wicket listens on it, so a revoked name is closed by the node
-itself, not by a firewall change that might fail. `wicket node serve` runs unprivileged and changes
+itself, not by a firewall change that might fail. `node-setup.sh` adds the rule when given the range
+(`WICKET_PUBLISH_PORTS=20000-20999`, the same as `names.public.ports`). `wicket node serve` runs unprivileged and changes
 no firewall rules.
 
 Each connection to a published port is checked as it is accepted (grant live, box running, the
@@ -252,8 +266,9 @@ one it doesn't.
 - **The desired state is the ledger's:** for each live public name held by a running box, its A,
   AAAA and SRV records for that box's node, and its owner record. The node must carry the labels
   `names.public.nodes` asks for and have public addresses; until then the name is *waiting*, with
-  why, and has no records. The SRV record needs the name's host port on that node, so it comes with
-  step 4c.
+  why, and has no records. So does a name without a host port on that node (step 4c: its run's
+  supervisor gives it one, on a node at protocol 21): an address with nothing listening would reach
+  nobody, or, once the port is someone else's, the wrong box.
 - **What the noop provider does:** it lists an empty zone and applies nothing, so the reconciler
   records nothing in `name_records` (the ledger never claims a record that isn't there), and audits
   each new plan as `name.plan` with `applied: false`. The same plan pass after pass is recorded once.
@@ -352,9 +367,11 @@ human's approval or denial, or a refused one, as for other asks), `name.register
 not, with the stranded records and the names waiting, recorded when it differs from the last one),
 `name.record` (each create, update or delete a provider is about to make, `state: intended`, and
 each record forgotten, `state: forgotten`), `name.applied` (how a provider's apply ended, and how
-many changes it made) and `name.conflict`. Still to come with 4c and 6:
-`name.port.opened`, `name.port.closed`, `name.conn` (per connection, on the node) and
-`name.challenge`.
+many changes it made) and `name.conflict`. The node's (step 4c, shipped as node audit records):
+`name.port.opened`, `name.port.closed` (with why), `name.port.failed` (a port it couldn't bind, or
+one two boxes claim, recorded once), `name.conn` (per connection: the peer, bytes each way, how
+long) and `name.conn.refused` (connections over the per-name limit, counted each tick). Still to
+come with step 6: `name.challenge`.
 
 `wicket names list` and the console's **Names** card list every name: kind, full name, owner (the
 principal, zone and run), target (node, address, host port and box port), state (pending, live,
@@ -378,9 +395,12 @@ has a name's records as the zone last listed them, and its last connections.
   node. Also `names.domain`: the boxes domain a public name was approved under, so a change of
   `names.public.zone` doesn't move live names into a zone nobody approved them in.
 - **Protocol 18:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
-  node only of a control host at 18. Public names will add the feed's published ports (name, run,
-  node, host port, box port, until) for the nodes that listen on them, and a node's report of a
-  listener it couldn't bind.
+  node only of a control host at 18.
+- **Protocol 21** (step 4c): a box's record in the feed carries its public names' host ports
+  (`BoxAuthority.ports`: the name, its label, the host port, the box's port, until), omitted when
+  there are none, and sent only to a node at 21. A port the node can't bind is a node audit record
+  (`name.port.failed`), not a message of its own.
+- **Ledger schema 43** (#748): `name_records.missing_since`, when a listing first lacked a record.
 
 ## Steps
 
@@ -393,7 +413,7 @@ has a name's records as the zone last listed them, and its last connections.
      operators' `name` kind) and `await_grant` on it;
    - 4b: the installation's `names:` config, node public addresses, and the reconciler with the
      `noop` provider;
-   - 4c: host ports, published on the feed, and the node's listener;
+   - 4c: host ports, published on the feed, and the node's listener (built: below);
    - 4d: the console's Names card.
 5. The `vultr` and `rfc2136` providers.
 6. DNS-01 challenges.

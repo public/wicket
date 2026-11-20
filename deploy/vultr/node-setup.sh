@@ -88,6 +88,22 @@ systemctl daemon-reload
 # The user manager started by `enable-linger` above reads its new limit when it restarts.
 systemctl try-restart "user@$uid.service"
 
+# A node that publishes its boxes' public names (#575 step 4c): its firewall admits the host ports
+# wicket hands out, from anywhere. Inside the range a port is open only while `wicket node serve`
+# listens on it (`publish.json`, written by `wicket node install`); it changes no firewall rule.
+# Opt in with the same range as names.public.ports, e.g. WICKET_PUBLISH_PORTS=20000-20999.
+if [ -n "${WICKET_PUBLISH_PORTS:-}" ]; then
+  case "$WICKET_PUBLISH_PORTS" in
+    *[!0-9-]* | -* | *- | *-*-*) echo "node-setup: WICKET_PUBLISH_PORTS must be low-high (e.g. 20000-20999)" >&2; exit 1 ;;
+  esac
+  if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+    ufw allow "${WICKET_PUBLISH_PORTS/-/:}/tcp" >/dev/null
+    echo "node-setup: the firewall admits host ports $WICKET_PUBLISH_PORTS/tcp"
+  else
+    echo "node-setup: no active ufw: admit host ports $WICKET_PUBLISH_PORTS/tcp in this node's firewall yourself"
+  fi
+fi
+
 docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
 runsc --version | sed -n 1p   # sed reads it all: head would close the pipe early (SIGPIPE under pipefail)
 echo "node ready"

@@ -61,6 +61,7 @@ mod gw;
 mod images;
 mod links;
 mod nodeca;
+mod ports;
 mod volumes;
 use conn::*;
 use gateway::*;
@@ -1215,6 +1216,28 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             loop {
                 t.tick().await;
                 n.ship_audit();
+            }
+        });
+    }
+    // Its boxes' public names' host ports (#575 step 4c), from its replica alone.
+    {
+        let n = node.clone();
+        let range = match ports::publish_range(&n.paths.root) {
+            Ok(r) => r,
+            Err(e) => {
+                say_err!("[node] {e}: this node publishes no host ports");
+                None
+            }
+        };
+        if let Some(r) = &range {
+            say_err!("[node] publishes host ports {}-{} for its boxes' public names", r.start(), r.end());
+        }
+        tokio::spawn(async move {
+            let mut st = ports::Published::default();
+            let mut t = tokio::time::interval(ports::TICK);
+            loop {
+                t.tick().await;
+                ports::tick(&n, range.as_ref(), &mut st);
             }
         });
     }
@@ -3811,6 +3834,96 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         *node.replica.lock().unwrap() = r;
         for (run, zone) in boxes {
             add_box(node, inst, run, zone);
+        }
+    }
+
+    /// #575 step 4c: a box's published host port is listened on here from the replica alone, a
+    /// connection's bytes reach the box's port (a fake `docker exec` that echoes), and a record
+    /// without the port closes the listener and drops the live connection, each audited.
+    #[tokio::test]
+    async fn a_published_port_relays_into_its_box_until_its_record_drops_it() {
+        use tokio::io::AsyncReadExt;
+        use wicket_feed::{Change, Issuer, KeyCert, Publisher, PublisherConfig};
+        let inst = Install::new("nodesrv-ports");
+        let echo = inst.dir.join("fake-docker");
+        std::fs::write(&echo, "#!/bin/sh\nexec cat\n").unwrap();
+        std::fs::set_permissions(&echo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut node = test_node(&inst);
+        Arc::get_mut(&mut node).unwrap().docker = Docker::with_command(vec![echo.display().to_string()]);
+        // A port the OS says is free.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let zone = "{ name: web }";
+        // The node's feed, with run_web's record carrying the port (as `fed_boxes`, by hand).
+        let root = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+        let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
+        let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
+        let cfg = PublisherConfig { ttl_ms: 30_000, refresh_ms: 100, retain: 100 };
+        let mut p =
+            Publisher::open_with(&inst.dir.join("pub"), "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
+        let mut r = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
+        let now = (node.clock)();
+        let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
+        let issuer = Issuer::root(
+            &authz_root,
+            "t0",
+            "run:run_web",
+            "run_web",
+            0,
+            &z,
+            &[],
+            u64::try_from(now / 1000 + 3600).unwrap(),
+            vec![approver.public()],
+        )
+        .unwrap();
+        let mut a = issuer.publish(&approver, &[]).unwrap();
+        a.ports = vec![wicket_feed::PublishedPort {
+            name: "n-1".into(),
+            label: "demo".into(),
+            host_port: port,
+            box_port: 3000,
+            until_ms: i64::MAX,
+        }];
+        let hello = r.hello();
+        p.commit(vec![Change::PutZone { zone: a.clone() }], now).unwrap();
+        for f in p.catch_up(&hello, now).unwrap() {
+            r.accept(&f, now).unwrap();
+        }
+        *node.replica.lock().unwrap() = r;
+        add_box(&node, &inst, "run_web", zone);
+
+        // Outside the node's range: not opened.
+        let mut st = ports::Published::default();
+        ports::tick(&node, Some(&(port + 1..=port + 1)), &mut st);
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "not in the range: nothing listens");
+        // In it: a connection's bytes reach the box and come back.
+        let range = port..=port;
+        ports::tick(&node, Some(&range), &mut st);
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // The name is gone from the box's record: the port closes, the live connection with it.
+        let mut without = a.clone();
+        without.ports.clear();
+        let hello = node.replica.lock().unwrap().hello();
+        p.commit(vec![Change::PutZone { zone: without }], now + 1).unwrap();
+        for f in p.catch_up(&hello, now + 1).unwrap() {
+            node.replica.lock().unwrap().accept(&f, now + 1).unwrap();
+        }
+        ports::tick(&node, Some(&range), &mut st);
+        let mut rest = vec![];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut rest)).await;
+        assert!(read.is_ok(), "the live connection is dropped");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "nothing listens once the name is gone");
+        let kinds: Vec<String> = node.audit.lock().unwrap().audit_tail(50).unwrap().into_iter().map(|a| a.2).collect();
+        for k in ["name.port.opened", "name.port.closed"] {
+            assert!(kinds.iter().any(|x| x == k), "{k} in {kinds:?}");
         }
     }
 

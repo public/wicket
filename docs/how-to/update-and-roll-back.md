@@ -129,6 +129,13 @@ A rollback is a switch to `previous`, so a second rollback goes forward again. I
 below the ledger's schema floor: after a contract step, restore the snapshot instead (below). Root's
 `/usr/local/bin/wicket` moves to root's copy of the build rolled back to, if it has one.
 
+Going back to a build before protocol 21 is refused while a node's feed holds a box's record with
+host ports (#575: public names published on a node), because that build couldn't open the feed.
+The refusal names the nodes: revoke the public names published there (`wicket names list`,
+`wicket names revoke <id>`), let their runs drop the ports from their records, and wait for each
+feed's next checkpoint (every 64 records). A failed update's automatic rollback is refused the same
+way: the new build stays, and says so loudly (`self.rollback_refused`).
+
 A build upgrades a ledger from schema 17 on (`wicket self status` shows the schema). An installation
 whose ledger is older is refused, with a message naming a build that upgrades it: update to that build
 first (main at `a3135ea`), then to this one.
