@@ -15,6 +15,7 @@ pub mod out;
 
 pub mod audit_export;
 pub mod control;
+pub mod exit;
 pub mod exitcause;
 pub mod images_policy;
 pub mod nodeauth;

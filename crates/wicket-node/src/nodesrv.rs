@@ -2677,7 +2677,8 @@ fn too_old_for(tool: chan::ControlTool, args: &serde_json::Value, proto: u32) ->
     if proto >= chan::NAMES {
         return None;
     }
-    let by_name = tool == chan::ControlTool::Connect && args.get("name").is_some();
+    // As the control host's dispatch reads it: a string `name` makes it a connect by name.
+    let by_name = tool == chan::ControlTool::Connect && args.get("name").and_then(|v| v.as_str()).is_some();
     (tool == chan::ControlTool::RequestName || by_name).then(|| {
         format!(
             "not requested: this box's control host speaks protocol {proto}, and names need {} (an update of the control host)",

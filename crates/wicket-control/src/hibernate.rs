@@ -390,11 +390,11 @@ pub fn trigger_wake(agent: &str, by: &str) {
 /// An agent named by its id or by any of its runs.
 pub fn resolve(l: &Ledger, who: &str) -> Result<AgentRow> {
     if wicket_store::valid_agent_id(who) {
-        return l.agent(who)?.with_context(|| format!("no agent {who}"));
+        return l.agent(who)?.ok_or_else(|| wicket_home::exit::not_found(format!("no agent {who}")));
     }
     match l.agent_of_run(who)? {
-        Some((id, _)) => Ok(l.agent(&id)?.with_context(|| format!("no agent {id}"))?),
-        None => bail!("{who} is not an agent or a run of one"),
+        Some((id, _)) => Ok(l.agent(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no agent {id}")))?),
+        None => Err(wicket_home::exit::not_found(format!("{who} is not an agent or a run of one"))),
     }
 }
 
@@ -515,7 +515,8 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
         let Some(generation) = l.claim_wake(&a.id, &run.0, wicket_store::now() + BUSY_CLAIM_SECS)? else {
             let a = l.agent(&a.id)?.unwrap_or(a);
             say!("[wicket] agent {} not woken: it is {} (generation {}, run {})", a.id, a.state, a.generation, a.run);
-            std::process::exit(2);
+            // Refused (#574): something else has it; 2 is a usage error.
+            std::process::exit(wicket_home::exit::Code::Refused as i32);
         };
         let by = by.unwrap_or_else(|| format!("wicket wake by {}", crate::cli_principal()["id"].as_str().unwrap_or("operator")));
         if let Some(t) = &text {
@@ -1032,17 +1033,26 @@ pub async fn hibernate(who: &str, wait_secs: u64) -> Result<()> {
     }
 }
 
+/// `wicket agents --json`: one object per long-lived agent.
+pub fn agents_json(rows: &[wicket_store::AgentRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|a| serde_json::json!({
+                "id": a.id, "name": a.name, "zone": a.zone, "state": a.state, "generation": a.generation, "run": a.run,
+                "session_id": a.session_id, "bundle_bytes": a.bundle_bytes, "head": a.head, "restorable": a.restorable, "note": a.note,
+                "workspace": a.workspace, "updated_at": a.updated_at,
+                "used": { "requests": a.used_requests, "input_tokens": a.used_input_tokens, "output_tokens": a.used_output_tokens, "secs": a.used_secs },
+            }))
+            .collect(),
+    )
+}
+
 /// `wicket agents`.
 pub fn list(json: bool) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     let rows = l.agents(&TenantId::single().0)?;
     if json {
-        say!("{}", serde_json::to_string_pretty(&rows.iter().map(|a| serde_json::json!({
-            "id": a.id, "name": a.name, "zone": a.zone, "state": a.state, "generation": a.generation, "run": a.run,
-            "session_id": a.session_id, "bundle_bytes": a.bundle_bytes, "head": a.head, "restorable": a.restorable, "note": a.note,
-            "workspace": a.workspace, "updated_at": a.updated_at,
-            "used": { "requests": a.used_requests, "input_tokens": a.used_input_tokens, "output_tokens": a.used_output_tokens, "secs": a.used_secs },
-        })).collect::<Vec<_>>())?);
+        say!("{}", serde_json::to_string_pretty(&agents_json(&rows))?);
         return Ok(());
     }
     if rows.is_empty() {

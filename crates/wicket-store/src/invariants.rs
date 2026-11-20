@@ -200,7 +200,13 @@ pub fn check(l: &Ledger, zone_of: &ZoneOf<'_>, grace_secs: i64, now: i64) -> Res
                     Why::Grant(id) => {
                         s.by_grant += 1;
                         let risk = ev["risk"].as_str().and_then(wicket_core::RiskClass::from_name).map(|r| r.rank()).unwrap_or(0);
-                        if let Some(why) = grant_fault(l, &id, &r.run, method, host, path, risk, r.ts, revoked.get(&id).copied())? {
+                        // A standing rule (#572, `s-…`) allows as a grant does, by its own record.
+                        let fault = if id.starts_with("s-") {
+                            standing_fault(l, &id, &r.run, starts.get(&r.run), method, host, path, r.ts)?
+                        } else {
+                            grant_fault(l, &id, &r.run, method, host, path, risk, r.ts, revoked.get(&id).copied())?
+                        };
+                        if let Some(why) = fault {
                             findings.push(Finding {
                                 invariant: "egress",
                                 run: r.run.clone(),
@@ -348,6 +354,55 @@ fn grant_fault(
         Some(format!("before it was made ({created})"))
     } else {
         None
+    };
+    Ok(why)
+}
+
+/// Why standing rule `id` (#572) couldn't have allowed `method host path` at `ts` for `run`, if it
+/// couldn't: it must have been approved (and not yet revoked, past the feed's window, or lapsed)
+/// before the request, its rule must allow the request as a reach rule would, and it must bind the
+/// run: the asking agent's principal, or its zone (read from the run's `run.start`; the zone
+/// definition's digest isn't on the record, so a rule bound to it is checked by the zone's name).
+#[allow(clippy::too_many_arguments)]
+fn standing_fault(
+    l: &Ledger,
+    id: &str,
+    run: &str,
+    start: Option<&Value>,
+    method: &str,
+    host: &str,
+    path: &str,
+    ts: i64,
+) -> Result<Option<String>> {
+    let s = match l.standing(id) {
+        Ok(s) => s,
+        Err(crate::StoreError::NoSuchRequest(_)) => return Ok(Some("which was never issued".into())),
+        // A ledger that can't be read isn't a rule that was never issued: say so, as an error.
+        Err(e) => return Err(e),
+    };
+    let Some(decided) = s.decided_at.filter(|_| matches!(s.status.as_str(), "approved" | "revoked")) else {
+        return Ok(Some(format!("which was never approved (it is {})", s.status)));
+    };
+    let zone = start.and_then(|b| b["zone"].as_str()).unwrap_or("");
+    let agent = start.and_then(|b| b["agent"].as_str()).unwrap_or("");
+    let op = wicket_core::Op::egress(&wicket_core::TenantId(s.tenant.clone()), &wicket_core::RunId(run.into()), zone, method, host, path);
+    let rule = &s.rule;
+    let shown = || format!("{} {}{}", rule.methods.join(","), rule.host, rule.paths.join(","));
+    let binds = match s.bound {
+        Some(crate::StandingBound::Zone) => zone == s.zone,
+        Some(crate::StandingBound::Agent) => s.principal.ends_with(&format!("/t/{}/z/{zone}/a/{agent}", s.tenant)),
+        None => false,
+    };
+    let why = if !rule.allows(&op).unwrap_or(false) {
+        Some(format!("which is for {}", shown()))
+    } else if !binds {
+        Some(format!("which is for {} (bound to its {})", s.principal, s.bound.map(|b| b.as_str()).unwrap_or("nothing")))
+    } else if ts + SKEW_SECS < decided {
+        Some(format!("before it was approved ({decided})"))
+    } else if let Some(end) = s.expires_at.filter(|e| ts > e + SKEW_SECS) {
+        Some(format!("past its lifetime (ended {end})"))
+    } else {
+        s.revoked_at.filter(|at| ts > at + REVOKE_LAG_SECS).map(|at| format!("{}s after it was revoked", ts - at))
     };
     Ok(why)
 }

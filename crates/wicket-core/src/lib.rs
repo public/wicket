@@ -20,6 +20,7 @@ pub mod placement;
 pub mod quota;
 pub mod service;
 pub mod splice;
+pub mod standing;
 pub mod subset;
 pub mod text;
 pub mod time;

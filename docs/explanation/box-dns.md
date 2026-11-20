@@ -328,6 +328,8 @@ has a name's records as the zone last listed them, and its last connections.
   revoked by), `name_records` (the records this installation created: zone, name, type, value,
   provider, created, last seen) and `host_ports` (`node`, protocol, port unique; the name holding it,
   released at). Node public addresses are columns of the node's row.
+- **Ledger schema 31** (#668): `name_exposures`, the ports a run's names exposed (not the box
+  itself), which a name's move may take away once no other name of the run names the port.
 - **Protocol 18:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
   node only of a control host at 18. Public names will add the feed's published ports (name, run,
   node, host port, box port, until) for the nodes that listen on them, and a node's report of a
@@ -339,8 +341,13 @@ has a name's records as the zone last listed them, and its last connections.
 2. The provider trait, the `noop` provider and the plan function, in their own crate
    (`wicket-names`), with property tests for ownership.
 3. Ledger schema 28 (#658); `request_name` for internal names, `connect` by name, protocol 18.
-4. Public names: the approval, standing names, port allocation, the node's listener, the reconciler,
-   the console card.
+4. Public names, in four parts:
+   - 4a: the ask (`request_name` with `kind: public`), the human decision (`wicket names`, the
+     operators' `name` kind) and `await_grant` on it;
+   - 4b: the installation's `names:` config, node public addresses, and the reconciler with the
+     `noop` provider;
+   - 4c: host ports, published on the feed, and the node's listener;
+   - 4d: the console's Names card.
 5. The `vultr` and `rfc2136` providers.
 6. DNS-01 challenges.
 

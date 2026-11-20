@@ -30,6 +30,10 @@ Input: `{"zones": [zone…], "cases": [case…]}`. A case is one of
 - `{"kind": "take_use", "uses_left": n|null}` → `take_use` (`refused`, `uncounted`, or the uses left);
 - `{"kind": "money", "rh", "rt", "nh", "nt", "mh", "mt"}` → `money_fits` (`fits`, `hourly`, `total`);
 - `{"kind": "spawn", limits (or null), ask}` → `SpawnLimits::admits`.
+- `{"kind": "narrow", "host": h, "ops": [[method, path, granted]…]}` → `standing::narrow` (#572):
+  `none`, or `[host, methods, paths, allow_dangerous]` as compact JSON;
+- `{"kind": "rule_allows", "rule": {host, methods, paths, dangerous}, "op": {…}}` →
+  `ReachRule::allows`, what a standing rule decides: `true`/`false`;
 - `{"kind": "relation", "to_child", "to_parent", "accept_from", "zone", "principal", "reply"}` →
   `message::relation` (#565): `child`, `parent`, `peer`, `reply` or `none`;
 - `{"kind": "subtree_permits", "subtree": s, "host": h}` → `splice::subtree_permits` (#573);
@@ -248,6 +252,21 @@ def decideCase (zs : Array Zone) (c : Json) : Except String String := do
     let g : String → Except String Int := fun k => c.getObjValAs? Int k
     return toString (spawnAdmits (← oi "min_isolation") (← oi "max_mem") (← oi "max_cpus") (← oi "max_pids") (← oi "max_timeout")
       (← g "isolation") (← g "mem") (← g "cpus") (← g "pids") (← g "timeout"))
+  | "narrow" =>
+    let ops ← (← jArr c "ops").mapM (fun o => do
+      let a ← o.getArr?
+      let g := fun (i : Nat) => (a[i]?).elim (.error "evidence op") pure
+      return ({ method := bytesOf (← (← g 0).getStr?), path := bytesOf (← (← g 1).getStr?),
+                granted := ← (← g 2).getNat? } : EvOp))
+    return match narrow (← jStr c "host") ops with
+      | none => "none"
+      | some r =>
+        let strs := fun (l : List Str) => Json.arr (l.map (fun x => Json.str (stringOf x))).toArray
+        (Json.arr #[Json.str (stringOf r.host), strs r.methods, strs r.paths, Json.bool r.dangerous]).compress
+  | "rule_allows" =>
+    let r ← parseReach (← c.getObjVal? "rule")
+    if !(r.paths.all Wicket.supported) then return "unsupported"
+    return toString (r.allows (← parseOp (← c.getObjVal? "op")))
   | "relation" =>
     let pr ← match c.getObjVal? "principal" with
       | .ok .null => pure none

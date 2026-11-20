@@ -5,13 +5,12 @@
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
     use std::collections::BTreeMap;
 
     /// `wicket <path> --help`, for every visible command, depth-first.
     fn helps() -> BTreeMap<String, String> {
-        let mut root = crate::Cli::command();
-        root.build();
+        // The parser `wicket` runs, with its help by area (#574).
+        let mut root = crate::command();
         let mut out = BTreeMap::new();
         fn walk(c: &mut clap::Command, path: Vec<String>, out: &mut BTreeMap<String, String>) {
             let name = std::iter::once("wicket".to_string()).chain(path.iter().cloned()).collect::<Vec<_>>().join(" ");
