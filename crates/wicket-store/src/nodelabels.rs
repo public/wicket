@@ -89,11 +89,15 @@ impl Ledger {
         )? > 0)
     }
 
-    /// `node`'s public addresses (none if its operator set none).
+    /// `node`'s public addresses (none if its operator set none, or it isn't an active node).
     pub fn node_addresses(&self, node: &str) -> Result<NodeAddresses> {
         let row: Option<(Option<String>, Option<String>)> = self
             .conn
-            .query_row("SELECT ipv4, ipv6 FROM node_addresses WHERE node = ?1", params![node], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT a.ipv4, a.ipv6 FROM node_addresses a JOIN nodes n ON n.name = a.node WHERE a.node = ?1 AND n.status = 'active'",
+                params![node],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()?;
         let (v4, v6) = row.unwrap_or_default();
         Ok(NodeAddresses { ipv4: v4.and_then(|a| a.parse().ok()), ipv6: v6.and_then(|a| a.parse().ok()) })
@@ -124,10 +128,28 @@ impl Ledger {
             let Some(row) = l.node(node)? else {
                 return Err(crate::StoreError::Refused(format!("node {node} is not enrolled")));
             };
+            if row.status != "active" {
+                return Err(crate::StoreError::Refused(format!("node {node} is {}, not active", row.status)));
+            }
             let old = l.node_addresses(node)?;
             let new = NodeAddresses { ipv4: ipv4.apply(old.ipv4), ipv6: ipv6.apply(old.ipv6) };
             if new == old {
                 return Ok(new);
+            }
+            // One address, one node (#716 review, F4): host ports are allocated per node, so two
+            // nodes behind one address would both hand out the same port.
+            let other: Option<String> = l
+                .conn
+                .query_row(
+                    "SELECT a.node FROM node_addresses a JOIN nodes n ON n.name = a.node
+                     WHERE n.status = 'active' AND a.node != ?1 AND ((?2 IS NOT NULL AND a.ipv4 = ?2) OR (?3 IS NOT NULL AND a.ipv6 = ?3))
+                     LIMIT 1",
+                    params![node, new.ipv4.map(|a| a.to_string()), new.ipv6.map(|a| a.to_string())],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(other) = other {
+                return Err(crate::StoreError::Refused(format!("node {other} already has that public address")));
             }
             l.conn.execute(
                 "INSERT INTO node_addresses (node, ipv4, ipv6, set_at, set_by) VALUES (?1, ?2, ?3, ?4, ?5)

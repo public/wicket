@@ -216,8 +216,8 @@ impl StoreError {
 /// checkpoints retention asked the exporter to sign. Older builds don't read them; a prune raises
 /// the floor to 32, so a build that would walk a pruned chain from seq 1 refuses the ledger.
 /// Version 34 (expand, #575 step 4b; 33 is #637's) adds `node_addresses`: each node's public
-/// addresses as its operator set them, where its boxes' public names point. Older builds don't read
-/// it; the floor stays 17.
+/// addresses as its operator set them, where its boxes' public names point, and `names.domain`, the
+/// boxes domain a public name was approved under. Older builds don't read them; the floor stays 17.
 pub const SCHEMA_VERSION: u32 = 34;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
@@ -625,6 +625,7 @@ impl Ledger {
         conn.execute_batch(triggers::SCHEMA)?;
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
+        names::migrate(&conn)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -683,6 +684,7 @@ impl Ledger {
         conn.execute_batch(triggers::SCHEMA)?;
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
+        names::migrate(&conn)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
@@ -2440,6 +2442,32 @@ mod node_tests {
             (last["ipv4"].clone(), last["was_ipv4"].as_str(), last["by"].as_str()),
             (serde_json::Value::Null, Some("1.1.1.1"), Some("ann"))
         );
+    }
+
+    /// #716 review, F2 and F4: a node's addresses go with its enrolment, a revoked node gets none,
+    /// and no two active nodes share one.
+    #[test]
+    fn node_addresses_follow_the_enrolment_and_are_one_nodes() {
+        use crate::AddressChange as A;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let v4: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
+        for (n, serial) in [("n1", "01"), ("n2", "02")] {
+            let t = l.create_node_token(&TenantId::single(), n, 3600).unwrap();
+            l.enrol_node(&t, &node(n), &ca(n, serial)).unwrap();
+        }
+        l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann").unwrap();
+        assert!(
+            matches!(l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("n1")),
+            "another active node has it"
+        );
+        l.revoke_node("n1").unwrap();
+        assert!(l.node_addresses("n1").unwrap().is_empty(), "revoked: no address");
+        assert!(matches!(l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("not active")));
+        // n1's address is free for n2 now, and a machine enrolled again as n1 starts with none.
+        l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann").unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "03")).unwrap();
+        assert!(l.node_addresses("n1").unwrap().is_empty());
     }
 
     #[test]

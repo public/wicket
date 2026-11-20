@@ -154,8 +154,15 @@ impl PublicConfig {
     /// label.
     pub fn rules(&self) -> Rules {
         let mut reserved = self.reserved.clone();
-        if let Some(first) = self.console_host.as_deref().and_then(|h| h.trim_end_matches('.').split('.').next()) {
-            reserved.push(first.to_ascii_lowercase());
+        if let Some(host) = self.console_host.as_deref().map(|h| h.trim_end_matches('.').to_ascii_lowercase()) {
+            if let Some(first) = host.split('.').next() {
+                reserved.push(first.to_string());
+            }
+            // A console host under the boxes zone (`console.ops.<zone>`): the label directly under
+            // the zone too, or a box could take `ops.<zone>` (#716 review, F9).
+            if let Some(under) = host.strip_suffix(&format!(".{}", self.domain())).and_then(|rest| rest.rsplit('.').next()) {
+                reserved.push(under.to_string());
+            }
         }
         Rules { reserved, allow_idn: self.allow_idn }
     }
@@ -250,6 +257,15 @@ mod tests {
         assert!(crate::check_label("0ps", &r).is_err(), "a lookalike of the console's label");
         assert!(crate::check_label("demo", &r).is_ok());
         assert_eq!(c.public.unwrap().domain(), "boxes.example.com");
+        // A console deep under the boxes zone: the label under the zone is the console's too.
+        let c = parse(
+            r#"{ "public": { "provider": "noop", "zone": "boxes.example.com", "owner": "a1b2c3d4",
+                 "console_host": "console.ops.boxes.example.com" } }"#,
+        );
+        let r = c.public_rules().unwrap();
+        assert!(crate::check_label("ops", &r).is_err());
+        assert!(crate::check_label("0ps", &r).is_err());
+        assert!(crate::check_label("demo", &r).is_ok());
     }
 
     #[test]

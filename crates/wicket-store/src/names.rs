@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS names (
   zone TEXT NOT NULL, zone_digest TEXT NOT NULL, principal TEXT NOT NULL, asked_run TEXT NOT NULL,
   holder TEXT, port INTEGER NOT NULL, service TEXT, reason TEXT NOT NULL, scope TEXT NOT NULL,
   status TEXT NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT, bound TEXT,
-  expires_at INTEGER, effect_sha256 TEXT, ended_at INTEGER, ended_by TEXT, end_reason TEXT
+  expires_at INTEGER, effect_sha256 TEXT, ended_at INTEGER, ended_by TEXT, end_reason TEXT, domain TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS names_internal_live ON names (tenant, zone, label) WHERE kind = 'internal' AND status = 'live';
 CREATE UNIQUE INDEX IF NOT EXISTS names_public_live ON names (label) WHERE kind = 'public' AND status = 'live';
@@ -70,6 +70,16 @@ CREATE TABLE IF NOT EXISTS name_records (
   PRIMARY KEY (zone, name, rtype, value)
 );
 "#;
+
+/// Schema 34 (expand, #716 review, F3): `names.domain`, the boxes domain a public name was
+/// approved under, added to a ledger made before. Older builds don't read it.
+pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
+    let has: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info('names') WHERE name = 'domain'", [], |r| r.get(0))?;
+    if has == 0 {
+        conn.execute_batch("ALTER TABLE names ADD COLUMN domain TEXT")?;
+    }
+    Ok(())
+}
 
 /// Which kind of name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -172,6 +182,9 @@ pub struct NameRow {
     /// `run ended`, `run gone` (its run had ended without letting it go, found by
     /// [`Ledger::sweep_stale_names`]), `revoked` or `lapsed`.
     pub end_reason: Option<String>,
+    /// A public name: the boxes domain it was approved under (#716 review, F3), which its records
+    /// may be published in only while it is the installation's. None: not decided, or internal.
+    pub domain: Option<String>,
 }
 
 impl NameRow {
@@ -242,7 +255,7 @@ pub const PENDING_STANDING_SECS: i64 = 14 * 24 * 3600;
 pub const MAX_PENDING_NAMES: usize = 3;
 
 const COLS: &str = "id, tenant, kind, label, zone, zone_digest, principal, asked_run, holder, port, service, reason, scope, status, \
-                    created_at, decided_at, decided_by, bound, expires_at, effect_sha256, ended_at, ended_by, end_reason";
+                    created_at, decided_at, decided_by, bound, expires_at, effect_sha256, ended_at, ended_by, end_reason, domain";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NameRow> {
     let kind: String = r.get(2)?;
@@ -273,6 +286,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NameRow> {
         ended_at: r.get(20)?,
         ended_by: r.get(21)?,
         end_reason: r.get(22)?,
+        domain: r.get(23)?,
     })
 }
 
@@ -300,11 +314,12 @@ impl Ledger {
         Ok(rows)
     }
 
-    /// The live names `run` holds.
+    /// The live, unlapsed names `run` holds.
     pub fn names_held_by(&self, run: &RunId) -> Result<Vec<NameRow>> {
-        let mut st =
-            self.conn.prepare(&format!("SELECT {COLS} FROM names WHERE holder = ?1 AND status = 'live' ORDER BY created_at, id"))?;
-        let rows = st.query_map(params![run.0], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM names WHERE holder = ?1 AND status = 'live' AND (expires_at IS NULL OR expires_at > ?2) ORDER BY created_at, id"
+        ))?;
+        let rows = st.query_map(params![run.0, now()], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -348,8 +363,9 @@ impl Ledger {
             return self.name(&n.id);
         }
         let held: i64 = tx.query_row(
-            "SELECT count(*) FROM names WHERE tenant = ?1 AND principal = ?2 AND status = 'live' AND kind = 'internal'",
-            params![ask.tenant.0, ask.principal],
+            "SELECT count(*) FROM names WHERE tenant = ?1 AND principal = ?2 AND status = 'live' AND kind = 'internal'
+               AND (expires_at IS NULL OR expires_at > ?3)",
+            params![ask.tenant.0, ask.principal, t],
             |r| r.get(0),
         )?;
         if held as usize >= limit {
@@ -405,9 +421,11 @@ impl Ledger {
     fn ask_public_in(&self, ask: &NameAsk<'_>) -> Result<(String, bool)> {
         let live: Option<String> = self
             .conn
-            .query_row("SELECT principal FROM names WHERE label = ?1 AND kind = 'public' AND status = 'live'", params![ask.label], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT principal FROM names WHERE label = ?1 AND kind = 'public' AND status = 'live' AND (expires_at IS NULL OR expires_at > ?2)",
+                params![ask.label, now()],
+                |r| r.get(0),
+            )
             .optional()?;
         if live.is_some() {
             return Err(taken(ask.label));
@@ -473,8 +491,12 @@ impl Ledger {
         shown: Option<&str>,
         public: &wicket_names::PublicConfig,
     ) -> Result<String> {
-        // One write lock: the limit counted and the approval see the same names.
-        self.immediate(|l| l.approve_name_in(id, terms, by, shown, public))
+        // One write lock: the limit counted and the approval see the same names. Names past their
+        // lifetime end first, so they hold neither a label nor a slot (#716 review, F1).
+        self.immediate(|l| {
+            l.lapse_names(now())?;
+            l.approve_name_in(id, terms, by, shown, public)
+        })
     }
 
     fn approve_name_in(
@@ -517,10 +539,10 @@ impl Ledger {
         let r = self.conn.execute(
             "UPDATE names SET status = 'live',
                holder = CASE WHEN EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running') THEN asked_run END,
-               decided_at = ?2, decided_by = ?3, bound = ?4, expires_at = ?5, effect_sha256 = ?6
+               decided_at = ?2, decided_by = ?3, bound = ?4, expires_at = ?5, effect_sha256 = ?6, domain = ?7
              WHERE id = ?1 AND status = 'pending'
                AND (scope != 'run' OR EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running'))",
-            params![id, t, by, bound, expires, effect],
+            params![id, t, by, bound, expires, effect, public.domain()],
         );
         match r {
             Err(e) if is_unique_violation(&e) => Err(taken(&n.label)),
@@ -534,11 +556,12 @@ impl Ledger {
         }
     }
 
-    /// How many live public names `principal` holds, or has standing (held by a run or not).
+    /// How many live, unlapsed public names `principal` holds, or has standing (held by a run or
+    /// not).
     pub fn live_public_names(&self, principal: &str) -> Result<usize> {
         let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM names WHERE kind = 'public' AND status = 'live' AND principal = ?1",
-            params![principal],
+            "SELECT count(*) FROM names WHERE kind = 'public' AND status = 'live' AND principal = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
+            params![principal, now()],
             |r| r.get(0),
         )?;
         Ok(n as usize)
@@ -642,12 +665,14 @@ impl Ledger {
             [],
         )?;
         let t = now();
+        // Names past their lifetime end, so they hold neither a label nor a slot (#716 review, F1).
+        let lapsed = self.lapse_names(t)?.len();
         let mut released = 0;
         for n in &stale {
             let holder = RunId(n.holder.clone().unwrap_or_default());
             released += self.release_held(n, &holder, t, "run gone")? as usize;
         }
-        Ok(released + withdrawn)
+        Ok(released + withdrawn + lapsed)
     }
 
     /// Lets go of name `n` if `run` still holds it: a run-scoped one ends (its ports released), a
@@ -719,8 +744,18 @@ impl Ledger {
         })
     }
 
-    /// Ends the live names whose lifetime is over at `at`. Each one ended.
+    /// Ends the live names whose lifetime is over at `at`, each audited `name.lapsed`. Each one
+    /// ended. The sweep runs it ([`Ledger::sweep_stale_names`]), and so does the names reconciler.
     pub fn lapse_names(&self, at: i64) -> Result<Vec<NameRow>> {
+        // Each end and its audit record are one write.
+        if self.conn.is_autocommit() {
+            self.immediate(|l| l.lapse_in(at))
+        } else {
+            self.lapse_in(at)
+        }
+    }
+
+    fn lapse_in(&self, at: i64) -> Result<Vec<NameRow>> {
         let mut st = self
             .conn
             .prepare(&format!("SELECT {COLS} FROM names WHERE status = 'live' AND expires_at IS NOT NULL AND expires_at <= ?1"))?;
@@ -733,6 +768,11 @@ impl Ledger {
             )? == 1
             {
                 self.release_ports(&n.id)?;
+                let body = serde_json::json!({
+                    "id": n.id, "kind": n.kind.as_str(), "label": n.label, "zone": n.zone, "scope": n.scope.as_str(),
+                    "expired_at": n.expires_at,
+                });
+                self.audit(&TenantId(n.tenant.clone()), n.holder.as_ref().map(|h| RunId(h.clone())).as_ref(), "name.lapsed", &body)?;
                 ended.push(self.name(&n.id)?);
             }
         }
@@ -966,6 +1006,36 @@ mod tests {
 
     const P1: &str = "spiffe://t/z/build/a/one";
     const P2: &str = "spiffe://t/z/build/a/two";
+
+    /// #716 review, F1: a standing public name past its lifetime holds neither its label nor its
+    /// agent's slot, though nothing but the sweep ran.
+    #[test]
+    fn a_lapsed_name_frees_its_label_and_slot() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let mut p = public();
+        p.per_workload = 1;
+        let terms = NameTerms { bound: Bound::Agent, ttl_secs: Some(3600) };
+        let (id, _) = l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Standing)).unwrap();
+        let effect = name_effect(&l.name(&id).unwrap(), &terms, &p.domain());
+        l.approve_name(&id, &terms, "op", Some(&effect), &p).unwrap();
+        assert_eq!(l.name(&id).unwrap().domain.as_deref(), Some("boxes.example.com"), "F3: the domain approved");
+        assert_eq!(l.live_public_names(P1).unwrap(), 1);
+        // Its lifetime is over.
+        l.conn.execute("UPDATE names SET expires_at = ?2 WHERE id = ?1", params![id, now() - 1]).unwrap();
+        assert_eq!(l.live_public_names(P1).unwrap(), 0);
+        assert!(l.names_held_by(&r1).unwrap().is_empty());
+        // Another agent may ask for the label, and this one for another name: the sweep ends it.
+        let (other, _) = l.ask_public(&ask(&t, &r1, P2, "demo", NameScope::Standing)).unwrap();
+        assert_eq!(l.name(&id).unwrap().end_reason.as_deref(), Some("lapsed"));
+        assert_eq!(l.audit_of_kind("name.lapsed").unwrap().len(), 1);
+        let effect = name_effect(&l.name(&other).unwrap(), &terms, &p.domain());
+        l.approve_name(&other, &terms, "op", Some(&effect), &p).unwrap();
+        let (again, _) = l.ask_public(&ask(&t, &r1, P1, "demo2", NameScope::Standing)).unwrap();
+        let effect = name_effect(&l.name(&again).unwrap(), &terms, &p.domain());
+        l.approve_name(&again, &terms, "op", Some(&effect), &p).unwrap();
+    }
 
     #[test]
     fn internal_names_are_unique_per_zone_and_limited() {

@@ -782,6 +782,13 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 l.audit(&m.tenant, Some(&run), "identity.rotated", &serde_json::json!({
                     "id": claims.sub, "identity_sha256": wicket_identity::identity_digest(&jws), "expires_at": claims.exp, "reattached": true,
                 }))?;
+                // Standing names freed while nobody supervised it are taken up again, as at a
+                // start (#716 review, F12); not without the names settings (above).
+                if names_settings.is_some() {
+                    for n in crate::names::claim_for_run(&l, &m.tenant, &run, &claims.sub, &m.zone) {
+                        say!("[wicket] {run} holds its standing name {} ({}, port {})", n.label, n.id, n.port);
+                    }
+                }
             }
             id_spec = Some(spec);
             Some(Arc::new(wicket_proxy::IdentityCell::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() })))

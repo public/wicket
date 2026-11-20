@@ -23,7 +23,6 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | field | type | default | meaning |
 |---|---|---|---|
 | `acp.allow_subscription_backed_claude_adapter` | boolean | `false` | Whether Claude Code may run through its ACP adapter (`agent.acp.profile: claude-agent-acp`) on the zone's Claude subscription. The adapter runs the `claude` binary through the Claude Agent SDK, and whether a subscription may back that is the owner's reading of the subscription's terms ([research 21 §2.6](../explanation/research/21-agent-client-protocol.md#26-claude-code-over-acp-stays-the-fallback-not-the-default)). While it is `false`, such a run is refused when it starts, and so is a wake. |
-
 | `names.internal.per_workload` | integer ≥ 1 | `3` | The most live internal names one workload (an agent's principal) holds at once. |
 | `names.public` | mapping | absent | Public names for boxes (`<label>.<zone>`, [box DNS](../explanation/box-dns.md)). Absent: this installation publishes none, and `request_name` with `kind: public` is refused. |
 | `names.public.provider` | `noop` | required | Who publishes the zone's records. `noop` publishes nothing and records each plan; `vultr` and `rfc2136` are to come. |
@@ -33,7 +32,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `names.public.ttl` | seconds, 30–3600 | `60` | The records' TTL. |
 | `names.public.per_workload` | integer ≥ 1 | `1` | The most live public names one workload holds at once. An ask beyond it is refused, and so is an approval. |
 | `names.public.reserved` | list of labels | `[]` | Labels no box gets, besides wicket's own (`wicket`, `console`, `www`, `api`, `admin`, `mail`, `ns`). Their lookalikes (`5tatus` for `status`) are refused too. |
-| `names.public.console_host` | host name | none | The console's host name: its first label is reserved too. |
+| `names.public.console_host` | host name | none | The console's host name: its first label is reserved too, and, for a host under the boxes zone, the label directly under the zone. |
 | `names.public.allow_idn` | boolean | `false` | Whether `xn--` labels are allowed. |
 | `names.public.nodes` | mapping of node labels | `{}` | The labels a node needs to publish public ports. |
 | `names.public.ports` | `low-high`, from 1024 | `20000-20999` | The host ports wicket allocates on each node. |

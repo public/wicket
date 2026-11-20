@@ -17,3 +17,9 @@ type: Added
     ones only, audited `node.addresses`; ledger schema 34). `wicket node list --json` shows them.
   - `wicket pending --json` documents its `kind: "name"` objects. `wicket pending` says "no pending
     requests" only when nothing at all waits.
+  - A name past its lifetime ends when names are next swept or decided (`name.lapsed`), so it holds
+    neither its label nor a place in its agent's limit.
+  - A public name records the boxes domain it was approved under (`names.domain`, schema 34).
+  - A node's public addresses go when it is revoked or enrolled again, can be set only on an active
+    node, and no two active nodes have the same one.
+  - With `console_host` under the boxes zone, the label directly under the zone is reserved too.
