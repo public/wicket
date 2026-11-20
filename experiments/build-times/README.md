@@ -71,6 +71,8 @@ previous build, so incremental state would only take space there.
 - `measure.sh LABEL [STEP…]`: clean, incremental, test and release builds, with `cargo --timings`
   (summarized by `units.py`), and wicket-cli's own steps (`cli-*`); `peaktime.py` stands in for GNU
   time where there is none.
+- `pair.sh LABEL CHECKOUT`: #219's done-when pair, a clean build and `cargo test --workspace` from an
+  empty target dir (the fifth round).
 
 ## Second round: fewer test binaries, one crypto generation
 
@@ -130,14 +132,9 @@ runs there; 2 in 4 on this branch, counting the full run).
 
 ### Still open for #219's done-when
 
-- **A clean build**, before and after: not recorded in either round (`-j1` cold on the shared host
-  ran more than 2 hours; the box rounds measured warm builds only).
-- **`cargo test --workspace`**, before and after: recorded, but neither run was green (the box-only
-  failures above). A run outside a box would give a clean pair.
-- **One CI run**, before and after: not recorded.
-- Tried in neither round: `split-debuginfo` and nextest locally (CI already runs nextest), and
-  measuring the release build (`measure.sh release`). Not checked in this round: CI's agent-image
-  reuse across steps and parallel e2e jobs (item 3).
+The clean-build pair, a green `cargo test --workspace` pair and a CI run before and after: recorded in
+the [fifth round](#fifth-round-the-done-when-pairs). Still not tried: `split-debuginfo`, nextest
+locally (CI runs it), and the release build (`measure.sh release`).
 
 ## Third round: wicket-cli's clean build, duplicates and Cedar
 
@@ -244,3 +241,65 @@ The list is `[profile.dev.package]`'s `<name> = { opt-level = 0 }` entries. ci/d
 names some package has (cargo warns about others), and to crates built only for the host. That's
 why `quote` and `proc-macro2` aren't on it: the vendored biscuit-parser depends on both, so they're
 built for the target too.
+
+## Fifth round: the done-when pairs
+
+Measured 2026-11-20 in a cloud sandbox (a Firecracker VM, 4 vCPU, 15 GiB, nothing else building), at
+`-j4`, with no sccache. Both variants build main's code at a261244; each one starts from an empty
+target dir (`pair.sh`, raw rows in `pair.jsonl`). Only the build settings differ:
+
+- **before:** the `[profile]` sections of `Cargo.toml` as they were at 91a4b3ac, the last commit
+  before #219's first change, with `CARGO_INCREMENTAL=0` as sessions then ran;
+- **after:** `Cargo.toml` as it is (line tables only, dependencies at opt-level 1 without debug info,
+  proc-macros and build tools at 0), incremental builds as cargo defaults.
+
+The structural changes (one integration-test binary per crate, one crypto generation, fewer
+duplicate crates) are in both, since they are the code itself; the second and third rounds measured
+them.
+
+| | before | after | |
+|---|---:|---:|---|
+| clean `cargo build --workspace --all-targets` | 144 s | **200 s** | +39% |
+| `cargo test --workspace` (built, so the run and doctests) | 285 s | **206 s** | −28% |
+| target dir after both | 11 GB | 5.3 GB | −52% |
+
+- **The clean build is slower** (two runs of before: 144.8 s and 144.3 s). Dependencies at opt-level 1
+  (#524) cost compile time once, and save it in every test run and in every warm rebuild (round one:
+  a change to wicket-core 39 s → 31 s). That trade was made on purpose: sessions and CI rarely build
+  from nothing (CI restores its cache). The fourth round's proc-macros at level 0 took back part of it.
+- **The tests are faster:** `wicket-sim`'s `scenario.rs` 104 s → 63 s, `wicket-policy`'s
+  `tests/cedar.rs` 44 s → 24 s; the rest of the run is mostly the same few slow tests.
+- **Green:** after, every test passed (0 failures; 205.5 s). The container runs as root, so three
+  `wicket-cli` daemon tests that check an operator isn't root (`an_operator_cannot_approve_deny_or_enrol_a_passkey`,
+  `an_operator_reads_state_as_itself_through_the_daemon`, `internal_arguments_and_foreign_directories_are_refused`)
+  fail on both sides, and are skipped in the green pair (they take under a second). One property test,
+  `wicket-store`'s `cas::gc::tests::no_reachable_object_is_deleted_whatever_the_pushes_do_1`, failed
+  once on each side in two full runs ("deleted only 10 objects: the property isn't exercised") and
+  passed 5 times out of 5 alone: a flake, the same on both sides, not counted.
+- A first attempt put the target dir under a long scratch path: unix sockets under
+  `CARGO_TARGET_TMPDIR` passed 108 bytes and 52 tests failed with `path must be shorter than
+  SUN_LEN`. `pair.sh` defaults to `/tmp/pair-<label>` for that reason.
+
+### CI, before and after
+
+`CI` on main, pushes, from the Actions API: run #237 ([43522912737](https://github.com/public/wicket/actions/runs/43522912737), 91a4b3ac, 2026-11-13 22:53, the last success before #219's first change) against run #1525
+([44750910710](https://github.com/public/wicket/actions/runs/44750910710), 3cd68000, 2026-11-20 14:10).
+
+| | #237 before | #1525 after |
+|---|---:|---:|
+| "Format, clippy and tests" (the like-for-like job) | 5:43 | **3:31** |
+| ↳ its tests (nextest) | 4:08 | 2:32 |
+| ↳ its cache restore | 0:26 | 0:13 |
+| the gVisor smoke job (the critical path) | 7:23 | 21:38 |
+| jobs | 5 | 27 |
+| wall time, first job to last | 7:39 | 26:03 |
+
+- **The job #219 changed is 38% faster**, its tests 39%. Two more runs on each side agree (before:
+  8:21 and 7:44 in total; after, the smoke job 21:51 and 21:50).
+- **The run as a whole is longer, for reasons outside #219:** 22 more jobs (Kani, TLA+, Lean, fuzz,
+  supply chain), and two steps added to the smoke job since, "Per-node services" (12:11) and the
+  "Attack matrix" (5:20), which are 17.5 of its 21.6 minutes. Pushes to main also queue behind each
+  other (`concurrency: ci-${{ github.ref }}`, cancelling only for pull requests): #1525's jobs were
+  created when #1517 ended, 24 minutes after its push. The smoke job's two new steps are the next
+  target for CI time, as their own issue.
+
