@@ -333,9 +333,12 @@ Proposed:
 
 ### 3.1 Host leases, epochs and fencing
 
-**Tables** (expand steps, at the next free schema number when it is built: 33 to 35 are taken):
-- `supervisor_hosts`: `host`, `owner` (`machine:pid:start`), `lease_until`, `updated_at`;
-- `shard_nodes`: `node` → `host`, `epoch`;
+**Tables** (schema 42, an expand step, built: `wicket-store/src/hosts.rs`):
+- `supervisor_hosts`, one row per shard: `host` (the shard's name), `owner` (`machine:pid:start`, the
+  process holding it), `epoch`, `lease_until`, `stopping` (the clean-stop marker, §3.4), `adopting`
+  (the safe-mode batch, §3.4), `updated_at`. The epoch is the shard's, so it sits here rather than on
+  each of its nodes;
+- `shard_nodes`: `node` → `host`;
 - `runs.host`.
 
 **The lease.**
@@ -585,7 +588,11 @@ would quarantine the wrong runs, or, with #688, stop a whole shard's boxes. So:
 Each step ships on its own, keeps the previous behaviour behind a setting until the next, and can be
 rolled back by running the previous build.
 
-1. **Two hosts, static by node, opt-in.**
+1. **Two hosts, static by node, opt-in.** Built so far: the ledger's shards, leases, epochs and
+   epoch-conditional writes (schema 42, `wicket-store/src/hosts.rs`); the static shard of a node,
+   the lease renewed only on runtime progress, and wicketd's start-or-fence rule
+   (`wicket-control/src/supervise.rs`); and the rollback reading below (`wicket-home/src/owner.rs`).
+   Nothing starts a host yet.
    - `wicket supervise` runs today's supervisor, `run_to_end`, as **a thread per run** with a
      current-thread runtime each, as child supervisors do. That is one thread a run, up to the host's
      bound (2,000), plus each runtime's blocking threads while they're busy (ledger and file work).
