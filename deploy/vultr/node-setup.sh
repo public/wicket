@@ -25,8 +25,17 @@ JSON
 apt-get update -q
 apt-get install -y -q docker.io curl gnupg ca-certificates openssl >/dev/null
 
-# gVisor from its signed apt repository.
-curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+# gVisor from its signed apt repository. Its signing key is accepted only if it is the one key with
+# the fingerprint pinned here (#722): a fetched key could be anyone's, and a second key appended to
+# it would be trusted too.
+fpr=6F1DF85E3A71C24918E727D56FC6D554E32BD943
+kd=$(mktemp -d)
+key=$kd/archive.key
+curl -fsSL --retry 3 -o "$key" https://gvisor.dev/archive.key
+got=$(GNUPGHOME=$kd gpg --show-keys --with-colons "$key" | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { print $10; p = 0 }')
+[ "$got" = "$fpr" ] || { echo "gVisor's apt key is not the pinned $fpr (got ${got:-nothing})" >&2; exit 1; }
+GNUPGHOME=$kd gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg <"$key"
+rm -rf "$kd"
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" > /etc/apt/sources.list.d/gvisor.list
 apt-get update -q
 apt-get install -y -q runsc >/dev/null

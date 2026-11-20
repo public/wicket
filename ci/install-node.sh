@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 # A pinned Node.js for building the console's session view (#327, ci/session-view.sh): nodejs.org's
 # linux-x64 tarball, checked against NODE_SHA256, unpacked under RUNNER_TEMP (or /tmp) and put first
-# on PATH (GITHUB_PATH in Actions). With NODE_SHA256 empty it uses the runner's own Node, with a
-# warning: pin it (the SHASUMS256.txt next to the tarball has the value).
+# on PATH (GITHUB_PATH in Actions). NODE_SHA256 is required (#722): the SHASUMS256.txt next to the
+# tarball has the value, to compare when updating, never to fetch at run time.
 #
 #   NODE_VERSION=22.23.5 NODE_SHA256=<hex> ci/install-node.sh
 set -euo pipefail
 v=${NODE_VERSION:?NODE_VERSION}
-if [ -z "${NODE_SHA256:-}" ]; then
-  echo "::warning::NODE_SHA256 is not set: building with the runner's node $(node --version 2>/dev/null || echo '(none)')"
-  exit 0
-fi
+[ -n "${NODE_SHA256:-}" ] || { echo "::error::NODE_SHA256 is not set: pin node-v$v-linux-x64.tar.xz's sha256" >&2; exit 1; }
 dir=${RUNNER_TEMP:-/tmp}/node-v$v
 f=node-v$v-linux-x64.tar.xz
 mkdir -p "$dir"

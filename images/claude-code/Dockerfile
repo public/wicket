@@ -7,7 +7,10 @@
 # The in-box forwarder (crates/wicket-fwd): std only, so it builds offline. Statically linked, so it
 # runs whatever the final image's C library is. It resolves no names, so static glibc's NSS caveat
 # doesn't apply.
-FROM rust:1.99.1-slim-bookworm AS fwd
+#
+# Base images are pinned by digest (#720): a tag can be pushed again, a digest can't. The tag before
+# the digest says which release it is; Docker uses only the digest. Renovate proposes new digests.
+FROM rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS fwd
 COPY wicket-fwd /src/wicket-fwd
 WORKDIR /src/wicket-fwd
 RUN RUSTFLAGS="-C target-feature=+crt-static -C strip=symbols" \
@@ -15,7 +18,7 @@ RUN RUSTFLAGS="-C target-feature=+crt-static -C strip=symbols" \
  && cp target/*/release/wicket-fwd /wicket-fwd \
  && /wicket-fwd --help >/dev/null
 
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
