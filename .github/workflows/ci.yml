@@ -80,7 +80,7 @@ jobs:
           # run's) before this one, if it is an ancestor of this commit: what is known green.
           last_green() {
             local sha
-            sha=$(curl -sSf -H "authorization: Bearer $GH_TOKEN" -H 'accept: application/vnd.github+json' \
+            sha=$(curl -sSf --max-time 30 -H "authorization: Bearer $GH_TOKEN" -H 'accept: application/vnd.github+json' \
               "https://api.github.com/repos/$GH_REPO/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" |
               jq -r --argjson me "$RUN_ID" '[.workflow_runs[] | select(.id != $me and (.event == "push" or .event == "schedule"))][0].head_sha // empty') || return 1
             [ -n "$sha" ] && git merge-base --is-ancestor "$sha" HEAD && echo "$sha"
