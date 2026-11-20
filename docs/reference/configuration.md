@@ -83,6 +83,12 @@ operators:
   unix/auditor: nothing      # may list requests, decides none
 ```
 
+Kind `node` (at R4) is setting a node's public addresses, in the console or with
+`wicket node set --public-ipv4/--public-ipv6`: a public name's records point at them. With
+`default: anything`, or no `operators.yaml` at all, every passkey and every CLI operator may set
+them, as they may decide public names (`name`); list the operators, or give the default a scope,
+to narrow it.
+
 An operator is named by `<via>/<name>` or by its full identity. A file that doesn't parse stops every
 operator's decision until it is fixed: an authority is never guessed. Roles, several operators with their
 own enrolment, and two-person approval are later steps of #11.

@@ -159,6 +159,8 @@ impl Ledger {
             }
             // One address, one node (#716 review, F4): host ports are allocated per node, so two
             // nodes behind one address would both hand out the same port.
+            // Which node (perhaps another tenant's) isn't said: the reply reaches a console or CLI
+            // of this node's tenant (#575 review, L2).
             let other: Option<String> = l
                 .conn
                 .query_row(
@@ -169,8 +171,8 @@ impl Ledger {
                     |r| r.get(0),
                 )
                 .optional()?;
-            if let Some(other) = other {
-                return Err(crate::StoreError::Refused(format!("node {other} already has that public address")));
+            if other.is_some() {
+                return Err(crate::StoreError::Refused("that public address is already another node's".into()));
             }
             let mut body = serde_json::json!({
                 "name": node, "ipv4": new.ipv4.map(|a| a.to_string()), "ipv6": new.ipv6.map(|a| a.to_string()),

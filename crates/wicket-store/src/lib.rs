@@ -2526,15 +2526,15 @@ mod node_tests {
     fn node_addresses_follow_the_enrolment_and_are_one_nodes() {
         use crate::AddressChange as A;
         let mut l = Ledger::open_in_memory().unwrap();
-        let v4: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let v4 = std::net::Ipv4Addr::new(1, 1, 1, 1);
         for (n, serial) in [("n1", "01"), ("n2", "02")] {
             let t = l.create_node_token(&TenantId::single(), n, 3600).unwrap();
             l.enrol_node(&t, &node(n), &ca(n, serial)).unwrap();
         }
         l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann").unwrap();
         assert!(
-            matches!(l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("n1")),
-            "another active node has it"
+            matches!(l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("already another node's") && !m.contains("n1")),
+            "another active node has it, unnamed"
         );
         l.revoke_node("n1").unwrap();
         assert!(l.node_addresses("n1").unwrap().is_empty(), "revoked: no address");

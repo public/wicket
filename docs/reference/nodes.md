@@ -491,7 +491,8 @@ knows when it decides, among every enrolled, active node not held by a capacity 
   records where a public name of a box on the node points (`none` clears one; audited `node.addresses`,
   ledger schema 34). Only addresses on the public internet are taken: for a node behind NAT that forwards
   its port range one to one, the router's. They are the operator's alone: a node never sets its own, since
-  a node that could name its address could point a name at someone else's server. A node with neither
+  a node that could name its address could point a name at someone else's server, and only an operator
+  whose authority covers kind `node` (`operators.yaml`, at R4) may set them. A node with neither
   can't publish.
 - **Filter.** Out are: a node that starts no box (`full`); one without the vCPUs and memory the box's limits
   ask for, by its report and its admission's room ([above](#health-admission-and-disk-377)); a label or

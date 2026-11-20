@@ -95,7 +95,7 @@ fn lasts_text(n: &NameRow, ttl: Option<Duration>) -> String {
 
 /// The node the asking run of `n` is on now, and that node's public addresses: where an approval
 /// publishes it first, bound by the signature.
-fn target_now(l: &Ledger, n: &NameRow) -> anyhow::Result<Value> {
+fn target_now(l: &Ledger, n: &NameRow) -> wicket_store::Result<Value> {
     let node = match l.run_status(&n.asked_run)?.as_deref() {
         Some("running") => l.run_node(&n.asked_run)?,
         _ => None,
@@ -105,6 +105,12 @@ fn target_now(l: &Ledger, n: &NameRow) -> anyhow::Result<Value> {
         None => NodeAddresses::default(),
     };
     Ok(json!({ "node": node, "public_ipv4": a.ipv4.map(|a| a.to_string()), "public_ipv6": a.ipv6.map(|a| a.to_string()) }))
+}
+
+/// The agent's words about name `n`, apart from wicket's in what the passkey signs (#575 review,
+/// L7): its label, the service it says the port serves, and its reason.
+fn agent_words(n: &NameRow) -> Value {
+    json!({ "label": n.label, "service": n.service, "reason": n.reason })
 }
 
 fn forbidden(e: anyhow::Error) -> Reply {
@@ -150,8 +156,8 @@ pub(super) fn build_approve(state: &State, oc: &OperatorCredential, l: &Ledger, 
     // (`wicket audit --verify`) matches the decision's record against.
     let v = json!({
         "v": 1, "action": "name_approve", "decision": "approve", "tenant": state.tenant.0, "name": n.id, "kind": "public",
-        "fqdn": public.fqdn(&n.label), "label": n.label, "zone": n.zone, "zone_digest": n.zone_digest, "principal": n.principal,
-        "asked_run": n.asked_run, "box_port": n.port, "service": n.service, "scope": n.scope.as_str(),
+        "fqdn": public.fqdn(&n.label), "zone": n.zone, "zone_digest": n.zone_digest, "principal": n.principal,
+        "asked_run": n.asked_run, "box_port": n.port, "scope": n.scope.as_str(), "agent": agent_words(&n),
         "for": standing.then(|| bound.as_str()), "ttl_secs": if standing { terms.ttl_secs } else { None },
         "lasts": lasts_text(&n, ttl), "target": target, "warning": nm::WARNING, "effect_sha256": effect,
     });
@@ -170,8 +176,8 @@ pub(super) fn build_deny(state: &State, oc: &OperatorCredential, l: &Ledger, bod
     let s = settings();
     let v = json!({
         "v": 1, "action": "name_deny", "decision": "deny", "tenant": state.tenant.0, "name": n.id, "kind": n.kind.as_str(),
-        "fqdn": names_view::full_name(&n, s.as_ref().ok().and_then(|s| s.public.as_ref())), "label": n.label, "zone": n.zone,
-        "principal": n.principal, "asked_run": n.asked_run, "box_port": n.port,
+        "fqdn": names_view::full_name(&n, s.as_ref().ok().and_then(|s| s.public.as_ref())), "zone": n.zone,
+        "principal": n.principal, "asked_run": n.asked_run, "box_port": n.port, "agent": agent_words(&n),
     });
     Ok((Action::NameDeny { id: n.id }, v))
 }
@@ -196,6 +202,7 @@ pub(super) fn build_renew(state: &State, oc: &OperatorCredential, l: &Ledger, bo
         "v": 1, "action": "name_renew", "tenant": state.tenant.0, "name": n.id, "kind": n.kind.as_str(),
         "fqdn": names_view::full_name(&n, s.as_ref().ok().and_then(|s| s.public.as_ref())), "zone": n.zone, "principal": n.principal,
         "for": n.bound.map(|b| b.as_str()), "ttl_secs": ttl_secs, "lasts": lasts_text(&n, ttl), "previous_until": n.expires_at,
+        "agent": agent_words(&n),
     });
     Ok((Action::NameRenew { id: n.id, ttl_secs, previous: n.expires_at }, v))
 }
@@ -212,7 +219,7 @@ pub(super) fn build_revoke(state: &State, l: &Ledger, body: &Value) -> Result<(A
     let v = json!({
         "v": 1, "action": "name_revoke", "tenant": state.tenant.0, "name": n.id, "kind": n.kind.as_str(),
         "fqdn": names_view::full_name(&n, s.as_ref().ok().and_then(|s| s.public.as_ref())), "zone": n.zone, "principal": n.principal,
-        "holder": n.holder,
+        "holder": n.holder, "agent": agent_words(&n),
     });
     Ok((Action::NameRevoke { id: n.id }, v))
 }
@@ -282,16 +289,18 @@ pub(super) fn apply_approve(
     let by = super::fence::human(state, oc)?;
     let names = settings().map_err(|e| anyhow::anyhow!("the installation's settings can't be read: {e}"))?;
     let terms = nm::terms(bound, ttl_secs.map(Duration::from_secs))?;
-    // The node shown, read again (#575 step 4d): a run that moved, or a node whose addresses
-    // changed, isn't what the passkey signed.
-    let n = l.name(id)?;
-    if target_now(l, &n)? != *target {
-        let why =
-            anyhow::anyhow!("{id}: the node its run is on, or that node's public addresses, changed since you were shown them: look again");
-        return Err(nm::refuse(l, &by, id, "approve", why));
-    }
+    // The node shown, read again in the approval's own write (#575 step 4d; review, L3): a run
+    // that moved, or a node whose addresses changed, isn't what the passkey signed.
+    let same_target = |l: &Ledger| {
+        if target_now(l, &l.name(id)?)? == *target {
+            return Ok(());
+        }
+        Err(wicket_store::StoreError::Refused(format!(
+            "{id}: the node its run is on, or that node's public addresses, changed since you were shown them: look again"
+        )))
+    };
     // The effect is recomputed under the settings as they are now, and refused if it differs.
-    nm::approve(l, &by, id, &terms, effect, &names, json!({ "via": "console", "signed": signed }))?;
+    nm::approve_checked(l, &by, id, &terms, effect, &names, json!({ "via": "console", "signed": signed }), same_target)?;
     Ok(format!(
         "approved {id} (signed with {}): the next reconcile publishes it once a run holds it on a node with a public address",
         oc.name
@@ -344,11 +353,10 @@ pub(super) fn apply_node_addresses(
     signed: Value,
 ) -> anyhow::Result<String> {
     let by = super::fence::human(state, oc)?;
-    if let Err(why) = nm::may_set_addresses(&by, node) {
-        return Err(nm::refuse(l, &by, node, "node_addresses", why));
-    }
     let extra = json!({ "action": "node_addresses", "via": "console", "signed": signed });
-    let a = l.set_node_addresses_checked(node, Some(old), ipv4, ipv6, &format!("passkey:{}", oc.name), extra)?;
+    // Authority checked again, the addresses shown compared in the change's own write, and any
+    // refusal (the authority's or the ledger's) on the record (#575 review, L2).
+    let a = nm::set_node_addresses(l, &by, node, Some(old), ipv4, ipv6, extra)?;
     let show = |a: Option<String>| a.unwrap_or_else(|| "none".into());
     Ok(format!("node {node}: public IPv4 {}, IPv6 {} (signed with {})", show(text(a.ipv4)), show(text(a.ipv6)), oc.name))
 }
