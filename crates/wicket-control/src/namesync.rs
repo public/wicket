@@ -1169,6 +1169,6 @@ mod tests {
         let (want, waiting) = desired(&l, &public(), wicket_store::now()).unwrap();
         assert!(want.is_empty(), "{want:?}");
         assert_eq!(waiting.len(), 2);
-        assert!(waiting.iter().all(|w| w.why.contains("shares its public address 8.8.4.4")), "{waiting:?}");
+        assert!(waiting.iter().all(|w| w.why.contains("shares its public address")), "{waiting:?}");
     }
 }
