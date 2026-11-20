@@ -233,12 +233,23 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
     let n = needles(&f);
     // The scanner finds them where they are: in the stored record itself.
     assert!(!leaks(&serde_json::to_string(&f.record).unwrap(), &n).is_empty(), "the scanner must catch the raw record");
+    // A placement decision recorded for the run, so the scan sees one.
+    f.t.ledger()
+        .record_placement_decision(
+            RUN,
+            &json!({ "request": { "vcpus": 1.0, "memory_mib": 512 }, "ca_hosts": ["api.example.com"], "node": "local",
+                     "candidates": 1, "ranked": ["local"], "ranked_more": 0, "refused": [], "refused_more": 0, "behind": null })
+            .to_string(),
+            wicket_feed::now_ms(),
+        )
+        .unwrap();
     let paths = [
         "/api/me".to_string(),
         "/api/state".into(),
         "/api/policy".into(),
         format!("/api/runs/{RUN}/authority"),
         "/api/runs/run_nope/authority".into(),
+        format!("/api/runs/{RUN}/placement"),
         format!("/api/explain/{}", f.op_seq),
         format!("/api/explain/{}", f.op_seq + 1),
         "/api/explain/999999".into(),
@@ -246,12 +257,40 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         "/api/nodes/n1/ca".into(),
         "/api/nodes/nope/ca".into(),
     ];
+    // The views that answer must answer (an error page would scan clean and prove nothing).
+    let answers = [
+        "/api/me".to_string(),
+        "/api/state".into(),
+        "/api/policy".into(),
+        format!("/api/runs/{RUN}/authority"),
+        format!("/api/runs/{RUN}/placement"),
+        format!("/api/explain/{}", f.op_seq),
+    ];
     for p in paths {
         let (s, _, body) = get(&f.t, &p).await;
+        if answers.contains(&p) {
+            assert_eq!(s, StatusCode::OK, "{p}: {body}");
+        }
         assert!(leaks(&body, &n).is_empty(), "{p} ({s}) leaks {:?}", leaks(&body, &n));
     }
+    // The org policy preview (#712), of the applied policy and of another.
+    let org = include_str!("../../../../../examples/policy/org.cedar");
+    for body in
+        [json!({ "cedar": org }), json!({ "cedar": org, "entities": include_str!("../../../../../examples/policy/org-entities.json") })]
+    {
+        let r = f.t.post("/api/policy/preview", body);
+        assert_eq!(r.status, StatusCode::OK, "the preview answered: {:?}", r.body);
+        let text = r.body.to_string();
+        assert!(leaks(&text, &n).is_empty(), "/api/policy/preview ({}) leaks {:?}", r.status, leaks(&text, &n));
+    }
     // Signed out: the same views refuse, and say nothing.
-    for p in ["/api/policy", "/api/runs/run_01authz0000000000000000000/authority", "/api/explain/1", "/api/nodes/n1/ca"] {
+    for p in [
+        "/api/policy",
+        "/api/runs/run_01authz0000000000000000000/authority",
+        "/api/runs/run_01authz0000000000000000000/placement",
+        "/api/explain/1",
+        "/api/nodes/n1/ca",
+    ] {
         let (s, _, body) = super::http::call(&f.t.state, "GET", p, &[], b"").await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{p}: {body}");
     }

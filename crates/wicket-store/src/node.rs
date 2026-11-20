@@ -200,6 +200,17 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// Whether `run`'s files are on this host: `fetched` or `bundled` (#590). A taken result
+    /// (`outbox`) or an allowed push (`pushed`) leaves them on its node.
+    pub fn files_collected(&self, run: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM run_collected WHERE run = ?1 AND how IN ('fetched', 'bundled')",
+            params![run],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn node_feed_at(&self, node: &str, epoch: i64) -> Result<()> {
         self.conn.execute("UPDATE grants SET node_epoch = NULL WHERE node = ?1 AND node_epoch <= ?2", params![node, epoch])?;
         // And the standing rules published to it (#572).

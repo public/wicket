@@ -202,7 +202,17 @@ wicket node revoke n1
   dropped, the process not dumpable (`PR_SET_DUMPABLE` 0), never logged. A run's use of a secret lasts
   until its authority ends, or the upstream token's own expiry if earlier; the node drops a secret when
   the last run that used it ends, and when the control host says it changed, was rebound or removed
-  (checked every 2 s while connected; the next use fetches it again). While the node is cut off, the
+  (checked every 2 s while connected; the next use fetches it again). A secret the zone uses but the
+  vault doesn't hold yet (an optional `inject` rule's, #415) is refused once: the node keeps that answer
+  for the run, never asking per request, until the control host says the secret is now set (the same
+  check, 2 s) or for 30 s if it doesn't say; the control host audits the refusal once while it lasts.
+  While the control host can't be asked, a run's fetch of a secret fails at once for 2 s after each
+  try (no request waits on a dead link), audited once per run, secret and outage. Each new connection
+  revokes every secret released to the run (a revoke sent on a link that died may not have arrived,
+  and a re-attached supervisor reads what an earlier one released from `ctl/holdings.json`): the node
+  fetches again what it uses (a resent revoke leaves the uses shared with children the node started while cut off). A revoke for a change ends a child's uses shared from the run too, and an answer a
+  revoke overtook is not taken. Only a node at protocol 23 is sent an optional rule whose secret
+  isn't set; an older one gets the zone without it, as before (#415). While the node is cut off, the
   secrets it holds keep working; one first needed then fails with "credential … not cached on this node;
   control host unreachable" (audited as `node.secret_unavailable`) until the control host is back. A
   restart of `serve` while cut off loses the cache: model calls and injected hosts stop until reconnect,
@@ -600,6 +610,24 @@ from the control host first (#191):
     (`node.secret_fetch`, with `image_pull`); it isn't among the secrets the node keeps for the run.
 - **Recorded.** The node's audit records `image.received` (digest, name, bytes, `via` `channel` or
   `registry`) or `image.refused` (why).
+- **Removed once unused** (#191). An image the node was given (sent or pulled) that hasn't been used for
+  7 days of the node serving is removed from its runtime, hourly. Used means imported, started from, or
+  reported present when the control host asks before placing a box with it. Time the node wasn't
+  serving doesn't count, so a node back after a week away doesn't remove everything at once.
+  - **The keep** is `image_keep_days` in the node's `node.json`. `0`, or more than 100 years, keeps every
+    image. So does a value that isn't a whole number of days, which the node logs.
+  - **Only images the node imported itself** are touched: never one built or loaded there by other means,
+    and nothing on the control host's own node, which shares its runtime.
+  - **Never while it may be started from.** Removal is never forced, so an image is kept while any
+    container (running or not) was made from it. A box start holds its image from resolving it until the
+    box is live, and a start that comes while the image is being removed waits. A live box keeps its own
+    image and the pinned entries of its zone's `images`, which it may start children from on the node
+    itself (#164).
+  - **Recorded** in the node's audit as `image.removed` (digest, when it was last used, the keep),
+    `image.kept` (the runtime's reason) or `image.remove_failed` (tried again at the next sweep). The node
+    keeps what it knows in `image-uses.json` under its directory.
+  - **A removed image a later box needs is sent or pulled again.** If the node, the control host and the
+    registries all lack it (a hibernated agent whose image went, say), the start fails saying so.
 - **What it needs.** Both ends talking protocol 7 (8 to pull), and a runtime that ids images by their manifest digest
   (Docker's containerd image store): a pin that is a config digest is refused with that reason. An image
   of at most 64 GiB, with room for it under the node's data directory (`images/`, cleared when `serve`

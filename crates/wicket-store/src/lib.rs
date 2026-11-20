@@ -36,6 +36,7 @@ mod placements;
 pub use nodeca::{CaHosts, CaWant};
 pub use placements::{BoxTerms, Placement, PreemptMark, RunningBox, PREEMPTED_SEEN_MS, RESERVE_SECS, WAIT_SEEN_MS};
 mod changes;
+mod inbox;
 pub mod money;
 mod node;
 #[cfg(test)]
@@ -49,6 +50,7 @@ pub use changes::{ChangeWatch, Topic};
 mod retention;
 mod standing;
 mod triggers;
+pub use inbox::InboxMessage;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use retention::{Anchor as AuditAnchor, AuditUsage, Checkpoint as AuditCheckpoint};
@@ -73,7 +75,9 @@ pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
 mod writer;
 pub use writer::{AuditWriter, Ticket, WriterConfig};
 mod export;
+mod hosts;
 pub use export::{ExportCursor, EXPORT_LEASE_SECS};
+pub use hosts::{lapsed_alone, SupervisorHost, Taken as ShardTaken};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -101,6 +105,10 @@ pub enum StoreError {
     EffectChanged(String, String, String),
     #[error("{0}: an egress grant is decided and counted on the box's node, never consumed by the ledger (#257)")]
     EgressGrant(String),
+    #[error("shard {0} is held by another supervisor host for {1} s more")]
+    ShardHeld(String, i64),
+    #[error("shard {0} is no longer this supervisor host's at epoch {1}: it was taken at a higher one")]
+    ShardLost(String, i64),
     #[error("this ledger was migrated by a newer wicket (schema {version}), past a step this build (schema {SCHEMA_VERSION}) can't read: roll forward, or restore the snapshot taken before that update")]
     TooNew { version: u32, floor: u32 },
     #[error("this ledger is schema {version}, older than schema {UPGRADES_FROM}, the oldest this build upgrades: open it once with a wicket build that still upgrades it (main at {STEP_THROUGH}), then with this one")]
@@ -233,6 +241,10 @@ impl StoreError {
 /// their way into a run's token on its node, and which the node confirmed, so `await_grant` on a
 /// standing ask answers once the box's node can honour it. Older builds don't read it; the floor
 /// stays 17.
+/// Version 42 (expand, #582 step 5; 38 to 41 are others' in flight) adds `supervisor_hosts`,
+/// `shard_nodes` and `runs.host`: supervisor hosts, the shards of nodes they hold under a lease at
+/// an epoch, and which shard's host supervises each run (`hosts`). Older builds don't read them;
+/// the floor stays 17.
 /// Version 43 (expand, #748; 38 to 42 are others' in flight) adds `name_records.missing_since`:
 /// when a listing of its zone first lacked the record, so one listing alone forgets none. Older
 /// builds don't read it; the floor stays 17.
@@ -251,13 +263,17 @@ const _: () = assert!(SCHEMA_FLOOR <= SCHEMA_VERSION);
 /// `messages.kind` (#253): a peer's message (pulled with `await_message`, signed by its sender),
 /// an operator's prompt, or a notice from wicket (each pushed as the agent's next turn).
 pub const KIND_MESSAGE: &str = "message";
+/// A message an operator signed (#252): delivered as a peer's message is, but a kind of its own, so
+/// a previous build (whose queries read `kind = 'message'` and verify only agents' envelopes)
+/// leaves it alone rather than taking it and refusing it ([`previous_build`]).
+pub const KIND_OPERATOR_MESSAGE: &str = "operator-message";
 pub const KIND_PROMPT: &str = "prompt";
 pub const KIND_NOTICE: &str = "notice";
 /// Who a notice is from, as shown.
 pub const NOTICE_LABEL: &str = "wicket";
 /// The SQL condition for a row that is a turn (a prompt or a notice), and for a peer's message.
 pub(crate) const TURNS: &str = "kind IN ('prompt', 'notice')";
-pub(crate) const PEER: &str = "kind = 'message'";
+pub(crate) const PEER: &str = "kind IN ('message', 'operator-message')";
 
 /// A prompt or notice taken for a run: its message id, text, who it shows as, and the operator's
 /// principal id (None for a notice, and for prompts recorded before #253).
@@ -645,6 +661,8 @@ impl Ledger {
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         names::migrate(&conn)?;
+        conn.execute_batch(hosts::SCHEMA)?;
+        hosts::migrate(&conn)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -704,6 +722,8 @@ impl Ledger {
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         names::migrate(&conn)?;
+        conn.execute_batch(hosts::SCHEMA)?;
+        hosts::migrate(&conn)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
@@ -1257,8 +1277,8 @@ impl Ledger {
                 .optional()?,
         };
         tx.execute(
-            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 tenant.0,
@@ -1269,7 +1289,8 @@ impl Ledger {
                 to,
                 meta.from_principal,
                 meta.priority.as_str(),
-                meta.in_reply_to
+                meta.in_reply_to,
+                if meta.operator { KIND_OPERATOR_MESSAGE } else { KIND_MESSAGE }
             ],
         )?;
         tx.commit()?;
@@ -1350,7 +1371,7 @@ impl Ledger {
     /// `run` (already read, or someone else's).
     pub fn message_read(&self, run: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE messages SET delivered_at = ?3 WHERE id = ?1 AND to_run = ?2 AND kind = 'message' AND delivered_at IS NULL",
+            &format!("UPDATE messages SET delivered_at = ?3 WHERE id = ?1 AND to_run = ?2 AND {PEER} AND delivered_at IS NULL"),
             params![id, run, now()],
         )?;
         Ok(n == 1)
@@ -1361,7 +1382,7 @@ impl Ledger {
     /// has had. How many.
     pub fn requeue_in_flight(&self, run: &str) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE messages SET taken_at = NULL WHERE to_run = ?1 AND kind = 'message' AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            &format!("UPDATE messages SET taken_at = NULL WHERE to_run = ?1 AND {PEER} AND delivered_at IS NULL AND taken_at IS NOT NULL"),
             params![run],
         )?)
     }
@@ -1370,7 +1391,7 @@ impl Ledger {
     /// node (the link dropped first). False if it wasn't in flight for `run`.
     pub fn requeue_message(&self, run: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE messages SET taken_at = NULL WHERE id = ?1 AND to_run = ?2 AND kind = 'message' AND delivered_at IS NULL AND taken_at IS NOT NULL",
+            &format!("UPDATE messages SET taken_at = NULL WHERE id = ?1 AND to_run = ?2 AND {PEER} AND delivered_at IS NULL AND taken_at IS NOT NULL"),
             params![id, run],
         )?;
         Ok(n == 1)
@@ -1378,7 +1399,7 @@ impl Ledger {
 
     /// Every stored envelope (id, envelope, created_at), for offline verification.
     pub fn envelopes(&self) -> Result<Vec<(String, String, i64)>> {
-        let mut st = self.conn.prepare("SELECT id, envelope, created_at FROM messages WHERE kind = 'message' ORDER BY created_at")?;
+        let mut st = self.conn.prepare(&format!("SELECT id, envelope, created_at FROM messages WHERE {PEER} ORDER BY created_at"))?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }

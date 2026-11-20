@@ -120,6 +120,16 @@ fn size_of_cli(s: &str) -> Option<u64> {
     Some((n * unit as f64) as u64)
 }
 
+/// What [`Docker::remove_image`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageRemoval {
+    Removed,
+    /// There was no such image.
+    Absent,
+    /// The runtime kept it, and why: a container uses it, or other names refer to it.
+    Kept(String),
+}
+
 /// An image as a Docker has it (#192).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageIdentity {
@@ -184,6 +194,15 @@ impl ImageCache {
         if s.watching && s.gen == ticket {
             s.ids.insert(image.to_string(), ident.clone());
         }
+    }
+
+    /// For tests of the crates that use this one: the cache as if its images' events were followed,
+    /// knowing `image` as `ident`.
+    #[cfg(feature = "testkit")]
+    pub fn seed(&self, image: &str, ident: ImageIdentity) {
+        let mut s = self.state();
+        s.watching = true;
+        s.ids.insert(image.to_string(), ident);
     }
 
     /// Something changed this Docker's images: forget everything.
@@ -843,6 +862,33 @@ impl Docker {
             .filter(|(_, r)| !r.is_empty())
             .map(|(n, r)| (n.to_string(), r.to_string()))
             .collect())
+    }
+
+    /// Removes image `image` (an id or a digest reference), never forced (#191): the runtime keeps
+    /// it while any container, running or not, was made from it, or while other names refer to it.
+    pub async fn remove_image(&self, image: &str) -> Result<ImageRemoval> {
+        let _t = self.span("rmi");
+        if let Some(e) = self.engine().await {
+            let (status, body) = e.call(Method::DELETE, &format!("/images/{}", engine::enc(image, true)), None).await?;
+            return Ok(match status.as_u16() {
+                200..=299 => ImageRemoval::Removed,
+                404 => ImageRemoval::Absent,
+                409 => ImageRemoval::Kept(engine::message(&body)),
+                _ => bail!("docker image rm {image}: {} ({status})", engine::message(&body)),
+            });
+        }
+        let out = self.command_with(["image".to_string(), "rm".into(), "--".into(), image.into()]).stdin(Stdio::null()).output().await?;
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let lower = err.to_ascii_lowercase();
+        Ok(if out.status.success() {
+            ImageRemoval::Removed
+        } else if lower.contains("no such image") {
+            ImageRemoval::Absent
+        } else if ["conflict", "being used", "must be forced", "referenced in multiple"].iter().any(|w| lower.contains(w)) {
+            ImageRemoval::Kept(err)
+        } else {
+            bail!("docker image rm {image}: {err}")
+        })
     }
 
     /// Removes a box (running or not).

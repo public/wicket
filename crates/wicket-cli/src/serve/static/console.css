@@ -300,6 +300,10 @@ code.block { display: block; margin-top: var(--s2); padding: var(--s2); user-sel
 /* ---- a request card, short (#574 review): the ask, who, the risk and the buttons; the rest under Details ---- */
 .req-head { display: flex; justify-content: space-between; align-items: center; gap: var(--s2); }
 .req-head .age { color: var(--quiet); font-size: var(--t-sm); white-space: nowrap; }
+/* On a phone the longest risk words ("Pushes code, deploys, or gains privileges") wrap inside their
+   pill rather than push the time past the edge (found by ci/console-browsers.sh). */
+.req-head { flex-wrap: wrap; }
+.req-head .risk { white-space: normal; min-width: 0; }
 .req .what { font-size: var(--t-md); overflow-wrap: normal; word-break: normal; }
 .req .what.said { font-family: var(--sans); font-weight: 600; }
 .req .agent { border-top: 0; padding-top: 0; margin-top: var(--s2); }
