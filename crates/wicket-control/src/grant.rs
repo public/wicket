@@ -1075,6 +1075,7 @@ mod tests {
                     node: "local".into(),
                     principal: serde_json::json!({"type": "human", "id": "alice"}),
                     act: None,
+                    kind: None,
                 };
                 let k = if run == "run_p" { key.public() } else { wicket_identity::AgentKey::generate().public() };
                 let doc = issuer.issue(&spec, wicket_store::now(), 3600, &k);

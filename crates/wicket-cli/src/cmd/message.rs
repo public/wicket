@@ -163,16 +163,19 @@ pub(crate) fn principals_json(
     let mut out = vec![];
     for p in l.principals(&tenant.0)? {
         let wicket_store::Principal::Agent(r) = p else { continue };
-        let acts_for = wicket_identity::verify_identity(&r.jws, issuer, r.issued_at)
-            .is_ok_and(|c| c.principal.get("sub").and_then(|s| s.as_str()) == Some(me));
-        // An operator has no zone: only an entry naming its id lists it (never an empty one).
+        let claims = wicket_identity::verify_identity(&r.jws, issuer, r.issued_at).ok();
+        let acts_for = claims.as_ref().is_some_and(|c| c.principal.get("sub").and_then(|s| s.as_str()) == Some(me));
+        // An agent or a program (#255), as its signed identity says.
+        let kind = claims.as_ref().map_or("agent", |c| c.workload_kind());
+        // As send decides it: an operator has no zone, so only an entry naming its id lists it
+        // (never an empty one).
         let entries: Vec<&str> = r.accept_from.iter().map(String::as_str).filter(|e| !e.is_empty()).collect();
         let listed = wicket_core::manifest::accepts(&entries, "", Some(me));
         if !acts_for && !listed {
             continue;
         }
         out.push(serde_json::json!({
-            "id": r.spiffe_id, "kind": "agent", "agent": r.agent, "zone": r.zone,
+            "id": r.spiffe_id, "kind": kind, "agent": r.agent, "zone": r.zone,
             "relation": if acts_for { "acts for you" } else { "accepts you" },
             "state": l.presence(&tenant.0, &r.spiffe_id)?,
         }));

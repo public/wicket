@@ -30,6 +30,7 @@ fn with_agent(t: &mut T) -> (String, String, wicket_identity::AgentKey, String) 
         node: "local".into(),
         principal: json!({ "type": "human", "id": "passkey:laptop", "via": "console", "sub": me }),
         act: None,
+        kind: None,
     };
     let now = wicket_store::now();
     let jws = issuer.issue(&spec, now, 600, &key.public());

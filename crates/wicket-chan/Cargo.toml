@@ -31,4 +31,7 @@ base64.workspace = true
 libc = "0.2"
 tar = "0.4"
 zeroize = "1"
+# Image signatures (#191): both already built for the token format (biscuit-auth), with these features.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pem"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["pem"] }
 

@@ -104,6 +104,20 @@ pub enum Want {
 /// Sends the agent's lifetime requests to its supervisor.
 pub type Lifecycle = tokio::sync::mpsc::UnboundedSender<Want>;
 
+/// Whether `region` is a region's name as providers write them (`ewr`, `us-east-1`): 1 to 32
+/// lowercase letters, digits and hyphens, starting with a letter or digit. The agent chooses it,
+/// and it is written into a capacity request's terms (#731): no other text may pass for them.
+pub fn check_region(region: &str) -> Result<(), String> {
+    let ok = (1..=32).contains(&region.len())
+        && region.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && region.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("region must be a provider's region name: 1 to 32 lowercase letters, digits and hyphens (e.g. ewr), not {region:?}"))
+    }
+}
+
 /// What an agent asks for with `request_capacity` (#7): a node for a while, at most this price.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct CapacityAsk {

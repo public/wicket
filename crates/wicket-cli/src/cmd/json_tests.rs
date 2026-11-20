@@ -321,6 +321,7 @@ fn agent_writes_to_alice(l: &mut wicket_store::Ledger, issuer: &wicket_identity:
         node: "local".into(),
         principal: serde_json::json!({ "type": "human", "id": "alice", "via": "cli", "sub": alice }),
         act: None,
+        kind: None,
     };
     let now = wicket_store::now();
     let jws = issuer.issue(&spec, now, 600, &key.public());
