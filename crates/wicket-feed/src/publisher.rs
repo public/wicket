@@ -573,16 +573,12 @@ impl<P: Policy> Publisher<P> {
             issued_at: now,
             changes,
         };
-        let len = self.file.metadata()?.len();
-        if len != self.end {
-            // Another publisher appended since this one last read the log: a delta now would fork
-            // the chain (its epoch and prev are stale). Refused, so a caller that skipped
-            // `refresh` fails closed instead of signing on a head the log no longer has.
-            return Err(PublishError::Invalid(format!(
-                "the delta log is {len} bytes, not the {} this publisher last read: refresh first",
-                self.end
-            )));
-        }
+        // Another publisher appended since this one last read the log, or the log was set aside
+        // for another: a delta now would fork the chain (its epoch and prev are stale), or go to a
+        // file no one reads. Refused, so a caller that skipped `refresh` fails closed instead of
+        // signing on a head the log no longer has.
+        self.check_current()?;
+        let len = self.end;
         let jws = sign(&self.key, TYP_DELTA, &d);
         let written = self.file.write_all(format!("{jws}\n").as_bytes()).and_then(|()| self.file.sync_data());
         if let Err(e) = written {
@@ -625,7 +621,26 @@ impl<P: Policy> Publisher<P> {
         }
     }
 
-    /// Signs a new statement for the current epoch.
+    /// Fails unless the log at this publisher's path is the one it last read or wrote, and as long
+    /// as it was then: otherwise what it holds may be behind the log (another publisher appended,
+    /// or the log was set aside for a new one), and it must [`Publisher::refresh`] (or be opened
+    /// again) before it commits, serves a catch-up or signs a statement.
+    pub fn check_current(&self) -> Result<(), PublishError> {
+        let stale = |why: String| Err(PublishError::Invalid(format!("{why}: refresh first")));
+        match std::fs::metadata(&self.path) {
+            Ok(m) if m.ino() != self.ino => stale("the delta log was replaced since this publisher opened it".into()),
+            Ok(m) if m.len() != self.end => {
+                stale(format!("the delta log is {} bytes, not the {} this publisher last read", m.len(), self.end))
+            }
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => stale("the delta log is gone".into()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Signs a new statement for the current epoch. It vouches for the epoch this publisher holds:
+    /// call it on a current publisher ([`Publisher::check_current`]; [`Publisher::tick`] and
+    /// [`Publisher::catch_up`] check).
     pub fn statement(&mut self, now: i64) -> Frame {
         let issued_at = now.max(self.last_issued.saturating_add(1));
         self.last_issued = issued_at;
@@ -647,25 +662,30 @@ impl<P: Policy> Publisher<P> {
     /// A new statement if one is due, to push to the node: `refresh_ms` after the last one signed
     /// for this feed, by this publisher or another ([`Publisher::note_issued`]), so the node gets
     /// one per refresh, however many processes publish to it. One is due at once when none has
-    /// been signed (that this publisher knows of), and after a rotation to a new version.
+    /// been signed (that this publisher knows of), and after a rotation to a new version. None
+    /// from a publisher behind the log ([`Publisher::check_current`]): it must refresh first.
     pub fn tick(&mut self, now: i64) -> Option<Frame> {
         let due = self.statement_due || now >= self.last_issued.saturating_add(self.cfg.refresh_ms);
-        due.then(|| self.statement(now))
+        (due && self.check_current().is_ok()).then(|| self.statement(now))
     }
 
     /// A signed snapshot of the current state (also worth sending now and then, so nodes can compact
-    /// their persisted deltas).
+    /// their persisted deltas). Like [`Publisher::statement`], it vouches for what this publisher
+    /// holds: call it on a current publisher ([`Publisher::check_current`]; [`Publisher::catch_up`]
+    /// checks). A snapshot from one behind the log is refused by a node that holds more
+    /// (a rollback), but would set back one that holds less.
     pub fn snapshot(&mut self, now: i64) -> Frame {
         self.state.prune(now);
         Frame::new(FrameKind::Snap, sign(&self.key, TYP_SNAP, &self.state.snapshot(&self.feed, now)))
     }
 
     /// The frames that bring a node from what it holds (`hello`) to the current epoch, ending with a
-    /// statement that names it.
+    /// statement that names it. Refused from a publisher behind the log ([`Publisher::check_current`]).
     pub fn catch_up(&mut self, hello: &Hello, now: i64) -> Result<Vec<Frame>, PublishError> {
         if hello.node != self.feed {
             return Err(PublishError::Invalid(format!("hello from {} on {}'s feed", hello.node, self.feed)));
         }
+        self.check_current()?;
         let mut frames = vec![self.key_frame()];
         let on_chain = match (hello.version, hello.epoch, &hello.head) {
             (Some(v), Some(e), Some(h)) => {

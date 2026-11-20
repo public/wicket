@@ -313,20 +313,32 @@ when `state-store.yaml` or `audit-sinks.yaml` exists. `wicket top` shows the sam
   the sink is behind the chain head and how long the oldest of them has waited, where its cursor
   is, how long ago its last signed checkpoint was, and its last error.
 - A config that can't be read is a line of its own. It doesn't stop the rest of the page.
-- **Alerts.** Three conditions are health alerts, pushed like a node's: once when one appears, and
+- **Alerts.** Four conditions are health alerts, pushed like a node's: once when one appears, and
   again only after it has cleared, under the `wicket-health` tag. Their text names the condition,
-  never an error (that stays in the rows, as it can quote a collector's reply).
+  never a sink's or Litestream's error message (those stay in the rows, as they can quote a
+  collector's reply).
   - **The ledger stream** is in any state but streaming, and its last sync was more than 5 minutes
-    ago. When Litestream doesn't report a last sync (it is stopped, or restarting), that counts from
+    ago (or 10 sync intervals, if that is longer: with `sync_interval` over 30 s, the stream isn't
+    lagging before then). When Litestream doesn't report a last sync (it is stopped, or restarting), that counts from
     the last sync the console saw while it was streaming, or from when the console started.
   - **An audit sink**'s oldest unacknowledged record has waited more than 5 minutes, or the sink is
     more than 10,000 records behind. A `jsonl` sink to standard output (`path: "-"`) is fed only by
     `wicket audit export` in the foreground: its row says *manual*, and it never alerts.
   - **A config** (`state-store.yaml` or `audit-sinks.yaml`) can't be read for more than 5 minutes.
+    The alert names the file.
+  - **The console's own reads** haven't succeeded for more than 5 minutes (the ledger can't be
+    opened, or a read hangs). After 30 seconds without one, the rows say they may be out of date.
+- The section lists these alerts above its rows, so they show with notifications off too.
+- A question to Litestream's socket, connecting included, gives up after 3 seconds.
 - The console reads all of this every 3 seconds in the background, whether or not notifications are
   on, and the page shows what it last read: a request never waits on Litestream.
 
-The data is under `health.state_store` in `/api/state`: `stream`, `audit` and `errors`.
+The data is under `health.state_store` in `/api/state`:
+- `stream`, `audit` and `errors`: what the last read found;
+- `read_ms`: when that read was (Unix ms), or null before the first;
+- `stale`: true once the last read is more than 30 seconds old;
+- `not_read_yet`: true when the console has run for more than 30 seconds without a first read;
+- `alerts`: the texts of the alerts the section raises, as listed above its rows.
 
 ## Notifications
 

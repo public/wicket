@@ -78,6 +78,14 @@ const HEALTH_WRITE_MS: i64 = 20_000;
 /// it is opened (after a restore, #154: its delta log stayed behind).
 pub const REGENESIS: &str = "regenesis";
 
+/// [`open_feed`] under the node feed's lock (`<data dir>/nodes/<name>/feed.lock`), as every
+/// publisher on it holds it: for a caller outside [`SharedFeed`], such as `wicket keys certify`
+/// starting a new generation, which renames the log.
+pub fn open_feed_locked(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
+    let _lock = feed_lock(&crate::data_dir().join("nodes").join(name))?;
+    open_feed(name, cfg)
+}
+
 /// Opens node `name`'s feed: its key (created here on first use, 0600) and a certificate for it from
 /// the installation's feed root. A delta log that doesn't read is an error, not set aside.
 pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
@@ -174,6 +182,14 @@ fn renew_margin() -> Option<i64> {
     (!crate::roots::offline()).then_some(86_400_000)
 }
 
+/// Whether a publisher whose certificate couldn't be renewed may go on publishing with the one it
+/// holds: only while that is valid at `now` (Unix ms), and the certificate on disk (`cert.jws`) is
+/// of the same version. One on disk that is missing or doesn't read isn't the same version.
+fn keep_after_failed_renewal(held: &KeyCert, on_disk: Option<&str>, now: i64) -> bool {
+    let disk_version = on_disk.and_then(wicket_feed::jws::payload_unverified::<KeyCert>).map(|c| c.version);
+    held.not_after > now && disk_version == Some(held.version)
+}
+
 /// How often a feed's certificate is checked for nearing its end, to be renewed.
 const CERT_CHECK_MS: i64 = 3_600_000;
 
@@ -235,11 +251,18 @@ impl SharedFeed {
     /// Node `name`'s feed for this process: the one its other runs on the node use, or opened now.
     pub fn open(name: &str, cfg: PublisherConfig) -> Result<Arc<SharedFeed>> {
         let dir = crate::data_dir().join("nodes").join(name);
-        let mut feeds = FEEDS.lock().expect("feeds");
-        if let Some(f) = feeds.get(&dir).and_then(std::sync::Weak::upgrade) {
+        // The map only holds handles, each insert or removal whole: one a panic left poisoned is
+        // still sound. It isn't held while a feed opens (the node's lock, the log read), so nodes
+        // open in parallel; two runs opening the same node at once keep the first one in.
+        let feeds = || FEEDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(f) = feeds().get(&dir).and_then(std::sync::Weak::upgrade) {
             return Ok(f);
         }
         let f = Arc::new(SharedFeed::open_new(name, cfg)?);
+        let mut feeds = feeds();
+        if let Some(first) = feeds.get(&dir).and_then(std::sync::Weak::upgrade) {
+            return Ok(first);
+        }
         feeds.retain(|_, w| w.strong_count() > 0);
         feeds.insert(dir, Arc::downgrade(&f));
         Ok(f)
@@ -269,30 +292,51 @@ impl SharedFeed {
     /// The feed, locked and current.
     pub fn lock(&self) -> Result<FeedGuard<'_>> {
         let lock = feed_lock(&self.dir)?;
-        // A run that panicked holding the feed may have left the publisher half-updated: it is
-        // opened again from the files, and the other runs on the node carry on.
+        // A run that panicked holding the feed may have left the publisher half-updated (a commit
+        // that wrote its delta but didn't apply it): it is opened again from the files, and the
+        // other runs on the node carry on. The poison is cleared only once that worked, so a
+        // reopen that fails leaves it for the next lock to try again, never trusting the old one.
         let (mut g, poisoned) = match self.inner.lock() {
             Ok(g) => (g, false),
-            Err(e) => {
-                self.inner.clear_poison();
-                (e.into_inner(), true)
-            }
+            Err(e) => (e.into_inner(), true),
         };
-        let now = wicket_feed::now_ms();
-        // Another process (or `wicket keys certify`) renewed the certificate, or it nears its end
-        // (`open_feed` renews it, with the roots at hand; checked hourly, as without them it can't).
-        let on_disk = std::fs::read_to_string(self.dir.join("feed/cert.jws")).ok();
-        let mut cert_due = on_disk.as_deref() != Some(g.0.key_frame().jws.as_str());
-        if now >= g.1.saturating_add(CERT_CHECK_MS) {
-            g.1 = now;
-            // The same window `open_feed` renews in, so the reopen does renew it.
-            cert_due |= renew_margin().is_some_and(|m| g.0.cert().not_after <= now + m);
-        }
-        let current = !poisoned && !cert_due && matches!(g.0.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_)));
-        if !current {
+        let reopen = |g: &mut (Publisher<BoxAuthority>, i64)| -> Result<()> {
             let issued = g.0.last_issued();
             g.0 = open_feed(&self.name, self.cfg.clone())?;
             g.0.note_issued(issued);
+            Ok(())
+        };
+        // What other processes appended first: a publisher that can't follow the log must be
+        // opened again, or nothing may be published.
+        if poisoned || !matches!(g.0.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_))) {
+            reopen(&mut g)?;
+            self.inner.clear_poison();
+        } else {
+            let now = wicket_feed::now_ms();
+            // Another process (or `wicket keys certify`) renewed the certificate, or it nears its
+            // end (`open_feed` renews it in the same window, with the roots at hand; checked
+            // hourly, as without them it can't).
+            let on_disk = std::fs::read_to_string(self.dir.join("feed/cert.jws")).ok();
+            let mut cert_due = on_disk.as_deref() != Some(g.0.key_frame().jws.as_str());
+            if now >= g.1.saturating_add(CERT_CHECK_MS) {
+                g.1 = now;
+                cert_due |= renew_margin().is_some_and(|m| g.0.cert().not_after <= now + m);
+            }
+            // A renewal that fails keeps the publisher as it is, current, so the commit or
+            // revocation this lock is for still goes out; but only while its certificate is still
+            // valid and the one on disk is of the same version. A higher version on disk is a new
+            // generation: publishing under the old one would be refused by the node, and hide it.
+            if cert_due {
+                if let Err(e) = reopen(&mut g) {
+                    if !keep_after_failed_renewal(g.0.cert(), on_disk.as_deref(), now) {
+                        return Err(e.context(format!(
+                            "node {}'s feed certificate can't be renewed, and the one held is past its end or of another version than the one on disk",
+                            self.name
+                        )));
+                    }
+                    say_err!("[wicket] could not renew node {}'s feed certificate ({e:#}); publishing with the current one", self.name);
+                }
+            }
         }
         g.0.note_issued(last_issued(&self.dir.join("feed")));
         let issued = g.0.last_issued();
@@ -1263,6 +1307,9 @@ async fn session(
     sh.ctl.calls.set_out(Some(out_tx.clone()));
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis((sh.cfg.refresh_ms / 2).clamp(50, 1000) as u64));
+    // When the statement tick last logged that it couldn't take the feed: at most once a minute,
+    // as it ticks up to twenty times a second.
+    let mut tick_failed_logged: Option<std::time::Instant> = None;
     let mut grants = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut ident = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut leases = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -1292,7 +1339,18 @@ async fn session(
                 }
             },
             _ = tick.tick() => {
-                let f = sh.ctl.publisher.lock().ok().and_then(|mut p| p.tick(wicket_feed::now_ms()));
+                let f = match sh.ctl.publisher.lock() {
+                    Ok(mut p) => p.tick(wicket_feed::now_ms()),
+                    Err(e) => {
+                        // No statement this tick: the node goes offline at its last one's end
+                        // unless a later lock works.
+                        if tick_failed_logged.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
+                            tick_failed_logged = Some(std::time::Instant::now());
+                            say_err!("[wicket] could not take node {}'s feed for a statement: {e:#}", sh.node);
+                        }
+                        None
+                    }
+                };
                 if let Some(f) = f {
                     send(feed_frame(f));
                 }
@@ -2534,6 +2592,20 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A failed renewal keeps the publisher only on a valid certificate of the version on disk.
+    #[test]
+    fn a_failed_renewal_keeps_the_publisher_only_on_a_valid_same_version_certificate() {
+        let key = wicket_identity::SigningKey::from_bytes(&[7; 32]);
+        let held = KeyCert::new(&key.verifying_key(), 3, 10_000, 30_000);
+        let on_disk =
+            |version: u64| wicket_feed::sign(&key, wicket_feed::TYP_KEY, &KeyCert::new(&key.verifying_key(), version, 20_000, 30_000));
+        assert!(keep_after_failed_renewal(&held, Some(&on_disk(3)), 9_999));
+        assert!(!keep_after_failed_renewal(&held, Some(&on_disk(3)), 10_000), "the held certificate is at its end");
+        assert!(!keep_after_failed_renewal(&held, Some(&on_disk(4)), 9_999), "a new generation on disk");
+        assert!(!keep_after_failed_renewal(&held, Some("not a certificate"), 9_999), "one that doesn't read");
+        assert!(!keep_after_failed_renewal(&held, None, 9_999), "none on disk");
+    }
     use super::*;
 
     /// #572: an approved standing rule goes in the box's token as its rule: its host, methods and

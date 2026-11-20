@@ -31,6 +31,9 @@ pub mod kind {
     // daemon → client
     pub const WELCOME: u8 = b'W';
     pub const ERROR: u8 = b'E';
+    /// The command turned away with the caller's exit code (#574): 4 bytes, big-endian, then the
+    /// reason as text. Sent only to a client whose hello says it reads it (`codes`).
+    pub const REFUSE: u8 = b'R';
     pub const EXIT: u8 = b'X';
 }
 
@@ -54,6 +57,9 @@ pub struct Hello {
     pub manifest_name: Option<String>,
     #[serde(default)]
     pub program_source: Option<String>,
+    /// Whether the client reads a `REFUSE` frame (#574); one before it gets `ERROR`, the text only.
+    #[serde(default)]
+    pub codes: bool,
 }
 
 /// The daemon's answer once it has let the caller in.
@@ -355,26 +361,23 @@ pub fn group_id(name: &str) -> Option<u32> {
     (r == 0 && !out.is_null()).then_some(gr.gr_gid)
 }
 
-/// An `ERROR` frame's text starts with the caller's exit code in words (#574): `usage: ` (2),
-/// `refused: ` (3, the daemon's policy) or `try again: ` (75, the daemon is moving to a new build);
-/// with none, the command failed otherwise (1). A client before it shows the text as it is.
-const MARKS: [(wicket_home::exit::Code, &str); 3] = [
-    (wicket_home::exit::Code::Usage, "usage: "),
-    (wicket_home::exit::Code::Refused, "refused: "),
-    (wicket_home::exit::Code::TryAgain, "try again: "),
-];
-
-/// `why`, marked with `code` for the caller.
-pub fn marked(code: wicket_home::exit::Code, why: &str) -> String {
-    match MARKS.iter().find(|(c, _)| *c == code) {
-        Some((_, m)) => format!("{m}{why}"),
-        None => why.to_string(),
-    }
+/// A `REFUSE` frame's payload: `code`, then `why`.
+pub fn refuse_frame(code: wicket_home::exit::Code, why: &str) -> Vec<u8> {
+    let mut p = (code as i32).to_be_bytes().to_vec();
+    p.extend_from_slice(why.as_bytes());
+    p
 }
 
-/// The code an `ERROR` frame's text is marked with (`Failed` if none).
-pub fn mark_of(text: &str) -> wicket_home::exit::Code {
-    MARKS.iter().find(|(_, m)| text.starts_with(m)).map(|(c, _)| *c).unwrap_or(wicket_home::exit::Code::Failed)
+/// A `REFUSE` frame's code and text (a code it doesn't know is `Failed`).
+pub fn parse_refuse(p: &[u8]) -> (wicket_home::exit::Code, String) {
+    use wicket_home::exit::Code;
+    let (head, text) = p.split_at(p.len().min(4));
+    let n = <[u8; 4]>::try_from(head).map(i32::from_be_bytes).unwrap_or(1);
+    let code = [Code::Usage, Code::Refused, Code::NotFound, Code::NeedsApproval, Code::Revoked, Code::TryAgain]
+        .into_iter()
+        .find(|c| *c as i32 == n)
+        .unwrap_or(Code::Failed);
+    (code, String::from_utf8_lossy(text).into_owned())
 }
 
 #[cfg(test)]

@@ -251,11 +251,8 @@ impl Daemon {
             Some((kind::HELLO, p)) => serde_json::from_slice(&p).context("bad hello")?,
             _ => bail!("uid {}: no hello", peer.uid),
         };
-        if DRAINING.load(Ordering::SeqCst) {
-            return fail_with(&mut w, Code::TryAgain, "wicketd is moving to a new build: try again in a few seconds");
-        }
-        if fds.len() < 3 || (hello.dir_fd && fds.len() < 4) {
-            return fail(&mut w, "the caller's stdin, stdout and stderr did not arrive");
+        if let Some((code, why)) = turned_away(DRAINING.load(Ordering::SeqCst), fds.len(), hello.dir_fd) {
+            return fail_with(&mut w, hello.codes, code, why);
         }
         let dir_fd = if hello.dir_fd { fds.pop() } else { None };
         let (cmd, class, basis) = match self.admit(&peer, &hello) {
@@ -263,7 +260,7 @@ impl Daemon {
             Err((code, why)) => {
                 say_err!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
                 self.audit_refusal(&peer, &hello, &why);
-                return fail_with(&mut w, code, &why);
+                return fail_with(&mut w, hello.codes, code, &why);
             }
         };
         let mut plan = match self.plan(&peer, &basis, &cmd, &hello, dir_fd) {
@@ -272,7 +269,7 @@ impl Daemon {
                 let why = format!("{e:#}");
                 say_err!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
                 self.audit_refusal(&peer, &hello, &why);
-                return refuse_or_fail(&mut w, &e, &why);
+                return refuse_or_fail(&mut w, hello.codes, &e, &why);
             }
         };
         proto::write_json(
@@ -298,7 +295,7 @@ impl Daemon {
                     let (e, data) = proto::parse_upload(&p)?;
                     let stage = plan.stage.as_mut().context("this command takes no uploads")?;
                     if let Err(e) = stage.add(&e, data) {
-                        return fail(&mut w, &format!("{e:#}"));
+                        return fail(&mut w, hello.codes, &format!("{e:#}"));
                     }
                 }
                 Some((kind::GO, _)) => break,
@@ -311,7 +308,7 @@ impl Daemon {
                 let why = format!("{e:#}");
                 say_err!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
                 self.audit_refusal(&peer, &hello, &why);
-                return refuse_or_fail(&mut w, &e, &why);
+                return refuse_or_fail(&mut w, hello.codes, &e, &why);
             }
         }
         say_err!(
@@ -496,7 +493,13 @@ impl Daemon {
                 if *only_nodes {
                     argv.push("--only-nodes".into());
                 }
-                argv.extend(["--window".into(), window.clone(), "--interval".into(), interval.clone()]);
+                // Durations as clap parsed them, in ns: exact, and parsed again the same way.
+                argv.extend([
+                    "--window".into(),
+                    format!("{}ns", window.as_nanos()),
+                    "--interval".into(),
+                    format!("{}ns", interval.as_nanos()),
+                ]);
                 for c in check {
                     argv.extend(["--check".into(), c.clone()]);
                 }
@@ -663,30 +666,39 @@ fn accessible(dir: &Path) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
 
-/// Refuses the command for the policy (the daemon's, for this caller): the caller exits 3 (#574).
-fn refuse(w: &mut UnixStream, why: &str) -> Result<()> {
-    fail_with(w, Code::Refused, why)
+/// Whether a command is turned away before it is looked at, and with what code (#574): while the
+/// daemon moves to a new build (75: nothing was done, try again), or without the caller's stdio (1).
+fn turned_away(draining: bool, fds: usize, dir_fd: bool) -> Option<(Code, &'static str)> {
+    if draining {
+        return Some((Code::TryAgain, "wicketd is moving to a new build: try again in a few seconds"));
+    }
+    if fds < 3 || (dir_fd && fds < 4) {
+        return Some((Code::Failed, "the caller's stdin, stdout and stderr did not arrive"));
+    }
+    None
 }
 
 /// The command can't go ahead for another reason (the caller's fds or uploads didn't arrive
 /// whole): the caller exits 1.
-fn fail(w: &mut UnixStream, why: &str) -> Result<()> {
-    fail_with(w, Code::Failed, why)
+fn fail(w: &mut UnixStream, coded: bool, why: &str) -> Result<()> {
+    fail_with(w, coded, Code::Failed, why)
 }
 
-/// Turns the command away, its text marked with the caller's exit code ([`proto::marked`]).
-fn fail_with(w: &mut UnixStream, code: Code, why: &str) -> Result<()> {
-    let _ = proto::write_frame(w, kind::ERROR, proto::marked(code, why).as_bytes());
+/// Turns the command away with the caller's exit code (#574): in a `REFUSE` frame, the code a field
+/// of its own (nothing in the text can pass for one), to a client that reads it; else the text in
+/// an `ERROR` frame, as before.
+fn fail_with(w: &mut UnixStream, coded: bool, code: Code, why: &str) -> Result<()> {
+    let _ = match coded {
+        true => proto::write_frame(w, kind::REFUSE, &proto::refuse_frame(code, why)),
+        false => proto::write_frame(w, kind::ERROR, why.as_bytes()),
+    };
     let _ = w.flush();
     Ok(())
 }
 
-/// [`refuse`] if `e` is the policy's refusal (an [`wicket_home::exit::Exit`] that says so), else [`fail`].
-fn refuse_or_fail(w: &mut UnixStream, e: &anyhow::Error, why: &str) -> Result<()> {
-    match wicket_home::exit::code_of(e) {
-        Some(wicket_home::exit::Code::Refused) => refuse(w, why),
-        _ => fail(w, why),
-    }
+/// Turns the command away with the code `e` says (the policy's refusal 3, a usage error 2, …), or 1.
+fn refuse_or_fail(w: &mut UnixStream, coded: bool, e: &anyhow::Error, why: &str) -> Result<()> {
+    fail_with(w, coded, wicket_home::exit::code_of(e).unwrap_or(Code::Failed), why)
 }
 
 #[cfg(test)]
