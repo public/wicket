@@ -18,13 +18,63 @@ framework prototypes were written by separate agents from the same brief; vanill
 from the Preact one, screen for screen. `preact-esbuild`, `lit-esbuild` and `solid-h` are the same
 code with a smaller build (see "Size optimisation"). The framework prototypes each have a `NOTES.md`
 on what was easy and awkward.
-- `measure.mjs` loads each one cold, 7 times, on a phone profile: 390×844 at DPR 2, the CPU slowed
-  4×, and Lighthouse's slow 4G (150 ms RTT, 1.6 Mbit/s down). It reports medians.
+- `measure.mjs` loads each one cold, 7 times, on a phone profile: 390×844 at DPR 2, the CPU slowed to
+  a Pixel 8 Pro's (1.4× here; the first runs used 4×), and Lighthouse's slow 4G (150 ms RTT,
+  1.6 Mbit/s down). It reports medians. `UNTHROTTLED=1` runs the same with no slowdown.
 - `static.sh` builds each from clean twice: size, packages, build time and whether the bytes repeat.
 
 Everything ran on one shared 4 vCPU box, on 2026-11-20, one candidate at a time with nothing else running.
 
-## Results
+## Results on a Pixel 8 Pro profile
+
+Every measure of every build, all from one run (2026-11-20, one candidate at a time, nothing else
+running): `results/all.md`, built by `combine.mjs`. Svelte and Vue were dropped by the operator after
+the first results below and are not in this run.
+
+**Profile.** The CPU slowdown is calibrated to a Pixel 8 Pro: `speedometer.mjs` runs Speedometer 3.0
+in this machine's Chromium. Unslowed it scores 15.1 ± 0.9; slowed 1.6× 7.84 ± 0.51; slowed 1.4×
+9.72 ± 0.54, against about 9.5 reported for a Pixel 8 Pro's Chrome (one owner's run, early 2024;
+Google kept reviewers from benchmarking the Tensor G3, and Chrome has got faster since, so this is if
+anything slow). The network is unchanged: slow 4G, 150 ms RTT, 1.6 Mbit/s down. 390×844 at DPR 2.
+"Desktop" is the same with no slowdown at all. Medians of 7 cold loads.
+
+| candidate | first card, phone (ms) | range of 7 | first paint, phone (ms) | script per poll, phone (ms) | JS heap (KB) | elements | first card, desktop (ms) | JS gzip (B) | CSS gzip (B) | npm packages (shipped) | node_modules | clean build (s) | Node needed to build | size (nodes) | branches | worst unit | writes by hand | DOM calls |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| plain JS, esbuild | 1009 | 1004–1036 | 572 | 0.7 | 1946 | 333 | 102 | 8364 | 5520 | 27 (0) | 12M | 0.5 | yes | 4439 | 223 | 37 | 35 | 39 |
+| Preact, esbuild | 1013 | 1003–1031 | 652 | 2.7 | 2179 | 315 | 105 | 14056 | 5520 | 28 (1) | 13M | 0.7 | yes | 3932 | 189 | 37 | 16 | 0 |
+| Preact, Vite | 1016 | 1001–1029 | 648 | 2.9 | 2162 | 315 | 111 | 13866 | 5560 | 48 (1) | 66M | 1.3 | yes | 3932 | 189 | 37 | 16 | 0 |
+| Lit (lit-html), esbuild | 1020 | 1014–1034 | 940 | 0.8 | 2137 | 320 | 106 | 12432 | 5520 | 29 (2) | 14M | 0.7 | yes | 3644 | 188 | 34 | 18 | 2 |
+| Lit (lit-html), Vite | 1023 | 1015–1041 | 932 | 0.7 | 2137 | 322 | 95 | 12231 | 5573 | 49 (2) | 68M | 1.3 | yes | 3644 | 188 | 34 | 18 | 2 |
+| plain JS, no build | 1024 | 1014–1043 | 664 | 0.7 | 1955 | 334 | 95 | 11637 | 7288 | 0 (0) | 0 | 0 (none) | no | 4439 | 223 | 37 | 35 | 39 |
+| Solid, Vite (Babel) | 1061 | 1044–1516 | 724 | 0.8 | 2805 | 483 | 118 | 17482 | 5551 | 106 (4) | 88M | 2.4 | yes | 3692 | 171 | 28 | 8 | 3 |
+| Lit (lit-html), no build (4 files committed) | 1071 | 1042–1079 | 1048 | 0.7 | 2159 | 327 | 95 | 16392 | 7288 | 0 (1) | 0 | 0 (none) | no | 3644 | 188 | 34 | 18 | 2 |
+| Solid, esbuild (no Babel) | 1516 | 1084–1524 | 740 | 0.8 | 2982 | 483 | 116 | 20043 | 5520 | 31 (4) | 15M | 0.6 | yes | 3692 | 171 | 28 | 8 | 3 |
+| today's console on main (reference) | 1530 | 1508–1552 | 436 | 0.8 | 2061 | 569 | 109 | 25581 | 3114 | 0 (0) | 0 | 0 (none) | no | – | – | – | – | – |
+
+- **The network sets the time, not the framework.** Every build under about 14 KB of JavaScript shows
+  the first card in 1.01–1.07 s, and the same build moves by about 30 ms between loads: they tie.
+  On a desktop all of them take 95–118 ms.
+- **A file over about 14 KB costs a round trip.** Solid without Babel (20 KB) took about 1.5 s in 6 of
+  7 loads, Solid with Babel (17.5 KB) in 1 of 7, and today's console on main (25.6 KB, unminified)
+  in all 7. A new TCP connection sends about 14.6 KB (10 segments) before it waits for an
+  acknowledgement, and the 0.45–0.5 s steps are three of these 150 ms round trips; this is the likely
+  cause (about 60% confident). Lit without a build is 16.4 KB but in five files fetched at once, and
+  paid nothing. For the console, staying under about 14 KB per file matters more than the framework.
+- **First paint**: plain JS and Preact at 0.57–0.66 s, Lit at 0.93–1.05 s. The Lit prototype's page is
+  empty until its first render, where plain JS's `index.html` holds the header and tabs; that is the
+  likely cause, untested.
+- **Script per poll** is under 3 ms for all, and **memory** 1.9–3.0 MB.
+- **Code to maintain** and **build cost** are as in the sections below: Lit is the least code; plain JS
+  the most, and the only one managing the DOM by hand; only the two no-build variants keep the
+  console buildable by `cargo build` alone.
+- Tested in Chromium only; Firefox and Safari are unverified.
+
+## First results (CPU slowed 4×)
+
+The first runs slowed the CPU 4× (Lighthouse's default), a phone about 2.5 times slower than a Pixel
+8 Pro by Speedometer, and included Svelte and Vue. Kept for the record (`results/runtime-4x.md`);
+the tables in "Complexity", "Without a build" and the sections after it come from these runs too.
+
 
 Medians of 7 cold loads on the throttled phone profile, then the static build measures. The first-card
 range is the fastest and slowest of the 7.
@@ -144,8 +194,8 @@ the same 2 branches each, and 48–58 nodes.
 
 ### Unthrottled
 
-On a desktop with no throttling, the first card arrives in 85–102 ms for plain JS, Lit, Vue and
-Preact alike (`results/runtime-unthrottled.md`). The differences above exist only on a slow phone.
+An earlier unthrottled run of plain JS, Lit, Vue and Preact gave 85–102 ms to the first card; the
+Pixel 8 Pro run's desktop column (95–118 ms, every build) replaces it (`results/runtime-unthrottled.md`).
 
 ### Without a build: Lit as committed files
 
@@ -176,7 +226,7 @@ comboboxes, about 50) with keyboard, focus and screen reader support, plus an "a
 an AI agent read and operate the page's components.
 
 Tested with `@ui-sdk/web` (its web components, no framework), bundled and minified with esbuild
-(`ui-sdk/`: `npm ci`, `node build-and-size.cjs`, then `node check.cjs` to load it under the CSP):
+(`ui-sdk/`: `npm install --ignore-scripts`, `node build-and-size.cjs`, then `node check.cjs` to load it under the CSP):
 - **Size**: the dialog alone is 48.6 KB gzip; dialog, tabs and toast together 64.7 KB, plus 12.6 KB of
   CSS. That is more than the whole Vue prototype, for three widgets.
 - **CSP**: they work (the dialog opens, takes focus and closes on Escape; tabs switch), but setting
@@ -192,24 +242,25 @@ Not a candidate for the console. Its behaviours might be worth reading for acces
 ## Verdict
 
 **Recommended: Lit (`lit-html` only), committed as files with no build** (about 60% confident).
-Plain JS is a close second.
+Plain JS without a build is a close second.
 
-- It answers the worry about plain JS. Lit is the least code (3,644 nodes against plain JS's 4,439),
-  needs no DOM code by hand (2 calls against 39), and keeps rows across polls with `repeat()` instead
-  of a hand-written cache, which is where this work's bugs were.
-- It keeps what plain JS had: `cargo build` alone gives a working console. The four vendored files are
-  4.4 KB gzip; there is no compiler, and nothing runs at build time.
-- It costs about 0.1 s to the first card on a slow phone (none on a desktop), and one vendored
-  dependency to keep current.
+- On the target phone, speed doesn't separate them: both no-build variants show the first card in
+  1.02–1.07 s, and on a desktop in 95 ms.
+- Lit is the least code (3,644 nodes against plain JS's 4,439), needs no DOM code by hand (2 calls
+  against 39), and keeps rows across polls with `repeat()` instead of a hand-written cache, which is
+  where this work's bugs were.
+- Both keep `cargo build` alone giving a working console. Lit's four vendored files are 4.4 KB gzip;
+  there is no compiler, and nothing runs at build time. They need a pinned version, hashes and a CI
+  check, as the session view's lockfile has.
+- Whatever is chosen, keep each file the console loads under about 14 KB gzip, or the first visit pays
+  an extra round trip (about 0.5 s on slow 4G).
 
-Plain JS stays reasonable if no dependency at all is the rule. Vue is close in code shape (the best
-split, no DOM by hand) and already in the repository, but is 0.5 s slower on a phone and needs its
-compiler, so a Node build. Preact, Solid and Svelte add a build step without a gain over Lit here.
+Preact ties on speed but adds a build step; Solid adds Babel or crosses the 14 KB line. Vue and Svelte
+were dropped.
 
 If this fails, the likely causes: Lit's late first paint is not just the prototype's (test: put the
-header and tabs in `index.html`, as plain JS does); the vendored copy falls behind (needs a check, as
-`ci/session-view.sh` checks its lockfile); or template whitespace quirks in inline layouts (the Lit
-author's main complaint).
+header and tabs in `index.html`); the vendored copy falls behind; template whitespace quirks in
+inline layouts (the Lit author's main complaint); or Firefox or Safari behave differently (untested).
 
 ## Files
 
@@ -217,7 +268,15 @@ author's main complaint).
 - `serve.mjs`, `measure.mjs`, `static.sh`, `parity.mjs`, `complexity.mjs`: the mock, the measurements,
   the check that every candidate shows the same thing, and the code measures.
 - `ui-sdk/`: the Vercel UI SDK size and CSP check.
+- `speedometer.mjs`: the Pixel 8 Pro calibration. `combine.mjs`: every measure in one table.
 - `fixture.js`: a copy of the console preview's made-up data, so the experiment runs on its own.
 - `results/`: the tables (`runtime.md`, `runtime-unthrottled.md`, `static.md`, `complexity.md`) and their JSON.
-- `<candidate>/`: each prototype and its `NOTES.md`. `npm ci && npm run build`, then
-  `node serve.mjs <candidate>` to try it.
+- `<candidate>/`: each prototype and its `NOTES.md`. `npm install --ignore-scripts && npm run build`
+  (`lit-nobuild` and `vanilla-nobuild`: `./build.sh`), then `node serve.mjs <candidate>` to try it.
+
+**Lockfiles.** Every build was measured from a committed `package-lock.json`; the lockfiles were then
+removed (#737 review), so that the repository's dependency tooling doesn't scan or update code wicket
+won't ship. Each `package.json` keeps exact versions, but an install today resolves their own
+dependencies afresh and may get newer versions than were measured. The package counts in the tables
+are from the lockfiles as measured. `lit-nobuild` needs no install: its four lit-html files are
+committed.

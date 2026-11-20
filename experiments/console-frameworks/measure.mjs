@@ -3,7 +3,8 @@
 //   node measure.mjs [RUNS] [candidate...]      (default: 7 runs; baseline and every */dist)
 //
 // Profile, per run, in a fresh browser context (cold cache): 390x844 at DPR 2, Chromium's CPU slowed
-// 4x, and the network as Lighthouse's "slow 4G" (150 ms RTT, 1.6 Mbit/s down, 750 kbit/s up).
+// to a Pixel 8 Pro's (CPU_RATE, below), and the network as Lighthouse's "slow 4G" (150 ms RTT,
+// 1.6 Mbit/s down, 750 kbit/s up).
 // For each run:
 // - card_ms: from navigation start until the first request card's Allow button is in the page;
 // - fcp_ms: first contentful paint;
@@ -25,6 +26,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // UNTHROTTLED=1: the same runs with no CPU or network slowdown (a desktop on a local network), written
 // to results/runtime-unthrottled.json and results/raw-unthrottled/ instead.
 const UNTHROTTLED = process.env.UNTHROTTLED === "1";
+// The CPU slowdown. 1.4 makes this machine's Chromium score Speedometer 3.0 like a Pixel 8 Pro's
+// Chrome (9.72 ± 0.54 here against about 9.5 reported; see speedometer.mjs and RESULTS.md). The first
+// runs used Lighthouse's 4, a phone about 2.5 times slower (results/runtime-4x.md).
+const CPU_RATE = Number(process.env.CPU_RATE) || 1.4;
 const RAW = UNTHROTTLED ? "raw-unthrottled" : "raw";
 const args = process.argv.slice(2);
 const RUNS = Number(args[0]) || 7;
@@ -51,7 +56,7 @@ async function once(browser, url) {
   await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
   if (!UNTHROTTLED) {
     await cdp.send("Network.emulateNetworkConditions", { offline: false, latency: 150, downloadThroughput: 1.6e6 / 8, uploadThroughput: 750e3 / 8 });
-    await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
+    await cdp.send("Emulation.setCPUThrottlingRate", { rate: CPU_RATE });
   }
   await cdp.send("Performance.enable");
   await page.goto(url, { waitUntil: "commit" });

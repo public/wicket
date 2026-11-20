@@ -1,10 +1,12 @@
-vanilla {"card_ms":84.70000000111759,"fcp_ms":32,"heap_kb":1914.06640625,"dom":333,"poll_ms":0.43520000000000003,"kept":true,"errors":[]}
-lit {"card_ms":97,"fcp_ms":84,"heap_kb":2121.7265625,"dom":322,"poll_ms":0.5227999999999999,"kept":true,"errors":[]}
-vue {"card_ms":92.20000000111759,"fcp_ms":44,"heap_kb":2624.5078125,"dom":318,"poll_ms":0.5201999999999998,"kept":true,"errors":[]}
-preact {"card_ms":101.90000000037253,"fcp_ms":44,"heap_kb":2143.2734375,"dom":315,"poll_ms":1.6954000000000005,"kept":true,"errors":[]}
 | candidate | first card (ms) | FCP (ms) | heap (KB) | elements | script per poll (ms) | cards kept | errors |
 |---|---|---|---|---|---|---|---|
-| vanilla | 85 | 32 | 1914 | 333 | 0.4 | yes | none |
-| lit | 97 | 84 | 2122 | 322 | 0.5 | yes | none |
-| vue | 92 | 44 | 2625 | 318 | 0.5 | yes | none |
-| preact | 102 | 44 | 2143 | 315 | 1.7 | yes | none |
+| baseline | 109 | 28 | 2026 | 569 | 0.5 | yes | none |
+| lit | 95 | 84 | 2122 | 322 | 0.5 | yes | none |
+| lit-esbuild | 106 | 92 | 2122 | 320 | 0.5 | yes | none |
+| lit-nobuild | 95 | 84 | 2140 | 327 | 0.5 | yes | none |
+| preact | 111 | 44 | 2132 | 315 | 1.8 | yes | none |
+| preact-esbuild | 105 | 48 | 2133 | 315 | 1.8 | yes | none |
+| solid | 118 | 48 | 2776 | 483 | 0.5 | yes | none |
+| solid-h | 116 | 48 | 2947 | 483 | 0.5 | yes | none |
+| vanilla | 102 | 36 | 1914 | 333 | 0.5 | yes | none |
+| vanilla-nobuild | 95 | 36 | 1922 | 334 | 0.4 | yes | none |

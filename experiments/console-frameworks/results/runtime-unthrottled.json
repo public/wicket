@@ -1,37 +1,91 @@
 {
- "vanilla": {
-  "card_ms": 84.70000000111759,
-  "fcp_ms": 32,
-  "heap_kb": 1914.06640625,
-  "dom": 333,
-  "poll_ms": 0.43520000000000003,
+ "baseline": {
+  "card_ms": 108.5,
+  "fcp_ms": 28,
+  "heap_kb": 2025.89453125,
+  "dom": 569,
+  "poll_ms": 0.5416000000000001,
   "kept": true,
   "errors": []
  },
  "lit": {
-  "card_ms": 97,
+  "card_ms": 95.40000000037253,
   "fcp_ms": 84,
-  "heap_kb": 2121.7265625,
+  "heap_kb": 2121.66015625,
   "dom": 322,
-  "poll_ms": 0.5227999999999999,
+  "poll_ms": 0.4782,
   "kept": true,
   "errors": []
  },
- "vue": {
-  "card_ms": 92.20000000111759,
-  "fcp_ms": 44,
-  "heap_kb": 2624.5078125,
-  "dom": 318,
-  "poll_ms": 0.5201999999999998,
+ "lit-esbuild": {
+  "card_ms": 106.09999999962747,
+  "fcp_ms": 92,
+  "heap_kb": 2121.953125,
+  "dom": 320,
+  "poll_ms": 0.5158,
+  "kept": true,
+  "errors": []
+ },
+ "lit-nobuild": {
+  "card_ms": 95,
+  "fcp_ms": 84,
+  "heap_kb": 2139.83203125,
+  "dom": 327,
+  "poll_ms": 0.5164000000000001,
   "kept": true,
   "errors": []
  },
  "preact": {
-  "card_ms": 101.90000000037253,
+  "card_ms": 110.80000000074506,
   "fcp_ms": 44,
-  "heap_kb": 2143.2734375,
+  "heap_kb": 2132.015625,
   "dom": 315,
-  "poll_ms": 1.6954000000000005,
+  "poll_ms": 1.8261999999999996,
+  "kept": true,
+  "errors": []
+ },
+ "preact-esbuild": {
+  "card_ms": 105.09999999962747,
+  "fcp_ms": 48,
+  "heap_kb": 2133.47265625,
+  "dom": 315,
+  "poll_ms": 1.7617999999999998,
+  "kept": true,
+  "errors": []
+ },
+ "solid": {
+  "card_ms": 118.10000000149012,
+  "fcp_ms": 48,
+  "heap_kb": 2776.29296875,
+  "dom": 483,
+  "poll_ms": 0.5007999999999998,
+  "kept": true,
+  "errors": []
+ },
+ "solid-h": {
+  "card_ms": 115.90000000037253,
+  "fcp_ms": 48,
+  "heap_kb": 2946.55078125,
+  "dom": 483,
+  "poll_ms": 0.5062,
+  "kept": true,
+  "errors": []
+ },
+ "vanilla": {
+  "card_ms": 102.20000000111759,
+  "fcp_ms": 36,
+  "heap_kb": 1914.06640625,
+  "dom": 333,
+  "poll_ms": 0.4696000000000001,
+  "kept": true,
+  "errors": []
+ },
+ "vanilla-nobuild": {
+  "card_ms": 95.40000000037253,
+  "fcp_ms": 36,
+  "heap_kb": 1922.44921875,
+  "dom": 334,
+  "poll_ms": 0.4438,
   "kept": true,
   "errors": []
  }

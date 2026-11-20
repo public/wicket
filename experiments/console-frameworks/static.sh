@@ -5,8 +5,13 @@
 #
 # For each: gzip -9 of what the browser loads (the baseline: console.js and console.css; a prototype:
 # dist/app.js and dist/app.css); the packages in package-lock.json, all and runtime only (not "dev");
-# node_modules' size; the wall time of `npm ci && npm run build` from clean; whether a second clean
+# node_modules' size; the wall time of the install and `npm run build` from clean; whether a second clean
 # build gives the same bytes; and the lines of the prototype's own source (src/, without helpers.*).
+#
+# The lockfiles were measured, then removed from the repository (#737 review), so the experiment
+# isn't scanned for updates to code wicket will never ship. Without one, the install resolves each
+# package.json's exact versions afresh: their own dependencies may resolve to newer versions than were
+# measured. The first install writes a lockfile (git-ignored), and the rebuild check reuses it.
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$here"
@@ -24,6 +29,7 @@ for n in "${names[@]}"; do
   (
     cd "$n"
     rm -rf node_modules dist
+    [ -f package-lock.json ] || npm install --ignore-scripts --no-audit --no-fund --package-lock-only >/dev/null 2>&1
     t0=$(date +%s.%N); npm ci --ignore-scripts --no-audit --no-fund >/dev/null 2>&1; npm run build >/dev/null 2>&1; t1=$(date +%s.%N)
     h1=$(cat dist/app.js dist/app.css | sha256sum)
     rm -rf node_modules dist; npm ci --ignore-scripts --no-audit --no-fund >/dev/null 2>&1; npm run build >/dev/null 2>&1
