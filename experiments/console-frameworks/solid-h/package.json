@@ -1,0 +1,15 @@
+{
+  "name": "wicket-console-solid-h",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "solid-js": "1.9.20"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}
