@@ -73,6 +73,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Performance of the network path](explanation/performance.md)
 - [One feed publisher per node](explanation/feed-publisher.md)
 - [How updates work](explanation/updates.md)
+- [Supply chain](explanation/supply-chain.md): what the build, CI and the installers download, and how each is checked
 - The design and the research behind it:
   - [Design](explanation/design.md) (v0.2; much of it not built yet)
   - [One decision path](explanation/one-decision-path.md): where the control host still decides per

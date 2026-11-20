@@ -94,7 +94,17 @@ if [ "$skip_gvisor" = 0 ]; then
     say "gVisor"
     if ! command -v runsc >/dev/null; then
         arch=$(dpkg --print-architecture)
-        curl -fsSL --max-time 60 --retry 3 https://gvisor.dev/archive.key | gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+        # gVisor's apt signing key, accepted only if it is the one key with the fingerprint pinned
+        # here (#722): a key fetched at install time could be anyone's, and a second key appended
+        # to it would be trusted too.
+        fpr=6F1DF85E3A71C24918E727D56FC6D554E32BD943
+        kd=$(mktemp -d)
+        key=$kd/archive.key
+        curl -fsSL --max-time 60 --retry 3 -o "$key" https://gvisor.dev/archive.key
+        got=$(GNUPGHOME=$kd gpg --show-keys --with-colons "$key" | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { print $10; p = 0 }')
+        [ "$got" = "$fpr" ] || { rm -rf "$kd"; die "gVisor's apt key is not the pinned $fpr (got ${got:-nothing})"; }
+        GNUPGHOME=$kd gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg <"$key"
+        rm -rf "$kd"
         echo "deb [arch=$arch signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
             >/etc/apt/sources.list.d/gvisor.list
         # gVisor's repository is sometimes caught mid-sync ("File has unexpected size"): retry.
