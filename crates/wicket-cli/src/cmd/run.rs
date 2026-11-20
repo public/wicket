@@ -8,8 +8,8 @@ use crate::*;
 /// Runs one of this group's commands.
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
-        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id } => {
-            run::run(run::RunOpts {
+        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id } => ended(
+            run::run_to_end(run::RunOpts {
                 manifest: &manifest,
                 workdir: workdir.as_deref(),
                 workspace_dir: workspace_dir.as_deref(),
@@ -26,10 +26,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 adopt: None,
                 stop: None,
             })
-            .await
-        }
-        Cmd::Wrap { manifest, image, argv } => {
-            run::run(run::RunOpts {
+            .await,
+        ),
+        Cmd::Wrap { manifest, image, argv } => ended(
+            run::run_to_end(run::RunOpts {
                 manifest: &manifest,
                 workdir: None,
                 workspace_dir: None,
@@ -46,8 +46,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 adopt: None,
                 stop: None,
             })
-            .await
-        }
+            .await,
+        ),
         Cmd::Attach { run } => run::run(run::RunOpts {
             manifest: std::path::Path::new("(the run's record)"),
             workdir: None,
@@ -71,18 +71,29 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             let text = text.join(" ");
             let text = (!text.trim().is_empty()).then_some(text);
             if no_wait && text.is_none() {
-                bail!("--no-wait needs a prompt to send");
+                return Err(wicket_home::exit::usage("--no-wait needs a prompt to send"));
             }
             session::open(session::Opts { run, text, wait: !no_wait, timeout: timeout.map(std::time::Duration::from_secs) }).await
         }
         Cmd::Hibernate { run, wait } => hibernate::hibernate(&run, wait).await,
         Cmd::Wake { agent, text, by, wait } => {
             let text = text.join(" ");
-            let wait = wicket_core::time::parse_duration(&wait).context("bad --wait")?;
+            let wait =
+                wicket_core::time::parse_duration(&wait).map_err(|e| wicket_home::exit::usage(format!("bad --wait {wait:?}: {e}")))?;
             hibernate::wake(&agent, (!text.trim().is_empty()).then_some(text), by, wait).await
         }
         Cmd::Agents { json } => hibernate::list(json),
         Cmd::WhyHere { run, json } => wicket_control::whyhere::why_here(&run, json),
         _ => unreachable!("dispatched to the wrong command group"),
+    }
+}
+
+/// How `wicket run` and `wicket wrap` end (#574): 0 unless the box failed (a non-zero exit, out of
+/// memory, over a cap) or timed out, which is exit 1. Its status line is already printed.
+fn ended(r: Result<String>) -> Result<()> {
+    let status = r?;
+    match run::box_failed(&status) {
+        true => bail!("the run ended: {status}"),
+        false => Ok(()),
     }
 }

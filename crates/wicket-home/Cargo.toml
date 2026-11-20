@@ -13,6 +13,7 @@ testkit = ["getrandom/sys_rng"]
 [dependencies]
 wicket-core.workspace = true
 wicket-store.workspace = true
+wicket-placement.workspace = true
 wicket-sandbox.workspace = true
 wicket-proxy.workspace = true
 wicket-agent.workspace = true

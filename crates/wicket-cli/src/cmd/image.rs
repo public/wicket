@@ -12,7 +12,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             let d = wicket_sandbox::Docker::from_env();
             for r in &refs {
                 wicket_core::image::parse(r).map_err(anyhow::Error::msg)?;
-                let i = d.image_identity(r).await?.with_context(|| format!("no image {r} here"))?;
+                let i = d.image_identity(r).await?.ok_or_else(|| wicket_home::exit::not_found(format!("no image {r} here")))?;
                 println!("{r} {}", i.id);
             }
             Ok(())

@@ -284,7 +284,13 @@ fn the_lockfile_selects_what_its_change_rebuilds() {
     // Compared with itself, the lockfile changes no crate's build; wicket-policy's test reads it.
     check(&["Cargo.lock"], &["wicket-policy", "wicket-policy-diff", "wicket-control", "wicket-cli"], &with(CLI, &["policy", "fuzz-manifest"]));
     // A crate's manifest is its crate's (and its simulated build's).
-    check(&["crates/wicket-placement/Cargo.toml"], &["wicket-placement", "wicket-control", "wicket-cli", "wicket-sim"], CLI);
+    // wicket-home classifies placement's errors into exit codes (#574), so it and wicket-node (and
+    // the node suites) come with it.
+    check(
+        &["crates/wicket-placement/Cargo.toml"],
+        &["wicket-placement", "wicket-home", "wicket-node", "wicket-control", "wicket-cli", "wicket-sim"],
+        &with(CLI, NODES),
+    );
 }
 
 #[test]
