@@ -1477,6 +1477,19 @@ mod tests {
         assert!(capacity_ask(&json!({ "duration_minutes": 0, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(capacity_ask(&json!({ "duration_minutes": 100000, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(wicket_proxy::gateway::tools().as_array().unwrap().iter().any(|t| t["name"] == "request_capacity"));
+        // #731: a region is a provider's region name, or nothing; a string, trimmed.
+        let with = |r: Value| {
+            let mut a = json!({ "duration_minutes": 10, "max_hourly_usd": "0.01", "reason": "x" });
+            a["region"] = r;
+            capacity_ask(&a)
+        };
+        assert_eq!(with(json!(null)).unwrap().region, None);
+        assert_eq!(with(json!(" lhr ")).unwrap().region.as_deref(), Some("lhr"));
+        assert_eq!(with(json!("us-east-1")).unwrap().region.as_deref(), Some("us-east-1"));
+        assert!(with(json!(7)).unwrap_err().contains("a string"));
+        for bad in ["lhr\nfor 1 minute", "lhr\u{202e}", "lhr, at no cost", "\u{43b}hr", "LHR", ""] {
+            assert!(with(json!(bad)).unwrap_err().contains("region name"), "{bad:?}");
+        }
     }
 
     /// #231: `await_grant` answers "granted" only once the box's node has the grant: not between the

@@ -545,6 +545,17 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
         }
         v.join("; ")
     };
+    // The same, comma-separated, for the values of one entry. A string that already holds quoted
+    // values is never clipped again (#731 review): a clip could cut a closing quote off. Each value
+    // is bounded by `shown`, and their number here.
+    let values = |items: Vec<String>, max: usize| {
+        let n = items.len();
+        let mut v: Vec<String> = items.into_iter().take(max).collect();
+        if n > max {
+            v.push(format!("and {} more", n - max));
+        }
+        v.join(", ")
+    };
     let model = match &z.llm {
         Some(l) => format!(
             "model route {} via {} with secret {} (this zone's own), {} requests, {} output tokens, {} input tokens, {}{}",
@@ -557,7 +568,7 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
             match &l.models {
                 None => "any model".to_string(),
                 Some(ms) if ms.is_empty() => "no models".to_string(),
-                Some(ms) => format!("models {}", ms.iter().map(|m| shown(m, 128)).collect::<Vec<_>>().join(", ")),
+                Some(ms) => format!("models {}", values(ms.iter().map(|m| shown(m, 128)).collect(), 8)),
             },
             if l.allow_server_tools { ", server-side tools allowed" } else { "" }
         ),
@@ -584,13 +595,9 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
                 let methods = if r.methods.is_empty() {
                     "GET, HEAD".to_string()
                 } else {
-                    r.methods.iter().map(|m| shown(m, 60)).collect::<Vec<_>>().join(", ")
+                    values(r.methods.iter().map(|m| shown(m, 60)).collect(), 8)
                 };
-                let paths = if r.paths.is_empty() {
-                    "/**".to_string()
-                } else {
-                    r.paths.iter().map(|p| shown(p, 200)).collect::<Vec<_>>().join(", ")
-                };
+                let paths = if r.paths.is_empty() { "/**".to_string() } else { values(r.paths.iter().map(|p| shown(p, 200)).collect(), 8) };
                 let decode = if r.decode_slash.is_empty() {
                     String::new()
                 } else {
@@ -598,9 +605,9 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
                 };
                 format!(
                     "{} {} {}{}{decode}",
-                    clip(&methods, 60),
+                    methods,
                     shown(&r.host, 120),
-                    clip(&paths, 200),
+                    paths,
                     if r.allow_dangerous { " (allow_dangerous)" } else { "" }
                 )
             })
@@ -612,9 +619,7 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
     let forbid = list(
         z.forbid
             .iter()
-            .map(|f| {
-                format!("{} {}", shown(&f.host, 120), clip(&f.paths.iter().map(|p| shown(p, 200)).collect::<Vec<_>>().join(", "), 200))
-            })
+            .map(|f| format!("{} {}", shown(&f.host, 120), values(f.paths.iter().map(|p| shown(p, 200)).collect(), 8)))
             .collect(),
         12,
     );
@@ -626,7 +631,9 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
         "start {kind} {} in zone {}, beyond this agent's own. It exceeds: {}. It gets: {model}; {inject}; reach {}; forbid {}; unlisted hosts {:?}; isolation {:?}; image {}; may start images {}; accepts messages from {}; volumes {}; memory {}, cpus {}, pids {}, timeout {}; may start {children} box(es).",
         clip(name, 40),
         clip(&z.name, 200),
-        list(violations.iter().map(|v| clip(v, 240)).collect(), 16),
+        // Each violation's values are `shown` where it is written (subset.rs): bounded, and never
+        // clipped again here.
+        list(violations.to_vec(), 16),
         or_none(reach),
         or_none(forbid),
         z.unlisted_hosts,
@@ -1266,6 +1273,18 @@ mod tests {
         assert!(r.reason.contains(r#""GET; no other reach, no model route" other.example.org "/x, and nothing else/**""#), "{}", r.reason);
         assert!(r.reason.contains("GET api.example.com /**"), "{}", r.reason);
         assert!(r.reason.contains(r#"It exceeds: reach rule 1: "GET; no other reach, no model route" other.example.org"#), "{}", r.reason);
+        // A long value is clipped inside its own quotes, never by a clip of the text around it
+        // (#731 review): every quote the agent's values open is closed.
+        let p = parent(2, zone);
+        let (method, path) = ("X".repeat(70), format!("/{}", "a b".repeat(80)));
+        let long = json!({ "reach": [{ "host": "api.example.com", "methods": ["GET"] }, { "host": "other.example.org", "methods": [method], "paths": [path] }] });
+        assert!(spawn(&p.ctx, agent(long)).unwrap().starts_with("needs approval: request r-"));
+        let r = p.ctx.ledger.lock().unwrap().pending(&wicket_core::TenantId::single()).unwrap().pop().unwrap();
+        let clipped_method = format!("\"{}\\u{{2026}}\"", "X".repeat(60));
+        assert!(r.reason.contains(&format!("{clipped_method} other.example.org \"/a ba ba")), "{}", r.reason);
+        assert!(r.reason.contains("\\u{2026}\"; forbid"), "the path's quote closes before what follows: {}", r.reason);
+        let unescaped = r.reason.replace("\\\"", "");
+        assert_eq!(unescaped.matches('"').count() % 2, 0, "quotes pair up: {}", r.reason);
     }
 
     /// #369: a spawn beyond the parent is approved for exactly its arguments. While it is pending,

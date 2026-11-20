@@ -35,13 +35,16 @@ pub fn clip(s: &str, n: usize) -> String {
 /// A value someone other than wicket chose (an agent's zone's host, glob, method, name), for a
 /// sentence wicket writes (#731): [`clip`]ped to `n`, and shown as is when it is one plain token,
 /// quoted (`{:?}`) when it has anything that could read as wicket's own words (spaces, commas,
-/// semicolons, quotes), so no value passes for the sentence's terms.
+/// semicolons, quotes), so no value passes for the sentence's terms. Quoted, it is escaped as
+/// [`char::escape_default`] does: quotes, backslashes and every character outside printable ASCII.
 pub fn shown(s: &str, n: usize) -> String {
     let c = clip(s, n);
     if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric() || "-._/*:@{}[]?=+~%!$&()#^|<>".contains(ch)) {
         c
     } else {
-        format!("{c:?}")
+        // Every character that isn't plain ASCII escaped, as `\u{…}`: a look-alike of a quote
+        // (” ″ « ») can't seem to end the value early (#731 review).
+        format!("\"{}\"", c.escape_default())
     }
 }
 
@@ -135,6 +138,12 @@ mod tests {
         assert_eq!(shown("a, b", 200), r#""a, b""#);
         assert_eq!(shown(r#"x" and "y"#, 200), r#""x\" and \"y""#);
         assert_eq!(shown("", 200), r#""""#);
+        // Look-alikes of a quote, and anything else outside printable ASCII, are escaped.
+        assert_eq!(shown("x” and “y", 200), r#""x\u{201d} and \u{201c}y""#);
+        for lookalike in ['\u{201d}', '\u{2033}', '\u{ab}', '\u{bb}', '\u{ff02}'] {
+            let s = shown(&format!("a{lookalike}b"), 200);
+            assert!(s.is_ascii() && s.starts_with('"') && s.ends_with('"') && s.matches('"').count() == 2, "{s}");
+        }
     }
 
     #[test]

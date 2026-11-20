@@ -147,6 +147,10 @@ impl PlacementConfig {
         }
         for h in &c.static_hosts {
             crate::enrol::validate_name(&h.name)?;
+            // The shape an agent's region preference is held to (#731), so the two compare.
+            if let Some(r) = &h.region {
+                wicket_proxy::check_region(r).map_err(anyhow::Error::msg).with_context(|| format!("static_hosts {}: region", h.name))?;
+            }
         }
         Ok(c)
     }
@@ -324,7 +328,8 @@ pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId
     let rid = filed.id().to_string();
     // The agent's own words, apart from wicket's (#715, #731), for the console to quote as its.
     if matches!(filed, wicket_store::Filed::New(_) | wicket_store::Filed::Existing(_)) {
-        l.set_request_claims(&rid, &serde_json::json!({ "reason": a.reason, "region": a.region }))?;
+        // Not a failure of the ask: the request is filed and the lease linked below either way.
+        let _ = l.set_request_claims(&rid, &serde_json::json!({ "reason": a.reason, "region": a.region }));
     }
     l.set_lease_request(&id, &rid)?;
     l.audit(
