@@ -152,6 +152,50 @@ are transport. The steps:
 
 Step 7 comes after step 8, and in the same protocol (22) if it is ready before 22 is released.
 
+### Step 7: one message decision, at the receiver's node (proposed)
+
+Today one rule (`wicket_core::message::relation`: to a child, to a parent, the receiver's
+`accept_from`, a reply), plus the receiver's org layer, is applied in two places from two sources:
+by the control host's `RunCtx::send` from the ledger's identity records, while the sender's node
+is connected, and by `nodegw::send_local` from both boxes' tokens, while it is cut off. The
+proposal is that it is applied once, by the receiver's node, from the receiver's token.
+
+- **The control host routes.** `send_message` still reaches the control host as a
+  `ControlTool::SendMessage` call (signing needs the sender's identity, which stays there). It
+  checks what only it can: the sender's identity is live and not revoked, the body's size, that
+  the recipient is an agent of the tenant, and that an `in_reply_to` names a message the recipient
+  sent the sender. It signs the envelope, stores the message with its routing facts (the sender's
+  principal, zone and box path, and whether it is a reply), and answers `routed` (or `held`, with
+  no live run). It no longer reads `accept_from` or the org layer.
+- **The receiver's node decides.** When it takes a message for its box (`await_message`'s answer,
+  or push delivery), it applies `relation` from the receiver's token (its `accept_from`, its box
+  path for parent and child, its org layer) and the routing facts. A refused message never reaches
+  the box: the node says so (`Msg::MessageRefused { run, id, why }`), the control host records the
+  receipt as `refused` and audits `message.refused`, and the node takes the next one. A message
+  between two boxes of one node while it is cut off (`send_local`) is decided by the same function
+  on the same node, so the rule has one implementation, at the receiver's edge.
+- **Receipts.** `routed` and `held` are new states before `delivered`. A refusal reaches the sender
+  on its receipt (`receipts` with `message_id`, which can wait for it), not as the answer to
+  `send_message`.
+
+**Two questions for review before this is built:**
+
+1. **Waking.** A hibernated recipient has no box and no node to decide. If waking stays as it is
+   (any routed message wakes it), any agent in the tenant can wake any hibernated agent with a
+   message its node will refuse, which spends a wake (a box start) each time. The proposal: the
+   control host decides the *wake*, a lifecycle action as #253 keeps them, from the recipient's
+   recorded `accept_from` and org layer; a message that wouldn't be accepted is held for the
+   agent's next run instead of waking it, and still decided at its node then. That keeps a check
+   of the same rule on the control host, for waking only.
+2. **Refusals arrive later.** Today an agent that messages a principal that doesn't accept it is
+   told at once (`refused: ...`). After this it is told `routed`, and learns of the refusal only
+   from its receipt. An agent that never reads receipts never learns. The alternative is that
+   `send_message` waits a short while (a few seconds) for the receiver's node to decide, when the
+   receiver's box is running and its node connected, and answers with the decision if it came.
+
+A protocol bump (22 if it lands before 22 is released): `Msg::MessageRefused`, the routing facts
+in `await_message`'s answer, and the new receipt states.
+
 ### Step 8: how the node reads the harness's control lines
 
 A tool prompt is not an enforcement point. The harness runs in the box, and the box is hostile
