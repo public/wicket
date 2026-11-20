@@ -177,12 +177,16 @@ fn generic_key(k: &str) -> bool {
 
 /// A generic webhook's fields: the top-level scalars of a JSON object body (strings, numbers,
 /// bools), at most [`MAX_GENERIC_FIELDS`], keys `[a-z0-9_.-]` of at most 64 bytes, strings cut at
-/// [`MAX_GENERIC_VALUE`]. Anything else in the body (nested values, other keys) is dropped. A body
-/// that isn't a JSON object gives no fields.
+/// [`MAX_GENERIC_VALUE`], the first by key order kept. Anything else in the body (nested values,
+/// other keys) is dropped. A body that isn't a JSON object gives no fields.
 pub fn generic_fields(body: &[u8]) -> Value {
     let mut out = Map::new();
     let Ok(Value::Object(m)) = serde_json::from_slice::<Value>(body) else { return Value::Object(out) };
-    for (k, v) in m {
+    // In key order, whatever order the body had (and whether serde_json keeps it): which keys
+    // are kept under the cap doesn't depend on how the sender ordered them.
+    let mut entries: Vec<(String, Value)> = m.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (k, v) in entries {
         if out.len() >= MAX_GENERIC_FIELDS {
             break;
         }
