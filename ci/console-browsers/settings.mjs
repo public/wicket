@@ -59,6 +59,15 @@ async function check(engine) {
   });
   const poll = () => page.evaluate(async () => { while (polling) await new Promise(r => setTimeout(r, 20)); await refresh(); });
   const settle = () => page.waitForTimeout(900);
+  // What a tap posted (Revoke) has arrived: waited for, up to 5 s.
+  const until = async f => { for (let i = 0; i < 100 && !f(); i++) await page.waitForTimeout(50); };
+  // A tap that asks the server to sign: its begin request has arrived before what it asked is read.
+  const signs = async locator => {
+    const n = begun.length;
+    await locator.click();
+    await until(() => begun.length > n);
+    assert.ok(begun.length > n, "the tap asked the server to sign");
+  };
   const cancelSheet = async () => { await page.waitForSelector("#confirm:not([hidden])"); await settle(); await page.click("#confirm-cancel"); await page.waitForSelector("#confirm", { state: "hidden" }); };
   try {
     await page.goto(url);
@@ -76,7 +85,7 @@ async function check(engine) {
     assert.strictEqual(await page.locator("#capacity img").count(), 0, "a principal stays text");
     // Renew is signed.
     await settle();
-    await cap.locator("button", { hasText: "Renew" }).click();
+    await signs(cap.locator("button", { hasText: "Renew" }));
     assert.deepStrictEqual([begun.at(-1).action, begun.at(-1).id, begun.at(-1).ttl_secs], ["capacity_renew", "g-cap1", 28800]);
     await cancelSheet();
     // Revoke asks first; nothing is sent until its own button; Cancel puts the row back.
@@ -93,8 +102,7 @@ async function check(engine) {
     assert.strictEqual(posted.length, 0, "a tap just after the question appeared is ignored");
     await settle();
     await btn("Revoke").click();
-    await page.waitForFunction(() => true);
-    await page.waitForTimeout(200);
+    await until(() => posted.length);
     assert.deepStrictEqual(posted, [["/api/capacity/revoke", { id: "g-cap1" }]]);
 
     // The form: seven fields, kept across polls, issuing exactly what was typed.
@@ -106,7 +114,7 @@ async function check(engine) {
     await poll();
     assert.strictEqual(await inputs.nth(0).inputValue(), "unix/alex", "what was typed survives a poll");
     await settle();
-    await page.locator("#capacity-form button", { hasText: "Grant" }).click();
+    await signs(page.locator("#capacity-form button", { hasText: "Grant" }));
     const gb = begun.at(-1);
     assert.deepStrictEqual([gb.action, gb.principal, gb.plans, gb.regions, gb.max_hourly_usd, gb.max_daily_usd, gb.nodes, gb.ttl_secs],
       ["capacity_grant", "unix/alex", "vc2-1c-2gb", "lhr", "0.05", "1", 2, 14400]);
@@ -207,11 +215,11 @@ async function check(engine) {
     await poll();
     assert.ok(await page.evaluate(() => document.querySelector("#standing-asks .always").__mark === 1), "an unchanged ask is kept across a poll");
     await settle();
-    await page.locator("#standing-asks button", { hasText: "Always: only what it used" }).click();
+    await signs(page.locator("#standing-asks button", { hasText: "Always: only what it used" }));
     assert.deepStrictEqual([begun.at(-1).action, begun.at(-1).id, begun.at(-1).for, begun.at(-1).narrow], ["standing_approve", "s-1", "agent", true]);
     await cancelSheet();
     await settle();
-    await page.locator("#standing-asks button", { hasText: "Don't allow" }).click();
+    await signs(page.locator("#standing-asks button", { hasText: "Don't allow" }));
     assert.deepStrictEqual([begun.at(-1).action, begun.at(-1).id], ["standing_deny", "s-1"]);
     await cancelSheet();
 
@@ -225,7 +233,7 @@ async function check(engine) {
     assert.ok((await sr.textContent()).includes("Runs it allows lose it at once."));
     await settle();
     await sr.locator("button", { hasText: /^Revoke$/ }).click();
-    await page.waitForTimeout(200);
+    await until(() => posted.some(([p]) => p === "/api/standing/revoke"));
     assert.deepStrictEqual(posted.at(-1), ["/api/standing/revoke", { id: "s-2" }]);
     // A rule that allows dangerous requests says so on its row.
     state = { ...base, standing: { asks: [], rules: [{ ...rule, rule: { ...rule.rule, allow_dangerous: true } }] } };
