@@ -14,6 +14,13 @@ EnvironmentFile=/etc/wicket/console.env
 ExecStart=/var/lib/wicket-versions/current/wicket serve $WICKET_CONSOLE_ARGS
 UMask=0077
 NoNewPrivileges=yes
+# Limits for many boxes (#582 step 4; docs/reference/daemon.md#limits): every supervisor it
+# starts is a process in this unit's cgroup. TasksMax counts their threads (about 6 each, a
+# two-worker runtime and its blocking pool), so 262144 covers 10,000 supervisors with room; the
+# kernel's pid_max must allow as many (see the docs). LimitNOFILE is per process: a supervisor's
+# sockets, logs and ledger, and wicketd's callers' descriptors.
+LimitNOFILE=1048576
+TasksMax=262144
 ProtectSystem=full
 Restart=on-failure
 # Runs started from the console are their own process groups: restarting the console keeps them.

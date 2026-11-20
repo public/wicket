@@ -313,6 +313,29 @@ wicket node revoke n1
 - **For now.** Gateway tools beyond #164's are still decided on the control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
   the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
 
+## Limits
+
+A node runs every box's relays in one process, `wicket node serve`, a systemd user service of the
+`wicket` user, and the control host reaches each box over its own ssh session
+([#582](https://github.com/public/wicket/issues/582) step 4). `deploy/vultr/node-setup.sh` (and
+so every node `wicket node create` makes) sets what that needs. On a node you set up yourself, set
+the same:
+
+- **sshd** (`/etc/ssh/sshd_config.d/60-wicket.conf`, then reload sshd):
+  - `MaxSessions 512`: the control host multiplexes every run's session on one connection per
+    node. The default of 10 refuses the eleventh box on a node.
+  - `MaxStartups 64:30:256`: bursts of new connections, such as every run reattaching after a
+    control-host restart, aren't dropped.
+- **The unit** (`wicket node install` writes it): `LimitNOFILE=524288` (the user manager's own hard
+  limit) and `TasksMax=infinity`.
+- **The wicket user's slice** (`/etc/systemd/system/user-<uid>.slice.d/60-wicket.conf`):
+  `[Slice]` `TasksMax=infinity`, so the user manager's default doesn't cap the node's threads.
+- **The kernel**, for thousands of boxes: `kernel.pid_max` and `kernel.threads-max`, as on the
+  control host ([daemon limits](daemon.md#limits)).
+
+Once supervisors are tasks in a few processes, with one channel per node (step 5), the session
+count stops growing with boxes.
+
 ## Health, admission and disk ([#377](https://github.com/public/wicket/issues/377))
 
 - **Health.** Every 30 s, on each control connection that speaks protocol 12 or later, a node reports its

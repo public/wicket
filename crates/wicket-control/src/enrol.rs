@@ -540,6 +540,11 @@ After=docker.service
 ExecStart=%h/.local/bin/wicket node serve
 Restart=always
 RestartSec=2
+# Limits for many boxes (#582 step 4; docs/reference/nodes.md#limits): one process relays every
+# box on the node. 524288 is the user manager's own hard limit on files; the tasks are bounded by
+# the wicket user's slice, which deploy/vultr/node-setup.sh raises.
+LimitNOFILE=524288
+TasksMax=infinity
 
 [Install]
 WantedBy=default.target

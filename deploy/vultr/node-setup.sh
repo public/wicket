@@ -40,6 +40,24 @@ install -m 600 -o wicket -g wicket /root/.ssh/authorized_keys /home/wicket/.ssh/
 # `wicket node serve` runs as a systemd user service of `wicket`: keep its user manager running.
 loginctl enable-linger wicket
 
+# Limits for many boxes (#582 step 4; docs/reference/nodes.md#limits). The control host runs each
+# box's supervisor over its own ssh session, multiplexed on one shared connection per node: sshd's
+# default of 10 sessions a connection would refuse the eleventh box. MaxStartups allows bursts of
+# new connections (box starts after a control-host restart) before sshd starts dropping them.
+install -d -m 755 /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/60-wicket.conf <<'SSHD'
+MaxSessions 512
+MaxStartups 64:30:256
+SSHD
+sshd -t
+systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+# The wicket user's slice holds `wicket node serve` and every thread it runs: no task limit beyond
+# the kernel's.
+uid=$(id -u wicket)
+install -d -m 755 "/etc/systemd/system/user-$uid.slice.d"
+printf '[Slice]\nTasksMax=infinity\n' > "/etc/systemd/system/user-$uid.slice.d/60-wicket.conf"
+systemctl daemon-reload
+
 docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
 runsc --version | sed -n 1p   # sed reads it all: head would close the pipe early (SIGPIPE under pipefail)
 echo "node ready"
