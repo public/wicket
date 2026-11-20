@@ -75,7 +75,9 @@ pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
 mod writer;
 pub use writer::{AuditWriter, Ticket, WriterConfig};
 mod export;
+mod hosts;
 pub use export::{ExportCursor, EXPORT_LEASE_SECS};
+pub use hosts::{lapsed_alone, SupervisorHost, Taken as ShardTaken};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -103,6 +105,10 @@ pub enum StoreError {
     EffectChanged(String, String, String),
     #[error("{0}: an egress grant is decided and counted on the box's node, never consumed by the ledger (#257)")]
     EgressGrant(String),
+    #[error("shard {0} is held by another supervisor host for {1} s more")]
+    ShardHeld(String, i64),
+    #[error("shard {0} is no longer this supervisor host's at epoch {1}: it was taken at a higher one")]
+    ShardLost(String, i64),
     #[error("this ledger was migrated by a newer wicket (schema {version}), past a step this build (schema {SCHEMA_VERSION}) can't read: roll forward, or restore the snapshot taken before that update")]
     TooNew { version: u32, floor: u32 },
     #[error("this ledger is schema {version}, older than schema {UPGRADES_FROM}, the oldest this build upgrades: open it once with a wicket build that still upgrades it (main at {STEP_THROUGH}), then with this one")]
@@ -235,6 +241,10 @@ impl StoreError {
 /// their way into a run's token on its node, and which the node confirmed, so `await_grant` on a
 /// standing ask answers once the box's node can honour it. Older builds don't read it; the floor
 /// stays 17.
+/// Version 42 (expand, #582 step 5; 38 to 41 are others' in flight) adds `supervisor_hosts`,
+/// `shard_nodes` and `runs.host`: supervisor hosts, the shards of nodes they hold under a lease at
+/// an epoch, and which shard's host supervises each run (`hosts`). Older builds don't read them;
+/// the floor stays 17.
 /// Version 43 (expand, #748; 38 to 42 are others' in flight) adds `name_records.missing_since`:
 /// when a listing of its zone first lacked the record, so one listing alone forgets none. Older
 /// builds don't read it; the floor stays 17.
@@ -651,6 +661,8 @@ impl Ledger {
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         names::migrate(&conn)?;
+        conn.execute_batch(hosts::SCHEMA)?;
+        hosts::migrate(&conn)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -710,6 +722,8 @@ impl Ledger {
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         names::migrate(&conn)?;
+        conn.execute_batch(hosts::SCHEMA)?;
+        hosts::migrate(&conn)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })

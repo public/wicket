@@ -1119,7 +1119,8 @@ fn want_ca_hosts(sh: &Shared) -> Vec<String> {
 
 /// Makes sure node `node` has image `pin` (#191): if it hasn't, this host's runtime exports it as an
 /// OCI image layout, and the node verifies it against the pin before importing it. If this host
-/// hasn't it either, nothing is sent, and the node refuses the box as before.
+/// hasn't it either, it fails saying so: the image can't reach the node (it may have removed it
+/// once unused, #191).
 ///
 /// With `pull` (the image's registry is allowed in `images.yaml`), the node pulls it from there
 /// itself first, host-side; if that fails, this host sends it if it can.
@@ -1157,8 +1158,11 @@ pub async fn deliver_image(
                 e.context(format!("pulling it from {}, and this host hasn't it to send", pull.map(|p| p.host.as_str()).unwrap_or("")))
             );
         }
-        say!("[wicket] node {node} hasn't image {pin}, and this host hasn't it to send");
-        return Ok(());
+        // Not here either (a node may have removed an image it was given once unused, #191): said
+        // plainly, rather than the node's refusal later.
+        bail!(
+            "node {node} hasn't image {image} ({pin}), and this host hasn't it to send: load it here (docker pull {image}), or list its registry in images.yaml so the node pulls it"
+        );
     }
     say!("[wicket] sending image {image} ({pin}) to node {node}");
     let t0 = std::time::Instant::now();
@@ -1737,7 +1741,7 @@ async fn on_frame(
                 if !sh.ctl.keep {
                     // Decided first: a guard in the match's scrutinee would be held into its arms,
                     // which lock the ledger again (a deadlock).
-                    let refused = forget_refused(&sh.ledger.lock().expect("ledger"), &sh.node, &sh.run.0);
+                    let refused = forget_refused(&sh.ledger.lock().expect("ledger"), &sh.node, &sh.run.0, true);
                     match refused {
                         None => send(Frame::Msg(Msg::Forget { run })),
                         Some(why) => {
@@ -4010,12 +4014,21 @@ mod tests {
 
 /// Why `run`'s files on `node` aren't deleted yet (#377): its work hasn't been collected, and it is
 /// a remote node's (this host's own node keeps a run's files as its run directory). None: they may be.
-pub fn forget_refused(l: &wicket_store::Ledger, node: &str, run: &str) -> Option<String> {
-    if node == crate::localnode::NAME || l.collected(run).is_ok_and(|c| !c.is_empty()) {
+///
+/// Collected means its files came here (fetched or bundled) or a push of them was allowed (#590
+/// review), as the node hold and the simulation's invariant count it: a taken result alone
+/// (`outbox`) leaves a workspace that was to be fetched on the node. Unless `no_files`: a box whose
+/// workspace isn't kept to be fetched (`ctl.keep` off), where the result is all there is.
+pub fn forget_refused(l: &wicket_store::Ledger, node: &str, run: &str, no_files: bool) -> Option<String> {
+    let collected = |l: &wicket_store::Ledger| -> wicket_store::Result<bool> {
+        let how = l.collected(run)?;
+        Ok(l.files_collected(run)? || how.iter().any(|(h, _)| h == "pushed" || (no_files && h == "outbox")))
+    };
+    if node == crate::localnode::NAME || collected(l).unwrap_or(false) {
         return None;
     }
     Some(format!(
-        "run {run}'s work hasn't been collected (no fetch, outbox, push or bundle is recorded): node {node} keeps its workspace; `wicket node forget {run} --force` deletes it"
+        "run {run}'s work hasn't been collected (no fetch, push or bundle is recorded): node {node} keeps its workspace; `wicket node forget {run} --force` deletes it"
     ))
 }
 
@@ -4052,7 +4065,7 @@ pub async fn forget_command(run: &str, force: bool, by: &str) -> anyhow::Result<
     let (node, refused) = {
         let l = ledger.lock().expect("ledger");
         let node = l.run_node(run)?.with_context(|| format!("run {run} wasn't placed on a node"))?;
-        let refused = forget_refused(&l, &node, run);
+        let refused = forget_refused(&l, &node, run, false);
         (node, refused)
     };
     match (&refused, force) {
@@ -4087,16 +4100,23 @@ pub async fn forget_command(run: &str, force: bool, by: &str) -> anyhow::Result<
 
 #[cfg(test)]
 mod forget_tests {
-    /// #377: a remote node's files for a run whose work was never collected stay; collected any
-    /// way, or on this host's own node, they may go.
+    /// #377: a remote node's files for a run whose work was never collected stay; fetched,
+    /// bundled or pushed, or on this host's own node, they may go. A taken result alone leaves a
+    /// workspace that was to be fetched (#590 review), but is all a box without one has.
     #[test]
     fn an_uncollected_workspace_is_not_forgotten() {
         let l = wicket_store::Ledger::open_in_memory().unwrap();
-        let why = super::forget_refused(&l, "n1", "run_a").expect("refused");
+        let why = super::forget_refused(&l, "n1", "run_a", false).expect("refused");
         assert!(why.contains("hasn't been collected") && why.contains("--force"), "{why}");
-        assert!(super::forget_refused(&l, crate::localnode::NAME, "run_a").is_none(), "this host's own node keeps them anyway");
+        assert!(super::forget_refused(&l, crate::localnode::NAME, "run_a", false).is_none(), "this host's own node keeps them anyway");
         l.record_collected("run_a", "outbox").unwrap();
-        assert!(super::forget_refused(&l, "n1", "run_a").is_none());
+        assert!(super::forget_refused(&l, "n1", "run_a", false).is_some(), "an outbox alone: the workspace is still to fetch");
+        assert!(super::forget_refused(&l, "n1", "run_a", true).is_none(), "an outbox is all a box without a kept workspace has");
+        for how in ["pushed", "fetched", "bundled"] {
+            let run = format!("run_{how}");
+            l.record_collected(&run, how).unwrap();
+            assert!(super::forget_refused(&l, "n1", &run, false).is_none(), "{how}");
+        }
     }
 
     /// #453: a message the gateway gave on a link that dropped before its node said the box had
