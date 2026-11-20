@@ -291,7 +291,7 @@ for a kind to see its body):
 | secrets | `secret.set`, `secret.hosts`, `secret.removed`, `secret.refused` (the console's [secrets](console.md#secrets): by name, never a value) |
 | nodes | `node.token`, `node.enrolled`, `node.ca_renewed`, `node.revoked`, `node.audit`, `node.audit.restart`, `node.ask_queued`, `node.authority_expired`, `node.secret_fetch`, `node.secret_fetched`, `node.secret_unavailable`, `feed.refused`, `image.received`, `image.refused`, and a node's published ports (#575 step 4c): `name.port.opened`, `name.port.closed`, `name.port.failed`, `name.conn`, `name.conn.refused` |
 | placement | `lease.requested`, `lease.released`, `placement.node_created`, `placement.node_released`, `reconcile.<what>` (one per change a pass makes, such as `reconcile.destroyed` and `reconcile.run_adopted`) |
-| updates | `self.staged`, `self.snapshot`, `self.switched`, `self.health`, `self.committed`, `self.rolled_back`, `self.rollback_refused`, `self.update_refused`, `self.pruned`, `self.key_trusted`, `self.follow_update`, `self.follow_skipped`, `self.follow_failed` |
+| updates | `self.staged`, `self.snapshot`, `self.switched`, `self.health`, `self.committed`, `self.rolled_back`, `self.rollback_refused`, `feed.checkpointed`, `self.update_refused`, `self.pruned`, `self.key_trusted`, `self.follow_update`, `self.follow_skipped`, `self.follow_failed` |
 | state and keys | `state.kit`, `state.restored`, `keys.roots_offline`, `keys.roots_online`, `keys.certified` |
 
 A node's own records arrive as `node.audit`, each carrying the node's record in its body.

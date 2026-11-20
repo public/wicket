@@ -9,8 +9,9 @@ type: Added
     ports go in the box's record in the node's feed, so the names reconciler's SRV records name
     them.
   - The node listens on each port while the box holds authority there and the name lasts, from its
-    own copy of the feed: it closes a port at once when the name is revoked or the box's authority
-    ends, also while the control host is out of reach. It copies each connection's bytes into the
+    own copy of the feed: it closes a port within 2 s of its feed saying the name is revoked, and
+    when the box's authority or the name's end passes, the last also while the control host is
+    out of reach (a node that can't hear of a revoke keeps the port until one of those ends). It copies each connection's bytes into the
     box's port, at most 64 at once per name: layer 4 only, no TLS, no HTTP, no routing by name.
     Audited on the node as `name.port.opened`, `name.port.closed`, `name.port.failed`,
     `name.conn` and `name.conn.refused`.
@@ -26,3 +27,10 @@ type: Added
     record with host ports (that build couldn't open the feed): `wicket self rollback` refuses,
     saying how to clear it, and a failed update's automatic rollback refuses too, keeping the new
     build and saying so loudly (`self.rollback_refused`).
+    The same holds for a node going back to such a build, by hand or after a failed health gate.
+    `wicket node feed-checkpoint <node>` writes a checkpoint now, so a feed whose records no longer
+    hold ports can be opened by such a build at once.
+  - While an update from a build before protocol 21 runs its health gate, no box's record gets
+    ports, so a failed gate can still roll back.
+  - `names.public.ports` can't hold a port wicket itself listens on (2222, 8787, 9999), and a
+    public name gets records only on a node at protocol 21 whose `publish.json` holds its port.

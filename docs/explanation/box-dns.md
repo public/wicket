@@ -225,7 +225,9 @@ restarts: a port in its range (`publish.json` in its directory, written by `wick
 a node with the `names.public.nodes` labels; without it the node publishes nothing), unexpired,
 claimed by one box, whose authority holds on the node. It listens on one IPv6 socket that takes
 IPv4 too, and dials each connection into the box (`wicket-fwd`), at most 64 at once per name. A port
-that stops being published closes at once with its connections, before DNS catches up. **Layer 4
+that stops being published closes within 2 s of the node's feed saying so, with its connections,
+before DNS catches up; a node cut off from its control host can't hear of a revoke, and closes the
+port when the box's authority or the name's end passes. **Layer 4
 only:** the node never terminates TLS, reads a protocol, or routes by name; nothing passes through
 the control host.
 

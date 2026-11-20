@@ -91,16 +91,43 @@ systemctl try-restart "user@$uid.service"
 # A node that publishes its boxes' public names (#575 step 4c): its firewall admits the host ports
 # wicket hands out, from anywhere. Inside the range a port is open only while `wicket node serve`
 # listens on it (`publish.json`, written by `wicket node install`); it changes no firewall rule.
-# Opt in with the same range as names.public.ports, e.g. WICKET_PUBLISH_PORTS=20000-20999.
+# Opt in with the same range as names.public.ports (e.g. WICKET_PUBLISH_PORTS=20000-20999);
+# WICKET_PUBLISH_PORTS=off removes the rule this script added.
+# The range is kept in /etc/wicket-publish-ports, so a new one replaces it.
 if [ -n "${WICKET_PUBLISH_PORTS:-}" ]; then
-  case "$WICKET_PUBLISH_PORTS" in
-    *[!0-9-]* | -* | *- | *-*-*) echo "node-setup: WICKET_PUBLISH_PORTS must be low-high (e.g. 20000-20999)" >&2; exit 1 ;;
-  esac
-  if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
-    ufw allow "${WICKET_PUBLISH_PORTS/-/:}/tcp" >/dev/null
-    echo "node-setup: the firewall admits host ports $WICKET_PUBLISH_PORTS/tcp"
+  kept=/etc/wicket-publish-ports
+  have_ufw=0
+  if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then have_ufw=1; fi
+  old=$(cat "$kept" 2>/dev/null || true)
+  if [ -n "$old" ] && [ "$old" != "$WICKET_PUBLISH_PORTS" ] && [ "$have_ufw" = 1 ]; then
+    ufw delete allow "${old/-/:}/tcp" >/dev/null 2>&1 || true
+    echo "node-setup: the firewall no longer admits host ports $old/tcp"
+  fi
+  if [ "$WICKET_PUBLISH_PORTS" = off ]; then
+    rm -f "$kept"
   else
-    echo "node-setup: no active ufw: admit host ports $WICKET_PUBLISH_PORTS/tcp in this node's firewall yourself"
+    case "$WICKET_PUBLISH_PORTS" in
+      *[!0-9-]* | -* | *- | *-*-*) echo "node-setup: WICKET_PUBLISH_PORTS must be low-high (e.g. 20000-20999), or off" >&2; exit 1 ;;
+    esac
+    lo=${WICKET_PUBLISH_PORTS%-*}
+    hi=${WICKET_PUBLISH_PORTS#*-}
+    if [ "$lo" -lt 1024 ] || [ "$lo" -gt "$hi" ] || [ "$hi" -gt 65535 ]; then
+      echo "node-setup: WICKET_PUBLISH_PORTS $WICKET_PUBLISH_PORTS: ports from 1024 to 65535, low first" >&2
+      exit 1
+    fi
+    for own in 2222 8787 9999; do
+      if [ "$own" -ge "$lo" ] && [ "$own" -le "$hi" ]; then
+        echo "node-setup: WICKET_PUBLISH_PORTS $WICKET_PUBLISH_PORTS holds port $own, which wicket itself listens on" >&2
+        exit 1
+      fi
+    done
+    if [ "$have_ufw" = 1 ]; then
+      ufw allow "${WICKET_PUBLISH_PORTS/-/:}/tcp" >/dev/null
+      echo "node-setup: the firewall admits host ports $WICKET_PUBLISH_PORTS/tcp"
+    else
+      echo "node-setup: no active ufw: admit host ports $WICKET_PUBLISH_PORTS/tcp in this node's firewall yourself"
+    fi
+    printf '%s\n' "$WICKET_PUBLISH_PORTS" > "$kept"
   fi
 fi
 

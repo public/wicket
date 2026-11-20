@@ -787,7 +787,6 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         (Some(public), true) => ports_for(&s.ledger.lock().expect("ledger"), public, &s.run, &name, wicket_store::now()),
         _ => vec![],
     };
-    let ports_at_start = authority.ports.clone();
     // What the node attenuates a child's token from, deciding its spawns (#164).
     let mut s = s;
     if let Some(sp) = s.start.edge.as_mut().and_then(|e| e.spawn.as_mut()) {
@@ -799,7 +798,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     // drop them: a run killed hard) go in the same delta, so the feed and the node's snapshot don't
     // grow with every run.
     let published = t.span("feed.publish");
-    let target_epoch = {
+    let (target_epoch, ports_at_start) = {
         let mut publisher = feed.lock()?;
         let ended: Vec<String> = {
             let l = s.ledger.lock().expect("ledger");
@@ -817,8 +816,16 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         // (any process's) may have connected at an older protocol since the check above (#691).
         check_protocol(&name, &s.zone)?;
         gate_ports(&mut changes, node_protocol_now(&name));
+        // What the node's record carries, as committed (#796 review, L2).
+        let carried_ports = changes
+            .iter()
+            .find_map(|c| match c {
+                Change::PutZone { zone } => Some(zone.ports.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
         publisher.commit(changes, now).context("publishing the box's token")?;
-        publisher.epoch()
+        (publisher.epoch(), carried_ports)
     };
     // That token carries grants only: a re-attached run's standing rules aren't in it until its
     // first sync puts them back, so none reads as on the node meanwhile (#752 review, F1).
@@ -2922,6 +2929,22 @@ pub fn feeds_holding_ports() -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Writes a checkpoint of node `name`'s feed now, under its lock (#575 step 4c): the state as it is,
+/// so records with host ports that no box's record holds any more are behind it. Its epoch.
+pub fn checkpoint_feed(name: &str) -> Result<u64> {
+    let _lock = feed_lock(&crate::data_dir().join("nodes").join(name))?;
+    let mut p = open_feed(name, feed_config())?;
+    p.checkpoint(wicket_feed::now_ms()).map_err(|e| anyhow::anyhow!("checkpointing node {name}'s feed: {e}"))?;
+    Ok(p.epoch())
+}
+
+/// Whether node `name`'s feed holds a box record with host ports where a build before protocol 21
+/// parses it (see [`feeds_holding_ports`]): for a node going back to such a build.
+pub fn node_feed_holds_ports(name: &str) -> Result<bool> {
+    let dir = crate::data_dir().join("nodes").join(name).join("feed");
+    Ok(dir.join("deltas.jsonl").exists() && feed_holds_ports(&dir)?)
+}
+
 /// Whether the feed in `dir` holds a box record with host ports where an older build parses it.
 fn feed_holds_ports(dir: &Path) -> Result<bool> {
     use base64::Engine;
@@ -2953,10 +2976,29 @@ fn feed_holds_ports(dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// While this file is in the data directory (written by `wicket self update` for an update from a
+/// build before protocol 21, removed once its health gate has ended), no supervisor puts ports in
+/// a box's record (#796 review, M3): the build it would roll back to couldn't read a feed holding
+/// them, so a failed gate couldn't roll back. One older than [`GATING_MAX_SECS`] is ignored (an
+/// update that died mid-gate).
+pub const UPDATE_GATING: &str = "update-gating";
+/// How long an [`UPDATE_GATING`] file holds ports back at most.
+pub const GATING_MAX_SECS: u64 = 30 * 60;
+
+/// Whether an update's health gate holds ports back now ([`UPDATE_GATING`]).
+fn update_gating() -> bool {
+    std::fs::metadata(crate::data_dir().join(UPDATE_GATING))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() < GATING_MAX_SECS)
+}
+
 /// Whether node `node` reads published ports (#575 step 4c): every live session to it talks
-/// [`wicket_chan::chan::PORTS`] or later (or, with none live, the one last noted did).
+/// [`wicket_chan::chan::PORTS`] or later (or, with none live, the one last noted did), and no
+/// update's health gate holds them back ([`UPDATE_GATING`]).
 fn reads_ports(node: &str) -> bool {
-    node_protocol_now(node).is_some_and(|p| p >= wicket_chan::chan::PORTS)
+    node_protocol_now(node).is_some_and(|p| p >= wicket_chan::chan::PORTS) && !update_gating()
 }
 
 /// Holds back the host ports of the records in `changes` unless the node talks
@@ -3144,12 +3186,16 @@ mod tests {
         let now = 1_000;
         p.commit(vec![Change::PutZone { zone: plain.clone() }], now).unwrap();
         assert!(!feed_holds_ports(&dir).unwrap());
+        let with2 = with.clone();
         p.commit(vec![Change::PutZone { zone: with }], now + 1).unwrap();
         assert!(feed_holds_ports(&dir).unwrap(), "a record with ports after the checkpoint");
         // Its name revoked: the record without them, and a checkpoint covering that state.
         p.set_checkpoint_every(1);
         p.commit(vec![Change::PutZone { zone: plain }], now + 2).unwrap();
         assert!(!feed_holds_ports(&dir).unwrap(), "the checkpoint covers a state without ports");
+        // A checkpoint whose state holds ports (a box published with them as it was written).
+        p.commit(vec![Change::PutZone { zone: with2 }], now + 3).unwrap();
+        assert!(feed_holds_ports(&dir).unwrap(), "the checkpoint's state holds ports");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

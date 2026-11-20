@@ -8,6 +8,11 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
+/// Ports wicket itself listens on, which no published host port range may hold (#796 review, M2):
+/// the console's default (8787), the reverse tunnel's ssh (2222) and the mock model's (9999). A
+/// local node binds on the control host itself.
+pub const WICKET_PORTS: &[u16] = &[2222, 8787, 9999];
+
 /// The lowest and highest record TTL an operator may set (seconds).
 pub const TTL_RANGE: RangeInclusive<u32> = 30..=3600;
 /// The longest DNS name.
@@ -212,6 +217,9 @@ impl PublicConfig {
         if lo < 1024 || lo > hi {
             bad.push(format!("names.public.ports {lo}-{hi}: a range of ports from 1024 up, low first"));
         }
+        if let Some(p) = WICKET_PORTS.iter().find(|p| (lo..=hi).contains(*p)) {
+            bad.push(format!("names.public.ports {lo}-{hi} holds port {p}, which wicket itself listens on"));
+        }
         if let (ProviderKind::Noop, Some(_)) = (self.provider, &self.credential) {
             bad.push("names.public.credential: the noop provider takes none".into());
         }
@@ -280,6 +288,7 @@ mod tests {
             ("per_workload", "0", "at least 1"),
             ("reserved", r#"["a.b"]"#, "not a DNS label"),
             ("console_host", r#""bad host""#, "not a host name"),
+            ("ports", r#""8000-9000""#, "wicket itself listens on"),
             ("ports", r#""80-443""#, "from 1024"),
             ("ports", r#""30000-20000""#, "low first"),
             ("credential", r#""dns-boxes""#, "takes none"),

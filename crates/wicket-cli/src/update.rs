@@ -1007,9 +1007,8 @@ pub fn feeds_block(protocol: u32, to: &str) -> Result<Option<String>> {
     let held = wicket_control::noderun::feeds_holding_ports()?;
     Ok((!held.is_empty()).then(|| {
         format!(
-            "{to} speaks protocol {protocol}, before host ports (21), and couldn't open the feed of node(s) {}: it holds boxes' records with host ports. To go back: revoke the public names published there (`wicket names list`, `wicket names revoke <id>`), let their runs publish their records without them, and wait for each feed's next checkpoint (every {} records); or roll forward instead",
-            held.join(", "),
-            wicket_feed::CHECKPOINT_EVERY
+            "{to} speaks protocol {protocol}, before host ports (21), and couldn't open the feed of node(s) {}: it holds boxes' records with host ports. To go back: revoke the public names published there (`wicket names list`, `wicket names revoke <id>`), let their runs publish their records without them, and checkpoint each feed (`wicket node feed-checkpoint <node>`); or roll forward instead",
+            held.join(", ")
         )
     }))
 }
@@ -1167,6 +1166,10 @@ async fn control_switch(
     if let Some((k, d)) = &stored {
         say(format!("ledger snapshot {} (and in the state store as {k}, {d})", snap.display()));
     }
+    // Again just before the switch (#796 review, L1): a run may have published ports since.
+    if let Some(why) = feeds_block(target.describe.protocol, to)? {
+        bail!("{why}");
+    }
     v.switch(to)?;
     let kind = if rollback { "self.rolled_back" } else { "self.switched" };
     audit(ledger, kind, serde_json::json!({ "target": "control", "from": from, "to": to, "automatic": false, "by": crate::operator() }));
@@ -1205,6 +1208,12 @@ async fn control_switch(
             }
         }
     }
+    // From a build before host ports to one with them (#796 review, M3): none go in a box's record
+    // until the gate has passed, so a failed one can still roll back to `from`.
+    let from_protocol = v.manifest(from).map(|m| m.describe.protocol).unwrap_or(0);
+    let _gating = (!rollback && from_protocol < crate::chan::PORTS && target.describe.protocol >= crate::chan::PORTS)
+        .then(GatingMark::set)
+        .transpose()?;
     handover(&bin).await?;
     let gate = if rollback { Gate { window: Duration::ZERO, canary: None, ..gate.clone() } } else { gate.clone() };
     match run_gate(ledger, &bin, "control", nodes, &gate).await {
@@ -1813,22 +1822,68 @@ async fn node_update(ledger: &Arc<Mutex<Ledger>>, v: &Versions, name: &str, gree
         Err(why) => {
             say(format!("node {name}: {green} failed its health gate ({why}); rolling it back"));
             let back = node_rollback(ledger, &node, name).await;
-            audit(
-                ledger,
-                "self.rolled_back",
-                serde_json::json!({ "target": target, "from": green, "to": back.as_ref().ok(), "automatic": true, "why": why }),
-            );
+            if !back.as_ref().is_err_and(|e| e.to_string().starts_with(KEPT)) {
+                audit(
+                    ledger,
+                    "self.rolled_back",
+                    serde_json::json!({ "target": target, "from": green, "to": back.as_ref().ok(), "automatic": true, "why": why }),
+                );
+            }
             let back = back?;
             bail!("the update of node {name} to {green} failed its health gate and was rolled back to {back}: {why}; the rollout stopped")
         }
     }
 }
 
+/// [`wicket_control::noderun::UPDATE_GATING`], while an update's health gate runs: removed when
+/// dropped, however the gate ends.
+struct GatingMark(PathBuf);
+
+impl GatingMark {
+    fn set() -> Result<GatingMark> {
+        let p = crate::data_dir().join(wicket_control::noderun::UPDATE_GATING);
+        std::fs::write(&p, b"").with_context(|| format!("writing {}", p.display()))?;
+        Ok(GatingMark(p))
+    }
+}
+
+impl Drop for GatingMark {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// How a refused node rollback's error begins: the node keeps its build.
+const KEPT: &str = "kept";
+
 /// Switches a node back to its previous version and restarts its serve. Returns that version.
 async fn node_rollback(ledger: &Arc<Mutex<Ledger>>, node: &crate::node::Node, name: &str) -> Result<String> {
     let prev = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/previous\" 2>/dev/null || true")).await?;
     if !valid_id(&prev) {
         bail!("node {name} has no previous version");
+    }
+    // A node build before protocol 21 can't parse its feed while a box's record there holds host
+    // ports (#575 step 4c, #796 review H1): it would refuse its feed, and every box on it. Its
+    // protocol as that build says it; one that can't say counts as older.
+    let current = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/current\" 2>/dev/null || true")).await.unwrap_or_default();
+    let proto = node
+        .sh(&format!("{NODE_ROOT}; \"$vr/{prev}/wicket\" self describe 2>/dev/null || true"))
+        .await
+        .ok()
+        .and_then(|o| serde_json::from_str::<Describe>(&o).ok())
+        .map(|d| d.protocol)
+        .unwrap_or(0);
+    if proto < crate::chan::PORTS && wicket_control::noderun::node_feed_holds_ports(name)? {
+        let block = format!(
+            "{prev} speaks protocol {proto}, before host ports (21), and couldn't parse node {name}'s feed: it holds boxes' records with host ports. To go back: revoke the public names published on it (`wicket names list`, `wicket names revoke <id>`), let their runs publish their records without them, and force a checkpoint (`wicket node feed-checkpoint {name}`); or roll forward instead"
+        );
+        say(format!("NODE {name}: NOT rolled back to {prev}: {block}. {current} stays"));
+        audit(
+            ledger,
+            "self.rollback_refused",
+            serde_json::json!({ "target": format!("node:{name}"), "kept": current, "not": prev, "block": block }),
+        );
+        bail!("{KEPT} node {name} on {current}, not {prev}: {block}");
     }
     node.script("switching back", &format!("set -eu\n{NODE_ROOT}\n{}\n", node_switch_sh(&prev))).await?;
     restart_node_serve(node).await?;
