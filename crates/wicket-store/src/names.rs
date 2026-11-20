@@ -950,6 +950,20 @@ impl Ledger {
         Ok(rows.into_iter().filter_map(|(name, t, value, ttl)| Some(Record { name, rtype: rtype(&t)?, value, ttl })).collect())
     }
 
+    /// The records this installation created in every zone it has rows for: `(zone, record)`.
+    pub fn owned_records_everywhere(&self) -> Result<Vec<(String, Record)>> {
+        let mut st = self.conn.prepare("SELECT zone, name, rtype, value, ttl FROM name_records ORDER BY zone, name, rtype, value")?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, u32>(4)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(zone, name, t, value, ttl)| Some((zone, Record { name, rtype: rtype(&t)?, value, ttl })))
+            .collect())
+    }
+
     /// [`Ledger::owned_records`] as [`Owned`].
     pub fn owned(&self, zone: &Zone) -> Result<Owned> {
         Ok(Owned::new(&self.owned_records(zone)?))

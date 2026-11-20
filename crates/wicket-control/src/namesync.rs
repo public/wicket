@@ -20,14 +20,16 @@
 //!    the ledger knows of. Each change is audited `name.record`. The `noop` provider writes nothing,
 //!    so nothing is recorded as created: the ledger never claims a record that isn't there.
 //! 4. The plan, with the conflicts it left alone and the names waiting, is audited `name.plan`
-//!    (`applied` says whether the provider made it), when it differs from the last one recorded:
+//!    (`applied` says whether the provider made it, `error` why not), when it differs from the
+//!    last one recorded, its outcome included:
 //!    the `noop` provider plans the same each pass, and a pass every 30 s mustn't fill the record.
 //!    Each conflict (a wanted name the zone holds records at that wicket doesn't own) is audited
 //!    `name.conflict` with it. A conflict is never adopted.
 //!
-//! 5. A host port its name let go of (quarantined) is freed for twice the TTL from now once none
-//!    of that name's records is left in the ledger's list: a cached record for the old name can't
-//!    reach the next box given the port.
+//! 5. A host port its name let go of (quarantined) is freed once none of that name's records is
+//!    left in the ledger's list, in any zone: from twice the longest TTL its records had, counted
+//!    from after the apply. A cached record for the old name can't reach the next box given the
+//!    port. A pass whose apply failed frees none.
 //!
 //! A dry run computes the plan and changes nothing: no lapse, no apply, no record, no port freed.
 
@@ -124,12 +126,10 @@ pub fn desired(l: &Ledger, public: &PublicConfig, now: i64) -> Result<(Vec<Desir
 /// The tenant a record of box name `base` is audited under: its name's, found by the wanted names
 /// or by the grant its owner record in `owned` names; the installation's if neither says.
 fn tenant_of(l: &Ledger, base: &str, wanted: &BTreeMap<String, String>, owned: &[Record]) -> TenantId {
-    let grant = wanted.get(base).cloned().or_else(|| {
-        owned
-            .iter()
-            .find(|r| r.is_owner_record() && r.base() == base)
-            .and_then(|r| r.value.split(';').find_map(|f| f.strip_prefix("name=")).map(str::to_string))
-    });
+    let grant = wanted
+        .get(base)
+        .cloned()
+        .or_else(|| owned.iter().find(|r| r.is_owner_record() && r.base() == base).and_then(|r| owner_grant(&r.value).map(str::to_string)));
     grant.and_then(|g| l.name(&g).ok()).map(|n| TenantId(n.tenant)).unwrap_or_else(TenantId::single)
 }
 
@@ -157,8 +157,9 @@ pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &
         let applied = match provider.apply(&zone, &report.plan).await {
             Ok(a) => a,
             Err(e) => {
-                let body = plan_body(&zone, &report, Some(&e.to_string()));
-                l.audit(&TenantId::single(), None, "name.plan", &body)?;
+                // Recorded once while it keeps failing the same way (#742 review, F6). No port is
+                // freed: the records may still be there.
+                record_plan(l, &plan_body(&zone, &report, Some(&e.to_string())))?;
                 return Err(anyhow!("applying the plan for zone {} with provider {}: {e}", zone.apex(), provider.id()));
             }
         };
@@ -181,10 +182,7 @@ pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &
         report.applied = writes;
     }
 
-    let body = plan_body(&zone, &report, None);
-    let last = l.audit_latest_unscoped("name.plan")?.and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok());
-    if last.as_ref().and_then(|b| b.get("digest")) != body.get("digest") {
-        l.audit(&TenantId::single(), None, "name.plan", &body)?;
+    if record_plan(l, &plan_body(&zone, &report, None))? {
         let wanted: BTreeMap<String, String> = want.iter().map(|d| (d.name.clone(), d.grant.clone())).collect();
         for c in &report.plan.conflicts {
             let body = serde_json::json!({ "zone": zone.apex(), "name": c.name, "records": c.records, "grant": wanted.get(&c.name) });
@@ -194,34 +192,68 @@ pub async fn pass<P: DnsProvider>(l: &Ledger, public: &PublicConfig, provider: &
     }
 
     // A host port its name let go of is free again twice the TTL after none of the name's records
-    // is left in the ledger's list (which a failed apply keeps), so a cached record for the old
-    // name can't reach the next box given it.
-    let left = l.owned_records(&zone)?;
-    let free_at = now + 2 * i64::from(public.ttl);
+    // is left in the ledger's list (which a failed apply keeps), in any zone (#742 review, F2: the
+    // zone it was approved in may not be the zone now), so a cached record for the old name can't
+    // reach the next box given it. Twice the longest TTL its records had, from now, after the
+    // apply (F1: a pass can take minutes).
+    let left = l.owned_records_everywhere()?;
+    let after = std::cmp::max(now, wicket_store::now());
     for (node, proto, port, last) in l.quarantined_ports()? {
-        let name = l.name(&last).ok().map(|n| public.fqdn(&n.label));
-        if !name.is_some_and(|name| left.iter().any(|r| r.base() == name)) {
-            l.free_port_after(&node, &proto, port, free_at)?;
-            report.freed.push((node, port));
+        let n = l.name(&last)?;
+        let bases: Vec<String> = [n.domain.clone(), Some(public.domain())]
+            .into_iter()
+            .flatten()
+            .map(|d| format!("{}.{d}", n.label))
+            .chain(
+                left.iter()
+                    .filter(|(_, r)| r.is_owner_record() && owner_grant(&r.value) == Some(n.id.as_str()))
+                    .map(|(_, r)| r.base().to_string()),
+            )
+            .collect();
+        if left.iter().any(|(_, r)| bases.iter().any(|b| b == r.base())) {
+            continue;
         }
+        let ttl = report
+            .plan
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::Delete(r) | Change::Update { from: r, .. } if bases.iter().any(|b| b == r.base()) => Some(r.ttl),
+                _ => None,
+            })
+            .fold(public.ttl, u32::max);
+        l.free_port_after(&node, &proto, port, after + 2 * i64::from(ttl))?;
+        report.freed.push((node, port));
     }
     Ok(report)
 }
 
-/// `name.plan`'s body. Its digest covers what the plan is (the zone, the provider, the changes,
-/// the conflicts and the names waiting), not when it was made or whether it was applied, so the
-/// same plan again is told from a new one.
-fn plan_body(zone: &Zone, r: &Report, error: Option<&str>) -> serde_json::Value {
-    let what = serde_json::json!({
-        "zone": zone.apex(), "provider": r.provider, "changes": r.plan.changes, "conflicts": r.plan.conflicts, "waiting": r.waiting,
-    });
-    let digest = hex::encode(Sha256::digest(what.to_string().as_bytes()));
-    let mut body = what;
-    body["applied"] = serde_json::json!(r.applied);
-    body["digest"] = serde_json::json!(digest);
-    if let Some(e) = error {
-        body["error"] = serde_json::json!(e);
+/// The grant an owner record's text names (`…;name=<grant>`).
+fn owner_grant(text: &str) -> Option<&str> {
+    text.split(';').find_map(|f| f.strip_prefix("name="))
+}
+
+/// Audits `name.plan` with `body` unless the last one recorded has its digest. Whether it did.
+fn record_plan(l: &Ledger, body: &serde_json::Value) -> Result<bool> {
+    let last = l.audit_latest_unscoped("name.plan")?.and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok());
+    if last.as_ref().and_then(|b| b.get("digest")) == body.get("digest") {
+        return Ok(false);
     }
+    l.audit(&TenantId::single(), None, "name.plan", body)?;
+    Ok(true)
+}
+
+/// `name.plan`'s body. Its digest covers what the plan is and how it ended (the zone, the
+/// provider, the changes, the conflicts, the names waiting, whether it was applied and its error),
+/// not when it was made, so the same outcome again is told from a new one, and a success after a
+/// failure is recorded (#742 review, F6).
+fn plan_body(zone: &Zone, r: &Report, error: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "zone": zone.apex(), "provider": r.provider, "changes": r.plan.changes, "conflicts": r.plan.conflicts, "waiting": r.waiting,
+        "applied": r.applied, "error": error,
+    });
+    let digest = hex::encode(Sha256::digest(body.to_string().as_bytes()));
+    body["digest"] = serde_json::json!(digest);
     body
 }
 
@@ -404,8 +436,160 @@ mod tests {
         assert!(matches!(gone.plan.changes.last(), Some(Change::Delete(r)) if r.is_owner_record()));
         assert_eq!(p.records(), vec![theirs]);
         assert!(l.owned_records(&zone).unwrap().is_empty());
-        // Audited under the name's tenant.
-        assert!(l.audit_of_kind("name.record").unwrap().iter().all(|a| a.tenant == TenantId::single().0));
+    }
+
+    /// A provider that lists what it is given and fails every apply.
+    struct Failing(Vec<Record>);
+
+    impl DnsProvider for Failing {
+        fn id(&self) -> &str {
+            "failing"
+        }
+        fn caps(&self) -> wicket_names::Caps {
+            wicket_names::Caps { types: vec![RecordType::A, RecordType::Aaaa, RecordType::Srv, RecordType::Txt], min_ttl: 1, atomic: true }
+        }
+        async fn list(&self, _zone: &Zone) -> Result<Vec<Record>, wicket_names::ProviderError> {
+            Ok(self.0.clone())
+        }
+        async fn apply(&self, _zone: &Zone, _plan: &Plan) -> Result<wicket_names::Applied, wicket_names::ProviderError> {
+            Err(wicket_names::ProviderError::Failed("the provider is down".into()))
+        }
+    }
+
+    /// #742 review: a failed apply frees no port and is recorded once; the success after it is
+    /// recorded too, and only then is the port freed.
+    #[tokio::test]
+    async fn a_failing_provider_keeps_the_port_and_is_recorded_once() {
+        let (l, _run, id) = ledger();
+        let port = l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
+        let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
+        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        crate::names::revoke(&l, "op", &id).unwrap();
+        let plans = kinds(&l, "name.plan");
+        let down = Failing(p.records());
+        for _ in 0..3 {
+            assert!(pass(&l, &public(), &down, wicket_store::now(), false).await.is_err());
+        }
+        assert_eq!(kinds(&l, "name.plan"), plans + 1, "the same failure recorded once");
+        assert_eq!(l.quarantined_ports().unwrap().len(), 1, "no port freed while its records may be there");
+        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        assert!(r.applied && r.recorded, "the success after a failure is recorded");
+        let last: serde_json::Value = serde_json::from_str(&l.audit_of_kind("name.plan").unwrap().pop().unwrap().body).unwrap();
+        assert_eq!((last["applied"].as_bool(), last["error"].is_null()), (Some(true), true));
+        assert_eq!(r.freed, vec![("n1".to_string(), port)]);
+    }
+
+    /// #742 review: what ends a name's publication withdraws its records, whatever its status.
+    #[tokio::test]
+    async fn records_are_withdrawn_whatever_ends_publication() {
+        let other: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
+        type Change = Box<dyn Fn(&mut Ledger, &RunId, &mut PublicConfig)>;
+        let cases: Vec<(&str, Change)> = vec![
+            (
+                "run ended",
+                Box::new(|l, run, _| {
+                    l.run_ended(run, "succeeded", "").unwrap();
+                    l.release_run_names(run).unwrap();
+                }),
+            ),
+            (
+                "node revoked",
+                Box::new(|l, _, _| {
+                    l.revoke_node("n1").unwrap();
+                }),
+            ),
+            (
+                "address cleared",
+                Box::new(|l, _, _| {
+                    l.set_node_addresses("n1", AddressChange::Clear, AddressChange::Keep, "op").unwrap();
+                }),
+            ),
+            ("label reserved", Box::new(|_, _, p| p.reserved.push("demo".into()))),
+            (
+                "address changed",
+                Box::new(move |l, _, _| {
+                    l.set_node_addresses("n1", AddressChange::Set(other), AddressChange::Keep, "op").unwrap();
+                }),
+            ),
+        ];
+        for (case, change) in cases {
+            let (mut l, run, _) = ledger();
+            let mut cfg = public();
+            let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
+            pass(&l, &cfg, &p, wicket_store::now(), false).await.unwrap();
+            assert!(p.records().contains(&Record::a("demo.boxes.example.com", V4, 60)), "{case}");
+            change(&mut l, &run, &mut cfg);
+            pass(&l, &cfg, &p, wicket_store::now(), false).await.unwrap();
+            let a: Vec<Record> = p.records().into_iter().filter(|r| r.rtype == RecordType::A).collect();
+            match case {
+                "address changed" => assert_eq!(a, vec![Record::a("demo.boxes.example.com", other, 60)], "{case}"),
+                _ => assert!(p.records().is_empty(), "{case}: {:?}", p.records()),
+            }
+        }
+    }
+
+    /// #742 review, F2: after a zone change, a revoked name's port stays quarantined while its
+    /// records in the old zone are still the ledger's.
+    #[tokio::test]
+    async fn a_port_waits_for_its_records_in_the_zone_it_was_published_in() {
+        let (l, _run, id) = ledger();
+        l.allocate_port("n1", PROTO, &id, 20000..=20999, None).unwrap();
+        let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
+        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        crate::names::revoke(&l, "op", &id).unwrap();
+        let mut moved = public();
+        moved.zone = "other.example.com".into();
+        let q = MemoryProvider::new(Zone::new("other.example.com"), vec![]);
+        let r = pass(&l, &moved, &q, wicket_store::now(), false).await.unwrap();
+        assert!(r.freed.is_empty(), "{:?}", r.freed);
+        assert_eq!(l.quarantined_ports().unwrap().len(), 1);
+    }
+
+    /// A crash after the plan's records were recorded and before it was applied: the next pass
+    /// makes them, and the one after has nothing to do.
+    #[tokio::test]
+    async fn a_crash_between_recording_and_applying_converges() {
+        let (l, _run, _) = ledger();
+        let zone = Zone::new("boxes.example.com");
+        let p = MemoryProvider::new(zone.clone(), vec![]);
+        let dry = pass(&l, &public(), &p, wicket_store::now(), true).await.unwrap();
+        l.owned_before_apply(&zone, "memory", &dry.plan).unwrap();
+        let r = pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        assert!(r.applied);
+        assert_eq!(p.records().len(), 2);
+        assert_eq!(l.owned_records(&zone).unwrap().len(), 2);
+        assert!(pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap().plan.is_empty());
+    }
+
+    /// Each record's audit is filed under its name's tenant, not the installation's.
+    #[tokio::test]
+    async fn records_are_audited_under_their_names_tenant() {
+        let (l, _run, _) = ledger();
+        let t1 = TenantId("t1".into());
+        let run = RunId("run_t1".into());
+        l.run_started(&t1, &run, "web", "shop").unwrap();
+        l.set_run_node(&run.0, "n1").unwrap();
+        let principal = "spiffe://t.wicket.test/t/t1/z/web/a/shop";
+        let ask = NameAsk {
+            tenant: &t1,
+            run: &run,
+            zone: "web",
+            zone_digest: "zd",
+            principal,
+            label: "shop",
+            port: 3000,
+            service: None,
+            reason: "the shop",
+            scope: NameScope::Run,
+        };
+        let (id, _) = l.ask_public(&ask).unwrap();
+        approve(&l, &id, &NameTerms { bound: StandingBound::Agent, ttl_secs: None });
+        let p = MemoryProvider::new(Zone::new("boxes.example.com"), vec![]);
+        pass(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        let recs = l.audit_of_kind("name.record").unwrap();
+        let of = |name: &str| recs.iter().filter(|a| a.body.contains(name)).map(|a| a.tenant.clone()).collect::<Vec<_>>();
+        assert_eq!(of("shop.boxes.example.com"), vec!["t1".to_string(); 2]);
+        assert_eq!(of("demo.boxes.example.com"), vec![TenantId::single().0; 2]);
     }
 
     #[tokio::test]
