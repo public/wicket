@@ -12,7 +12,7 @@
 
 use super::Peer;
 use crate::{
-    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd,
+    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, RequestCmd, SecretCmd, SelfCmd,
     ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
 };
 use serde::Deserialize;
@@ -71,7 +71,7 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(
             "`wicket audit compact` runs with wicketd stopped, as the wicket user: sudo systemctl stop wicketd wicket-console wicket-reconcile; sudo -u wicket WICKET_HOME=/var/lib/wicket wicket audit compact",
         ),
-        Cmd::Pending { .. } | Cmd::Request { .. } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
+        Cmd::Pending { .. } | Cmd::Request { cmd: RequestCmd::List { .. } } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
         // Renewing a grant or a box's authority grants more time: a decision, as approving is.
