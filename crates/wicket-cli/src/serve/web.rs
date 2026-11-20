@@ -13,14 +13,14 @@ use std::sync::LazyLock;
 
 /// The policy on every response. Nothing inline, nothing from elsewhere, no framing, no `<base>`;
 /// `manifest-src` lets the browser read the web app manifest (with `default-src 'none'` it couldn't).
+///
+/// Trusted Types are enforced (#739): a page may write HTML or script only through a policy, and the
+/// only policies allowed are lit-html's (the console's views) and Vue's (the session view's static
+/// nodes). Both are created inside those libraries and pass their own templates; no code of ours can
+/// set `innerHTML` or the like from a string, and a browser with Trusted Types throws if it tries.
 pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; \
-manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
-
-/// Trusted Types, reported but not yet enforced (#739): the console's DOM writes must go through text
-/// or lit-html's templates, never a raw HTML or script sink. Browsers that support it report a write
-/// that would break that (in the console and as a `securitypolicyviolation` event, which the browser
-/// tests fail on); it moves into [`CSP`] once every screen is on Lit.
-pub const CSP_REPORT_ONLY: &str = "require-trusted-types-for 'script'; trusted-types lit-html";
+manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; \
+require-trusted-types-for 'script'; trusted-types lit-html vue";
 
 /// Strict-Transport-Security for HTTPS origins: two years, subdomains, and eligible for the browsers'
 /// preload lists (submitting the domain to hstspreload.org is the operator's step).
@@ -115,7 +115,6 @@ pub fn secure_headers(h: &mut HeaderMap, hsts: bool) {
         h.insert(k, HeaderValue::from_static(v));
     };
     set(h, "content-security-policy", CSP);
-    set(h, "content-security-policy-report-only", CSP_REPORT_ONLY);
     set(h, "x-content-type-options", "nosniff");
     set(h, "referrer-policy", "no-referrer");
     set(h, "x-frame-options", "DENY");
@@ -137,7 +136,8 @@ pub fn secure_headers(h: &mut HeaderMap, hsts: bool) {
     }
 }
 
-/// Writes the console as `wicket serve` sends it into `dir` (#574): `index.html` (the page), each
+/// Writes the console as `wicket serve` sends it into `dir` (#574): `index.html` (the page),
+/// `session.html` (a run's session view), each
 /// file at its served path (`static/console.<hash>.js`, `sw.js`, …) with its Brotli copy as
 /// `<file>.br` where there is one, and `headers.json` with the
 /// security headers, for the browser tests (ci/console-browsers.sh) to serve the same bytes under the
@@ -145,6 +145,7 @@ pub fn secure_headers(h: &mut HeaderMap, hsts: bool) {
 pub fn write_console_assets(dir: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("index.html"), &ASSETS.page.body)?;
+    std::fs::write(dir.join("session.html"), &ASSETS.session_page.body)?;
     if let Some(br) = &ASSETS.page.br {
         std::fs::write(dir.join("index.html.br"), br)?;
     }
@@ -159,6 +160,6 @@ pub fn write_console_assets(dir: &std::path::Path) -> std::io::Result<()> {
             std::fs::write(p.with_file_name(format!("{}.br", p.file_name().and_then(|n| n.to_str()).unwrap_or_default())), br)?;
         }
     }
-    let headers = serde_json::json!({ "content-security-policy": CSP, "content-security-policy-report-only": CSP_REPORT_ONLY });
+    let headers = serde_json::json!({ "content-security-policy": CSP });
     std::fs::write(dir.join("headers.json"), serde_json::to_vec_pretty(&headers)?)
 }

@@ -95,6 +95,8 @@ http.createServer((req, res) => {
     if (want) { res.setHeader("set-cookie", "fixture=" + want + "; Path=/; SameSite=Strict"); scenario = want; polls.set(want, 0); }
     return page(req, res);
   }
+  // A run's session view (#327), as wicket sends it; only with --assets (it is a separate build).
+  if (p === "/session" && ASSETS) return sendFile(req, res, "text/html; charset=utf-8", path.join(ASSETS, "session.html"));
   if (p.startsWith("/static/") || p === "/sw.js" || p === "/manifest.webmanifest") {
     // With --assets, the file at its served path (the dump holds nothing else); else the source, by
     // its path under static/ (the modules import lit-html from static/vendor/).

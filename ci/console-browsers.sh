@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # The console in real browsers (#574): builds wicket, writes the console as `wicket serve` sends it
-# (`wicket dev console-assets`: minified, content-hashed, with its CSP and Trusted Types report-only
-# headers), serves that against the preview's mock API (ci/console-preview), and runs
-# ci/console-browsers/test.mjs (the whole page) and inbox.mjs (the request cards, with the API
-# answered in the page) in each browser named (default: chromium firefox webkit).
+# (`wicket dev console-assets`: minified, content-hashed, under its CSP with Trusted Types enforced),
+# serves that against the preview's mock API (ci/console-preview), and runs
+# ci/console-browsers/test.mjs (the whole page, and a run's session view) and inbox.mjs (the request
+# cards, with the API answered in the page) in each browser named (default: chromium firefox webkit).
+# With WICKET_SESSION_VIEW set (ci/session-view.sh prints it), wicket embeds the built session view
+# and that is what is checked; WICKET_SESSION_VIEW_REQUIRED=1 fails on the placeholder.
 #
 #   ci/console-browsers.sh [--install] [chromium] [firefox] [webkit]
 #
