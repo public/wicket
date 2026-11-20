@@ -379,7 +379,8 @@ doesn't) can get one by DNS-01: a gateway tool, `dns_challenge(name, value)`, ma
 
 Audit records, as written so far: `name.requested` (an ask), `decision` and `decision.refused` (a
 human's approval or denial, or a refused one, as for other asks), `name.registered` (internal),
-`name.revoked`, `name.released`, `name.claimed` (a later run took up a standing name),
+`name.revoked`, `name.renewed` (a standing name's new end, step 4d), `name.released`,
+`name.claimed` (a later run took up a standing name),
 `node.addresses` (an operator set a node's public addresses), and the reconciler's (step 4b):
 `name.lapsed` (a name's lifetime ended), `name.plan` (a reconcile's plans for every zone, applied or
 not, with the stranded records and the names waiting, recorded when it differs from the last one),
@@ -399,6 +400,21 @@ principal, zone and run), target (node, address, host port and box port), state 
 waiting for a run, taken in the zone, records out of sync) and when it lapses. The card approves or
 denies public asks (passkey-signed, bound to the effect), and renews or revokes. `wicket names show`
 has a name's records as the zone last listed them, and its last connections.
+
+Built in step 4d: the card's server side (`GET /api/names`, `GET /api/names/<id>`, the dashboard's
+`names`; [the console](../reference/console.md#names)) and `wicket names list --json` and `wicket
+names show --json`, one shape for both. A name's state comes from what the reconciler would do now
+(why it waits) and its last recorded plan (a conflict: taken; records the ledger doesn't list as
+made: out of sync), and its last connections from a bounded read of the newest node records (there
+is no index by name). What the agent wrote (label, service, reason) is in fields of its own, never
+in wicket's sentences. The card's actions are passkey-signed: `name_approve` binds the full name,
+zone, principal, box port, binding, lifetime, the node the asking run is on with its addresses, and
+the effect, and is refused if the effect (under `wicket.yaml` as it is when applied) or the node
+changed since; `name_deny`, `name_renew` (and `wicket names renew <id> --lasts 30d|forever`, a
+live standing name only, audited `name.renewed`), `name_revoke`, and `node_addresses` (a node's
+public addresses, old and new both signed, refused if they changed since; operator kind `node` at
+R4). An approval, a renewal and an address change are recorded first, in the same write as the
+change: one that can't be recorded isn't made. The page itself is the console's (later).
 
 ## Data and protocol
 

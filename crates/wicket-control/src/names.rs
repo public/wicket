@@ -1,6 +1,7 @@
 //! Decisions on public names (#575; design in `docs/explanation/box-dns.md`): a human approves a
-//! box's ask for a name on the internet, denies it, or revokes an approved name. Each is on the
-//! audit record, and an approval whose record can't be written is undone (fail closed).
+//! box's ask for a name on the internet, denies it, renews a standing name, or revokes a name. Each
+//! is on the audit record. An approval and a renewal are recorded first, in the same write as the
+//! change (#575 step 4d): one whose record can't be written isn't made (fail closed).
 //!
 //! Only a human decides, and only one whose authority (`operators.yaml`) covers `name` decisions at
 //! the highest risk: a public name lets anyone on the internet connect to the box's port and read
@@ -21,7 +22,8 @@ pub const DEFAULT_NAME_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 pub const WARNING: &str =
     "anyone on the internet can connect to this box's port and read whatever it serves: it is a way out for the box's data, not only a way in";
 
-fn may_decide(by: &Granter) -> Result<crate::operators::Operator> {
+/// The human operator `by`, if its authority covers `name` decisions at R4: Err says why not.
+pub fn may_decide(by: &Granter) -> Result<crate::operators::Operator> {
     let o = crate::grant::human(by, "a public name")?;
     o.may_decide(&crate::operators::Asked { kind: "name".into(), host: String::new(), risk: Some(4) }).map_err(anyhow::Error::msg)?;
     Ok(o.clone())
@@ -71,13 +73,12 @@ pub fn approve(
         Ok(p) => p,
         Err(why) => return Err(refused(l, by, id, "approve", why)),
     };
-    let effect = match l.approve_name(id, terms, &o.label, Some(shown), public) {
-        Ok(e) => e,
-        Err(e @ (wicket_store::StoreError::EffectChanged(..) | wicket_store::StoreError::Refused(_))) => {
-            return Err(refused(l, by, id, "approve", e.into()))
-        }
-        Err(e) => return Err(e.into()),
-    };
+    // The effect as it is now, checked before anything is written, so the refusal is on the
+    // record (inside the write below it would be rolled back with the rest).
+    let effect = wicket_store::name_effect(&n, terms, &public.domain());
+    if effect != shown {
+        return Err(refused(l, by, id, "approve", wicket_store::StoreError::EffectChanged(id.into(), shown.into(), effect).into()));
+    }
     let standing = n.scope == NameScope::Standing;
     let record = serde_json::json!({
         "decision": "approve", "name": id, "label": n.label, "fqdn": public.fqdn(&n.label), "kind": "public", "port": n.port, "service": n.service,
@@ -85,12 +86,72 @@ pub fn approve(
         "scope": n.scope.as_str(), "bound": standing.then(|| terms.bound.as_str()), "ttl_secs": standing.then_some(terms.ttl_secs),
         "effect_sha256": effect,
     });
-    if let Err(e) = l.audit(&TenantId(n.tenant.clone()), Some(&wicket_core::RunId(n.asked_run.clone())), "decision", &merged(record, extra))
-    {
-        let _ = l.revoke_name(id, "wicket:audit-failed");
-        return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so it was undone"));
+    let record = merged(record, extra);
+    // On the record first, in the same write as the approval (#575 step 4d): an approval that
+    // can't be recorded isn't made, and one the ledger refuses leaves no decision behind.
+    let made = l.immediate(|l| {
+        l.audit(&TenantId(n.tenant.clone()), Some(&wicket_core::RunId(n.asked_run.clone())), "decision", &record)?;
+        l.approve_name(id, terms, &o.label, Some(shown), public)
+    });
+    match made {
+        Ok(e) => Ok(e),
+        Err(
+            e @ (wicket_store::StoreError::EffectChanged(..)
+            | wicket_store::StoreError::Refused(_)
+            | wicket_store::StoreError::NotPending(..)),
+        ) => Err(refused(l, by, id, "approve", e.into())),
+        Err(e) => Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so it wasn't made")),
     }
-    Ok(effect)
+}
+
+/// A refusal of `decision` on name `id` by `by`, on the audit record (`decision.refused`): for a
+/// caller that checks more than this module does before deciding (the console's signed target).
+pub fn refuse(l: &Ledger, by: &Granter, id: &str, decision: &str, why: anyhow::Error) -> anyhow::Error {
+    refused(l, by, id, decision, why)
+}
+
+/// Renews live standing name `id` as `by` (a human whose authority covers `name` at R4, as
+/// approving needs): it lapses `ttl` from now (None: until revoked; at most [`MAX_NAME_TTL`]).
+/// Audited `name.renewed`, in the same write and first (#575 step 4d); `extra` goes on the
+/// record. The name as renewed.
+pub fn renew(l: &Ledger, by: &Granter, id: &str, ttl: Option<Duration>, extra: serde_json::Value) -> Result<NameRow> {
+    renew_from(l, by, id, ttl, None, extra)
+}
+
+/// [`renew`], only if the name's end is still `shown` (what the decider was shown), checked in
+/// the same write.
+pub fn renew_from(
+    l: &Ledger,
+    by: &Granter,
+    id: &str,
+    ttl: Option<Duration>,
+    shown: Option<Option<i64>>,
+    extra: serde_json::Value,
+) -> Result<NameRow> {
+    let n = l.name(id)?;
+    let o = match may_decide(by).and_then(|o| terms(StandingBound::Agent, ttl).map(|_| o)) {
+        Ok(o) => o,
+        Err(why) => return Err(refused(l, by, id, "renew", why)),
+    };
+    let until = ttl.map(|t| wicket_store::now().saturating_add(i64::try_from(t.as_secs()).unwrap_or(i64::MAX)));
+    let record = merged(
+        serde_json::json!({
+            "name": id, "kind": n.kind.as_str(), "label": n.label, "zone": n.zone, "principal": n.principal, "until": until,
+            "previous_until": n.expires_at, "by": o.label, "granter": "human", "granter_identity": o.id,
+        }),
+        extra,
+    );
+    let made = l.immediate(|l| {
+        l.audit(&TenantId(n.tenant.clone()), None, "name.renewed", &record)?;
+        l.renew_name_from(id, until, shown)
+    });
+    match made {
+        Ok(n) => Ok(n),
+        Err(e @ (wicket_store::StoreError::Refused(_) | wicket_store::StoreError::NoSuchRequest(_))) => {
+            Err(refused(l, by, id, "renew", e.into()))
+        }
+        Err(e) => Err(anyhow::Error::from(e).context("the renewal could not be recorded in the audit log, so it wasn't made")),
+    }
 }
 
 /// Denies public-name ask `id` as `by`; `extra` goes on the audit record.
@@ -132,14 +193,32 @@ pub fn claim_for_run(
 
 /// Revokes live name `id` (public or internal): it ends now, whoever holds it.
 pub fn revoke(l: &Ledger, by: &str, id: &str) -> Result<NameRow> {
+    revoke_with(l, by, id, serde_json::json!({}))
+}
+
+/// [`revoke`], with `extra` on the audit record (the console's signed action, #575 step 4d).
+pub fn revoke_with(l: &Ledger, by: &str, id: &str, extra: serde_json::Value) -> Result<NameRow> {
     let n = l.revoke_name(id, by)?;
     l.audit(
         &TenantId(n.tenant.clone()),
         None,
         "name.revoked",
-        &serde_json::json!({ "name": id, "label": n.label, "kind": n.kind.as_str(), "zone": n.zone, "by": by }),
+        &merged(serde_json::json!({ "name": id, "label": n.label, "kind": n.kind.as_str(), "zone": n.zone, "by": by }), extra),
     )?;
     Ok(n)
+}
+
+/// What setting a node's public addresses asks of an operator's authority (#575 step 4d): kind
+/// `node`, at R4, since a public name's records point at them.
+pub fn node_asked(node: &str) -> crate::operators::Asked {
+    crate::operators::Asked { kind: "node".into(), host: node.into(), risk: Some(4) }
+}
+
+/// The human operator `by`, if its authority covers setting node `node`'s public addresses.
+pub fn may_set_addresses(by: &Granter, node: &str) -> Result<crate::operators::Operator> {
+    let o = crate::grant::human(by, "a node's public addresses")?;
+    o.may_decide(&node_asked(node)).map_err(anyhow::Error::msg)?;
+    Ok(o.clone())
 }
 
 #[cfg(test)]
@@ -201,16 +280,19 @@ mod tests {
         assert!(l.audit_tail(10).unwrap().iter().any(|a| a.2 == "name.revoked"));
     }
 
+    /// #575 step 4d: the decision is recorded first, in the same write: an approval whose record
+    /// can't be written isn't made.
     #[test]
-    fn an_approval_that_cant_be_recorded_is_undone() {
+    fn an_approval_that_cant_be_recorded_isnt_made() {
         let l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "demo", NameScope::Run);
         let t = terms(StandingBound::Agent, None).unwrap();
         assert!(deny(&l, &op("default: nothing\n"), &id, serde_json::json!({})).is_err());
         l.fail_audit_inserts_for_tests().unwrap();
         let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t, "boxes.example.com");
-        assert!(approve(&l, &op("default: anything\n"), &id, &t, &shown, &cfg(), serde_json::json!({})).is_err());
-        assert_eq!(l.name(&id).unwrap().status, "ended", "undone");
+        let e = approve(&l, &op("default: anything\n"), &id, &t, &shown, &cfg(), serde_json::json!({})).unwrap_err();
+        assert!(format!("{e:#}").contains("wasn't made"), "{e:#}");
+        assert_eq!(l.name(&id).unwrap().status, "pending", "not made");
         assert!(terms(StandingBound::Agent, Some(Duration::ZERO)).is_err());
         assert!(terms(StandingBound::Agent, Some(MAX_NAME_TTL * 2)).is_err());
     }
@@ -239,6 +321,44 @@ mod tests {
         assert!(format!("{e:#}").contains("names.public"), "{e:#}");
         // The kind at R4 (no ceiling) decides.
         approve(&l, &op("default: { kinds: [name] }\n"), &id, &t, &shown, &cfg(), serde_json::json!({})).unwrap();
+    }
+
+    /// #575 step 4d: a live standing name is renewed by a human with name authority, recorded
+    /// first; a renewal that can't be recorded, or by an operator without the authority, isn't made.
+    #[test]
+    fn a_standing_name_is_renewed_on_the_record() {
+        let l = Ledger::open_in_memory().unwrap();
+        let id = asked(&l, "demo", NameScope::Standing);
+        let t = terms(StandingBound::Agent, Some(DEFAULT_NAME_TTL)).unwrap();
+        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t, "boxes.example.com");
+        approve(&l, &op("default: anything\n"), &id, &t, &shown, &cfg(), serde_json::json!({})).unwrap();
+        let before = l.name(&id).unwrap().expires_at;
+        let narrow = op("default: { kinds: [http] }\n");
+        assert!(renew(&l, &narrow, &id, None, serde_json::json!({})).is_err());
+        assert!(renew(&l, &op("default: anything\n"), &id, Some(MAX_NAME_TTL * 2), serde_json::json!({})).is_err());
+        assert_eq!(l.name(&id).unwrap().expires_at, before);
+        assert_eq!(l.audit_tail(20).unwrap().iter().filter(|a| a.2 == "decision.refused").count(), 2);
+        let n = renew(&l, &op("default: anything\n"), &id, None, serde_json::json!({ "via": "cli" })).unwrap();
+        assert_eq!(n.expires_at, None);
+        let rec = l.audit_tail(20).unwrap().into_iter().rev().find(|a| a.2 == "name.renewed").unwrap().4;
+        let rec: serde_json::Value = serde_json::from_str(&rec).unwrap();
+        assert_eq!(
+            (rec["until"].clone(), rec["previous_until"].as_i64(), rec["via"].as_str()),
+            (serde_json::Value::Null, before, Some("cli"))
+        );
+        l.fail_audit_inserts_for_tests().unwrap();
+        let e = renew(&l, &op("default: anything\n"), &id, Some(DEFAULT_NAME_TTL), serde_json::json!({})).unwrap_err();
+        assert!(format!("{e:#}").contains("wasn't made"), "{e:#}");
+        assert_eq!(l.name(&id).unwrap().expires_at, None, "not made");
+    }
+
+    /// #575 step 4d: setting a node's public addresses needs kind `node` at R4.
+    #[test]
+    fn a_nodes_addresses_need_node_authority_at_r4() {
+        assert!(may_set_addresses(&op("default: anything\n"), "n1").is_ok());
+        assert!(may_set_addresses(&op("default: { kinds: [node] }\n"), "n1").is_ok());
+        assert!(may_set_addresses(&op("default: { kinds: [name] }\n"), "n1").is_err());
+        assert!(may_set_addresses(&op("default: { kinds: [node], max_risk: R3 }\n"), "n1").is_err());
     }
 
     /// #575 review, M2: a later run of the agent takes up its standing name when it starts, under

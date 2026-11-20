@@ -354,7 +354,8 @@ pub(crate) fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
             // on the same run (and, for a started run, the same manifest bytes).
             let same = |k: &str| decided.get(k) == v.get(k);
             let matches = if kind == "decision" {
-                same("request") && same("decision")
+                // A decision on a public name (#575 step 4d) names it, and an approval its effect.
+                same("request") && same("decision") && same("name") && (decided.get("name").is_none() || same("effect_sha256"))
             } else {
                 same("action")
                     && same("run")

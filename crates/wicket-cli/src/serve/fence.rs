@@ -81,7 +81,7 @@ thread_local! {
     pub(super) static AUTHORITY: std::cell::RefCell<Option<crate::operators::Authority>> = const { std::cell::RefCell::new(None) };
 }
 
-fn human(state: &State, oc: &OperatorCredential) -> anyhow::Result<grant::Granter> {
+pub(super) fn human(state: &State, oc: &OperatorCredential) -> anyhow::Result<grant::Granter> {
     #[allow(unused_mut)]
     let mut o = crate::operators::Operator::console(&state.tenant.0, &oc.name)?;
     #[cfg(test)]

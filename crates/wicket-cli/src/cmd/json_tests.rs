@@ -185,6 +185,50 @@ fn service_list_json() {
     documented_as("`wicket service list --json`", &v);
 }
 
+/// #575 step 4d: `wicket names list --json` and `names show --json` print the Names card's shapes.
+#[test]
+fn names_list_and_show_json() {
+    let (_d, l) = super::test_ledger("names");
+    let t = TenantId::single();
+    let id = ask_name(&l, "demo");
+    let cfg: wicket_names::NamesConfig =
+        serde_json::from_value(serde_json::json!({ "public": { "provider": "noop", "zone": "boxes.example.com", "owner": "a1b2c3d4" } }))
+            .unwrap();
+    let settings: crate::names_view::Settings = Ok(cfg);
+    let listens = |_: &wicket_store::Ledger, _: &str, _: u16| -> anyhow::Result<Option<String>> { Ok(None) };
+    let c = crate::names_view::Ctx { l: &l, settings: &settings, listens: &listens, now: wicket_store::now() };
+    let rows = crate::names_view::rows(&c, &l.names_with_status(&t, "pending").unwrap()).unwrap();
+    let v = serde_json::Value::from(rows);
+    assert_eq!(
+        (v[0]["id"].as_str(), v[0]["state"].as_str(), v[0]["name"].as_str()),
+        (Some(id.as_str()), Some("pending"), Some("demo.boxes.example.com"))
+    );
+    documented_as("`wicket names list --json`", &v);
+    documented_as("a name's `owner`", &v[0]["owner"]);
+    documented_as("a name's `target`", &v[0]["target"]);
+    documented_as("a name's `agent`", &v[0]["agent"]);
+    // One name, with a record the ledger lists, the last plan's entry and a connection.
+    let zone = wicket_names::Zone::new("boxes.example.com");
+    let rec = wicket_names::Record::a("demo.boxes.example.com", std::net::Ipv4Addr::new(192, 0, 2, 1), 60);
+    l.owned_before_apply(
+        &zone,
+        "memory",
+        &wicket_names::Plan { changes: vec![wicket_names::Change::Create(rec.clone())], conflicts: vec![] },
+    )
+    .unwrap();
+    let plan = serde_json::json!({ "provider": "noop", "waiting": [], "zones": [{ "zone": "boxes.example.com", "applied": false, "error": null,
+                                   "conflicts": [{ "name": "demo.boxes.example.com", "records": [rec] }], "changes": [] }] });
+    l.audit(&t, None, "name.plan", &plan).unwrap();
+    let inner = serde_json::json!({ "name": id, "label": "demo", "port": 30000, "phase": "start", "conn": "c1", "peer": "192.0.2.9:5000" });
+    let outer = serde_json::json!({ "node": "n1", "seq": 1, "ts": 1, "tenant": t.0, "run": "run_n", "kind": "name.conn", "body": inner.to_string() });
+    l.audit(&t, Some(&RunId("run_n".into())), "node.audit", &outer).unwrap();
+    let d = crate::names_view::detail(&c, &l.name(&id).unwrap()).unwrap();
+    documented_as("`wicket names show --json`", &d);
+    documented_as("a name's `records`, each", &d["records"]);
+    documented_as("a name's `plan`", &d["plan"]);
+    documented_as("a name's `connections`, each", &d["connections"]);
+}
+
 #[test]
 fn node_list_json() {
     let (_d, l) = super::test_ledger("nodes");

@@ -69,7 +69,8 @@ reference](manifest.md)).
 ## Output for scripts
 
 The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
-`agents`, `links`, `grant list`, `standing list`, `node list`, `lease list`, `service list` and `audit`. With it, stdout holds one JSON document
+`agents`, `links`, `grant list`, `standing list`, `names list`, `node list`, `lease list`, `service list` and `audit`, and so does
+`names show` (one name: an object). With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -89,6 +90,14 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
+| `wicket names list --json` | `id`, `kind` (`internal`, `public`), `status` (the ledger's: `pending`, `live`, `denied`, `withdrawn`, `ended`), `state` (wicket's: `pending`, `live`, `waiting`, `taken` in the zone by records wicket didn't make, `out_of_sync`, `lapsed`, `denied`, `withdrawn`, `ended`), `why` (wicket's words for the state, or null), `name` (the full name: `<label>.<zone>.wicket.internal`, or under the boxes domain; null for a public ask on an installation without public names), `scope` (`run`, `standing`), `for` (`agent`, `zone`, or null), `expires_at` (null: until revoked, or as its run lasts), `created_at`, `decided_by`, `decided_at`, `ended_at`, `end_reason`, `owner`, `target`, `agent` (what the agent wrote) |
+| a name's `owner` | `principal`, `zone`, `run` (the run that asked), `holder` (the run that holds it now, or null) |
+| a name's `target` | `node` (the holder's node, or null), `public_ipv4` and `public_ipv6` (that node's, or null), `host_port` (a public name's on that node, or null), `box_port` |
+| a name's `agent` | `label`, `service`, `reason` (as the agent wrote them) |
+| `wicket names show --json` | `id`, `kind`, `status`, `state`, `why`, `name`, `scope`, `for`, `expires_at`, `created_at`, `decided_by`, `decided_at`, `ended_at`, `end_reason`, `owner`, `target`, `agent` (as `names list --json` has them), `records` (the records the ledger says this installation made for it), `plan` (the last reconcile's plan for it, or null), `connections` (its last connections, newest first, at most 50) |
+| a name's `records`, each | `zone`, `provider`, `name`, `type`, `value`, `ttl` |
+| a name's `plan` | `provider`, `zones` (each zone with a conflict at the name or a change to it: its `zone`, `conflicts`, `changes`, `applied`, `error`), `waiting` (why it was waiting, or null) |
+| a name's `connections`, each | `seq`, `ts`, `node`, `run`, `kind` (`name.conn`, `name.conn.refused`), `record` (the node's record, its label left out) |
 | `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
 | `wicket lease list --json` | `id`, `status` (`pending`, `approved`, `active`, `ended`, `denied`, `withdrawn`, `failed`), `run` (the run that holds it), `provider`, `request` (the request a person decides; null: none yet), `node` (the enrolled node's name; null: none yet), `node_id` (the provider's id for it), `hourly_cap_micro_usd`, `reserved_micro_usd`, `billed_micro_usd` (null: not ended), `duration_secs`, `created_at`, `not_after` (null: no node yet), `ended_at`, `detail` |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
