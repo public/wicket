@@ -80,6 +80,14 @@ pub const REGENESIS: &str = "regenesis";
 
 /// Opens node `name`'s feed: its key (created here on first use, 0600) and a certificate for it from
 /// the installation's feed root. A delta log that doesn't read is an error, not set aside.
+/// [`open_feed`] under the node feed's lock (`<data dir>/nodes/<name>/feed.lock`), as every
+/// publisher on it holds it: for a caller outside [`SharedFeed`], such as `wicket keys certify`
+/// starting a new generation, which renames the log.
+pub fn open_feed_locked(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
+    let _lock = feed_lock(&crate::data_dir().join("nodes").join(name))?;
+    open_feed(name, cfg)
+}
+
 pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
     let dir = crate::data_dir().join("nodes").join(name).join("feed");
     if dir.join(REGENESIS).exists() {
@@ -306,10 +314,20 @@ impl SharedFeed {
                 g.1 = now;
                 cert_due |= renew_margin().is_some_and(|m| g.0.cert().not_after <= now + m);
             }
-            // A renewal that fails keeps the publisher as it is, current and still certified:
-            // the commit or revocation this lock is for still goes out.
+            // A renewal that fails keeps the publisher as it is, current, so the commit or
+            // revocation this lock is for still goes out; but only while its certificate is still
+            // valid and the one on disk is of the same version. A higher version on disk is a new
+            // generation: publishing under the old one would be refused by the node, and hide it.
             if cert_due {
                 if let Err(e) = reopen(&mut g) {
+                    let disk_version = on_disk.as_deref().and_then(wicket_feed::jws::payload_unverified::<KeyCert>).map(|c| c.version);
+                    let held = g.0.cert();
+                    if held.not_after <= now || disk_version.is_some_and(|v| v != held.version) {
+                        return Err(e.context(format!(
+                            "node {}'s feed certificate can't be renewed, and the one held is past its end or of another version than the one on disk",
+                            self.name
+                        )));
+                    }
                     say_err!("[wicket] could not renew node {}'s feed certificate ({e:#}); publishing with the current one", self.name);
                 }
             }
@@ -1312,7 +1330,15 @@ async fn session(
                 }
             },
             _ = tick.tick() => {
-                let f = sh.ctl.publisher.lock().ok().and_then(|mut p| p.tick(wicket_feed::now_ms()));
+                let f = match sh.ctl.publisher.lock() {
+                    Ok(mut p) => p.tick(wicket_feed::now_ms()),
+                    Err(e) => {
+                        // No statement this tick: the node goes offline at its last one's end
+                        // unless a later lock works.
+                        say_err!("[wicket] could not take node {}'s feed for a statement: {e:#}", sh.node);
+                        None
+                    }
+                };
                 if let Some(f) = f {
                     send(feed_frame(f));
                 }
