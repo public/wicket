@@ -6,6 +6,7 @@ pub mod dev;
 pub mod identity;
 pub mod image;
 pub mod itself;
+pub mod message;
 pub mod names;
 pub mod node;
 pub mod operator;
