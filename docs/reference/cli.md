@@ -185,6 +185,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 - [`wicket daemon`](#wicket-daemon)
 - [`wicket dev`](#wicket-dev)
   - [`wicket dev node-feed-probe`](#wicket-dev-node-feed-probe)
+  - [`wicket dev console-assets`](#wicket-dev-console-assets)
   - [`wicket dev mock-llm`](#wicket-dev-mock-llm)
 
 ## `wicket`
@@ -1143,7 +1144,7 @@ Commands:
   enrol            Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
   list             List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a node from `wicket node create` or a capacity lease), with any leased node not enrolled
   create           Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Its money is reserved first against placement.yaml's limits (with every lease's); then its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
-  release          Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
+  release          Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the provider is asked, then `placement.node_released` or `placement.node_release_failed`, the records the console's release of a node past its lease writes too
   plans            List a provider's (Vultr's) plans in a region, with their hourly price
   revoke           Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
   install          Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node` systemd user service that runs `wicket node serve` there
@@ -1268,7 +1269,7 @@ Options:
 ### `wicket node release`
 
 ```text
-Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
+Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the provider is asked, then `placement.node_released` or `placement.node_release_failed`, the records the console's release of a node past its lease writes too
 
 Usage: wicket node release [OPTIONS] <ID>
 
@@ -1280,6 +1281,8 @@ Options:
           The vault secret holding the Vultr API key [default: vultr-api-key]
       --owner <OWNER>
           The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
+      --reason <REASON>
+          Why: it goes on the audit record
   -h, --help
           Print help
 ```
@@ -1974,7 +1977,7 @@ Usage: wicket policy <COMMAND>
 Commands:
   show   The org policy's version, and the running runs minted under another
   check  Validate and compile an org policy without installing it
-  apply  Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy)
+  apply  Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy). The console applies one the same way, signed with a passkey on what --dry-run shows
   zone   A zone's policy as Cedar, generated from a manifest (what its boxes' tokens are compiled from)
   help   Print this message or the help of the given subcommand(s)
 
@@ -2012,7 +2015,7 @@ Options:
 ### `wicket policy apply`
 
 ```text
-Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy)
+Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy). The console applies one the same way, signed with a passkey on what --dry-run shows
 
 Usage: wicket policy apply [OPTIONS] <FILE>
 
@@ -2022,6 +2025,7 @@ Arguments:
 Options:
       --entities <ENTITIES>  
       --keep-runs            Leave running runs on the policy they were minted under until they end
+      --dry-run              Change nothing: print what applying it would do (its version and the one it replaces, what it changes against the applied policy for each running zone and group, whether it mints for every running run's zone, and the runs it would revoke) and the effect the console signs
   -h, --help                 Print help
 ```
 
@@ -2439,6 +2443,7 @@ Usage: wicket dev <COMMAND>
 
 Commands:
   node-feed-probe  On a node: send `node serve` its own last freshness statement, tampered and then replayed, and print how each was refused (a check for ci/node-e2e.sh). The control connection stays up
+  console-assets   Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
   mock-llm         A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without an API key
   help             Print this message or the help of the given subcommand(s)
 
@@ -2456,6 +2461,20 @@ Usage: wicket dev node-feed-probe [OPTIONS]
 Options:
       --dir <DIR>  
   -h, --help       Print help
+```
+
+### `wicket dev console-assets`
+
+```text
+Write the console as `wicket serve` sends it (the page, its files at their paths, and the security headers in headers.json) into DIR, for the browser tests (ci/console-browsers.sh)
+
+Usage: wicket dev console-assets <DIR>
+
+Arguments:
+  <DIR>  
+
+Options:
+  -h, --help  Print help
 ```
 
 ### `wicket dev mock-llm`

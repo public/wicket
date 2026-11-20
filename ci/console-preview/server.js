@@ -3,7 +3,12 @@
 // with made-up data (fixture.js). For looking at the page, not for testing wicket: nothing here is
 // signed or checked, and every action "succeeds".
 //
-//   node ci/console-preview/server.js [PORT]
+//   node ci/console-preview/server.js [PORT] [--assets DIR]
+//
+// With --assets, it serves the console as `wicket serve` sends it, from what `wicket dev
+// console-assets DIR` wrote: the page, its minified, content-hashed files and the same security
+// headers (headers.json), so the browser tests (ci/console-browsers.sh) check what ships. Without
+// it, the source files, read fresh on each load.
 //
 // The scenario is a cookie, set from the page's query: /?fixture=full (the default), empty,
 // signedout, bootstrap, stale (every poll fails, after a first good one) or expired (the next poll
@@ -16,7 +21,13 @@ const fx = require("./fixture.js");
 const STATIC = path.join(__dirname, "../../crates/wicket-cli/src/serve/static");
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; " +
   "manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
-const port = Number(process.argv[2] || process.env.PORT || 8790);
+const args = process.argv.slice(2);
+const ai = args.indexOf("--assets");
+const ASSETS = ai >= 0 ? path.resolve(args.splice(ai, 2)[1]) : null;
+const port = Number(args[0] || process.env.PORT || 8790);
+// The security headers: as wicket sends them with --assets; otherwise the CSP, kept equal to
+// serve/web.rs's by hand.
+const HEADERS = ASSETS ? JSON.parse(fs.readFileSync(path.join(ASSETS, "headers.json"), "utf8")) : { "content-security-policy": CSP };
 const T0 = Date.now();
 
 const types = { ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
@@ -24,6 +35,7 @@ const cookie = req => Object.fromEntries((req.headers.cookie || "").split(/;\s*/
 const polls = new Map();
 
 function page(res) {
+  if (ASSETS) return send(res, 200, "text/html; charset=utf-8", fs.readFileSync(path.join(ASSETS, "index.html")));
   // As serve/web.rs builds it, without the content hashes (the files are read fresh on each load).
   const html = fs.readFileSync(path.join(STATIC, "console.html"), "utf8")
     .replace("{{css}}", "/static/console.css").replace("{{js}}", "/static/console.js")
@@ -31,7 +43,7 @@ function page(res) {
   send(res, 200, "text/html; charset=utf-8", html);
 }
 function send(res, status, type, body, extra) {
-  res.writeHead(status, { "content-type": type, "content-security-policy": CSP, "cache-control": "no-store", ...(extra || {}) });
+  res.writeHead(status, { "content-type": type, ...HEADERS, "cache-control": "no-store", ...(extra || {}) });
   res.end(body);
 }
 const json = (res, v, status) => send(res, status || 200, "application/json", JSON.stringify(v));
@@ -69,7 +81,8 @@ http.createServer((req, res) => {
     return page(res);
   }
   if (p.startsWith("/static/") || p === "/sw.js" || p === "/manifest.webmanifest") {
-    const f = path.join(STATIC, path.basename(p));
+    // With --assets, the file at its served path (the dump holds nothing else); else the source.
+    const f = ASSETS ? path.join(ASSETS, path.normalize(p).replace(/^([/\\]|\.\.[/\\])+/, "")) : path.join(STATIC, path.basename(p));
     if (!fs.existsSync(f)) return send(res, 404, "text/plain", "not found");
     return send(res, 200, types[path.extname(f)] || "application/octet-stream", fs.readFileSync(f));
   }

@@ -1348,6 +1348,29 @@ pub fn from_index(names: &[String], health: &[(String, i64, String)], now_ms: i6
     (found, ask)
 }
 
+/// Each placed (paid) node's lease end, by name, from its latest record (#579): an ended one's is
+/// when it ended, if that was sooner, so a node whose enrolment outlived its placed node's end counts
+/// as past its lease, not as one that was never placed.
+pub fn placed_leases(rows: &[wicket_store::PlacedNodeRow]) -> Vec<(String, i64)> {
+    let mut latest: std::collections::BTreeMap<&str, &wicket_store::PlacedNodeRow> = Default::default();
+    for r in rows {
+        let newer = latest.get(r.name.as_str()).is_none_or(|p| (r.created_at, &r.id) >= (p.created_at, &p.id));
+        if newer {
+            latest.insert(&r.name, r);
+        }
+    }
+    latest
+        .into_values()
+        .map(|r| {
+            let until = match r.status.as_str() {
+                "active" => r.lease_until,
+                _ => r.ended_at.map_or(r.lease_until, |e| e.min(r.lease_until)),
+            };
+            (r.name.clone(), until)
+        })
+        .collect()
+}
+
 /// Whether `node` may take a box that runs up to `needs_secs` from `now` (s), by the leases of the
 /// placed (paid) nodes in `placed` (name, lease end): one that isn't placed always may; a placed one
 /// only if its lease outlasts the box (#579).
@@ -1398,7 +1421,7 @@ pub async fn place_box(
     let index = || -> Result<(Vec<Candidate>, Vec<String>)> {
         let l = ledger.lock().expect("ledger");
         let leased: Vec<String> = l.leases(wicket_store::LIVE_LEASES)?.into_iter().filter_map(|x| x.node_name).collect();
-        let placed: Vec<(String, i64)> = l.placed_nodes(&["active"])?.into_iter().map(|p| (p.name, p.lease_until)).collect();
+        let placed = placed_leases(&l.placed_nodes(&[])?);
         let now = wicket_store::now();
         let names: Vec<String> = l
             .nodes()?
@@ -2592,6 +2615,39 @@ mod tests {
             .map(|a| (a.kind, serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["why"].as_str().unwrap_or_default().to_string()))
             .collect();
         assert_eq!(kinds, [("placement.preempt_abandoned".to_string(), "another wake asked it to stop since".to_string())]);
+    }
+
+    /// #579 (review): a placed node that has ended counts by when it ended, by its latest record, so
+    /// an enrolment that outlived it isn't taken for a node that was never placed.
+    #[test]
+    fn an_ended_placed_node_counts_as_past_its_lease() {
+        let row =
+            |id: &str, name: &str, created_at: i64, lease_until: i64, status: &str, ended_at: Option<i64>| wicket_store::PlacedNodeRow {
+                id: id.into(),
+                backend: "b".into(),
+                name: name.into(),
+                owner: "o".into(),
+                api_key_secret: "k".into(),
+                created_at,
+                lease_until,
+                status: status.into(),
+                held_by: None,
+                ended_at,
+                detail: None,
+                hourly: None,
+            };
+        let rows = [
+            row("i1", "p1", 10, 5_000, "released", Some(900)),
+            row("i2", "p2", 10, 5_000, "active", None),
+            // p3 was placed, ended, and placed again: its latest lease counts.
+            row("i3", "p3", 10, 1_000, "released", Some(800)),
+            row("i4", "p3", 20, 9_000, "active", None),
+        ];
+        let placed = placed_leases(&rows);
+        assert!(!lasts_for(&placed, "p1", 1_000, 60), "ended at 900: past its lease, though its node row may linger");
+        assert!(lasts_for(&placed, "p2", 1_000, 60));
+        assert!(lasts_for(&placed, "p3", 1_000, 60), "placed again");
+        assert!(lasts_for(&placed, "n1", 1_000, 60), "never placed");
     }
 
     /// #579 (review): a placed node whose lease ends before the box would is no candidate.

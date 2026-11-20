@@ -2664,6 +2664,50 @@ mod tests {
         assert_eq!(deletes(&st), vec!["placed-files"]);
     }
 
+    /// #590 (sim seed 32300777): a run whose work one supervisor collected, and whose next
+    /// supervisor (it took the run over after a control host crash) failed to fetch it again, holds
+    /// no node: the work is on this host, so the node is released at its lease end, not billed on.
+    #[tokio::test]
+    async fn a_collected_run_holds_no_node_whatever_a_later_fetch_said() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-done", "done-node", end);
+        started(&l, "run_done", "alive:1");
+        l.set_run_node("run_done", "done-node").unwrap();
+        l.record_collected("run_done", "fetched").unwrap();
+        l.run_ended(&RunId("run_done".into()), "failed", "fetching its files failed").unwrap();
+        l.set_run_uncollected("run_done", Some("done-node")).unwrap();
+        assert!(l.uncollected_runs_on_node("done-node").unwrap().is_empty());
+        let w = World::new(vultr(&base));
+        let d = full_pass(&w, &mut l, end + 1, false).await;
+        assert_eq!(deletes(&st), vec!["placed-done"], "{d:?}");
+    }
+
+    /// The review of #590: a taken result (`outbox`, written when the box exits, before its files
+    /// are fetched) or an allowed push (`pushed`, mid-run) leaves the files on the node, so a run
+    /// whose fetch then failed still holds it (#324).
+    #[tokio::test]
+    async fn a_taken_result_or_push_leaves_the_run_holding_its_node() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-kept", "kept-node", end);
+        started(&l, "run_kept", "alive:1");
+        l.set_run_node("run_kept", "kept-node").unwrap();
+        l.record_collected("run_kept", "outbox").unwrap();
+        l.record_collected("run_kept", "pushed").unwrap();
+        l.run_ended(&RunId("run_kept".into()), "failed", "fetching its files failed").unwrap();
+        l.set_run_uncollected("run_kept", Some("kept-node")).unwrap();
+        assert_eq!(l.uncollected_runs_on_node("kept-node").unwrap(), vec!["run_kept"]);
+        let w = World::new(vultr(&base));
+        let d = full_pass(&w, &mut l, end + 1, false).await;
+        assert!(deletes(&st).is_empty(), "{d:?}");
+        // Once its files are fetched, it doesn't.
+        l.record_collected("run_kept", "fetched").unwrap();
+        assert!(l.uncollected_runs_on_node("kept-node").unwrap().is_empty());
+    }
+
     /// #494, #495: a node held past its lease bills hours its worst case didn't reserve. The pass
     /// reserves them (every started hour and the next), so the next node's spend check counts them;
     /// a dry run changes nothing.

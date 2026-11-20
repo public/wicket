@@ -33,6 +33,9 @@ pub(super) fn clear_spool(root: &std::path::Path) {
 pub(super) fn have(node: &Arc<Node>, gen: u64, id: u64, digest: String) {
     let n = node.clone();
     tokio::spawn(async move {
+        // Held while it is checked, and counted as a use: the control host places a box on what
+        // this says (#191), so no image sweep removes it between the two.
+        let _held = super::imagegc::hold(&n.paths.root, &digest, (n.clock)()).await;
         let (out, error) = match n.docker.image_identity(&digest).await {
             Ok(i) => (Some(if i.is_some_and(|i| i.is(&digest)) { "present" } else { "absent" }.to_string()), None),
             Err(e) => (None, Some(format!("{e:#}"))),
@@ -122,7 +125,10 @@ async fn receive(
     let unpacked = unpacked??;
     node.docker.import_layout(dir).await.context("importing the image")?;
     match node.docker.image_identity(digest).await? {
-        Some(i) if i.is(digest) => Ok(unpacked),
+        Some(i) if i.is(digest) => {
+            super::imagegc::imported(&node.paths.root, digest, (node.clock)());
+            Ok(unpacked)
+        }
         _ => bail!("the runtime does not report {digest} after importing it"),
     }
 }
@@ -180,7 +186,10 @@ async fn pull_into(
     drop(cred);
     node.docker.import_layout(dir).await.context("importing the image")?;
     match node.docker.image_identity(digest).await? {
-        Some(i) if i.is(digest) => Ok(unpacked),
+        Some(i) if i.is(digest) => {
+            super::imagegc::imported(&node.paths.root, digest, (node.clock)());
+            Ok(unpacked)
+        }
         _ => bail!("the runtime does not report {digest} after importing it"),
     }
 }
@@ -244,7 +253,8 @@ mod tests {
     use crate::oci::testkit::{archive, image_with, sha};
 
     /// A runtime that keeps what it loads in a directory: `load` takes a layout archive and checks
-    /// it names one image whose blobs are all there; `image inspect` reports it by digest or name.
+    /// it names one image whose blobs are all there; `image inspect` reports it by digest or name;
+    /// `image rm` removes it, unless `<store>/in-use` names it (a container made from it).
     const FAKE_RUNTIME: &str = r#"#!/usr/bin/env python3
 import io, json, os, sys, tarfile
 store = os.environ["FAKE_STORE"]
@@ -262,9 +272,26 @@ if a[:1] == ["load"]:
         rec["RepoDigests"].append(n)
     open(os.path.join(store, d["digest"][7:]), "w").write(json.dumps(rec))
     sys.exit(0)
+if a[:2] == ["image", "rm"]:
+    ref = a[-1]
+    used = open(os.path.join(store, "in-use")).read().split() if os.path.exists(os.path.join(store, "in-use")) else []
+    for f in os.listdir(store):
+        if f == "in-use":
+            continue
+        rec = json.load(open(os.path.join(store, f)))
+        if ref == rec["Id"] or ref in rec["RepoDigests"]:
+            if rec["Id"] in used:
+                sys.stderr.write("Error response from daemon: conflict: unable to delete (must be forced) - image is being used by stopped container\n")
+                sys.exit(1)
+            os.remove(os.path.join(store, f))
+            sys.exit(0)
+    sys.stderr.write("Error response from daemon: No such image: " + ref + "\n")
+    sys.exit(1)
 if a[:2] == ["image", "inspect"]:
     ref = a[-1]
     for f in os.listdir(store):
+        if f == "in-use":
+            continue
         rec = json.load(open(os.path.join(store, f)))
         if ref == rec["Id"] or ref in rec["RepoDigests"]:
             print(json.dumps(rec))
@@ -361,6 +388,92 @@ sys.exit(2)
         assert!(k.iter().any(|(k, b)| k == "image.refused" && b["digest"] == other.index.as_str()), "{k:?}");
         // Nothing is left in the spool.
         assert_eq!(std::fs::read_dir(spool(&node.paths.root)).map(|d| d.count()).unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn an_image_given_to_the_node_is_removed_once_unused_unless_a_container_holds_it() {
+        let inst = Install::new("nodesrv-images-gc");
+        let store = inst.dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let fake = inst.dir.join("fake-runtime");
+        std::fs::write(&fake, FAKE_RUNTIME).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut node = test_node(&inst);
+        Arc::get_mut(&mut node).unwrap().docker =
+            Docker::with_command(vec!["env".into(), format!("FAKE_STORE={}", store.display()), fake.display().to_string()]);
+        let calls = Arc::new(crate::calls::Calls::default());
+        pump(connect(&node, 1, &inst).await, calls.clone());
+        let (old, held, fresh, live) =
+            (image_with(b"old layer"), image_with(b"held layer"), image_with(b"fresh layer"), image_with(b"live box's layer"));
+        let (starting, asked) = (image_with(b"starting box's layer"), image_with(b"asked-about layer"));
+        for img in [&old, &held, &fresh, &live, &starting, &asked] {
+            calls.put_image(&img.index, None, archive(&img.entries).as_slice()).await.unwrap();
+        }
+        let root = &node.paths.root;
+        // Two of them last used long ago; one of those still has a container made from it.
+        let long_ago = (node.clock)() - 30 * 86_400_000;
+        let mut u = super::super::imagegc::read(root);
+        assert_eq!(u.uses.len(), 6, "every image it was given is recorded: {u:?}");
+        for img in [&old, &held, &live, &starting, &asked] {
+            u.uses.insert(img.index.clone(), long_ago);
+        }
+        std::fs::write(root.join("image-uses.json"), serde_json::to_vec(&u).unwrap()).unwrap();
+        std::fs::write(store.join("in-use"), &held.index).unwrap();
+        // A box starting from one holds it; the control host asking about another counts as a use.
+        let hold = super::super::imagegc::hold(root, &starting.index, long_ago).await;
+        assert!(calls.has_image(&asked.index).await.unwrap());
+        // A live box pinned to one, as a box that may start children from it is.
+        let mut rec = super::super::tests::fake_record("run_live");
+        rec.start.image_pin = Some(live.index.clone());
+        node.boxes.lock().unwrap().insert(
+            "run_live".into(),
+            BoxState {
+                streams: [1, 2, 3],
+                name: "wicket-run-live".into(),
+                dir: inst.dir.join("runs/run_live"),
+                stdin: None,
+                stdin_next: 0,
+                out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
+                exited: None,
+                ended: false,
+                tasks: vec![],
+                user: String::new(),
+                cpus: 1.0,
+                memory_mib: 1,
+                listeners: HashMap::new(),
+                owner: Some(1),
+                record: rec,
+            },
+        );
+
+        let removed = super::super::imagegc::sweep(&node).await;
+        assert_eq!(removed, vec![old.index.clone()]);
+        assert!(!calls.has_image(&old.index).await.unwrap(), "removed from the runtime");
+        assert!(calls.has_image(&held.index).await.unwrap(), "a container holds it");
+        assert!(calls.has_image(&fresh.index).await.unwrap(), "used recently");
+        assert!(calls.has_image(&live.index).await.unwrap(), "a live box may start from it");
+        // (Asked through the runtime, not the control host: asking would count as a use.)
+        assert!(node.docker.image_identity(&starting.index).await.unwrap().is_some(), "a box is starting from it");
+        assert!(calls.has_image(&asked.index).await.unwrap(), "the control host was told it is here");
+        let k = kinds(&node);
+        assert!(k.iter().any(|(k, b)| k == "image.kept" && b["digest"] == held.index.as_str()), "{k:?}");
+        assert!(k.iter().any(|(k, b)| k == "image.removed" && b["digest"] == old.index.as_str() && b["keep_days"] == 7), "{k:?}");
+        assert!(!k.iter().any(|(k, b)| k == "image.removed" && b["digest"] != old.index.as_str()), "{k:?}");
+        // The held one counts as used now, so it isn't asked about again until it has been unused
+        // for the whole keep; the removed one is forgotten.
+        let u = super::super::imagegc::read(root);
+        assert!(!u.uses.contains_key(&old.index) && u.uses[&held.index] > long_ago, "{u:?}");
+        assert!(super::super::imagegc::sweep(&node).await.is_empty());
+        // Once the start is over (its box would be live, or it failed), the hold is gone; still unused
+        // by then, the image goes at the next sweep.
+        drop(hold);
+        // What the node's cache knew of it is forgotten with it, so a start asks the runtime afresh.
+        let known = node.docker.image_identity(&starting.index).await.unwrap().unwrap();
+        node.idents.seed(&starting.index, known);
+        assert!(node.idents.get(&starting.index).is_some());
+        assert_eq!(super::super::imagegc::sweep(&node).await, vec![starting.index.clone()]);
+        assert!(node.idents.get(&starting.index).is_none(), "not left in the cache");
+        assert!(node.docker.image_identity_cached(&node.idents, &starting.index).await.unwrap().is_none());
     }
 
     /// A run id, as `check_run_id` wants one.

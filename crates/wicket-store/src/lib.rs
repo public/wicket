@@ -76,7 +76,9 @@ pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
 mod writer;
 pub use writer::{AuditWriter, Ticket, WriterConfig};
 mod export;
+mod hosts;
 pub use export::{ExportCursor, EXPORT_LEASE_SECS};
+pub use hosts::{lapsed_alone, SupervisorHost, Taken as ShardTaken};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -104,6 +106,10 @@ pub enum StoreError {
     EffectChanged(String, String, String),
     #[error("{0}: an egress grant is decided and counted on the box's node, never consumed by the ledger (#257)")]
     EgressGrant(String),
+    #[error("shard {0} is held by another supervisor host for {1} s more")]
+    ShardHeld(String, i64),
+    #[error("shard {0} is no longer this supervisor host's at epoch {1}: it was taken at a higher one")]
+    ShardLost(String, i64),
     #[error("this ledger was migrated by a newer wicket (schema {version}), past a step this build (schema {SCHEMA_VERSION}) can't read: roll forward, or restore the snapshot taken before that update")]
     TooNew { version: u32, floor: u32 },
     #[error("this ledger is schema {version}, older than schema {UPGRADES_FROM}, the oldest this build upgrades: open it once with a wicket build that still upgrades it (main at {STEP_THROUGH}), then with this one")]
@@ -236,6 +242,10 @@ impl StoreError {
 /// their way into a run's token on its node, and which the node confirmed, so `await_grant` on a
 /// standing ask answers once the box's node can honour it. Older builds don't read it; the floor
 /// stays 17.
+/// Version 42 (expand, #582 step 5; 38 to 41 are others' in flight) adds `supervisor_hosts`,
+/// `shard_nodes` and `runs.host`: supervisor hosts, the shards of nodes they hold under a lease at
+/// an epoch, and which shard's host supervises each run (`hosts`). Older builds don't read them;
+/// the floor stays 17.
 /// Version 43 (expand, #748; 38 to 42 are others' in flight) adds `name_records.missing_since`:
 /// when a listing of its zone first lacked the record, so one listing alone forgets none. Older
 /// builds don't read it; the floor stays 17.
@@ -359,6 +369,50 @@ pub struct Request {
     /// The sha256 of the arguments it asks with, for the kinds whose effect depends on more than
     /// the target (spawn, link, capacity, update: #369, [`wicket_core::effect::args_sha256`]).
     pub args_sha256: Option<String>,
+}
+
+/// Inserts a message row (for [`Ledger::post_message`]): to `to_run`, or the principal's live run,
+/// or held. Returns the run it is for.
+#[allow(clippy::too_many_arguments)]
+fn insert_message(
+    conn: &rusqlite::Connection,
+    id: &str,
+    tenant: &TenantId,
+    from_run: &str,
+    to: &str,
+    to_run: Option<&str>,
+    envelope: &str,
+    meta: &MessageMeta,
+) -> Result<Option<String>> {
+    let to_run = match to_run {
+        Some(r) => Some(r.to_string()),
+        None => conn
+            .query_row(
+                "SELECT i.run FROM identities i JOIN runs r ON r.id = i.run
+                 WHERE i.tenant = ?1 AND i.spiffe_id = ?2 AND r.status = 'running' ORDER BY i.issued_at DESC, i.rowid DESC LIMIT 1",
+                params![tenant.0, to],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?,
+    };
+    conn.execute(
+        "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            id,
+            tenant.0,
+            from_run,
+            to_run.as_deref().unwrap_or(""),
+            envelope,
+            now(),
+            to,
+            meta.from_principal,
+            meta.priority.as_str(),
+            meta.in_reply_to,
+            if meta.operator { KIND_OPERATOR_MESSAGE } else { KIND_MESSAGE }
+        ],
+    )?;
+    Ok(to_run)
 }
 
 #[derive(Debug, Clone)]
@@ -652,6 +706,8 @@ impl Ledger {
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         names::migrate(&conn)?;
+        conn.execute_batch(hosts::SCHEMA)?;
+        hosts::migrate(&conn)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -711,6 +767,8 @@ impl Ledger {
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         names::migrate(&conn)?;
+        conn.execute_batch(hosts::SCHEMA)?;
+        hosts::migrate(&conn)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
@@ -1252,36 +1310,49 @@ impl Ledger {
         meta: &MessageMeta,
     ) -> Result<Option<String>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let to_run = match to_run {
-            Some(r) => Some(r.to_string()),
-            None => tx
-                .query_row(
-                    "SELECT i.run FROM identities i JOIN runs r ON r.id = i.run
-                     WHERE i.tenant = ?1 AND i.spiffe_id = ?2 AND r.status = 'running' ORDER BY i.issued_at DESC, i.rowid DESC LIMIT 1",
-                    params![tenant.0, to],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?,
-        };
-        tx.execute(
-            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                id,
-                tenant.0,
-                from_run,
-                to_run.as_deref().unwrap_or(""),
-                envelope,
-                now(),
-                to,
-                meta.from_principal,
-                meta.priority.as_str(),
-                meta.in_reply_to,
-                if meta.operator { KIND_OPERATOR_MESSAGE } else { KIND_MESSAGE }
-            ],
-        )?;
+        let to_run = insert_message(&tx, id, tenant, from_run, to, to_run, envelope, meta)?;
         tx.commit()?;
         Ok(to_run)
+    }
+
+    /// [`Ledger::post_message`] with its audit record in the same transaction (#252 review): the
+    /// message is never in an inbox without its record, so nothing can take it unaudited.
+    /// `record` is the audit body; this sets its `to_run` and `held` to where the message went.
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_message_audited(
+        &mut self,
+        id: &str,
+        tenant: &TenantId,
+        from_run: &str,
+        to: &str,
+        to_run: Option<&str>,
+        envelope: &str,
+        meta: &MessageMeta,
+        audit_run: Option<&RunId>,
+        mut record: serde_json::Value,
+    ) -> Result<Option<String>> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let r = (|| -> Result<Option<String>> {
+            let routed = insert_message(&self.conn, id, tenant, from_run, to, to_run, envelope, meta)?;
+            record["to_run"] = serde_json::json!(routed);
+            record["held"] = serde_json::json!(routed.is_none());
+            // Inside this transaction, the record joins it.
+            self.audit(tenant, audit_run, "message", &record)?;
+            Ok(routed)
+        })();
+        match r {
+            Ok(routed) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(routed),
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Records a message for run `to_run` only (tests, and envelopes made outside the gateway).
