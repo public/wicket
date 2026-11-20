@@ -22,7 +22,10 @@ const AGENT = "#agent/run_01JDRELEASEQQQQQQQQQQQQQQQ";
 // (the CSP's, Trusted Types' included), recorded from before any script.
 async function watch(page) {
   const problems = [];
-  page.on("console", m => { if (m.type() === "error") problems.push("console: " + m.text()); });
+  // WebKit ignores a report-only policy without a `report-to`, and logs that as an error: a note
+  // about the header, not a problem of the page's. Chromium and Firefox still report under it.
+  const reportOnly = /delivered in report-only mode, but does not specify a 'report-to'/;
+  page.on("console", m => { if (m.type() === "error" && !reportOnly.test(m.text())) problems.push("console: " + m.text()); });
   page.on("pageerror", e => problems.push("error: " + e.message));
   await page.addInitScript(() => {
     window.__violations = [];
