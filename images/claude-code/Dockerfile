@@ -15,7 +15,8 @@ RUN RUSTFLAGS="-C target-feature=+crt-static -C strip=symbols" \
  && cp target/*/release/wicket-fwd /wicket-fwd \
  && /wicket-fwd --help >/dev/null
 
-FROM node:22-bookworm-slim
+# Node's Active LTS line (#732): 26, LTS from 2026-10-28, maintained to 2029-04-30.
+FROM node:26.13.1-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1
 
 ARG CLAUDE_CODE_VERSION=2.1.319
 

@@ -4,7 +4,7 @@
 # on PATH (GITHUB_PATH in Actions). With NODE_SHA256 empty it uses the runner's own Node, with a
 # warning: pin it (the SHASUMS256.txt next to the tarball has the value).
 #
-#   NODE_VERSION=22.23.5 NODE_SHA256=<hex> ci/install-node.sh
+#   NODE_VERSION=26.13.1 NODE_SHA256=<hex> ci/install-node.sh
 set -euo pipefail
 v=${NODE_VERSION:?NODE_VERSION}
 if [ -z "${NODE_SHA256:-}" ]; then
