@@ -108,7 +108,7 @@ fn bare_imports(src: &str, path: &Path, rel: &str) -> String {
     let alloc = Allocator::default();
     let parsed = Parser::new(&alloc, src, SourceType::mjs()).parse();
     if !parsed.diagnostics.is_empty() {
-        panic!("{}: {:?}", path.display(), parsed.diagnostics);
+        panic!("{}", report(path, src, &parsed.diagnostics));
     }
     // From the module to the modules' root: "./" at the root, "../" for each directory below it.
     let up = match rel.matches('/').count() {
