@@ -264,7 +264,15 @@ fn pin_target(l: &Ledger, tenant: &str, owner: &str, spec: &mut TriggerSpec) -> 
 /// Keeps `spec` as `op`'s trigger, until `until` if given. `via`: where it was made (`cli`). The
 /// trigger's id, and the agent it reaches (resolved now; a `wake` is kept as the agent's id).
 pub fn create(l: &Ledger, op: &Operator, spec: &TriggerSpec, until: Option<i64>, via: &str) -> Result<(String, Option<AgentRow>)> {
-    let c = create_with(l, op, spec, until, via, None, &wicket_proxy::vault::Vault::new(wicket_proxy::vault::Vault::default_dir()))?;
+    let c = create_with(
+        l,
+        op,
+        spec,
+        until,
+        via,
+        Intake::default(),
+        &wicket_proxy::vault::Vault::new(wicket_proxy::vault::Vault::default_dir()),
+    )?;
     Ok((c.id, c.agent))
 }
 
@@ -276,15 +284,23 @@ pub struct Created {
     pub hook: Option<(String, String)>,
 }
 
-/// [`create`], with the intake node for a webhook trigger (`intake_node`; the only one if None) and
-/// the vault its verify secret is in.
+/// Where a webhook trigger's deliveries arrive: its intake node (`node`; the only one if None), and
+/// whether that may be the control host's own machine (`allow_local`).
+#[derive(Clone, Debug, Default)]
+pub struct Intake {
+    pub node: Option<String>,
+    pub allow_local: bool,
+}
+
+/// [`create`], with where a webhook trigger's deliveries arrive (`intake`) and the vault its verify
+/// secret is in.
 pub fn create_with(
     l: &Ledger,
     op: &Operator,
     spec: &TriggerSpec,
     until: Option<i64>,
     via: &str,
-    intake_node: Option<&str>,
+    intake_at: Intake,
     vault: &wicket_proxy::vault::Vault,
 ) -> Result<Created> {
     spec.check().map_err(anyhow::Error::msg)?;
@@ -293,9 +309,9 @@ pub fn create_with(
     let node = match intake::is_hook(&spec.source) {
         true => {
             intake::check_verify(spec, vault)?;
-            Some(intake::intake_node(l, &TenantId::single().0, intake_node)?)
+            Some(intake::intake_node(l, &TenantId::single().0, intake_at.node.as_deref(), intake_at.allow_local)?)
         }
-        false if intake_node.is_some() => bail!("--intake-node is for a webhook or GitHub trigger"),
+        false if intake_at.node.is_some() => bail!("--intake-node is for a webhook or GitHub trigger"),
         false => None,
     };
     let t = TenantId::single();
@@ -2170,7 +2186,10 @@ mod tests {
         let vault = wicket_proxy::vault::Vault::new(dir.clone());
         let s = spec("trigger: hook\nsource: { webhook: { verify: { hmac_sha256: hook-key } } }\naction: { wake: captain }\n");
         let mk = |v: &wicket_proxy::vault::Vault, node: Option<&str>| {
-            create_with(&l, &operator(), &s, None, "t", node, v).err().map(|e| e.to_string()).unwrap_or_default()
+            create_with(&l, &operator(), &s, None, "t", Intake { node: node.map(String::from), allow_local: false }, v)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
         };
         assert!(mk(&vault, None).contains("no secret hook-key"), "{}", mk(&vault, None));
         vault.set("hook-key", "k3y").unwrap();
@@ -2179,7 +2198,10 @@ mod tests {
         assert!(mk(&vault, None).contains("no intake node"), "{}", mk(&vault, None));
         assert!(mk(&vault, Some("edge")).contains("isn't an intake node"));
         let plain = spec("trigger: p\nsource: { schedule: { cron: '* * * * *' } }\naction: { wake: captain }\n");
-        let e = create_with(&l, &operator(), &plain, None, "t", Some("edge"), &vault).err().unwrap().to_string();
+        let e = create_with(&l, &operator(), &plain, None, "t", Intake { node: Some("edge".into()), allow_local: false }, &vault)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(e.contains("--intake-node is for a webhook"), "{e}");
         assert!(l.triggers("t0", None).unwrap().is_empty(), "nothing kept");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2214,7 +2236,7 @@ mod tests {
                 delivery: format!("g-{n}"),
                 received_at: at,
                 fields: wicket_core::intake::github_fields("check_suite", &body),
-                raw_sha256: "00".into(),
+                raw_sha256: format!("sha-{n}"),
                 bytes: 1,
             }
         };
@@ -2257,6 +2279,49 @@ mod tests {
         let (fired, ack) = intake::ingest(&l, "edge", &[ev("8", "failure", now)], now, &no_wake, &anyone).unwrap();
         assert!(fired.is_empty() && ack == ["s-8"]);
         assert!(l.trigger_event_known("t0", &format!("hook:{id}"), "g-8").unwrap());
+    }
+
+    /// #714 review H2 and H3: a signed body replayed under a new delivery id doesn't fire again; a
+    /// node's time from the future counts as now, so it neither escapes the hourly limit nor the
+    /// staleness check, and wicket's own fields win over a body's.
+    #[test]
+    fn a_node_cant_replay_or_move_time() {
+        use wicket_core::intake::IntakeEvent;
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        let mut s = spec(
+            "trigger: hook\nsource: { webhook: { verify: { hmac_sha256: k } } }\naction: { wake: captain }\nlimits: { per_hour: 2 }\n",
+        );
+        pin_target(&l, "t0", &operator().id, &mut s).unwrap();
+        let id = l.create_trigger("t0", &operator().id, &s, "unix:alex", false, None).unwrap();
+        l.set_trigger_intake(&id, "edge", "x").unwrap();
+        let now = wicket_store::now();
+        let ev = |n: &str, body: &str, at: i64| IntakeEvent {
+            id: format!("s-{n}"),
+            trigger: id.clone(),
+            kind: "webhook".into(),
+            delivery: format!("d-{n}"),
+            received_at: at,
+            fields: serde_json::json!({ "delivery": "spoofed", "at": 1 }),
+            raw_sha256: body.into(),
+            bytes: 1,
+        };
+        let (fired, _) = intake::ingest(&l, "edge", &[ev("1", "body-a", now)], now, &no_wake, &anyone).unwrap();
+        assert_eq!(fired[0].status, "started");
+        // The same body under a new delivery id: a replay.
+        let (fired, ack) = intake::ingest(&l, "edge", &[ev("2", "body-a", now)], now, &no_wake, &anyone).unwrap();
+        assert!(fired.is_empty() && ack == ["s-2"], "{fired:?}");
+        // Far in the future: counted as now, so the hourly limit (2) holds.
+        let future = now + 10 * 86_400;
+        let (fired, _) = intake::ingest(&l, "edge", &[ev("3", "body-b", future)], now, &no_wake, &anyone).unwrap();
+        assert_eq!(fired[0].status, "started");
+        let (fired, _) = intake::ingest(&l, "edge", &[ev("4", "body-c", future)], now, &no_wake, &anyone).unwrap();
+        assert_eq!(fired[0].status, "skipped", "over the hour's limit though its time was the future: {fired:?}");
+        // wicket's fields won over the body's.
+        let e = l.trigger_event_known("t0", &format!("hook:{id}"), "d-3").unwrap();
+        assert!(e);
+        let fired = l.audit_of_kind("trigger.fired").unwrap();
+        assert!(fired.iter().all(|r| !r.body.contains("spoofed")), "the body's delivery didn't replace wicket's");
     }
 
     /// A node's refusals are audited at most once an hour, counted.

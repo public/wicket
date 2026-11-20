@@ -1211,7 +1211,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         });
     }
     // Webhook intake's socket (#578 step 4), in the same 0700 directory: `wicket intake serve`.
-    if let Err(e) = intake::serve_socket(node.clone(), intake::socket(&ctl)) {
+    let (intake_sock, intake_uid) = intake::endpoint(&node.paths.root, &ctl);
+    if let Err(e) = intake::serve_socket(node.clone(), intake_sock, intake_uid) {
         say_err!("[node] intake socket: {e:#}");
     }
     let mode = node.replica.lock().expect("replica").mode((node.clock)());

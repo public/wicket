@@ -22,6 +22,10 @@ pub enum TriggerCmd {
         /// only when there are several.
         #[arg(long)]
         intake_node: Option<String>,
+        /// Let the intake node be this host's own (`local`): deliveries from the internet then reach
+        /// the machine with the ledger and the vault. Off unless asked for.
+        #[arg(long)]
+        allow_local_intake: bool,
     },
     /// A webhook or GitHub trigger's new URL: its old one stops working. Only its owner (or root).
     #[command(name = "rotate-url")]
@@ -179,12 +183,13 @@ pub async fn dispatch(c: TriggerCmd) -> Result<()> {
     let now = wicket_store::now();
     let op = operators::Operator::cli(&TenantId::single().0)?;
     match c {
-        TriggerCmd::Create { file, lasts: d, intake_node } => {
+        TriggerCmd::Create { file, lasts: d, intake_node, allow_local_intake } => {
             let raw = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
             let spec: wicket_core::trigger::TriggerSpec =
                 wicket_core::yaml::from_str(&raw).with_context(|| format!("{}: not a trigger document", file.display()))?;
             let vault = wicket_proxy::vault::Vault::new(wicket_proxy::vault::Vault::default_dir());
-            let c = tr::create_with(&l, &op, &spec, lasts(&d)?, "cli", intake_node.as_deref(), &vault)?;
+            let at = tr::Intake { node: intake_node, allow_local: allow_local_intake };
+            let c = tr::create_with(&l, &op, &spec, lasts(&d)?, "cli", at, &vault)?;
             let t = l.trigger(&c.id)?.context("the trigger just kept")?;
             println!("kept trigger {} as {}", t.name, c.id);
             println!("{}", line(&t, now));

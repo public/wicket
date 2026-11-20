@@ -13,8 +13,11 @@ use wicket_core::intake::{IntakeEvent, IntakeRefused, IntakeTrigger};
 
 /// The node label that makes a node an intake node (`wicket node set <n> --label wicket.intake=true`).
 pub const INTAKE_LABEL: &str = "wicket.intake";
-/// The most events one pass takes from one node (a backlog goes over several passes).
+/// The most events one pass takes from one node (a backlog goes over several passes) …
 pub const PASS_MAX_EVENTS: usize = 2000;
+/// … in at most this many syncs, and this long: a slow or hostile node can't stall the pass.
+pub const PASS_MAX_ROUNDS: usize = 10;
+pub const PASS_NODE_SECS: u64 = 20;
 /// A node's refusals are audited at most this often (s), counted.
 pub const REFUSED_AUDIT_SECS: i64 = 3600;
 
@@ -23,17 +26,28 @@ pub fn is_hook(s: &Source) -> bool {
     matches!(s, Source::Webhook { .. } | Source::Github { .. })
 }
 
+/// Whether node `node` is labelled for intake.
+fn labelled(l: &Ledger, node: &str) -> Result<bool> {
+    Ok(l.node_labels(node)?.get(INTAKE_LABEL).map(String::as_str) == Some("true"))
+}
+
 /// The intake node for a new webhook trigger of tenant `tenant`: `wanted` if it is one, else the
 /// only one there is. An intake node is labelled [`INTAKE_LABEL`]`=true`, active, of the tenant,
-/// and was last noted at protocol [`wicket_chan::chan::INTAKE`] or later.
-pub fn intake_node(l: &Ledger, tenant: &str, wanted: Option<&str>) -> Result<String> {
+/// and was last noted at protocol [`wicket_chan::chan::INTAKE`] or later. The local node (the
+/// control host's own machine) only with `allow_local`: intake there puts internet traffic on the
+/// machine with the ledger and the vault (#714 review H4).
+pub fn intake_node(l: &Ledger, tenant: &str, wanted: Option<&str>, allow_local: bool) -> Result<String> {
     let mut ok = vec![];
     let mut why = vec![];
     for n in l.nodes()? {
         if n.tenant != tenant || n.status != "active" {
             continue;
         }
-        if l.node_labels(&n.name)?.get(INTAKE_LABEL).map(String::as_str) != Some("true") {
+        if !labelled(l, &n.name)? {
+            continue;
+        }
+        if n.name == crate::localnode::NAME && !allow_local {
+            why.push(format!("{} (the control host's own machine: only with --allow-local-intake)", n.name));
             continue;
         }
         match crate::noderun::known_protocol(&n.name) {
@@ -139,10 +153,23 @@ pub fn ingest(
     wake: Waker<'_>,
     owner: OwnerCheck<'_>,
 ) -> Result<(Vec<Fired>, Vec<String>)> {
+    ingest_checked(l, node, events, now, wake, owner, &mut HashMap::new())
+}
+
+/// [`ingest`], with the owners checked so far this pass (`checked`, by trigger): a trigger's owner
+/// is checked once a pass, however many syncs the node's events take; one that couldn't be is
+/// held for the rest of the pass, its events skipped (not acked) without blocking the others'.
+pub(super) fn ingest_checked(
+    l: &Ledger,
+    node: &str,
+    events: &[IntakeEvent],
+    now: i64,
+    wake: Waker<'_>,
+    owner: OwnerCheck<'_>,
+    checked: &mut HashMap<String, bool>,
+) -> Result<(Vec<Fired>, Vec<String>)> {
     let mut out = vec![];
     let mut ack = vec![];
-    // Within one pass, a trigger's owner is checked once.
-    let mut checked: HashMap<String, bool> = HashMap::new();
     for e in events {
         // Only a trigger this node serves, and only fields within what intake makes: a node is
         // trusted as far as its own triggers, no further.
@@ -166,12 +193,22 @@ pub fn ingest(
             || e.delivery.is_empty()
             || e.delivery.len() > wicket_core::intake::MAX_DELIVERY
         {
+            // Counted, and audited with the node's refusals (#714 review M6).
+            note_dropped(node);
             ack.push(e.id.clone());
             continue;
         }
+        // The node's clock isn't the control host's: a time from the future is now. The rate
+        // window and the staleness below use the control host's now (#714 review H3).
+        let received_at = e.received_at.min(now);
         // The dedup key is the trigger's own: one URL, one trigger.
         let dedup = format!("hook:{}", t.id);
         let raw = &e.raw_sha256;
+        // A signed body replayed under a new delivery id is the same delivery (#714 review H2).
+        if !l.trigger_event_known(&t.tenant, &dedup, &e.delivery)? && l.trigger_event_body_known(&t.tenant, &dedup, raw)? {
+            ack.push(e.id.clone());
+            continue;
+        }
         // Paused, lapsed, or waiting for a human: recorded, not fired.
         if !t.live(now) {
             l.record_trigger_event(&t.tenant, &dedup, &e.kind, &e.delivery, &e.fields, raw, &format!("intake:{node}"))?;
@@ -179,14 +216,14 @@ pub fn ingest(
             continue;
         }
         // Too old when read (the reconciler or the link was down): recorded once and passed over.
-        if e.received_at < now - EVENT_STALE_SECS {
+        if received_at < now - EVENT_STALE_SECS {
             let r = l.immediate(|l| -> Result<Option<Fired>> {
                 let (event, fresh) =
                     l.record_trigger_event(&t.tenant, &dedup, &e.kind, &e.delivery, &e.fields, raw, &format!("intake:{node}"))?;
                 if !fresh {
                     return Ok(None);
                 }
-                let why = format!("delivered {} s before it was read: passed over", now - e.received_at);
+                let why = format!("delivered {} s before it was read: passed over", now - received_at);
                 l.record_firing(&t.id, &event, "skipped", Some(&why))?;
                 Ok(Some(Fired { trigger: t.id.clone(), name: t.name.clone(), status: "skipped".into(), detail: why }))
             })?;
@@ -228,9 +265,11 @@ pub fn ingest(
                 continue;
             }
         }
+        // wicket's own fields win over a body's of the same name.
         let mut fields = e.fields.clone();
         if let Some(m) = fields.as_object_mut() {
-            m.entry("delivery").or_insert(Value::String(e.delivery.clone()));
+            m.insert("delivery".into(), Value::String(e.delivery.clone()));
+            m.insert("at".into(), Value::from(received_at));
         }
         let r = l.immediate(|l| -> Result<(Option<Fired>, Option<String>)> {
             let (event, fresh) = l.record_trigger_event(&t.tenant, &dedup, &e.kind, &e.delivery, &fields, raw, &format!("intake:{node}"))?;
@@ -238,7 +277,8 @@ pub fn ingest(
                 // A redelivery: fired once already.
                 return Ok((None, None));
             }
-            let ev = Ev { id: event, source, at: e.received_at, fields: fields.clone(), chain: Default::default() };
+            // The firing's time is the control host's: what the hourly limit counts back from.
+            let ev = Ev { id: event, source, at: now, fields: fields.clone(), chain: Default::default() };
             match l.savepoint(|l| fire_event(l, &t, &ev)) {
                 Ok(x) => Ok(x),
                 Err(err) => {
@@ -275,33 +315,43 @@ pub fn ingest(
     Ok((out, ack))
 }
 
-/// When each node's refusals were last audited (this process: a reconciler is long-lived).
-static REFUSED_AT: std::sync::LazyLock<Mutex<HashMap<String, (i64, IntakeRefused)>>> = std::sync::LazyLock::new(Default::default);
+/// When each node's refusals were last audited, and what it refused (and what the control host
+/// dropped of what it sent) since. In this process's memory: a reconciler is long-lived, and one
+/// that restarts audits its first refusals at once.
+static REFUSED_AT: std::sync::LazyLock<Mutex<HashMap<String, (i64, IntakeRefused, u64)>>> = std::sync::LazyLock::new(Default::default);
+
+/// Counts an event from `node` the control host dropped (fields outside intake's shape, another
+/// trigger's kind): audited with the node's refusals.
+fn note_dropped(node: &str) {
+    let mut m = REFUSED_AT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    m.entry(node.to_string()).or_insert((0, IntakeRefused::default(), 0)).2 += 1;
+}
 
 /// Counts node `node`'s refusals, and audits them (`trigger.intake_refused`) at most once every
 /// [`REFUSED_AUDIT_SECS`].
 pub fn note_refused(l: &Ledger, node: &str, r: &IntakeRefused, now: i64) -> Result<()> {
     let mut m = REFUSED_AT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let e = m.entry(node.to_string()).or_insert((0, IntakeRefused::default()));
+    let e = m.entry(node.to_string()).or_insert((0, IntakeRefused::default(), 0));
     e.1.token += r.token;
     e.1.signature += r.signature;
     e.1.rate += r.rate;
     e.1.other += r.other;
-    if e.1.total() > 0 && now - e.0 >= REFUSED_AUDIT_SECS {
+    if (e.1.total() > 0 || e.2 > 0) && now - e.0 >= REFUSED_AUDIT_SECS {
         audit(
             l,
             "trigger.intake_refused",
-            &json!({ "node": node, "token": e.1.token, "signature": e.1.signature, "rate": e.1.rate, "other": e.1.other, "since": e.0 }),
+            &json!({ "node": node, "token": e.1.token, "signature": e.1.signature, "rate": e.1.rate, "other": e.1.other, "dropped": e.2, "since": e.0 }),
         )?;
-        *e = (now, IntakeRefused::default());
+        *e = (now, IntakeRefused::default(), 0);
     }
     Ok(())
 }
 
 /// One pass over every intake node, from the reconciler: each is sent the triggers it serves and
 /// the events recorded since, and what it hands back is recorded and fired, until its spool is
-/// empty or [`PASS_MAX_EVENTS`] have been read. `ledger` is the pass's own connection; `link_ledger`
-/// is a second one for the links' handshakes (the node's identity, its certificates).
+/// empty, or [`PASS_MAX_EVENTS`], [`PASS_MAX_ROUNDS`] syncs or [`PASS_NODE_SECS`] are reached. One
+/// node's failure is its own: the others are still synced. `ledger` is the pass's own connection;
+/// `link_ledger` is a second one for the links' handshakes.
 pub async fn pass(
     ledger: &Ledger,
     link_ledger: &Arc<Mutex<Ledger>>,
@@ -312,56 +362,77 @@ pub async fn pass(
     let vault = wicket_proxy::vault::Vault::new(wicket_proxy::vault::Vault::default_dir());
     let mut out = vec![];
     for node in ledger.intake_nodes()? {
-        let skip = |why: String| Fired { trigger: String::new(), name: format!("intake on {node}"), status: "failed".into(), detail: why };
-        if crate::noderun::known_protocol(&node).is_none_or(|p| p < wicket_chan::chan::INTAKE) {
-            out.push(skip(format!("node {node} isn't known to talk protocol {} (intake): not synced", wicket_chan::chan::INTAKE)));
-            continue;
-        }
-        let (triggers, problems) = table(ledger, &node, &vault)?;
-        out.extend(problems.into_iter().map(skip));
-        let link = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            crate::nodecall::Link::connect(&node, &format!("intake:{}", std::process::id()), link_ledger),
-        )
-        .await
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(PASS_NODE_SECS);
+        if let Err(e) = tokio::time::timeout_at(deadline, sync_node(ledger, link_ledger, &vault, &node, now, wake, owner, &mut out))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("node {node} took more than {PASS_NODE_SECS} s: the rest waits for the next pass")))
         {
-            Ok(Ok(l)) => l,
-            Ok(Err(e)) => {
-                out.push(skip(format!("{e:#}")));
-                continue;
-            }
-            Err(_) => {
-                out.push(skip(format!("node {node} didn't answer within 10 s")));
-                continue;
-            }
-        };
-        if link.proto < wicket_chan::chan::INTAKE {
-            out.push(skip(format!("node {node} talks protocol {} now: intake needs {}", link.proto, wicket_chan::chan::INTAKE)));
-            continue;
-        }
-        let (mut ack, mut read) = (vec![], 0usize);
-        loop {
-            let (events, refused) = match link.calls.intake_sync(triggers.clone(), std::mem::take(&mut ack)).await {
-                Ok(x) => x,
-                Err(e) => {
-                    out.push(skip(format!("syncing: {e:#}")));
-                    break;
-                }
-            };
-            note_refused(ledger, &node, &refused, now)?;
-            if events.is_empty() {
-                break;
-            }
-            read += events.len();
-            let (fired, acked) = ingest(ledger, &node, &events, now, wake, owner)?;
-            out.extend(fired);
-            ack = acked;
-            if read >= PASS_MAX_EVENTS {
-                // The acks go with the next pass's first sync.
-                let _ = link.calls.intake_sync(triggers.clone(), std::mem::take(&mut ack)).await;
-                break;
-            }
+            out.push(Fired {
+                trigger: String::new(),
+                name: format!("intake on {node}"),
+                status: "failed".into(),
+                detail: format!("{e:#}"),
+            });
         }
     }
     Ok(out)
+}
+
+/// One intake node's sync, for [`pass`].
+#[allow(clippy::too_many_arguments)]
+async fn sync_node(
+    ledger: &Ledger,
+    link_ledger: &Arc<Mutex<Ledger>>,
+    vault: &wicket_proxy::vault::Vault,
+    node: &str,
+    now: i64,
+    wake: Waker<'_>,
+    owner: OwnerCheck<'_>,
+    out: &mut Vec<Fired>,
+) -> Result<()> {
+    if crate::noderun::known_protocol(node).is_none_or(|p| p < wicket_chan::chan::INTAKE) {
+        bail!("node {node} isn't known to talk protocol {} (intake): not synced", wicket_chan::chan::INTAKE);
+    }
+    // A node no longer labelled for intake is sent an empty table: its secrets go from its memory,
+    // and its spool keeps what it holds until it is labelled again or the triggers move.
+    let (triggers, problems) = if labelled(ledger, node)? { table(ledger, node, vault)? } else { (vec![], vec![]) };
+    let serving: Vec<String> = ledger.intake_triggers(node)?.into_iter().map(|(id, _)| id).collect();
+    for p in problems {
+        out.push(Fired { trigger: String::new(), name: format!("intake on {node}"), status: "failed".into(), detail: p });
+    }
+    let link = crate::nodecall::Link::connect(node, &format!("intake:{}", std::process::id()), link_ledger).await?;
+    if link.proto < wicket_chan::chan::INTAKE {
+        bail!("node {node} talks protocol {} now: intake needs {}", link.proto, wicket_chan::chan::INTAKE);
+    }
+    let (mut ack, mut read) = (vec![], 0usize);
+    let mut checked: HashMap<String, bool> = HashMap::new();
+    for round in 0..PASS_MAX_ROUNDS {
+        let hold: Vec<String> = checked.iter().filter(|(_, ok)| !**ok).map(|(id, _)| id.clone()).collect();
+        let (events, refused) = link.calls.intake_sync(triggers.clone(), std::mem::take(&mut ack), serving.clone(), hold).await?;
+        if let Err(e) = note_refused(ledger, node, &refused, now) {
+            out.push(Fired {
+                trigger: String::new(),
+                name: format!("intake on {node}"),
+                status: "failed".into(),
+                detail: format!("{e:#}"),
+            });
+        }
+        if events.is_empty() {
+            break;
+        }
+        read += events.len();
+        let (fired, acked) = ingest_checked(ledger, node, &events, now, wake, owner, &mut checked)?;
+        out.extend(fired);
+        ack = acked;
+        // Every event of this batch was held (owners that can't be checked): the next sync would
+        // hand the same ones over again.
+        let progressed = !ack.is_empty();
+        if read >= PASS_MAX_EVENTS || round + 1 == PASS_MAX_ROUNDS || !progressed {
+            if !ack.is_empty() {
+                link.calls.intake_sync(triggers.clone(), std::mem::take(&mut ack), serving.clone(), vec![]).await?;
+            }
+            break;
+        }
+    }
+    Ok(())
 }

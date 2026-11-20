@@ -17,40 +17,56 @@ wicket node set edge-1 --label wicket.intake=true
 ```
 
 The node must talk protocol 21 or later (`wicket node list` shows it), so update it first if it
-doesn't. On a one-machine installation you can label the local node, `local`, but then inbound
-traffic reaches the control host's machine.
+doesn't. The local node, `local`, is the control host's own machine: a trigger takes it only with
+`wicket trigger create --allow-local-intake`. Inbound internet traffic would then reach the machine
+with the ledger, the vault and the keys, so use a separate node if you can.
 
-## 2. Run intake on the node
+## 2. Run intake on the node, as its own user
 
-On the node, as its `wicket` user, run `wicket node intake` as a user service beside
-`wicket node serve`:
-
-```ini
-# ~/.config/systemd/user/wicket-intake.service
-[Unit]
-Description=wicket webhook intake
-After=wicket-node.service
-
-[Service]
-ExecStart=%h/.local/bin/wicket node intake --listen 0.0.0.0:8443 --tls-cert %h/intake/cert.pem --tls-key %h/intake/key.pem
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-```
+Intake parses whatever the internet sends it, so it runs as a user of its own, `wicket-intake`,
+which can't read the node's keys, its boxes or its spool. It reaches the node's `wicket node serve`
+only through a socket that `serve` checks by the peer's uid. As root, on the node:
 
 ```sh
-systemctl --user daemon-reload
-systemctl --user enable --now wicket-intake
+useradd --system --no-create-home --shell /usr/sbin/nologin wicket-intake
+# The socket's directory: setgid, so the socket wicket makes there is group wicket-intake.
+echo 'd /run/wicket-intake 2750 wicket wicket-intake -' > /etc/tmpfiles.d/wicket-intake.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/wicket-intake.conf
+install -d -m 750 -o root -g wicket-intake /etc/wicket-intake   # cert.pem and key.pem go here, mode 640
 ```
 
-- **TLS.** Give it a certificate and key with `--tls-cert` and `--tls-key`. Or leave them out and
-  put a TLS-terminating reverse proxy in front: then it listens on plain HTTP, so bind it to an
-  address only the proxy reaches.
+Tell the node's `serve` where intake's socket is and whose it is, in its `node.json`
+(`~wicket/.local/share/wicket-node/node.json`), then restart `wicket node serve`:
+
+```json
+"intake_socket": "/run/wicket-intake/intake.sock",
+"intake_uid": 998
+```
+
+(`id -u wicket-intake` gives the uid.) Then install and start the unit:
+
+```sh
+install -m 644 deploy/node/wicket-intake.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now wicket-intake
+```
+
+The unit (`deploy/node/wicket-intake.service`) gives intake nothing else. It has no home, no
+devices and no privileges, a read-only system, memory and task limits, and only the IPv4, IPv6 and
+unix socket families. Restart it after a self update of the node.
+
+- **TLS.** Give it a certificate and key in `/etc/wicket-intake`. Or drop `--tls-cert` and
+  `--tls-key` from its command, and put a TLS-terminating reverse proxy in front: then it listens
+  on plain HTTP, so bind it to an address only the proxy reaches.
 - **What it holds.** Its table of triggers (their URL tokens' hashes and verify secrets) comes from
-  `wicket node serve` every 10 s, in memory. While that `serve` isn't running, every delivery gets
-  404.
+  `wicket node serve` every 10 s, in memory, and only this node's triggers.
+  - While that `serve` isn't running, or hasn't heard from the control host since it started (up to
+    a reconcile pass), deliveries get 503, and senders that retry try again.
+  - GitHub doesn't redeliver on its own: a delivery refused then shows in the hook's "Recent
+    Deliveries", where you can redeliver it.
+- **Trying it out.** Without `intake_uid`, `serve` takes intake as its own user, on
+  `ctl/intake.sock`: `wicket node intake --listen 127.0.0.1:8443`, as the wicket user. Keep that
+  for a test node.
 
 ## 3. Store the webhook's secret as a verify secret
 
@@ -93,9 +109,15 @@ with `--intake-node`.
   `application/json`, give it the secret, and pick the events the trigger listens to. GitHub signs
   each delivery (`X-Hub-Signature-256`) and names it (`X-GitHub-Delivery`).
 - **A generic webhook.** Use `webhook: { verify: { hmac_sha256: <secret> } }` as the source. The
-  sender signs the raw body: `X-Wicket-Signature-256: sha256=<hex HMAC-SHA256>`. It may name the
-  delivery with `X-Wicket-Delivery`, which wicket uses to drop resends; otherwise the body's sha256
-  is used.
+  sender sends:
+  - `X-Wicket-Timestamp`: the time, in Unix seconds;
+  - optionally `X-Wicket-Delivery`: an id for the delivery, which wicket uses to drop resends (the
+    body's sha256 otherwise);
+  - `X-Wicket-Signature-256: sha256=<hex>`: the HMAC-SHA256, under the secret, of
+    `v1:<timestamp>:<delivery id>:` followed by the raw body (the id empty if it sends none).
+
+  A delivery more than 5 minutes from intake's clock, or under another id than it was signed with,
+  is refused, so one that was seen can't be sent again.
 
 ## What a delivery becomes
 
@@ -106,13 +128,31 @@ with `--intake-node`.
     `issue.number`, `issue.author`, `issue.title`, `issue.url`, `comment.author`, `comment.url`,
     `check.name`, `check.status`, `check.conclusion`, `check.url`, `pusher`, `delivery`.
   - **Generic:** the body's top-level strings, numbers and booleans, if it is a JSON object: at most
-    32 keys of `a-z`, `0-9`, `_` and `-`, each value at most 512 bytes. Plus `delivery`.
+    32 keys of `a-z`, `0-9`, `_` and `-` (the first by key order), each value at most 512 bytes.
+  - **Both:** plus `delivery` and `at`, wicket's own, which a body's keys of those names don't
+    replace.
+  - **Forks.** A pull request from a fork names the fork's branch, often `main`. Use `fork: false`
+    (or `head_repo`) with `branch` when it matters whose branch it is. A check suite or run doesn't
+    say where its change came from, and GitHub lists no pull request on one from a fork.
 - **Data, never authority.** Everything in a delivery was written by whoever sent it. A valid
-  signature only says they had the secret. Fields reach the agent as quoted event input in its
-  message, and never a manifest, a zone or a limit.
-- **Once.** A resent delivery (the same delivery id) fires once.
+  signature only says they had the secret. Control characters are stripped on the node, and a node
+  that sends any is refused on the control host. Fields reach the agent as quoted event input in
+  its message, and never a manifest, a zone or a limit.
+- **Loops.** An agent that pushes, comments or opens a pull request makes GitHub send a delivery,
+  which can fire its own trigger again. Filter out what the agent does itself, for example
+  `sender: "!my-agent-bot"` or `pusher: "!my-agent-bot"`.
+- **Once.** A resent delivery fires once: the same delivery id, or the same body under another
+  id.
+  - GitHub doesn't sign its delivery id or a time. So a GitHub delivery someone captured (GitHub
+    shows them on the hook's page) could be sent again under another id. wicket drops the same body
+    for as long as it keeps the event, 14 days, but not after.
+  - If that matters, filter on fields that age out (`action`, a check's status), or rotate the
+    secret.
 - **Within limits.**
-  - Intake allows each trigger 60 deliveries a minute (bursts of 20), and the node 600.
+  - Intake checks the path and token before it reads a body, and caps the body at 1 MiB.
+  - An address that keeps failing (unknown tokens, bad signatures) is slowed down.
+  - Only verified deliveries count against a trigger's 60 a minute (bursts of 20), and the node's
+    600, so a leaked URL alone can't use up a trigger's rate.
   - The trigger's `per_hour` still applies when it fires.
   - A paused trigger records deliveries and fires nothing.
   - A delivery read more than 15 minutes after it arrived (the reconciler was down) is passed over.

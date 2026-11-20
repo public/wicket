@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS trigger_intake (
   trigger TEXT PRIMARY KEY, node TEXT NOT NULL, token_sha256 TEXT NOT NULL, created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS trigger_intake_node ON trigger_intake (node);
+CREATE INDEX IF NOT EXISTS trigger_events_body ON trigger_events (tenant, source, raw_sha256);
 "#;
 
 /// How long triggers' settled firings and the events they fired on are kept (as the design keeps
@@ -568,10 +569,24 @@ impl Ledger {
     pub fn intake_triggers(&self, node: &str) -> Result<Vec<(String, String)>> {
         let mut st = self.conn.prepare(
             "SELECT i.trigger, i.token_sha256 FROM trigger_intake i JOIN triggers t ON t.id = i.trigger
-             WHERE i.node = ?1 AND t.status != 'deleted' ORDER BY i.trigger",
+             WHERE i.node = ?1 AND t.status NOT IN ('deleted', 'done') ORDER BY i.trigger",
         )?;
         let rows = st.query_map(params![node], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Whether `source` (a webhook trigger's `hook:<id>`) has an event of this raw body already:
+    /// a signed body replayed under a new delivery id is the same delivery (#714 review H2).
+    pub fn trigger_event_body_known(&self, tenant: &str, source: &str, raw_sha256: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM trigger_events WHERE tenant = ?1 AND source = ?2 AND raw_sha256 = ?3 LIMIT 1",
+                params![tenant, source, raw_sha256],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// The nodes some trigger's intake is assigned to.

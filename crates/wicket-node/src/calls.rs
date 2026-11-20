@@ -295,9 +295,11 @@ impl Calls {
         &self,
         triggers: Vec<wicket_core::intake::IntakeTrigger>,
         ack: Vec<String>,
+        serving: Vec<String>,
+        hold: Vec<String>,
     ) -> Result<(Vec<wicket_core::intake::IntakeEvent>, wicket_core::intake::IntakeRefused)> {
         let id = self.id();
-        match self.answer(id, Frame::Msg(Msg::IntakeSync { id, triggers, ack }), "an intake sync").await? {
+        match self.answer(id, Frame::Msg(Msg::IntakeSync { id, triggers, ack, serving, hold }), "an intake sync").await? {
             Msg::IntakeEvents { error: Some(e), .. } => bail!("{e}"),
             Msg::IntakeEvents { events, refused, .. } => Ok((events, refused)),
             _ => bail!("an unexpected answer to an intake sync"),

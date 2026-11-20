@@ -646,6 +646,14 @@ pub enum Msg {
         id: u64,
         triggers: Vec<wicket_core::intake::IntakeTrigger>,
         ack: Vec<String>,
+        /// Every trigger still assigned to the node, `triggers`' and those left out of it this time
+        /// (a secret that didn't read): the node drops spooled events only for triggers not here.
+        #[serde(default)]
+        serving: Vec<String>,
+        /// Triggers whose events the control host holds this pass (their owner couldn't be
+        /// checked): kept in the spool and not sent, so they don't crowd out the others'.
+        #[serde(default)]
+        hold: Vec<String>,
     },
     // ---- node → control host ----
     /// Answer to [`Msg::IntakeSync`]: spooled events, oldest first (bounded), and what intake
@@ -1337,7 +1345,7 @@ mod tests {
             events: vec!["check_suite".into()],
         };
         assert!(!format!("{t:?}").contains("hunter2"));
-        let m = Msg::IntakeSync { id: 1, triggers: vec![t.clone()], ack: vec!["s1".into()] };
+        let m = Msg::IntakeSync { id: 1, triggers: vec![t.clone()], ack: vec!["s1".into()], serving: vec!["trg_1".into()], hold: vec![] };
         let back: Msg = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert!(matches!(back, Msg::IntakeSync { triggers, .. } if triggers == [t]));
     }
