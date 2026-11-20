@@ -108,6 +108,8 @@ multihost() {
   log "multi-host ($nodes): a lease, a box on the node, the node e2e flow, then revoke"
   if [ "$nodes" = local ]; then node_local_setup; else node_vultr_setup; fi
   cap_ws=$(workdir cap)
+  # Delegation across nodes (#252) only with a local node: its boxes reach the mock model on this host.
+  if [ "$nodes" = local ]; then : >"$cap_ws/delegate"; fi
   HOME=$HOMEW "$W" run "$(manifest cap)" --workdir "$cap_ws" --image "$IMAGE_TAG" --node local >"$work/cap.log" 2>&1 &
   cap_pid=$!
   pids+=("$cap_pid")
@@ -154,6 +156,18 @@ multihost() {
   echo "   connect to the box on the node: $(cf connect)"
   check "the agent linked to the box on the other node" 'cf connect | grep -q "remote.wicket.internal:8000"'
   check "  and fetched its page across nodes, relayed by the control host" '[ "$(cf connect_fetch)" = acc-remote ]'
+  # Delegation across nodes (#252): an agent child on the leased node, continued by name.
+  if [ "$nodes" = local ]; then
+    echo "   delegate: $(cf helper | head -c 300)"
+    check "the agent delegated to an agent child on the other node (spawn with placement {lease})" \
+      'cf helper | grep -q "^started agent helper as run run_[a-z0-9]* on node ${node_name:-?}" && cf helper | grep -q "d-"'
+    check "  its report on its task came back as a message from its child" \
+      '[ "$(cf report1 | jq -r .from.relation)" = "your child" ] && [ "$(cf report1 | jq -r .body.turn)" = 1 ] && cf report1 | jq -r .body.delegation | grep -q "^d-"'
+    check "  continue_child gave it another brief on that node" 'cf continued | grep -q "^continued d-"'
+    check "  and its report on that one came back too, the same delegation" \
+      '[ "$(cf report2 | jq -r .body.turn)" = 2 ] && [ "$(cf report2 | jq -r .body.delegation)" = "$(cf report1 | jq -r .body.delegation)" ]'
+    check "  the delegation records both reports" 'cf delegations | grep -q "$(cf report1 | jq -r .body.delegation)"'
+  fi
 
   # The node e2e flow, against the same node, once the remote box has ended.
   remote_run=$(cf remote | grep -o 'run_[a-z0-9]*' | head -1 || true)
