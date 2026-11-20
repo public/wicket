@@ -60,7 +60,7 @@ pub struct Token(pub(crate) Biscuit);
 /// structural check (e.g. a zone over the per-block caps), or if a request to one of its hosts could
 /// cost more than the step budget in the generic engine ([`AuthzError::Cost`]).
 pub fn mint(root: &SigningKey, tenant: &str, principal: &str, ceiling: &Ceiling) -> Result<Token, AuthzError> {
-    let code = ceiling_code(ceiling, Some(&AuthorityInfo { tenant, principal }))?;
+    let code = ceiling_code(ceiling, Some(&AuthorityInfo { tenant, principal }), false)?;
     checked(code.authority()?.build(&root.0).map_err(enc)?, &ceiling.zone)
 }
 
@@ -82,7 +82,19 @@ impl Token {
     /// could cost more than the step budget in the generic engine ([`AuthzError::Cost`]). Grants are
     /// not checked here: [`crate::load`] refuses one from a key no block trusts.
     pub fn attenuate(&self, child: &Ceiling) -> Result<Token, AuthzError> {
-        checked(self.0.append(ceiling_code(child, None)?.block()?).map_err(enc)?, &child.zone)
+        checked(self.0.append(ceiling_code(child, None, self.decodes()?)?.block()?).map_err(enc)?, &child.zone)
+    }
+
+    /// Whether a first-party block reads `decoded` (#664): every later link then says which
+    /// decoded segments it allows, none included.
+    fn decodes(&self) -> Result<bool, AuthzError> {
+        for i in 0..self.0.block_count() {
+            let b = self.0.block_datalog(i).map_err(|e| AuthzError::Load(e.to_string()))?;
+            if b.external_key.is_none() && b.checks.iter().flat_map(|c| &c.queries).any(|q| q.body.iter().any(|p| p.name == "decoded")) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The request a node sends an approver (the approval service, or the parent box's grantor) to

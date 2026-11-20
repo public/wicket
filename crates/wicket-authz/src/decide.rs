@@ -144,9 +144,14 @@ pub fn load_with(
 
 impl Loaded {
     pub fn decide(&self, r: &Request) -> Decision {
-        if let Action::Http { host, .. } = &r.action {
+        if let Action::Http { host, decoded, .. } = &r.action {
             if let Some(why) = wicket_core::never_reachable(host) {
                 return Decision::Forbidden(why);
+            }
+            // A token whose root decides no encoded slash carries no `decoded` rules (#664): every
+            // link must allow each decoded segment, and the root allows none.
+            if !decoded.is_empty() && !self.vetted.decodes {
+                return Decision::Forbidden("an encoded slash this token's zone doesn't decide (decode_slash)".into());
             }
         }
         self.classify(self.compiled.authorize(&request_facts(r), &self.limits))
@@ -171,6 +176,12 @@ impl Loaded {
     /// mustn't decide a whole host from a probe (no splicing).
     pub fn has_org_layer(&self) -> bool {
         self.vetted.org
+    }
+
+    /// Whether block 0 decides encoded slashes (reads `decoded`, #664); if not, a decoded request
+    /// is refused before Datalog.
+    pub fn decodes(&self) -> bool {
+        self.vetted.decodes
     }
 
     /// Whether the compiled evaluator handles this token (otherwise every request uses the generic

@@ -572,6 +572,26 @@ fn only_the_token_allows_a_decoded_slash() {
     };
     assert_eq!(ask_child(vec![]), 0);
     assert_ne!(ask_child(vec![1]), 0, "the spawned link narrows");
+    assert!(source(&token.attenuate(&child).unwrap())[1].contains("decoded("), "it says so: it allows no segment");
+    // #682 re-review: a token no link of which decodes reads no `decoded`, so a node before
+    // protocol 19 (whose vocabulary lacks it) loads it; a decoded request is refused all the same.
+    let plain = mint(&keys.root, TENANT, "trigger:t", &Ceiling::from_zone(&child_zone, "b0", T0 + 3600, vec![]).unwrap()).unwrap();
+    assert!(source(&plain).iter().all(|b| !b.contains("decoded")), "{:?}", source(&plain));
+    let lp = load_ok(&plain, &keys);
+    assert!(!lp.decodes());
+    assert_eq!(ask(&lp, "pkgs.example", vec![]), 0);
+    assert_ne!(ask(&lp, "pkgs.example", vec![1]), 0, "a plain token allows no decoded slash");
+    // A decoding link under a plain root narrows nothing open: the root allows no segment.
+    let mut deco = c.clone();
+    deco.box_prefix = "b0/b1".into();
+    let under_plain = load_ok(&plain.attenuate(&deco).unwrap(), &keys);
+    let mut o = op(&z.name, "GET", "pkgs.example", "/@types/node");
+    o.decoded = vec![1];
+    assert_ne!(kind_of(&decide_compiled(&under_plain, &http_request("b0/b1", &o))), 0, "the root decides no segment");
+}
+
+fn source(t: &Token) -> Vec<String> {
+    wicket_authz::describe(&t.to_bytes().unwrap()).unwrap().into_iter().map(|b| b.source).collect()
 }
 
 /// #664 (#143's guarantees): where a rule asks (`decode_slash: [1]`), `/@scope%2fname` is decided on

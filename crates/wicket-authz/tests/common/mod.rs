@@ -355,7 +355,8 @@ pub fn http_request(box_id: &str, o: &wicket_core::Op) -> Request {
 /// Metadata and private hosts are decided before evaluation, so there is nothing to check for them.
 pub fn decide_compiled(l: &Loaded, r: &Request) -> Decision {
     let d = l.decide(r);
-    let early = matches!(&r.action, Action::Http { host, .. } if wicket_core::never_reachable(host).is_some());
+    let early = matches!(&r.action, Action::Http { host, decoded, .. }
+        if wicket_core::never_reachable(host).is_some() || (!decoded.is_empty() && !l.decodes()));
     assert!(early || !l.last_fell_back(), "decided in the generic engine, not the compiled evaluator: {r:?}");
     d
 }
