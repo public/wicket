@@ -136,12 +136,13 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
         dir_fd: fds.len() > 3,
         manifest_name,
         program_source,
+        codes: true,
     };
     proto::write_json(&mut w, kind::HELLO, &hello)?;
     let welcome: Welcome = match proto::read_frame(&mut r)? {
         Some((kind::WELCOME, p)) => serde_json::from_slice(&p)?,
         // Its policy refused the command (exit 3), or it failed otherwise (1).
-        Some((kind::ERROR, p)) => return Err(daemon_error(&p)),
+        Some((k @ (kind::REFUSE | kind::ERROR), p)) => return Err(daemon_error(k, &p)),
         _ => bail!("wicketd closed the connection"),
     };
     let mut client_ok = true;
@@ -161,7 +162,7 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
                 match proto::read_frame(&mut r)? {
                     Some((kind::EXIT, p)) if p.len() == 4 => return Ok(i32::from_be_bytes(p[..4].try_into().expect("4 bytes"))),
                     // Its policy refused the command (exit 3), or it failed otherwise (1).
-                    Some((kind::ERROR, p)) => return Err(daemon_error(&p)),
+                    Some((k @ (kind::REFUSE | kind::ERROR), p)) => return Err(daemon_error(k, &p)),
                     Some(_) => {}
                     // A restart by the service manager (#455): the command itself goes on.
                     None => bail!(
@@ -243,11 +244,20 @@ fn doctor(sock: &Path, w: &Welcome) -> bool {
     ok
 }
 
-/// The daemon's `ERROR` frame as this command's error, with the exit code it is marked with
-/// (#574, [`proto::mark_of`]).
-fn daemon_error(p: &[u8]) -> anyhow::Error {
-    let text = String::from_utf8_lossy(p);
-    wicket_home::exit::Exit { code: proto::mark_of(&text), msg: format!("wicketd: {text}") }.into()
+/// [`daemon_error`] for a `REFUSE` frame, for the daemon's tests.
+#[cfg(test)]
+pub(super) fn daemon_error_for_test(p: &[u8]) -> anyhow::Error {
+    daemon_error(kind::REFUSE, p)
+}
+
+/// The daemon turning the command away as this command's error: a `REFUSE` frame with the exit
+/// code it carries (#574), an `ERROR` frame (a daemon before it) as a failure, 1.
+fn daemon_error(kind: u8, p: &[u8]) -> anyhow::Error {
+    let (code, text) = match kind {
+        kind::REFUSE => proto::parse_refuse(p),
+        _ => (wicket_home::exit::Code::Failed, String::from_utf8_lossy(p).into_owned()),
+    };
+    wicket_home::exit::Exit { code, msg: format!("wicketd: {text}") }.into()
 }
 
 #[cfg(test)]
@@ -256,16 +266,19 @@ mod tests {
     /// uploads that didn't arrive) exit 1.
     #[test]
     fn only_the_policys_refusal_is_refused() {
-        use super::proto::marked;
+        use super::proto::{kind, refuse_frame};
         use wicket_home::exit::{code_of, Code};
-        let refused = super::daemon_error(marked(Code::Refused, "needs root, or a passkey in the console").as_bytes());
+        let refused = super::daemon_error(kind::REFUSE, &refuse_frame(Code::Refused, "needs root, or a passkey in the console"));
         assert_eq!(code_of(&refused), Some(Code::Refused));
         assert!(refused.to_string().contains("needs root"), "{refused}");
-        let moving = super::daemon_error(marked(Code::TryAgain, "wicketd is moving to a new build: try again in a few seconds").as_bytes());
-        assert_eq!(code_of(&moving), Some(Code::TryAgain));
-        let usage = super::daemon_error(marked(Code::Usage, "unexpected argument").as_bytes());
-        assert_eq!(code_of(&usage), Some(Code::Usage));
-        let other = super::daemon_error(marked(Code::Failed, "the caller's stdin, stdout and stderr did not arrive").as_bytes());
-        assert_eq!(code_of(&other), Some(Code::Failed));
+        for code in [Code::Usage, Code::TryAgain, Code::Failed, Code::NotFound] {
+            assert_eq!(code_of(&super::daemon_error(kind::REFUSE, &refuse_frame(code, "x"))), Some(code));
+        }
+        // The text can't pass for a code: only the field says one.
+        let spoof = super::daemon_error(kind::REFUSE, &refuse_frame(Code::Failed, "refused: try again: usage:"));
+        assert_eq!(code_of(&spoof), Some(Code::Failed));
+        // A daemon before it: its ERROR frame is a failure, its text kept.
+        let old = super::daemon_error(kind::ERROR, b"refused: needs root");
+        assert_eq!((code_of(&old), old.to_string().contains("needs root")), (Some(Code::Failed), true));
     }
 }
