@@ -129,37 +129,58 @@ fn audit_json((seq, ts, kind, run, body): wicket_store::AuditRow) -> serde_json:
 /// pass, the console or a run writing would wait past their budget); it needs as much free space
 /// again as the file, and takes about a minute per 2.5 GB.
 fn compact(yes: bool) -> Result<()> {
+    // Nothing else of wicket's may be writing: a VACUUM holds the write lock for about a minute per
+    // 2.5 GB, past what the audit writer waits (#582 re-review N3).
+    for (role, unit) in [("daemon", "wicketd"), ("console", "wicket-console"), ("reconcile", "wicket-reconcile")] {
+        if pid_alive(&crate::update::pidfile(role)) {
+            bail!("{unit} is running: stop it first (sudo systemctl stop wicketd wicket-console wicket-reconcile), then run this as the wicket user");
+        }
+    }
+    if std::os::unix::net::UnixStream::connect(crate::daemon::SOCKET_PATH).is_ok() {
+        bail!("wicketd is listening on {}: stop it first (sudo systemctl stop wicketd)", crate::daemon::SOCKET_PATH);
+    }
+    // No reconcile pass meanwhile, on this host.
+    let _lock = crate::reconcile::Lock::take()?;
     let path = ledger_path();
+    let dir = path.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
+    // SQLite's temporary copy goes beside the ledger, not in a small /tmp. Set before any
+    // connection of this process opens: it is read when SQLite first needs a temporary file.
+    std::env::set_var("SQLITE_TMPDIR", &dir);
     let l = Ledger::open(&path)?;
     if l.auto_vacuum_incremental()? {
         println!("{}: already gives pruned space back (auto_vacuum = incremental): nothing to do", path.display());
         return Ok(());
     }
     let size = l.file_bytes()?;
-    let free = free_bytes(path.parent().unwrap_or(std::path::Path::new("/")))?;
+    let free = free_bytes(&dir)?;
     if free < 2 * size {
         bail!(
-            "compacting needs about twice the ledger's size free ({} MB, with its WAL): {} MB is free beside {}",
+            "compacting needs about twice the ledger's size free beside it ({} MB, for the copy and its WAL): {} MB is free in {}",
             2 * size / 1_000_000,
             free / 1_000_000,
-            path.display()
+            dir.display()
         );
     }
     println!(
-        "compacting {} ({} MB): one VACUUM, about a minute per 2.5 GB, under an exclusive lock. Stop wicket's services first \
-         (systemctl stop wicket-console wicket-reconcile wicketd, or end `wicket serve` and `wicket reconcile`).",
+        "compacting {} ({} MB): one VACUUM, about a minute per 2.5 GB, holding the ledger exclusively.",
         path.display(),
         size / 1_000_000
     );
     if !yes && !confirm("compact now?")? {
         bail!("not compacted");
     }
-    // No reconcile pass meanwhile, on this host.
-    let _lock = crate::reconcile::Lock::take()?;
     let t = std::time::Instant::now();
-    l.make_auto_vacuum_incremental()?;
+    l.compact_exclusively()?;
     println!("compacted in {:.1} s: {} MB now", t.elapsed().as_secs_f64(), l.file_bytes()? / 1_000_000);
     Ok(())
+}
+
+/// Whether the process a pid file names is running.
+fn pid_alive(pidfile: &std::path::Path) -> bool {
+    std::fs::read_to_string(pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
 }
 
 /// Bytes free on the file system holding `dir`.
@@ -175,19 +196,20 @@ fn free_bytes(dir: &std::path::Path) -> Result<i64> {
 
 #[derive(Subcommand)]
 pub enum AuditCmd {
-    /// Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or
-    /// $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which
-    /// feed the sinks too; each sink is fed by one process at a time. The only process that writes
-    /// to a `path: "-"` (stdout) sink.
     /// Switch the ledger to giving pruned audit space back (`auto_vacuum = incremental`), with one
-    /// VACUUM (#582). Stop wicket's services first: the whole file is rewritten under an exclusive
-    /// lock (about a minute per 2.5 GB), and it needs as much free space again. Ledgers made by
-    /// this build don't need it.
+    /// VACUUM (#582). Run it as the wicket user with wicketd, the console and the reconciler
+    /// stopped: the whole file is rewritten under an exclusive lock (about a minute per 2.5 GB),
+    /// and it needs as much free space again beside the ledger. Ledgers made by this build don't
+    /// need it.
     Compact {
         /// Don't ask for confirmation at a terminal.
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or
+    /// $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which
+    /// feed the sinks too; each sink is fed by one process at a time. The only process that writes
+    /// to a `path: "-"` (stdout) sink.
     Export {
         /// One pass, then exit (non-zero if a sink failed).
         #[arg(long)]

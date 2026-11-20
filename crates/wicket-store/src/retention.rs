@@ -23,7 +23,8 @@ use wicket_core::TenantId;
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS audit_checkpoints (
-  sink TEXT NOT NULL, seq INTEGER NOT NULL, head TEXT NOT NULL, ts INTEGER NOT NULL, jws TEXT NOT NULL, PRIMARY KEY (sink, seq)
+  sink TEXT NOT NULL, seq INTEGER NOT NULL, head TEXT NOT NULL, ts INTEGER NOT NULL, jws TEXT NOT NULL,
+  target TEXT NOT NULL DEFAULT '', PRIMARY KEY (sink, seq)
 );
 CREATE TABLE IF NOT EXISTS audit_anchor (
   id INTEGER PRIMARY KEY CHECK (id = 1), seq INTEGER NOT NULL, hash TEXT NOT NULL, jws TEXT NOT NULL, sink TEXT NOT NULL,
@@ -49,6 +50,9 @@ const CHECKPOINTS_KEPT: i64 = 500;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Checkpoint {
     pub sink: String,
+    /// What the sink delivered it to (`SinkSpec::target`): a checkpoint counts only while the sink
+    /// still points there.
+    pub target: String,
     pub seq: i64,
     pub head: String,
     pub ts: i64,
@@ -92,10 +96,10 @@ const ROW_OVERHEAD: i64 = 24;
 impl Ledger {
     /// Records that `sink` acknowledged a checkpoint of the chain at `seq` (head `head`), keeping
     /// the sink's newest [`CHECKPOINTS_KEPT`].
-    pub fn record_checkpoint(&self, sink: &str, seq: i64, head: &str, ts: i64, jws: &str) -> Result<()> {
+    pub fn record_checkpoint(&self, sink: &str, target: &str, seq: i64, head: &str, ts: i64, jws: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO audit_checkpoints (sink, seq, head, ts, jws) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![sink, seq, head, ts, jws],
+            "INSERT OR REPLACE INTO audit_checkpoints (sink, seq, head, ts, jws, target) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![sink, seq, head, ts, jws, target],
         )?;
         self.conn.execute(
             "DELETE FROM audit_checkpoints WHERE sink = ?1 AND seq NOT IN (SELECT seq FROM audit_checkpoints WHERE sink = ?1 ORDER BY seq DESC LIMIT ?2)",
@@ -106,9 +110,10 @@ impl Ledger {
 
     /// The checkpoints recorded, newest first.
     pub fn checkpoints(&self) -> Result<Vec<Checkpoint>> {
-        let mut st = self.conn.prepare("SELECT sink, seq, head, ts, jws FROM audit_checkpoints ORDER BY seq DESC, sink")?;
-        let rows =
-            st.query_map([], |r| Ok(Checkpoint { sink: r.get(0)?, seq: r.get(1)?, head: r.get(2)?, ts: r.get(3)?, jws: r.get(4)? }))?;
+        let mut st = self.conn.prepare("SELECT sink, seq, head, ts, jws, target FROM audit_checkpoints ORDER BY seq DESC, sink")?;
+        let rows = st.query_map([], |r| {
+            Ok(Checkpoint { sink: r.get(0)?, seq: r.get(1)?, head: r.get(2)?, ts: r.get(3)?, jws: r.get(4)?, target: r.get(5)? })
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -150,8 +155,15 @@ impl Ledger {
     /// Asks for a checkpoint at `seq`, which the exporter signs for each sink once its cursor is
     /// past it.
     pub fn want_checkpoint(&self, seq: i64) -> Result<()> {
+        // One at a time: the newest cut asked for replaces any older.
+        self.conn.execute("DELETE FROM audit_checkpoint_wants WHERE seq != ?1", params![seq])?;
         self.conn.execute("INSERT OR IGNORE INTO audit_checkpoint_wants (seq, created_at) VALUES (?1, ?2)", params![seq, now()])?;
         Ok(())
+    }
+
+    /// The target `sink`'s cursor was last kept for, if any.
+    pub fn sink_target_of(&self, sink: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT target FROM audit_sink_targets WHERE sink = ?1", params![sink], |r| r.get(0)).optional()?)
     }
 
     /// The checkpoints asked for, oldest first.
@@ -200,12 +212,17 @@ impl Ledger {
     /// `synced_ms`), that no trigger is still to read past (#578's cursor), and past the current
     /// anchor. None if there is none: never one above `target`, so a prune never cuts deeper than
     /// asked.
-    pub fn prune_point(&self, sinks: &[&str], target: i64, synced_ms: i64) -> Result<Option<Checkpoint>> {
+    pub fn prune_point(&self, sinks: &[(&str, &str)], target: i64, synced_ms: i64) -> Result<Option<Checkpoint>> {
         if sinks.is_empty() {
             return Ok(None);
         }
         let mut limit = target;
-        for s in sinks {
+        for (s, t) in sinks {
+            // A sink pointed elsewhere since its cursor was kept counts for nothing until the
+            // exporter has started it again (#582 re-review).
+            if self.sink_target_of(s)?.as_deref() != Some(*t) {
+                return Ok(None);
+            }
             limit = limit.min(self.peek_export_cursor(s)?.seq);
         }
         // Wicket's own events (#578): what a trigger hasn't read yet stays.
@@ -219,10 +236,22 @@ impl Ledger {
             }
         }
         let floor = self.audit_anchor()?.map(|a| a.seq).unwrap_or(0);
-        Ok(self
-            .checkpoints()?
-            .into_iter()
-            .find(|c| sinks.contains(&c.sink.as_str()) && c.seq <= limit && c.seq > floor && c.ts.saturating_mul(1000) <= synced_ms))
+        Ok(self.checkpoints()?.into_iter().find(|c| {
+            sinks.iter().any(|(s, t)| *s == c.sink && *t == c.target)
+                && c.seq <= limit
+                && c.seq > floor
+                && c.ts.saturating_mul(1000) <= synced_ms
+        }))
+    }
+
+    /// [`Ledger::prune_point`] and [`Ledger::begin_prune`] in one transaction, so nothing the check
+    /// read (cursors, targets, checkpoints) changes between them. The checkpoint pruned to.
+    pub fn begin_prune_at(&self, sinks: &[(&str, &str)], target: i64, synced_ms: i64) -> Result<Option<Checkpoint>> {
+        self.immediate::<_, StoreError>(|l| {
+            let Some(cp) = l.prune_point(sinks, target, synced_ms)? else { return Ok(None) };
+            l.begin_prune_in(&cp)?;
+            Ok(Some(cp))
+        })
     }
 
     /// Starts a prune to `cp`: in one transaction, `cp` becomes the anchor (refused if the record at
@@ -230,7 +259,13 @@ impl Ledger {
     /// schema floor rises to [`PRUNED_FLOOR`]. Nothing is deleted yet: [`Ledger::prune_chunk`] does
     /// that, a chunk at a time, and the chain verifies from the anchor throughout.
     pub fn begin_prune(&self, cp: &Checkpoint) -> Result<()> {
-        self.immediate::<_, StoreError>(|l| {
+        self.immediate::<_, StoreError>(|l| l.begin_prune_in(cp))
+    }
+
+    /// [`Ledger::begin_prune`] inside the caller's transaction.
+    fn begin_prune_in(&self, cp: &Checkpoint) -> Result<()> {
+        let l = self;
+        {
             let at: Option<String> = l.conn.query_row("SELECT hash FROM audit WHERE seq = ?1", params![cp.seq], |r| r.get(0)).optional()?;
             if at.as_deref() != Some(cp.head.as_str()) {
                 return Err(StoreError::Refused(format!(
@@ -254,7 +289,7 @@ impl Ledger {
             l.conn.execute("DELETE FROM audit_checkpoints WHERE seq < ?1", params![cp.seq])?;
             l.conn.execute("DELETE FROM audit_checkpoint_wants WHERE seq <= ?1", params![cp.seq])?;
             Ok(())
-        })
+        }
     }
 
     /// Deletes up to `rows` audit records before the anchor (all but [`KEPT_KINDS`]), in one short
@@ -290,6 +325,17 @@ impl Ledger {
         }
         self.conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
         Ok(true)
+    }
+
+    /// [`Ledger::make_auto_vacuum_incremental`], but only if nothing else has the ledger: no busy
+    /// wait (another connection's lock fails it at once), and an exclusive transaction taken and
+    /// released first to prove it.
+    pub fn compact_exclusively(&self) -> Result<bool> {
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let r =
+            self.conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;").map_err(StoreError::from).and_then(|_| self.make_auto_vacuum_incremental());
+        let _ = self.conn.busy_timeout(std::time::Duration::from_secs(5));
+        r
     }
 
     /// Gives up to `pages` free pages back to the file system, in one short transaction (the
@@ -353,18 +399,20 @@ mod tests {
         l.audit(&TenantId::single(), None, "run.remote_session", &serde_json::json!({ "url": "x" })).unwrap();
         chain(&l, 69);
         let hash = |s: i64| l.audit_hash_at(s).unwrap().unwrap();
-        l.record_checkpoint("a", 40, &hash(40), 1, "jws40").unwrap();
-        l.record_checkpoint("a", 70, &hash(70), 2, "jws70").unwrap();
+        l.record_checkpoint("a", "t", 40, &hash(40), 1, "jws40").unwrap();
+        l.record_checkpoint("a", "t", 70, &hash(70), 2, "jws70").unwrap();
         l.advance_export("a", 80).unwrap();
         l.advance_export("b", 50).unwrap();
         let far = i64::MAX;
-        assert_eq!(l.prune_point(&["a"], 90, far).unwrap().map(|c| c.seq), Some(70));
-        assert_eq!(l.prune_point(&["a", "b"], 90, far).unwrap().map(|c| c.seq), Some(40), "b has only 50");
-        assert_eq!(l.prune_point(&["a", "b"], 30, far).unwrap(), None, "never deeper than asked");
-        assert_eq!(l.prune_point(&["a"], 90, 1500).unwrap().map(|c| c.seq), Some(40), "the store had synced only the first");
+        l.sink_target("a", "t").unwrap();
+        l.sink_target("b", "t").unwrap();
+        assert_eq!(l.prune_point(&[("a", "t")], 90, far).unwrap().map(|c| c.seq), Some(70));
+        assert_eq!(l.prune_point(&[("a", "t"), ("b", "t")], 90, far).unwrap().map(|c| c.seq), Some(40), "b has only 50");
+        assert_eq!(l.prune_point(&[("a", "t"), ("b", "t")], 30, far).unwrap(), None, "never deeper than asked");
+        assert_eq!(l.prune_point(&[("a", "t")], 90, 1500).unwrap().map(|c| c.seq), Some(40), "the store had synced only the first");
         assert_eq!(l.prune_point(&[], 90, far).unwrap(), None, "no sink, no prune");
-        let cp = l.prune_point(&["a", "b"], 90, far).unwrap().unwrap();
-        l.begin_prune(&cp).unwrap();
+        let cp = l.begin_prune_at(&[("a", "t"), ("b", "t")], 90, far).unwrap().unwrap();
+        assert_eq!(cp.seq, 40);
         assert_eq!(
             l.verify_audit().unwrap(),
             62,
@@ -381,7 +429,7 @@ mod tests {
         assert_eq!(l.audit_of_kind("run.remote_session").unwrap().len(), 1);
         assert_eq!(l.audit_of_kind("audit.pruned").unwrap().len(), 1);
         assert_eq!(l.floor_for_test(), PRUNED_FLOOR, "the floor rose");
-        assert_eq!(l.prune_point(&["a", "b"], 90, far).unwrap(), None, "nothing past the anchor b has");
+        assert_eq!(l.prune_point(&[("a", "t"), ("b", "t")], 90, far).unwrap(), None, "nothing past the anchor b has");
     }
 
     /// A trigger that hasn't read past a record holds the prune before it (#578's cursor).
@@ -389,14 +437,15 @@ mod tests {
     fn a_lagging_trigger_cursor_holds_the_prune() {
         let l = Ledger::open_in_memory().unwrap();
         chain(&l, 50);
-        l.record_checkpoint("a", 40, &l.audit_hash_at(40).unwrap().unwrap(), 1, "j").unwrap();
-        l.record_checkpoint("a", 20, &l.audit_hash_at(20).unwrap().unwrap(), 1, "j").unwrap();
+        l.record_checkpoint("a", "t", 40, &l.audit_hash_at(40).unwrap().unwrap(), 1, "j").unwrap();
+        l.record_checkpoint("a", "t", 20, &l.audit_hash_at(20).unwrap().unwrap(), 1, "j").unwrap();
         l.advance_export("a", 50).unwrap();
+        l.sink_target("a", "t").unwrap();
         l.conn
             .execute_batch("CREATE TABLE IF NOT EXISTS trigger_cursors (tenant TEXT, source TEXT, seq INTEGER, updated_at INTEGER)")
             .unwrap();
         l.conn.execute("INSERT INTO trigger_cursors VALUES ('t0', 'wicket', 30, 0)", []).unwrap();
-        assert_eq!(l.prune_point(&["a"], 45, i64::MAX).unwrap().map(|c| c.seq), Some(20));
+        assert_eq!(l.prune_point(&[("a", "t")], 45, i64::MAX).unwrap().map(|c| c.seq), Some(20));
     }
 
     /// A record changed under the anchor is caught; a checkpoint that doesn't match its record is
@@ -405,15 +454,71 @@ mod tests {
     fn a_wrong_anchor_is_caught() {
         let l = Ledger::open_in_memory().unwrap();
         chain(&l, 10);
-        let bad = Checkpoint { sink: "a".into(), seq: 5, head: "v2:nope".into(), ts: 0, jws: String::new() };
+        let bad = Checkpoint { sink: "a".into(), target: "t".into(), seq: 5, head: "v2:nope".into(), ts: 0, jws: String::new() };
         assert!(l.begin_prune(&bad).is_err());
         assert_eq!(l.audit_usage().unwrap().rows, 10);
-        let good = Checkpoint { sink: "a".into(), seq: 5, head: l.audit_hash_at(5).unwrap().unwrap(), ts: 0, jws: String::new() };
+        let good = Checkpoint {
+            sink: "a".into(),
+            target: "t".into(),
+            seq: 5,
+            head: l.audit_hash_at(5).unwrap().unwrap(),
+            ts: 0,
+            jws: String::new(),
+        };
         prune(&l, &good);
         l.conn.execute("UPDATE audit SET body = '{}' WHERE seq = 5", []).unwrap();
         assert!(matches!(l.verify_audit(), Err(StoreError::ChainBroken(5))));
         l.conn.execute("DELETE FROM audit", []).unwrap();
         assert!(l.verify_audit().is_err(), "an anchor over nothing");
+    }
+
+    /// #582 re-review N1: an anchor copied in from a saved checkpoint, the records before it
+    /// deleted, doesn't verify: no `audit.pruned` record after it names it.
+    #[test]
+    fn a_copied_anchor_is_caught() {
+        let l = Ledger::open_in_memory().unwrap();
+        chain(&l, 20);
+        let head = l.audit_hash_at(10).unwrap().unwrap();
+        l.conn
+            .execute(
+                "INSERT INTO audit_anchor (id, seq, hash, jws, sink, pruned_at, pruned) VALUES (1, 10, ?1, 'j', 'a', 0, 9)",
+                params![head],
+            )
+            .unwrap();
+        l.conn.execute("DELETE FROM audit WHERE seq < 10", []).unwrap();
+        assert!(matches!(l.verify_audit(), Err(StoreError::ChainBroken(10))), "{:?}", l.verify_audit());
+        // A real prune names its anchor, and verifies.
+        let l = Ledger::open_in_memory().unwrap();
+        chain(&l, 20);
+        let cp = Checkpoint {
+            sink: "a".into(),
+            target: "t".into(),
+            seq: 10,
+            head: l.audit_hash_at(10).unwrap().unwrap(),
+            ts: 0,
+            jws: String::new(),
+        };
+        prune(&l, &cp);
+        assert!(l.verify_audit().is_ok());
+    }
+
+    /// #582 re-review N2: a sink pointed at another target since its cursor was kept, or whose
+    /// checkpoint went to another target, allows no prune.
+    #[test]
+    fn a_retargeted_sink_allows_no_prune() {
+        let l = Ledger::open_in_memory().unwrap();
+        chain(&l, 50);
+        l.sink_target("a", "jsonl:/a").unwrap();
+        l.advance_export("a", 50).unwrap();
+        l.record_checkpoint("a", "jsonl:/a", 40, &l.audit_hash_at(40).unwrap().unwrap(), 1, "j").unwrap();
+        assert_eq!(l.prune_point(&[("a", "jsonl:/a")], 45, i64::MAX).unwrap().map(|c| c.seq), Some(40));
+        assert_eq!(l.prune_point(&[("a", "jsonl:/b")], 45, i64::MAX).unwrap(), None, "the sink now points elsewhere");
+        assert!(l.begin_prune_at(&[("a", "jsonl:/b")], 45, i64::MAX).unwrap().is_none());
+        assert!(l.audit_anchor().unwrap().is_none());
+        // Only one checkpoint asked for at a time.
+        l.want_checkpoint(10).unwrap();
+        l.want_checkpoint(20).unwrap();
+        assert_eq!(l.checkpoint_wants().unwrap(), [20]);
     }
 
     /// A sink pointed at another target starts again, and its checkpoints are forgotten.
@@ -423,7 +528,7 @@ mod tests {
         chain(&l, 5);
         assert!(!l.sink_target("s", "jsonl:/a").unwrap());
         l.advance_export("s", 5).unwrap();
-        l.record_checkpoint("s", 5, &l.audit_hash_at(5).unwrap().unwrap(), 1, "j").unwrap();
+        l.record_checkpoint("s", "t", 5, &l.audit_hash_at(5).unwrap().unwrap(), 1, "j").unwrap();
         assert!(!l.sink_target("s", "jsonl:/a").unwrap(), "the same target");
         assert!(l.sink_target("s", "jsonl:/b").unwrap());
         let c = l.peek_export_cursor("s").unwrap();
@@ -444,7 +549,14 @@ mod tests {
         assert!(l.auto_vacuum_incremental().unwrap(), "a new ledger is incremental");
         assert!(!l.make_auto_vacuum_incremental().unwrap());
         chain(&l, 2000);
-        let cp = Checkpoint { sink: "a".into(), seq: 1900, head: l.audit_hash_at(1900).unwrap().unwrap(), ts: 0, jws: String::new() };
+        let cp = Checkpoint {
+            sink: "a".into(),
+            target: "t".into(),
+            seq: 1900,
+            head: l.audit_hash_at(1900).unwrap().unwrap(),
+            ts: 0,
+            jws: String::new(),
+        };
         let big = l.file_bytes().unwrap();
         prune(&l, &cp);
         assert_eq!(l.vacuum_step(10).unwrap(), 10, "ten pages a step of ten, not one");
@@ -456,6 +568,14 @@ mod tests {
         assert!(l.file_bytes().unwrap() < big / 2, "{} of {big}", l.file_bytes().unwrap());
         let mem = Ledger::open_in_memory().unwrap();
         assert_eq!(mem.vacuum_step(10).unwrap(), 0, "not incremental: nothing");
+        // Compacting needs the ledger to itself: another connection's write fails it at once.
+        let other = Ledger::open(&path).unwrap();
+        other.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let t = std::time::Instant::now();
+        assert!(l.compact_exclusively().is_err());
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "no busy wait");
+        other.conn.execute_batch("ROLLBACK").unwrap();
+        assert!(!l.compact_exclusively().unwrap(), "already incremental: nothing to do");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

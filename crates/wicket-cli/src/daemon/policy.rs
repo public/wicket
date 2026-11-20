@@ -67,8 +67,10 @@ pub fn route(cmd: &Cmd) -> Route {
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
         Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } => Forward(Read),
-        // Rewriting the ledger (#582) is a host maintenance step.
-        Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Forward(Privileged),
+        // Rewriting the ledger (#582) needs wicketd stopped: never through it.
+        Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(
+            "`wicket audit compact` runs with wicketd stopped, as the wicket user: sudo systemctl stop wicketd wicket-console wicket-reconcile; sudo -u wicket WICKET_HOME=/var/lib/wicket wicket audit compact",
+        ),
         Cmd::Pending { .. } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
@@ -356,7 +358,6 @@ mod tests {
             (&["pending"], Route::Forward(Read)),
             (&["links"], Route::Forward(Read)),
             (&["audit", "--verify"], Route::Forward(Read)),
-            (&["audit", "compact", "--yes"], Route::Forward(Privileged)),
             (&["doctor"], Route::Forward(Read)),
             (&["approve", "R1"], Route::Forward(Privileged)),
             (&["approve", "R1", "--unlimited", "--ttl", "1h"], Route::Forward(Privileged)),
@@ -423,6 +424,7 @@ mod tests {
         }
         assert!(matches!(route(&cmd(&["serve"])), Route::Refuse(_)));
         assert!(matches!(route(&cmd(&["daemon"])), Route::Refuse(_)));
+        assert!(matches!(route(&cmd(&["audit", "compact", "--yes"])), Route::Refuse(_)), "never with wicketd running");
     }
 
     #[test]

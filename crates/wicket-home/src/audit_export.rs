@@ -167,16 +167,18 @@ impl SinkSpec {
     }
 
     /// What the sink's cursor is for: its path, endpoint, or the state store's bucket. A sink
-    /// whose target changes starts again from the first record (`Ledger::sink_target`).
-    pub fn target(&self) -> String {
-        match &self.kind {
+    /// whose target changes starts again from the first record (`Ledger::sink_target`). Err when
+    /// it can't be told (the state store's file doesn't read): then nothing is reset, and nothing
+    /// is pruned on that sink's word.
+    pub fn target(&self) -> Result<String> {
+        Ok(match &self.kind {
             SinkKind::Jsonl { path } => format!("jsonl:{path}"),
             SinkKind::Otlp { endpoint, .. } => format!("otlp:{endpoint}"),
-            SinkKind::Store {} => match crate::statestore::StateStore::load() {
-                Ok(Some(crate::statestore::StateStore { s3: Some(c), .. })) => format!("store:{}/{}", c.endpoint, c.bucket),
-                _ => "store:".into(),
+            SinkKind::Store {} => match crate::statestore::StateStore::load()? {
+                Some(crate::statestore::StateStore { s3: Some(c), .. }) => format!("store:{}/{}", c.endpoint, c.bucket),
+                _ => bail!("sink {}: state-store.yaml names no store", self.name),
             },
-        }
+        })
     }
 }
 
@@ -286,6 +288,8 @@ pub struct Retention {
 const PRUNE_TO: f64 = 0.9;
 /// Records deleted per transaction, so a prune never holds the write lock long.
 const PRUNE_ROWS: i64 = 10_000;
+/// Chunks per pass (500,000 records at most).
+const PRUNE_CHUNKS: usize = 50;
 /// Free pages given back per transaction, and at most per pass.
 const VACUUM_PAGES: i64 = 2000;
 const VACUUM_STEPS: usize = 500;
@@ -336,14 +340,35 @@ pub fn retention_with(l: &Ledger, cfg: std::result::Result<&SinksConfig, &str>, 
         compact_needed: !l.auto_vacuum_incremental()?,
     };
     let (Ok(cfg), Some(synced)) = (cfg, synced_ms) else { return Ok(r) };
+    if prune {
+        // What an earlier pass left of its prune (it stops after PRUNE_CHUNKS), first.
+        for _ in 0..PRUNE_CHUNKS {
+            let n = l.prune_chunk(PRUNE_ROWS)?;
+            if n == 0 {
+                break;
+            }
+            r.pruned += n;
+        }
+    }
     if r.usage.bytes <= limit_bytes || r.usage.rows == 0 {
         return Ok(r);
     }
     let per_row = (r.usage.bytes / r.usage.rows).max(1);
     let keep = ((limit_bytes as f64 * PRUNE_TO) as i64 / per_row).max(1);
     let target = r.usage.head - keep + 1;
-    let durable: Vec<&str> = cfg.sinks.iter().filter(|s| s.is_durable()).map(|s| s.name.as_str()).collect();
-    let Some(cp) = l.prune_point(&durable, target, synced)? else {
+    let mut targets = vec![];
+    for s in cfg.sinks.iter().filter(|s| s.is_durable()) {
+        match s.target() {
+            Ok(t) => targets.push((s.name.as_str(), t)),
+            Err(e) => {
+                r.waiting = Some(format!("over its limit, but where sink {} points can't be told ({e:#}): nothing pruned", s.name));
+                return Ok(r);
+            }
+        }
+    }
+    let durable: Vec<&str> = targets.iter().map(|(n, _)| *n).collect();
+    let pairs: Vec<(&str, &str)> = targets.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let Some(cp) = l.prune_point(&pairs, target, synced)? else {
         if prune && target > r.usage.first {
             l.want_checkpoint(target)?;
         }
@@ -357,12 +382,16 @@ pub fn retention_with(l: &Ledger, cfg: std::result::Result<&SinksConfig, &str>, 
         r.waiting = Some(format!("over its limit: the records before seq {} are due to be pruned", cp.seq));
         return Ok(r);
     }
+    // Chosen again and begun in one transaction: nothing it read (cursors, targets) changes in
+    // between.
+    let Some(cp) = l.begin_prune_at(&pairs, target, synced)? else { return Ok(r) };
     if cp.seq < target {
         // Short of the cut: this prune goes as far as it may, and the next goes the rest.
         l.want_checkpoint(target)?;
     }
-    l.begin_prune(&cp)?;
-    loop {
+    // At most PRUNE_CHUNKS a pass: a long backlog goes over several passes, the chain verifying
+    // from the anchor throughout.
+    for _ in 0..PRUNE_CHUNKS {
         let n = l.prune_chunk(PRUNE_ROWS)?;
         if n == 0 {
             break;
@@ -743,7 +772,11 @@ impl Exporter {
         // A sink whose target changed starts again (#582): its cursor was for records another
         // target got.
         for s in &cfg.sinks {
-            ledger.sink_target(&s.name, &s.target())?;
+            // Can't tell (the state store's file doesn't read): the cursor is kept, and retention
+            // won't prune on this sink until it can.
+            if let Ok(t) = s.target() {
+                ledger.sink_target(&s.name, &t)?;
+            }
         }
         Ok(Exporter {
             ledger,
@@ -839,8 +872,9 @@ impl Exporter {
             let jws = cp["jws"].as_str().unwrap_or_default().to_string();
             self.deliver(i, &[cp])?;
             self.ledger.export_checkpointed(&name, at)?;
-            // What retention may prune back to (#582): kept with what it signed.
-            self.ledger.record_checkpoint(&name, cur.seq, &head, at, &jws)?;
+            // What retention may prune back to (#582): kept with what it signed, and where it went.
+            let target = self.sinks[i].spec.target().unwrap_or_default();
+            self.ledger.record_checkpoint(&name, &target, cur.seq, &head, at, &jws)?;
             cps = 1;
         }
         // Checkpoints retention asked for, where it wants to cut (#582): signed once each sink is
@@ -854,7 +888,8 @@ impl Exporter {
                 let cp = checkpoint_json(self.issuer.as_ref().expect("checked"), seq, &head, at);
                 let jws = cp["jws"].as_str().unwrap_or_default().to_string();
                 self.deliver(i, &[cp])?;
-                self.ledger.record_checkpoint(&name, seq, &head, at, &jws)?;
+                let target = self.sinks[i].spec.target().unwrap_or_default();
+                self.ledger.record_checkpoint(&name, &target, seq, &head, at, &jws)?;
                 cps += 1;
             }
         }

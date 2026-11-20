@@ -1800,7 +1800,9 @@ impl Ledger {
     /// Recomputes the whole chain: from seq 1, or after a prune (#582) from the anchor on (kinds
     /// the host keeps below it aren't chained), whose record must be the first and hash to what
     /// the anchor's checkpoint signed (its own `prev` is a deleted record's, taken as stored). An
-    /// anchor over no records fails. The anchor's signature is the caller's to check (it needs the
+    /// anchor over no records fails, and so does one that no `audit.pruned` record after it names:
+    /// a prune writes that record in the chain it leaves, so an anchor copied in from a saved
+    /// checkpoint, with the records before it deleted, is caught. The anchor's signature is the caller's to check (it needs the
     /// issuer key: `wicket_home::audit_export::verify_anchor`). Returns the number of records
     /// verified.
     pub fn verify_audit(&self) -> Result<i64> {
@@ -1810,6 +1812,7 @@ impl Ledger {
         let mut rows = st.query(params![from])?;
         let mut prev = CHAIN_ZERO.to_string();
         let mut n = 0;
+        let mut named = false;
         while let Some(r) = rows.next()? {
             let (seq, ts, tenant, run, kind, body, p, h): (i64, i64, String, Option<String>, String, String, String, String) =
                 (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?);
@@ -1825,11 +1828,18 @@ impl Ledger {
             if p != prev || chain_hash_v2(&prev, &f) != h {
                 return Err(StoreError::ChainBroken(seq));
             }
+            // A prune records itself in the chain it leaves (#582): an anchor no `audit.pruned`
+            // record after it names was copied in from a saved checkpoint, the front cut off.
+            if kind == "audit.pruned" && !named {
+                named = anchor.as_ref().is_some_and(|a| {
+                    serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|b| b["checkpoint"].as_i64()) == Some(a.seq)
+                });
+            }
             prev = h;
             n += 1;
         }
-        if n == 0 {
-            if let Some(a) = &anchor {
+        if let Some(a) = &anchor {
+            if n == 0 || !named {
                 return Err(StoreError::ChainBroken(a.seq));
             }
         }

@@ -204,9 +204,14 @@ steps:
 1. One transaction sets the anchor (seq, hash and the signed checkpoint), appends an
    `audit.pruned` record (the range, the checkpoint and the sink), and raises the ledger's schema
    floor to 32. A build that would walk the chain from seq 1 then refuses the ledger, rather than
-   reporting it broken.
+   reporting it broken. So after the first prune, `wicket self rollback` to a build before
+   schema 32 is refused: restore the snapshot taken before the update instead.
 2. The records before the anchor are deleted 10,000 per transaction, so the write lock is never
-   held long.
+   held long, and at most 500,000 per pass: a longer backlog goes over several passes.
+
+An anchor counts only if an `audit.pruned` record after it names it, which only a prune writes.
+So an anchor copied in from a saved checkpoint, with the records before it deleted, fails
+verification even on an installation that never pruned.
 
 `wicket audit --verify`, `wicket doctor`, `wicket self health` and a restore start from the
 anchor:
@@ -222,7 +227,10 @@ not as mismatches.
 **A sink's target.** Each sink's cursor is kept with what it was made against: a file's path, a
 Collector's endpoint, the state store's bucket. If that changes under the same name, the sink
 starts again from the first record (the export status says why), rather than claiming records
-the new target never got.
+the new target never got. Each checkpoint is kept with its target too. A prune counts a sink only
+while both still match where the sink points now, checked in the prune's own transaction. If
+the state store's file doesn't read, a store sink's target can't be told: its cursor is kept and
+nothing is pruned.
 
 **Space.** Ledgers made by this build use SQLite's `auto_vacuum = incremental`. After each prune
 they give the freed pages back in steps of 2,000 pages (8 MB) a transaction, so the file shrinks.
@@ -230,7 +238,17 @@ A ledger made by an earlier build keeps the freed pages for new records (the fil
 but doesn't shrink) until you run `wicket audit compact` once, with wicket's services stopped.
 That is one full `VACUUM`, which rewrites the file under an exclusive lock and needs about as
 much free space again. It took 69 seconds for a 2.5 GB ledger, with 1.27 GB of WAL. wicket never
-does it on its own, because no service could write meanwhile.
+does it on its own, because no service could write meanwhile. Run it as the wicket user, with the
+services stopped (it refuses otherwise, and wicketd refuses to run it):
+
+```sh
+sudo systemctl stop wicketd wicket-console wicket-reconcile
+sudo -u wicket WICKET_HOME=/var/lib/wicket wicket audit compact
+sudo systemctl start wicketd wicket-console wicket-reconcile
+```
+
+It keeps SQLite's temporary copy beside the ledger (not in `/tmp`), checks that twice the file's
+size is free there, and fails at once if anything else has the ledger open for writing.
 
 **Why 2 GB by default.** That is about two months of the small installation above. It's well
 within what SQLite handles quickly, and under 5% of a typical 40 to 80 GB control host disk. The
