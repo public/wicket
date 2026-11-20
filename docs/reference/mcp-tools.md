@@ -415,7 +415,11 @@ The zone part is the zone's name as it is, so only a zone whose name is already 
 names: each dot-separated part lower case letters, digits and `-` (a spawned zone,
 `<parent>.<agent>.<run>`, is, when its parent's and agent's names are). A zone such as `Build` or
 `web_api` can't: it would share a DNS form with `build` or `web-api`, which are other zones to
-`accept_from` (#668). `connect` looks names up in any case. The answer says the name in full.
+`accept_from` (#668). Nor can a zone named `wicket.internal` or ending in it. `connect` looks names
+up in any case. The answer says the name in full.
+
+A port the box exposed itself (`expose`) keeps that exposure and its name: the internal name is
+added beside it.
 
 It is held by the run that asked, and ends with it (audited as `name.released`). Asking again from
 the same run moves the name to another port, and the old port is no longer offered under it. Audited

@@ -328,6 +328,8 @@ has a name's records as the zone last listed them, and its last connections.
   revoked by), `name_records` (the records this installation created: zone, name, type, value,
   provider, created, last seen) and `host_ports` (`node`, protocol, port unique; the name holding it,
   released at). Node public addresses are columns of the node's row.
+- **Ledger schema 31** (#668): `name_exposures`, the ports a run's names exposed (not the box
+  itself), which a name's move may take away once no other name of the run names the port.
 - **Protocol 18:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
   node only of a control host at 18. Public names will add the feed's published ports (name, run,
   node, host port, box port, until) for the nodes that listen on them, and a node's report of a
