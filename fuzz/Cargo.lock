@@ -3519,6 +3519,7 @@ dependencies = [
  "wicket-policy",
  "wicket-proxy",
  "wicket-sandbox",
+ "wicket-sources",
  "wicket-store",
  "zeroize",
 ]
@@ -3685,6 +3686,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "socket2",
  "time",
  "tokio",
  "wicket-agent",
@@ -3694,6 +3696,7 @@ dependencies = [
  "wicket-feed",
  "wicket-home",
  "wicket-identity",
+ "wicket-names",
  "wicket-proxy",
  "wicket-sandbox",
  "wicket-store",
@@ -3786,6 +3789,15 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "wicket-core",
+]
+
+[[package]]
+name = "wicket-sources"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "serde_json",
  "wicket-core",
 ]
 

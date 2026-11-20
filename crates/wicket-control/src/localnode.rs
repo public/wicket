@@ -72,6 +72,21 @@ pub async fn ensure(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
                 std::fs::copy(&from, &to).with_context(|| format!("copying {f} for the local node"))?;
             }
         }
+        // The host ports it may publish for its boxes' public names (#575 step 4c), as
+        // `wicket node install` writes them on a remote node; read when its serve starts.
+        let publish = dir.join("publish.json");
+        match crate::namesync::publish_range_for(&ledger.lock().expect("ledger"), NAME) {
+            Ok(Some(r)) => {
+                let want = serde_json::json!({ "ports": r }).to_string();
+                if std::fs::read_to_string(&publish).ok().as_deref() != Some(want.as_str()) {
+                    std::fs::write(&publish, want).context("writing the local node's publish.json")?;
+                }
+            }
+            Ok(None) => {
+                let _ = std::fs::remove_file(&publish);
+            }
+            Err(e) => wicket_home::say_err!("[wicket] the local node publishes no host ports: {e:#}"),
+        }
         renew_cert(ledger, &dir)?;
     }
     let sock = socket()?;

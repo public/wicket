@@ -27,6 +27,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Create nodes on Vultr](how-to/create-nodes-on-vultr.md), and leases for agents
 - [Hibernate and wake an agent](how-to/hibernate-and-wake-an-agent.md)
 - [Wake an agent on a schedule](how-to/wake-an-agent-on-a-schedule.md)
+- [Fire a trigger from a webhook](how-to/trigger-from-a-webhook.md): GitHub events and signed webhooks
 - [Drive a box from the Claude apps](how-to/drive-a-box-from-the-claude-apps.md)
 - [Run a program instead of an agent](how-to/run-a-program.md)
 - [Run an ACP agent](how-to/run-an-acp-agent.md)

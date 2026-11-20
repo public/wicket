@@ -359,6 +359,17 @@ fn show_grant(r: &wicket_store::GrantListing, now: i64) -> String {
     format!("{}  {what}  {to}{uses}, {state}{node}  by {}", g.id, wicket_agent::clip(&r.decided_by, 80))
 }
 
+/// `wicket request`: the requests `wicket pending` lists, named as `grant list` names grants (#654).
+#[derive(Subcommand)]
+pub enum RequestCmd {
+    /// List pending requests: the same as `wicket pending`.
+    List {
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum GrantCmd {
     /// List grants, newest first: approvals, and runs' quotas (#256): model budget, children and
