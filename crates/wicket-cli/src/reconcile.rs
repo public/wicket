@@ -973,8 +973,29 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
 }
 
 /// [`placed_pass`] for every owner and API key placed nodes were recorded under (Vultr: the only
-/// backend `wicket node create` has).
+/// backend `wicket node create` has), then the human releases whose ledger side didn't finish
+/// (#812 review): a failed step, or a process that stopped after the node was marked released
+/// (a console release runs in the background, and an update restarts it).
 async fn placed_nodes(ledger: &mut Ledger, now: i64, dry_run: bool) -> Result<Vec<Done>> {
+    let mut done = released_nodes(ledger, now, dry_run)?;
+    done.extend(placed_groups(ledger, now, dry_run).await?);
+    Ok(done)
+}
+
+/// [`wicket_control::noderelease::finish_released`], as the reconciler.
+fn released_nodes(ledger: &mut Ledger, now: i64, dry_run: bool) -> Result<Vec<Done>> {
+    let tried =
+        wicket_control::noderelease::finish_released(ledger, "wicket reconcile", crate::nodecreate::retire_enrolment_named, now, dry_run)?;
+    Ok(tried
+        .into_iter()
+        .map(|(id, r)| match r {
+            Ok(detail) => Done { kind: "placed_release_finished", target: id, detail },
+            Err(e) => Done { kind: "error", target: id, detail: format!("{e:#}") },
+        })
+        .collect())
+}
+
+async fn placed_groups(ledger: &mut Ledger, now: i64, dry_run: bool) -> Result<Vec<Done>> {
     let mut groups: Vec<(String, String)> = ledger
         .placed_nodes(&["active"])?
         .into_iter()

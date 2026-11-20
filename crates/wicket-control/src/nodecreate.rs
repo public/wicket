@@ -636,16 +636,24 @@ pub async fn release(common: Common, id: String, reason: Option<String>, root: b
         let why = reason.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("wicket node release");
         let d = nr::Decision { by, shown: &shown, why, extra: serde_json::json!({ "via": "cli" }) };
         let (n, seq) = nr::decide(&l, &id, &d, now)?;
-        let said = nr::release(&mut l, &p, &n, &crate::operator(), seq, retire_enrolment, now).await?;
+        let said = nr::release(&mut l, &p, &n, &crate::operator(), seq, retire_enrolment_named, now).await?;
         say!("{said}");
         return Ok(());
     }
-    // A release whose ledger side didn't finish (`placement.node_release_incomplete`): finish it.
-    if let Some(row) = l.placed_nodes(&["released"])?.into_iter().find(|r| r.id == id || r.name == id) {
-        if let Ok(said) = crate::noderelease::finish_incomplete(&mut l, &row.id, &crate::operator(), retire_enrolment_named) {
-            say!("{said}");
-            return Ok(());
+    // A node the ledger has as released: its release is finished if its ledger side didn't (a step
+    // failed, or the process stopped), and never released again through the provider. By instance
+    // id, or by name the latest release of a node so named (names are reused).
+    let released = l.placed_nodes(&["released"])?;
+    let row = released
+        .iter()
+        .find(|r| r.id == id)
+        .or_else(|| released.iter().filter(|r| r.name == id).max_by_key(|r| (r.ended_at, r.created_at)));
+    if let Some(row) = row {
+        match nr::finish_incomplete(&mut l, &row.id, &crate::operator(), retire_enrolment_named)? {
+            Some(said) => say!("{said}"),
+            None => say!("{} ({}) was already released: nothing is left to finish", row.name, row.id),
         }
+        return Ok(());
     }
     drop(l);
     let o = owner(&common);

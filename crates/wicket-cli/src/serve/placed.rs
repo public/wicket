@@ -95,7 +95,9 @@ pub(super) fn release_in_background(ledger: std::path::PathBuf, r: Release) -> R
     tokio::spawn(async move {
         let done = match Ledger::open(&ledger) {
             // Its own failures, before or after the destroy, are audited by `release` itself.
-            Ok(mut l) => nr::release(&mut l, &p, &r.node, &r.by, r.seq, crate::nodecreate::retire_enrolment, wicket_store::now()).await,
+            Ok(mut l) => {
+                nr::release(&mut l, &p, &r.node, &r.by, r.seq, crate::nodecreate::retire_enrolment_named, wicket_store::now()).await
+            }
             Err(e) => Err(anyhow::Error::from(e).context("the ledger can't be opened, so nothing was released")),
         };
         match done {

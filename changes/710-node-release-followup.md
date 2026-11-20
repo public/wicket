@@ -9,6 +9,11 @@ type: Fixed
   ([#710](https://github.com/public/wicket/issues/710)).
 - A release whose ledger side fails after the machine is destroyed (ending its runs, stopping its
   services, revoking its enrolment) still does every other step, records which failed
-  (`placement.node_release_incomplete`), and is finished by `wicket node release <id>` again. A run that
-  ended on its own during the release keeps how it ended. `wicket node release` asks before destroying a
-  machine the ledger doesn't list too ([#710](https://github.com/public/wicket/issues/710)).
+  (`placement.node_release_incomplete`), and is finished by `wicket node release <id>` again or by the
+  reconciler, which also finishes a release whose process stopped after the node was marked released.
+  A retry decides from the ledger, and touches only the runs, services, files and enrolment from before
+  the release ended, never those of a machine given the node's name since. `wicket node release` on a
+  released node finishes it or says there is nothing left, and never asks the provider to destroy it
+  again. A run that ended on its own during the release keeps how it ended, and a run the release ends
+  fires `run.lost` triggers. `wicket node release` asks before destroying a machine the ledger doesn't
+  list too ([#710](https://github.com/public/wicket/issues/710)).
