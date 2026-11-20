@@ -595,13 +595,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
     // its pinned ssh (a revoked one is refused), or this host's own built-in node over its unix socket.
     timings.since("checks", lap);
-    let run = match run_id {
-        Some(id) => {
-            check_run_id(&id).with_context(|| "--run-id".to_string())?;
-            RunId(id)
-        }
-        None => RunId::new(),
-    };
     // #579: a fresh run with no node named goes where the scheduler places it, as a woken agent
     // does: this host's own node is one candidate among the enrolled ones. With no other node
     // enrolled, it goes on this host's own, as before, whatever its placement terms.
