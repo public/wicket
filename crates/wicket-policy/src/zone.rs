@@ -136,6 +136,14 @@ fn one_host(m: &HttpMatch) -> Result<String, CompileError> {
     }
 }
 
+/// The segments `base`'s rules for exactly `host` decide an encoded slash in (a manifest refuses
+/// `decode_slash` on a wildcard host).
+fn decoding_for(base: &Ceiling, host: &str) -> Vec<u8> {
+    let segs: std::collections::BTreeSet<u8> =
+        base.reach.iter().filter(|r| r.host == host).flat_map(|r| r.decode_slash.iter().copied()).collect();
+    segs.into_iter().collect()
+}
+
 /// The token's zone fields from a compiled zone layer, over `base` (whose other fields, the
 /// structural ones and the model budget, aren't policy).
 pub fn ceiling_fields(layer: &Layer, base: &Ceiling) -> Result<Ceiling, CompileError> {
@@ -150,12 +158,16 @@ pub fn ceiling_fields(layer: &Layer, base: &Ceiling) -> Result<Ceiling, CompileE
         if m.min_risk.is_some() || m.max_risk.is_some_and(|r| r != MAX_REACH_RISK) {
             return bad(format!("a reach rule bounds risk only as context.risk <= {MAX_REACH_RISK}, or not at all"));
         }
+        let host = one_host(m)?;
+        // Which encoded slashes the proxy decides is the zone's decoding, not policy, so Cedar
+        // doesn't carry it: it comes from the zone's own rules for the host (#664).
+        let decode_slash = decoding_for(base, &host);
         reach.push(Reach {
-            host: one_host(m)?,
+            host,
             methods: m.methods.clone().unwrap_or_else(|| all.clone()),
             paths: vec![path],
             allow_dangerous: m.max_risk.is_none(),
-            decode_slash: vec![],
+            decode_slash,
         });
     }
     let mut forbid = vec![];

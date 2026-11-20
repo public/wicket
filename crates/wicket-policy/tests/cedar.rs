@@ -23,6 +23,11 @@ use wicket_policy::{compile, MintCtx, OrgPolicy};
 /// or path dropped (they allow nothing), lists sorted.
 fn canon(c: &Ceiling) -> Ceiling {
     let mut c = c.clone();
+    // The decoding is per host (the token and the proxy read it so), however the rules split.
+    let decoding = |host: &str| -> Vec<u8> {
+        let segs: BTreeSet<u8> = c.reach.iter().filter(|r| r.host == host).flat_map(|r| r.decode_slash.iter().copied()).collect();
+        segs.into_iter().collect()
+    };
     let mut reach: Vec<Reach> = c
         .reach
         .iter()
@@ -38,7 +43,7 @@ fn canon(c: &Ceiling) -> Ceiling {
                     .collect(),
                 paths: vec![p.clone()],
                 allow_dangerous: r.allow_dangerous,
-                decode_slash: vec![],
+                decode_slash: decoding(&r.host),
             })
         })
         .collect();
@@ -68,6 +73,37 @@ fn every_zones_cedar_compiles_back_to_its_zone_fields() {
             .unwrap_or_else(|e| panic!("zone {}: {e}\n{}", z.name, wicket_policy::zone::cedar(z, &base)));
         assert_eq!(canon(&c), canon(&base), "zone {}", z.name);
     }
+}
+
+/// The decoding isn't policy, so Cedar doesn't carry it, but the compiled ceiling keeps the zone's
+/// (it was dropped, and a token refused every decided slash: the npm cache's /@types%2fms, #664).
+#[test]
+fn a_cedar_compiled_ceiling_keeps_the_zones_decoding() {
+    let keys = Keys::new(0);
+    let yaml = "name: npm\nreach:\n  - { host: registry.npmjs.org, methods: [GET, HEAD], paths: [\"/**\"], decode_slash: [1] }\n  - { host: registry.npmjs.org, methods: [GET], paths: [\"/-/**\"] }\n  - { host: other.example, methods: [GET], paths: [\"/**\"] }\n";
+    let z: ZoneSpec = wicket_core::yaml::from_str(yaml).unwrap();
+    let base = Ceiling::from_zone(&z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap();
+    let c = wicket_policy::ceiling(&z, "b0", T0 + 3600, vec![keys.approver.public()], &[], None).unwrap();
+    assert_eq!(canon(&c), canon(&base));
+    for r in &c.reach {
+        let want: &[u8] = if r.host == "registry.npmjs.org" { &[1] } else { &[] };
+        assert_eq!(r.decode_slash, want, "{r:?}");
+    }
+    let token = wicket_authz::mint(&keys.root, TENANT, "human:alex", &c).unwrap();
+    let loaded = load(&token.to_bytes().unwrap(), &keys.root.public(), &|_| false).unwrap();
+    let get = |host: &str, decoded: Vec<u8>| Request {
+        action: Action::Http {
+            method: "GET".into(),
+            host: host.into(),
+            path: "/@types/ms".into(),
+            risk: RiskClass::R1ReadScoped,
+            inject: None,
+            decoded,
+        },
+        ..token_request(&Req::Msg { from: "x".into(), sender: None })
+    };
+    assert_eq!(kind(&loaded.decide(&get("registry.npmjs.org", vec![1]))), ALLOW, "a decided slash where the zone decodes");
+    assert_ne!(kind(&loaded.decide(&get("other.example", vec![1]))), ALLOW, "nor where it doesn't");
 }
 
 fn mint() -> MintCtx {
