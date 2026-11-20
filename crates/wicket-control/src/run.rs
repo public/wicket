@@ -1703,6 +1703,10 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // The hibernate asked is preemption's (#579 step 4) and no other: dropped if preemption gives up
     // on it before the quiet point.
     let mut hib_for_preemption = false;
+    // The same, carried through a linger for a quiet box: re-checked before it hibernates out of it.
+    let mut linger_for_preemption = false;
+    // Its children still running: what preemption won't stop (hibernating ends the run).
+    let live_children = || children.lock().map(|k| k.iter().filter(|(_, s)| !s.thread.is_finished()).count()).unwrap_or(0);
     let mut finish_asked = asked.finish;
     let mut notified_msgs = 0i64;
     // The turn state last reported as the run's presence (#252).
@@ -2140,15 +2144,18 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     notified_msgs = waiting;
                     turn_running = true;
                 }
-                // Preemption gave up on this agent before its quiet point: it isn't needed to stop.
-                if hib_asked && hib_for_preemption && !ledger.lock().ok().and_then(|l| l.preemption_pending(&run.0).ok()).unwrap_or(true) {
-                    hib_asked = false;
-                    hib_for_preemption = false;
-                    say!("[wicket] not hibernating: the wake that asked for room no longer needs it");
+                // A hibernate asked only to make room (#579 step 4): not if preemption gave up, the
+                // request is stale or its wake gone, or a child runs (hibernating would stop it).
+                if hib_asked && hib_for_preemption {
+                    if let Some(why) = preemption_declined(&ledger, &m.tenant, &run, live_children()) {
+                        hib_asked = false;
+                        hib_for_preemption = false;
+                        say!("[wicket] not hibernating to make room: {why}");
+                    }
                 }
                 if !turn_running && !hibernating && hib_asked && lingering.is_none() {
                     hib_asked = false;
-                    hib_for_preemption = false;
+                    let for_preemption = std::mem::take(&mut hib_for_preemption);
                     match &fence {
                         None => say!("[wicket] not hibernated: only a long-lived agent wicket started itself can hibernate"),
                         Some(f) => match stopper.check_quiet(&box_user, &|c: &str| harness.is_some_and(|h| h.is_runtime(&m, c)), &agent_cmd).await {
@@ -2165,6 +2172,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                                 say!("[wicket] not quiet yet: {note}");
                                 set_state("active", Some(&note));
                                 lingering = Some(Linger::Hibernate);
+                                linger_for_preemption = for_preemption;
                                 linger.as_mut().reset(tokio::time::Instant::now() + exit_grace);
                             }
                             Err(why) => {
@@ -2183,6 +2191,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     // waiting for a quiet box gives way: the agent asked to finish since.)
                     if lingering != Some(Linger::Finish) {
                         lingering = Some(Linger::Finish);
+                        linger_for_preemption = false;
                         linger.as_mut().reset(tokio::time::Instant::now() + exit_grace);
                     }
                 }
@@ -2210,8 +2219,17 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     // A turn began meanwhile (a message): hibernate at its end, with a grace of its own.
                     say!("[wicket] a turn began before the box was quiet: hibernating at its end");
                     hib_asked = true;
+                    // Still only preemption's, if it was: it can still be withdrawn.
+                    hib_for_preemption = std::mem::take(&mut linger_for_preemption);
                 }
                 Some(Linger::Hibernate) if hibernating || stdin.is_none() || fence.is_none() => {}
+                Some(Linger::Hibernate)
+                    if std::mem::take(&mut linger_for_preemption)
+                        && preemption_declined(&ledger, &m.tenant, &run, live_children()).inspect(|why| {
+                            let note = format!("not hibernated to make room: {why}");
+                            say!("[wicket] {note}; the agent goes on running, and nothing is stopped");
+                            set_state("active", Some(&note));
+                        }).is_some() => {}
                 Some(Linger::Hibernate) => {
                     let agent = fence.as_ref().map(|f| f.agent.as_str()).unwrap_or_default();
                     let is_harness = |c: &str| harness.is_some_and(|h| h.is_runtime(&m, c));
@@ -2805,6 +2823,24 @@ impl tokio::io::AsyncWrite for Counted {
     fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+}
+
+/// Whether a hibernate asked only to make room is declined now (#579 step 4), and why
+/// (`hibernate::preempted_hibernate`). Declined, preemption's mark is cleared (so the wake gives up on
+/// this agent at once) and it is audited as `placement.preempt_declined`.
+fn preemption_declined(ledger: &Mutex<Ledger>, tenant: &wicket_core::TenantId, run: &RunId, live_children: usize) -> Option<String> {
+    let now = wicket_feed::now_ms();
+    let l = ledger.lock().ok()?;
+    let mark = l.preemption_mark(&run.0, now).ok().flatten();
+    let why = crate::hibernate::preempted_hibernate(true, mark.as_ref(), live_children, now).err()?;
+    let _ = l.clear_preempted(&run.0);
+    let _ = l.audit(
+        tenant,
+        Some(run),
+        "placement.preempt_declined",
+        &serde_json::json!({ "run": run.0, "for": mark.and_then(|m| m.for_run), "why": why, "children": live_children }),
+    );
+    Some(why.to_string())
 }
 
 /// What the agent asked of its own run, as the ledger records it (`Ledger::record_run_want`,

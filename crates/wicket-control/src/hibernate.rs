@@ -567,7 +567,10 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
         Err(e) => {
             let l = Ledger::open(&ledger_path())?;
             // Any room it held (a preemption's) goes back with the wake.
-            let _ = l.placement_released(&run.0);
+            // Agents it asked to hibernate are asked no more, and room it held goes back, whatever
+            // stopped it.
+            let _ =
+                withdraw_preemptions_for(&l, &run, &wicket_core::TenantId(agent.tenant.clone()), wicket_feed::now_ms(), "the wake failed");
             l.release_failed_wake(&agent.id, generation, &format!("wake failed: {e:#}"))?;
             return Err(e);
         }
@@ -949,7 +952,7 @@ pub fn preempt_for(
             // An operator's own request, if any, stands; preemption's is tagged, so only it is ever
             // withdrawn.
             l.want_agent_if_unasked(agent, PREEMPT_WANT)?;
-            l.mark_preempted(v, now_ms)?;
+            l.mark_preempted(v, now_ms, &run.0)?;
             l.audit(
                 &tenant,
                 Some(&RunId(v.clone())),
@@ -1040,6 +1043,59 @@ pub fn end_wait(
     })
 }
 
+/// Whether an agent's supervisor hibernates now for a hibernate it was asked (#579 step 4). One
+/// asked by an operator or by the agent itself (`for_preemption` false) always does. One asked only by
+/// preemption doesn't, with the reason, when preemption no longer asks it (`mark` gone: given up),
+/// the request is older than [`PREEMPT_DEADLINE`] (the wake is long gone or gave up), the wake that
+/// asked no longer waits nor holds a reservation (it ended, failed or was killed), or the agent
+/// has a child running (hibernating ends its run, which stops its children; it may have spawned
+/// one since it was chosen). Checked at its quiet point, and again before it hibernates out of a
+/// linger.
+pub fn preempted_hibernate(
+    for_preemption: bool,
+    mark: Option<&wicket_store::PreemptMark>,
+    live_children: usize,
+    now_ms: i64,
+) -> std::result::Result<(), &'static str> {
+    if !for_preemption {
+        return Ok(());
+    }
+    let Some(m) = mark else { return Err("the wake that asked for room no longer needs it") };
+    if now_ms - m.asked_ms >= PREEMPT_DEADLINE.as_millis() as i64 {
+        return Err("the request for room is older than the preemption deadline");
+    }
+    if !m.asker_alive {
+        return Err("the wake that asked for room is gone");
+    }
+    if live_children > 0 {
+        return Err("it has a child running, which hibernating would stop");
+    }
+    Ok(())
+}
+
+/// Withdraws every preemption made for `run` whose victims still run (#579 step 4): what a wake
+/// that fails does, whatever stopped it. Each is asked no more and audited as
+/// `placement.preempt_abandoned`; the room held for `run` is released.
+pub fn withdraw_preemptions_for(l: &Ledger, run: &RunId, tenant: &wicket_core::TenantId, now_ms: i64, why: &str) -> Result<Vec<String>> {
+    l.immediate(|l| {
+        let left = l.preempted_for(&run.0)?;
+        for v in &left {
+            if let Some((agent, _)) = l.agent_of_run(v)? {
+                l.withdraw_agent_want(&agent, PREEMPT_WANT)?;
+            }
+            l.clear_preempted(v)?;
+            l.audit(
+                tenant,
+                Some(&RunId(v.clone())),
+                "placement.preempt_abandoned",
+                &serde_json::json!({ "run": v, "for": run.0, "why": why, "by": PREEMPT_BY, "at_ms": now_ms }),
+            )?;
+        }
+        l.placement_released(&run.0)?;
+        Ok(left)
+    })
+}
+
 /// The victims of `p` whose runs still run.
 pub fn still_running(l: &Ledger, p: &wicket_placement::schedule::Preemption) -> Result<Vec<String>> {
     let mut left = vec![];
@@ -1081,6 +1137,17 @@ pub fn settle_preemption(
         let left = still_running(l, p)?;
         if left.is_empty() {
             return Ok(Settled::Done);
+        }
+        // A victim whose supervisor declined (its mark cleared: a child running, say) won't stop.
+        let mut declined = vec![];
+        for v in &left {
+            if !l.preemption_pending(v)? {
+                declined.push(v.clone());
+            }
+        }
+        if !declined.is_empty() {
+            abandon_preemption(l, run, ask, p, &declined, asked_ms, now_ms, "it declined to hibernate", true)?;
+            return Ok(Settled::Abandoned(declined));
         }
         if now_ms - asked_ms < PREEMPT_DEADLINE.as_millis() as i64 {
             l.reserve_placement(&run.0, &p.node, ask.req.vcpus, ask.req.memory_mib, now_ms)?;
@@ -2159,6 +2226,71 @@ mod tests {
         assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
     }
 
+    /// #579 step 4 (review): the supervisor's decision, before it hibernates for a hibernate it was
+    /// asked: an operator's or the agent's own always goes ahead; one only preemption asked for is
+    /// declined when preemption gave up (no mark), the mark is stale or its wake is gone, or a child
+    /// runs (hibernating would stop it). Checked at the quiet point and again out of a linger.
+    #[test]
+    fn the_supervisor_hibernates_for_preemption_only_while_it_is_still_wanted() {
+        let now = 1_000_000_000;
+        let mark = |asked_ms, asker_alive| wicket_store::PreemptMark { asked_ms, for_run: Some("run_w".into()), asker_alive };
+        let fresh = mark(now - 1_000, true);
+        assert_eq!(preempted_hibernate(true, Some(&fresh), 0, now), Ok(()), "still wanted");
+        // An operator's (or the agent's own) hibernate goes ahead whatever preemption says.
+        for m in [None, Some(&fresh)] {
+            for kids in [0, 3] {
+                assert_eq!(preempted_hibernate(false, m, kids, now), Ok(()), "the operator's request takes precedence");
+            }
+        }
+        assert!(preempted_hibernate(true, None, 0, now).unwrap_err().contains("no longer needs it"), "withdrawn");
+        let stale = mark(now - PREEMPT_DEADLINE.as_millis() as i64, true);
+        assert!(preempted_hibernate(true, Some(&stale), 0, now).unwrap_err().contains("older than"), "stale");
+        assert!(preempted_hibernate(true, Some(&mark(now - 1_000, false)), 0, now).unwrap_err().contains("gone"), "its wake died");
+        assert!(preempted_hibernate(true, Some(&fresh), 1, now).unwrap_err().contains("child"), "a child spawned since");
+    }
+
+    /// #579 step 4 (review): the ledger's side of that decision. The mark names the run it is for
+    /// and whether that run is alive (waiting, or holding a reservation); a victim that declines
+    /// (its mark cleared while it runs) is given up on by the wake at once, not at the deadline.
+    #[test]
+    fn a_victim_that_declines_is_given_up_on_at_once() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let now = (wicket_store::now() - 5) * 1000;
+        let n1 = crowded(&mut l, now);
+        let ask = asking("t0", 5);
+        let run = RunId("run_new".into());
+        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        let mark = l.preemption_mark("run_batch", now + 1).unwrap().unwrap();
+        assert_eq!((mark.for_run.as_deref(), mark.asker_alive), (Some("run_new"), true), "it holds the room it reserved");
+        assert_eq!(preempted_hibernate(true, Some(&mark), 0, now + 1), Ok(()));
+        // Its reservation lapses and it doesn't wait: the wake is gone.
+        l.placement_released("run_new").unwrap();
+        assert!(!l.preemption_mark("run_batch", now + 1).unwrap().unwrap().asker_alive);
+        l.reserve_placement("run_new", "n1", 1.0, 1024, now).unwrap();
+        // The supervisor declines (a child spawned since, say): it clears the mark.
+        l.clear_preempted("run_batch").unwrap();
+        assert_eq!(settle_preemption(&l, &run, &ask, &p, now, now + 2_000).unwrap(), Settled::Abandoned(vec!["run_batch".into()]));
+        assert_eq!(l.placement("run_new").unwrap().unwrap().state, "released");
+        assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
+    }
+
+    /// #579 step 4 (review): a wake that fails, by any path, withdraws every preemption made for it.
+    #[test]
+    fn a_failed_wake_withdraws_its_preemptions() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let now = 98_900_000;
+        let n1 = crowded(&mut l, now);
+        let run = RunId("run_new".into());
+        preempt_for(&l, &run, &asking("t0", 5), std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        assert_eq!(l.preempted_for("run_new").unwrap(), ["run_batch"]);
+        let t0 = wicket_core::TenantId("t0".into());
+        assert_eq!(withdraw_preemptions_for(&l, &run, &t0, now + 1, "the wake failed").unwrap(), ["run_batch"]);
+        assert!(l.preempted_for("run_new").unwrap().is_empty());
+        assert!(!l.preemption_pending("run_batch").unwrap());
+        assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
+        assert_eq!(l.placement("run_new").unwrap().unwrap().state, "released");
+    }
+
     /// #579 step 4 (review): a re-attach records a box's terms again without forgetting that
     /// preemption asked it to stop.
     #[test]
@@ -2168,7 +2300,7 @@ mod tests {
         l.run_started(&t0, &RunId("r".into()), "z", "a").unwrap();
         l.set_run_node("r", "n1").unwrap();
         l.record_run_terms("r", 1.0, 1024, 0, true, 1).unwrap();
-        l.mark_preempted("r", 42).unwrap();
+        l.mark_preempted("r", 42, "run_x").unwrap();
         l.record_run_terms("r", 1.0, 1024, 0, true, 2).unwrap();
         assert_eq!(l.preemption_view(1).unwrap()[0].preempted_at_ms, Some(42));
     }

@@ -10,9 +10,11 @@ type: Added
   Programs are never preempted, by design (a program has no stop that keeps its work). Each agent
   asked is audited as `placement.preempted`, and the wake holds the room while they hibernate. An
   operator's own `wicket hibernate` request stands; preemption's is tagged, and one that hasn't
-  been honoured within 5 minutes, or that the wake no longer needs (it was placed, or gave up), is
-  withdrawn, its supervisor dropping it before it hibernates, audited as
-  `placement.preempt_abandoned`. An agent that has hibernated counts as gone until a node report
+  been honoured within 5 minutes, or that the wake no longer needs (it was placed, gave up or failed), is
+  withdrawn, audited as `placement.preempt_abandoned`. The agent's supervisor checks before it
+  hibernates for preemption, at its quiet point and again out of a linger, and declines (audited as
+  `placement.preempt_declined`) if the request was withdrawn, is stale, its wake is gone, or the
+  agent has started a child since. An agent that has hibernated counts as gone until a node report
   from after its end, so no second agent is stopped for the same room. The wake defers only to a
   wake ahead of it that fits a node now or could make room itself; it probes nodes only when it has
   something to stop, at most every 30 s; and it doesn't preempt with under 30 s of its wait left.

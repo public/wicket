@@ -487,8 +487,15 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
     room. One that hasn't hibernated by then (a hibernate request can be declined) is left alone for the
     rest of that wait: preemption's request is withdrawn (and its supervisor, if it has taken the request
     already, drops it before hibernating), the room released, and it is audited as
-    `placement.preempt_abandoned`. A wake that is placed, or gives up waiting, while agents it asked still
-    run asks them no more in the same way; given up, it releases the room it held.
+    `placement.preempt_abandoned`. A wake that is placed, gives up waiting or fails, while agents it asked
+    still run asks them no more in the same way, and releases any room it held.
+  - **The agent's side.** Before it hibernates for preemption (at its quiet point, and again before it
+    stops what lingers in its box), the agent's supervisor checks the request is still wanted. It declines
+    if preemption gave up, the request is older than the deadline, the wake that asked no longer waits or
+    holds a reservation (it ended, failed or was killed), or the agent has started a child since (which
+    hibernating would stop). A decline is audited as `placement.preempt_declined`, and the wake gives up
+    on that agent at once. An operator's own `wicket hibernate`, and the agent's own request, always go
+    ahead.
   - **Cost.** The wake works out what it would stop from the nodes' last reports first, without a write
     lock; only then does it ask every node for its room (a report may still count a box that has ended),
     at most every 30 s, and always after a preemption completes. It doesn't preempt with under 30 s of its
