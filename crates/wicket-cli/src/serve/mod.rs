@@ -58,6 +58,7 @@
 mod acme;
 mod authority;
 mod capacity;
+mod fence;
 mod limits;
 mod manifests;
 mod net;
@@ -210,6 +211,12 @@ enum Action {
     StandingRenew {
         id: String,
         ttl_secs: Option<u64>,
+    },
+    /// Release a run's fence without its node (#690), on the effect the passkey signed.
+    ReleaseFence {
+        run: String,
+        reason: String,
+        effect: String,
     },
 }
 
@@ -1429,8 +1436,9 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         Some("standing_approve") => standing::build_approve(state, &l, body),
         Some("standing_deny") => standing::build_deny(state, &l, body),
         Some("standing_renew") => standing::build_renew(state, &l, body),
+        Some("release_fence") => fence::build_release(state, oc, &l, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny or standing_renew",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew or release_fence",
         )),
     }
 }
@@ -1701,6 +1709,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         }
         Action::StandingDeny { id } => standing::apply_deny(state, &l, oc, id, signed),
         Action::StandingRenew { id, ttl_secs } => standing::apply_renew(state, &l, oc, id, *ttl_secs, signed),
+        Action::ReleaseFence { run, reason, effect } => fence::apply_release(state, &l, oc, run, reason, effect, signed),
     }
 }
 
@@ -1944,6 +1953,7 @@ fn dashboard(state: &State) -> Result<Value> {
             v
         })
         .collect();
+    let recent: Vec<String> = runs.iter().filter_map(|r| r["id"].as_str().map(String::from)).collect();
     Ok(json!({
         "now": wicket_store::now(),
         "tenant": t.0,
@@ -1966,6 +1976,7 @@ fn dashboard(state: &State) -> Result<Value> {
         "health": health_view(state, wicket_feed::now_ms())?.0,
         "capacity": capacity::view(&l, &t.0)?,
         "standing": standing::view(&l, &t.0)?,
+        "fenced": fence::view(state, &l, &recent)?,
         "audit": audit,
     }))
 }
@@ -2858,6 +2869,61 @@ mod tests {
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
         assert_eq!(t.ledger().standing(&id).unwrap().status, "revoked");
         assert_eq!(t.begin(json!({ "action": "standing_renew", "id": id })).status, StatusCode::CONFLICT);
+    }
+
+    /// #690: a run fenced until its node confirms is listed on the Fenced runs card with its node and
+    /// why; releasing it is signed (with a reason, the fence's end and its effect), lifts the fence,
+    /// and is audited as `run.fence_released` with the operator's principal.
+    #[test]
+    fn a_fenced_run_is_shown_and_released_with_a_passkey() {
+        let mut t = setup("fence");
+        let run = "run_00000000000000000000fenced";
+        std::fs::create_dir_all(t.dir.join("runs").join(run).join("ctl")).unwrap();
+        // Its run record can't say when its authority ends, and the ledger has no hard end: fenced
+        // until node n1 confirms the box stopped.
+        std::fs::write(t.dir.join("runs").join(run).join("ctl/run.json"), b"not json").unwrap();
+        {
+            let l = t.ledger();
+            l.run_started(&TenantId::single(), &RunId(run.into()), "z", "lead").unwrap();
+            l.set_run_node(run, "n1").unwrap();
+        }
+        let d = dashboard(&t.state).unwrap();
+        let f = &d["fenced"][0];
+        assert_eq!((f["id"].as_str(), f["fence"]["node"].as_str()), (Some(run), Some("n1")), "{d}");
+        assert!(f["fence"]["fenced_until_ms"].is_null(), "{f}");
+        assert!(f["fence"]["why"].as_str().unwrap().contains("until its node confirms the box stopped"), "{f}");
+        // Refused before the passkey: no reason, or a run that isn't fenced.
+        assert_refused(&t.begin(json!({ "action": "release_fence", "run": run })), StatusCode::BAD_REQUEST, "say why");
+        let other = "run_0000000000000000000000none";
+        assert_refused(&t.begin(json!({ "action": "release_fence", "run": other, "reason": "x" })), StatusCode::NOT_FOUND, "isn't fenced");
+        // What the passkey signs: the run, its node, the fence's end, the reason and the effect.
+        let b = t.begin(json!({ "action": "release_fence", "run": run, "reason": "n1 was destroyed" }));
+        assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+        let a = &b.body["action"];
+        assert_eq!(
+            (a["node"].as_str(), a["reason"].as_str(), a["source"].as_str()),
+            (Some("n1"), Some("n1 was destroyed"), Some("unknown")),
+            "{a}"
+        );
+        assert_eq!(a["effect_sha256"].as_str(), Some(wicket_control::fence::effect(run, "n1", None).as_str()));
+        let r = t.act(json!({ "action": "release_fence", "run": run, "reason": "n1 was destroyed" }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        assert!(r.body["ok"].as_str().unwrap_or("").contains("released run"), "{:?}", r.body);
+        let l = t.ledger();
+        let rec: Value = serde_json::from_str(&l.audit_latest(run, "run.fence_released").unwrap().expect("audited")).unwrap();
+        assert_eq!(
+            (rec["by"].as_str(), rec["via"].as_str(), rec["why"].as_str()),
+            (Some("passkey:laptop"), Some("console"), Some("n1 was destroyed"))
+        );
+        assert!(rec["granter_identity"].as_str().unwrap().ends_with("/op/passkey/laptop"), "{rec}");
+        assert!(rec["signed"].is_object(), "{rec}");
+        drop(l);
+        assert!(dashboard(&t.state).unwrap()["fenced"].as_array().unwrap().is_empty(), "released");
+        assert_refused(
+            &t.begin(json!({ "action": "release_fence", "run": run, "reason": "again" })),
+            StatusCode::NOT_FOUND,
+            "isn't fenced",
+        );
     }
 
     /// #256: the Capacity card issues and renews a standing capacity grant with signed actions,
