@@ -144,6 +144,18 @@ pub fn retire_enrolment(ledger: &mut Ledger, n: &NodeHandle) -> Result<bool> {
     Ok(true)
 }
 
+/// After a release whose first try didn't revoke its enrolment: revokes node `name`'s, if it is
+/// still enrolled and was enrolled before the release ended at `ended_at` (so it is that machine,
+/// not one enrolled under its name since). Returns whether it revoked.
+pub fn retire_enrolment_named(ledger: &mut Ledger, name: &str, ended_at: i64) -> Result<bool> {
+    let enrolled = ledger.node(name)?.filter(|r| r.status != "revoked" && r.enrolled_at <= ended_at);
+    if enrolled.is_none() {
+        return Ok(false);
+    }
+    crate::enrol::revoke(ledger, &crate::enrol::Paths::installation().nodes_dir, name)?;
+    Ok(true)
+}
+
 fn usd(micros: i64) -> String {
     MicroUsd(micros.max(0) as u64).to_string()
 }
@@ -628,12 +640,25 @@ pub async fn release(common: Common, id: String, reason: Option<String>, root: b
         say!("{said}");
         return Ok(());
     }
+    // A release whose ledger side didn't finish (`placement.node_release_incomplete`): finish it.
+    if let Some(row) = l.placed_nodes(&["released"])?.into_iter().find(|r| r.id == id || r.name == id) {
+        if let Ok(said) = crate::noderelease::finish_incomplete(&mut l, &row.id, &crate::operator(), retire_enrolment_named) {
+            say!("{said}");
+            return Ok(());
+        }
+    }
     drop(l);
     let o = owner(&common);
     let p = Placer::new(provider(&common, VultrConfig::default())?, envelope::DenyAll, o);
     // An instance the ledger doesn't have as an active placed node (a create that failed half way).
     let id = NodeId(instance_id(&Ledger::open(&crate::ledger_path())?, &id)?);
     let node = p.get(&id).await?;
+    // Asked first too, on a terminal, unless --yes: it is destroyed now.
+    let what = node.as_ref().map(|n| format!("{} ({id})", n.name)).unwrap_or_else(|| id.0.clone());
+    say!("releasing {what}: the ledger doesn't have it as an active placed node; this destroys the machine now, whatever runs on it");
+    if !yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) && !wicket_home::confirm(&format!("release {what}?"))? {
+        return Err(wicket_home::exit::refused("not released: declined at the confirmation"));
+    }
     match p.release(&id, ReleaseMode::Now).await? {
         Released::AlreadyGone => say!("{id} is already gone"),
         r => say!("{id}: {r:?}"),

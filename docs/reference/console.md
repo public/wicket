@@ -110,7 +110,10 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   passkey and operator identity, the record root's command writes too, `granter` `human` or `root`,
   `via` `console` or `cli`); if it can't be written, nothing is released. Then, in the background, with the server's own provider key: if it is still what you signed and still
   active, the provider destroys it; then its service instances are stopped, the runs on it are
-  ended as lost (and revoked, if they have an identity), and `placement.node_released` (with the decision's sequence) is written and its enrolment revoked.
+  ended as lost (and revoked, if they have an identity; a run that ended on its own meanwhile keeps how
+  it ended), and `placement.node_released` (with the decision's sequence) is written and its enrolment
+  revoked. If one of those steps fails the others are still done, `placement.node_release_incomplete` says
+  which, and `wicket node release <id>` on the host finishes it.
   Otherwise `placement.node_release_failed` (it is as it was) or
   `placement.node_release_already_ended` (another release got there first). Files it keeps are
   forgotten only when this release destroyed it. The page's button waits for the Lit servers card
