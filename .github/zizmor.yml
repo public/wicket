@@ -1,0 +1,4 @@
+# zizmor's configuration (the Workflow audit job in ci.yml, #726). An accepted finding goes here as
+# `rules: { <audit>: { ignore: [<file>:<line>] } }`, with a comment saying why it is accepted.
+# Nothing is accepted yet.
+rules: {}
