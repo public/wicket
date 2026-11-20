@@ -2,8 +2,9 @@ name: CI
 
 on:
   pull_request:
-    # `labeled`: adding the full-ci label runs everything (#218).
-    types: [opened, synchronize, reopened, labeled]
+    # `labeled`: adding the full-ci label runs everything (#218). `ready_for_review`: a draft runs
+    # the fast checks only, and marking it ready runs the heavy suites too.
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
   push:
     branches: [main]
   # GitHub's merge queue (#220): each queued PR is tested on top of the latest main, and of the PRs
@@ -48,6 +49,9 @@ jobs:
       suites: ${{ steps.select.outputs.suites }}
       fuzz: ${{ steps.select.outputs.fuzz }}
       fuzz_matrix: ${{ steps.select.outputs.fuzz_matrix }}
+      # `false` for a draft pull request: the heavy suites (fuzz, Lean, TLA+, Kani, gVisor) wait
+      # until it is marked ready. Empty, as every output here, means run.
+      heavy: ${{ steps.draft.outputs.heavy }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -59,6 +63,15 @@ jobs:
           # select-tests saves this cache (its build has what `cargo run` needs).
           shared-key: select
           save-if: false
+      - id: draft
+        name: Draft or ready
+        env:
+          DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          if [ "$DRAFT" = true ]; then
+            echo "heavy=false" >>"$GITHUB_OUTPUT"
+            echo "a draft: the fast checks only; marking it ready for review runs the heavy suites" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - id: select
         name: Select
         # The full-ci label as the pull request has it now, from the API (#246), not as this event's
@@ -119,6 +132,8 @@ jobs:
         run: cargo test --locked --manifest-path ci/determinator/Cargo.toml
       - name: The label check's own test
         run: ci/pr-has-label_test.sh
+      - name: The verdict waits for every job
+        run: ci/verdict-needs.sh
 
   # The repository is public: no secrets or details of real machines, in any commit.
   public:
@@ -267,7 +282,7 @@ jobs:
   fuzz-replay:
     name: Fuzz corpora and past findings (stable)
     needs: select
-    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' }}
+    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -285,7 +300,7 @@ jobs:
     # the matrix exists leaves no check named after an unexpanded expression.
     name: Fuzz targets
     needs: select
-    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' && needs.select.outputs.fuzz_matrix != '[]' }}
+    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' && needs.select.outputs.fuzz_matrix != '[]' && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -322,7 +337,7 @@ jobs:
   fuzz:
     name: Fuzz (short)
     needs: [select, fuzz-replay, fuzz-target]
-    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' }}
+    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -383,7 +398,7 @@ jobs:
   lean:
     name: Lean spec and oracle
     needs: select
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' lean ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' lean ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -404,7 +419,7 @@ jobs:
   tla-shard:
     name: TLA+ models (TLC) ${{ matrix.shard }}/2
     needs: select
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -420,7 +435,7 @@ jobs:
   tla:
     name: TLA+ models (TLC)
     needs: [select, tla-shard]
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -441,7 +456,7 @@ jobs:
   kani-shard:
     name: Kani proofs and loom ${{ matrix.shard }}/4
     needs: select
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -475,7 +490,7 @@ jobs:
   kani:
     name: Kani proofs and loom
     needs: [select, kani-shard]
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -518,7 +533,7 @@ jobs:
     name: gVisor smoke test
     needs: select
     # Any of its suites selected (or no selection: everything).
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') || contains(needs.select.outputs.suites, ' hibernate ') || contains(needs.select.outputs.suites, ' restore ') || contains(needs.select.outputs.suites, ' services ') || contains(needs.select.outputs.suites, ' daemon-uids ') || contains(needs.select.outputs.suites, ' install-test ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') || contains(needs.select.outputs.suites, ' hibernate ') || contains(needs.select.outputs.suites, ' restore ') || contains(needs.select.outputs.suites, ' services ') || contains(needs.select.outputs.suites, ' daemon-uids ') || contains(needs.select.outputs.suites, ' install-test ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -566,7 +581,7 @@ jobs:
   acceptance:
     name: gVisor acceptance
     needs: select
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' acceptance ')) }}
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' acceptance ')) && needs.select.outputs.heavy != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -578,3 +593,33 @@ jobs:
         run: target/debug/wicket image
       - name: Acceptance
         run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:poc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh
+
+  # The one check a merge waits for (#219): every job above passed or was skipped by the selection,
+  # and the run is a full one. A draft's run, which leaves the heavy suites out, fails here, so only
+  # a ready head's run (what it runs today) can pass. A job added to this workflow goes in `needs`.
+  verdict:
+    name: CI verdict (full)
+    needs: [select, select-tests, public, deny, dep-age, rust, fuzz-replay, fuzz-target, fuzz, session-view, policy, lean, tla-shard, tla, kani-shard, kani, simulation, smoke, acceptance]
+    # Not for a run that was cancelled (a newer push superseded it): its verdict is skipped, which
+    # doesn't pass either.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed or was not selected, in a full run
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          HEAVY: ${{ needs.select.outputs.heavy }}
+        run: |
+          set -euo pipefail
+          bad=$(jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | "\(.key): \(.value.result)"' <<<"$NEEDS")
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -n "$bad" ]; then
+            echo "::error::not every job passed: $(tr '\n' ' ' <<<"$bad")"
+            exit 1
+          fi
+          if [ "$HEAVY" = false ]; then
+            echo "::error::a draft's run leaves out the heavy suites: mark the pull request ready for review for a full verdict"
+            exit 1
+          fi
+          echo "verdict: pass" | tee -a "$GITHUB_STEP_SUMMARY"
