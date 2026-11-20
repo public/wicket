@@ -11,7 +11,7 @@ type: Fixed
     published. If that fails, the next use tries again rather than trusting the publisher.
   - A certificate renewal that fails is logged, and the commit or revocation it came with is still
     published with the current certificate, while that certificate is valid and the one on disk
-    is of the same version; otherwise the lock fails.
-  - A statement tick that can't take the feed is logged.
+    is of the same version (one missing or unreadable is not); otherwise the lock fails.
+  - A statement tick that can't take the feed is logged, at most once a minute.
   - `wicket keys certify` starting a new generation takes the node feed's lock first.
   - Opening one node's feed no longer holds up runs opening another node's.
