@@ -1202,6 +1202,18 @@ async fn session(
         let _ = out_tx.send(f);
     };
     let feed_frame = |f: wicket_feed::Frame| Frame::Feed(f.to_line().trim_end().as_bytes().to_vec());
+    // A node below protocol 19 can't read a record whose zone decodes a slash (#664): its strict
+    // parse would refuse it, and its whole feed with it. Never sent; the run can't go there.
+    if p.proto < wicket_chan::chan::DECODE_SLASH && sh.zone.reach.iter().any(|r| !r.decode_slash.is_empty()) {
+        p.ever = false;
+        bail!(
+            "node {} talks protocol {}, and zone {} decides an encoded slash (decode_slash), which needs {}: update the node (wicket self update --nodes)",
+            sh.node,
+            p.proto,
+            sh.zone.name,
+            wicket_chan::chan::DECODE_SLASH
+        );
+    }
     let now = wicket_feed::now_ms();
     let catching = std::time::Instant::now();
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
