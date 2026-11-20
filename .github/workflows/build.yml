@@ -1,22 +1,14 @@
 name: Signed build
 
-# #190: main is built and tested here, and its archive is signed only after a reviewer approves the
-# `sign` job in the `release` environment (Settings, Environments, release: required
+# #190: every push to main is built and tested here; its archive is signed only after a reviewer
+# approves the `sign` job in the `release` environment (Settings, Environments, release: required
 # reviewers, deployment branches main only, prevent self-review; the signing key is that
 # environment's secret WICKET_RELEASE_KEY). Installations take a build with
 # `wicket self update --from-ci`, or `wicket self follow`. No tags and no GitHub Releases: builds
 # are this run's artifacts, named by commit (docs/how-to/update-from-ci.md).
-#
-# Not every push: a push builds only if no build of main ran in the last 6 hours and none is running,
-# so a batch of merges gets one build and one review. The schedule then builds main's head if it
-# isn't built yet (the batch's last merges), and a manual run builds it at once. Installations find
-# a build from any of the three (wicket-cli's ci_update.rs, BUILD_EVENTS).
 on:
   push:
     branches: [main]
-  schedule:
-    - cron: "23 */6 * * *"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -33,53 +25,8 @@ env:
   NODE_SHA256: "5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864" # node-v26.13.1-linux-x64.tar.xz, from nodejs.org/dist/v26.13.1/SHASUMS256.txt (its signature checked against nodejs/release-keys)
 
 jobs:
-  # Whether this run builds: not if this commit is built already; for a push, not if a build of main
-  # ran in the last 6 hours or one is still running (the schedule picks up what that leaves).
-  due:
-    name: Due for a build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      build: ${{ steps.due.outputs.build }}
-    steps:
-      - id: due
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          EVENT: ${{ github.event_name }}
-          SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
-          REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-          [ "$REF" = refs/heads/main ] || { echo "::error::main only, not $REF"; exit 1; }
-          api() { curl -sSf -H "authorization: Bearer $GH_TOKEN" -H 'accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/$1"; }
-          arts=$(api "actions/artifacts?per_page=100")
-          cutoff=$(date -u -d '-6 hours' +%Y-%m-%dT%H:%M:%SZ)
-          built=$(jq --arg s "${SHA:0:12}" '[.artifacts[] | select(.expired | not) | .name | select(endswith("-x86_64-linux.tar.gz") and contains($s))] | length' <<<"$arts")
-          recent=$(jq --arg c "$cutoff" '[.artifacts[] | select(.name | endswith("-x86_64-linux.tar.gz")) | select(.created_at >= $c)] | length' <<<"$arts")
-          running=$(api "actions/workflows/build.yml/runs?branch=main&per_page=30" |
-            jq --argjson me "$RUN_ID" '[.workflow_runs[] | select(.id != $me and .status != "completed" and .created_at < (now | todate))] | length')
-          if [ "$built" -gt 0 ]; then
-            build=false why="${SHA:0:12} is built already"
-          elif [ "$EVENT" = push ] && [ "$running" -gt 0 ]; then
-            build=false why="another build of main is running: the schedule builds what it leaves"
-          elif [ "$EVENT" = push ] && [ "$recent" -gt 0 ]; then
-            build=false why="main was built in the last 6 hours: the schedule builds this batch"
-          else
-            build=true why="building ${SHA:0:12} ($EVENT)"
-          fi
-          echo "build=$build" >>"$GITHUB_OUTPUT"
-          echo "$why"
-          echo "$why" >>"$GITHUB_STEP_SUMMARY"
-
   build:
     name: Build and gate
-    needs: due
-    if: needs.due.outputs.build == 'true'
     # The oldest supported runner: the binary's glibc floor (2.35) runs on Ubuntu 24.04 and Debian 12.
     runs-on: ubuntu-22.04
     timeout-minutes: 60
