@@ -71,6 +71,18 @@ async function check(engine, name, opts) {
       try { document.createElement("div").innerHTML = "<b>x</b>"; return "allowed"; } catch (e) { return e instanceof TypeError ? "throws" : String(e); }
     });
     if (tt === "allowed") fail("a raw innerHTML write was allowed: Trusted Types aren't enforced");
+    // The service worker still registers: its URL comes through wicket-sw, console.js's policy,
+    // which makes nothing but /sw.js; and a policy not on the CSP's list can't be made (#739).
+    const sw = await page.evaluate(async () => {
+      if (navigator.serviceWorker) {
+        try { await navigator.serviceWorker.register(swUrl(), { scope: "/" }); } catch (e) { return "the service worker didn't register: " + e.message; }
+      }
+      if (window.trustedTypes) {
+        try { window.trustedTypes.createPolicy("not-listed", { createScriptURL: u => u }); return "a policy not on the CSP's list was made"; } catch (e) { /* refused, as it should be */ }
+      }
+      return "ok";
+    });
+    if (sw !== "ok") fail(sw);
     if (tt === "none") console.log(`${engine} ${name}: no Trusted Types in this browser`);
     console.log(`${engine} ${name}: ok (${cards} cards)`);
   } finally {
@@ -88,7 +100,7 @@ async function session(engine) {
     const seen = await watch(page);
     const r = await page.goto(url + "session?run=run_01JDRELEASEQQQQQQQQQQQQQQQ");
     if (!r || r.status() !== 200) return console.log(`${engine} session: not served by the preview, skipped`);
-    await page.waitForFunction(() => document.getElementById("app")?.childElementCount > 0, null, { timeout: 10000 })
+    await page.waitForFunction(() => document.getElementById("app")?.hasChildNodes(), null, { timeout: 10000 })
       .catch(() => { throw new Error(`${engine} session: nothing mounted on #app`); });
     const built = await page.evaluate(() => !document.body.textContent.includes("no session view"));
     const violations = (await seen()).filter(p => p.startsWith("violation") || p.startsWith("error: Failed to set") || p.includes("TrustedHTML"));

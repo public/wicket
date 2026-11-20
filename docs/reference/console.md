@@ -567,10 +567,12 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
   'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self';
-  require-trusted-types-for 'script'; trusted-types lit-html vue`. Trusted Types are enforced
-  ([#739](https://github.com/public/wicket/issues/739)): HTML reaches the page only through lit-html's
-  templates (the console) or Vue's (the session view), each through its library's own policy, and a
-  browser throws on any other `innerHTML`-style write from a string. The browser tests check both.
+  require-trusted-types-for 'script'; trusted-types lit-html vue wicket-sw`. Trusted Types are
+  enforced ([#739](https://github.com/public/wicket/issues/739)): HTML reaches the page only through
+  lit-html's templates (the console) or Vue's (the session view), each through its library's own
+  policy, and a browser throws on any other `innerHTML`-style write from a string. The one script URL,
+  the service worker's, comes from `wicket-sw`, a policy that makes `/sw.js` and nothing else. The
+  browser tests check all three.
   No CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
   `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
 - **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS

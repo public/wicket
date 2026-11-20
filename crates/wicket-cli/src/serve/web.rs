@@ -15,12 +15,14 @@ use std::sync::LazyLock;
 /// `manifest-src` lets the browser read the web app manifest (with `default-src 'none'` it couldn't).
 ///
 /// Trusted Types are enforced (#739): a page may write HTML or script only through a policy, and the
-/// only policies allowed are lit-html's (the console's views) and Vue's (the session view's static
-/// nodes). Both are created inside those libraries and pass their own templates; no code of ours can
-/// set `innerHTML` or the like from a string, and a browser with Trusted Types throws if it tries.
+/// only policies allowed are lit-html's (the console's views), Vue's (the session view's static
+/// nodes) and `wicket-sw`, console.js's, which makes the service worker's URL, "/sw.js", and nothing
+/// else. lit-html's and Vue's are created inside those libraries and pass their own templates; no
+/// code of ours can set `innerHTML` or the like from a string, and a browser with Trusted Types
+/// throws if it tries.
 pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; \
 manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; \
-require-trusted-types-for 'script'; trusted-types lit-html vue";
+require-trusted-types-for 'script'; trusted-types lit-html vue wicket-sw";
 
 /// Strict-Transport-Security for HTTPS origins: two years, subdomains, and eligible for the browsers'
 /// preload lists (submitting the domain to hstspreload.org is the operator's step).
