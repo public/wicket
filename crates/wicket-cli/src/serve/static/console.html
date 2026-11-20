@@ -14,6 +14,9 @@
 <!-- No inline script or style: the CSP allows only these files (named by their content hash). -->
 <link rel="stylesheet" href="{{css}}" integrity="{{css_sri}}">
 <script src="{{js}}" integrity="{{js_sri}}" defer></script>
+<!-- The console's ES modules (#574): lit-html and the views drawn with it, after console.js (a
+     module runs after the deferred classic script, before DOMContentLoaded). -->
+{{modules}}
 </head>
 <body>
 <a class="skip" href="#main">Skip to the page</a>

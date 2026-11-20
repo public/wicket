@@ -66,8 +66,35 @@ pub fn console_js() -> &'static str {
     CONSOLE_JS
 }
 
+/// The console's ES modules (#574), as build.rs wrote them: (path under the module directory, bytes),
+/// its own first (`inbox.js`, the entry), then the vendored lit-html files they import.
+const MODULES: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/modules.rs"));
+
+/// The console's modules' directory, `/static/m.<hash>/`, named by a hash over every module's path and
+/// bytes, so their relative imports resolve as written and any change gives a new directory; and the
+/// page's tags for them: a `modulepreload` with Subresource Integrity for each import, then the entry.
+fn modules() -> (String, String) {
+    let mut h = sha2::Sha256::new();
+    for (path, body) in MODULES {
+        h.update((path.len() as u64).to_le_bytes());
+        h.update(path.as_bytes());
+        h.update((body.len() as u64).to_le_bytes());
+        h.update(body);
+    }
+    let dir = format!("/static/m.{}", &hex::encode(h.finalize())[..16]);
+    let sri = |b: &[u8]| format!("sha256-{}", base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(b)));
+    let mut tags = String::new();
+    for (path, body) in &MODULES[1..] {
+        tags.push_str(&format!("<link rel=\"modulepreload\" href=\"{dir}/{path}\" integrity=\"{}\">\n", sri(body)));
+    }
+    let (entry, body) = MODULES[0];
+    tags.push_str(&format!("<script type=\"module\" src=\"{dir}/{entry}\" integrity=\"{}\"></script>", sri(body)));
+    (dir, tags)
+}
+
 pub static ASSETS: LazyLock<Assets> = LazyLock::new(|| {
     const JS: &str = CONSOLE_JS;
+    let (module_dir, module_tags) = modules();
     const CSS: &str = include_str!("static/console.css");
     let (js, js_sri) = hashed("console", "js", JS.as_bytes());
     let (css, css_sri) = hashed("console", "css", CSS.as_bytes());
@@ -75,7 +102,8 @@ pub static ASSETS: LazyLock<Assets> = LazyLock::new(|| {
         .replace("{{css}}", &css)
         .replace("{{css_sri}}", &css_sri)
         .replace("{{js}}", &js)
-        .replace("{{js_sri}}", &js_sri);
+        .replace("{{js_sri}}", &js_sri)
+        .replace("{{modules}}", &module_tags);
     let (sjs, sjs_sri) = hashed("session", "js", SESSION_JS);
     let (scss, scss_sri) = hashed("session", "css", SESSION_CSS);
     let session_page = include_str!("static/session.html")
@@ -88,6 +116,9 @@ pub static ASSETS: LazyLock<Assets> = LazyLock::new(|| {
         files.insert(path.to_string(), Asset { ctype, body: Bytes::from_static(body), immutable });
     };
     add(&js, "text/javascript; charset=utf-8", JS.as_bytes(), true);
+    for (path, body) in MODULES {
+        add(&format!("{module_dir}/{path}"), "text/javascript; charset=utf-8", body, true);
+    }
     add(&css, "text/css; charset=utf-8", CSS.as_bytes(), true);
     add(&sjs, "text/javascript; charset=utf-8", SESSION_JS, true);
     add(&scss, "text/css; charset=utf-8", SESSION_CSS, true);
