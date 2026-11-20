@@ -33,7 +33,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `names.public.per_workload` | integer ≥ 1 | `1` | The most live public names one workload holds at once. An ask beyond it is refused, and so is an approval. |
 | `names.public.reserved` | list of labels | `[]` | Labels no box gets, besides wicket's own (`wicket`, `console`, `www`, `api`, `admin`, `mail`, `ns`). Their lookalikes (`5tatus` for `status`) are refused too. |
 | `names.public.console_host` | host name | none | The console's host name: its first label is reserved too, and, for a host under the boxes zone, the label directly under the zone. |
-| `names.public.allow_idn` | boolean | `false` | Whether `xn--` labels are allowed. |
+| `names.public.allow_idn` | boolean | `false` | Whether `xn--` labels are allowed. The lookalike check reads a label as written, `xn--` form and all, not as the Unicode it shows: with this on, a name can look like a reserved one in a browser. |
 | `names.public.nodes` | mapping of node labels | `{}` | The labels a node needs to publish public ports. |
 | `names.public.ports` | `low-high`, from 1024 | `20000-20999` | The host ports wicket allocates on each node. |
 
