@@ -27,7 +27,7 @@ mod lifecycle_props;
 mod links;
 mod names;
 mod services;
-pub use names::{name_effect, new_name_id, NameAsk, NameKind, NameRow, NameScope, NameTerms, MAX_PENDING_NAMES};
+pub use names::{name_effect, new_name_id, Forgot as ForgotRecords, NameAsk, NameKind, NameRow, NameScope, NameTerms, MAX_PENDING_NAMES};
 pub use services::{Instance, ServiceRow, SHARED_TENANT};
 mod nodeca;
 mod nodelabels;
@@ -230,7 +230,10 @@ impl StoreError {
 /// their way into a run's token on its node, and which the node confirmed, so `await_grant` on a
 /// standing ask answers once the box's node can honour it. Older builds don't read it; the floor
 /// stays 17.
-pub const SCHEMA_VERSION: u32 = 37;
+/// Version 43 (expand, #748; 38 to 42 are others' in flight) adds `name_records.missing_since`:
+/// when a listing of its zone first lacked the record, so one listing alone forgets none. Older
+/// builds don't read it; the floor stays 17.
+pub const SCHEMA_VERSION: u32 = 43;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is

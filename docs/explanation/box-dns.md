@@ -269,7 +269,22 @@ one it doesn't.
   grant shows "taken in the zone", and the conflict is audited. It is never adopted on its own.
 - **Order:** an owner record is written before the records it owns, and deleted after them, so a
   crash between the two leaves an owner record for nothing (cleaned on the next pass), never an
-  unowned A record.
+  unowned A record. The ledger records a plan's new records, and an intent per change, in one write
+  before the provider applies it; a provider whose apply isn't atomic says how far it got, and only
+  those changes count as made.
+- **Every zone with records** (#748): a pass also withdraws the records of a zone that isn't the
+  configured one (after a zone change), with the provider that made them. Records another provider
+  made (after a provider change, or with `names.public` removed) are *stranded*: the pass says so
+  each time until the setting is put back, and never forgets them.
+- **Records gone from the zone** (deleted by hand, or never made because of a crash) are forgotten
+  once listings by the provider that made them have lacked them for 10 minutes or more (the first
+  such listing notes when; one that has them again clears it), so they hold no name's port. A
+  listing that lacks every record the provider made in the zone forgets none, and the pass says so.
+  A provider's `Ok` listing is the whole zone; its id names its account, and each provider's rows
+  are its own: none writes over, plans on or forgets another's.
+- **Links by name:** a name that ends closes the links other boxes opened with `connect` by it.
+- **One address, one node:** names on two nodes that share a public address wait, since host ports
+  are allocated per node.
 - **Lifecycle:** a name's records go when its grant ends, is revoked or lapses, or its run stops.
   A standing name's come back when its workload runs again. A box moving to another node has its A
   and AAAA updated to that node's addresses (and its SRV if the port changed).
@@ -333,9 +348,11 @@ Audit records, as written so far: `name.requested` (an ask), `decision` and `dec
 human's approval or denial, or a refused one, as for other asks), `name.registered` (internal),
 `name.revoked`, `name.released`, `name.claimed` (a later run took up a standing name),
 `node.addresses` (an operator set a node's public addresses), and the reconciler's (step 4b):
-`name.lapsed` (a name's lifetime ended), `name.plan` (a reconcile's plan, applied or not, recorded
-when it differs from the last one, with the names waiting and why), `name.record` (each create,
-update or delete a provider made) and `name.conflict`. Still to come with 4c and 6:
+`name.lapsed` (a name's lifetime ended), `name.plan` (a reconcile's plans for every zone, applied or
+not, with the stranded records and the names waiting, recorded when it differs from the last one),
+`name.record` (each create, update or delete a provider is about to make, `state: intended`, and
+each record forgotten, `state: forgotten`), `name.applied` (how a provider's apply ended, and how
+many changes it made) and `name.conflict`. Still to come with 4c and 6:
 `name.port.opened`, `name.port.closed`, `name.conn` (per connection, on the node) and
 `name.challenge`.
 
