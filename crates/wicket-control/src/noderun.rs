@@ -2976,29 +2976,38 @@ fn feed_holds_ports(dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// While this file is in the data directory (written by `wicket self update` for an update from a
-/// build before protocol 21, removed once its health gate has ended), no supervisor puts ports in
-/// a box's record (#796 review, M3): the build it would roll back to couldn't read a feed holding
-/// them, so a failed gate couldn't roll back. One older than [`GATING_MAX_SECS`] is ignored (an
-/// update that died mid-gate).
+/// While this file is in the data directory (written by `wicket self update` for an update of the
+/// control host from a build before protocol 21, removed once its health gate has ended), no
+/// supervisor puts ports in a box's record (#796 review, M3); in a node's directory
+/// (`nodes/<node>/update-gating`, for that node's update), none for boxes on that node. The build
+/// a failed gate would roll back to couldn't read a feed holding them. The file holds when it stops
+/// holding ports back (Unix seconds: the gate's window and a margin), so an update that died
+/// mid-gate doesn't hold them for ever; one that can't be read counts for [`GATING_MAX_SECS`] from
+/// its writing.
 pub const UPDATE_GATING: &str = "update-gating";
-/// How long an [`UPDATE_GATING`] file holds ports back at most.
+/// How long an [`UPDATE_GATING`] file whose end can't be read holds ports back.
 pub const GATING_MAX_SECS: u64 = 30 * 60;
 
-/// Whether an update's health gate holds ports back now ([`UPDATE_GATING`]).
-fn update_gating() -> bool {
-    std::fs::metadata(crate::data_dir().join(UPDATE_GATING))
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age.as_secs() < GATING_MAX_SECS)
+/// Whether the [`UPDATE_GATING`] file at `p` holds ports back now.
+pub fn gating_at(p: &Path) -> bool {
+    if let Some(until) = std::fs::read_to_string(p).ok().and_then(|t| t.trim().parse::<i64>().ok()) {
+        return wicket_store::now() < until;
+    }
+    std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() < GATING_MAX_SECS)
+}
+
+/// Whether an update's health gate holds back ports for boxes on `node` now: the control host's or
+/// that node's ([`UPDATE_GATING`]).
+fn update_gating(node: &str) -> bool {
+    let data = crate::data_dir();
+    gating_at(&data.join(UPDATE_GATING)) || gating_at(&data.join("nodes").join(node).join(UPDATE_GATING))
 }
 
 /// Whether node `node` reads published ports (#575 step 4c): every live session to it talks
 /// [`wicket_chan::chan::PORTS`] or later (or, with none live, the one last noted did), and no
 /// update's health gate holds them back ([`UPDATE_GATING`]).
 fn reads_ports(node: &str) -> bool {
-    node_protocol_now(node).is_some_and(|p| p >= wicket_chan::chan::PORTS) && !update_gating()
+    node_protocol_now(node).is_some_and(|p| p >= wicket_chan::chan::PORTS) && !update_gating(node)
 }
 
 /// Holds back the host ports of the records in `changes` unless the node talks

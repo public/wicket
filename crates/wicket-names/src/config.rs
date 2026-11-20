@@ -8,10 +8,49 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
-/// Ports wicket itself listens on, which no published host port range may hold (#796 review, M2):
-/// the console's default (8787), the reverse tunnel's ssh (2222) and the mock model's (9999). A
-/// local node binds on the control host itself.
-pub const WICKET_PORTS: &[u16] = &[2222, 8787, 9999];
+/// Where the console's options are (`WICKET_CONSOLE_ARGS`, as `deploy/install.sh` writes them).
+pub const CONSOLE_ENV: &str = "/etc/wicket/console.env";
+/// Where webhook intake's unit is installed on a node (#578), its `--listen` in `ExecStart`.
+pub const INTAKE_UNIT: &str = "/etc/systemd/system/wicket-intake.service";
+/// The console's port when its options don't say (`wicket serve --listen`'s default).
+pub const CONSOLE_PORT: u16 = 8787;
+/// Intake's port when its unit doesn't say (`deploy/node/wicket-intake.service`).
+pub const INTAKE_PORT: u16 = 8443;
+
+/// The ports wicket itself listens on here, which no published host port range may hold (#796
+/// review, M2): the console's (from [`CONSOLE_ENV`]) and webhook intake's (from [`INTAKE_UNIT`]),
+/// each its default where the file doesn't say. A local node binds on the control host itself.
+pub fn own_ports() -> Vec<u16> {
+    let read = |p: &str| std::fs::read_to_string(p).ok();
+    own_ports_from(read(CONSOLE_ENV).as_deref(), read(INTAKE_UNIT).as_deref())
+}
+
+/// [`own_ports`] from the console's environment file and intake's unit, as text.
+pub fn own_ports_from(console_env: Option<&str>, intake_unit: Option<&str>) -> Vec<u16> {
+    // The port of the address after `--listen` (or `--listen=`) in a line of arguments.
+    let listen = |args: &str| -> Option<u16> {
+        let mut words = args.split_whitespace();
+        while let Some(w) = words.next() {
+            let addr = match w.strip_prefix("--listen=") {
+                Some(a) => a,
+                None if w == "--listen" => words.next()?,
+                None => continue,
+            };
+            return addr.rsplit(':').next()?.trim_end_matches(['"', '\'']).parse().ok();
+        }
+        None
+    };
+    let console = console_env
+        .and_then(|t| t.lines().find_map(|l| l.trim().strip_prefix("WICKET_CONSOLE_ARGS=")).map(|v| v.trim_matches('"').to_string()))
+        .and_then(|a| listen(&a))
+        .unwrap_or(CONSOLE_PORT);
+    let intake =
+        intake_unit.and_then(|t| t.lines().find_map(|l| l.trim().strip_prefix("ExecStart=")).and_then(listen)).unwrap_or(INTAKE_PORT);
+    let mut v = vec![console, intake];
+    v.sort_unstable();
+    v.dedup();
+    v
+}
 
 /// The lowest and highest record TTL an operator may set (seconds).
 pub const TTL_RANGE: RangeInclusive<u32> = 30..=3600;
@@ -133,14 +172,20 @@ impl<'de> Deserialize<'de> for PortRange {
 }
 
 impl NamesConfig {
-    /// Every setting that can't work, as one message: a run doesn't start on them.
+    /// Every setting that can't work, as one message: a run doesn't start on them. Host ports are
+    /// checked against the ports wicket itself listens on here ([`own_ports`]).
     pub fn check(&self) -> Result<(), String> {
+        self.check_with(&own_ports())
+    }
+
+    /// [`NamesConfig::check`], with the ports wicket listens on.
+    pub fn check_with(&self, own: &[u16]) -> Result<(), String> {
         let mut bad = vec![];
         if self.internal.per_workload == 0 {
             bad.push("names.internal.per_workload must be at least 1".to_string());
         }
         if let Some(p) = &self.public {
-            bad.extend(p.problems());
+            bad.extend(p.problems(own));
         }
         match bad.is_empty() {
             true => Ok(()),
@@ -182,7 +227,7 @@ impl PublicConfig {
         format!("{label}.{}", self.domain())
     }
 
-    fn problems(&self) -> Vec<String> {
+    fn problems(&self, own: &[u16]) -> Vec<String> {
         let mut bad = vec![];
         let d = self.domain();
         if d.is_empty() || d.split('.').count() < 2 || d.split('.').any(|p| check_shape(p, true).is_err()) {
@@ -217,7 +262,7 @@ impl PublicConfig {
         if lo < 1024 || lo > hi {
             bad.push(format!("names.public.ports {lo}-{hi}: a range of ports from 1024 up, low first"));
         }
-        if let Some(p) = WICKET_PORTS.iter().find(|p| (lo..=hi).contains(*p)) {
+        if let Some(p) = own.iter().find(|p| (lo..=hi).contains(*p)) {
             bad.push(format!("names.public.ports {lo}-{hi} holds port {p}, which wicket itself listens on"));
         }
         if let (ProviderKind::Noop, Some(_)) = (self.provider, &self.credential) {
@@ -243,10 +288,10 @@ mod tests {
     fn defaults_and_a_minimal_public_section() {
         let c = NamesConfig::default();
         assert_eq!((c.internal.per_workload, c.public.is_none()), (3, true));
-        assert_eq!(c.check(), Ok(()));
+        assert_eq!(c.check_with(&[CONSOLE_PORT, INTAKE_PORT]), Ok(()));
         assert!(c.public_rules().is_none());
         let c = parse(OK);
-        assert_eq!(c.check(), Ok(()));
+        assert_eq!(c.check_with(&[CONSOLE_PORT, INTAKE_PORT]), Ok(()));
         let p = c.public.as_ref().unwrap();
         assert_eq!((p.ttl, p.per_workload, p.ports, p.provider.as_str()), (60, 1, PortRange(20000, 20999), "noop"));
         assert_eq!(p.fqdn("demo"), "demo.boxes.example.com");
@@ -258,7 +303,7 @@ mod tests {
             r#"{ "public": { "provider": "noop", "zone": "Boxes.Example.com.", "owner": "a1b2c3d4",
                  "reserved": ["status"], "console_host": "Ops.example.com" } }"#,
         );
-        assert_eq!(c.check(), Ok(()));
+        assert_eq!(c.check_with(&[CONSOLE_PORT, INTAKE_PORT]), Ok(()));
         let r = c.public_rules().unwrap();
         assert!(crate::check_label("status", &r).is_err());
         assert!(crate::check_label("ops", &r).is_err());
@@ -277,6 +322,15 @@ mod tests {
     }
 
     #[test]
+    fn wickets_own_ports_are_read_from_its_settings() {
+        assert_eq!(own_ports_from(None, None), vec![INTAKE_PORT, CONSOLE_PORT]);
+        let env = "# options\nWICKET_CONSOLE_ARGS=\"--listen 0.0.0.0:9443 --no-bootstrap-link\"\n";
+        let unit = "[Service]\nExecStart=/usr/local/lib/wicket-intake/wicket node intake --listen=0.0.0.0:7443 --socket /x\n";
+        assert_eq!(own_ports_from(Some(env), Some(unit)), vec![7443, 9443]);
+        assert_eq!(own_ports_from(Some("WICKET_CONSOLE_ARGS=--origin https://c.example.com"), None), vec![INTAKE_PORT, CONSOLE_PORT]);
+    }
+
+    #[test]
     fn settings_that_cant_work_are_refused() {
         for (field, value, says) in [
             ("zone", r#""com""#, "two or more labels"),
@@ -289,6 +343,7 @@ mod tests {
             ("reserved", r#"["a.b"]"#, "not a DNS label"),
             ("console_host", r#""bad host""#, "not a host name"),
             ("ports", r#""8000-9000""#, "wicket itself listens on"),
+            ("ports", r#""8400-8500""#, "wicket itself listens on"),
             ("ports", r#""80-443""#, "from 1024"),
             ("ports", r#""30000-20000""#, "low first"),
             ("credential", r#""dns-boxes""#, "takes none"),
@@ -296,7 +351,7 @@ mod tests {
             let mut v: serde_json::Value = serde_json::from_str(OK).unwrap();
             v["public"][field] = serde_json::from_str(value).unwrap();
             let c: NamesConfig = serde_json::from_value(v).unwrap();
-            let e = c.check().unwrap_err();
+            let e = c.check_with(&[CONSOLE_PORT, INTAKE_PORT]).unwrap_err();
             assert!(e.contains(says), "{field}={value}: {e}");
         }
         assert!(serde_json::from_str::<NamesConfig>(
@@ -309,6 +364,6 @@ mod tests {
         .is_err());
         assert!(serde_json::from_str::<NamesConfig>(r#"{ "internal": { "per_workloads": 3 } }"#).is_err(), "unknown keys");
         let zero: NamesConfig = serde_json::from_str(r#"{ "internal": { "per_workload": 0 } }"#).unwrap();
-        assert!(zero.check().is_err());
+        assert!(zero.check_with(&[CONSOLE_PORT, INTAKE_PORT]).is_err());
     }
 }

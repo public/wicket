@@ -74,6 +74,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
             NodeCmd::Forget { run, force } => noderun::forget_command(&run, force, &operator()).await,
             NodeCmd::FeedCheckpoint { name } => {
+                // An enrolled node's name only: it names a directory (#796 re-review).
+                if Ledger::open(&ledger_path())?.node(&name)?.is_none() {
+                    return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
+                }
                 let epoch = noderun::checkpoint_feed(&name)?;
                 let held = noderun::node_feed_holds_ports(&name)?;
                 Ledger::open(&ledger_path())?.audit(

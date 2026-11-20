@@ -510,9 +510,17 @@ pub async fn pass_with<P: DnsProvider>(
             )
             .collect();
         // A name still live that holds a port on another node now moved there (#796 review, L7):
-        // its records point at that node, not this one, so this port is free as if they were gone.
-        let moved = n.live(now) && l.port_elsewhere(&n.id, &node, &proto)?.is_some();
-        if !moved && left.iter().any(|(_, r)| bases.iter().any(|b| b == r.base())) {
+        // this port is free once none of its address records points here any more, as if they
+        // were gone (its SRV names the name, which resolves to the new node). Not while a failing
+        // apply leaves the old ones in place, and not if this node's addresses can't be told.
+        let mine = |r: &Record, here: &wicket_store::NodeAddresses| {
+            here.ipv4.is_some_and(|a| r.value == a.to_string()) || here.ipv6.is_some_and(|a| r.value == a.to_string())
+        };
+        let here = l.node_addresses(&node)?;
+        let moved = n.live(now) && l.port_elsewhere(&n.id, &node, &proto)?.is_some() && !here.is_empty();
+        let pointing_here = left.iter().any(|(_, r)| bases.iter().any(|b| b == r.base()) && mine(r, &here));
+        let any_left = left.iter().any(|(_, r)| bases.iter().any(|b| b == r.base()));
+        if if moved { pointing_here } else { any_left } {
             continue;
         }
         let ttl = report
@@ -1280,14 +1288,23 @@ mod tests {
     async fn a_moved_names_old_port_is_freed() {
         let (l, run, id) = ledger_srv();
         let old = l.port_of(&id, "n1", PROTO).unwrap().unwrap();
+        let p = MemoryProvider::new(Zone::new(BOXES), vec![]);
+        pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
+        assert!(p.records().iter().any(|r| r.value == V4.to_string()), "published on n1");
+        // The box moves to n2, as its supervisor's ports_for does it.
         enrol_bare(&l, "n2");
-        l.set_node_addresses("n2", AddressChange::Set(Ipv4Addr::new(8, 8, 8, 8)), AddressChange::Keep, "op").unwrap();
+        let n2 = Ipv4Addr::new(8, 8, 8, 8);
+        l.set_node_addresses("n2", AddressChange::Set(n2), AddressChange::Keep, "op").unwrap();
         l.set_run_node(&run.0, "n2").unwrap();
         l.allocate_port("n2", PROTO, &id, 20000..=20999, Some(old)).unwrap();
         l.release_ports_elsewhere(&id, "n2").unwrap();
-        let p = MemoryProvider::new(Zone::new(BOXES), vec![]);
+        // The provider fails to apply the move: n1's A record is still there, so its port isn't free.
+        let down = Failing(p.records());
+        let r = pass_t(&l, &public(), &down, wicket_store::now(), false).await.unwrap();
+        assert!(r.freed.is_empty(), "{:?}", r.freed);
+        // Applied: the records point at n2, and n1's port is free.
         let r = pass_t(&l, &public(), &p, wicket_store::now(), false).await.unwrap();
         assert_eq!(r.freed, vec![("n1".to_string(), old)]);
-        assert!(p.records().iter().any(|r| r.value == Ipv4Addr::new(8, 8, 8, 8).to_string()), "{:?}", p.records());
+        assert!(p.records().iter().any(|r| r.value == n2.to_string()) && !p.records().iter().any(|r| r.value == V4.to_string()));
     }
 }

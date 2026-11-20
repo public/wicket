@@ -1212,7 +1212,7 @@ async fn control_switch(
     // until the gate has passed, so a failed one can still roll back to `from`.
     let from_protocol = v.manifest(from).map(|m| m.describe.protocol).unwrap_or(0);
     let _gating = (!rollback && from_protocol < crate::chan::PORTS && target.describe.protocol >= crate::chan::PORTS)
-        .then(GatingMark::set)
+        .then(|| GatingMark::set(None, gate.window))
         .transpose()?;
     handover(&bin).await?;
     let gate = if rollback { Gate { window: Duration::ZERO, canary: None, ..gate.clone() } } else { gate.clone() };
@@ -1792,6 +1792,13 @@ async fn node_update(ledger: &Arc<Mutex<Ledger>>, v: &Versions, name: &str, gree
     };
     // The version's image first, so the node's new boxes have it the moment it switches.
     ensure_image_on_node(&node, &crate::image::tag_for(green)).await.with_context(|| format!("node {name}: nothing changed there"))?;
+    // From a node build before host ports to one with them (#796 re-review): none go in the
+    // records of boxes on it until its gate has passed, so a failed gate can roll it back.
+    let current = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/current\" 2>/dev/null || true")).await.unwrap_or_default();
+    let was = if valid_id(&current) { node_build_protocol(&node, &current).await } else { 0 };
+    let _gating = (was < crate::chan::PORTS && v.manifest(green)?.describe.protocol >= crate::chan::PORTS)
+        .then(|| GatingMark::set(Some(name), g.window))
+        .transpose()?;
     let bytes = std::fs::read(&bin)?;
     let prev = push_version(&node, &bytes, &sha).await?;
     audit(
@@ -1840,9 +1847,17 @@ async fn node_update(ledger: &Arc<Mutex<Ledger>>, v: &Versions, name: &str, gree
 struct GatingMark(PathBuf);
 
 impl GatingMark {
-    fn set() -> Result<GatingMark> {
-        let p = crate::data_dir().join(wicket_control::noderun::UPDATE_GATING);
-        std::fs::write(&p, b"").with_context(|| format!("writing {}", p.display()))?;
+    /// The control host's, or node `node`'s, for a gate of `window`: it holds ports back until the
+    /// window and 10 minutes have passed, if nothing removes it first.
+    fn set(node: Option<&str>, window: Duration) -> Result<GatingMark> {
+        let dir = match node {
+            None => crate::data_dir(),
+            Some(n) => crate::data_dir().join("nodes").join(n),
+        };
+        std::fs::create_dir_all(&dir)?;
+        let p = dir.join(wicket_control::noderun::UPDATE_GATING);
+        let until = wicket_store::now() + i64::try_from(window.as_secs()).unwrap_or(i64::MAX / 2) + 600;
+        std::fs::write(&p, until.to_string()).with_context(|| format!("writing {}", p.display()))?;
         Ok(GatingMark(p))
     }
 }
@@ -1850,6 +1865,16 @@ impl GatingMark {
 impl Drop for GatingMark {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The protocol node build `id` speaks, as it says itself (`self describe`, within 30 s); 0 for
+/// one that can't say, which counts as older than any feature.
+async fn node_build_protocol(node: &crate::node::Node, id: &str) -> u32 {
+    let cmd = format!("{NODE_ROOT}; \"$vr/{id}/wicket\" self describe 2>/dev/null || true");
+    match tokio::time::timeout(Duration::from_secs(30), node.sh(&cmd)).await {
+        Ok(Ok(o)) => serde_json::from_str::<Describe>(&o).map(|d| d.protocol).unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -1866,14 +1891,10 @@ async fn node_rollback(ledger: &Arc<Mutex<Ledger>>, node: &crate::node::Node, na
     // ports (#575 step 4c, #796 review H1): it would refuse its feed, and every box on it. Its
     // protocol as that build says it; one that can't say counts as older.
     let current = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/current\" 2>/dev/null || true")).await.unwrap_or_default();
-    let proto = node
-        .sh(&format!("{NODE_ROOT}; \"$vr/{prev}/wicket\" self describe 2>/dev/null || true"))
-        .await
-        .ok()
-        .and_then(|o| serde_json::from_str::<Describe>(&o).ok())
-        .map(|d| d.protocol)
-        .unwrap_or(0);
-    if proto < crate::chan::PORTS && wicket_control::noderun::node_feed_holds_ports(name)? {
+    let proto = node_build_protocol(node, &prev).await;
+    // A feed that can't be read counts as holding ports (#796 re-review): the node is kept.
+    let held = wicket_control::noderun::node_feed_holds_ports(name).unwrap_or(true);
+    if proto < crate::chan::PORTS && held {
         let block = format!(
             "{prev} speaks protocol {proto}, before host ports (21), and couldn't parse node {name}'s feed: it holds boxes' records with host ports. To go back: revoke the public names published on it (`wicket names list`, `wicket names revoke <id>`), let their runs publish their records without them, and force a checkpoint (`wicket node feed-checkpoint {name}`); or roll forward instead"
         );

@@ -31,7 +31,8 @@ type: Added
     The same holds for a node going back to such a build, by hand or after a failed health gate.
     `wicket node feed-checkpoint <node>` writes a checkpoint now, so a feed whose records no longer
     hold ports can be opened by such a build at once.
-  - While an update from a build before protocol 21 runs its health gate, no box's record gets
-    ports, so a failed gate can still roll back.
-  - `names.public.ports` can't hold a port wicket itself listens on (2222, 8787, 9999), and a
+  - While an update from a build before protocol 21 runs its health gate, the control host's or
+    a node's, no box's record (on that node) gets ports, so a failed gate can still roll back.
+  - `names.public.ports` can't hold a port wicket itself listens on (the console's `--listen`, and
+    webhook intake's, read from their settings; 8787 and 8443 by default), and a
     public name gets records only on a node at protocol 21 whose `publish.json` holds its port.
