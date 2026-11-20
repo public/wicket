@@ -609,8 +609,9 @@ trust:
 - **What is checked.** The run's image and every entry of its zone's `images` (a node may start children
   from them itself, #164), except the installation's own agent image. The first rule whose repository
   matches decides. Under `require: signed` an image runs only if one of the rule's keys signed exactly its
-  digest; a tag is refused, since a signature names a digest. Keys are read and parsed when the policy is
-  loaded: a missing or unreadable key, or a rule with no keys, fails every run until it is fixed.
+  digest; a tag is refused, since a signature names a digest. Keys are read and parsed when a run is
+  admitted: a missing or unreadable key, or a rule with no keys, refuses new runs until it is fixed. A
+  box already admitted (re-attached to, or a long-lived agent waking) doesn't read them.
 - **Names are normalised before matching.** Hosts are lowercased and lose `:443`, and Docker Hub's names
   are one. Once any rule requires signatures, a pinned image whose name maps to no registry in
   `registries` (a bare `sha256:…` included) is refused, so how an image is spelled can't dodge a rule.
@@ -625,9 +626,10 @@ trust:
   signatures made with a key, in its tag format: the `sha256-<hex>.sig` tag in the image's repository,
   whose "simple signing" payload names the digest, signed with ECDSA P-256 (cosign's default) or
   Ed25519. They are fetched from the image's registry with its `secret`, if it has one (bound to the
-  registry's host and `auth_hosts`), within 60 s altogether. A signature that verified is cached under
-  the data dir (`cache/signatures/`) by the digest and the rule's keys, so changing the keys checks
-  afresh.
+  registry's host and `auth_hosts`), within 60 s for all of a run's images together. A signature
+  that verified is cached under the data dir (`cache/signatures/`) for 10 minutes, by the digest and the
+  rule's keys: changing the keys checks afresh, and a signature withdrawn from the registry stops
+  admitting runs within 10 minutes.
 - **Signing for it.** cosign 3 writes a Sigstore bundle as an OCI 1.1 referrer by default, which wicket
   doesn't read yet. Sign in the tag format, by digest:
 

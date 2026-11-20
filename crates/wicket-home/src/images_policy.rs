@@ -253,16 +253,35 @@ pub fn path() -> std::path::PathBuf {
     crate::data_dir().join("images.yaml")
 }
 
+/// The policy, its trust rules' keys unread: for what only needs its registries or
+/// `require_digests` (a box's start on its node, re-attaching, waking), which a missing or rotated
+/// key must not stop. Admitting a run reads them ([`load_with_keys`]).
 pub fn load() -> Result<ImagesPolicy> {
-    match std::fs::read_to_string(path()) {
-        Ok(t) => {
-            let mut p: ImagesPolicy = wicket_core::yaml::from_str(&t).with_context(|| path().display().to_string())?;
-            p.trust.load_keys(&crate::data_dir()).with_context(|| path().display().to_string())?;
-            Ok(p)
-        }
+    load_from(&crate::data_dir())
+}
+
+/// As [`load`], from data dir `dir`.
+pub fn load_from(dir: &std::path::Path) -> Result<ImagesPolicy> {
+    let f = dir.join("images.yaml");
+    match std::fs::read_to_string(&f) {
+        Ok(t) => wicket_core::yaml::from_str(&t).with_context(|| f.display().to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ImagesPolicy::default()),
-        Err(e) => Err(e).with_context(|| path().display().to_string()),
+        Err(e) => Err(e).with_context(|| f.display().to_string()),
     }
+}
+
+/// The policy with its trust rules checked and their keys read and parsed: what admitting a run
+/// needs (`wicket_control::imagetrust::admit`). A rule without keys, or a key that is missing or
+/// isn't one, is an error.
+pub fn load_with_keys() -> Result<ImagesPolicy> {
+    load_with_keys_from(&crate::data_dir())
+}
+
+/// As [`load_with_keys`], from data dir `dir`.
+pub fn load_with_keys_from(dir: &std::path::Path) -> Result<ImagesPolicy> {
+    let mut p = load_from(dir)?;
+    p.trust.load_keys(dir).with_context(|| dir.join("images.yaml").display().to_string())?;
+    Ok(p)
 }
 
 /// The operator's `require_digests` policy, for a run of `m` starting `image`: refused, naming the
@@ -417,6 +436,27 @@ mod tests {
         // With nothing required, nothing is refused for its spelling.
         let lax = trust("trust:\n  rules: [{repositories: [a/*], keys: [keys/a.pub], require: allow-unsigned}]\n", &dir);
         assert!(!lax.trust.requires_any() && lax.trust.wanted(&lax, &pin).refused.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_admission_reads_the_keys() {
+        let dir = key_dir();
+        std::fs::write(
+            dir.join("images.yaml"),
+            "registries: [{host: r.example.com}]\ntrust:\n  rules: [{repositories: ['r.example.com/*'], keys: [keys/gone.pub]}]\n",
+        )
+        .unwrap();
+        // A start on a node, a re-attach or a wake reads the registries: a missing key doesn't stop it.
+        let p = load_from(&dir).unwrap();
+        assert!(p.registry_for("r.example.com/x:1").is_some() && p.trust.rules[0].parsed.is_empty());
+        // Admitting a run does read them.
+        assert!(format!("{:#}", load_with_keys_from(&dir).unwrap_err()).contains("keys/gone.pub"));
+        std::fs::copy(dir.join("keys/a.pub"), dir.join("keys/gone.pub")).unwrap();
+        assert_eq!(load_with_keys_from(&dir).unwrap().trust.rules[0].parsed.len(), 1);
+        // No file: the default, with or without keys.
+        let empty = dir.join("none");
+        assert!(load_from(&empty).unwrap().trust.is_empty() && load_with_keys_from(&empty).unwrap().trust.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -541,9 +541,9 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // operator's `require_digests`, then the `trust` policy's signatures (#191), then the grant on
     // its digest (#258). The signature that verified it is what `run.image` records.
     let mut signed: Option<wicket_chan::signature::Verified> = None;
-    if record.is_none() && wake.is_none() {
+    if crate::imagetrust::admits(record.is_some(), wake.is_some()) {
         let default_image = crate::image::effective(crate::image::DEFAULT);
-        let policy = crate::images_policy::load()?;
+        let policy = crate::images_policy::load_with_keys()?;
         let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
         let ledger = Ledger::open(&ledger_path())?;
         let cache = crate::imagetrust::cache_dir();

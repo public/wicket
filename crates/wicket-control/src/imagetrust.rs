@@ -23,8 +23,22 @@ use wicket_chan::signature::{self, Key, Subject, Verified};
 use wicket_core::RunId;
 use wicket_store::Ledger;
 
-/// The most the fetches for one image's signatures may take, altogether.
+/// The most the fetches for a run's signatures may take, for all its images together.
 pub const FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a verified signature is taken from the cache: a signature withdrawn from its registry
+/// stops admitting new runs within this.
+pub const CACHE_TTL_SECS: i64 = 600;
+
+/// A cache entry: what verified, and when (Unix seconds).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Cached {
+    verified: Verified,
+    at: i64,
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
 
 /// What checking one image found, as its `image.signature` audit records it.
 #[derive(Debug, Default, serde::Serialize)]
@@ -52,7 +66,7 @@ impl Outcome {
     }
 }
 
-/// Where verified signatures are cached, by (digest, keys).
+/// Where verified signatures are cached, by (digest, keys), for [`CACHE_TTL_SECS`].
 pub fn cache_dir() -> std::path::PathBuf {
     crate::data_dir().join("cache/signatures")
 }
@@ -66,12 +80,13 @@ fn cache_key(digest: &str, keys: &[Key]) -> String {
 
 /// Checks `image` (pinned to `pin`, if it is) against `p`'s trust policy. `cred(name, hosts)` is
 /// the registry's secret, if it may go to all of `hosts`. `cache`, if given, is where verified
-/// signatures are kept.
+/// signatures are kept. Fetching stops at `deadline`.
 pub async fn check(
     p: &ImagesPolicy,
     image: &str,
     pin: Option<&str>,
     cache: Option<&Path>,
+    deadline: tokio::time::Instant,
     mut cred: impl FnMut(&str, &[String]) -> Result<String>,
 ) -> Outcome {
     let mut out = Outcome::default();
@@ -95,9 +110,10 @@ pub async fn check(
         return done(out, "no trust rule names keys for it".into());
     }
     let cached = cache.map(|d| d.join(format!("{}.json", cache_key(pin, &w.keys))));
-    if let Some(v) = cached.as_ref().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice::<Verified>(&b).ok()) {
-        if w.keys.iter().any(|k| k.fingerprint() == v.key) {
-            out.verified = Some(v);
+    if let Some(c) = cached.as_ref().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice::<Cached>(&b).ok()) {
+        let age = now_secs() - c.at;
+        if (0..CACHE_TTL_SECS).contains(&age) && w.keys.iter().any(|k| k.fingerprint() == c.verified.key) {
+            out.verified = Some(c.verified);
             out.cached = true;
             return out;
         }
@@ -129,7 +145,7 @@ pub async fn check(
         None => None,
     };
     let subject = Subject { digest: pin, repository: w.repository.as_deref().unwrap_or_default() };
-    let found = tokio::time::timeout(FETCH_DEADLINE, async {
+    let found = tokio::time::timeout_at(deadline, async {
         let mut why = vec![];
         for scheme in signature::schemes() {
             let Some(tag) = scheme.tag(pin) else { continue };
@@ -151,13 +167,13 @@ pub async fn check(
                 if let Some(d) = f.parent() {
                     let _ = std::fs::create_dir_all(d);
                 }
-                let _ = std::fs::write(f, serde_json::to_vec(&v).unwrap_or_default());
+                let _ = std::fs::write(f, serde_json::to_vec(&Cached { verified: v.clone(), at: now_secs() }).unwrap_or_default());
             }
             out.verified = Some(v);
             out
         }
         Ok(Err(why)) => done(out, format!("no signature verified ({why})")),
-        Err(_) => done(out, format!("its signatures weren't fetched within {} s", FETCH_DEADLINE.as_secs())),
+        Err(_) => done(out, format!("its signatures weren't fetched within the run's {} s for them", FETCH_DEADLINE.as_secs())),
     }
 }
 
@@ -184,6 +200,12 @@ pub struct Admit<'a> {
     pub cache: Option<&'a Path>,
 }
 
+/// Whether a run is admitted ([`admit`]): a new one is; one re-attaching to its box or waking (a
+/// long-lived agent's next activation) was admitted when it first started.
+pub fn admits(reattaching: bool, waking: bool) -> bool {
+    !reattaching && !waking
+}
+
 /// Admits a new run's image, in order: the operator's `require_digests`, then the `trust`
 /// policy's signatures for every image it may start (each audited as `image.signature`, its
 /// registry credential as `image.secret_fetch`), and only then the grant on its digest (#258). A
@@ -194,17 +216,24 @@ pub async fn admit(a: Admit<'_>, mut cred: impl FnMut(&str, &[String]) -> Result
     crate::images_policy::require_pinned_with(a.policy, m, a.image, a.default_image)?;
     let mut signed = None;
     if !a.policy.trust.is_empty() {
+        // One deadline for every image's fetches.
+        let deadline = tokio::time::Instant::now() + FETCH_DEADLINE;
         for img in images_to_check(m, a.image, a.default_image) {
             let pin = wicket_core::image::parse(img).map_err(anyhow::Error::msg)?.pin;
-            let out = check(a.policy, img, pin.as_deref(), a.cache, &mut cred).await;
-            if let Some((secret, why)) = &out.credential {
+            // The credential's read is audited as it is read, before it is used: if the audit
+            // can't be written, it isn't released.
+            let audited = |name: &str, hosts: &[String]| -> Result<String> {
+                let r = cred(name, hosts);
+                let why = r.as_ref().err().map(|e| format!("{e:#}"));
                 a.ledger.audit(
                     &m.tenant,
                     Some(a.run),
                     "image.secret_fetch",
-                    &serde_json::json!({ "secret": secret, "released": why.is_none(), "why": why, "image": img, "for": "signature" }),
+                    &serde_json::json!({ "secret": name, "released": why.is_none(), "why": why, "image": img, "for": "signature" }),
                 )?;
-            }
+                r
+            };
+            let out = check(a.policy, img, pin.as_deref(), a.cache, deadline, audited).await;
             let mut body = serde_json::json!({ "image": img, "digest": pin, "zone": m.zone.name });
             body.as_object_mut().expect("an object").extend(serde_json::to_value(&out)?.as_object().cloned().unwrap_or_default());
             body["refused"] = out.refused().into();
@@ -285,6 +314,10 @@ mod tests {
         p
     }
 
+    fn later() -> tokio::time::Instant {
+        tokio::time::Instant::now() + FETCH_DEADLINE
+    }
+
     fn no_cred(_: &str, _: &[String]) -> Result<String> {
         bail!("no credential asked for")
     }
@@ -298,7 +331,7 @@ mod tests {
         let k = p256_key(7);
         let s = setup(&k, &k, &sha(b"the image's index")).await;
         let image = format!("{}/team/agent@{}", s.host, s.pin);
-        let o = check(&policy(&s, "require-signed", "signed"), &image, Some(&s.pin), None, no_cred).await;
+        let o = check(&policy(&s, "require-signed", "signed"), &image, Some(&s.pin), None, later(), no_cred).await;
         let v = o.verified.clone().unwrap();
         assert_eq!((o.rule, o.required, o.refused(), o.cached), (Some(1), true, false, false));
         assert_eq!(v.scheme, "cosign");
@@ -306,7 +339,7 @@ mod tests {
         assert!(v.signature.starts_with("sha256:"));
         // No trust section: nothing is fetched or asked.
         let before = s.hits();
-        let o = check(&ImagesPolicy::default(), &image, Some(&s.pin), None, no_cred).await;
+        let o = check(&ImagesPolicy::default(), &image, Some(&s.pin), None, later(), no_cred).await;
         assert!(o.verified.is_none() && !o.required && o.why.is_none() && s.hits() == before);
         std::fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -317,22 +350,22 @@ mod tests {
         // Signed by a key the rule doesn't name.
         let s = setup(&stranger, &k, &sha(b"the image's index")).await;
         let image = format!("{}/team/agent@{}", s.host, s.pin);
-        let o = check(&policy(&s, "require-signed", "signed"), &image, Some(&s.pin), None, no_cred).await;
+        let o = check(&policy(&s, "require-signed", "signed"), &image, Some(&s.pin), None, later(), no_cred).await;
         assert!(o.refused() && why(&o).contains("none of the policy's keys"), "{o:?}");
         // The same, allowed unsigned: runs, and why it is unsigned is recorded.
-        let o = check(&policy(&s, "allow-unsigned", "allow-unsigned"), &image, Some(&s.pin), None, no_cred).await;
+        let o = check(&policy(&s, "allow-unsigned", "allow-unsigned"), &image, Some(&s.pin), None, later(), no_cred).await;
         assert!(!o.refused() && o.verified.is_none() && why(&o).contains("none of the policy's keys"), "{o:?}");
         // A tag can't be checked.
-        let o = check(&policy(&s, "require-signed", "signed"), &format!("{}/team/agent:1", s.host), None, None, no_cred).await;
+        let o = check(&policy(&s, "require-signed", "signed"), &format!("{}/team/agent:1", s.host), None, None, later(), no_cred).await;
         assert!(o.refused() && why(&o).contains("it is a tag"), "{o:?}");
         // Another repository: the default, which requires a signature and names no keys.
         let other = format!("{}/elsewhere/x@{}", s.host, s.pin);
-        let o = check(&policy(&s, "require-signed", "signed"), &other, Some(&s.pin), None, no_cred).await;
+        let o = check(&policy(&s, "require-signed", "signed"), &other, Some(&s.pin), None, later(), no_cred).await;
         assert!(o.refused() && o.rule.is_none() && why(&o).contains("no trust rule names keys"), "{o:?}");
         // Under allow-unsigned with a rule requiring signatures, a bare digest or another
         // registry's name is refused rather than slipping past the rule.
         for img in [s.pin.clone(), format!("unlisted.example.com/team/agent@{}", s.pin)] {
-            let o = check(&policy(&s, "allow-unsigned", "signed"), &img, Some(&s.pin), None, no_cred).await;
+            let o = check(&policy(&s, "allow-unsigned", "signed"), &img, Some(&s.pin), None, later(), no_cred).await;
             assert!(o.refused() && why(&o).contains("maps to no registry"), "{img}: {o:?}");
         }
         std::fs::remove_dir_all(&s.dir).unwrap();
@@ -340,13 +373,19 @@ mod tests {
         // A good signature over another digest.
         let s = setup(&k, &k, &sha(b"another image")).await;
         let image = format!("{}/team/agent@{}", s.host, s.pin);
-        let o = check(&policy(&s, "require-signed", "signed"), &image, Some(&s.pin), None, no_cred).await;
+        let o = check(&policy(&s, "require-signed", "signed"), &image, Some(&s.pin), None, later(), no_cred).await;
         assert!(o.refused() && why(&o).contains("a signature for"), "{o:?}");
         // Unsigned: the registry has no signature for this digest.
         let unsigned = sha(b"unsigned");
-        let o =
-            check(&policy(&s, "require-signed", "signed"), &format!("{}/team/agent@{unsigned}", s.host), Some(&unsigned), None, no_cred)
-                .await;
+        let o = check(
+            &policy(&s, "require-signed", "signed"),
+            &format!("{}/team/agent@{unsigned}", s.host),
+            Some(&unsigned),
+            None,
+            later(),
+            no_cred,
+        )
+        .await;
         assert!(o.refused() && why(&o).contains("cosign: no signature (sha256-"), "{o:?}");
         std::fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -360,7 +399,7 @@ mod tests {
         p.registries[0].secret = Some("reg".into());
         p.registries[0].auth_hosts = vec!["auth.example.com".into()];
         let mut asked = vec![];
-        let o = check(&p, &image, Some(&s.pin), None, |n, h| {
+        let o = check(&p, &image, Some(&s.pin), None, later(), |n, h| {
             asked.push((n.to_string(), h.to_vec()));
             Ok("u:p".into())
         })
@@ -368,7 +407,7 @@ mod tests {
         assert!(o.verified.is_some());
         assert_eq!(o.credential, Some(("reg".to_string(), None)));
         assert_eq!(asked, vec![("reg".to_string(), vec![s.host.clone(), "auth.example.com".to_string()])]);
-        let o = check(&p, &image, Some(&s.pin), None, |_, _| bail!("not bound")).await;
+        let o = check(&p, &image, Some(&s.pin), None, later(), |_, _| bail!("not bound")).await;
         assert!(o.refused() && why(&o).contains("the registry's credential reg"), "{o:?}");
         assert_eq!(o.credential, Some(("reg".to_string(), Some("not bound".to_string()))));
         std::fs::remove_dir_all(&s.dir).unwrap();
@@ -381,17 +420,70 @@ mod tests {
         let image = format!("{}/team/agent@{}", s.host, s.pin);
         let cache = s.dir.join("cache");
         let p = policy(&s, "require-signed", "signed");
-        let first = check(&p, &image, Some(&s.pin), Some(&cache), no_cred).await;
+        let first = check(&p, &image, Some(&s.pin), Some(&cache), later(), no_cred).await;
         assert!(first.verified.is_some() && !first.cached);
         let hits = s.hits();
-        let again = check(&p, &image, Some(&s.pin), Some(&cache), no_cred).await;
+        let again = check(&p, &image, Some(&s.pin), Some(&cache), later(), no_cred).await;
         assert!(again.cached && again.verified == first.verified && s.hits() == hits, "no fetch the second time");
+        // Past its time, an entry is fetched and checked afresh: a withdrawn signature stops admitting.
+        for f in std::fs::read_dir(&cache).unwrap() {
+            let f = f.unwrap().path();
+            let mut c: serde_json::Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+            c["at"] = (now_secs() - CACHE_TTL_SECS).into();
+            std::fs::write(&f, serde_json::to_vec(&c).unwrap()).unwrap();
+        }
+        let stale = check(&p, &image, Some(&s.pin), Some(&cache), later(), no_cred).await;
+        assert!(stale.verified.is_some() && !stale.cached && s.hits() > hits, "refetched once stale");
+        let hits = s.hits();
         // Other keys: another cache entry, fetched and checked afresh.
         std::fs::write(s.dir.join("keys/team.pub"), pem_of_p256(&p256_key(9))).unwrap();
         let p = policy(&s, "require-signed", "signed");
-        let o = check(&p, &image, Some(&s.pin), Some(&cache), no_cred).await;
+        let o = check(&p, &image, Some(&s.pin), Some(&cache), later(), no_cred).await;
         assert!(o.refused() && !o.cached && s.hits() > hits, "{o:?}");
         std::fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_deadline_is_the_run_s_and_a_credential_read_is_audited_whatever_follows() {
+        let k = p256_key(7);
+        let s = setup(&k, &k, &sha(b"the image's index")).await;
+        let image = format!("{}/team/agent@{}", s.host, s.pin);
+        let mut p = policy(&s, "require-signed", "signed");
+        p.registries[0].secret = Some("reg".into());
+        // A deadline already past: nothing is fetched, and the image is refused for it.
+        let o = check(&p, &image, Some(&s.pin), None, tokio::time::Instant::now(), |_, _| Ok("u:p".into())).await;
+        assert!(o.refused() && why(&o).contains("weren't fetched within the run's"), "{o:?}");
+        // The credential's read is in the audit when it is handed over, before any fetch.
+        let (l, m, run) = (Ledger::open_in_memory().unwrap(), manifest(""), RunId::new());
+        let seen = std::cell::Cell::new(None);
+        let a = Admit {
+            policy: &p,
+            ledger: &l,
+            manifest: &m,
+            run: &run,
+            image: &image,
+            default_image: "own",
+            parent: None,
+            by: "op",
+            cache: None,
+        };
+        admit(a, |_, _| {
+            seen.set(Some(l.audit_of_kind("image.secret_fetch").unwrap().len()));
+            Ok("u:p".into())
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen.get(), Some(0), "read first");
+        assert_eq!(rows(&l, "image.secret_fetch").len(), 1, "then audited, then used");
+        std::fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_new_run_is_admitted() {
+        assert!(admits(false, false));
+        assert!(!admits(true, false), "re-attaching");
+        assert!(!admits(false, true), "waking");
+        assert!(!admits(true, true));
     }
 
     fn manifest(zone_images: &str) -> wicket_core::Manifest {
