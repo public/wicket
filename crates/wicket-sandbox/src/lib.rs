@@ -196,6 +196,15 @@ impl ImageCache {
         }
     }
 
+    /// For tests of the crates that use this one: the cache as if its images' events were followed,
+    /// knowing `image` as `ident`.
+    #[cfg(feature = "testkit")]
+    pub fn seed(&self, image: &str, ident: ImageIdentity) {
+        let mut s = self.state();
+        s.watching = true;
+        s.ids.insert(image.to_string(), ident);
+    }
+
     /// Something changed this Docker's images: forget everything.
     pub fn invalidate(&self) {
         let mut s = self.state();
