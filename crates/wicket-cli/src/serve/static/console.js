@@ -60,6 +60,25 @@ function principalName(p) {
   if (ag) return strip(ag[2]) + " (zone " + strip(ag[1]) + ")";
   return strip(x);
 }
+// A principal as an element (#707 review): the short name as a button that shows the full identity
+// under it on a tap (a phone has no hover), and as its title.
+function principalEl(p) {
+  const w = el("span", "principal");
+  const full = strip(p), short = principalName(p);
+  if (short === full) { w.append(el("span", "run-name", full)); return w; }
+  const b = el("button", "idname", short);
+  b.type = "button"; b.title = full;
+  if (b.setAttribute) b.setAttribute("aria-expanded", "false");
+  const line = el("div", "idline", full); line.hidden = true;
+  b.onclick = () => { line.hidden = !line.hidden; if (b.setAttribute) b.setAttribute("aria-expanded", String(!line.hidden)); layoutAt = performance.now(); };
+  w.append(b, line);
+  return w;
+}
+// Server text with RFC 3339 UTC times in it (a node's health, a refusal's reason) in the rows' local
+// time; the original stays in the element's title (#707 review).
+const UTC_TIME = /\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?Z\b/g;
+const localTimes = text => strip(text).replace(UTC_TIME, m => { const t = Date.parse(m) / 1000; return isNaN(t) ? m : clock(t); });
+function serverText(tag, cls, text) { const e = el(tag, cls, localTimes(text)); if (UTC_TIME.test(String(text))) e.title = strip(text); UTC_TIME.lastIndex = 0; return e; }
 // A sentence with `commands` in backticks as code spans (#648): the rest stays text.
 function codeText(tag, cls, text) {
   const e = el(tag, cls);
@@ -225,7 +244,12 @@ async function openSheet(body, extra) {
   if (sheet !== sheetToken) return;
   // An error that stays sits above the sheet (#597): it goes when the sheet opens.
   document.getElementById("msg").hidden = true;
-  document.getElementById("confirm-what").textContent = describe(begin.action);
+  // The decision (describe's first line) in an element of its own, styled strongly; the rest, the
+  // target among it, in full ink. The text, newline included, is describe's exactly (#698 review).
+  const said = describe(begin.action), cut = said.indexOf("\n");
+  const lead = el("div", "lead", cut < 0 ? said : said.slice(0, cut));
+  document.getElementById("confirm-what").replaceChildren(lead, ...(cut < 0 ? [] : [document.createTextNode("\n"), el("div", "rest", said.slice(cut + 1))]));
+  announce("");
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   state.textContent = "";
@@ -246,6 +270,7 @@ async function openSheet(body, extra) {
     if (left > 0) { state.textContent = "Expires in " + Math.floor(left / 60000) + ":" + String(Math.floor(left / 1000) % 60).padStart(2, "0"); return; }
     clearInterval(expiryTimer);
     state.textContent = "This expired before it was signed. Nothing was signed.";
+    announce(state.textContent);
     go.textContent = "Ask again"; go.className = "approve"; go.disabled = false;
     go.onclick = () => { go.disabled = true; state.textContent = "Preparing\u2026"; openSheet(body, extra); };
   };
@@ -256,6 +281,7 @@ async function openSheet(body, extra) {
     go.dataset.waiting = "1";
     clearInterval(expiryTimer);
     state.textContent = "Waiting for your passkey\u2026";
+    announce(state.textContent);
     try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
     catch (e) { toastError(e, null, true); }
     closeConfirm();
@@ -263,6 +289,8 @@ async function openSheet(body, extra) {
   document.getElementById("confirm").hidden = false;
   go.focus();
 }
+// What a screen reader is told about the sheet: state changes only, not the countdown's every second.
+function announce(t) { const a = document.getElementById("confirm-announce"); if (a) a.textContent = t; }
 // #369: what else an approval that widens would allow, shown before the passkey is asked for.
 function renderBlast(box, b) {
   box.replaceChildren();
@@ -465,7 +493,14 @@ function pendingCard(s, p) {
 // browser has one, the installed app's badge; and how many health alerts, beside Health in the nav.
 let shownCount = -1;
 function renderCounts(waiting, alerts) {
-  const set = (id, v) => { const e = document.getElementById(id); if (e) { e.textContent = v ? String(v) : ""; e.hidden = !v; } };
+  // Each count with its link's accessible name: "Waiting, 10 items" (#698 review).
+  const set = (id, v) => {
+    const e = document.getElementById(id);
+    if (!e) return;
+    e.textContent = v ? String(v) : ""; e.hidden = !v;
+    const a = e.parentNode;
+    if (a && a.setAttribute && a.dataset) { if (v) a.setAttribute("aria-label", a.dataset.label + ", " + v + (v === 1 ? " item" : " items")); else a.removeAttribute("aria-label"); }
+  };
   set("nav-waiting", waiting);
   set("nav-health", alerts);
   const h = document.getElementById("waiting-h");
@@ -599,9 +634,9 @@ function healthRow(n) {
   const w = el("div", "hrow");
   const d = el("div", "row");
   d.append(el("span", "mono", strip(n.node)));
-  d.append(el("span", (n.alerts || []).length ? "blocked" : "", strip(n.summary) + " · reported " + whenMs(n.received_ms)));
+  d.append(serverText("span", (n.alerts || []).length ? "blocked" : "", n.summary + " · reported " + whenMs(n.received_ms)));
   w.append(d);
-  for (const a of n.alerts || []) w.append(el("div", "blocked", "! " + strip(a)));
+  for (const a of n.alerts || []) w.append(serverText("div", "blocked", "! " + a));
   return w;
 }
 
@@ -622,7 +657,7 @@ function stateStoreRows(p, nowMs) {
   };
   // What is alerted (and pushed, if notifications are on) first, so a sink past its threshold
   // doesn't look like one a few records behind; then whether these rows are current.
-  for (const a of p.alerts || []) out.push(el("div", "blocked", "! " + strip(a)));
+  for (const a of p.alerts || []) out.push(serverText("div", "blocked", "! " + a));
   if (p.not_read_yet) out.push(el("div", "pend", "! not read yet: the console hasn't managed a first read of the state store"));
   else if (p.stale) out.push(el("div", "pend", "! not checked for " + secs((nowMs - (p.read_ms || 0)) / 1000) + ": these rows may be out of date"));
   const st = p.stream;
@@ -645,7 +680,7 @@ function stateStoreRows(p, nowMs) {
     out.push(row("Audit export " + strip(a.sink) + " (" + strip(a.kind) + ")", a.error ? "blocked" : a.behind && !a.manual ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
   }
   // An error already alerted on (the config alert quotes it) isn't said twice.
-  for (const e of p.errors || []) if (!(p.alerts || []).some(a => a.startsWith(e))) out.push(el("div", "blocked", "! " + strip(e)));
+  for (const e of p.errors || []) if (!(p.alerts || []).some(a => a.startsWith(e))) out.push(serverText("div", "blocked", "! " + e));
   return out;
 }
 
@@ -679,7 +714,7 @@ function capacityRow(g) {
   const t = g.terms || {}, u = g.used || {}, left = g.left || {};
   const d = el("div", "row cap");
   const head = el("div", "run-head");
-  const who = el("span", "run-name", principalName(g.principal)); who.title = strip(g.principal);
+  const who = principalEl(g.principal);
   head.append(who, el("span", "mono quiet", strip(g.id)));
   const nodes = n => plural(Number(n) || 0, "node");
   const what = el("div", "meta", "Allows: " + nodes(t.nodes) + " at once of " + (t.plans || []).map(strip).join(" or ") + " in " + (t.regions || []).map(strip).join(", ") +
@@ -779,7 +814,9 @@ function standingRuleRow(r) {
     refresh();
   });
   b.append(renew, revoke);
-  d.append(head, el("div", "meta", "for " + to + " · " + until + " · by " + strip(r.decided_by)), b);
+  const forWho = el("div", "meta");
+  forWho.append(document.createTextNode("for "), r.for === "zone" ? document.createTextNode(to) : principalEl(r.principal), document.createTextNode(" · " + until + " · by " + strip(r.decided_by)));
+  d.append(head, forWho, b);
   return d;
 }
 // The form's inputs, by name; built once, so what the operator types survives the poll.
@@ -1205,13 +1242,13 @@ async function showExplain(seq) {
     const r = x.recorded, n = x.against_token_now;
     const out = [
       kv("request", r.method + " " + r.host + r.path + " (" + (r.risk || "?") + ")"),
-      kv("recorded", String(r.outcome) + " on " + r.decided_on + " at " + when(r.at) + ": " + strip(r.detail)),
+      kv("recorded", String(r.outcome) + " on " + r.decided_on + " at " + when(r.at) + ": " + localTimes(r.detail)),
       kv("run", x.run + " · policy " + (x.policy || "none")),
     ];
     if (n.available) {
       out.push(kv("token now", n.decision), el("pre", "src", n.why), kv("zone says", n.zone_says));
       out.push(el("div", "note", "Against the run's token as its node's feed holds it now: grants and policy may have changed since it was decided."));
-    } else out.push(el("div", "note", "Can't evaluate it now: " + strip(n.why)));
+    } else out.push(el("div", "note", "Can't evaluate it now: " + localTimes(n.why)));
     body.replaceChildren(...out);
   } catch (e) { body.replaceChildren(el("div", "blocked", strip(e.message))); }
 }
@@ -1506,7 +1543,7 @@ async function submitSecret(ev) {
 function decidedRow(x) {
   const d = el("div", "decided");
   const head = el("div", "run-head");
-  head.append(el("span", "pill " + ({ granted: "good", denied: "bad" })[x.status] || "pill", ({ granted: "approved", denied: "denied" })[x.status] || strip(x.status)),
+  head.append(el("span", "pill " + (({ granted: "good", denied: "bad" })[x.status] || ""), ({ granted: "approved", denied: "denied" })[x.status] || strip(x.status)),
     el("span", "mono", strip(x.method + " " + x.host + x.path)));
   const meta = el("div", "meta");
   meta.append(document.createTextNode(strip(x.id) + " \u00b7 zone " + strip(x.zone) + " \u00b7 asked "), timeEl(x.created_at, rel(x.created_at)));
