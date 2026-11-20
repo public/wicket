@@ -4664,6 +4664,7 @@ dependencies = [
  "libc",
  "oxc_allocator",
  "oxc_codegen",
+ "oxc_diagnostics",
  "oxc_minifier",
  "oxc_parser",
  "oxc_span",
