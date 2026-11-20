@@ -8,7 +8,7 @@
 //! (`operators.yaml`); the org layer and every ancestor's ceiling still bound the rule where it
 //! is enforced, on the box's node, which no grant lifts.
 
-use crate::grant::Granter;
+use crate::grant::{merged, refused_as as refused, Granter};
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
 use wicket_core::manifest::ReachRule;
@@ -97,29 +97,12 @@ fn check_ttl(ttl: Option<Duration>) -> Result<()> {
 /// The operator's own authority over a rule: every method of it on its host, at the risk it can
 /// reach (R4 with `allow_dangerous`, else R2).
 fn may_decide(by: &Granter, rule: &ReachRule) -> Result<crate::operators::Operator> {
-    let Granter::Human(o) = by else { bail!("standing reach is decided by a human operator, not {}", by.label()) };
+    let o = crate::grant::human(by, "standing reach")?;
     let risk = if rule.allow_dangerous { 4 } else { 2 };
     for m in &rule.methods {
         o.may_decide(&crate::operators::Asked::of_op(m, rule.host.trim_start_matches("*."), Some(risk))).map_err(anyhow::Error::msg)?;
     }
     Ok(o.clone())
-}
-
-fn refused(l: &Ledger, by: &Granter, id: &str, decision: &str, why: anyhow::Error) -> anyhow::Error {
-    let record = serde_json::json!({ "target": id, "decision": decision, "by": by.label(), "why": format!("{why:#}") });
-    match l.audit(&TenantId::single(), None, "decision.refused", &record) {
-        Ok(_) => why.context("refused (the refusal is on the audit record)"),
-        Err(e) => why.context(format!("refused (the refusal could not be recorded: {e})")),
-    }
-}
-
-/// `extra`'s fields, merged into an audit record (the console's: how it was decided, and the
-/// signed action).
-fn merged(mut record: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
-    if let (Some(r), serde_json::Value::Object(x)) = (record.as_object_mut(), extra) {
-        r.extend(x);
-    }
-    record
 }
 
 /// Approves standing ask `id` as `by`, on the effect `shown` (if the decider was shown one).
@@ -161,8 +144,9 @@ pub fn approve(
 /// Denies standing ask `id` as `by`; `extra` goes on the audit record.
 pub fn deny(l: &Ledger, by: &Granter, id: &str, extra: serde_json::Value) -> Result<()> {
     let s = l.standing(id)?;
-    let Granter::Human(o) = by else {
-        return Err(refused(l, by, id, "deny", anyhow::anyhow!("standing reach is decided by a human operator")));
+    let o = match crate::grant::human(by, "standing reach") {
+        Ok(o) => o,
+        Err(why) => return Err(refused(l, by, id, "deny", why)),
     };
     l.deny_standing(id, &o.label)?;
     l.audit(

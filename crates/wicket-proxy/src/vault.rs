@@ -260,10 +260,16 @@ impl Vault {
         }
     }
 
-    /// Binds `name` to exactly these hosts (patterns: `api.example.com`, `*.example.com`).
+    /// Binds `name` to exactly these hosts (patterns: `api.example.com`, `*.example.com`). Refused
+    /// for a `verify` secret (#578): it is sent nowhere, whatever binding is asked for.
     pub fn set_hosts(&self, name: &str, hosts: &[String]) -> Result<()> {
         let p = self.path(name)?;
         let v = normalize_hosts(hosts)?;
+        if !v.is_empty() && self.is_verify(name) {
+            bail!(
+                "secret {name:?} verifies trigger deliveries, so it is sent nowhere: give it no hosts (or store another secret for egress)"
+            );
+        }
         std::fs::create_dir_all(&self.dir)?;
         std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
         let f = p.with_extension("hosts");
@@ -272,6 +278,49 @@ impl Vault {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(&tmp, &f)?;
         Ok(())
+    }
+
+    /// Whether `name` is a `verify` secret (#578): used only to check the signatures of a trigger's
+    /// webhook deliveries (`<name>.verify`). It is bound to no host, so no injection, credential
+    /// swap or model proxy can read it (`get_for` refuses a secret with no hosts).
+    pub fn is_verify(&self, name: &str) -> bool {
+        if self.source.is_some() {
+            return false;
+        }
+        self.path(name).map(|p| p.with_extension("verify").exists()).unwrap_or(false)
+    }
+
+    /// Makes `name` a `verify` secret ([`Vault::is_verify`]). Refused while it is bound to hosts:
+    /// one secret either goes to hosts or checks deliveries, never both.
+    pub fn set_verify(&self, name: &str) -> Result<()> {
+        let p = self.path(name)?;
+        if !self.has(name) {
+            bail!("no secret {name:?} (wicket secret set {name})");
+        }
+        let hosts = self.hosts(name);
+        if !hosts.is_empty() {
+            bail!(
+                "secret {name:?} may be sent to {}: a verify secret is sent nowhere, so store the webhook's key as a secret of its own",
+                hosts.join(", ")
+            );
+        }
+        let f = p.with_extension("verify");
+        std::fs::write(&f, b"verify\n")?;
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    /// A `verify` secret's value, for checking a delivery's signature: refused for any other secret,
+    /// and for one too short to verify with (under 16 bytes, #714 review E).
+    pub fn get_verify(&self, name: &str) -> Result<String> {
+        if !self.is_verify(name) {
+            bail!("secret {name:?} isn't a verify secret (as root: wicket secret verify {name})");
+        }
+        let v = self.get(name)?;
+        if v.len() < 16 {
+            bail!("secret {name:?} is shorter than 16 bytes: too short to verify deliveries with");
+        }
+        Ok(v)
     }
 
     /// Whether `name` may be sent to `host` (a host name, or a `*.` pattern: then every host it
@@ -319,7 +368,7 @@ impl Vault {
     /// Removes `name` (its value or reference, and its host binding).
     pub fn remove(&self, name: &str) -> Result<()> {
         let p = self.path(name)?;
-        for f in [p.clone(), p.with_extension("ref"), p.with_extension("hosts")] {
+        for f in [p.clone(), p.with_extension("ref"), p.with_extension("hosts"), p.with_extension("verify")] {
             match std::fs::remove_file(&f) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
                 _ => {}
@@ -358,7 +407,7 @@ impl Vault {
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| !n.ends_with(".tmp") && !n.ends_with(".hosts") && !n.ends_with(".hosts-tmp"))
+                    .filter(|n| !n.ends_with(".tmp") && !n.ends_with(".hosts") && !n.ends_with(".hosts-tmp") && !n.ends_with(".verify"))
                     .map(|n| match n.strip_suffix(".ref") {
                         Some(b) => format!("{b} (reference)"),
                         None => n,
@@ -649,6 +698,33 @@ fn acl_readers(acl: &[AclEntry], me: u32) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// #578 step 4: a `verify` secret is sent nowhere. It can't have hosts, a secret with hosts
+    /// can't become one, egress can't read it, and only `get_verify` gives its value.
+    #[test]
+    fn a_verify_secret_is_sent_nowhere() {
+        let dir = std::env::temp_dir().join(format!("wicket-vault-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let v = super::Vault::new(dir.clone());
+        v.set("hook", "k3y-k3y-k3y-k3y-k3y").unwrap();
+        v.set("gh", "t0k").unwrap();
+        v.set_hosts("gh", &["api.github.com".into()]).unwrap();
+        assert!(v.get_verify("hook").is_err(), "not yet a verify secret");
+        v.set_verify("hook").unwrap();
+        assert!(v.is_verify("hook"));
+        assert_eq!(v.get_verify("hook").unwrap(), "k3y-k3y-k3y-k3y-k3y");
+        v.set("short", "k").unwrap();
+        v.set_verify("short").unwrap();
+        assert!(v.get_verify("short").unwrap_err().to_string().contains("shorter than 16"));
+        assert!(v.get_for("hook", "api.github.com").is_err(), "egress never reads it");
+        assert!(v.set_hosts("hook", &["api.github.com".into()]).unwrap_err().to_string().contains("sent nowhere"));
+        assert!(v.set_verify("gh").unwrap_err().to_string().contains("api.github.com"), "a secret with hosts can't be one");
+        assert!(v.set_verify("missing").is_err());
+        assert_eq!(v.names(), ["gh", "hook", "short"], "the binding isn't listed as a secret");
+        v.remove("hook").unwrap();
+        assert!(!v.is_verify("hook"), "removed with its secret");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

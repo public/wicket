@@ -154,13 +154,21 @@ pub(crate) fn receipts_json(rs: &[wicket_store::Receipt]) -> serde_json::Value {
 }
 
 /// The agents `me` may write to, and what each is to it.
-pub(crate) fn principals_json(l: &Ledger, tenant: &TenantId, me: &str, issuer: &wicket_identity::VerifyingKey) -> Result<serde_json::Value> {
+pub(crate) fn principals_json(
+    l: &Ledger,
+    tenant: &TenantId,
+    me: &str,
+    issuer: &wicket_identity::VerifyingKey,
+) -> Result<serde_json::Value> {
     let mut out = vec![];
     for p in l.principals(&tenant.0)? {
         let wicket_store::Principal::Agent(r) = p else { continue };
         let acts_for = wicket_identity::verify_identity(&r.jws, issuer, r.issued_at)
             .is_ok_and(|c| c.principal.get("sub").and_then(|s| s.as_str()) == Some(me));
-        let listed = wicket_core::manifest::accepts(&r.accept_from, "", Some(me));
+        // As send decides it: an operator has no zone, so only an entry naming its id lists it
+        // (never an empty one).
+        let entries: Vec<&str> = r.accept_from.iter().map(String::as_str).filter(|e| !e.is_empty()).collect();
+        let listed = wicket_core::manifest::accepts(&entries, "", Some(me));
         if !acts_for && !listed {
             continue;
         }

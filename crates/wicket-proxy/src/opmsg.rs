@@ -42,9 +42,9 @@ fn reply(l: &Ledger, tenant: &str, in_reply_to: Option<&str>, other: &str, me: &
     let Some(m) = in_reply_to else { return Ok(false) };
     let shaped = m.len() <= MAX_REPLY_ID && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     let found = shaped
-        && l.message_row(m).map_err(|e| e.to_string())?.is_some_and(|r| {
-            r.tenant == tenant && r.to_principal.as_deref() == Some(me) && r.from_principal.as_deref() == Some(other)
-        });
+        && l.message_row(m)
+            .map_err(|e| e.to_string())?
+            .is_some_and(|r| r.tenant == tenant && r.to_principal.as_deref() == Some(me) && r.from_principal.as_deref() == Some(other));
     if !found {
         let shown = if shaped { m.to_string() } else { "(not a message id)".into() };
         return Err(format!("in_reply_to {shown} is not a message {other} sent you").into());
@@ -109,7 +109,8 @@ pub(crate) fn agent_to_operator(
         "reply_to": sub, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
     });
     let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
-    let meta = wicket_store::MessageMeta { from_principal: Some(sub), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: false };
+    let meta =
+        wicket_store::MessageMeta { from_principal: Some(sub), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: false };
     l.post_message(&id, &ctx.tenant, &ctx.run.0, to, None, &env, &meta).map_err(|e| e.to_string())?;
     let audited = l.audit(
         &ctx.tenant,
@@ -203,8 +204,13 @@ pub fn send_as_operator(
     if relation.is_empty() {
         let why = format!("{to} does not accept messages from you ({me}): it doesn't act for you and its accept_from doesn't list you");
         l.refuse_message(&id, &tenant.0, "", Some(&me), to, &why).map_err(|e| e.to_string())?;
-        l.audit(tenant, None, "message.refused", &json!({ "id": id, "kind": kind, "from": me, "to": to, "why": "accept_from", "bytes": size }))
-            .map_err(|e| format!("not sent: the audit record could not be written ({e})"))?;
+        l.audit(
+            tenant,
+            None,
+            "message.refused",
+            &json!({ "id": id, "kind": kind, "from": me, "to": to, "why": "accept_from", "bytes": size }),
+        )
+        .map_err(|e| format!("not sent: the audit record could not be written ({e})"))?;
         return Err(SendError::Refused { id, to: to.to_string(), why });
     }
     let (to_run, wake) = route(&l, &tenant.0, to, &rec, None, waker.is_some())?;
@@ -215,7 +221,8 @@ pub fn send_as_operator(
         "reply_to": me, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
     });
     let env = wicket_identity::sign_operator_envelope(&key, &doc, &payload);
-    let meta = wicket_store::MessageMeta { from_principal: Some(&me), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: true };
+    let meta =
+        wicket_store::MessageMeta { from_principal: Some(&me), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: true };
     let routed = l.post_message(&id, tenant, "", to, to_run.as_deref(), &env, &meta).map_err(|e| e.to_string())?;
     let audited = l.audit(
         tenant,
@@ -278,7 +285,9 @@ pub fn verify_received(
         return Err("the sender's identity has been revoked".into());
     }
     let (agent, zone, run, chain) = match &sender {
-        wicket_identity::Sender::Agent(c) if c.run == m.from_run => (Some(c.agent.clone()), Some(c.zone.clone()), Some(c.run.clone()), c.chain()),
+        wicket_identity::Sender::Agent(c) if c.run == m.from_run => {
+            (Some(c.agent.clone()), Some(c.zone.clone()), Some(c.run.clone()), c.chain())
+        }
         wicket_identity::Sender::Operator(c) if m.from_run.is_empty() => (None, None, None, vec![format!("{} ({})", c.name, c.via)]),
         _ => return Err("its envelope does not match its delivery".into()),
     };

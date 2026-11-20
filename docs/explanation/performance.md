@@ -369,8 +369,10 @@ ledger's schema statements run once per process, not on every open.
 
 ### Docker, runsc, or a restore (#287, step 3)
 
-What Docker and runsc add to a start has to be measured on a host with Docker (`measure.sh`, its
-`docker.run.create`, `.runtime` and `.return` spans); it wasn't in this round. What is known:
+What Docker and runsc add to a start is measured on a host with Docker: `measure.sh`'s
+`docker.run.create`, `.runtime` and `.return` spans, or `runtime.sh` for Docker and the runtimes
+alone ([experiments/box-start](../../experiments/box-start/README.md#on-a-host-with-docker)). What is
+known:
 
 | what | time | source |
 |---|---:|---|
@@ -379,6 +381,9 @@ What Docker and runsc add to a start has to be measured on a host with Docker (`
 | `docker run` (gVisor) to Claude Code's first line | 3.54 s | [hibernate E4](../../experiments/hibernate/RESULTS.md) |
 | `runsc restore` of a checkpointed agent box | 0.13–0.16 s | hibernate E1 |
 | `runsc checkpoint` of it | 0.23 s (114 MB of pages, 20 MB zstd) | hibernate E1 |
+| `docker.run.runtime` with runsc (Created → StartedAt) | 18.5 ms (p90 21.1); runc 17.9 | `runtime.sh`, a cloud sandbox, not a node (2026-11-20) |
+| Created → the box's `true` exited, runsc | 94.8 ms (p90 109.9); runc 102.6 | the same |
+| `box.entry.init` (gVisor's start after `StartedAt`, to wicket-entry) | 148 ms | the control host's node, #287 |
 
 **The choice.** For an agent, the box's start isn't what the user waits for: Claude Code's own
 start in gVisor is (3.5 s to its first line, against ~0.1 s for wicket and whatever runsc's boot is).
@@ -389,11 +394,16 @@ against 3.5 s), but it needs direct runsc too (Docker restores only into the sam
 restore hook, restore-once fencing and carrying the box's addresses across (#71, #177, #365's
 item 3). So:
 
-- **Keep Docker for cold starts.** Measure `docker.run.runtime` on a Docker host before changing
-  anything: if runsc's boot (sandbox and gofer) is under ~200 ms, Docker's chain on top of it is not
-  worth replacing.
+- **Keep Docker for cold starts.** If runsc's boot (sandbox and gofer) is under ~200 ms, Docker's
+  chain on top of it is not worth replacing. Measured in a cloud sandbox (2026-11-20, above), it is:
+  `docker.run.runtime` is 18 ms with runsc as with runc, and the whole start, until `true` has run
+  and exited, under 110 ms at p90, no slower than runc. dockerd, containerd and the shim add the
+  same to both, so driving runsc directly would save part of that ~18 ms. **Not measured on a node
+  yet**: the sandbox has no KVM and cgroup v1. The procedure is in
+  [experiments/box-start](../../experiments/box-start/README.md#on-a-host-with-docker); the
+  coordinator runs it on a node and adds the numbers here.
 - **Restores are the step worth taking**, for wakes and warm boxes: they cut what dominates (the
   harness's start), and they bring direct runsc with them, which also ends the docker group's
   root-equivalence on a node (#261). That is #365's work.
-- **runsc's own settings** (directfs, the systrap platform, `--host-uds`) can't be weighed here
-  (no runsc); `measure.sh` against a node with `runtimeArgs` changed is how.
+- **runsc's own settings** (directfs, the systrap platform, `--host-uds`) are weighed by `runtime.sh`
+  (or `measure.sh`) on a node with `runtimeArgs` changed: step 3 of the procedure. Not done yet.

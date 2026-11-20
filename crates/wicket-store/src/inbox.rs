@@ -64,9 +64,11 @@ impl Ledger {
     /// unread message to it (already read, expired, or someone else's).
     pub fn operator_read(&self, tenant: &str, principal: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            &format!("UPDATE messages SET delivered_at = ?4
+            &format!(
+                "UPDATE messages SET delivered_at = ?4
               WHERE id = ?1 AND tenant = ?2 AND to_principal = ?3 AND to_run = '' AND {PEER}
-                AND delivered_at IS NULL AND created_at >= ?5"),
+                AND delivered_at IS NULL AND created_at >= ?5"
+            ),
             params![id, tenant, principal, now(), now() - MESSAGE_HOLD_SECS],
         )?;
         Ok(n == 1)
@@ -105,8 +107,20 @@ impl Ledger {
             };
             Ok(true)
         })();
-        let _ = self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
-        r
+        match r {
+            Ok(read) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(read),
+                Err(e) => {
+                    // Not committed: neither the read nor its record happened.
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 }
 
