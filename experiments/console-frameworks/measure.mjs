@@ -30,7 +30,10 @@ const UNTHROTTLED = process.env.UNTHROTTLED === "1";
 // Chrome (9.72 ± 0.54 here against about 9.5 reported; see speedometer.mjs and RESULTS.md). The first
 // runs used Lighthouse's 4, a phone about 2.5 times slower (results/runtime-4x.md).
 const CPU_RATE = Number(process.env.CPU_RATE) || 1.4;
-const RAW = UNTHROTTLED ? "raw-unthrottled" : "raw";
+// LOAD_ONLY=1: a quick check of loading alone (first card and first paint, about 2 s a load instead of
+// 15): no memory or per-poll measure, and written to results/quick/ so the full results stay as they are.
+const LOAD_ONLY = process.env.LOAD_ONLY === "1";
+const RAW = LOAD_ONLY ? "quick" : UNTHROTTLED ? "raw-unthrottled" : "raw";
 const args = process.argv.slice(2);
 const RUNS = Number(args[0]) || 7;
 let names = args.slice(1);
@@ -63,6 +66,7 @@ async function once(browser, url) {
   await page.waitForSelector(".req button.approve", { timeout: 60000 });
   const card_ms = await page.evaluate(() => performance.now());
   const fcp_ms = await page.evaluate(() => (performance.getEntriesByName("first-contentful-paint")[0] || {}).startTime || NaN);
+  if (LOAD_ONLY) { await ctx.close(); return { card_ms, fcp_ms, heap_kb: NaN, dom: NaN, poll_ms: NaN, kept: true, errors }; }
   await sleep(3000);
   await cdp.send("HeapProfiler.collectGarbage");
   const heap = await cdp.send("Runtime.getHeapUsage");
@@ -94,7 +98,7 @@ for (const name of names) {
   console.error(name, JSON.stringify(out[name]));
 }
 await browser.close();
-fs.writeFileSync(path.join(here, "results", UNTHROTTLED ? "runtime-unthrottled.json" : "runtime.json"), JSON.stringify(out, null, 1));
+if (!LOAD_ONLY) fs.writeFileSync(path.join(here, "results", UNTHROTTLED ? "runtime-unthrottled.json" : "runtime.json"), JSON.stringify(out, null, 1));
 console.log("| candidate | first card (ms) | FCP (ms) | heap (KB) | elements | script per poll (ms) | cards kept | errors |");
 console.log("|---|---|---|---|---|---|---|---|");
 for (const [n, r] of Object.entries(out)) console.log(`| ${n} | ${Math.round(r.card_ms)} | ${Math.round(r.fcp_ms)} | ${Math.round(r.heap_kb)} | ${r.dom} | ${r.poll_ms.toFixed(1)} | ${r.kept ? "yes" : "NO"} | ${r.errors.length ? r.errors.join("; ") : "none"} |`);

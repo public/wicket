@@ -60,9 +60,20 @@ anything slow). The network is unchanged: slow 4G, 150 ms RTT, 1.6 Mbit/s down. 
   acknowledgement, and the 0.45–0.5 s steps are three of these 150 ms round trips; this is the likely
   cause (about 60% confident). Lit without a build is 16.4 KB but in five files fetched at once, and
   paid nothing. For the console, staying under about 14 KB per file matters more than the framework.
-- **First paint**: plain JS and Preact at 0.57–0.66 s, Lit at 0.93–1.05 s. The Lit prototype's page is
-  empty until its first render, where plain JS's `index.html` holds the header and tabs; that is the
-  likely cause, untested.
+- **First paint**: plain JS and Preact at 0.57–0.66 s, Lit at 0.93–1.05 s. The cause was the Lit
+  prototype, not Lit: its `boot()` waited for the first `/api/state` before drawing anything, so the
+  page stayed blank for a round trip, where plain JS's `index.html` already holds the header and tabs.
+  `lit-nobuild-paint/` draws once before that fetch (one line). In one run of the three:
+
+  | Pixel 8 Pro, slow 4G | first card (ms) | first paint (ms) |
+  |---|---|---|
+  | Lit, no build | 1068 | 1048 |
+  | Lit, no build, drawn before the fetch | 1064 | 740 |
+  | plain JS, no build | 1013 | 660 |
+
+  The 80 ms left is Lit's modules arriving and running before the header can be drawn; the header
+  and tabs as plain HTML in `index.html` would remove it. (`LOAD_ONLY=1 node measure.mjs` checks
+  loading alone in about 2 s a load; it gave the same: 744 and 660 ms.)
 - **Script per poll** is under 3 ms for all, and **memory** 1.9–3.0 MB.
 - **Code to maintain** and **build cost** are as in the sections below: Lit is the least code; plain JS
   the most, and the only one managing the DOM by hand; only the two no-build variants keep the
@@ -258,8 +269,10 @@ Plain JS without a build is a close second.
 Preact ties on speed but adds a build step; Solid adds Babel or crosses the 14 KB line. Vue and Svelte
 were dropped.
 
-If this fails, the likely causes: Lit's late first paint is not just the prototype's (test: put the
-header and tabs in `index.html`); the vendored copy falls behind; template whitespace quirks in
+Lit's late first paint was the prototype's (see above): draw before the first fetch, and put the
+header and tabs in `index.html`.
+
+If this fails, the likely causes: the vendored copy falls behind; template whitespace quirks in
 inline layouts (the Lit author's main complaint); or Firefox or Safari behave differently (untested).
 
 ## Files

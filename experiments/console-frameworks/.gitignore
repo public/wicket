@@ -5,3 +5,4 @@ results/raw/
 results/raw-unthrottled/
 */package-lock.json
 results/*.err
+results/quick/
