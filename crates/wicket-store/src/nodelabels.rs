@@ -167,6 +167,24 @@ impl Ledger {
         })
     }
 
+    /// Test support: sets `node`'s public addresses without the checks of
+    /// [`Ledger::set_node_addresses`] (one node per address among them), as a ledger written by
+    /// hand or by an older build might have them. Not for production use.
+    #[doc(hidden)]
+    pub fn force_node_addresses_for_tests(
+        &self,
+        node: &str,
+        ipv4: Option<std::net::Ipv4Addr>,
+        ipv6: Option<std::net::Ipv6Addr>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO node_addresses (node, ipv4, ipv6, set_at, set_by) VALUES (?1, ?2, ?3, ?4, 'test')
+             ON CONFLICT(node) DO UPDATE SET ipv4 = excluded.ipv4, ipv6 = excluded.ipv6, set_at = excluded.set_at",
+            params![node, ipv4.map(|a| a.to_string()), ipv6.map(|a| a.to_string()), crate::now()],
+        )?;
+        Ok(())
+    }
+
     /// Removes the taint with this key. Returns whether there was one.
     pub fn remove_node_taint(&self, node: &str, key: &str) -> Result<bool> {
         Ok(self.conn.execute("DELETE FROM node_taints WHERE node = ?1 AND key = ?2", params![node, key])? > 0)

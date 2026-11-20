@@ -1201,7 +1201,23 @@ async fn names_pass(ledger: &Ledger, now: i64, dry_run: bool) -> Vec<Done> {
         Ok(n) => n,
         Err(e) => return vec![Done { kind: "error", target: "names".into(), detail: e }],
     };
-    let Some(public) = names.public else { return vec![] };
+    let Some(public) = names.public else {
+        // Records this installation made stay where they are until names.public is back to
+        // withdraw them (#748, F3): said each pass.
+        return match ledger.owned_zones() {
+            Ok(z) => z
+                .into_iter()
+                .map(|(zone, provider, n)| Done {
+                    kind: "name_stranded",
+                    target: format!("{n} record(s) in {zone}"),
+                    detail: format!(
+                        "made by provider {provider}; names.public is gone from wicket.yaml, so nothing withdraws them: put it back"
+                    ),
+                })
+                .collect(),
+            Err(e) => vec![Done { kind: "error", target: "names".into(), detail: format!("reading its records: {e:#}") }],
+        };
+    };
     let pass = match public.provider {
         wicket_names::ProviderKind::Noop => {
             wicket_control::namesync::pass(ledger, &public, &wicket_names::NoopProvider::new(), now, dry_run).await
@@ -1225,6 +1241,20 @@ fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done
         target: format!("host port {port} on {node}"),
         detail: "its name's records are gone: free again after twice the TTL".into(),
     }));
+    // Said each pass, recorded or not: something needs a person.
+    done.extend(r.errors().map(|(zone, e)| Done { kind: "error", target: format!("names in {zone}"), detail: e.to_string() }));
+    done.extend(r.stranded.iter().map(|s| Done {
+        kind: "name_stranded",
+        target: format!("{} record(s) in {}", s.records, s.zone),
+        detail: format!("made by provider {}: {}", s.provider, s.why),
+    }));
+    for z in &r.zones {
+        done.extend(z.forgotten.iter().map(|rec| Done {
+            kind: "name_forgotten",
+            target: format!("{} {}", rec.name, rec.rtype),
+            detail: format!("gone from {}'s listing: no longer counted as this installation's", z.zone),
+        }));
+    }
     if !(r.recorded || dry_run) {
         return done;
     }
@@ -1233,7 +1263,7 @@ fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done
         (false, true) => format!("applied by {}", r.provider),
         (false, false) => format!("provider {}: not applied, only recorded", r.provider),
     };
-    for c in &r.plan.changes {
+    for c in r.zones.iter().flat_map(|z| z.plan.changes.iter()) {
         let (op, rec) = match c {
             wicket_names::Change::Create(x) => ("create", x),
             wicket_names::Change::Update { to, .. } => ("update", to),
@@ -1245,7 +1275,7 @@ fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done
             detail: format!("{op} {} ({how})", rec.value),
         });
     }
-    for c in &r.plan.conflicts {
+    for c in r.zones.iter().flat_map(|z| z.plan.conflicts.iter()) {
         done.push(Done {
             kind: "name_conflict",
             target: c.name.clone(),

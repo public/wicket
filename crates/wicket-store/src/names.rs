@@ -978,20 +978,63 @@ impl Ledger {
 
     /// Records a plan's new records as this installation's, before the plan is applied, so a crash
     /// while applying leaves only records the ledger knows of.
+    /// A record written again is as new (#748: the age guard of [`Ledger::forget_unlisted`] counts
+    /// from its last write). Inside a caller's transaction, its writes join it.
     pub fn owned_before_apply(&self, zone: &Zone, provider: &str, plan: &Plan) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
         let t = now();
         for c in &plan.changes {
             if let Change::Create(r) | Change::Update { to: r, .. } = c {
-                tx.execute(
+                self.conn.execute(
                     "INSERT INTO name_records (zone, name, rtype, value, ttl, provider, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT (zone, name, rtype, value) DO UPDATE SET ttl = ?5, provider = ?6",
+                     ON CONFLICT (zone, name, rtype, value) DO UPDATE SET ttl = ?5, provider = ?6, created_at = ?7",
                     params![zone.apex(), r.name, r.rtype.to_string(), r.value, r.ttl, provider, t],
                 )?;
             }
         }
-        tx.commit()?;
+        if let Some(own) = own {
+            own.commit()?;
+        }
         Ok(())
+    }
+
+    /// Forgets the records of `zone` that `provider` created before `before` (Unix s) and that its
+    /// listing `listed` doesn't have (#748, F4): gone from the zone (deleted by hand, or never made
+    /// by a crash before the apply), so they hold no name's port. Only for a zone the provider
+    /// listed in full, and never one another provider made: its listing doesn't say. The ones
+    /// forgotten.
+    pub fn forget_unlisted(&self, zone: &Zone, provider: &str, listed: &[Record], before: i64) -> Result<Vec<Record>> {
+        let have: std::collections::BTreeSet<_> = listed.iter().map(|r| r.normalized().key()).collect();
+        let mut st = self.conn.prepare(
+            "SELECT name, rtype, value, ttl FROM name_records WHERE zone = ?1 AND provider = ?2 AND created_at < ?3 ORDER BY name, rtype, value",
+        )?;
+        let rows = st
+            .query_map(params![zone.apex(), provider, before], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, u32>(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut gone = vec![];
+        for (name, t, value, ttl) in rows {
+            let Some(rtype) = rtype(&t) else { continue };
+            let r = Record { name, rtype, value, ttl };
+            if !have.contains(&r.key()) {
+                self.conn.execute(
+                    "DELETE FROM name_records WHERE zone = ?1 AND name = ?2 AND rtype = ?3 AND value = ?4",
+                    params![zone.apex(), r.name, t, r.value],
+                )?;
+                gone.push(r);
+            }
+        }
+        Ok(gone)
+    }
+
+    /// The zones this installation has records in, each with the provider that made them and how
+    /// many: `(zone, provider, count)`.
+    pub fn owned_zones(&self) -> Result<Vec<(String, String, usize)>> {
+        let mut st =
+            self.conn.prepare("SELECT zone, provider, count(*) FROM name_records GROUP BY zone, provider ORDER BY zone, provider")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as usize)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Forgets the records a plan deleted or replaced, once it was applied (a value it also wrote
@@ -1005,18 +1048,20 @@ impl Ledger {
                 Change::Delete(_) => None,
             })
             .collect();
-        let tx = self.conn.unchecked_transaction()?;
+        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
         for c in &plan.changes {
             if let Change::Delete(r) | Change::Update { from: r, .. } = c {
                 if !written.contains(&r.key()) {
-                    tx.execute(
+                    self.conn.execute(
                         "DELETE FROM name_records WHERE zone = ?1 AND name = ?2 AND rtype = ?3 AND value = ?4",
                         params![zone.apex(), r.name, r.rtype.to_string(), r.value],
                     )?;
                 }
             }
         }
-        tx.commit()?;
+        if let Some(own) = own {
+            own.commit()?;
+        }
         Ok(())
     }
 }

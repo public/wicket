@@ -54,6 +54,10 @@ pub enum ProviderError {
     Zone(String),
     #[error("the provider refused the change: {0}")]
     Failed(String),
+    /// A provider whose apply isn't atomic made the plan's first `done` changes, in order, and
+    /// then stopped: the caller records those as made (#748, F8).
+    #[error("the provider made {done} of the plan's changes, then stopped: {why}")]
+    Partial { done: usize, why: String },
 }
 
 /// A DNS provider: one implementation per DNS service (Vultr, RFC 2136, …).
