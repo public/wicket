@@ -914,8 +914,18 @@ mod tests {
                 fence: None,
                 waker: None,
                 lifecycle: None,
+                names: Some(Arc::new(names_settings())),
             }
         }
+    }
+
+    /// The installation's names settings these tests run under: public names in a boxes domain,
+    /// with the operator's reserved label `status`.
+    pub(crate) fn names_settings() -> wicket_names::NamesConfig {
+        serde_json::from_value(serde_json::json!({
+            "public": { "provider": "noop", "zone": "boxes.example.com", "owner": "a1b2c3d4", "reserved": ["status"], "console_host": "ops.example.com" }
+        }))
+        .unwrap()
     }
 
     fn link_id(text: &str) -> String {
@@ -1157,18 +1167,20 @@ mod tests {
         let ask = |name: &str| {
             crate::names::request_name(&api, &serde_json::json!({ "name": name, "port": 3000, "kind": "public", "reason": "the demo" }))
         };
-        for reserved in ["console", "c0nsole", "www"] {
+        // wicket's reserved labels, the operator's, and the console's first label.
+        for reserved in ["console", "c0nsole", "www", "status", "5tatus", "ops"] {
             let (text, err) = ask(reserved);
             assert!(err && text.contains("reserved"), "{reserved}: {text}");
         }
         let (text, err) = ask("demo");
-        assert!(!err && text.contains("needs approval"), "{text}");
+        assert!(!err && text.contains("needs approval") && text.contains("demo.boxes.example.com"), "{text}");
         let id = text.split_whitespace().find(|w| w.starts_with("n-")).unwrap().to_string();
         assert_eq!(ask("demo").0, text, "the same ask is the same request");
         let (text, _) = gw.call_tool("await_grant", serde_json::json!({ "request_id": id, "timeout_seconds": 5 })).await;
         assert!(text.starts_with("pending"), "{text}");
         let terms = wicket_store::NameTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: None };
-        w.ledger.lock().unwrap().approve_name(&id, &terms, "ann", None).unwrap();
+        let public = names_settings().public.unwrap();
+        w.ledger.lock().unwrap().approve_name(&id, &terms, "ann", None, &public).unwrap();
         let (text, err) = gw.call_tool("await_grant", serde_json::json!({ "request_id": id, "timeout_seconds": 5 })).await;
         assert!(!err && text.starts_with("granted") && text.contains("this run holds it"), "{text}");
         // Another agent can't wait on it.
@@ -1187,6 +1199,14 @@ mod tests {
         assert!(err && text.contains("`scope` is for public names"), "{text}");
         let (text, err) = crate::names::request_name(&api, &serde_json::json!({ "name": "x", "port": 1, "service": "http" }));
         assert!(err && text.contains("`service` is for public names"), "{text}");
+        // It holds one public name, this installation's limit: another ask is refused up front.
+        let (text, err) = ask("second");
+        assert!(err && text.contains("already hold 1 public name"), "{text}");
+        // An installation without names.public takes no asks.
+        let mut bare = w.boxed(w.zone("build", &[]), "bare", "run_bare", None, &[]);
+        bare.names = None;
+        let (text, err) = crate::names::request_name(&bare, &serde_json::json!({ "name": "demo2", "port": 3000, "kind": "public" }));
+        assert!(err && text.contains("publishes no public names"), "{text}");
     }
 
     #[tokio::test]

@@ -43,25 +43,74 @@ fn pending_request(l: &mut wicket_store::Ledger, run: &str, path: &str) -> Strin
     rid
 }
 
+/// A pending ask for the public name `label`, of a running run.
+pub(super) fn ask_name(l: &wicket_store::Ledger, label: &str) -> String {
+    let t = TenantId::single();
+    let r = RunId("run_n".into());
+    l.run_started(&t, &r, "work", "worker").unwrap();
+    let ask = wicket_store::NameAsk {
+        tenant: &t,
+        run: &r,
+        zone: "work",
+        zone_digest: "zd",
+        principal: "spiffe://w.test/t/t0/z/work/a/worker",
+        label,
+        port: 3000,
+        service: Some("http"),
+        reason: "asked by the agent: the demo",
+        scope: wicket_store::NameScope::Run,
+    };
+    l.ask_public(&ask).unwrap().0
+}
+
 #[test]
-fn pending_json_lists_requests_and_standing_asks() {
+fn pending_json_lists_requests_standing_asks_and_names() {
     let (_d, mut l) = super::test_ledger("pending");
     let t = TenantId::single();
     pending_request(&mut l, "run_a", "/v1/data");
     let rule: wicket_core::manifest::ReachRule =
         wicket_core::yaml::from_str("{ host: ci.example, methods: [GET], paths: ['/jobs/**'] }").unwrap();
     l.ask_standing(&t, &RunId("run_a".into()), "work", "zd", "spiffe://w.test/t/t0/z/work/a/worker", &rule, "logs").unwrap();
+    let nid = ask_name(&l, "demo");
     let v = crate::cmd::approve::pending_json(&l).unwrap();
     let a = v.as_array().unwrap();
-    assert_eq!(a.len(), 2, "{v:#}");
-    assert_eq!((a[0]["kind"].as_str(), a[1]["kind"].as_str()), (Some("request"), Some("standing")));
+    assert_eq!(a.len(), 3, "{v:#}");
+    assert_eq!((a[0]["kind"].as_str(), a[1]["kind"].as_str(), a[2]["kind"].as_str()), (Some("request"), Some("standing"), Some("name")));
     assert_eq!(a[0]["host"], "api.example.com");
+    assert_eq!((a[2]["id"].as_str(), a[2]["label"].as_str(), a[2]["port"].as_u64()), (Some(nid.as_str()), Some("demo"), Some(3000)));
     documented_as("`wicket pending --json`, a request", &a[0]);
     documented_as("`wicket pending --json`, a standing ask", &a[1]);
     documented_as("a standing `rule`", &a[1]["rule"]);
+    documented_as("`wicket pending --json`, an ask for a public name", &a[2]);
+    // The text listing has it too, with the commands that decide it.
+    let text = crate::cmd::approve::pending_text(&l).unwrap();
+    assert!(text.contains(&format!("{nid}  public demo  port 3000")), "{text}");
+    assert!(text.contains(&format!("decide: wicket names show {nid}; wicket names approve {nid}; wicket names deny {nid}")), "{text}");
+    assert!(!text.contains("no pending requests"), "{text}");
     // Nothing pending is an empty array, not a sentence.
     let (_d, l) = super::test_ledger("pending-empty");
     assert_eq!(crate::cmd::approve::pending_json(&l).unwrap(), serde_json::json!([]));
+    assert_eq!(crate::cmd::approve::pending_text(&l).unwrap(), "no pending requests\n");
+}
+
+/// `wicket approve` and `deny` send an `n-` or `s-` id to the command that decides it (#696
+/// review), as a usage error; any other id is theirs.
+#[test]
+fn approve_and_deny_redirect_names_and_standing_asks() {
+    let msg = |id: &str, verb: &str| crate::cmd::approve::elsewhere(id, verb).map(|e| format!("{e:#}"));
+    assert_eq!(
+        msg("n-01abc", "approve").as_deref(),
+        Some("n-01abc is an ask for a public name: wicket names show n-01abc, then wicket names approve n-01abc")
+    );
+    assert_eq!(msg("n-01abc", "deny").as_deref(), Some("n-01abc is an ask for a public name: wicket names deny n-01abc"));
+    assert_eq!(
+        msg("s-01abc", "approve").as_deref(),
+        Some("s-01abc is a standing ask: wicket standing show s-01abc, then wicket standing approve s-01abc")
+    );
+    assert_eq!(msg("s-01abc", "deny").as_deref(), Some("s-01abc is a standing ask: wicket standing deny s-01abc"));
+    assert!(msg("r-01abc", "approve").is_none());
+    let e = crate::cmd::approve::elsewhere("n-1", "deny").unwrap();
+    assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::Usage as i32);
 }
 
 #[test]
@@ -153,8 +202,11 @@ fn node_list_json() {
         revoked_at: None,
     })
     .unwrap();
+    let v4: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
+    l.set_node_addresses("local", wicket_store::AddressChange::Set(v4), wicket_store::AddressChange::Keep, "ann").unwrap();
     let v = wicket_control::enrol::list_json(&l).unwrap();
     assert_eq!((v[0]["name"].as_str(), v[0]["ca"].is_null()), (Some("local"), true), "{v:#}");
+    assert_eq!((v[0]["public_ipv4"].as_str(), v[0]["public_ipv6"].is_null()), (Some("1.1.1.1"), true), "{v:#}");
     documented_as("`wicket node list --json`", &v);
 }
 

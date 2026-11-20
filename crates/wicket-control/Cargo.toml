@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 wicket-core.workspace = true
+wicket-names.workspace = true
 wicket-store.workspace = true
 wicket-proxy.workspace = true
 wicket-chan.workspace = true

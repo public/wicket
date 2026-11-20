@@ -31,9 +31,10 @@ pub use names::{name_effect, new_name_id, NameAsk, NameKind, NameRow, NameScope,
 pub use services::{Instance, ServiceRow, SHARED_TENANT};
 mod nodeca;
 mod nodelabels;
+pub use nodelabels::{AddressChange, NodeAddresses};
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
-pub use placements::{Placement, RunningBox, RESERVE_SECS, WAIT_SEEN_MS};
+pub use placements::{BoxTerms, Placement, PreemptMark, RunningBox, PREEMPTED_SEEN_MS, RESERVE_SECS, WAIT_SEEN_MS};
 mod changes;
 pub mod money;
 mod node;
@@ -214,6 +215,12 @@ impl StoreError {
 /// starts once retention has pruned its front, which target each sink's cursor is for, and the
 /// checkpoints retention asked the exporter to sign. Older builds don't read them; a prune raises
 /// the floor to 32, so a build that would walk a pruned chain from seq 1 refuses the ledger.
+/// Version 33 (expand, after #677's 32) adds `run_terms` (#579 step 4): each box's limits, priority
+/// and whether it may be preempted, recorded at its start, which preemption chooses from. Older
+/// builds don't read it (a box they start has no terms, and is never preempted); it raises no floor.
+/// Version 34 (expand, #575 step 4b; 33 is #637's) adds `node_addresses`: each node's public
+/// addresses as its operator set them, where its boxes' public names point, and `names.domain`, the
+/// boxes domain a public name was approved under. Older builds don't read them; the floor stays 17.
 /// Version 35 (expand, #578 step 4; 33 and 34 are other features') adds `trigger_intake`: each
 /// webhook trigger's intake node and the sha256 of its URL's token. Older builds don't read it;
 /// the floor stays where it was.
@@ -629,6 +636,7 @@ impl Ledger {
         conn.execute_batch(triggers::SCHEMA)?;
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
+        names::migrate(&conn)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at);
@@ -687,6 +695,7 @@ impl Ledger {
         conn.execute_batch(triggers::SCHEMA)?;
         conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
+        names::migrate(&conn)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
         Ok(Ledger { conn, path: None, writer: None })
@@ -2410,6 +2419,66 @@ mod node_tests {
             hosts: vec!["api.example.com".into()],
             status: "active".into(),
         }
+    }
+
+    /// #575: a node's public addresses are its operator's to set, public ones only, audited.
+    #[test]
+    fn a_nodes_public_addresses() {
+        use crate::{AddressChange as A, NodeAddresses};
+        let mut l = Ledger::open_in_memory().unwrap();
+        let (v4, v6): (std::net::Ipv4Addr, std::net::Ipv6Addr) = ("1.1.1.1".parse().unwrap(), "2a00::1".parse().unwrap());
+        assert!(
+            matches!(l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("not enrolled"))
+        );
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "01")).unwrap();
+        assert!(l.node_addresses("n1").unwrap().is_empty());
+        for private in ["10.0.0.1", "127.0.0.1", "203.0.113.7", "100.64.0.1"] {
+            assert!(
+                matches!(l.set_node_addresses("n1", A::Set(private.parse().unwrap()), A::Keep, "ann"), Err(StoreError::Refused(_))),
+                "{private}"
+            );
+        }
+        assert!(l.set_node_addresses("n1", A::Keep, A::Set("fd00::1".parse().unwrap()), "ann").is_err());
+        assert_eq!(l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann").unwrap(), NodeAddresses { ipv4: Some(v4), ipv6: None });
+        assert_eq!(l.set_node_addresses("n1", A::Keep, A::Set(v6), "ann").unwrap(), NodeAddresses { ipv4: Some(v4), ipv6: Some(v6) });
+        assert_eq!(l.set_node_addresses("n1", A::Clear, A::Keep, "ann").unwrap(), NodeAddresses { ipv4: None, ipv6: Some(v6) });
+        assert_eq!(l.node_addresses("n1").unwrap(), NodeAddresses { ipv4: None, ipv6: Some(v6) });
+        // Each change is on the record; one that changes nothing isn't.
+        l.set_node_addresses("n1", A::Keep, A::Set(v6), "ann").unwrap();
+        let rec = l.audit_of_kind("node.addresses").unwrap();
+        assert_eq!(rec.len(), 3);
+        let last: serde_json::Value = serde_json::from_str(&rec[2].body).unwrap();
+        assert_eq!(
+            (last["ipv4"].clone(), last["was_ipv4"].as_str(), last["by"].as_str()),
+            (serde_json::Value::Null, Some("1.1.1.1"), Some("ann"))
+        );
+    }
+
+    /// #716 review, F2 and F4: a node's addresses go with its enrolment, a revoked node gets none,
+    /// and no two active nodes share one.
+    #[test]
+    fn node_addresses_follow_the_enrolment_and_are_one_nodes() {
+        use crate::AddressChange as A;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let v4: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
+        for (n, serial) in [("n1", "01"), ("n2", "02")] {
+            let t = l.create_node_token(&TenantId::single(), n, 3600).unwrap();
+            l.enrol_node(&t, &node(n), &ca(n, serial)).unwrap();
+        }
+        l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann").unwrap();
+        assert!(
+            matches!(l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("n1")),
+            "another active node has it"
+        );
+        l.revoke_node("n1").unwrap();
+        assert!(l.node_addresses("n1").unwrap().is_empty(), "revoked: no address");
+        assert!(matches!(l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("not active")));
+        // n1's address is free for n2 now, and a machine enrolled again as n1 starts with none.
+        l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann").unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "03")).unwrap();
+        assert!(l.node_addresses("n1").unwrap().is_empty());
     }
 
     #[test]

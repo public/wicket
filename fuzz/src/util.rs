@@ -50,6 +50,7 @@ pub fn ctx(zone: &str, vault: PathBuf) -> (wicket_proxy::RunCtx, tokio::sync::mp
         fence: None,
         waker: None,
         lifecycle: None,
+        names: None,
     };
     (ctx, rx)
 }

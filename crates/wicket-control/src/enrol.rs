@@ -627,18 +627,21 @@ pub fn list() -> Result<()> {
 }
 
 /// `wicket node list --json`: the enrolled nodes (revoked ones too), with their active CA and
-/// identity certificate (null: none), labels and taints. Times are Unix seconds.
+/// identity certificate (null: none), labels and taints, and public addresses (null: none). Times
+/// are Unix seconds.
 pub fn list_json(l: &Ledger) -> Result<serde_json::Value> {
     let mut out = vec![];
     for n in l.nodes()? {
         let cert = |not_after: i64, serial: &str| serde_json::json!({ "serial": serial, "not_after": not_after });
         let ca = l.node_cas(&n.name)?.into_iter().find(|c| c.status == "active").map(|c| cert(c.not_after, &c.serial));
         let id = l.node_certs(&n.name)?.into_iter().find(|c| c.status == "active").map(|c| cert(c.not_after, &c.serial));
+        let addr = l.node_addresses(&n.name)?;
         out.push(serde_json::json!({
             "name": n.name, "status": n.status, "target": n.target, "host_key_fp": n.host_key_fp, "hosts": n.hosts,
             "enrolled_at": n.enrolled_at, "revoked_at": n.revoked_at, "ca": ca, "identity": id,
             "labels": l.node_labels(&n.name)?,
             "taints": l.node_taints(&n.name)?.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            "public_ipv4": addr.ipv4.map(|a| a.to_string()), "public_ipv6": addr.ipv6.map(|a| a.to_string()),
         }));
     }
     Ok(serde_json::Value::Array(out))

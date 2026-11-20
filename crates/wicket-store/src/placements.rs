@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS placement_waits (
 CREATE TABLE IF NOT EXISTS placement_owners (
   run TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, principal TEXT
 );
+CREATE TABLE IF NOT EXISTS run_terms (
+  run TEXT PRIMARY KEY, vcpus REAL NOT NULL, memory_mib INTEGER NOT NULL, priority INTEGER NOT NULL,
+  preemptible INTEGER NOT NULL, at_ms INTEGER NOT NULL, preempted_at_ms INTEGER, preempted_for TEXT
+);
 "#;
 
 /// A waiter not seen for this long (ms) has gone (its process ended): it no longer holds its place.
@@ -46,6 +50,48 @@ pub struct RunningBox {
     /// Its principal's id, if it has an identity.
     pub principal: Option<String>,
 }
+
+/// A running box's placement terms, for preemption (#579 step 4): what it holds, where, and
+/// whether a box of higher priority may stop it ([`Ledger::preemption_view`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxTerms {
+    pub run: String,
+    pub node: String,
+    pub tenant: String,
+    pub vcpus: f32,
+    pub memory_mib: u64,
+    pub priority: i32,
+    pub preemptible: bool,
+    /// The active long-lived agent whose current run it is, if it is one: the only kind preemption
+    /// stops (by asking it to hibernate).
+    pub agent: Option<String>,
+    /// When preemption last asked it to stop (ms).
+    pub preempted_at_ms: Option<i64>,
+    /// A run it started (spawned) still runs: such an agent is never preempted, since hibernating
+    /// it stops its children.
+    pub live_children: bool,
+    /// When its run ended (ms), for a box preemption asked to stop that has ended since; None while
+    /// it runs.
+    pub ended_ms: Option<i64>,
+}
+
+/// What preemption asks of a box ([`Ledger::preemption_mark`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreemptMark {
+    /// When it was asked (ms).
+    pub asked_ms: i64,
+    /// The run it makes room for.
+    pub for_run: Option<String>,
+    /// That run still waits for a node, or holds a reservation.
+    pub asker_alive: bool,
+    /// How many of the box's children the ledger has running: what a supervisor that re-attached
+    /// after a restart (and so doesn't hold its children) still sees.
+    pub running_children: usize,
+}
+
+/// How long after its end a box preemption stopped is still listed ([`Ledger::preemption_view`]):
+/// longer than a node takes to report (every 30 s) and the time a report is trusted for (90 s).
+pub const PREEMPTED_SEEN_MS: i64 = 120_000;
 
 /// A run's reservation.
 #[derive(Clone, Debug, PartialEq)]
@@ -158,6 +204,119 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Records the terms `run`'s box started with (#579 step 4): its limits as requests, its
+    /// priority, and whether it may be preempted. Recorded for every box at its start.
+    pub fn record_run_terms(&self, run: &str, vcpus: f32, memory_mib: u64, priority: i32, preemptible: bool, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            // A re-attach records them again; when preemption last asked the box to stop stays.
+            "INSERT INTO run_terms (run, vcpus, memory_mib, priority, preemptible, at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run) DO UPDATE SET vcpus = excluded.vcpus, memory_mib = excluded.memory_mib,
+               priority = excluded.priority, preemptible = excluded.preemptible, at_ms = excluded.at_ms",
+            params![run, vcpus as f64, memory_mib as i64, priority, preemptible, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Every running box placed on a node with its recorded terms: what preemption may choose from.
+    /// A box without terms (started before they were recorded) is left out: it is never preempted.
+    /// A box preemption asked to stop that has ended since is listed too, with `ended_ms`, until
+    /// [`PREEMPTED_SEEN_MS`] after its end: a node's report may still count it.
+    pub fn preemption_view(&self, now_ms: i64) -> Result<Vec<BoxTerms>> {
+        let mut st = self.conn.prepare(
+            "SELECT r.id, r.node, r.tenant, t.vcpus, t.memory_mib, t.priority, t.preemptible, a.id, t.preempted_at_ms,
+                    EXISTS (SELECT 1 FROM identities i JOIN runs c ON c.id = i.run WHERE i.parent_run = r.id AND c.status = 'running'),
+                    CASE WHEN r.status = 'running' THEN NULL ELSE (COALESCE(r.ended_at, 0) + 1) * 1000 END
+             FROM runs r JOIN run_terms t ON t.run = r.id LEFT JOIN agents a ON a.run = r.id AND a.state = 'active'
+             WHERE r.node IS NOT NULL
+               AND (r.status = 'running' OR (t.preempted_at_ms IS NOT NULL AND (COALESCE(r.ended_at, 0) + 1) * 1000 > ?1))
+             ORDER BY r.node, r.id",
+        )?;
+        let rows = st.query_map(params![now_ms - PREEMPTED_SEEN_MS], |r| {
+            Ok(BoxTerms {
+                run: r.get(0)?,
+                node: r.get(1)?,
+                tenant: r.get(2)?,
+                vcpus: r.get::<_, f64>(3)? as f32,
+                memory_mib: r.get::<_, i64>(4)?.max(0) as u64,
+                priority: r.get(5)?,
+                preemptible: r.get(6)?,
+                agent: r.get(7)?,
+                preempted_at_ms: r.get(8)?,
+                live_children: r.get(9)?,
+                ended_ms: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Records that preemption asked `run`'s box to stop, at `now_ms`, for `for_run`'s wake.
+    pub fn mark_preempted(&self, run: &str, now_ms: i64, for_run: &str) -> Result<()> {
+        self.conn.execute("UPDATE run_terms SET preempted_at_ms = ?2, preempted_for = ?3 WHERE run = ?1", params![run, now_ms, for_run])?;
+        Ok(())
+    }
+
+    /// Preemption no longer asks `run`'s box to stop for `for_run` (it gave up, or the box
+    /// declined): clears the mark only if it is still that run's, and, with `asked_ms`, still the
+    /// request made then. A mark a later wake made since is kept. Whether one was cleared.
+    pub fn clear_preempted(&self, run: &str, for_run: &str, asked_ms: Option<i64>) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE run_terms SET preempted_at_ms = NULL, preempted_for = NULL
+             WHERE run = ?1 AND preempted_for = ?2 AND (?3 IS NULL OR preempted_at_ms = ?3)",
+            params![run, for_run, asked_ms],
+        )? > 0)
+    }
+
+    /// What preemption asks of `run`'s box, if anything: when, for which run, and whether that run
+    /// still waits for a node or holds a reservation (it is alive). What its supervisor checks before
+    /// it hibernates for preemption.
+    pub fn preemption_mark(&self, run: &str, now_ms: i64) -> Result<Option<PreemptMark>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT t.preempted_at_ms, t.preempted_for,
+                        EXISTS (SELECT 1 FROM placement_waits w WHERE w.run = t.preempted_for AND w.seen_ms > ?2)
+                        OR EXISTS (SELECT 1 FROM placements p WHERE p.run = t.preempted_for
+                                   AND ((p.state = 'reserved' AND p.at_ms > ?3) OR p.state = 'bound')),
+                        (SELECT COUNT(*) FROM identities i JOIN runs c ON c.id = i.run WHERE i.parent_run = t.run AND c.status = 'running')
+                 FROM run_terms t WHERE t.run = ?1 AND t.preempted_at_ms IS NOT NULL",
+                params![run, now_ms - WAIT_SEEN_MS, now_ms - RESERVE_SECS * 1000],
+                |r| {
+                    Ok(PreemptMark {
+                        asked_ms: r.get(0)?,
+                        for_run: r.get(1)?,
+                        asker_alive: r.get(2)?,
+                        running_children: r.get::<_, i64>(3)?.max(0) as usize,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The running boxes preemption asked to stop for `for_run`.
+    pub fn preempted_for(&self, for_run: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT t.run FROM run_terms t JOIN runs r ON r.id = t.run
+             WHERE t.preempted_for = ?1 AND t.preempted_at_ms IS NOT NULL AND r.status = 'running' ORDER BY t.run",
+        )?;
+        let rows = st.query_map(params![for_run], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether preemption still asks `run`'s box to stop for `for_run`, as it asked at `asked_ms`:
+    /// what a wake checks while its victims run, so a victim that declined (its mark cleared) is
+    /// given up on. A mark made since by another wake doesn't count.
+    pub fn preemption_pending(&self, run: &str, for_run: &str, asked_ms: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM run_terms WHERE run = ?1 AND preempted_for = ?2 AND preempted_at_ms = ?3",
+                params![run, for_run, asked_ms],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Every running run placed on a node: what affinity sees on each (#579 step 4).
     pub fn running_boxes(&self) -> Result<Vec<RunningBox>> {
         let mut st = self.conn.prepare(
@@ -215,9 +374,27 @@ impl Ledger {
         let mut n = self.conn.execute("DELETE FROM placements WHERE state != 'reserved' AND at_ms < ?1", params![cutoff])?;
         // Owners go with their reservation.
         n += self.conn.execute("DELETE FROM placement_owners WHERE run NOT IN (SELECT run FROM placements)", [])?;
+        // A box's terms go with it: a day after its run ended (by its end, not its start, so a box
+        // preemption stopped stays listed while a node may still count it).
+        n += self.conn.execute(
+            "DELETE FROM run_terms WHERE run IN
+               (SELECT id FROM runs WHERE status != 'running' AND COALESCE(ended_at, 0) * 1000 < ?1)",
+            params![cutoff],
+        )?;
         // Decisions are kept with their run: a week, as #582's archive keeps its settled rows.
         let week = (now - crate::ARCHIVE_AFTER_SECS) * 1000;
         Ok(n + self.conn.execute("DELETE FROM placement_decisions WHERE at_ms < ?1", params![week])?)
+    }
+
+    /// [`Ledger::held_on`], not counting `run`'s own reservation.
+    pub fn held_on_except(&self, node: &str, report_at_ms: i64, now_ms: i64, run: &str) -> Result<(f32, u64)> {
+        let (cpu, mib): (f64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(vcpus), 0), COALESCE(SUM(memory_mib), 0) FROM placements
+             WHERE node = ?1 AND run != ?4 AND ((state = 'reserved' AND at_ms > ?3) OR (state = 'bound' AND bound_at_ms > ?2))",
+            params![node, report_at_ms, now_ms - RESERVE_SECS * 1000, run],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((cpu as f32, mib.max(0) as u64))
     }
 
     /// What reservations hold on `node` beyond its report received at `report_at_ms`: (vCPUs, MiB).
@@ -275,6 +452,65 @@ mod tests {
     }
 
     #[test]
+    fn preemption_sees_running_boxes_with_their_terms() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId("t0".into());
+        for (run, node) in [("r1", "n1"), ("r2", "n1"), ("r3", "n2"), ("r4", "n2")] {
+            l.run_started(&t, &wicket_core::RunId(run.into()), "z", "a").unwrap();
+            l.set_run_node(run, node).unwrap();
+        }
+        l.record_run_terms("r1", 1.0, 1024, -1, true, 1).unwrap();
+        l.record_run_terms("r2", 0.5, 512, 3, false, 1).unwrap();
+        l.record_run_terms("r3", 2.0, 2048, 0, true, 1).unwrap();
+        // r4 has no terms (started before they were recorded): never a candidate. r1 is an agent's
+        // current run.
+        let mut l = l;
+        l.create_agent(&crate::NewAgent {
+            id: "agt_a",
+            tenant: "t0",
+            zone: "z",
+            name: "a",
+            run: "r1",
+            session_id: "s",
+            manifest: "m",
+            image: "img",
+            workspace: None,
+            claim_until: crate::now() + 30,
+        })
+        .unwrap();
+        l.mark_preempted("r3", 7, "run_x").unwrap();
+        let v = l.preemption_view(1).unwrap();
+        assert_eq!(v.iter().map(|b| b.run.as_str()).collect::<Vec<_>>(), ["r1", "r2", "r3"]);
+        assert_eq!(
+            v[0],
+            BoxTerms {
+                run: "r1".into(),
+                node: "n1".into(),
+                tenant: "t0".into(),
+                vcpus: 1.0,
+                memory_mib: 1024,
+                priority: -1,
+                preemptible: true,
+                agent: Some("agt_a".into()),
+                preempted_at_ms: None,
+                live_children: false,
+                ended_ms: None,
+            }
+        );
+        assert!(!v[1].preemptible && v[1].agent.is_none(), "a run that is no agent's");
+        assert_eq!(v[2].preempted_at_ms, Some(7));
+        l.run_ended(&wicket_core::RunId("r1".into()), "done", "").unwrap();
+        assert_eq!(l.preemption_view(1).unwrap().len(), 2, "running only (r1 was never asked to stop)");
+        // Kept within a day of its end (whenever it started); a day after its end, an ended run's
+        // terms go and a running one's stay.
+        let count = |l: &Ledger| -> i64 { l.conn.query_row("SELECT count(*) FROM run_terms", [], |r| r.get(0)).unwrap() };
+        l.drop_settled_placements(crate::now() + 3600).unwrap();
+        assert_eq!(count(&l), 3, "ended an hour ago: kept");
+        l.drop_settled_placements(crate::now() + 86_400 + 2).unwrap();
+        assert_eq!(count(&l), 2);
+    }
+
+    #[test]
     fn what_runs_where() {
         let l = Ledger::open_in_memory().unwrap();
         let t = wicket_core::TenantId("t0".into());
@@ -304,6 +540,21 @@ mod tests {
         assert!(l.boxes_in_flight(now + RESERVE_SECS * 1000 + 1).unwrap().is_empty(), "unconfirmed past its time");
         l.placement_released("r5").unwrap();
         assert!(l.boxes_in_flight(now + 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn owners_go_with_their_settled_reservation() {
+        let l = Ledger::open_in_memory().unwrap();
+        let now = crate::now();
+        let owners = |l: &Ledger| -> i64 { l.conn.query_row("SELECT COUNT(*) FROM placement_owners", [], |r| r.get(0)).unwrap() };
+        l.reserve_placement("r1", "n1", 1.0, 512, now * 1000).unwrap();
+        l.record_placement_owner("r1", "t0", "z", None).unwrap();
+        l.placement_released("r1").unwrap();
+        l.drop_settled_placements(now + 3600).unwrap();
+        assert_eq!(owners(&l), 1, "kept while its reservation is");
+        l.drop_settled_placements(now + 86_400 + 2).unwrap();
+        assert!(l.placement("r1").unwrap().is_none());
+        assert_eq!(owners(&l), 0, "and dropped with it");
     }
 
     #[test]

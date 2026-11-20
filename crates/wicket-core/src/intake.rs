@@ -151,12 +151,20 @@ pub fn github_event_object(event: &str) -> Option<&'static str> {
 /// review or a comment, theirs too).
 pub fn github_body_is(event: &str, body: &Value) -> bool {
     let Some(p) = github_event_object(event) else { return false };
-    let extra = match event {
-        "pull_request_review" => body.pointer("/review").is_some(),
-        "pull_request_review_comment" | "issue_comment" => body.pointer("/comment").is_some(),
+    let has = |q: &str| body.pointer(q).is_some_and(|v| !v.is_null());
+    // Each event's own objects, and none of a sibling event's: a review's or a comment's body isn't
+    // the pull request's or the issue's, and only a push has `after` with its commits or pusher
+    // (#714 fourth review, B).
+    let fits = match event {
+        "pull_request" => !has("/review") && !has("/comment"),
+        "pull_request_review" => has("/review") && !has("/comment"),
+        "pull_request_review_comment" => has("/comment") && !has("/review"),
+        "issues" => !has("/comment"),
+        "issue_comment" => has("/comment"),
+        "push" => has("/after") && (has("/commits") || has("/pusher")),
         _ => true,
     };
-    body.pointer(p).is_some_and(|v| !v.is_null()) && extra
+    has(p) && fits
 }
 
 /// The generic webhook's timestamp header (Unix seconds), signed with the body.
@@ -540,6 +548,17 @@ mod tests {
         assert!(!github_body_is("star", &issue), "an event intake doesn't know");
         let pr = serde_json::json!({ "pull_request": null });
         assert!(!github_body_is("pull_request", &pr));
+        // A sibling event's body, carrying more than the event claimed.
+        let comment = serde_json::json!({ "issue": { "number": 1 }, "comment": { "id": 2 } });
+        assert!(github_body_is("issue_comment", &comment) && !github_body_is("issues", &comment));
+        let review = serde_json::json!({ "pull_request": { "number": 1 }, "review": { "state": "approved" } });
+        assert!(github_body_is("pull_request_review", &review) && !github_body_is("pull_request", &review));
+        let dispatch = serde_json::json!({ "ref": "refs/heads/main", "inputs": {} });
+        assert!(!github_body_is("push", &dispatch), "a workflow_dispatch isn't a push");
+        let create = serde_json::json!({ "ref": "main", "ref_type": "branch" });
+        assert!(!github_body_is("push", &create), "nor a create");
+        let push = serde_json::json!({ "ref": "refs/heads/main", "after": "abc", "commits": [], "pusher": { "name": "a" } });
+        assert!(github_body_is("push", &push));
     }
 
     #[test]

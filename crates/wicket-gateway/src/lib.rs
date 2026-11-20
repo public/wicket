@@ -541,9 +541,8 @@ impl Gateway {
         (text.into(), false)
     }
 
-    /// `await_grant` on a standing ask (#572, its `s-` id, from `request_access` with scope
-    /// standing): this run's agent's own ask (any run of it may wait), answered as it is decided.
-    /// `await_grant` on a public name's ask (#575): its human's decision.
+    /// `await_grant` on a public name's ask (#575, its `n-` id): this run's agent's own ask,
+    /// answered as its human decides.
     async fn await_name(&self, id: &str, timeout: Duration) -> (String, bool) {
         let start = Instant::now();
         let _waiting = Waiting::start(&self.ctx);
@@ -561,8 +560,7 @@ impl Gateway {
                     let holder = match n.holder.as_deref() {
                         Some(h) if h == self.ctx.run.0 => "this run holds it".to_string(),
                         Some(h) => format!("run {h} holds it"),
-                        // Later runs don't take a standing name up yet (#575 step 4b).
-                        None => "no run holds it now (later runs don't take up a standing name yet)".to_string(),
+                        None => "no run holds it now: the next run it is for takes it up when it starts".to_string(),
                     };
                     let until = n
                         .expires_at
@@ -1081,6 +1079,7 @@ mod tests {
                 fence: None,
                 waker: None,
                 lifecycle: None,
+                names: None,
             }
         }
     }
@@ -1939,6 +1938,7 @@ mod tests {
             fence: Some(wicket_proxy::Fence { agent, generation: 1 }),
             waker: None,
             lifecycle: None,
+            names: None,
         }
     }
 

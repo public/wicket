@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS names (
   zone TEXT NOT NULL, zone_digest TEXT NOT NULL, principal TEXT NOT NULL, asked_run TEXT NOT NULL,
   holder TEXT, port INTEGER NOT NULL, service TEXT, reason TEXT NOT NULL, scope TEXT NOT NULL,
   status TEXT NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT, bound TEXT,
-  expires_at INTEGER, effect_sha256 TEXT, ended_at INTEGER, ended_by TEXT, end_reason TEXT
+  expires_at INTEGER, effect_sha256 TEXT, ended_at INTEGER, ended_by TEXT, end_reason TEXT, domain TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS names_internal_live ON names (tenant, zone, label) WHERE kind = 'internal' AND status = 'live';
 CREATE UNIQUE INDEX IF NOT EXISTS names_public_live ON names (label) WHERE kind = 'public' AND status = 'live';
@@ -70,6 +70,34 @@ CREATE TABLE IF NOT EXISTS name_records (
   PRIMARY KEY (zone, name, rtype, value)
 );
 "#;
+
+/// Schema 34 (expand, #716 review, F3): `names.domain`, the boxes domain a public name was
+/// approved under, added to a ledger made before. Older builds don't read it.
+/// Several processes may open an old ledger at once (after an update, the console and the
+/// re-attaching supervisors): the check and the change are one write, checked again under its lock,
+/// so the second sees the column the first added (#716 review).
+pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
+    let has = |c: &rusqlite::Connection| -> Result<bool> {
+        let n: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('names') WHERE name = 'domain'", [], |r| r.get(0))?;
+        Ok(n > 0)
+    };
+    if has(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let r = has(conn).and_then(|h| match h {
+        true => Ok(()),
+        false => conn.execute_batch("ALTER TABLE names ADD COLUMN domain TEXT").map_err(Into::into),
+    });
+    match r {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+    Ok(())
+}
 
 /// Which kind of name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -172,6 +200,9 @@ pub struct NameRow {
     /// `run ended`, `run gone` (its run had ended without letting it go, found by
     /// [`Ledger::sweep_stale_names`]), `revoked` or `lapsed`.
     pub end_reason: Option<String>,
+    /// A public name: the boxes domain it was approved under (#716 review, F3), which its records
+    /// may be published in only while it is the installation's. None: not decided, or internal.
+    pub domain: Option<String>,
 }
 
 impl NameRow {
@@ -203,14 +234,16 @@ pub struct NameTerms {
 }
 
 /// The effect a decision on public ask `n` with `terms` approves (#369): what the card showed,
-/// hashed. A decision made on another one is refused.
-pub fn name_effect(n: &NameRow, terms: &NameTerms) -> String {
+/// hashed, the boxes domain `domain` included (the whole name is what is approved, #575 review,
+/// M1). A decision made on another one is refused.
+pub fn name_effect(n: &NameRow, terms: &NameTerms, domain: &str) -> String {
     let standing = n.scope == NameScope::Standing;
     let v = serde_json::json!({
         "kind": "name",
         "id": n.id,
         "name": n.kind.as_str(),
         "label": n.label,
+        "fqdn": format!("{}.{domain}", n.label),
         "port": n.port,
         "service": n.service,
         "zone": n.zone,
@@ -240,7 +273,7 @@ pub const PENDING_STANDING_SECS: i64 = 14 * 24 * 3600;
 pub const MAX_PENDING_NAMES: usize = 3;
 
 const COLS: &str = "id, tenant, kind, label, zone, zone_digest, principal, asked_run, holder, port, service, reason, scope, status, \
-                    created_at, decided_at, decided_by, bound, expires_at, effect_sha256, ended_at, ended_by, end_reason";
+                    created_at, decided_at, decided_by, bound, expires_at, effect_sha256, ended_at, ended_by, end_reason, domain";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NameRow> {
     let kind: String = r.get(2)?;
@@ -271,6 +304,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NameRow> {
         ended_at: r.get(20)?,
         ended_by: r.get(21)?,
         end_reason: r.get(22)?,
+        domain: r.get(23)?,
     })
 }
 
@@ -298,11 +332,12 @@ impl Ledger {
         Ok(rows)
     }
 
-    /// The live names `run` holds.
+    /// The live, unlapsed names `run` holds.
     pub fn names_held_by(&self, run: &RunId) -> Result<Vec<NameRow>> {
-        let mut st =
-            self.conn.prepare(&format!("SELECT {COLS} FROM names WHERE holder = ?1 AND status = 'live' ORDER BY created_at, id"))?;
-        let rows = st.query_map(params![run.0], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM names WHERE holder = ?1 AND status = 'live' AND (expires_at IS NULL OR expires_at > ?2) ORDER BY created_at, id"
+        ))?;
+        let rows = st.query_map(params![run.0, now()], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -346,8 +381,9 @@ impl Ledger {
             return self.name(&n.id);
         }
         let held: i64 = tx.query_row(
-            "SELECT count(*) FROM names WHERE tenant = ?1 AND principal = ?2 AND status = 'live' AND kind = 'internal'",
-            params![ask.tenant.0, ask.principal],
+            "SELECT count(*) FROM names WHERE tenant = ?1 AND principal = ?2 AND status = 'live' AND kind = 'internal'
+               AND (expires_at IS NULL OR expires_at > ?3)",
+            params![ask.tenant.0, ask.principal, t],
             |r| r.get(0),
         )?;
         if held as usize >= limit {
@@ -392,19 +428,22 @@ impl Ledger {
     /// someone else. The same pending ask (principal, label, port, scope) is that one (false: not
     /// new).
     pub fn ask_public(&self, ask: &NameAsk<'_>) -> Result<(String, bool)> {
-        // One transaction: the checks and the insert see the same names.
-        let tx = self.conn.unchecked_transaction()?;
-        let r = self.ask_public_in(ask)?;
-        tx.commit()?;
-        Ok(r)
+        // One write lock: the sweep, the checks and the insert see the same names. The sweep first,
+        // so an ask past its time, or one of a run that is gone, holds no slot (#696 review).
+        self.immediate(|l| {
+            l.sweep_in()?;
+            l.ask_public_in(ask)
+        })
     }
 
     fn ask_public_in(&self, ask: &NameAsk<'_>) -> Result<(String, bool)> {
         let live: Option<String> = self
             .conn
-            .query_row("SELECT principal FROM names WHERE label = ?1 AND kind = 'public' AND status = 'live'", params![ask.label], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT principal FROM names WHERE label = ?1 AND kind = 'public' AND status = 'live' AND (expires_at IS NULL OR expires_at > ?2)",
+                params![ask.label, now()],
+                |r| r.get(0),
+            )
             .optional()?;
         if live.is_some() {
             return Err(taken(ask.label));
@@ -462,14 +501,47 @@ impl Ledger {
     /// ([`name_effect`]); a decision on another one is refused. A label someone else took since is
     /// refused too. The asking run holds the name if it is still running (#575 review, M1);
     /// otherwise a standing name waits for the next run it binds. The effect approved is returned.
-    pub fn approve_name(&self, id: &str, terms: &NameTerms, by: &str, shown: Option<&str>) -> Result<String> {
+    pub fn approve_name(
+        &self,
+        id: &str,
+        terms: &NameTerms,
+        by: &str,
+        shown: Option<&str>,
+        public: &wicket_names::PublicConfig,
+    ) -> Result<String> {
+        // One write lock: the limit counted and the approval see the same names. Names past their
+        // lifetime end first, so they hold neither a label nor a slot (#716 review, F1).
+        self.immediate(|l| {
+            l.lapse_names(now())?;
+            l.approve_name_in(id, terms, by, shown, public)
+        })
+    }
+
+    fn approve_name_in(
+        &self,
+        id: &str,
+        terms: &NameTerms,
+        by: &str,
+        shown: Option<&str>,
+        public: &wicket_names::PublicConfig,
+    ) -> Result<String> {
         let n = self.name(id)?;
         if n.status != "pending" {
             return Err(StoreError::NotPending(id.into(), n.status));
         }
-        let effect = name_effect(&n, terms);
+        let effect = name_effect(&n, terms, &public.domain());
         if let Some(shown) = shown.filter(|x| *x != effect) {
             return Err(StoreError::EffectChanged(id.into(), shown.into(), effect));
+        }
+        // The rules as they are now, not as they were when it was asked for (#575 review, M1): a
+        // label the operator reserved since isn't approved.
+        wicket_names::check_label(&n.label, &public.rules())
+            .map_err(|e| StoreError::Refused(format!("{id}: the name {:?} isn't allowed here now: {e}", n.label)))?;
+        let held = self.live_public_names(&n.principal)?;
+        if held >= public.per_workload {
+            return Err(StoreError::Refused(format!(
+                "{id}: its agent already holds {held} public name(s), this installation's limit (names.public.per_workload)"
+            )));
         }
         // A run-scoped name is its run's: once that run isn't running, nobody would hold it (#668).
         if n.scope == NameScope::Run && self.run_status(&n.asked_run)?.as_deref() != Some("running") {
@@ -485,10 +557,10 @@ impl Ledger {
         let r = self.conn.execute(
             "UPDATE names SET status = 'live',
                holder = CASE WHEN EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running') THEN asked_run END,
-               decided_at = ?2, decided_by = ?3, bound = ?4, expires_at = ?5, effect_sha256 = ?6
+               decided_at = ?2, decided_by = ?3, bound = ?4, expires_at = ?5, effect_sha256 = ?6, domain = ?7
              WHERE id = ?1 AND status = 'pending'
                AND (scope != 'run' OR EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running'))",
-            params![id, t, by, bound, expires, effect],
+            params![id, t, by, bound, expires, effect, public.domain()],
         );
         match r {
             Err(e) if is_unique_violation(&e) => Err(taken(&n.label)),
@@ -500,6 +572,17 @@ impl Ledger {
             Ok(_) => Ok(effect),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// How many live, unlapsed public names `principal` holds, or has standing (held by a run or
+    /// not).
+    pub fn live_public_names(&self, principal: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM names WHERE kind = 'public' AND status = 'live' AND principal = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
+            params![principal, now()],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Denies a pending public ask.
@@ -517,24 +600,33 @@ impl Ledger {
     /// Revokes a live name: it ends now, whoever holds it.
     pub fn revoke_name(&self, id: &str, by: &str) -> Result<NameRow> {
         let before = self.name(id)?;
-        let n = self.conn.execute(
-            "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = ?3, end_reason = 'revoked' WHERE id = ?1 AND status = 'live'",
-            params![id, now(), by],
-        )?;
-        if n == 0 {
+        if !self.end_live_name(&before, now(), by, "revoked")? {
             return Err(StoreError::NotPending(id.into(), self.name(id)?.status));
         }
-        self.release_ports(id)?;
-        // An internal name's port stops being offered if the name exposed it and no other live name
-        // of its run names it, as a move does (#680 review, L1).
-        if let (NameKind::Internal, Some(holder)) = (before.kind, before.holder.as_deref()) {
+        self.name(id)
+    }
+
+    /// Ends live name `n` at `at`, as `by`, for `reason` (`revoked`, `lapsed`): its ports are
+    /// released, and an internal name's port stops being offered if the name exposed it and no
+    /// other live name of its run names it, as a move does (#680 review, L1). One way to end a
+    /// live name, so none leaves its exposure behind (#716 review). Whether it was live.
+    fn end_live_name(&self, n: &NameRow, at: i64, by: &str, reason: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = ?3, end_reason = ?4 WHERE id = ?1 AND status = 'live'",
+            params![n.id, at, by, reason],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        self.release_ports(&n.id)?;
+        if let (NameKind::Internal, Some(holder)) = (n.kind, n.holder.as_deref()) {
             let run = RunId(holder.to_string());
-            if self.names_on_port(&run, before.port)? == 0 && self.is_name_exposure(&run, before.port)? {
-                self.unexpose(holder, before.port)?;
-                self.drop_name_exposure(&run, before.port)?;
+            if self.names_on_port(&run, n.port)? == 0 && self.is_name_exposure(&run, n.port)? {
+                self.unexpose(holder, n.port)?;
+                self.drop_name_exposure(&run, n.port)?;
             }
         }
-        self.name(id)
+        Ok(true)
     }
 
     /// `run` ended: its run-scoped names end, and its standing ones are let go for the next run they
@@ -600,12 +692,14 @@ impl Ledger {
             [],
         )?;
         let t = now();
+        // Names past their lifetime end, so they hold neither a label nor a slot (#716 review, F1).
+        let lapsed = self.lapse_names(t)?.len();
         let mut released = 0;
         for n in &stale {
             let holder = RunId(n.holder.clone().unwrap_or_default());
             released += self.release_held(n, &holder, t, "run gone")? as usize;
         }
-        Ok(released + withdrawn)
+        Ok(released + withdrawn + lapsed)
     }
 
     /// Lets go of name `n` if `run` still holds it: a run-scoped one ends (its ports released), a
@@ -652,37 +746,56 @@ impl Ledger {
         zone_digest: &str,
     ) -> Result<Vec<NameRow>> {
         let t = now();
-        let mut st = self.conn.prepare(&format!(
-            "SELECT {COLS} FROM names WHERE tenant = ?1 AND status = 'live' AND scope = 'standing' AND holder IS NULL AND (principal = ?2 OR zone = ?3)"
-        ))?;
-        let free = st.query_map(params![tenant.0, principal, zone], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut claimed = vec![];
-        for n in free.into_iter().filter(|n| n.live(t) && n.binds(principal, zone, zone_digest)) {
-            if self
-                .conn
-                .execute("UPDATE names SET holder = ?2 WHERE id = ?1 AND holder IS NULL AND status = 'live'", params![n.id, run.0])?
-                == 1
-            {
-                claimed.push(self.name(&n.id)?);
+        // Each claim and its audit record (`name.claimed`) are one write: a name is never held off
+        // the record (fail closed).
+        self.immediate(|l: &Ledger| {
+            let mut st = l.conn.prepare(&format!(
+                "SELECT {COLS} FROM names WHERE tenant = ?1 AND status = 'live' AND scope = 'standing' AND holder IS NULL AND (principal = ?2 OR zone = ?3)"
+            ))?;
+            let free = st.query_map(params![tenant.0, principal, zone], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut claimed = vec![];
+            for n in free.into_iter().filter(|n| n.live(t) && n.binds(principal, zone, zone_digest)) {
+                if self
+                    .conn
+                    .execute("UPDATE names SET holder = ?2 WHERE id = ?1 AND holder IS NULL AND status = 'live'", params![n.id, run.0])?
+                    == 1
+                {
+                    let body = serde_json::json!({
+                        "id": n.id, "kind": n.kind.as_str(), "label": n.label, "zone": n.zone, "port": n.port, "principal": principal,
+                    });
+                    l.audit(tenant, Some(run), "name.claimed", &body)?;
+                    claimed.push(l.name(&n.id)?);
+                }
             }
-        }
-        Ok(claimed)
+            Ok(claimed)
+        })
     }
 
-    /// Ends the live names whose lifetime is over at `at`. Each one ended.
+    /// Ends the live names whose lifetime is over at `at`, each audited `name.lapsed`. Each one
+    /// ended. The sweep runs it ([`Ledger::sweep_stale_names`]), and so does a decision on a
+    /// public name.
     pub fn lapse_names(&self, at: i64) -> Result<Vec<NameRow>> {
+        // Each end and its audit record are one write.
+        if self.conn.is_autocommit() {
+            self.immediate(|l| l.lapse_in(at))
+        } else {
+            self.lapse_in(at)
+        }
+    }
+
+    fn lapse_in(&self, at: i64) -> Result<Vec<NameRow>> {
         let mut st = self
             .conn
             .prepare(&format!("SELECT {COLS} FROM names WHERE status = 'live' AND expires_at IS NOT NULL AND expires_at <= ?1"))?;
         let due = st.query_map(params![at], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut ended = vec![];
         for n in due {
-            if self.conn.execute(
-                "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = 'wicket', end_reason = 'lapsed' WHERE id = ?1 AND status = 'live'",
-                params![n.id, at],
-            )? == 1
-            {
-                self.release_ports(&n.id)?;
+            if self.end_live_name(&n, at, "wicket", "lapsed")? {
+                let body = serde_json::json!({
+                    "id": n.id, "kind": n.kind.as_str(), "label": n.label, "zone": n.zone, "scope": n.scope.as_str(),
+                    "expired_at": n.expires_at,
+                });
+                self.audit(&TenantId(n.tenant.clone()), n.holder.as_ref().map(|h| RunId(h.clone())).as_ref(), "name.lapsed", &body)?;
                 ended.push(self.name(&n.id)?);
             }
         }
@@ -713,8 +826,8 @@ impl Ledger {
     /// How many live names `run` holds on `port`.
     pub fn names_on_port(&self, run: &RunId, port: u16) -> Result<usize> {
         let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM names WHERE holder = ?1 AND port = ?2 AND status = 'live'",
-            params![run.0, port],
+            "SELECT count(*) FROM names WHERE holder = ?1 AND port = ?2 AND status = 'live' AND (expires_at IS NULL OR expires_at > ?3)",
+            params![run.0, port, now()],
             |r| r.get(0),
         )?;
         Ok(n as usize)
@@ -880,6 +993,14 @@ fn rtype(s: &str) -> Option<RecordType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The installation's public-names settings these tests decide under.
+    pub(crate) fn public() -> wicket_names::PublicConfig {
+        serde_json::from_value(
+            serde_json::json!({ "provider": "noop", "zone": "boxes.example.com", "owner": "a1b2c3d4", "per_workload": 2 }),
+        )
+        .unwrap()
+    }
     use std::net::Ipv4Addr;
     use wicket_names::{plan, Desired, MemoryProvider, OwnerId};
 
@@ -908,6 +1029,72 @@ mod tests {
 
     const P1: &str = "spiffe://t/z/build/a/one";
     const P2: &str = "spiffe://t/z/build/a/two";
+
+    /// #716 review, F1: a standing public name past its lifetime holds neither its label nor its
+    /// agent's slot, though nothing but the sweep ran.
+    #[test]
+    fn a_lapsed_name_frees_its_label_and_slot() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let mut p = public();
+        p.per_workload = 1;
+        let terms = NameTerms { bound: Bound::Agent, ttl_secs: Some(3600) };
+        let (id, _) = l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Standing)).unwrap();
+        let effect = name_effect(&l.name(&id).unwrap(), &terms, &p.domain());
+        l.approve_name(&id, &terms, "op", Some(&effect), &p).unwrap();
+        assert_eq!(l.name(&id).unwrap().domain.as_deref(), Some("boxes.example.com"), "F3: the domain approved");
+        assert_eq!(l.live_public_names(P1).unwrap(), 1);
+        // Its lifetime is over.
+        l.conn.execute("UPDATE names SET expires_at = ?2 WHERE id = ?1", params![id, now() - 1]).unwrap();
+        assert_eq!(l.live_public_names(P1).unwrap(), 0);
+        assert!(l.names_held_by(&r1).unwrap().is_empty());
+        // Another agent may ask for the label, and this one for another name: the sweep ends it.
+        let (other, _) = l.ask_public(&ask(&t, &r1, P2, "demo", NameScope::Standing)).unwrap();
+        assert_eq!(l.name(&id).unwrap().end_reason.as_deref(), Some("lapsed"));
+        assert_eq!(l.audit_of_kind("name.lapsed").unwrap().len(), 1);
+        let effect = name_effect(&l.name(&other).unwrap(), &terms, &p.domain());
+        l.approve_name(&other, &terms, "op", Some(&effect), &p).unwrap();
+        let (again, _) = l.ask_public(&ask(&t, &r1, P1, "demo2", NameScope::Standing)).unwrap();
+        let effect = name_effect(&l.name(&again).unwrap(), &terms, &p.domain());
+        l.approve_name(&again, &terms, "op", Some(&effect), &p).unwrap();
+    }
+
+    /// #716 review: two processes opening a ledger made before `names.domain` both open it.
+    #[test]
+    fn the_domain_column_is_added_once_whoever_opens_first() {
+        let d = std::env::temp_dir().join(format!("wicket-names-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("ledger.db");
+        drop(Ledger::open(&p).unwrap());
+        rusqlite::Connection::open(&p).unwrap().execute_batch("ALTER TABLE names DROP COLUMN domain").unwrap();
+        let opens: Vec<_> = (0..4)
+            .map(|_| {
+                let p = p.clone();
+                std::thread::spawn(move || Ledger::open(&p).map(|_| ()))
+            })
+            .collect();
+        for o in opens {
+            o.join().unwrap().unwrap();
+        }
+        let l = Ledger::open(&p).unwrap();
+        let n: i64 = l.conn.query_row("SELECT count(*) FROM pragma_table_info('names') WHERE name = 'domain'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #716 review: a lapse ends a name as a revoke does: an internal name's exposure goes too.
+    #[test]
+    fn a_lapsed_internal_name_takes_its_exposure_away() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let n = l.register_internal(&ask(&t, &r1, P1, "api", NameScope::Standing), 3, 3600).unwrap();
+        l.mark_name_exposure(&r1, 3000).unwrap();
+        assert!(l.lapse_names(now() + 7200).unwrap().iter().any(|x| x.id == n.id));
+        assert!(!l.is_name_exposure(&r1, 3000).unwrap());
+    }
 
     #[test]
     fn internal_names_are_unique_per_zone_and_limited() {
@@ -950,11 +1137,26 @@ mod tests {
         assert!(l.register_internal(&ask(&t, &r2, P2, "web", NameScope::Run), 5, 3600).is_err());
         // A run of another zone definition doesn't get it; the next run of the agent does.
         assert!(l.claim_standing_names(&t, &r2, P1, "build", "d2").unwrap().is_empty());
+        // Not off the record (fail closed): with no audit record, nothing is taken up.
+        {
+            let broken = ledger();
+            let s = broken.register_internal(&ask(&t, &r1, P1, "web", NameScope::Standing), 5, 3600).unwrap();
+            broken.release_run_names(&r1).unwrap();
+            broken.fail_audit_inserts_for_tests().unwrap();
+            assert!(broken.claim_standing_names(&t, &r2, P1, "build", "d1").is_err());
+            assert_eq!(broken.name(&s.id).unwrap().holder, None);
+        }
         let claimed = l.claim_standing_names(&t, &r2, P1, "build", "d1").unwrap();
         assert_eq!(
             claimed.iter().map(|n| (n.id.as_str(), n.holder.as_deref())).collect::<Vec<_>>(),
             vec![(standing.id.as_str(), Some("run-2"))]
         );
+        let rec = l.audit_of_kind("name.claimed").unwrap();
+        assert_eq!(rec.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&rec[0].body).unwrap();
+        assert_eq!((rec[0].run.as_deref(), body["id"].as_str()), (Some("run-2"), Some(standing.id.as_str())));
+        // Held now: a second claim takes nothing.
+        assert!(l.claim_standing_names(&t, &r2, P1, "build", "d1").unwrap().is_empty());
         // The ended run-scoped label is free again.
         l.register_internal(&ask(&t, &r2, P2, "api", NameScope::Run), 5, 3600).unwrap();
         // Lapse.
@@ -976,16 +1178,16 @@ mod tests {
         assert_eq!((n.status.as_str(), n.holder.as_deref()), ("pending", None));
 
         let terms = NameTerms { bound: Bound::Agent, ttl_secs: Some(30 * 86_400) };
-        let shown = name_effect(&n, &terms);
+        let shown = name_effect(&n, &terms, "boxes.example.com");
         let wider = NameTerms { bound: Bound::Zone, ttl_secs: None };
-        assert!(matches!(l.approve_name(&id, &wider, "alice", Some(&shown)), Err(StoreError::EffectChanged(..))));
-        assert_eq!(l.approve_name(&id, &terms, "alice", Some(&shown)).unwrap(), shown);
+        assert!(matches!(l.approve_name(&id, &wider, "alice", Some(&shown), &public()), Err(StoreError::EffectChanged(..))));
+        assert_eq!(l.approve_name(&id, &terms, "alice", Some(&shown), &public()).unwrap(), shown);
         let n = l.name(&id).unwrap();
         assert_eq!((n.status.as_str(), n.holder.as_deref(), n.bound), ("live", Some("run-1"), Some(Bound::Agent)));
-        assert!(matches!(l.approve_name(&id, &terms, "alice", None), Err(StoreError::NotPending(..))));
+        assert!(matches!(l.approve_name(&id, &terms, "alice", None, &public()), Err(StoreError::NotPending(..))));
 
         // The other ask for the label: refused as taken, and new asks too.
-        assert!(matches!(l.approve_name(&other, &terms, "alice", None), Err(StoreError::Refused(m)) if m.contains("taken")));
+        assert!(matches!(l.approve_name(&other, &terms, "alice", None, &public()), Err(StoreError::Refused(m)) if m.contains("taken")));
         assert!(matches!(l.ask_public(&ask(&t, &r2, P2, "demo", NameScope::Run)), Err(StoreError::Refused(_))));
         l.deny_name(&other, "alice").unwrap();
         assert_eq!(l.name(&other).unwrap().status, "denied");
@@ -1003,6 +1205,39 @@ mod tests {
         assert!(l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Run)).unwrap().1);
     }
 
+    /// #575 review, M1: an approval is decided under the installation's rules as they are now: the
+    /// boxes domain is part of the effect, a label reserved since the ask isn't approved, and a
+    /// workload holds at most `per_workload` public names.
+    #[test]
+    fn approvals_follow_the_rules_as_configured_now() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let terms = NameTerms { bound: Bound::Agent, ttl_secs: None };
+        let (a, _) = l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Run)).unwrap();
+        let n = l.name(&a).unwrap();
+        assert_ne!(name_effect(&n, &terms, "boxes.example.com"), name_effect(&n, &terms, "boxes.example.org"));
+        let elsewhere = name_effect(&n, &terms, "boxes.example.org");
+        assert!(matches!(l.approve_name(&a, &terms, "alice", Some(&elsewhere), &public()), Err(StoreError::EffectChanged(..))));
+        // Reserved since it was asked for.
+        let mut now_reserved = public();
+        now_reserved.reserved.push("demo".into());
+        assert!(matches!(l.approve_name(&a, &terms, "alice", None, &now_reserved), Err(StoreError::Refused(m)) if m.contains("reserved")));
+        let mut console = public();
+        console.console_host = Some("dem0.example.com".into());
+        assert!(matches!(l.approve_name(&a, &terms, "alice", None, &console), Err(StoreError::Refused(m)) if m.contains("reserved")));
+        assert_eq!(l.name(&a).unwrap().status, "pending");
+        // The limit: two here (`public()`), so the third waits for one to end.
+        let (b, _) = l.ask_public(&ask(&t, &r1, P1, "beta", NameScope::Run)).unwrap();
+        let (c, _) = l.ask_public(&ask(&t, &r1, P1, "gamma", NameScope::Run)).unwrap();
+        l.approve_name(&a, &terms, "alice", None, &public()).unwrap();
+        l.approve_name(&b, &terms, "alice", None, &public()).unwrap();
+        assert_eq!(l.live_public_names(P1).unwrap(), 2);
+        assert!(matches!(l.approve_name(&c, &terms, "alice", None, &public()), Err(StoreError::Refused(m)) if m.contains("per_workload")));
+        l.revoke_name(&a, "alice").unwrap();
+        l.approve_name(&c, &terms, "alice", None, &public()).unwrap();
+    }
+
     /// #575 review, M1: a standing name approved after its asking run ended isn't held by that dead
     /// run (which would block the label for good); the next run it binds claims it.
     #[test]
@@ -1014,7 +1249,7 @@ mod tests {
         l.run_ended(&r1, "succeeded", "").unwrap();
         assert_eq!(l.name(&id).unwrap().status, "pending", "a standing ask outlives its run");
         let terms = NameTerms { bound: Bound::Agent, ttl_secs: None };
-        l.approve_name(&id, &terms, "alice", None).unwrap();
+        l.approve_name(&id, &terms, "alice", None, &public()).unwrap();
         let n = l.name(&id).unwrap();
         assert_eq!((n.status.as_str(), n.holder), ("live", None));
         let claimed = l.claim_standing_names(&t, &r2, P1, "build", "d1").unwrap();
@@ -1055,7 +1290,9 @@ mod tests {
         // As an older build ends a run: the runs row only.
         l.conn.execute("UPDATE runs SET status = 'succeeded' WHERE id = 'run-1'", []).unwrap();
         let terms = NameTerms { bound: Bound::Agent, ttl_secs: None };
-        assert!(matches!(l.approve_name(&dead_ask, &terms, "alice", None), Err(StoreError::Refused(m)) if m.contains("isn't running")));
+        assert!(
+            matches!(l.approve_name(&dead_ask, &terms, "alice", None, &public()), Err(StoreError::Refused(m)) if m.contains("isn't running"))
+        );
         assert_eq!(l.sweep_stale_names().unwrap(), 2);
         assert_eq!(l.name(&api.id).unwrap().end_reason.as_deref(), Some("run gone"));
         assert_eq!(l.name(&dead_ask).unwrap().status, "withdrawn");
@@ -1113,7 +1350,8 @@ mod tests {
 
         let (old, _) = l.ask_public(&ask(&t, &r1, P1, "later", NameScope::Standing)).unwrap();
         l.conn.execute("UPDATE names SET created_at = created_at - ?2 WHERE id = ?1", params![old, PENDING_STANDING_SECS + 1]).unwrap();
-        l.sweep_stale_names().unwrap();
+        // The next ask sweeps first (#696 review): the old one holds no slot.
+        l.ask_public(&ask(&t, &r1, P1, "another", NameScope::Standing)).unwrap();
         let n = l.name(&old).unwrap();
         assert_eq!((n.status.as_str(), n.decided_by.as_deref()), ("withdrawn", Some("wicket:expired")));
     }

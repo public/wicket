@@ -8,7 +8,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | file | read by | what | page |
 |---|---|---|---|
 | `/etc/wicket/wicketd.yaml` | `wicket daemon` | Who may read, run and revoke through the daemon. | [daemon](daemon.md#the-policy-file) |
-| `/etc/wicket/wicket.yaml` (or `$WICKET_CONFIG`) | `wicket run` (each new run and wake) | Installation settings: decisions that belong to the owner, not to a manifest. A missing file means every default; an unreadable or invalid one stops the run. | [below](#wicketyaml) |
+| `/etc/wicket/wicket.yaml` (or `$WICKET_CONFIG`) | `wicket run` (each new run and wake), `wicket names` | Installation settings: decisions that belong to the owner, not to a manifest. A missing file means every default; an unreadable or invalid one stops the run. | [below](#wicketyaml) |
 | `/etc/wicket/console.env` | the `wicket-console` unit | `WICKET_CONSOLE_ARGS`: the `wicket serve` options. | [daemon](daemon.md#the-systemd-units) |
 | `/etc/docker/daemon.json` | Docker | gVisor registered as `runsc` with `--host-uds=open`. | [install](../how-to/install-on-a-host.md) |
 | `<data dir>/audit-sinks.yaml` (or `$WICKET_AUDIT_SINKS`) | `wicket run`, `wicket serve`, `wicket audit export` | Where audit records are exported, how often checkpoints are signed, and how big the audit table on the host may grow (`host_gb`). | [audit](audit.md#the-sinks-file) |
@@ -23,6 +23,24 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | field | type | default | meaning |
 |---|---|---|---|
 | `acp.allow_subscription_backed_claude_adapter` | boolean | `false` | Whether Claude Code may run through its ACP adapter (`agent.acp.profile: claude-agent-acp`) on the zone's Claude subscription. The adapter runs the `claude` binary through the Claude Agent SDK, and whether a subscription may back that is the owner's reading of the subscription's terms ([research 21 §2.6](../explanation/research/21-agent-client-protocol.md#26-claude-code-over-acp-stays-the-fallback-not-the-default)). While it is `false`, such a run is refused when it starts, and so is a wake. |
+| `names.internal.per_workload` | integer ≥ 1 | `3` | The most live internal names one workload (an agent's principal) holds at once. |
+| `names.public` | mapping | absent | Public names for boxes (`<label>.<zone>`, [box DNS](../explanation/box-dns.md)). Absent: this installation publishes none, and `request_name` with `kind: public` is refused. |
+| `names.public.provider` | `noop` | required | Who publishes the zone's records. `noop` publishes nothing and records each plan; `vultr` and `rfc2136` are to come. |
+| `names.public.zone` | DNS domain | required | The boxes domain. A delegated subzone is recommended, so the provider's credential touches nothing else. Not under `wicket.internal`. |
+| `names.public.credential` | vault secret name | none | The provider's credential, by name. The `noop` provider takes none. |
+| `names.public.owner` | 8–32 lower-case hex characters | required | This installation's owner id, written in its owner records. Random and made once (`openssl rand -hex 8`): no host name or other detail in it. |
+| `names.public.ttl` | seconds, 30–3600 | `60` | The records' TTL. |
+| `names.public.per_workload` | integer ≥ 1 | `1` | The most live public names one workload holds at once. An ask beyond it is refused, and so is an approval. |
+| `names.public.reserved` | list of labels | `[]` | Labels no box gets, besides wicket's own (`wicket`, `console`, `www`, `api`, `admin`, `mail`, `ns`). Their lookalikes (`5tatus` for `status`) are refused too. |
+| `names.public.console_host` | host name | none | The console's host name: its first label is reserved too, and, for a host under the boxes zone, the label directly under the zone. |
+| `names.public.allow_idn` | boolean | `false` | Whether `xn--` labels are allowed. The lookalike check reads a label as written, `xn--` form and all, not as the Unicode it shows: with this on, a name can look like a reserved one in a browser. |
+| `names.public.nodes` | mapping of node labels | `{}` | The labels a node needs to publish public ports. |
+| `names.public.ports` | `low-high`, from 1024 | `20000-20999` | The host ports wicket allocates on each node. |
+
+The `names` settings are checked as a whole when a run starts: one that can't work (a zone that
+isn't a domain, a malformed owner id, a TTL out of range) stops it, as an invalid file does. A
+human's approval of a public name is decided under the settings as they are then, so a label
+reserved after it was asked for isn't approved, and the boxes domain is part of what is approved.
 
 Unknown keys are errors, so a misspelt setting can't silently stay at its default.
 
@@ -59,7 +77,7 @@ default: anything            # for operators not listed: anything (the default),
 operators:
   unix/alice: anything
   passkey/laptop:
-    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority
+    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority, fence
     hosts: ["*.example.com"] # for http requests: these hosts only (absent: any)
     max_risk: R2             # the highest risk it may decide (absent: any)
   unix/auditor: nothing      # may list requests, decides none

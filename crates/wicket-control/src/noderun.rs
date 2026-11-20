@@ -2046,7 +2046,7 @@ pub fn record_authority(run_dir: &Path, node: &str, until_ms: i64) -> Result<()>
     write_authority(run_dir, &AuthorityRecord { node: node.into(), until_ms, stopped, released_by: None })
 }
 
-fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
+pub(crate) fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
     use std::io::Write;
     let p = authority_file(run_dir);
     let dir = p.parent().expect("ctl");
@@ -2079,8 +2079,20 @@ pub fn confirm_stopped(run_dir: &Path) {
 /// An operator releases run `run_dir`'s fence without its node (#676): for a run its node can't
 /// confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end. Marked as if the
 /// node had confirmed, with who did it; the caller audits it (`run.fence_released`).
-pub fn release_fence(run_dir: &Path, by: &str) -> Result<()> {
-    let mut a = read_authority(run_dir).unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
+///
+/// `expected` is the authority record the decision was made on: its node and `until_ms`, or None
+/// if the run had none (#708). Refused if the record is no longer that (renewed, confirmed, or
+/// written since), so a renewal between the decision and this write isn't overwritten.
+pub fn release_fence(run_dir: &Path, by: &str, expected: Option<(&str, i64)>) -> Result<()> {
+    let now = read_authority(run_dir);
+    let current = now.as_ref().filter(|a| !a.stopped).map(|a| (a.node.as_str(), a.until_ms));
+    if now.as_ref().is_some_and(|a| a.stopped) || current != expected {
+        anyhow::bail!(
+            "{}'s authority record changed since the fence was shown (renewed, or its node confirmed the box stopped): look again",
+            run_dir.display()
+        );
+    }
+    let mut a = now.unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
     a.stopped = true;
     a.released_by = Some(by.to_string());
     write_authority(run_dir, &a)
@@ -2146,17 +2158,27 @@ pub struct Held {
 /// the ledger's hard end of its box's authority holds it, plus 1 s and the skew, as
 /// `Ledger::agent_fenced_until` has it. The cap rather than the latest renewal: a renewal the
 /// standby's copy hasn't caught up with may have moved the box's end on.
-pub fn held_until(l: &wicket_store::Ledger, run: &str, now_ms: i64, fenced: Option<(String, i64)>, has_record: bool) -> Option<Held> {
+///
+/// A ledger that can't be read is an error, never "not held": the caller doesn't end a run whose
+/// box it couldn't rule out.
+pub fn held_until(
+    l: &wicket_store::Ledger,
+    run: &str,
+    now_ms: i64,
+    fenced: Option<(String, i64)>,
+    has_record: bool,
+) -> anyhow::Result<Option<Held>> {
     if let Some((node, until_ms)) = fenced {
-        return Some(Held { node, until_ms, by_ledger: false });
+        return Ok(Some(Held { node, until_ms, by_ledger: false }));
     }
     if has_record {
-        return None;
+        return Ok(None);
     }
-    let (_, cap) = l.run_authority(run).ok().flatten()?;
+    let Some((_, cap)) = l.run_authority(run)? else { return Ok(None) };
     let until_ms = cap.saturating_add(1 + wicket_store::WAKE_SKEW_SECS).saturating_mul(1000);
+    // Only the hold's words: a node that can't be read is "its node".
     let node = l.run_node(run).ok().flatten().unwrap_or_else(|| "its node".into());
-    (now_ms < until_ms).then_some(Held { node, until_ms, by_ledger: true })
+    Ok((now_ms < until_ms).then_some(Held { node, until_ms, by_ledger: true }))
 }
 
 /// How long a hold lasts, in words: its end, or, for a fence this host can't bound, until its node
@@ -3245,7 +3267,7 @@ mod tests {
         assert!(fenced_in(&d, 2_000, None).is_none(), "no record of either kind: no box was started");
         std::fs::write(d.join("ctl/run.json"), b"not json").unwrap();
         // An operator releases it (#676): the fence lifts, the record says who.
-        release_fence(&d, "root@cli").unwrap();
+        release_fence(&d, "root@cli", None).unwrap();
         assert!(fenced_in(&d, 2_000, None).is_none(), "released");
         assert_eq!(read_authority(&d).unwrap().released_by.as_deref(), Some("root@cli"));
         std::fs::remove_file(d.join("ctl/authority.json")).unwrap();
@@ -3384,18 +3406,17 @@ pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> a
     anyhow::ensure!(root, "only root releases a run's fence (its box may still be running on its node)");
     anyhow::ensure!(!reason.trim().is_empty(), "say why with --reason: it goes on the audit record");
     let l = wicket_store::Ledger::open(&crate::ledger_path())?;
-    let Some((node, until)) = fenced_until(&l, run, wicket_feed::now_ms()) else {
+    let runs = crate::data_dir().join("runs");
+    let now = wicket_feed::now_ms();
+    let Some(f) = crate::fence::fence_of(&l, &runs, run, now)? else {
         anyhow::bail!("run {run} isn't fenced: its node confirmed its box stopped, or its authority has ended");
     };
-    release_fence(&crate::data_dir().join("runs").join(run), by)?;
-    let until_ms = (until != UNKNOWN_END).then_some(until);
-    l.audit(
-        &l.run_tenant(run)?.unwrap_or_else(wicket_core::TenantId::single),
-        Some(&wicket_core::RunId(run.into())),
-        "run.fence_released",
-        &serde_json::json!({ "node": node, "by": by, "why": reason, "fenced_until_ms": until_ms }),
-    )?;
-    say!("released run {run}'s fence on node {node}; its box may still be running there");
+    // The same decision and record as the console's (#690), as root: any fence, whatever its node says.
+    let identity = crate::operators::Operator::cli(&f.tenant).ok().map(|o| o.id);
+    let by = crate::fence::Decider::Root { label: by.to_string(), identity };
+    let r = crate::fence::Release { run, reason, shown: &f.effect_sha256, now_ms: now, extra: serde_json::json!({ "via": "cli" }) };
+    let f = crate::fence::release(&l, &runs, &by, r)?;
+    say!("released run {run}'s fence on node {}; its box may still be running there", f.node);
     Ok(())
 }
 
