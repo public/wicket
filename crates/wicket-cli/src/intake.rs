@@ -84,12 +84,6 @@ impl Bucket {
             false
         }
     }
-
-    /// Whether a token is left, without taking it.
-    fn has(&mut self, per_min: f64, burst: f64, now: Instant) -> bool {
-        self.fill(per_min, burst, now);
-        self.tokens >= 1.0
-    }
 }
 
 /// What intake decided about one delivery.

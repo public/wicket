@@ -1227,12 +1227,13 @@ On the node: webhook intake for triggers (#578; docs/explanation/trigger-intake.
 Usage: wicket node intake [OPTIONS] --listen <LISTEN>
 
 Options:
-      --listen <LISTEN>      Where to listen (e.g. `0.0.0.0:8443`)
-      --tls-cert <TLS_CERT>  A certificate chain (PEM) to serve TLS with; without it, plain HTTP behind a reverse proxy that has TLS
-      --tls-key <TLS_KEY>    The certificate's private key (PEM)
-      --socket <SOCKET>      The node's intake socket, which `wicket node serve` listens on for intake (default: `<node dir>/ctl/intake.sock`, for intake run as the node's own user). Run as its own user, intake is given the socket the node's `intake_socket` names
-      --dir <DIR>            The node's directory, for the default socket (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node)
-  -h, --help                 Print help
+      --listen <LISTEN>                Where to listen (e.g. `0.0.0.0:8443`)
+      --tls-cert <TLS_CERT>            A certificate chain (PEM) to serve TLS with; without it, plain HTTP behind a reverse proxy that has TLS
+      --tls-key <TLS_KEY>              The certificate's private key (PEM)
+      --socket <SOCKET>                The node's intake socket, which `wicket node serve` listens on for intake (default: `<node dir>/ctl/intake.sock`, for intake run as the node's own user). Run as its own user, intake is given the socket the node's `intake_socket` names
+      --dir <DIR>                      The node's directory, for the default socket (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node)
+      --trusted-proxy <TRUSTED_PROXY>  A reverse proxy in front of intake (an address or a CIDR range; repeatable), whose `X-Forwarded-For` names the client. Without one, the client is the peer
+  -h, --help                           Print help
 ```
 
 ### `wicket node top`

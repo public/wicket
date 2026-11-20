@@ -14,8 +14,8 @@ type: Added
     - It is bounded as the console's server is (connections, addresses, header and body timeouts),
       and checks the URL's token before it reads a body.
     - It checks each delivery's signature (HMAC-SHA256: GitHub's `X-Hub-Signature-256`, or
-      `X-Wicket-Signature-256` over a timestamp, the delivery id and the body), and for GitHub the
-      event and repository.
+      `X-Wicket-Signature-256` over a timestamp, the delivery id's length, the id and the body), and
+      for GitHub the event and repository.
     - It hands what it verified to `wicket node serve`, which spools it.
     - The control host's own machine takes intake only with `--allow-local-intake`.
   - **Collected each reconcile pass** over the node channel (protocol 20), and fired once per
@@ -27,8 +27,11 @@ type: Added
   - **Its URL.** `wicket trigger create` shows a trigger's URL once (`--intake-node` picks among
     several intake nodes). `wicket trigger rotate-url` replaces it.
   - **Limits.**
-    - Only verified deliveries count against a trigger's 60 a minute and the node's 600.
-    - An address that keeps failing is slowed down.
+    - Only verified, new deliveries count against a trigger's 60 a minute and the node's 600. A
+      resend is answered 202 without counting.
+    - Requests with no trigger's token are counted by address, and bad signatures by trigger. A
+      delivery with a valid token is never slowed down for its address. `--trusted-proxy` names a
+      reverse proxy in front.
     - The trigger's `per_hour` still holds, counted on the control host's clock.
     - A delivery read more than 15 minutes late is passed over.
     - The same body under a new delivery id fires once.

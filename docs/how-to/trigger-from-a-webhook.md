@@ -56,8 +56,10 @@ devices and no privileges, a read-only system, memory and task limits, and only 
 unix socket families. Restart it after a self update of the node.
 
 - **TLS.** Give it a certificate and key in `/etc/wicket-intake`. Or drop `--tls-cert` and
-  `--tls-key` from its command, and put a TLS-terminating reverse proxy in front: then it listens
-  on plain HTTP, so bind it to an address only the proxy reaches.
+  `--tls-key` from its command, and put a TLS-terminating reverse proxy in front.
+  - It then listens on plain HTTP, so bind it to an address only the proxy reaches.
+  - Name the proxy with `--trusted-proxy <address or CIDR>`, so intake takes the client's address
+    from its `X-Forwarded-For`. Otherwise every request looks like the proxy's.
 - **What it holds.** Its table of triggers (their URL tokens' hashes and verify secrets) comes from
   `wicket node serve` every 10 s, in memory, and only this node's triggers.
   - While that `serve` isn't running, or hasn't heard from the control host since it started (up to
@@ -114,7 +116,9 @@ with `--intake-node`.
   - optionally `X-Wicket-Delivery`: an id for the delivery, which wicket uses to drop resends (the
     body's sha256 otherwise);
   - `X-Wicket-Signature-256: sha256=<hex>`: the HMAC-SHA256, under the secret, of
-    `v1:<timestamp>:<delivery id>:` followed by the raw body (the id empty if it sends none).
+    `v1:<timestamp>:<length of the delivery id>:<delivery id>:` followed by the raw body (the id
+    empty, length 0, if it sends none). The id's length is signed, so a delivery can't be split
+    differently between its id and its body.
 
   A delivery more than 5 minutes from intake's clock, or under another id than it was signed with,
   is refused, so one that was seen can't be sent again.
@@ -132,8 +136,10 @@ with `--intake-node`.
   - **Both:** plus `delivery` and `at`, wicket's own, which a body's keys of those names don't
     replace.
   - **Forks.** A pull request from a fork names the fork's branch, often `main`. Use `fork: false`
-    (or `head_repo`) with `branch` when it matters whose branch it is. A check suite or run doesn't
-    say where its change came from, and GitHub lists no pull request on one from a fork.
+    (or `head_repo`) with `branch` when it matters whose branch it is.
+    - A pull request whose head repository is gone (a deleted fork) counts as a fork.
+    - Other events don't say where their change came from (a check suite or run, an issue comment,
+      a push), so `fork` is false there. GitHub lists no pull request on a check from a fork.
 - **Data, never authority.** Everything in a delivery was written by whoever sent it. A valid
   signature only says they had the secret. Control characters are stripped on the node, and a node
   that sends any is refused on the control host. Fields reach the agent as quoted event input in
@@ -141,8 +147,12 @@ with `--intake-node`.
 - **Loops.** An agent that pushes, comments or opens a pull request makes GitHub send a delivery,
   which can fire its own trigger again. Filter out what the agent does itself, for example
   `sender: "!my-agent-bot"` or `pusher: "!my-agent-bot"`.
-- **Once.** A resent delivery fires once: the same delivery id, or the same body under another
-  id.
+- **Once.** A resent delivery fires once: the same delivery id, or, for GitHub, the same body
+  under another id.
+  - For a generic webhook the whole signed message counts (its time, its id and its body), so the
+    same body sent as a new delivery isn't taken for a resend.
+  - Intake also remembers what it handed on for 24 hours, and answers a resend 202 without counting
+    it against the trigger, so a replayed body can't use up the trigger's rate.
   - GitHub doesn't sign its delivery id or a time. So a GitHub delivery someone captured (GitHub
     shows them on the hook's page) could be sent again under another id. wicket drops the same body
     for as long as it keeps the event, 14 days, but not after.
@@ -150,7 +160,11 @@ with `--intake-node`.
     secret.
 - **Within limits.**
   - Intake checks the path and token before it reads a body, and caps the body at 1 MiB.
-  - An address that keeps failing (unknown tokens, bad signatures) is slowed down.
+  - A request with a trigger's token is never slowed down for what its address did before.
+    - Requests with no trigger's token are counted by address, an IPv6 address by its /64, and an
+      address that keeps sending them is answered 429.
+    - Bad signatures are counted by trigger, never by an address another sender may share (GitHub
+      sends from shared addresses).
   - Only verified deliveries count against a trigger's 60 a minute (bursts of 20), and the node's
     600, so a leaked URL alone can't use up a trigger's rate.
   - The trigger's `per_hour` still applies when it fires.

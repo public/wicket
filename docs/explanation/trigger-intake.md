@@ -86,21 +86,32 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
   - a 30 s body timeout;
   - a 60 s connection lifetime.
 - **One delivery.** It accepts only `POST /hook/<trigger>/<token>`, and checks, in order:
-  1. the address: one that has kept failing (unknown tokens, bad signatures: 30 a minute, a burst
-     of 10) is answered 429 before anything else;
-  2. the path's shape, and that the trigger is served here with that token: the token's shape,
-     then its sha256 compared in constant time. 404 otherwise, the same as for an unknown trigger.
-     This happens before any of the body is read;
-  3. the body: at most 1 MiB. 413 from its announced length, or as soon as it runs past, read no
+  1. the path's shape, and that the trigger is served here with that token: the token's shape,
+     then its sha256 compared in constant time. This happens before any of the body is read.
+     - A trigger whose secret didn't read this time is answered 503, and nobody's failure is
+       counted.
+     - No trigger's token: 404, the same as for an unknown trigger. That is counted by client
+       address (an IPv6 address by its /64), and an address that keeps sending them is answered 429
+       (30 a minute, a burst of 10).
+     - A request with a trigger's token is never slowed down for its address's failures: behind a
+       proxy, or from GitHub's shared addresses, others share it.
+     - Behind a reverse proxy named with `--trusted-proxy`, the client's address is the one it
+       forwards (as the console's, #123);
+  2. the body: at most 1 MiB. 413 from its announced length, or as soon as it runs past, read no
      further;
-  4. the signature (401 otherwise):
+  3. the signature (401 otherwise; bad signatures are counted by trigger, and past 30 a minute
+     answered 429, without slowing down a signed delivery):
      - GitHub's `X-Hub-Signature-256: sha256=<hex>`, the HMAC-SHA256 of the raw body under the
        verify secret;
-     - a generic webhook's `X-Wicket-Signature-256`, the HMAC of `v1:<timestamp>:<delivery id>:`
-       and the raw body, with `X-Wicket-Timestamp` within 5 minutes of intake's clock. The time
-       and the id are under the MAC, so a captured delivery can't be sent again later or under
-       another id;
-  5. the trigger's rate, counting only verified deliveries (a token bucket: 60 a minute, a burst
+     - a generic webhook's `X-Wicket-Signature-256`, the HMAC of `v1:<timestamp>:<length of the
+       delivery id>:<delivery id>:` and the raw body, with `X-Wicket-Timestamp` within 5 minutes of
+       intake's clock. The time and the id are under the MAC, so a captured delivery can't be sent
+       again later or under another id. The id's length is too, so it can't be split differently
+       between its id and its body;
+  4. a delivery it handed on in the last 24 hours, by its body (GitHub's) or its signed message (a
+     generic webhook's), or by its id: answered 202, neither spooled nor counted against the
+     trigger, so a replayed body can't use up the trigger's rate;
+  5. the trigger's rate, counting only verified, new deliveries (a token bucket: 60 a minute, a burst
      of 20; 600 a minute for all; 429 past it). A leaked URL alone can't use up a trigger's rate;
   6. for GitHub, the `X-GitHub-Event` is one the trigger listens to, and the payload's
      `repository.full_name` is its repository (ignoring case). Others are answered 202 and
@@ -139,10 +150,12 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
 - **Delivery is at least once.** An event the control host recorded but didn't ack comes again. The
   ledger records an event once per `(source, delivery)` (`trigger_events`, as for every source), so
   it fires once.
-- **The same body is the same delivery.** A trigger's events are also matched by the raw body's
-  sha256. A signed GitHub body replayed under a new delivery id doesn't fire again, for as long as
-  the event is kept (14 days). GitHub signs neither its delivery id nor a time, so that is the
-  limit for GitHub. A generic webhook signs both (§2).
+- **The same body is the same delivery, for GitHub.** A GitHub trigger's events are also matched by
+  the raw body's sha256. A signed GitHub body replayed under a new delivery id doesn't fire again,
+  for as long as the event is kept (14 days). GitHub signs neither its delivery id nor a time, so
+  that is the limit for GitHub.
+- **For a generic webhook,** the match is on its whole signed message (time, id and body), since
+  those are signed (§2). The same body sent again as a new delivery is a new event.
 
 ### 4. From event to firing
 
@@ -203,3 +216,7 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
 - **Routing** (`claim_work`, `owner_of`), `start`, debounce, concurrency, the queue, retries and
   dead letters are step 5. Until then a webhook trigger may `wake` or `message`, like the others.
 - **Polling GitHub** for installations with no inbound path is step 8.
+- **GitHub's specifics live in `wicket_core::intake` (a decision).** Its headers, its event fields
+  and its repository check are in core for now, beside the generic webhook's. Putting sources
+  behind an adapter trait outside core, so GitLab or Forgejo don't touch core, is
+  [#740](https://github.com/public/wicket/issues/740).
