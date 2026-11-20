@@ -143,7 +143,7 @@ principal or its zone. Run ids are not addresses.
 |---|---|---|
 | `to` | string, required | `"parent"`, or a principal: `spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>`, as `whoami` and `spawn` show it |
 | `body` | any JSON value, required | at most 16 KB |
-| `priority` | `now`, `next` (default) or `later` | how soon the sender wants it read: interrupt the recipient's turn, join it, or wait for it to end. The recipient's inbox hands out `now` first and `later` last; a harness that takes pushed messages gets it in `meta` (#252) |
+| `priority` | `now`, `next` (default) or `later` | how soon the sender wants it read. The recipient's inbox hands out `now` first and `later` last; a harness that takes pushed messages gets it in `meta`. A `now` message from the recipient's parent, or from the operator it acts for, interrupts its running turn, as an operator's cancel does (audited as `run.turn_interrupt`): a parent can interrupt its child's work, but a turn an operator's prompt started only that operator interrupts. Only a message delivery would accept interrupts (its sender not revoked, the org policy allowing it, its envelope verifying). A burst interrupts one turn, and one sender interrupts at most once a minute. From anyone else it waits for the turn to end. Either way, the agent is told between turns how many messages wait, and how many asked to be read now (#252) |
 | `in_reply_to` | string | the `message_id` being answered. A reply to a message the recipient sent this principal needs no `accept_from`: the sender gave its reply address when it wrote |
 
 The answer's first line says where it went; its second, `receipt: {…}`, is the message's first
