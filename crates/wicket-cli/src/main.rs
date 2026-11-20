@@ -524,13 +524,41 @@ fn seconds_or_duration(s: &str) -> std::result::Result<Duration, String> {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run().await {
+fn main() {
+    let first = std::env::args().nth(1);
+    let rt = runtime(first.as_deref()).expect("a tokio runtime");
+    if let Err(e) = rt.block_on(run()) {
         // As a `main` returning the error would print it, then the code for its kind (#574).
         let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("Error: {e:?}\n"));
         std::process::exit(exit_code(&e));
     }
+}
+
+/// The commands that supervise a run for its whole life, one process each (`wicket run`, `attach`,
+/// `wrap`, and `wake`, which supervises the woken agent): what a host runs hundreds of at once.
+fn supervises(first_arg: Option<&str>) -> bool {
+    matches!(first_arg, Some("run" | "attach" | "wrap" | "wake"))
+}
+
+/// Worker threads a supervisor's runtime has (#582 step 4), unless `WICKET_SUPERVISOR_WORKERS`
+/// says otherwise. Its work is relaying sockets and waiting on its box: two workers keep a slow
+/// task from stalling the rest (and `block_in_place` working), without one thread per core per
+/// supervisor.
+pub(crate) const SUPERVISOR_WORKERS: usize = 2;
+
+/// The most blocking-pool threads a supervisor may have at once (ledger and file work); idle ones
+/// end after tokio's keep-alive.
+pub(crate) const SUPERVISOR_BLOCKING: usize = 32;
+
+/// The runtime for this process: a small one for a supervisor, tokio's default (a worker per core)
+/// for everything else.
+fn runtime(first_arg: Option<&str>) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut b = tokio::runtime::Builder::new_multi_thread();
+    if supervises(first_arg) {
+        let workers = std::env::var("WICKET_SUPERVISOR_WORKERS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0);
+        b.worker_threads(workers.unwrap_or(SUPERVISOR_WORKERS)).max_blocking_threads(SUPERVISOR_BLOCKING);
+    }
+    b.enable_all().build()
 }
 
 /// The exit code for `e` (#574; docs/reference/cli.md lists them): [`wicket_home::exit::code_of`],
@@ -605,6 +633,46 @@ async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Threads this process has now (Linux: its tasks).
+    fn threads() -> usize {
+        std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// The threads a runtime adds once busy: every worker woken, and a burst of blocking work.
+    fn threads_added(rt: tokio::runtime::Runtime) -> usize {
+        let before = threads();
+        let peak = rt.block_on(async {
+            let tasks: Vec<_> = (0..64).map(|_| tokio::spawn(async { tokio::task::yield_now().await })).collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+            let blocking: Vec<_> =
+                (0..8).map(|_| tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(50)))).collect();
+            let at = threads();
+            for b in blocking {
+                b.await.unwrap();
+            }
+            at
+        });
+        drop(rt);
+        peak - before
+    }
+
+    /// #582 step 4: a supervisor's runtime has two workers, not one per core: the threads it adds
+    /// don't grow with the host's cores. Other commands keep tokio's default.
+    #[test]
+    fn a_supervisor_runs_a_small_runtime() {
+        assert!(crate::supervises(Some("run")) && crate::supervises(Some("attach")) && crate::supervises(Some("wake")));
+        assert!(!crate::supervises(Some("serve")) && !crate::supervises(Some("reconcile")) && !crate::supervises(None));
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let small = threads_added(crate::runtime(Some("run")).unwrap());
+        let default = threads_added(crate::runtime(Some("serve")).unwrap());
+        // Workers, plus the eight blocking threads the burst asked for.
+        assert!(small <= crate::SUPERVISOR_WORKERS + 8, "a supervisor added {small} threads");
+        assert!(default >= cores.min(64), "the default added {default} on {cores} cores");
+        eprintln!("threads added under load: supervisor runtime {small}, default runtime {default} ({cores} cores)");
+    }
+
     /// #574: `wicket --help` lists every visible command once, in its area, and nothing else.
     #[test]
     fn every_command_is_in_one_area() {
