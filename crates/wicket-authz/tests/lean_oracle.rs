@@ -565,6 +565,20 @@ fn rust_decides_as_the_lean_spec() {
     decisions(&mut c, &mut rng);
     let decisions = c.cases.len() - decisions_from;
 
+    // 9. Standing reach (#572): asks narrowed to generated evidence, and what the rules decide.
+    let standing_from = c.cases.len();
+    standing(&mut c, &mut rng);
+    let standing = c.cases.len() - standing_from;
+    // 10. Who may send whom a message (#565): `message::relation` on generated facts.
+    let relations_from = c.cases.len();
+    relations(&mut c, &mut rng);
+    let relations = c.cases.len() - relations_from;
+    // 11. A node CA's name constraints (#573): permitting, covering, and what a widened CA is
+    // signed for.
+    let node_ca_from = c.cases.len();
+    node_ca(&mut c, &mut rng);
+    let node_ca = c.cases.len() - node_ca_from;
+
     let file = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lean-oracle-cases.json");
     std::fs::write(&file, serde_json::to_vec(&json!({ "zones": c.zones, "cases": c.cases })).unwrap()).unwrap();
     let lean = run_lean(&file);
@@ -591,6 +605,9 @@ fn rust_decides_as_the_lean_spec() {
     println!("lean oracle: {routes_admitted} of 600 route children admitted; {chains} token chains, {node_admitted} of their leaves admitted by check");
     assert!(routes_admitted > 50 && routes_admitted < 550, "route children admitted: {routes_admitted} of 600");
     assert!(chains > 100, "too few token chains ({chains})");
+    println!("lean oracle: {standing} cases of standing reach (narrowing to evidence, a rule's decisions)");
+    println!("lean oracle: {relations} cases of the message rule");
+    println!("lean oracle: {node_ca} cases of node CA name constraints");
     println!("lean oracle: {decisions} cases of wicket-core's pure decisions (is_public_ip, the token's end, agents' terms, escalation, uses, money, spawn)");
     assert!(
         divergent.is_empty(),
@@ -747,5 +764,138 @@ fn decisions(c: &mut Cases, rng: &mut Rng) {
             rust,
             format!("{l:?}.admits({a:?})"),
         );
+    }
+}
+
+/// The cases of section 9: `standing::narrow` on generated evidence (methods in either case, paths
+/// with and without glob metacharacters, counts of 0 to 3, sometimes more distinct paths than a rule
+/// may have pairs), and `ReachRule::allows` for each narrowed rule and generated rules, on requests
+/// for the evidence's paths and others, at every risk the methods give.
+fn standing(c: &mut Cases, rng: &mut Rng) {
+    use wicket_core::standing::narrow;
+    let methods = ["GET", "HEAD", "POST", "DELETE", "get", "PUT"];
+    // Edge spellings too: an escape, a brace, a backslash, the empty path and a non-ASCII one.
+    let paths = ["/a", "/b", "/a/b", "/b/a", "/c*", "/[x]", "/a?", "/", "/a/b/c", "/a%2Fb", "/a{b}", "/a\\b", "", "/\u{e9}"];
+    let probes = ["/a", "/b", "/a/b", "/b/a", "/c", "/cd", "/x", "/a/", "/", "/a/b/c", "/A", "/a%2Fb", "/\u{e9}"];
+    let rule_json = |r: &ReachRule| json!({ "host": r.host, "methods": r.methods, "paths": r.paths, "dangerous": r.allow_dangerous });
+    let (mut narrowed, mut truncated) = (0, 0);
+    for i in 0..2000 {
+        // Every tenth ask is wide: 17 to 24 granted paths, each for one or both of GET and HEAD,
+        // so the rule has more pairs than `STANDING_PAIRS` allows and `narrow` truncates its paths.
+        let wide = i % 10 == 0;
+        let ops: Vec<(String, String, u64)> = if wide {
+            let both = rng.chance(50);
+            (0..17 + rng.below(8))
+                .flat_map(|k| {
+                    let ms: &[&str] = if both { &["GET", "HEAD"] } else { &["GET"] };
+                    ms.iter().map(move |m| (m.to_string(), format!("/p{k}"))).collect::<Vec<_>>()
+                })
+                .map(|(m, p)| (m, p, 1 + rng.below(3) as u64))
+                .collect()
+        } else {
+            (0..rng.below(7)).map(|_| (rng.pick(&methods).to_string(), rng.pick(&paths).to_string(), rng.below(4) as u64)).collect()
+        };
+        let host = *rng.pick(&["a.test", "A.Test", "a.test."]);
+        let got = narrow(host, ops.iter().map(|(m, p, n)| (m.as_str(), p.as_str(), *n)));
+        let rust = match &got {
+            None => "none".to_string(),
+            Some(r) => serde_json::to_string(&json!([r.host, r.methods, r.paths, r.allow_dangerous])).unwrap(),
+        };
+        c.push(json!({ "kind": "narrow", "host": host, "ops": ops }), rust, format!("narrow({host:?}, {ops:?})"));
+        let rule = match got {
+            Some(r) => {
+                narrowed += 1;
+                let granted: std::collections::BTreeSet<&str> = ops.iter().filter(|o| o.2 > 0).map(|o| o.1.as_str()).collect();
+                truncated += usize::from(r.paths.len() < granted.len() && r.methods.len() * r.paths.len() <= 16);
+                r
+            }
+            None => gen_rule(rng),
+        };
+        for _ in 0..4 {
+            let m = *rng.pick(&methods);
+            let p = if rng.chance(50) && !ops.is_empty() { rng.pick(&ops).1.clone() } else { rng.pick(&probes).to_string() };
+            let o = op("z", m, "a.test", &p);
+            let Ok(allowed) = rule.allows(&o) else { continue };
+            let case = json!({ "kind": "rule_allows", "rule": rule_json(&rule), "op": {
+                "method": o.method, "host": o.host, "path": o.path, "risk": o.risk.rank(),
+                "unreachable": wicket_core::never_reachable(&o.host).is_some(),
+            }});
+            c.push(case, allowed.to_string(), format!("{rule:?}.allows({m} a.test{p}, risk {:?})", o.risk));
+        }
+    }
+    assert!(narrowed > 1000, "too few asks narrowed ({narrowed} of 2000)");
+    assert!(truncated >= 150, "too few asks truncated to the pairs a rule may have ({truncated} of 200 wide ones)");
+}
+
+/// The cases of section 10: `message::relation` on every combination of family and reply, generated
+/// `accept_from` lists, and senders whose zone and principal (known or not) are listed or not.
+fn relations(c: &mut Cases, rng: &mut Rng) {
+    use wicket_core::message::{relation, Facts};
+    let zones = ["g", "ops", "dev", "other"];
+    let principals = [None, Some("spiffe://acc.test/t/t0/z/ops/a/x"), Some("spiffe://acc.test/t/t0/z/dev/a/y"), Some("ops")];
+    let mut peers = 0;
+    for i in 0..3000 {
+        let accept_from = gen_accept(rng);
+        let (zone, principal) = (*rng.pick(&zones), *rng.pick(&principals));
+        let (to_child, to_parent, reply) = (i & 1 != 0 && rng.chance(50), i & 2 != 0 && rng.chance(50), rng.chance(40));
+        let f = Facts { to_child, to_parent, accept_from: &accept_from, sender_zone: zone, sender: principal, reply };
+        let got = relation(&f);
+        peers += usize::from(got == Some(wicket_core::message::Relation::Peer));
+        let rust = got.map_or("none", |r| r.as_str()).to_string();
+        let case = json!({ "kind": "relation", "to_child": to_child, "to_parent": to_parent, "accept_from": accept_from,
+            "zone": zone, "principal": principal, "reply": reply });
+        c.push(
+            case,
+            rust,
+            format!("relation(child {to_child}, parent {to_parent}, {accept_from:?}, {zone}, {principal:?}, reply {reply})"),
+        );
+    }
+    assert!(peers > 300, "too few peers accepted ({peers} of 3000)");
+}
+
+/// The cases of section 11: `splice::subtree_permits` on every pair of subtrees and hosts below,
+/// coverage by generated lists, and `splice::widen` on generated operator's hosts and runs' wants
+/// (sometimes over the cap).
+fn node_ca(c: &mut Cases, rng: &mut Rng) {
+    use wicket_core::splice::{subtree_permits, uncovered, widen};
+    const SUBTREES: [&str; 14] = [
+        "a.test",
+        "b.a.test",
+        ".a.test",
+        ".test",
+        "test",
+        "*",
+        "A.Test",
+        ".b.a.test",
+        "ab.test",
+        "x.b.a.test",
+        ".A.TEST",
+        "b.test",
+        ".",
+        "",
+    ];
+    const NAMES: [&str; 12] =
+        ["a.test", "b.a.test", "x.b.a.test", "ab.test", "test", "A.TEST.", "a.test..", ".a.test", "b.test", "xa.test", "*", "c.ab.test"];
+    for s in SUBTREES {
+        for h in NAMES.iter().chain(&SUBTREES) {
+            let rust = subtree_permits(s, h).to_string();
+            c.push(json!({ "kind": "subtree_permits", "subtree": s, "host": h }), rust, format!("subtree_permits({s:?}, {h:?})"));
+        }
+    }
+    let pick = |rng: &mut Rng, n: usize| -> Vec<String> { (0..rng.below(n)).map(|_| rng.pick(&SUBTREES[..12]).to_string()).collect() };
+    for _ in 0..1500 {
+        let permitted = pick(rng, 4);
+        let need = rng.pick(&SUBTREES[..12]).to_string();
+        let rust = uncovered(&permitted, std::slice::from_ref(&need)).is_empty().to_string();
+        c.push(json!({ "kind": "covered", "permitted": permitted, "need": need }), rust, format!("covered({permitted:?}, {need:?})"));
+    }
+    for _ in 0..1500 {
+        let base: Vec<String> = pick(rng, 3).into_iter().filter(|s| s != "*" || rng.chance(10)).collect();
+        let wants: Vec<(String, String)> =
+            (0..rng.below(9)).map(|_| (rng.pick(&["r1", "r2", "r3"]).to_string(), rng.pick(&SUBTREES[..12]).to_string())).collect();
+        let max = rng.below(7);
+        let (hosts, dropped) = widen(&base, &wants, max);
+        let rust = serde_json::to_string(&json!([hosts, dropped])).unwrap();
+        c.push(json!({ "kind": "widen", "base": base, "wants": wants, "max": max }), rust, format!("widen({base:?}, {wants:?}, {max})"));
     }
 }

@@ -20,10 +20,12 @@ pub mod placement;
 pub mod quota;
 pub mod service;
 pub mod splice;
+pub mod standing;
 pub mod subset;
 pub mod text;
 pub mod time;
 pub mod timing;
+pub mod trigger;
 pub mod version;
 pub mod yaml;
 

@@ -209,6 +209,8 @@ pub struct ControlFrame {
     pub runs: Vec<RunLine>,
     pub pending: usize,
     pub leases: Vec<LeaseLine>,
+    /// The state store's sync and the audit export's progress (#635), if either is set up.
+    pub progress: Option<crate::statesync::Progress>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -348,9 +350,12 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
             f.leases.len(),
             plural(f.leases.len())
         ),
-        String::new(),
-        format!("{:<16} {:<26} {:>5} {:>10} {:>12} {:>5}", "NODE", "CONTROL", "BOXES", "CPU", "MEM", "DISK"),
     ];
+    if let Some(p) = &f.progress {
+        out.extend(progress_lines(p, now));
+    }
+    out.push(String::new());
+    out.push(format!("{:<16} {:<26} {:>5} {:>10} {:>12} {:>5}", "NODE", "CONTROL", "BOXES", "CPU", "MEM", "DISK"));
     let mut alerts = Vec::new();
     for n in &f.nodes {
         let link = match (n.status.as_str(), n.link) {
@@ -419,6 +424,46 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
         }
     }
     fit_all(out, width)
+}
+
+/// The ledger stream's line and one per audit sink, their errors under them.
+fn progress_lines(p: &crate::statesync::Progress, now_ms: i64) -> Vec<String> {
+    let ago = |ms: i64| crate::audit_export::ago((now_ms - ms) / 1000);
+    let mut out = vec![String::new()];
+    let mut errs = Vec::new();
+    if let Some(st) = &p.stream {
+        let at = match (st.last_sync_ms, st.behind_secs) {
+            (Some(t), _) => format!(", last sync {} ago", ago(t)),
+            (None, Some(b)) => format!(", no sync yet in {}", crate::audit_export::ago(b)),
+            (None, None) => String::new(),
+        };
+        let state =
+            if st.state == crate::statesync::StreamState::Streaming { "streaming".into() } else { st.state.as_str().to_uppercase() };
+        out.push(format!("ledger stream   {state}{at}"));
+        if st.state != crate::statesync::StreamState::Streaming || st.error_ms > st.last_sync_ms {
+            if let Some(e) = &st.error {
+                errs.push(format!("ledger stream: {}", clean(e, 300)));
+            }
+        }
+    }
+    for s in &p.audit {
+        let behind = match s.behind {
+            0 => "caught up".to_string(),
+            n => format!("{n} behind (oldest {})", crate::audit_export::ago(s.behind_secs)),
+        };
+        let cp = match s.checkpoint_at {
+            0 => "never".to_string(),
+            t => format!("{} ago", ago(t * 1000)),
+        };
+        let behind = if s.manual { format!("{behind} (manual)") } else { behind };
+        out.push(format!("audit {:<9} {behind}, checkpoint {cp}", cut(&clean(&s.sink, 64), 9)));
+        if let Some(e) = &s.error {
+            errs.push(format!("audit sink {}: {}", clean(&s.sink, 64), clean(e, 300)));
+        }
+    }
+    errs.extend(p.errors.iter().map(|e| clean(e, 300)));
+    out.extend(errs.into_iter().map(|e| format!("  ! {e}")));
+    out
 }
 
 fn plural(n: usize) -> &'static str {
@@ -665,29 +710,103 @@ pub async fn node_top(dir: Option<std::path::PathBuf>, once: bool, json: bool) -
 }
 
 /// `wicket top`: the control host's view, across its nodes.
-pub async fn control_top(once: bool) -> Result<()> {
+pub async fn control_top(once: bool, json: bool) -> Result<()> {
+    if json {
+        let f = live_frame(wicket_feed::now_ms()).await?;
+        return crate::cmd::print_json(&control_json(&f));
+    }
     show(once, |w| async move {
         let now = wicket_feed::now_ms();
-        let f = wicket_store::Ledger::open(&crate::ledger_path())
-            .map_err(anyhow::Error::from)
-            .and_then(|l| control_frame(&l, &crate::data_dir().join("runs"), now));
-        match f {
-            Ok(mut f) => {
-                // This host's own node answers its status socket here.
-                if let Ok(sock) = crate::localnode::socket() {
-                    if let Ok(s) = read_status(&status_socket(&sock)).await {
-                        if let Some(n) = f.nodes.iter_mut().find(|n| n.name == crate::localnode::NAME) {
-                            n.link = Some((s.control.connections > 0, s.control.since_ms));
-                            n.boxes = s.boxes.iter().filter(|b| b.state != "exited").count();
-                        }
-                    }
-                }
-                render_control(&f, w)
-            }
+        match live_frame(now).await {
+            Ok(f) => render_control(&f, w),
             Err(e) => fit_all(vec![format!("wicket top — {}", clock(now)), format!("the ledger can't be read: {e:#}")], w),
         }
     })
     .await
+}
+
+/// The control host's frame now: the ledger's, with this host's own node from its status socket.
+async fn live_frame(now: i64) -> Result<ControlFrame> {
+    let l = wicket_store::Ledger::open(&crate::ledger_path())?;
+    let mut f = control_frame(&l, &crate::data_dir().join("runs"), now)?;
+    f.progress = crate::statesync::installed_progress(&l, &crate::ledger_path(), now);
+    if let Ok(sock) = crate::localnode::socket() {
+        if let Ok(s) = read_status(&status_socket(&sock)).await {
+            if let Some(n) = f.nodes.iter_mut().find(|n| n.name == crate::localnode::NAME) {
+                n.link = Some((s.control.connections > 0, s.control.since_ms));
+                n.boxes = s.boxes.iter().filter(|b| b.state != "exited").count();
+            }
+        }
+    }
+    Ok(f)
+}
+
+/// A node's size and use, as `top --json` prints it (#574): every field, always.
+fn capacity_json(c: &crate::chan::NodeCapacity) -> serde_json::Value {
+    serde_json::json!({
+        "vcpus": c.vcpus, "memory_mib": c.memory_mib, "used_vcpus": c.used_vcpus, "used_memory_mib": c.used_memory_mib,
+        "boxes": c.boxes, "room_mib": c.room_mib, "full": c.full,
+    })
+}
+
+/// A node's latest health report, as `top --json` prints it: times in ms like the rest of `top`.
+fn health_json(h: &crate::health::NodeHealth) -> serde_json::Value {
+    let event = |e: &Option<crate::health::HealthEvent>| e.as_ref().map(|e| serde_json::json!({ "at_ms": e.at_ms, "what": e.what }));
+    serde_json::json!({
+        "at_ms": h.at_ms,
+        "disk": { "total_bytes": h.disk.total_bytes, "avail_bytes": h.disk.avail_bytes, "reserve_bytes": h.disk.reserve_bytes },
+        "memory": { "total_mib": h.memory.total_mib, "available_mib": h.memory.available_mib, "committed_mib": h.memory.committed_mib },
+        "feed_mode": h.feed_mode, "feed_fresh_until_ms": h.feed_fresh_until_ms,
+        "oom_kills": h.oom_kills, "last_oom": event(&h.last_oom),
+        "persist_failures": h.persist_failures, "last_persist_failure": event(&h.last_persist_failure),
+        "ca_not_after_ms": h.ca_not_after.map(|t| t * 1000),
+        "orphaned": h.orphaned.iter().map(|o| serde_json::json!({ "run": o.run, "bytes": o.bytes })).collect::<Vec<_>>(),
+    })
+}
+
+/// A run's model use, as `top --json` prints it.
+fn spent_json(s: &Spent) -> serde_json::Value {
+    serde_json::json!({
+        "requests": s.requests, "input_tokens": s.input_tokens, "cache_read_tokens": s.cache_read_tokens,
+        "cache_creation_tokens": s.cache_creation_tokens, "output_tokens": s.output_tokens,
+    })
+}
+
+/// `wicket top --json`: one frame. Times are Unix ms here, as the node's status has them.
+/// `connected` is null for a node no run's supervisor has talked to, and for a run not yet seen.
+pub fn control_json(f: &ControlFrame) -> serde_json::Value {
+    let nodes: Vec<_> = f
+        .nodes
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "name": n.name, "status": n.status, "connected": n.link.map(|l| l.0), "since_ms": n.link.map(|l| l.1),
+                "boxes": n.boxes, "capacity": n.capacity.as_ref().map(capacity_json),
+                "health": n.health.as_ref().map(health_json),
+            })
+        })
+        .collect();
+    let runs: Vec<_> = f
+        .runs
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "run": r.run, "node": r.node, "agent": r.agent, "zone": r.zone, "status": r.status, "started_ms": r.started_ms,
+                "spent": r.spent.as_ref().map(spent_json), "connected": r.connected,
+            })
+        })
+        .collect();
+    let leases: Vec<_> = f
+        .leases
+        .iter()
+        .map(|x| {
+            serde_json::json!({
+                "id": x.id, "provider": x.provider, "run": x.run, "node": x.node, "not_after_ms": x.not_after.map(|t| t * 1000),
+                "reserved_micro_usd": x.reserved_micro_usd,
+            })
+        })
+        .collect();
+    serde_json::json!({ "now_ms": f.now_ms, "nodes": nodes, "runs": runs, "pending": f.pending, "leases": leases })
 }
 
 #[cfg(test)]
@@ -828,7 +947,7 @@ mod tests {
             boxes: 2,
             ..Default::default()
         };
-        let f = ControlFrame {
+        let mut f = ControlFrame {
             now_ms: NOW,
             nodes: vec![
                 NodeLine {
@@ -907,7 +1026,49 @@ mod tests {
                 not_after: Some(NOW / 1000 + 2280),
                 reserved_micro_usd: 120_000,
             }],
+            progress: None,
         };
+        // The state store lagging, one sink behind and failing (#635).
+        f.progress = Some(crate::statesync::Progress {
+            stream: Some(crate::statesync::StreamStatus {
+                endpoint: "https://s3.example.com".into(),
+                bucket: "b-1".into(),
+                lineage: None,
+                state: crate::statesync::StreamState::Lagging,
+                last_sync_ms: Some(NOW - 420_000),
+                behind_secs: Some(420),
+                lag_secs: 60,
+                error: Some("monitor error: calc pos: connection refused".into()),
+                error_ms: Some(NOW - 5_000),
+            }),
+            audit: vec![
+                crate::audit_export::SinkStatus {
+                    sink: "store".into(),
+                    kind: "store",
+                    seq: 1180,
+                    head: 1204,
+                    behind: 24,
+                    behind_secs: 400,
+                    checkpoint_at: NOW / 1000 - 900,
+                    holder: None,
+                    error: Some("PUT: connection refused".into()),
+                    manual: false,
+                },
+                crate::audit_export::SinkStatus {
+                    sink: "collector".into(),
+                    kind: "otlp",
+                    seq: 1204,
+                    head: 1204,
+                    behind: 0,
+                    behind_secs: 0,
+                    checkpoint_at: NOW / 1000 - 120,
+                    holder: Some("serve".into()),
+                    error: None,
+                    manual: false,
+                },
+            ],
+            errors: vec![],
+        });
         let got = render_control(&f, 80).join("\n");
         fixture("control-80.txt", &got);
         let want = include_str!("top/testdata/control-80.txt");

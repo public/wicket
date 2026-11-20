@@ -13,7 +13,7 @@
 use super::Peer;
 use crate::{
     Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd, ServiceCmd,
-    StandingCmd, StateCmd,
+    StandingCmd, StateCmd, TriggerCmd,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -67,7 +67,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
         Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } => Forward(Read),
-        Cmd::Pending | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
+        Cmd::Pending { .. } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
         // Renewing a grant or a box's authority grants more time: a decision, as approving is.
@@ -76,6 +76,13 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Standing { cmd: StandingCmd::List { .. } | StandingCmd::Show { .. } } => Forward(Read),
         Cmd::Standing { cmd: StandingCmd::Approve { .. } | StandingCmd::Deny { .. } | StandingCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Standing { cmd: StandingCmd::Revoke { .. } } => Forward(Revoke),
+        // A trigger wakes and messages agents later, as its owner (the caller): what `wake` and
+        // `session` do now. Pausing and removing one only narrows.
+        Cmd::Trigger { cmd } => match cmd {
+            TriggerCmd::List | TriggerCmd::Show { .. } | TriggerCmd::Fire { .. } => Forward(Read),
+            TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } => Forward(Run),
+            TriggerCmd::Pause { .. } | TriggerCmd::Rm { .. } => Forward(Revoke),
+        },
         Cmd::Secret { cmd } => match cmd {
             SecretCmd::List => Forward(Read),
             // The helper runs as the caller, the owner of the files it serves (#350): never as wicket.
@@ -95,7 +102,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // Reads a manifest the caller names, in the caller's own process.
         Cmd::Zone { .. } => Local,
         // Installing a service decides what runs on every node, under its reach (#579).
-        Cmd::Service { cmd: ServiceCmd::List } => Forward(Read),
+        Cmd::Service { cmd: ServiceCmd::List { .. } } => Forward(Read),
         Cmd::Service { .. } => Forward(Privileged),
         Cmd::Operator { cmd } => match cmd {
             OperatorCmd::List | OperatorCmd::Sessions => Forward(Read),
@@ -356,6 +363,14 @@ mod tests {
             (&["standing", "deny", "s-1"], Route::Forward(Privileged)),
             (&["standing", "renew", "s-1"], Route::Forward(Privileged)),
             (&["standing", "revoke", "s-1"], Route::Forward(Revoke)),
+            (&["trigger", "list"], Route::Forward(Read)),
+            (&["trigger", "show", "t-1"], Route::Forward(Read)),
+            (&["trigger", "fire", "t-1", "--dry-run"], Route::Forward(Read)),
+            (&["trigger", "create", "--file", "t.yaml"], Route::Forward(Run)),
+            (&["trigger", "resume", "t-1"], Route::Forward(Run)),
+            (&["trigger", "renew", "t-1", "--lasts", "30d"], Route::Forward(Run)),
+            (&["trigger", "pause", "t-1"], Route::Forward(Revoke)),
+            (&["trigger", "rm", "t-1"], Route::Forward(Revoke)),
             (&["secret", "list"], Route::Forward(Read)),
             (&["secret", "set", "claude-oauth"], Route::Forward(Privileged)),
             (&["secret", "set", "gh", "--hosts", "api.github.com"], Route::Forward(Privileged)),

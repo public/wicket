@@ -8,9 +8,10 @@
 //!   for its requests is a third-party block signed here with the approver key; the token is rebuilt
 //!   from its base with the live grants and published whole (bound to its box; the node counts their
 //!   uses, and the ledger hands them over so it never consumes them too). Revocations of those grants
-//!   go by grant id, and a run revocation also revokes the token's block 0 by its revocation id. Freshness statements go out every refresh. Many runs share a
-//!   node's feed ([`SharedFeed`]): each commit or statement holds the feed's lock and first reloads the
-//!   delta log if another process appended to it.
+//!   go by grant id, and a run revocation also revokes the token's block 0 by its revocation id. A
+//!   freshness statement goes out every refresh, from whichever run's connection signs it first. Many
+//!   runs share a node's feed ([`SharedFeed`], one publisher per node in a process): each commit or
+//!   statement holds the feed's lock and first applies the deltas other processes appended.
 //! - **Channel.** `ssh <pinned> <target> wicket node attach` joins the ssh session to the node's
 //!   control socket (for this host's own node, the socket itself: [`Via`]). The connection is the
 //!   run's own (its scope is the run id). When it drops, the run keeps going: reconnects back off from 0.5 s to 5 s, and on
@@ -41,7 +42,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use wicket_core::timing::Timings;
 use wicket_core::{Op, RunId, TenantId, ZoneSpec};
-use wicket_feed::{BoxAuthority, Change, KeyCert, LiveGrant, Publisher, PublisherConfig, RevokeKind};
+use wicket_feed::{BoxAuthority, Change, KeyCert, LiveGrant, Publisher, PublisherConfig, Refreshed, RevokeKind};
 use wicket_identity::node::NodeCertClaims;
 use wicket_node::AGENT_ASKS;
 use wicket_store::Ledger;
@@ -58,6 +59,16 @@ pub fn feed_config() -> PublisherConfig {
 
 /// A node's delta log past this size starts a new feed generation when no box holds authority from it.
 const COMPACT_BYTES: u64 = 1 << 20;
+
+/// The supervisor's loops do their ledger work at least this often, whether or not the change
+/// counters moved (#582 step 2): what a counter can't see (a grant's end, a due renewal) is caught.
+const FULL_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether `topic` changed since this connection last looked (true if the ledger can't say).
+fn changed(sh: &Shared, p: &mut Progress, topic: wicket_store::Topic) -> bool {
+    let l = sh.ledger.lock().expect("ledger");
+    p.watch.changed(&l, topic).unwrap_or(true)
+}
 
 /// A node's health is written to the ledger at most this often (ms), whichever of its runs'
 /// connections has it first: each reports the same, every 30 s.
@@ -114,7 +125,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
     // With the roots offline (#154) a certificate is used to its end (`wicket keys certify` renews it);
     // with them here, renewed when under a day is left.
     let offline = crate::roots::offline();
-    let margin = if offline { 0 } else { 86_400_000 };
+    let margin = renew_margin().unwrap_or(0);
     let cert_jws = match old {
         Some((c, j)) if !new_generation && c.kid == kid && c.not_after > now + margin && c.max_ttl_ms >= cfg.ttl_ms => {
             if offline && c.not_after < now + 7 * 86_400_000 {
@@ -145,19 +156,35 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
 }
 
 /// A node's feed, shared by every process that publishes to it (each run on the node, and each
-/// link relay). Every use holds `<data dir>/nodes/<name>/feed.lock` for its duration, and first reloads
-/// the delta log if another process appended to it since, so each delta extends the one true head.
+/// link relay), and within a process by every run on the node ([`SharedFeed::open`] hands them the
+/// same one: one publisher per node per process). Every use holds `<data dir>/nodes/<name>/feed.lock`
+/// for its duration, and first applies the deltas other processes appended since
+/// ([`Publisher::refresh`]), so each delta extends the one true head.
 pub struct SharedFeed {
     name: String,
     cfg: PublisherConfig,
     dir: PathBuf,
-    /// The publisher, and the delta log's length when it was last loaded or written.
-    inner: Mutex<(Publisher<BoxAuthority>, u64)>,
+    /// The publisher, and when its certificate was last compared with the one on disk (Unix ms).
+    inner: Mutex<(Publisher<BoxAuthority>, i64)>,
 }
+
+/// How long before its end a feed's certificate is renewed when the feed is opened: a day, with the
+/// roots on this host; none without them (`wicket keys certify` renews it then).
+fn renew_margin() -> Option<i64> {
+    (!crate::roots::offline()).then_some(86_400_000)
+}
+
+/// How often a feed's certificate is checked for nearing its end, to be renewed.
+const CERT_CHECK_MS: i64 = 3_600_000;
+
+/// The node feeds this process publishes to, by directory.
+static FEEDS: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<SharedFeed>>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// A held feed: the publisher, current, with the feed's lock taken.
 pub struct FeedGuard<'a> {
-    g: std::sync::MutexGuard<'a, (Publisher<BoxAuthority>, u64)>,
+    g: std::sync::MutexGuard<'a, (Publisher<BoxAuthority>, i64)>,
+    name: &'a str,
     dir: &'a Path,
     /// The last statement time when the lock was taken.
     issued: i64,
@@ -179,7 +206,10 @@ impl std::ops::DerefMut for FeedGuard<'_> {
 
 impl Drop for FeedGuard<'_> {
     fn drop(&mut self) {
-        self.g.1 = std::fs::metadata(self.g.0.log_path()).map(|m| m.len()).unwrap_or(0);
+        if let Some(e) = self.g.0.take_checkpoint_error() {
+            // Only the next open is slower: tried again at the next interval.
+            say_err!("[wicket] could not write node {}'s feed checkpoint: {e}", self.name);
+        }
         if self.g.0.last_issued() != self.issued {
             let _ = std::fs::write(self.dir.join("feed/issued"), self.g.0.last_issued().to_string());
         }
@@ -202,13 +232,26 @@ fn last_issued(feed_dir: &Path) -> i64 {
 }
 
 impl SharedFeed {
-    pub fn open(name: &str, cfg: PublisherConfig) -> Result<SharedFeed> {
+    /// Node `name`'s feed for this process: the one its other runs on the node use, or opened now.
+    pub fn open(name: &str, cfg: PublisherConfig) -> Result<Arc<SharedFeed>> {
+        let dir = crate::data_dir().join("nodes").join(name);
+        let mut feeds = FEEDS.lock().expect("feeds");
+        if let Some(f) = feeds.get(&dir).and_then(std::sync::Weak::upgrade) {
+            return Ok(f);
+        }
+        let f = Arc::new(SharedFeed::open_new(name, cfg)?);
+        feeds.retain(|_, w| w.strong_count() > 0);
+        feeds.insert(dir, Arc::downgrade(&f));
+        Ok(f)
+    }
+
+    fn open_new(name: &str, cfg: PublisherConfig) -> Result<SharedFeed> {
         let dir = crate::data_dir().join("nodes").join(name);
         let _lock = feed_lock(&dir)?;
         let mut p = open_feed(name, cfg.clone())?;
-        // Every run adds a few deltas and the log is replayed on every open: once it is large and no
-        // box holds authority from it (each run drops its token at exit), the feed starts a new
-        // generation, which nodes take as a snapshot.
+        // Every run adds a few deltas: once the log is large and no box holds authority from it
+        // (each run drops its token at exit), the feed starts a new generation, which nodes take as
+        // a snapshot. (Opening doesn't replay it, from its checkpoint; this bounds its size.)
         let log = p.log_path().to_path_buf();
         let cap = std::env::var("WICKET_FEED_COMPACT_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(COMPACT_BYTES);
         // (Only with the feed root at hand: a new generation needs it.)
@@ -220,22 +263,40 @@ impl SharedFeed {
             p = open_feed_inner(name, &cfg, true, false)?;
         }
         p.note_issued(last_issued(&dir.join("feed")));
-        let len = std::fs::metadata(p.log_path()).map(|m| m.len()).unwrap_or(0);
-        Ok(SharedFeed { name: name.into(), cfg, dir, inner: Mutex::new((p, len)) })
+        Ok(SharedFeed { name: name.into(), cfg, dir, inner: Mutex::new((p, wicket_feed::now_ms())) })
     }
 
     /// The feed, locked and current.
     pub fn lock(&self) -> Result<FeedGuard<'_>> {
         let lock = feed_lock(&self.dir)?;
-        let mut g = self.inner.lock().expect("feed");
-        let len = std::fs::metadata(g.0.log_path()).map(|m| m.len()).unwrap_or(0);
-        if len != g.1 {
+        // A run that panicked holding the feed may have left the publisher half-updated: it is
+        // opened again from the files, and the other runs on the node carry on.
+        let (mut g, poisoned) = match self.inner.lock() {
+            Ok(g) => (g, false),
+            Err(e) => {
+                self.inner.clear_poison();
+                (e.into_inner(), true)
+            }
+        };
+        let now = wicket_feed::now_ms();
+        // Another process (or `wicket keys certify`) renewed the certificate, or it nears its end
+        // (`open_feed` renews it, with the roots at hand; checked hourly, as without them it can't).
+        let on_disk = std::fs::read_to_string(self.dir.join("feed/cert.jws")).ok();
+        let mut cert_due = on_disk.as_deref() != Some(g.0.key_frame().jws.as_str());
+        if now >= g.1.saturating_add(CERT_CHECK_MS) {
+            g.1 = now;
+            // The same window `open_feed` renews in, so the reopen does renew it.
+            cert_due |= renew_margin().is_some_and(|m| g.0.cert().not_after <= now + m);
+        }
+        let current = !poisoned && !cert_due && matches!(g.0.refresh(), Ok(Refreshed::Current | Refreshed::Applied(_)));
+        if !current {
+            let issued = g.0.last_issued();
             g.0 = open_feed(&self.name, self.cfg.clone())?;
-            g.1 = len;
+            g.0.note_issued(issued);
         }
         g.0.note_issued(last_issued(&self.dir.join("feed")));
         let issued = g.0.last_issued();
-        Ok(FeedGuard { g, dir: &self.dir, issued, _lock: lock })
+        Ok(FeedGuard { g, name: &self.name, dir: &self.dir, issued, _lock: lock })
     }
 }
 
@@ -517,7 +578,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let name = s.node.clone();
     let issuer = Arc::new(crate::issuer()?);
     let cfg = feed_config();
-    let feed = Arc::new(SharedFeed::open(&name, cfg.clone())?);
+    let feed = SharedFeed::open(&name, cfg.clone())?;
     let now = wicket_feed::now_ms();
     let paths = crate::enrol::Paths::installation();
     // Every grant has a lifetime (#153), block 0 included: the zone's `limits.authority` (default
@@ -945,6 +1006,11 @@ struct Progress {
     fetched: std::collections::HashMap<String, String>,
     /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
     remint_failed: i64,
+    /// What changed in the ledger since this connection's loops last looked (#582 step 2), and when
+    /// each last did its work regardless (the fallback every [`FULL_EVERY`]).
+    watch: wicket_store::ChangeWatch,
+    grants_full: std::time::Instant,
+    ident_full: std::time::Instant,
     /// What `wicket top` reads of this run's node (`ctl/link.json`).
     link: wicket_node::status::LinkRecord,
     /// The standing rules (#572) the box's token carries now, by id, with the end each was
@@ -979,6 +1045,9 @@ async fn manage(
         slice: None,
         fetched: std::collections::HashMap::new(),
         remint_failed: 0,
+        watch: wicket_store::ChangeWatch::new(),
+        grants_full: std::time::Instant::now(),
+        ident_full: std::time::Instant::now(),
         link: wicket_node::status::LinkRecord { node: sh.node.clone(), ..Default::default() },
         standing: std::collections::HashMap::new(),
     };
@@ -1237,12 +1306,25 @@ async fn session(
                 }
             }
             _ = grants.tick() => {
-                for f in sync_grants(sh, p) {
-                    send(feed_frame(f));
+                // Only when the grants changed (#582 step 2), or every FULL_EVERY regardless.
+                if changed(sh, p, wicket_store::Topic::Grants) || p.grants_full.elapsed() >= FULL_EVERY {
+                    p.grants_full = std::time::Instant::now();
+                    for f in sync_grants(sh, p) {
+                        send(feed_frame(f));
+                    }
                 }
             }
             _ = ident.tick() => {
-                if let Some(why) = revoked(sh, p) {
+                // Revocations and the node's status when they changed, or every FULL_EVERY, or as
+                // the node's certificate (held here) reaches its end.
+                let now = wicket_store::now();
+                let ending = p.cert.as_ref().is_some_and(|c| c.exp <= now + 1);
+                let check = changed(sh, p, wicket_store::Topic::Revocations) || ending || p.ident_full.elapsed() >= FULL_EVERY;
+                let ca_check = changed(sh, p, wicket_store::Topic::NodeCa) || check || p.ca.busy();
+                if check {
+                    p.ident_full = std::time::Instant::now();
+                }
+                if let Some(why) = check.then(|| revoked(sh, p)).flatten() {
                     // Stop the box (in case the node still obeys), then drop the node for good.
                     send(Frame::Msg(Msg::Kill { run: sh.run.0.clone() }));
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1252,7 +1334,7 @@ async fn session(
                 if let Some(f) = renewal(sh, p) {
                     send(f);
                 }
-                if let Some(m) = p.ca.tick(&sh.ledger, &sh.node, p.proto, wicket_store::now()) {
+                if let Some(m) = ca_check.then(|| p.ca.tick(&sh.ledger, &sh.node, p.proto, wicket_store::now())).flatten() {
                     send(Frame::Msg(m));
                 }
             }

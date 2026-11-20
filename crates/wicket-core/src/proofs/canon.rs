@@ -195,7 +195,8 @@ fn segments_end(b: &[u8], seg: usize) -> Option<(usize, usize)> {
 /// canonical paths, if the grant for `P` covers `Q` then `Q`'s segments begin with all of `P`'s.
 /// No escape, dot segment, doubled `/` or separator in a segment takes a covered path outside its
 /// prefix, since `canonical_path` admits none of them. With `upstream_reads_the_same_segments`, an
-/// upstream that decodes and resolves the path names the same segments.
+/// upstream that decodes and resolves the path names the same segments. Lean:
+/// `prefix_covers_segments` and `prefix_no_escape` (`Wicket/Canon.lean`).
 #[kani::proof]
 #[kani::unwind(10)]
 fn a_prefix_grant_covers_only_paths_under_it() {

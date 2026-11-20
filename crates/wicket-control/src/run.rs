@@ -632,29 +632,31 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         crate::serviceuse::check_zone(&ledger.lock().expect("ledger"), &m.zone.name, &run.0)?;
     }
     if record.is_none() {
-        let l = ledger.lock().expect("ledger");
-        l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
-        // Who supervises it, for the reconciler (#38), and the lease it is placed on, if any.
-        l.set_run_owner(&run.0, &crate::owner::owner_label())?;
-        if let Some(lease) = &lease {
-            l.set_run_lease(&run.0, lease)?;
-        }
-        drop(l);
-        if long_lived && wake.is_none() {
-            let mut l = ledger.lock().expect("ledger");
-            let id = wicket_store::new_agent_id();
-            l.create_agent(&wicket_store::NewAgent {
-                id: &id,
-                tenant: &m.tenant.0,
-                zone: &m.zone.name,
-                name: &workload,
-                run: &run.0,
-                session_id: &session.id,
-                manifest: &text,
-                image,
-                workspace: workspace_dir.as_deref().and_then(|w| w.to_str()),
-                claim_until: wicket_store::now() + crate::hibernate::CLAIM_SECS,
-            })?;
+        // The run's row, who supervises it (for the reconciler, #38), the lease it is placed on,
+        // and a new long-lived agent's row: one transaction (#582 step 2).
+        let agent_id = (long_lived && wake.is_none()).then(wicket_store::new_agent_id);
+        let new_agent = agent_id.as_deref().map(|id| wicket_store::NewAgent {
+            id,
+            tenant: &m.tenant.0,
+            zone: &m.zone.name,
+            name: &workload,
+            run: &run.0,
+            session_id: &session.id,
+            manifest: &text,
+            image,
+            workspace: workspace_dir.as_deref().and_then(|w| w.to_str()),
+            claim_until: wicket_store::now() + crate::hibernate::CLAIM_SECS,
+        });
+        ledger.lock().expect("ledger").record_run_start(
+            &m.tenant,
+            &run,
+            &m.zone.name,
+            &workload,
+            &crate::owner::owner_label(),
+            lease.as_deref(),
+            new_agent.as_ref(),
+        )?;
+        if let Some(id) = agent_id {
             fence = Some(wicket_proxy::Fence { agent: id, generation: 1 });
         }
         let l = ledger.lock().expect("ledger");
@@ -1312,9 +1314,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 let now = wicket_feed::now_ms();
                 let (found, _) = crate::hibernate::from_index(std::slice::from_ref(&node_name), &l.node_health()?, now);
                 if !found.is_empty() {
-                    let req = wicket_placement::schedule::Request::of(&m);
-                    let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
-                    let d = crate::hibernate::bind(&l, &run, &crate::hibernate::Waiting { req, need }, &found, None, now, false)?.decision;
+                    let ask = crate::hibernate::Waiting::of(&m);
+                    let d = crate::hibernate::bind(&l, &run, &ask, &found, None, now, false)?.decision;
                     // Refused for room only, the node's own admission decides: its report may
                     // still count a box that has ended.
                     let room_only = d.refused.iter().all(|(_, why)| {
@@ -1607,6 +1608,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         None => true,
     };
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut asks_watch = wicket_store::ChangeWatch::new();
     // A wrapped agent's stdout goes straight to its launcher; otherwise wicket reads it.
     let mut lines = stdout.map(|o| BufReader::new(o).lines());
     let mut wrapped_exit: Option<std::process::ExitStatus> = None;
@@ -1996,7 +1998,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
                 // A `session/cancel` from the console's session view (#327): the running turn, if any.
                 // Prompts still queued behind it stay queued.
-                let cancels = ledger.lock().ok().and_then(|mut l| l.take_turn_cancels(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
+                // Asks are read only when the ledger says some changed (#582 step 2).
+                let asks = ledger.lock().map(|l| asks_watch.changed(&l, wicket_store::Topic::Asks).unwrap_or(true)).unwrap_or(true);
+                let cancels = if asks {
+                    ledger.lock().ok().and_then(|mut l| l.take_turn_cancels(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default()
+                } else {
+                    vec![]
+                };
                 if let Some(by) = cancels.last() {
                     use tokio::io::AsyncWriteExt;
                     let out = match (acp.as_mut(), control.as_mut()) {
@@ -2038,7 +2046,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
                     write_lines(&mut stdin, &out.write).await;
                 }
-                let modes = ledger.lock().ok().and_then(|mut l| l.take_mode_changes(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
+                let modes = if asks {
+                    ledger.lock().ok().and_then(|mut l| l.take_mode_changes(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default()
+                } else {
+                    vec![]
+                };
                 if let Some((want, by)) = modes.last() {
                     let outcome = match (crate::control::parse_mode(want), control.as_mut()) {
                         (Some(mode), Some(c)) => {

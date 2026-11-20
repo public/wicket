@@ -893,6 +893,20 @@ impl Manifest {
         for u in &self.zone.uses {
             crate::service::check_name(u).map_err(|e| ManifestError::Invalid(format!("zone.uses: {e}")))?;
         }
+        // Affinity names what this box has: a service its zone uses, a volume its zone declares.
+        for a in &self.placement.affinity {
+            match a.near() {
+                Some(crate::placement::Near::Service(s)) if !self.zone.uses.contains(&s) => {
+                    return Err(ManifestError::Invalid(format!("placement.affinity: service {s} is not one zone.uses names")));
+                }
+                Some(crate::placement::Near::Volume(v)) if !self.zone.volumes.iter().any(|x| x.name == v && x.keep) => {
+                    return Err(ManifestError::Invalid(format!(
+                        "placement.affinity: volume {v} is not one zone.volumes declares with keep: true (only a kept volume stays on a node)"
+                    )));
+                }
+                _ => {}
+            }
+        }
         if let Some(s) = &self.service {
             s.check().map_err(ManifestError::Invalid)?;
             if self.program.is_none() {
@@ -996,7 +1010,7 @@ impl Manifest {
                 return Err(ManifestError::Invalid(format!("bad reach host {:?}", r.host)));
             }
             for p in &r.paths {
-                compile_glob(p)?;
+                check_path_glob("reach", p)?;
             }
         }
         for f in &self.zone.forbid {
@@ -1004,7 +1018,7 @@ impl Manifest {
                 return Err(ManifestError::Invalid(format!("bad forbid host {:?}", f.host)));
             }
             for p in &f.paths {
-                compile_glob(p)?;
+                check_path_glob("forbid", p)?;
             }
         }
         for i in &self.zone.inject {
@@ -1033,6 +1047,20 @@ impl Manifest {
         self.zone.limits.check()?;
         Ok(())
     }
+}
+
+/// A reach or forbid rule's path glob, as a manifest may have it: starting with `/`, as a request's
+/// path always does (`canon::canonical_path`), and one globset compiles. Some globs that don't start
+/// with `/` match absolute paths anyway (`**/merge`, `{/a/**,/b}`, `[/]repos/*`); others
+/// (`repos/**`) match none, and `subset::check` could admit one of those under a parent's `/**`
+/// while the parent's glob doesn't match what it does (the manifest fuzzer's
+/// `fuzz/regressions/manifest/relative-*`). Requiring the leading `/` refuses both kinds; a glob of
+/// the first is written `/**/merge` instead.
+fn check_path_glob(kind: &str, p: &str) -> Result<(), ManifestError> {
+    if !p.starts_with('/') {
+        return Err(ManifestError::Invalid(format!("{kind} path {p:?} must start with / (a request's path always does)")));
+    }
+    compile_glob(p).map(|_| ())
 }
 
 pub(crate) fn compile_glob(p: &str) -> Result<GlobMatcher, ManifestError> {
@@ -1168,6 +1196,25 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
 
+    /// #579 step 4: affinity names a service the zone uses or a volume it declares.
+    #[test]
+    fn affinity_names_what_the_box_has() {
+        let m = |placement: &str| {
+            super::Manifest::from_yaml(&format!(
+                "task: t\nprogram: {{ name: p, command: [x] }}\nplacement: {placement}\n\
+                 zone: {{ name: z, uses: [npm-cache], volumes: [{{ name: data, path: /volumes/data, keep: true }}, \
+                 {{ name: scratch, path: /volumes/scratch }}] }}\n"
+            ))
+        };
+        let ok = m("{ priority: 5, affinity: [{ service: npm-cache }, { volume: data, required: true }] }").unwrap();
+        assert_eq!(ok.placement.priority, 5);
+        assert_eq!(super::Manifest::from_yaml(&crate::yaml::to_string(&ok).unwrap()).unwrap().placement, ok.placement);
+        assert!(m("{ affinity: [{ service: crates-mirror }] }").unwrap_err().to_string().contains("not one zone.uses names"));
+        assert!(m("{ affinity: [{ volume: other }] }").unwrap_err().to_string().contains("not one zone.volumes declares"));
+        assert!(m("{ affinity: [{ volume: scratch }] }").unwrap_err().to_string().contains("keep: true"), "a run's cache is on no node");
+        assert!(m("{ priority: 5000 }").is_err());
+    }
+
     /// #579 step 3: a service is a program with `service:`, its users name it in `zone.uses`, and
     /// both are written out only when set.
     #[test]
@@ -1190,6 +1237,25 @@ mod tests {
         let plain = super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z }\n").unwrap();
         let y = crate::yaml::to_string(&plain).unwrap();
         assert!(!y.contains("uses") && !y.contains("service"), "{y}");
+    }
+
+    /// A reach or forbid path glob must start with `/`: one that doesn't either matches no request
+    /// (`subset::check` could admit it under a parent's `/**`, the manifest fuzzer's
+    /// `relative-child-*` findings) or is spelt without it (`**/merge`, written `/**/merge`).
+    #[test]
+    fn a_path_glob_starts_with_a_slash() {
+        let m =
+            |rule: &str| super::Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  {rule}\n"));
+        for p in ["tena/repos/**", "re/po/*", "**/merge", "*", ""] {
+            let reach = m(&format!("reach: [{{ host: a.test, methods: [GET], paths: ['{p}'] }}]")).unwrap_err().to_string();
+            assert!(reach.contains("must start with /"), "{p:?}: {reach}");
+            let forbid = m(&format!("forbid: [{{ host: a.test, paths: ['{p}'] }}]")).unwrap_err().to_string();
+            assert!(forbid.contains("must start with /"), "{p:?}: {forbid}");
+        }
+        for p in ["/**", "/", "/repos/*/merge", "/**/merge"] {
+            assert!(m(&format!("reach: [{{ host: a.test, methods: [GET], paths: ['{p}'] }}]")).is_ok(), "{p:?}");
+            assert!(m(&format!("forbid: [{{ host: a.test, paths: ['{p}'] }}]")).is_ok(), "{p:?}");
+        }
     }
 
     /// #325: `is_principal_entry` scans bytes now (for Kani); it decides as `contains("://")` did.

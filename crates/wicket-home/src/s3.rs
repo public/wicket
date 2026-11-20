@@ -48,12 +48,35 @@ fn yes() -> bool {
 }
 
 impl S3Config {
-    pub fn host(&self) -> Result<String> {
-        let u = url::Url::parse(&self.endpoint).with_context(|| format!("endpoint {}", self.endpoint))?;
+    /// The endpoint, checked: http(s), a host, and no user info (the key goes in `secret:`, and
+    /// the endpoint is shown). Errors don't repeat it.
+    fn url(&self) -> Result<url::Url> {
+        let u = url::Url::parse(&self.endpoint).map_err(|e| anyhow::anyhow!("endpoint isn't a URL ({e})"))?;
         if !matches!(u.scheme(), "https" | "http") {
-            bail!("endpoint {}: not http(s)", self.endpoint);
+            bail!("endpoint: not http(s)");
         }
-        Ok(u.host_str().context("endpoint has no host")?.to_string())
+        if !u.username().is_empty() || u.password().is_some() {
+            bail!("endpoint: no user info (user:password@) in it; the secret access key goes in `secret:`");
+        }
+        if u.host_str().is_none() {
+            bail!("endpoint has no host");
+        }
+        Ok(u)
+    }
+
+    pub fn host(&self) -> Result<String> {
+        Ok(self.url()?.host_str().expect("checked").to_string())
+    }
+
+    /// `scheme://host[:port]`, to show.
+    pub fn shown_endpoint(&self) -> String {
+        match self.url() {
+            Ok(u) => match u.port() {
+                Some(p) => format!("{}://{}:{p}", u.scheme(), u.host_str().unwrap_or("")),
+                None => format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")),
+            },
+            Err(_) => "(an endpoint that isn't valid)".into(),
+        }
     }
 
     pub fn check(&self) -> Result<()> {
@@ -434,6 +457,25 @@ fn authorization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_endpoint_with_user_info_is_refused_without_repeating_it() {
+        let c = |e: &str| S3Config {
+            endpoint: e.into(),
+            bucket: "b".into(),
+            prefix: String::new(),
+            region: "r".into(),
+            path_style: true,
+            access_key_id: "k".into(),
+            secret: "s".into(),
+            conditional_put: true,
+        };
+        let e = c("https://AKIA:hunter2@s3.example.com").check().unwrap_err().to_string();
+        assert!(e.contains("no user info") && !e.contains("hunter2"), "{e}");
+        assert!(!c("ftp://hunter2").check().unwrap_err().to_string().contains("hunter2"));
+        assert_eq!(c("https://s3.example.com/x?y=1").shown_endpoint(), "https://s3.example.com");
+        assert_eq!(c("http://localhost:7070").shown_endpoint(), "http://localhost:7070");
+    }
 
     /// AWS's own worked example (S3 API reference, "Signature Calculations for the Authorization
     /// Header", GET Object): the published signature for the published example credentials.

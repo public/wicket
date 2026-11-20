@@ -11,6 +11,9 @@ pub enum StandingCmd {
     List {
         #[arg(long)]
         all: bool,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// One ask or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and
     /// what it would allow beyond them.
@@ -74,6 +77,31 @@ fn rule_text(r: &wicket_core::manifest::ReachRule) -> String {
         r.paths.iter().map(|p| format!("'{}'", wicket_agent::clip(p, 4096))).collect::<Vec<_>>().join(", "),
         if r.allow_dangerous { ", allow_dangerous: true" } else { "" }
     )
+}
+
+/// A rule as `--json` prints it: the manifest's reach rule fields.
+pub fn rule_json(r: &wicket_core::manifest::ReachRule) -> serde_json::Value {
+    serde_json::json!({ "host": r.host, "methods": r.methods, "paths": r.paths, "allow_dangerous": r.allow_dangerous })
+}
+
+/// `wicket standing list --json`.
+pub(crate) fn standing_list_json(rows: &[wicket_store::Standing], now: i64) -> serde_json::Value {
+    serde_json::Value::Array(rows.iter().map(|s| standing_json(s, now)).collect())
+}
+
+/// One rule of `wicket standing list --json`. `state` is `status`, except that an approved rule
+/// past its `expires_at` is `lapsed`; `for` is `agent`, `zone`, or null while undecided.
+fn standing_json(s: &wicket_store::Standing, now: i64) -> serde_json::Value {
+    let state = match (s.status.as_str(), s.expires_at) {
+        ("approved", Some(e)) if e <= now => "lapsed",
+        (st, _) => st,
+    };
+    serde_json::json!({
+        "id": s.id, "status": s.status, "state": state, "rule": rule_json(&s.rule),
+        "for": s.bound,
+        "principal": s.principal, "zone": s.zone, "run": s.run, "reason": s.reason, "created_at": s.created_at,
+        "decided_at": s.decided_at, "decided_by": s.decided_by, "expires_at": s.expires_at, "revoked_at": s.revoked_at,
+    })
 }
 
 fn when(t: i64) -> String {
@@ -146,7 +174,7 @@ pub fn show(s: &wicket_store::Standing, rule: &wicket_core::manifest::ReachRule)
 pub async fn dispatch(c: StandingCmd) -> Result<()> {
     let human = || -> Result<grant::Granter> { Ok(grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?)) };
     match c {
-        StandingCmd::List { all } => {
+        StandingCmd::List { all, json } => {
             let l = Ledger::open(&ledger_path())?;
             let t = TenantId::single();
             let now = wicket_store::now();
@@ -155,6 +183,9 @@ pub async fn dispatch(c: StandingCmd) -> Result<()> {
             if all {
                 rows.extend(l.standing_with_status(&t, "denied")?);
                 rows.extend(l.standing_with_status(&t, "revoked")?);
+            }
+            if json {
+                return crate::cmd::print_json(&standing_list_json(&rows, now));
             }
             if rows.is_empty() {
                 println!("no standing reach");

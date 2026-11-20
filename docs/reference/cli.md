@@ -9,11 +9,53 @@ only: [the daemon](daemon.md#who-may-run-what) lists which commands need `sudo`.
 numbers with units (`90s`, `10m`, `1h`, `1h 30m`; the units in [the manifest
 reference](manifest.md)).
 
+## Output for scripts
+
+The commands that list things take `--json`: `pending`, `top`, `agents`, `links`, `grant list`,
+`standing list`, `node list`, `service list` and `audit` (and `why-here`, `zone` and `node top`,
+which print one record). With it, stdout holds one JSON document and nothing else: a list is an
+array, `[]` when there is nothing to list, and `top --json` is one frame, an object. Messages and
+warnings go to stderr. A field is never renamed or removed, and its meaning doesn't change; new
+fields may be added, so a script should ignore fields it doesn't know. A field with nothing in it
+is `null`, not left out. Times are Unix seconds (`…_at`, `expires_at`, `not_after`), except
+`top`'s, which are Unix milliseconds (`…_ms`). What an agent wrote (a reason, a rule, an
+attribution) is as it wrote it: shown to a person, it needs the cleaning the text output gives it.
+
+| Output | Fields |
+| --- | --- |
+| `wicket pending --json`, a request | `kind` (`request`), `id`, `run`, `zone`, `method`, `host`, `path`, `prefix` (the whole path prefix asked for), `risk`, `reason`, `created_at`, `attribution` (who in the box asked, as the agent reported it: untrusted) |
+| `wicket pending --json`, a standing ask | `kind` (`standing`), `id`, `run`, `zone`, `principal`, `rule`, `reason`, `created_at` |
+| a standing `rule` | `host`, `methods`, `paths`, `allow_dangerous` |
+| `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
+| `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
+| `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
+| `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
+| `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
+| `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
+| `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
+| an agent's `used` | `requests`, `input_tokens`, `output_tokens`, `secs` |
+| `wicket top --json` | `now_ms`, `nodes`, `runs`, `pending` (how many requests wait), `leases` |
+| `wicket top --json`, each of `nodes` | `name`, `status`, `connected` (null: no run's supervisor has talked to it), `since_ms`, `boxes`, `capacity` (null: not reported), `health` (its latest report; null: none yet) |
+| `wicket top --json`, a node's `capacity` | `vcpus`, `memory_mib`, `used_vcpus`, `used_memory_mib`, `boxes`, `room_mib` (the memory a new box may have now; null from an older node), `full` (it starts no box now) |
+| `wicket top --json`, a node's `health` | `at_ms`, `disk` (`total_bytes`, `avail_bytes`, `reserve_bytes`), `memory` (`total_mib`, `available_mib`, `committed_mib`), `feed_mode`, `feed_fresh_until_ms`, `oom_kills`, `last_oom` (`at_ms` and `what`, or null), `persist_failures`, `last_persist_failure` (likewise), `ca_not_after_ms` (null: no CA), `orphaned` (runs' directories kept with no box: each `run` and `bytes`) |
+| `wicket top --json`, each of `runs` | `run`, `node`, `agent`, `zone`, `status`, `started_ms`, `spent` (null: not reported yet), `connected` |
+| `wicket top --json`, a run's `spent` | `requests`, `input_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `output_tokens` |
+| `wicket top --json`, each of `leases` | `id`, `provider`, `run`, `node`, `not_after_ms`, `reserved_micro_usd` |
+
 - [`wicket run`](#wicket-run)
 - [`wicket session`](#wicket-session)
 - [`wicket top`](#wicket-top)
 - [`wicket agents`](#wicket-agents)
 - [`wicket hibernate`](#wicket-hibernate)
+- [`wicket trigger`](#wicket-trigger)
+  - [`wicket trigger create`](#wicket-trigger-create)
+  - [`wicket trigger list`](#wicket-trigger-list)
+  - [`wicket trigger show`](#wicket-trigger-show)
+  - [`wicket trigger pause`](#wicket-trigger-pause)
+  - [`wicket trigger resume`](#wicket-trigger-resume)
+  - [`wicket trigger renew`](#wicket-trigger-renew)
+  - [`wicket trigger rm`](#wicket-trigger-rm)
+  - [`wicket trigger fire`](#wicket-trigger-fire)
 - [`wicket wrap`](#wicket-wrap)
 - [`wicket links`](#wicket-links)
 - [`wicket unlink`](#wicket-unlink)
@@ -130,6 +172,7 @@ Runs and agents:
   top        A live view of nodes, runs, pending requests and leases (read-only)
   agents     Long-lived agents: state, generation, current run and bundle size
   hibernate  Hibernate a long-lived agent at its next quiet point
+  trigger    Triggers: when a schedule or timer comes due, wake or message an agent
   wrap       Run an agent command line that another program launches, inside a wicket box
   links      Links between boxes (expose/connect/link), newest first
   unlink     Cut a link between boxes: its relay closes it and drops its connections within seconds
@@ -231,6 +274,9 @@ Options:
       --once
           Print one frame and exit (also what a stdout that isn't a terminal gets, every 2 s, without it)
 
+      --json
+          One frame as JSON, then exit (implies --once)
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -243,7 +289,7 @@ Long-lived agents: state, generation, current run and bundle size
 Usage: wicket agents [OPTIONS]
 
 Options:
-      --json  
+      --json  JSON instead of text
   -h, --help  Print help
 ```
 
@@ -268,6 +314,142 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+```
+
+## `wicket trigger`
+
+```text
+Triggers: when a schedule or timer comes due, wake or message an agent.
+
+Triggers (#578): when a schedule or timer comes due, wake or message an agent.
+
+Usage: wicket trigger <COMMAND>
+
+Commands:
+  create  Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`). The agent it wakes or messages is resolved now (a live agent; a `wake` is kept as the agent's id)
+  list    Triggers that aren't removed: each with its state, source, action and next firing
+  show    One trigger (its id, or its name): its document, agent, state, next firing and last firings
+  pause   Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up)
+  resume  Resume a paused trigger: only its owner (or root), since it fires as its owner
+  renew   Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root)
+  rm      Remove a trigger: it fires nothing again
+  fire    Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `wicket trigger create`
+
+```text
+Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`). The agent it wakes or messages is resolved now (a live agent; a `wake` is kept as the agent's id)
+
+Usage: wicket trigger create [OPTIONS] --file <FILE>
+
+Options:
+      --file <FILE>    
+      --lasts <LASTS>  How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew` [default: 30d]
+  -h, --help           Print help
+```
+
+### `wicket trigger list`
+
+```text
+Triggers that aren't removed: each with its state, source, action and next firing
+
+Usage: wicket trigger list
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger show`
+
+```text
+One trigger (its id, or its name): its document, agent, state, next firing and last firings
+
+Usage: wicket trigger show <TRIGGER>
+
+Arguments:
+  <TRIGGER>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger pause`
+
+```text
+Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up)
+
+Usage: wicket trigger pause <TRIGGER>
+
+Arguments:
+  <TRIGGER>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger resume`
+
+```text
+Resume a paused trigger: only its owner (or root), since it fires as its owner
+
+Usage: wicket trigger resume <TRIGGER>
+
+Arguments:
+  <TRIGGER>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger renew`
+
+```text
+Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root)
+
+Usage: wicket trigger renew [OPTIONS] <TRIGGER>
+
+Arguments:
+  <TRIGGER>  
+
+Options:
+      --lasts <LASTS>  [default: 30d]
+  -h, --help           Print help
+```
+
+### `wicket trigger rm`
+
+```text
+Remove a trigger: it fires nothing again
+
+Usage: wicket trigger rm <TRIGGER>
+
+Arguments:
+  <TRIGGER>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket trigger fire`
+
+```text
+Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now
+
+Usage: wicket trigger fire [OPTIONS] --dry-run <TRIGGER>
+
+Arguments:
+  <TRIGGER>  
+
+Options:
+      --event <EVENT>  A JSON file with the event's fields
+      --dry-run        Only show what would happen (the one mode this version has)
+  -h, --help           Print help
 ```
 
 ## `wicket wrap`
@@ -303,6 +485,7 @@ Usage: wicket links [OPTIONS]
 
 Options:
       --tail <TAIL>  [default: 40]
+      --json         JSON instead of text
   -h, --help         Print help
 ```
 
@@ -436,9 +619,12 @@ List pending requests: what boxes asked for, waiting for a decision.
 
 List pending requests: what boxes asked for that their zones don't allow, waiting for a grant or a denial.
 
-Usage: wicket pending
+Usage: wicket pending [OPTIONS]
 
 Options:
+      --json
+          JSON instead of text
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -504,6 +690,7 @@ Usage: wicket grant list [OPTIONS]
 Options:
       --all          Also revoked and expired grants
       --tail <TAIL>  [default: 40]
+      --json         JSON instead of text
   -h, --help         Print help
 ```
 
@@ -568,6 +755,7 @@ Usage: wicket standing list [OPTIONS]
 
 Options:
       --all   
+      --json  JSON instead of text
   -h, --help  Print help
 ```
 
@@ -662,6 +850,7 @@ Options:
       --verify                   
       --against <AGAINST>        With --verify: also check the local chain against exported records and signed checkpoints (JSON lines, or a Collector's OTLP JSON file output). Catches a rewritten or truncated chain. `store:<sink>`: what a `store` sink wrote to the state store
       --issuer-jwk <ISSUER_JWK>  The issuer public key (JWK, as `wicket identity issuer` prints it) checkpoints must be signed with. Default: this installation's issuer key
+      --json                     The records as JSON instead of text
   -h, --help                     Print help
 ```
 
@@ -758,6 +947,8 @@ Options:
           The vault secret holding the Vultr API key [default: vultr-api-key]
       --owner <OWNER>
           The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
+      --json
+          The enrolled nodes as JSON instead of text (not with --provider)
   -h, --help
           Print help
 ```
@@ -1051,9 +1242,10 @@ Options:
 ```text
 The installed services
 
-Usage: wicket service list
+Usage: wicket service list [OPTIONS]
 
 Options:
+      --json  JSON instead of text
   -h, --help  Print help
 ```
 

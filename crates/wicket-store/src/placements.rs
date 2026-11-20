@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS placement_decisions (run TEXT PRIMARY KEY, at_ms INTE
 CREATE TABLE IF NOT EXISTS placement_waits (
   run TEXT PRIMARY KEY, at_ms INTEGER NOT NULL, seen_ms INTEGER NOT NULL, request TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS placement_owners (
+  run TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, principal TEXT
+);
 "#;
 
 /// A waiter not seen for this long (ms) has gone (its process ended): it no longer holds its place.
@@ -32,6 +35,17 @@ pub const WAIT_SEEN_MS: i64 = 10_000;
 
 /// How long an unconfirmed reservation counts against its node (s).
 pub const RESERVE_SECS: i64 = 120;
+
+/// A running run on a node ([`Ledger::running_boxes`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunningBox {
+    pub run: String,
+    pub node: String,
+    pub tenant: String,
+    pub zone: String,
+    /// Its principal's id, if it has an identity.
+    pub principal: Option<String>,
+}
 
 /// A run's reservation.
 #[derive(Clone, Debug, PartialEq)]
@@ -135,16 +149,62 @@ impl Ledger {
         Ok(())
     }
 
-    /// The live waiters ahead of `run`, oldest first: (run, request). All of them if `run` isn't
-    /// waiting. A waiter not seen for [`WAIT_SEEN_MS`] is left out.
-    pub fn waiting_before(&self, run: &str, now_ms: i64) -> Result<Vec<(String, String)>> {
-        let mine: Option<i64> =
-            self.conn.query_row("SELECT at_ms FROM placement_waits WHERE run = ?1", params![run], |r| r.get(0)).optional()?;
+    /// The live waiters, oldest first: (run, when it first waited (ms), request). A waiter not seen
+    /// for [`WAIT_SEEN_MS`] is left out. Which go ahead of a run is the scheduler's
+    /// (`wicket-placement::schedule::ahead`: by priority, then first come, first served).
+    pub fn live_waiters(&self, now_ms: i64) -> Result<Vec<(String, i64, String)>> {
+        let mut st = self.conn.prepare("SELECT run, at_ms, request FROM placement_waits WHERE seen_ms > ?1 ORDER BY at_ms, run")?;
+        let rows = st.query_map(params![now_ms - WAIT_SEEN_MS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every running run placed on a node: what affinity sees on each (#579 step 4).
+    pub fn running_boxes(&self) -> Result<Vec<RunningBox>> {
         let mut st = self.conn.prepare(
-            "SELECT run, request FROM placement_waits WHERE run != ?1 AND seen_ms > ?2 AND (?3 IS NULL OR at_ms < ?3 OR (at_ms = ?3 AND run < ?1))
-             ORDER BY at_ms, run",
+            "SELECT r.id, r.node, r.tenant, r.zone, i.spiffe_id FROM runs r LEFT JOIN identities i ON i.run = r.id
+             WHERE r.status = 'running' AND r.node IS NOT NULL ORDER BY r.node, r.id",
         )?;
-        let rows = st.query_map(params![run, now_ms - WAIT_SEEN_MS, mine], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = st.query_map([], |r| {
+            Ok(RunningBox { run: r.get(0)?, node: r.get(1)?, tenant: r.get(2)?, zone: r.get(3)?, principal: r.get(4)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The nodes that ran a box of `tenant`'s `zone`, by name, with whether one runs there now and
+    /// when one last ran there (s: its end, or its start if it hasn't ended): where its kept volumes
+    /// are, until their retention deletes them (#377).
+    pub fn nodes_that_ran(&self, tenant: &str, zone: &str) -> Result<Vec<(String, bool, i64)>> {
+        let mut st = self.conn.prepare(
+            "SELECT node, MAX(status = 'running'), MAX(COALESCE(ended_at, started_at)) FROM runs
+             WHERE tenant = ?1 AND zone = ?2 AND node IS NOT NULL GROUP BY node ORDER BY node",
+        )?;
+        let rows = st.query_map(params![tenant, zone], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Records whose box `run`'s reservation is for (#579 step 4): in the transaction that reserves,
+    /// so affinity counts a box from its reservation, before its run records its node.
+    pub fn record_placement_owner(&self, run: &str, tenant: &str, zone: &str, principal: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO placement_owners (run, tenant, zone, principal) VALUES (?1, ?2, ?3, ?4)",
+            params![run, tenant, zone, principal],
+        )?;
+        Ok(())
+    }
+
+    /// The boxes being started: reserved within [`RESERVE_SECS`], or bound and still running, with
+    /// whose they are ([`Ledger::record_placement_owner`]). With [`Ledger::running_boxes`], what
+    /// affinity sees on each node: two starts in flight see each other.
+    pub fn boxes_in_flight(&self, now_ms: i64) -> Result<Vec<RunningBox>> {
+        let mut st = self.conn.prepare(
+            "SELECT p.run, p.node, o.tenant, o.zone, o.principal FROM placements p JOIN placement_owners o ON o.run = p.run
+             WHERE (p.state = 'reserved' AND p.at_ms > ?1)
+                OR (p.state = 'bound' AND p.run IN (SELECT id FROM runs WHERE status = 'running'))
+             ORDER BY p.node, p.run",
+        )?;
+        let rows = st.query_map(params![now_ms - RESERVE_SECS * 1000], |r| {
+            Ok(RunningBox { run: r.get(0)?, node: r.get(1)?, tenant: r.get(2)?, zone: r.get(3)?, principal: r.get(4)? })
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -152,7 +212,9 @@ impl Ledger {
     /// reconcile pass's upkeep drops (#582), so the table holds the boxes being started.
     pub fn drop_settled_placements(&self, now: i64) -> Result<usize> {
         let cutoff = (now - 86_400) * 1000;
-        let n = self.conn.execute("DELETE FROM placements WHERE state != 'reserved' AND at_ms < ?1", params![cutoff])?;
+        let mut n = self.conn.execute("DELETE FROM placements WHERE state != 'reserved' AND at_ms < ?1", params![cutoff])?;
+        // Owners go with their reservation.
+        n += self.conn.execute("DELETE FROM placement_owners WHERE run NOT IN (SELECT run FROM placements)", [])?;
         // Decisions are kept with their run: a week, as #582's archive keeps its settled rows.
         let week = (now - crate::ARCHIVE_AFTER_SECS) * 1000;
         Ok(n + self.conn.execute("DELETE FROM placement_decisions WHERE at_ms < ?1", params![week])?)
@@ -202,18 +264,46 @@ mod tests {
         l.wait_for_placement("run_a", "{}", t).unwrap();
         l.wait_for_placement("run_b", "{\"b\":1}", t + 1).unwrap();
         l.wait_for_placement("run_a", "{\"a\":2}", t + 5).unwrap(); // a heartbeat keeps its place
-        let names = |v: Vec<(String, String)>| v.into_iter().map(|(r, _)| r).collect::<Vec<_>>();
-        assert_eq!(names(l.waiting_before("run_b", t + 6).unwrap()), ["run_a"]);
-        assert!(l.waiting_before("run_a", t + 6).unwrap().is_empty(), "first");
-        assert_eq!(
-            l.waiting_before("run_c", t + 6).unwrap(),
-            [("run_a".into(), "{\"a\":2}".into()), ("run_b".into(), "{\"b\":1}".into())],
-            "a newcomer is behind all"
-        );
-        // run_a's process went: not seen for WAIT_SEEN_MS, it holds no place.
-        assert!(l.waiting_before("run_b", t + 5 + WAIT_SEEN_MS).unwrap().is_empty());
+        let names = |v: Vec<(String, i64, String)>| v.into_iter().map(|(r, _, _)| r).collect::<Vec<_>>();
+        assert_eq!(names(l.live_waiters(t + 6).unwrap()), ["run_a", "run_b"]);
+        assert_eq!(l.live_waiters(t + 6).unwrap()[0], ("run_a".into(), t, "{\"a\":2}".into()), "its first wait, its latest request");
+        // run_a's process went: not seen for WAIT_SEEN_MS, it holds no place; run_b, seen since, does.
+        l.wait_for_placement("run_b", "{\"b\":1}", t + 6).unwrap();
+        assert_eq!(names(l.live_waiters(t + 5 + WAIT_SEEN_MS).unwrap()), ["run_b"]);
         l.stop_waiting("run_b").unwrap();
-        assert_eq!(names(l.waiting_before("run_c", t + 6).unwrap()), ["run_a"]);
+        assert_eq!(names(l.live_waiters(t + 6).unwrap()), ["run_a"]);
+    }
+
+    #[test]
+    fn what_runs_where() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId("t0".into());
+        for (run, zone, node) in [("r1", "z1", Some("n1")), ("r2", "z2", Some("n1")), ("r3", "z1", Some("n2")), ("r4", "z1", None)] {
+            l.run_started(&t, &wicket_core::RunId(run.into()), zone, "a").unwrap();
+            if let Some(n) = node {
+                l.set_run_node(run, n).unwrap();
+            }
+        }
+        l.run_ended(&wicket_core::RunId("r3".into()), "done", "").unwrap();
+        let on: Vec<(String, String, String)> = l.running_boxes().unwrap().into_iter().map(|b| (b.run, b.node, b.zone)).collect();
+        assert_eq!(on, [("r1".into(), "n1".into(), "z1".into()), ("r2".into(), "n1".into(), "z2".into())], "running and placed only");
+        let ran = l.nodes_that_ran("t0", "z1").unwrap();
+        assert_eq!(
+            ran.iter().map(|(n, running, _)| (n.as_str(), *running)).collect::<Vec<_>>(),
+            [("n1", true), ("n2", false)],
+            "ended runs too"
+        );
+        assert!(l.nodes_that_ran("t1", "z1").unwrap().is_empty(), "per tenant");
+
+        // A start in flight is seen before its run records its node, and not once released.
+        let now = 5_000_000;
+        l.reserve_placement("r5", "n3", 1.0, 512, now).unwrap();
+        l.record_placement_owner("r5", "t0", "z9", Some("spiffe://w.test/t/t0/z/z9/a/b")).unwrap();
+        let fl = l.boxes_in_flight(now + 1).unwrap();
+        assert_eq!((fl.len(), fl[0].node.as_str(), fl[0].zone.as_str()), (1, "n3", "z9"));
+        assert!(l.boxes_in_flight(now + RESERVE_SECS * 1000 + 1).unwrap().is_empty(), "unconfirmed past its time");
+        l.placement_released("r5").unwrap();
+        assert!(l.boxes_in_flight(now + 1).unwrap().is_empty());
     }
 
     #[test]
