@@ -211,6 +211,38 @@ fn node_list_json() {
 }
 
 #[test]
+fn lease_list_json() {
+    let (_d, mut l) = super::test_ledger("leases");
+    let row = wicket_store::LeaseRow {
+        id: "l-1".into(),
+        tenant: TenantId::single().0,
+        run: "run_l".into(),
+        request_id: None,
+        provider: "static".into(),
+        spec: serde_json::json!({}),
+        hourly_cap: 0,
+        reserved: 0,
+        duration_secs: 1800,
+        created_at: 0,
+        not_after: None,
+        status: "pending".into(),
+        node_id: None,
+        node_name: None,
+        ssh_target: None,
+        host_key: None,
+        billed: None,
+        ended_at: None,
+        detail: None,
+    };
+    l.create_lease(&row, wicket_store::LeaseBudget { max_hourly: 0, max_total: 0 }).unwrap().unwrap();
+    let v = wicket_control::capacity::list_json(&l).unwrap();
+    assert_eq!((v[0]["id"].as_str(), v[0]["status"].as_str(), v[0]["node"].is_null()), (Some("l-1"), Some("pending"), true), "{v:#}");
+    let at = v[0]["created_at"].as_i64().unwrap();
+    assert!((wicket_store::now() - 60..=wicket_store::now()).contains(&at), "Unix seconds, not ms: {at}");
+    documented_as("`wicket lease list --json`", &v);
+}
+
+#[test]
 fn agents_json() {
     let (_d, mut l) = super::test_ledger("agents");
     l.create_agent(&wicket_store::NewAgent {
@@ -334,5 +366,19 @@ fn message_inbox_receipts_and_principals_json() {
     assert_eq!((v[0]["id"].as_str(), v[0]["relation"].as_str()), (Some(worker.as_str()), Some("acts for you")), "{v:#}");
     documented_as("`wicket message principals --json`", &v);
     let bob = wicket_identity::operator_id("w.test", &t.0, "unix", "bob");
+    assert_eq!(super::message::principals_json(&l, &t, &bob, &issuer.verifying_key()).unwrap(), serde_json::json!([]));
+    // An empty accept_from entry (from before manifests refused one) lists no operator: as send decides.
+    l.put_identity(&wicket_store::IdentityRow {
+        run: "run_e".into(),
+        tenant: t.0.clone(),
+        spiffe_id: "spiffe://w.test/t/default/z/work/a/empty".into(),
+        zone: "work".into(),
+        agent: "empty".into(),
+        parent_run: None,
+        accept_from: vec![String::new()],
+        jws: "x.y.z".into(),
+        issued_at: wicket_store::now(),
+    })
+    .unwrap();
     assert_eq!(super::message::principals_json(&l, &t, &bob, &issuer.verifying_key()).unwrap(), serde_json::json!([]));
 }

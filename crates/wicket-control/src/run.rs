@@ -1432,6 +1432,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
             spawn: spawn_ctx.clone(),
             adopt: adopter.clone(),
             timings: timings.clone(),
+            names: names_settings.clone(),
         })
         .await;
         // The room it reserved (#579): counted until the node reports the box, or given back.
@@ -3010,22 +3011,25 @@ impl tokio::io::AsyncWrite for Counted {
 
 /// Whether a hibernate asked only to make room is declined now (#579 step 4), and why
 /// (`hibernate::preempted_hibernate`). Declined, preemption's mark is cleared (so the wake gives up on
-/// this agent at once) and it is audited as `placement.preempt_declined`.
+/// this agent at once) and it is audited as `placement.preempt_declined`, once: with no mark (given
+/// up on, or declined already) there is nothing to clear or record.
 fn preemption_declined(ledger: &Mutex<Ledger>, tenant: &wicket_core::TenantId, run: &RunId, live_children: usize) -> Option<String> {
     let now = wicket_feed::now_ms();
     let l = ledger.lock().ok()?;
     let mark = l.preemption_mark(&run.0, now).ok().flatten();
     let why = crate::hibernate::preempted_hibernate(true, mark.as_ref(), live_children, now).err()?;
-    // Only the request it read: one a later wake made since (this one past its deadline) stands.
+    // No mark: preemption gave up on it already (and audited that), or this supervisor declined it
+    // already (a re-check out of a linger): it declines, with nothing more to record.
     if let Some(m) = &mark {
+        // Only the request it read: one a later wake made since (this one past its deadline) stands.
         let _ = l.clear_preempted(&run.0, m.for_run.as_deref().unwrap_or_default(), Some(m.asked_ms));
+        let _ = l.audit(
+            tenant,
+            Some(run),
+            "placement.preempt_declined",
+            &serde_json::json!({ "run": run.0, "for": m.for_run, "why": why, "children": live_children }),
+        );
     }
-    let _ = l.audit(
-        tenant,
-        Some(run),
-        "placement.preempt_declined",
-        &serde_json::json!({ "run": run.0, "for": mark.and_then(|m| m.for_run), "why": why, "children": live_children }),
-    );
     Some(why.to_string())
 }
 

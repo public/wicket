@@ -260,9 +260,9 @@ impl Default for Limits {
 
 /// Counts open connections per client address.
 #[derive(Default)]
-struct PerIp(Mutex<HashMap<String, usize>>);
+pub(crate) struct PerIp(Mutex<HashMap<String, usize>>);
 
-struct PerIpGuard(Arc<PerIp>, String);
+pub(crate) struct PerIpGuard(Arc<PerIp>, String);
 
 impl Drop for PerIpGuard {
     fn drop(&mut self) {
@@ -277,7 +277,7 @@ impl Drop for PerIpGuard {
 }
 
 impl PerIp {
-    fn enter(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<PerIpGuard> {
+    pub(crate) fn enter(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<PerIpGuard> {
         let key = ip_key(ip);
         let mut m = self.0.lock().expect("lock");
         let n = m.entry(key.clone()).or_insert(0);
@@ -292,7 +292,7 @@ impl PerIp {
 /// Accepts connections until the listener fails: over-limit connections are closed at once, TLS
 /// (if any) is negotiated within the handshake timeout, and ACME validation handshakes are closed
 /// after the handshake (they carry no HTTP).
-pub async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, state: Arc<State>) -> Result<()> {
+pub(super) async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, state: Arc<State>) -> Result<()> {
     let limits = state.limits.clone();
     let slots = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip = Arc::new(PerIp::default());

@@ -180,6 +180,22 @@ struct Entry {
 /// How a node fetches a secret for a run: over the run's own connection to its control host.
 pub type Fetcher = Arc<dyn Fn(String, String) -> futures_util::future::BoxFuture<'static, Result<Fetched, String>> + Send + Sync>;
 
+/// Whether `name` is a run's own value rather than a vault secret: a swap's value
+/// ([`crate::chan::swap_value_key`]), whose name has a `.`, which no vault secret's has (#773).
+fn is_run_value(name: &str) -> bool {
+    name.contains('.')
+}
+
+/// Where the cache keeps `name` for `run`: a vault secret under its name, one value shared by every
+/// run that uses it; a run's own value under the run too, so no other run can read or replace it
+/// (#773: two runs' `swap.0` are different credentials).
+fn slot(run: &str, name: &str) -> String {
+    match is_run_value(name) {
+        true => format!("{name}@{run}"),
+        false => name.to_string(),
+    }
+}
+
 /// One fetch in flight for a run and a secret.
 type Inflight = Arc<tokio::sync::Mutex<()>>;
 
@@ -230,7 +246,7 @@ impl Cache {
     /// Takes a secret fetched for `run`.
     pub fn put(&self, run: &str, f: &Fetched) {
         let mut m = self.entries.lock().expect("cache");
-        let e = m.entry(f.name.clone()).or_insert_with(|| Entry {
+        let e = m.entry(slot(run, &f.name)).or_insert_with(|| Entry {
             value: Locked::new(&f.value),
             hosts: vec![],
             upstream_expiry: None,
@@ -251,7 +267,9 @@ impl Cache {
     pub fn share(&self, from: &str, to: &str, names: &[String], until: i64) -> Vec<String> {
         let mut m = self.entries.lock().expect("cache");
         let mut shared = vec![];
-        for n in names {
+        // A run's own values (its swaps') are never shared: only vault secrets, which are one value
+        // for every run of the control host.
+        for n in names.iter().filter(|n| !is_run_value(n)) {
             if let Some(e) = m.get_mut(n) {
                 if let Some(u) = e.users.get(from).copied() {
                     e.users.insert(to.into(), u.min(until));
@@ -266,10 +284,11 @@ impl Cache {
     /// no run uses it any more.
     pub fn revoke(&self, run: &str, name: &str) {
         let mut m = self.entries.lock().expect("cache");
-        if let Some(e) = m.get_mut(name) {
+        let key = slot(run, name);
+        if let Some(e) = m.get_mut(&key) {
             e.users.remove(run);
             if e.users.is_empty() {
-                m.remove(name);
+                m.remove(&key);
             }
         }
     }
@@ -397,7 +416,7 @@ struct RunSecrets {
 impl wicket_proxy::vault::SecretSource for RunSecrets {
     fn get(&self, name: &str) -> Result<String> {
         let m = self.cache.entries.lock().expect("cache");
-        match m.get(name) {
+        match m.get(&slot(&self.run, name)) {
             Some(e) if self.cache.usable(e, &self.run) => e.value.text(),
             _ => bail!("secret {name:?} is not cached on this node for this run"),
         }
@@ -405,12 +424,12 @@ impl wicket_proxy::vault::SecretSource for RunSecrets {
 
     fn hosts(&self, name: &str) -> Vec<String> {
         let m = self.cache.entries.lock().expect("cache");
-        m.get(name).filter(|e| self.cache.usable(e, &self.run)).map(|e| e.hosts.clone()).unwrap_or_default()
+        m.get(&slot(&self.run, name)).filter(|e| self.cache.usable(e, &self.run)).map(|e| e.hosts.clone()).unwrap_or_default()
     }
 
     fn has(&self, name: &str) -> bool {
         let m = self.cache.entries.lock().expect("cache");
-        m.get(name).is_some_and(|e| self.cache.usable(e, &self.run))
+        m.get(&slot(&self.run, name)).is_some_and(|e| self.cache.usable(e, &self.run))
     }
 
     fn fetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
@@ -723,6 +742,38 @@ mod tests {
         a.refetch("gh").await.unwrap();
         assert_eq!((a.get("gh").unwrap().as_str(), calls.load(Ordering::SeqCst)), ("ghp_wicket-test-refreshed", 2));
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// #773: two runs' swap values share a key (`swap.0`) but are different credentials: each run
+    /// reads only its own, a second run's fetch replaces nothing of the first's, a revoke of one
+    /// leaves the other, and a child is never given its parent's.
+    #[tokio::test]
+    async fn a_runs_swap_value_is_its_own() {
+        let cache = Cache::new(Arc::new(|| 1_000));
+        let value = |v: &str| Fetched {
+            name: "swap.0".into(),
+            value: v.into(),
+            hosts: vec!["m.example".into()],
+            not_after: 5_000,
+            upstream_expiry: None,
+        };
+        cache.put(RA, &value("session-a"));
+        cache.put(RB, &value("session-b"));
+        let fail: Fetcher = Arc::new(|_, _| Box::pin(async { Err("unreachable".to_string()) }));
+        let a = Vault::from_source(cache.source(RA, fail.clone()));
+        let b = Vault::from_source(cache.source(RB, fail.clone()));
+        assert_eq!(a.get_for("swap.0", "m.example").unwrap(), "session-a");
+        assert_eq!(b.get_for("swap.0", "m.example").unwrap(), "session-b");
+        // A third run with no value of its own reads none.
+        let c = Vault::from_source(cache.source("run_cccccccccccccccccccccccccc", fail));
+        assert!(!c.has("swap.0") && c.get("swap.0").is_err());
+        assert!(cache.share(RA, "run_cccccccccccccccccccccccccc", &["swap.0".into()], 5_000).is_empty(), "never shared");
+        assert!(!c.has("swap.0"));
+        cache.revoke(RB, "swap.0");
+        assert!(!b.has("swap.0"));
+        assert_eq!(a.get("swap.0").unwrap(), "session-a");
+        cache.release(RA);
+        assert!(cache.names().is_empty());
     }
 
     fn grep_tree(d: &Path, needle: &str) -> bool {

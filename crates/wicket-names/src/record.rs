@@ -72,7 +72,21 @@ impl Record {
         let value = match self.rtype {
             RecordType::A => self.value.trim().parse::<Ipv4Addr>().map(|i| i.to_string()).unwrap_or_else(|_| self.value.clone()),
             RecordType::Aaaa => self.value.trim().parse::<Ipv6Addr>().map(|i| i.to_string()).unwrap_or_else(|_| self.value.clone()),
-            _ => self.value.clone(),
+            // `<priority> <weight> <port> <target>`, its target as a name is (#778 review, R1:
+            // providers list it with a trailing dot, or in upper case).
+            RecordType::Srv => {
+                let parts: Vec<&str> = self.value.split_whitespace().collect();
+                match parts.as_slice() {
+                    [p, w, port, target] => format!("{p} {w} {port} {}", norm_name(target)),
+                    _ => self.value.clone(),
+                }
+            }
+            // The text without the quotes a provider may list it in.
+            RecordType::Txt => {
+                let v = self.value.trim();
+                v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(v).to_string()
+            }
+            RecordType::Other => self.value.clone(),
         };
         Record { name: norm_name(&self.name), rtype: self.rtype, value, ttl: self.ttl }
     }
@@ -189,6 +203,20 @@ mod tests {
         let n = r.normalized();
         assert_eq!(n.name, "demo.boxes.example.com");
         assert_eq!(n.value, "2001:db8::1");
+        let srv = Record {
+            name: "_http._tcp.demo.boxes.example.com".into(),
+            rtype: RecordType::Srv,
+            value: "0 0 20001 Demo.Boxes.Example.com.".into(),
+            ttl: 60,
+        };
+        assert_eq!(srv.normalized(), Record::srv("demo.boxes.example.com", "http", 20001, 60));
+        let txt = Record {
+            name: "_wicket.demo.boxes.example.com".into(),
+            rtype: RecordType::Txt,
+            value: "\"wicket-owner=a1b2c3d4;name=g1\"".into(),
+            ttl: 60,
+        };
+        assert_eq!(txt.normalized().value, "wicket-owner=a1b2c3d4;name=g1");
     }
 
     #[test]

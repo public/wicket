@@ -6,6 +6,7 @@
 // a turn. Exits non-zero on the first failure.
 import { createApp, nextTick } from 'vue';
 import App from '../src/App.vue';
+import { blastSections, describe, reasonLine, requestState, updateSections } from '../src/lib/wicket';
 
 const RUN = 'run_s';
 const fail = (why: string): never => {
@@ -41,7 +42,13 @@ const pk = { challenge: 'AAAA', allowCredentials: [], userVerification: 'require
       return reply({ ok: 'opened', ticket: 'feedc0de' });
     case '/api/decide/begin':
       return reply({
-        action: { action: 'decide', request: body.id, run: RUN, decision: body.decision, uses: 1, ttl_secs: 600, method: 'GET', host: 'api.example.com', path: '/v1', risk: 'R1ReadScoped', scope: 'run' },
+        action: {
+          action: 'decide', request: body.id, run: RUN, decision: body.decision, uses: 1, ttl_secs: 600, method: 'GET', host: 'api.example.com', path: '/v1', risk: 'R1ReadScoped', scope: 'run',
+          effect_sha256: 'ab'.repeat(32),
+          // What the sheet must show from the signed action (#652), never from the page's ask.
+          blast: { widens: ['every path under /v1'], examples: ['GET api.example.com/v1/admin'], zone_rules: [], covered: 3, recent: 7 },
+          update: { sha256: 'cd'.repeat(32), artifact: 'wicket', size: 2097152, commit_said: 'abc123', nodes: ['n1', 'n2'], applies: true, why_not: null, node: null },
+        },
         publicKey: pk,
       });
     case '/api/decide/finish':
@@ -104,11 +111,11 @@ class FakeSocket {
       up({ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed', content: [{ type: 'diff', path: '/workspace/main.rs', oldText: 'a', newText: 'b' }] });
       up({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'fixed <img src=x onerror=alert(1)><b>bold</b>' } });
       const esc = { id: 'r-1', method: 'GET', host: 'api.example.com', path: '/v1', risk: 'R1ReadScoped', reason: 'needs the API', prefix: false, status: 'pending' };
-      up({ sessionUpdate: 'tool_call', toolCallId: 'wicket:escalation:r-1', title: 'wicket escalation r-1', kind: 'fetch', status: 'pending', _meta: { wicket: { escalation: esc } } });
+      up({ sessionUpdate: 'tool_call', toolCallId: 'wicket:escalation:r-1', title: 'wicket request r-1', kind: 'fetch', status: 'pending', _meta: { wicket: { escalation: esc } } });
       this.serve({
         jsonrpc: '2.0', id: 'wicket-0', method: 'session/request_permission',
         params: {
-          sessionId: RUN, toolCall: { toolCallId: 'wicket:escalation:r-1', title: 'wicket escalation r-1', kind: 'fetch', status: 'pending' },
+          sessionId: RUN, toolCall: { toolCallId: 'wicket:escalation:r-1', title: 'wicket request r-1', kind: 'fetch', status: 'pending' },
           options: [
             { optionId: 'approve', name: 'Approve once (passkey)', kind: 'allow_once' },
             { optionId: 'deny', name: 'Deny (passkey)', kind: 'reject_once' },
@@ -119,7 +126,7 @@ class FakeSocket {
       });
     }
     if (m.id === 'wicket-0' && m.result) {
-      up({ sessionUpdate: 'tool_call_update', toolCallId: 'wicket:escalation:r-1', status: 'completed', _meta: { wicket: { escalation: { id: 'r-1', status: 'approved' } } } });
+      up({ sessionUpdate: 'tool_call_update', toolCallId: 'wicket:escalation:r-1', status: 'completed', _meta: { wicket: { escalation: { id: 'r-1', status: 'granted' } } } });
     }
     if (m.method === 'session/prompt') {
       const said = m.params.prompt[0].text;
@@ -170,11 +177,26 @@ const diff = document.querySelector('.diff pre.new');
 if (diff?.textContent !== 'b') fail('the diff');
 
 // An escalation: once options only; decided with the passkey through /api/decide/*, then answered.
-await until('the escalation card', () => text().includes('wicket is asking you'));
-if (!text().includes('GET api.example.com/v1') || !text().includes('needs the API') || !text().includes('R1 · read')) fail('the escalation described');
+await until('the escalation card', () => text().includes('Request waiting for you'));
+if (!text().includes('wicket request · waiting for you')) fail("the request's card names it a request, its status in words");
+if (!text().includes('wicket enforces this one')) fail('which ask wicket enforces');
+if (!text().includes('GET api.example.com/v1') || !text().includes('Why: “needs the API”') || !text().includes('R1 · read')) fail('the escalation described, its reason as the agent\'s words');
 if (button('Always allow')) fail('an "always" option offered');
 await tap('Approve once (passkey)');
 await until('the decision described', () => text().includes('Approve once for 10 min: GET api.example.com/v1'));
+for (const want of [
+  `effect ${'ab'.repeat(8)}`,
+  'This approval is wider than the one request:',
+  'every path under /v1',
+  'GET api.example.com/v1/admin',
+  'It would have covered 3 of this run’s last 7 egress requests.',
+  'Approving installs this build now',
+  'artifact: wicket (2.0 MiB)',
+  'commit: abc123 (as the agent says; not checked)',
+  'then nodes n1, n2 (the first is the canary)',
+]) {
+  if (!document.querySelector('.sheet')?.textContent?.includes(want)) fail(`the sheet lacks ${JSON.stringify(want)}`);
+}
 if (sent.some((m) => m.id === 'wicket-0')) fail('answered before the passkey signed');
 await tap('Sign with passkey');
 await until('the ACP answer', () => sent.some((m) => m.id === 'wicket-0'));
@@ -185,7 +207,8 @@ if (decide?.body.id !== 'r-1' || decide.body.decision !== 'approve' || decide.bo
 if (!posts.some((p) => p.path === '/api/decide/finish')) fail('the decision signed through /api/decide/finish');
 if (assertions !== 2) fail(`passkey assertions: ${assertions}`);
 await until('the escalation approved', () => document.querySelector('.escalation.approved') !== null);
-if (text().includes('wicket is asking you')) fail('the answered prompt still shown');
+if (text().includes('Request waiting for you')) fail('the answered prompt still shown');
+if (!text().includes('wicket request · allowed')) fail('the approval in words');
 
 // A prompt, through the endpoint.
 const ta = document.querySelector('.composer textarea') as HTMLTextAreaElement;
@@ -207,5 +230,17 @@ await tap('Stop');
 if (!sent.some((m) => m.method === 'session/cancel' && m.params.sessionId === RUN)) fail('session/cancel sent');
 await until('the cancelled turn', () => text().includes('the turn ended: cancelled'));
 
+// A wicket.internal request's text is the agent's words mixed with wicket's, never wicket's alone.
+if (reasonLine({ host: 'wicket.internal', reason: 'start agent x' }) !== 'The request\'s text, with the agent\'s words in it: “start agent x”') fail('the mixed text labelled');
+if (reasonLine({ host: 'h', reason: '' }) !== '') fail('no reason, no line');
+if (!describe({ action: 'decide', decision: 'deny', method: 'GET', host: 'h', path: '/', risk: 'R0Read', request: 'r', run: 'x', requested_by: ['sub'] }).includes(' · asked by sub (as reported)')) fail('who asked, as reported');
+// The sheet's other cases, and each status in words (#647, #652).
+if (blastSections(null).length || updateSections(undefined).length) fail('a sheet section with nothing to show');
+const notApplied = updateSections({ sha256: 'ef'.repeat(32), applies: false, why_not: 'no file in the outbox' });
+if (notApplied.length !== 1 || !notApplied[0].title.includes("doesn’t install it: no file in the outbox")) fail(`an update that won't apply: ${JSON.stringify(notApplied)}`);
+for (const [st, word, cls] of [['pending', 'waiting for you', 'pending'], ['granted', 'allowed', 'approved'], ['denied', 'refused', 'denied'], ['withdrawn', 'withdrawn: the run ended first', 'withdrawn']]) {
+  const r = requestState(st);
+  if (r.word !== word || r.cls !== cls) fail(`${st}: ${JSON.stringify(r)}`);
+}
 console.log(JSON.stringify({ ok: true, sent: sent.length, posts: posts.length, assertions }));
 process.exit(0);

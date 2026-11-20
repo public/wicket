@@ -135,8 +135,20 @@ impl Ledger {
             };
             Ok(true)
         })();
-        let _ = self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
-        r
+        match r {
+            Ok(read) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(read),
+                Err(e) => {
+                    // Not committed: neither the read nor its record happened.
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 }
 

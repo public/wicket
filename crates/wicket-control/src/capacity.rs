@@ -368,6 +368,24 @@ pub fn lease_of_request(l: &Ledger, r: &wicket_store::Request) -> Result<Option<
     Ok(l.lease_for_request(&r.id)?.filter(|x| x.run == r.run && x.tenant == r.tenant).map(|x| x.id))
 }
 
+/// `wicket lease list --json`: the rows the text shows, money in micro-USD, times in Unix seconds.
+pub fn list_json(l: &Ledger) -> Result<serde_json::Value> {
+    Ok(serde_json::Value::Array(
+        l.leases(&[])?
+            .into_iter()
+            .map(|x| {
+                serde_json::json!({
+                    "id": x.id, "status": x.status, "run": x.run, "provider": x.provider, "request": x.request_id,
+                    "node": x.node_name, "node_id": x.node_id,
+                    "hourly_cap_micro_usd": x.hourly_cap, "reserved_micro_usd": x.reserved, "billed_micro_usd": x.billed,
+                    "duration_secs": x.duration_secs, "created_at": x.created_at, "not_after": x.not_after, "ended_at": x.ended_at,
+                    "detail": x.detail,
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// `wicket lease list`.
 pub fn list() -> Result<()> {
     let l = Ledger::open(&crate::ledger_path())?;
