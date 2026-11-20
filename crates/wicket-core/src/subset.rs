@@ -4,7 +4,7 @@
 //! can narrow its request or ask a human for the difference (request_access).
 
 use crate::manifest::{host_matches, Isolation, UnlistedHosts, ZoneSpec};
-use crate::text::shown;
+use crate::text::{shown, shown_list};
 use std::time::Duration;
 
 /// What the constructing agent has: its zone and what's left of its budgets.
@@ -104,7 +104,7 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     }
     // By digest where either side is pinned (#192): one matcher, wherever a spawn is decided.
     if crate::image::matching(ask.image, &parent.images).is_none() {
-        v.push(format!("image {}: not one this zone may start (allowed: {})", shown(ask.image, 120), parent.images.join(", ")));
+        v.push(format!("image {}: not one this zone may start (allowed: {})", shown(ask.image, 120), shown_list(&parent.images, 120, 8)));
     }
     for i in &c.images {
         if crate::image::matching(i, &parent.images).is_none() {
@@ -197,11 +197,11 @@ pub fn reach_within(outer: &ZoneSpec, inner: &ZoneSpec) -> Result<(), Vec<String
 fn model_violations(c: &crate::manifest::LlmSpec, p: &crate::manifest::LlmSpec) -> Vec<String> {
     let Some(pm) = &p.models else { return vec![] };
     match &c.models {
-        None => vec![format!("any model: this zone allows only {}", pm.join(", "))],
+        None => vec![format!("any model: this zone allows only {}", shown_list(pm, 128, 8))],
         Some(cm) => cm
             .iter()
             .filter(|m| !pm.iter().any(|q| crate::manifest::model_covers(q, m)))
-            .map(|m| format!("model {}: this zone allows only {}", shown(m, 128), pm.join(", ")))
+            .map(|m| format!("model {}: this zone allows only {}", shown(m, 128), shown_list(pm, 128, 8)))
             .collect(),
     }
 }
@@ -259,7 +259,7 @@ fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
     for (i, f) in p.forbid.iter().enumerate() {
         let kept = f.paths.iter().all(|fp| c.forbid.iter().any(|g| host_covers(&g.host, &f.host) && path_covered(&g.paths, fp)));
         if !kept {
-            v.push(format!("forbid rule {i} ({} {}) of this zone must be kept", f.host, f.paths.join(", ")));
+            v.push(format!("forbid rule {i} ({} {}) of this zone must be kept", shown(&f.host, 120), shown_list(&f.paths, 200, 8)));
         }
     }
     for i in &c.inject {
