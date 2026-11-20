@@ -93,8 +93,9 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
      - No trigger's token: 404, the same as for an unknown trigger. That is counted by client
        address (an IPv6 address by its /64), and an address that keeps sending them is answered 429
        (30 a minute, a burst of 10).
-     - A request with a trigger's token is never slowed down for its address's failures: behind a
-       proxy, or from GitHub's shared addresses, others share it.
+     - A request with a trigger's token isn't slowed down for its address's bad tokens or bad
+       signatures: behind a proxy, or from GitHub's shared addresses, others share it. Only its own
+       bodies to that trigger can slow it down, if they keep timing out or finding no room (step 2);
      - Behind a reverse proxy named with `--trusted-proxy`, the client's address is the one it
        forwards (as the console's, #123);
   2. the body: at most 1 MiB. 413 from its announced length, or as soon as it runs past, read no
@@ -105,8 +106,8 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
      whole budget from the node's other triggers, and half-sent bodies can't exhaust intake's
      memory (`MemoryMax=256M`). A body keeps its room until it is answered. A body that
      doesn't arrive within the body timeout is answered 408.
-     - An address whose bodies to a trigger keep being 408, 503 (no room) or 401 (4 at once,
-       then 2 a minute) gets 429 for its next requests to that trigger before any of the body is
+     - An address whose bodies to a trigger keep being 408 or 503 (no room) (4 at once, then 2 a
+       minute) gets 429 for its next requests to that trigger before any of the body is
        read. Other addresses, and its requests to other triggers, aren't slowed down.
      - **A leaked URL can still degrade its own trigger:** from many addresses, slow bodies can keep
        its share full, so its real deliveries get 503. The node's other triggers keep their room.

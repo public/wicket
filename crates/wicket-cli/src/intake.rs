@@ -41,7 +41,7 @@ pub const ALL_BURST: f64 = 100.0;
 /// before anything else is looked at.
 pub const FAILURES_PER_MIN: f64 = 30.0;
 pub const FAILURES_BURST: f64 = 10.0;
-/// One address's bodies to one trigger that were too slow, found no room, or didn't verify: past
+/// One address's bodies to one trigger that were too slow or found no room: past
 /// this burst (refilled at this rate) its next requests to that trigger are 429 before any of the
 /// body is read, so a leaked URL can't keep the trigger's body share full (#714 fifth review).
 pub const SLOW_PER_MIN: f64 = 2.0;
@@ -135,7 +135,7 @@ pub struct Intake {
     failures: Mutex<HashMap<String, Bucket>>,
     /// Bad signatures, by trigger: they never slow down another address's delivery.
     bad_signatures: Mutex<HashMap<String, Bucket>>,
-    /// Bodies too slow, without room, or unverified, by trigger and address (`slow_key`).
+    /// Bodies too slow or without room, by trigger and address (`slow_key`).
     slow: Mutex<HashMap<String, Bucket>>,
     /// Deliveries handed to the node, by (trigger, body hash) and (trigger, delivery id).
     seen: Mutex<HashMap<(String, String), Instant>>,
@@ -258,13 +258,13 @@ impl Intake {
     }
 
     /// Whether address `ip` may send `trigger` a body: not if too many of its bodies to it lately
-    /// were too slow, found no room, or didn't verify.
+    /// were too slow or found no room.
     pub fn may_send(&self, trigger: &str, ip: IpAddr, at: Instant) -> bool {
         let mut m = self.slow.lock().expect("slow");
         m.get_mut(&slow_key(trigger, ip)).is_none_or(|b| b.left(SLOW_PER_MIN, SLOW_BURST, at))
     }
 
-    /// Charges a body that was too slow, found no room, or didn't verify to its address and trigger.
+    /// Charges a body that was too slow or found no room to its address and trigger.
     pub fn charge_slow(&self, trigger: &str, ip: IpAddr, at: Instant) {
         let mut m = self.slow.lock().expect("slow");
         let key = slow_key(trigger, ip);
@@ -597,8 +597,8 @@ async fn handle(
         Err(Outcome::Answer(code, word)) => return Ok(answer(code, word)),
         Err(Outcome::Spool(_)) => unreachable!("admit spools nothing"),
     };
-    // An address whose bodies to this trigger keep timing out, finding no room or failing to verify
-    // is refused before its body is read (#714 fifth review).
+    // An address whose bodies to this trigger keep timing out or finding no room is refused before
+    // its body is read (#714 fifth review).
     if !i.may_send(&t.trigger, ip, at) {
         i.refused.lock().expect("refused").rate += 1;
         return Ok(answer(StatusCode::TOO_MANY_REQUESTS, "slow down"));
@@ -641,12 +641,10 @@ async fn handle(
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(String::from);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     Ok(match i.verify(&t, &header, &body, now, at) {
-        Outcome::Answer(code, word) => {
-            if code == StatusCode::UNAUTHORIZED {
-                i.charge_slow(&t.trigger, ip, at);
-            }
-            answer(code, word)
-        }
+        // A bad signature isn't charged to the address: anyone with a leaked URL can point their own
+        // repository's webhook at it with a wrong secret, and GitHub's shared addresses would send
+        // the 401s. Bad signatures have the trigger's own bucket.
+        Outcome::Answer(code, word) => answer(code, word),
         Outcome::Spool(e) => {
             // Reserved at verify, so concurrent replays don't each charge the bucket (#714 fourth
             // review, R2); given back unless the node takes it.

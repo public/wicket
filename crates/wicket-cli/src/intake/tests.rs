@@ -561,3 +561,30 @@ async fn the_server_is_bounded() {
     assert_eq!(n, 0, "closed without an answer");
     drop(held);
 }
+
+/// #714 final check: bad signatures aren't charged to their address, so a leaked URL pointed at
+/// with a wrong secret from GitHub's shared addresses can't slow down GitHub's real deliveries.
+#[tokio::test]
+async fn bad_signatures_dont_slow_down_their_address() {
+    let token = ik::new_token().unwrap();
+    let s = served("badsig", &token, limits()).await;
+    let path = format!("/hook/trg_1/{token}");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let body: &[u8] = b"{}";
+    for n in 0..8 {
+        let id = format!("bad-{n}");
+        let forged = vec![
+            (ik::GENERIC_SIGNATURE, ik::generic_signature(b"wrong-wrong-wrong-wrong", now, &id, body)),
+            (ik::GENERIC_TIMESTAMP, now.to_string()),
+            (ik::GENERIC_DELIVERY, id.clone()),
+        ];
+        assert!(send(s.addr, &post(&path, &forged, body)).await.starts_with("HTTP/1.1 401"));
+    }
+    let signed = vec![
+        (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", now, "good", body)),
+        (ik::GENERIC_TIMESTAMP, now.to_string()),
+        (ik::GENERIC_DELIVERY, "good".to_string()),
+    ];
+    let ok = send(s.addr, &post(&path, &signed, body)).await;
+    assert!(ok.starts_with("HTTP/1.1 202"), "{ok}");
+}

@@ -143,6 +143,8 @@ pub fn github_event_object(event: &str) -> Option<&'static str> {
         "check_run" => "/check_run",
         "workflow_run" => "/workflow_run",
         "push" => "/ref",
+        // Not listened to yet (not in `GITHUB_EVENTS`), but told apart from its status already.
+        "deployment" => "/deployment",
         _ => return None,
     })
 }
@@ -166,6 +168,7 @@ pub fn github_body_is(event: &str, body: &Value) -> bool {
         "issue_comment" => has("/comment"),
         "push" => has("/after") && (has("/commits") || has("/pusher")),
         "check_suite" | "check_run" | "workflow_run" => !has("/deployment") && !has("/deployment_status"),
+        "deployment" => !has("/deployment_status"),
         _ => true,
     };
     has(p) && fits
@@ -570,6 +573,8 @@ mod tests {
         assert!(!github_body_is("check_run", &status) && !github_body_is("workflow_run", &status));
         let deployment = serde_json::json!({ "deployment": {}, "workflow_run": {} });
         assert!(!github_body_is("workflow_run", &deployment));
+        assert!(github_body_is("deployment", &deployment));
+        assert!(!github_body_is("deployment", &status), "a deployment's status isn't a deployment");
         assert!(github_body_is("check_run", &serde_json::json!({ "check_run": { "deployment": {} } })), "a run's own deployment is fine");
     }
 

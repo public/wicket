@@ -32,10 +32,11 @@ type: Added
       202 without counting.
     - Bodies in flight share a 32 MiB budget, so held connections can't exhaust intake's memory.
     - A body takes room as its bytes arrive, within 8 MiB for one trigger and for one address. An
-      address whose bodies to a trigger keep timing out, finding no room or failing to verify gets
+      address whose bodies to a trigger keep timing out or finding no room gets
       429 before its body is read. A leaked URL can still slow its own trigger: rotate its URL.
     - Requests with no trigger's token are counted by address, and bad signatures by trigger. A
-      delivery with a valid token is never slowed down for its address. `--trusted-proxy` names a
+      delivery with a valid token isn't slowed down for its address's bad tokens or signatures, only
+      for its own bodies to that trigger timing out or finding no room. `--trusted-proxy` names a
       reverse proxy in front.
     - The trigger's `per_hour` still holds, counted on the control host's clock.
     - A delivery read more than 15 minutes late is passed over.
