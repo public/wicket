@@ -593,9 +593,38 @@ fn instance_id(l: &Ledger, arg: &str) -> Result<String> {
 
 /// `wicket node release`: destroys an owned node now (by its instance id, or the name `create` gave
 /// it), refusing anything without the owner tag, and revokes its enrolment.
-pub async fn release(common: Common, id: String) -> Result<()> {
+/// A node the ledger has as placed and active goes through [`crate::noderelease`], as the
+/// console's release does (#710): decided as root's (or, not as root, as the operator's within its
+/// authority) on the effect printed, audited first, then released with the node's own placer (its
+/// owner and API key), not `common`'s.
+pub async fn release(common: Common, id: String, reason: Option<String>, root: bool) -> Result<()> {
+    use crate::noderelease as nr;
+    let mut l = Ledger::open(&crate::ledger_path())?;
+    let now = wicket_store::now();
+    if let Some(n) = nr::view(&l, &id, now)? {
+        let p = release_placer(&n.owner, &n.api_key_secret)?;
+        // operators.yaml that doesn't parse doesn't stop root's break-glass release; only its identity.
+        let op = crate::operators::Operator::cli(&TenantId::single().0);
+        let granter;
+        let by = if root {
+            nr::Decider::Root { label: crate::operator(), identity: op.ok().map(|o| o.id) }
+        } else {
+            granter = crate::grant::Granter::Human(op?);
+            nr::Decider::Operator { by: &granter, console: false }
+        };
+        say!("releasing {}: this {}", n.name, n.consequence());
+        let shown = n.effect_sha256();
+        let why = reason.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("wicket node release");
+        let d = nr::Decision { by, shown: &shown, why, extra: serde_json::json!({ "via": "cli" }) };
+        let (n, seq) = nr::decide(&l, &id, &d, now)?;
+        let said = nr::release(&mut l, &p, &n, &crate::operator(), seq, retire_enrolment, now).await?;
+        say!("{said}");
+        return Ok(());
+    }
+    drop(l);
     let o = owner(&common);
     let p = Placer::new(provider(&common, VultrConfig::default())?, envelope::DenyAll, o);
+    // An instance the ledger doesn't have as an active placed node (a create that failed half way).
     let id = NodeId(instance_id(&Ledger::open(&crate::ledger_path())?, &id)?);
     let node = p.get(&id).await?;
     match p.release(&id, ReleaseMode::Now).await? {

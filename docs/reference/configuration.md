@@ -89,6 +89,9 @@ Kind `node` (at R4) is setting a node's public addresses, in the console or with
 them, as they may decide public names (`name`); list the operators, or give the default a scope,
 to narrow it.
 
+`capacity` covers a CAPACITY request and, at R4, releasing a placed server past its lease from the console
+(#710): it stops the boxes still running there and loses the files it keeps.
+
 An operator is named by `<via>/<name>` or by its full identity. A file that doesn't parse stops every
 operator's decision until it is fixed: an authority is never guessed. Roles, several operators with their
 own enrolment, and two-person approval are later steps of #11.
