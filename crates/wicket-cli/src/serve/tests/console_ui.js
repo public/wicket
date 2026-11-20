@@ -169,6 +169,9 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   const lines = what.split("\n");
   assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
   assert.strictEqual(lines[1], "Risk: R1 \u00b7 read (scoped)");
+  // The decision and its target are one element, the lead, styled strongly; its text is unchanged (#698 review).
+  assert.strictEqual(ids["confirm-what"].children[0].className, "lead");
+  assert.strictEqual(ids["confirm-what"].children[0].textContent, lines[0]);
   assert.ok(lines[lines.length - 1].startsWith("Request q-a \u00b7 run run_a"), what);
   // The agent with its zone, from the signed fields; a hostile newline in what the agent reported
   // or in the path can't make a line of its own (#599 review).
@@ -643,7 +646,9 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   for (const want of ["Standing reach on ci.example", "Methods: GET, POST", "Paths: /jobs/**", "Asked by worker (zone work)", "with this zone definition (0123456789ab", "2 granted of 3 blocked request(s) it covers in the last 14 days", "in 2 run(s) on 1 day(s)",
     "2 \u00d7 GET /jobs/1/logs (2 granted)", "and 4 ask(s) ahead of its own, not counted as evidence",
     "Wider than the evidence: methods never asked for: POST", "Narrowed: methods GET, paths /jobs/1/logs"]) assert.ok(sa.includes(want), want + " in " + sa);
-  assert.strictEqual(ids["standing-pointer"].textContent, "1 standing reach ask waiting, under Standing reach below");
+  assert.deepStrictEqual([ids["standing-pointer"].textContent, ids["standing-pointer"].hidden], ["Standing reach ask (1)", false]);
+  // #650: what waits, counted where a background tab or an installed app shows it.
+  assert.strictEqual(sandbox.document.title, "(1) wicket");
   const sbuttons = ids["standing-asks"].all(n => n.tagName === "button");
   assert.deepStrictEqual(sbuttons.map(n => [n.textContent, n.className]), [["Approve narrowed (30 days)", "approve"], ["Approve as asked (30 days)", ""],
     ["Approve for every agent in zone work (30 days)", "deny"], ["Deny", "deny"]], "the narrowest first and primary; the widest marked");

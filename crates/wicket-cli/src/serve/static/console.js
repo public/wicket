@@ -168,7 +168,12 @@ async function openSheet(body, extra) {
   if (sheet !== sheetToken) return;
   // An error that stays sits above the sheet (#597): it goes when the sheet opens.
   document.getElementById("msg").hidden = true;
-  document.getElementById("confirm-what").textContent = describe(begin.action);
+  // The decision (describe's first line) in an element of its own, styled strongly; the rest, the
+  // target among it, in full ink. The text, newline included, is describe's exactly (#698 review).
+  const said = describe(begin.action), cut = said.indexOf("\n");
+  const lead = el("div", "lead", cut < 0 ? said : said.slice(0, cut));
+  document.getElementById("confirm-what").replaceChildren(lead, ...(cut < 0 ? [] : [document.createTextNode("\n"), el("div", "rest", said.slice(cut + 1))]));
+  announce("");
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   state.textContent = "";
@@ -189,6 +194,7 @@ async function openSheet(body, extra) {
     if (left > 0) { state.textContent = "Expires in " + Math.floor(left / 60000) + ":" + String(Math.floor(left / 1000) % 60).padStart(2, "0"); return; }
     clearInterval(expiryTimer);
     state.textContent = "This expired before it was signed. Nothing was signed.";
+    announce(state.textContent);
     go.textContent = "Ask again"; go.className = "approve"; go.disabled = false;
     go.onclick = () => { go.disabled = true; state.textContent = "Preparing\u2026"; openSheet(body, extra); };
   };
@@ -199,6 +205,7 @@ async function openSheet(body, extra) {
     go.dataset.waiting = "1";
     clearInterval(expiryTimer);
     state.textContent = "Waiting for your passkey\u2026";
+    announce(state.textContent);
     try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
     catch (e) { toastError(e, null, true); }
     closeConfirm();
@@ -206,6 +213,8 @@ async function openSheet(body, extra) {
   document.getElementById("confirm").hidden = false;
   go.focus();
 }
+// What a screen reader is told about the sheet: state changes only, not the countdown's every second.
+function announce(t) { const a = document.getElementById("confirm-announce"); if (a) a.textContent = t; }
 // #369: what else an approval that widens would allow, shown before the passkey is asked for.
 function renderBlast(box, b) {
   box.replaceChildren();
@@ -355,6 +364,30 @@ function pendingCard(s, p) {
   return c;
 }
 
+// How many decisions wait (#650): in the tab's title, the heading, the section nav and, where the
+// browser has one, the installed app's badge; and how many health alerts, beside Health in the nav.
+let shownCount = -1;
+function renderCounts(waiting, alerts) {
+  // Each count with its link's accessible name: "Waiting, 10 items" (#698 review).
+  const set = (id, v) => {
+    const e = document.getElementById(id);
+    if (!e) return;
+    e.textContent = v ? String(v) : ""; e.hidden = !v;
+    const a = e.parentNode;
+    if (a && a.setAttribute && a.dataset) { if (v) a.setAttribute("aria-label", a.dataset.label + ", " + v + (v === 1 ? " item" : " items")); else a.removeAttribute("aria-label"); }
+  };
+  set("nav-waiting", waiting);
+  set("nav-health", alerts);
+  const h = document.getElementById("waiting-h");
+  if (h) h.textContent = waiting ? "Waiting for you (" + waiting + ")" : "Waiting for you";
+  document.title = waiting ? "(" + waiting + ") wicket" : "wicket";
+  if (waiting === shownCount) return;
+  shownCount = waiting;
+  try {
+    if (typeof navigator !== "undefined" && navigator.setAppBadge) (waiting ? navigator.setAppBadge(waiting) : navigator.clearAppBadge()).catch(() => {});
+  } catch (e) { /* no badge here */ }
+}
+
 function renderPending(s) {
   const box = document.getElementById("pending");
   const live = new Set(s.pending.map(p => p.id));
@@ -421,7 +454,7 @@ function line(op) {
     const [x, where] = eg;
     const outcome = String(x.outcome || "?");
     const cls = outcome === "allow" || outcome === "spliced" ? "ok" : outcome === "pending" ? "pend" : "blocked";
-    const d = el("div"); d.append(el("span", cls, outcome.toUpperCase().padEnd(9)), document.createTextNode(strip(x.method + " " + x.host + x.path + where) + " "));
+    const d = el("div"); d.append(el("span", cls, outcome.toUpperCase().padEnd(10)), document.createTextNode(strip(x.method + " " + x.host + x.path + where) + " "));
     if (op.run) { const why = el("button", "link", "explain"); why.onclick = () => showExplain(op.seq); d.append(why); }
     return d;
   }
@@ -873,8 +906,10 @@ async function boot() {
   const me = r.ok ? await r.json() : { who: { state: "none" } };
   const auth = document.getElementById("auth"), con = document.getElementById("console");
   auth.replaceChildren();
-  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; await refresh(); fromHash(); renderPush(); return; }
+  const nav = document.getElementById("nav");
+  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; if (nav) nav.hidden = false; await refresh(); fromHash(); renderPush(); return; }
   con.hidden = true; auth.hidden = false;
+  if (nav) nav.hidden = true;
   document.getElementById("tenant").textContent = "";
   if (me.who.state === "bootstrap") {
     auth.append(el("div", "", "Enrol this device's passkey. It signs you in, and you will sign every approval with it."));
@@ -1287,10 +1322,11 @@ async function refreshOnce() {
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};
-    // Standing asks wait below (their own section); said at the top, where decisions are made.
+    // Standing asks wait with the requests, under a heading of their own, shown only when there are some.
     const ptr = document.getElementById("standing-pointer");
     const n = (st.asks || []).length;
-    if (ptr) ptr.textContent = n ? n + " standing reach ask" + (n === 1 ? "" : "s") + " waiting, under Standing reach below" : "";
+    if (ptr) { ptr.textContent = n ? "Standing reach " + (n === 1 ? "ask" : "asks") + " (" + n + ")" : ""; ptr.hidden = !n; }
+    renderCounts(s.pending.length + n, ((s.health || {}).alerts || []).length + ((((s.health || {}).nodes) || []).filter(x => (x.alerts || []).length).length));
     renderKeyed("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
     renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: every one-off ask waits for a decision.");
     renderStart(s);
