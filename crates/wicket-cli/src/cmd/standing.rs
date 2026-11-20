@@ -26,7 +26,7 @@ pub enum StandingCmd {
         #[arg(long = "for", default_value = "agent")]
         bound: String,
         /// How long it lasts (at most 366d), or `forever`: until revoked.
-        #[arg(long, default_value = "30d")]
+        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d")]
         lasts: String,
         /// Approve only the methods and paths the evidence shows were asked for.
         #[arg(long)]
@@ -37,10 +37,11 @@ pub enum StandingCmd {
     },
     /// Deny a standing ask.
     Deny { id: String },
-    /// Move an approved rule's lapse to --lasts from now (or `forever`).
+    /// Move an approved rule's lapse to --ttl from now (or `forever`).
     Renew {
         id: String,
-        #[arg(long, default_value = "30d")]
+        /// How long it lasts from now (at most 366d), or `forever`: until revoked.
+        #[arg(long = "ttl", value_name = "TTL", visible_alias = "lasts", default_value = "30d")]
         lasts: String,
     },
     /// Revoke an approved rule: it allows nothing from now on (a box's node, once its run publishes
@@ -51,7 +52,10 @@ pub enum StandingCmd {
 fn lasts(s: &str) -> Result<Option<std::time::Duration>> {
     match s {
         "forever" => Ok(None),
-        d => Ok(Some(wicket_core::time::parse_duration(d).context("bad --lasts (a duration such as 30d, or forever)")?)),
+        d => Ok(Some(
+            wicket_core::time::parse_duration(d)
+                .map_err(|e| wicket_home::exit::usage(format!("bad --ttl {d:?} (a duration such as 30d, or forever): {e}")))?,
+        )),
     }
 }
 
@@ -59,7 +63,7 @@ fn bound(s: &str) -> Result<wicket_store::StandingBound> {
     match s {
         "agent" => Ok(wicket_store::StandingBound::Agent),
         "zone" => Ok(wicket_store::StandingBound::Zone),
-        x => bail!("--for is agent or zone, not {x:?}"),
+        x => Err(wicket_home::exit::usage(format!("--for is agent or zone, not {x:?}"))),
     }
 }
 
@@ -201,13 +205,15 @@ pub async fn dispatch(c: StandingCmd) -> Result<()> {
             Ok(())
         }
         StandingCmd::Approve { id, bound: b, lasts: d, narrow, yes } => {
+            // The command line first: a usage error is one whatever the ledger holds.
+            let (b, d) = (bound(&b)?, lasts(&d)?);
             let l = Ledger::open(&ledger_path())?;
             let s = l.standing(&id)?;
             let rule = match narrow {
                 true => Some(st::narrowed(&s).context("nothing to narrow to: the ask has no evidence (approve it as asked, or deny it)")?),
                 false => None,
             };
-            let a = st::Approve { rule, bound: bound(&b)?, ttl: lasts(&d)? };
+            let a = st::Approve { rule, bound: b, ttl: d };
             let shown_rule = a.rule.clone().unwrap_or_else(|| s.rule.clone());
             // What is approved is what wicket recorded, shown before it is decided (#121), and the
             // decision is made on that effect (#369).
@@ -223,7 +229,7 @@ pub async fn dispatch(c: StandingCmd) -> Result<()> {
                 a.ttl.map(|t| wicket_core::time::format_duration(t).to_string()).unwrap_or_else(|| "until revoked".into())
             );
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
-                bail!("not approved");
+                return Err(wicket_home::exit::refused("not approved: declined at the confirmation"));
             }
             st::approve(&l, &human()?, &id, &a, Some(&shown), serde_json::json!({ "via": "cli" }))?;
             println!("approved {id}: the agent's later runs are allowed {} without asking", rule_text(&shown_rule));

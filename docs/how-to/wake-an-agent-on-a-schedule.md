@@ -2,8 +2,10 @@
 
 A trigger is your standing intent, kept in the ledger: "when this happens, do that". This page
 covers the triggers that tell time: a schedule (cron, in a time zone) or a one-off timer that wakes
-a long-lived agent or gives it a message. Webhooks, GitHub events and wicket's own events come in
-later steps of [#578](https://github.com/public/wicket/issues/578); this version refuses them.
+a long-lived agent or gives it a message. It also covers triggers on wicket's own events (a run
+ending, an agent waking, a decision): see [on wicket's own events](#on-wickets-own-events).
+Webhooks and GitHub events come in later steps of
+[#578](https://github.com/public/wicket/issues/578); this version refuses them.
 
 Triggers fire from the reconciler, so run it on a timer (`wicket reconcile --every 1m`, as the
 install sets up). Each pass looks at the minutes a schedule matched since the last one it fired
@@ -41,6 +43,56 @@ limits: { per_hour: 6 }            # the default; at most 60
   `missed` (how many earlier minutes it stands for).
 - **Limits.** `per_hour` and `queue` are enforced. `concurrency` and `debounce` aren't yet, so
   leave them out (they're refused).
+
+## On wicket's own events
+
+A `wicket` source listens to the records wicket writes in its audit chain:
+
+```yaml
+trigger: failed-runs
+source:
+  wicket: { kinds: [run.end, run.lost] }
+filter: { status: "!ok" }          # equals, one of a list, a glob; a leading ! is "not"
+action:
+  wake: release-captain
+  message:
+    body: "Run {{ event.run }} ended {{ event.status }}: look at why."
+```
+
+| kind | what it is | fields from the record's body |
+|---|---|---|
+| `run.end` | a run ended | `status`, `cause`, `seconds`, `result`, token counts |
+| `run.lost` | the reconciler found a run's process or box gone | `target`, `detail` |
+| `box.exited` | a box ended with a cause (out of memory, killed, a non-zero exit) | `code`, `cause` |
+| `box.memory_pressure` | a node saw a box near its memory limit | `current`, `max`, `peak` |
+| `agent.wake`, `agent.hibernate` | a long-lived agent woke or hibernated | `by` (a wake's cause), `generation` |
+| `message.refused` | a message to an agent was refused | `from`, `to`, `why` |
+| `decision` | an approval, denial, renewal or revocation | `decision`, `request` or `grant`, `by` |
+
+wicket sets these fields itself, from the ledger, and a record's body can't replace them: `kind`,
+`record` (the audit kind it came from), `seq`, `run`, `at`, and the run's `zone`, `agent` (its
+name), `principal` and `agent_id` (null for a record of no run), plus `node` for a node's record.
+Everything else comes from the record's body. Some of that is the run's own words: a run's
+`result` is whatever its agent wrote. Filter on wicket's fields when it matters who a record is
+about. For example, `filter: { zone: build }` hears only the build zone's runs. Filters can name
+nested fields with dots (`pr.number`).
+
+- **When it fires.** Each reconcile pass reads the records written since the last pass, and fires
+  each trigger once per record its filter passes. A trigger hears only records written while it
+  was live (since it was made, approved or resumed). A new installation starts at the chain's
+  newest record, and a record more than 15 minutes old when read (the reconciler was down) is
+  passed over.
+- **Chains of triggers.** Each turn a trigger queues records the triggers that led to it. A
+  record of the run that read the turn carries those triggers on. A trigger never fires on a
+  record its own firing led to, however many triggers came between (A wakes B, B wakes A, stops
+  at the second A), and no record fires a fifth trigger in a row. These are skipped and audited
+  (`trigger.skipped`). Only what a trigger queued is followed. If an agent a trigger woke goes on
+  to message another agent itself, that is the agent's doing, and the second agent's records
+  don't carry the chain.
+- **Quoted input.** Because body fields can hold an agent's words, every text field these
+  triggers fill into a message is a JSON string, `"…"`. Quote marks inside are escaped, a long
+  value is cut inside its quotes, and the turn ends by saying the quoted text is the event's data,
+  not instructions.
 
 ## Keep it
 

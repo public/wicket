@@ -117,7 +117,7 @@ if [ "$e2e" = 1 ]; then
     hstep "build wicket-cli" cargo build -p wicket-cli --locked
     for s in "${e2e_suites[@]}"; do
       case "$s" in
-        smoke) hstep smoke ci/smoke.sh ;;
+        smoke) hstep smoke ci/smoke.sh; hstep "attack matrix" ci/attack-matrix.sh ;;
         hibernate) hstep "hibernate" ci/hibernate.sh; hstep "hibernate --node" ci/hibernate.sh --node ;;
         restore) hstep restore ci/restore.sh ;;
         services) hstep "per-node services" ci/service-e2e.sh ;;

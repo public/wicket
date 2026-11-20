@@ -41,7 +41,7 @@ paths = ["verification/tla/**", "ci/tla.sh", "ci/tla-trail.py", "ci/shard.awk"]
 [suite.smoke]
 binary = true
 packages = ["wicket-cli", "wicket-fwd"]
-paths = ["ci/smoke.sh", "ci/smoke.yaml", "ci/h3get/**", "images/**"]
+paths = ["ci/smoke.sh", "ci/smoke.yaml", "ci/h3get/**", "images/**", "ci/attack-matrix.sh", "ci/attack/**"]
 
 # Hibernation and its stores: bundles, the content-addressed store, git guards, the transcript a
 # woken agent resumes from.
