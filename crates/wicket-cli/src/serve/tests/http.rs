@@ -840,6 +840,11 @@ async fn an_enrolment_link_without_a_live_maker_enrols_nothing_and_ends_its_sess
     let failed = audits(&t, "operator.enrol_failed");
     assert!(failed.iter().any(|f| f["reason"].as_str().unwrap_or("").contains("no longer enrolled")), "{failed:?}");
     assert!(failed.iter().any(|f| f["reason"].as_str().unwrap_or("").contains("no record")), "{failed:?}");
+    // Each refusal names the client, as the success record does.
+    assert!(
+        failed.iter().filter(|f| !f["reason"].as_str().unwrap_or("").contains("invalid")).all(|f| f["client"].is_string()),
+        "{failed:?}"
+    );
     assert_eq!(register_begin_as(&t, &boot).await.0, StatusCode::UNAUTHORIZED, "the link's session ended");
     assert!(t
         .ledger()

@@ -59,10 +59,21 @@ pub(super) fn apply(state: &State, l: &Ledger, oc: &OperatorCredential, ttl_secs
 
 /// The name a passkey enrolled with link `link` takes: for a console link, its maker's (refused if
 /// the maker's passkey is no longer enrolled); for a host link, what the new device asked for. A
-/// link with no record enrols nothing. A refusal is audited (`operator.enrol_failed`).
-pub(super) fn enrolled_name(state: &State, l: &Ledger, link: &str, asked: &str) -> Result<(String, Option<String>), Reply> {
+/// link with no record enrols nothing. A refusal is audited (`operator.enrol_failed`, with the client).
+pub(super) fn enrolled_name(
+    state: &State,
+    l: &Ledger,
+    link: &str,
+    asked: &str,
+    client: Option<&str>,
+) -> Result<(String, Option<String>), Reply> {
     let refuse = |why: &str| {
-        let _ = l.audit(&state.tenant, None, "operator.enrol_failed", &json!({ "link": &link[..16.min(link.len())], "reason": why }));
+        let _ = l.audit(
+            &state.tenant,
+            None,
+            "operator.enrol_failed",
+            &json!({ "link": &link[..16.min(link.len())], "reason": why, "client": client }),
+        );
         err(StatusCode::FORBIDDEN, why)
     };
     let Some(by) = l.enrol_link_by(&state.tenant, link).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))? else {

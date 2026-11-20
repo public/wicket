@@ -855,6 +855,16 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-cancel"].listeners.click(); await flush();
   await run("refresh()"); await flush();
   assert.ok(ids.operator.textContent.includes("https://c.example/enrol?t=abc"), ids.operator.textContent);
+  // Signing out forgets the link: whoever signs in next on this tab doesn't see it.
+  ids.operator.all(n => n.tagName === "button" && n.textContent === "Sign out")[0].click(); await flush();
+  assert.strictEqual(run("enrolLink"), null);
+  await run("refresh()"); await flush();
+  assert.ok(!ids.operator.textContent.includes("https://c.example/enrol?t=abc"), ids.operator.textContent);
+  // boot() forgets it too, however it is reached.
+  run("showEnrolLink({ link: 'https://c.example/enrol?t=def', expires_in_secs: 300 })");
+  await run("boot()"); await flush();
+  assert.strictEqual(run("enrolLink"), null);
+  assert.ok(!ids.operator.textContent.includes("t=def"), ids.operator.textContent);
   console.log("console enrol a device: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open

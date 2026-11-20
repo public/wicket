@@ -129,8 +129,9 @@ const MAX_REASON: usize = 500;
 const DENIED: &str = r#"{"error":"sign in with your passkey"}"#;
 /// The one answer to a failed sign-in, whatever failed.
 const SIGN_IN_FAILED: &str = "sign-in failed";
-/// Why a session that didn't come from an enrolment link can't register a passkey.
-const ENROL_ON_HOST: &str = "adding a passkey needs a one-time enrolment link: run `wicket operator enrol-link` on the host";
+/// Why a session that didn't come from an enrolment link can't register a passkey, and where links
+/// come from: a signed-in operator makes one with Add a device (#711); the host makes the first.
+const ENROL_ON_HOST: &str = "adding a passkey needs a one-time enrolment link: signed in, use Add a device under Your passkeys and open the link on the new device; with no passkey yet, run `wicket operator enrol-link` on the host";
 
 #[derive(Clone, Debug, PartialEq)]
 enum SessionKind {
@@ -1158,8 +1159,9 @@ fn register_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &V
                 Ok(l) => l,
                 Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             };
+            let client = l.console_session(&state.tenant, sid, wicket_store::now()).ok().flatten().map(|s| s.client);
             // A console link enrols its maker's operator again, on this device (#711).
-            let (name, made_by) = match enrol::enrolled_name(state, &l, link, &asked) {
+            let (name, made_by) = match enrol::enrolled_name(state, &l, link, &asked, client.as_deref()) {
                 Ok(x) => x,
                 Err(r) => {
                     // The link was used: its session has nothing left to do.
@@ -1171,7 +1173,6 @@ fn register_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &V
             if let Err(e) = l.add_operator_credential(&state.tenant, &oc) {
                 return err(StatusCode::CONFLICT, e);
             }
-            let client = l.console_session(&state.tenant, sid, wicket_store::now()).ok().flatten().map(|s| s.client);
             let _ = l.audit(
                 &state.tenant,
                 None,

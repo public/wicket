@@ -1253,7 +1253,7 @@ function renderOperator(s) {
   const box = document.getElementById("operator"); box.replaceChildren();
   for (const k of s.passkeys) { const d = el("div", "row"); d.append(el("span", "", "passkey: " + strip(k.name)), el("span", "mono", String(k.id).slice(0, 16) + "…")); box.append(d); }
   const b = el("div", "buttons");
-  const out = el("button", "", "Sign out"); out.onclick = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
+  const out = el("button", "", "Sign out"); out.onclick = async () => { enrolLink = null; try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
   const add = el("button", "", "Add a device"); add.onclick = () => signed({ action: "enrol_link" });
   b.append(add, out); box.append(b);
   if (enrolLink && enrolLink.until > Date.now()) {
@@ -1430,6 +1430,9 @@ function openHealth() {
 // Signed out, the server answers /api/me with 401 and tells the page nothing else: the page offers
 // passkey sign-in (and says where enrolment links come from) whatever the server's state.
 async function boot() {
+  // An unused enrolment link enrols a device as the operator who made it, so it never outlives
+  // their session in this tab: whoever signs in next starts without it (#711).
+  enrolLink = null;
   // Signed out is what the server says (401, 403, or who: none); a server that can't answer now (a
   // restart's 502, a network error) is retried, not shown as a sign-in (#574).
   let r;
