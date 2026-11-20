@@ -116,9 +116,47 @@ pub fn same(a: &[u8], b: &[u8]) -> bool {
 /// Whether `header` (`sha256=<hex>`, as GitHub sends it) is the HMAC-SHA256 of `body` under
 /// `secret`. Anything else (no prefix, bad hex, another length) is not.
 pub fn signature_ok(secret: &[u8], body: &[u8], header: Option<&str>) -> bool {
+    if secret.len() < MIN_SECRET {
+        return false;
+    }
     let Some(h) = header.and_then(|h| h.trim().strip_prefix("sha256=")) else { return false };
     let Ok(sig) = hex::decode(h.trim()) else { return false };
     same(&sig, &hmac_sha256(secret, body))
+}
+
+/// The shortest verify secret (bytes) intake uses: an empty or short key would let anyone forge a
+/// signature (#714 review E).
+pub const MIN_SECRET: usize = 16;
+
+/// Whether `secret` is long enough to verify with.
+pub fn secret_ok(secret: &str) -> bool {
+    secret.len() >= MIN_SECRET
+}
+
+/// The object a GitHub event's payload must carry to be that event (#714 review B): the event
+/// header isn't signed, so a signed body of one event can't be resent as another.
+pub fn github_event_object(event: &str) -> Option<&'static str> {
+    Some(match event {
+        "pull_request" | "pull_request_review" | "pull_request_review_comment" => "/pull_request",
+        "issues" | "issue_comment" => "/issue",
+        "check_suite" => "/check_suite",
+        "check_run" => "/check_run",
+        "workflow_run" => "/workflow_run",
+        "push" => "/ref",
+        _ => return None,
+    })
+}
+
+/// Whether `body` is a payload of GitHub `event`: it has that event's own object (and, for a
+/// review or a comment, theirs too).
+pub fn github_body_is(event: &str, body: &Value) -> bool {
+    let Some(p) = github_event_object(event) else { return false };
+    let extra = match event {
+        "pull_request_review" => body.pointer("/review").is_some(),
+        "pull_request_review_comment" | "issue_comment" => body.pointer("/comment").is_some(),
+        _ => true,
+    };
+    body.pointer(p).is_some_and(|v| !v.is_null()) && extra
 }
 
 /// The generic webhook's timestamp header (Unix seconds), signed with the body.
@@ -420,6 +458,9 @@ pub fn fields_within(fields: &Value) -> bool {
 mod tests {
     use super::*;
 
+    const KEY: &[u8] = b"0123456789abcdef-key";
+    const OTHER: &[u8] = b"0123456789abcdef-other";
+
     /// RFC 4231's test cases 1, 2 and 6 (a key longer than a block), and GitHub's documented example.
     #[test]
     fn hmac_sha256_is_rfc_4231s() {
@@ -440,14 +481,14 @@ mod tests {
 
     #[test]
     fn only_the_right_signature_passes() {
-        let sig = format!("sha256={}", hex::encode(hmac_sha256(b"k", b"body")));
-        assert!(signature_ok(b"k", b"body", Some(&sig)));
-        assert!(!signature_ok(b"k", b"body ", Some(&sig)), "another body");
-        assert!(!signature_ok(b"j", b"body", Some(&sig)), "another key");
-        assert!(!signature_ok(b"k", b"body", Some(&sig[7..])), "no prefix");
-        assert!(!signature_ok(b"k", b"body", Some("sha256=zz")), "not hex");
-        assert!(!signature_ok(b"k", b"body", Some(&sig[..sig.len() - 2])), "short");
-        assert!(!signature_ok(b"k", b"body", None));
+        let sig = format!("sha256={}", hex::encode(hmac_sha256(KEY, b"body")));
+        assert!(signature_ok(KEY, b"body", Some(&sig)));
+        assert!(!signature_ok(KEY, b"body ", Some(&sig)), "another body");
+        assert!(!signature_ok(OTHER, b"body", Some(&sig)), "another key");
+        assert!(!signature_ok(KEY, b"body", Some(&sig[7..])), "no prefix");
+        assert!(!signature_ok(KEY, b"body", Some("sha256=zz")), "not hex");
+        assert!(!signature_ok(KEY, b"body", Some(&sig[..sig.len() - 2])), "short");
+        assert!(!signature_ok(KEY, b"body", None));
         assert!(same(b"abc", b"abc") && !same(b"abc", b"abd") && !same(b"abc", b"ab"));
     }
 
@@ -455,8 +496,8 @@ mod tests {
     /// again later or under another id, and only within the window.
     #[test]
     fn a_generic_signature_binds_its_time_and_id() {
-        let sig = generic_signature(b"k", 1000, "d-1", b"{}");
-        let ok = |ts: &str, id: Option<&str>, body: &[u8], now: i64| generic_check(b"k", Some(ts), id, body, Some(&sig), now);
+        let sig = generic_signature(KEY, 1000, "d-1", b"{}");
+        let ok = |ts: &str, id: Option<&str>, body: &[u8], now: i64| generic_check(KEY, Some(ts), id, body, Some(&sig), now);
         assert_eq!(ok("1000", Some("d-1"), b"{}", 1000), Ok(()));
         assert_eq!(ok("1000", Some("d-1"), b"{}", 1299), Ok(()));
         assert_eq!(ok("1000", Some("d-1"), b"{}", 1301), Err("timestamp outside the window"), "too late");
@@ -464,19 +505,41 @@ mod tests {
         assert_eq!(ok("1000", Some("d-2"), b"{}", 1000), Err("bad signature"), "another id: a replay");
         assert_eq!(ok("1001", Some("d-1"), b"{}", 1000), Err("bad signature"), "another time");
         assert_eq!(ok("1000", None, b"{}", 1000), Err("bad signature"), "the id dropped");
-        assert_eq!(generic_check(b"k", None, Some("d-1"), b"{}", Some(&sig), 1000), Err("no timestamp"));
-        assert_eq!(generic_check(b"k", Some("x"), Some("d-1"), b"{}", Some(&sig), 1000), Err("no timestamp"));
+        assert_eq!(generic_check(KEY, None, Some("d-1"), b"{}", Some(&sig), 1000), Err("no timestamp"));
+        assert_eq!(generic_check(KEY, Some("x"), Some("d-1"), b"{}", Some(&sig), 1000), Err("no timestamp"));
     }
 
     /// #714 review F1: a capture can't be replayed by moving the boundary between its id and its
     /// body (an id with a `:` and the body's start).
     #[test]
     fn a_capture_cant_be_split_differently() {
-        let sig = generic_signature(b"k", 1000, "d-1", br#"{"a":1}"#);
-        let split = |id: &str, body: &[u8]| generic_check(b"k", Some("1000"), Some(id), body, Some(&sig), 1000);
+        let sig = generic_signature(KEY, 1000, "d-1", br#"{"a":1}"#);
+        let split = |id: &str, body: &[u8]| generic_check(KEY, Some("1000"), Some(id), body, Some(&sig), 1000);
         assert_eq!(split("d-1", br#"{"a":1}"#), Ok(()));
         assert_eq!(split(r#"d-1:{"a""#, b"1}"), Err("bad signature"));
         assert_eq!(split("d", br#"1:{"a":1}"#), Err("bad signature"));
+    }
+
+    /// #714 review E: an empty or short key verifies nothing.
+    #[test]
+    fn a_short_key_verifies_nothing() {
+        let sig = format!("sha256={}", hex::encode(hmac_sha256(b"", b"body")));
+        assert!(!signature_ok(b"", b"body", Some(&sig)));
+        let short = generic_signature(b"k", 1, "", b"b");
+        assert_eq!(generic_check(b"k", Some("1"), None, b"b", Some(&short), 1), Err("bad signature"));
+        assert!(!secret_ok("short") && secret_ok(&"x".repeat(MIN_SECRET)));
+    }
+
+    /// #714 review B: a signed body is the event it says only if it has that event's object.
+    #[test]
+    fn a_body_is_only_its_own_event() {
+        let issue = serde_json::json!({ "action": "opened", "issue": { "number": 1 }, "repository": { "full_name": "a/b" } });
+        assert!(github_body_is("issues", &issue));
+        assert!(!github_body_is("pull_request", &issue), "an issue resent as a pull request");
+        assert!(!github_body_is("issue_comment", &issue), "a comment needs its comment");
+        assert!(!github_body_is("star", &issue), "an event intake doesn't know");
+        let pr = serde_json::json!({ "pull_request": null });
+        assert!(!github_body_is("pull_request", &pr));
     }
 
     #[test]
