@@ -4979,6 +4979,57 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(!e.contains("past its lease"), "{e}");
     }
 
+    /// #415: a secret a run can't get while its control host is unreachable is audited once per
+    /// outage, not per request; an answer from the control host (a refusal too) ends the outage, so
+    /// the next one is audited again.
+    #[tokio::test]
+    async fn an_unreachable_control_host_is_audited_once_per_outage() {
+        const RUN: &str = "run_uuuuuuuuuuuuuuuuuuuuuuuuuu";
+        let inst = Install::new("nodesrv-unreachable");
+        let node = test_node(&inst);
+        fed_box(&node, &inst, RUN, "name: z\n");
+        let unavailable =
+            || node.audit.lock().unwrap().audit_tail(100).unwrap().iter().filter(|r| r.2 == "node.secret_unavailable").count();
+        let fetch = node.fetcher();
+        // No connection for the run: unreachable, audited once however often it is asked.
+        for _ in 0..3 {
+            assert!(matches!(fetch(RUN.into(), "gh".into()).await, Err(crate::nodesecrets::Unfetched::Unreachable(_))));
+        }
+        assert_eq!(unavailable(), 1);
+        // Connected: the control host answers, refusing it, which is audited and ends the outage.
+        let mut c = connect_run(&node, 2, &inst, RUN).await;
+        c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        for _ in 0..500 {
+            if node.owner(RUN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let answering = tokio::spawn(async move {
+            loop {
+                if let Frame::Msg(Msg::SecretFetch { id, .. }) = next_msg(&mut c).await {
+                    let refused = Msg::SecretFetched { id, secret: None, error: Some("not set".into()) };
+                    c.write_all(&Frame::Msg(refused).encode()).await.unwrap();
+                    return c;
+                }
+            }
+        });
+        assert!(matches!(fetch(RUN.into(), "gh".into()).await, Err(crate::nodesecrets::Unfetched::Refused(_))));
+        assert_eq!(unavailable(), 2, "the refusal");
+        // Cut off again: a new outage, audited again.
+        drop(answering.await.unwrap());
+        for _ in 0..500 {
+            if node.owner(RUN).is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        for _ in 0..3 {
+            assert!(fetch(RUN.into(), "gh".into()).await.is_err());
+        }
+        assert_eq!(unavailable(), 3, "one more for the new outage");
+    }
+
     #[tokio::test]
     async fn a_swapped_host_is_decided_on_the_node_and_its_credential_fetched_there() {
         const RUN: &str = "run_ssssssssssssssssssssssssss";

@@ -330,39 +330,21 @@ pub fn protocol_needed(zone: &wicket_core::ZoneSpec) -> u32 {
 }
 
 /// Readies `zone` for a node talking `proto` (None: not known), given which secrets `is_set` (#415).
-/// At [`wicket_chan::chan::LIVE_SECRETS`] or later every rule goes. Below it, its optional `inject`
-/// rules whose secrets aren't set are dropped, as before, and returned. With the protocol not known
-/// (its note lost) for a box re-attached to, the rules go as the node's feed already `held` them for
-/// it: a running box isn't re-minted with rules dropped, or given rules it went without. Also
-/// whether the zone goes out with optional rules whatever their secrets, which only a node at that
-/// protocol may then carry (the session checks it once the node says what it talks).
+/// At [`wicket_chan::chan::LIVE_SECRETS`] or later every rule goes. Otherwise, a node whose protocol
+/// isn't known included (a re-attach whose note was lost: what the node's feed holds can't tell a
+/// node at 23 from one below that had every secret set), it is taken as older: its optional
+/// `inject` rules whose secrets aren't set now are dropped, and returned. That fails narrow: such a
+/// host's requests go without the secret for the run's life, and the session is never ended for
+/// it. Also whether the zone goes out with optional rules whatever their secrets, which only a node
+/// at that protocol may then carry.
 pub fn zone_for_node(
     zone: &mut ZoneSpec,
     proto: Option<u32>,
-    held: Option<&[wicket_core::manifest::InjectRule]>,
     is_set: impl Fn(&str) -> bool,
 ) -> (Vec<wicket_core::manifest::InjectRule>, bool) {
-    let same = |a: &wicket_core::manifest::InjectRule, b: &wicket_core::manifest::InjectRule| {
-        a.host == b.host && a.header == b.header && a.format == b.format && a.secret == b.secret && a.optional == b.optional
-    };
-    let live = match (proto, held) {
-        (Some(p), _) => p >= wicket_chan::chan::LIVE_SECRETS,
-        // Re-attached, protocol unknown: live if the record went out with every rule while one of
-        // its optional secrets wasn't set, i.e. it holds every rule of the zone.
-        (None, Some(h)) => zone.inject.iter().all(|i| h.iter().any(|j| same(i, j))) && zone.inject.iter().any(|i| i.optional),
-        (None, None) => false,
-    };
-    match live {
+    match proto.is_some_and(|p| p >= wicket_chan::chan::LIVE_SECRETS) {
         true => (vec![], zone.inject.iter().any(|i| i.optional)),
-        false => match held.filter(|_| proto.is_none()) {
-            // As the record has them: an optional rule it went without stays out, even if set since.
-            Some(h) => {
-                let (kept, dropped) = std::mem::take(&mut zone.inject).into_iter().partition(|i| h.iter().any(|j| same(i, j)));
-                zone.inject = kept;
-                (dropped, false)
-            }
-            None => (zone.drop_unset_optional_injections(is_set), false),
-        },
+        false => (zone.drop_unset_optional_injections(is_set), false),
     }
 }
 
@@ -787,13 +769,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let issuer = Arc::new(crate::issuer()?);
     let cfg = feed_config();
     let feed = SharedFeed::open(&name, cfg.clone())?;
-    // What the node's feed holds for a box re-attached to (#415): its inject rules then stay as they
-    // went out, whatever this host knows of the node's protocol now.
-    let held: Option<Vec<wicket_core::manifest::InjectRule>> = match s.attach {
-        true => feed.lock()?.state().zones.get(&s.run.0).map(|z| z.spec.zone.inject.clone()),
-        false => None,
-    };
-    let (dropped, optional_rules) = zone_for_node(&mut s.zone, node_protocol_now(&name), held.as_deref(), |n| s.vault.has(n));
+    let (dropped, optional_rules) = zone_for_node(&mut s.zone, node_protocol_now(&name), |n| s.vault.has(n));
     for i in dropped {
         say!(
             "[wicket] node {name} doesn't take secrets set later (protocol 23): requests to {} go without {:?} for this run",
@@ -3310,26 +3286,19 @@ mod tests {
         let is_set = |n: &str| n != "unset";
         for proto in [None, Some(wicket_chan::chan::LIVE_SECRETS - 1)] {
             let mut z = zone();
-            let (dropped, optional_rules) = zone_for_node(&mut z, proto, None, is_set);
+            let (dropped, optional_rules) = zone_for_node(&mut z, proto, is_set);
             assert_eq!(dropped.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["unset"], "{proto:?}");
             assert_eq!(z.inject.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["set", "required"]);
             assert!(!optional_rules);
         }
         let mut z = zone();
-        let (dropped, optional_rules) = zone_for_node(&mut z, Some(wicket_chan::chan::LIVE_SECRETS), None, is_set);
+        let (dropped, optional_rules) = zone_for_node(&mut z, Some(wicket_chan::chan::LIVE_SECRETS), is_set);
         assert!(dropped.is_empty() && z.inject.len() == 3 && optional_rules);
-        // Re-attached with the node's protocol note lost: the rules stay as the feed holds them for
-        // the box. Every rule there (it went out live): all kept, and the session must talk 23.
-        let all = zone().inject;
+        // Re-attached with the node's protocol note lost: taken as older, whatever the feed holds,
+        // so the session is never ended for it, and a rule whose secret isn't set now stays out.
         let mut z = zone();
-        let (dropped, optional_rules) = zone_for_node(&mut z, None, Some(&all), |_| true);
-        assert!(dropped.is_empty() && z.inject.len() == 3 && optional_rules, "nothing dropped though everything is set now");
-        // The unset rule left out when it went: left out still, even once it is set.
-        let without: Vec<_> = all.iter().filter(|i| i.secret != "unset").cloned().collect();
-        let mut z = zone();
-        let (dropped, optional_rules) = zone_for_node(&mut z, None, Some(&without), |_| true);
-        assert_eq!(dropped.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["unset"]);
-        assert!(!optional_rules && z.inject.len() == 2);
+        let (dropped, optional_rules) = zone_for_node(&mut z, None, |_| true);
+        assert!(dropped.is_empty() && z.inject.len() == 3 && !optional_rules, "every secret set: nothing dropped, no 23 needed");
     }
 
     /// #415: a re-attached supervisor starts from what an earlier one recorded it released
