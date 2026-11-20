@@ -37,9 +37,29 @@ function timeEl(t, text) {
   return e;
 }
 const ago = (now, t) => rel(t, now);
+// A relative time that stays true in a row kept across polls: refreshRel() rewrites every one.
+const relEls = new Set();
+function relEl(t, prefix, now) {
+  const e = timeEl(t, (prefix || "") + rel(t, now));
+  e.dataset.rel = String(t); e.dataset.prefix = prefix || "";
+  relEls.add(e);
+  return e;
+}
+function refreshRel() {
+  for (const e of relEls) {
+    if (e.isConnected === false) { relEls.delete(e); continue; }
+    const text = e.dataset.prefix + rel(Number(e.dataset.rel));
+    if (e.textContent !== text) e.textContent = text;
+  }
+}
 const riskClass = r => ({ R0Read: "r0", R1ReadScoped: "r1", R2WriteReversible: "r2", R3ExternalOrIrreversible: "r3", R4ExecOrPrivilege: "r4" })[r] || "r4";
 // What a risk class means to whoever decides, with its code (docs/reference/risk-classes.md, #574).
+// Risk as what could happen (docs/explanation/console-design.md); the class's code only under Details.
+const riskWords = r => ({ R0Read: "Only reads", R1ReadScoped: "Only reads", R2WriteReversible: "Changes data that can be put back", R3ExternalOrIrreversible: "Others will see it, or it can't be undone", R4ExecOrPrivilege: "Pushes code, deploys, or gains privileges" })[r] || strip(r);
+// The signing sheet's words, unchanged until the sheet's own change is reviewed (#715 review):
+// describe() stays byte for byte what main shows.
 const riskLabel = r => ({ R0Read: "R0 \u00b7 read", R1ReadScoped: "R1 \u00b7 read (scoped)", R2WriteReversible: "R2 \u00b7 changes data", R3ExternalOrIrreversible: "R3 \u00b7 visible to others, or can't be undone", R4ExecOrPrivilege: "R4 \u00b7 push, deploy or privilege" })[r] || r;
+const riskCode = r => ({ R0Read: "R0", R1ReadScoped: "R1", R2WriteReversible: "R2", R3ExternalOrIrreversible: "R3", R4ExecOrPrivilege: "R4" })[r] || strip(r);
 // A lifetime as the card and the sheet both say it: whole hours as hours, else minutes.
 // Money as people write it (#639): "$0.05", "$1.00", and more places only where a value needs them
 // ("$0.014"). The server sends "$0.0500"; anything that isn't a dollar amount is shown as sent.
@@ -80,9 +100,28 @@ const UTC_TIME = /\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?Z\b/g;
 const localTimes = text => strip(text).replace(UTC_TIME, m => { const t = Date.parse(m) / 1000; return isNaN(t) ? m : clock(t); });
 function serverText(tag, cls, text) { const e = el(tag, cls, localTimes(text)); if (UTC_TIME.test(String(text))) e.title = strip(text); UTC_TIME.lastIndex = 0; return e; }
 // A sentence with `commands` in backticks as code spans (#648): the rest stays text.
-function codeText(tag, cls, text) {
+// A command to run on the host, with a Copy button (#715 review): the console's own controls come
+// first, and a command is the secondary way, so it is small, but one tap copies it whole.
+function copyButton(cmd) {
+  const b = el("button", "link copy", "Copy");
+  b.type = "button";
+  if (b.setAttribute) b.setAttribute("aria-label", "Copy " + cmd);
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText(cmd); toast("Copied: " + cmd); }
+    catch { toast("Couldn't copy here; select the command instead.", true); }
+  };
+  return b;
+}
+// `copy`: the commands in `text` that are instructions to run, each given a Copy button (#715
+// review); a command only mentioned gets none.
+function codeText(tag, cls, text, copy = []) {
   const e = el(tag, cls);
-  String(text).split("`").forEach((part, i) => { if (part) e.append(i % 2 ? el("code", "", part) : document.createTextNode(part)); });
+  String(text).split("`").forEach((part, i) => {
+    if (!part) return;
+    if (i % 2 === 0) { e.append(document.createTextNode(part)); return; }
+    e.append(el("code", "", part));
+    if (copy.includes(part)) e.append(copyButton(part));
+  });
   return e;
 }
 const span = secs => { const s = Math.round(secs || 0); return s >= 3600 && s % 3600 === 0 ? (s / 3600) + (s === 3600 ? " hour" : " hours") : Math.round(s / 60) + " min"; };
@@ -421,21 +460,40 @@ const r0 = rs => rs[0];
 const shortText = id => id.length > 18 ? id.slice(0, 10) + "\u2026" + id.slice(-6) : id;
 function asks(p) {
   const raw = strip(p.method + " " + p.host + p.path);
-  if (p.host !== "wicket.internal") return { what: raw + (p.scope_prefix ? "\u2026  (every path under it)" : ""), raw: "", why: strip(p.reason), internal: false };
+  if (p.host !== "wicket.internal") return { what: raw + (p.scope_prefix ? "\u2026  (every path under it)" : ""), raw: "", said: [["Why", strip(p.reason)]], wicket: null, mixed: null, internal: false };
   const seg = String(p.path || "").split("/").filter(Boolean).map(strip);
-  let what = raw, why = strip(p.reason);
-  let asked = null;
+  // Three kinds of text, kept apart (#715 review): `what`, wicket's sentence from fields it checked;
+  // `said`, what the agent chose (quoted, as its words); `wicket`, a reason wicket wrote whole (a
+  // spawn's limits, a link's policy). A reason that mixes wicket's words with the agent's is never
+  // shown as wicket's: when its parts aren't sent apart, it is `mixed`, shown under Details as such.
+  let what = raw, said = [], wicket = null, mixed = null;
   if (p.method === "CAPACITY") {
     const x = p.lease;
     if (x) {
-      what = "Lease a node: " + plural(Number(x.vcpus) || 0, "vCPU", "vCPUs") + ", " + (Number(x.memory_mib) || 0) + " MiB, for " + span(Number(x.duration_secs) || 0) +
-        " on " + strip(x.provider) + ", at most " + money(x.hourly_cap_usd) + "/h, " + money(x.reserved_usd) + " reserved";
-      if (x.region) asked = ["region", strip(x.region)];
-    } else what = "Lease a node (" + seg.slice(1).join("/") + ")";
-  } else if (p.method === "SPAWN" && seg[0] === "zones") what = "Start a child agent" + (seg[2] ? " named " + seg[2] : "") + " in zone " + seg[1];
-  else if (p.method === "LINK" && seg[0] === "links") what = "Link " + shortText(seg[1]) + " \u2192 " + shortText(seg[2]) + (seg[3] ? ", port " + seg[3] : "");
-  else if (p.method === "UPDATE" && seg[0] === "self") what = "Install wicket build " + String(seg[1] || "").slice(0, 12) + "\u2026";
-  return { what, raw, why, internal: true, asked };
+      what = "Lease a node: " + plural(Number(x.vcpus) || 0, "vCPU", "vCPUs") + ", " + (Number(x.memory_mib) || 0) + " MiB, " + strip(x.isolation || "default") + " isolation, for " +
+        span(Number(x.duration_secs) || 0) + " on " + strip(x.provider) + ", at most " + money(x.hourly_cap_usd) + "/h, " + money(x.reserved_usd) + " reserved";
+      if (x.region) said.push(["Region", strip(x.region)]);
+      if (x.reason) said.push(["Why", strip(x.reason)]);
+    } else { what = "Lease a node (" + seg.slice(1).join("/") + "); its terms arrive with the next refresh"; mixed = strip(p.reason); }
+  } else if (p.method === "SPAWN" && seg[0] === "zones") {
+    // wicket writes the reason as "start <kind> …"; only its two kinds are read from it, nothing else.
+    const k = /^start (agent|program) /.exec(String(p.reason || ""));
+    what = "Start " + (k ? "a new " + k[1] : "a new agent or program") + (seg[2] ? " named " + seg[2] : "") + " in zone " + seg[1];
+    wicket = strip(p.reason);
+  } else if (p.method === "LINK" && seg[0] === "links") {
+    // The path is /links/<from run>/<to run>/<port>: the port is on the second box, the one linked to.
+    const nm = id => { const n = runName(id); return n === id ? shortText(n) : n; };
+    what = "Let " + nm(seg[1]) + "'s box reach port " + (seg[3] || "?") + " on " + nm(seg[2]) + "'s box";
+    wicket = strip(p.reason);
+  } else if (p.method === "UPDATE" && seg[0] === "self") {
+    what = "Install wicket build " + String(seg[1] || "").slice(0, 12) + "\u2026";
+    const c = p.claims;
+    if (c) {
+      if (c.commit) said.push(["Commit", strip(c.commit)]);
+      if (c.reason) said.push(["Why", strip(c.reason)]);
+    } else mixed = strip(p.reason);
+  } else mixed = strip(p.reason);
+  return { what, raw, said, wicket, mixed, internal: true };
 }
 
 // Pending cards are kept by request id: a card whose content hasn't changed is the same element
@@ -468,49 +526,115 @@ function wrapped(cls, text) {
   return e;
 }
 function fillMeta(meta, p) { meta.replaceChildren(document.createTextNode(p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 run "), idEl(p.run)); }
+// What a request wants to do, as a verb (docs/explanation/console-design.md): from its method, or
+// git's service for a push or a fetch.
+function verb(p) {
+  // git's own words only for the methods git uses (#715 review): a DELETE to a git path is a delete.
+  const m = String(p.method).toUpperCase();
+  if ((m === "GET" || m === "POST") && /git-receive-pack$|service=git-receive-pack/.test(p.path || "")) return "push code to";
+  if ((m === "GET" || m === "POST") && /git-upload-pack$|service=git-upload-pack/.test(p.path || "")) return "fetch code from";
+  return ({ GET: "read", HEAD: "read", OPTIONS: "read", POST: "send data to", PUT: "change", PATCH: "change", DELETE: "delete" })[String(p.method).toUpperCase()] || strip(p.method);
+}
+// Methods as the verbs a person would use: [GET, HEAD, POST] is "read and send data to".
+function verbsOf(methods) {
+  const v = [];
+  for (const m of methods && methods.length ? methods : ["GET"]) { const w = verb({ method: m, path: "" }); if (!v.includes(w)) v.push(w); }
+  return v.length > 1 ? v.slice(0, -1).join(", ") + " and " + v[v.length - 1] : v[0];
+}
+// The "Where" of a request: its host, its path quieter and wrapped at its slashes.
+function where(p) {
+  const d = el("div", "where");
+  d.append(el("span", "host", strip(p.host)));
+  if (p.path && p.path !== "/") d.append(wrapped("path", strip(p.path) + (p.scope_prefix ? "\u2026" : "")));
+  if (p.scope_prefix) d.append(el("div", "meta", "and every page under it"));
+  return d;
+}
+// A labelled field of a card: its label and its value (text or an element).
+function field(dl, label, value, cls) {
+  const dt = el("dt", "", label), dd = el("dd", cls || "");
+  if (typeof value === "string") dd.textContent = value; else dd.append(value);
+  dl.append(dt, dd);
+  return dd;
+}
+// Who asks: the agent and its zone, verified (#574, item 5), or said plainly when it isn't.
+function whoAsks(id) {
+  const w = el("span", "who-ask");
+  if (id.verified) {
+    // The agent by name; its full identity behind a tap: a real button, focusable, saying whether it is shown.
+    const name = el("button", "idname", strip(id.agent));
+    name.type = "button";
+    const idline = el("div", "idline", strip(id.id));
+    idline.hidden = true;
+    name.title = "Show its identity";
+    name.setAttribute("aria-expanded", "false");
+    name.onclick = () => {
+      idline.hidden = !idline.hidden;
+      name.setAttribute("aria-expanded", String(!idline.hidden));
+      layoutAt = performance.now(); // the line moves the buttons below it
+    };
+    w.append(el("span", "ok", "\u2713 "), name, document.createTextNode(" \u00b7 zone " + strip(id.zone)), idline);
+    return [w, true];
+  }
+  if ((id.error || "").startsWith("no identity was issued")) { w.append(document.createTextNode("a program (it has no agent identity)")); return [w, true]; }
+  w.append(el("span", "bad", "We can't confirm which agent this is (" + strip(id.error || "unknown") + "). Only Don't allow is offered."));
+  return [w, false];
+}
+function fillMeta(meta, p) { meta.replaceChildren(document.createTextNode(p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 run "), idEl(p.run)); }
 function pendingCard(s, p) {
-  const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run]);
+  const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run, p.lease, p.claims, p.once_terms]);
   const had = cards.get(p.id);
   if (had && had.key === key) { had.age.textContent = rel(p.created_at, s.now); return had.node; }
-  // It leads with what is asked, who asks, the risk and the decision (#574 review); the rest (on
-  // whose behalf, who in the box asked, the ids, how a push is granted) is under Details.
+  // Labelled fields (docs/explanation/console-design.md): who, wants to, where, why, risk; then the
+  // choices; the rest (on whose behalf, who in the box asked, the exact request, the ids) under Details.
   const c = el("div", "card req"); c.dataset.id = p.id;
+  const tone = riskClass(p.risk);
   const head = el("div", "req-head");
   const age = timeEl(p.created_at, rel(p.created_at, s.now)); age.className = "age";
-  head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)), age);
+  head.append(el("span", "risk " + tone, riskWords(p.risk)), age);
+  c.append(head);
   const a = asks(p);
-  c.append(head, a.internal ? el("div", "what said", a.what) : wrapped("what", a.what));
-  // What the agent chose, quoted as its own, apart from wicket's sentence.
-  if (a.asked) c.append(el("div", "meta asked", a.asked[0] + ", as the agent asked: \u201c" + a.asked[1] + "\u201d"));
-  // wicket writes the reason of its own kinds (they quote the agent's inside): said as wicket's.
-  c.append(el("div", "why", a.internal ? "wicket says: " + a.why : a.why));
+  const dl = el("dl", "fields");
+  const [who, idOk] = whoAsks(p.identity || {});
+  field(dl, "Who", who);
+  // The verb, and always the exact method beside it (#715 review): a verb alone could mislead.
+  if (a.internal) field(dl, "Wants to", a.what.charAt(0).toLowerCase() + a.what.slice(1), "said");
+  else { field(dl, "Wants to", verb(p) + " (" + strip(p.method) + ")", "said"); field(dl, "Where", where(p)); }
+  // What the agent chose, quoted and labelled as its words (#709, #715 review); text wicket wrote
+  // whole, labelled as wicket's.
+  for (const [label, text] of a.said) field(dl, label + (label === "Why" ? "" : ", as the agent says"), "\u201c" + text + "\u201d", label === "Why" ? "why" : "asked");
+  if (a.wicket) field(dl, "wicket says", a.wicket, "why");
+  c.append(dl);
+  // How far a grant reaches stays on the card (#709 review); who in the box asked is detail.
+  c.append(renderWho(p.attribution || [], "warnings"));
   const more = el("details", "more req-more");
   more.append(el("summary", "", "Details"));
-  const idOk = renderAgent(c, p.identity || {}, more);
-  c.append(renderWho(p.attribution || [], "warnings"));
-  if (a.raw) more.append(el("div", "mono quiet raw", a.raw));
+  const id = p.identity || {};
+  if (id.verified) more.append(el("div", "chain", "On behalf of: " + (id.acting_for || []).map(strip).join(" \u2192 ")));
+  more.append(el("div", "mono raw", strip(p.method + " " + p.host + p.path) + " \u00b7 risk class " + riskCode(p.risk)));
+  if (a.mixed) more.append(el("div", "meta", "The request's text, with the agent's words in it: \u201c" + a.mixed + "\u201d"));
   more.append(renderWho(p.attribution || [], "list"));
   const meta = el("div", "meta");
   fillMeta(meta, p);
   more.append(meta);
-  const b = el("div", "buttons");
+  const b = el("div", "buttons ladder");
   // The first button's words are the server's terms for it (`once_terms`): a git push is granted
   // as a window whatever is picked, and the card mustn't say otherwise.
   const ot = p.once_terms || { uses: 1, ttl_secs: 600 };
   const window_ = ot.uses !== 1;
-  // wicket's own kinds are one decision each: their lifetime means nothing to the operator (#621).
-  const onceLabel = window_ ? "Approve this push (any number of uses for " + span(ot.ttl_secs) + ")"
-    : a.internal ? "Approve" : p.scope_prefix ? "Approve prefix once (expires in 10 min)" : "Approve once (expires in 10 min)";
+  const onceLabel = window_ ? "Allow for " + span(ot.ttl_secs) + " (any number of uses)" : a.internal ? "Allow" : "Allow once (expires in " + span(ot.ttl_secs) + ")";
   const once = el("button", "approve", onceLabel); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
-  const hour = el("button", "", p.scope_prefix ? "Approve prefix for 1 hour (any number of uses)" : "Approve for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
-  const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
+  const hour = el("button", "", "Allow for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
+  const deny = el("button", "deny apart", "Don't allow"); deny.onclick = () => act("deny", { id: p.id });
   if (!idOk) { once.disabled = true; hour.disabled = true; }
-  // A push to a host that isn't github.com can be R2, but it is still granted as the window: no
-  // hour button, which would promise what the grant doesn't give (#597 re-review).
-  if (a.internal) b.append(once, deny);
+  // Only the steps the server grants: a push is one window, R3 and R4 one use, wicket's own kinds one
+  // decision (#597 re-review, #621). A push to a host that isn't github.com can be R2, but it is still
+  // granted as the window: no hour button, which would promise what the grant doesn't give.
+  if (!idOk) b.append(deny);
+  else if (a.internal) b.append(once, deny);
   else if (window_ || p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
     b.append(once, deny);
-    more.append(el("div", "note", window_ ? "A push is approved as one window: any number of uses for " + span(ot.ttl_secs) + ", for its ref discovery and upload." : "R3 and R4 are approved one use at a time."));
+    more.append(el("div", "note", window_ ? "A push is allowed as one window: any number of requests for " + span(ot.ttl_secs) + ", for its ref discovery and upload." :
+      "This kind is allowed one request at a time."));
   } else b.append(once, hour, deny);
   c.append(b, more);
   cards.set(p.id, { key, node: c, meta, age });
@@ -527,12 +651,12 @@ function renderCounts(waiting, alerts) {
     if (!e) return;
     e.textContent = v ? String(v) : ""; e.hidden = !v;
     const a = e.parentNode;
-    if (a && a.setAttribute && a.dataset) { if (v) a.setAttribute("aria-label", a.dataset.label + ", " + v + (v === 1 ? " item" : " items")); else a.removeAttribute("aria-label"); }
+    if (a && a.setAttribute && a.dataset) { if (v) a.setAttribute("aria-label", a.dataset.label + ", " + plural(v, a.dataset.noun || "item")); else a.removeAttribute("aria-label"); }
   };
   set("nav-waiting", waiting);
   set("nav-health", alerts);
   const h = document.getElementById("waiting-h");
-  if (h) h.textContent = waiting ? "Waiting for you (" + waiting + ")" : "Waiting for you";
+  if (h) h.textContent = waiting ? "Needs you (" + waiting + ")" : "Needs you";
   document.title = waiting ? "(" + waiting + ") wicket" : "wicket";
   if (waiting === shownCount) return;
   shownCount = waiting;
@@ -546,7 +670,7 @@ function renderPending(s) {
   const box = document.getElementById("pending");
   const live = new Set(s.pending.map(p => p.id));
   for (const id of [...cards.keys()]) if (!live.has(id)) cards.delete(id);
-  const nodes = s.pending.length ? s.pending.map(p => pendingCard(s, p)) : [el("div", "empty", "Nothing is waiting for a decision.")];
+  const nodes = s.pending.length ? s.pending.map(p => pendingCard(s, p)) : [el("div", "empty", "Nothing is waiting for you.")];
   const same = nodes.length === box.children.length && nodes.every((n, i) => n === box.children[i]);
   if (same) return;
   const empty = !s.pending.length && box.children.length === 1 && box.children[0].className === "empty";
@@ -605,30 +729,58 @@ function egressOf(op) {
 // happened. Every kind wicket writes that an operator acts on has words; anything else is its kind
 // and run, so nothing is dropped.
 const num = n => Number(n || 0).toLocaleString("en-US");
-const by = b => b.by ? " by " + strip(b.by) + (b.signed ? " (passkey-signed)" : "") : "";
+// Who did it: an operator by their passkey's name ("passkey:phone" is "phone"), signed or not.
+const byName = x => strip(String(x || "").replace(/^passkey:/, ""));
+// Who decided, from the decider's label (#715 review): never "you", since another operator, a parent
+// agent (`agent:<run>`) or a standing capacity grant (`capacity-grant:<id>`) may have.
+function decider(label) {
+  const s = String(label || "");
+  if (s.startsWith("agent:")) {
+    // An agent run names itself by its agent; a program run, which has none, by its run id.
+    const run = s.slice(6), n = runName(run);
+    return (n === "a program" ? "run " + shortText(strip(run)) : n) + " (a parent agent)";
+  }
+  if (s.startsWith("capacity-grant:")) return "capacity grant " + strip(s.slice(15));
+  return s ? byName(s) : "?";
+}
+const by = b => b.by ? " by " + decider(b.by) + (b.signed ? ", signed with a passkey" : "") : "";
 function logLine(op, tag, tone, text, extra) {
   const d = el("div", "logline");
-  d.append(op.ts ? timeEl(op.ts, clock(op.ts)) : el("span"), el("span", "tag " + (tone || ""), tag), el("span", "text", text));
-  if (extra) d.lastChild.append(document.createTextNode(" "), extra);
+  d.dataset.cat = /^(decision|standing|grant|capacity|lease)/.test(op.kind) ? "decisions" : /^(run|identity|session|operator\.message)/.test(op.kind) || (op.body || {}).kind === "llm" || (op.body || {}).kind === "box" ? "agents" : /^node/.test(op.kind) ? "servers" : "other";
+  const t = el("span", "text", text);
+  d.append(op.ts ? timeEl(op.ts, clock(op.ts)) : el("span"), el("span", "tag " + (tone || ""), tag), t);
+  if (extra) t.append(document.createTextNode(" "), extra);
   return d;
+}
+// An agent run by its agent's name where the latest list knows it; its id otherwise.
+function runName(id) {
+  const x = ((lastState && lastState.runs) || []).find(r => r.id === id);
+  return x ? (x.agent ? strip(x.agent) : "a program") : strip(id);
 }
 function line(op) {
   const b = op.body || {};
-  const r = op.run ? strip(op.run) : "";
+  const r = op.run ? runName(op.run) : "";
   const eg = egressOf(op);
   if (eg) {
     const [x, where] = eg;
     const outcome = String(x.outcome || "?");
     const tone = outcome === "allow" || outcome === "spliced" ? "ok" : outcome === "pending" ? "pend" : "blocked";
     let why = null;
-    if (op.run) { why = el("button", "link", "explain"); why.onclick = () => showExplain(op.seq); }
-    return logLine(op, outcome, tone, strip(x.method + " " + x.host + x.path + where), why);
+    if (op.run) {
+      why = el("button", "link", "why?");
+      why.onclick = () => { const box = why.parentNode.parentNode.nextSibling; if (box && box.className === "explained") { box.hidden = !box.hidden; return; }
+        const nb = el("div", "explained"); why.parentNode.parentNode.after ? why.parentNode.parentNode.after(nb) : null; showExplain(op.seq, nb); };
+    }
+    const said = ({ allow: "allowed", spliced: "allowed", pending: "waiting", forbidden: "blocked", denied: "blocked", deny: "blocked" })[outcome] || outcome;
+    const ln = logLine(op, said, tone, (r ? r + ": " : "") + verb(x) + " " + strip(x.host + x.path + where), why);
+    ln.dataset.cat = outcome === "allow" || outcome === "spliced" ? "allowed" : "blocked";
+    return ln;
   }
   switch (op.kind === "op" ? "op." + b.kind : op.kind) {
     case "op.llm": return logLine(op, "model", "", strip(b.model || "?") + " request #" + num(b.requests) + " \u2192 " + strip(b.status) +
       " \u00b7 " + num(b.input_tokens) + " in / " + num(b.output_tokens) + " out tokens" + (r ? " \u00b7 " + r : ""));
     case "op.box": return logLine(op, "box", "pend", strip(b.what) + ": " + strip(b.detail) + (r ? " \u00b7 " + r : ""));
-    case "decision": return logLine(op, b.decision === "approve" ? "approved" : "denied", b.decision === "approve" ? "ok" : "blocked", strip(b.request) + by(b));
+    case "decision": return logLine(op, b.decision === "approve" ? "allowed" : "refused", b.decision === "approve" ? "ok" : "blocked", strip(b.request) + by(b));
     case "decision.refused": return logLine(op, "refused", "blocked", "a decision (" + strip(b.decision) + ") on " + strip(b.target) + " was refused" +
       (b.by ? " for " + strip(b.by) : "") + ": " + strip(b.why));
     case "grant.revoked": return logLine(op, "revoked", "", "grant " + strip(b.grant) + " revoked" + by(b));
@@ -641,11 +793,11 @@ function line(op) {
     case "operator.passkey_added": return logLine(op, "passkey", "", "passkey " + strip(b.name) + " added via " + strip(b.via));
     case "run.start": return logLine(op, "start", "", r + " started: agent " + strip(b.agent) + " in zone " + strip(b.zone));
     // operator.message is from before `wicket say` was removed (#198); prompts are session.prompt.
-    case "operator.message": case "session.prompt": return logLine(op, "prompt", "", plural(b.chars || 0, "character") + " to " + r + by(b) + (b.via ? " via " + strip(b.via) : ""));
-    case "identity.revoked": return logLine(op, "revoked", "blocked", r + "'s identity revoked" + by(b) + ": " + strip(b.reason));
-    case "run.console_start": return logLine(op, "launch", "", r + " from " + strip(b.root + "/" + b.manifest) + " by " + strip(b.by) + " (passkey-signed)");
-    case "run.exit_cause": return logLine(op, "ended", "blocked", r + " exited with status " + strip(b.code) + ": " + strip(b.cause));
-    case "run.end": return logLine(op, "end", b.cause ? "blocked" : "", r + " " + strip(b.status) + " \u00b7 " + plural(b.model_requests || 0, "model call"));
+    case "operator.message": case "session.prompt": return logLine(op, "message", "", "a message of " + plural(b.chars || 0, "character") + " to " + r + by(b) + (b.via ? " in the " + strip(b.via) : ""));
+    case "identity.revoked": return logLine(op, "stopped", "blocked", r + " stopped" + by(b) + ": " + strip(b.reason));
+    case "run.console_start": return logLine(op, "started", "", r + " started from " + strip(b.manifest) + " by " + byName(b.by) + ", signed with a passkey");
+    case "run.exit_cause": return logLine(op, "failed", "blocked", r + " failed (exit status " + strip(b.code) + "): " + strip(b.cause));
+    case "run.end": return logLine(op, "finished", b.cause ? "blocked" : "", r + " " + (b.status === "exited" ? "finished" : strip(b.status)) + " after " + plural(b.model_requests || 0, "model call"));
   }
   if (op.kind === "node.audit") {
     let inner = "";
@@ -698,14 +850,14 @@ function stateStoreRows(p, nowMs) {
     // old one, recovered from, isn't news.
     const live = st.error && (st.state !== "streaming" || (st.error_ms || 0) > (st.last_sync_ms || 0));
     const err = live ? "last error" + (st.error_ms ? " " + secs((nowMs - st.error_ms) / 1000) + " ago" : "") + ": " + strip(st.error) : null;
-    out.push(row("State store", cls, text, err));
+    out.push(row("Record backup", cls, text, err));
   }
   for (const a of p.audit || []) {
     let text = a.behind ? a.behind + " record" + (a.behind === 1 ? "" : "s") + " behind (oldest " + secs(a.behind_secs) + ")" : "caught up";
     // A jsonl sink to stdout is fed only by `wicket audit export` in the foreground: behind is expected.
     if (a.manual) text += " (manual: fed only by `wicket audit export`)";
     text += " at " + a.seq + " of " + a.head + " \u00b7 last checkpoint " + (a.checkpoint_at ? secs(nowMs / 1000 - a.checkpoint_at) + " ago" : "never");
-    out.push(row("Audit export " + strip(a.sink) + " (" + strip(a.kind) + ")", a.error ? "blocked" : a.behind && !a.manual ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
+    out.push(row("Activity export to " + strip(a.sink), a.error ? "blocked" : a.behind && !a.manual ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
   }
   // An error already alerted on (the config alert quotes it) isn't said twice.
   for (const e of p.errors || []) if (!(p.alerts || []).some(a => a.startsWith(e))) out.push(serverText("div", "blocked", "! " + e));
@@ -724,7 +876,7 @@ function placedRow(p) {
   if (p.past_lease && p.held_by) {
     const w = el("div", "callout warn");
     w.append(document.createTextNode("Lease ended "), timeEl(p.lease_until), document.createTextNode("; still billing: run " + strip(p.held_by) + " holds it. Release it on the host:"));
-    w.append(el("code", "block", "wicket node release " + strip(p.id)));
+    w.append(el("code", "block", "wicket node release " + strip(p.id)), copyButton("wicket node release " + strip(p.id)));
     d.append(w);
   } else if (p.past_lease) {
     const w = el("div", "meta");
@@ -790,48 +942,70 @@ function ruleText(r) {
 // An agent's ask: the rule, who asked and why, the ledger's evidence, and what it allows beyond it.
 // Approved once (signed): as asked or narrowed to the evidence, for the agent or its zone, 30 days.
 function standingAskRow(a) {
-  const d = el("div", "card req");
+  // An agent's ask to be always allowed something (#572): the same card as a request, with its
+  // evidence, and the Always choices narrowest first.
+  const d = el("div", "card req always");
   const e = a.evidence || {};
   const r = a.rule || {};
   const agent = String(a.principal || "").split("/a/").pop();
-  d.append(el("div", "what", "Standing reach on " + strip(r.host)));
-  d.append(el("div", "meta", "Methods: " + (r.methods || []).map(strip).join(", ") + (r.allow_dangerous ? " \u00b7 dangerous requests too (R3, R4)" : "")));
-  d.append(el("div", "meta", "Paths: " + (r.paths || []).map(strip).join(", ")));
-  d.append(el("div", "why", strip(a.reason)));
-  const who = el("div", "meta", "Asked by " + strip(agent) + " (zone " + strip(a.zone) + ") \u00b7 for its later runs with this zone definition" +
-    (a.zone_digest ? " (" + strip(a.zone_digest).slice(0, 12) + "\u2026)" : ""));
-  who.title = strip(a.principal);
-  d.append(who);
-  d.append(el("div", "meta", "Evidence: " + e.granted + " granted of " + e.requests + " blocked request(s) it covers in the last 14 days (" +
-    e.denied + " denied, " + e.undecided + " undecided), in " + e.runs + " run(s) on " + e.days + " day(s)" +
-    ((e.ops || []).length >= 10 ? ", the 10 most asked:" : (e.ops || []).length ? ":" : "")));
-  for (const o of (e.ops || [])) d.append(el("div", "meta mono", o.count + " \u00d7 " + strip(o.method) + " " + strip(o.path) + " (" + o.granted + " granted)"));
-  if (e.own_asks) d.append(el("div", "meta", "and " + e.own_asks + " ask(s) ahead of its own, not counted as evidence"));
-  for (const b of (a.beyond || [])) d.append(el("div", "blocked", "Wider than the evidence: " + strip(b)));
-  const b = el("div", "buttons");
+  const head = el("div", "req-head");
+  // The pill says only what the rule says (#715 review): dangerous requests included or not, and its
+  // methods. Whether a POST changes data depends on the API, so it isn't guessed here.
+  head.append(el("span", "risk " + (r.allow_dangerous ? "r4" : ""),
+    (r.allow_dangerous ? "Includes requests that can't be undone: " : "") + (r.methods || []).map(strip).join(", ")),
+    timeEl(a.created_at, rel(a.created_at)));
+  head.children[head.children.length - 1].className = "age";
+  d.append(head);
+  const dl = el("dl", "fields");
+  const who = el("span"); who.append(el("strong", "", strip(agent)), document.createTextNode(" \u00b7 zone " + strip(a.zone))); who.title = strip(a.principal);
+  field(dl, "Who", who);
+  field(dl, "Wants to", "always be allowed to " + verbsOf(r.methods), "said");
+  const w = el("div", "where"); w.append(el("span", "host", strip(r.host)), el("div", "path", (r.paths || []).map(strip).join("  ")));
+  field(dl, "Where", w);
+  field(dl, "Why", "\u201c" + strip(a.reason) + "\u201d", "why");
+  field(dl, "So far", plural(e.requests || 0, "request") + " like this in " + plural(e.days || 0, "day") + "; allowed " + (e.granted || 0) +
+    (e.denied ? ", refused " + e.denied : "") + (e.undecided ? ", " + e.undecided + " not decided" : ""));
+  d.append(dl);
+  for (const x of (a.beyond || [])) d.append(el("div", "callout warn", "Wider than what it used: " + strip(x)));
+  const b = el("div", "buttons ladder");
   // The narrowest choice first, and the default; the widest (a whole zone) marked as such.
-  const narrow = el("button", a.narrowed ? "approve" : "", a.narrowed ? "Approve narrowed (30 days)" : "Approve narrowed: no evidence to narrow to");
+  const narrow = el("button", a.narrowed ? "approve" : "", a.narrowed ? "Always: only what it used" : "Always: only what it used (nothing to narrow to)");
   narrow.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent", narrow: true });
   narrow.disabled = !a.narrowed;
-  const asAsked = el("button", a.narrowed ? "" : "approve", "Approve as asked (30 days)");
+  const asAsked = el("button", a.narrowed ? "" : "approve", "Always: as asked");
   asAsked.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "agent" });
-  const zone = el("button", "deny", "Approve for every agent in zone " + strip(a.zone) + " (30 days)");
+  const zone = el("button", "deny", "Always, for every agent in zone " + strip(a.zone));
   zone.onclick = () => signedSettled({ action: "standing_approve", id: a.id, for: "zone" });
-  const deny = el("button", "deny", "Deny");
+  const deny = el("button", "deny apart", "Don't allow");
   deny.onclick = () => signedSettled({ action: "standing_deny", id: a.id });
-  b.append(narrow, asAsked, zone);
-  const b2 = el("div", "buttons");
-  b2.append(deny);
-  if (a.narrowed) d.append(el("div", "meta", "Narrowed: methods " + (a.narrowed.methods || []).map(strip).join(", ") + ", paths " + (a.narrowed.paths || []).map(strip).join(", ")));
-  d.append(b, b2, el("div", "meta", strip(a.id) + " \u00b7 asked " + when(a.created_at)));
+  b.append(narrow, asAsked, zone, deny);
+  d.append(b, el("div", "meta", "\u201cAlways\u201d lasts 30 days, and you can remove it in Settings."));
+  const more = el("details", "more req-more");
+  more.append(el("summary", "", "Details"));
+  if (a.narrowed) more.append(el("div", "meta", "Only what it used: methods " + (a.narrowed.methods || []).map(strip).join(", ") + ", paths " + (a.narrowed.paths || []).map(strip).join(", ")));
+  more.append(el("div", "meta", "Methods: " + (r.methods || []).map(strip).join(", ") + (r.allow_dangerous ? " \u00b7 dangerous requests too (R3, R4)" : "")));
+  more.append(el("div", "meta", "Paths: " + (r.paths || []).map(strip).join(", ")));
+  more.append(el("div", "meta", "Asked by " + strip(agent) + " (zone " + strip(a.zone) + ") \u00b7 for its later runs with this zone definition" +
+    (a.zone_digest ? " (" + strip(a.zone_digest).slice(0, 12) + "\u2026)" : "")));
+  more.append(el("div", "meta", "Evidence: " + e.granted + " granted of " + e.requests + " blocked request(s) it covers in the last 14 days (" +
+    e.denied + " denied, " + e.undecided + " undecided), in " + e.runs + " run(s) on " + e.days + " day(s)" +
+    ((e.ops || []).length >= 10 ? ", the 10 most asked:" : (e.ops || []).length ? ":" : "")));
+  for (const o of (e.ops || [])) more.append(el("div", "meta mono", o.count + " \u00d7 " + strip(o.method) + " " + strip(o.path) + " (" + o.granted + " granted)"));
+  if (e.own_asks) more.append(el("div", "meta", "and " + e.own_asks + " ask(s) ahead of its own, not counted as evidence"));
+  more.append(el("div", "meta", "standing reach " + strip(a.id) + " \u00b7 asked " + when(a.created_at)));
+  d.append(more);
   return d;
 }
 // An approved rule: who it is for, when it lapses; renewed (signed, 30 days) or revoked (session).
 function standingRuleRow(r) {
   const d = el("div", "row cap");
   const head = el("div");
-  head.append(el("span", "mono", strip(r.id) + " "), el("span", "", ruleText(r.rule)));
-  const to = r.for === "zone" ? "every agent of zone " + strip(r.zone) : principalName(r.principal);
+  const rr = r.rule || {};
+  const to = r.for === "zone" ? "every agent in zone " + strip(r.zone) : principalName(r.principal);
+  head.append(r.for === "zone" ? el("span", "run-name", to) : principalEl(r.principal), el("span", "", " may " + verbsOf(rr.methods) + " "), el("span", "mono", strip(rr.host)));
+  // On the row, not only in its title (#715 review): this rule allows requests that can't be undone.
+  if (rr.allow_dangerous) head.append(document.createTextNode(" "), el("span", "risk r4", "including requests that can't be undone"));
+  head.title = "standing reach " + strip(r.id) + ": " + ruleText(r.rule);
   const until = r.expires_at ? (r.live ? "ends " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
   const b = el("div", "buttons");
   const renew = el("button", "approve", "Renew (30 days)");
@@ -842,9 +1016,7 @@ function standingRuleRow(r) {
     refresh();
   });
   b.append(renew, revoke);
-  const forWho = el("div", "meta");
-  forWho.append(document.createTextNode("for "), r.for === "zone" ? document.createTextNode(to) : principalEl(r.principal), document.createTextNode(" · " + until + " · by " + strip(r.decided_by)));
-  d.append(head, forWho, b);
+  d.append(head, el("div", "meta", (rr.paths || []).map(strip).join("  ") + " \u00b7 " + until + " \u00b7 allowed by " + strip(r.decided_by)), b);
   return d;
 }
 // The form's inputs, by name; built once, so what the operator types survives the poll.
@@ -879,19 +1051,23 @@ function renderCapacityForm() {
 
 // A run: who, where, its state and times, its pages; an ACP agent's session opens on its own page,
 // where prompts are sent (#198).
-function renderRun(s, x) {
+function renderRun(s, x, page) {
   // The agent first, its zone and state; the run id quieter under it (#641). A program run has no agent.
   const d = el("div", "row run");
   const left = el("div");
   const head = el("div", "run-head");
-  head.append(el("span", "run-name", x.agent ? strip(x.agent) : "program run"), el("span", "meta", " \u00b7 zone " + strip(x.zone)));
+  const name = x.agent ? strip(x.agent) : "program run";
+  if (page) head.append(el("h2", "run-name", name));
+  else { const a = el("a", "run-name", name); a.href = "#agent/" + encodeURIComponent(x.id); head.append(a); }
+  head.append(el("span", "meta", " \u00b7 zone " + strip(x.zone)));
   const status = x.revoked ? "revoked" : String(x.status || "");
   const tone = ({ running: "good", revoked: "bad", failed: "bad", hibernated: "info" })[status] || "";
-  head.append(el("span", "pill " + tone, strip(status)));
+  const waiting = x.waiting !== undefined ? x.waiting : ((s && s.pending) || []).some(p => p.run === x.id);
+  head.append(el("span", "pill " + (waiting ? "warn" : tone), waiting ? "waiting for you" : ({ running: "working", exited: "finished", revoked: "stopped", hibernated: "asleep" })[status] || strip(status)));
   left.append(head);
   const meta = el("div", "meta");
-  meta.append(timeEl(x.started_at, "started " + rel(x.started_at, s.now)));
-  if (x.ended_at) meta.append(document.createTextNode(" \u00b7 "), timeEl(x.ended_at, "ended " + rel(x.ended_at, s.now)));
+  meta.append(relEl(x.started_at, "started ", s.now));
+  if (x.ended_at) meta.append(document.createTextNode(" \u00b7 "), relEl(x.ended_at, "ended ", s.now));
   meta.append(document.createTextNode(" \u00b7 "), idEl(x.id));
   left.append(meta);
   const links = el("div", "links");
@@ -907,19 +1083,51 @@ function renderRun(s, x) {
     a.href = x.remote_url; a.target = "_blank"; a.rel = "noopener noreferrer";
     links.append(a);
   }
-  const auth = el("button", "link", "Authority");
-  auth.onclick = () => showAuthority(x.id);
-  links.append(auth);
+  if (!page) { const auth = el("a", "", "What it can reach \u203a"); auth.href = "#agent/" + encodeURIComponent(x.id); links.append(auth); }
   left.append(links);
   d.append(left);
   // A running agent can have its identity revoked, signed.
-  if (x.status === "running" && x.has_identity && !x.revoked) {
+  if (page && x.status === "running" && x.has_identity && !x.revoked) {
     const acts = el("span", "acts");
-    const rev = el("button", "deny", "Revoke\u2026");
+    const rev = el("button", "deny", "Stop agent\u2026");
     rev.onclick = () => openRunForm("revoke", x.id);
     acts.append(rev); d.append(acts);
   }
   return d;
+}
+
+// An agent's page: its name, state and links, what it can reach (the authority view, #651), and what
+// it did. Stop is the signed revoke, from here only.
+function openAgent(run) {
+  // A Stop form left open for another agent goes (#715 review): its submit would revoke that one.
+  if (agentRun !== run) closeRunForm();
+  agentRun = run;
+  show("agent");
+  renderAgentHead();
+  showAuthority(run);
+  renderAgentLog();
+  if (typeof window !== "undefined" && window.scrollTo) window.scrollTo(0, 0);
+}
+function renderAgentHead() {
+  const box = document.getElementById("agent-head");
+  if (!box || view !== "agent") return;
+  const x = ((lastState && lastState.runs) || []).find(r => r.id === agentRun);
+  if (!x) { box.replaceChildren(el("h2", "", "Agent"), el("p", "note", "This agent run isn't in the latest list (only the 15 most recent are).")); return; }
+  const key = JSON.stringify(x);
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  const row = renderRun(lastState, x, true);
+  box.replaceChildren(row);
+}
+function renderAgentLog() {
+  const box = document.getElementById("agent-log");
+  if (!box || view !== "agent") return;
+  const mine = ((lastState && lastState.audit) || []).filter(op => op.run === agentRun).slice().reverse();
+  // Rebuilt only when its records changed, so a line (and its "why?") stays put across polls.
+  const key = agentRun + ":" + mine.map(op => op.seq).join(",");
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  box.replaceChildren(...(mine.length ? mine.map(line) : [el("div", "empty", "Nothing recorded for it in the latest activity.")]));
 }
 
 // The revoke form: an in-page form (no browser dialogs), kept outside the runs list
@@ -928,18 +1136,25 @@ function openRunForm(kind, run) {
   const f = document.getElementById("runform"), text = document.getElementById("runform-text");
   f.dataset.kind = kind; f.dataset.run = run;
   f.className = "card " + kind;
+  // Named in the question, with its run, so the operator sees which agent they stop (#715 review).
   document.getElementById("runform-title").textContent =
-    "Revoke " + run + "'s identity: its box is stopped and its requests can't be approved. Reason:";
+    "Stop " + runName(run) + " (run " + strip(run) + ")? Its identity is revoked: its box stops and nothing it asks can be allowed. Say why (it goes in the activity log):";
   const go = document.getElementById("runform-go");
-  go.textContent = "Revoke";
+  go.textContent = "Stop agent";
   go.className = "deny";
   text.value = "revoked by the operator";
   f.hidden = false; text.focus();
 }
-function closeRunForm() { const f = document.getElementById("runform"); f.hidden = true; document.getElementById("runform-text").value = ""; }
+function closeRunForm() {
+  const f = document.getElementById("runform");
+  if (!f) return;
+  f.hidden = true; f.dataset.run = ""; document.getElementById("runform-text").value = "";
+}
 function submitRunForm(ev) {
   ev.preventDefault();
   const f = document.getElementById("runform"), text = document.getElementById("runform-text").value;
+  // Only the agent whose page is open (#715 review): a form for another run is refused, not sent.
+  if (!f.dataset.run || view !== "agent" || f.dataset.run !== agentRun) { closeRunForm(); toast("That form was for another agent; nothing was stopped. Open Stop agent… again.", true); return; }
   signed({ action: "revoke", run: f.dataset.run, reason: text });
   closeRunForm();
 }
@@ -989,7 +1204,7 @@ function renderOperator(s) {
   const b = el("div", "buttons");
   const out = el("button", "", "Sign out"); out.onclick = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
   b.append(out); box.append(b);
-  box.append(codeText("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device."));
+  box.append(codeText("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device.", ["wicket operator enrol-link"]));
 }
 
 // ---- notifications (Web Push) ----
@@ -1115,20 +1330,42 @@ function openPending(id) {
   const target = card ? card.node : document.getElementById("waiting") || document.getElementById("pending");
   if (target && target.scrollIntoView) target.scrollIntoView({ block: "start" });
   if (openId && !card && pendingLoaded) {
-    toast(strip(openId) + " is no longer waiting: it was decided or expired. Recent decisions, under Runs, has it.", false, true);
+    toast(strip(openId) + " is no longer waiting: it was decided or expired. Activity has what became of it.", false, true);
     openId = "";
+  }
+}
+// Four views and an agent's page, by the address's hash, so the back button and a notification's
+// link work: #inbox (the default), #agents, #agent/<run>, #activity, #settings. A notification's
+// #pending/<id> opens the Inbox at that card; #health the Inbox's problems; #notifications Settings.
+let view = "inbox", agentRun = "";
+function show(v) {
+  // Leaving the agent's page closes its Stop form (#715 review).
+  if (v !== "agent") closeRunForm();
+  view = v;
+  for (const n of ["inbox", "agents", "agent", "activity", "settings"]) {
+    const e = document.getElementById("view-" + n);
+    if (e) e.hidden = n !== v;
+  }
+  const nav = document.getElementById("nav");
+  if (nav && nav.querySelectorAll) for (const a of nav.querySelectorAll("a")) {
+    const here = a.dataset.view === v || (v === "agent" && a.dataset.view === "agents");
+    if (here) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
   }
 }
 function fromHash() {
   const h = (typeof location !== "undefined" && location.hash) || "";
   const m = /^#pending(?:\/([A-Za-z0-9_-]{1,64}))?$/.exec(h);
-  if (m) openPending(m[1]);
-  if (h === "#notifications") openNotifications();
-  if (h === "#health") openHealth();
+  const ag = /^#agent\/([A-Za-z0-9_-]{1,80})$/.exec(h);
+  if (m) { show("inbox"); openPending(m[1]); }
+  else if (ag) openAgent(ag[1]);
+  else if (h === "#notifications") { show("settings"); openNotifications(); }
+  else if (h === "#health") { show("inbox"); openHealth(); }
+  else if (["#agents", "#activity", "#settings"].includes(h)) { show(h.slice(1)); if (typeof window !== "undefined" && window.scrollTo) window.scrollTo(0, 0); }
+  else show("inbox");
 }
 // A node-health notification opens the nodes' health, not the pending list (#574, B5).
 function openHealth() {
-  const box = document.getElementById("health");
+  const box = document.getElementById("problems");
   if (box && box.scrollIntoView) box.scrollIntoView();
 }
 
@@ -1162,7 +1399,7 @@ async function boot() {
   } else {
     auth.append(el("div", "", "Sign in to approve or deny what your agents are waiting on, start runs and steer them."));
     const b = el("div", "buttons"); const go = el("button", "approve", "Sign in with passkey"); go.onclick = signIn; b.append(go); auth.append(b);
-    auth.append(codeText("div", "note", "No passkey yet? Open a one-time enrolment link from the host (`wicket serve` prints one at first start; `wicket operator enrol-link` makes another)."));
+    auth.append(codeText("div", "note", "No passkey yet? Open a one-time enrolment link from the host (`wicket serve` prints one at first start; `wicket operator enrol-link` makes another).", ["wicket operator enrol-link"]));
   }
 }
 
@@ -1203,7 +1440,7 @@ function reachLine(text, end, note) {
   return d;
 }
 async function showAuthority(run) {
-  const body = openDetail("Authority of " + strip(run));
+  const body = openDetail("Permissions");
   try {
     const a = await getJson("/api/runs/" + encodeURIComponent(run) + "/authority");
     const t = a.token || {};
@@ -1212,37 +1449,48 @@ async function showAuthority(run) {
     // What it can reach.
     out.push(el("h4", "", "Can reach"));
     const reach = [];
-    for (const r of t.reach || []) reach.push(reachLine(strip(r.host) + " \u00b7 " + methodsText(r.methods) + " \u00b7 " + pathsText(r.paths), undefined,
-      "its zone's rule" + (r.allow_dangerous ? "; dangerous requests (R3, R4) too" : "")));
+    for (const r of t.reach || []) reach.push(reachLine(verbsOf(r.methods) + " " + strip(r.host) + "  " + pathsText(r.paths), undefined,
+      "from its zone's rules" + (r.allow_dangerous ? "; including requests that can't be undone" : "") +
+      ((r.decode_slash || []).length ? "; reads an encoded slash (%2F) as / in path part " + r.decode_slash.map(Number).join(", ") : "")));
     for (const g of (t.grants || []).filter(g => !g.revoked && (!g.expires_at || g.expires_at > now))) {
-      const end = el("span"); end.append(document.createTextNode("grant " + strip(g.id) + ", ends "), timeEl(g.expires_at));
-      reach.push(reachLine(strip(g.method + " " + g.host + g.path), end,
-        (g.uses == null ? "any number of uses" : plural(g.uses, "use") + " (counted on the node)") + " \u00b7 approved by " + strip(g.approved_by || "?") +
-        (g.reached_node === false ? " \u00b7 not yet on its node" : "")));
+      const end = el("span"); end.append(document.createTextNode("allowed by " + decider(g.approved_by) + "; ends "), timeEl(g.expires_at));
+      // All that the grant reaches (#715 review): a standing grant is a rule on the host (its methods,
+      // path globs and allow_dangerous); a prefix grant covers every path under its path.
+      const sr = g.standing;
+      const what = sr ? verbsOf(sr.methods) + " " + strip(g.host) + "  " + pathsText(sr.paths)
+        : verb(g) + " " + strip(g.host + g.path) + (g.prefix ? " and every path under it" : "");
+      reach.push(reachLine(what, end,
+        (g.uses == null ? "any number of times" : plural(g.uses, "more time", "more times")) +
+        (sr && sr.allow_dangerous ? " \u00b7 including requests that can't be undone" : "") +
+        (g.reached_node === false ? " \u00b7 not yet on its server" : "")));
     }
     const st = (lastState && lastState.standing && lastState.standing.rules) || [];
     const row = ((lastState && lastState.runs) || []).find(x => x.id === run) || {};
     for (const r of st.filter(r => r.live && (r.for === "zone" ? r.zone === t.zone : row.agent && String(r.principal || "").endsWith("/z/" + row.zone + "/a/" + row.agent)))) {
-      const end = el("span"); end.append(document.createTextNode("standing reach " + strip(r.id) + ", "), r.expires_at ? timeEl(r.expires_at, "ends " + at(r.expires_at)) : document.createTextNode("until revoked"));
-      reach.push(reachLine(strip(r.rule.host) + " \u00b7 " + methodsText(r.rule.methods) + " \u00b7 " + pathsText(r.rule.paths), end, r.for === "zone" ? "for its zone" : "for this agent"));
+      const end = el("span"); end.append(document.createTextNode("always allowed, "), r.expires_at ? timeEl(r.expires_at, "ends " + at(r.expires_at)) : document.createTextNode("until removed"));
+      reach.push(reachLine(verbsOf(r.rule.methods) + " " + strip(r.rule.host) + "  " + pathsText(r.rule.paths), end, (r.for === "zone" ? "for every agent in its zone" : "for this agent") +
+        (r.rule.allow_dangerous ? "; including requests that can't be undone" : "") + " \u00b7 allowed by " + decider(r.decided_by)));
     }
+    // What its zone forbids beats everything above, a grant included.
+    for (const f of t.forbid || []) reach.push(reachLine("never " + strip(f.host) + "  " + pathsText(f.paths), undefined, "forbidden by its zone's rules, even if you allow it"));
     if (!t.held) reach.push(el("div", "note", "No token now: " + strip(t.why)));
-    else if (!reach.length) reach.push(el("div", "empty", "Nothing beyond what its zone forbids: every request waits for a decision."));
+    else if (!reach.length) reach.push(el("div", "empty", "Nothing: everything it asks for waits for you."));
     out.push(...reach);
     // The run, and what its node holds for it.
-    out.push(el("h4", "", "Run"));
-    out.push(kv("status", strip(a.status) + (a.revoked ? " \u00b7 identity revoked by " + strip(a.revoked.by) + ": " + strip(a.revoked.reason) : "")));
-    out.push(kv("node", strip(a.node) + (a.feed ? " \u00b7 its feed at epoch " + strip(a.feed.epoch) : "")));
-    out.push(kv("policy", (a.policy.version ? strip(a.policy.version) + (a.policy.current ? " (current)" : " (not the installed " + strip(a.policy.installed || "none") + ")") : "no org policy")));
-    if (a.deadline) out.push(kv("authority ends", whenMs(a.deadline.until_ms) + (a.deadline.stopped ? " \u00b7 box stopped" : "")));
+    out.push(el("h4", "", "Where it runs"));
+    if (a.revoked) out.push(el("div", "callout warn", "Stopped by " + strip(a.revoked.by) + ": " + strip(a.revoked.reason)));
+    out.push(kv("server", strip(a.node)));
+    if (a.deadline) out.push(kv("its permissions end", whenMs(a.deadline.until_ms) + (a.deadline.stopped ? " (stopped)" : "")));
     if (a.holdings) {
-      out.push(kv("secrets on its node", a.holdings.secrets.length ? a.holdings.secrets.map(strip).join(", ") + " (names only)" : "none"));
+      out.push(kv("keys it can use", a.holdings.secrets.length ? a.holdings.secrets.map(strip).join(", ") : "none"));
       const sl = a.holdings.slice;
-      out.push(kv("budget slice", sl ? num(sl.requests) + " requests, " + num(sl.output_tokens) + " output tokens" + (sl.input_tokens != null ? ", " + num(sl.input_tokens) + " input tokens" : "") : "none"));
+      out.push(kv("model budget left on its server", sl ? num(sl.requests) + " requests, " + num(sl.output_tokens) + " output tokens" + (sl.input_tokens != null ? ", " + num(sl.input_tokens) + " input tokens" : "") : "none"));
     }
+    out.push(kv("organisation rules", (a.policy.version ? strip(a.policy.version) + (a.policy.current ? " (current)" : " (not the installed " + strip(a.policy.installed || "none") + ")") : "none")));
     if (t.held) {
       const det = el("details", "more");
-      det.append(el("summary", "", "Details: the token, its blocks and grants, the zone's Cedar"));
+      det.append(el("summary", "", "Technical details: its token, grants and zone policy"));
+      det.append(kv("status", strip(a.status) + (a.feed ? " \u00b7 node feed epoch " + strip(a.feed.epoch) : "")));
       det.append(kv("token", "box " + strip(t.box_path) + " \u00b7 epoch " + strip(t.epoch) + " \u00b7 zone " + strip(t.zone) + " \u00b7 minted by " + strip(t.issued_by) +
         (t.loads === true ? " \u00b7 loads" : " \u00b7 does NOT load: " + strip((t.loads || {}).error || ""))));
       for (const b of t.blocks || []) {
@@ -1263,8 +1511,9 @@ async function showAuthority(run) {
   } catch (e) { body.replaceChildren(el("div", "blocked", strip(e.message))); }
 }
 
-async function showExplain(seq) {
-  const body = openDetail("decision #" + seq);
+async function showExplain(seq, into) {
+  const body = into || openDetail("decision #" + seq);
+  if (into) { into.hidden = false; into.replaceChildren(el("div", "meta", "loading\u2026")); }
   try {
     const x = await getJson("/api/explain/" + encodeURIComponent(seq));
     const r = x.recorded, n = x.against_token_now;
@@ -1444,9 +1693,9 @@ async function saltedDigest(value) {
 }
 const utc = t => at(t);
 function secretUse(u) {
-  const where = "zone " + u.zone + " (" + u.root + "/" + u.manifest + "): ";
-  return strip(u.use === "llm" ? where + "model credential" + (u.provider ? " (" + u.provider + ")" : "")
-    : where + "inject \u2192 " + u.host + " \u00b7 header " + u.header + " \u00b7 format " + u.format + (u.optional ? " \u00b7 optional" : ""));
+  const where = "Used by " + u.manifest + " (zone " + u.zone + ")";
+  return strip(u.use === "llm" ? where + " as the model key" + (u.provider ? " (" + u.provider + ")" : "")
+    : where + ": sent to " + u.host + " in its " + u.header + " header" + (u.format ? ", as " + u.format : "") + (u.optional ? " (optional)" : ""));
 }
 let secretsKey = "";
 function renderSecrets(s) {
@@ -1461,7 +1710,7 @@ function renderSecrets(s) {
   for (const x of v.secrets || []) {
     const d = el("div", "secret");
     const head = el("div", "row");
-    head.append(el("span", "mono", strip(x.name)), el("span", "risk " + (x.kind === "reference" ? "r2" : "r0"), x.kind === "reference" ? "reference" : "value"));
+    head.append(el("span", "mono", strip(x.name)), el("span", "risk " + (x.kind === "reference" ? "r2" : "r0"), x.kind === "reference" ? "read from a file on the host" : "stored"));
     d.append(head);
     d.append(el("div", "meta", (x.hosts || []).length ? "sent only to " + x.hosts.map(strip).join(", ") : "bound to no host: sent nowhere"));
     if (x.reference) d.append(el("div", "meta", "refers to " + strip(x.reference.file) + (x.reference.pointer ? "#" + strip(x.reference.pointer) : "") + ", read at each use"));
@@ -1478,7 +1727,7 @@ function renderSecrets(s) {
   for (const m of v.missing || []) {
     const d = el("div", "secret");
     const head = el("div", "row");
-    head.append(el("span", "mono", strip(m.name)), el("span", "risk r3", "not set"));
+    head.append(el("span", "mono", strip(m.name)), el("span", "risk r3", "needed, not set"));
     d.append(head);
     for (const u of m.used_by || []) d.append(el("div", "meta", secretUse(u)));
     const b = el("div", "buttons"); const set = el("button", "approve", "Set\u2026");
@@ -1571,12 +1820,73 @@ async function submitSecret(ev) {
 function decidedRow(x) {
   const d = el("div", "decided");
   const head = el("div", "run-head");
-  head.append(el("span", "pill " + (({ granted: "good", denied: "bad" })[x.status] || ""), ({ granted: "approved", denied: "denied" })[x.status] || strip(x.status)),
-    el("span", "mono", strip(x.method + " " + x.host + x.path)));
+  head.append(el("span", "pill " + (({ granted: "good", denied: "bad" })[x.status] || ""), ({ granted: "allowed", denied: "refused" })[x.status] || strip(x.status)),
+    el("span", "", runName(x.run) + ": " + verb(x) + " "), wrapped("mono inline", strip(x.host + x.path)));
   const meta = el("div", "meta");
   meta.append(document.createTextNode(strip(x.id) + " \u00b7 zone " + strip(x.zone) + " \u00b7 asked "), timeEl(x.created_at, rel(x.created_at)));
   d.append(head, meta);
   return d;
+}
+
+// The activity log's filters: everything, or one kind of line (docs/explanation/console-design.md).
+let logFilter = "all";
+function renderFilters() {
+  const box = document.getElementById("filters");
+  if (!box || box.dataset.built) return;
+  box.dataset.built = "1";
+  for (const [k, label] of [["all", "Everything"], ["blocked", "Blocked"], ["decisions", "Decisions"], ["agents", "Agents"], ["servers", "Servers"]]) {
+    const b = el("button", "chip", label); b.type = "button"; b.setAttribute("aria-pressed", String(k === logFilter));
+    b.onclick = () => { logFilter = k; for (const c of box.children) c.setAttribute("aria-pressed", String(c === b)); applyFilter(); };
+    box.append(b);
+  }
+}
+function applyFilter() {
+  const box = document.getElementById("audit");
+  if (!box) return;
+  for (const n of box.children) if (n.dataset && n.dataset.cat) n.hidden = logFilter !== "all" && n.dataset.cat !== logFilter;
+}
+
+// The Inbox's first line: how things are, each part a link to where it is (#574 redesign).
+function renderStatus(s) {
+  const box = document.getElementById("status");
+  if (!box) return;
+  const runs = s.runs || [];
+  const working = runs.filter(r => r.status === "running" && !r.revoked).length;
+  const waiting = (s.pending || []).length + (((s.standing || {}).asks) || []).length;
+  const problems = problemList(s).length;
+  const part = (n, one, many, href, cls) => { const a = el("a", cls || "", plural(n, one, many)); a.href = href; return a; };
+  const parts = [part(working, "agent working", "agents working", "#agents")];
+  if (waiting) parts.push(part(waiting, "request waiting for you", "requests waiting for you", "#inbox", "warn"));
+  parts.push(problems ? part(problems, "problem", "problems", "#health", "bad") : el("span", "ok", "no problems"));
+  box.replaceChildren();
+  parts.forEach((x, i) => { if (i) box.append(document.createTextNode(" \u00b7 ")); box.append(x); });
+}
+// What is wrong, in plain words, each with where to act: health alerts, the record backup, servers
+// still billing past their rental, keys a task setup needs that aren't set.
+function problemList(s) {
+  const out = [];
+  const h = s.health || {};
+  for (const n of h.nodes || []) for (const a of n.alerts || []) out.push(["bad", "Server " + strip(a), "#settings"]);
+  if (h.control_disk_pct > 85) out.push(["bad", "The control host's disk is " + h.control_disk_pct + "% full", "#settings"]);
+  const st = h.state_store;
+  if (st) {
+    for (const a of st.alerts || []) out.push(["warn", "Record backup: " + strip(a), "#settings"]);
+    if (st.stream && st.stream.state !== "streaming" && st.stream.state !== "starting") out.push(["bad", "The record backup isn't running (" + strip(st.stream.state) + ")", "#settings"]);
+  }
+  for (const p of s.placed || []) if (p.past_lease && p.held_by) out.push(["warn", "Rented server " + strip(p.name) + " is still billing after its rental ended", "#settings"]);
+  for (const m of ((s.secrets || {}).missing) || []) out.push(["warn", "Key " + strip(m.name) + " isn't set, and a task setup needs it", "#settings"]);
+  return out;
+}
+let problemsKey = "";
+function renderProblems(s) {
+  const box = document.getElementById("problems");
+  if (!box) return;
+  const list = problemList(s);
+  const key = JSON.stringify(list);
+  if (key === problemsKey) return;
+  problemsKey = key;
+  if (!list.length) { box.replaceChildren(el("div", "empty", "Nothing is wrong.")); return; }
+  box.replaceChildren(...list.map(([tone, text, href]) => { const a = el("a", "problem " + tone, text); a.href = href; return a; }));
 }
 
 // When the console last heard from wicket, and a line saying so while it can't (#574): what is on
@@ -1624,7 +1934,11 @@ async function refreshOnce() {
     lastState = s;
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
     renderPending(s);
-    renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
+    renderStatus(s);
+    renderProblems(s);
+    // Kept across polls, as the pending cards are (#715 review): a row is rebuilt only when its run, or
+    // whether it waits for you, changed.
+    renderKeyed("runs", s.runs.map(x => ({ ...x, waiting: s.pending.some(p => p.run === x.id) })), x => renderRun(s, x), "No runs yet.");
     renderRows("health", ((s.health || {}).nodes) || [], healthRow, "No node has reported its health yet.");
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
@@ -1635,8 +1949,8 @@ async function refreshOnce() {
     // Standing asks wait with the requests, under a heading of their own, shown only when there are some.
     const ptr = document.getElementById("standing-pointer");
     const n = (st.asks || []).length;
-    if (ptr) { ptr.textContent = n ? "Standing reach " + (n === 1 ? "ask" : "asks") + " (" + n + ")" : ""; ptr.hidden = !n; }
-    renderCounts(s.pending.length + n, ((s.health || {}).alerts || []).length + ((((s.health || {}).nodes) || []).filter(x => (x.alerts || []).length).length));
+    if (ptr) { ptr.textContent = n ? "Asking to be always allowed (" + n + ")" : ""; ptr.hidden = !n; }
+    renderCounts(s.pending.length + n, problemList(s).length);
     renderKeyed("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
     renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: each request waits for a decision.");
     renderStart(s);
@@ -1644,6 +1958,9 @@ async function refreshOnce() {
     renderSecrets(s);
     renderRows("decided", s.decided, decidedRow, "No decisions yet.");
     renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
+    renderFilters(); applyFilter();
+    refreshRel();
+    renderAgentHead(); renderAgentLog();
     const ar = document.getElementById("audit-retention");
     if (ar) ar.textContent = s.audit_retention ? strip(s.audit_retention.line) : "";
     renderOperator(s);
@@ -1652,6 +1969,8 @@ async function refreshOnce() {
 }
 document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("runform").addEventListener("submit", submitRunForm);
+  const so = document.getElementById("start-open");
+  if (so) so.addEventListener("click", () => { const c = document.getElementById("start-card"); c.hidden = !c.hidden; so.setAttribute("aria-expanded", String(!c.hidden)); });
   document.getElementById("runform-cancel").addEventListener("click", closeRunForm);
   document.getElementById("confirm-cancel").addEventListener("click", closeConfirm);
   document.getElementById("secret-edit").addEventListener("submit", submitSecret);

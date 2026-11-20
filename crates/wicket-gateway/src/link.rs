@@ -460,11 +460,13 @@ async fn open(
                     return Err(format!("exactly this link ({rid}) was denied a few minutes ago; don't ask again"));
                 }
                 let reason = format!(
-                    "link box {} ({}) to port {port} of box {} ({}): {}",
+                    "link box {} ({}) to port {port} of box {} ({}), named {}.{}: {}",
                     from.agent,
                     from.zone_name,
                     to.agent,
                     to.zone_name,
+                    wanted,
+                    policy::DOMAIN,
                     d.needs_human.join("; ")
                 );
                 let rid = match l.file_request(&op, Some(&args), &reason, None).map_err(|e| e.to_string())? {

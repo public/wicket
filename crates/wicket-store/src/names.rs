@@ -73,10 +73,28 @@ CREATE TABLE IF NOT EXISTS name_records (
 
 /// Schema 34 (expand, #716 review, F3): `names.domain`, the boxes domain a public name was
 /// approved under, added to a ledger made before. Older builds don't read it.
+/// Several processes may open an old ledger at once (after an update, the console and the
+/// re-attaching supervisors): the check and the change are one write, checked again under its lock,
+/// so the second sees the column the first added (#716 review).
 pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
-    let has: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info('names') WHERE name = 'domain'", [], |r| r.get(0))?;
-    if has == 0 {
-        conn.execute_batch("ALTER TABLE names ADD COLUMN domain TEXT")?;
+    let has = |c: &rusqlite::Connection| -> Result<bool> {
+        let n: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('names') WHERE name = 'domain'", [], |r| r.get(0))?;
+        Ok(n > 0)
+    };
+    if has(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let r = has(conn).and_then(|h| match h {
+        true => Ok(()),
+        false => conn.execute_batch("ALTER TABLE names ADD COLUMN domain TEXT").map_err(Into::into),
+    });
+    match r {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -592,24 +610,33 @@ impl Ledger {
     /// Revokes a live name: it ends now, whoever holds it.
     pub fn revoke_name(&self, id: &str, by: &str) -> Result<NameRow> {
         let before = self.name(id)?;
-        let n = self.conn.execute(
-            "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = ?3, end_reason = 'revoked' WHERE id = ?1 AND status = 'live'",
-            params![id, now(), by],
-        )?;
-        if n == 0 {
+        if !self.end_live_name(&before, now(), by, "revoked")? {
             return Err(StoreError::NotPending(id.into(), self.name(id)?.status));
         }
-        self.release_ports(id)?;
-        // An internal name's port stops being offered if the name exposed it and no other live name
-        // of its run names it, as a move does (#680 review, L1).
-        if let (NameKind::Internal, Some(holder)) = (before.kind, before.holder.as_deref()) {
+        self.name(id)
+    }
+
+    /// Ends live name `n` at `at`, as `by`, for `reason` (`revoked`, `lapsed`): its ports are
+    /// released, and an internal name's port stops being offered if the name exposed it and no
+    /// other live name of its run names it, as a move does (#680 review, L1). One way to end a
+    /// live name, so none leaves its exposure behind (#716 review). Whether it was live.
+    fn end_live_name(&self, n: &NameRow, at: i64, by: &str, reason: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = ?3, end_reason = ?4 WHERE id = ?1 AND status = 'live'",
+            params![n.id, at, by, reason],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        self.release_ports(&n.id)?;
+        if let (NameKind::Internal, Some(holder)) = (n.kind, n.holder.as_deref()) {
             let run = RunId(holder.to_string());
-            if self.names_on_port(&run, before.port)? == 0 && self.is_name_exposure(&run, before.port)? {
-                self.unexpose(holder, before.port)?;
-                self.drop_name_exposure(&run, before.port)?;
+            if self.names_on_port(&run, n.port)? == 0 && self.is_name_exposure(&run, n.port)? {
+                self.unexpose(holder, n.port)?;
+                self.drop_name_exposure(&run, n.port)?;
             }
         }
-        self.name(id)
+        Ok(true)
     }
 
     /// `run` ended: its run-scoped names end, and its standing ones are let go for the next run they
@@ -755,7 +782,8 @@ impl Ledger {
     }
 
     /// Ends the live names whose lifetime is over at `at`, each audited `name.lapsed`. Each one
-    /// ended. The sweep runs it ([`Ledger::sweep_stale_names`]), and so does the names reconciler.
+    /// ended. The sweep runs it ([`Ledger::sweep_stale_names`]), and so does a decision on a
+    /// public name.
     pub fn lapse_names(&self, at: i64) -> Result<Vec<NameRow>> {
         // Each end and its audit record are one write.
         if self.conn.is_autocommit() {
@@ -772,12 +800,7 @@ impl Ledger {
         let due = st.query_map(params![at], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut ended = vec![];
         for n in due {
-            if self.conn.execute(
-                "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = 'wicket', end_reason = 'lapsed' WHERE id = ?1 AND status = 'live'",
-                params![n.id, at],
-            )? == 1
-            {
-                self.release_ports(&n.id)?;
+            if self.end_live_name(&n, at, "wicket", "lapsed")? {
                 let body = serde_json::json!({
                     "id": n.id, "kind": n.kind.as_str(), "label": n.label, "zone": n.zone, "scope": n.scope.as_str(),
                     "expired_at": n.expires_at,
@@ -813,8 +836,8 @@ impl Ledger {
     /// How many live names `run` holds on `port`.
     pub fn names_on_port(&self, run: &RunId, port: u16) -> Result<usize> {
         let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM names WHERE holder = ?1 AND port = ?2 AND status = 'live'",
-            params![run.0, port],
+            "SELECT count(*) FROM names WHERE holder = ?1 AND port = ?2 AND status = 'live' AND (expires_at IS NULL OR expires_at > ?3)",
+            params![run.0, port, now()],
             |r| r.get(0),
         )?;
         Ok(n as usize)
@@ -1055,6 +1078,42 @@ mod tests {
         let (again, _) = l.ask_public(&ask(&t, &r1, P1, "demo2", NameScope::Standing)).unwrap();
         let effect = name_effect(&l.name(&again).unwrap(), &terms, &p.domain());
         l.approve_name(&again, &terms, "op", Some(&effect), &p).unwrap();
+    }
+
+    /// #716 review: two processes opening a ledger made before `names.domain` both open it.
+    #[test]
+    fn the_domain_column_is_added_once_whoever_opens_first() {
+        let d = std::env::temp_dir().join(format!("wicket-names-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("ledger.db");
+        drop(Ledger::open(&p).unwrap());
+        rusqlite::Connection::open(&p).unwrap().execute_batch("ALTER TABLE names DROP COLUMN domain").unwrap();
+        let opens: Vec<_> = (0..4)
+            .map(|_| {
+                let p = p.clone();
+                std::thread::spawn(move || Ledger::open(&p).map(|_| ()))
+            })
+            .collect();
+        for o in opens {
+            o.join().unwrap().unwrap();
+        }
+        let l = Ledger::open(&p).unwrap();
+        let n: i64 = l.conn.query_row("SELECT count(*) FROM pragma_table_info('names') WHERE name = 'domain'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #716 review: a lapse ends a name as a revoke does: an internal name's exposure goes too.
+    #[test]
+    fn a_lapsed_internal_name_takes_its_exposure_away() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let n = l.register_internal(&ask(&t, &r1, P1, "api", NameScope::Standing), 3, 3600).unwrap();
+        l.mark_name_exposure(&r1, 3000).unwrap();
+        assert!(l.lapse_names(now() + 7200).unwrap().iter().any(|x| x.id == n.id));
+        assert!(!l.is_name_exposure(&r1, 3000).unwrap());
     }
 
     #[test]
