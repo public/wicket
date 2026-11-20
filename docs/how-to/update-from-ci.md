@@ -31,6 +31,8 @@ unless the environment has required reviewers and a branch rule.
    Add the contents of `wicket-release.pem` as the environment's secret `WICKET_RELEASE_KEY`
    (**Environment secrets**, not repository secrets). Keep the private key offline, or delete it: a
    new one only needs trusting again. `wicket-release.pub.pem` goes to each installation.
+   [Rotate the release signing key](rotate-the-release-key.md) says where each half lives and how to
+   replace it, on a schedule or if it may have leaked.
 
 The workflow is `.github/workflows/build.yml`. Its `build` job builds the archive (`ci/package.sh`,
 reproducible) and runs the gates on every push to `main`. Its `sign` job waits for a reviewer, who sees
