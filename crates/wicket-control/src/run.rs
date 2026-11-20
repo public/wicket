@@ -529,53 +529,42 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // starts it by its id.
     let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
     let image_name = image.to_string();
-    // The signature that verified the image, if the trust policy asked for one (#191).
+    // The run's id, before anything is admitted, so what admitting it audits names it.
+    let run = match run_id {
+        Some(id) => {
+            check_run_id(&id).with_context(|| "--run-id".to_string())?;
+            RunId(id)
+        }
+        None => RunId::new(),
+    };
+    // The image, admitted before anything is asked of a grant or a node (`imagetrust::admit`): the
+    // operator's `require_digests`, then the `trust` policy's signatures (#191), then the grant on
+    // its digest (#258). The signature that verified it is what `run.image` records.
     let mut signed: Option<wicket_chan::signature::Verified> = None;
     if record.is_none() && wake.is_none() {
-        // The operator's policy first (`images.yaml`'s `require_digests`): a tag is refused before
-        // anything is asked of a grant.
         let default_image = crate::image::effective(crate::image::DEFAULT);
-        crate::images_policy::require_pinned(&m, image, &default_image)?;
-        // Then the signatures the policy's `trust` asks for (#191), checked here before the box
-        // starts: its image's, and those of its zone's `images`, which a node may start children
-        // from itself (#164). The installation's own image is exempt, as from `require_digests`.
         let policy = crate::images_policy::load()?;
-        if !policy.trust.is_empty() {
-            let mut checked = std::collections::BTreeSet::new();
-            for img in std::iter::once(image).chain(m.zone.images.iter().map(String::as_str)) {
-                if img == default_image || !checked.insert(img) {
-                    continue;
-                }
-                let pin = wicket_core::image::parse(img).map_err(anyhow::Error::msg)?.pin;
-                let r = crate::imagetrust::check(&policy, img, pin.as_deref(), &m.zone.name, |name, hosts| {
-                    for h in hosts {
-                        vault.get_for(name, h)?;
-                    }
-                    vault.get(name)
-                })
-                .await;
-                let body = match &r {
-                    Ok(v) => serde_json::json!({ "image": img, "digest": pin, "zone": m.zone.name, "verified": v }),
-                    Err(e) => serde_json::json!({ "image": img, "digest": pin, "zone": m.zone.name, "refused": format!("{e:#}") }),
-                };
-                Ledger::open(&ledger_path())?.audit(&m.tenant, None, "image.signature", &body)?;
-                let v = r?;
-                if let Some(v) = &v {
-                    say!("[wicket] image {img} signed by key {} ({} {})", v.key, v.scheme, v.signature);
-                }
-                if img == image {
-                    signed = v;
-                }
+        let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
+        let ledger = Ledger::open(&ledger_path())?;
+        let cache = crate::imagetrust::cache_dir();
+        let admit = crate::imagetrust::Admit {
+            policy: &policy,
+            ledger: &ledger,
+            manifest: &m,
+            run: &run,
+            image,
+            default_image: &default_image,
+            parent: parent_run.as_deref(),
+            by: &by,
+            cache: Some(&cache),
+        };
+        signed = crate::imagetrust::admit(admit, |name, hosts| {
+            for h in hosts {
+                vault.get_for(name, h)?;
             }
-        }
-        // The one "may this digest run" check (#258): a pinned image is accepted by a grant on its
-        // digest, which the operator running the manifest records. A child's image is pinned to
-        // its parent's, as its parent's zone allows (decided where it is spawned): not regranted.
-        if let (Some(pin), None) = (&image_pin, &parent_run) {
-            let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
-            let u = crate::digest::accept_image(&Ledger::open(&ledger_path())?, &m.tenant, &m.zone.name, image, pin, &by)?;
-            say!("[wicket] image {image} accepted by grant {} from {}", u.grant, u.decided_by);
-        }
+            vault.get(name)
+        })
+        .await?;
     }
     // The workload's name, and what runs it: an agent's harness, or a program's command.
     let (workload, workload_runs) = match (&m.agent, &m.program) {
@@ -615,13 +604,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // or wrapped). Its proxies are its own, as on any node.
     let shares_host = node.is_none();
 
-    let run = match run_id {
-        Some(id) => {
-            check_run_id(&id).with_context(|| "--run-id".to_string())?;
-            RunId(id)
-        }
-        None => RunId::new(),
-    };
     // A long-lived agent (#70): one wicket launches itself, here, so it can be hibernated and
     // rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
@@ -1513,7 +1495,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     &m.tenant,
                     Some(&run),
                     "run.image",
-                    &serde_json::json!({ "image": image_name, "digest": d, "pinned": image_pin, "signature": signed }),
+                    &crate::imagetrust::run_image_body(&image_name, d, image_pin.as_deref(), signed.as_ref()),
                 )?;
                 say!("  image {image_name} started as {d}");
             }

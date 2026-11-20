@@ -8,21 +8,27 @@
 //!     secret: registry-login          # optional: a vault secret bound to the host, `user:password` or a token
 //!     auth_hosts: [auth.example.com]  # where its token service is, if elsewhere
 //!     blob_hosts: [cdn.example.com]   # where it redirects blob downloads, if elsewhere
-
 //! trust:                              # image signatures (#191): which keys must have signed what
 //!   default: allow-unsigned           # or require-signed: for images no rule matches
-//!   rules:                            # the first that matches an image (and its zone) decides
+//!   rules:                            # the first that matches an image decides
 //!     - repositories: ["registry.example.com/team/*"]   # host/repository; `*` matches anything
-//!       zones: ["prod-*"]             # optional: only for these zones
 //!       keys: [keys/team.pub]         # PEM public keys, relative to the data dir
 //!       require: signed               # the default; or allow-unsigned (checked if signed)
 //! ```
 //!
 //! `trust` is checked on the control host before a box starts (`wicket_control::imagetrust`), never
-//! in the box: the signature is fetched from the image's registry (one of `registries`) and must be by one
-//! of the rule's keys over exactly the image's digest ([`wicket_chan::signature`]). The image's node
-//! checks its bytes against that digest. Unsigned, signed by another key or over another digest,
-//! an image a rule requires signed is refused, and so is a tag (a signature names a digest).
+//! in the box: the signature is fetched from the image's registry (one of `registries`) and must be
+//! by one of the rule's keys over exactly the image's digest ([`wicket_chan::signature`]). The
+//! image's node checks its bytes against that digest. Unsigned, signed by another key or over
+//! another digest, an image a rule requires signed is refused, and so is a tag (a signature names a
+//! digest). No `trust` section asks nothing: no signature is fetched or checked.
+//!
+//! Rules match an image's name as written, so names are normalised first (the host lowercased, its
+//! `:443` dropped, Docker Hub's names folded together), and, once any rule requires signatures, a
+//! pinned image whose name maps to no listed registry (a bare digest included) is refused: it
+//! could otherwise dodge every rule by how it is spelled. Even so, only `default: require-signed`
+//! holds every image to a signature; under `allow-unsigned`, rules cover the repositories they name.
+//! Rules don't match zones: a zone's name is the manifest's own choice, so it is no boundary.
 //!
 //! `require_digests` is the operator's policy, not a trust path: with it, a run is refused unless
 //! its own image and every entry of its zone's `images` are pinned (`name@sha256:…`; `wicket zone
@@ -78,14 +84,14 @@ pub enum Require {
 pub struct TrustRule {
     /// `host/repository` patterns (`docker.io/` names Docker Hub); `*` matches any run of characters.
     pub repositories: Vec<String>,
-    /// Zone name patterns it is for; none: every zone.
-    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
-    pub zones: Vec<String>,
     /// PEM public keys, relative to the data dir unless absolute.
     #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     pub keys: Vec<String>,
     #[serde(default = "require_signed")]
     pub require: Require,
+    /// The keys, as read and parsed when the policy is loaded ([`load`]).
+    #[serde(skip)]
+    pub parsed: Vec<wicket_chan::signature::Key>,
 }
 
 fn require_signed() -> Require {
@@ -117,24 +123,35 @@ fn glob(pat: &str, s: &str) -> bool {
     p[i..].iter().all(|&c| c == '*')
 }
 
-/// `host/repository` as [`registry_of`] names it, with Docker Hub's other names folded in.
-fn qualified(pat: &str) -> String {
-    for hub in ["docker.io/", "index.docker.io/"] {
-        if let Some(rest) = pat.strip_prefix(hub) {
-            return format!("registry-1.docker.io/{rest}");
-        }
+/// A registry host as wicket compares them: lowercased, without HTTPS's own port, and Docker
+/// Hub's names as one.
+pub fn host_key(h: &str) -> String {
+    let h = h.to_ascii_lowercase();
+    let h = h.strip_suffix(":443").map(String::from).unwrap_or(h);
+    match h.as_str() {
+        "docker.io" | "index.docker.io" => "registry-1.docker.io".into(),
+        _ => h,
     }
-    pat.to_string()
+}
+
+/// A `host/repository` pattern with its host as [`host_key`] has it.
+fn qualified(pat: &str) -> String {
+    match pat.split_once('/') {
+        Some((h, rest)) => format!("{}/{rest}", host_key(h)),
+        None => pat.to_string(),
+    }
 }
 
 /// What [`Trust`] asks of one image.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Wanted {
+    /// Why the image is refused before any signature is looked at, if it is.
+    pub refused: Option<String>,
     /// The matching rule's index, if one matched.
     pub rule: Option<usize>,
     pub require: Require,
-    /// Its keys' paths, as resolved.
-    pub keys: Vec<std::path::PathBuf>,
+    /// Its keys, as loaded.
+    pub keys: Vec<wicket_chan::signature::Key>,
     /// `host/repository`, if the image names one.
     pub repository: Option<String>,
 }
@@ -145,31 +162,43 @@ impl Trust {
         self.default == Require::AllowUnsigned && self.rules.is_empty()
     }
 
-    /// What it asks of `image` started in zone `zone`.
-    pub fn wanted(&self, image: &str, zone: &str) -> Wanted {
+    /// Whether any image may need a signature.
+    pub fn requires_any(&self) -> bool {
+        self.default == Require::RequireSigned || self.rules.iter().any(|r| r.require == Require::RequireSigned)
+    }
+
+    /// What it asks of `image`, given the registries `p` lists.
+    pub fn wanted(&self, p: &ImagesPolicy, image: &str) -> Wanted {
         let repository = registry_of(image).map(|(h, r)| format!("{h}/{r}"));
-        let hit = repository.as_deref().and_then(|repo| {
-            self.rules.iter().position(|r| {
-                r.repositories.iter().any(|p| glob(&qualified(p), repo)) && (r.zones.is_empty() || r.zones.iter().any(|z| glob(z, zone)))
-            })
+        let pinned = wicket_core::image::parse(image).is_ok_and(|r| r.pin.is_some());
+        let refused = (self.requires_any() && pinned && p.registry_for(image).is_none()).then(|| {
+            "its name maps to no registry in images.yaml's registries, and a rule here requires signatures: name it by its registry"
+                .to_string()
         });
+        let hit =
+            repository.as_deref().and_then(|repo| self.rules.iter().position(|r| r.repositories.iter().any(|p| glob(&qualified(p), repo))));
         match hit {
-            Some(i) => {
-                let r = &self.rules[i];
-                let keys = r.keys.iter().map(|k| crate::data_dir().join(k)).collect();
-                Wanted { rule: Some(i), require: r.require, keys, repository }
-            }
-            None => Wanted { rule: None, require: self.default, keys: vec![], repository },
+            Some(i) => Wanted { refused, rule: Some(i), require: self.rules[i].require, keys: self.rules[i].parsed.clone(), repository },
+            None => Wanted { refused, rule: None, require: self.default, keys: vec![], repository },
         }
     }
 
-    fn check(&self) -> Result<()> {
-        for (i, r) in self.rules.iter().enumerate() {
+    /// Checks the rules and reads their keys (relative to `dir` unless absolute).
+    pub fn load_keys(&mut self, dir: &std::path::Path) -> Result<()> {
+        for (i, r) in self.rules.iter_mut().enumerate() {
             if r.repositories.is_empty() {
                 bail!("trust rule {} names no repositories", i + 1);
             }
             if r.keys.is_empty() {
                 bail!("trust rule {} ({}) names no keys", i + 1, r.repositories.join(", "));
+            }
+            r.parsed.clear();
+            for k in &r.keys {
+                let path = dir.join(k);
+                let pem = std::fs::read_to_string(&path).with_context(|| format!("trust rule {}'s key {}", i + 1, path.display()))?;
+                let key = wicket_chan::signature::Key::from_pem(&pem)
+                    .with_context(|| format!("trust rule {}'s key {}", i + 1, path.display()))?;
+                r.parsed.push(key);
             }
         }
         Ok(())
@@ -200,12 +229,13 @@ pub fn registry_of(image: &str) -> Option<(String, String)> {
     }
     let repo = wicket_core::image::repository(&r.name);
     let (first, rest) = repo.split_once('/').unwrap_or(("", repo));
-    if first == "docker.io" || first == "index.docker.io" {
+    let host = host_key(first);
+    if host == "registry-1.docker.io" {
         let rest = if rest.contains('/') { rest.to_string() } else { format!("library/{rest}") };
-        return Some(("registry-1.docker.io".into(), rest));
+        return Some((host, rest));
     }
-    if first.contains('.') || first.contains(':') || first == "localhost" {
-        return Some((first.to_string(), rest.to_string()));
+    if first.contains('.') || first.contains(':') || host == "localhost" {
+        return Some((host, rest.to_string()));
     }
     let rest = if repo.contains('/') { repo.to_string() } else { format!("library/{repo}") };
     Some(("registry-1.docker.io".into(), rest))
@@ -215,8 +245,7 @@ impl ImagesPolicy {
     /// The registry entry `image` may be pulled from, and its repository there, if any.
     pub fn registry_for(&self, image: &str) -> Option<(Registry, String)> {
         let (host, repo) = registry_of(image)?;
-        let host_of = |h: &str| if h == "docker.io" || h == "index.docker.io" { "registry-1.docker.io".to_string() } else { h.to_string() };
-        self.registries.iter().find(|r| host_of(&r.host) == host).map(|r| (Registry { host: host.clone(), ..r.clone() }, repo))
+        self.registries.iter().find(|r| host_key(&r.host) == host).map(|r| (Registry { host: host.clone(), ..r.clone() }, repo))
     }
 }
 
@@ -227,8 +256,8 @@ pub fn path() -> std::path::PathBuf {
 pub fn load() -> Result<ImagesPolicy> {
     match std::fs::read_to_string(path()) {
         Ok(t) => {
-            let p: ImagesPolicy = wicket_core::yaml::from_str(&t).with_context(|| path().display().to_string())?;
-            p.trust.check().with_context(|| path().display().to_string())?;
+            let mut p: ImagesPolicy = wicket_core::yaml::from_str(&t).with_context(|| path().display().to_string())?;
+            p.trust.load_keys(&crate::data_dir()).with_context(|| path().display().to_string())?;
             Ok(p)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ImagesPolicy::default()),
@@ -319,36 +348,98 @@ mod tests {
         assert!(t.elapsed() < std::time::Duration::from_secs(2));
     }
 
+    /// A data dir with `keys/a.pub` (a P-256 key) in it.
+    fn key_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wicket-trust-{}-{}", std::process::id(), wicket_core::new_ulid()));
+        std::fs::create_dir_all(d.join("keys")).unwrap();
+        let k = wicket_chan::signature::testkit::p256_key(7);
+        std::fs::write(d.join("keys/a.pub"), wicket_chan::signature::testkit::pem_of_p256(&k)).unwrap();
+        d
+    }
+
+    fn trust(y: &str, dir: &std::path::Path) -> ImagesPolicy {
+        let mut p: ImagesPolicy = wicket_core::yaml::from_str(y).unwrap();
+        p.trust.load_keys(dir).unwrap();
+        p
+    }
+
     #[test]
     fn the_first_matching_trust_rule_decides() {
-        let p: ImagesPolicy = wicket_core::yaml::from_str(
-            "trust:\n  default: require-signed\n  rules:\n    - repositories: [registry.example.com/team/*]\n      zones: [prod-*]\n      keys: [keys/prod.pub]\n    - repositories: [registry.example.com/team/*, docker.io/library/*]\n      keys: [keys/team.pub, /etc/k.pub]\n      require: allow-unsigned\n",
-        )
-        .unwrap();
-        p.trust.check().unwrap();
-        assert!(!p.trust.is_empty());
-        let w = p.trust.wanted(&format!("registry.example.com/team/agent@sha256:{}", "a".repeat(64)), "prod-eu");
-        assert_eq!((w.rule, w.require, w.keys.len()), (Some(0), Require::RequireSigned, 1));
-        assert!(w.keys[0].ends_with("keys/prod.pub"));
+        let dir = key_dir();
+        let pin = format!("sha256:{}", "a".repeat(64));
+        let p = trust(
+            "registries: [{host: registry.example.com}, {host: docker.io}]\ntrust:\n  default: require-signed\n  rules:\n    - repositories: [registry.example.com/team/*]\n      keys: [keys/a.pub]\n    - repositories: [registry.example.com/*, docker.io/library/*]\n      keys: [keys/a.pub, keys/a.pub]\n      require: allow-unsigned\n",
+            &dir,
+        );
+        assert!(!p.trust.is_empty() && p.trust.requires_any());
+        let w = p.trust.wanted(&p, &format!("registry.example.com/team/agent@{pin}"));
+        assert_eq!((w.rule, w.require, w.keys.len(), w.refused.as_deref()), (Some(0), Require::RequireSigned, 1, None));
         assert_eq!(w.repository.as_deref(), Some("registry.example.com/team/agent"));
-        let w = p.trust.wanted("registry.example.com/team/agent:1", "dev");
-        assert_eq!((w.rule, w.require), (Some(1), Require::AllowUnsigned));
-        assert_eq!(w.keys[1], std::path::PathBuf::from("/etc/k.pub"), "absolute paths stay");
-        assert_eq!(p.trust.wanted("ubuntu:24.04", "dev").rule, Some(1), "Docker Hub by its other name");
-        let w = p.trust.wanted("other.example.com/x:1", "prod-eu");
+        let w = p.trust.wanted(&p, "registry.example.com/other/x:1");
+        assert_eq!((w.rule, w.require, w.keys.len()), (Some(1), Require::AllowUnsigned, 2));
+        assert_eq!(p.trust.wanted(&p, "ubuntu:24.04").rule, Some(1), "Docker Hub by its other name");
+        let w = p.trust.wanted(&p, &format!("other.example.com/x@{pin}"));
         assert_eq!((w.rule, w.require, w.keys.len()), (None, Require::RequireSigned, 0), "the default");
-        assert_eq!(p.trust.wanted("sha256:aa", "z").repository, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
-        // `require: signed`, as #191's proposal spells it; a rule needs keys and repositories.
-        let p: ImagesPolicy =
-            wicket_core::yaml::from_str("trust:\n  rules: [{repositories: [a/*], keys: [k], require: signed}]\n").unwrap();
-        assert_eq!(p.trust.rules[0].require, Require::RequireSigned);
-        let p: ImagesPolicy = wicket_core::yaml::from_str("trust:\n  rules: [{repositories: [a/*]}]\n").unwrap();
-        assert!(p.trust.check().unwrap_err().to_string().contains("names no keys"));
-        let p: ImagesPolicy = wicket_core::yaml::from_str("trust:\n  rules: [{repositories: [], keys: [k]}]\n").unwrap();
-        assert!(p.trust.check().is_err());
-        assert!(wicket_core::yaml::from_str::<ImagesPolicy>("trust: {default: maybe}").is_err());
-        assert!(wicket_core::yaml::from_str::<ImagesPolicy>("trust: {rules: [{repositories: [a], keys: [k], typo: 1}]}").is_err());
-        assert!(wicket_core::yaml::from_str::<ImagesPolicy>("trust:\n").unwrap().trust.is_empty());
+    #[test]
+    fn how_an_image_is_spelled_doesnt_dodge_a_rule() {
+        let dir = key_dir();
+        let pin = format!("sha256:{}", "a".repeat(64));
+        // Under allow-unsigned, a rule requiring signatures for one registry.
+        let p = trust(
+            "registries: [{host: Registry.Example.com}]\ntrust:\n  rules: [{repositories: ['REGISTRY.example.com:443/team/*'], keys: [keys/a.pub]}]\n",
+            &dir,
+        );
+        assert_eq!(host_key("Registry.Example.COM:443"), "registry.example.com");
+        assert_eq!(host_key("registry.example.com:5000"), "registry.example.com:5000");
+        let mut tried = vec![];
+        for spelled in ["registry.example.com", "REGISTRY.EXAMPLE.COM", "registry.example.com:443", "Registry.Example.Com:443"] {
+            let img = format!("{spelled}/team/agent@{pin}");
+            if wicket_core::image::parse(&img).is_err() {
+                continue; // not a name wicket would run
+            }
+            tried.push(spelled);
+            let w = p.trust.wanted(&p, &img);
+            assert_eq!((w.rule, w.require, w.refused.as_deref()), (Some(0), Require::RequireSigned, None), "{img}");
+            assert!(p.registry_for(&img).is_some(), "{img}");
+        }
+        println!("spellings wicket runs: {tried:?}");
+        assert!(tried.len() >= 2, "{tried:?}");
+        // A bare digest, or a name on no listed registry, names no repository a rule could match.
+        for img in [pin.clone(), format!("elsewhere.example.com/team/agent@{pin}")] {
+            let w = p.trust.wanted(&p, &img);
+            assert!(w.refused.as_deref().is_some_and(|r| r.contains("maps to no registry")), "{img}: {w:?}");
+        }
+        // A tag there is the default's to decide (it can't be signed-checked anyway).
+        assert!(p.trust.wanted(&p, "elsewhere.example.com/x:1").refused.is_none());
+        // With nothing required, nothing is refused for its spelling.
+        let lax = trust("trust:\n  rules: [{repositories: [a/*], keys: [keys/a.pub], require: allow-unsigned}]\n", &dir);
+        assert!(!lax.trust.requires_any() && lax.trust.wanted(&lax, &pin).refused.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trust_rules_are_checked_and_their_keys_read_when_loaded() {
+        let dir = key_dir();
+        let load = |y: &str| -> Result<ImagesPolicy> {
+            let mut p: ImagesPolicy = wicket_core::yaml::from_str(y)?;
+            p.trust.load_keys(&dir)?;
+            Ok(p)
+        };
+        // `require: signed`, as #191's proposal spells it.
+        let p = load("trust:\n  rules: [{repositories: [a/*], keys: [keys/a.pub], require: signed}]\n").unwrap();
+        assert_eq!((p.trust.rules[0].require, p.trust.rules[0].parsed.len()), (Require::RequireSigned, 1));
+        assert!(format!("{:#}", load("trust:\n  rules: [{repositories: [a/*]}]\n").unwrap_err()).contains("names no keys"));
+        assert!(load("trust:\n  rules: [{repositories: [], keys: [keys/a.pub]}]\n").is_err());
+        assert!(format!("{:#}", load("trust:\n  rules: [{repositories: [a/*], keys: [keys/none.pub]}]\n").unwrap_err())
+            .contains("keys/none.pub"));
+        std::fs::write(dir.join("keys/bad.pub"), "not a key").unwrap();
+        assert!(load("trust:\n  rules: [{repositories: [a/*], keys: [keys/bad.pub]}]\n").is_err());
+        assert!(load("trust: {default: maybe}").is_err());
+        assert!(load("trust: {rules: [{repositories: [a], keys: [k], zones: [z]}]}").is_err(), "no zone filters");
+        assert!(load("trust:\n").unwrap().trust.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

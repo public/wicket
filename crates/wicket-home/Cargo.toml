@@ -34,6 +34,7 @@ hex.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+wicket-chan = { workspace = true, features = ["testkit"] }
 # audit_export's tests: an edited ledger, and a sink's HTTP server.
 rusqlite.workspace = true
 hyper.workspace = true

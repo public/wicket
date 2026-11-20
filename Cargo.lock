@@ -4084,6 +4084,7 @@ dependencies = [
  "wicket-proxy",
  "wicket-sandbox",
  "wicket-store",
+ "zeroize",
 ]
 
 [[package]]
