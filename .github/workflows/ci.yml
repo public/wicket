@@ -27,17 +27,20 @@ env:
 
 jobs:
   # #218: what a pull request can affect (ci/determinator: guppy's determinator with its rules.toml,
-  # and suites.toml): its crates and their reverse dependencies, and the end-to-end suites. Pushes to
-  # main, the merge queue, the nightly run and a PR labelled full-ci select everything. Every job
-  # below runs in full when this job fails or says nothing: an empty output means run.
+  # and suites.toml): its crates and their reverse dependencies, and the end-to-end suites. A push to
+  # main selects what changed since the last green run of main (its pull request and the merge queue
+  # tested it already; this catches what merging together changed), or everything if there is none.
+  # The merge queue, the nightly run and a PR labelled full-ci select everything. Every job below
+  # runs in full when this job fails or says nothing: an empty output means run.
   select:
     name: What this change can affect
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    # Reading the pull request's labels (#246).
+    # Reading the pull request's labels (#246), and main's earlier runs.
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     outputs:
       crates: ${{ steps.select.outputs.crates }}
       all_crates: ${{ steps.select.outputs.all_crates }}
@@ -70,14 +73,27 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           affected() { cargo run -q --locked --manifest-path ci/determinator/Cargo.toml -- "$@"; }
+          # The commit of main's newest successful run of this workflow (a push's or the nightly
+          # run's) before this one, if it is an ancestor of this commit: what is known green.
+          last_green() {
+            local sha
+            sha=$(curl -sSf -H "authorization: Bearer $GH_TOKEN" -H 'accept: application/vnd.github+json' \
+              "https://api.github.com/repos/$GH_REPO/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" |
+              jq -r --argjson me "$RUN_ID" '[.workflow_runs[] | select(.id != $me and (.event == "push" or .event == "schedule"))][0].head_sha // empty') || return 1
+            [ -n "$sha" ] && git merge-base --is-ancestor "$sha" HEAD && echo "$sha"
+          }
           FULL=
           if [ "$EVENT" = pull_request ]; then
             FULL=$(ci/pr-has-label.sh full-ci) || FULL="unknown (the labels couldn't be read)"
           fi
           if [ "$EVENT" = pull_request ] && [ "$FULL" = false ]; then
             affected --base "origin/$BASE" --github-output "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = push ] && green=$(last_green); then
+            echo "what changed since the last green run of main, at $green"
+            affected --base "$green" --github-output "$GITHUB_OUTPUT"
           else
             echo "the full set ($EVENT; full-ci label: ${FULL:-n/a})"
             affected --files /dev/null --github-output "$GITHUB_OUTPUT"
