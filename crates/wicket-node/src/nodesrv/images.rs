@@ -467,7 +467,13 @@ sys.exit(2)
         // Once the start is over (its box would be live, or it failed), the hold is gone; still unused
         // by then, the image goes at the next sweep.
         drop(hold);
+        // What the node's cache knew of it is forgotten with it, so a start asks the runtime afresh.
+        let known = node.docker.image_identity(&starting.index).await.unwrap().unwrap();
+        node.idents.seed(&starting.index, known);
+        assert!(node.idents.get(&starting.index).is_some());
         assert_eq!(super::super::imagegc::sweep(&node).await, vec![starting.index.clone()]);
+        assert!(node.idents.get(&starting.index).is_none(), "not left in the cache");
+        assert!(node.docker.image_identity_cached(&node.idents, &starting.index).await.unwrap().is_none());
     }
 
     /// A run id, as `check_run_id` wants one.

@@ -245,6 +245,12 @@ pub(super) async fn sweep(node: &Arc<Node>) -> Vec<String> {
             r.uses.get(&digest).copied()
         };
         let result = node.docker.remove_image(&digest).await;
+        // What the node knows of its images is forgotten before a waiting start goes on, so the
+        // start asks the runtime afresh rather than trusting the cache until Docker's delete event
+        // arrives (#287): it then finds the image gone, and says so.
+        if matches!(result, Ok(wicket_sandbox::ImageRemoval::Removed)) {
+            node.idents.invalidate();
+        }
         let _one = RECORD.lock().expect("image uses");
         STATE.lock().expect("image gc").removing.remove(&digest);
         let mut r = read(&root);
