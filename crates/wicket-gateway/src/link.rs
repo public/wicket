@@ -958,8 +958,8 @@ mod tests {
         assert!(err && text.contains("taken"), "{text}");
         let (text, err) = crate::names::request_name(&web, &serde_json::json!({ "name": "Bad.Name", "port": 1 }));
         assert!(err && text.contains("a-z"), "{text}");
-        let (text, err) = crate::names::request_name(&web, &serde_json::json!({ "name": "x", "port": 1, "kind": "public" }));
-        assert!(err && text.contains("aren't available yet"), "{text}");
+        let (text, err) = crate::names::request_name(&web, &serde_json::json!({ "name": "x", "port": 1, "kind": "global" }));
+        assert!(err && text.contains("internal or public"), "{text}");
 
         // web is in api's accept_from: linked by the name, at the name's port, and it resolves there.
         let (text, err) = connect_name(&web, "api.build.wicket.internal", None).await;
@@ -1143,6 +1143,38 @@ mod tests {
         assert!(!expose(&api, 4002, Some("mine")).1);
         req("two", 4003);
         assert!(offered(4002));
+    }
+
+    /// #575 step 4a: a public name is an ask a human decides, never the box: request_name files it
+    /// (n-…), refuses reserved labels and their lookalikes, and await_grant follows the decision.
+    #[tokio::test]
+    async fn a_public_name_is_asked_for_and_awaited() {
+        let w = World::new();
+        let api = w.boxed(w.zone("build", &[]), "api", "run_api", None, &[]);
+        let gw = crate::Gateway::new(api.clone());
+        let ask = |name: &str| {
+            crate::names::request_name(&api, &serde_json::json!({ "name": name, "port": 3000, "kind": "public", "reason": "the demo" }))
+        };
+        for reserved in ["console", "c0nsole", "www"] {
+            let (text, err) = ask(reserved);
+            assert!(err && text.contains("reserved"), "{reserved}: {text}");
+        }
+        let (text, err) = ask("demo");
+        assert!(!err && text.contains("needs approval"), "{text}");
+        let id = text.split_whitespace().find(|w| w.starts_with("n-")).unwrap().to_string();
+        assert_eq!(ask("demo").0, text, "the same ask is the same request");
+        let (text, _) = gw.call_tool("await_grant", serde_json::json!({ "request_id": id, "timeout_seconds": 5 })).await;
+        assert!(text.starts_with("pending"), "{text}");
+        let terms = wicket_store::NameTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: None };
+        w.ledger.lock().unwrap().approve_name(&id, &terms, "ann", None).unwrap();
+        let (text, err) = gw.call_tool("await_grant", serde_json::json!({ "request_id": id, "timeout_seconds": 5 })).await;
+        assert!(!err && text.starts_with("granted") && text.contains("this run holds it"), "{text}");
+        // Another agent can't wait on it.
+        let other = w.boxed(w.zone("build", &[]), "other", "run_other", None, &[]);
+        let (text, err) = crate::Gateway::new(other).call_tool("await_grant", serde_json::json!({ "request_id": id })).await;
+        assert!(err && text.contains("not this agent's"), "{text}");
+        let audit = w.ledger.lock().unwrap().audit_tail(30).unwrap();
+        assert!(audit.iter().any(|a| a.2 == "name.requested" && a.4.contains(&id)));
     }
 
     #[tokio::test]

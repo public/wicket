@@ -422,17 +422,34 @@ A port the box exposed itself (`expose`) keeps that exposure and its name: the i
 added beside it.
 
 It is held by the run that asked, and ends with it (audited as `name.released`). Asking again from
-the same run moves the name to another port, and the old port is no longer offered under it. Audited
-as `name.registered`.
+the same run moves the name to another port. The old port stays offered while the box itself, or
+another of the run's names, offers it; otherwise it is no longer offered. Audited as
+`name.registered`.
 
-Public names, on the internet, aren't available yet: `kind: public` is refused. The tool needs a
-control host and node at protocol 18; with an older control host the node refuses it.
+**`kind: public`** asks for a name on the internet, `<name>.<boxes domain>`. Only a human decides it
+(`wicket names approve`), since anyone could then connect to the port and read what the box serves.
+The answer is a request id, `n-…`, for `await_grant`.
+
+- The label is checked as above, and also against reserved labels and their lookalikes (`console`,
+  `c0nsole`, `www`, `api`, `admin` and others).
+- `scope: standing` asks for it for every later run of the workload, as standing reach does.
+- `service` is the SRV record's service label (default `http`).
+- At most 3 asks of an agent wait at once.
+- Audited as `name.requested`, and the decision as `decision`.
+
+wicket doesn't publish public records yet, so an approved public name is a record only, until the
+DNS reconciler and the node's listener come (#575).
+
+The tool needs a control host and node at protocol 18; with an older control host the node refuses
+it.
 
 | argument | type | default |
 |---|---|---|
 | `name` | string, required | |
 | `port` | integer, 1–65535, required | |
-| `kind` | `internal` | `internal` |
+| `kind` | `internal` or `public` | `internal` |
+| `scope` | `run` or `standing` (public names) | `run` |
+| `service` | string: the SRV service label (public names) | `http` |
 | `reason` | string: what it serves, for the record (at most 200 characters) | |
 
 ## `connect`

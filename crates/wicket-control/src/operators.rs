@@ -14,7 +14,7 @@
 //! operators:
 //!   unix/alice: anything
 //!   passkey/laptop:
-//!     kinds: [http]            # http, spawn, link, capacity, update, authority
+//!     kinds: [http]            # http, spawn, link, capacity, update, tool, name, authority
 //!     hosts: ["*.example.com"] # an http request's host; empty or absent: any host
 //!     max_risk: R2             # the highest risk it may decide; absent: any
 //!   unix/auditor: nothing      # sees requests, decides none
@@ -65,7 +65,7 @@ pub struct Scope {
     pub max_risk: Option<String>,
 }
 
-const KINDS: &[&str] = &["http", "spawn", "link", "capacity", "update", "tool", "authority"];
+const KINDS: &[&str] = &["http", "spawn", "link", "capacity", "update", "tool", "name", "authority"];
 
 #[derive(Deserialize)]
 #[serde(untagged)]

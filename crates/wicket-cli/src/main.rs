@@ -64,6 +64,7 @@ pub(crate) use cmd::dev::DevCmd;
 pub(crate) use cmd::identity::IdentityCmd;
 pub(crate) use cmd::image::ImageCmd;
 pub(crate) use cmd::itself::SelfCmd;
+pub(crate) use cmd::names::NamesCmd;
 pub(crate) use cmd::node::LeaseCmd;
 pub(crate) use cmd::node::NodeCmd;
 pub(crate) use cmd::operator::OperatorCmd;
@@ -90,7 +91,7 @@ const AREAS: &[(&str, &[&str])] = &[
         "Runs and agents",
         &["run", "session", "top", "agents", "hibernate", "trigger", "wrap", "links", "unlink", "zone", "program", "image"],
     ),
-    ("Approvals and grants", &["pending", "approve", "deny", "grant", "standing", "audit"]),
+    ("Approvals and grants", &["pending", "approve", "deny", "grant", "standing", "names", "audit"]),
     ("Nodes and placement", &["node", "lease", "service", "why-here", "reconcile"]),
     (
         "The installation",
@@ -295,6 +296,13 @@ enum Cmd {
     Grant {
         #[command(subcommand)]
         cmd: GrantCmd,
+    },
+    /// Names for boxes: internal names, and the public names a human approves.
+    ///
+    /// Names for boxes (#575): internal names, and the public names a human approves.
+    Names {
+        #[command(subcommand)]
+        cmd: NamesCmd,
     },
     /// Standing reach: a reach rule an agent asked for once, approved once for its later runs.
     ///
@@ -578,6 +586,7 @@ async fn run() -> Result<()> {
         c @ (Cmd::Pending { .. } | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await
         }
+        Cmd::Names { cmd } => cmd::names::dispatch(cmd).await,
         Cmd::Standing { cmd } => cmd::standing::dispatch(cmd).await,
         Cmd::Trigger { cmd } => cmd::trigger::dispatch(cmd).await,
         c @ Cmd::Identity { .. } => cmd::identity::dispatch(c).await,

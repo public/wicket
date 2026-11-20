@@ -553,6 +553,11 @@ impl Ledger {
              WHERE status = 'pending' AND scope = 'run' AND NOT EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running')",
             params![now()],
         )?;
+        // And the ports their names exposed are theirs no more (#671 review).
+        self.conn.execute(
+            "DELETE FROM name_exposures WHERE NOT EXISTS (SELECT 1 FROM runs WHERE id = name_exposures.run AND status = 'running')",
+            [],
+        )?;
         let t = now();
         let mut released = 0;
         for n in &stale {
@@ -1015,6 +1020,10 @@ mod tests {
         assert_eq!(l.name(&live_ask).unwrap().status, "pending");
         let audit = l.audit_tail(10).unwrap();
         assert!(audit.iter().any(|a| a.2 == "name.released" && a.4.contains(&api.id) && a.4.contains("run gone")), "{audit:?}");
+        // The ports its names exposed went with it.
+        l.mark_name_exposure(&r1, 3000).unwrap();
+        l.sweep_stale_names().unwrap();
+        assert!(!l.is_name_exposure(&r1, 3000).unwrap());
     }
 
     /// #668 review: releasing a name is conditional on the run still holding it, so a sweep that

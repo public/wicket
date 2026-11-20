@@ -1021,10 +1021,13 @@ fn triggers_pass(
 /// Whether a trigger's owner may still have it fire (#578): `operators.yaml`
 /// ([`wicket_control::triggers::operator_may`]) and, on a host where wicketd decides who may do
 /// what, wicketd's policy as it stands now: the run class that keeping one needed, for the unix
-/// user the owner is. A user removed from the host, or from the policy's groups, has their
-/// triggers paused. Root and wicket's own user keep theirs, as wicketd lets them do anything.
-fn trigger_owner_may(t: &wicket_store::Trigger) -> std::result::Result<(), String> {
+/// user the owner is. A user removed from the host, or from the policy's groups, is a definite no
+/// (the trigger is paused). A lookup that fails (the user database doesn't answer, a policy file
+/// doesn't read) is `Unknown`: that firing is skipped, and the trigger kept. Root and wicket's own
+/// user keep theirs, as wicketd lets them do anything.
+fn trigger_owner_may(t: &wicket_store::Trigger) -> std::result::Result<(), wicket_control::triggers::NotOwner> {
     use crate::daemon::policy;
+    use wicket_control::triggers::NotOwner;
     wicket_control::triggers::operator_may(t)?;
     let installed = std::path::Path::new(policy::POLICY_PATH).exists() || std::path::Path::new(crate::daemon::SOCKET_PATH).exists();
     if !installed {
@@ -1032,16 +1035,18 @@ fn trigger_owner_may(t: &wicket_store::Trigger) -> std::result::Result<(), Strin
         return Ok(());
     }
     let Some(wicket_identity::Principal::Operator { via, name, .. }) = wicket_identity::Principal::parse(&t.owner) else {
-        return Err(format!("{} is not an operator's principal", t.owner));
+        return Err(NotOwner::No(format!("{} is not an operator's principal", t.owner)));
     };
     if via != "unix" {
-        return Err(format!("{} isn't a unix user, whom wicketd's policy names", t.owner));
+        return Err(NotOwner::No(format!("{} isn't a unix user, whom wicketd's policy names", t.owner)));
     }
-    let peer = crate::daemon::proto::user_as_peer(&name).ok_or_else(|| format!("there is no user {name} on this host"))?;
-    let rules = policy::Policy::load(std::path::Path::new(policy::POLICY_PATH)).map_err(|e| format!("{e:#}"))?;
+    let peer = crate::daemon::proto::user_as_peer(&name)
+        .map_err(NotOwner::Unknown)?
+        .ok_or_else(|| NotOwner::No(format!("there is no user {name} on this host")))?;
+    let rules = policy::Policy::load(std::path::Path::new(policy::POLICY_PATH)).map_err(|e| NotOwner::Unknown(format!("{e:#}")))?;
     // SAFETY: a plain getter.
     let me = unsafe { libc::geteuid() };
-    policy::authorize(&peer, policy::Class::Run, &rules, me).map(|_| ())
+    policy::authorize(&peer, policy::Class::Run, &rules, me).map(|_| ()).map_err(NotOwner::No)
 }
 
 /// Runs, leases, the capacity leases' machines (with placement.yaml) and boxes.
