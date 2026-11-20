@@ -295,7 +295,19 @@ impl Ledger {
             // Nothing is vouched for on a chain that doesn't hold: from the old anchor up to the cut,
             // every record must hash and link (the old audit.pruned record and the restores above
             // the old anchor included). A broken chain refuses the prune, and keeps its evidence.
-            if let Err(e) = l.verify_audit_to(cp.seq) {
+            // The list copied below comes from the newest audit.pruned record, which can be above the
+            // cut: then the chain is verified past it too, up to the record after it (whose `prev`
+            // vouches for it), so a rewritten record with the next one re-pointed doesn't pass.
+            let anchor_seq = l.audit_anchor()?.map(|a| a.seq).unwrap_or(0);
+            let pruned_at: Option<i64> =
+                l.conn
+                    .query_row("SELECT MAX(seq) FROM audit WHERE kind = 'audit.pruned' AND seq >= ?1", params![anchor_seq], |r| r.get(0))?;
+            let mut to = cp.seq;
+            if let Some(p) = pruned_at.filter(|p| *p >= cp.seq) {
+                let next: Option<i64> = l.conn.query_row("SELECT MIN(seq) FROM audit WHERE seq > ?1", params![p], |r| r.get(0))?;
+                to = next.unwrap_or(p);
+            }
+            if let Err(e) = l.verify_audit_to(to) {
                 return Err(StoreError::Refused(format!(
                     "the audit chain doesn't verify up to checkpoint {} ({e}): nothing pruned",
                     cp.seq
@@ -684,6 +696,57 @@ mod tests {
         assert_eq!(seqs(&l), [20], "one link deep, it looks chained");
         assert!(l.begin_prune(&at(&l, 25)).unwrap_err().to_string().contains("doesn't verify"), "but the prune verifies the whole range");
         assert!(l.audit_record_at(21).unwrap().is_some(), "and deletes nothing");
+    }
+
+    /// #694 second review: a prune whose cut is below the previous audit.pruned record copies that
+    /// record's list, so the chain is verified past it: a rewritten record (its list naming a forged
+    /// restore, its hash recomputed, the next record re-pointed to it) refuses the prune.
+    #[test]
+    fn a_cut_below_the_last_prune_record_still_verifies_it() {
+        let l = Ledger::open_in_memory().unwrap();
+        chain(&l, 40);
+        let at = |l: &Ledger, s: i64| Checkpoint {
+            sink: "a".into(),
+            target: "t".into(),
+            seq: s,
+            head: l.audit_hash_at(s).unwrap().unwrap(),
+            ts: 0,
+            jws: String::new(),
+        };
+        prune(&l, &at(&l, 25));
+        chain(&l, 20);
+        let hash_of = |r: &crate::AuditRecord, body: &str| {
+            crate::chain_hash_v2(
+                &r.prev,
+                &crate::ChainFields { seq: r.seq, ts: r.ts, tenant: &r.tenant, run: r.run.as_deref(), kind: &r.kind, body },
+            )
+        };
+        // A restore forged below the anchor, hashing as a record would.
+        let r26 = l.audit_record_at(26).unwrap().unwrap();
+        let fbody = r#"{"rolled_back_after":0}"#;
+        let fh = crate::chain_hash_v2(
+            &r26.prev,
+            &crate::ChainFields { seq: 3, ts: r26.ts, tenant: &r26.tenant, run: None, kind: "state.restored", body: fbody },
+        );
+        l.conn
+            .execute(
+                "INSERT INTO audit (seq, ts, tenant, run, kind, body, prev, hash) VALUES (3, ?1, ?2, NULL, 'state.restored', ?3, ?4, ?5)",
+                params![r26.ts, r26.tenant, fbody, r26.prev, fh],
+            )
+            .unwrap();
+        // The prune record rewritten to list it, rehashed, and the next record re-pointed.
+        let pr = l.audit_of_kind("audit.pruned").unwrap().pop().unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&pr.body).unwrap();
+        v["kept_restores"] = serde_json::json!([[3, fh]]);
+        let nb = v.to_string();
+        let nh = hash_of(&pr, &nb);
+        l.conn.execute("UPDATE audit SET body = ?1, hash = ?2 WHERE seq = ?3", params![nb, nh, pr.seq]).unwrap();
+        l.conn.execute("UPDATE audit SET prev = ?1 WHERE seq = ?2", params![nh, pr.seq + 1]).unwrap();
+        // A cut between the anchor and that record.
+        let cut = 28;
+        assert!(cut < pr.seq);
+        assert!(l.begin_prune(&at(&l, cut)).unwrap_err().to_string().contains("doesn't verify"), "refused");
+        assert_eq!(l.audit_anchor().unwrap().unwrap().seq, 25, "nothing moved");
     }
 
     /// #677 follow-up: a second prune lists only the restores the chain vouched for before it, so a
