@@ -175,16 +175,22 @@ names:
   internal:
     per_workload: 3
   public:
-    provider: noop               # noop | vultr | rfc2136 (later: cloudflare, route53)
+    provider: noop               # noop now; vultr and rfc2136 with step 5 (later: cloudflare, route53)
     zone: boxes.example.com      # a delegated subzone is recommended: wicket's credential then touches nothing else
     credential: dns-boxes        # a vault secret's name; never its value
     owner: a1b2c3d4              # this installation's owner id, random, made at install
     ttl: 60
     per_workload: 1
     reserved: [status, docs]
+    console_host: console.example.com  # its first label is reserved too
     nodes: { publish: "true" }   # node labels a node needs to publish public ports
     ports: 20000-20999           # the host ports wicket allocates on each node
 ```
+
+Every part of the section is optional: without `names.public` the installation publishes no names,
+and asks for them are refused. The section is checked when a run starts ([configuration
+reference](../reference/configuration.md#wicketyaml)); a human's approval is decided under it as it
+is then.
 
 Each node that publishes also has its public addresses in the ledger, set by the operator
 (new flags: `wicket node set n1 --public-ipv4 … --public-ipv6 …`) or read from the placement provider for a
@@ -318,7 +324,8 @@ doesn't) can get one by DNS-01: a gateway tool, `dns_challenge(name, value)`, ma
 
 Audit records, as written so far: `name.requested` (an ask), `decision` and `decision.refused` (a
 human's approval or denial, or a refused one, as for other asks), `name.registered` (internal),
-`name.revoked`, `name.released`. Still to come with 4b and 4c: `name.lapsed`, `name.port.opened`, `name.port.closed`,
+`name.revoked`, `name.released`, `name.claimed` (a later run took up a standing name), and
+`node.addresses` (an operator set a node's public addresses). Still to come with 4b and 4c: `name.lapsed`, `name.port.opened`, `name.port.closed`,
 `name.conn` (per connection, on the node), `name.plan` (each reconcile's plan, applied or not),
 `name.record` (each create, update or delete), `name.conflict` and `name.challenge`.
 
@@ -334,9 +341,15 @@ has a name's records as the zone last listed them, and its last connections.
   principal, run, label, kind, box port, service, status, bound, expiry, effect hash, decided and
   revoked by), `name_records` (the records this installation created: zone, name, type, value,
   provider, created, last seen) and `host_ports` (`node`, protocol, port unique; the name holding it,
-  released at). Node public addresses are columns of the node's row.
+  released at).
 - **Ledger schema 31** (#668): `name_exposures`, the ports a run's names exposed (not the box
   itself), which a name's move may take away once no other name of the run names the port.
+- **Ledger schema 34** (step 4b): `node_addresses`, each node's public addresses as its operator set
+  them (`wicket node set --public-ipv4 … --public-ipv6 …`), audited `node.addresses`. They are
+  deleted when the node is revoked or enrolled again (its address may be someone else's by then),
+  are set only on an active node, and are one node's each, since host ports are allocated per
+  node. Also `names.domain`: the boxes domain a public name was approved under, so a change of
+  `names.public.zone` doesn't move live names into a zone nobody approved them in.
 - **Protocol 18:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
   node only of a control host at 18. Public names will add the feed's published ports (name, run,
   node, host port, box port, until) for the nodes that listen on them, and a node's report of a

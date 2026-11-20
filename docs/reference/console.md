@@ -74,7 +74,7 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 - **release a run's fence** (`release_fence`, #690), the console's path beside root's `wicket node
   release-fence`. A run is fenced while its box may still be running on a node that hasn't confirmed
   it stopped (see [the wake fence](nodes.md)): its agent isn't woken and the run isn't ended. Every
-  box a node runs is fenced while its authority is live, so the **Fenced runs** card lists only
+  box a node runs is fenced while its authority is live, so the **Agents held on lost servers** card (Settings) lists only
   fences whose node can never end them: the node is revoked or no longer enrolled. An enrolled node's
   silence isn't enough: its health is recorded only while a supervisor here is attached to it, and an
   offline node keeps acting on its boxes' tokens until they end. For a node that will never run its

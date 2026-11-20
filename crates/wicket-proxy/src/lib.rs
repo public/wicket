@@ -75,6 +75,9 @@ pub struct RunCtx {
     /// Where the agent's own lifetime requests go (`finish`, `hibernate`, #249): to its supervisor,
     /// which acts at the end of the agent's turn. None for programs.
     pub lifecycle: Option<Lifecycle>,
+    /// The installation's `names:` settings (`wicket.yaml`, #575), read when the run started. None:
+    /// every default, and no public names.
+    pub names: Option<Arc<wicket_names::NamesConfig>>,
 }
 
 /// An activation's fencing token: the agent's generation when it was woken.
@@ -737,6 +740,7 @@ mod fence_tests {
             fence: Some(Fence { agent, generation: 1 }),
             waker: None,
             lifecycle: None,
+            names: None,
         }
     }
 

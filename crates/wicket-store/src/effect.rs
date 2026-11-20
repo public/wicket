@@ -138,6 +138,21 @@ impl Ledger {
         Ok(filed)
     }
 
+    /// Records what the agent claimed when it asked for request `id` (#715 review): fields the
+    /// agent chose, such as an update's `reason` and `commit`, which the console shows as the agent's
+    /// words, apart from the reason wicket wrote. The first claims recorded for a request stay.
+    pub fn set_request_claims(&self, id: &str, claims: &serde_json::Value) -> Result<()> {
+        self.conn.execute("INSERT OR IGNORE INTO request_claims (request_id, claims) VALUES (?1, ?2)", params![id, claims.to_string()])?;
+        Ok(())
+    }
+
+    /// What the agent claimed when it asked for request `id`, if anything was recorded.
+    pub fn request_claims(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        let c: Option<String> =
+            self.conn.query_row("SELECT claims FROM request_claims WHERE request_id = ?1", params![id], |r| r.get(0)).optional()?;
+        Ok(c.and_then(|c| serde_json::from_str(&c).ok()))
+    }
+
     /// Adds `who` to request `id`'s attribution, if it isn't there (at most 8 askers).
     pub(crate) fn merge_attribution(&self, id: &str, who: Option<&serde_json::Value>) -> Result<()> {
         let Some(w) = who else { return Ok(()) };

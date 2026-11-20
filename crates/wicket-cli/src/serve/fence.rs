@@ -1,4 +1,4 @@
-//! The console's Fenced runs card (#690): runs whose box may still be running on a node that can
+//! The console's Agents held on lost servers card (Settings, #690): runs whose box may still be running on a node that can
 //! never end its fence (revoked, or no longer enrolled), so their agent isn't woken and the run isn't
 //! ended. An operator releases such a fence here instead of as root on the host.
 //!
