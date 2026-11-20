@@ -478,21 +478,14 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // A tap on a notification while the console is open marks that request's card: inbox.mjs's.
   console.log("console notifications: ok");
 
-  // Secrets: listed by name, kind, hosts and users; a value is typed into a password field cleared on
-  // submit, begin carries only its salted sha256, and the value goes only with finish.
+  // Secrets: a value is typed into a password field cleared on submit, begin carries only its salted
+  // sha256, and the value goes only with finish. (The list, which opens this form, is settings.js's,
+  // checked in browsers: ci/console-browsers/settings.mjs.)
   const SECRET = "s3cret-VALUE-typed-in";
   const gh = { name: "gh", kind: "value", reference: null, hosts: ["api.github.com"], set_at: 1700000000,
     used_by: [{ root: "manifests", manifest: "d.yaml", zone: "docs", use: "inject", host: "api.github.com", header: "authorization", format: "Bearer {secret}", optional: false }],
     zones: ["docs"], runs: [{ run: "run_a", zone: "docs" }] };
-  const login = { name: "login", kind: "reference", reference: { file: "/home/you/.claude/.credentials.json", pointer: "/a/token" }, hosts: [], set_at: 1700000000, used_by: [], zones: [], runs: [] };
-  state = { ...base, pending: [], secrets: { secrets: [gh, login], missing: [{ name: "HOSTILE<b>", zones: ["z"], used_by: [] }], link_cli_only: "references are made on the host: wicket secret link NAME --file PATH" } };
-  await run("refresh()"); await flush();
-  const sx = ids.secrets.textContent;
-  for (const want of ["gh", "sent only to api.github.com", "sent to api.github.com in its authorization header, as Bearer {secret}", "running now: run_a", "read from a file on the host", "/home/you/.claude/.credentials.json#/a/token", "needed, not set", "wicket secret link"]) assert.ok(sx.includes(want), want + " in " + sx);
-  const sbtn = label => ids.secrets.all(n => n.tagName === "button" && n.textContent.startsWith(label));
-  assert.strictEqual(sbtn("Replace value").length, 1, "a reference's value isn't set here");
-  assert.strictEqual(sbtn("Hosts").length, 2, "a reference's hosts can be changed");
-  sbtn("Replace value")[0].click(); await flush();
+  run("openSecret('set', " + JSON.stringify(gh) + ")"); await flush();
   assert.strictEqual(ids["secret-edit"].hidden, false);
   const input = id => ids["secret-edit-body"].all(n => n.id === id)[0];
   const vIn = input("secret-value");
@@ -513,9 +506,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await advance(1000); await ids["confirm-go"].click(); await flush(); await flush();
   const sfin = calls.filter(c => c.path === "/api/action/finish").pop().body;
   assert.strictEqual(sfin.value, SECRET, "the value goes with finish");
-  assert.ok(!ids.secrets.textContent.includes(SECRET));
   // Delete: a warning naming the zones and runs that use it, then the signed confirmation.
-  sbtn("Delete")[0].click(); await flush();
+  run("openSecret('delete', " + JSON.stringify(gh) + ")"); await flush();
   const warn = ids["secret-edit-body"].textContent;
   assert.ok(warn.includes("docs") && warn.includes("run_a"), warn);
   nextAction = { v: 1, action: "delete_secret", name: "gh", kind: "value", zones: ["docs"], runs: ["run_a"], hosts: [] };

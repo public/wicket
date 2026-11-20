@@ -7,7 +7,7 @@
 // every signed action is console.js's.
 import { html, nothing } from "lit-html";
 import { repeat } from "lit-html/directives/repeat.js";
-import { draw, time, code, copyButton, serverText, serverLine, keeper } from "./ui.js";
+import { draw, time, kv, code, copyButton, serverText, serverLine, keeper } from "./ui.js";
 
 const g = globalThis;
 
@@ -151,6 +151,48 @@ function placedRow(p) {
   return html`<div class="lease"><div class="run-head"><span class="run-name mono">${strip(p.name)}</span>${p.past_lease ? nothing : html`<span class="meta">lease ends ${time(p.lease_until)}</span>`}</div><div class="meta mono quiet">${strip(p.id)}</div>${after}</div>`;
 }
 
+// ---- keys and passwords, task setups, organisation rules, passkeys ----
+
+// The vault by name (console.js's secrets section says how a value is handled): the server sends no
+// value, nor anything derived from one. Each button opens console.js's form, which signs.
+function secretUse(u) {
+  const where = "Used by " + u.manifest + " (zone " + u.zone + ")";
+  return strip(u.use === "llm" ? where + " as the model key" + (u.provider ? " (" + u.provider + ")" : "")
+    : where + ": sent to " + u.host + " in its " + u.header + " header" + (u.format ? ", as " + u.format : "") + (u.optional ? " (optional)" : ""));
+}
+function secretsView(v) {
+  const uses = list => (list || []).map(u => html`<div class="meta">${secretUse(u)}</div>`);
+  const stored = x => html`<div class="secret"><div class="row"><span class="mono">${strip(x.name)}</span><span class="risk ${x.kind === "reference" ? "r2" : "r0"}">${x.kind === "reference" ? "read from a file on the host" : "stored"}</span></div><div class="meta">${(x.hosts || []).length ? "sent only to " + x.hosts.map(strip).join(", ") : "bound to no host: sent nowhere"}</div>${x.reference ? html`<div class="meta">${"refers to " + strip(x.reference.file) + (x.reference.pointer ? "#" + strip(x.reference.pointer) : "") + ", read at each use"}</div>` : nothing}<div class="meta">${x.set_at ? "last set " + at(x.set_at) : "last set: unknown"}</div>${uses(x.used_by)}${(x.used_by || []).length ? nothing : html`<div class="meta">no listed manifest uses it</div>`}${(x.runs || []).length ? html`<div class="meta">${"running now: " + x.runs.map(r => strip(r.run)).join(", ")}</div>` : nothing}<div class="buttons">${x.kind !== "reference" ? html`<button @click=${() => openSecret("set", x)}>Replace value…</button>` : nothing}<button @click=${() => openSecret("hosts", x)}>Hosts…</button><button class="deny" @click=${() => openSecret("delete", x)}>Delete…</button></div></div>`;
+  const missing = m => html`<div class="secret"><div class="row"><span class="mono">${strip(m.name)}</span><span class="risk r3">needed, not set</span></div>${uses(m.used_by)}<div class="buttons"><button class="approve" @click=${() => openSecret("set", { name: m.name, hosts: (m.used_by || []).filter(u => u.host).map(u => u.host), missing: true })}>Set…</button></div></div>`;
+  const none = !(v.secrets || []).length && !(v.missing || []).length;
+  return html`${(v.secrets || []).map(stored)}${(v.missing || []).map(missing)}${none ? html`<div class="empty">No secrets in the vault.</div>` : nothing}<div class="buttons"><button @click=${() => openSecret("set", null)}>New secret…</button></div><div class="note">${"Values are never shown, here or anywhere. " + strip(v.link_cli_only ||
+    "References (a file on the host, like a harness login) are made on the host: wicket secret link.")}</div>`;
+}
+
+// The task setups (#172) the server lists; each opens in console.js's editor.
+const manifestsView = ms => html`${ms.map(m => html`<div class="row"><span class=${m.valid ? "mono" : "blocked mono"}>${strip(m.root + "/" + m.name) + (m.valid ? "" : " · invalid")}</span><button class="link" @click=${() => openManifest(m.root, m.name)}>${m.root === "manifests" ? "view / edit" : "view"}</button></div>`)}<button class="link" @click=${() => openManifest("manifests", null)}>new manifest</button>`;
+
+// The organisation's rules (#173): fetched at most every 30 s, as they change rarely.
+let policyAt = 0;
+async function renderPolicy() {
+  if (policyAt && performance.now() - policyAt < 30000) return;
+  policyAt = performance.now();
+  const box = document.getElementById("policy");
+  if (!box) return;
+  try {
+    const p = await getJson("/api/policy");
+    draw(html`${!p.installed ? html`<div class="note">No org policy applied: tokens carry their zone's policy only (wicket policy apply).</div>`
+      : html`${kv("applied", p.installed + (p.current.matches_applied === false ? " · org.cedar was changed by hand: every mint is refused until it is applied" : ""))}<pre class="src">${p.current.cedar || ""}</pre>`}${p.versions.map(v => {
+      const a = v.applied.length ? v.applied[v.applied.length - 1] : null;
+      return kv("version " + v.version + (v.current ? " (current)" : ""), a ? "applied " + at(a.at) + " by " + a.by : "kept");
+    })}${p.runs.map(r => kv(r.run, "zone " + r.zone + " · policy " + (r.policy || "none") + " · " + r.status))}`, box);
+  } catch (e) { draw(html`<div class="blocked">${strip(e.message)}</div>`, box); }
+}
+
+// Your passkeys, and signing out.
+const signOut = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
+const operatorView = s => html`${(s.passkeys || []).map(k => html`<div class="row"><span>${"passkey: " + strip(k.name)}</span><span class="mono">${String(k.id).slice(0, 16) + "…"}</span></div>`)}<div class="buttons"><button @click=${signOut}>Sign out</button></div><div class="note">${code("To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device.", ["wicket operator enrol-link"])}</div>`;
+
 // ---- the view ----
 
 let formDrawn = false;
@@ -166,6 +208,13 @@ function renderSettings(s) {
   if (health) draw(healthView(s), health);
   const placed = document.getElementById("placed");
   if (placed) draw((s.placed || []).length ? s.placed.map(placedRow) : html`<div class="empty">No leased nodes.</div>`, placed);
+  const secrets = document.getElementById("secrets");
+  if (secrets) draw(secretsView(s.secrets || { secrets: [], missing: [] }), secrets);
+  const manifests = document.getElementById("manifests");
+  if (manifests) draw(manifestsView(s.manifests || []), manifests);
+  const operator = document.getElementById("operator");
+  if (operator) draw(operatorView(s), operator);
+  renderPolicy();
 }
 
 g.wicketSettings = { renderSettings };

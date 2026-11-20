@@ -13,7 +13,8 @@
 // nodes with their errors as text; a rented server past its lease says how to release it; an ask to
 // be always allowed shows its evidence and offers the narrowest choice first, signed; a rule says
 // when it ends, whether it allows what can't be undone, and is revoked with the session alone; and
-// unchanged rows are the same elements after a poll.
+// unchanged rows are the same elements after a poll. Keys and passwords, task setups, organisation
+// rules and passkeys are listed as text, each button opening console.js's form or editor.
 import assert from "node:assert";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
@@ -33,6 +34,15 @@ const ask = { id: "s-1", principal: "spiffe://x/t/t0/z/work/a/worker", zone: "wo
   evidence: { requests: 3, granted: 2, denied: 1, undecided: 0, runs: 2, days: 1, own_asks: 4, ops: [{ method: "GET", path: "/jobs/1/logs", count: 2, granted: 2 }] },
   beyond: ["methods never asked for: POST"], narrowed: { host: "ci.example", methods: ["GET"], paths: ["/jobs/1/logs"], allow_dangerous: false }, created_at: NOW - 60 };
 const rule = { id: "s-2", principal: ask.principal, zone: "work", rule: ask.narrowed, for: "agent", expires_at: null, live: true, decided_by: "passkey:laptop" };
+const gh = { name: "gh", kind: "value", reference: null, hosts: ["api.github.com"], set_at: 1700000000,
+  used_by: [{ root: "manifests", manifest: "d.yaml", zone: "docs", use: "inject", host: "api.github.com", header: "authorization", format: "Bearer {secret}", optional: false }],
+  zones: ["docs"], runs: [{ run: "run_a", zone: "docs" }] };
+const login = { name: "login", kind: "reference", reference: { file: "/home/you/.claude/.credentials.json", pointer: "/a/token" }, hosts: [], set_at: 1700000000, used_by: [], zones: [], runs: [] };
+const secrets = { secrets: [gh, login], missing: [{ name: "HOSTILE<b>", zones: ["z"], used_by: [{ root: "manifests", manifest: "e.yaml", zone: "z", use: "inject", host: "e.example", header: "x-key", optional: true }] }],
+  link_cli_only: "references are made on the host: wicket secret link NAME --file PATH" };
+const policy = { installed: "v2", current: { cedar: "permit(principal, action, resource) when { \"" + HOSTILE + "\" };", matches_applied: true },
+  versions: [{ version: "v2", current: true, applied: [{ at: 1700000000, by: "passkey:laptop" }] }, { version: "v1", current: false, applied: [] }], runs: [{ run: "run_a", zone: "docs", policy: "v2", status: "running" }] };
+const manifests = [{ root: "manifests", name: "a.yaml", valid: true }, { root: "examples", name: "b.yaml", valid: false }];
 const base = { now: NOW, tenant: "t0", pending: [], runs: [], manifests: [], decided: [], audit: [], passkeys: [], health: { nodes: [] } };
 
 async function check(engine) {
@@ -55,6 +65,9 @@ async function check(engine) {
     }
     if (p === "/api/capacity/revoke" || p === "/api/standing/revoke") { posted.push([p, body]); return reply({ ok: "revoked" }); }
     if (p === "/api/push") return reply({ public_key: "BAEC", devices: [], min_interval_secs: 30 });
+    if (p === "/api/policy") return reply(policy);
+    if (p === "/api/logout") { posted.push([p, body]); return reply({ ok: "signed out" }); }
+    if (p.startsWith("/api/manifests/")) return reply({ root: "manifests", name: "a.yaml", yaml: "task: x\n", writable: false, history: [], valid: true, fields: [] });
     return reply({});
   });
   const poll = () => page.evaluate(async () => { while (polling) await new Promise(r => setTimeout(r, 20)); await refresh(); });
@@ -231,12 +244,52 @@ async function check(engine) {
     state = { ...base, standing: { asks: [], rules: [{ ...rule, rule: { ...rule.rule, allow_dangerous: true } }] } };
     await poll();
     assert.ok((await sr.textContent()).includes("including requests that can't be undone"));
+    // Keys and passwords: by name, kind, hosts and users; each button opens the form (console.js's).
+    state = { ...base, secrets, manifests, passkeys: [{ name: "laptop", id: "0123456789abcdef0123" }] };
+    await poll();
+    const sx = await page.locator("#secrets").textContent();
+    for (const want of ["gh", "sent only to api.github.com", "sent to api.github.com in its authorization header, as Bearer {secret}", "running now: run_a", "read from a file on the host",
+      "/home/you/.claude/.credentials.json#/a/token", "needed, not set", "HOSTILE<b>", "(optional)", "wicket secret link"]) assert.ok(sx.includes(want), want + " in " + sx);
+    assert.strictEqual(await page.locator("#secrets b").count(), 0);
+    const sbtn = label => page.locator("#secrets button", { hasText: label });
+    assert.strictEqual(await sbtn("Replace value").count(), 1, "a reference's value isn't set here");
+    assert.strictEqual(await sbtn("Hosts").count(), 2, "a reference's hosts can be changed");
+    await sbtn("Replace value").click();
+    assert.strictEqual(await page.locator("#secret-edit").isHidden(), false);
+    assert.strictEqual(await page.locator("#secret-value").getAttribute("type"), "password");
+    assert.strictEqual(await page.inputValue("#secret-name"), "gh");
+    await page.click("#secret-edit-cancel");
+    await sbtn("Set…").click();
+    assert.strictEqual(await page.inputValue("#secret-name"), "HOSTILE<b>");
+    assert.strictEqual(await page.inputValue("#secret-hosts"), "e.example");
+    await page.click("#secret-edit-cancel");
+    // Task setups: each opens in the editor; only those under manifests/ say edit.
+    assert.deepStrictEqual(await page.$$eval("#manifests .row", rs => rs.map(r => r.textContent)), ["manifests/a.yamlview / edit", "examples/b.yaml · invalidview"]);
+    await page.locator("#manifests button", { hasText: "view / edit" }).click();
+    await page.waitForSelector("#mfedit:not([hidden]) textarea");
+    assert.strictEqual(await page.locator("#mfedit-title").textContent(), "manifests/a.yaml");
+    await page.click("#mfedit-close");
+    // Organisation rules, as text; versions and runs.
+    await page.waitForSelector("#policy pre");
+    const pol = await page.locator("#policy").textContent();
+    assert.ok(pol.includes(HOSTILE) && pol.includes("version v2 (current)") && pol.includes("version v1kept") && pol.includes("zone docs · policy v2 · running"), pol);
+    assert.strictEqual(await page.locator("#policy img").count(), 0);
+    // Passkeys, and the command that adds one, with Copy; Sign out posts it.
+    assert.ok((await page.locator("#operator").textContent()).includes("passkey: laptop0123456789abcdef…"));
+    assert.strictEqual(await page.locator("#operator code").textContent(), "wicket operator enrol-link");
+    assert.strictEqual(await page.locator("#operator button.copy").count(), 1);
+    await page.locator("#operator button", { hasText: "Sign out" }).click();
+    await page.waitForTimeout(300);
+    assert.ok(posted.some(([p]) => p === "/api/logout"));
+    await page.evaluate(() => { location.hash = "#settings"; });
+
     // Nothing: each list says so.
     state = { ...base };
     await poll();
     assert.ok((await page.locator("#capacity").innerText()).includes("No capacity grants"));
     assert.strictEqual(await page.locator("#capacity code").textContent(), "wicket node create");
     assert.ok((await sr.innerText()).includes("No standing rules"));
+    assert.ok((await page.locator("#secrets").innerText()).includes("No secrets in the vault."));
 
     if (problems.length) throw new Error(problems.join("\n  "));
     console.log(`${engine} settings: ok`);
