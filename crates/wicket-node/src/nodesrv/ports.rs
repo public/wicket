@@ -20,20 +20,23 @@
 //! once until it binds, filed under each claiming run), and `name.conn` twice per connection
 //! (#796 re-review, M4): `"phase": "start"` once its relay is running (the peer and a connection id
 //! unique across the node's restarts), and `"phase": "end"` with the same id, bytes each way, how
-//! long, and `cut` with why when the node cut it (the port's end, or [`LIFETIME`]). So a connection
-//! the node never recorded the end of (it restarted) is still on record, and a long one is visible
-//! while it lasts. Records are written each [`TICK`]; past [`CONN_RECORDS`] in one tick, that tick's
+//! long, and `"cut": true` with why when the node ended it (its port closed, [`LIFETIME`], [`IDLE`],
+//! [`AFTER_CLOSE`]; #796 review, N2), no `cut` when either side closed. So a connection the node
+//! never recorded the end of (it restarted) is still on record, and a long one is visible while it
+//! lasts. Records are written each [`TICK`]; past [`CONN_RECORDS`] in one tick, that tick's
 //! starts and ends are one aggregate `name.conn` instead. Connections let go without a relay (over
-//! a limit, silent past [`FIRST_BYTE`], or a relay that couldn't start) are counted in
-//! `name.conn.refused`.
+//! a limit, silent past [`FIRST_BYTE`], evicted while waiting for it, or a relay that couldn't
+//! start) are counted in `name.conn.refused`.
 //!
 //! **Limits** (#796 review and re-review, H2): per port ([`MAX_CONNS`], and at most a
 //! [`PORT_SHARE`]th of the node's relays; [`MAX_NEW_PER_TICK`]), per peer on a port
-//! ([`MAX_PER_PEER`], an IPv6 peer counted by its /64), and over the node ([`MAX_NODE_EXECS`],
-//! [`MAX_NODE_NEW_PER_TICK`]), all checked before anything costs more. No exec is spawned before a
-//! connection's first byte, and connections still waiting for it have their own small caps
-//! ([`MAX_WAITING`], [`MAX_WAITING_PER_PEER`]). A relay ends when it carries nothing for [`IDLE`],
-//! [`AFTER_CLOSE`] after its peer's half-close, and at [`LIFETIME`] whatever it carries; the
+//! ([`MAX_PER_PEER`], an IPv6 peer counted by its /64), per peer over the node
+//! ([`MAX_NODE_PER_PEER`]), and over the node ([`MAX_NODE_EXECS`], [`MAX_NODE_NEW_PER_TICK`]), all
+//! checked before anything costs more. No exec is spawned before a connection's first byte, and
+//! connections still waiting for it have their own small caps ([`MAX_WAITING`],
+//! [`MAX_WAITING_PER_PEER`]): a newcomer to a full pool evicts its oldest waiter rather than being
+//! refused. A relay ends when it carries nothing for [`IDLE`], [`AFTER_CLOSE`] after its peer's
+//! half-close with nothing sent to the peer since, and at [`LIFETIME`] whatever it carries; the
 //! `wicket-fwd` in the box is given the first two too, so it ends on its own.
 
 use super::*;
@@ -100,6 +103,8 @@ pub(super) struct Limits {
     pub max_new_per_tick: u64,
     /// The most connections one peer (an IPv4 address, an IPv6 /64) holds at once on one port.
     pub per_peer: usize,
+    /// The most relays one peer holds at once over all the node's ports ([`MAX_NODE_PER_PEER`]).
+    pub node_per_peer: usize,
     /// How long a connection may send nothing before it is closed, with no exec spawned for it.
     pub first_byte: Duration,
     /// The most connections on one port still waiting for their first byte.
@@ -108,7 +113,7 @@ pub(super) struct Limits {
     pub waiting_per_peer: usize,
     /// How long a connection may carry no bytes either way before it is closed.
     pub idle: Duration,
-    /// How long a relay may go on after its peer's half-close.
+    /// How long a relay may go on after its peer's half-close with nothing sent to the peer.
     pub after_close: Duration,
     /// How long a relay may last, whatever it carries.
     pub lifetime: Duration,
@@ -123,12 +128,21 @@ pub(super) struct Limits {
 
 /// The most connections one peer holds at once on one port.
 pub const MAX_PER_PEER: usize = 8;
+/// The most relays one peer holds at once over all the node's ports (#796 review, R1): the per-port
+/// cap alone let four addresses hold eight ports' worth, all [`MAX_NODE_EXECS`], for an hour. With
+/// this, it takes `MAX_NODE_EXECS / MAX_NODE_PER_PEER` (8) peers to fill the node, while one client
+/// still has four ports' worth of [`MAX_PER_PEER`].
+pub const MAX_NODE_PER_PEER: usize = 32;
+const _: () = assert!(MAX_PER_PEER <= MAX_NODE_PER_PEER && MAX_NODE_PER_PEER <= MAX_NODE_EXECS / PORT_SHARE);
 /// How long a connection may send nothing before it is closed (no exec is spawned until it does).
 pub const FIRST_BYTE: Duration = Duration::from_secs(10);
 /// The most connections on one port waiting for their first byte at once (#796 re-review, H2):
 /// half the port's [`MAX_CONNS`], so silent ones never hold the rest, which only connections that
 /// spoke can. A client's first bytes follow its handshake at once, so a speaking connection waits
-/// here for moments, not seconds.
+/// here for moments, not seconds. A newcomer to a full pool evicts its oldest waiter (#796 review,
+/// R1): refusing it instead let a few peers reconnecting about twice a second keep the pool full
+/// and shut the port to everyone, while a speaking connection, gone from the pool within moments,
+/// is never the oldest for long.
 pub const MAX_WAITING: usize = 16;
 const _: () = assert!(MAX_WAITING < MAX_CONNS && MAX_WAITING_PER_PEER <= MAX_WAITING);
 /// The most of those from one peer: a browser's burst to one host (six connections at once) must
@@ -139,6 +153,8 @@ pub const MAX_WAITING_PER_PEER: usize = 6;
 pub const IDLE: Duration = Duration::from_secs(5 * 60);
 /// How long a relay goes on after its peer's half-close, for the box's answer (#796 re-review, H2):
 /// a peer that sends a byte and closes doesn't hold a relay for as long as the service ignores it.
+/// Counted from the half-close or the last byte sent to the peer since, whichever is later (#796
+/// review, N1): a half-closed peer still downloading is not cut while its download flows.
 pub const AFTER_CLOSE: Duration = Duration::from_secs(30);
 /// How long a relay may last at all (#796 re-review, H2): one byte every few minutes doesn't hold
 /// a slot for good. A connection cut here is recorded `cut`, why `lifetime`.
@@ -156,6 +172,7 @@ impl Default for Limits {
             max_conns: MAX_CONNS,
             max_new_per_tick: MAX_NEW_PER_TICK,
             per_peer: MAX_PER_PEER,
+            node_per_peer: MAX_NODE_PER_PEER,
             first_byte: FIRST_BYTE,
             waiting: MAX_WAITING,
             waiting_per_peer: MAX_WAITING_PER_PEER,
@@ -185,6 +202,8 @@ struct Execs {
     live: AtomicUsize,
     /// Started since the last [`tick`].
     new: AtomicU64,
+    /// By [`peer_key`], the relays each peer holds over all the node's ports (#796 review, R1).
+    peers: Mutex<HashMap<std::net::IpAddr, usize>>,
 }
 
 impl Execs {
@@ -192,22 +211,36 @@ impl Execs {
         self.live.load(Ordering::SeqCst) >= l.node_execs || self.new.load(Ordering::SeqCst) >= l.node_new_per_tick
     }
 
-    /// A relay's place, if the node has one: given back when the returned guard drops.
-    fn take(self: &Arc<Self>, l: &Limits) -> Option<ExecSlot> {
-        self.live.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < l.node_execs).then_some(n + 1)).ok()?;
+    /// Whether peer `key` holds all the relays one peer may over the node (R1): a cheap check
+    /// before anything else, as [`Execs::full`]; [`Execs::take`] decides.
+    fn peer_full(&self, key: std::net::IpAddr, l: &Limits) -> bool {
+        self.peers.lock().expect("execs").get(&key).copied().unwrap_or(0) >= l.node_per_peer
+    }
+
+    /// A relay's place for peer `key`, if the node and the peer have one: given back when the
+    /// returned guard drops. Otherwise why not.
+    fn take(self: &Arc<Self>, l: &Limits, key: std::net::IpAddr) -> Result<ExecSlot, Dropped> {
+        // Held throughout, so two relays of one peer can't both take its last place.
+        let mut peers = self.peers.lock().expect("execs");
+        if peers.get(&key).copied().unwrap_or(0) >= l.node_per_peer {
+            return Err(Dropped::NodePeer);
+        }
+        self.live.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < l.node_execs).then_some(n + 1)).map_err(|_| Dropped::Node)?;
         if self.new.fetch_add(1, Ordering::SeqCst) >= l.node_new_per_tick {
             self.live.fetch_sub(1, Ordering::SeqCst);
-            return None;
+            return Err(Dropped::Node);
         }
-        Some(ExecSlot(self.clone()))
+        *peers.entry(key).or_default() += 1;
+        Ok(ExecSlot(self.clone(), key))
     }
 }
 
-struct ExecSlot(Arc<Execs>);
+struct ExecSlot(Arc<Execs>, std::net::IpAddr);
 
 impl Drop for ExecSlot {
     fn drop(&mut self) {
         self.0.live.fetch_sub(1, Ordering::SeqCst);
+        dec(&mut self.0.peers.lock().expect("execs"), self.1);
     }
 }
 
@@ -488,12 +521,36 @@ struct ConnStats {
     bytes_out: AtomicU64,
     /// When bytes last moved either way, in ms since `started`.
     last_ms: AtomicU64,
+    /// When bytes last went to the peer (box to peer), in ms since `started` (#796 review, N1).
+    last_out_ms: AtomicU64,
+    /// Told when the connection is evicted while it waits for its first byte (#796 review, R1):
+    /// its task, waiting on the peer, lets it go at once. One permit (`notify_one`), so an eviction
+    /// before the task waits is not lost.
+    evict: tokio::sync::Notify,
 }
 
 impl ConnStats {
     fn moved(&self, n: &AtomicU64, k: usize) {
         n.fetch_add(k as u64, Ordering::SeqCst);
-        self.last_ms.store(self.started.elapsed().as_millis() as u64, Ordering::SeqCst);
+        let ms = self.started.elapsed().as_millis() as u64;
+        self.last_ms.store(ms, Ordering::SeqCst);
+        // Bytes to the peer also reset the after-close timer (N1).
+        if std::ptr::eq(n, &self.bytes_out) {
+            self.last_out_ms.store(ms, Ordering::SeqCst);
+        }
+    }
+
+    fn new(peer: SocketAddr, key: std::net::IpAddr) -> Self {
+        ConnStats {
+            peer,
+            key,
+            started: std::time::Instant::now(),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+            last_ms: AtomicU64::new(0),
+            last_out_ms: AtomicU64::new(0),
+            evict: tokio::sync::Notify::new(),
+        }
     }
 }
 
@@ -504,10 +561,14 @@ enum Dropped {
     Port,
     /// Over its peer's limit.
     Peer,
-    /// Over the port's (or its peer's) connections waiting for their first byte.
+    /// Over its peer's connections waiting for their first byte (or a port that takes none).
     Waiting,
+    /// Evicted while it waited for its first byte, by a newcomer to a full pool (#796 review, R1).
+    Evicted,
     /// Over the node's relays.
     Node,
+    /// Over its peer's relays over the node ([`Limits::node_per_peer`]; #796 review, R1).
+    NodePeer,
     /// It sent nothing within [`Limits::first_byte`] (or closed first).
     Silent,
     /// Its relay couldn't start (no running box, or `docker exec` failed to spawn).
@@ -521,20 +582,23 @@ struct Counts {
     port: u64,
     peer: u64,
     waiting: u64,
+    evicted: u64,
     node: u64,
+    node_peer: u64,
     silent: u64,
     failed: u64,
     closed: u64,
 }
 
-/// How a relayed connection ended, when the node ended it.
+/// How a relayed connection ended: either side closing ([`Why::Done`]), or the node ending it
+/// (every other: recorded `"cut": true` with why, #796 review, N2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Why {
     /// Either side closed: nothing to say.
     Done,
     /// No bytes either way for [`Limits::idle`].
     Idle,
-    /// [`Limits::after_close`] after its peer's half-close.
+    /// [`Limits::after_close`] after its peer's half-close, or the last byte sent to it since.
     AfterClose,
     /// It reached [`Limits::lifetime`]: cut.
     Lifetime,
@@ -543,8 +607,9 @@ enum Why {
 }
 
 impl Why {
+    /// Whether the node ended it: every end but either side closing (#796 review, N2).
     fn cut(self) -> bool {
-        matches!(self, Why::Lifetime | Why::PortClosed)
+        self != Why::Done
     }
 
     fn says(self) -> Option<&'static str> {
@@ -624,7 +689,8 @@ struct LogState {
     /// By [`peer_key`], the port's connections, and those of them still waiting.
     peers: HashMap<std::net::IpAddr, usize>,
     waiting_peers: HashMap<std::net::IpAddr, usize>,
-    waiting: usize,
+    /// The ids of those still waiting, oldest (lowest) first: whom a newcomer evicts (R1).
+    waiters: std::collections::BTreeSet<u64>,
     /// This tick's records in order, one by one while there are few (a start before its end).
     events: Vec<Event>,
     /// Or, once there are more, all of them as totals (H2).
@@ -645,9 +711,9 @@ fn dec(m: &mut HashMap<std::net::IpAddr, usize>, k: std::net::IpAddr) {
 
 impl LogState {
     /// No longer waiting for its first byte.
-    fn unwait(&mut self, l: &mut Live) {
+    fn unwait(&mut self, id: u64, l: &mut Live) {
         if std::mem::take(&mut l.waiting) {
-            self.waiting -= 1;
+            self.waiters.remove(&id);
             dec(&mut self.waiting_peers, l.stats.key);
         }
     }
@@ -655,9 +721,18 @@ impl LogState {
     /// Takes `id` out, with what it counted for: the caller records it.
     fn remove(&mut self, id: u64) -> Option<Live> {
         let mut l = self.live.remove(&id)?;
-        self.unwait(&mut l);
+        self.unwait(id, &mut l);
         dec(&mut self.peers, l.stats.key);
         Some(l)
+    }
+
+    /// Evicts waiter `id` (R1): taken out and counted here, and its task told, which closes its
+    /// socket at once.
+    fn evict(&mut self, id: u64) {
+        if let Some(l) = self.remove(id) {
+            l.stats.evict.notify_one();
+            PortLog::count(self, Dropped::Evicted);
+        }
     }
 }
 
@@ -697,7 +772,9 @@ impl PortLog {
             Dropped::Port => d.port += 1,
             Dropped::Peer => d.peer += 1,
             Dropped::Waiting => d.waiting += 1,
+            Dropped::Evicted => d.evicted += 1,
             Dropped::Node => d.node += 1,
+            Dropped::NodePeer => d.node_peer += 1,
             Dropped::Silent => d.silent += 1,
             Dropped::Failed => d.failed += 1,
             Dropped::Closed => d.closed += 1,
@@ -706,45 +783,55 @@ impl PortLog {
 
     /// Takes a connection from `from`, if its port and its peer are under their limits (checked
     /// before anything costs more): its id and counts. It waits for its first byte until
-    /// [`PortLog::spoke`].
+    /// [`PortLog::spoke`]. Every refusal is decided before anything is evicted.
     fn take(&self, from: SocketAddr) -> Result<(u64, Arc<ConnStats>), Dropped> {
         let l = &self.limits;
         let mut st = self.st.lock().expect("port log");
-        if st.closed || st.live.len() >= l.port_cap() {
+        if st.closed {
             return Err(Dropped::Port);
         }
         let key = peer_key(from.ip());
         if st.peers.get(&key).copied().unwrap_or(0) >= l.per_peer {
             return Err(Dropped::Peer);
         }
-        // Silent sockets can't fill the port (#796 re-review, H2).
-        if st.waiting >= l.waiting || st.waiting_peers.get(&key).copied().unwrap_or(0) >= l.waiting_per_peer {
+        // A peer at its own waiting cap is refused, not let evict its own oldest waiter (#796
+        // review, R1). Either way it evicts no other peer's (checked before the pool's eviction
+        // below, which it never reaches); refusing also means a peer at its cap evicts nothing at
+        // all, and can't keep its waiters the pool's youngest by replacing them, so they age into
+        // the ones other newcomers evict. What it costs: silent sockets from one shared address (a
+        // NAT) refuse that address's other connections until they speak or time out.
+        if st.waiting_peers.get(&key).copied().unwrap_or(0) >= l.waiting_per_peer {
             return Err(Dropped::Waiting);
+        }
+        // Silent sockets can't fill the port (#796 re-review, H2), nor shut it (R1): a newcomer to
+        // a full pool, or to a port at its cap while some of it still waits, evicts the oldest
+        // waiter instead of being refused. Only a port full of relays refuses it.
+        let pool_full = st.waiters.len() >= l.waiting;
+        if pool_full || st.live.len() >= l.port_cap() {
+            match st.waiters.first().copied() {
+                Some(oldest) => st.evict(oldest),
+                None if pool_full => return Err(Dropped::Waiting),
+                None => return Err(Dropped::Port),
+            }
         }
         *st.peers.entry(key).or_default() += 1;
         *st.waiting_peers.entry(key).or_default() += 1;
-        st.waiting += 1;
         st.next += 1;
         let id = st.next;
-        let stats = Arc::new(ConnStats {
-            peer: from,
-            key,
-            started: std::time::Instant::now(),
-            bytes_in: AtomicU64::new(0),
-            bytes_out: AtomicU64::new(0),
-            last_ms: AtomicU64::new(0),
-        });
+        st.waiters.insert(id);
+        let stats = Arc::new(ConnStats::new(from, key));
         st.live.insert(id, Live { stats: stats.clone(), waiting: true, started: false });
         Ok((id, stats))
     }
 
-    /// A taken connection's first byte arrived: no longer counted as waiting.
-    fn spoke(&self, id: u64) {
+    /// A taken connection's first byte arrived: no longer counted as waiting. False if it is gone
+    /// (evicted, or the port closed): the caller lets it go, with no exec spawned.
+    fn spoke(&self, id: u64) -> bool {
         let mut st = self.st.lock().expect("port log");
-        if let Some(mut l) = st.live.remove(&id) {
-            st.unwait(&mut l);
-            st.live.insert(id, l);
-        }
+        let Some(mut l) = st.live.remove(&id) else { return false };
+        st.unwait(id, &mut l);
+        st.live.insert(id, l);
+        true
     }
 
     /// Its relay is running: its start goes on record (M4). False if the port closed meanwhile
@@ -846,8 +933,8 @@ impl PortLog {
                 }),
             );
         }
-        let refused = d.port + d.peer + d.waiting + d.node;
-        if refused + d.silent + d.failed + d.closed > 0 {
+        let refused = d.port + d.peer + d.waiting + d.node + d.node_peer;
+        if refused + d.evicted + d.silent + d.failed + d.closed > 0 {
             let l = &self.limits;
             self.node.audit_note(
                 &c.run,
@@ -855,9 +942,9 @@ impl PortLog {
                 serde_json::json!({
                     "name": c.name, "label": c.label, "port": self.port,
                     "refused": refused, "over_port": d.port, "over_peer": d.peer, "waiting": d.waiting, "over_node": d.node,
-                    "silent": d.silent, "failed": d.failed, "closed": d.closed,
+                    "node_peer": d.node_peer, "evicted": d.evicted, "silent": d.silent, "failed": d.failed, "closed": d.closed,
                     "max_conns": l.port_cap(), "max_new_per_tick": l.max_new_per_tick, "max_per_peer": l.per_peer,
-                    "max_waiting": l.waiting, "max_waiting_per_peer": l.waiting_per_peer,
+                    "max_node_per_peer": l.node_per_peer, "max_waiting": l.waiting, "max_waiting_per_peer": l.waiting_per_peer,
                 }),
             );
         }
@@ -935,6 +1022,10 @@ async fn serve(node: Arc<Node>, l: tokio::net::TcpListener, c: Claim, log: Arc<P
                     log.refuse(Dropped::Node);
                     continue;
                 }
+                if execs.peer_full(peer_key(from.ip()), &log.limits) {
+                    log.refuse(Dropped::NodePeer);
+                    continue;
+                }
                 let (id, stats) = match log.take(from) {
                     Ok(t) => t,
                     Err(why) => {
@@ -1005,12 +1096,20 @@ async fn relay(node: Arc<Node>, s: tokio::net::TcpStream, box_port: u16, mut tak
     let log = taken.0.clone();
     let limits = log.limits.clone();
     // No exec until the peer has said something: one that sends nothing costs only its socket.
+    // Evicted meanwhile (R1): gone at once, its socket with it (counted by the evictor).
     let mut b = [0u8; 1];
-    match tokio::time::timeout(limits.first_byte, s.peek(&mut b)).await {
-        Ok(Ok(n)) if n > 0 => log.spoke(taken.1),
-        _ => return log.let_go(taken.1, Dropped::Silent),
+    let spoke = tokio::select! {
+        r = tokio::time::timeout(limits.first_byte, s.peek(&mut b)) => matches!(r, Ok(Ok(n)) if n > 0),
+        _ = stats.evict.notified() => return,
+    };
+    // Evicted (or the port closed) just as its byte arrived: still no exec.
+    if !spoke || !log.spoke(taken.1) {
+        return log.let_go(taken.1, Dropped::Silent);
     }
-    let Some(_slot) = execs.take(&limits) else { return log.let_go(taken.1, Dropped::Node) };
+    let _slot = match execs.take(&limits, stats.key) {
+        Ok(s) => s,
+        Err(why) => return log.let_go(taken.1, why),
+    };
     let found =
         node.boxes.lock().expect("boxes").get(&log.claim.run).filter(|b| b.exited.is_none()).map(|b| (b.name.clone(), b.user.clone()));
     let Some((name, user)) = found else { return log.let_go(taken.1, Dropped::Failed) };
@@ -1044,9 +1143,19 @@ async fn relay(node: Arc<Node>, s: tokio::net::TcpStream, box_port: u16, mut tak
         };
         let bounds = async {
             let lifetime = tokio::time::sleep_until(tokio::time::Instant::from_std(st.started + limits.lifetime));
+            // An idle timer from the half-close, reset by each byte sent to the peer since (#796
+            // review, N1): a half-closed peer still downloading isn't cut while bytes flow to it.
             let after_close = async {
                 half_closed.notified().await;
-                tokio::time::sleep(limits.after_close).await;
+                let closed_ms = st.started.elapsed().as_millis() as u64;
+                loop {
+                    let from = Duration::from_millis(closed_ms.max(st.last_out_ms.load(Ordering::SeqCst)));
+                    let since = st.started.elapsed().saturating_sub(from);
+                    if since >= limits.after_close {
+                        return;
+                    }
+                    tokio::time::sleep(limits.after_close - since).await;
+                }
             };
             let idle = async {
                 loop {
@@ -1111,7 +1220,7 @@ mod tests {
     /// A connection taken, spoken and started, as a relay does.
     fn go(log: &PortLog, from: SocketAddr) -> (u64, Arc<ConnStats>) {
         let (id, s) = log.take(from).unwrap();
-        log.spoke(id);
+        assert!(log.spoke(id));
         assert!(log.start(id));
         (id, s)
     }
@@ -1235,23 +1344,65 @@ mod tests {
         assert_eq!(Limits { node_execs: 2, ..Limits::default() }.port_cap(), 1);
     }
 
-    /// H2 (#796 re-review): connections waiting for their first byte are capped per port and per
-    /// peer; one that speaks frees its place.
-    #[test]
-    fn waiting_connections_are_capped() {
+    /// Whether `s`'s task has been told it is evicted (the permit `notify_one` leaves).
+    async fn evicted(s: &ConnStats) -> bool {
+        tokio::time::timeout(Duration::from_millis(10), s.evict.notified()).await.is_ok()
+    }
+
+    /// H2 (#796 re-review), R1 (#796 review): connections waiting for their first byte are capped
+    /// per peer (past it the newcomer is refused, evicting nothing) and per port, where a newcomer
+    /// to a full pool evicts the oldest waiter, whichever peer's, and is taken; one that speaks
+    /// frees its place.
+    #[tokio::test]
+    async fn waiting_connections_are_capped_and_the_oldest_evicted() {
         let inst = crate::nodeauth::testkit::Install::new("ports-waiting");
         let node = super::super::tests::test_node(&inst);
         let claim = Claim { run: "run_w".into(), name: "n-0".into(), label: "demo".into(), box_port: 3000, until_ms: i64::MAX };
-        let log = PortLog::new(node, claim, 20997, Arc::new(Limits { waiting: 3, waiting_per_peer: 2, ..Limits::default() }));
+        let log = PortLog::new(node.clone(), claim, 20997, Arc::new(Limits { waiting: 3, waiting_per_peer: 2, ..Limits::default() }));
         let v6 = |n: u8| -> SocketAddr { format!("[2001:db8::{n}]:4000").parse().unwrap() };
-        let (a, _) = log.take(v6(1)).unwrap();
-        let _b = log.take(v6(2)).unwrap();
+        let v4 = |n: u8| -> SocketAddr { format!("192.0.2.{n}:4000").parse().unwrap() };
+        let (a, sa) = log.take(v6(1)).unwrap();
+        let (b, sb) = log.take(v6(2)).unwrap();
         assert!(matches!(log.take(v6(3)), Err(Dropped::Waiting)), "two waiting from one /64");
-        let _c = log.take("192.0.2.1:4000".parse().unwrap()).unwrap();
-        assert!(matches!(log.take("192.0.2.2:4000".parse().unwrap()), Err(Dropped::Waiting)), "three on the port");
-        log.spoke(a);
-        log.take(v6(4)).expect("a place freed by one speaking");
-        log.let_go(a, Dropped::Silent);
+        assert!(!evicted(&sa).await && !evicted(&sb).await, "a peer over its own cap evicts nothing");
+        let (c, sc) = log.take(v4(1)).unwrap();
+        // The pool is full (three): the next evicts the oldest, the first from the /64.
+        let (d, _) = log.take(v4(2)).expect("taken, not refused, into a full pool");
+        assert!(evicted(&sa).await, "the oldest is told");
+        assert!(!evicted(&sb).await && !evicted(&sc).await, "only the oldest");
+        assert!(!log.spoke(a), "an evicted one is gone: no exec for it");
+        log.let_go(a, Dropped::Silent); // as its task does: nothing more is counted
+        assert!(log.spoke(c));
+        log.take(v6(4)).expect("a place freed by one speaking: nothing evicted");
+        assert!(!evicted(&sb).await);
+        for id in [b, c, d] {
+            log.let_go(id, Dropped::Failed);
+        }
+        log.flush();
+        let k = conn_records(&node);
+        let refused = &k.iter().find(|(kind, _)| kind == "name.conn.refused").expect("refused").1;
+        assert_eq!(
+            (refused["evicted"].clone(), refused["waiting"].clone(), refused["silent"].clone()),
+            (1.into(), 0.into(), 0.into()),
+            "the eviction counted by the evictor (a refusal is by `serve`), the evicted one not again as silent: {refused}"
+        );
+    }
+
+    /// R1 (#796 review): a port at its cap while some of it still waits evicts the oldest waiter
+    /// for a newcomer; one full of relays refuses it.
+    #[tokio::test]
+    async fn a_full_port_evicts_a_waiter_but_not_a_relay() {
+        let inst = crate::nodeauth::testkit::Install::new("ports-full");
+        let node = super::super::tests::test_node(&inst);
+        let claim = Claim { run: "run_f".into(), name: "n-0".into(), label: "demo".into(), box_port: 3000, until_ms: i64::MAX };
+        let log = PortLog::new(node, claim, 20996, Arc::new(Limits { max_conns: 2, ..Limits::default() }));
+        let v4 = |n: u8| -> SocketAddr { format!("192.0.2.{n}:4000").parse().unwrap() };
+        let _relay = go(&log, v4(1));
+        let (_, sb) = log.take(v4(2)).unwrap();
+        let (c, _) = log.take(v4(3)).expect("evicts the waiter");
+        assert!(evicted(&sb).await);
+        assert!(log.spoke(c));
+        assert!(matches!(log.take(v4(4)), Err(Dropped::Port)), "two relays: full");
     }
 
     /// H2 (#796 re-review): the box's `wicket-fwd` is given the node's idle and after-close limits.
@@ -1277,13 +1428,34 @@ mod tests {
     fn the_nodes_relays_are_capped() {
         let l = Limits { node_execs: 2, node_new_per_tick: 3, ..Limits::default() };
         let e = Arc::new(Execs::default());
-        let (a, b) = (e.take(&l).unwrap(), e.take(&l).unwrap());
-        assert!(e.full(&l) && e.take(&l).is_none(), "two at once");
+        let k = |s: &str| peer_key(s.parse().unwrap());
+        let (a, b) = (e.take(&l, k("192.0.2.1")).unwrap(), e.take(&l, k("192.0.2.2")).unwrap());
+        assert!(e.full(&l) && matches!(e.take(&l, k("192.0.2.3")), Err(Dropped::Node)), "two at once");
         drop(a);
-        let _c = e.take(&l).unwrap();
+        let _c = e.take(&l, k("192.0.2.3")).unwrap();
         drop(b);
-        assert!(e.take(&l).is_none(), "three new this tick");
+        assert!(matches!(e.take(&l, k("192.0.2.4")), Err(Dropped::Node)), "three new this tick");
         e.new.store(0, Ordering::SeqCst);
-        assert!(e.take(&l).is_some());
+        assert!(e.take(&l, k("192.0.2.4")).is_ok());
+    }
+
+    /// R1 (#796 review): one peer (an IPv6 /64 as one) holds at most `node_per_peer` of the node's
+    /// relays, over all its ports; a refused take leaves nothing held, and a slot dropped frees it.
+    #[test]
+    fn a_peers_relays_over_the_node_are_capped() {
+        let l = Limits { node_per_peer: 2, ..Limits::default() };
+        let e = Arc::new(Execs::default());
+        let k = |s: &str| peer_key(s.parse().unwrap());
+        let a = e.take(&l, k("2001:db8::1")).unwrap();
+        let _b = e.take(&l, k("2001:db8::2")).unwrap();
+        assert!(e.peer_full(k("2001:db8::3"), &l));
+        assert!(matches!(e.take(&l, k("2001:db8::3")), Err(Dropped::NodePeer)), "two from one /64");
+        assert_eq!(e.live.load(Ordering::SeqCst), 2, "the refused one holds no relay");
+        let _c = e.take(&l, k("192.0.2.1")).expect("another peer");
+        drop(a);
+        assert!(!e.peer_full(k("2001:db8::3"), &l));
+        let _d = e.take(&l, k("2001:db8::3")).unwrap();
+        drop((_b, _c, _d));
+        assert!(e.peers.lock().unwrap().is_empty(), "every slot given back");
     }
 }

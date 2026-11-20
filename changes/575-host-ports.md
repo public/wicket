@@ -14,8 +14,10 @@ type: Added
     out of reach (a node that can't hear of a revoke keeps the port until one of those ends). It copies each connection's bytes into the
     box's port once its first byte has come (layer 4 only: no TLS, no HTTP, no routing by name).
     Per name: at most 32 at once, 8 per peer (an IPv6 /64 counts as one), 16 still silent (6 per
-    peer); per node, 256 at once. A relay ends after 5 minutes idle, 30 s after the peer closes its
-    side, or after an hour, and the box's `wicket-fwd` ends by itself the same way. Each connection
+    peer; a newcomer to a full pool evicts the oldest); per node, 256 at once and 32 per peer. A relay ends after 5 minutes idle, 30 s after the peer has closed
+    its side and nothing more has gone to it, or after an hour, and the box's `wicket-fwd` ends by itself the same way (in a box image
+    older than this, its `wicket-fwd` ignores those limits: a cut relay may linger in the box,
+    unbounded until the box image is rebuilt). Each connection
     is recorded when it starts and when it ends (`name.conn`), aggregated under load.
     Audited on the node as `name.port.opened`, `name.port.closed`, `name.port.failed`,
     `name.conn` and `name.conn.refused`.

@@ -399,7 +399,9 @@ pub fn dial(addr: SocketAddr, mode: CopyMode, buf_size: usize) -> io::Result<(u6
 pub struct DialLimits {
     /// No bytes either way for this long: the relay ends.
     pub idle: Option<Duration>,
-    /// This long after stdin's end of file, the relay ends even if the box's side stays open.
+    /// This long after stdin's end of file, the relay ends even if the box's side stays open,
+    /// counted from the last byte written to stdout since (#796 review, N1): a peer that has
+    /// closed its side but is still being sent bytes keeps its relay.
     pub after_close: Option<Duration>,
 }
 
@@ -424,12 +426,14 @@ pub fn dial_bounded(addr: SocketAddr, mode: CopyMode, buf_size: usize, limits: D
     // When bytes last moved either way, and when stdin ended (u64::MAX: not yet), in ms since start.
     let last = Arc::new(AtomicU64::new(0));
     let closed = Arc::new(AtomicU64::new(u64::MAX));
+    // When a byte last went to stdout (the outside peer), in ms since start.
+    let last_out = Arc::new(AtomicU64::new(0));
     // Wakes the watchdog when stdin ends or this call returns; `done` (set before the latter) ends
     // it, so a watchdog never acts once the relay is over.
     let (wake, woken) = mpsc::channel::<()>();
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if limits != DialLimits::default() {
-        let (tcp, last, closed, done) = (tcp.try_clone()?, last.clone(), closed.clone(), done.clone());
+        let (tcp, last, closed, done, last_out) = (tcp.try_clone()?, last.clone(), closed.clone(), done.clone(), last_out.clone());
         let over = move || done.load(Ordering::SeqCst);
         thread::Builder::new().stack_size(THREAD_STACK).spawn(move || {
             let why = loop {
@@ -439,7 +443,8 @@ pub fn dial_bounded(addr: SocketAddr, mode: CopyMode, buf_size: usize, limits: D
                 let now = ms();
                 let idle = limits.idle.map(|d| (last.load(Ordering::SeqCst) + d.as_millis() as u64, "idle"));
                 let c = closed.load(Ordering::SeqCst);
-                let after = limits.after_close.filter(|_| c != u64::MAX).map(|d| (c + d.as_millis() as u64, "stdin closed"));
+                let from = c.max(last_out.load(Ordering::SeqCst));
+                let after = limits.after_close.filter(|_| c != u64::MAX).map(|d| (from + d.as_millis() as u64, "stdin closed"));
                 let next = [idle, after].into_iter().flatten().min_by_key(|(at, _)| *at);
                 let got = match next {
                     Some((at, why)) if at <= now => break why,
@@ -477,7 +482,11 @@ pub fn dial_bounded(addr: SocketAddr, mode: CopyMode, buf_size: usize, limits: D
         r
     })?;
     let mut tcp_r = tcp;
-    let down = copy::copy_with(mode, &mut tcp_r, &mut stdout, buf_size, &|_| last.store(ms(), Ordering::SeqCst));
+    let down = copy::copy_with(mode, &mut tcp_r, &mut stdout, buf_size, &|_| {
+        let t = ms();
+        last.store(t, Ordering::SeqCst);
+        last_out.store(t, Ordering::SeqCst);
+    });
     let _ = stdout.flush();
     done.store(true, Ordering::SeqCst);
     let _ = wake.send(());

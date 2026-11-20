@@ -226,12 +226,17 @@ a node with the `names.public.nodes` labels; without it the node publishes nothi
 claimed by one box, whose authority holds on the node. It listens on one IPv6 socket that takes
 IPv4 too (IPv4 alone where IPv6 is off), and dials each connection into the box (`wicket-fwd`)
 once its first byte has come (within 10 s; until then a connection costs only its socket, and at
-most 16 per name, 6 per peer, wait so). Per name it holds at most 32 relays, 8 per peer (an IPv6
+most 16 per name, 6 per peer, wait so: a newcomer to a full pool evicts the oldest waiter rather
+than being refused, so silent sockets can't keep speaking clients out). Per name it holds at most 32 relays, 8 per peer (an IPv6
 /64 counts as one peer), and takes 128 new per 2 s; per node, 256 at once (so 8 names at their cap
-fill it) and 256 new per 2 s. A relay ends after 5 minutes without a byte, 30 s after the peer
-closes its side, or after an hour; the box's `wicket-fwd` is given the same idle and after-close
+fill it), 32 per peer across all its ports, and 256 new per 2 s. A relay ends after 5 minutes
+without a byte, 30 s after the peer has closed its side and nothing more has gone to it, or after
+an hour; the box's `wicket-fwd` is given the same idle and after-close
 limits (as environment variables, which an older one ignores), so a service that ignores
-half-close doesn't keep it. The limits are checked before anything else, refusals are counted per
+half-close doesn't keep it. **In a box whose image is older than this,** its `wicket-fwd` ignores
+them: a relay the node has cut may linger in the box, unbounded until the box image is rebuilt.
+The node's slots free faster than such leftovers end, so they can pile up in the box up to its
+process limit. The limits are checked before anything else, refusals are counted per
 kind, not recorded one by one, and each connection is recorded as it starts and as it ends
 (`name.conn`, `phase`), aggregated per tick under load. It publishes only while its feed is fresh,
 or offline within its grace, and the box's authority holds there as for any other decision (not
@@ -385,7 +390,8 @@ many changes it made) and `name.conflict`. The node's (step 4c, shipped as node 
 two boxes claim, or one outside its range, recorded once, under the claiming run), `name.conn` (per
 connection, `phase: start` and `phase: end` with one `conn` id: the peer, bytes each way, how long,
 and `cut` with `why` when the node ended it; per tick, one aggregate record under load) and
-`name.conn.refused` (counted each tick, by limit: per port, peer, node, waiting, silent, failed). Still to
+`name.conn.refused` (counted each tick, by limit: per port, peer, node, a peer over the node,
+waiting, evicted, silent, failed). Still to
 come with step 6: `name.challenge`.
 
 `wicket names list` and the console's **Names** card list every name: kind, full name, owner (the

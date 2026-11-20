@@ -435,3 +435,33 @@ fn dial_takes_its_limits_from_the_environment() {
     child.stdin.take().unwrap().write_all(b"x").unwrap();
     exits_within(&mut child, Duration::from_secs(5)).expect("exits after stdin closes, by the environment's limit");
 }
+
+/// #796 review, N1: the after-close limit counts from the last byte sent to the peer, so a peer
+/// that has closed its side but is still downloading keeps its relay.
+#[test]
+fn after_close_waits_while_bytes_flow_to_the_peer() {
+    let addr = holding_server(|c| {
+        let mut c = c.try_clone().unwrap();
+        thread::spawn(move || {
+            for _ in 0..10 {
+                thread::sleep(Duration::from_millis(100));
+                if c.write_all(b"d").is_err() {
+                    return;
+                }
+            }
+        });
+    });
+    let mut child = dialer(addr, &["--after-close-secs", "0.3"]);
+    drop(child.stdin.take());
+    let mut out = child.stdout.take().unwrap();
+    let reader = thread::spawn(move || {
+        let mut got = Vec::new();
+        let _ = out.read_to_end(&mut got);
+        got
+    });
+    let start = Instant::now();
+    let took = exits_within(&mut child, Duration::from_secs(5)).expect("exits once bytes stop");
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(1100), "cut while bytes still flowed: {took:?} ({elapsed:?})");
+    assert_eq!(reader.join().unwrap().len(), 10, "every byte reached the peer");
+}

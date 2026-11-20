@@ -4055,13 +4055,46 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
 
     /// A connection on `port` that has been relayed: `ping` sent and echoed back.
     async fn relayed(port: u16) -> tokio::net::TcpStream {
+        relayed_from(1, port).await
+    }
+
+    /// A connection to `port` on loopback from 127.0.0.`n`: a peer of its own to the node's limits.
+    async fn connect_from(n: u8, port: u16) -> tokio::net::TcpStream {
+        let s = tokio::net::TcpSocket::new_v4().unwrap();
+        s.bind(std::net::SocketAddr::from((std::net::Ipv4Addr::new(127, 0, 0, n), 0))).unwrap();
+        s.connect(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))).await.unwrap()
+    }
+
+    /// [`relayed`], from 127.0.0.`n`.
+    async fn relayed_from(n: u8, port: u16) -> tokio::net::TcpStream {
         use tokio::io::AsyncReadExt;
-        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut c = connect_from(n, port).await;
         c.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut buf)).await.unwrap().unwrap();
         assert_eq!(&buf, b"ping");
         c
+    }
+
+    /// Whether `c` is still open: nothing read, no end, for 200 ms.
+    async fn still_open(c: &mut tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut b = [0u8; 1];
+        tokio::time::timeout(std::time::Duration::from_millis(200), c.read(&mut b)).await.is_err()
+    }
+
+    /// The sum of `field` over the `name.conn.refused` records so far, once it reaches `want`
+    /// (waited for up to 5 s; a tick's flush may split them).
+    async fn await_refused(f: &PortsFeed, field: &str, want: u64) {
+        let sum = || f.audit().iter().filter(|(k, ..)| k == "name.conn.refused").map(|(.., b)| b[field].as_u64().unwrap_or(0)).sum::<u64>();
+        for _ in 0..100 {
+            if sum() >= want {
+                assert_eq!(sum(), want, "{field} in {:?}", f.audit());
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{field}: {} of {want} in {:?}", sum(), f.audit());
     }
 
     /// Whether `c` is ended by the other side within 5 s (end of file or a reset).
@@ -4238,7 +4271,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(ends(&mut c).await, "closed for carrying nothing");
         let rec = f.await_audit("name.conn", |b| b["phase"] == "end").await;
         assert_eq!((rec["bytes_in"].clone(), rec["bytes_out"].clone()), (4.into(), 4.into()), "{rec}");
-        assert_eq!((rec["why"].clone(), rec.get("cut")), ("idle".into(), None), "{rec}");
+        // N2 (#796 review): every end the node causes is `cut`, with why.
+        assert_eq!((rec["why"].clone(), rec["cut"].clone()), ("idle".into(), true.into()), "{rec}");
     }
 
     /// #796 re-review, M4: a relayed connection's start is on record while it is live, with the
@@ -4345,6 +4379,103 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let end = f.await_audit("name.conn", |b| b["phase"] == "end").await;
         assert_eq!((end["cut"].clone(), end["why"].clone()), (true.into(), "lifetime".into()), "{end}");
         assert!(end["ms"].as_u64().unwrap() >= 1200, "{end}");
+    }
+
+    /// R1 (#796 review): a port's waiting pool full of silent sockets from three peers doesn't
+    /// refuse a newcomer: it evicts the oldest waiter (closed at once, well before the first-byte
+    /// timeout, and counted `evicted`) and the newcomer, speaking, is relayed. A peer at its own
+    /// waiting cap is refused, evicting no one.
+    #[tokio::test]
+    async fn the_oldest_waiter_is_evicted_for_a_newcomer() {
+        let mut f = PortsFeed::new("nodesrv-ports-evict");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().first_byte = std::time::Duration::from_secs(8);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        // 6 + 6 + 4: the pool of 16, in the order they're accepted.
+        let mut quiet = vec![];
+        for (n, k) in [(2, ports::MAX_WAITING_PER_PEER), (3, ports::MAX_WAITING_PER_PEER), (4, 4)] {
+            for _ in 0..k {
+                quiet.push(connect_from(n, port).await);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        assert_eq!(quiet.len(), ports::MAX_WAITING);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        let _c = relayed_from(5, port).await;
+        assert!(ends(&mut quiet[0]).await, "the oldest waiter is evicted");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "at once, not at the first-byte timeout");
+        assert!(still_open(&mut quiet[1]).await, "only the oldest");
+        // A seventh from a peer at its own waiting cap: refused, and no other peer's waiter goes.
+        let mut over = connect_from(3, port).await;
+        assert!(ends(&mut over).await, "refused");
+        assert!(still_open(&mut quiet[1]).await && still_open(&mut quiet[6]).await, "nothing evicted for it");
+        assert_eq!(f.execs(), 1, "one exec: the newcomer's");
+        await_refused(&f, "evicted", 1).await;
+        await_refused(&f, "waiting", 1).await;
+    }
+
+    /// R1 (#796 review): one peer's relays are capped over the whole node, across its ports:
+    /// past it a connection on another port is refused before any exec, counted `node_peer`;
+    /// another address still gets through.
+    #[tokio::test]
+    async fn a_peers_relays_are_capped_across_ports() {
+        let mut f = PortsFeed::new("nodesrv-ports-node-peer");
+        let (l1, l2) = (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (p1, p2) = (l1.local_addr().unwrap().port(), l2.local_addr().unwrap().port());
+        drop((l1, l2));
+        f.put("run_web", &[(p1, i64::MAX), (p2, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().node_per_peer = 2;
+        let range = p1.min(p2)..=p1.max(p2);
+        ports::tick(&f.node, Some(&range), &mut st);
+        let (_a, _b) = (relayed(p1).await, relayed(p2).await);
+        let mut third = connect_from(1, p1).await;
+        let _ = third.write_all(b"ping").await;
+        assert!(ends(&mut third).await, "a third relay for the same address, on either port, is refused");
+        assert_eq!(f.execs(), 2, "no exec for the refused one");
+        let r = f.await_audit("name.conn.refused", |b| b["node_peer"] == 1).await;
+        assert_eq!((r["port"].clone(), r["refused"].clone(), r["max_node_per_peer"].clone()), (p1.into(), 1.into(), 2.into()), "{r}");
+        let _c = relayed_from(2, p2).await;
+        assert_eq!(f.execs(), 3);
+    }
+
+    /// N1, N2 (#796 review): after the peer's half-close, the relay isn't cut while bytes still
+    /// go to the peer (a download), only once none have for `after_close`; that end is `cut`,
+    /// why `after close`.
+    #[tokio::test]
+    async fn after_close_waits_while_bytes_flow_to_the_peer() {
+        use tokio::io::AsyncReadExt;
+        let mut f = PortsFeed::new("nodesrv-ports-after-close");
+        // A box's service that answers once its input ends: a byte every 100 ms for a second, then
+        // nothing, its side still open.
+        let docker = f.inst.dir.join("fake-docker-download");
+        let script = "#!/bin/sh\ncat >/dev/null\ni=0\nwhile [ $i -lt 10 ]; do printf x; sleep 0.1; i=$((i+1)); done\nexec sleep 30\n";
+        std::fs::write(&docker, script).unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Arc::get_mut(&mut f.node).unwrap().docker = Docker::with_command(vec![docker.display().to_string()]);
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().after_close = std::time::Duration::from_millis(500);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        c.shutdown().await.unwrap();
+        let mut got = vec![];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut got)).await.expect("cut in time").unwrap();
+        assert_eq!(got, b"xxxxxxxxxx", "the whole download, though it outlasts after_close");
+        let end = f.await_audit("name.conn", |b| b["phase"] == "end").await;
+        assert_eq!(
+            (end["cut"].clone(), end["why"].clone(), end["bytes_out"].clone()),
+            (true.into(), "after close".into(), 10.into()),
+            "{end}"
+        );
+        assert!(end["ms"].as_u64().unwrap() >= 1400, "a second of download, then after_close: {end}");
     }
 
     fn add_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {
