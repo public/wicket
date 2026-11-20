@@ -1,7 +1,8 @@
 //! `wicket trigger`: triggers (#578), an operator's standing intent ("when this happens, do that"),
-//! kept in the ledger and fired by the reconciler's scheduler. This version keeps the ones that
-//! tell time (`schedule` and `timer` sources) and their `wake` and `message` actions; a `start`
-//! is queued for the engine, which comes later.
+//! kept in the ledger and fired by the reconciler. This version keeps the ones that tell time
+//! (`schedule` and `timer` sources) and the ones on wicket's own events (`wicket`: runs ending,
+//! agents waking, decisions), with their `wake` and `message` actions; a `start` is queued for the
+//! engine, which comes later.
 
 use crate::*;
 use wicket_control::triggers as tr;
@@ -35,7 +36,8 @@ pub enum TriggerCmd {
     /// Remove a trigger: it fires nothing again.
     Rm { trigger: String },
     /// Show what a trigger would do for an event, its templates filled in, changing nothing. The
-    /// event is a JSON object of the source's fields (--event); without one, a time-told event now.
+    /// event is a JSON object of the source's fields (--event); without one, a time-told event now,
+    /// or for wicket's own events, one of the first kind it listens to.
     Fire {
         trigger: String,
         /// A JSON file with the event's fields.
@@ -59,6 +61,7 @@ fn c(s: &str) -> String {
 fn state(t: &wicket_store::Trigger, now: i64) -> String {
     match (t.status.as_str(), t.approval.as_str(), t.until) {
         ("paused", _, _) => "paused".into(),
+        ("done", _, _) => "done (its timer has fired)".into(),
         (_, "pending", _) => "waiting for approval".into(),
         (_, _, Some(u)) if u <= now => format!("lapsed {}", when(u)),
         (_, _, Some(u)) => format!("active, until {}", when(u)),

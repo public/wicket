@@ -1,0 +1,15 @@
+# Another box on the same node (ci/attack-matrix.sh): it serves a canary on a port it exposes, has a
+# request and a standing ask of its own pending, and uses the second service (atk-svc2, whose reach is
+# within its own, so its link opens). The attacker may reach none of it, nor decide either ask.
+task: Serve a canary to nobody.
+program:
+  name: peer
+  command: [bash, /workspace/peer.sh]
+zone:
+  name: atk-peer
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  escalation: { request: true }
+  uses: [atk-svc2]
+  limits: { memory: 256m, cpus: 1, timeout: 10m }

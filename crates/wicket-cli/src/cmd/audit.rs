@@ -8,7 +8,12 @@ use crate::*;
 /// Runs one of this group's commands.
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
-        Cmd::Audit { tail, verify, against, issuer_jwk, cmd } => {
+        Cmd::Audit { tail, verify, against, issuer_jwk, json, cmd } => {
+            if json && cmd.is_some() {
+                return Err(wicket_home::exit::usage(
+                    "--json lists the audit records: not with export (`wicket audit export --status` shows the sinks)",
+                ));
+            }
             if let Some(AuditCmd::Export { once, checkpoint, status }) = cmd {
                 // The exporter blocks (its own runtime, file and HTTP writes): off the async runtime.
                 return std::thread::spawn(move || audit_export_cmd(once, checkpoint, status))
@@ -65,6 +70,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 return Ok(());
             }
             let rows = l.audit_tail(tail)?;
+            if json {
+                return crate::cmd::print_json(&audit_records_json(rows));
+            }
             if rows.is_empty() {
                 println!("no audit records yet");
             }
@@ -75,6 +83,18 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         _ => unreachable!("dispatched to the wrong command group"),
     }
+}
+
+/// `wicket audit --json`: the records, oldest first, as the text lists them.
+pub(crate) fn audit_records_json(rows: Vec<wicket_store::AuditRow>) -> serde_json::Value {
+    serde_json::Value::Array(rows.into_iter().map(audit_json).collect())
+}
+
+/// One record of `wicket audit --json`: its body as the JSON it was written as (a body that isn't
+/// JSON, from an older ledger, as a string).
+fn audit_json((seq, ts, kind, run, body): wicket_store::AuditRow) -> serde_json::Value {
+    let body = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+    serde_json::json!({ "seq": seq, "ts": ts, "kind": kind, "run": run, "body": body })
 }
 
 #[derive(Subcommand)]

@@ -366,7 +366,8 @@ pub fn describe(opts: &ServeOpts) -> Result<(String, String, &'static str, std::
 }
 
 pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
-    let plan = net::plan(&opts, &data_dir())?;
+    // The options, checked together: what's wrong with them is a usage error (#574).
+    let plan = net::plan(&opts, &data_dir()).map_err(|e| wicket_home::exit::usage(format!("{e:#}")))?;
     let tenant = TenantId::single();
     let l = Ledger::open(&ledger_path())?;
     // #258: not while an agent's head is a version-1 bundle, which this build can't read.

@@ -15,7 +15,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         Cmd::Lease { cmd: LeaseCmd::List } => capacity::list(),
         Cmd::Lease { cmd: LeaseCmd::Release { id } } => {
             let l = Ledger::open(&ledger_path())?;
-            let x = l.lease(&id)?.with_context(|| format!("no lease {id}"))?;
+            let x = l.lease(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no lease {id}")))?;
             let why = format!("released by {}", operator());
             match x.status.as_str() {
                 "active" => {
@@ -24,7 +24,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 "pending" | "approved" => {
                     l.lease_ended(&id, "withdrawn", &why, None)?;
                 }
-                s => bail!("lease {id} is {s}"),
+                s => return Err(wicket_home::exit::refused(format!("lease {id} is {s}"))),
             }
             l.audit(&TenantId::single(), None, "lease.released", &serde_json::json!({ "lease": id, "by": operator() }))?;
             drop(l);
@@ -47,7 +47,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 })
                 .await
             }
-            NodeCmd::List { provider, common } => {
+            NodeCmd::List { provider, common, json } => {
+                if json {
+                    return crate::cmd::print_json(&enrol::list_json(&Ledger::open(&ledger_path())?)?);
+                }
                 enrol::list()?;
                 if provider {
                     println!();
@@ -125,7 +128,9 @@ fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String])
     let policy = ca_hosts.map(|c| wicket_store::CaHosts::parse(c).map_err(anyhow::Error::msg)).transpose()?;
     let marks = marks(labels, taints)?;
     let l = Ledger::open(&ledger_path())?;
-    anyhow::ensure!(l.node(name)?.is_some(), "node {name} is not enrolled");
+    if l.node(name)?.is_none() {
+        return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
+    }
     let tenant = wicket_core::TenantId::single();
     if let Some(policy) = policy {
         l.set_node_ca_policy_audited(name, &policy, &operator())?;
@@ -244,6 +249,9 @@ pub enum NodeCmd {
         provider: bool,
         #[command(flatten)]
         common: nodecreate::Common,
+        /// The enrolled nodes as JSON instead of text (not with --provider).
+        #[arg(long, conflicts_with = "provider")]
+        json: bool,
     },
     /// Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and
     /// pinned at creation. Its money is reserved first against placement.yaml's limits (with every

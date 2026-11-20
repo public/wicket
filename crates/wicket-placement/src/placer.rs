@@ -2,7 +2,7 @@
 //! the rules it enforces.
 
 use crate::billing::{self, PoolRules, ReleaseDecision};
-use crate::envelope::{Approval, SpendApprover, SpendRequest};
+use crate::envelope::{SpendApprover, SpendRequest};
 use crate::model::*;
 use crate::money::MicroUsd;
 use std::collections::HashMap;
@@ -145,8 +145,8 @@ impl<P: Provider, A: SpendApprover> Placer<P, A> {
                 warm: true,
             };
             if hourly > MicroUsd::ZERO || ask.worst_case > MicroUsd::ZERO {
-                if let Approval::Denied(why) = self.approver.approve(&ask).await {
-                    return Err(PlacementError::NotApproved(why));
+                if let Some(e) = self.approver.approve(&ask).await.refusal() {
+                    return Err(e);
                 }
             }
             let (n, _) = st.pool.remove(i);
@@ -179,8 +179,8 @@ impl<P: Provider, A: SpendApprover> Placer<P, A> {
                 worst_case: worst,
                 warm: false,
             };
-            if let Approval::Denied(why) = self.approver.approve(&ask).await {
-                return Err(PlacementError::NotApproved(why));
+            if let Some(e) = self.approver.approve(&ask).await.refusal() {
+                return Err(e);
             }
         }
         let until = offer.billing.granted_until(now, req.lifetime_secs, self.rules.margin);

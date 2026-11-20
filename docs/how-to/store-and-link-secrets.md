@@ -141,10 +141,10 @@ The [manifest reference](../reference/manifest.md#inject) has every field.
 ```sh
 wicket secret list                                  # names and where each may go, never values
 wicket secret hosts github-ro --hosts api.github.com,github.com   # replace its hosts
-wicket secret rm github-ro
+wicket secret remove github-ro
 ```
 
-`secret rm` of a linked secret removes only the reference. Nodes holding a copy delete it when their
+`secret remove` of a linked secret removes only the reference. Nodes holding a copy delete it when their
 run's lease next reaches them, within seconds while connected.
 
 ## From the console

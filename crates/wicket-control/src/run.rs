@@ -300,6 +300,18 @@ pub fn box_image(named: Option<&str>, m: &Manifest) -> Result<String> {
 }
 
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
+    run_to_end(o).await.map(|_| ())
+}
+
+/// Whether a run's final status (as [`run_to_end`] returns it) is its box failing: a non-zero exit,
+/// out of memory, over a cap, or its timeout. `wicket run` and `wicket wrap` exit 1 then (#574).
+pub fn box_failed(status: &str) -> bool {
+    status.starts_with("failed") || status == "timeout"
+}
+
+/// [`run`], returning the run's final status: `succeeded`, `failed (…)`, `timeout`, `hibernated`,
+/// `interrupted`, `revoked`, `superseded`…, as the run's record has it.
+pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
     let RunOpts {
         manifest: manifest_path,
         workdir,
@@ -1314,9 +1326,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 let now = wicket_feed::now_ms();
                 let (found, _) = crate::hibernate::from_index(std::slice::from_ref(&node_name), &l.node_health()?, now);
                 if !found.is_empty() {
-                    let req = wicket_placement::schedule::Request::of(&m);
-                    let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
-                    let d = crate::hibernate::bind(&l, &run, &crate::hibernate::Waiting { req, need }, &found, None, now, false)?.decision;
+                    let ask = crate::hibernate::Waiting::of(&m);
+                    let d = crate::hibernate::bind(&l, &run, &ask, &found, None, now, false)?.decision;
                     // Refused for room only, the node's own admission decides: its report may
                     // still count a box that has ended.
                     let room_only = d.refused.iter().all(|(_, why)| {
@@ -2516,7 +2527,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if record.is_none() {
         let _ = save_timings(&dir, &timings);
     }
-    Ok(())
+    Ok(status)
 }
 
 /// Brings a kept box's files back from its node: its workspace (into the run's directory, or an
