@@ -8,7 +8,9 @@ spelling: no dot or empty segments, no `;`, no backslash or control character, n
 would percent-encode on the way upstream (space, `"`, `#`, `<`, `>`, `?`, `` ` ``, `{`, `}` or a
 non-ASCII byte: those go percent-encoded), and every `%` an
 upper-case escape of a byte that has to be escaped (never `/`, `\`, `.`, NUL, `%` or an unreserved
-character). npm's scoped-package form (`/@scope%2fname`, #143) is decided as `/@scope/name`.
+character). Nothing is decoded, unless a zone's reach rule for the host names segments in which one
+encoded slash is decided as `/` (`decode_slash`, #664): `canonical_path_decoding`, whose result
+passes the same checks (`canonicalPathDecoding_plain`).
 
 An upstream may read a path differently: it may percent-decode it, and resolve dot segments
 (RFC 3986 §5.2.4), in either order. On a canonical path neither changes which segments it names
@@ -65,40 +67,57 @@ def segsOk : Str → Bool
 def plainOk (p : Str) : Bool :=
   !p.any badChar && !p.any unescapedChar && !p.contains ';' && escapesOk p && segsOk p
 
-def npmPart (s : Str) : Bool :=
-  !s.isEmpty && decide (s.length ≤ 214) && s.head? != some '.' &&
-    s.all (fun c => ('a' ≤ c && c ≤ 'z') || ('0' ≤ c && c ≤ '9') || c ∈ ['-', '.', '_', '~'])
+/-- Where a segment's encoded slashes (`%2F`, `%2f`) start, scanning as `slash_escape` does. -/
+def slashEscs : Str → Nat → List Nat
+  | [], _ => []
+  | c :: t, i =>
+    match c, t with
+    | '%', '2' :: d :: rest => if d == 'f' || d == 'F' then i :: slashEscs rest (i + 3) else slashEscs t (i + 1)
+    | _, _ => slashEscs t (i + 1)
 
-/-- `npm_scoped`. -/
-def npmScoped (p : Str) : Option Str :=
-  let first := p.tail.takeWhile (· != '/')
-  let rest := p.drop (1 + first.length)
-  match first with
-  | '@' :: sc =>
-    let scope := sc.takeWhile (· != '%')
-    let name := sc.dropWhile (· != '%')
-    let name := match name with
-      | '%' :: '2' :: 'f' :: n => some n
-      | '%' :: '2' :: 'F' :: n => some n
-      | _ => none
-    match name with
-    | some n => if scope.length < sc.length && npmPart scope && npmPart n then
-        some ("/@".toList ++ scope ++ '/' :: n ++ rest) else none
-    | none => none
+/-- `slash_escape`: the segment's only encoded slash, if it has one, between two non-empty parts. -/
+def slashEscape (seg : Str) : Option Nat :=
+  match slashEscs seg 0 with
+  | [pos] => if decide (0 < pos) && decide (pos + 3 < seg.length) then some pos else none
   | _ => none
 
-/-- `canonical_path(path_and_query)`: the path decided on, or `none` (an error). The symbols are
-bytes, as Rust checks them (the oracle passes UTF-8 bytes; `MAX_PATH` is in bytes). -/
-def canonicalPath (pq : Str) : Option Str :=
+/-- A segment with its only encoded slash decoded, if it has one. -/
+def decodeSeg (seg : Str) : Option Str :=
+  (slashEscape seg).map (fun pos => seg.take pos ++ '/' :: seg.drop (pos + 3))
+
+/-- The segments from number `k` on, those named in `segs` decoded; and whether any was. -/
+def decodeParts : List Str → Nat → List Nat → List Str × Bool
+  | [], _, _ => ([], false)
+  | s :: rest, k, segs =>
+    let r := decodeParts rest (k + 1) segs
+    match (if segs.contains k then decodeSeg s else none) with
+    | some d => (d :: r.1, true)
+    | none => (s :: r.1, r.2)
+
+/-- `decode_slash`: the path (starting with `/`) with the named segments decoded, if any was. -/
+def decodeSlash (p : Str) (segs : List Nat) : Option Str :=
+  if segs.isEmpty then none
+  else
+    let r := decodeParts (split p.tail) 1 segs
+    if r.2 then some ('/' :: List.intercalate ['/'] r.1) else none
+
+/-- `canonical_path_decoding(path_and_query, segs)`: the path decided on, or `none` (an error).
+The symbols are bytes, as Rust checks them (the oracle passes UTF-8 bytes; `MAX_PATH` is in
+bytes). -/
+def canonicalPathDecoding (pq : Str) (segs : List Nat) : Option Str :=
   let path := pq.takeWhile (· != '?')
   if path.length > 4096 then none
   else if path.head? != some '/' then none
   else
-    let p := (npmScoped path).getD path
+    let p := (decodeSlash path segs).getD path
     if plainOk p then some p else none
 
-theorem canonicalPath_plain {pq p : Str} (h : canonicalPath pq = some p) : plainOk p = true := by
-  unfold canonicalPath at h
+/-- `canonical_path`: nothing decoded. -/
+def canonicalPath (pq : Str) : Option Str := canonicalPathDecoding pq []
+
+theorem canonicalPathDecoding_plain {pq p : Str} {segs : List Nat} (h : canonicalPathDecoding pq segs = some p) :
+    plainOk p = true := by
+  unfold canonicalPathDecoding at h
   simp only at h
   split at h
   · cases h
@@ -107,6 +126,9 @@ theorem canonicalPath_plain {pq p : Str} (h : canonicalPath pq = some p) : plain
     · split at h
       · cases h; assumption
       · cases h
+
+theorem canonicalPath_plain {pq p : Str} (h : canonicalPath pq = some p) : plainOk p = true :=
+  canonicalPathDecoding_plain h
 
 /-! ## How an upstream may read it -/
 

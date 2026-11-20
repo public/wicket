@@ -216,12 +216,15 @@ fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
                         && q.methods.iter().any(|qm| qm.eq_ignore_ascii_case(m))
                         && path_covered(&q.paths, path)
                         && (!r.allow_dangerous || q.allow_dangerous)
+                        // Deciding an encoded slash decoded reaches requests the parent refuses.
+                        && r.decode_slash.iter().all(|n| q.decode_slash.contains(n))
                 });
                 if !covered {
                     v.push(format!(
-                        "reach rule {i}: {m} {}{path} is not within this zone's reach{}",
+                        "reach rule {i}: {m} {}{path} is not within this zone's reach{}{}",
                         r.host,
-                        if r.allow_dangerous { " (with allow_dangerous)" } else { "" }
+                        if r.allow_dangerous { " (with allow_dangerous)" } else { "" },
+                        if r.decode_slash.is_empty() { String::new() } else { format!(" (with decode_slash {:?})", r.decode_slash) }
                     ));
                 }
             }
@@ -386,6 +389,23 @@ pub(crate) mod tests {
             all.extend(last.iter().cloned());
         }
         all
+    }
+
+    /// #664: deciding an encoded slash decoded reaches requests a zone that doesn't would refuse, so
+    /// a child or linked zone may name only the segments its parent's rule names.
+    #[test]
+    fn decode_slash_is_within_only_where_the_parent_decodes() {
+        let z = |rule: &str| {
+            Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{rule}]\n")).unwrap().zone
+        };
+        let plain = z("{ host: pkgs.example }");
+        let first = z("{ host: pkgs.example, decode_slash: [1] }");
+        let both = z("{ host: pkgs.example, decode_slash: [1, 2] }");
+        assert!(reach_within(&plain, &first).unwrap_err()[0].contains("decode_slash"));
+        assert!(reach_within(&first, &first).is_ok());
+        assert!(reach_within(&both, &first).is_ok());
+        assert!(reach_within(&first, &both).is_err());
+        assert!(reach_within(&first, &plain).is_ok(), "deciding less is within");
     }
 
     /// #325 made `host_matches` and `host_covers` allocation-free for Kani: they agree with the

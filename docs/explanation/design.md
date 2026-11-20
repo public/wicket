@@ -1170,8 +1170,10 @@ Detail: [04 §7].
   2. **Canonicalize-or-reject:** dot segments (Codex `authorization_path.rs`), encoded slashes, duplicate
      query/JSON keys, method-override headers, `@` in the authority, Host ≠ SNI ≠ CONNECT target, unknown
      protocols after CONNECT, TRACE/TRACK, bodies on GET/HEAD. A truncated body gets the strict outcome.
-     One encoded slash is accepted: npm's scoped-package first segment `@scope%2fname` (npm's
-     characters only), decided as `/@scope/name` and forwarded as written (#143).
+     An encoded slash is accepted only where a reach rule for the host names its segment
+     (`decode_slash`, #664; npm's scoped `@scope%2fname` is the case): one per named segment,
+     decided as `/` and forwarded as written. Core decodes nothing on its own (#143's guarantees
+     kept: no dot segment, no double escape, nothing a rule didn't name).
   3. Adapter match → `Op` → decision.
   4. Rebuild the request from the `Op` and inject the credential, or SigV4 re-sign.
   5. Upstream; redirects are not followed.

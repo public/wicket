@@ -14,7 +14,8 @@ Input: `{"zones": [zone…], "cases": [case…]}`. A case is one of
 - `{"kind": "check", "parent": i, "child": j, "bounds": {…}, "max_children": n}` → `true`/`false`;
 - `{"kind": "reach_within", "outer": i, "inner": j}` → `true`/`false`;
 - `{"kind": "host", "pattern": p, "host": h}` → `true`/`false`;
-- `{"kind": "canon", "path": pq}` → the canonical path as a JSON string, or `null`.
+- `{"kind": "canon", "path": pq, "segs": [n…]}` → the canonical path as a JSON string, or `null`
+  (`segs`, optional: the segments in which one encoded slash is decided decoded).
 - `{"kind": "prefix_covers", "prefix": p, "path": q}` → `prefix_covers` (#257 4a): `true`/`false`;
 - `{"kind": "model", "zone": i, "model": m}` → whether the zone's boxes may call model `m`;
 - `{"kind": "accepts", "list": [e…], "zone": z, "principal": p}` → `manifest::accepts` (`p` may be
@@ -171,7 +172,11 @@ def decideCase (zs : Array Zone) (c : Json) : Except String String := do
   | "host" => return toString (hostMatches (← jStr c "pattern") (← jStr c "host"))
   | "prefix_covers" => return toString (prefixCovers (← jStr c "prefix") (← jStr c "path"))
   | "canon" =>
-    match canonicalPath (← jStr c "path") with
+    -- `segs`: a reach rule's `decode_slash` (#664), absent for `canonical_path`.
+    let segs := match c.getObjValAs? (Array Nat) "segs" with
+      | .ok a => a.toList
+      | .error _ => []
+    match canonicalPathDecoding (← jStr c "path") segs with
     | some p => return (Json.str (stringOf p)).compress
     | none => return "null"
   | "model" =>

@@ -133,6 +133,7 @@ fn grant_matches(g: &TokenGrant, op: &Op) -> bool {
             methods: s.methods.clone(),
             paths: s.paths.clone(),
             allow_dangerous: true,
+            decode_slash: vec![],
         };
         return rule.allows(op).unwrap_or(false);
     }

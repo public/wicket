@@ -254,7 +254,7 @@ const GLOBS: [&str; 12] = [
 fn random_rule(rng: &mut Rng) -> wicket_core::ReachRule {
     let methods: Vec<String> = METHODS.iter().filter(|_| rng.chance(50)).map(|m| m.to_string()).collect();
     let paths: Vec<String> = (0..rng.below(3)).map(|_| rng.pick(&GLOBS).to_string()).collect();
-    wicket_core::ReachRule { host: rng.pick(&HOSTS).to_string(), methods, paths, allow_dangerous: rng.chance(30) }
+    wicket_core::ReachRule { host: rng.pick(&HOSTS).to_string(), methods, paths, allow_dangerous: rng.chance(30), decode_slash: vec![] }
 }
 
 fn random_forbid(rng: &mut Rng) -> wicket_core::manifest::ForbidRule {
@@ -520,14 +520,14 @@ fn oracle3_compiled_equals_authorizer_builder_100k() {
     differential(100_000, 1);
 }
 
-/// #143: npm's scoped-package form (`/@scope%2fname`) is decided on its decoded path, and the
-/// zone, the compiled token and the generic engine agree on it, as on the unencoded spelling: a
-/// forbid on `/@scope/**` blocks both, a reach rule allows both.
+/// #664 (#143's guarantees): where a rule asks (`decode_slash: [1]`), `/@scope%2fname` is decided on
+/// its decoded path, and the zone, the compiled token and the generic engine agree on it, as on the
+/// unencoded spelling: a forbid on `/@scope/**` blocks both, a reach rule allows both.
 #[test]
-fn npm_scoped_paths_decide_alike_in_every_oracle() {
+fn decoded_slash_paths_decide_alike_in_every_oracle() {
     let keys = Keys::new(0);
     let z = wicket_core::Manifest::from_yaml(
-        "task: t\nagent: { name: a }\nzone:\n  name: npm\n  llm: {}\n  reach:\n    - { host: registry.npmjs.org, methods: [GET], paths: [\"/**\"] }\n    - { host: npm.internal.example, methods: [GET], paths: [\"/@acme/**\"] }\n  forbid:\n    - { host: registry.npmjs.org, paths: [\"/@evil/**\", \"/@types/secret\"] }\n",
+        "task: t\nagent: { name: a }\nzone:\n  name: pkgs\n  llm: {}\n  reach:\n    - { host: pkgs.example, methods: [GET], paths: [\"/**\"], decode_slash: [1] }\n    - { host: internal.pkgs.example, methods: [GET], paths: [\"/@acme/**\"], decode_slash: [1] }\n  forbid:\n    - { host: pkgs.example, paths: [\"/@evil/**\", \"/@types/secret\"] }\n",
     )
     .unwrap()
     .zone;
@@ -537,11 +537,11 @@ fn npm_scoped_paths_decide_alike_in_every_oracle() {
     let mut generic = l.generic_session();
     let names = ["@types%2fnode", "@types%2Fsecret", "@evil%2fpkg", "@acme%2flib", "@babel%2fcore", "@eslint-community%2feslint-utils"];
     let mut kinds = [0usize; 3];
-    for h in ["registry.npmjs.org", "npm.internal.example"] {
+    for h in ["pkgs.example", "internal.pkgs.example"] {
         for name in names {
             for tail in ["", "/", "/1.0.0", "/-/x-1.0.0.tgz"] {
                 let raw = format!("/{name}{tail}");
-                let decoded = wicket_core::canonical_path(&raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+                let decoded = wicket_core::canonical_path_decoding(&raw, &z.decode_slash_for(h)).unwrap_or_else(|e| panic!("{raw}: {e}"));
                 let plain = raw.replacen("%2f", "/", 1).replacen("%2F", "/", 1);
                 assert_eq!(decoded, plain.as_str(), "{raw}");
                 for m in METHODS {

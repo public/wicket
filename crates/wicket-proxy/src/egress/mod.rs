@@ -21,7 +21,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::path::Path;
 use std::sync::Arc;
-use wicket_core::{canonical_path, manifest::host_matches};
+use wicket_core::{canonical_path_decoding, manifest::host_matches};
 
 mod canary;
 mod connect;
@@ -363,7 +363,9 @@ impl Egress {
             );
         }
         let pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
-        let path = match canonical_path(&pq) {
+        // Encoded slashes are decided decoded only in the segments the zone's rules for this host
+        // name (`decode_slash`, #664); the request still goes upstream as written.
+        let path = match canonical_path_decoding(&pq, &self.ctx.zone.decode_slash_for(&host)) {
             Ok(p) => p.to_string(),
             Err(e) => return self.refuse(&host, &method, &pq, &format!("ambiguous path: {e}")),
         };

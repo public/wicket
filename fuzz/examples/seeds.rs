@@ -295,7 +295,7 @@ fn canon() {
         ("path-dots", "/a/%2e%2e/b"),
         ("path-encoded-slash", "/a%2Fb"),
         ("path-matrix", "/a;x/b"),
-        ("path-npm", "/@scope%2fname"),
+        ("path-encoded-slash", "/@scope%2fname"),
         ("path-escape-lower", "/a%7bb"),
         ("path-unreserved-escape", "/%41"),
         ("path-trailing", "/a/b/"),

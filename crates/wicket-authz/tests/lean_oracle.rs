@@ -173,6 +173,7 @@ fn gen_rule(rng: &mut Rng) -> ReachRule {
         methods,
         paths: (0..1 + rng.below(2)).map(|_| gen_glob(rng)).collect(),
         allow_dangerous: rng.chance(30),
+        decode_slash: vec![],
     }
 }
 
@@ -383,8 +384,13 @@ fn rust_decides_as_the_lean_spec() {
     let mut skipped = 0;
     for _ in 0..1500 {
         let mut z = base.clone();
-        z.reach =
-            vec![ReachRule { host: "a.test".into(), methods: vec!["GET".into()], paths: vec![gen_glob(&mut rng)], allow_dangerous: false }];
+        z.reach = vec![ReachRule {
+            host: "a.test".into(),
+            methods: vec!["GET".into()],
+            paths: vec![gen_glob(&mut rng)],
+            allow_dangerous: false,
+            decode_slash: vec![],
+        }];
         if rng.chance(40) {
             z.forbid = vec![ForbidRule { host: "a.test".into(), paths: vec![gen_glob(&mut rng)] }];
         }
@@ -411,6 +417,16 @@ fn rust_decides_as_the_lean_spec() {
             Err(_) => "null".into(),
         };
         c.push(json!({ "kind": "canon", "path": pq }), rust, format!("canonical_path({pq:?})"));
+    }
+    // #664: a reach rule's `decode_slash`, over the segments it may name.
+    for _ in 0..3000 {
+        let pq = gen_canon(&mut rng);
+        let segs: Vec<u8> = rng.pick(&[vec![1u8], vec![2], vec![1, 2], vec![3]]).clone();
+        let rust = match wicket_core::canon::canonical_path_decoding(&pq, &segs) {
+            Ok(p) => serde_json::to_string(&p.to_string()).unwrap(),
+            Err(_) => "null".into(),
+        };
+        c.push(json!({ "kind": "canon", "path": pq, "segs": segs }), rust, format!("canonical_path_decoding({pq:?}, {segs:?})"));
     }
     // #257 4a: what a path-prefix grant covers, on every pair of canonical paths of up to 4 bytes
     // over `/`, two letters and `.` (the containment itself is Kani's and canon.rs's).

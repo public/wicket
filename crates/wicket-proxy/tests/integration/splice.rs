@@ -37,7 +37,7 @@ fn zone() -> ZoneSpec {
             {"host": "checked.test", "methods": ["GET"]},
             {"host": "fenced.test", "methods": ALL},
             {"host": "private.test", "methods": ALL},
-            {"host": "registry.test", "methods": ["GET"]}
+            {"host": "registry.test", "methods": ["GET"], "decode_slash": [1]}
         ],
         "forbid": [
             {"host": "fenced.test", "paths": ["/admin/**"]},
@@ -373,11 +373,12 @@ async fn a_spliced_connection_is_cut_when_its_activation_is_superseded() {
     assert!(ev.iter().any(|e| e.1 == "spliced" && e.2.contains("cut:") && e.2.contains("generation 2")), "{ev:?}");
 }
 
-/// #143: npm asks an inspected registry for a scoped package as `GET /@scope%2fname`. It is decided
-/// as `/@scope/name` (so the forbid on `/@evil/**` holds) and sent upstream as written; any other
-/// encoded separator is still refused.
+/// #664 (#143's guarantees): the registry's rule asks for an encoded slash in the first segment to
+/// be decided decoded (`decode_slash: [1]`), as a registry that names `/@scope%2fname` needs. It is
+/// decided as `/@scope/name` (so the forbid on `/@evil/**` holds) and sent upstream as written; any
+/// other encoded separator is still refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn npm_scoped_packages_pass_an_inspected_registry() {
+async fn an_encoded_slash_the_rule_asks_for_passes_an_inspected_host() {
     let w = World::new().await;
     for (path, want) in [
         ("/@types%2fnode", "origin /@types%2fnode"),
@@ -398,7 +399,7 @@ async fn npm_scoped_packages_pass_an_inspected_registry() {
     for (path, refusal) in [
         ("/@evil%2fpkg", "never allowed"),
         ("/@evil/pkg", "never allowed"),
-        ("/x%2fy", "malformed request"),
+        ("/x%2f", "malformed request"),
         ("/@types%2fnode%2fx", "malformed request"),
         ("/-/package/@types%2fnode/dist-tags", "malformed request"),
     ] {

@@ -182,6 +182,7 @@ ordered list.
 | `methods` | list of strings | `[GET, HEAD]` | The methods allowed. The proxy forwards only GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS. |
 | `paths` | list of globs | `["/**"]` | Path globs, each starting with `/` (a request's path always does; a manifest with one that doesn't is refused): `*` matches within one segment, `**` across segments. Case-sensitive. The query string isn't matched. |
 | `allow_dangerous` | boolean | `false` | Allow requests the dangerous-pattern list rates R3 or R4 without a grant. |
+| `decode_slash` | list of segment numbers | `[]` | Path segments (1 for the first, at most 16) in which one encoded slash, `%2F` or `%2f`, between two non-empty parts, is decided as `/` for this host ([#664](https://github.com/public/wicket/issues/664)). For an API that names one resource with an encoded slash: npm asks for a scoped package as `/@scope%2fname`, so `decode_slash: [1]` has every rule and forbid of the zone on the host read it as `/@scope/name`. The decoded path must still be canonical, and the request goes upstream as written. Otherwise an encoded slash is refused. A spawned or linked zone may use it only where its parent's rule does, and standing reach never carries it. |
 
 A host allowed wholesale (every forwarded method, `/**`, `allow_dangerous` where the host can be
 rated R3+, nothing forbidden or injected, not the model host) is spliced through rather than

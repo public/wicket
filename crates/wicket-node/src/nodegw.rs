@@ -858,6 +858,7 @@ async fn ask_standing(node: &Arc<Node>, run: &str, args: &Value, host: &str, pat
         methods,
         paths,
         allow_dangerous: args.get("dangerous").and_then(|v| v.as_bool()).unwrap_or(false),
+        decode_slash: vec![],
     };
     if let Err(why) = rule.check_standing() {
         return (format!("not requested: {why}"), true);
@@ -918,7 +919,10 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
     };
     let pq = if pq.is_empty() { "/" } else { pq };
     let (raw_path, query) = pq.split_once('?').unwrap_or((pq, ""));
-    let path = match wicket_core::canonical_path(raw_path) {
+    // As the egress proxy decides it: encoded slashes decoded only where the zone's rules for the
+    // host say (`decode_slash`, #664).
+    let decode = node.replica.lock().expect("replica").zone_of(run).map(|z| z.decode_slash_for(&host)).unwrap_or_default();
+    let path = match wicket_core::canonical_path_decoding(raw_path, &decode) {
         Ok(p) => p.to_string(),
         Err(e) => return (format!("not requested: ambiguous path ({e})"), true),
     };

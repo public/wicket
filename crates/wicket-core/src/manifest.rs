@@ -449,6 +449,16 @@ impl ZoneSpec {
         self.reach.iter().find(|r| r.host.starts_with("*.") && host_matches(&r.host, host)).map(|r| r.host.as_str())
     }
 
+    /// The path segments in which an encoded slash is decided decoded for `host` (#664): every
+    /// `decode_slash` of the reach rules that name it, sorted, each once. Empty for most hosts.
+    pub fn decode_slash_for(&self, host: &str) -> Vec<u8> {
+        let mut out: Vec<u8> =
+            self.reach.iter().filter(|r| host_matches(&r.host, host)).flat_map(|r| r.decode_slash.iter().copied()).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Whether any reach or inject rule names `host` (exactly or by wildcard).
     pub fn names_host(&self, host: &str) -> bool {
         self.reach.iter().any(|r| host_matches(&r.host, host)) || self.inject.iter().any(|r| host_matches(&r.host, host))
@@ -550,6 +560,14 @@ pub struct ReachRule {
     /// Allow requests that the dangerous-pattern list rates R3+ without a grant. Default false.
     #[serde(default)]
     pub allow_dangerous: bool,
+    /// Path segments (1 for the first) in which one encoded slash, `%2F` or `%2f`, is decided as
+    /// `/` for this rule's host (#664): for an API that names one resource with an encoded slash,
+    /// as some package registries name a scoped package (`/@scope%2fname`). The request still goes upstream as written;
+    /// only the decision, and every rule and forbid of the zone on the host, reads the decoded
+    /// path, which must still be canonical (no dot or empty segment, no other escape of a separator).
+    /// Empty by default: an encoded slash is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "crate::yaml::null_as_default")]
+    pub decode_slash: Vec<u8>,
 }
 
 fn default_methods() -> Vec<String> {
@@ -1012,6 +1030,7 @@ impl Manifest {
             for p in &r.paths {
                 check_path_glob("reach", p)?;
             }
+            check_decode_slash(&r.host, &r.decode_slash)?;
         }
         for f in &self.zone.forbid {
             if f.host.is_empty() || f.host.contains('/') {
@@ -1048,6 +1067,21 @@ impl Manifest {
         Ok(())
     }
 }
+
+/// A reach rule's `decode_slash`: segment numbers from 1, at most [`MAX_DECODE_SEGMENT`], each once.
+fn check_decode_slash(host: &str, segs: &[u8]) -> Result<(), ManifestError> {
+    for (i, n) in segs.iter().enumerate() {
+        if *n == 0 || *n > MAX_DECODE_SEGMENT || segs[..i].contains(n) {
+            return Err(ManifestError::Invalid(format!(
+                "reach rule for {host}: decode_slash names path segments, 1 to {MAX_DECODE_SEGMENT}, each once (not {segs:?})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The deepest path segment a `decode_slash` may name.
+pub const MAX_DECODE_SEGMENT: u8 = 16;
 
 /// A reach or forbid rule's path glob, as a manifest may have it: starting with `/`, as a request's
 /// path always does (`canon::canonical_path`), and one globset compiles. Some globs that don't start

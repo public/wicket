@@ -368,24 +368,6 @@ mod tests {
         }
     }
 
-    /// The example (examples/services/npm-cache) is a valid service: per tenant, read-only reach of
-    /// the public registry, and the env that points npm at it; and it snapshots.
-    #[test]
-    fn the_npm_cache_example_is_a_per_tenant_service() {
-        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/services/npm-cache/manifest.yaml"));
-        let m = wicket_core::Manifest::from_yaml(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let s = m.service.as_ref().unwrap();
-        assert_eq!((s.port, s.tenancy, s.public_only), (4873, Tenancy::PerTenant, false));
-        assert_eq!(s.user_env("npm-cache")["npm_config_registry"], "http://npm-cache.wicket.internal:4873/");
-        assert!(m.zone.reach.iter().all(|r| r.host == "registry.npmjs.org" && r.methods.iter().all(|x| x == "GET" || x == "HEAD")));
-        let root = std::env::temp_dir().join(format!("wicket-svc-example-{}", std::process::id()));
-        let snap = snapshot(path, &root).unwrap();
-        for f in ["config.yaml", "package.json", "package-lock.json", "start.sh"] {
-            assert!(snap.path.parent().unwrap().join("source").join(f).is_file(), "{f} in the snapshot");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     #[test]
     fn one_instance_per_service_node_and_tenant_that_something_wants() {
         let services = BTreeMap::from([

@@ -64,7 +64,7 @@ pub fn narrowed(s: &Standing) -> Option<ReachRule> {
         .collect();
     let keep = (wicket_core::op::STANDING_PAIRS / methods.len()).max(1);
     let paths: Vec<String> = paths.iter().take(keep).cloned().collect();
-    Some(ReachRule { host: s.rule.host.clone(), methods, paths, allow_dangerous: false }.canonical())
+    Some(ReachRule { host: s.rule.host.clone(), methods, paths, allow_dangerous: false, decode_slash: vec![] }.canonical())
 }
 
 /// `path` as a glob that matches only itself.
@@ -82,7 +82,13 @@ pub fn beyond(s: &Standing, rule: &ReachRule) -> Vec<String> {
     }
     for m in &rule.methods {
         for p in &rule.paths {
-            let one = ReachRule { host: rule.host.clone(), methods: vec![m.clone()], paths: vec![p.clone()], allow_dangerous: true };
+            let one = ReachRule {
+                host: rule.host.clone(),
+                methods: vec![m.clone()],
+                paths: vec![p.clone()],
+                allow_dangerous: true,
+                decode_slash: vec![],
+            };
             let asked = s.evidence.ops.iter().any(|o| {
                 o.method.eq_ignore_ascii_case(m)
                     && one
