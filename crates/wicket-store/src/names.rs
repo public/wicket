@@ -630,6 +630,13 @@ impl Ledger {
         }
         self.release_ports(&n.id)?;
         if let (NameKind::Internal, Some(holder)) = (n.kind, n.holder.as_deref()) {
+            // The links other boxes opened by this name close with it (#668, item 6): their
+            // relays see the ledger's word and stop.
+            self.conn.execute(
+                "UPDATE links SET status = 'closed', closed_at = ?3, closed_by = ?4, close_reason = ?5
+                 WHERE status = 'open' AND to_run = ?1 AND name = ?2",
+                params![holder, format!("{}.{}", n.label, n.zone), at, by, format!("the name {}.{} was {reason}", n.label, n.zone)],
+            )?;
             let run = RunId(holder.to_string());
             if self.names_on_port(&run, n.port)? == 0 && self.is_name_exposure(&run, n.port)? {
                 self.unexpose(holder, n.port)?;
