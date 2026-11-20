@@ -1,0 +1,312 @@
+use super::*;
+use std::net::Ipv4Addr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+fn trig(kind: &str, token: &str) -> IntakeTrigger {
+    IntakeTrigger {
+        trigger: "trg_1".into(),
+        kind: kind.into(),
+        token_sha256: ik::token_sha256(token),
+        secret: "s3cret".into(),
+        repo: (kind == "github").then(|| "acme/app".to_string()),
+        events: if kind == "github" { vec!["check_suite".into()] } else { vec![] },
+    }
+}
+
+fn github_sig(body: &[u8]) -> String {
+    format!("sha256={}", hex::encode(ik::hmac_sha256(b"s3cret", body)))
+}
+
+fn headers(h: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
+    let h: Vec<(String, String)> = h.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    move |n: &str| h.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone())
+}
+
+fn generic(ts: i64, id: &str, body: &[u8]) -> impl Fn(&str) -> Option<String> {
+    headers(&[
+        (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret", ts, id, body)),
+        (ik::GENERIC_TIMESTAMP, ts.to_string()),
+        (ik::GENERIC_DELIVERY, id.to_string()),
+    ])
+}
+
+fn ready(t: Vec<IntakeTrigger>) -> Intake {
+    let i = Intake::default();
+    i.set_table(t, true);
+    i
+}
+
+/// A generic delivery: the path and token before the body, then the signature (with its time and
+/// id), and each refusal counted by why.
+#[test]
+fn a_generic_delivery_is_checked_in_order() {
+    let token = ik::new_token().unwrap();
+    let i = ready(vec![trig("webhook", &token)]);
+    let body = br#"{"status":"failed","n":3}"#;
+    let at = Instant::now();
+    let path = format!("/hook/trg_1/{token}");
+    let t = i.admit(&path, IP, at).unwrap();
+    let Outcome::Spool(e) = i.verify(&t, &generic(1000, "d-1", body), body, IP, 1000, at) else { panic!("refused") };
+    assert_eq!((e.trigger.as_str(), e.delivery.as_str(), e.kind.as_str()), ("trg_1", "d-1", "webhook"));
+    assert_eq!(e.fields, serde_json::json!({ "status": "failed", "n": 3 }));
+    let other = ik::new_token().unwrap();
+    assert_eq!(i.admit(&format!("/hook/trg_1/{other}"), IP, at), Err(Outcome::Answer(StatusCode::NOT_FOUND, "not found")));
+    assert_eq!(i.admit(&format!("/hook/trg_2/{token}"), IP, at), Err(Outcome::Answer(StatusCode::NOT_FOUND, "not found")));
+    assert_eq!(i.admit("/hook/trg_1", IP, at), Err(Outcome::Answer(StatusCode::NOT_FOUND, "not found")));
+    let forged =
+        headers(&[(ik::GENERIC_SIGNATURE, ik::generic_signature(b"other", 1000, "d-1", body)), (ik::GENERIC_TIMESTAMP, "1000".into())]);
+    assert_eq!(i.verify(&t, &forged, body, IP, 1000, at), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"));
+    let r = i.take_refused();
+    assert_eq!((r.token, r.signature), (3, 1));
+    assert_eq!(i.take_refused().total(), 0, "reported once");
+}
+
+/// #714 review H2: a captured generic delivery can't be sent again under a new delivery id, or
+/// after its window.
+#[test]
+fn a_captured_generic_delivery_cant_be_replayed() {
+    let token = ik::new_token().unwrap();
+    let i = ready(vec![trig("webhook", &token)]);
+    let t = i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()).unwrap();
+    let body = br#"{"a":1}"#;
+    let sig = ik::generic_signature(b"s3cret", 1000, "d-1", body);
+    let replay = |id: &str, now: i64| {
+        let h = headers(&[(ik::GENERIC_SIGNATURE, sig.clone()), (ik::GENERIC_TIMESTAMP, "1000".into()), (ik::GENERIC_DELIVERY, id.into())]);
+        i.verify(&t, &h, body, IP, now, Instant::now())
+    };
+    assert!(matches!(replay("d-1", 1000), Outcome::Spool(_)));
+    assert_eq!(replay("d-2", 1000), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"), "a new id");
+    assert_eq!(replay("d-1", 1000 + ik::GENERIC_WINDOW_SECS + 1), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"), "later");
+}
+
+/// GitHub: its own signature header; events and repositories it doesn't listen to are 202 and
+/// dropped; repository names ignore case; the fields are the normalised ones.
+#[test]
+fn a_github_delivery_keeps_its_fields() {
+    let token = ik::new_token().unwrap();
+    let i = ready(vec![trig("github", &token)]);
+    let path = format!("/hook/trg_1/{token}");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "completed",
+        "check_suite": { "conclusion": "failure", "head_branch": "fix", "pull_requests": [{ "number": 9 }] },
+        "repository": { "full_name": "Acme/App" }
+    }))
+    .unwrap();
+    let h = |event: &str, body: &[u8]| {
+        headers(&[(ik::GITHUB_SIGNATURE, github_sig(body)), (ik::GITHUB_EVENT, event.into()), (ik::GITHUB_DELIVERY, "g-1".into())])
+    };
+    let at = Instant::now();
+    let t = i.admit(&path, IP, at).unwrap();
+    let Outcome::Spool(e) = i.verify(&t, &h("check_suite", &body), &body, IP, 5, at) else { panic!("refused") };
+    assert_eq!((e.kind.as_str(), e.fields["pr"]["number"].as_i64()), ("check_suite", Some(9)));
+    assert_eq!(i.verify(&t, &h("push", &body), &body, IP, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not listened to"));
+    let elsewhere = serde_json::to_vec(&serde_json::json!({ "repository": { "full_name": "evil/app" } })).unwrap();
+    assert_eq!(
+        i.verify(&t, &h("check_suite", &elsewhere), &elsewhere, IP, 5, at),
+        Outcome::Answer(StatusCode::ACCEPTED, "another repository")
+    );
+    // The generic header doesn't sign a GitHub delivery.
+    let generic = headers(&[(ik::GENERIC_SIGNATURE, github_sig(&body)), (ik::GITHUB_EVENT, "check_suite".into())]);
+    assert_eq!(i.verify(&t, &generic, &body, IP, 5, at), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"));
+}
+
+/// #714 review M1: only verified deliveries count against a trigger, so a leaked URL can't starve
+/// it; an address that keeps failing is slowed down before anything else is looked at; verified
+/// deliveries past the trigger's burst are slowed down too.
+#[test]
+fn rates_count_what_they_should() {
+    let token = ik::new_token().unwrap();
+    let i = ready(vec![trig("webhook", &token)]);
+    let path = format!("/hook/trg_1/{token}");
+    let at = Instant::now();
+    let t = i.admit(&path, IP, at).unwrap();
+    let attacker = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+    for _ in 0..100 {
+        let _ = i.verify(&t, &headers(&[]), b"{}", attacker, 1, at);
+    }
+    assert_eq!(i.admit(&path, attacker, at), Err(Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down")), "the failing address");
+    let mut ok = 0;
+    for n in 0..30 {
+        let id = format!("d-{n}");
+        if matches!(i.verify(&t, &generic(1, &id, b"{}"), b"{}", IP, 1, at), Outcome::Spool(_)) {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, PER_TRIGGER_BURST as usize, "the sender still gets its burst, the attacker's failures not counted against it");
+    assert!(
+        matches!(i.verify(&t, &generic(1, "late", b"{}"), b"{}", IP, 1, at + Duration::from_secs(2)), Outcome::Spool(_)),
+        "a token a second comes back"
+    );
+    // A trigger no longer served loses its bucket, and its deliveries are not found.
+    i.set_table(vec![], true);
+    assert_eq!(i.admit(&path, IP, at), Err(Outcome::Answer(StatusCode::NOT_FOUND, "not found")));
+}
+
+/// #714 review M4: until `node serve` has the control host's table, deliveries are answered 503
+/// (try later), not 404.
+#[test]
+fn a_node_without_its_table_says_try_later() {
+    let token = ik::new_token().unwrap();
+    let i = Intake::default();
+    i.set_table(vec![trig("webhook", &token)], false);
+    assert_eq!(
+        i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()),
+        Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later"))
+    );
+}
+
+/// A stand-in `node serve`: answers the table (ready) and records deliveries.
+fn fake_node(sock: PathBuf, table: Vec<IntakeTrigger>) -> Arc<Mutex<Vec<serde_json::Value>>> {
+    let delivered = Arc::new(Mutex::new(vec![]));
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    let d = delivered.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((c, _)) = listener.accept().await else { return };
+            let (rd, mut wr) = c.into_split();
+            let mut line = String::new();
+            let _ = tokio::io::BufReader::new(rd).read_line(&mut line).await;
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let answer = match req["op"].as_str() {
+                Some("table") => serde_json::json!({ "triggers": table, "ready": true }),
+                Some("deliver") => {
+                    d.lock().unwrap().push(req["event"].clone());
+                    serde_json::json!({ "ok": true })
+                }
+                _ => serde_json::json!({ "ok": true }),
+            };
+            let mut out = serde_json::to_vec(&answer).unwrap();
+            out.push(b'\n');
+            let _ = wr.write_all(&out).await;
+        }
+    });
+    delivered
+}
+
+struct Served {
+    addr: std::net::SocketAddr,
+    delivered: Arc<Mutex<Vec<serde_json::Value>>>,
+    dir: PathBuf,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The service on a free port, its node a stand-in, with `lim`, its table fetched.
+async fn served(name: &str, token: &str, lim: crate::serve::net::Limits) -> Served {
+    let dir = std::env::temp_dir().join(format!("wi-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("intake.sock");
+    let delivered = fake_node(sock.clone(), vec![trig("webhook", token)]);
+    let intake = Arc::new(Intake::default());
+    let v = ask(&sock, &serde_json::json!({ "op": "table" })).await.unwrap();
+    intake.set_table(serde_json::from_value(v["triggers"].clone()).unwrap(), true);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(accept(listener, None, intake, sock, lim));
+    Served { addr, delivered, dir }
+}
+
+async fn send(addr: std::net::SocketAddr, raw: &[u8]) -> String {
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    c.write_all(raw).await.unwrap();
+    let mut out = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), c.read_to_string(&mut out)).await;
+    out
+}
+
+fn post(path: &str, h: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+    let mut req = format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());
+    for (k, v) in h {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    let mut out = req.into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+/// The service end to end, over TCP and a stand-in node: a signed delivery reaches the node and
+/// is answered 202 with nothing of it echoed; a forged one is 401 and doesn't; a GET is 405.
+#[tokio::test]
+async fn the_service_hands_verified_deliveries_to_its_node() {
+    let token = ik::new_token().unwrap();
+    let s = served("e2e", &token, limits()).await;
+    let body = br#"{"status":"failed"}"#;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let h = |id: &str, body: &[u8]| {
+        vec![
+            (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret", now, id, body)),
+            (ik::GENERIC_TIMESTAMP, now.to_string()),
+            (ik::GENERIC_DELIVERY, id.to_string()),
+        ]
+    };
+    let path = format!("/hook/trg_1/{token}");
+    let ok = send(s.addr, &post(&path, &h("d-1", body), body)).await;
+    assert!(ok.starts_with("HTTP/1.1 202"), "{ok}");
+    assert!(!ok.contains("failed"), "the payload isn't echoed: {ok}");
+    let mut forged = h("d-1", body);
+    forged[0].1 = ik::generic_signature(b"other", now, "d-1", body);
+    assert!(send(s.addr, &post(&path, &forged, body)).await.starts_with("HTTP/1.1 401"));
+    let get = send(s.addr, format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").as_bytes()).await;
+    assert!(get.starts_with("HTTP/1.1 405"), "{get}");
+    let d = s.delivered.lock().unwrap().clone();
+    assert_eq!(d.len(), 1, "only the verified one reached the node");
+    assert_eq!(
+        (d[0]["trigger"].as_str(), d[0]["delivery"].as_str(), d[0]["fields"]["status"].as_str()),
+        (Some("trg_1"), Some("d-1"), Some("failed"))
+    );
+}
+
+/// #714 review H1: the server's bounds. A body announced over the cap is 413 before it is read; an
+/// unknown token is 404 before the body is read; slow headers and a slow body are cut off; past
+/// the connection cap, a connection is closed at once.
+#[tokio::test]
+async fn the_server_is_bounded() {
+    let token = ik::new_token().unwrap();
+    let lim = crate::serve::net::Limits {
+        header_timeout: Duration::from_millis(300),
+        body_timeout: Duration::from_millis(300),
+        max_connections: 2,
+        per_ip_connections: 2,
+        ..limits()
+    };
+    let s = served("bounds", &token, lim).await;
+    let path = format!("/hook/trg_1/{token}");
+    // 413 from the announced length alone: no body sent.
+    let big = format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", ik::MAX_BODY + 1);
+    assert!(send(s.addr, big.as_bytes()).await.starts_with("HTTP/1.1 413"));
+    // 404 for another token without waiting for the (never sent) body.
+    let other = ik::new_token().unwrap();
+    let head = format!("POST /hook/trg_1/{other} HTTP/1.1\r\nhost: x\r\ncontent-length: 1000\r\n\r\n");
+    let started = Instant::now();
+    assert!(send(s.addr, head.as_bytes()).await.starts_with("HTTP/1.1 404"));
+    assert!(started.elapsed() < Duration::from_millis(250), "answered before any body");
+    // Slow headers: cut off by the header timeout, no answer.
+    let started = Instant::now();
+    let slow = send(s.addr, b"POST /hook/x HTTP/1.1\r\nhost: x\r\n").await;
+    assert!(!slow.starts_with("HTTP/1.1 2"), "{slow}");
+    assert!(started.elapsed() < Duration::from_secs(3), "cut off");
+    // A slow body: its headers whole, then too little: 408.
+    let slow_body = format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{{");
+    assert!(send(s.addr, slow_body.as_bytes()).await.starts_with("HTTP/1.1 408"));
+    // The connection cap: two held open, a third is closed at once.
+    let mut held = vec![];
+    for _ in 0..2 {
+        let mut c = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+        c.write_all(b"POST /hook/x HTTP/1.1\r\n").await.unwrap();
+        held.push(c);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut third = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf)).await.expect("closed, not left waiting").unwrap_or(0);
+    assert_eq!(n, 0, "closed without an answer");
+    drop(held);
+}

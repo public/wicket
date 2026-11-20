@@ -260,9 +260,9 @@ impl Default for Limits {
 
 /// Counts open connections per client address.
 #[derive(Default)]
-struct PerIp(Mutex<HashMap<String, usize>>);
+pub(crate) struct PerIp(Mutex<HashMap<String, usize>>);
 
-struct PerIpGuard(Arc<PerIp>, String);
+pub(crate) struct PerIpGuard(Arc<PerIp>, String);
 
 impl Drop for PerIpGuard {
     fn drop(&mut self) {
@@ -277,7 +277,7 @@ impl Drop for PerIpGuard {
 }
 
 impl PerIp {
-    fn enter(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<PerIpGuard> {
+    pub(crate) fn enter(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<PerIpGuard> {
         let key = ip_key(ip);
         let mut m = self.0.lock().expect("lock");
         let n = m.entry(key.clone()).or_insert(0);

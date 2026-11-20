@@ -116,6 +116,47 @@ pub fn signature_ok(secret: &[u8], body: &[u8], header: Option<&str>) -> bool {
     same(&sig, &hmac_sha256(secret, body))
 }
 
+/// The generic webhook's timestamp header (Unix seconds), signed with the body.
+pub const GENERIC_TIMESTAMP: &str = "x-wicket-timestamp";
+/// How far a generic delivery's timestamp may be from intake's clock (s), either way.
+pub const GENERIC_WINDOW_SECS: i64 = 300;
+
+/// What a generic webhook's sender signs: `v1:<timestamp>:<delivery id>:` then the raw body (the
+/// delivery id empty if it sends none). The timestamp and the id are under the MAC, so a captured
+/// delivery can't be sent again later, or under another id.
+pub fn generic_signed(timestamp: i64, delivery: &str, body: &[u8]) -> Vec<u8> {
+    let mut m = format!("v1:{timestamp}:{delivery}:").into_bytes();
+    m.extend_from_slice(body);
+    m
+}
+
+/// The `X-Wicket-Signature-256` a sender sends (`sha256=<hex>`).
+pub fn generic_signature(secret: &[u8], timestamp: i64, delivery: &str, body: &[u8]) -> String {
+    format!("sha256={}", hex::encode(hmac_sha256(secret, &generic_signed(timestamp, delivery, body))))
+}
+
+/// Why a generic delivery's signature doesn't pass, if it doesn't: its timestamp missing, malformed
+/// or outside [`GENERIC_WINDOW_SECS`] of `now`, or its MAC over [`generic_signed`] wrong.
+pub fn generic_check(
+    secret: &[u8],
+    timestamp: Option<&str>,
+    delivery: Option<&str>,
+    body: &[u8],
+    signature: Option<&str>,
+    now: i64,
+) -> Result<(), &'static str> {
+    let ts = timestamp.and_then(|t| t.trim().parse::<i64>().ok()).ok_or("no timestamp")?;
+    if (now - ts).abs() > GENERIC_WINDOW_SECS {
+        return Err("timestamp outside the window");
+    }
+    let signed = generic_signed(ts, delivery.map(str::trim).unwrap_or(""), body);
+    if signature_ok(secret, &signed, signature) {
+        Ok(())
+    } else {
+        Err("bad signature")
+    }
+}
+
 /// The sha256 (hex) of a trigger URL's token: what the ledger and intake keep of it.
 pub fn token_sha256(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
@@ -217,8 +258,8 @@ pub fn github_repo(body: &Value) -> Option<String> {
 ///
 /// - every event: `event`, `action`, `repo`, `sender`;
 /// - `pull_request`, `pull_request_review`, `pull_request_review_comment`: `pr.number`,
-///   `pr.author`, `pr.title`, `pr.url`, `pr.draft`, `branch` (its head), `base`, `labels`, and for
-///   a review `review.state`;
+///   `pr.author`, `pr.title`, `pr.url`, `pr.draft`, `branch` (its head), `head_repo`, `base`,
+///   `labels`, and for a review `review.state`;
 /// - `issues`, `issue_comment`: `issue.number`, `issue.author`, `issue.title`, `issue.url`,
 ///   `labels`, `comment.author` and `comment.url` (a comment), and `pr.number` when the issue is a
 ///   pull request;
@@ -226,17 +267,33 @@ pub fn github_repo(body: &Value) -> Option<String> {
 ///   `branch`, `sha`, and `pr.number` for the first pull request it belongs to;
 /// - `workflow_run`: `check.name`, `check.status`, `check.conclusion`, `check.url`, `branch`,
 ///   `sha`, `pr.number`;
-/// - `push`: `branch` (the ref without `refs/heads/`), `sha` (after), `pusher`.
+/// - `push`: `branch` (a branch's ref without its one `refs/heads/`; none for a tag), `ref`, `sha`
+///   (after), `pusher`;
+/// - and `fork` on every event: whether `head_repo` (a pull request's or workflow run's head
+///   repository) is another repository than `repo`. A check suite or run doesn't say, and GitHub
+///   lists no pull request on one from a fork: `fork` is false there, so don't rely on `branch`
+///   alone to mean the repository's own branch.
 pub fn github_fields(event: &str, body: &Value) -> Value {
     let mut f = Map::new();
     let s = |p: &str| body.pointer(p).and_then(Value::as_str).map(|v| Value::String(keep_text(v, MAX_GITHUB_TEXT)));
     let n = |p: &str| body.pointer(p).and_then(Value::as_i64).map(Value::from);
     let b = |p: &str| body.pointer(p).and_then(Value::as_bool).map(Value::Bool);
+    // Labels joined with `,`, whole labels only, within MAX_GITHUB_TEXT: a long list keeps its
+    // first ones rather than making the event too big to keep (#714 review M6).
     let labels = |p: &str| {
         body.pointer(p).and_then(Value::as_array).map(|ls| {
-            let names: Vec<String> =
-                ls.iter().filter_map(|l| l["name"].as_str()).take(MAX_LABELS).map(|l| keep_text(l, 64).replace(',', " ")).collect();
-            Value::String(names.join(","))
+            let mut out = String::new();
+            for l in ls.iter().filter_map(|l| l["name"].as_str()).take(MAX_LABELS) {
+                let l = keep_text(l, 64).replace(',', " ");
+                if out.len() + l.len() + 1 > MAX_GITHUB_TEXT {
+                    break;
+                }
+                if !out.is_empty() {
+                    out.push(',');
+                }
+                out.push_str(&l);
+            }
+            Value::String(out)
         })
     };
     let mut put = |path: &str, v: Option<Value>| {
@@ -262,6 +319,9 @@ pub fn github_fields(event: &str, body: &Value) -> Value {
             put("pr.draft", b("/pull_request/draft"));
             put("branch", s("/pull_request/head/ref"));
             put("base", s("/pull_request/base/ref"));
+            // A fork's PR names its own branch (often `main`): the branch alone says nothing about
+            // the repository's (#714 review M5).
+            put("head_repo", s("/pull_request/head/repo/full_name"));
             put("labels", labels("/pull_request/labels"));
             put("review.state", s("/review/state"));
             put("comment.author", s("/comment/user/login"));
@@ -297,14 +357,27 @@ pub fn github_fields(event: &str, body: &Value) -> Value {
             put("branch", s("/workflow_run/head_branch"));
             put("sha", s("/workflow_run/head_sha"));
             put("pr.number", n("/workflow_run/pull_requests/0/number"));
+            put("head_repo", s("/workflow_run/head_repository/full_name"));
         }
         "push" => {
-            put("branch", s("/ref").map(|v| Value::String(v.as_str().unwrap_or("").trim_start_matches("refs/heads/").to_string())));
+            // Only the one prefix: a branch named `refs/heads/main` stays itself (#714 review M5);
+            // a tag's push isn't a branch.
+            put(
+                "branch",
+                s("/ref").and_then(|v| v.as_str().and_then(|r| r.strip_prefix("refs/heads/")).map(|b| Value::String(b.to_string()))),
+            );
+            put("ref", s("/ref"));
             put("sha", s("/after"));
             put("pusher", s("/pusher/name"));
         }
         _ => {}
     }
+    // `fork`: the change comes from another repository than the one the trigger listens to.
+    let fork = match (f.get("head_repo").and_then(Value::as_str), f.get("repo").and_then(Value::as_str)) {
+        (Some(h), Some(r)) => !h.eq_ignore_ascii_case(r),
+        _ => false,
+    };
+    f.insert("fork".into(), Value::Bool(fork));
     Value::Object(f)
 }
 
@@ -365,6 +438,23 @@ mod tests {
         assert!(!signature_ok(b"k", b"body", Some(&sig[..sig.len() - 2])), "short");
         assert!(!signature_ok(b"k", b"body", None));
         assert!(same(b"abc", b"abc") && !same(b"abc", b"abd") && !same(b"abc", b"ab"));
+    }
+
+    /// #714 review H2: a generic delivery's timestamp and id are under its MAC, so it can't be sent
+    /// again later or under another id, and only within the window.
+    #[test]
+    fn a_generic_signature_binds_its_time_and_id() {
+        let sig = generic_signature(b"k", 1000, "d-1", b"{}");
+        let ok = |ts: &str, id: Option<&str>, body: &[u8], now: i64| generic_check(b"k", Some(ts), id, body, Some(&sig), now);
+        assert_eq!(ok("1000", Some("d-1"), b"{}", 1000), Ok(()));
+        assert_eq!(ok("1000", Some("d-1"), b"{}", 1299), Ok(()));
+        assert_eq!(ok("1000", Some("d-1"), b"{}", 1301), Err("timestamp outside the window"), "too late");
+        assert_eq!(ok("1000", Some("d-1"), b"{}", 699), Err("timestamp outside the window"), "too early");
+        assert_eq!(ok("1000", Some("d-2"), b"{}", 1000), Err("bad signature"), "another id: a replay");
+        assert_eq!(ok("1001", Some("d-1"), b"{}", 1000), Err("bad signature"), "another time");
+        assert_eq!(ok("1000", None, b"{}", 1000), Err("bad signature"), "the id dropped");
+        assert_eq!(generic_check(b"k", None, Some("d-1"), b"{}", Some(&sig), 1000), Err("no timestamp"));
+        assert_eq!(generic_check(b"k", Some("x"), Some("d-1"), b"{}", Some(&sig), 1000), Err("no timestamp"));
     }
 
     #[test]
@@ -446,6 +536,28 @@ mod tests {
         assert_eq!((f["pr"]["number"].as_i64(), f["labels"].as_str(), f["base"].as_str()), (Some(7), Some("bug,c i"), Some("main")));
         let push = serde_json::json!({ "ref": "refs/heads/main", "after": "def", "repository": { "full_name": "acme/app" } });
         assert_eq!(github_fields("push", &push)["branch"], "main");
+        // #714 review M5: one prefix only, and a tag isn't a branch.
+        let tricky = serde_json::json!({ "ref": "refs/heads/refs/heads/main", "repository": { "full_name": "acme/app" } });
+        assert_eq!(github_fields("push", &tricky)["branch"], "refs/heads/main");
+        let tag = serde_json::json!({ "ref": "refs/tags/v1", "repository": { "full_name": "acme/app" } });
+        assert!(github_fields("push", &tag).get("branch").is_none());
+        // A fork's PR from its own `main`: branch main, but a fork.
+        let fork = serde_json::json!({
+            "action": "opened",
+            "pull_request": { "number": 8, "head": { "ref": "main", "repo": { "full_name": "evil/app" } }, "base": { "ref": "main" } },
+            "repository": { "full_name": "acme/app" }
+        });
+        let f = github_fields("pull_request", &fork);
+        assert_eq!((f["branch"].as_str(), f["head_repo"].as_str(), f["fork"].as_bool()), (Some("main"), Some("evil/app"), Some(true)));
+        assert_eq!(github_fields("pull_request", &pr)["fork"], false, "no head repo given: not a fork");
+        // #714 review M6: many long labels still fit what a node may send.
+        let many = serde_json::json!({
+            "issue": { "number": 1, "labels": (0..20).map(|i| serde_json::json!({ "name": format!("{i:02}-{}", "l".repeat(60)) })).collect::<Vec<_>>() },
+            "repository": { "full_name": "acme/app" }
+        });
+        let f = github_fields("issues", &many);
+        assert!(fields_within(&f), "{}", f["labels"]);
+        assert!(f["labels"].as_str().unwrap().split(',').all(|l| l.len() == 63), "whole labels only");
     }
 
     /// What a node sends is checked again: no deep nesting, no long or unsafe text, no odd keys.

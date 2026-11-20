@@ -57,9 +57,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Set { name, ca_hosts, labels, taints } => set(&name, ca_hosts.as_deref(), &labels, &taints),
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
-            NodeCmd::Intake { listen, tls_cert, tls_key, dir } => {
-                let dir = dir.unwrap_or_else(wicket_node::nodesrv::NodePaths::default_root);
-                crate::intake::serve(listen, crate::intake::tls_pair(tls_cert, tls_key)?, dir).await
+            NodeCmd::Intake { listen, tls_cert, tls_key, socket, dir } => {
+                let sock = socket
+                    .unwrap_or_else(|| dir.unwrap_or_else(wicket_node::nodesrv::NodePaths::default_root).join("ctl").join("intake.sock"));
+                crate::intake::serve(listen, crate::intake::tls_pair(tls_cert, tls_key)?, sock).await
             }
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
@@ -303,7 +304,13 @@ pub enum NodeCmd {
         /// The certificate's private key (PEM).
         #[arg(long)]
         tls_key: Option<PathBuf>,
-        /// The node's directory (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node).
+        /// The node's intake socket, which `wicket node serve` listens on for intake (default:
+        /// `<node dir>/ctl/intake.sock`, for intake run as the node's own user). Run as its own
+        /// user, intake is given the socket the node's `intake_socket` names.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// The node's directory, for the default socket (default: $WICKET_NODE_HOME or
+        /// ~/.local/share/wicket-node).
         #[arg(long)]
         dir: Option<PathBuf>,
     },

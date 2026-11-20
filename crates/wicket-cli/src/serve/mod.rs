@@ -60,7 +60,7 @@ mod authority;
 mod capacity;
 mod limits;
 mod manifests;
-mod net;
+pub(crate) mod net;
 mod push;
 mod secrets;
 pub mod session;
