@@ -14,9 +14,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 policy::sanity(&file)?;
                 policy::check(&file, entities.as_deref())
             }
-            PolicyCmd::Apply { file, entities, keep_runs } => {
+            PolicyCmd::Apply { file, entities, keep_runs, dry_run, decision } => {
                 policy::sanity(&file)?;
-                policy::apply(&file, entities.as_deref(), keep_runs).await
+                policy::apply(&file, entities.as_deref(), keep_runs, dry_run, decision).await
             }
             PolicyCmd::Zone { manifest } => policy::zone(&manifest),
         },
@@ -60,7 +60,8 @@ pub enum PolicyCmd {
         entities: Option<PathBuf>,
     },
     /// Install an org policy, and revoke the running runs minted under an older version (their boxes
-    /// stop; new runs get the new policy).
+    /// stop; new runs get the new policy). The console applies one the same way, signed with a
+    /// passkey on what --dry-run shows.
     Apply {
         file: PathBuf,
         #[arg(long)]
@@ -68,6 +69,15 @@ pub enum PolicyCmd {
         /// Leave running runs on the policy they were minted under until they end.
         #[arg(long)]
         keep_runs: bool,
+        /// Change nothing: print what applying it would do (its version and the one it replaces,
+        /// whether it mints for every running run's zone, and the runs it would revoke) and the
+        /// effect the console signs.
+        #[arg(long)]
+        dry_run: bool,
+        /// The console's signed decision to apply it (its audit sequence): applied only if it is
+        /// still what that decision previewed, once.
+        #[arg(long, hide = true, conflicts_with = "dry_run")]
+        decision: Option<i64>,
     },
     /// A zone's policy as Cedar, generated from a manifest (what its boxes' tokens are compiled from).
     Zone { manifest: PathBuf },

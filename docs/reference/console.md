@@ -241,6 +241,14 @@ that stays a signed action.
   whether `org.cedar` still matches what was applied (a hand edit refuses every mint), every kept
   version with when and by whom it was applied, and each running run with the version it was minted
   under: current, older, or revoked by a later `wicket policy apply`.
+- **Applying an org policy** (#712): `POST /api/policy/preview` with `cedar`, `entities` and
+  `keep_runs` shows what `wicket policy apply --dry-run` prints: its version and the one it replaces,
+  what it holds, the zones it doesn't mint for and the running runs it revokes. That is read-only,
+  so it needs only the session. Applying it is the signed action `policy_apply` on that preview;
+  see [the org policy](policy.md). Begin refuses a policy that doesn't parse (400) or doesn't mint
+  (409), and an operator whose authority doesn't cover `policy` at R4 (403). A preview that changed
+  before you signed is refused (audited `decision.refused`). The page's form waits for the Lit
+  Settings screen (#751).
 
 **Never shown:** a serialized token, any signature (a block's or a JWS's), a secret's value, a private
 key. Each view is built from named fields, never by serializing a stored record, and a test fetches

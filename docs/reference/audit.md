@@ -293,5 +293,6 @@ for a kind to see its body):
 | placement | `lease.requested`, `lease.released`, `placement.node_created`, `placement.node_released`, `reconcile.<what>` (one per change a pass makes, such as `reconcile.destroyed` and `reconcile.run_adopted`) |
 | updates | `self.staged`, `self.snapshot`, `self.switched`, `self.health`, `self.committed`, `self.rolled_back`, `self.update_refused`, `self.pruned`, `self.key_trusted`, `self.follow_update`, `self.follow_skipped`, `self.follow_failed` |
 | state and keys | `state.kit`, `state.restored`, `keys.roots_offline`, `keys.roots_online`, `keys.certified` |
+| org policy | `policy.applied` (`version`, `previous`, `by`, `effect_sha256`, and `decision`: the console's decision it applied, or null), `policy.apply_decided` (a console decision to apply one, #712: `version`, `previous`, `keep_runs`, `revokes`, `effect_sha256`, `by`, `granter`, `granter_identity`, `via` and the `signed` assertion; written before anything is applied), `policy.apply_failed` (a decided apply that didn't happen: `version`, `decision`, `error`; nothing changed). The runs an apply revokes are `identity.revoked` with its `decision` |
 
 A node's own records arrive as `node.audit`, each carrying the node's record in its body.

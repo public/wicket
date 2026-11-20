@@ -62,6 +62,7 @@ mod fence;
 mod limits;
 mod manifests;
 mod net;
+mod orgpolicy;
 mod push;
 mod secrets;
 pub mod session;
@@ -218,6 +219,8 @@ enum Action {
         reason: String,
         effect: String,
     },
+    /// Apply an org policy (#712), on the preview the passkey signed.
+    PolicyApply(Box<orgpolicy::PolicyApply>),
 }
 
 enum Purpose {
@@ -243,6 +246,9 @@ type Launcher = Box<dyn Fn(&Launch) -> Result<()> + Send + Sync>;
 /// Applies an approved update request (#465): the real one runs `wicket self apply-update`
 /// detached; tests record instead. Given the request and the log to write.
 type Updater = Box<dyn Fn(&str, &std::path::Path) -> Result<()> + Send + Sync>;
+/// Applies an org policy the console decided to apply (#712): the real one runs
+/// `wicket policy apply --decision` detached ([`orgpolicy::apply_detached`]); tests record instead.
+type PolicyApplier = Box<dyn Fn(&orgpolicy::Apply) -> Result<()> + Send + Sync>;
 /// The verified identity of a run's agent (crate::verified_identity; replaceable in tests, which
 /// have no issuer key).
 type IdentityCheck = fn(&Ledger, &str) -> Value;
@@ -268,6 +274,7 @@ struct State {
     roots: Vec<(String, PathBuf)>,
     launcher: Launcher,
     updater: Updater,
+    policy_applier: PolicyApplier,
     identity: IdentityCheck,
     challenges: Mutex<HashMap<String, Pending>>,
     limiter: Limiter,
@@ -328,6 +335,7 @@ impl State {
             roots,
             launcher,
             updater: Box::new(|_, _| bail!("this console doesn't apply updates")),
+            policy_applier: Box::new(|_| bail!("this console doesn't apply org policies")),
             identity,
             challenges: Mutex::new(HashMap::new()),
             limiter: Limiter::default(),
@@ -391,6 +399,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     crate::update::reexec_on_hangup(crate::update::pidfile("console"), crate::update::Versions::control().root, || {});
     let exe = crate::update::self_exe()?;
     let update_exe = exe.clone();
+    let policy_exe = exe.clone();
     let mut state = State::new(
         RelyingParty { rp_id: plan.rp_id.clone(), origin: plan.origin.clone() },
         ledger_path(),
@@ -400,6 +409,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         |l, run| crate::verified_identity(l, run, None),
     );
     state.updater = Box::new(move |request, log| apply_update_detached(&update_exe, request, log));
+    state.policy_applier = Box::new(move |a| orgpolicy::apply_detached(&policy_exe, a));
     state.trusted = plan.trusted.clone();
     state.authority = plan.authority.clone();
     state.hsts = plan.hsts;
@@ -986,6 +996,11 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
             action_begin(state, &sess, &body)
         }
         "/api/action/finish" | "/api/decide/finish" => action_finish(state, &sess, body),
+        // What applying an org policy would do (#712): read-only, so unsigned.
+        "/api/policy/preview" => match &sess {
+            Some((_, SessionKind::Operator { .. })) => orgpolicy::preview(state, body),
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
         // Validates edited manifest YAML and diffs its authority (#172): read-only, so unsigned.
         "/api/manifests/check" => match &sess {
             Some((_, SessionKind::Operator { .. })) => match manifests::check(state, body) {
@@ -1439,8 +1454,9 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         Some("standing_deny") => standing::build_deny(state, &l, body),
         Some("standing_renew") => standing::build_renew(state, &l, body),
         Some("release_fence") => fence::build_release(state, oc, &l, body),
+        Some("policy_apply") => orgpolicy::build(state, &l, oc, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew or release_fence",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence or policy_apply",
         )),
     }
 }
@@ -1712,6 +1728,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::StandingDeny { id } => standing::apply_deny(state, &l, oc, id, signed),
         Action::StandingRenew { id, ttl_secs } => standing::apply_renew(state, &l, oc, id, *ttl_secs, signed),
         Action::ReleaseFence { run, reason, effect } => fence::apply_release(state, &l, oc, run, reason, effect, signed),
+        Action::PolicyApply(a) => orgpolicy::apply(state, &l, oc, a, signed),
     }
 }
 
@@ -2252,6 +2269,7 @@ mod tests {
     mod https;
     mod manifests;
     mod notify;
+    mod orgpolicy;
     mod secrets;
     mod session;
 

@@ -107,6 +107,7 @@ a `permit(principal, action, resource)` here would make the spawn rule below it 
 
 ```
 wicket policy check org.cedar --entities org-entities.json   # validate and compile, change nothing
+wicket policy apply org.cedar --entities org-entities.json --dry-run   # what it would do, change nothing
 wicket policy apply org.cedar --entities org-entities.json   # install it
 wicket policy show                                           # its version, runs minted under another
 wicket policy zone manifest.yaml                             # a zone's own policy, as Cedar
@@ -131,6 +132,19 @@ wicket policy zone manifest.yaml                             # a zone's own poli
   revoked on their nodes. `--keep-runs` leaves them on the policy they were minted under until they
   end.
 - A run's version is in the ledger, and in its token's `policy` fact.
+- `--dry-run` changes nothing. It prints the version and the one it replaces, what the policy holds
+  in a line, the zones it doesn't mint for, the running runs it would revoke (or keep, with
+  `--keep-runs`), and the effect's sha256: what the console signs.
+
+**From the console** (#712). An operator pastes or uploads a policy and its entities and sees the
+same preview (`POST /api/policy/preview`). Applying it is a passkey-signed action (`policy_apply`)
+on that preview, allowed to an operator whose `operators.yaml` authority covers `policy` at R4. The
+decision is audited first (`policy.apply_decided`). Then the console runs `wicket policy apply`
+itself on the policy it staged under `policy/staged/`, with the decision's sequence. That apply
+asks every node as root's does, and applies only if the decision is under 10 minutes old, unused,
+and its effect is still what was signed: no run started or ended in between, and no other apply
+came first. `policy.applied` then names the decision and the passkey; a failure is
+`policy.apply_failed`. Its output is in `policy/apply-<seq>.log`.
 
 ## SymCC in CI
 
