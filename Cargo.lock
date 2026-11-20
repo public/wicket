@@ -4135,6 +4135,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "wicket-authz",
  "wicket-core",
  "wicket-identity",
  "wicket-names",
