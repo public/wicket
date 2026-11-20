@@ -54,7 +54,7 @@ pub fn limits() -> crate::serve::net::Limits {
         max_header_bytes: 16 * 1024,
         max_headers: 64,
         max_body: ik::MAX_BODY,
-        max_connections: 256,
+        max_connections: 128,
         per_ip_connections: 16,
     }
 }
@@ -95,6 +95,16 @@ pub enum Outcome {
     Answer(StatusCode, &'static str),
 }
 
+/// The most body bytes all requests may hold at once (KiB): a request whose body would take it past
+/// this waits briefly, then is answered 503 (#714 review N3). With `MemoryMax=256M` in the unit,
+/// bodies can't take intake down.
+pub const BODY_BUDGET_KIB: usize = 32 * 1024;
+/// How long a request waits for room in the body budget.
+const BODY_BUDGET_WAIT: Duration = Duration::from_secs(2);
+/// How many table polls may fail in a row before intake stops serving (answers 503): the last
+/// table is kept until then, so a busy node doesn't stop every trigger at once.
+const TABLE_FAILURES: u32 = 6;
+
 /// How long intake remembers a delivery it handed to its node (its body's hash and its id), to
 /// answer one sent again 202 without spooling it or charging its trigger (#714 review F2).
 pub const SEEN_SECS: u64 = 86_400;
@@ -117,6 +127,8 @@ pub struct Intake {
     /// Deliveries handed to the node, by (trigger, body hash) and (trigger, delivery id).
     seen: Mutex<HashMap<(String, String), Instant>>,
     refused: Mutex<IntakeRefused>,
+    /// Room for bodies being read, in KiB.
+    bodies: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for Intake {
@@ -130,6 +142,7 @@ impl Default for Intake {
             bad_signatures: Default::default(),
             seen: Default::default(),
             refused: Default::default(),
+            bodies: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET_KIB)),
         }
     }
 }
@@ -184,7 +197,8 @@ impl Intake {
         };
         match found {
             // Served, but its secret didn't read this time: try later, and nobody's failure.
-            Some(t) if t.unavailable => Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later")),
+            // (A key too short to verify with is treated so too: #714 review E.)
+            Some(t) if t.unavailable || !ik::secret_ok(&t.secret) => Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later")),
             Some(t) => Ok(t),
             None => {
                 let key = crate::serve::limits::ip_key(ip);
@@ -215,13 +229,19 @@ impl Intake {
 
     /// Remembers a delivery the node took.
     pub fn remember(&self, e: &IntakeEvent, at: Instant) {
+        self.remember_keys(&e.trigger, &e.raw_sha256, &e.delivery, at);
+    }
+
+    /// Remembers a verified delivery by its trigger, hash and id: one the node took, or one intake
+    /// dropped (an event or repository not listened to), so that its replays cost nothing.
+    fn remember_keys(&self, trigger: &str, raw: &str, delivery: &str, at: Instant) {
         let mut m = self.seen.lock().expect("seen");
         while m.len() + 2 > SEEN_MAX {
             let Some(oldest) = m.iter().min_by_key(|(_, w)| **w).map(|(k, _)| k.clone()) else { break };
             m.remove(&oldest);
         }
-        m.insert((e.trigger.clone(), format!("b:{}", e.raw_sha256)), at);
-        m.insert((e.trigger.clone(), format!("d:{}", e.delivery)), at);
+        m.insert((trigger.to_string(), format!("b:{raw}")), at);
+        m.insert((trigger.to_string(), format!("d:{delivery}")), at);
     }
 
     /// With the body: the signature, a delivery seen before, then (verified and new) the trigger's
@@ -254,25 +274,58 @@ impl Intake {
                 false => Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down"),
             };
         }
-        let Some(delivery) = ik::delivery_id(delivery_header.as_deref(), body) else {
+        // A generic delivery with no id is named by its whole signed message (time included), so the
+        // same body sent again later is a new delivery (#714 review C); GitHub's by its body.
+        let signed_message = (!github).then(|| {
+            ik::generic_signed(
+                timestamp.as_deref().and_then(|t| t.trim().parse::<i64>().ok()).unwrap_or(0),
+                delivery_header.as_deref().map(str::trim).unwrap_or(""),
+                body,
+            )
+        });
+        let Some(delivery) = ik::delivery_id(delivery_header.as_deref(), signed_message.as_deref().unwrap_or(body)) else {
             self.refused.lock().expect("refused").other += 1;
             return Outcome::Answer(StatusCode::BAD_REQUEST, "bad delivery id");
         };
         // What the event's dedup is keyed on: GitHub's body (its id and time aren't signed), or a
         // generic delivery's whole signed message (time, id and body), so the same body sent again
         // as a new delivery isn't taken for a resend (#714 review F12).
-        let raw = if github {
-            ik::body_sha256(body)
-        } else {
-            let ts = timestamp.as_deref().and_then(|t| t.trim().parse::<i64>().ok()).unwrap_or(0);
-            ik::body_sha256(&ik::generic_signed(ts, delivery_header.as_deref().map(str::trim).unwrap_or(""), body))
-        };
+        let raw = ik::body_sha256(signed_message.as_deref().unwrap_or(body));
         // Sent again (a replay, or a resend): 202, nothing spooled, nothing charged (#714 review F2).
         if self.seen(&t.trigger, &raw, &delivery, at) {
             return Outcome::Answer(StatusCode::ACCEPTED, "already had it");
         }
-        // Only a verified, new delivery counts against its trigger: a leaked URL or a replayed body
-        // alone can't starve it.
+        // What wicket will never fire on is answered 202 (so GitHub doesn't send it again) and
+        // remembered, before the trigger's rate: a delivery the trigger doesn't listen to, sent once
+        // or replayed, never uses it up (#714 review N1).
+        let (kind, fields) = if github {
+            let event = header(ik::GITHUB_EVENT).unwrap_or_default();
+            let v = serde_json::from_slice::<serde_json::Value>(body).ok();
+            // The event header isn't signed: the body must be that event's (#714 review B).
+            let drop = match &v {
+                None => Some("not json"),
+                Some(_) if !t.events.contains(&event) => Some("not listened to"),
+                Some(v) if !ik::github_body_is(&event, v) => Some("not that event"),
+                // GitHub's repository names ignore case.
+                Some(v) => match (ik::github_repo(v), t.repo.as_deref()) {
+                    (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => None,
+                    _ => Some("another repository"),
+                },
+            };
+            if let Some(why) = drop {
+                if why != "not listened to" {
+                    self.refused.lock().expect("refused").other += 1;
+                }
+                self.remember_keys(&t.trigger, &raw, &delivery, at);
+                return Outcome::Answer(if why == "not json" { StatusCode::BAD_REQUEST } else { StatusCode::ACCEPTED }, why);
+            }
+            let v = v.expect("checked");
+            (event.clone(), ik::github_fields(&event, &v))
+        } else {
+            ("webhook".to_string(), ik::generic_fields(body))
+        };
+        // Only a verified, new delivery its trigger listens to counts against it: a leaked URL or a
+        // replayed body alone can't starve it.
         {
             let mut b = self.buckets.lock().expect("buckets");
             let mine = b.entry(t.trigger.clone()).or_insert_with(|| Bucket::full(PER_TRIGGER_BURST, at));
@@ -282,29 +335,6 @@ impl Intake {
                 return Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down");
             }
         }
-        let (kind, fields) = if github {
-            let event = header(ik::GITHUB_EVENT).unwrap_or_default();
-            // What wicket will never fire on is answered 202, so GitHub doesn't send it again.
-            if !t.events.contains(&event) {
-                return Outcome::Answer(StatusCode::ACCEPTED, "not listened to");
-            }
-            let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-                self.refused.lock().expect("refused").other += 1;
-                return Outcome::Answer(StatusCode::BAD_REQUEST, "not json");
-            };
-            // GitHub's repository names ignore case.
-            let same_repo = match (ik::github_repo(&v), t.repo.as_deref()) {
-                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                _ => false,
-            };
-            if !same_repo {
-                self.refused.lock().expect("refused").other += 1;
-                return Outcome::Answer(StatusCode::ACCEPTED, "another repository");
-            }
-            (event.clone(), ik::github_fields(&event, &v))
-        } else {
-            ("webhook".to_string(), ik::generic_fields(body))
-        };
         Outcome::Spool(Box::new(IntakeEvent {
             id: String::new(),
             trigger: t.trigger.clone(),
@@ -346,15 +376,23 @@ pub async fn serve(listen: std::net::SocketAddr, tls: Option<(PathBuf, PathBuf)>
     {
         let (i, s) = (intake.clone(), sock.clone());
         tokio::spawn(async move {
+            let mut failed = 0u32;
             loop {
                 match ask(&s, &serde_json::json!({ "op": "table" })).await {
                     Ok(v) => match serde_json::from_value::<Vec<IntakeTrigger>>(v["triggers"].clone()) {
-                        Ok(t) => i.set_table(t, v["ready"].as_bool().unwrap_or(false)),
+                        Ok(t) => {
+                            failed = 0;
+                            i.set_table(t, v["ready"].as_bool().unwrap_or(false));
+                        }
                         Err(e) => eprintln!("wicket intake: the node's table doesn't read: {e}"),
                     },
                     Err(e) => {
-                        // Not served while the node can't be asked: every delivery is a 503 meanwhile.
-                        i.set_table(vec![], false);
+                        // The last table is kept through a failed poll (a busy node); only once the
+                        // node can't be asked for a minute is every delivery a 503.
+                        failed += 1;
+                        if failed >= TABLE_FAILURES {
+                            i.set_table(vec![], false);
+                        }
                         eprintln!("wicket intake: {e:#}");
                     }
                 }
@@ -505,8 +543,19 @@ async fn handle(
         i.refused.lock().expect("refused").other += 1;
         return Ok(answer(StatusCode::PAYLOAD_TOO_LARGE, "too large"));
     }
+    // Room for the body in the budget, before any of it is read: its announced length, or the cap.
+    let announced = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(ik::MAX_BODY);
+    let kib = announced.min(ik::MAX_BODY).div_ceil(1024).max(1) as u32;
+    let Ok(Ok(_room)) = tokio::time::timeout(BODY_BUDGET_WAIT, i.bodies.clone().acquire_many_owned(kib)).await else {
+        return Ok(answer(StatusCode::SERVICE_UNAVAILABLE, "busy"));
+    };
     let headers = req.headers().clone();
-    let body = match tokio::time::timeout(body_timeout, Limited::new(req.into_body(), ik::MAX_BODY).collect()).await {
+    let body = match tokio::time::timeout(body_timeout, Limited::new(req.into_body(), announced.min(ik::MAX_BODY)).collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
         Ok(Err(_)) => {
             i.refused.lock().expect("refused").other += 1;

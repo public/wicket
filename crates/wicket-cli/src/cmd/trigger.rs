@@ -199,7 +199,7 @@ pub async fn dispatch(c: TriggerCmd) -> Result<()> {
             Ok(())
         }
         TriggerCmd::RotateUrl { trigger } => {
-            let (t, node, token) = tr::intake::rotate_url(&l, &op, is_root(), &find(&l, &op, &trigger)?.id)?;
+            let (t, node, token) = tr::intake::rotate_url(&l, &op, wicket_home::cli_is_root(), &find(&l, &op, &trigger)?.id)?;
             println!("trigger {} ({}) has a new URL; the old one stops working within a reconcile pass", t.name, t.id);
             print_url(&node, &format!("/hook/{}/{token}", t.id));
             Ok(())

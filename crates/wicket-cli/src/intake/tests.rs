@@ -9,7 +9,7 @@ fn trig(kind: &str, token: &str) -> IntakeTrigger {
         trigger: "trg_1".into(),
         kind: kind.into(),
         token_sha256: ik::token_sha256(token),
-        secret: "s3cret".into(),
+        secret: "s3cret-s3cret-s3cret".into(),
         repo: (kind == "github").then(|| "acme/app".to_string()),
         events: if kind == "github" { vec!["check_suite".into()] } else { vec![] },
         unavailable: false,
@@ -17,7 +17,7 @@ fn trig(kind: &str, token: &str) -> IntakeTrigger {
 }
 
 fn github_sig(body: &[u8]) -> String {
-    format!("sha256={}", hex::encode(ik::hmac_sha256(b"s3cret", body)))
+    format!("sha256={}", hex::encode(ik::hmac_sha256(b"s3cret-s3cret-s3cret", body)))
 }
 
 fn headers(h: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
@@ -27,7 +27,7 @@ fn headers(h: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
 
 fn generic(ts: i64, id: &str, body: &[u8]) -> impl Fn(&str) -> Option<String> {
     headers(&[
-        (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret", ts, id, body)),
+        (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", ts, id, body)),
         (ik::GENERIC_TIMESTAMP, ts.to_string()),
         (ik::GENERIC_DELIVERY, id.to_string()),
     ])
@@ -72,7 +72,7 @@ fn a_captured_generic_delivery_cant_be_replayed() {
     let i = ready(vec![trig("webhook", &token)]);
     let t = i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()).unwrap();
     let body = br#"{"a":1}"#;
-    let sig = ik::generic_signature(b"s3cret", 1000, "d-1", body);
+    let sig = ik::generic_signature(b"s3cret-s3cret-s3cret", 1000, "d-1", body);
     let replay = |id: &str, now: i64| {
         let h = headers(&[(ik::GENERIC_SIGNATURE, sig.clone()), (ik::GENERIC_TIMESTAMP, "1000".into()), (ik::GENERIC_DELIVERY, id.into())]);
         i.verify(&t, &h, body, now, Instant::now())
@@ -96,14 +96,18 @@ fn a_github_delivery_keeps_its_fields() {
     }))
     .unwrap();
     let h = |event: &str, body: &[u8]| {
-        headers(&[(ik::GITHUB_SIGNATURE, github_sig(body)), (ik::GITHUB_EVENT, event.into()), (ik::GITHUB_DELIVERY, "g-1".into())])
+        headers(&[
+            (ik::GITHUB_SIGNATURE, github_sig(body)),
+            (ik::GITHUB_EVENT, event.into()),
+            (ik::GITHUB_DELIVERY, format!("{event}-{}", ik::body_sha256(body))),
+        ])
     };
     let at = Instant::now();
     let t = i.admit(&path, IP, at).unwrap();
     let Outcome::Spool(e) = i.verify(&t, &h("check_suite", &body), &body, 5, at) else { panic!("refused") };
     assert_eq!((e.kind.as_str(), e.fields["pr"]["number"].as_i64()), ("check_suite", Some(9)));
     assert_eq!(i.verify(&t, &h("push", &body), &body, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not listened to"));
-    let elsewhere = serde_json::to_vec(&serde_json::json!({ "repository": { "full_name": "evil/app" } })).unwrap();
+    let elsewhere = serde_json::to_vec(&serde_json::json!({ "check_suite": {}, "repository": { "full_name": "evil/app" } })).unwrap();
     assert_eq!(i.verify(&t, &h("check_suite", &elsewhere), &elsewhere, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "another repository"));
     // The generic header doesn't sign a GitHub delivery.
     let generic = headers(&[(ik::GENERIC_SIGNATURE, github_sig(&body)), (ik::GITHUB_EVENT, "check_suite".into())]);
@@ -159,7 +163,8 @@ fn a_replayed_body_doesnt_use_up_the_trigger() {
     let i = ready(vec![trig("github", &token)]);
     let t = i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()).unwrap();
     let at = Instant::now();
-    let body = |n: u32| serde_json::to_vec(&serde_json::json!({ "n": n, "repository": { "full_name": "acme/app" } })).unwrap();
+    let body =
+        |n: u32| serde_json::to_vec(&serde_json::json!({ "n": n, "check_suite": {}, "repository": { "full_name": "acme/app" } })).unwrap();
     let h = |b: &[u8], id: &str| {
         headers(&[(ik::GITHUB_SIGNATURE, github_sig(b)), (ik::GITHUB_EVENT, "check_suite".into()), (ik::GITHUB_DELIVERY, id.into())])
     };
@@ -174,6 +179,69 @@ fn a_replayed_body_doesnt_use_up_the_trigger() {
     }
     let real = body(1);
     assert!(matches!(i.verify(&t, &h(&real, "g-1"), &real, 5, at), Outcome::Spool(_)), "the real delivery still goes through");
+}
+
+/// #714 review N1: a delivery of an event the trigger doesn't listen to (or of another repository,
+/// or a body that isn't the event it says), replayed, never uses up the trigger: it is answered 202
+/// and remembered before the rate, so the real delivery after it goes through.
+#[test]
+fn unlistened_replays_dont_starve_the_trigger() {
+    let token = ik::new_token().unwrap();
+    let i = ready(vec![trig("github", &token)]);
+    let t = i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()).unwrap();
+    let at = Instant::now();
+    let star = serde_json::to_vec(&serde_json::json!({ "action": "created", "repository": { "full_name": "acme/app" } })).unwrap();
+    let h = |b: &[u8], event: &str, id: &str| {
+        headers(&[(ik::GITHUB_SIGNATURE, github_sig(b)), (ik::GITHUB_EVENT, event.into()), (ik::GITHUB_DELIVERY, id.into())])
+    };
+    assert_eq!(i.verify(&t, &h(&star, "star", "s-0"), &star, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not listened to"));
+    for n in 1..40 {
+        let o = i.verify(&t, &h(&star, "star", &format!("s-{n}")), &star, 5, at);
+        assert_eq!(o, Outcome::Answer(StatusCode::ACCEPTED, "already had it"), "replay {n}");
+    }
+    // The same body claimed as a check suite: not that event.
+    assert_eq!(i.verify(&t, &h(&star, "check_suite", "s-x"), &star, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "already had it"));
+    let other = serde_json::to_vec(&serde_json::json!({ "issue": { "number": 1 }, "repository": { "full_name": "acme/app" } })).unwrap();
+    assert_eq!(i.verify(&t, &h(&other, "check_suite", "i-1"), &other, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not that event"));
+    let real =
+        serde_json::to_vec(&serde_json::json!({ "check_suite": { "conclusion": "failure" }, "repository": { "full_name": "acme/app" } }))
+            .unwrap();
+    assert!(matches!(i.verify(&t, &h(&real, "check_suite", "g-1"), &real, 5, at), Outcome::Spool(_)), "the real delivery goes through");
+}
+
+/// #714 review C: a generic delivery with no id is named by its signed message, time included, so
+/// the same body sent again later is a new delivery, not "already had it".
+#[test]
+fn the_same_generic_body_later_is_a_new_delivery() {
+    let token = ik::new_token().unwrap();
+    let i = ready(vec![trig("webhook", &token)]);
+    let t = i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()).unwrap();
+    let at = Instant::now();
+    let send = |ts: i64| {
+        let h = headers(&[
+            (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", ts, "", b"{}")),
+            (ik::GENERIC_TIMESTAMP, ts.to_string()),
+        ]);
+        i.verify(&t, &h, b"{}", ts, at)
+    };
+    let Outcome::Spool(a) = send(1000) else { panic!("refused") };
+    i.remember(&a, at);
+    assert_eq!(send(1000), Outcome::Answer(StatusCode::ACCEPTED, "already had it"), "the same send again");
+    let Outcome::Spool(b) = send(1060) else { panic!("a minute later: a new delivery") };
+    assert_ne!(a.delivery, b.delivery);
+}
+
+/// #714 review E: a trigger whose key is too short to verify with is answered 503, not served.
+#[test]
+fn a_short_key_isnt_served() {
+    let token = ik::new_token().unwrap();
+    let mut t = trig("webhook", &token);
+    t.secret = "k".into();
+    let i = ready(vec![t]);
+    assert_eq!(
+        i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()),
+        Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later"))
+    );
 }
 
 /// #714 review F5: a trigger whose secret didn't read is answered 503, and counts as nobody's failure.
@@ -291,7 +359,7 @@ async fn the_service_hands_verified_deliveries_to_its_node() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let h = |id: &str, body: &[u8]| {
         vec![
-            (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret", now, id, body)),
+            (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", now, id, body)),
             (ik::GENERIC_TIMESTAMP, now.to_string()),
             (ik::GENERIC_DELIVERY, id.to_string()),
         ]
@@ -345,6 +413,29 @@ async fn the_server_is_bounded() {
     // A slow body: its headers whole, then too little: 408.
     let slow_body = format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{{");
     assert!(send(s.addr, slow_body.as_bytes()).await.starts_with("HTTP/1.1 408"));
+    // The body budget: bodies held half-sent past it make the next request wait, then get 503.
+    drop(s);
+    let lim = crate::serve::net::Limits { max_connections: 64, per_ip_connections: 64, body_timeout: Duration::from_secs(10), ..limits() };
+    let s = served("budget", &token, lim).await;
+    let mut holding = vec![];
+    for _ in 0..(BODY_BUDGET_KIB / 1024) {
+        let mut c = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+        c.write_all(format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{{", ik::MAX_BODY).as_bytes()).await.unwrap();
+        holding.push(c);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let busy =
+        send(s.addr, format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}").as_bytes()).await;
+    assert!(busy.starts_with("HTTP/1.1 503"), "{busy}");
+    drop(holding);
+    let lim = crate::serve::net::Limits {
+        header_timeout: Duration::from_millis(300),
+        body_timeout: Duration::from_millis(300),
+        max_connections: 2,
+        per_ip_connections: 2,
+        ..limits()
+    };
+    let s = served("bounds2", &token, lim).await;
     // The connection cap: two held open, a third is closed at once.
     let mut held = vec![];
     for _ in 0..2 {
