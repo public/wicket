@@ -77,7 +77,7 @@ default: anything            # for operators not listed: anything (the default),
 operators:
   unix/alice: anything
   passkey/laptop:
-    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority
+    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority, fence
     hosts: ["*.example.com"] # for http requests: these hosts only (absent: any)
     max_risk: R2             # the highest risk it may decide (absent: any)
   unix/auditor: nothing      # may list requests, decides none
