@@ -155,13 +155,17 @@ pub fn github_body_is(event: &str, body: &Value) -> bool {
     // Each event's own objects, and none of a sibling event's: a review's or a comment's body isn't
     // the pull request's or the issue's, and only a push has `after` with its commits or pusher
     // (#714 fourth review, B).
+    // A review thread's body (`pull_request_review_thread`) has the pull request and a `thread`; a
+    // deployment's or its status's has a `deployment`, and may carry a check run or workflow run
+    // (#714 fifth review).
     let fits = match event {
-        "pull_request" => !has("/review") && !has("/comment"),
-        "pull_request_review" => has("/review") && !has("/comment"),
-        "pull_request_review_comment" => has("/comment") && !has("/review"),
+        "pull_request" => !has("/review") && !has("/comment") && !has("/thread"),
+        "pull_request_review" => has("/review") && !has("/comment") && !has("/thread"),
+        "pull_request_review_comment" => has("/comment") && !has("/review") && !has("/thread"),
         "issues" => !has("/comment"),
         "issue_comment" => has("/comment"),
         "push" => has("/after") && (has("/commits") || has("/pusher")),
+        "check_suite" | "check_run" | "workflow_run" => !has("/deployment") && !has("/deployment_status"),
         _ => true,
     };
     has(p) && fits
@@ -559,6 +563,14 @@ mod tests {
         assert!(!github_body_is("push", &create), "nor a create");
         let push = serde_json::json!({ "ref": "refs/heads/main", "after": "abc", "commits": [], "pusher": { "name": "a" } });
         assert!(github_body_is("push", &push));
+        // #714 fifth review: a review thread isn't a pull request, nor a deployment a run.
+        let thread = serde_json::json!({ "pull_request": { "number": 1 }, "thread": { "comments": [] } });
+        assert!(!github_body_is("pull_request", &thread) && !github_body_is("pull_request_review", &thread));
+        let status = serde_json::json!({ "deployment_status": {}, "deployment": {}, "check_run": {}, "workflow_run": {} });
+        assert!(!github_body_is("check_run", &status) && !github_body_is("workflow_run", &status));
+        let deployment = serde_json::json!({ "deployment": {}, "workflow_run": {} });
+        assert!(!github_body_is("workflow_run", &deployment));
+        assert!(github_body_is("check_run", &serde_json::json!({ "check_run": { "deployment": {} } })), "a run's own deployment is fine");
     }
 
     #[test]
