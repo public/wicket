@@ -497,7 +497,9 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
                 "agent.wake_refused",
                 &serde_json::json!({ "agent": a.id, "by": by, "why": why, "until_ms": until }),
             )?;
-            bail!("agent {} can't be woken yet: {why}", a.id);
+            // Refused (#574), as when another wake holds the claim: of two wakes at once, the loser
+            // lands here instead once the winner has started its run.
+            return Err(wicket_home::exit::refused(format!("agent {} not woken yet: {why}", a.id)));
         }
         // The same fence in the ledger (#446), which `claim_wake` keeps: a run of the agent still
         // recorded running, its authority not ended. It holds where this host's run files don't,
@@ -514,7 +516,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
                     "agent.wake_refused",
                     &serde_json::json!({ "agent": a.id, "by": by, "why": why, "until_ms": until.saturating_mul(1000) }),
                 )?;
-                bail!("agent {} can't be woken yet: {why}", a.id);
+                return Err(wicket_home::exit::refused(format!("agent {} not woken yet: {why}", a.id)));
             }
         }
         // Where it last ran (its run before this wake): only a tie-break when placing it.
