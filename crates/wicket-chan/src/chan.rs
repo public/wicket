@@ -45,11 +45,12 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 2, a connection talks
-/// 16, 17 or 18, so only the versions above 15 have a check here; the checks for features of 14 and
+/// 18, 19 or 20; checks for the versions from 15 to 19 remain until changes of their own take
+/// them out. The checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
-pub const PROTOCOL: u32 = 19;
+pub const PROTOCOL: u32 = 20;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -71,6 +72,10 @@ pub const NAMES: u32 = 18;
 /// record (an older node's strict parse refuses the record, and its whole feed with it). The
 /// control host never sends a zone using it over a connection below this.
 pub const DECODE_SLASH: u32 = 19;
+/// The first protocol version with webhook intake (#578 step 4): the control host sends a node
+/// [`Msg::IntakeSync`] and the node answers [`Msg::IntakeEvents`]. Only a node at this version is
+/// chosen for a webhook trigger's intake.
+pub const INTAKE: u32 = 20;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -634,7 +639,31 @@ pub enum Msg {
         from: crate::registry::Source,
     },
 
+    /// Webhook intake (#578 step 4, protocol [`INTAKE`]): the triggers this node's intake serves
+    /// (the whole table, replacing the last), and the events the control host has recorded, which
+    /// the node deletes from its spool. Answered with [`Msg::IntakeEvents`].
+    IntakeSync {
+        id: u64,
+        triggers: Vec<wicket_core::intake::IntakeTrigger>,
+        ack: Vec<String>,
+        /// Every trigger still assigned to the node, `triggers`' and those left out of it this time
+        /// (a secret that didn't read): the node drops spooled events only for triggers not here.
+        #[serde(default)]
+        serving: Vec<String>,
+        /// Triggers whose events the control host holds this pass (their owner couldn't be
+        /// checked): kept in the spool and not sent, so they don't crowd out the others'.
+        #[serde(default)]
+        hold: Vec<String>,
+    },
     // ---- node → control host ----
+    /// Answer to [`Msg::IntakeSync`]: spooled events, oldest first (bounded), and what intake
+    /// refused since the last sync.
+    IntakeEvents {
+        id: u64,
+        events: Vec<wicket_core::intake::IntakeEvent>,
+        refused: wicket_core::intake::IntakeRefused,
+        error: Option<String>,
+    },
     /// Answer to [`Msg::BoxCtl`] or [`Msg::Listen`].
     BoxCtlDone {
         id: u64,
@@ -1282,25 +1311,45 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build has no checks for features of protocol 16 or before: with [`PROTOCOL_SKEW`]
-    /// 2 and protocol 19 (#664), every connection talks 17, 18 or 19. 15's message reads (#445)
-    /// and 16's prefix grants (#257 4a) are on every connection (15's keeps its check until it goes
-    /// in a change of its own); 17's standing reach (#572), 18's names (#575) and 19's decoded
-    /// slashes keep theirs while a peer at 17 or 18 can connect.
+    /// With [`PROTOCOL_SKEW`] 2 and protocol 20 (#578's intake), every connection talks 18, 19 or
+    /// 20. 17's standing reach is on every connection now (its check goes in a change of its own);
+    /// 18's names, 19's decoded slashes and 20's intake keep theirs while a peer below them can
+    /// connect.
     #[test]
-    fn no_connection_talks_below_protocol_17() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH), (19, 2, 15, 16, 17, 18, 19));
+    fn no_connection_talks_below_protocol_18() {
+        assert_eq!(
+            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, INTAKE),
+            (20, 2, 15, 16, 17, 18, 19, 20)
+        );
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((17..=19).contains(&at) && (17..=21).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(17..=21).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((18..=20).contains(&at) && (18..=22).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(18..=22).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 20 or 21 talking to a control host at 19 from the other side.
-        assert_eq!((negotiate(20, PROTOCOL), negotiate(21, PROTOCOL)), (Ok(19), Ok(19)));
-        assert!(negotiate(17, PROTOCOL).unwrap() < NAMES, "a node at 17 sends no RequestName");
+        // And a node at 21 or 22 talking to a control host at 20 from the other side.
+        assert_eq!((negotiate(21, PROTOCOL), negotiate(22, PROTOCOL)), (Ok(20), Ok(20)));
         assert!(negotiate(18, PROTOCOL).unwrap() < DECODE_SLASH, "a node at 18 gets no zone that decodes a slash");
-        assert!(negotiate(PROTOCOL, 16).is_err() && negotiate(16, PROTOCOL).is_err());
+        assert!(negotiate(19, PROTOCOL).unwrap() < INTAKE, "a node at 19 is no intake node");
+        assert!(negotiate(PROTOCOL, 17).is_err() && negotiate(17, PROTOCOL).is_err());
+    }
+
+    /// #578 step 4: an intake trigger's secret never shows in a debug print.
+    #[test]
+    fn an_intake_triggers_secret_isnt_printed() {
+        let t = wicket_core::intake::IntakeTrigger {
+            trigger: "trg_1".into(),
+            kind: "github".into(),
+            token_sha256: "ab".into(),
+            secret: "hunter2".into(),
+            repo: Some("acme/app".into()),
+            events: vec!["check_suite".into()],
+            unavailable: false,
+        };
+        assert!(!format!("{t:?}").contains("hunter2"));
+        let m = Msg::IntakeSync { id: 1, triggers: vec![t.clone()], ack: vec!["s1".into()], serving: vec!["trg_1".into()], hold: vec![] };
+        let back: Msg = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert!(matches!(back, Msg::IntakeSync { triggers, .. } if triggers == [t]));
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start

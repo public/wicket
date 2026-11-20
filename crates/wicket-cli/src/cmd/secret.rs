@@ -73,6 +73,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     v.set_hosts(&name, &hosts)?;
                     println!("secret {name}: {}", secret_hosts_line(&v, &name));
                 }
+                SecretCmd::Verify { name } => {
+                    if !v.has(&name) {
+                        return Err(wicket_home::exit::not_found(format!("no secret {name}")));
+                    }
+                    v.set_verify(&name)?;
+                    println!("secret {name}: {}", secret_hosts_line(&v, &name));
+                }
                 SecretCmd::Rm { name } => {
                     if !v.has(&name) {
                         return Err(wicket_home::exit::not_found(format!("no secret {name}")));
@@ -111,6 +118,9 @@ pub enum SecretCmd {
     /// when the control host next checks that run's secrets, within seconds while connected (#152).
     #[command(name = "remove", alias = "rm")]
     Rm { name: String },
+    /// Make a secret a verify secret (#578): a webhook trigger's HMAC key, used only to check its
+    /// deliveries' signatures. It is sent to no host, and can't be bound to one.
+    Verify { name: String },
     /// Bind a secret to the only host names it may be sent to, replacing its list.
     Hosts {
         name: String,
@@ -258,7 +268,9 @@ pub(crate) fn link(
 /// Where a secret may be sent, for terminals.
 pub(crate) fn secret_hosts_line(v: &Vault, name: &str) -> String {
     let h = v.hosts(name);
-    if h.is_empty() {
+    if v.is_verify(name) {
+        "verifies trigger deliveries; sent to no host".to_string()
+    } else if h.is_empty() {
         format!("sent to no host (bind it: wicket secret hosts {name} --hosts HOST[,HOST])")
     } else {
         format!("sent only to {}", h.join(", "))

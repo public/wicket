@@ -188,8 +188,16 @@ fn pid_alive(pidfile: &std::path::Path) -> bool {
 }
 
 /// Whether process `pid` runs a wicket binary: its executable's name, or failing that (another
-/// user's process, whose `exe` can't be read) its command line's first word.
+/// user's process, whose `exe` can't be read) its command line's first word. A thread's id isn't a
+/// process: `/proc` answers for it too, with its process's executable, but a pid file never names
+/// one (a stale file's number may have gone to a thread of some wicket since, #663).
 fn is_wicket(pid: i32) -> bool {
+    let tgid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Tgid:").and_then(|v| v.trim().parse::<i32>().ok())));
+    if tgid != Some(pid) {
+        return false;
+    }
     let named = |p: &std::path::Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("wicket"));
     if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
         // A binary replaced by an update reads as "<path> (deleted)".
@@ -389,9 +397,37 @@ mod tests {
     fn a_pid_counts_only_if_it_is_wickets() {
         assert!(is_wicket(std::process::id() as i32), "this test binary is wicket_cli-…");
         let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        assert!(!is_wicket(other.id() as i32), "sleep isn't wicket");
+        let pid = other.id() as i32;
+        // Once it runs sleep (its name says so), whatever the machine's timing.
+        let comm = || std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        for _ in 0..250 {
+            if comm().trim() == "sleep" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let seen = format!(
+            "exe {:?}, cmdline {:?}, comm {:?}",
+            std::fs::read_link(format!("/proc/{pid}/exe")),
+            std::fs::read(format!("/proc/{pid}/cmdline")).map(|c| String::from_utf8_lossy(&c).into_owned()),
+            comm()
+        );
+        assert!(!is_wicket(pid), "sleep isn't wicket: {seen}");
         let _ = other.kill();
         let _ = other.wait();
+        // A thread of this process answers in /proc with this binary, but isn't a process.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            // SAFETY: a plain syscall.
+            tx.send(unsafe { libc::gettid() }).unwrap();
+            let _ = wait.recv();
+        });
+        let tid = rx.recv().unwrap();
+        assert!(std::fs::read_link(format!("/proc/{tid}/exe")).is_ok(), "a thread's id answers in /proc");
+        assert!(!is_wicket(tid), "a thread of wicket isn't a wicket process");
+        go.send(()).unwrap();
+        t.join().unwrap();
         let dir = std::env::temp_dir().join(format!("wicket-pid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("x.pid");

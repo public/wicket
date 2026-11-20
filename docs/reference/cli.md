@@ -53,6 +53,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 - [`wicket hibernate`](#wicket-hibernate)
 - [`wicket trigger`](#wicket-trigger)
   - [`wicket trigger create`](#wicket-trigger-create)
+  - [`wicket trigger rotate-url`](#wicket-trigger-rotate-url)
   - [`wicket trigger list`](#wicket-trigger-list)
   - [`wicket trigger show`](#wicket-trigger-show)
   - [`wicket trigger pause`](#wicket-trigger-pause)
@@ -104,6 +105,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket node revoke`](#wicket-node-revoke)
   - [`wicket node install`](#wicket-node-install)
   - [`wicket node serve`](#wicket-node-serve)
+  - [`wicket node intake`](#wicket-node-intake)
   - [`wicket node top`](#wicket-node-top)
   - [`wicket node forget`](#wicket-node-forget)
   - [`wicket node release-fence`](#wicket-node-release-fence)
@@ -129,6 +131,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket secret set`](#wicket-secret-set)
   - [`wicket secret list`](#wicket-secret-list)
   - [`wicket secret remove`](#wicket-secret-remove)
+  - [`wicket secret verify`](#wicket-secret-verify)
   - [`wicket secret hosts`](#wicket-secret-hosts)
   - [`wicket secret link`](#wicket-secret-link)
   - [`wicket secret serve`](#wicket-secret-serve)
@@ -342,15 +345,16 @@ Triggers (#578): when a schedule or timer comes due, wake or message an agent.
 Usage: wicket trigger <COMMAND>
 
 Commands:
-  create  Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`). The agent it wakes or messages is resolved now (a live agent; a `wake` is kept as the agent's id)
-  list    Triggers that aren't removed: each with its state, source, action and next firing
-  show    One trigger (its id, or its name): its document, agent, state, next firing and last firings
-  pause   Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up)
-  resume  Resume a paused trigger: only its owner (or root), since it fires as its owner
-  renew   Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root)
-  rm      Remove a trigger: it fires nothing again
-  fire    Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now, or for wicket's own events, one of the first kind it listens to
-  help    Print this message or the help of the given subcommand(s)
+  create      Keep a trigger document (YAML) as yours. It fires with your authority, so it asks no one; it is audited (`trigger.created`). The agent it wakes or messages is resolved now (a live agent; a `wake` is kept as the agent's id)
+  rotate-url  A webhook or GitHub trigger's new URL: its old one stops working. Only its owner (or root)
+  list        Triggers that aren't removed: each with its state, source, action and next firing
+  show        One trigger (its id, or its name): its document, agent, state, next firing and last firings
+  pause       Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up)
+  resume      Resume a paused trigger: only its owner (or root), since it fires as its owner
+  renew       Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root)
+  rm          Remove a trigger: it fires nothing again
+  fire        Show what a trigger would do for an event, its templates filled in, changing nothing. The event is a JSON object of the source's fields (--event); without one, a time-told event now, or for wicket's own events, one of the first kind it listens to
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -365,9 +369,25 @@ Keep a trigger document (YAML) as yours. It fires with your authority, so it ask
 Usage: wicket trigger create [OPTIONS] --file <FILE>
 
 Options:
-      --file <FILE>    
-      --lasts <LASTS>  How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew` [default: 30d]
-  -h, --help           Print help
+      --file <FILE>                
+      --lasts <LASTS>              How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew` [default: 30d]
+      --intake-node <INTAKE_NODE>  A webhook or GitHub trigger's intake node (a node labelled wicket.intake=true): needed only when there are several
+      --allow-local-intake         Let the intake node be this host's own (`local`): deliveries from the internet then reach the machine with the ledger and the vault. Off unless asked for
+  -h, --help                       Print help
+```
+
+### `wicket trigger rotate-url`
+
+```text
+A webhook or GitHub trigger's new URL: its old one stops working. Only its owner (or root)
+
+Usage: wicket trigger rotate-url <TRIGGER>
+
+Arguments:
+  <TRIGGER>  
+
+Options:
+  -h, --help  Print help
 ```
 
 ### `wicket trigger list`
@@ -1036,6 +1056,7 @@ Commands:
   revoke         Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
   install        Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node` systemd user service that runs `wicket node serve` there
   serve          On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
+  intake         On the node: webhook intake for triggers (#578; docs/explanation/trigger-intake.md). Takes deliveries for the triggers the control host assigned to this node, checks their token and signature, and hands what it verified to this node's `wicket node serve`, which the control host pulls from. It holds no ledger and no authority (the `wicket-intake` service runs this)
   top            On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
   forget         Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
   release-fence  Release a run's fence without its node (root only, audited as `run.fence_released`): for a run whose node can't confirm its box stopped (unreachable or revoked) and whose fence wouldn't otherwise end, as when its records don't say when its authority ends. Its agent can then be woken. The box may still be running on its node
@@ -1230,6 +1251,23 @@ Usage: wicket node serve [OPTIONS]
 Options:
       --dir <DIR>  The node's directory (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node)
   -h, --help       Print help
+```
+
+### `wicket node intake`
+
+```text
+On the node: webhook intake for triggers (#578; docs/explanation/trigger-intake.md). Takes deliveries for the triggers the control host assigned to this node, checks their token and signature, and hands what it verified to this node's `wicket node serve`, which the control host pulls from. It holds no ledger and no authority (the `wicket-intake` service runs this)
+
+Usage: wicket node intake [OPTIONS] --listen <LISTEN>
+
+Options:
+      --listen <LISTEN>                Where to listen (e.g. `0.0.0.0:8443`)
+      --tls-cert <TLS_CERT>            A certificate chain (PEM) to serve TLS with; without it, plain HTTP behind a reverse proxy that has TLS
+      --tls-key <TLS_KEY>              The certificate's private key (PEM)
+      --socket <SOCKET>                The node's intake socket, which `wicket node serve` listens on for intake (default: `<node dir>/ctl/intake.sock`, for intake run as the node's own user). Run as its own user, intake is given the socket the node's `intake_socket` names
+      --dir <DIR>                      The node's directory, for the default socket (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node)
+      --trusted-proxy <TRUSTED_PROXY>  A reverse proxy in front of intake (an address or a CIDR range; repeatable), whose `X-Forwarded-For` names the client. Without one, the client is the peer
+  -h, --help                           Print help
 ```
 
 ### `wicket node top`
@@ -1610,6 +1648,7 @@ Commands:
   set     Store a secret. Prompts without echo, or reads stdin when it isn't a terminal
   list    List secret names and the host names each may be sent to (never values)
   remove  Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it when the control host next checks that run's secrets, within seconds while connected (#152)
+  verify  Make a secret a verify secret (#578): a webhook trigger's HMAC key, used only to check its deliveries' signatures. It is sent to no host, and can't be bound to one
   hosts   Bind a secret to the only host names it may be sent to, replacing its list
   link    Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
   serve   Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd-user/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
@@ -1651,6 +1690,20 @@ Options:
 Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it when the control host next checks that run's secrets, within seconds while connected (#152)
 
 Usage: wicket secret remove <NAME>
+
+Arguments:
+  <NAME>  
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket secret verify`
+
+```text
+Make a secret a verify secret (#578): a webhook trigger's HMAC key, used only to check its deliveries' signatures. It is sent to no host, and can't be bound to one
+
+Usage: wicket secret verify <NAME>
 
 Arguments:
   <NAME>  

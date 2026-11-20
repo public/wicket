@@ -1192,6 +1192,9 @@ pub enum Settled {
     /// These declined to hibernate (a child running, say): the whole plan is given up on, every
     /// victim's request withdrawn and the room released; only these are spared in this wait.
     Declined(Vec<String>),
+    /// Another wake asked these to stop since: the plan is given up on (every request of its
+    /// withdrawn and the room released, the later wake's request left standing), and none is spared.
+    Taken(Vec<String>),
 }
 
 /// Checks on a preemption `run` made on `p.node` at `asked_ms` (#579 step 4). While its victims
@@ -1216,13 +1219,27 @@ pub fn settle_preemption(
         // A victim whose supervisor declined (its mark cleared: a child running, say) won't stop,
         // so the plan won't make its room: give up on all of it, not only on the decliners, so no
         // other victim hibernates for room that won't come. Only the decliners are spared in this
-        // wait; the others may be chosen again.
-        let (declined, rest): (Vec<String>, Vec<String>) =
-            left.into_iter().partition(|v| !l.preemption_pending(v, &run.0, asked_ms).unwrap_or(false));
-        if !declined.is_empty() {
+        // wait; the others may be chosen again. A victim another wake has asked since (this one's
+        // request past its deadline, say) didn't decline: it stops for that wake, whose room it is,
+        // so this plan is given up on too, but the victim isn't spared.
+        let (mut declined, mut taken, mut rest) = (vec![], vec![], vec![]);
+        for v in left {
+            match l.preemption_mark(&v, now_ms)? {
+                None => declined.push(v),
+                Some(m) if m.for_run.as_deref() == Some(run.0.as_str()) && m.asked_ms == asked_ms => rest.push(v),
+                Some(_) => taken.push(v),
+            }
+        }
+        if !declined.is_empty() || !taken.is_empty() {
+            let others = if declined.is_empty() {
+                "another wake asked another of the plan's boxes to stop since"
+            } else {
+                "another of the plan's boxes declined to hibernate"
+            };
             abandon_preemption(l, run, ask, p, &declined, asked_ms, now_ms, "it declined to hibernate", false)?;
-            abandon_preemption(l, run, ask, p, &rest, asked_ms, now_ms, "another of the plan's boxes declined to hibernate", true)?;
-            return Ok(Settled::Declined(declined));
+            abandon_preemption(l, run, ask, p, &taken, asked_ms, now_ms, "another wake asked it to stop since", false)?;
+            abandon_preemption(l, run, ask, p, &rest, asked_ms, now_ms, others, true)?;
+            return Ok(if declined.is_empty() { Settled::Taken(taken) } else { Settled::Declined(declined) });
         }
         let left = rest;
         if now_ms - asked_ms < PREEMPT_DEADLINE.as_millis() as i64 {
@@ -1463,6 +1480,14 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
                         PREEMPT_DEADLINE.as_secs()
                     );
                     spare.extend(left);
+                    pending = None;
+                }
+                Settled::Taken(left) => {
+                    say!(
+                        "[wicket] gave up preempting for agent {}: another wake asked {} to stop since (audited; the room is released)",
+                        agent.id,
+                        left.join(", "),
+                    );
                     pending = None;
                 }
                 Settled::Declined(left) => {
@@ -2502,6 +2527,32 @@ mod tests {
         assert_eq!(l.agent("agt_batch2").unwrap().unwrap().want.as_deref(), Some(PREEMPT_WANT), "the later request stands");
         assert!(end_wait(&l, &run, &ask, later, false).unwrap().is_empty(), "run_new has asked nothing of it since");
         assert_eq!(l.agent("agt_batch2").unwrap().unwrap().want.as_deref(), Some(PREEMPT_WANT));
+    }
+
+    /// #579 step 4 (review): a victim another wake has asked since isn't taken for a decline: the
+    /// plan is given up on, the later wake's request stands, and the victim isn't spared.
+    #[test]
+    fn a_victim_another_wake_asked_since_is_no_decline() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let now = (wicket_store::now() - 5) * 1000;
+        let n1 = crowded(&mut l, now);
+        let ask = asking("t0", 5);
+        let run = RunId("run_new".into());
+        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        l.mark_preempted("run_batch", now + 1_000, "run_late").unwrap();
+        assert_eq!(settle_preemption(&l, &run, &ask, &p, now, now + 2_000).unwrap(), Settled::Taken(vec!["run_batch".into()]));
+        let m = l.preemption_mark("run_batch", now + 2_000).unwrap().unwrap();
+        assert_eq!(m.for_run.as_deref(), Some("run_late"), "the later request stands");
+        assert_eq!(l.agent("agt_batch").unwrap().unwrap().want.as_deref(), Some(PREEMPT_WANT));
+        assert_eq!(l.placement("run_new").unwrap().unwrap().state, "released");
+        let kinds: Vec<(String, String)> = l
+            .audit_records_after(0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.kind.starts_with("placement.preempt_"))
+            .map(|a| (a.kind, serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["why"].as_str().unwrap_or_default().to_string()))
+            .collect();
+        assert_eq!(kinds, [("placement.preempt_abandoned".to_string(), "another wake asked it to stop since".to_string())]);
     }
 
     /// #579 step 4 (review): a wake that fails, by any path, withdraws every preemption made for it.
