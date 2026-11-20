@@ -92,12 +92,17 @@ nested fields with dots (`pr.number`).
   newest record, and a record more than 15 minutes old when read (the reconciler was down) is
   passed over.
 - **Chains of triggers.** Each turn a trigger queues records the triggers that led to it. A
-  record of the run that read the turn carries those triggers on. A trigger never fires on a
-  record its own firing led to, however many triggers came between (A wakes B, B wakes A, stops
-  at the second A), and no record fires a fifth trigger in a row. These are skipped and audited
-  (`trigger.skipped`). Only what a trigger queued is followed. If an agent a trigger woke goes on
-  to message another agent itself, that is the agent's doing, and the second agent's records
-  don't carry the chain.
+  record of the run that read the turn carries those triggers on: every trigger that ever queued
+  a turn for that run, and the length of the longest single chain among them.
+  - **No loops.** A trigger never fires on a record of a run any of its own turns reached (A wakes
+    B, B wakes A, stops at the second A). So a trigger about an agent's own records, which also
+    messages that agent, fires once per activation.
+  - **No long chains.** No record fires a trigger at the end of a chain of four. Four unrelated
+    schedules messaging one agent are four chains of one, not one of four.
+  - These are skipped and audited (`trigger.skipped`).
+  - **Only what a trigger queued is followed.** An agent a trigger woke that messages another
+    agent, or spawns a child, does so itself: the other agent's or the child's records don't carry
+    the chain. A loop through them is bounded only by each trigger's `per_hour`.
 - **Quoted input.** Because body fields can hold an agent's words, every text field these
   triggers fill into a message is a JSON string, `"…"`. Quote marks inside are escaped, a long
   value is cut inside its quotes, and the turn ends by saying the quoted text is the event's data,
@@ -115,11 +120,18 @@ wicket trigger renew morning-triage --lasts 30d           # 30 more days from no
 A trigger you make fires with your authority, so it asks no one. It is audited
 (`trigger.created`, with the agent it reaches). Before every firing wicket checks again that you
 may still have it fire. It checks `operators.yaml` and, on a host with wicketd, its policy's run
-class for your unix user. If you can't, the trigger is paused, with the reason audited. If wicket
-can't tell (the user database doesn't answer, or a policy file doesn't read), that firing is
-skipped and audited, and the trigger stays active for the next pass. One owner may keep at most
-100 live triggers (done timers aren't counted). Renewing a trigger changes only when it lapses,
-not which minutes it fires for.
+class for your unix user. If you can't, the trigger is paused, with the reason audited.
+
+If wicket can't tell (the user database or a group lookup fails, or a policy file doesn't read),
+that firing is skipped, audited at most once an hour, and the trigger stays active. For wicket's
+own events that trigger alone is held at the record before: other triggers go on hearing what
+follows, and once its owner checks out it hears the records it missed (except those that are
+more than 15 minutes old by then, which it passes over). One limit: the system call that lists a user's groups can't report a failed lookup, and
+a short list reads as not being in a group, which pauses the trigger.
+
+One owner may keep at most 100 live triggers (done timers aren't counted). Renewing a live trigger
+changes only when it lapses, not which minutes it fires for. Renewing one that had lapsed brings it
+back from now, as resuming does: the time it was lapsed isn't caught up.
 
 ## See what it would do
 

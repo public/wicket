@@ -55,7 +55,8 @@ pub use standing::{
     Standing, StandingTerms, AGENT_ASKS_PREFIX, EVIDENCE_SECS as STANDING_EVIDENCE_SECS, MAX_PENDING as STANDING_MAX_PENDING,
 };
 pub use triggers::{
-    Firing as TriggerFiring, Trigger, TriggerEvent, FIRING_STATES as TRIGGER_FIRING_STATES, MAX_TRIGGERS_PER_OWNER, TRIGGER_RETENTION_SECS,
+    Chain as TriggerChain, Firing as TriggerFiring, Trigger, TriggerEvent, FIRING_STATES as TRIGGER_FIRING_STATES, MAX_TRIGGERS_PER_OWNER,
+    TRIGGER_RETENTION_SECS,
 };
 pub mod objects;
 pub mod sealed;
