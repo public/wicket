@@ -87,8 +87,11 @@ def jArr (j : Json) (k : String) : Except String (List Json) := do
   return a.toList
 
 def parseReach (j : Json) : Except String Reach :=
+  let decode := match j.getObjValAs? (Array Nat) "decode" with
+    | .ok a => a.toList
+    | .error _ => []
   return { host := ← jStr j "host", methods := ← jStrs j "methods", paths := ← jStrs j "paths",
-           dangerous := ← jBool j "dangerous" }
+           dangerous := ← jBool j "dangerous", decode }
 
 def parseForbid (j : Json) : Except String Forbid :=
   return { host := ← jStr j "host", paths := ← jStrs j "paths" }

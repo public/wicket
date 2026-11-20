@@ -34,6 +34,7 @@ fn zone_json(z: &ZoneSpec) -> Value {
         "isolation": match z.isolation { Isolation::Runc => 1, Isolation::Gvisor => 2 },
         "reach": z.reach.iter().map(|r| json!({
             "host": r.host, "methods": r.methods, "paths": r.paths, "dangerous": r.allow_dangerous,
+            "decode": r.decode_slash,
         })).collect::<Vec<_>>(),
         "forbid": z.forbid.iter().map(|f| json!({ "host": f.host, "paths": f.paths })).collect::<Vec<_>>(),
         "hide": z.unlisted_hosts == UnlistedHosts::Hide,
@@ -173,7 +174,12 @@ fn gen_rule(rng: &mut Rng) -> ReachRule {
         methods,
         paths: (0..1 + rng.below(2)).map(|_| gen_glob(rng)).collect(),
         allow_dangerous: rng.chance(30),
-        decode_slash: vec![],
+        // #664: sometimes a segment or two decided decoded, so `decodeKept` is compared too.
+        decode_slash: match rng.below(4) {
+            0 => vec![1],
+            1 => vec![1, 2],
+            _ => vec![],
+        },
     }
 }
 

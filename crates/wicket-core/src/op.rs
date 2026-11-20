@@ -468,7 +468,7 @@ impl crate::manifest::ReachRule {
     pub fn check_standing(&self) -> Result<(), String> {
         self.check()?;
         if !self.decode_slash.is_empty() {
-            return Err("standing reach decides paths as written: decode_slash is a zone's to set".into());
+            return Err("standing reach can't set decode_slash: that is the zone's (a standing rule's paths are matched as decided, after the zone's decoding)".into());
         }
         if self.host.starts_with("*.") {
             return Err(format!("standing reach names its host exactly, not {}", self.host));
