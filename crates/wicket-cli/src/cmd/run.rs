@@ -73,13 +73,12 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             if no_wait && text.is_none() {
                 return Err(wicket_home::exit::usage("--no-wait needs a prompt to send"));
             }
-            session::open(session::Opts { run, text, wait: !no_wait, timeout: timeout.map(std::time::Duration::from_secs) }).await
+            session::open(session::Opts { run, text, wait: !no_wait, timeout }).await
         }
-        Cmd::Hibernate { run, wait } => hibernate::hibernate(&run, wait).await,
+        // Whole seconds, rounded up: a wait under a second is still a wait.
+        Cmd::Hibernate { run, wait } => hibernate::hibernate(&run, wait.as_millis().div_ceil(1000) as u64).await,
         Cmd::Wake { agent, text, by, wait } => {
             let text = text.join(" ");
-            let wait =
-                wicket_core::time::parse_duration(&wait).map_err(|e| wicket_home::exit::usage(format!("bad --wait {wait:?}: {e}")))?;
             hibernate::wake(&agent, (!text.trim().is_empty()).then_some(text), by, wait).await
         }
         Cmd::Agents { json } => hibernate::list(json),

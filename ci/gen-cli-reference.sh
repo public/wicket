@@ -15,9 +15,11 @@ out=docs/reference/cli.md
 check=0
 [ "${1:-}" = --check ] && check=1
 
-# Subcommand names listed in a help text's "Commands:" section, except `help`.
+# Subcommand names listed in a help text's "Commands:" section (in `wicket --help`, its sections by
+# area: every heading but Usage, Arguments and Options), except `help`.
 subcommands() {
-    awk '/^Commands:/ { on = 1; next } on && /^$/ { exit } on && /^  [a-z]/ { print $1 }' | grep -vx help || true
+    awk '/^[A-Z][A-Za-z ,]*:$/ { on = ($0 != "Arguments:" && $0 != "Options:"); next }
+         on && /^  [a-z]/ { print $1 }' | grep -vx help || true
 }
 
 # One section per command, depth-first: a heading, then its help in a code block.
