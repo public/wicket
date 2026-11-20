@@ -852,13 +852,8 @@ where
         }
         if let Some(a) = web::ASSETS.files.get(&path) {
             let mut r = send(a);
-            let cache = if a.immutable {
-                "public, max-age=31536000, immutable"
-            } else if path == "/sw.js" {
-                "no-cache"
-            } else {
-                "public, max-age=3600"
-            };
+            // Every file but /sw.js is named by its hash (#574); the worker is asked for anew.
+            let cache = if a.immutable { "public, max-age=31536000, immutable" } else { "no-cache" };
             r.headers_mut().insert("cache-control", http::HeaderValue::from_static(cache));
             return r;
         }

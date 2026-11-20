@@ -32,7 +32,7 @@ pub struct Asset {
     pub ctype: &'static str,
     pub body: Bytes,
     /// The same bytes, Brotli-compressed at build time (#574), for a browser that accepts `br`; `None`
-    /// for a file it doesn't make smaller (a PNG).
+    /// for a file it doesn't make smaller.
     pub br: Option<Bytes>,
     /// Named by content hash: cacheable forever.
     pub immutable: bool,
@@ -49,18 +49,22 @@ impl Asset {
     }
 }
 
-/// Whether an `Accept-Encoding` value accepts `coding`: named, or `*`, with a q-value above 0.
+/// Whether an `Accept-Encoding` value accepts `coding`: named, or else `*`, with a q-value above 0. A
+/// coding named with q=0 is refused even if `*` is accepted; an entry whose q-value doesn't parse is
+/// ignored.
 pub fn accepts(accept: Option<&str>, coding: &str) -> bool {
     let mut named = None;
     let mut star = None;
     for item in accept.unwrap_or("").split(',') {
         let mut parts = item.split(';');
         let name = parts.next().unwrap_or("").trim();
-        let q = parts
-            .filter_map(|p| p.trim().strip_prefix("q=").or_else(|| p.trim().strip_prefix("Q=")))
-            .next()
-            .and_then(|q| q.trim().parse::<f32>().ok())
-            .unwrap_or(1.0);
+        let q = match parts.filter_map(|p| p.trim().strip_prefix("q=").or_else(|| p.trim().strip_prefix("Q="))).next() {
+            None => 1.0,
+            Some(q) => match q.trim().parse::<f32>() {
+                Ok(q) if (0.0..=1.0).contains(&q) => q,
+                _ => continue,
+            },
+        };
         if name.eq_ignore_ascii_case(coding) {
             named = Some(q > 0.0);
         } else if name == "*" {
@@ -89,11 +93,10 @@ pub fn console_js() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/console.js"))
 }
 
-/// Everything wicket serves from its own bytes, as build.rs made it (#574): (path, content type,
-/// cacheable for good, bytes, Brotli copy). Files under `/static/` are named by their content's hash;
-/// the pages and `/sw.js` keep fixed names; the pages' references to the others are filled in.
-/// One file as build.rs wrote it: its path, content type, whether it is immutable, the bytes, and
-/// their Brotli copy (none when it wasn't smaller).
+/// One file wicket serves from its own bytes, as build.rs made it (#574): its path, content type,
+/// whether it is immutable, the bytes, and their Brotli copy (none when it wasn't smaller). Files under
+/// `/static/` are named by their content's hash; the pages and `/sw.js` keep fixed names; the pages'
+/// references to the others are filled in.
 type Built = (&'static str, &'static str, bool, &'static [u8], Option<&'static [u8]>);
 const BUILT: &[Built] = include!(concat!(env!("OUT_DIR"), "/assets.rs"));
 

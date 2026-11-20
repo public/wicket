@@ -193,6 +193,7 @@ async fn every_response_carries_the_security_headers() {
     let cookie = format!("__Host-wicket_sid={sid}");
     // The hashed console.js (not the service worker, which isn't immutable).
     let js = ASSETS.files.keys().find(|k| k.ends_with(".js") && *k != "/sw.js").unwrap().clone();
+    let manifest = served("/static/manifest.");
     for https in [false, true] {
         t.state.hsts = https;
         type Req<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
@@ -200,7 +201,7 @@ async fn every_response_carries_the_security_headers() {
             ("GET", "/", vec![]),
             ("GET", "/session", vec![]),
             ("GET", &js, vec![]),
-            ("GET", "/manifest.webmanifest", vec![]),
+            ("GET", &manifest, vec![("accept-encoding", "br")]),
             ("GET", "/api/state", vec![]),
             ("GET", "/api/state", vec![("cookie", &cookie)]),
             ("GET", "/api/me", vec![("cookie", &cookie)]),
@@ -369,7 +370,11 @@ async fn static_files_are_sent_brotli_compressed_to_browsers_that_accept_it() {
         brotli_decompressor::BrotliDecompress(&mut &a.1[..], &mut decoded).unwrap();
         assert_eq!(decoded, a.0.body, "{path}");
     }
-    assert!(crate::serve::web::accepts(Some("gzip;q=1.0, br;q=0.5"), "br") && !crate::serve::web::accepts(Some("*;q=0"), "br"));
+    let accepts = |h| crate::serve::web::accepts(Some(h), "br");
+    assert!(accepts("gzip;q=1.0, br;q=0.5") && !accepts("*;q=0"));
+    // Refused by name beats `*`; an entry whose q-value doesn't parse, or is out of range, is ignored
+    // (#747 review), as the preview server does too.
+    assert!(!accepts("br;q=0, *") && !accepts("br;q=abc") && accepts("br;q=abc, *") && !accepts("br;q=2") && accepts("BR"));
 }
 
 /// #327: the session view's page, as embedded (the built bundle, or the placeholder a build without
@@ -881,6 +886,8 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
     // The real session token is never used: the fuzzer has only what an outsider could have.
     let seed = std::env::var("WICKET_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x5eed_1234_abcd_0001u64);
     let mut rng = Rng(seed);
+    // The static files at their hashed paths (#574), and the old unhashed ones, now 404s.
+    let (manifest, icon) = (served("/static/manifest."), served("/static/icon."));
     let paths = [
         "/",
         "/enrol",
@@ -896,6 +903,9 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
         "/api/logout",
         "/manifest.webmanifest",
         "/static/icon.svg",
+        manifest.as_str(),
+        icon.as_str(),
+        "/sw.js",
         "//api/state",
         "/api/state/",
         "/API/STATE",
@@ -917,6 +927,7 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
         "content-length",
         "transfer-encoding",
         "authorization",
+        "accept-encoding",
     ];
     let values = [
         "1",
@@ -935,6 +946,10 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
         "99999999999999999999",
         "",
         "Bearer x",
+        "br",
+        "gzip, deflate, br",
+        "br;q=0, *",
+        "*;q=nope",
     ];
     let bodies: [&[u8]; 8] = [
         b"",

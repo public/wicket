@@ -38,8 +38,21 @@ const polls = new Map();
 
 // With --assets, a file's Brotli copy (`<file>.br`, as wicket dev console-assets writes it) to a
 // browser that accepts `br`, as wicket sends it (#574).
+// As wicket's `accepts` (serve/web.rs): br named, or else `*`, with q above 0; br named with q=0 is
+// refused even beside `*`; an entry whose q doesn't parse is ignored.
+function acceptsBr(header) {
+  let named = null, star = null;
+  for (const item of String(header || "").split(",")) {
+    const [name, ...params] = item.split(";").map(x => x.trim());
+    const qp = params.find(p => /^q=/i.test(p));
+    let q = 1;
+    if (qp) { q = Number(qp.slice(2)); if (!/^\s*[\d.]+\s*$/.test(qp.slice(2)) || !(q >= 0 && q <= 1)) continue; }
+    if (name.toLowerCase() === "br") named = q > 0; else if (name === "*") star = q > 0;
+  }
+  return named ?? star ?? false;
+}
 function sendFile(req, res, type, f) {
-  const accepts = /(^|,)\s*(br|\*)\s*(;\s*q=(?!0(\.0+)?\s*(,|$))[\d.]+)?\s*(,|$)/i.test(req.headers["accept-encoding"] || "");
+  const accepts = acceptsBr(req.headers["accept-encoding"]);
   if (ASSETS && accepts && fs.existsSync(f + ".br")) return send(res, 200, type, fs.readFileSync(f + ".br"), { "content-encoding": "br", vary: "accept-encoding" });
   return send(res, 200, type, fs.readFileSync(f), ASSETS && fs.existsSync(f + ".br") ? { vary: "accept-encoding" } : undefined);
 }
