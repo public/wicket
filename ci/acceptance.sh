@@ -33,6 +33,10 @@
 #     session, where a prompt asked during the replay isn't approved;
 #   - an orphaned box (its `wicket run` killed hard) is taken over by `wicket reconcile`, and after
 #     it is revoked a dry run has nothing to change;
+#   - (--nodes local) messages across nodes (#252): a box on each node finds the other through the
+#     gateway, messages it with a receipt that reaches read, gets its reply, and a message written
+#     unasked is refused with a receipt; a human's `wicket message send` reaches one box as its
+#     operator's, whose answer lands in `wicket message inbox`, with receipts on both sides;
 #   - (--nodes local) a node on its own (#152, #153): a box on the other node keeps working through a
 #     165 s cut of its control channel, its model calls included (the credential sealed to the node),
 #     an out-of-reach request is queued there and raised on reconnect, a secret removed meanwhile is
@@ -589,6 +593,7 @@ if [ -n "$nodes" ]; then
   escape_flow
 fi
 if [ "$nodes" = local ]; then
+  messages_flow
   offline_flow
 fi
 
