@@ -224,13 +224,16 @@ base64 and hex, except runs inside a public key), identity JWSs and private keys
 ## Placement view
 
 Why a run went where it did ([#579](https://github.com/public/wicket/issues/579)), read-only and behind
-an operator's session: `GET /api/runs/<run>/placement` returns the run's `status` and `node`, and the
-placement decision recorded when its node was chosen (`decision`: the request, the node, the nodes it
-may go on in order, every reason each other node was out, or the waiting run it went behind, as
-`wicket why-here --json` prints it, with `run` and `at_ms`) with `text`, the explanation `wicket
-why-here` prints. A run with no decision recorded (on a node named for it whose room wasn't known from a
-report, or decided over a week ago) has `decision: null` and `why`. An unknown run is not found.
-[Nodes: placement](nodes.md#placement) says how a node is chosen.
+an operator's session: `GET /api/runs/<run>/placement` returns the run's `status` and `node` (`local` for
+this host's own), the placement decision recorded when its node was chosen, and `text`, the explanation
+`wicket why-here` prints. `decision` is built from named fields of placement's record, never the record
+whole: `at_ms`, `node` (or `behind`, the waiting run it went behind), `candidates`, the `request`
+(`vcpus`, `memory_mib`, `priority`, `preemptible`, `node_selector`, `tolerations`, `affinity`,
+`anti_affinity`), `ca_hosts`, `ranked` (the nodes it may go on, best first) and `refused` (each other
+node with every reason it was out), at most 10 of each (`ranked_more`, `refused_more`). A run with no
+decision recorded (on a node named for it whose room wasn't known from a report, or decided over a week
+ago) has `decision: null` and `why`. A run that doesn't exist, or another tenant's, is not found, as for
+its authority view. [Nodes: placement](nodes.md#placement) says how a node is chosen.
 
 ## Manifests
 
