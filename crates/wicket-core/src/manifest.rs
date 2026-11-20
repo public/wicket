@@ -803,6 +803,31 @@ fn default_pids() -> u32 {
     512
 }
 
+/// A stored manifest's zone timeout, read without the rest of its checks: what a run's box ran
+/// under, even if the manifest no longer loads (a later version refuses something in it, #676).
+/// Only `zone.limits.timeout` is read (its default if absent); None if the YAML doesn't parse or the
+/// timeout doesn't. Fencing reads this, and must not take a manifest it can't load for one whose
+/// box has stopped.
+pub fn stored_timeout(yaml: &str) -> Option<Duration> {
+    #[derive(Deserialize)]
+    struct Stored {
+        zone: StoredZone,
+    }
+    #[derive(Deserialize)]
+    struct StoredZone {
+        #[serde(default)]
+        limits: Option<StoredLimits>,
+    }
+    #[derive(Deserialize)]
+    struct StoredLimits {
+        #[serde(default = "default_timeout")]
+        timeout: String,
+    }
+    let s: Stored = crate::yaml::from_str(yaml).ok()?;
+    let t = s.zone.limits.map_or_else(default_timeout, |l| l.timeout);
+    crate::time::parse_duration(&t).ok()
+}
+
 impl Limits {
     pub fn timeout(&self) -> Result<Duration, ManifestError> {
         crate::time::parse_duration(&self.timeout).map_err(|_| ManifestError::Duration(self.timeout.clone()))
@@ -1279,6 +1304,21 @@ mod tests {
         let plain = super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z }\n").unwrap();
         let y = crate::yaml::to_string(&plain).unwrap();
         assert!(!y.contains("uses") && !y.contains("service"), "{y}");
+    }
+
+    /// #676: a stored manifest's timeout reads even when the manifest no longer loads; its default
+    /// when it sets none; nothing when the YAML or the duration doesn't parse.
+    #[test]
+    fn a_stored_timeout_reads_without_the_rest_of_the_checks() {
+        use std::time::Duration;
+        let old = "task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, limits: { timeout: 5m }, forbid: [{ host: a.test, paths: ['**/x'] }] }\n";
+        assert!(super::Manifest::from_yaml(old).is_err());
+        assert_eq!(super::stored_timeout(old), Some(Duration::from_secs(300)));
+        assert_eq!(super::stored_timeout("zone: { name: z }\n"), Some(Duration::from_secs(1800)));
+        assert_eq!(super::stored_timeout("zone: { name: z, limits: {} }\n"), Some(Duration::from_secs(1800)));
+        for bad in ["{ not: [yaml", "task: t\n", "zone: { limits: { timeout: soon } }\n"] {
+            assert_eq!(super::stored_timeout(bad), None, "{bad:?}");
+        }
     }
 
     /// A reach or forbid path glob must start with `/`: one that doesn't either matches no request

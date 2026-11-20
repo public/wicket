@@ -1,0 +1,8 @@
+{
+  "name": "wicket-example-claude-agent-acp",
+  "private": true,
+  "description": "Claude Code's ACP adapter at a pinned version; package-lock.json pins every dependency by integrity.",
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.104.1"
+  }
+}

@@ -157,6 +157,17 @@ pub fn cli_principal() -> serde_json::Value {
     serde_json::json!({ "type": "human", "id": user, "via": "cli", "assurance": "unix-user" })
 }
 
+/// Whether the CLI's caller is root, for what only root may do: root over wicketd's socket (the
+/// principal wicketd sets from the caller's peer credentials, `WICKET_PRINCIPAL`), or, without one,
+/// this process's own effective uid. `$USER` is never taken for it: anyone can set that.
+pub fn cli_is_root() -> bool {
+    match principal_from_env(std::env::var("WICKET_PRINCIPAL").ok().as_deref()) {
+        Some(p) => p["id"].as_str() == Some("root") && p["via"].as_str() == Some("cli"),
+        // SAFETY: geteuid has no preconditions and can't fail.
+        None => (unsafe { libc::geteuid() }) == 0,
+    }
+}
+
 /// WICKET_PRINCIPAL's value, if it is a well-formed principal.
 pub fn principal_from_env(v: Option<&str>) -> Option<serde_json::Value> {
     let p: serde_json::Value = serde_json::from_str(v?).ok()?;

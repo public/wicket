@@ -141,6 +141,9 @@ pub fn route(cmd: &Cmd) -> Route {
             | NodeCmd::Install { .. } => Forward(Privileged),
             // Deletes a run's files on its node, perhaps uncollected work.
             NodeCmd::Forget { .. } => Forward(Privileged),
+            // Lifts a run's fence while its box may still run (#676); the command itself also
+            // refuses anyone but root.
+            NodeCmd::ReleaseFence { .. } => Forward(Privileged),
             NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } => Local,
         },
         // Applying an org policy changes what every box may do, and revokes runs.

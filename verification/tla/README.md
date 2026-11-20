@@ -241,6 +241,25 @@ fix, which TLC refuses:
 | `RequeueOnReconnect = TRUE` (done, #453) | after #451 (and before #453), a supervisor gave again its in-flight messages only on its first resume of a run it took over. If the link to the box's node dropped after `await_message` answered and before `MessageRead` arrived, while the supervisor lived on, the message stayed in flight, neither waiting nor read, until a later supervisor. Now every reconnect gives again what was given on the link that dropped (`noderun.rs` `requeue_on_resume`), and an answer that can't be sent gives its message back (`Ledger::requeue_message`); the node drops a repeat its box has had | `fail_lifecycle_reconnect_stuck`: `NoMessageStuck` |
 | `EndAgentOnLost = TRUE` (done, #474) | before #474, the reconciler ended a run as `lost` (its supervisor gone, its node with no box for it: a box that never started, say, `BoxFails`) but left its agent `active`, its claim lapsed, with nothing to renew it or read its messages. Now `Ledger::run_lost` ends the run and, if it was the agent's current activation, the agent: back to `hibernated` (restorable from its last head) if it has one, else `ended` | `fail_lifecycle_agent_left_active`: `ActiveHasRun` |
 
+The model reads each box's authority end as known (`AuthTtl` from its start, renewed). In the code
+the reconciler and wake read it from the run's authority record, or when that is missing from its
+timeout in the run's record (`noderun.rs` `fenced_in`, `timeout_end`; `reconcile.rs`
+`run_deadline`), read leniently (`manifest::stored_timeout`: a manifest a later version refuses
+still gives it), then from the ledger's hard end of the box's authority (`runs.authority_cap`,
+written before the box starts). With none of them, the run is fenced until its node confirms the
+box stopped, or root releases the fence (`wicket node release-fence`, audited), never ended
+unfenced (#676); a takeover that fails on such a run (`run.rs` `attach_failed`) leaves it to the
+reconciler while it is fenced, which backs off and after five failures stops the box through its
+node, ending the run once its node reports the box exited. A box counts as stopped by the
+reconciler only once its Docker no longer lists it after the kill. A run with no run record on this
+host (a standby restored from the state store, #154) is held by the ledger instead: the agent's
+fence (`Ledger::agent_fenced_until`) and, on a node that can't be asked, or a lease that ends while
+its node's boxes can't be listed, the hard end of its box's authority plus the same skew
+(`noderun::held_until`, `runs.authority_cap`: a standby's copy may lag a renewal). A takeover that
+fails holds by the same rule (`run.rs` `attach_failed`), so it never loses a run whose box may still
+run; nor does a lease end whose kill didn't stop its box. So the model's `Lost` doesn't come before
+the authority end the code can tell, except where root released a fence it couldn't.
+
 Every switch is now the code (#444, #445, #446, #453, #474), so `RunLifecycle.cfg` is main, and each
 `fail_lifecycle_*` variant is the code before one fix. `NoMessageTwice` holds in every variant: with
 `AckAfterHand` a message is queued again after a crash, and the box's record of what it has had

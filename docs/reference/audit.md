@@ -51,8 +51,9 @@ batch: 500
 # (only with a durable sink and the state store streaming: see Retention below). Default 2.
 host_gb: 2
 sinks:
-  # JSON lines, for journald, Vector or Fluent Bit. path "-" means stdout; only
-  # `wicket audit export` writes to stdout.
+  # JSON lines, for journald, Vector or Fluent Bit. The path must be absolute (a sink with a
+  # relative one is left out, with a warning); "-" means stdout, which only `wicket audit export`
+  # writes to.
   - name: local-file
     type: jsonl
     path: /var/log/wicket/audit.jsonl
@@ -281,7 +282,7 @@ for a kind to see its body):
 | area | kinds |
 |---|---|
 | requests | `op` (an egress or model decision), `decision` (an approve, deny or renewal), `decision.refused` (a decision outside the decider's authority: an operator's `operators.yaml`, or an agent's own reach, or one on another effect than the one shown, #369), `effect.refused` (a spawn, link or capacity lease whose arguments changed after its approval, or a lease whose approval ended first: the grant or lease, both hashes and why), `grant.revoked`, `daemon.refused`, `digest.granted` (an operator's grant on a digest, #258: a pinned program's source when its manifest is run), `digest.accepted` (a digest accepted by the one check, naming the grant) |
-| runs | `run.start`, `run.image`, `run.end`, `run.lost`, `run.child_stuck`, `run.attach`, `run.console_start`, `run.output`, `run.remote_session`, `run.remote_session_failed`, `run.exit_cause`, `run.agent_prompt`, `run.agent_call_refused`, `box.output`, `box.output.gap`, `box.exit_cause`, `box.memory_pressure` |
+| runs | `run.start`, `run.image`, `run.end`, `run.lost`, `run.child_stuck`, `run.attach`, `run.attach_failed` (a takeover failed while the run's box may still run: once per reason, with the count, #676), `run.attach_recovered`, `run.fence_released` (root released a fence without its node), `run.console_start`, `run.output`, `run.remote_session`, `run.remote_session_failed`, `run.exit_cause`, `run.agent_prompt`, `run.agent_call_refused`, `box.output`, `box.output.gap`, `box.exit_cause`, `box.memory_pressure` |
 | agents | `identity.issued`, `identity.rotated`, `identity.revoked`, `message`, `message.refused`, `spawn.beyond_parent`, `delegation.started`, `delegation.reported`, `delegation.report_failed`, `delegation.continued`, `delegation.refused`, `delegation.ended`, `agent.hibernate`, `agent.wake`, `agent.wake_refused` |
 | triggers | `trigger.created` (with the agent it reaches), `trigger.approved`, `trigger.paused` (by an operator, or `by: wicket` with why: its owner may no longer have it fire, or its firings kept failing), `trigger.resumed`, `trigger.renewed`, `trigger.done` (a timer that fired, or whose time passed: it fires nothing again), `trigger.deleted`, `trigger.fired` (a firing woke or messaged its agent, naming the agent and the message's id, length and sha256, or queued its run), `trigger.skipped` (with why: the hour's first over its limit, or a timer whose time passed), `trigger.failed` (with why, and a firing dead-lettered from a full queue) ([wake an agent on a schedule](../how-to/wake-an-agent-on-a-schedule.md)) |
 | sessions | `session.opened`, `session.attached`, `session.prompt`, `session.cancel`, `session.escalation_answered`, `session.closed` (the console's session view, [console](console.md#sessions)) |

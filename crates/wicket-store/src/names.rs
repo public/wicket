@@ -230,6 +230,12 @@ pub fn new_name_id() -> String {
     format!("n-{}", &r[2..])
 }
 
+/// How long after a denial the same agent can't ask for the same public name again.
+pub const DENIED_COOLDOWN_SECS: i64 = 15 * 60;
+/// How long a standing ask waits for a decision before it is withdrawn (a run-scoped one goes
+/// with its run).
+pub const PENDING_STANDING_SECS: i64 = 14 * 24 * 3600;
+
 /// At most this many of a principal's public asks wait at once.
 pub const MAX_PENDING_NAMES: usize = 3;
 
@@ -403,6 +409,24 @@ impl Ledger {
         if live.is_some() {
             return Err(taken(ask.label));
         }
+        // A human said no to this agent's ask for this label a moment ago: not again so soon (#680
+        // review, L5).
+        let denied: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT max(decided_at) FROM names WHERE tenant = ?1 AND principal = ?2 AND label = ?3 AND kind = 'public' AND status = 'denied'",
+                params![ask.tenant.0, ask.principal, ask.label],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if denied.is_some_and(|d| d > now() - DENIED_COOLDOWN_SECS) {
+            return Err(StoreError::Refused(format!(
+                "a human denied the public name {:?} for this agent in the last {} minutes: don't ask again yet",
+                ask.label,
+                DENIED_COOLDOWN_SECS / 60
+            )));
+        }
         if let Some(id) = self
             .conn
             .query_row(
@@ -492,6 +516,7 @@ impl Ledger {
 
     /// Revokes a live name: it ends now, whoever holds it.
     pub fn revoke_name(&self, id: &str, by: &str) -> Result<NameRow> {
+        let before = self.name(id)?;
         let n = self.conn.execute(
             "UPDATE names SET status = 'ended', holder = NULL, ended_at = ?2, ended_by = ?3, end_reason = 'revoked' WHERE id = ?1 AND status = 'live'",
             params![id, now(), by],
@@ -500,6 +525,15 @@ impl Ledger {
             return Err(StoreError::NotPending(id.into(), self.name(id)?.status));
         }
         self.release_ports(id)?;
+        // An internal name's port stops being offered if the name exposed it and no other live name
+        // of its run names it, as a move does (#680 review, L1).
+        if let (NameKind::Internal, Some(holder)) = (before.kind, before.holder.as_deref()) {
+            let run = RunId(holder.to_string());
+            if self.names_on_port(&run, before.port)? == 0 && self.is_name_exposure(&run, before.port)? {
+                self.unexpose(holder, before.port)?;
+                self.drop_name_exposure(&run, before.port)?;
+            }
+        }
         self.name(id)
     }
 
@@ -553,6 +587,13 @@ impl Ledger {
              WHERE status = 'pending' AND scope = 'run' AND NOT EXISTS (SELECT 1 FROM runs WHERE id = names.asked_run AND status = 'running')",
             params![now()],
         )?;
+        // Standing asks nobody decided in time are withdrawn (#680 review, L5).
+        let withdrawn = withdrawn
+            + self.conn.execute(
+                "UPDATE names SET status = 'withdrawn', decided_at = ?1, decided_by = 'wicket:expired'
+                 WHERE status = 'pending' AND scope = 'standing' AND created_at <= ?2",
+                params![now(), now() - PENDING_STANDING_SECS],
+            )?;
         // And the ports their names exposed are theirs no more (#671 review).
         self.conn.execute(
             "DELETE FROM name_exposures WHERE NOT EXISTS (SELECT 1 FROM runs WHERE id = name_exposures.run AND status = 'running')",
@@ -958,7 +999,8 @@ mod tests {
         // Revoked: the label is free.
         let r = l.revoke_name(&id, "alice").unwrap();
         assert_eq!((r.status.as_str(), r.end_reason.as_deref(), r.holder), ("ended", Some("revoked"), None));
-        assert!(l.ask_public(&ask(&t, &r2, P2, "demo", NameScope::Run)).unwrap().1);
+        // (P2 was denied it a moment ago, so it is P1 that asks again.)
+        assert!(l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Run)).unwrap().1);
     }
 
     /// #575 review, M1: a standing name approved after its asking run ended isn't held by that dead
@@ -1046,6 +1088,34 @@ mod tests {
         assert!(l.release_held(&read, &r2, now(), "run ended").unwrap());
         assert!(!l.release_held(&read, &r2, now(), "run ended").unwrap());
         assert_eq!(l.audit_tail(50).unwrap().iter().filter(|a| a.2 == "name.released").count(), 1);
+    }
+
+    /// #680 review, L1 and L5: revoking an internal name stops offering the port its name exposed;
+    /// an agent a human denied can't ask for the same public name again at once; and a standing ask
+    /// nobody decides is withdrawn in time.
+    #[test]
+    fn revokes_denials_and_old_asks() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let api = l.register_internal(&ask(&t, &r1, P1, "api", NameScope::Run), 3, 3600).unwrap();
+        l.expose(&t, "run-1", 3000, Some("api"), "{}").unwrap();
+        l.mark_name_exposure(&r1, 3000).unwrap();
+        l.revoke_name(&api.id, "ann").unwrap();
+        assert!(l.exposed("run-1", 3000).unwrap().is_none());
+        assert!(!l.is_name_exposure(&r1, 3000).unwrap());
+
+        let (id, _) = l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Run)).unwrap();
+        l.deny_name(&id, "ann").unwrap();
+        assert!(matches!(l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Run)), Err(StoreError::Refused(m)) if m.contains("denied")));
+        l.conn.execute("UPDATE names SET decided_at = decided_at - ?2 WHERE id = ?1", params![id, DENIED_COOLDOWN_SECS + 1]).unwrap();
+        assert!(l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Run)).unwrap().1);
+
+        let (old, _) = l.ask_public(&ask(&t, &r1, P1, "later", NameScope::Standing)).unwrap();
+        l.conn.execute("UPDATE names SET created_at = created_at - ?2 WHERE id = ?1", params![old, PENDING_STANDING_SECS + 1]).unwrap();
+        l.sweep_stale_names().unwrap();
+        let n = l.name(&old).unwrap();
+        assert_eq!((n.status.as_str(), n.decided_by.as_deref()), ("withdrawn", Some("wicket:expired")));
     }
 
     #[test]

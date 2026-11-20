@@ -56,9 +56,10 @@ pub fn terms(bound: StandingBound, ttl: Option<Duration>) -> Result<NameTerms> {
     Ok(NameTerms { bound, ttl_secs: ttl.map(|t| t.as_secs()) })
 }
 
-/// Approves public-name ask `id` as `by` with `terms`, on the effect `shown` (if the decider was
-/// shown one); `extra` goes on the decision's audit record. The effect approved.
-pub fn approve(l: &Ledger, by: &Granter, id: &str, terms: &NameTerms, shown: Option<&str>, extra: serde_json::Value) -> Result<String> {
+/// Approves public-name ask `id` as `by` with `terms`, on the effect `shown`: the one the decider
+/// was shown, always (#680 review, L6: a caller can't approve what it didn't show). `extra` goes on
+/// the decision's audit record. The effect approved.
+pub fn approve(l: &Ledger, by: &Granter, id: &str, terms: &NameTerms, shown: &str, extra: serde_json::Value) -> Result<String> {
     let n = l.name(id)?;
     if n.kind != wicket_store::NameKind::Public {
         return Err(refused(l, by, id, "approve", anyhow::anyhow!("{id} is an internal name, which needs no approval")));
@@ -67,7 +68,7 @@ pub fn approve(l: &Ledger, by: &Granter, id: &str, terms: &NameTerms, shown: Opt
         Ok(o) => o,
         Err(why) => return Err(refused(l, by, id, "approve", why)),
     };
-    let effect = match l.approve_name(id, terms, &o.label, shown) {
+    let effect = match l.approve_name(id, terms, &o.label, Some(shown)) {
         Ok(e) => e,
         Err(e @ (wicket_store::StoreError::EffectChanged(..) | wicket_store::StoreError::Refused(_))) => {
             return Err(refused(l, by, id, "approve", e.into()))
@@ -156,11 +157,11 @@ mod tests {
         let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t);
         // An operator whose kinds leave out `name` can't.
         let narrow = op("default: { kinds: [http] }\n");
-        assert!(approve(&l, &narrow, &id, &t, Some(&shown), serde_json::json!({})).unwrap_err().to_string().contains("refused"));
+        assert!(approve(&l, &narrow, &id, &t, &shown, serde_json::json!({})).unwrap_err().to_string().contains("refused"));
         // Another effect than the one shown is refused.
         let wide = terms(StandingBound::Zone, None).unwrap();
-        assert!(approve(&l, &op("default: anything\n"), &id, &wide, Some(&shown), serde_json::json!({})).is_err());
-        let effect = approve(&l, &op("default: anything\n"), &id, &t, Some(&shown), serde_json::json!({ "via": "cli" })).unwrap();
+        assert!(approve(&l, &op("default: anything\n"), &id, &wide, &shown, serde_json::json!({})).is_err());
+        let effect = approve(&l, &op("default: anything\n"), &id, &t, &shown, serde_json::json!({ "via": "cli" })).unwrap();
         assert_eq!(effect, shown);
         assert_eq!(l.name(&id).unwrap().status, "live");
         let audit = l.audit_tail(10).unwrap();
@@ -179,9 +180,32 @@ mod tests {
         let t = terms(StandingBound::Agent, None).unwrap();
         assert!(deny(&l, &op("default: nothing\n"), &id, serde_json::json!({})).is_err());
         l.fail_audit_inserts_for_tests().unwrap();
-        assert!(approve(&l, &op("default: anything\n"), &id, &t, None, serde_json::json!({})).is_err());
+        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t);
+        assert!(approve(&l, &op("default: anything\n"), &id, &t, &shown, serde_json::json!({})).is_err());
         assert_eq!(l.name(&id).unwrap().status, "ended", "undone");
         assert!(terms(StandingBound::Agent, Some(Duration::ZERO)).is_err());
         assert!(terms(StandingBound::Agent, Some(MAX_NAME_TTL * 2)).is_err());
+    }
+
+    /// #680 review, L4: only a human whose authority covers `name` at R4 decides: an operator with
+    /// the kind but a lower risk ceiling can't, nor a granter that isn't a human.
+    #[test]
+    fn only_a_human_with_name_at_r4_decides() {
+        let l = Ledger::open_in_memory().unwrap();
+        let id = asked(&l, "demo", NameScope::Run);
+        let t = terms(StandingBound::Agent, None).unwrap();
+        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &t);
+        let r2 = op("default: { kinds: [name], max_risk: R2 }\n");
+        assert!(format!("{:#}", approve(&l, &r2, &id, &t, &shown, serde_json::json!({})).unwrap_err()).contains("risk"));
+        assert!(deny(&l, &r2, &id, serde_json::json!({})).is_err());
+        let capacity = Granter::Capacity {
+            grant: "g-1".into(),
+            ask: wicket_store::CapacityAsk { node: "n1".into(), plan: "p".into(), region: "r".into(), hourly: 1, worst: 1 },
+        };
+        assert!(format!("{:#}", approve(&l, &capacity, &id, &t, &shown, serde_json::json!({})).unwrap_err()).contains("human"));
+        assert!(deny(&l, &capacity, &id, serde_json::json!({})).is_err());
+        assert_eq!(l.name(&id).unwrap().status, "pending");
+        // The kind at R4 (no ceiling) decides.
+        approve(&l, &op("default: { kinds: [name] }\n"), &id, &t, &shown, serde_json::json!({})).unwrap();
     }
 }

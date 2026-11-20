@@ -102,7 +102,7 @@ paths = ["ci/daemon-uids.sh", "deploy/install.sh"]
 [suite.install-test]
 binary = true
 paths = [
-  "ci/install-test.sh", "ci/install-acceptance.sh", "ci/package.sh", "deploy/**",
+  "ci/install-test.sh", "ci/install-acceptance.sh", "ci/base-images.sh", "ci/package.sh", "deploy/**",
   "crates/wicket-cli/src/daemon/**", "crates/wicket-cli/src/units.rs", "crates/wicket-cli/src/rootcopy.rs",
   "crates/wicket-cli/src/cmd/itself.rs",
 ]

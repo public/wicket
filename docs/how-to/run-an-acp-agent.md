@@ -8,7 +8,8 @@ gateway the agent's only MCP server, and answers the agent's permission prompts 
 ## 1. Put the agent in an image
 
 Build an image from wicket's agent image with the agent installed at a pinned version. Pin the version
-and its registry integrity together, and never install `latest`. [`examples/acp-claude`](../../examples/acp-claude/)
+and its integrity together, with its dependencies' (a committed lockfile), install with
+`npm ci --ignore-scripts`, and never install `latest`. [`examples/acp-claude`](../../examples/acp-claude/)
 has a Dockerfile that does this for Claude Code's ACP adapter.
 
 ```sh
