@@ -135,12 +135,19 @@ pub struct Pass<'a, P, S, B, F> {
     pub adopt: fn(&str) -> Result<()>,
     /// Whether a run's box may still run on its node at a time (Unix ms), and until when (#153).
     pub fenced: fn(&Ledger, &str, i64) -> Option<(String, i64)>,
+    /// A run's failed takeovers in a row (#676), if any.
+    pub attach_failures: fn(&str) -> Option<crate::run::AttachFailures>,
+    /// Whether this host has a run's record (`ctl/run.json`).
+    pub has_run_record: fn(&str) -> bool,
     pub now: i64,
     pub dry_run: bool,
     done: Vec<Done>,
     /// Effective statuses after this pass's changes (what a dry run would have changed).
     runs_ended: HashSet<String>,
     leases_ended: HashSet<String>,
+    /// Runs whose takeovers kept failing, with their node, whose boxes are stopped after the runs
+    /// pass (#676).
+    unattachable: Vec<(String, String, crate::run::AttachFailures)>,
 }
 
 impl<'a, P, S, B, F> Pass<'a, P, S, B, F>
@@ -160,11 +167,14 @@ where
             node_runs: HashMap::new(),
             adopt: crate::run::spawn_attach,
             fenced: crate::noderun::fenced_until,
+            attach_failures: run_attach_failures,
+            has_run_record,
             now,
             dry_run,
             done: vec![],
             runs_ended: HashSet::new(),
             leases_ended: HashSet::new(),
+            unattachable: vec![],
         }
     }
 
@@ -175,6 +185,9 @@ where
 
     pub async fn run(mut self) -> Result<Vec<Done>> {
         self.runs()?;
+        for (node, run, f) in std::mem::take(&mut self.unattachable) {
+            self.stop_unattachable(&node, &run, &f).await?;
+        }
         self.lease_decisions()?;
         self.lease_ends().await?;
         if self.machines.is_some() {
@@ -251,6 +264,23 @@ where
             };
             match self.node_runs.get(&node).cloned() {
                 Some(Some(list)) if list.contains(&run) => {
+                    // Takeovers that keep failing (#676): back off between them, and after
+                    // MAX_ATTACH_FAILURES stop the box through its node, which then reports it gone.
+                    if let Some(f) = (self.attach_failures)(&run) {
+                        if f.count >= crate::run::MAX_ATTACH_FAILURES {
+                            self.unattachable.push((node.clone(), run.clone(), f));
+                            continue;
+                        }
+                        let next = f.last_at.saturating_add(crate::run::attach_backoff_secs(f.count));
+                        if self.now < next {
+                            self.note(
+                                "attach_backoff",
+                                &run,
+                                &format!("its last {} takeover(s) failed ({}): tried again from {next}", f.count, f.why),
+                            );
+                            continue;
+                        }
+                    }
                     if !self.dry_run {
                         if let Err(e) = (self.adopt)(&run) {
                             self.note("error", &run, &format!("starting its new supervisor: {e:#}"));
@@ -296,6 +326,20 @@ where
                             &format!("its supervisor is gone and node {node} can't be asked about it; {left}: left for a later pass"),
                         );
                         continue;
+                    }
+                    // No run record here (a standby restored from the state store, #154): the
+                    // ledger's record of its box's authority bounds it, as the agent's fence does.
+                    let no_record = !(self.has_run_record)(&run);
+                    if let Some((until, _)) = self.ledger.run_authority(&run)?.filter(|_| no_record) {
+                        let until = until.saturating_add(wicket_store::WAKE_SKEW_SECS);
+                        if self.now < until {
+                            self.note(
+                                "unreachable",
+                                &run,
+                                &format!("its supervisor is gone and node {node} can't be asked about it; the ledger has it authorized there until {until}: left for a later pass"),
+                            );
+                            continue;
+                        }
                     }
                     if !active || overdue {
                         let why = match active {
@@ -419,13 +463,20 @@ where
             .map(|(r, _)| r)
             .collect();
         if !placed.is_empty() {
+            // None: its node's boxes couldn't be listed, so none could be stopped (#676).
             let boxes = match lease.node_name.as_deref().and_then(|n| (self.node_boxes)(n)) {
-                Some(b) => b.list().await.unwrap_or_default(),
-                None => vec![],
+                Some(b) => b.list().await.ok(),
+                None => None,
             };
             for run in placed {
-                for b in boxes.iter().filter(|b| b.run.as_deref() == Some(run.as_str())) {
+                for b in boxes.iter().flatten().filter(|b| b.run.as_deref() == Some(run.as_str())) {
                     self.stop_box(lease.node_name.as_deref(), b, "its capacity lease ended").await?;
+                }
+                // Not ended while its box may still run on a node whose boxes couldn't be listed:
+                // the unreachable-node pass ends it once its fence does.
+                if boxes.is_none() && (self.fenced)(self.ledger, &run, self.now.saturating_mul(1000)).is_some() {
+                    self.note("unreachable", &run, "its capacity lease ended, but its node's boxes couldn't be listed and it may still run there: left for a later pass");
+                    continue;
                 }
                 if !self.runs_ended.contains(&run) {
                     self.end_run(&run, &format!("its capacity lease {} ended: {why}", lease.id))?;
@@ -673,6 +724,28 @@ where
         self.stop_box(node, b, &why).await
     }
 
+    /// A run whose takeover failed [`crate::run::MAX_ATTACH_FAILURES`] times in a row while its node
+    /// still runs its box (#676): the box is stopped through its node, so it doesn't run on
+    /// unsupervised. Its run isn't ended here: its fence lifts only when the node has stopped the
+    /// box (the kill succeeded through it, or it lists no box for the run), and then the next pass
+    /// ends it as lost.
+    async fn stop_unattachable(&mut self, node: &str, run: &str, f: &crate::run::AttachFailures) -> Result<()> {
+        let why = format!("its supervisor is gone and {} takeovers of it failed ({})", f.count, f.why);
+        let Some(d) = (self.node_boxes)(node) else {
+            self.note("error", run, &format!("{why}; node {node} can't be asked to stop its box"));
+            return Ok(());
+        };
+        match d.list().await {
+            Ok(boxes) => {
+                for b in boxes.iter().filter(|b| b.run.as_deref() == Some(run)) {
+                    self.stop_box(Some(node), b, &why).await?;
+                }
+            }
+            Err(e) => self.note("error", run, &format!("{why}; listing node {node}'s boxes: {e:#}")),
+        }
+        Ok(())
+    }
+
     async fn stop_box(&mut self, node: Option<&str>, b: &BoxInfo, why: &str) -> Result<()> {
         let at = node.map(|n| format!(" on {n}")).unwrap_or_default();
         if !self.dry_run {
@@ -866,6 +939,17 @@ fn node_docker(name: &str) -> Option<Docker> {
         return None;
     }
     crate::enrol::resolve_installed(name, None).ok().filter(|n| n.name.is_some()).map(|n| Docker::over_ssh(n.ssh_prefix()))
+}
+
+/// The run's failed takeovers, from its directory.
+fn run_attach_failures(run: &str) -> Option<crate::run::AttachFailures> {
+    crate::run::check_run_id(run).ok()?;
+    crate::run::attach_failures(&crate::data_dir().join("runs").join(run))
+}
+
+/// Whether this host has the run's record.
+fn has_run_record(run: &str) -> bool {
+    crate::run::check_run_id(run).is_ok() && crate::data_dir().join("runs").join(run).join("ctl/run.json").exists()
 }
 
 /// When a run's box must have stopped (Unix seconds), from the run's record (none for a run without
@@ -1554,6 +1638,69 @@ mod tests {
         pass_at(&w, &mut l, &asked, false, NOW + 366 * 86_400).await;
         assert_eq!(l.run_status("run_unknown").unwrap().as_deref(), Some(LOST));
         let _ = std::fs::remove_dir_all(unknown_dir());
+    }
+
+    /// #676: a run whose takeovers keep failing while its node still runs its box is backed off
+    /// between tries (no `wicket attach` spawned, nothing audited, each pass), and after
+    /// MAX_ATTACH_FAILURES its box is stopped through its node; then, the node listing no box, the run
+    /// ends as lost. A run this host has no record of, on a node that can't be asked, is kept while
+    /// the ledger has its box authorized, and ended after.
+    #[tokio::test]
+    async fn takeovers_that_keep_failing_back_off_then_stop_the_box_through_its_node() {
+        let mut w = World::new(Fake::default());
+        w.nodes.insert("n1".into(), FakeBoxes::with(&[("box_stuck", "run_stuck", "dead:1:1"), ("box_back", "run_back", "dead:1:1")]));
+        let mut l = Ledger::open_in_memory().unwrap();
+        for (run, node) in [("run_stuck", "n1"), ("run_back", "n1"), ("run_ledger", "n2")] {
+            l.run_started(&TenantId::single(), &RunId(run.into()), "z", "a").unwrap();
+            l.set_run_owner(run, "dead:1:1").unwrap();
+            l.set_run_node(run, node).unwrap();
+        }
+        l.set_run_authority("run_ledger", NOW + 100, NOW + 600).unwrap();
+        static TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn try_adopt(run: &str) -> Result<()> {
+            TRIED.lock().unwrap().push(run.to_string());
+            Ok(())
+        }
+        fn failures(run: &str) -> Option<crate::run::AttachFailures> {
+            let f = |count, why: &str| crate::run::AttachFailures { count, last_at: NOW - 10, why: why.into() };
+            match run {
+                "run_stuck" => Some(f(crate::run::MAX_ATTACH_FAILURES, "its manifest no longer loads")),
+                "run_back" => Some(f(2, "its manifest no longer loads")),
+                _ => None,
+            }
+        }
+        async fn pass_at(w: &World<Fake>, l: &mut Ledger, asked: &HashMap<String, Option<Vec<String>>>, at: i64) -> Vec<Done> {
+            let m = Machines { placer: &w.placer, approver: &w.approver, setup: &w.setup, warm_pool: false };
+            let nodes = w.nodes.clone();
+            let mut p = Pass::new(l, Some(m), &w.local, move |n: &str| nodes.get(n).cloned(), at, false).with_node_runs(asked.clone());
+            p.owner_alive = alive;
+            p.adopt = try_adopt;
+            p.fenced = |_, _, _| None;
+            p.attach_failures = failures;
+            p.has_run_record = |_| false;
+            p.run().await.unwrap()
+        }
+        let mut asked = HashMap::new();
+        asked.insert("n1".to_string(), Some(vec!["run_stuck".to_string(), "run_back".to_string()]));
+        asked.insert("n2".to_string(), None);
+        let d = pass_at(&w, &mut l, &asked, NOW).await;
+        // Backed off: its second failure was 10 s ago, and it waits 120 s.
+        assert!(d.iter().any(|x| x.kind == "attach_backoff" && x.target == "run_back"), "{d:?}");
+        assert!(TRIED.lock().unwrap().is_empty(), "no takeover spawned while backing off, nor for the stuck run");
+        // Stuck: its box is stopped through its node; the run itself stays until the node says so.
+        assert_eq!(w.nodes["n1"].killed(), vec!["box_stuck".to_string()]);
+        assert_eq!(l.run_status("run_stuck").unwrap().as_deref(), Some("running"));
+        // The ledger's authority holds a run this host has no record of.
+        assert!(d.iter().any(|x| x.kind == "unreachable" && x.target == "run_ledger" && x.detail.contains("the ledger has it")), "{d:?}");
+        assert_eq!(l.run_status("run_ledger").unwrap().as_deref(), Some("running"));
+        // Past the backoff it is tried again; the node lists no box for the stuck run: it ends.
+        asked.insert("n1".to_string(), Some(vec!["run_back".to_string()]));
+        pass_at(&w, &mut l, &asked, NOW + 111).await;
+        assert_eq!(*TRIED.lock().unwrap(), vec!["run_back".to_string()]);
+        assert_eq!(l.run_status("run_stuck").unwrap().as_deref(), Some(LOST));
+        // Past the ledger's authority (and its skew), the unreachable run ends.
+        pass_at(&w, &mut l, &asked, NOW + 131).await;
+        assert_eq!(l.run_status("run_ledger").unwrap().as_deref(), Some(LOST));
     }
 
     /// #474: a long-lived agent's first box never starts on its node, so its run is lost straight

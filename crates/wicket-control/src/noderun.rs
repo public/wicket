@@ -3139,7 +3139,7 @@ pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> a
     release_fence(&crate::data_dir().join("runs").join(run), by)?;
     let until_ms = (until != UNKNOWN_END).then_some(until);
     l.audit(
-        &wicket_core::TenantId::single(),
+        &l.run_tenant(run)?.unwrap_or_else(wicket_core::TenantId::single),
         Some(&wicket_core::RunId(run.into())),
         "run.fence_released",
         &serde_json::json!({ "node": node, "by": by, "why": reason, "fenced_until_ms": until_ms }),

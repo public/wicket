@@ -249,7 +249,10 @@ still gives it), then from the ledger's hard end of the box's authority (`runs.a
 written before the box starts). With none of them, the run is fenced until its node confirms the
 box stopped, or root releases the fence (`wicket node release-fence`, audited), never ended
 unfenced (#676); a takeover that fails on such a run (`run.rs` `attach_failed`) leaves it to the
-reconciler while it is fenced. So the model's `Lost` doesn't come before the authority end the code
+reconciler while it is fenced, which backs off and after five failures stops the box through its
+node. A run with no run record on this host (a standby restored from the state store, #154) is held
+by the ledger instead: the agent's fence (`Ledger::agent_fenced_until`) and, on a node that can't be
+asked, the run's authority end (`reconcile.rs`, `runs.authority_until`). So the model's `Lost` doesn't come before the authority end the code
 can tell, except where root released a fence it couldn't.
 
 Every switch is now the code (#444, #445, #446, #453, #474), so `RunLifecycle.cfg` is main, and each

@@ -77,7 +77,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
             NodeCmd::Forget { run, force } => noderun::forget_command(&run, force, &operator()).await,
-            NodeCmd::ReleaseFence { run, reason } => noderun::release_fence_command(&run, &reason, &operator(), is_root()),
+            NodeCmd::ReleaseFence { run, reason } => noderun::release_fence_command(&run, &reason, &operator(), wicket_home::cli_is_root()),
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
@@ -386,10 +386,4 @@ pub enum LeaseCmd {
     List,
     /// End a lease now: what runs on it stops and its node is destroyed (one reconcile pass).
     Release { id: String },
-}
-
-/// Whether the caller is root: root over wicketd's socket (its peer credentials), or root itself.
-fn is_root() -> bool {
-    let p = wicket_home::cli_principal();
-    p["id"].as_str() == Some("root") && p["via"].as_str() == Some("cli")
 }

@@ -400,6 +400,12 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
         (None, None) => std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?,
     };
     let mut m = wicket_agent::load(&raw)?;
+    // A takeover that got this far clears its run's failed ones (#676).
+    if record.is_some() {
+        if let Some(run) = &run_id {
+            let _ = std::fs::remove_file(attach_file(&data_dir().join("runs").join(run)));
+        }
+    }
     if let Some(t) = task {
         if m.agent.is_none() {
             bail!("--task applies to agent manifests only");
@@ -2657,8 +2663,49 @@ fn print_event(ev: &Event) {
     }
 }
 
+/// A run's failed takeovers (`wicket attach`) while its box may still run (#676), kept beside the run
+/// (`ctl/attach.json`): how many in a row, when the last was (Unix s), and why. The reconciler backs
+/// off by it, and after [`MAX_ATTACH_FAILURES`] stops the box through its node. A takeover that gets
+/// as far as the run's manifest clears it.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AttachFailures {
+    pub count: u32,
+    pub last_at: i64,
+    pub why: String,
+}
+
+/// How many takeovers in a row may fail before the reconciler stops the box through its node.
+pub const MAX_ATTACH_FAILURES: u32 = 5;
+
+fn attach_file(run_dir: &Path) -> std::path::PathBuf {
+    run_dir.join("ctl").join("attach.json")
+}
+
+/// The failed takeovers recorded for the run in `run_dir`, if any.
+pub fn attach_failures(run_dir: &Path) -> Option<AttachFailures> {
+    serde_json::from_slice(&std::fs::read(attach_file(run_dir)).ok()?).ok()
+}
+
+/// One more failed takeover of the run in `run_dir`, at `at` (Unix s): the count so far, and whether
+/// its reason is new (the audit records only a change).
+pub fn record_attach_failure(run_dir: &Path, why: &str, at: i64) -> Result<(AttachFailures, bool)> {
+    let before = attach_failures(run_dir).unwrap_or_default();
+    let changed = before.why != why;
+    let now = AttachFailures { count: before.count.saturating_add(1), last_at: at, why: why.to_string() };
+    write_json(&attach_file(run_dir), &now)?;
+    Ok((now, changed))
+}
+
+/// How long the reconciler waits after a run's `count`th failed takeover before it tries again (s):
+/// a minute, doubling, at most an hour.
+pub fn attach_backoff_secs(count: u32) -> i64 {
+    (60i64 << count.saturating_sub(1).min(6)).min(3600)
+}
+
 /// A run that `wicket attach` could not take over is ended as lost (unless another process already
 /// supervises it), so its box is stopped by the next reconcile pass instead of being adopted again.
+/// While its box may still run on its node (it is fenced), it is left running instead, the failure
+/// recorded ([`record_attach_failure`]) and audited once per reason as `run.attach_failed`.
 pub fn attach_failed(run: &str, e: &anyhow::Error) {
     let why = format!("{e:#}");
     if why.contains("another wicket process supervises") || check_run_id(run).is_err() {
@@ -2666,24 +2713,36 @@ pub fn attach_failed(run: &str, e: &anyhow::Error) {
     }
     if let Ok(l) = Ledger::open(&ledger_path()) {
         if l.run_status(run).ok().flatten().as_deref() == Some("running") {
+            let tenant = l.run_tenant(run).ok().flatten().unwrap_or_else(wicket_core::TenantId::single);
+            let clipped = wicket_agent::clip(&why, 300);
             // Its box may still run on its node (#676: a manifest a later version no longer loads
             // fails the takeover, not the box): not ended while fenced, or the ledger's fence on
-            // its agent would lift with the box still running. The reconciler tries again, and
-            // ends it once its node says the box is gone or the fence ends.
+            // its agent would lift with the box still running. The reconciler tries again, backing
+            // off, and stops the box through its node after MAX_ATTACH_FAILURES.
             if let Some((node, until)) = crate::noderun::fenced_until(&l, run, wicket_feed::now_ms()) {
-                let _ = l.audit(
-                    &wicket_core::TenantId::single(),
-                    Some(&RunId(run.to_string())),
-                    "run.attach_failed",
-                    &serde_json::json!({ "why": wicket_agent::clip(&why, 300), "node": node, "fenced_until_ms": until }),
-                );
+                let dir = data_dir().join("runs").join(run);
+                let (failures, changed) = match record_attach_failure(&dir, &clipped, wicket_store::now()) {
+                    Ok(r) => r,
+                    Err(_) => (AttachFailures { count: 1, ..Default::default() }, true),
+                };
+                if changed {
+                    let fenced = match until {
+                        crate::noderun::UNKNOWN_END => "until the node confirms the box stopped".to_string(),
+                        u => crate::noderun::fmt_ms(u),
+                    };
+                    let _ = l.audit(
+                        &tenant,
+                        Some(&RunId(run.to_string())),
+                        "run.attach_failed",
+                        &serde_json::json!({ "why": clipped, "node": node, "fenced": fenced, "failures": failures.count }),
+                    );
+                }
                 return;
             }
-            let reason = format!("its supervisor is gone and it could not be taken over: {}", wicket_agent::clip(&why, 300));
+            let reason = format!("its supervisor is gone and it could not be taken over: {clipped}");
             // And its agent, if it was the agent's activation (#474).
             let _ = l.run_lost(run, &reason);
-            let _ =
-                l.audit(&wicket_core::TenantId::single(), Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
+            let _ = l.audit(&tenant, Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
         }
     }
 }
@@ -2837,6 +2896,26 @@ fn same_remote_session(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// #676: failed takeovers are counted, a new reason is told apart from a repeat (the audit
+    /// records only a change), and the wait between tries doubles from a minute to at most an hour.
+    #[test]
+    fn failed_takeovers_are_counted_and_backed_off() {
+        let d = std::env::temp_dir().join(format!("wicket-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        assert_eq!(attach_failures(&d), None);
+        let (f, changed) = record_attach_failure(&d, "no manifest", 100).unwrap();
+        assert_eq!((f.count, changed), (1, true));
+        let (f, changed) = record_attach_failure(&d, "no manifest", 200).unwrap();
+        assert_eq!((f.count, f.last_at, changed), (2, 200, false), "the same reason isn't audited again");
+        let (f, changed) = record_attach_failure(&d, "no node", 300).unwrap();
+        assert_eq!((f.count, changed), (3, true));
+        assert_eq!(attach_failures(&d), Some(f));
+        assert_eq!([1, 2, 3, 6, 7, 40].map(attach_backoff_secs), [60, 120, 240, 1920, 3600, 3600]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     use super::*;
 
     #[test]

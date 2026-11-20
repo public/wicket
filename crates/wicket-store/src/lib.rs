@@ -1141,6 +1141,15 @@ impl Ledger {
         Ok(self.conn.query_row("SELECT status FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?)
     }
 
+    /// The tenant `run` belongs to, if it is in this ledger.
+    pub fn run_tenant(&self, run: &str) -> Result<Option<wicket_core::TenantId>> {
+        Ok(self
+            .conn
+            .query_row("SELECT tenant FROM runs WHERE id = ?1", params![run], |r| r.get::<_, String>(0))
+            .optional()?
+            .map(wicket_core::TenantId))
+    }
+
     /// Children started by `run` (from their identity documents).
     pub fn children(&self, run: &str) -> Result<Vec<IdentityRow>> {
         let mut st = self.conn.prepare("SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities WHERE parent_run = ?1 ORDER BY issued_at")?;
