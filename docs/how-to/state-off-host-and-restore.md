@@ -66,6 +66,14 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
 4. **Check it**: `wicket state check --probe` writes, reads back and deletes a probe object, and says
    where each kind of state goes (without `--probe`, only the latter). The `wicket-state` service
    starts once `state-store.yaml` exists (`systemctl restart wicket-state`).
+   - It also says where the ledger's stream is, as Litestream reports it on its control socket
+     (`<data dir>/litestream.sock`, which `wicket state replicate` turns on): **streaming** (the store
+     was brought up to date within a minute, or 10 sync intervals if longer), **lagging** (it hasn't
+     been for longer: the store can't be reached, say), **starting** or **stopped** (Litestream isn't
+     running). With when it last synced and its last error, which `wicket state replicate` keeps
+     from Litestream's log in `<data dir>/state-stream.json`.
+   - And where each `store` audit sink is against the chain head, as `wicket audit export
+     --status` shows it.
    - Each control host streams to a path of its own, `ledger/<lineage>/`, listed in
      `ledger/lineages.json` with when each started. A restore takes the lineage that was current (at
      `--at`, if given) and starts a new one. A host whose lineage was taken over refuses to stream, as

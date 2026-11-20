@@ -49,6 +49,8 @@ pub fn expose(ctx: &RunCtx, port: u16, name: Option<&str>) -> Reply {
     if let Err(e) = l.expose(&ctx.tenant, &ctx.run.0, port, name.as_deref(), &zone) {
         return (e.to_string(), true);
     }
+    // The box's own now, whatever exposed it before: no name's move takes it away (#668).
+    let _ = l.drop_name_exposure(&ctx.run, port);
     // On the record before it takes effect (fail closed).
     if let Err(e) = l.audit(&ctx.tenant, Some(&ctx.run), "link.expose", &serde_json::json!({ "port": port, "name": name })) {
         let _ = l.unexpose(&ctx.run.0, port);
@@ -1023,6 +1025,124 @@ mod tests {
         let hosts = std::fs::read_to_string(w.root.join("run_web/hosts")).unwrap();
         assert_eq!(hosts.matches("api.lead.fetch-er.01x.wicket.internal").count(), 1, "{hosts}");
         assert_eq!(roundtrip(&w.root.join("run_web/sock").join(format!("link-{}.sock", link_id(&text)))).await.unwrap(), "run_b:ping");
+    }
+
+    /// #668 review: two names of one box from one connector share its address and each keeps its
+    /// own hosts line; unlinking one leaves the other working; connect(box:) to the same box takes
+    /// its own label, never a by-name link's; a port the box exposed itself keeps that exposure; a
+    /// zone named like wicket's domain holds no names; and a request_name whose audit record can't
+    /// be written leaves things as they were.
+    #[tokio::test]
+    async fn two_names_of_one_box_and_the_edges_around_them() {
+        let w = World::new();
+        let api = w.boxed(w.zone("build", &["web"]), "api", "run_api", None, &[]);
+        let web = w.boxed(w.zone("web", &[]), "web", "run_web", None, &[]);
+        let req = |name: &str, port: u16| crate::names::request_name(&api, &serde_json::json!({ "name": name, "port": port }));
+        assert!(!req("one", 3000).1);
+        assert!(!req("two", 3001).1);
+
+        let (t1, err) = connect_name(&web, "one.build", None).await;
+        assert!(!err, "{t1}");
+        let (t2, err) = connect_name(&web, "two.build", None).await;
+        assert!(!err, "{t2}");
+        let hosts = std::fs::read_to_string(w.root.join("run_web/hosts")).unwrap();
+        assert!(
+            hosts.contains("198.18.1.1\tone.build.wicket.internal") && hosts.contains("198.18.1.1\ttwo.build.wicket.internal"),
+            "{hosts}"
+        );
+        let (id1, id2) = (link_id(&t1), link_id(&t2));
+        assert!(!unlink(&web, &id1).1);
+        wait_closed(&w, &id1).await;
+        let hosts = std::fs::read_to_string(w.root.join("run_web/hosts")).unwrap();
+        assert!(!hosts.contains("one.build") && hosts.contains("two.build.wicket.internal"), "{hosts}");
+        assert_eq!(roundtrip(&w.root.join("run_web/sock").join(format!("link-{id2}.sock"))).await.unwrap(), "run_api:ping");
+
+        // connect(box:) to the same box, another port: its own label, at the box's address.
+        w.ledger
+            .lock()
+            .unwrap()
+            .expose(&TenantId::single(), "run_api", 3002, None, &serde_json::to_string(api.zone.spec()).unwrap())
+            .unwrap();
+        let (t3, err) = connect(&web, "run_api", Some(3002)).await;
+        assert!(!err && t3.contains("api.wicket.internal:3002") && !t3.contains("build"), "{t3}");
+        // ...and a later name still links by its exact name.
+        assert!(!req("three", 3003).1);
+        let (t4, err) = connect_name(&web, "three.build", None).await;
+        assert!(!err && t4.contains("three.build.wicket.internal:3003"), "{t4}");
+
+        // A port the box exposed itself (3002, no name) keeps that exposure when named.
+        let (text, err) = crate::names::request_name(&api, &serde_json::json!({ "name": "one", "port": 3002 }));
+        assert!(!err, "{text}");
+        assert_eq!(w.ledger.lock().unwrap().exposed("run_api", 3002).unwrap().unwrap().name, None);
+
+        // A zone named like wicket's domain holds no names.
+        let odd = w.boxed(w.zone("build.wicket.internal", &[]), "odd", "run_odd", None, &[]);
+        let (text, err) = crate::names::request_name(&odd, &serde_json::json!({ "name": "svc", "port": 1 }));
+        assert!(err && text.contains("can't be part of a DNS name"), "{text}");
+
+        // The audit record can't be written: a name asked again keeps its old port, and the box's
+        // own exposure stays as it was...
+        w.ledger.lock().unwrap().fail_audit_inserts_for_tests().unwrap();
+        let (text, err) = req("one", 3005);
+        assert!(err && text.contains("audit record"), "{text}");
+        {
+            let l = w.ledger.lock().unwrap();
+            assert_eq!(l.internal_name(&TenantId::single(), "build", "one").unwrap().unwrap().port, 3002);
+            assert!(l.exposed("run_api", 3005).unwrap().is_none());
+            assert_eq!(l.exposed("run_api", 3002).unwrap().unwrap().name, None);
+            // (room under the limit of 3 for a new one)
+            let three = l.internal_name(&TenantId::single(), "build", "three").unwrap().unwrap();
+            l.revoke_name(&three.id, "test").unwrap();
+        }
+        // ...and a new name is undone, its port left unexposed.
+        let (text, err) = req("four", 3004);
+        assert!(err && text.contains("audit record"), "{text}");
+        let l = w.ledger.lock().unwrap();
+        assert!(l.internal_name(&TenantId::single(), "build", "four").unwrap().is_none());
+        assert!(l.exposed("run_api", 3004).unwrap().is_none());
+    }
+
+    /// #668 review, F1 and F2: two names on one port keep it offered while either is there, in
+    /// whichever order they move away; and a port the box exposed itself stays exposed when a name
+    /// on it moves.
+    #[tokio::test]
+    async fn a_port_stays_offered_while_a_name_or_the_box_offers_it() {
+        let w = World::new();
+        let api = w.boxed(w.zone("build", &["web"]), "api", "run_api", None, &[]);
+        let web = w.boxed(w.zone("web", &[]), "web", "run_web", None, &[]);
+        let req = |name: &str, port: u16| {
+            let (text, err) = crate::names::request_name(&api, &serde_json::json!({ "name": name, "port": port }));
+            assert!(!err, "{name}@{port}: {text}");
+        };
+        let offered = |port: u16| w.ledger.lock().unwrap().exposed("run_api", port).unwrap().is_some();
+        for (first, second) in [("one", "two"), ("two", "one")] {
+            req("one", 3000);
+            req("two", 3000);
+            // The first moves away: the second still names 3000, so it stays offered.
+            req(first, 3005);
+            assert!(offered(3000), "after moving {first}");
+            let (text, err) = connect_name(&web, &format!("{second}.build"), None).await;
+            assert!(!err, "{text}");
+            assert!(!unlink(&web, &link_id(&text)).1);
+            wait_closed(&w, &link_id(&text)).await;
+            // The second moves too: nothing names 3000, which a name exposed, so it goes.
+            req(second, 3006);
+            assert!(!offered(3000), "after moving {second}");
+            // Back for the next round.
+            req("one", 3000);
+            req("two", 3000);
+            assert!(offered(3000));
+        }
+        // F2: the box exposes 4000 itself, under the same label; a name on it moves away.
+        assert!(!expose(&api, 4000, Some("one")).1);
+        req("one", 4000);
+        req("one", 4001);
+        assert!(offered(4000), "the box's own exposure stays");
+        // And a port a name exposed that the box then exposes itself is the box's.
+        req("two", 4002);
+        assert!(!expose(&api, 4002, Some("mine")).1);
+        req("two", 4003);
+        assert!(offered(4002));
     }
 
     #[tokio::test]

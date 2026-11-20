@@ -190,6 +190,100 @@ impl SinksConfig {
     }
 }
 
+// ---- where each sink is ----
+
+/// One sink's progress against the chain head (#635): what `wicket audit export --status`, the
+/// console's health section and `wicket top` show.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SinkStatus {
+    pub sink: String,
+    /// `jsonl`, `otlp` or `store`.
+    pub kind: &'static str,
+    /// The last sequence number it acknowledged.
+    pub seq: i64,
+    /// The chain head's sequence number.
+    pub head: i64,
+    /// Records it hasn't acknowledged yet.
+    pub behind: i64,
+    /// How long the oldest of those has waited (seconds), 0 when caught up.
+    pub behind_secs: i64,
+    /// When it last acknowledged a signed checkpoint (Unix seconds), 0 if never.
+    pub checkpoint_at: i64,
+    /// Who feeds it, while its lease lasts.
+    pub holder: Option<String>,
+    /// The last delivery error, cleared on success.
+    pub error: Option<String>,
+    /// A `jsonl` sink to standard output (`path: "-"`): only a `wicket audit export` in the
+    /// foreground feeds it, so being behind is expected, not a fault.
+    pub manual: bool,
+}
+
+impl SinkKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SinkKind::Jsonl { .. } => "jsonl",
+            SinkKind::Otlp { .. } => "otlp",
+            SinkKind::Store {} => "store",
+        }
+    }
+}
+
+/// Every configured sink's progress at `now` (Unix seconds), from the ledger's cursors.
+pub fn status(l: &Ledger, cfg: &SinksConfig, now: i64) -> Result<Vec<SinkStatus>> {
+    let head = l.audit_head()?.map(|h| h.0).unwrap_or(0);
+    cfg.sinks
+        .iter()
+        .map(|s| {
+            let c = l.peek_export_cursor(&s.name)?;
+            let oldest = if c.seq < head { l.audit_ts_after(c.seq)? } else { None };
+            Ok(SinkStatus {
+                sink: s.name.clone(),
+                kind: s.kind.name(),
+                seq: c.seq,
+                head,
+                behind: (head - c.seq).max(0),
+                behind_secs: oldest.map(|ts| (now - ts).max(0)).unwrap_or(0),
+                checkpoint_at: c.checkpoint_at,
+                holder: c.holder.filter(|_| c.lease_until >= now),
+                error: c.error,
+                manual: matches!(&s.kind, SinkKind::Jsonl { path } if path == "-"),
+            })
+        })
+        .collect()
+}
+
+/// A sink's status on one line: `wicket audit export --status` and `wicket top`.
+pub fn status_line(s: &SinkStatus, now: i64) -> String {
+    let behind = match s.behind {
+        0 => "caught up".to_string(),
+        n => format!("{n} behind (oldest {})", ago(s.behind_secs)),
+    };
+    let cp = match s.checkpoint_at {
+        0 => "never".to_string(),
+        at => format!("{} ago", ago(now - at)),
+    };
+    let behind = if s.manual { format!("{behind} (manual: fed only by `wicket audit export`)") } else { behind };
+    format!(
+        "{:<16} {:<5} at {} of {}, {behind}  last checkpoint {cp}  fed by {}{}",
+        s.sink,
+        s.kind,
+        s.seq,
+        s.head,
+        s.holder.as_deref().unwrap_or("-"),
+        s.error.as_ref().map(|e| format!("  error: {e}")).unwrap_or_default()
+    )
+}
+
+/// A span of seconds, short: `40 s`, `12 min`, `3 h`, `2 d`.
+pub fn ago(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 120 => format!("{s} s"),
+        s if s < 7200 => format!("{} min", s / 60),
+        s if s < 172_800 => format!("{} h", s / 3600),
+        s => format!("{} d", s / 86_400),
+    }
+}
+
 // ---- what is sent ----
 
 /// One audit record as exported: a JSON object, one line.
@@ -464,7 +558,8 @@ impl Exporter {
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    let _ = self.ledger.export_failed(&name, &msg);
+                    // Stored and shown: a URL's user info and query (tokens) dropped.
+                    let _ = self.ledger.export_failed(&name, &wicket_core::text::redact_urls(&msg));
                     let s = &mut self.sinks[i];
                     s.next_try = now + s.backoff;
                     s.backoff = (s.backoff * 2).min(Duration::from_secs(60));
@@ -833,6 +928,43 @@ mod tests {
         assert!(matches!(&c.sinks[1].kind, SinkKind::Otlp { headers, .. } if headers["x-tenant"] == "t"));
         assert!(SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: x}\n  - {name: a, type: jsonl, path: y}\n").is_err());
         assert!(SinksConfig::parse("sinks:\n  - {name: a, type: kafka}\n").is_err());
+    }
+
+    #[test]
+    fn a_sinks_status_counts_what_it_has_not_acknowledged() {
+        let l = Ledger::open_in_memory().unwrap();
+        let cfg = SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: '-'}\n  - {name: s, type: store}\n").unwrap();
+        write_records(&l, 0, 5);
+        let (head, _) = l.audit_head().unwrap().unwrap();
+        let first = l.audit_record_at(1).unwrap().unwrap();
+        l.advance_export("a", head).unwrap();
+        l.export_checkpointed("a", 77).unwrap();
+        l.lease_export("a", "serve-1", first.ts + 80).unwrap();
+        l.export_failed("s", "connection refused").unwrap();
+        let st = status(&l, &cfg, first.ts + 90).unwrap();
+        let a = &st[0];
+        assert_eq!((a.kind, a.seq, a.head, a.behind, a.behind_secs, a.checkpoint_at), ("jsonl", head, head, 0, 0, 77));
+        assert_eq!(a.holder.as_deref(), Some("serve-1"));
+        assert!(a.manual, "a jsonl sink to stdout is fed by hand");
+        assert!(status_line(a, first.ts + 90).contains("(manual: fed only by `wicket audit export`)"));
+        let s = &st[1];
+        assert_eq!(
+            (s.kind, s.seq, s.behind, s.behind_secs, s.manual),
+            ("store", 0, head, 90, false),
+            "behind by every record, the first 90 s old"
+        );
+        assert_eq!(s.error.as_deref(), Some("connection refused"));
+        let later = status(&l, &cfg, first.ts + 3600).unwrap();
+        assert_eq!(later[0].holder, None, "a lapsed lease feeds nothing");
+        let now = first.ts + 90;
+        assert!(status_line(a, now).contains(&format!("at {head} of {head}, caught up")), "{}", status_line(a, now));
+        let line = status_line(s, now);
+        assert!(
+            line.contains("5 behind (oldest 90 s)")
+                && line.contains("last checkpoint never")
+                && line.ends_with("error: connection refused"),
+            "{line}"
+        );
     }
 
     /// Rewrites record `seq`'s body and re-chains every record after it: a consistent forgery that
