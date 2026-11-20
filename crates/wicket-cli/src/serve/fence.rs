@@ -1,15 +1,14 @@
-//! The console's Fenced runs card (#690): runs whose box may still be running on a node that can't
-//! end its fence (revoked, no longer enrolled, or silent past the feed's TTL), so their agent isn't
-//! woken and the run isn't ended. An operator releases such a fence here instead of as root on the
-//! host.
+//! The console's Fenced runs card (#690): runs whose box may still be running on a node that can
+//! never end its fence (revoked, or no longer enrolled), so their agent isn't woken and the run isn't
+//! ended. An operator releases such a fence here instead of as root on the host.
 //!
 //! - **Shown:** each such run, its node (enrolled, revoked or gone, and when it last reported), when
 //!   the fence ends (or that it doesn't until the node confirms), and why
-//!   ([`wicket_control::fence::fence_of`]). A healthy node's boxes are fenced too (while their
-//!   authority is live), and are never listed or released here: their node will confirm them.
+//!   ([`wicket_control::fence::fence_of`]). An enrolled node's boxes are fenced too (while their
+//!   authority is live), and are never listed or released here, whether or not it reports (revoke
+//!   the node first); nor is a run with no node on record (its box still starting).
 //! - **Release** (`release_fence`) is a passkey-signed action, refused at begin to an operator whose
-//!   authority (`operators.yaml`) doesn't cover `fence` at R4 (403) and for a fence its node can
-//!   still end (409). The signed JSON names the run, its node, the node's status and last report,
+//!   authority (`operators.yaml`) doesn't cover `fence` at R4 (403) and for any other fence (409). The signed JSON names the run, its node, the node's status and last report,
 //!   the fence's end, the reason and the effect; a release of a fence that changed since is refused.
 //!   It is audited as `run.fence_released` with the operator's label and principal, the record
 //!   `wicket node release-fence` writes too.

@@ -1303,7 +1303,7 @@ async function refreshOnce() {
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
-    renderRows("fenced", s.fenced || [], fencedRow, "No fence to release: no box is held by a node that is revoked, gone or silent. A reporting node's boxes are released by the node itself.");
+    renderRows("fenced", s.fenced || [], fencedRow, "No fence to release: no box is held by a node that is revoked or no longer enrolled. An enrolled node's boxes are released by the node, or by revoking it first.");
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};

@@ -38,8 +38,8 @@
   <h2>Nodes</h2>
   <div class="card" id="health"></div>
   <div class="card" id="placed"></div>
-  <!-- Fenced runs (#690): boxes that may still run on a node that hasn't confirmed they stopped;
-       a fence is released passkey-signed, by an operator whose authority covers fence. -->
+  <!-- Fenced runs (#690): boxes that may still run on a node that is revoked or no longer enrolled,
+       so it can never end their fence; released passkey-signed, by an operator whose authority covers fence. -->
   <h2>Fenced runs</h2>
   <div class="card" id="fenced"></div>
   <!-- Standing capacity grants (#256): issuing and renewing one is passkey-signed; revoking isn't. -->

@@ -74,20 +74,23 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 - **release a run's fence** (`release_fence`, #690), the console's path beside root's `wicket node
   release-fence`. A run is fenced while its box may still be running on a node that hasn't confirmed
   it stopped (see [the wake fence](nodes.md)): its agent isn't woken and the run isn't ended. Every
-  box a node runs is fenced while its authority is live, and a reporting node ends its boxes' fences
-  itself, so the **Fenced runs** card lists only fences their node can't end: its node is revoked,
-  no longer enrolled, or hasn't reported for the feed's TTL plus two report intervals (90 s by
-  default). Each row shows the node, when it last reported, when the fence ends (or that it lasts
-  until the node confirms), and why. **Release…** asks for a reason; the passkey signs the run, its
-  node, the node's status and last report, the fence's end, the reason and its effect, and a
-  release of a fence that changed since you were shown it (its node reported again, say) is refused.
-  A fence whose node is enrolled and reporting is refused (409), and only an operator whose authority
-  in [`operators.yaml`](configuration.md#operatorsyaml) covers `fence` at R4 may release one (403
+  box a node runs is fenced while its authority is live, so the **Fenced runs** card lists only
+  fences whose node can never end them: the node is revoked or no longer enrolled. An enrolled node's
+  silence isn't enough: its health is recorded only while a supervisor here is attached to it, and an
+  offline node keeps acting on its boxes' tokens until they end. For a node that will never run its
+  boxes again, revoke it (`wicket node revoke`), then release. A run with no node on record (its box
+  still starting) isn't listed either. Each row shows the node, when it last reported, when the
+  fence ends (or that it lasts until the node confirms), and why. **Release…** asks for a reason;
+  the passkey signs the run, its node, the node's status and last report, the fence's end, the
+  reason and its effect, and a release of a fence that changed since you were shown it is refused.
+  Any other fence is refused (409), and only an operator whose authority in
+  [`operators.yaml`](configuration.md#operatorsyaml) covers `fence` at R4 may release one (403
   before the passkey; refusals when applied are audited as `decision.refused` with your identity).
   It is audited as `run.fence_released` with your passkey and operator identity, the record root's
-  command writes too (`granter` `human` or `root`, `via` `console` or `cli`). If that record can't
-  be written, the release is undone. The box may still be running: release a fence only for a node
-  that will never run it again.
+  command writes too (`granter` `human` or `root`, `via` `console` or `cli`). The record is written
+  before the fence is lifted: if it can't be written, nothing is released, and if the fence can't
+  be lifted after it (`run.fence_release_failed`), the fence still holds. The box may still be
+  running: release a fence only for a node that will never run it again.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.

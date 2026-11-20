@@ -72,7 +72,7 @@ fn changed(sh: &Shared, p: &mut Progress, topic: wicket_store::Topic) -> bool {
 
 /// A node's health is written to the ledger at most this often (ms), whichever of its runs'
 /// connections has it first: each reports the same, every 30 s.
-pub(crate) const HEALTH_WRITE_MS: i64 = 20_000;
+const HEALTH_WRITE_MS: i64 = 20_000;
 
 /// A node feed's directory holds this file when its feed must start a new generation the next time
 /// it is opened (after a restore, #154: its delta log stayed behind).
@@ -1838,7 +1838,7 @@ pub struct AuthorityRecord {
 /// The ledger's fence on a lapsed claim allows the same (#446).
 pub const WAKE_SKEW_MS: i64 = wicket_store::WAKE_SKEW_SECS * 1000;
 
-pub(crate) fn authority_file(run_dir: &Path) -> PathBuf {
+fn authority_file(run_dir: &Path) -> PathBuf {
     run_dir.join("ctl").join("authority.json")
 }
 

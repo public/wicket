@@ -2926,15 +2926,16 @@ mod tests {
         );
     }
 
-    /// The review of #690: a healthy node's box (an enrolled node that reported just now, its
-    /// authority record live, as every node box has) isn't listed and its fence isn't released,
-    /// whoever asks; an operator whose authority doesn't cover `fence` is refused before the passkey;
-    /// another tenant's fenced run isn't found.
+    /// The review of #690: an enrolled node's box (it reported just now, its authority record live,
+    /// as every node box has) and a run still starting (no node or authority on record) aren't
+    /// listed and their fences aren't released, whoever asks; an operator whose authority doesn't
+    /// cover `fence` is refused before the passkey; another tenant's fenced run isn't found.
     #[test]
     fn only_a_fence_its_node_cant_end_is_released_and_only_by_an_operator_it_covers() {
         let t = setup("fence-healthy");
         let (healthy, lost, theirs) =
             ("run_0000000000000000000healthy", "run_0000000000000000000000lost", "run_00000000000000000000theirs");
+        let starting = "run_000000000000000000starting";
         let mut l = t.ledger();
         let tok = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
         let now = wicket_store::now();
@@ -2969,6 +2970,10 @@ mod tests {
             l.run_started(&tenant, &RunId(run.into()), "z", "lead").unwrap();
             l.set_run_node(run, node).unwrap();
         }
+        // A run still starting: its run record written, its node and authority not yet.
+        std::fs::create_dir_all(t.dir.join("runs").join(starting).join("ctl")).unwrap();
+        std::fs::write(t.dir.join("runs").join(starting).join("ctl/run.json"), b"not json").unwrap();
+        l.run_started(&TenantId::single(), &RunId(starting.into()), "z", "lead").unwrap();
         // What every node box has while it runs: its authority, live for another hour.
         let until = wicket_feed::now_ms() + 3_600_000;
         std::fs::write(t.dir.join("runs").join(healthy).join("ctl/authority.json"), json!({ "node": "n1", "until_ms": until }).to_string())
@@ -2976,9 +2981,10 @@ mod tests {
         drop(l);
         let listed: Vec<String> =
             dashboard(&t.state).unwrap()["fenced"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap().to_string()).collect();
-        assert_eq!(listed, [lost], "the healthy node's box and the other tenant's aren't listed");
+        assert_eq!(listed, [lost], "the enrolled node's box, the starting run and the other tenant's aren't listed");
         let begin = |run: &str| t.begin(json!({ "action": "release_fence", "run": run, "reason": "x" }));
-        assert_refused(&begin(healthy), StatusCode::CONFLICT, "node n1 is enrolled and reported");
+        assert_refused(&begin(healthy), StatusCode::CONFLICT, "node n1 is enrolled");
+        assert_refused(&begin(starting), StatusCode::CONFLICT, "still starting");
         assert_refused(&begin(theirs), StatusCode::NOT_FOUND, "isn't fenced");
         fence::AUTHORITY.with(|a| {
             *a.borrow_mut() =
