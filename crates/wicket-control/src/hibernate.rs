@@ -403,12 +403,8 @@ pub fn resolve(l: &Ledger, who: &str) -> Result<AgentRow> {
 /// or its budget is spent. The checks `wake` makes before it claims, without its records: what a
 /// trigger asks before it counts a wake as done (#578).
 pub fn would_refuse(l: &Ledger, a: &AgentRow) -> Result<Option<String>> {
-    if let Some((node, until)) = crate::noderun::fenced_until(&a.run, wicket_feed::now_ms()) {
-        return Ok(Some(format!(
-            "its last activation (run {}) may still be running on node {node}, until {}",
-            a.run,
-            crate::noderun::fmt_ms(until)
-        )));
+    if let Some((node, until)) = crate::noderun::fenced_until(l, &a.run, wicket_feed::now_ms()) {
+        return Ok(Some(crate::noderun::fence_refusal(&a.run, &node, until)));
     }
     for (r, _) in l.agent_runs(&a.id)? {
         if let Some((rv, _, rby, why)) = l.revoked_in_chain(&r)? {
@@ -485,12 +481,8 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
         // The wake fence (#153): its last activation's box may still be running on a node cut off
         // from this host, until that box's authority ends. Not woken elsewhere until then, unless
         // the node has confirmed the box stopped.
-        if let Some((node, until)) = crate::noderun::fenced_until(&a.run, wicket_feed::now_ms()) {
-            let why = format!(
-                "its last activation (run {}) may still be running on node {node}, which this host can't confirm stopped, until its authority ends: it can be woken from {}, or as soon as node {node} reports the box stopped",
-                a.run,
-                crate::noderun::fmt_ms(until)
-            );
+        if let Some((node, until)) = crate::noderun::fenced_until(&l, &a.run, wicket_feed::now_ms()) {
+            let why = crate::noderun::fence_refusal(&a.run, &node, until);
             l.audit(
                 &TenantId(a.tenant.clone()),
                 None,
