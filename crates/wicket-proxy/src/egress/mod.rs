@@ -744,6 +744,62 @@ mod tests {
         }
     }
 
+    /// A node's cache of one secret, `gh`, that the control host may hold or not (#415): a fetch takes
+    /// what it holds now, and a revoke drops the copy.
+    struct NodeCopy {
+        upstream: std::sync::Mutex<Option<String>>,
+        held: std::sync::Mutex<Option<String>>,
+    }
+    impl crate::vault::SecretSource for NodeCopy {
+        fn get(&self, name: &str) -> anyhow::Result<String> {
+            self.held.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("secret {name:?} is not cached on this node for this run"))
+        }
+        fn hosts(&self, name: &str) -> Vec<String> {
+            self.held.lock().unwrap().iter().filter(|_| name == "gh").map(|_| "api.github.com".to_string()).collect()
+        }
+        fn has(&self, _: &str) -> bool {
+            self.held.lock().unwrap().is_some()
+        }
+        fn fetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                let v = self.upstream.lock().unwrap().clone();
+                *self.held.lock().unwrap() = v.clone();
+                v.map(|_| ()).ok_or_else(|| anyhow::anyhow!("credential {name} refused by the control host: not set"))
+            })
+        }
+    }
+
+    /// #415 on a node: a required rule's secret removed on the control host (the node's copy revoked)
+    /// fails its host's next request, and plain HTTP never carries a credential, whatever the guard
+    /// before the decision found (an older node's took an unfetched optional secret as none).
+    #[tokio::test]
+    async fn on_a_node_a_removed_required_secret_fails_closed_and_nothing_goes_over_plain_http() {
+        let src = std::sync::Arc::new(NodeCopy { upstream: std::sync::Mutex::new(Some("node-token".into())), held: Default::default() });
+        for optional in [false, true] {
+            let zone = format!("reach: [{{host: api.github.com, methods: [GET]}}], inject: [{{host: api.github.com, header: Authorization, format: 'Bearer {{secret}}', secret: gh, optional: {optional}}}]");
+            let (mut c, dir) = ctx(&zone, vec![], &format!("node-{optional}"));
+            c.vault = crate::vault::Vault::from_source(src.clone());
+            let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+            let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
+            let req =
+                || http::Request::get("/x").header("host", "api.github.com").body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+            *src.upstream.lock().unwrap() = Some("node-token".into());
+            let out = e.prepare(req(), "api.github.com", "https", "/x", true).await.unwrap();
+            assert_eq!(out.headers.get("authorization").unwrap(), "Bearer node-token");
+            let plain = e.prepare(req(), "api.github.com", "http", "/x", true).await.err().expect("refused").to_string();
+            assert!(plain.contains("never sends a credential") && plain.contains("plain HTTP"), "{plain}");
+            // Removed on the control host, which revokes the node's copy.
+            *src.upstream.lock().unwrap() = None;
+            *src.held.lock().unwrap() = None;
+            let out = e.prepare(req(), "api.github.com", "https", "/x", true).await;
+            match optional {
+                true => assert!(out.unwrap().headers.get("authorization").is_none(), "goes without it"),
+                false => assert!(out.is_err(), "a required rule fails closed"),
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// #51 with #180: the org policy is checked on an injected host before anything else, so a
     /// credential it refuses is never fetched or sent, required or optional; one it allows goes in.
     #[tokio::test]

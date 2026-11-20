@@ -373,6 +373,18 @@ impl Escalation {
     }
 }
 
+impl ZoneSpec {
+    /// Drops the optional injections whose secret `is_set` says isn't set, and returns them (#175).
+    /// Only for a node below protocol 23 (#415), which would take such a rule's host as having no
+    /// credential until its first fetch: there, requests to its host go without it for the run's
+    /// whole life, as before. A node at 23 is sent every rule, and reads the secret per request.
+    pub fn drop_unset_optional_injections(&mut self, is_set: impl Fn(&str) -> bool) -> Vec<InjectRule> {
+        let (dropped, kept) = std::mem::take(&mut self.inject).into_iter().partition(|i| i.optional && !is_set(&i.secret));
+        self.inject = kept;
+        dropped
+    }
+}
+
 /// What a zone allows of wildcard reach rules (#20).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

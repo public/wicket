@@ -253,8 +253,14 @@ impl Egress {
         // Inject the zone's credential for this host into its one declared slot. An optional rule
         // whose secret isn't set sends the request without it (e.g. anonymous reads).
         let mut injected: Vec<String> = Vec::new();
+        // No credential ever goes over plain HTTP (#129), whatever the check before the decision found
+        // (#415: a node that took an optional rule as no credential would have let it through).
+        let cleartext = |what: &str| anyhow::anyhow!("refused: wicket never sends {what} for {host} over plain HTTP; use https://{host}/");
         for rule in &self.ctx.zone.inject {
             if host_matches(&rule.host, host) {
+                if scheme != "https" {
+                    return Err(cleartext("a credential"));
+                }
                 // The org policy may refuse a credential the zone names (#51): the request is refused.
                 if let Some(org) = &self.ctx.org {
                     let key = format!("{}|{}|{}", rule.host.to_ascii_lowercase(), rule.header, rule.secret);
@@ -309,6 +315,7 @@ impl Egress {
             if let Some(auth) = &box_auth {
                 let presented = auth.strip_prefix("Bearer ").unwrap_or("");
                 match self.ctx.swaps.iter().find(|s| host_matches(&s.host, host) && !presented.is_empty() && s.placeholder == presented) {
+                    Some(_) if scheme != "https" => return Err(cleartext("a swapped credential")),
                     Some(sw) => {
                         // On a node, the credential is fetched from the control host on its first use
                         // (#257), as an injected one is.

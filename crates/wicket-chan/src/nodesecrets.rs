@@ -187,6 +187,21 @@ struct Entry {
     upstream_expiry: Option<i64>,
     /// The runs that fetched it, and until when each may use it (Unix ms).
     users: HashMap<String, i64>,
+    /// Users given it by [`Cache::share`] rather than fetching it (a child the node started), and
+    /// the run each was shared from: a revoke for that run ends theirs too.
+    shared_from: HashMap<String, String>,
+}
+
+impl Entry {
+    /// Ends `run`'s use, and the uses shared from it (and from those, a child's child).
+    fn drop_user(&mut self, run: &str) {
+        let mut gone = vec![run.to_string()];
+        while let Some(r) = gone.pop() {
+            self.users.remove(&r);
+            self.shared_from.remove(&r);
+            gone.extend(self.shared_from.iter().filter(|(_, from)| **from == r).map(|(to, _)| to.clone()));
+        }
+    }
 }
 
 /// Why a node didn't get a secret from its control host.
@@ -214,6 +229,13 @@ pub type Fetcher = Arc<dyn Fn(String, String) -> futures_util::future::BoxFuture
 /// the control host says sooner that the secret changed: it does within about 2 s.
 pub const REFUSAL_HELD_MS: i64 = 30_000;
 
+/// How long a node fails a secret's fetch at once after its control host couldn't be asked (#415),
+/// so a box's requests while cut off (or over a dead link not yet noticed) don't each wait for it.
+pub const UNREACHABLE_HELD_MS: i64 = 2_000;
+
+/// How many times a fetch is made again when a revoke overtook its answer (#415).
+const OVERTAKEN_TRIES: usize = 3;
+
 /// One fetch in flight for a run and a secret.
 type Inflight = Arc<tokio::sync::Mutex<()>>;
 
@@ -223,8 +245,12 @@ pub struct Cache {
     clock: wicket_proxy::decide::Clock,
     /// One fetch at a time per run and secret: concurrent first uses share it.
     inflight: Mutex<HashMap<(String, String), Inflight>>,
-    /// Secrets the control host refused a run (#415), by run and name: when, and why. Never a value.
+    /// Secrets the control host refused a run, or couldn't be asked for (#415), by run and name:
+    /// until when that answer holds, and why. Never a value.
     refused: Mutex<HashMap<(String, String), (i64, String)>>,
+    /// Revokes so far, by run and name (#415): an answer to a fetch that a revoke overtook is
+    /// stale, and not taken.
+    revokes: Mutex<HashMap<(String, String), u64>>,
 }
 
 /// Where a self-update's re-exec finds the cache handed over (#162): a sealed memfd's descriptor.
@@ -238,6 +264,8 @@ struct Handed {
     hosts: Vec<String>,
     upstream_expiry: Option<i64>,
     users: HashMap<String, i64>,
+    #[serde(default)]
+    shared_from: HashMap<String, String>,
 }
 
 impl Drop for Handed {
@@ -253,6 +281,7 @@ impl Cache {
             clock,
             inflight: Mutex::new(HashMap::new()),
             refused: Mutex::new(HashMap::new()),
+            revokes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -276,6 +305,7 @@ impl Cache {
             hosts: vec![],
             upstream_expiry: None,
             users: HashMap::new(),
+            shared_from: HashMap::new(),
         });
         if e.value.0.as_ref() != f.value.as_bytes() {
             e.value = Locked::new(&f.value);
@@ -283,6 +313,8 @@ impl Cache {
         e.hosts = f.hosts.clone();
         e.upstream_expiry = f.upstream_expiry;
         e.users.insert(run.into(), f.not_after);
+        // Fetched for itself now, not shared: a revoke for its parent no longer ends it.
+        e.shared_from.remove(run);
     }
 
     /// A child the node started for `from`'s box (#164) uses the secrets in `names` that `from`
@@ -296,6 +328,7 @@ impl Cache {
             if let Some(e) = m.get_mut(n) {
                 if let Some(u) = e.users.get(from).copied() {
                     e.users.insert(to.into(), u.min(until));
+                    e.shared_from.insert(to.into(), from.into());
                     shared.push(n.clone());
                 }
             }
@@ -303,14 +336,17 @@ impl Cache {
         shared
     }
 
-    /// Run `run` no longer uses `name` (the control host says it changed or was removed): dropped if
-    /// no run uses it any more. A refusal of it is forgotten too (it may have been set since, #415):
-    /// the next use asks again.
+    /// Run `run` no longer uses `name` (the control host says it changed or was removed), nor do the
+    /// runs it was shared with: dropped if no run uses it any more. A refusal of it is forgotten too
+    /// (it may have been set since, #415), and a fetch in flight for it is stale: the next use asks
+    /// again.
     pub fn revoke(&self, run: &str, name: &str) {
-        self.refused.lock().expect("refused").remove(&(run.to_string(), name.to_string()));
+        let key = (run.to_string(), name.to_string());
+        *self.revokes.lock().expect("revokes").entry(key.clone()).or_default() += 1;
+        self.refused.lock().expect("refused").remove(&key);
         let mut m = self.entries.lock().expect("cache");
         if let Some(e) = m.get_mut(name) {
-            e.users.remove(run);
+            e.drop_user(run);
             if e.users.is_empty() {
                 m.remove(name);
             }
@@ -320,6 +356,7 @@ impl Cache {
     /// A run has ended: every secret only it used is dropped.
     pub fn release(&self, run: &str) {
         self.refused.lock().expect("refused").retain(|(r, _), _| r != run);
+        self.revokes.lock().expect("revokes").retain(|(r, _), _| r != run);
         let mut m = self.entries.lock().expect("cache");
         m.retain(|_, e| {
             e.users.remove(run);
@@ -367,6 +404,7 @@ impl Cache {
                     hosts: e.hosts.clone(),
                     upstream_expiry: e.upstream_expiry,
                     users: e.users.clone(),
+                    shared_from: e.shared_from.clone(),
                 })
             })
             .collect::<Result<_>>()?;
@@ -425,7 +463,13 @@ impl Cache {
         for h in handed {
             m.insert(
                 h.name.clone(),
-                Entry { value: Locked::new(&h.value), hosts: h.hosts.clone(), upstream_expiry: h.upstream_expiry, users: h.users.clone() },
+                Entry {
+                    value: Locked::new(&h.value),
+                    hosts: h.hosts.clone(),
+                    upstream_expiry: h.upstream_expiry,
+                    users: h.users.clone(),
+                    shared_from: h.shared_from.clone(),
+                },
             );
         }
         Ok(n)
@@ -481,26 +525,40 @@ impl RunSecrets {
             return Ok(());
         }
         let key = (self.run.clone(), name.to_string());
-        let now = (self.cache.clock)();
         if !again {
-            // Refused a moment ago (#415): the same answer, without asking again on every request.
-            if let Some((_, why)) = self.cache.refused.lock().expect("refused").get(&key).filter(|(at, _)| now - at < REFUSAL_HELD_MS) {
+            // Refused, or unreachable, a moment ago (#415): the same answer, without asking again on
+            // every request.
+            let now = (self.cache.clock)();
+            if let Some((_, why)) = self.cache.refused.lock().expect("refused").get(&key).filter(|(until, _)| now < *until) {
                 bail!("{why}");
             }
         }
-        match (self.fetch)(self.run.clone(), name.to_string()).await {
-            Ok(f) if f.name == name => {
-                self.cache.refused.lock().expect("refused").remove(&key);
-                self.cache.put(&self.run, &f);
-                Ok(())
+        for _ in 0..OVERTAKEN_TRIES {
+            let revokes = self.cache.revokes.lock().expect("revokes").get(&key).copied().unwrap_or(0);
+            let answer = (self.fetch)(self.run.clone(), name.to_string()).await;
+            // A revoke that came while this was asked makes its answer stale (#415): ask again.
+            if self.cache.revokes.lock().expect("revokes").get(&key).copied().unwrap_or(0) != revokes {
+                continue;
             }
-            Ok(_) => bail!("the control host sent another secret"),
-            Err(Unfetched::Refused(why)) => {
-                self.cache.refused.lock().expect("refused").insert(key, (now, why.clone()));
-                bail!("{why}")
-            }
-            Err(e) => bail!("{e}"),
+            let now = (self.cache.clock)();
+            return match answer {
+                Ok(f) if f.name == name => {
+                    self.cache.refused.lock().expect("refused").remove(&key);
+                    self.cache.put(&self.run, &f);
+                    Ok(())
+                }
+                Ok(_) => bail!("the control host sent another secret"),
+                Err(e) => {
+                    let held = match &e {
+                        Unfetched::Refused(_) => REFUSAL_HELD_MS,
+                        Unfetched::Unreachable(_) => UNREACHABLE_HELD_MS,
+                    };
+                    self.cache.refused.lock().expect("refused").insert(key, (now + held, e.to_string()));
+                    bail!("{e}")
+                }
+            };
         }
+        bail!("secret {name:?} kept changing on the control host while it was fetched")
     }
 }
 
@@ -727,7 +785,11 @@ mod tests {
         let za = zone("name: za\ninject: [{ host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: gh }]\n");
         let zb = zone("name: zb\ninject: [{ host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: other }]\n");
         let (up, calls) = (Arc::new(AtomicI64::new(1)), Arc::new(AtomicU64::new(0)));
-        let cache = Cache::new(Arc::new(|| 1_000));
+        let now = Arc::new(AtomicI64::new(1_000));
+        let cache = Cache::new({
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        });
         let a = Vault::from_source(cache.source(RA, fetcher(v.clone(), za.clone(), up.clone(), calls.clone())));
         let b = Vault::from_source(cache.source(RB, fetcher(v.clone(), zb.clone(), up.clone(), calls.clone())));
         assert!(cache.names().is_empty(), "nothing prefetched");
@@ -745,7 +807,11 @@ mod tests {
         assert_eq!(a.get("gh").unwrap(), VALUE);
         let e = b.ensure("other").await.unwrap_err().to_string();
         assert!(e.contains("not cached on this node") && e.contains("unreachable"), "{e}");
+        // Each use while cut off fails at once for a moment, rather than wait on the control host.
+        assert!(b.ensure("other").await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "not asked again at once");
         up.store(1, Ordering::SeqCst);
+        now.fetch_add(UNREACHABLE_HELD_MS, Ordering::SeqCst);
         b.ensure("other").await.unwrap();
         assert_eq!(cache.names(), ["gh", "other"]);
         // A run ends: what only it used goes.
@@ -839,6 +905,51 @@ mod tests {
         cache.release(RA);
         assert!(cache.refused.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// #415: a revoke for a run ends the uses shared from it with a child the node started (and that
+    /// child's), not only the run's own; a child that fetched it for itself keeps it.
+    #[test]
+    fn a_revoke_ends_the_uses_shared_from_the_run() {
+        let cache = Cache::new(Arc::new(|| 1_000));
+        let f = Fetched { name: "gh".into(), value: VALUE.into(), hosts: vec!["h".into()], not_after: 5_000, upstream_expiry: None };
+        cache.put(RA, &f);
+        assert_eq!(cache.share(RA, RB, &["gh".into()], 5_000), ["gh"]);
+        assert_eq!(cache.share(RB, "run_cccccccccccccccccccccccccc", &["gh".into()], 5_000), ["gh"]);
+        cache.revoke(RA, "gh");
+        assert!(cache.names().is_empty(), "the child's and grandchild's shared uses went with it");
+        cache.put(RA, &f);
+        cache.share(RA, RB, &["gh".into()], 5_000);
+        cache.put(RB, &f);
+        cache.revoke(RA, "gh");
+        assert_eq!(cache.names(), ["gh"], "fetched for itself, the child keeps it");
+        cache.revoke(RB, "gh");
+        assert!(cache.names().is_empty());
+    }
+
+    /// #415: a revoke that arrives while a fetch is answered makes that answer stale: it isn't
+    /// taken, and the secret is asked for again.
+    #[tokio::test]
+    async fn an_answer_a_revoke_overtook_is_not_taken() {
+        let cache = Cache::new(Arc::new(|| 1_000));
+        let calls = Arc::new(AtomicU64::new(0));
+        let fetch: Fetcher = {
+            let (cache, calls) = (cache.clone(), calls.clone());
+            Arc::new(move |run, name| {
+                let (cache, calls) = (cache.clone(), calls.clone());
+                Box::pin(async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    // The first answer is overtaken by a revoke (the value changed meanwhile).
+                    if n == 0 {
+                        cache.revoke(&run, &name);
+                    }
+                    Ok(Fetched { name, value: format!("v{n}"), hosts: vec!["h".into()], not_after: 5_000, upstream_expiry: None })
+                })
+            })
+        };
+        let a = Vault::from_source(cache.source(RA, fetch));
+        a.ensure("gh").await.unwrap();
+        assert_eq!((a.get("gh").unwrap().as_str(), calls.load(Ordering::SeqCst)), ("v1", 2), "the stale answer was dropped");
     }
 
     fn grep_tree(d: &Path, needle: &str) -> bool {

@@ -45,11 +45,12 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 2, a connection talks
-/// 16, 17 or 18, so only the versions above 15 have a check here; the checks for features of 14 and
+/// 21, 22 or 23, so only the versions above 20 have a check here (20 to 22 are reserved for work
+/// in flight elsewhere: #714, DNS step 4c, #257); the checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
-pub const PROTOCOL: u32 = 19;
+pub const PROTOCOL: u32 = 23;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -71,6 +72,12 @@ pub const NAMES: u32 = 18;
 /// record (an older node's strict parse refuses the record, and its whole feed with it). The
 /// control host never sends a zone using it over a connection below this.
 pub const DECODE_SLASH: u32 = 19;
+/// The first protocol version whose nodes take a zone's optional `inject` rule while its secret
+/// isn't set (#415): such a node treats the rule's host as credentialed (plain HTTP to it refused)
+/// and injects only over HTTPS, holds a refusal of the secret for the run, and takes a
+/// [`Msg::SecretRevoke`] for a secret it doesn't hold as "ask again". To a node below it the control
+/// host sends the zone without an optional rule whose secret isn't set at start, as before.
+pub const LIVE_SECRETS: u32 = 23;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -134,6 +141,8 @@ const _: () = {
     assert!(PREFIX_GRANTS <= PROTOCOL);
     assert!(STANDING <= PROTOCOL);
     assert!(NAMES <= PROTOCOL);
+    assert!(DECODE_SLASH <= PROTOCOL);
+    assert!(LIVE_SECRETS <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -499,7 +508,11 @@ pub enum Msg {
         error: Option<String>,
     },
     /// A secret the node fetched for `run` changed or was removed on the control host: the node
-    /// drops the run's use of it (the next use fetches it again).
+    /// drops the run's use of it (the next use fetches it again). From [`LIVE_SECRETS`], also sent
+    /// for a secret the node was refused that can now be released, and for every secret released to
+    /// the run when a connection (re)starts (one sent on a link that died may never have arrived):
+    /// the node forgets the refusal or drops its copy, and the next use asks again. A node that
+    /// holds neither does nothing.
     SecretRevoke {
         run: String,
         name: String,
@@ -1282,25 +1295,21 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build has no checks for features of protocol 16 or before: with [`PROTOCOL_SKEW`]
-    /// 2 and protocol 19 (#664), every connection talks 17, 18 or 19. 15's message reads (#445)
-    /// and 16's prefix grants (#257 4a) are on every connection (15's keeps its check until it goes
-    /// in a change of its own); 17's standing reach (#572), 18's names (#575) and 19's decoded
-    /// slashes keep theirs while a peer at 17 or 18 can connect.
+    /// Why this build's checks start above 20: with [`PROTOCOL_SKEW`] 2 and protocol 23 (#415),
+    /// every connection talks 21, 22 or 23. The checks for 15 to 19 stay until each goes in a change
+    /// of its own; 23's live secrets keep theirs while a peer at 21 or 22 can connect.
     #[test]
-    fn no_connection_talks_below_protocol_17() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH), (19, 2, 15, 16, 17, 18, 19));
+    fn no_connection_talks_below_protocol_21() {
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW, LIVE_SECRETS), (23, 2, 23));
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((17..=19).contains(&at) && (17..=21).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(17..=21).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((21..=23).contains(&at) && (21..=25).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(21..=25).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 20 or 21 talking to a control host at 19 from the other side.
-        assert_eq!((negotiate(20, PROTOCOL), negotiate(21, PROTOCOL)), (Ok(19), Ok(19)));
-        assert!(negotiate(17, PROTOCOL).unwrap() < NAMES, "a node at 17 sends no RequestName");
-        assert!(negotiate(18, PROTOCOL).unwrap() < DECODE_SLASH, "a node at 18 gets no zone that decodes a slash");
-        assert!(negotiate(PROTOCOL, 16).is_err() && negotiate(16, PROTOCOL).is_err());
+        assert_eq!((negotiate(24, PROTOCOL), negotiate(25, PROTOCOL)), (Ok(23), Ok(23)));
+        assert!(negotiate(22, PROTOCOL).unwrap() < LIVE_SECRETS, "a node at 22 gets no unset optional rule");
+        assert!(negotiate(PROTOCOL, 20).is_err() && negotiate(20, PROTOCOL).is_err());
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start
