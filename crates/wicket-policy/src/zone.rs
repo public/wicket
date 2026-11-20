@@ -155,6 +155,7 @@ pub fn ceiling_fields(layer: &Layer, base: &Ceiling) -> Result<Ceiling, CompileE
             methods: m.methods.clone().unwrap_or_else(|| all.clone()),
             paths: vec![path],
             allow_dangerous: m.max_risk.is_none(),
+            decode_slash: vec![],
         });
     }
     let mut forbid = vec![];

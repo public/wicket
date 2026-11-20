@@ -79,6 +79,12 @@ pub fn canonical_path(path_and_query: &str) -> Result<Cow<'_, str>, CanonError> 
 /// escape), and the request still goes upstream as the client wrote it: only the decision reads
 /// the decoded form.
 pub fn canonical_path_decoding<'a>(path_and_query: &'a str, segments: &[u8]) -> Result<Cow<'a, str>, CanonError> {
+    canonical_path_decoded(path_and_query, segments).map(|(p, _)| p)
+}
+
+/// [`canonical_path_decoding`], with the segments it decoded (empty when none): what a request
+/// tells the box's token, which must allow each (#664).
+pub fn canonical_path_decoded<'a>(path_and_query: &'a str, segments: &[u8]) -> Result<(Cow<'a, str>, Vec<u8>), CanonError> {
     let path = path_and_query.split('?').next().unwrap_or("");
     if path.len() > MAX_PATH {
         return Err(CanonError::TooLong(MAX_PATH));
@@ -86,12 +92,12 @@ pub fn canonical_path_decoding<'a>(path_and_query: &'a str, segments: &[u8]) -> 
     if !path.starts_with('/') {
         return Err(CanonError::NotAbsolute);
     }
-    let path = match decode_slash(path, segments) {
-        Some(decoded) => Cow::Owned(decoded),
-        None => Cow::Borrowed(path),
+    let (path, decoded) = match decode_slash(path, segments) {
+        Some((d, segs)) => (Cow::Owned(d), segs),
+        None => (Cow::Borrowed(path), vec![]),
     };
     check_plain(&path)?;
-    Ok(path)
+    Ok((path, decoded))
 }
 
 /// Where a segment's only encoded slash starts, if it has exactly one and it is between two
@@ -116,13 +122,14 @@ fn slash_escape(seg: &[u8]) -> Option<usize> {
 }
 
 /// `path` (starting with `/`) with each of `segments` (1 for the first) that has one encoded
-/// slash ([`slash_escape`]) decoded; None if nothing was decoded.
-fn decode_slash(path: &str, segments: &[u8]) -> Option<String> {
+/// slash ([`slash_escape`]) decoded, and the segments decoded; None if nothing was decoded.
+fn decode_slash(path: &str, segments: &[u8]) -> Option<(String, Vec<u8>)> {
     if segments.is_empty() {
         return None;
     }
     let mut out = String::with_capacity(path.len());
     let mut changed = false;
+    let mut segs = vec![];
     for (k, seg) in path[1..].split('/').enumerate() {
         out.push('/');
         let at = if segments.iter().any(|&n| usize::from(n) == k + 1) { slash_escape(seg.as_bytes()) } else { None };
@@ -132,11 +139,12 @@ fn decode_slash(path: &str, segments: &[u8]) -> Option<String> {
                 out.push('/');
                 out.push_str(&seg[at + 3..]);
                 changed = true;
+                segs.push((k + 1) as u8);
             }
             None => out.push_str(seg),
         }
     }
-    changed.then_some(out)
+    changed.then_some((out, segs))
 }
 
 /// The checks every decided path passes: no odd characters, parameters, escapes or segments.
@@ -496,6 +504,8 @@ mod tests {
         assert_eq!(canonical_path_decoding("/x/a%2fb", &[2]).as_deref(), Ok("/x/a/b"));
         assert!(first("/x/a%2fb").is_err(), "the second segment wasn't named");
         assert_eq!(canonical_path_decoding("/a%2fb/c%2fd", &[1, 2]).as_deref(), Ok("/a/b/c/d"));
+        assert_eq!(canonical_path_decoded("/a%2fb/c", &[1, 2]).map(|(_, s)| s), Ok(vec![1]), "only what was decoded");
+        assert_eq!(canonical_path_decoded("/a/b", &[1]).map(|(_, s)| s), Ok(vec![]));
         for p in [
             "/a%2fb%2fc", // two in one segment
             "/a%2f%2fb",

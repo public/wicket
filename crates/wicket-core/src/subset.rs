@@ -232,7 +232,8 @@ fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
     // paths. So per rule, not per method and path: each segment a child's rule decodes, some rule of
     // the parent covering that host decodes too (#664 review).
     for (i, r) in c.reach.iter().enumerate() {
-        let parent: Vec<u8> = p.reach.iter().filter(|q| host_covers(&q.host, &r.host)).flat_map(|q| q.decode_slash.iter().copied()).collect();
+        let parent: Vec<u8> =
+            p.reach.iter().filter(|q| host_covers(&q.host, &r.host)).flat_map(|q| q.decode_slash.iter().copied()).collect();
         if let Some(n) = r.decode_slash.iter().find(|n| !parent.contains(n)) {
             v.push(format!("reach rule {i}: decode_slash segment {n} for {}: this zone doesn't decide an encoded slash there", r.host));
         }

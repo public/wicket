@@ -255,8 +255,14 @@ fn empty_lists_encode_as_empty_sets() {
         let l = load_ok(&t, &keys);
         let b = base_request(0);
         let d = |a: Action| decide_compiled(&l, &Request { action: a, ..b.clone() });
-        let docs =
-            Action::Http { host: "docs.rs".into(), method: "GET".into(), path: "/x".into(), risk: RiskClass::R1ReadScoped, inject: None };
+        let docs = Action::Http {
+            host: "docs.rs".into(),
+            method: "GET".into(),
+            path: "/x".into(),
+            risk: RiskClass::R1ReadScoped,
+            inject: None,
+            decoded: vec![],
+        };
         if cs.len() == 1 {
             assert_eq!(d(docs), Decision::Allow, "{msg}");
             let gh = Action::Http {
@@ -265,6 +271,7 @@ fn empty_lists_encode_as_empty_sets() {
                 path: "/x".into(),
                 risk: RiskClass::R1ReadScoped,
                 inject: None,
+                decoded: vec![],
             };
             assert!(is_grant(&d(gh)), "{msg}: no methods");
             assert!(is_forbidden(&d(http("GET", "docs.rs", "/x", RiskClass::R1ReadScoped))), "{msg}: no injections");

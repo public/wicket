@@ -1075,6 +1075,9 @@ impl Manifest {
 
 /// A reach rule's `decode_slash`: segment numbers from 1, at most [`MAX_DECODE_SEGMENT`], each once.
 fn check_decode_slash(host: &str, segs: &[u8]) -> Result<(), ManifestError> {
+    if !segs.is_empty() && host.starts_with("*.") {
+        return Err(ManifestError::Invalid(format!("reach rule for {host}: decode_slash names one host exactly, not a wildcard")));
+    }
     for (i, n) in segs.iter().enumerate() {
         if *n == 0 || *n > MAX_DECODE_SEGMENT || segs[..i].contains(n) {
             return Err(ManifestError::Invalid(format!(

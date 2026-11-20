@@ -922,8 +922,8 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
     // As the egress proxy decides it: encoded slashes decoded only where the zone's rules for the
     // host say (`decode_slash`, #664).
     let decode = node.replica.lock().expect("replica").zone_of(run).map(|z| z.decode_slash_for(&host)).unwrap_or_default();
-    let path = match wicket_core::canonical_path_decoding(raw_path, &decode) {
-        Ok(p) => p.to_string(),
+    let (path, decoded) = match wicket_core::canonical_path_decoded(raw_path, &decode) {
+        Ok((p, d)) => (p.to_string(), d),
         Err(e) => return (format!("not requested: ambiguous path ({e})"), true),
     };
     let Some((tenant, zone)) = node.tenant_zone(run) else { return ("no authority for this box on its node".into(), true) };
@@ -963,7 +963,8 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
         return ask_standing(node, run, args, &host, &path, reason).await;
     }
     // A push's discovery is asked for as the push it is part of (#26).
-    let op = wicket_core::git::op_for(&tenant, &wicket_core::RunId(run.into()), &zone, &method, &host, &path, query);
+    let mut op = wicket_core::git::op_for(&tenant, &wicket_core::RunId(run.into()), &zone, &method, &host, &path, query);
+    op.decoded = decoded;
     if let Some(why) = op.refused_for_agents() {
         return (format!("not requested: {why}"), true);
     }

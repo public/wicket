@@ -50,6 +50,11 @@ pub struct Op {
     pub risk: RiskClass,
     /// Why the risk is what it is (dangerous-pattern ids).
     pub effects: Vec<String>,
+    /// The path segments (1 for the first) in which an encoded slash was decided as `/` (#664): a
+    /// fact the box's token must allow, so a zone record on a node can only refuse more than the
+    /// token. Not part of what a grant binds to (both spellings are one op).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoded: Vec<u8>,
 }
 
 impl Op {
@@ -74,6 +79,7 @@ impl Op {
             path: path.to_string(),
             risk,
             effects,
+            decoded: vec![],
         }
     }
 

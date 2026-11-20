@@ -91,6 +91,8 @@ pub const AMBIENT: &[(&str, usize)] = &[
     ("spawn", 6),
     ("llm_used", 2),
     ("msg_from", 1),
+    // The path segments the proxy decided an encoded slash in (#664).
+    ("decoded", 1),
 ];
 
 /// How a failed check is reported.

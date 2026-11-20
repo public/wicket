@@ -189,6 +189,22 @@ pub(crate) fn ceiling_code(ceiling: &Ceiling, authority: Option<&AuthorityInfo<'
     let alts = reach_alternatives(&mut c, &dangerous)?;
     let esc = escape(&mut c, &ceiling.grant_keys);
     c.push(&format!("check if op($o), $o != {http}\n  or risk($r), $r <= {max}{alts}{esc};\n"));
+    // decoded slashes (#664): each segment the proxy decoded is one this link allows for the host.
+    // Every link of a token must pass, so a spawned link can only narrow what its parent allows.
+    // Hosts are named exactly (a manifest refuses `decode_slash` on a wildcard rule).
+    let mut by_seg: std::collections::BTreeMap<u8, BTreeSet<String>> = Default::default();
+    for r in ceiling.reach.iter().filter(|r| !r.host.starts_with("*.")) {
+        for n in &r.decode_slash {
+            by_seg.entry(*n).or_default().insert(r.host.clone());
+        }
+    }
+    let segs = c.p(Term::Set(by_seg.keys().map(|n| Term::Integer(i64::from(*n))).collect::<BTreeSet<_>>()));
+    c.push(&format!("reject if decoded($s), !{segs}.contains($s);\n"));
+    for (n, hosts) in &by_seg {
+        let n = c.i(i64::from(*n));
+        let hosts = c.set(hosts.iter().map(String::as_str));
+        c.push(&format!("reject if decoded({n}), host($h), !{hosts}.contains($h);\n"));
+    }
     // forbid
     for f in &ceiling.forbid {
         for glob in &f.paths {
@@ -439,7 +455,10 @@ pub fn request_facts(r: &Request) -> Vec<Fact> {
         fact("op", &[s(r.action.kind().as_str())]),
     ];
     match &r.action {
-        Action::Http { host, method, path, risk, inject } => {
+        Action::Http { host, method, path, risk, inject, decoded } => {
+            for seg in decoded {
+                f.push(fact("decoded", &[Term::Integer(i64::from(*seg))]));
+            }
             f.push(fact("host", &[s(host)]));
             f.push(fact("method", &[s(method)]));
             f.push(fact("path", &[s(&path_term(path))]));
@@ -490,7 +509,13 @@ mod tests {
             box_prefix: "b0".into(),
             not_after: 1,
             ops: vec![],
-            reach: vec![Reach { host: "*.evil\"".into(), methods: vec![], paths: vec!["/a/**".into()], allow_dangerous: true }],
+            reach: vec![Reach {
+                host: "*.evil\"".into(),
+                methods: vec![],
+                paths: vec!["/a/**".into()],
+                allow_dangerous: true,
+                decode_slash: vec![],
+            }],
             forbid: vec![],
             inject: vec![],
             spawn: SpawnLimits { images: vec![], min_isolation: 2, mem_bytes: 1, cpus_milli: 1, pids: 1, timeout_s: 1 },

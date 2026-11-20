@@ -21,7 +21,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::path::Path;
 use std::sync::Arc;
-use wicket_core::{canonical_path_decoding, manifest::host_matches};
+use wicket_core::{canonical_path_decoded, manifest::host_matches};
 
 mod canary;
 mod connect;
@@ -365,15 +365,18 @@ impl Egress {
         let pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
         // Encoded slashes are decided decoded only in the segments the zone's rules for this host
         // name (`decode_slash`, #664); the request still goes upstream as written.
-        let path = match canonical_path_decoding(&pq, &self.ctx.zone.decode_slash_for(&host)) {
-            Ok(p) => p.to_string(),
+        // On a node the zone is its feed record's, so the token decides too: each segment decoded
+        // is a fact the box's token must allow (`decoded`).
+        let (path, decoded) = match canonical_path_decoded(&pq, &self.ctx.zone.decode_slash_for(&host)) {
+            Ok((p, d)) => (p.to_string(), d),
             Err(e) => return self.refuse(&host, &method, &pq, &format!("ambiguous path: {e}")),
         };
         let ctx = &self.ctx;
         let query = pq.split_once('?').map(|(_, q)| q).unwrap_or("");
         // Both requests of a git push are decided as the push of its repository: one request, one
         // approval (#26).
-        let op = wicket_core::git::op_for(&ctx.tenant, &ctx.run, &ctx.zone.name, &method, &host, &path, query);
+        let mut op = wicket_core::git::op_for(&ctx.tenant, &ctx.run, &ctx.zone.name, &method, &host, &path, query);
+        op.decoded = decoded;
         let risk = format!("{:?}", op.risk);
         let emit = |outcome: &str, detail: String| {
             ctx.emit(Event::Egress {

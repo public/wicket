@@ -38,6 +38,7 @@ fn canon(c: &Ceiling) -> Ceiling {
                     .collect(),
                 paths: vec![p.clone()],
                 allow_dangerous: r.allow_dangerous,
+                decode_slash: vec![],
             })
         })
         .collect();
@@ -421,6 +422,7 @@ impl Cedar {
 fn token_request(r: &Req) -> Request {
     let action = match r {
         Req::Http { method, host, path, risk, inject } => Action::Http {
+            decoded: vec![],
             host: host.clone(),
             method: method.clone(),
             path: path.clone(),
