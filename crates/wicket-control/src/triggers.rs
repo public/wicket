@@ -300,11 +300,14 @@ fn get(l: &Ledger, id: &str) -> Result<Trigger> {
 
 /// A human's approval of a trigger that waits for one.
 pub fn approve(l: &Ledger, by: &Granter, id: &str) -> Result<()> {
-    let Granter::Human(o) = by else { bail!("a trigger is approved by a human operator, not {}", by.label()) };
-    if matches!(o.authority, Authority::Nothing) {
-        bail!("operator {} may decide nothing (operators.yaml)", o.id);
-    }
     let t = get(l, id)?;
+    let o = match crate::grant::human(by, "a trigger").and_then(|o| match o.authority {
+        Authority::Nothing => bail!("operator {} may decide nothing (operators.yaml)", o.id),
+        _ => Ok(o),
+    }) {
+        Ok(o) => o,
+        Err(why) => return Err(crate::grant::refused_as(l, by, id, "approve", why)),
+    };
     l.approve_trigger(id, &o.label)?;
     let record =
         json!({ "trigger": id, "name": t.name, "owner": t.owner, "by": o.label, "granter_identity": o.id, "action": action_text(&t.spec) });
@@ -2149,7 +2152,8 @@ mod tests {
         assert!(!l.trigger(&id).unwrap().unwrap().live(wicket_store::now()));
         let ask = wicket_store::CapacityAsk { node: "n".into(), plan: "p".into(), region: "r".into(), hourly: 0, worst: 0 };
         let agent = Granter::Capacity { grant: "g".into(), ask };
-        assert!(approve(&l, &agent, &id).unwrap_err().to_string().contains("human"));
+        let e = format!("{:#}", approve(&l, &agent, &id).unwrap_err());
+        assert!(e.contains("decided by a human operator") && e.contains("on the audit record"), "{e}");
         approve(&l, &Granter::Human(operator()), &id).unwrap();
         assert!(l.trigger(&id).unwrap().unwrap().live(wicket_store::now()));
         assert!(approve(&l, &Granter::Human(operator()), &id).is_err(), "once");
