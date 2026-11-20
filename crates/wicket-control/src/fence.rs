@@ -121,6 +121,7 @@ fn refused(l: &Ledger, by: &Granter, run: &str, why: anyhow::Error) -> anyhow::E
 
 /// Releases run `run`'s fence as `by`, for `reason`, on the effect `shown` (if the operator was
 /// shown one), at `now_ms`; `extra` goes on the audit record. The fence it released.
+#[allow(clippy::too_many_arguments)]
 pub fn release(
     l: &Ledger,
     runs_dir: &Path,

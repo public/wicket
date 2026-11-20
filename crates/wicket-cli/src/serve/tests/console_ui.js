@@ -28,7 +28,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "fenced", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 const EPOCH = 1700000000000;
@@ -658,6 +658,29 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await sr.all(n => n.tagName === "button" && n.textContent === "Revoke")[0].click(); await flush();
   assert.deepStrictEqual(calls.filter(c => c.path === "/api/standing/revoke").map(c => c.body), [{ id: "s-2" }]);
   console.log("console standing reach: ok");
+  // Fenced runs (#690): a run whose box may still be running on a node that won't confirm is listed
+  // with its node and why; Release opens the reason form, and the release is signed from a
+  // confirmation that says what it does, marked as dangerous.
+  const fenced = { id: "run_f", fence: { run: "run_f", node: "n1", node_status: "revoked", node_seen_ms: null, fenced_until_ms: null,
+    source: "unknown", why: "node n1 is <b>revoked</b> and won't confirm it", effect_sha256: "cd".repeat(32) } };
+  state = { ...base, pending: [], fenced: [fenced] };
+  await run("refresh()"); await flush();
+  const fr = ids.fenced.textContent;
+  for (const want of ["run_f on node n1 (revoked, never reported)", "fenced until its node confirms the box stopped", "node n1 is <b>revoked</b>"]) assert.ok(fr.includes(want), want + " in " + fr);
+  assert.strictEqual(ids.fenced.all(n => n.tagName === "b").length, 0, "the reason stays text");
+  await advance(1000);
+  ids.fenced.all(n => n.tagName === "button" && n.textContent === "Release\u2026")[0].click(); await flush();
+  assert.ok(!ids.runform.hidden && ids["runform-title"].textContent.startsWith("Release run_f's fence"), ids["runform-title"].textContent);
+  assert.strictEqual(ids["runform-text"].value, "", "a reason is typed, not offered");
+  ids["runform-text"].value = "n1 was destroyed";
+  nextAction = { v: 1, action: "release_fence", run: "run_f", node: "n1", node_status: "revoked", fenced_until_ms: null, why: fenced.fence.why, reason: "n1 was destroyed", effect_sha256: "cd".repeat(32) };
+  run("submitRunForm({ preventDefault() {} })"); await flush();
+  assert.deepStrictEqual((({ action, run, reason }) => [action, run, reason])(began().pop().body), ["release_fence", "run_f", "n1 was destroyed"]);
+  const fw = ids["confirm-what"].textContent;
+  assert.ok(fw.startsWith("Release run run_f's fence on node n1 (revoked), fenced until its node confirms the box stopped") && fw.includes("reason: n1 was destroyed") && fw.includes("effect cdcdcdcd"), fw);
+  assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: release"]);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  console.log("console fenced runs: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open
   // console is told, and one notification says so; tapping it opens the console's notifications.

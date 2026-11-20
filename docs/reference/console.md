@@ -71,6 +71,17 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   the value.
 - **issue and renew a capacity grant** (`capacity_grant`, `capacity_renew`): see
   [capacity grants](#capacity-grants). Revoking one needs only the session.
+- **release a run's fence** (`release_fence`, #690), the console's path beside root's `wicket node
+  release-fence`. A run is fenced while its box may still be running on a node that hasn't confirmed
+  it stopped (see [the wake fence](nodes.md)): its agent isn't woken and the run isn't ended. The
+  **Fenced runs** card lists each one with its node (enrolled, revoked or gone, and when it last
+  reported), when the fence ends (or that it lasts until the node confirms), and why. **Release…**
+  asks for a reason; the passkey signs the run, its node, the fence's end, the reason and its effect,
+  and a release of a fence that changed since you were shown it is refused. Only an operator whose
+  authority in [`operators.yaml`](configuration.md#operatorsyaml) covers `fence` at R4 may release
+  one (refusals are audited as `decision.refused`). It is audited as `run.fence_released` with your
+  passkey and operator identity. The box may still be running: release a fence only for a node that
+  will never run it again.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.

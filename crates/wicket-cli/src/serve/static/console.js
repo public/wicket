@@ -125,6 +125,10 @@ function describe(a) {
       " \u00b7 for " + to + " \u00b7 " + days + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
   }
   if (a.action === "standing_deny") return "Deny standing reach " + s(a.standing) + ": " + ruleText(a.rule);
+  if (a.action === "release_fence") return "Release run " + s(a.run) + "'s fence on node " + s(a.node) + " (" + s(a.node_status) + "), fenced " +
+    (a.fenced_until_ms ? "until " + whenMs(a.fenced_until_ms) : "until its node confirms the box stopped") +
+    ": its agent can be woken while its box may still be running there \u00b7 " + s(a.why) + " \u00b7 reason: " + s(a.reason) +
+    (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
   if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
@@ -173,8 +177,8 @@ async function openSheet(body, extra) {
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   state.textContent = "";
   delete go.dataset.waiting;
-  const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny"].includes(begin.action.action);
-  go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
+  const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny", "release_fence"].includes(begin.action.action);
+  go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete", release_fence: "release" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
   go.disabled = true; setTimeout(() => { if (sheet === sheetToken) go.disabled = false; }, SETTLE_MS);
@@ -431,6 +435,7 @@ function line(op) {
   if (op.kind === "run.start") return el("div", "", "start  " + op.run + " zone " + strip(b.zone) + " agent " + strip(b.agent));
   // operator.message is from before `wicket say` was removed (#198); prompts are session.prompt.
   if (op.kind === "operator.message" || op.kind === "session.prompt") return el("div", "", "prompt " + op.run + " by " + strip(b.by) + " · " + b.chars + " chars" + (b.via ? " via " + strip(b.via) : "") + (b.signed ? " (passkey-signed)" : ""));
+  if (op.kind === "run.fence_released") return el("div", "blocked", "fence  " + op.run + " released on node " + strip(b.node) + " by " + strip(b.by) + ": " + strip(b.why) + (b.signed ? " (passkey-signed)" : ""));
   if (op.kind === "identity.revoked") return el("div", "blocked", "revoke " + op.run + " by " + strip(b.by) + ": " + strip(b.reason) + (b.signed ? " (passkey-signed)" : ""));
   if (op.kind === "run.console_start") return el("div", "", "launch " + op.run + " " + strip(b.root + "/" + b.manifest) + " by " + strip(b.by) + " (passkey-signed)");
   if (op.kind === "op" && b.kind === "box") return el("div", "pend", "box    " + strip(b.what) + ": " + strip(b.detail));
@@ -649,25 +654,44 @@ function renderRun(s, x) {
   return d;
 }
 
-// The revoke form: an in-page form (no browser dialogs), kept outside the runs list
+// A fenced run (#690): its box may still be running on its node, which hasn't confirmed it stopped,
+// so its agent isn't woken. Released (signed, with a reason) when the node will never answer.
+function fencedRow(x) {
+  const f = x.fence || {};
+  const d = el("div", "row");
+  const left = el("span");
+  left.append(el("span", "mono", strip(x.id)), document.createTextNode(" on node " + strip(f.node) + " (" + strip(f.node_status) +
+    (f.node_seen_ms ? ", last reported " + whenMs(f.node_seen_ms) : ", never reported") + ") \u00b7 fenced " +
+    (f.fenced_until_ms ? "until " + whenMs(f.fenced_until_ms) : "until its node confirms the box stopped")));
+  d.append(left, el("div", "meta", strip(f.why)));
+  const acts = el("span", "acts");
+  const rel = el("button", "deny", "Release\u2026");
+  rel.onclick = () => openRunForm("release_fence", x.id);
+  acts.append(rel); d.append(acts);
+  return d;
+}
+
+// The revoke and release forms: an in-page form (no browser dialogs), kept outside the lists
 // so the 2-second refresh doesn't wipe what the operator is typing.
 function openRunForm(kind, run) {
   const f = document.getElementById("runform"), text = document.getElementById("runform-text");
   f.dataset.kind = kind; f.dataset.run = run;
   f.className = "card " + kind;
-  document.getElementById("runform-title").textContent =
-    "Revoke " + run + "'s identity: its box is stopped and its requests can't be approved. Reason:";
+  const release = kind === "release_fence";
+  document.getElementById("runform-title").textContent = release
+    ? "Release " + run + "'s fence: its agent can be woken and the run ended, while its box may still be running on its node. Only if that node will never run it again. Reason (on the audit record):"
+    : "Revoke " + run + "'s identity: its box is stopped and its requests can't be approved. Reason:";
   const go = document.getElementById("runform-go");
-  go.textContent = "Revoke";
+  go.textContent = release ? "Release" : "Revoke";
   go.className = "deny";
-  text.value = "revoked by the operator";
+  text.value = release ? "" : "revoked by the operator";
   f.hidden = false; text.focus();
 }
 function closeRunForm() { const f = document.getElementById("runform"); f.hidden = true; document.getElementById("runform-text").value = ""; }
 function submitRunForm(ev) {
   ev.preventDefault();
   const f = document.getElementById("runform"), text = document.getElementById("runform-text").value;
-  signed({ action: "revoke", run: f.dataset.run, reason: text });
+  signed({ action: f.dataset.kind === "release_fence" ? "release_fence" : "revoke", run: f.dataset.run, reason: text });
   closeRunForm();
 }
 
@@ -1278,6 +1302,7 @@ async function refreshOnce() {
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
+    renderRows("fenced", s.fenced || [], fencedRow, "No run is fenced: every box this host started has stopped, or its node can say.");
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};
