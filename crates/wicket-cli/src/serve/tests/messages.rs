@@ -59,15 +59,20 @@ async fn the_passkeys_operator_sends_signed_reads_its_inbox_and_marks_it_read() 
     // Sending is a signed action, bound to the whole message.
     let b = t.begin(json!({ "action": "send_message", "to": worker, "text": "ship it", "priority": "now" }));
     assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
-    assert_eq!((b.body["action"]["from"].as_str(), b.body["action"]["text"].as_str()), (Some(me.as_str()), Some("ship it")));
+    // The passkey signs the message by its digest and size; the record never holds the text.
+    let digest = hex::encode(sha2::Sha256::digest(b"ship it"));
+    assert_eq!((b.body["action"]["from"].as_str(), b.body["action"]["text_sha256"].as_str()), (Some(me.as_str()), Some(digest.as_str())));
+    assert!(b.body["action"].get("text").is_none());
     let r = t.act(json!({ "action": "send_message", "to": worker, "text": "ship it", "priority": "now" }));
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert!(r.body["ok"].as_str().unwrap().contains("delivered"), "{:?}", r.body);
     let m = t.ledger().take_message("run_w").unwrap().expect("in the agent's inbox");
-    let (sender, payload) = wicket_identity::verify_any_envelope(&m.envelope, &t.state.issuer.as_ref().unwrap().verifying_key(), m.created_at).unwrap();
+    let (sender, payload) =
+        wicket_identity::verify_any_envelope(&m.envelope, &t.state.issuer.as_ref().unwrap().verifying_key(), m.created_at).unwrap();
     assert_eq!((sender.principal(), payload["body"].as_str(), payload["priority"].as_str()), (me.as_str(), Some("ship it"), Some("now")));
     let rec = t.audit_kinds().into_iter().find(|(k, _)| k == "message").expect("audited").1;
     assert_eq!((rec["via"].as_str(), rec["signed"]["credential"].as_str()), (Some("passkey"), Some(t.cred.as_str())));
+    assert!(!rec.to_string().contains("ship it"), "only its size and digest: {rec}");
 
     // An agent that doesn't act for it, and whose accept_from doesn't name it, is refused.
     let l = t.ledger();
@@ -89,6 +94,14 @@ async fn the_passkeys_operator_sends_signed_reads_its_inbox_and_marks_it_read() 
     let r = t.act(json!({ "action": "send_message", "to": other, "text": "hi" }));
     assert_eq!(r.status, StatusCode::CONFLICT, "{:?}", r.body);
     assert!(r.body["error"].as_str().unwrap().contains("does not accept messages from you"), "{:?}", r.body);
+    // The refusal is on the record with how it was sent and what was signed.
+    let refused = t.audit_kinds().into_iter().rev().find(|(k, _)| k == "message.refused").expect("audited").1;
+    assert_eq!((refused["via"].as_str(), refused["signed"]["credential"].as_str()), (Some("passkey"), Some(t.cred.as_str())));
+    // A bogus in_reply_to is refused and audited, by its size only.
+    let r = t.act(json!({ "action": "send_message", "to": worker, "text": "hi", "in_reply_to": "m-nothing" }));
+    assert_eq!(r.status, StatusCode::CONFLICT, "{:?}", r.body);
+    let refused = t.audit_kinds().into_iter().rev().find(|(k, _)| k == "message.refused").unwrap().1;
+    assert_eq!((refused["why"].as_str(), refused["in_reply_to_bytes"].as_u64()), (Some("in_reply_to"), Some(9)));
     assert_eq!(t.begin(json!({ "action": "send_message", "to": "run_w", "text": "x" })).status, StatusCode::BAD_REQUEST);
 
     // The agent answers; the inbox shows it verified, and reading it changes nothing.
@@ -116,7 +129,10 @@ async fn the_passkeys_operator_sends_signed_reads_its_inbox_and_marks_it_read() 
 
     // Without a session, none of it.
     assert_eq!(post(&t.state, "/api/messages/read", &anon(), &json!({ "ids": ["m-back"] })).unwrap().status, StatusCode::UNAUTHORIZED);
-    assert_eq!(post(&t.state, "/api/action/begin", &anon(), &json!({ "action": "send_message", "to": worker, "text": "x" })).unwrap().status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        post(&t.state, "/api/action/begin", &anon(), &json!({ "action": "send_message", "to": worker, "text": "x" })).unwrap().status,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 /// A console without an issuer key says so, rather than sending unsigned.
@@ -126,4 +142,36 @@ async fn without_an_issuer_messages_are_unavailable() {
     assert_eq!(get(&t, "/api/messages").await.0, StatusCode::SERVICE_UNAVAILABLE);
     let to = wicket_identity::spiffe_id("w.test", "default", "z", "a");
     assert_eq!(t.begin(json!({ "action": "send_message", "to": to, "text": "x" })).status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// #252 review: a message is from the session's passkey, and only that passkey may sign it:
+/// another one enrolled can't send "from" it.
+#[tokio::test]
+async fn only_the_sessions_passkey_signs_its_message() {
+    let mut t = setup("messages-other-key");
+    let (_, worker, ..) = with_agent(&mut t);
+    let other = p256::ecdsa::SigningKey::generate();
+    let p = other.verifying_key().to_sec1_point(false);
+    t.ledger()
+        .add_operator_credential(
+            &TenantId::single(),
+            &OperatorCredential {
+                id: b64u(b"cred-2"),
+                name: "phone".into(),
+                x: p.x().unwrap().as_slice().try_into().unwrap(),
+                y: p.y().unwrap().as_slice().try_into().unwrap(),
+                sign_count: 0,
+            },
+        )
+        .unwrap();
+    let b = t.begin(json!({ "action": "send_message", "to": worker, "text": "from laptop" }));
+    assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+    let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
+    // The phone's passkey answers the laptop session's challenge.
+    t.key = other;
+    t.cred = b64u(b"cred-2");
+    let a = t.sign(&ch);
+    let r = t.post("/api/action/finish", a);
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{:?}", r.body);
+    assert!(t.ledger().take_message("run_w").unwrap().is_none(), "nothing sent");
 }

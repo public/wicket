@@ -60,13 +60,43 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Message `id` in operator `principal`'s inbox, read or not (not expired), if it is there.
+    pub fn operator_message(&self, tenant: &str, principal: &str, id: &str) -> Result<Option<InboxMessage>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT id, from_run, from_principal, envelope, created_at, delivered_at, priority, in_reply_to FROM messages
+                      WHERE id = ?3 AND tenant = ?1 AND to_principal = ?2 AND to_run = '' AND {PEER}
+                        AND (delivered_at IS NOT NULL OR created_at >= ?4)"
+                ),
+                params![tenant, principal, id, now() - MESSAGE_HOLD_SECS],
+                |r| {
+                    Ok(InboxMessage {
+                        id: r.get(0)?,
+                        from_run: r.get(1)?,
+                        from_principal: r.get(2)?,
+                        envelope: r.get(3)?,
+                        created_at: r.get(4)?,
+                        read_at: r.get(5)?,
+                        priority: r.get::<_, Option<String>>(6)?.unwrap_or_else(|| "next".into()),
+                        in_reply_to: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// Operator `principal` has read message `id`: its sender's receipt says read. False: no such
     /// unread message to it (already read, expired, or someone else's).
     pub fn operator_read(&self, tenant: &str, principal: &str, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            &format!("UPDATE messages SET delivered_at = ?4
+            &format!(
+                "UPDATE messages SET delivered_at = ?4
               WHERE id = ?1 AND tenant = ?2 AND to_principal = ?3 AND to_run = '' AND {PEER}
-                AND delivered_at IS NULL AND created_at >= ?5"),
+                AND delivered_at IS NULL AND created_at >= ?5"
+            ),
             params![id, tenant, principal, now(), now() - MESSAGE_HOLD_SECS],
         )?;
         Ok(n == 1)

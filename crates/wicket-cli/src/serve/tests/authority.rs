@@ -236,6 +236,7 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         "/api/me".to_string(),
         "/api/state".into(),
         "/api/policy".into(),
+        "/api/messages".into(),
         format!("/api/runs/{RUN}/authority"),
         "/api/runs/run_nope/authority".into(),
         format!("/api/explain/{}", f.op_seq),

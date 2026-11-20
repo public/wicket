@@ -42,14 +42,38 @@ fn reply(l: &Ledger, tenant: &str, in_reply_to: Option<&str>, other: &str, me: &
     let Some(m) = in_reply_to else { return Ok(false) };
     let shaped = m.len() <= MAX_REPLY_ID && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     let found = shaped
-        && l.message_row(m).map_err(|e| e.to_string())?.is_some_and(|r| {
-            r.tenant == tenant && r.to_principal.as_deref() == Some(me) && r.from_principal.as_deref() == Some(other)
-        });
+        && l.message_row(m)
+            .map_err(|e| e.to_string())?
+            .is_some_and(|r| r.tenant == tenant && r.to_principal.as_deref() == Some(me) && r.from_principal.as_deref() == Some(other));
     if !found {
         let shown = if shaped { m.to_string() } else { "(not a message id)".into() };
         return Err(format!("in_reply_to {shown} is not a message {other} sent you").into());
     }
     Ok(true)
+}
+
+/// [`reply`], with a refused `in_reply_to` on the audit record (#252 review): who tried to answer
+/// what, by its length (never the text itself, which may be anything).
+fn audited_reply(
+    l: &Ledger,
+    tenant: &TenantId,
+    run: Option<&wicket_core::RunId>,
+    in_reply_to: Option<&str>,
+    other: &str,
+    me: &str,
+    extra: serde_json::Value,
+) -> std::result::Result<bool, SendError> {
+    match reply(l, &tenant.0, in_reply_to, other, me) {
+        Err(e) => {
+            let mut rec = json!({ "from": me, "to": other, "why": "in_reply_to", "in_reply_to_bytes": in_reply_to.map(str::len) });
+            if let (Some(r), Some(x)) = (rec.as_object_mut(), extra.as_object()) {
+                r.extend(x.clone());
+            }
+            l.audit(tenant, run, "message.refused", &rec).map_err(|e| format!("not sent: the audit record could not be written ({e})"))?;
+            Err(e)
+        }
+        ok => ok,
+    }
 }
 
 /// [`RunCtx::send`] to an operator: allowed to the one the agent acts for, or as a reply.
@@ -81,7 +105,7 @@ pub(crate) fn agent_to_operator(
         accept_from: none,
         sender_zone: &ctx.zone.name,
         sender: Some(sub),
-        reply: reply(l, &ctx.tenant.0, opts.in_reply_to, to, sub)?,
+        reply: audited_reply(l, &ctx.tenant, Some(&ctx.run), opts.in_reply_to, to, sub, json!({}))?,
     };
     let relation = match wicket_core::message::relation(&facts) {
         Some(wicket_core::message::Relation::Parent) => "operator",
@@ -109,21 +133,15 @@ pub(crate) fn agent_to_operator(
         "reply_to": sub, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
     });
     let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
-    let meta = wicket_store::MessageMeta { from_principal: Some(sub), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: false };
-    l.post_message(&id, &ctx.tenant, &ctx.run.0, to, None, &env, &meta).map_err(|e| e.to_string())?;
-    let audited = l.audit(
-        &ctx.tenant,
-        Some(&ctx.run),
-        "message",
-        &json!({
-            "id": id, "kind": kind, "from": sub, "to": to, "to_run": null, "relation": relation, "bytes": size,
-            "held": false, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
-        }),
-    );
-    if let Err(e) = audited {
-        let _ = l.withdraw_message(&id);
-        return Err(format!("not sent: the audit record could not be written ({e})").into());
-    }
+    let meta =
+        wicket_store::MessageMeta { from_principal: Some(sub), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: false };
+    // The message and its audit record in one transaction: never in an inbox unaudited.
+    let rec = json!({
+        "id": id, "kind": kind, "from": sub, "to": to, "relation": relation, "bytes": size,
+        "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
+    });
+    l.post_message_audited(&id, &ctx.tenant, &ctx.run.0, to, None, &env, &meta, Some(&ctx.run), rec)
+        .map_err(|e| format!("not sent: the message and its audit record could not be written ({e})"))?;
     Ok(Sent { id, to: to.to_string(), run: None, woke: false })
 }
 
@@ -144,6 +162,15 @@ impl OperatorSender<'_> {
     pub fn id(&self, issuer: &wicket_identity::Issuer) -> String {
         wicket_identity::operator_id(&issuer.trust_domain, &self.tenant.0, self.via, self.name)
     }
+}
+
+/// How the operator sent it, for its audit records: `via`, its label, and what it signed.
+fn provenance(op: &OperatorSender) -> serde_json::Value {
+    let mut v = json!({ "via": op.via, "by": format!("{}:{}", op.via, op.name) });
+    if let Some(s) = op.signed {
+        v["signed"] = s.clone();
+    }
+    v
 }
 
 /// Sends a signed message from operator `op` to agent `to` (its principal id): allowed when the
@@ -195,7 +222,7 @@ pub fn send_as_operator(
         accept_from: &accept_from,
         sender_zone: "",
         sender: Some(&me),
-        reply: reply(&l, &tenant.0, opts.in_reply_to, to, &me)?,
+        reply: audited_reply(&l, tenant, None, opts.in_reply_to, to, &me, provenance(&op))?,
     };
     let relation = match wicket_core::message::relation(&facts) {
         Some(wicket_core::message::Relation::Child) => "operator",
@@ -206,8 +233,11 @@ pub fn send_as_operator(
     if relation.is_empty() {
         let why = format!("{to} does not accept messages from you ({me}): it doesn't act for you and its accept_from doesn't list you");
         l.refuse_message(&id, &tenant.0, "", Some(&me), to, &why).map_err(|e| e.to_string())?;
-        l.audit(tenant, None, "message.refused", &json!({ "id": id, "kind": kind, "from": me, "to": to, "why": "accept_from", "bytes": size }))
-            .map_err(|e| format!("not sent: the audit record could not be written ({e})"))?;
+        let mut rec = json!({ "id": id, "kind": kind, "from": me, "to": to, "why": "accept_from", "bytes": size });
+        if let (Some(r), Some(x)) = (rec.as_object_mut(), provenance(&op).as_object()) {
+            r.extend(x.clone());
+        }
+        l.audit(tenant, None, "message.refused", &rec).map_err(|e| format!("not sent: the audit record could not be written ({e})"))?;
         return Err(SendError::Refused { id, to: to.to_string(), why });
     }
     let (to_run, wake) = route(&l, &tenant.0, to, &rec, None, waker.is_some())?;
@@ -218,21 +248,19 @@ pub fn send_as_operator(
         "reply_to": me, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
     });
     let env = wicket_identity::sign_operator_envelope(&key, &doc, &payload);
-    let meta = wicket_store::MessageMeta { from_principal: Some(&me), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: true };
-    let routed = l.post_message(&id, tenant, "", to, to_run.as_deref(), &env, &meta).map_err(|e| e.to_string())?;
+    let meta =
+        wicket_store::MessageMeta { from_principal: Some(&me), priority: opts.priority, in_reply_to: opts.in_reply_to, operator: true };
     let mut rec = json!({
-        "id": id, "kind": kind, "from": me, "to": to, "to_run": routed, "relation": relation, "bytes": size,
-        "wakes": wake, "held": routed.is_none(), "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
-        "via": op.via,
+        "id": id, "kind": kind, "from": me, "to": to, "relation": relation, "bytes": size,
+        "wakes": wake, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
     });
-    if let Some(s) = op.signed {
-        rec["signed"] = s.clone();
+    if let (Some(r), Some(x)) = (rec.as_object_mut(), provenance(&op).as_object()) {
+        r.extend(x.clone());
     }
-    let audited = l.audit(tenant, None, "message", &rec);
-    if let Err(e) = audited {
-        let _ = l.withdraw_message(&id);
-        return Err(format!("not sent: the audit record could not be written ({e})").into());
-    }
+    // The message and its audit record in one transaction: never in an inbox unaudited.
+    let routed = l
+        .post_message_audited(&id, tenant, "", to, to_run.as_deref(), &env, &meta, None, rec)
+        .map_err(|e| format!("not sent: the message and its audit record could not be written ({e})"))?;
     drop(l);
     if let (Some(agent), Some(w)) = (&wake, waker) {
         w(agent, &format!("a message from {me}"));
@@ -281,7 +309,9 @@ pub fn verify_received(
         return Err("the sender's identity has been revoked".into());
     }
     let (agent, zone, run, chain) = match &sender {
-        wicket_identity::Sender::Agent(c) if c.run == m.from_run => (Some(c.agent.clone()), Some(c.zone.clone()), Some(c.run.clone()), c.chain()),
+        wicket_identity::Sender::Agent(c) if c.run == m.from_run => {
+            (Some(c.agent.clone()), Some(c.zone.clone()), Some(c.run.clone()), c.chain())
+        }
         wicket_identity::Sender::Operator(c) if m.from_run.is_empty() => (None, None, None, vec![format!("{} ({})", c.name, c.via)]),
         _ => return Err("its envelope does not match its delivery".into()),
     };

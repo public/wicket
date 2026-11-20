@@ -396,11 +396,17 @@ impl Gateway {
                 Ok(Some((m, _, _, Some((z, id))))) if self.ctx.org.as_ref().is_some_and(|o| !o.allows_message_from(&z, Some(&id))) => {
                     self.message_read(&m.id);
                     let (why, said) = if m.from_run.is_empty() {
-                        (format!("the org policy doesn't let you hear from operator {id}"), format!("a message from operator {id} was refused: the org policy doesn't accept messages from it"))
+                        (
+                            format!("the org policy doesn't let you hear from operator {id}"),
+                            format!("a message from operator {id} was refused: the org policy doesn't accept messages from it"),
+                        )
                     } else {
                         (
                             format!("the org policy doesn't let you hear from zone {z}"),
-                            format!("a message from run {} (zone {z}) was refused: the org policy doesn't accept messages from that zone", m.from_run),
+                            format!(
+                                "a message from run {} (zone {z}) was refused: the org policy doesn't accept messages from that zone",
+                                m.from_run
+                            ),
                         )
                     };
                     self.refused_on_delivery(&m, &cell.current().claims.sub, &why);
@@ -1177,7 +1183,10 @@ mod tests {
         let inbox = l.operator_inbox("t0", &alice_id, false, 10).unwrap();
         assert_eq!(inbox.len(), 1);
         let got = verify_received(&inbox[0], &alice_id, &w.issuer.verifying_key(), false).unwrap();
-        assert_eq!((got.from.as_str(), got.agent.as_deref(), got.body.clone()), (id_of(&lead).as_str(), Some("lead"), json!({"done": true})));
+        assert_eq!(
+            (got.from.as_str(), got.agent.as_deref(), got.body.clone()),
+            (id_of(&lead).as_str(), Some("lead"), json!({"done": true}))
+        );
         // Not bob's to read, nor to verify as his.
         assert!(l.operator_inbox("t0", &bob_id, true, 10).unwrap().is_empty());
         assert!(verify_received(&inbox[0], &bob_id, &w.issuer.verifying_key(), false).is_err());
@@ -1191,7 +1200,10 @@ mod tests {
         assert!(!err, "{text}");
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!((v["from"]["id"].as_str(), v["from"]["relation"].as_str()), (Some(alice_id.as_str()), Some("your operator")));
-        assert_eq!((v["body"].as_str(), v["in_reply_to"].as_str(), v["reply_to"].as_str()), (Some("thanks"), Some(sent.id.as_str()), Some(alice_id.as_str())));
+        assert_eq!(
+            (v["body"].as_str(), v["in_reply_to"].as_str(), v["reply_to"].as_str()),
+            (Some("thanks"), Some(sent.id.as_str()), Some(alice_id.as_str()))
+        );
 
         // bob: the agent doesn't act for him and doesn't list him: refused, with a receipt that says so.
         let e = send_as_operator(&w.ledger, &w.issuer, bob, &id_of(&lead), "message", json!("hi"), Default::default(), None).unwrap_err();
@@ -1207,7 +1219,8 @@ mod tests {
         let reply = wicket_proxy::SendOpts { in_reply_to: Some(&m.id), ..Default::default() };
         let back = ops.send(&to(&bob_id), "message", json!("green"), reply).unwrap();
         let l = w.ledger.lock().unwrap();
-        let got = verify_received(&l.operator_inbox("t0", &bob_id, false, 10).unwrap()[0], &bob_id, &w.issuer.verifying_key(), false).unwrap();
+        let got =
+            verify_received(&l.operator_inbox("t0", &bob_id, false, 10).unwrap()[0], &bob_id, &w.issuer.verifying_key(), false).unwrap();
         assert_eq!((got.message_id.as_str(), got.in_reply_to.as_deref()), (back.id.as_str(), Some(m.id.as_str())));
         drop(l);
         // A reply to a message that wasn't bob's is no reply.
@@ -1238,7 +1251,8 @@ mod tests {
         let alice = OperatorSender { tenant: &t0, via: "unix", name: "alice", signed: None };
         let alice_id = alice.id(&w.issuer);
         // A message alice sent elsewhere: lead can't claim to answer it.
-        let elsewhere = send_as_operator(&w.ledger, &w.issuer, alice, &id_of(&other), "message", json!("x"), Default::default(), None).unwrap();
+        let elsewhere =
+            send_as_operator(&w.ledger, &w.issuer, alice, &id_of(&other), "message", json!("x"), Default::default(), None).unwrap();
         let hostile = "m-1\u{1b}]52;c;cGF5bG9hZA==\u{7}\nfake line";
         let long = "m-".to_string() + &"a".repeat(10_000);
         for bogus in ["m-none", elsewhere.id.as_str(), hostile, long.as_str()] {
@@ -1247,7 +1261,8 @@ mod tests {
             let e = lead.send(&to(&alice_id), "message", json!("hi"), opts).unwrap_err().to_string();
             assert!(e.contains("is not a message") && !e.contains('\u{1b}') && e.len() < 300, "{e:?}");
             // The operator writing to an agent that acts for it (likewise).
-            let e = send_as_operator(&w.ledger, &w.issuer, alice, &id_of(&lead), "message", json!("hi"), opts, None).unwrap_err().to_string();
+            let e =
+                send_as_operator(&w.ledger, &w.issuer, alice, &id_of(&lead), "message", json!("hi"), opts, None).unwrap_err().to_string();
             assert!(e.contains("is not a message") && !e.contains('\u{1b}') && e.len() < 300, "{e:?}");
         }
         // A real one goes, and is what the recipient sees.

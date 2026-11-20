@@ -154,7 +154,12 @@ pub(crate) fn receipts_json(rs: &[wicket_store::Receipt]) -> serde_json::Value {
 }
 
 /// The agents `me` may write to, and what each is to it.
-pub(crate) fn principals_json(l: &Ledger, tenant: &TenantId, me: &str, issuer: &wicket_identity::VerifyingKey) -> Result<serde_json::Value> {
+pub(crate) fn principals_json(
+    l: &Ledger,
+    tenant: &TenantId,
+    me: &str,
+    issuer: &wicket_identity::VerifyingKey,
+) -> Result<serde_json::Value> {
     let mut out = vec![];
     for p in l.principals(&tenant.0)? {
         let wicket_store::Principal::Agent(r) = p else { continue };

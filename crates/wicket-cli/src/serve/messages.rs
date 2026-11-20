@@ -21,7 +21,10 @@ fn bad(m: &str) -> Reply {
 const MAX_READ: usize = 100;
 
 fn issuer(state: &State) -> Result<&wicket_identity::Issuer, Reply> {
-    state.issuer.as_deref().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "this console has no issuer key: it can't sign or verify messages"))
+    state
+        .issuer
+        .as_deref()
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "this console has no issuer key: it can't sign or verify messages"))
 }
 
 /// The operator signed in with passkey `oc`, as the protocol names it.
@@ -69,9 +72,17 @@ pub(super) fn read(state: &State, oc: &OperatorCredential, body: &Value) -> Repl
     let me = me(state, issuer, oc);
     let go = || -> Result<Vec<String>> {
         let l = state.ledger()?;
+        let key = issuer.verifying_key();
         let mut read = vec![];
-        for (m, r) in cli::verified_inbox(&l, &state.tenant, &me, &issuer.verifying_key(), false, 500)? {
-            if ids.contains(&m.id.as_str()) && cli::mark_read(&l, &state.tenant, &me, &m, &r, "console")? {
+        // Each id looked up as itself: however many messages wait, an id asked for is found.
+        for id in &ids {
+            let Some(m) = l.operator_message(&state.tenant.0, &me, id)? else { continue };
+            if m.read_at.is_some() {
+                continue;
+            }
+            let revoked = !m.from_run.is_empty() && l.revoked_in_chain(&m.from_run)?.is_some();
+            let r = opmsg::verify_received(&m, &me, &key, revoked);
+            if cli::mark_read(&l, &state.tenant, &me, &m, &r, "console")? {
                 read.push(m.id);
             }
         }
@@ -98,12 +109,15 @@ pub(super) fn build_send(state: &State, oc: &OperatorCredential, body: &Value) -
     if json!(text).to_string().len() > wicket_proxy::MAX_MESSAGE_BYTES {
         return Err(bad(&format!("the message is over {} bytes", wicket_proxy::MAX_MESSAGE_BYTES)));
     }
-    // What the passkey signs: the sender as the console names it, the recipient, and the whole message.
+    // What the passkey signs: the sender as the console names it, the recipient, and the message,
+    // by its digest and size (the audit record keeps the signed JSON, and an agent's message's
+    // record has only its size, never its text).
     let v = json!({
         "v": 1, "action": "send_message", "tenant": state.tenant.0, "credential": oc.id, "from": me(state, issuer, oc),
-        "to": to, "text": text, "priority": p.as_str(), "in_reply_to": in_reply_to,
+        "to": to, "text_sha256": hex::encode(sha2::Sha256::digest(text.as_bytes())), "bytes": text.len(),
+        "priority": p.as_str(), "in_reply_to": in_reply_to,
     });
-    Ok((Action::SendMessage { to: to.to_string(), text: text.to_string(), priority: p, in_reply_to }, v))
+    Ok((Action::SendMessage { credential: oc.id.clone(), to: to.to_string(), text: text.to_string(), priority: p, in_reply_to }, v))
 }
 
 /// Sends a signed `send_message` action: what `wicket message send` does, as the passkey's operator.

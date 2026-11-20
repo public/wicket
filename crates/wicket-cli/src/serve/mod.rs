@@ -215,6 +215,8 @@ enum Action {
     },
     /// Send a message to an agent as the passkey's operator (#252), as `wicket message send` does.
     SendMessage {
+        /// The passkey of the session it was begun in: the one it is from, which must sign it.
+        credential: String,
         to: String,
         text: String,
         priority: wicket_store::Priority,
@@ -1585,7 +1587,11 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
             Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
         };
     }
-    if let Action::SendMessage { to, text, priority, in_reply_to } = &*action {
+    if let Action::SendMessage { credential, to, text, priority, in_reply_to } = &*action {
+        // From the session's own passkey (#252 review): another one enrolled can't sign "from" it.
+        if &a.oc.id != credential {
+            return err(StatusCode::FORBIDDEN, "this message is from the passkey you signed in with: sign it with that one");
+        }
         return match messages::apply_send(state, &a.oc, to, text, *priority, in_reply_to.as_deref(), signed) {
             Ok(msg) => ok(json!({ "ok": msg })),
             Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
