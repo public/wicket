@@ -355,6 +355,23 @@ function pendingCard(s, p) {
   return c;
 }
 
+// How many decisions wait (#650): in the tab's title, the heading, the section nav and, where the
+// browser has one, the installed app's badge; and how many health alerts, beside Health in the nav.
+let shownCount = -1;
+function renderCounts(waiting, alerts) {
+  const set = (id, v) => { const e = document.getElementById(id); if (e) { e.textContent = v ? String(v) : ""; e.hidden = !v; } };
+  set("nav-waiting", waiting);
+  set("nav-health", alerts);
+  const h = document.getElementById("waiting-h");
+  if (h) h.textContent = waiting ? "Waiting for you (" + waiting + ")" : "Waiting for you";
+  document.title = waiting ? "(" + waiting + ") wicket" : "wicket";
+  if (waiting === shownCount) return;
+  shownCount = waiting;
+  try {
+    if (typeof navigator !== "undefined" && navigator.setAppBadge) (waiting ? navigator.setAppBadge(waiting) : navigator.clearAppBadge()).catch(() => {});
+  } catch (e) { /* no badge here */ }
+}
+
 function renderPending(s) {
   const box = document.getElementById("pending");
   const live = new Set(s.pending.map(p => p.id));
@@ -421,7 +438,7 @@ function line(op) {
     const [x, where] = eg;
     const outcome = String(x.outcome || "?");
     const cls = outcome === "allow" || outcome === "spliced" ? "ok" : outcome === "pending" ? "pend" : "blocked";
-    const d = el("div"); d.append(el("span", cls, outcome.toUpperCase().padEnd(9)), document.createTextNode(strip(x.method + " " + x.host + x.path + where) + " "));
+    const d = el("div"); d.append(el("span", cls, outcome.toUpperCase().padEnd(10)), document.createTextNode(strip(x.method + " " + x.host + x.path + where) + " "));
     if (op.run) { const why = el("button", "link", "explain"); why.onclick = () => showExplain(op.seq); d.append(why); }
     return d;
   }
@@ -873,8 +890,10 @@ async function boot() {
   const me = r.ok ? await r.json() : { who: { state: "none" } };
   const auth = document.getElementById("auth"), con = document.getElementById("console");
   auth.replaceChildren();
-  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; await refresh(); fromHash(); renderPush(); return; }
+  const nav = document.getElementById("nav");
+  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; if (nav) nav.hidden = false; await refresh(); fromHash(); renderPush(); return; }
   con.hidden = true; auth.hidden = false;
+  if (nav) nav.hidden = true;
   document.getElementById("tenant").textContent = "";
   if (me.who.state === "bootstrap") {
     auth.append(el("div", "", "Enrol this device's passkey. It signs you in, and you will sign every approval with it."));
@@ -1287,10 +1306,11 @@ async function refreshOnce() {
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};
-    // Standing asks wait below (their own section); said at the top, where decisions are made.
+    // Standing asks wait with the requests, under a heading of their own, shown only when there are some.
     const ptr = document.getElementById("standing-pointer");
     const n = (st.asks || []).length;
-    if (ptr) ptr.textContent = n ? n + " standing reach ask" + (n === 1 ? "" : "s") + " waiting, under Standing reach below" : "";
+    if (ptr) { ptr.textContent = n ? "Standing reach " + (n === 1 ? "ask" : "asks") + " (" + n + ")" : ""; ptr.hidden = !n; }
+    renderCounts(s.pending.length + n, ((s.health || {}).alerts || []).length + ((((s.health || {}).nodes) || []).filter(x => (x.alerts || []).length).length));
     renderKeyed("standing-asks", st.asks || [], standingAskRow, "No agent is asking for standing reach.");
     renderKeyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: every one-off ask waits for a decision.");
     renderStart(s);
