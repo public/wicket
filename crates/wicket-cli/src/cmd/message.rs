@@ -125,8 +125,9 @@ pub(crate) fn inbox_text(me: &str, got: &[std::result::Result<opmsg::Received, (
                 };
                 let read = if m.read_at.is_some() { "read" } else { "new" };
                 out.push_str(&format!(
-                    "{}  {}  from {}  {}  {read}{}\n",
+                    "{}  {}  {}  from {}  {}  {read}{}\n",
                     c(&m.message_id, 64),
+                    c(m.kind.as_deref().unwrap_or("message"), 32),
                     when(m.sent_at),
                     c(&who, 400),
                     c(&m.priority, 8),
@@ -259,7 +260,7 @@ pub async fn dispatch(c: MessageCmd) -> Result<()> {
             let ledger = std::sync::Mutex::new(Ledger::open(&ledger_path())?);
             let waker: wicket_proxy::Waker = std::sync::Arc::new(|a: &str, by: &str| hibernate::trigger_wake(a, by));
             let op = OperatorSender { tenant: &tenant, via: &via, name: &name, signed: None };
-            let opts = SendOpts { priority, in_reply_to: in_reply_to.as_deref() };
+            let opts = SendOpts { priority, in_reply_to: in_reply_to.as_deref(), run: None };
             let sent = opmsg::send_as_operator(&ledger, &issuer, op, &to, "message", serde_json::json!(text.join(" ")), opts, Some(&waker));
             let l = ledger.into_inner().map_err(|_| anyhow::anyhow!("ledger lock"))?;
             match sent {

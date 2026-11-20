@@ -325,6 +325,9 @@ pub struct Sent {
 pub struct SendOpts<'a> {
     pub priority: wicket_store::Priority,
     pub in_reply_to: Option<&'a str>,
+    /// Deliver to this run of the principal only (#252 review): a delegation's brief goes to the
+    /// delegated run, never to another live run of the same principal. It must be live.
+    pub run: Option<&'a str>,
 }
 
 /// Why a message wasn't sent.
@@ -424,11 +427,16 @@ impl RunCtx {
                 }
             },
         };
-        let rec = match l.principal_identity(&self.tenant.0, &principal).map_err(|e| e.to_string())? {
-            Some(r) if r.tenant == self.tenant.0 => r,
-            _ => return Err(format!("no agent {principal}: none has run as it in this tenant").into()),
+        let rec = match opts.run {
+            Some(r) => pinned(&l, &self.tenant.0, &principal, r)?,
+            None => match l.principal_identity(&self.tenant.0, &principal).map_err(|e| e.to_string())? {
+                Some(r) if r.tenant == self.tenant.0 => r,
+                _ => return Err(format!("no agent {principal}: none has run as it in this tenant").into()),
+            },
         };
-        let (to_run, wake) = route(&l, &self.tenant.0, &principal, &rec, prefer.clone(), self.waker.is_some())?;
+        // Where it goes: the pinned run, else the parent run itself; `prefer` alone says "parent".
+        let target = opts.run.map(String::from).or_else(|| prefer.clone());
+        let (to_run, wake) = route(&l, &self.tenant.0, &principal, &rec, target, self.waker.is_some())?;
         // A reply (#252): to a message this principal sent us, which gave its reply address.
         let replies = match opts.in_reply_to {
             None => false,
@@ -554,6 +562,24 @@ impl RunCtx {
         }
         let _ = self.events.send(ev);
         Ok(())
+    }
+}
+
+/// Run `run` of `principal`, live: where a message pinned to one run goes (#252 review). Its
+/// identity is what the message's relation is judged by, not the principal's newest one.
+pub(crate) fn pinned(
+    l: &wicket_store::Ledger,
+    tenant: &str,
+    principal: &str,
+    run: &str,
+) -> std::result::Result<wicket_store::IdentityRow, String> {
+    let rec = match l.identity(run).map_err(|e| e.to_string())? {
+        Some(i) if i.tenant == tenant && i.spiffe_id == principal => i,
+        _ => return Err(format!("run {run} is not one of {principal}'s")),
+    };
+    match l.run_status(run).map_err(|e| e.to_string())?.as_deref() {
+        Some("running") => Ok(rec),
+        s => Err(format!("{principal}'s run {run} has ended ({})", s.unwrap_or("unknown"))),
     }
 }
 

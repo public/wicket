@@ -2776,6 +2776,10 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 ctx.end_delegation(None);
             }
         }
+    } else if parent_run.is_none() {
+        // An operator's delegation (#252): its run ended, so it can't be continued. Its last
+        // report is already in the operator's inbox; the run's end is on the record.
+        ctx.end_delegation(None);
     }
     // A parent's children end with it: each is asked to stop its box and end, then waited for
     // briefly. One that hasn't ended by then is recorded as stuck (#409): it goes on until its box

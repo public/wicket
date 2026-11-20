@@ -222,7 +222,7 @@ impl Gateway {
                 None => return (format!("`priority` is now, next or later, not {p:?}"), true),
             },
         };
-        let opts = wicket_proxy::SendOpts { priority, in_reply_to: args.get("in_reply_to").and_then(|v| v.as_str()) };
+        let opts = wicket_proxy::SendOpts { priority, in_reply_to: args.get("in_reply_to").and_then(|v| v.as_str()), run: None };
         let body = args.get("body").cloned().unwrap_or(Value::Null);
         match self.ctx.send(&to, "message", body, opts) {
             Ok(s) => {
@@ -1153,6 +1153,22 @@ mod tests {
             accept_from: &[&str],
             kind: Option<&str>,
         ) -> RunCtx {
+            self.workload_for(tenant, zone, name, run, parent, accept_from, kind, "alice")
+        }
+
+        /// [`World::workload`], acting for operator `unix/<operator>`.
+        #[allow(clippy::too_many_arguments)]
+        fn workload_for(
+            &self,
+            tenant: &str,
+            zone: &str,
+            name: &str,
+            run: &str,
+            parent: Option<&str>,
+            accept_from: &[&str],
+            kind: Option<&str>,
+            operator: &str,
+        ) -> RunCtx {
             let yaml = format!(
                 "tenant: {tenant}\ntask: t\nagent: {{ name: {name} }}\nzone: {{ name: {zone}, llm: {{}}, accept_from: {accept_from:?} }}\n"
             );
@@ -1167,8 +1183,8 @@ mod tests {
                 manifest_sha256: "m".into(),
                 image: "img".into(),
                 node: "local".into(),
-                principal: serde_json::json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user",
-                                              "sub": wicket_identity::operator_id("test.local", tenant, "unix", "alice")}),
+                principal: serde_json::json!({"type": "human", "id": operator, "via": "cli", "assurance": "unix-user",
+                                              "sub": wicket_identity::operator_id("test.local", tenant, "unix", operator)}),
                 act: None,
                 kind: kind.map(String::from),
             };
@@ -1454,6 +1470,126 @@ mod tests {
         let l = w.ledger.lock().unwrap();
         assert!(l.audit_tail(50).unwrap().iter().any(|a| a.2 == "delegation.continued"));
         assert!(l.audit_tail(50).unwrap().iter().any(|a| a.2 == "delegation.refused"));
+        drop(l);
+        // Its run ends (what run.rs does for a run with no parent): the delegation ends with it, on
+        // the record, and can't be continued.
+        lead.end_delegation(None);
+        let l = w.ledger.lock().unwrap();
+        assert_eq!(l.delegation("d-lead").unwrap().unwrap().state, "ended");
+        assert!(l.audit_tail(5).unwrap().iter().any(|a| a.2 == "delegation.ended" && a.4.contains("d-lead")));
+        drop(l);
+        let e = continue_as_operator(&w.ledger, &w.issuer, alice, "lead", json!("x"), Default::default(), None).unwrap_err();
+        assert!(e.contains("has ended"), "{e}");
+    }
+
+    /// #252 review: a delegation's brief goes to the delegated run, never to another live run of
+    /// the same principal. Alice and bob each run the same manifest; each continues their own.
+    /// Agents and operators continue only their own kind of delegation, and none once its run ended.
+    #[test]
+    fn a_brief_goes_to_the_delegated_run_and_only_its_delegator_continues_it() {
+        use wicket_proxy::opmsg::{continue_as_operator, OperatorSender};
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let t0 = TenantId("t0".into());
+        let alice = OperatorSender { tenant: &t0, via: "unix", name: "alice", signed: None };
+        let bob = OperatorSender { tenant: &t0, via: "unix", name: "bob", signed: None };
+        let a_run = w.workload_for("t0", "research", "worker", "run_a", None, &[], None, "alice");
+        let b_run = w.workload_for("t0", "research", "worker", "run_b", None, &[], None, "bob");
+        assert_eq!(id_of(&a_run), id_of(&b_run), "one principal, two live runs");
+        let delegate = |id: &str, run: &str, op: &OperatorSender| {
+            let l = w.ledger.lock().unwrap();
+            l.record_delegation(&wicket_store::NewDelegation {
+                id,
+                tenant: "t0",
+                parent_run: "",
+                parent_principal: &op.id(&w.issuer),
+                child_run: run,
+                child_principal: &id_of(&a_run),
+                name: "worker",
+                brief: "t",
+            })
+            .unwrap();
+            l.delegation_reported(id, "m-r").unwrap();
+        };
+        delegate("d-a", "run_a", &alice);
+        delegate("d-b", "run_b", &bob);
+        // Alice's brief reaches alice's run, though bob's is the principal's newest.
+        let (sent, _) = continue_as_operator(&w.ledger, &w.issuer, alice, "d-a", json!("for alice"), Default::default(), None).unwrap();
+        assert_eq!(sent.run.as_deref(), Some("run_a"));
+        let (sent, _) = continue_as_operator(&w.ledger, &w.issuer, bob, "d-b", json!("for bob"), Default::default(), None).unwrap();
+        assert_eq!(sent.run.as_deref(), Some("run_b"));
+        assert!(take(&a_run).0.contains("for alice"));
+        assert!(take(&b_run).0.contains("for bob"));
+        // Bob can't continue alice's, and the refusal names him, not her.
+        w.ledger.lock().unwrap().delegation_reported("d-a", "m-r2").unwrap();
+        let e = continue_as_operator(&w.ledger, &w.issuer, bob, "d-a", json!("x"), Default::default(), None).unwrap_err();
+        assert!(e.contains("is not yours"), "{e}");
+        let refused = w.ledger.lock().unwrap().audit_tail(5).unwrap().into_iter().rev().find(|r| r.2 == "delegation.refused").unwrap();
+        assert!(refused.4.contains(&bob.id(&w.issuer)) && !refused.4.contains("/op/unix/alice\""), "{}", refused.4);
+        // An agent can't continue a human's delegation, even as the same principal.
+        let (text, err) = wicket_gateway_continue(&b_run, "d-a");
+        assert!(err && text.contains("not your child"), "{text}");
+        // An operator can't continue an agent's child.
+        let child = w.workload_for("t0", "research", "kid", "run_kid", Some("run_a"), &[], None, "alice");
+        {
+            let l = w.ledger.lock().unwrap();
+            l.record_delegation(&wicket_store::NewDelegation {
+                id: "d-kid",
+                tenant: "t0",
+                parent_run: "run_a",
+                parent_principal: &id_of(&a_run),
+                child_run: "run_kid",
+                child_principal: &id_of(&child),
+                name: "kid",
+                brief: "t",
+            })
+            .unwrap();
+            l.delegation_reported("d-kid", "m-k").unwrap();
+        }
+        let e = continue_as_operator(&w.ledger, &w.issuer, alice, "d-kid", json!("x"), Default::default(), None).unwrap_err();
+        assert!(e.contains("is not yours"), "{e}");
+        // Once the run has ended, nobody continues it, and that refusal is audited too.
+        w.ledger.lock().unwrap().run_ended(&RunId("run_a".into()), "succeeded", "{}").unwrap();
+        let e = continue_as_operator(&w.ledger, &w.issuer, alice, "d-a", json!("x"), Default::default(), None).unwrap_err();
+        assert!(e.contains("has ended"), "{e}");
+        let last = w.ledger.lock().unwrap().audit_tail(1).unwrap().remove(0);
+        assert_eq!(last.2, "delegation.refused");
+        assert!(last.4.contains("has ended") && last.4.contains(&alice.id(&w.issuer)), "{}", last.4);
+    }
+
+    /// #252 review: an agent's `continue_child` goes to the delegated child run, not to another
+    /// live run of the same child principal.
+    #[test]
+    fn an_agents_brief_goes_to_its_delegated_childs_run() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let lead = w.agent("t0", "research", "lead", "run_lead", None, &[]);
+        let c1 = w.agent("t0", "research.kid", "kid", "run_c1", Some("run_lead"), &[]);
+        let c2 = w.agent("t0", "research.kid", "kid", "run_c2", Some("run_lead"), &[]);
+        assert_eq!(id_of(&c1), id_of(&c2));
+        {
+            let l = w.ledger.lock().unwrap();
+            l.record_delegation(&wicket_store::NewDelegation {
+                id: "d-c1",
+                tenant: "t0",
+                parent_run: "run_lead",
+                parent_principal: &id_of(&lead),
+                child_run: "run_c1",
+                child_principal: &id_of(&c1),
+                name: "kid",
+                brief: "t",
+            })
+            .unwrap();
+            l.delegation_reported("d-c1", "m-r").unwrap();
+        }
+        let (text, err) = wicket_gateway_continue(&lead, "d-c1");
+        assert!(!err, "{text}");
+        let (got, _) = take(&c1);
+        assert!(got.contains("\"kind\": \"brief\"") && got.contains("d-c1"), "{got}");
+        assert!(w.ledger.lock().unwrap().take_message("run_c2").unwrap().is_none(), "never the other run");
+    }
+
+    /// `continue_child`, as the gateway answers it.
+    fn wicket_gateway_continue(ctx: &RunCtx, child: &str) -> (String, bool) {
+        delegate::continue_child(ctx, &json!({ "child": child, "brief": "x" }))
     }
 
     /// #70, #250: a message to a hibernated agent's principal wakes it, and its next activation
