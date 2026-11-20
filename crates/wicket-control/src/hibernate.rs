@@ -403,12 +403,8 @@ pub fn resolve(l: &Ledger, who: &str) -> Result<AgentRow> {
 /// or its budget is spent. The checks `wake` makes before it claims, without its records: what a
 /// trigger asks before it counts a wake as done (#578).
 pub fn would_refuse(l: &Ledger, a: &AgentRow) -> Result<Option<String>> {
-    if let Some((node, until)) = crate::noderun::fenced_until(&a.run, wicket_feed::now_ms()) {
-        return Ok(Some(format!(
-            "its last activation (run {}) may still be running on node {node}, until {}",
-            a.run,
-            crate::noderun::fmt_ms(until)
-        )));
+    if let Some((node, until)) = crate::noderun::fenced_until(l, &a.run, wicket_feed::now_ms()) {
+        return Ok(Some(crate::noderun::fence_refusal(&a.run, &node, until)));
     }
     for (r, _) in l.agent_runs(&a.id)? {
         if let Some((rv, _, rby, why)) = l.revoked_in_chain(&r)? {
