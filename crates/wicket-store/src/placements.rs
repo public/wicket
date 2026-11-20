@@ -67,7 +67,17 @@ pub struct BoxTerms {
     pub agent: Option<String>,
     /// When preemption last asked it to stop (ms).
     pub preempted_at_ms: Option<i64>,
+    /// A run it started (spawned) still runs: such an agent is never preempted, since hibernating
+    /// it stops its children.
+    pub live_children: bool,
+    /// When its run ended (ms), for a box preemption asked to stop that has ended since; None while
+    /// it runs.
+    pub ended_ms: Option<i64>,
 }
+
+/// How long after its end a box preemption stopped is still listed ([`Ledger::preemption_view`]):
+/// longer than a node takes to report (every 30 s) and the time a report is trusted for (90 s).
+pub const PREEMPTED_SEEN_MS: i64 = 120_000;
 
 /// A run's reservation.
 #[derive(Clone, Debug, PartialEq)]
@@ -195,13 +205,19 @@ impl Ledger {
 
     /// Every running box placed on a node with its recorded terms: what preemption may choose from.
     /// A box without terms (started before they were recorded) is left out: it is never preempted.
-    pub fn preemption_view(&self) -> Result<Vec<BoxTerms>> {
+    /// A box preemption asked to stop that has ended since is listed too, with `ended_ms`, until
+    /// [`PREEMPTED_SEEN_MS`] after its end: a node's report may still count it.
+    pub fn preemption_view(&self, now_ms: i64) -> Result<Vec<BoxTerms>> {
         let mut st = self.conn.prepare(
-            "SELECT r.id, r.node, r.tenant, t.vcpus, t.memory_mib, t.priority, t.preemptible, a.id, t.preempted_at_ms
+            "SELECT r.id, r.node, r.tenant, t.vcpus, t.memory_mib, t.priority, t.preemptible, a.id, t.preempted_at_ms,
+                    EXISTS (SELECT 1 FROM identities i JOIN runs c ON c.id = i.run WHERE i.parent_run = r.id AND c.status = 'running'),
+                    CASE WHEN r.status = 'running' THEN NULL ELSE COALESCE(r.ended_at, 0) * 1000 END
              FROM runs r JOIN run_terms t ON t.run = r.id LEFT JOIN agents a ON a.run = r.id AND a.state = 'active'
-             WHERE r.status = 'running' AND r.node IS NOT NULL ORDER BY r.node, r.id",
+             WHERE r.node IS NOT NULL
+               AND (r.status = 'running' OR (t.preempted_at_ms IS NOT NULL AND COALESCE(r.ended_at, 0) * 1000 > ?1))
+             ORDER BY r.node, r.id",
         )?;
-        let rows = st.query_map([], |r| {
+        let rows = st.query_map(params![now_ms - PREEMPTED_SEEN_MS], |r| {
             Ok(BoxTerms {
                 run: r.get(0)?,
                 node: r.get(1)?,
@@ -212,6 +228,8 @@ impl Ledger {
                 preemptible: r.get(6)?,
                 agent: r.get(7)?,
                 preempted_at_ms: r.get(8)?,
+                live_children: r.get(9)?,
+                ended_ms: r.get(10)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -221,6 +239,22 @@ impl Ledger {
     pub fn mark_preempted(&self, run: &str, now_ms: i64) -> Result<()> {
         self.conn.execute("UPDATE run_terms SET preempted_at_ms = ?2 WHERE run = ?1", params![run, now_ms])?;
         Ok(())
+    }
+
+    /// Preemption no longer asks `run`'s box to stop (it gave up on it).
+    pub fn clear_preempted(&self, run: &str) -> Result<()> {
+        self.conn.execute("UPDATE run_terms SET preempted_at_ms = NULL WHERE run = ?1", params![run])?;
+        Ok(())
+    }
+
+    /// Whether preemption still asks `run`'s box to stop: what its supervisor checks before it
+    /// hibernates for preemption, so a request given up on is dropped.
+    pub fn preemption_pending(&self, run: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT preempted_at_ms IS NOT NULL FROM run_terms WHERE run = ?1", params![run], |r| r.get(0))
+            .optional()?
+            .unwrap_or(false))
     }
 
     /// Every running run placed on a node: what affinity sees on each (#579 step 4).
@@ -383,7 +417,7 @@ mod tests {
         })
         .unwrap();
         l.mark_preempted("r3", 7).unwrap();
-        let v = l.preemption_view().unwrap();
+        let v = l.preemption_view(1).unwrap();
         assert_eq!(v.iter().map(|b| b.run.as_str()).collect::<Vec<_>>(), ["r1", "r2", "r3"]);
         assert_eq!(
             v[0],
@@ -397,12 +431,14 @@ mod tests {
                 preemptible: true,
                 agent: Some("agt_a".into()),
                 preempted_at_ms: None,
+                live_children: false,
+                ended_ms: None,
             }
         );
         assert!(!v[1].preemptible && v[1].agent.is_none(), "a run that is no agent's");
         assert_eq!(v[2].preempted_at_ms, Some(7));
         l.run_ended(&wicket_core::RunId("r1".into()), "done", "").unwrap();
-        assert_eq!(l.preemption_view().unwrap().len(), 2, "running only");
+        assert_eq!(l.preemption_view(1).unwrap().len(), 2, "running only (r1 was never asked to stop)");
         // Settled a day on, an ended run's terms go; a running one's stay.
         l.drop_settled_placements(1 + 86_400 + 1).unwrap();
         let left: i64 = l.conn.query_row("SELECT count(*) FROM run_terms", [], |r| r.get(0)).unwrap();

@@ -425,23 +425,30 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
 - **Preemption.** A waiting wake which no node may take now may stop long-lived agents to make room. It
   defers to a wake ahead of it in the queue only if that one fits a node now or could make room this way
   itself, so a wake that can't be served doesn't hold preemption up. It stops only active long-lived agents
-  of its own tenant whose manifest marks them [`placement.preemptible`](manifest.md#placement) and whose
-  priority is below its own: on one node, each one needed to make the room, the lowest priority first.
+  of its own tenant whose manifest marks them [`placement.preemptible`](manifest.md#placement), whose
+  priority is below its own, and **which have no live child**: on one node, each one needed to make the
+  room, the lowest priority first.
   - **How.** Each agent is stopped the normal way an agent stops: it is asked to hibernate at its next
     quiet point, as `wicket hibernate` asks, so it keeps its work and can be woken again. Nothing is
-    revoked, so nothing in its subtree is either. Each is audited as `placement.preempted` (the run, its
-    agent, node and priority, and the run it made room for).
+    revoked. Hibernating ends the agent's run, which stops its children, so an agent with a child still
+    running is never chosen. Each is audited as `placement.preempted` (the run, its agent, node and
+    priority, and the run it made room for). An operator's own `wicket hibernate` request stands; the
+    preemption's request is tagged, so it alone is ever withdrawn.
   - **The room.** The wake reserves the room on that node while they hibernate, renewing the reservation,
-    so another start doesn't take it; a wake that gives up or fails releases it. Room is all it makes: a
-    node out for a label, a taint, its CA or an affinity stays out. The wake is placed once the node's
-    report shows the room, and the node's admission still decides.
+    so another start doesn't take it. Room is all it makes: a node out for a label, a taint, its CA or an
+    affinity stays out. The wake is placed once the node's report shows the room, and the node's admission
+    still decides. An agent that has hibernated counts as gone until a node report from after its end
+    arrives, so a second agent isn't stopped for the same room.
   - **The deadline.** An agent asked counts as gone for 5 minutes, so nothing more is stopped for the same
     room. One that hasn't hibernated by then (a hibernate request can be declined) is left alone for the
-    rest of that wait: its request is withdrawn, the room released, and it is audited as
-    `placement.preempt_abandoned`.
-  - **Cost.** The wake works out what it would stop from the nodes' last reports first; only then does it
-    ask every node for its room (a report may still count a box that has ended), at most every 30 s. It
-    doesn't preempt with under 30 s of its wait left.
+    rest of that wait: preemption's request is withdrawn (and its supervisor, if it has taken the request
+    already, drops it before hibernating), the room released, and it is audited as
+    `placement.preempt_abandoned`. A wake that is placed, or gives up waiting, while agents it asked still
+    run asks them no more in the same way; given up, it releases the room it held.
+  - **Cost.** The wake works out what it would stop from the nodes' last reports first, without a write
+    lock; only then does it ask every node for its room (a report may still count a box that has ended),
+    at most every 30 s, and always after a preemption completes. It doesn't preempt with under 30 s of its
+    wait left.
   - **Programs are never preempted.** That's a decision: a program has no stop that keeps its work, so
     stopping one for room would lose it.
   - Each box's limits and priority are recorded at its start (`run_terms`, ledger schema 33); a box

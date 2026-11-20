@@ -567,7 +567,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
         Err(e) => {
             let l = Ledger::open(&ledger_path())?;
             // Any room it held (a preemption's) goes back with the wake.
-            l.placement_released(&run.0)?;
+            let _ = l.placement_released(&run.0);
             l.release_failed_wake(&agent.id, generation, &format!("wake failed: {e:#}"))?;
             return Err(e);
         }
@@ -834,12 +834,19 @@ pub const PREEMPT_BY: &str = "wicket:preempt";
 fn preemptable(
     run: &str,
     ask: &Waiting,
+    cands: &[Candidate],
     nodes: &mut [wicket_placement::schedule::Node],
     terms: &[wicket_store::BoxTerms],
     spare: &[String],
     now_ms: i64,
 ) -> std::collections::BTreeMap<String, Vec<wicket_placement::schedule::Running>> {
-    let settling = |b: &wicket_store::BoxTerms| b.preempted_at_ms.is_some_and(|t| now_ms - t < PREEMPT_DEADLINE.as_millis() as i64);
+    // Gone: asked within the deadline and still running, or ended since, after the node's report
+    // (which still counts its box).
+    let report_at = |node: &str| cands.iter().find(|c| c.name == node).map_or(i64::MAX, |c| c.at_ms);
+    let settling = |b: &wicket_store::BoxTerms| match b.ended_ms {
+        None => b.preempted_at_ms.is_some_and(|t| now_ms - t < PREEMPT_DEADLINE.as_millis() as i64),
+        Some(end) => report_at(&b.node) <= end,
+    };
     for n in nodes.iter_mut() {
         for b in terms.iter().filter(|b| b.node == n.name && settling(b)) {
             n.used_vcpus = (n.used_vcpus - b.vcpus).max(0.0);
@@ -848,8 +855,17 @@ fn preemptable(
         }
     }
     let mut running: std::collections::BTreeMap<String, Vec<wicket_placement::schedule::Running>> = Default::default();
-    for b in terms.iter().filter(|b| b.agent.is_some() && !settling(b) && b.tenant == ask.tenant && b.run != run && !spare.contains(&b.run))
-    {
+    // An agent with a live child is never chosen: hibernating it stops its children.
+    let eligible = |b: &&wicket_store::BoxTerms| {
+        b.ended_ms.is_none()
+            && b.agent.is_some()
+            && !b.live_children
+            && !settling(b)
+            && b.tenant == ask.tenant
+            && b.run != run
+            && !spare.contains(&b.run)
+    };
+    for b in terms.iter().filter(eligible) {
         running.entry(b.node.clone()).or_default().push(wicket_placement::schedule::Running {
             run: b.run.clone(),
             vcpus: b.vcpus,
@@ -895,17 +911,18 @@ pub fn preempt_for(
     if ask.tenant.is_empty() {
         return Ok(None);
     }
-    l.immediate(|l| {
+    // A dry run only reads: it takes no write lock.
+    let work = |l: &Ledger| -> Result<Option<wicket_placement::schedule::Preemption>> {
         let (mut held, mut held_me) = (vec![], vec![]);
         for c in cands {
             held.push(l.held_on(&c.name, c.at_ms, now_ms)?);
             held_me.push(l.held_on_except(&c.name, c.at_ms, now_ms, &run.0)?);
         }
         let on = OnNodes::read(l, now_ms)?;
-        let terms = l.preemption_view()?;
+        let terms = l.preemption_view(now_ms)?;
         let view = |w: &Waiting, who: &str| {
             let mut nodes = seen(l, cands, if who == run.0 { &held_me } else { &held }, &on, w, who);
-            let running = preemptable(who, w, &mut nodes, &terms, if who == run.0 { spare } else { &[] }, now_ms);
+            let running = preemptable(who, w, cands, &mut nodes, &terms, if who == run.0 { spare } else { &[] }, now_ms);
             (nodes, running)
         };
         let (me, waiting) = queue(l, run, &ask.tenant, ask.req.priority, now_ms)?;
@@ -928,7 +945,9 @@ pub fn preempt_for(
         for v in &p.victims {
             let Some(b) = terms.iter().find(|b| &b.run == v) else { continue };
             let Some(agent) = &b.agent else { continue };
-            l.want_agent(agent, "hibernate")?;
+            // An operator's own request, if any, stands; preemption's is tagged, so only it is ever
+            // withdrawn.
+            l.want_agent_if_unasked(agent, PREEMPT_WANT)?;
             l.mark_preempted(v, now_ms)?;
             l.audit(
                 &tenant,
@@ -944,7 +963,91 @@ pub fn preempt_for(
         l.reserve_placement(&run.0, &p.node, ask.req.vcpus, ask.req.memory_mib, now_ms)?;
         l.record_placement_owner(&run.0, &ask.tenant, &ask.zone, ask.principal.as_deref())?;
         Ok(Some(p))
+    };
+    if dry_run {
+        work(l)
+    } else {
+        l.immediate(work)
+    }
+}
+
+/// What preemption asks of an agent: to hibernate, tagged so that only preemption's own request is
+/// ever withdrawn (an operator's `wicket hibernate` asks plain `hibernate`).
+pub const PREEMPT_WANT: &str = "hibernate:preempt";
+
+/// Gives up on the victims in `left` of `run`'s preemption `p` (#579 step 4): each is asked no
+/// more (its pending request withdrawn, and preemption's mark cleared, which its supervisor checks
+/// before it hibernates for preemption), the room held for `run` is released, and each is audited as
+/// `placement.preempt_abandoned`, with `why`.
+#[allow(clippy::too_many_arguments)]
+pub fn abandon_preemption(
+    l: &Ledger,
+    run: &RunId,
+    ask: &Waiting,
+    p: &wicket_placement::schedule::Preemption,
+    left: &[String],
+    asked_ms: i64,
+    now_ms: i64,
+    why: &str,
+    release_room: bool,
+) -> Result<()> {
+    let tenant = wicket_core::TenantId(ask.tenant.clone());
+    for v in left {
+        if let Some((agent, _)) = l.agent_of_run(v)? {
+            l.withdraw_agent_want(&agent, PREEMPT_WANT)?;
+        }
+        l.clear_preempted(v)?;
+        l.audit(
+            &tenant,
+            Some(&RunId(v.clone())),
+            "placement.preempt_abandoned",
+            &serde_json::json!({
+                "run": v, "node": p.node, "for": run.0, "after_secs": (now_ms - asked_ms) / 1000, "why": why, "by": PREEMPT_BY,
+            }),
+        )?;
+    }
+    if release_room {
+        l.placement_released(&run.0)?;
+    }
+    Ok(())
+}
+
+/// A wake stops waiting (#579 step 4): placed (`placed`: its new reservation stays), or given up.
+/// Victims of its pending preemption that still run are asked no more ([`abandon_preemption`], with
+/// `why`); given up, the room it held is released too. Returns the victims given up on.
+pub fn end_wait(
+    l: &Ledger,
+    run: &RunId,
+    ask: &Waiting,
+    pending: Option<&(wicket_placement::schedule::Preemption, i64)>,
+    now_ms: i64,
+    placed: bool,
+) -> Result<Vec<String>> {
+    l.immediate(|l| {
+        let mut left = vec![];
+        if let Some((p, asked_ms)) = pending {
+            left = still_running(l, p)?;
+            if !left.is_empty() {
+                let why = if placed { "the wake was placed without them" } else { "the wake gave up waiting" };
+                abandon_preemption(l, run, ask, p, &left, *asked_ms, now_ms, why, false)?;
+            }
+        }
+        if !placed {
+            l.placement_released(&run.0)?;
+        }
+        Ok(left)
     })
+}
+
+/// The victims of `p` whose runs still run.
+pub fn still_running(l: &Ledger, p: &wicket_placement::schedule::Preemption) -> Result<Vec<String>> {
+    let mut left = vec![];
+    for v in &p.victims {
+        if l.run_status(v)?.as_deref() == Some("running") {
+            left.push(v.clone());
+        }
+    }
+    Ok(left)
 }
 
 /// What became of a preemption a wake made ([`settle_preemption`]).
@@ -974,12 +1077,7 @@ pub fn settle_preemption(
     now_ms: i64,
 ) -> Result<Settled> {
     l.immediate(|l| {
-        let mut left = vec![];
-        for v in &p.victims {
-            if l.run_status(v)?.as_deref() == Some("running") {
-                left.push(v.clone());
-            }
-        }
+        let left = still_running(l, p)?;
         if left.is_empty() {
             return Ok(Settled::Done);
         }
@@ -987,22 +1085,7 @@ pub fn settle_preemption(
             l.reserve_placement(&run.0, &p.node, ask.req.vcpus, ask.req.memory_mib, now_ms)?;
             return Ok(Settled::Waiting);
         }
-        let tenant = wicket_core::TenantId(ask.tenant.clone());
-        for v in &left {
-            if let Some((agent, _)) = l.agent_of_run(v)? {
-                l.withdraw_agent_want(&agent, "hibernate")?;
-            }
-            l.audit(
-                &tenant,
-                Some(&RunId(v.clone())),
-                "placement.preempt_abandoned",
-                &serde_json::json!({
-                    "run": v, "node": p.node, "for": run.0, "after_secs": (now_ms - asked_ms) / 1000,
-                    "why": "it didn't hibernate by the deadline", "by": PREEMPT_BY,
-                }),
-            )?;
-        }
-        l.placement_released(&run.0)?;
+        abandon_preemption(l, run, ask, p, &left, asked_ms, now_ms, "it didn't hibernate by the deadline", true)?;
         Ok(Settled::Abandoned(left))
     })
 }
@@ -1174,7 +1257,11 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
     let mut preempt_probed_at: Option<std::time::Instant> = None;
     loop {
         if let Some(n) = &b.decision.node {
-            let _ = ledger.lock().expect("ledger").stop_waiting(&run.0);
+            let l = ledger.lock().expect("ledger");
+            let _ = l.stop_waiting(&run.0);
+            // Agents it asked to hibernate and still running aren't needed now.
+            let _ = end_wait(&l, run, &me, pending.as_ref(), wicket_feed::now_ms(), true);
+            drop(l);
             say!(
                 "[wicket] placing agent {} on node {n} (best fit of {} it may go on, of {} available{})",
                 agent.id,
@@ -1191,8 +1278,9 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
         if started.elapsed() >= wait {
             let l = ledger.lock().expect("ledger");
             let _ = l.stop_waiting(&run.0);
-            // Room it held for itself after preempting goes back.
-            let _ = l.placement_released(&run.0);
+            // Room it held for itself after preempting goes back, and agents it asked to hibernate
+            // are asked no more.
+            let _ = end_wait(&l, run, &me, pending.as_ref(), wicket_feed::now_ms(), false);
             drop(l);
             // No silent overcommit (#377): each node would refuse the box itself.
             bail!(
@@ -1214,7 +1302,12 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
             let settled = settle_preemption(&ledger.lock().expect("ledger"), run, &me, p, *asked_ms, wicket_feed::now_ms())?;
             match settled {
                 Settled::Waiting => {}
-                Settled::Done => pending = None,
+                Settled::Done => {
+                    // The node's last report may still count them: ask every node before deciding
+                    // to stop more.
+                    pending = None;
+                    preempt_probed_at = None;
+                }
                 Settled::Abandoned(left) => {
                     say!(
                         "[wicket] gave up preempting {} for agent {}: not hibernated within {} s (audited; the room is released)",
@@ -1821,7 +1914,7 @@ mod tests {
             assert!(l.revoked_in_chain(r).unwrap().is_none(), "{r}: preemption never revokes");
         }
         let batch = l.agent("agt_batch").unwrap().unwrap();
-        assert_eq!(batch.want.as_deref(), Some("hibernate"), "asked to hibernate, the normal way");
+        assert_eq!(batch.want.as_deref(), Some(PREEMPT_WANT), "asked to hibernate, the normal way, tagged as preemption's");
         for a in ["agt_kept", "agt_theirs", "agt_old"] {
             assert_eq!(l.agent(a).unwrap().unwrap().want, None, "{a}");
         }
@@ -1844,7 +1937,7 @@ mod tests {
 
         // Its supervisor hibernates it (takes the want, commits its state, ends the run); then a
         // wake claims it as for any hibernated agent.
-        assert_eq!(l.take_agent_want("agt_batch", batch.generation).unwrap().as_deref(), Some("hibernate"));
+        assert_eq!(l.take_agent_want("agt_batch", batch.generation).unwrap().as_deref(), Some(PREEMPT_WANT));
         assert!(l.commit_agent_push("agt_batch", batch.generation, 0, 1, "head-1", 10).unwrap());
         l.run_ended(&RunId("run_batch".into()), "hibernated", "").unwrap();
         assert_eq!(l.agent("agt_batch").unwrap().unwrap().state, "hibernated");
@@ -1912,10 +2005,11 @@ mod tests {
         assert_eq!(settle_preemption(&l, &run, &ask, &p, now, now + 5_000).unwrap(), Settled::Done);
     }
 
-    /// #579 step 4 (review): a preempted agent's child keeps working. Preemption revokes nothing,
-    /// so nothing in the agent's subtree is revoked, before or after the agent wakes again.
+    /// #579 step 4 (review): an agent with a live child is never preempted. Hibernating an agent
+    /// stops its children (its run ends through `stop_children`), so it would take their work too.
+    /// Once the child has ended, the agent may be.
     #[test]
-    fn a_preempted_agents_child_keeps_working_and_the_agent_wakes_again() {
+    fn an_agent_with_a_live_child_is_never_preempted() {
         let mut l = Ledger::open_in_memory().unwrap();
         let now = 99_000_000;
         let n1 = crowded(&mut l, now);
@@ -1934,18 +2028,131 @@ mod tests {
         };
         l.put_identity(&identity("run_batch", None)).unwrap();
         l.put_identity(&identity("run_child", Some("run_batch"))).unwrap();
-        let p = preempt_for(&l, &RunId("run_new".into()), &asking("t0", 5), std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
-        assert_eq!(p.victims, ["run_batch"], "the child, a program without terms, isn't a victim");
-        assert!(l.revoked_in_chain("run_child").unwrap().is_none(), "its child isn't revoked");
+        let ask = asking("t0", 5);
+        assert!(
+            preempt_for(&l, &RunId("run_new".into()), &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().is_none(),
+            "run_batch has a live child, and nothing else yields"
+        );
+        assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
         assert_eq!(l.run_status("run_child").unwrap().as_deref(), Some("running"));
-        // The agent hibernates and wakes again; its child's chain is still clean.
-        let batch = l.agent("agt_batch").unwrap().unwrap();
-        l.take_agent_want("agt_batch", batch.generation).unwrap();
-        assert!(l.commit_agent_push("agt_batch", batch.generation, 0, 1, "head-1", 10).unwrap());
-        l.run_ended(&RunId("run_batch".into()), "hibernated", "").unwrap();
-        assert!(l.claim_wake("agt_batch", "run_batch2", wicket_store::now() + 60).unwrap().is_some());
-        assert!(l.revoked_in_chain("run_child").unwrap().is_none());
-        assert_eq!(l.run_status("run_child").unwrap().as_deref(), Some("running"), "the child works on");
+        // The child ended: run_batch may be preempted now.
+        l.run_ended(&RunId("run_child".into()), "succeeded", "").unwrap();
+        let p = preempt_for(&l, &RunId("run_new".into()), &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        assert_eq!(p.victims, ["run_batch"]);
+    }
+
+    /// #579 step 4 (review): a victim whose run has ended still counts as gone while the node's
+    /// last report predates its end (that report still counts its box), so no second agent is asked
+    /// to hibernate for the same room; a report from after its end shows the room itself.
+    #[test]
+    fn a_victim_that_has_ended_counts_as_gone_until_a_newer_report() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        // Two preemptible agents on n1, so a second victim exists.
+        let now = (wicket_store::now() - 10) * 1000;
+        let mut n1 = crowded(&mut l, now);
+        let t0 = wicket_core::TenantId("t0".into());
+        l.run_started(&t0, &RunId("run_batch2".into()), "z", "a").unwrap();
+        l.set_run_node("run_batch2", "n1").unwrap();
+        l.record_run_terms("run_batch2", 1.0, 1024, 0, true, now).unwrap();
+        l.create_agent(&wicket_store::NewAgent {
+            id: "agt_batch2",
+            tenant: "t0",
+            zone: "z",
+            name: "b2",
+            run: "run_batch2",
+            session_id: "s",
+            manifest: "m",
+            image: "img",
+            workspace: None,
+            claim_until: wicket_store::now() + 30,
+        })
+        .unwrap();
+        let ask = asking("t0", 5);
+        let run = RunId("run_new".into());
+        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        assert_eq!(p.victims.len(), 1);
+        let victim = p.victims[0].clone();
+        // It hibernated: its run ended. n1's report is from before that, so still counts its box.
+        l.run_ended(&RunId(victim.clone()), "hibernated", "").unwrap();
+        l.placement_released(&run.0).unwrap();
+        let later = now + 20_000;
+        assert!(
+            preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), later, &[], false).unwrap().is_none(),
+            "the ended victim counts as gone: no second agent is asked"
+        );
+        let other = if victim == "run_batch" { "agt_batch2" } else { "agt_batch" };
+        assert_eq!(l.agent(other).unwrap().unwrap().want, None);
+        // A report from after its end: it shows the room (here, the box gone from the node's use).
+        n1.at_ms = (wicket_store::now() + 5) * 1000;
+        n1.cap.used_vcpus = 3.0;
+        n1.cap.used_memory_mib = 3072;
+        assert!(preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), later, &[], true).unwrap().is_none(), "it fits: nothing to stop");
+    }
+
+    /// #579 step 4 (review): giving up withdraws only preemption's own request. Its supervisor,
+    /// which may have taken the request already, checks `preemption_pending` before it hibernates
+    /// and drops it; an operator's own `wicket hibernate` is never withdrawn.
+    #[test]
+    fn giving_up_withdraws_only_preemptions_own_request() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let now = 98_500_000;
+        let n1 = crowded(&mut l, now);
+        let ask = asking("t0", 5);
+        let run = RunId("run_new".into());
+        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        assert!(l.preemption_pending("run_batch").unwrap(), "what its supervisor checks");
+        let past = now + PREEMPT_DEADLINE.as_millis() as i64 + 1;
+        assert!(matches!(settle_preemption(&l, &run, &ask, &p, now, past).unwrap(), Settled::Abandoned(_)));
+        assert!(!l.preemption_pending("run_batch").unwrap(), "its supervisor drops the request it took");
+        assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
+
+        // An operator asked first: preemption doesn't replace that request, and giving up leaves it.
+        let mut l = Ledger::open_in_memory().unwrap();
+        let n1 = crowded(&mut l, now);
+        assert!(l.want_agent("agt_batch", "hibernate").unwrap());
+        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        assert_eq!(p.victims, ["run_batch"], "it hibernates anyway: the room counts");
+        assert_eq!(l.agent("agt_batch").unwrap().unwrap().want.as_deref(), Some("hibernate"));
+        settle_preemption(&l, &run, &ask, &p, now, past).unwrap();
+        assert_eq!(l.agent("agt_batch").unwrap().unwrap().want.as_deref(), Some("hibernate"), "the operator's request stands");
+    }
+
+    /// #579 step 4 (review): a wake that stops waiting asks its victims no more. Given up (its
+    /// `--wait` over), the room it held is released too; placed (anywhere), its new reservation stays.
+    #[test]
+    fn a_wake_that_stops_waiting_asks_its_victims_no_more() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let now = 98_700_000;
+        let n1 = crowded(&mut l, now);
+        let ask = asking("t0", 5);
+        let run = RunId("run_new".into());
+        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        let pending = (p, now);
+        assert_eq!(end_wait(&l, &run, &ask, Some(&pending), now + 1_000, false).unwrap(), ["run_batch"]);
+        assert_eq!(l.placement("run_new").unwrap().unwrap().state, "released", "the room goes back");
+        assert!(!l.preemption_pending("run_batch").unwrap());
+        assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
+        let why: Vec<String> = l
+            .audit_records_after(0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.kind == "placement.preempt_abandoned")
+            .map(|a| serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["why"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(why, ["the wake gave up waiting"]);
+        // No preemption pending: giving up still releases what it held.
+        l.reserve_placement("run_x", "n1", 1.0, 1024, now).unwrap();
+        assert!(end_wait(&l, &RunId("run_x".into()), &ask, None, now, false).unwrap().is_empty());
+        assert_eq!(l.placement("run_x").unwrap().unwrap().state, "released");
+
+        // Placed: the victims are asked no more, and its reservation stays.
+        let mut l = Ledger::open_in_memory().unwrap();
+        let n1 = crowded(&mut l, now);
+        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        l.reserve_placement("run_new", "n2", 1.0, 1024, now + 2).unwrap();
+        assert_eq!(end_wait(&l, &run, &ask, Some(&(p, now)), now + 3, true).unwrap(), ["run_batch"]);
+        assert_eq!(l.placement("run_new").unwrap().unwrap().state, "reserved");
+        assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
     }
 
     /// #579 step 4 (review): a re-attach records a box's terms again without forgetting that
@@ -1959,7 +2166,7 @@ mod tests {
         l.record_run_terms("r", 1.0, 1024, 0, true, 1).unwrap();
         l.mark_preempted("r", 42).unwrap();
         l.record_run_terms("r", 1.0, 1024, 0, true, 2).unwrap();
-        assert_eq!(l.preemption_view().unwrap()[0].preempted_at_ms, Some(42));
+        assert_eq!(l.preemption_view(1).unwrap()[0].preempted_at_ms, Some(42));
     }
 
     /// #579 step 4 (review): a run waiting ahead defers preemption only if it can be served (it fits

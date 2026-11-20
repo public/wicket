@@ -342,6 +342,15 @@ impl Ledger {
         Ok(n == 1)
     }
 
+    /// Asks `want` of active agent `id` only if nothing is asked of it yet (an operator's request
+    /// stands). True if asked.
+    pub fn want_agent_if_unasked(&self, id: &str, want: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET want = ?2, note = NULL, updated_at = ?3 WHERE id = ?1 AND state = 'active' AND want IS NULL",
+            params![id, want, now()],
+        )? > 0)
+    }
+
     /// Withdraws a request `want` made of agent `id` that its supervisor hasn't taken yet (#579 step
     /// 4: a preemption given up on). True if it was still pending.
     pub fn withdraw_agent_want(&self, id: &str, want: &str) -> Result<bool> {

@@ -33,7 +33,7 @@ mod nodeca;
 mod nodelabels;
 mod placements;
 pub use nodeca::{CaHosts, CaWant};
-pub use placements::{BoxTerms, Placement, RunningBox, RESERVE_SECS, WAIT_SEEN_MS};
+pub use placements::{BoxTerms, Placement, RunningBox, PREEMPTED_SEEN_MS, RESERVE_SECS, WAIT_SEEN_MS};
 mod changes;
 pub mod money;
 mod node;

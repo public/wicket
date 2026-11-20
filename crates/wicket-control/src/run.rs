@@ -1700,6 +1700,9 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         say!("[wicket] the agent asked to {what} before this supervisor took the run over: at the end of its turn");
     }
     let mut hib_asked = asked.hibernate;
+    // The hibernate asked is preemption's (#579 step 4) and no other: dropped if preemption gives up
+    // on it before the quiet point.
+    let mut hib_for_preemption = false;
     let mut finish_asked = asked.finish;
     let mut notified_msgs = 0i64;
     // The turn state last reported as the run's presence (#252).
@@ -1924,6 +1927,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     wicket_proxy::Want::Hibernate => {
                         say!("[wicket] the agent asked to hibernate{when}");
                         hib_asked = true;
+                        // Its own request stands whatever preemption does.
+                        hib_for_preemption = false;
                     }
                 }
             }
@@ -2100,11 +2105,15 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     }
                 }
                 if let Some(f) = &fence {
-                    // An operator's `wicket hibernate`.
-                    if ledger.lock().ok().and_then(|l| l.take_agent_want(&f.agent, f.generation).ok().flatten()).as_deref() == Some("hibernate") {
+                    // An operator's `wicket hibernate`, or preemption's request (#579 step 4).
+                    let want = ledger.lock().ok().and_then(|l| l.take_agent_want(&f.agent, f.generation).ok().flatten());
+                    let by_preemption = want.as_deref() == Some(crate::hibernate::PREEMPT_WANT);
+                    if want.as_deref() == Some("hibernate") || by_preemption {
+                        // An operator's request stands whatever preemption does.
+                        hib_for_preemption = by_preemption && (!hib_asked || hib_for_preemption);
                         hib_asked = true;
                         if turn_running {
-                            say!("[wicket] hibernate asked: at the end of this turn");
+                            say!("[wicket] hibernate asked{}: at the end of this turn", if by_preemption { " (to make room)" } else { "" });
                         }
                     }
                 }
@@ -2131,8 +2140,15 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     notified_msgs = waiting;
                     turn_running = true;
                 }
+                // Preemption gave up on this agent before its quiet point: it isn't needed to stop.
+                if hib_asked && hib_for_preemption && !ledger.lock().ok().and_then(|l| l.preemption_pending(&run.0).ok()).unwrap_or(true) {
+                    hib_asked = false;
+                    hib_for_preemption = false;
+                    say!("[wicket] not hibernating: the wake that asked for room no longer needs it");
+                }
                 if !turn_running && !hibernating && hib_asked && lingering.is_none() {
                     hib_asked = false;
+                    hib_for_preemption = false;
                     match &fence {
                         None => say!("[wicket] not hibernated: only a long-lived agent wicket started itself can hibernate"),
                         Some(f) => match stopper.check_quiet(&box_user, &|c: &str| harness.is_some_and(|h| h.is_runtime(&m, c)), &agent_cmd).await {
