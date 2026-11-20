@@ -14,6 +14,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     "--json lists the audit records: not with export (`wicket audit export --status` shows the sinks)",
                 ));
             }
+            if let Some(AuditCmd::Compact { yes }) = cmd {
+                return compact(yes);
+            }
             if let Some(AuditCmd::Export { once, checkpoint, status }) = cmd {
                 // The exporter blocks (its own runtime, file and HTTP writes): off the async runtime.
                 return std::thread::spawn(move || audit_export_cmd(once, checkpoint, status))
@@ -22,7 +25,27 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             }
             let l = Ledger::open(&ledger_path())?;
             if verify {
-                println!("audit chain OK: {} records", l.verify_audit()?);
+                let n = l.verify_audit()?;
+                // After a prune (#582) the chain starts at a checkpoint a durable sink acknowledged:
+                // its signature, and that it signed the record kept there, are checked first.
+                let anchor = match l.audit_anchor()? {
+                    Some(a) => {
+                        let key = match &issuer_jwk {
+                            Some(p) => wicket_identity::verifying_key_from_jwk(&serde_json::from_slice(&std::fs::read(p)?)?)?,
+                            None => issuer()?.verifying_key(),
+                        };
+                        audit_export::verify_anchor(&l, &key)?;
+                        Some(a)
+                    }
+                    None => None,
+                };
+                println!("audit chain OK: {n} records");
+                if let Some(a) = anchor {
+                    println!(
+                        "  from its anchor at seq {} (a signed checkpoint sink {} acknowledged): {} older record(s) pruned here, kept in the sinks",
+                        a.seq, a.sink, a.pruned
+                    );
+                }
                 let (ok, bad) = verify_signed_decisions(&l)?;
                 println!("passkey-signed decisions and console actions: {ok} verified offline, {bad} failed");
                 let (iok, ibad) = verify_identities_and_messages(&l)?;
@@ -50,6 +73,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     }
                     let a = audit_export::verify_against(&l, &objs, &key)?;
                     println!("against the exported copies: {} signed checkpoint(s) and {} record(s) match", a.checkpoints, a.records);
+                    if a.pruned > 0 {
+                        println!("  ({} exported from before the local anchor, pruned here by retention: not compared)", a.pruned);
+                    }
                     if a.superseded > 0 {
                         println!("  ({} exported before a restore to an earlier point, which discarded them: not compared)", a.superseded);
                     }
@@ -97,8 +123,108 @@ fn audit_json((seq, ts, kind, run, body): wicket_store::AuditRow) -> serde_json:
     serde_json::json!({ "seq": seq, "ts": ts, "kind": kind, "run": run, "body": body })
 }
 
+/// `wicket audit compact`: switches the ledger to `auto_vacuum = incremental` with one `VACUUM`
+/// (#582), so audit retention gives pruned space back to the file system from then on. The whole
+/// file is rewritten under an exclusive lock, so wicket's services must be stopped (a reconcile
+/// pass, the console or a run writing would wait past their budget); it needs as much free space
+/// again as the file, and takes about a minute per 2.5 GB.
+fn compact(yes: bool) -> Result<()> {
+    // Nothing else of wicket's may be writing: a VACUUM holds the write lock for about a minute per
+    // 2.5 GB, past what the audit writer waits (#582 re-review N3).
+    for (role, unit) in [("daemon", "wicketd"), ("console", "wicket-console"), ("reconcile", "wicket-reconcile")] {
+        if pid_alive(&crate::update::pidfile(role)) {
+            bail!("{unit} is running: stop it first (sudo systemctl stop wicketd wicket-console wicket-reconcile), then run this as the wicket user");
+        }
+    }
+    if std::os::unix::net::UnixStream::connect(crate::daemon::SOCKET_PATH).is_ok() {
+        bail!("wicketd is listening on {}: stop it first (sudo systemctl stop wicketd)", crate::daemon::SOCKET_PATH);
+    }
+    // No reconcile pass meanwhile, on this host: one running now is a reason to stop, not wait.
+    let Some(_lock) = crate::reconcile::Lock::try_take()? else {
+        bail!("a reconcile pass is running (it holds reconcile.lock): stop wicket-reconcile, or try again once it ends");
+    };
+    let path = ledger_path();
+    let dir = path.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
+    // SQLite's temporary copy goes beside the ledger, not in a small /tmp. Set before any
+    // connection of this process opens: it is read when SQLite first needs a temporary file.
+    std::env::set_var("SQLITE_TMPDIR", &dir);
+    let l = Ledger::open(&path)?;
+    if l.auto_vacuum_incremental()? {
+        println!("{}: already gives pruned space back (auto_vacuum = incremental): nothing to do", path.display());
+        return Ok(());
+    }
+    let size = l.file_bytes()?;
+    let free = free_bytes(&dir)?;
+    if free < 2 * size {
+        bail!(
+            "compacting needs about twice the ledger's size free beside it ({} MB, for the copy and its WAL): {} MB is free in {}",
+            2 * size / 1_000_000,
+            free / 1_000_000,
+            dir.display()
+        );
+    }
+    println!(
+        "compacting {} ({} MB): one VACUUM, about a minute per 2.5 GB, holding the ledger exclusively.",
+        path.display(),
+        size / 1_000_000
+    );
+    if !yes && !confirm("compact now?")? {
+        bail!("not compacted");
+    }
+    let t = std::time::Instant::now();
+    // The exclusive lock is asked for without waiting: another writer (a run, a `wicket` command)
+    // refuses it at once. (Opening the ledger above waited at most its 5 s busy timeout.)
+    l.compact_exclusively().map_err(|e| {
+        anyhow::anyhow!("{e}: another process has the ledger open for writing (a run or a wicket command): stop it and try again")
+    })?;
+    println!("compacted in {:.1} s: {} MB now", t.elapsed().as_secs_f64(), l.file_bytes()? / 1_000_000);
+    Ok(())
+}
+
+/// Whether the process a pid file names is running, and is wicket: a pid a stale file names may
+/// have been reused by something else since.
+fn pid_alive(pidfile: &std::path::Path) -> bool {
+    std::fs::read_to_string(pidfile).ok().and_then(|s| s.trim().parse::<i32>().ok()).is_some_and(is_wicket)
+}
+
+/// Whether process `pid` runs a wicket binary: its executable's name, or failing that (another
+/// user's process, whose `exe` can't be read) its command line's first word.
+fn is_wicket(pid: i32) -> bool {
+    let named = |p: &std::path::Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("wicket"));
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        // A binary replaced by an update reads as "<path> (deleted)".
+        let exe = std::path::PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)").to_string());
+        return named(&exe);
+    }
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .and_then(|c| c.split(|b| *b == 0).next().map(|a| std::path::PathBuf::from(String::from_utf8_lossy(a).into_owned())))
+        .is_some_and(|a| named(&a))
+}
+
+/// Bytes free on the file system holding `dir`.
+fn free_bytes(dir: &std::path::Path) -> Result<i64> {
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statvfs fills `st`; `c` is a NUL-terminated path.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("statvfs");
+    }
+    Ok((st.f_bavail as i64).saturating_mul(st.f_frsize as i64))
+}
+
 #[derive(Subcommand)]
 pub enum AuditCmd {
+    /// Switch the ledger to giving pruned audit space back (`auto_vacuum = incremental`), with one
+    /// VACUUM (#582). Run it as the wicket user with wicketd, the console and the reconciler
+    /// stopped: the whole file is rewritten under an exclusive lock (about a minute per 2.5 GB),
+    /// and it needs as much free space again beside the ledger. Ledgers made by this build don't
+    /// need it.
+    Compact {
+        /// Don't ask for confirmation at a terminal.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or
     /// $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which
     /// feed the sinks too; each sink is fed by one process at a time. The only process that writes
@@ -251,4 +377,29 @@ pub(crate) fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
         }
     }
     Ok((ok, bad))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #677 third check: a pid file names a running wicket only if the pid runs a wicket binary
+    /// (a stale file's pid may be something else's now).
+    #[test]
+    fn a_pid_counts_only_if_it_is_wickets() {
+        assert!(is_wicket(std::process::id() as i32), "this test binary is wicket_cli-…");
+        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(!is_wicket(other.id() as i32), "sleep isn't wicket");
+        let _ = other.kill();
+        let _ = other.wait();
+        let dir = std::env::temp_dir().join(format!("wicket-pid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.pid");
+        std::fs::write(&f, std::process::id().to_string()).unwrap();
+        assert!(pid_alive(&f));
+        std::fs::write(&f, "1").unwrap();
+        assert_eq!(pid_alive(&f), is_wicket(1));
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }

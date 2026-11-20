@@ -45,10 +45,12 @@ mod quota;
 mod receipts;
 mod scale;
 pub use changes::{ChangeWatch, Topic};
+mod retention;
 mod standing;
 mod triggers;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
+pub use retention::{Anchor as AuditAnchor, AuditUsage, Checkpoint as AuditCheckpoint};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};
 pub use standing::{
     new_standing_id, standing_effect, zone_digest, Bound as StandingBound, Evidence as StandingEvidence, EvidenceOp as StandingEvidenceOp,
@@ -196,7 +198,12 @@ pub enum StoreError {
 /// Version 31 (expand, #668, after 30) adds `name_exposures`: the ports a run's names exposed,
 /// which `request_name` may take away again, unlike an exposure the box made itself. Older builds
 /// don't read it; the floor stays 17.
-pub const SCHEMA_VERSION: u32 = 31;
+/// Version 32 (expand, after 31) adds `audit_checkpoints`, `audit_anchor`, `audit_sink_targets`
+/// and `audit_checkpoint_wants` (#582): the checkpoints sinks acknowledged, where the audit chain
+/// starts once retention has pruned its front, which target each sink's cursor is for, and the
+/// checkpoints retention asked the exporter to sign. Older builds don't read them; a prune raises
+/// the floor to 32, so a build that would walk a pruned chain from seq 1 refuses the ledger.
+pub const SCHEMA_VERSION: u32 = 32;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 17;
 /// The oldest ledger schema this build upgrades (#253). An existing ledger older than it is
@@ -584,6 +591,9 @@ impl Ledger {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        // Before any table exists, so a new ledger gives freed pages back (#582); on an existing
+        // one it changes nothing until a VACUUM (`make_auto_vacuum_incremental`).
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
         check_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(links::SCHEMA)?;
@@ -598,6 +608,7 @@ impl Ledger {
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
         conn.execute_batch(triggers::SCHEMA)?;
+        conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         // Indexes a ledger of schema 17 or later has, made here for a new one.
         conn.execute_batch(
@@ -655,6 +666,7 @@ impl Ledger {
         conn.execute_batch(placements::SCHEMA)?;
         conn.execute_batch(services::SCHEMA)?;
         conn.execute_batch(triggers::SCHEMA)?;
+        conn.execute_batch(retention::SCHEMA)?;
         conn.execute_batch(names::SCHEMA)?;
         scale::migrate(&conn)?;
         changes::migrate(&conn)?;
@@ -1786,21 +1798,51 @@ impl Ledger {
             .optional()?)
     }
 
-    /// Recomputes the whole chain. Returns the number of records verified.
+    /// Recomputes the whole chain: from seq 1, or after a prune (#582) from the anchor on (kinds
+    /// the host keeps below it aren't chained), whose record must be the first and hash to what
+    /// the anchor's checkpoint signed (its own `prev` is a deleted record's, taken as stored). An
+    /// anchor over no records fails, and so does one that no `audit.pruned` record after it names:
+    /// a prune writes that record in the chain it leaves, so an anchor copied in from a saved
+    /// checkpoint, with the records before it deleted, is caught. The anchor's signature is the caller's to check (it needs the
+    /// issuer key: `wicket_home::audit_export::verify_anchor`). Returns the number of records
+    /// verified.
     pub fn verify_audit(&self) -> Result<i64> {
-        let mut st = self.conn.prepare("SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit ORDER BY seq")?;
-        let mut rows = st.query([])?;
+        let anchor = self.audit_anchor()?;
+        let from = anchor.as_ref().map(|a| a.seq).unwrap_or(i64::MIN);
+        let mut st = self.conn.prepare("SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit WHERE seq >= ?1 ORDER BY seq")?;
+        let mut rows = st.query(params![from])?;
         let mut prev = CHAIN_ZERO.to_string();
         let mut n = 0;
+        let mut named = false;
         while let Some(r) = rows.next()? {
             let (seq, ts, tenant, run, kind, body, p, h): (i64, i64, String, Option<String>, String, String, String, String) =
                 (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?);
+            if n == 0 {
+                if let Some(a) = &anchor {
+                    if seq != a.seq || h != a.hash {
+                        return Err(StoreError::ChainBroken(seq));
+                    }
+                    prev = p.clone();
+                }
+            }
             let f = ChainFields { seq, ts, tenant: &tenant, run: run.as_deref(), kind: &kind, body: &body };
             if p != prev || chain_hash_v2(&prev, &f) != h {
                 return Err(StoreError::ChainBroken(seq));
             }
+            // A prune records itself in the chain it leaves (#582): an anchor no `audit.pruned`
+            // record after it names was copied in from a saved checkpoint, the front cut off.
+            if kind == "audit.pruned" && !named {
+                named = anchor.as_ref().is_some_and(|a| {
+                    serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|b| b["checkpoint"].as_i64()) == Some(a.seq)
+                });
+            }
             prev = h;
             n += 1;
+        }
+        if let Some(a) = &anchor {
+            if n == 0 || !named {
+                return Err(StoreError::ChainBroken(a.seq));
+            }
         }
         Ok(n)
     }

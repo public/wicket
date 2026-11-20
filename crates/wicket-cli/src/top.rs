@@ -209,6 +209,8 @@ pub struct ControlFrame {
     pub runs: Vec<RunLine>,
     pub pending: usize,
     pub leases: Vec<LeaseLine>,
+    /// The audit table against its limit on this host, and the prune checkpoint (#582).
+    pub audit: Option<String>,
     /// The state store's sync and the audit export's progress (#635), if either is set up.
     pub progress: Option<crate::statesync::Progress>,
 }
@@ -253,6 +255,7 @@ pub struct LeaseLine {
 pub fn control_frame(l: &wicket_store::Ledger, runs_dir: &Path, now_ms: i64) -> Result<ControlFrame> {
     let tenant = wicket_core::TenantId::single();
     let mut f = ControlFrame { now_ms, ..Default::default() };
+    f.audit = crate::statesync::audit_retention(l, false).ok().map(|r| wicket_home::audit_export::retention_line(&r));
     let mut by_node: HashMap<String, (Vec<LinkRecord>, usize)> = HashMap::new();
     let agents = l.agents(&tenant.0)?;
     // A long-lived agent's run on its way to hibernating (or waking) says so.
@@ -422,6 +425,10 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
                 format!("${:.2}", x.reserved_micro_usd as f64 / 1e6)
             ));
         }
+    }
+    if let Some(a) = &f.audit {
+        out.push(String::new());
+        out.push(clean(a, 400));
     }
     fit_all(out, width)
 }
@@ -1026,6 +1033,7 @@ mod tests {
                 not_after: Some(NOW / 1000 + 2280),
                 reserved_micro_usd: 120_000,
             }],
+            audit: None,
             progress: None,
         };
         // The state store lagging, one sink behind and failing (#635).
@@ -1074,6 +1082,11 @@ mod tests {
         let want = include_str!("top/testdata/control-80.txt");
         assert_eq!(got, want.trim_end_matches('\n'), "got:\n{got}");
         assert!(got.lines().all(|l| l.chars().count() <= 80));
+        // The audit table against its limit, and the prune checkpoint (#582), last.
+        let mut g = f.clone();
+        g.audit = Some("audit 0.18 GB of 2.00 GB, pruned to seq 40 (39 records, kept in sink offsite)".into());
+        let got = render_control(&g, 80);
+        assert_eq!(got.last().map(String::as_str), Some("audit 0.18 GB of 2.00 GB, pruned to seq 40 (39 records, kept in sink offsite)"));
     }
 
     #[test]

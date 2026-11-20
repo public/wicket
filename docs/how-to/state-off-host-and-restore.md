@@ -143,6 +143,15 @@ Then:
 
 `ci/restore.sh` runs all of this against a local S3 gateway (versitygw) and Litestream's image.
 
+## Audit retention
+
+With the state store streaming the ledger and at least one durable audit sink (a `store` sink, or
+one marked `durable: true`), wicket prunes the oldest audit records on the host once the audit
+table passes `host_gb` (2 GB by default). It only prunes records every durable sink has, behind a
+checkpoint one acknowledged that the stream had synced. Without either, it never prunes. A ledger
+from an earlier build needs `wicket audit compact` once, with the services stopped, to give the
+space back. See [audit retention](../reference/audit.md#retention-on-the-host).
+
 ## What it doesn't do yet
 
 - **Failover is manual.** A standby is restored by you, not promoted on its own (phase 5, #155).
