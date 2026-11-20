@@ -49,22 +49,28 @@ pub fn redact_urls(s: &str) -> String {
             .map_or(0, |(j, c)| j + c.len_utf8());
         let mut end =
             rest[i + 3..].find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')).map_or(rest.len(), |j| i + 3 + j);
-        // A closing bracket or quote the URL didn't open is the text's: `(see https://h/x)`.
+        // A closing bracket or quote the URL didn't open is the text's: `(see https://h/x)`. Each
+        // kind is counted once, then as it is trimmed (linear in the token).
+        let token = &rest[start..end];
+        let mut balance = [('(', ')'), ('[', ']'), ('{', '}')].map(|(o, c)| (c, token.matches(o).count(), token.matches(c).count()));
         while let Some(c) = rest[i + 3..end].chars().last() {
-            let open = match c {
-                ')' => Some('('),
-                ']' => Some('['),
-                '}' => Some('{'),
-                '\u{201d}' | '\u{2019}' | '\u{bb}' | '\u{203a}' => None,
-                _ => break,
-            };
-            let token = &rest[start..end];
-            if open.is_some_and(|o| token.matches(o).count() >= token.matches(c).count()) {
-                break;
+            match balance.iter_mut().find(|(close, ..)| *close == c) {
+                Some((_, opens, closes)) if *opens < *closes => *closes -= 1,
+                Some(_) => break,
+                None if matches!(c, '\u{201d}' | '\u{2019}' | '\u{bb}' | '\u{203a}') => {}
+                None => break,
             }
             end -= c.len_utf8();
         }
         out.push_str(&rest[..start]);
+        // A letter or digit outside ASCII right before the scheme (or in place of one: fullwidth
+        // `ｈｔｔｐｓ://`) makes the scheme unclear: what follows is cut, not shown.
+        if rest[..start].chars().last().is_some_and(|c| !c.is_ascii() && c.is_alphanumeric()) {
+            out.push_str(&rest[start..i]);
+            out.push_str("://…");
+            rest = &rest[end..];
+            continue;
+        }
         if start == i {
             // No scheme: not a URL, nothing to redact.
             out.push_str(&rest[i..i + 3]);
@@ -145,9 +151,15 @@ mod tests {
         }
         // Text before the scheme, non-ASCII included, stays text; a bracket the URL didn't open is
         // the text's.
-        assert_eq!(redact_urls("éhttps://us:pw@host/"), "éhttps://host/");
+        assert_eq!(redact_urls("éhttps://us:pw@host/"), "éhttps://…", "a letter outside ASCII before it: unclear");
         assert_eq!(redact_urls("\u{201c}https://us:pw@host/\u{201d}"), "\u{201c}https://host/\u{201d}");
-        assert_eq!(redact_urls("错误https://us:pw@host/"), "错误https://host/");
+        assert_eq!(redact_urls("错误https://us:pw@host/"), "错误https://…");
+        assert_eq!(
+            redact_urls("x \u{ff48}\u{ff54}\u{ff54}\u{ff50}://us:pw@host/ y"),
+            "x \u{ff48}\u{ff54}\u{ff54}\u{ff50}://… y",
+            "fullwidth"
+        );
+        assert_eq!(redact_urls("错误: https://us:pw@host/"), "错误: https://host/", "text, then a space");
         assert_eq!(redact_urls("→ws://us:pw@host/"), "→ws://host/");
         assert_eq!(redact_urls("(see https://usr:pwd@host)"), "(see https://host/)");
         assert_eq!(redact_urls("[https://h/a_(b)]"), "[https://h/a_(b)]");
@@ -165,6 +177,17 @@ mod tests {
         assert_eq!(clip("abcdef", 3), "abc…");
         // Ordinary text, accents and other scripts are kept.
         assert_eq!(strip("café 東京 — ok"), "café 東京 — ok");
+    }
+
+    /// A megabyte body (what Litestream's reply is read up to) is redacted in linear time: closing
+    /// brackets aren't recounted for each one trimmed.
+    #[test]
+    fn a_large_body_is_redacted_in_linear_time() {
+        let body = format!("(https://u:p@h/{}", ")".repeat(1 << 20));
+        let t = std::time::Instant::now();
+        let out = redact_urls(&body);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t.elapsed());
+        assert!(out.starts_with("(https://h/") && !out.contains("u:p"));
     }
 
     /// A small deterministic generator (xorshift): the crate has no property-test framework, and
@@ -226,9 +249,10 @@ mod tests {
         fn text(&mut self, max: usize) -> String {
             (0..self.below(max + 1)).map(|_| self.char()).collect()
         }
-        /// A secret-looking word: at least 4 characters, none that ends a URL or its user info.
+        /// A secret-looking word: at least 4 characters, the URL's own delimiters (`/ ? # \\ @`)
+        /// included, none that ends the URL token (whitespace, quotes).
         fn word(&mut self) -> String {
-            const A: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+            const A: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/?#\\@";
             (0..4 + self.below(12)).map(|_| A[self.below(A.len())] as char).collect()
         }
     }
