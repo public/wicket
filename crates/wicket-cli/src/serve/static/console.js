@@ -55,7 +55,10 @@ function refreshRel() {
 const riskClass = r => ({ R0Read: "r0", R1ReadScoped: "r1", R2WriteReversible: "r2", R3ExternalOrIrreversible: "r3", R4ExecOrPrivilege: "r4" })[r] || "r4";
 // What a risk class means to whoever decides, with its code (docs/reference/risk-classes.md, #574).
 // Risk as what could happen (docs/explanation/console-design.md); the class's code only under Details.
-const riskLabel = r => ({ R0Read: "Only reads", R1ReadScoped: "Only reads", R2WriteReversible: "Changes data that can be put back", R3ExternalOrIrreversible: "Others will see it, or it can't be undone", R4ExecOrPrivilege: "Pushes code, deploys, or gains privileges" })[r] || strip(r);
+const riskWords = r => ({ R0Read: "Only reads", R1ReadScoped: "Only reads", R2WriteReversible: "Changes data that can be put back", R3ExternalOrIrreversible: "Others will see it, or it can't be undone", R4ExecOrPrivilege: "Pushes code, deploys, or gains privileges" })[r] || strip(r);
+// The signing sheet's words, unchanged until the sheet's own change is reviewed (#715 review):
+// describe() stays byte for byte what main shows.
+const riskLabel = r => ({ R0Read: "R0 \u00b7 read", R1ReadScoped: "R1 \u00b7 read (scoped)", R2WriteReversible: "R2 \u00b7 changes data", R3ExternalOrIrreversible: "R3 \u00b7 visible to others, or can't be undone", R4ExecOrPrivilege: "R4 \u00b7 push, deploy or privilege" })[r] || r;
 const riskCode = r => ({ R0Read: "R0", R1ReadScoped: "R1", R2WriteReversible: "R2", R3ExternalOrIrreversible: "R3", R4ExecOrPrivilege: "R4" })[r] || strip(r);
 // A lifetime as the card and the sheet both say it: whole hours as hours, else minutes.
 // Money as people write it (#639): "$0.05", "$1.00", and more places only where a value needs them
@@ -97,9 +100,26 @@ const UTC_TIME = /\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?Z\b/g;
 const localTimes = text => strip(text).replace(UTC_TIME, m => { const t = Date.parse(m) / 1000; return isNaN(t) ? m : clock(t); });
 function serverText(tag, cls, text) { const e = el(tag, cls, localTimes(text)); if (UTC_TIME.test(String(text))) e.title = strip(text); UTC_TIME.lastIndex = 0; return e; }
 // A sentence with `commands` in backticks as code spans (#648): the rest stays text.
+// A command to run on the host, with a Copy button (#715 review): the console's own controls come
+// first, and a command is the secondary way, so it is small, but one tap copies it whole.
+function copyButton(cmd) {
+  const b = el("button", "link copy", "Copy");
+  b.type = "button";
+  if (b.setAttribute) b.setAttribute("aria-label", "Copy " + cmd);
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText(cmd); toast("Copied: " + cmd); }
+    catch { toast("Couldn't copy here; select the command instead.", true); }
+  };
+  return b;
+}
 function codeText(tag, cls, text) {
   const e = el(tag, cls);
-  String(text).split("`").forEach((part, i) => { if (part) e.append(i % 2 ? el("code", "", part) : document.createTextNode(part)); });
+  String(text).split("`").forEach((part, i) => {
+    if (!part) return;
+    if (i % 2 === 0) { e.append(document.createTextNode(part)); return; }
+    e.append(el("code", "", part));
+    if (/^wicket [a-z]/.test(part)) e.append(copyButton(part));
+  });
   return e;
 }
 const span = secs => { const s = Math.round(secs || 0); return s >= 3600 && s % 3600 === 0 ? (s / 3600) + (s === 3600 ? " hour" : " hours") : Math.round(s / 60) + " min"; };
@@ -178,7 +198,7 @@ function describe(a) {
     // zones mustn't read the same), its full id with the ids; who in the box asked, as reported.
     const agent = a.agent ? String(a.agent).split("/a/").pop() : "";
     const lines = [verb + how + ": " + what + (a.prefix ? "\u2026 (every path under it)" : "") + (a.scope === "zone" ? " \u00b7 for any run in zone " + s(a.zone) : ""),
-      "Risk: " + riskLabel(a.risk) + " (" + riskCode(a.risk) + ")"];
+      "Risk: " + riskLabel(a.risk)];
     lines.push((agent ? "For " + s(agent) : "For run " + s(a.run)) + " (zone " + s(a.zone) + ")" +
       ((a.requested_by || []).length ? " \u00b7 asked by " + a.requested_by.map(s).join(", ") + " (as reported)" : ""));
     lines.push("Request " + s(a.request) + " \u00b7 run " + s(a.run) + (a.agent ? " \u00b7 agent " + s(a.agent) : "") + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : ""));
@@ -401,8 +421,15 @@ function renderAgent(c, id, more) {
 // Which call in the box asked, as the agent's event stream reports it (#574, item 5): helpful, not
 // proof. Labelled apart from "On behalf of" above, and always with the note that anything in the
 // box could use the grant.
-function renderWho(list) {
+function renderWho(list, part) {
   const w = el("div", "who");
+  // What stays on the card (#709 review): whether more than one agent asked, and that anything in
+  // the box could use the grant, are about how far a grant reaches, not detail.
+  if (part === "warnings") {
+    if (list.length > 1) w.append(el("div", "warn", "Asked by more than one agent: one grant would serve all of them."));
+    w.append(el("div", "note", (list.length ? "As the agent reports it, not proven: anything" : "Anything") + " in this box could use the grant."));
+    return w;
+  }
   const line = r => strip(r.agent) + " \u2014 " + strip(r.tool) + ": " + strip(r.call).slice(0, 120);
   if (!list.length) w.append(el("div", "", "Asked by (in the box): unknown (no agent event stream)"));
   for (const a of list) {
@@ -413,16 +440,20 @@ function renderWho(list) {
     if (a.basis === "ambiguous") { w.append(el("div", "", "Asked by (in the box): one of " + rs.length + " concurrent calls:")); for (const r of rs) w.append(el("div", "cand", "\u2022 " + line(r))); }
     else w.append(el("div", "", "Asked by (in the box): " + line(r0(rs))));
   }
-  if (list.length > 1) w.append(el("div", "warn", "Asked by more than one agent: one grant would serve all of them."));
-  // Always: whoever asked, the grant is the box's.
-  w.append(el("div", "note", (list.length ? "As the agent reports it, not proven: anything" : "Anything") + " in this box could use the grant."));
+  if (part !== "list") {
+    if (list.length > 1) w.append(el("div", "warn", "Asked by more than one agent: one grant would serve all of them."));
+    // Always: whoever asked, the grant is the box's.
+    w.append(el("div", "note", (list.length ? "As the agent reports it, not proven: anything" : "Anything") + " in this box could use the grant."));
+  }
   return w;
 }
 const r0 = rs => rs[0];
 
 // What a request asks for, in words (#621): an HTTP request as its method and URL; wicket's own kinds
 // (on wicket.internal) as a sentence, with the raw op on a small line under it. A capacity lease's
-// terms are in the reason wicket wrote for it ("capacity lease <id>: <terms>. Asked by the agent: <why>").
+// sentence is built from its terms as the server sends them (`lease`), never parsed out of the
+// reason, which quotes agent-chosen text (#709 review). The region the agent asked for is its own
+// value (`asked`), shown quoted.
 // A long id in a sentence: its head and tail (the whole op is on the raw line under Details).
 const shortText = id => id.length > 18 ? id.slice(0, 10) + "\u2026" + id.slice(-6) : id;
 function asks(p) {
@@ -430,14 +461,25 @@ function asks(p) {
   if (p.host !== "wicket.internal") return { what: raw + (p.scope_prefix ? "\u2026  (every path under it)" : ""), raw: "", why: strip(p.reason), internal: false };
   const seg = String(p.path || "").split("/").filter(Boolean).map(strip);
   let what = raw, why = strip(p.reason);
+  let asked = null;
   if (p.method === "CAPACITY") {
-    const m = /^capacity lease ([^:]+): ([\s\S]*?)\. Asked by the agent: ([\s\S]*)$/.exec(String(p.reason || ""));
-    what = m ? "Lease a node: " + strip(m[2]) : "Lease a node (" + seg.slice(1).join("/") + ")";
-    if (m) why = strip(m[3]);
-  } else if (p.method === "SPAWN" && seg[0] === "zones") what = "Start a child agent" + (seg[2] ? " named " + seg[2] : "") + " in zone " + seg[1];
-  else if (p.method === "LINK" && seg[0] === "links") what = "Link " + shortText(seg[1]) + " \u2192 " + shortText(seg[2]) + (seg[3] ? ", port " + seg[3] : "");
+    const x = p.lease;
+    if (x) {
+      what = "Lease a node: " + plural(Number(x.vcpus) || 0, "vCPU", "vCPUs") + ", " + (Number(x.memory_mib) || 0) + " MiB, for " + span(Number(x.duration_secs) || 0) +
+        " on " + strip(x.provider) + ", at most " + money(x.hourly_cap_usd) + "/h, " + money(x.reserved_usd) + " reserved";
+      if (x.region) asked = ["region", strip(x.region)];
+    } else what = "Lease a node (" + seg.slice(1).join("/") + ")";
+  } else if (p.method === "SPAWN" && seg[0] === "zones") {
+    // wicket writes the reason as "start <kind> …"; only its two kinds are read from it, nothing else.
+    const k = /^start (agent|program) /.exec(String(p.reason || ""));
+    what = "Start " + (k ? "a new " + k[1] : "a new agent or program") + (seg[2] ? " named " + seg[2] : "") + " in zone " + seg[1];
+  } else if (p.method === "LINK" && seg[0] === "links") {
+    // The path is /links/<from run>/<to run>/<port>: the port is on the second box, the one linked to.
+    const nm = id => { const n = runName(id); return n === id ? shortText(n) : n; };
+    what = "Let " + nm(seg[1]) + "'s box reach port " + (seg[3] || "?") + " on " + nm(seg[2]) + "'s box";
+  }
   else if (p.method === "UPDATE" && seg[0] === "self") what = "Install wicket build " + String(seg[1] || "").slice(0, 12) + "\u2026";
-  return { what, raw, why, internal: true };
+  return { what, raw, why, internal: true, asked };
 }
 
 // Pending cards are kept by request id: a card whose content hasn't changed is the same element
@@ -446,13 +488,22 @@ function asks(p) {
 const cards = new Map();
 // A long id shortened in the middle, its head and tail kept (#574 review): what is copied is the
 // whole id, and the whole id is its title.
+// Inline text (so a copy is one line), shortened in the middle; a tap or click shows it whole, to
+// read or select and copy on a phone (#709 review).
 function idEl(id) {
   id = strip(id);
-  const e = el("span", "id-short");
-  e.title = id;
-  if (id.length <= 18) { e.textContent = id; return e; }
-  e.append(el("span", "id-head", id.slice(0, -6)), el("span", "id-tail", id.slice(-6)));
-  return e;
+  if (id.length <= 18) { const e = el("span", "id-short mono", id); e.title = id; return e; }
+  const short = id.slice(0, 10) + "\u2026" + id.slice(-6);
+  const b = el("button", "id-short link", short);
+  b.type = "button"; b.title = id;
+  if (b.setAttribute) { b.setAttribute("aria-label", id + " (tap to show it whole)"); b.setAttribute("aria-expanded", "false"); }
+  b.onclick = () => {
+    const whole = b.textContent === short;
+    b.textContent = whole ? id : short;
+    if (b.setAttribute) b.setAttribute("aria-expanded", String(whole));
+    layoutAt = performance.now();
+  };
+  return b;
 }
 // A URL broken only after its slashes and dots, so it wraps at a segment, not mid-word.
 function wrapped(cls, text) {
@@ -464,8 +515,10 @@ function fillMeta(meta, p) { meta.replaceChildren(document.createTextNode(p.id +
 // What a request wants to do, as a verb (docs/explanation/console-design.md): from its method, or
 // git's service for a push or a fetch.
 function verb(p) {
-  if (/git-receive-pack$|service=git-receive-pack/.test(p.path || "")) return "push code to";
-  if (/git-upload-pack$|service=git-upload-pack/.test(p.path || "")) return "fetch code from";
+  // git's own words only for the methods git uses (#715 review): a DELETE to a git path is a delete.
+  const m = String(p.method).toUpperCase();
+  if ((m === "GET" || m === "POST") && /git-receive-pack$|service=git-receive-pack/.test(p.path || "")) return "push code to";
+  if ((m === "GET" || m === "POST") && /git-upload-pack$|service=git-upload-pack/.test(p.path || "")) return "fetch code from";
   return ({ GET: "read", HEAD: "read", OPTIONS: "read", POST: "send data to", PUT: "change", PATCH: "change", DELETE: "delete" })[String(p.method).toUpperCase()] || strip(p.method);
 }
 // Methods as the verbs a person would use: [GET, HEAD, POST] is "read and send data to".
@@ -514,7 +567,7 @@ function whoAsks(id) {
 }
 function fillMeta(meta, p) { meta.replaceChildren(document.createTextNode(p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 run "), idEl(p.run)); }
 function pendingCard(s, p) {
-  const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run]);
+  const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run, p.lease]);
   const had = cards.get(p.id);
   if (had && had.key === key) { had.age.textContent = rel(p.created_at, s.now); return had.node; }
   // Labelled fields (docs/explanation/console-design.md): who, wants to, where, why, risk; then the
@@ -523,22 +576,30 @@ function pendingCard(s, p) {
   const tone = riskClass(p.risk);
   const head = el("div", "req-head");
   const age = timeEl(p.created_at, rel(p.created_at, s.now)); age.className = "age";
-  head.append(el("span", "risk " + tone, riskLabel(p.risk)), age);
+  head.append(el("span", "risk " + tone, riskWords(p.risk)), age);
   c.append(head);
   const a = asks(p);
   const dl = el("dl", "fields");
   const [who, idOk] = whoAsks(p.identity || {});
   field(dl, "Who", who);
+  // The verb, and always the exact method beside it (#715 review): a verb alone could mislead.
   if (a.internal) field(dl, "Wants to", a.what.charAt(0).toLowerCase() + a.what.slice(1), "said");
-  else { field(dl, "Wants to", verb(p), "said"); field(dl, "Where", where(p)); }
-  field(dl, "Why", "\u201c" + a.why + "\u201d", "why");
+  else { field(dl, "Wants to", verb(p) + " (" + strip(p.method) + ")", "said"); field(dl, "Where", where(p)); }
+  // What the agent chose, as its own value, out of wicket's sentence (#709 review).
+  if (a.asked) field(dl, a.asked[0].charAt(0).toUpperCase() + a.asked[0].slice(1), "\u201c" + a.asked[1] + "\u201d", "asked");
+  // An agent's reason is quoted as its words; wicket's own kinds carry wicket's text, labelled so
+  // (#715 review), with what it says in full (a spawn's limits beyond its parent, say).
+  if (a.internal) field(dl, "wicket says", a.why, "why");
+  else field(dl, "Why", "\u201c" + a.why + "\u201d", "why");
   c.append(dl);
+  // How far a grant reaches stays on the card (#709 review); who in the box asked is detail.
+  c.append(renderWho(p.attribution || [], "warnings"));
   const more = el("details", "more req-more");
   more.append(el("summary", "", "Details"));
   const id = p.identity || {};
   if (id.verified) more.append(el("div", "chain", "On behalf of: " + (id.acting_for || []).map(strip).join(" \u2192 ")));
   more.append(el("div", "mono raw", strip(p.method + " " + p.host + p.path) + " \u00b7 risk class " + riskCode(p.risk)));
-  more.append(renderWho(p.attribution || []));
+  more.append(renderWho(p.attribution || [], "list"));
   const meta = el("div", "meta");
   fillMeta(meta, p);
   more.append(meta);
@@ -547,9 +608,9 @@ function pendingCard(s, p) {
   // as a window whatever is picked, and the card mustn't say otherwise.
   const ot = p.once_terms || { uses: 1, ttl_secs: 600 };
   const window_ = ot.uses !== 1;
-  const onceLabel = window_ ? "Allow for " + span(ot.ttl_secs) : a.internal ? "Allow" : "Allow once";
+  const onceLabel = window_ ? "Allow for " + span(ot.ttl_secs) + " (any number of uses)" : a.internal ? "Allow" : "Allow once";
   const once = el("button", "approve", onceLabel); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
-  const hour = el("button", "", "Allow for 1 hour"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
+  const hour = el("button", "", "Allow for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
   const deny = el("button", "deny apart", "Don't allow"); deny.onclick = () => act("deny", { id: p.id });
   if (!idOk) { once.disabled = true; hour.disabled = true; }
   // Only the steps the server grants: a push is one window, R3 and R4 one use, wicket's own kinds one
@@ -790,7 +851,7 @@ function placedRow(p) {
   if (p.past_lease && p.held_by) {
     const w = el("div", "callout warn");
     w.append(document.createTextNode("Lease ended "), timeEl(p.lease_until), document.createTextNode("; still billing: run " + strip(p.held_by) + " holds it. Release it on the host:"));
-    w.append(el("code", "block", "wicket node release " + strip(p.id)));
+    w.append(el("code", "block", "wicket node release " + strip(p.id)), copyButton("wicket node release " + strip(p.id)));
     d.append(w);
   } else if (p.past_lease) {
     const w = el("div", "meta");
@@ -863,8 +924,10 @@ function standingAskRow(a) {
   const r = a.rule || {};
   const agent = String(a.principal || "").split("/a/").pop();
   const head = el("div", "req-head");
-  head.append(el("span", "risk " + (r.allow_dangerous ? "r4" : (r.methods || []).every(m => /^(GET|HEAD|OPTIONS)$/i.test(m)) ? "r1" : "r2"),
-    r.allow_dangerous ? "Includes requests that can't be undone" : (r.methods || []).every(m => /^(GET|HEAD|OPTIONS)$/i.test(m)) ? "Only reads" : "Changes data"),
+  // The pill says only what the rule says (#715 review): dangerous requests included or not, and its
+  // methods. Whether a POST changes data depends on the API, so it isn't guessed here.
+  head.append(el("span", "risk " + (r.allow_dangerous ? "r4" : ""),
+    (r.allow_dangerous ? "Includes requests that can't be undone: " : "") + (r.methods || []).map(strip).join(", ")),
     timeEl(a.created_at, rel(a.created_at)));
   head.children[head.children.length - 1].className = "age";
   d.append(head);
@@ -1350,7 +1413,8 @@ async function showAuthority(run) {
     out.push(el("h4", "", "Can reach"));
     const reach = [];
     for (const r of t.reach || []) reach.push(reachLine(verbsOf(r.methods) + " " + strip(r.host) + "  " + pathsText(r.paths), undefined,
-      "from its zone's rules" + (r.allow_dangerous ? "; including requests that can't be undone" : "")));
+      "from its zone's rules" + (r.allow_dangerous ? "; including requests that can't be undone" : "") +
+      ((r.decode_slash || []).length ? "; reads an encoded slash (%2F) as / in path part " + r.decode_slash.map(Number).join(", ") : "")));
     for (const g of (t.grants || []).filter(g => !g.revoked && (!g.expires_at || g.expires_at > now))) {
       const end = el("span"); end.append(document.createTextNode("you allowed it; ends "), timeEl(g.expires_at));
       reach.push(reachLine(verb(g) + " " + strip(g.host + g.path), end,
@@ -1363,6 +1427,8 @@ async function showAuthority(run) {
       const end = el("span"); end.append(document.createTextNode("always allowed, "), r.expires_at ? timeEl(r.expires_at, "ends " + at(r.expires_at)) : document.createTextNode("until removed"));
       reach.push(reachLine(verbsOf(r.rule.methods) + " " + strip(r.rule.host) + "  " + pathsText(r.rule.paths), end, r.for === "zone" ? "for every agent in its zone" : "for this agent"));
     }
+    // What its zone forbids beats everything above, a grant included.
+    for (const f of t.forbid || []) reach.push(reachLine("never " + strip(f.host) + "  " + pathsText(f.paths), undefined, "forbidden by its zone's rules, even if you allow it"));
     if (!t.held) reach.push(el("div", "note", "No token now: " + strip(t.why)));
     else if (!reach.length) reach.push(el("div", "empty", "Nothing: everything it asks for waits for you."));
     out.push(...reach);

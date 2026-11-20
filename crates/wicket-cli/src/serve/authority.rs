@@ -211,6 +211,8 @@ fn run_authority(state: &State, run: &str) -> Result<Value> {
         "zone": spec.zone.name,
         // What the zone itself may reach (#651): the view leads with it, before the token's blocks.
         "reach": spec.zone.reach,
+        // What it may never reach, whatever is allowed (#715 review): shown under it.
+        "forbid": spec.zone.forbid,
         "loads": entry.compiled.as_ref().err().map_or(Value::Bool(true), |e| json!({ "error": e })),
         "issued_by": if spec.issuer_cert.is_some() { "an online issuing key, certified by the authority root" } else { "the authority root" },
         "issuer_until_ms": entry.compiled.as_ref().ok().and_then(|c| c.issuer_until),

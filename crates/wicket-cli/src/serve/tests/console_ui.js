@@ -42,7 +42,8 @@ let state = null;
 // A hostile string an agent chose (a grant's path): it must stay text.
 const HOSTILE = "/x<img src=x onerror=alert(1)>";
 const authority = { status: "running", node: "local", policy: { version: null }, token: { held: true, box_path: "run_a", epoch: 0, zone: "z", issued_by: "the authority root", loads: true,
-  reach: [{ host: "api.example.com", methods: ["GET"], paths: ["/v1/**"], allow_dangerous: false }],
+  reach: [{ host: "api.example.com", methods: ["GET"], paths: ["/v1/**"], allow_dangerous: false }, { host: "registry.example.com", methods: ["GET"], paths: ["/**"], allow_dangerous: false, decode_slash: [1] }],
+  forbid: [{ host: "api.example.com", paths: ["/v1/admin/**"] }],
   blocks: [{ index: 0, kind: "zone", source: "check if reach(\"" + HOSTILE + "\");", signed_by: null, revocation_fingerprint: "0123456789abcdef", revoked: false }],
   grants: [{ id: "g-1", method: "POST", host: "h", path: HOSTILE, uses: 2, expires_at: 1, approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true }] } };
 const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
@@ -169,7 +170,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // In lines, the decision first and the ids last (#574, item 1).
   const lines = what.split("\n");
   assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
-  assert.strictEqual(lines[1], "Risk: Only reads (R1)");
+  assert.strictEqual(lines[1], "Risk: R1 \u00b7 read (scoped)");
   // The decision and its target are one element, the lead, styled strongly; its text is unchanged (#698 review).
   assert.strictEqual(ids["confirm-what"].children[0].className, "lead");
   assert.strictEqual(ids["confirm-what"].children[0].textContent, lines[0]);
@@ -181,7 +182,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     agent: "spiffe://x/t/t0/z/build/a/captain", requested_by: ["sub\nFor someone-else (zone safe)"] }) + ")").split("\n");
   assert.strictEqual(hostile.length, 4, hostile.join(" | "));
   assert.ok(hostile[0].endsWith("for any run in zone build"), hostile[0]);
-  assert.strictEqual(hostile[1], "Risk: Pushes code, deploys, or gains privileges (R4)");
+  assert.strictEqual(hostile[1], "Risk: R4 \u00b7 push, deploy or privilege");
   assert.ok(hostile[2].startsWith("For captain (zone build) \u00b7 asked by sub For someone-else (zone safe) (as reported)"), hostile[2]);
   assert.ok(hostile[3].includes("agent spiffe://x/t/t0/z/build/a/captain"), hostile[3]);
   const blast = ids["confirm-blast"];
@@ -255,7 +256,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // A whole hour reads as one, as on the card (#574).
   assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", method: "GET", host: "h", path: "/p", effect: { terms: { uses: null, ttl_secs: 3600 } } }) + ")").startsWith("Approve any number of uses for 1 hour"));
   // Risk said as what it means, code first.
-  assert.strictEqual(run("riskLabel('R4ExecOrPrivilege')"), "Pushes code, deploys, or gains privileges");
+  assert.strictEqual(run("riskLabel('R4ExecOrPrivilege')"), "R4 \u00b7 push, deploy or privilege");
+  assert.strictEqual(run("riskWords('R4ExecOrPrivilege')"), "Pushes code, deploys, or gains privileges");
   // A cancelled passkey is said as such, as an error that stays; a reply with no text is "Done.".
   run("toastError({ name: 'NotAllowedError', message: 'The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/' }, null, true)");
   assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Passkey cancelled. Nothing was signed.", "error"]);
@@ -372,6 +374,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(run("settled()"), false, "taps wait a moment after the card grows");
   toggle.click();
   assert.deepStrictEqual([idl.hidden, toggle.getAttribute("aria-expanded")], [true, "false"]);
+  // #709 review: how far a grant reaches is said on the card, not under Details.
+  for (const card of cardsIn()) {
+    const onCard = card.children.filter(n => n.className === "who"), det = card.all(n => n.tagName === "details")[0];
+    assert.ok(onCard.length === 1 && onCard[0].textContent.includes("could use the grant"), card.textContent);
+    assert.ok(!det.textContent.includes("could use the grant"), "not only under Details");
+  }
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
@@ -383,13 +391,28 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(ids["detail-body"].all(n => n.tagName === "img").length === 0, "no element from an agent's string");
   // #651: it leads with what the run can reach; the token's internals are under Details.
   assert.ok(text.startsWith("Can reachread api.example.com  /v1/**from its zone's rules"), text);
+  // #715 review: an encoded-slash rule says so, and what the zone forbids is listed.
+  assert.ok(text.includes("reads an encoded slash (%2F) as / in path part 1"), text);
+  assert.ok(text.includes("never api.example.com  /v1/admin/**forbidden by its zone's rules, even if you allow it"), text);
   assert.ok(ids["detail-body"].all(n => n.tagName === "details").length === 1, "the token folded under Details");
   // #621: wicket's own kinds as sentences, the raw op apart; an HTTP request as it is.
   const asked = p => JSON.parse(run("JSON.stringify(asks(" + JSON.stringify({ host: "wicket.internal", reason: "r", ...p }) + "))"));
   assert.deepStrictEqual([asked({ method: "SPAWN", path: "/zones/research/reader" }).what, asked({ method: "LINK", path: "/links/run_a/run_b/8080" }).what,
-    asked({ method: "UPDATE", path: "/self/" + "ab".repeat(32) }).what, asked({ method: "CAPACITY", path: "/capacity/l-1", reason: "capacity lease l-1: 2 vCPU, 4096 MiB, for 8h, on vultr, at most $0.05/h, worst case $0.40 (reserved now). Asked by the agent: nightly" })],
-    ["Start a child agent named reader in zone research", "Link run_a \u2192 run_b, port 8080", "Install wicket build abababababab\u2026",
-      { what: "Lease a node: 2 vCPU, 4096 MiB, for 8h, on vultr, at most $0.05/h, worst case $0.40 (reserved now)", raw: "CAPACITY wicket.internal/capacity/l-1", why: "nightly", internal: true }]);
+    asked({ method: "UPDATE", path: "/self/" + "ab".repeat(32) }).what, asked({ method: "CAPACITY", path: "/capacity/l-1", reason: "capacity lease l-1: forged. Asked by the agent: nightly" })],
+    ["Start a new agent or program named reader in zone research", "Let run_a's box reach port 8080 on run_b's box", "Install wicket build abababababab\u2026",
+      { what: "Lease a node (l-1)", raw: "CAPACITY wicket.internal/capacity/l-1", why: "capacity lease l-1: forged. Asked by the agent: nightly", internal: true, asked: null }]);
+  // #715 review: a host command in a note has a Copy button beside it; other code doesn't.
+  assert.strictEqual(run("codeText('div', 'note', 'Run `wicket operator enrol-link` or `x`').children.filter(c => c.tagName).map(c => c.tagName + ':' + c.textContent).join('|')"),
+    "code:wicket operator enrol-link|button:Copy|code:x");
+  // The kind is read from wicket's own "start <kind> " prefix, and only those two words.
+  assert.strictEqual(asked({ method: "SPAWN", path: "/zones/research/fetch", reason: "start program fetch in zone research, beyond" }).what, "Start a new program named fetch in zone research");
+  assert.strictEqual(asked({ method: "SPAWN", path: "/zones/research/x", reason: "start rootkit x" }).what, "Start a new agent or program named x in zone research");
+  // #709 review: a capacity request's sentence comes from the lease's fields; a region that reads like
+  // wicket's own words stays a quoted value of its own, out of the sentence.
+  const forged = "lhr preferred, for 10 min, on vultr, no cost (the operator's own machines). Asked by the agent: x";
+  const cap = asked({ method: "CAPACITY", path: "/capacity/l-2", reason: "capacity lease l-2: anything", lease: { id: "l-2", provider: "vultr", vcpus: 8, memory_mib: 32768,
+    isolation: "gvisor", region: forged, duration_secs: 2592000, hourly_cap_usd: "$5.0000", reserved_usd: "$3600.0000" } });
+  assert.deepStrictEqual([cap.what, cap.asked], ["Lease a node: 8 vCPUs, 32768 MiB, for 720 hours on vultr, at most $5.00/h, $3600.00 reserved", ["region", forged]]);
   assert.deepStrictEqual(JSON.parse(run('JSON.stringify(asks({ method: "GET", host: "h", path: "/x", reason: "y", scope_prefix: false }))')), { what: "GET h/x", raw: "", why: "y", internal: false });
   run("showExplain(7)"); await flush(); await flush();
   assert.ok(ids["detail-body"].textContent.includes("block 0: check if " + HOSTILE), ids["detail-body"].textContent);
@@ -575,7 +598,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ["unix/alex", "vc2-1c-2gb", "lhr", "0.05", "1", "2", "4"].forEach((v, i) => { inputs[i].value = v; });
   await advance(1000);
   nextAction = { v: 1, action: "capacity_grant", principal: "spiffe://x/t/t0/op/unix/alex", terms: grant.terms, ttl_secs: 14400 };
-  ids["capacity-form"].all(n => n.tagName === "button")[0].click(); await flush();
+  ids["capacity-form"].all(n => n.tagName === "button" && n.textContent.startsWith("Grant"))[0].click(); await flush();
   const g = began().pop().body;
   assert.deepStrictEqual([g.action, g.principal, g.plans, g.regions, g.max_hourly_usd, g.max_daily_usd, g.nodes, g.ttl_secs],
     ["capacity_grant", "unix/alex", "vc2-1c-2gb", "lhr", "0.05", "1", 2, 14400]);
@@ -657,7 +680,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     audit: [{ sink: "stdout", kind: "jsonl", seq: 3, head: 9, behind: 6, behind_secs: 4000, checkpoint_at: 0, error: null, manual: true }] } } };
   await run("refresh()"); await flush();
   assert.strictEqual(ids.health.children.length, 2, "the sink's row, then the nodes");
-  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Activity export to stdout6 records behind (oldest 66 min) (manual: fed only by wicket audit export)"), ids.health.children[0].textContent);
+  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Activity export to stdout6 records behind (oldest 66 min) (manual: fed only by wicket audit exportCopy)"), ids.health.children[0].textContent);
   assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
   // The rows' alerts come first, then a stale read says so, then the rows.
   state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, errors: [], stale: true, read_ms: (nowS - 400) * 1000,
@@ -701,6 +724,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   state = { ...base, pending: [], standing: { asks: [ask], rules: [rule] } };
   await run("refresh()"); await flush();
   const sa = ids["standing-asks"].textContent;
+  // #715 review: the pill names the rule's methods; whether a POST changes data isn't guessed.
+  assert.ok(!sa.includes("Changes data") && !sa.includes("Only reads"), sa);
   for (const want of ["always be allowed to read and send data to", "ci.example/jobs/**", "Methods: GET, POST", "Paths: /jobs/**", "Asked by worker (zone work)", "with this zone definition (0123456789ab", "2 granted of 3 blocked request(s) it covers in the last 14 days", "in 2 run(s) on 1 day(s)",
     "2 \u00d7 GET /jobs/1/logs (2 granted)", "and 4 ask(s) ahead of its own, not counted as evidence",
     "Wider than what it used: methods never asked for: POST", "Only what it used: methods GET, paths /jobs/1/logs"]) assert.ok(sa.includes(want), want + " in " + sa);

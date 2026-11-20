@@ -309,9 +309,9 @@ code.block { display: block; margin-top: var(--s2); padding: var(--s2); user-sel
 .req details.req-more .chain { color: var(--soft); font-size: var(--t-sm); }
 .raw { margin-top: var(--s1); }
 /* A long id, cut in the middle on screen and copied whole. */
-.id-short { display: inline-flex; max-width: 100%; vertical-align: bottom; font-family: var(--mono); font-size: .95em; }
-.id-short .id-head { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 4ch; max-width: 10ch; }
-.id-short .id-tail { white-space: nowrap; }
+.id-short { display: inline; font-family: var(--mono); font-size: .95em; overflow-wrap: anywhere; }
+button.id-short.link { font: inherit; font-family: var(--mono); font-size: .95em; text-decoration: underline dotted; white-space: normal; text-align: left; }
+.asked { margin-top: var(--s1); }
 summary:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: 2px; border-radius: 6px; }
 details.more > summary { list-style: none; gap: var(--s2); }
 details.more > summary::-webkit-details-marker { display: none; }
@@ -402,3 +402,6 @@ button.idname { font: 650 var(--t-md)/1.3 var(--sans); padding: 0; min-height: 0
 button.idname:hover { background: none; }
 .principal .idline { color: var(--quiet); font: var(--t-xs)/1.4 var(--mono); margin-top: 2px; overflow-wrap: anywhere; }
 @media (pointer: coarse) { button.idname { min-height: 32px; } }
+
+/* A host command's Copy button (#715 review): small, beside the command. */
+.copy { margin-left: var(--s1); font-size: var(--t-sm); }
