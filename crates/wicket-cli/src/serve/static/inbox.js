@@ -5,8 +5,8 @@
 // console.js is still a classic script: its helpers (strip, asks, act, …) are globals, and this
 // module calls them; the signing path (act, signed, describe and the sheet) is console.js's and
 // unchanged. console.js calls window.wicketInbox's functions where it drew these itself.
-import { html, render, nothing } from "./vendor/lit-html/lit-html.js";
-import { repeat } from "./vendor/lit-html/directives/repeat.js";
+import { html, render, nothing } from "lit-html";
+import { repeat } from "lit-html/directives/repeat.js";
 
 // console.js's helpers are named bare: a classic script's top-level `const` and `function`
 // declarations are global names a module can use, though `const`s aren't properties of globalThis.

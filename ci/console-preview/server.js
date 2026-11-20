@@ -88,6 +88,14 @@ http.createServer((req, res) => {
     const rel = path.normalize(p).replace(/^([/\\]|\.\.[/\\])+/, "");
     const f = ASSETS ? path.join(ASSETS, rel) : path.join(STATIC, rel.replace(/^static[/\\]/, ""));
     if (!fs.existsSync(f)) return send(res, 404, "text/plain", "not found");
+    // From source, a console module's `from "lit-html…"` points at the vendored files, as build.rs
+    // rewrites it for wicket (#574).
+    if (!ASSETS && f.endsWith(".js") && !rel.includes("vendor")) {
+      const up = "../".repeat(rel.replace(/^static[/\\]/, "").split(/[/\\]/).length - 1) || "./";
+      const js = fs.readFileSync(f, "utf8").replace(/((?:from|import)\s*)(["'])lit-html(\/[^"']*)?\2/g,
+        (_, kw, q, sub) => kw + q + up + "vendor/lit-html" + (sub || "/lit-html.js") + q);
+      return send(res, 200, types[".js"], js);
+    }
     return send(res, 200, types[path.extname(f)] || "application/octet-stream", fs.readFileSync(f));
   }
   if (p === "/api/me") {

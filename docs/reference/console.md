@@ -185,7 +185,10 @@ WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
 **Its views are moving to [lit-html](https://lit.dev/docs/libraries/standalone-templates/)** (#574),
 one at a time: the Inbox first (`static/inbox.js`). lit-html's published modules are committed under
 `static/vendor/lit-html/`, unchanged, with their version, licence and hashes in `VENDOR.toml`
-(`ci/vendor-lit.sh` updates them; `ci/vendor-check.py` checks them). The console's modules and
+(`ci/vendor-lit.sh` updates them; `ci/vendor-check.py` checks them). The console's modules import it
+by name (`import { html } from "lit-html"`), and `build.rs` rewrites each such import to the vendored
+file's path, so the browser needs no import map and the CSP stays `script-src 'self'`; any other bare
+import fails the build. The console's modules and
 lit-html's are served from one directory named by their hash, `/static/m.<hash>/`, each with
 Subresource Integrity, so the browser loads them without a bundler.
 
