@@ -365,8 +365,11 @@ impl Ledger {
         Ok(recs.len())
     }
 
-    /// Recomputes every node's shipped chain from its `node.audit` records.
+    /// Recomputes every node's shipped chain from its `node.audit` records. After a prune (#582)
+    /// each node's first record kept starts its chain (the records before it are gone, and the
+    /// control host's chain, which holds each record whole, verifies from its anchor).
     pub fn verify_node_audit(&self) -> Result<Vec<NodeAuditSummary>> {
+        let pruned = self.audit_anchor()?.is_some();
         let mut st = self.conn.prepare("SELECT seq, body FROM audit WHERE kind = 'node.audit' ORDER BY seq")?;
         let mut rows = st.query([])?;
         type Head = (i64, String, NodeAuditSummary);
@@ -381,7 +384,8 @@ impl Ledger {
             let f = ChainFields { seq, ts, tenant: &tenant, run: v["run"].as_str(), kind: &kind, body: &b };
             let e = heads.entry(node.clone()).or_insert_with(|| (0, ZERO.to_string(), NodeAuditSummary { node, records: 0, restarts: 0 }));
             let restart = seq == 1 && p == ZERO;
-            if !(restart || (seq == e.0 + 1 && p == e.1)) || chain_hash_v2(&p, &f) != h {
+            let first_kept = pruned && e.2.records == 0;
+            if !(restart || first_kept || (seq == e.0 + 1 && p == e.1)) || chain_hash_v2(&p, &f) != h {
                 return Err(StoreError::ChainBroken(at));
             }
             if restart && e.2.records > 0 {

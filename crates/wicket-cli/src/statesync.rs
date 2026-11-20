@@ -190,7 +190,11 @@ pub fn status_of(s: &StateStore, db: &Path, now_ms: i64) -> Result<StreamStatus>
         Ok(v) => v,
         Err(e) => {
             if st.error.is_none() || log.error_ms < log.started_ms {
-                st.error = Some(format!("Litestream isn't running (its control socket: {e:#})"));
+                let said = match e.downcast_ref::<NoAnswer>() {
+                    Some(n) => format!("Litestream isn't answering: {n}"),
+                    None => format!("Litestream isn't running (its control socket: {e:#})"),
+                };
+                st.error = Some(wicket_core::text::redact_urls(&said));
                 st.error_ms = None;
             }
             return Ok(st);
@@ -238,20 +242,83 @@ fn go_time_ms(s: &str) -> Option<i64> {
     Some(ms)
 }
 
-/// A GET on Litestream's control socket (HTTP over a unix socket), its JSON body.
+/// How long a question to Litestream's socket may take, connecting included.
+const ASK_DEADLINE: Duration = Duration::from_secs(3);
+
+/// A GET on Litestream's control socket (HTTP over a unix socket), its JSON body, within
+/// [`ASK_DEADLINE`]. std has no connect timeout for unix sockets (a listener with a full backlog
+/// blocks it), so the question runs on a thread of its own, left behind if it doesn't answer. One
+/// question per socket at a time: while one is left waiting, the next is refused at once, so a
+/// frozen Litestream holds one thread and one descriptor, not one per read.
 fn ask(sock: &Path, path: &str) -> Result<serde_json::Value> {
+    ask_within(sock, path, ASK_DEADLINE)
+}
+
+/// Litestream didn't answer in time, or a question left waiting before hasn't been answered yet.
+#[derive(Debug)]
+struct NoAnswer(String);
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for NoAnswer {}
+
+/// The sockets with a question still waiting.
+fn asking() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static ASKING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    ASKING.get_or_init(Default::default)
+}
+
+fn ask_within(sock: &Path, path: &str, deadline: Duration) -> Result<serde_json::Value> {
+    if !asking().lock().unwrap_or_else(|e| e.into_inner()).insert(sock.to_path_buf()) {
+        return Err(NoAnswer("Litestream hasn't answered an earlier question on its control socket yet".into()).into());
+    }
+    // Takes `sock` out of [`asking`] however the question ends, a panic included.
+    struct Asked(PathBuf);
+    impl Drop for Asked {
+        fn drop(&mut self) {
+            asking().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        }
+    }
+    let asked = Asked(sock.to_path_buf());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (sock, path) = (sock.to_path_buf(), path.to_string());
+    // The thread's own timeouts are the deadline: a question left waiting ends about when it is
+    // given up on.
+    let spawned = std::thread::Builder::new().name("litestream-ask".into()).spawn(move || {
+        let _asked = asked;
+        let _ = tx.send(ask_now(&sock, &path, deadline));
+    });
+    if let Err(e) = spawned {
+        return Err(e.into()); // the closure, and `asked` with it, was dropped
+    }
+    rx.recv_timeout(deadline).unwrap_or_else(|_| Err(no_answer(deadline)))
+}
+
+fn no_answer(deadline: Duration) -> anyhow::Error {
+    NoAnswer(format!("Litestream didn't answer on its control socket within {} s", deadline.as_secs_f32())).into()
+}
+
+fn ask_now(sock: &Path, path: &str, deadline: Duration) -> Result<serde_json::Value> {
     let mut s = std::os::unix::net::UnixStream::connect(sock).with_context(|| format!("{}", sock.display()))?;
-    s.set_read_timeout(Some(Duration::from_secs(2)))?;
-    s.set_write_timeout(Some(Duration::from_secs(2)))?;
+    s.set_read_timeout(Some(deadline))?;
+    s.set_write_timeout(Some(deadline))?;
+    let timed_out = |e: &std::io::Error| matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut);
     // HTTP/1.0: the reply is the whole body, then the connection closes (no chunking).
-    write!(s, "GET {path} HTTP/1.0\r\nHost: litestream\r\n\r\n")?;
     let mut resp = Vec::new();
-    s.take(1 << 20).read_to_end(&mut resp)?;
+    let asked = s.write_all(format!("GET {path} HTTP/1.0\r\nHost: litestream\r\n\r\n").as_bytes());
+    match asked.and_then(|_| s.take(1 << 20).read_to_end(&mut resp)) {
+        Err(e) if timed_out(&e) => return Err(no_answer(deadline)),
+        r => r?,
+    };
     let resp = String::from_utf8_lossy(&resp);
     let (head, body) = resp.split_once("\r\n\r\n").context("Litestream's reply has no body")?;
     let status = head.lines().next().unwrap_or("");
     if status.split_whitespace().nth(1) != Some("200") {
-        bail!("Litestream said {status:?}: {}", body.trim());
+        // Shown in the console: cut, and any URL in it without its user info or query.
+        let body = wicket_core::text::clip(&wicket_core::text::redact_urls(body.trim()), 200);
+        bail!("Litestream said {:?}: {body}", wicket_core::text::clip(status, 60));
     }
     serde_json::from_str(body).context("Litestream's reply")
 }
@@ -343,7 +410,8 @@ impl Watch {
 
 /// The health alerts `p` raises at `now_ms` (#635), which the console shows and pushes as it does a
 /// node's: once each until it clears.
-/// - The ledger stream, in any state but streaming, not current for [`STREAM_ALERT_SECS`]: since
+/// - The ledger stream, in any state but streaming, not current for [`STREAM_ALERT_SECS`] (or its
+///   lag threshold, 10 sync intervals, if longer): since
 ///   Litestream's last sync if it reports one, else since `w` last saw one.
 /// - An audit sink (not a manual one) whose oldest unacknowledged record has waited
 ///   [`AUDIT_ALERT_SECS`], or that is [`AUDIT_ALERT_RECORDS`] behind.
@@ -356,7 +424,8 @@ pub fn alerts(p: &Progress, w: &Watch, now_ms: i64) -> Vec<crate::health::Alert>
     let mut out = Vec::new();
     if let Some(st) = p.stream.as_ref().filter(|s| s.state != StreamState::Streaming) {
         let current = st.last_sync_ms.unwrap_or(w.stream_current_ms);
-        if now_ms - current > STREAM_ALERT_SECS * 1000 {
+        // Never sooner than the stream counts as lagging: 10 sync intervals, if that is longer.
+        if now_ms - current > STREAM_ALERT_SECS.max(st.lag_secs) * 1000 {
             let since = match st.last_sync_ms {
                 Some(t) => format!("last sync {} ago", ago(now_ms - t)),
                 None => format!("not current for {}", ago(now_ms - current)),
@@ -378,13 +447,29 @@ pub fn alerts(p: &Progress, w: &Watch, now_ms: i64) -> Vec<crate::health::Alert>
     if let Some(since) = w.errors_since_ms.filter(|t| !p.errors.is_empty() && now_ms - t > CONFIG_ALERT_SECS * 1000) {
         out.push(crate::health::Alert {
             key: "control:state-store/config".into(),
-            text: format!(
-                "the state store or audit sinks: a config can't be read for {}: `wicket state check` says why",
-                ago(now_ms - since)
-            ),
+            // The errors name the file and the command that says why, never a value.
+            text: format!("{} (for {})", p.errors.join("; "), ago(now_ms - since)),
         });
     }
     out
+}
+
+/// A read of the progress older than this is stale: the console marks its rows so, as they may no
+/// longer say what is true (the ledger couldn't be opened, or a read hung).
+pub const STALE_SECS: i64 = 30;
+
+/// Whether a read made at `read_ms` is stale at `now_ms`, and the alert once it has been for
+/// [`STREAM_ALERT_SECS`]: then nothing about the stream or the sinks is being checked.
+pub fn staleness(read_ms: i64, now_ms: i64) -> (bool, Option<crate::health::Alert>) {
+    let age = (now_ms - read_ms) / 1000;
+    let alert = (age > STREAM_ALERT_SECS).then(|| crate::health::Alert {
+        key: "control:state-store/unread".into(),
+        text: format!(
+            "the state store and audit export haven't been checked for {}: the console's reads fail or hang (its log says why)",
+            crate::audit_export::ago(age)
+        ),
+    });
+    (age > STALE_SECS, alert)
 }
 
 /// [`progress`] with this installation's configs, at the ledger `l` opened from `ledger`.
@@ -406,6 +491,23 @@ pub fn line(st: &StreamStatus, now_ms: i64) -> String {
         out += &format!("  last error{when}: {e}");
     }
     out
+}
+
+/// Until when the state store has the ledger: the last sync of a stream that is streaming now,
+/// None if there is no stream or it isn't streaming. What audit retention may prune behind (#582).
+pub fn ledger_synced_ms(now_ms: i64) -> Option<i64> {
+    let s = wicket_home::statestore::StateStore::load().ok()??;
+    s.ledger.as_ref()?;
+    let st = status_of(&s, &crate::ledger_path(), now_ms).ok()?;
+    (st.state == StreamState::Streaming).then_some(st.last_sync_ms).flatten()
+}
+
+/// Audit retention (#582): a pass (`prune`) or where it stands, with this installation's sinks and
+/// its state store's stream.
+pub fn audit_retention(l: &wicket_store::Ledger, prune: bool) -> anyhow::Result<wicket_home::audit_export::Retention> {
+    let cfg = wicket_home::audit_export::retention_config()?;
+    let synced = ledger_synced_ms(wicket_feed::now_ms());
+    wicket_home::audit_export::retention_with(l, cfg.as_ref().map_err(|e| e.as_str()), synced, prune)
 }
 
 #[cfg(test)]
@@ -431,15 +533,25 @@ mod tests {
         }
     }
 
+    /// A request read whole (to its blank line), however it was split into writes.
+    fn read_request(c: &mut std::os::unix::net::UnixStream) -> String {
+        let mut req = Vec::new();
+        let mut b = [0u8; 256];
+        while !req.ends_with(b"\r\n\r\n") {
+            let n = c.read(&mut b).unwrap();
+            assert!(n > 0, "the request ended early: {:?}", String::from_utf8_lossy(&req));
+            req.extend_from_slice(&b[..n]);
+        }
+        String::from_utf8(req).unwrap()
+    }
+
     /// A stand-in for Litestream's control socket: answers each connection with `body` (v0.5.18's
     /// `GET /list` shape) until dropped.
     fn litestream(db: &Path, body: String) -> std::thread::JoinHandle<()> {
         let l = std::os::unix::net::UnixListener::bind(socket_path(db)).unwrap();
         std::thread::spawn(move || {
             if let Ok((mut c, _)) = l.accept() {
-                let mut req = [0u8; 512];
-                let n = c.read(&mut req).unwrap();
-                assert!(String::from_utf8_lossy(&req[..n]).starts_with("GET /list HTTP/1.0\r\n"));
+                assert!(read_request(&mut c).starts_with("GET /list HTTP/1.0\r\n"));
                 write!(c, "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{body}").unwrap();
             }
         })
@@ -598,12 +710,124 @@ mod tests {
         assert!(keys(&bad, &w, NOW).is_empty());
         w.observe(Some(&bad), NOW + 2_000);
         assert_eq!(keys(&bad, &w, NOW + 2_000), ["control:state-store/config"]);
+        let sinks_bad = progress_of(None, vec![], &["audit-sinks.yaml can't be read: `wicket audit export --status` says why"]);
+        assert_eq!(
+            alerts(&sinks_bad, &w, NOW + 2_000)[0].text,
+            "audit-sinks.yaml can't be read: `wicket audit export --status` says why (for 5 min)",
+            "names the file that is broken"
+        );
         let good = progress_of(None, vec![sink("store", 0, 0, false)], &[]);
         w.observe(Some(&good), NOW + 5_000);
         assert_eq!(w.errors_since_ms, None);
         assert!(keys(&good, &w, NOW + 5_000).is_empty(), "cleared");
         w.observe(Some(&bad), NOW + 8_000);
         assert!(keys(&bad, &w, NOW + 9_000).is_empty(), "back: the delay starts again");
+    }
+
+    #[test]
+    fn a_slow_sync_interval_alerts_no_sooner_than_it_lags() {
+        let w = Watch::new(NOW - 3_600_000);
+        let mut st = stream(StreamState::Starting, Some(NOW - 400_000), NOW);
+        st.lag_secs = 600; // sync_interval: 60s
+        assert!(keys(&progress_of(Some(st.clone()), vec![], &[]), &w, NOW).is_empty());
+        st.last_sync_ms = Some(NOW - 601_000);
+        assert_eq!(keys(&progress_of(Some(st), vec![], &[]), &w, NOW), ["control:state-store/stream"]);
+    }
+
+    #[test]
+    fn a_read_goes_stale_then_alerts() {
+        assert_eq!(staleness(NOW - 30_000, NOW), (false, None));
+        assert!(staleness(NOW - 31_000, NOW).0);
+        assert_eq!(staleness(NOW - 299_000, NOW).1, None);
+        assert_eq!(staleness(NOW - 301_000, NOW).1.unwrap().key, "control:state-store/unread");
+    }
+
+    /// A socket that accepts nothing (its backlog full, or a process that never reads) doesn't hold a
+    /// read past the deadline; and a refusal's body is cut and its URLs redacted.
+    #[test]
+    fn litestreams_socket_is_asked_within_a_deadline() {
+        let d = Dir::new();
+        let db = d.0.join("ledger.db");
+        let _held = std::os::unix::net::UnixListener::bind(socket_path(&db)).unwrap(); // never accepted, never answered
+        let t = std::time::Instant::now();
+        let e = ask_within(&socket_path(&db), "/list", Duration::from_millis(300)).unwrap_err().to_string();
+        assert!(t.elapsed() < Duration::from_secs(2) && e.contains("didn't answer"), "{e}");
+        drop(_held);
+        // Another socket: the question left waiting on this one holds it until its read times out.
+        let d2 = Dir::new();
+        let db = d2.0.join("ledger.db");
+        let l = std::os::unix::net::UnixListener::bind(socket_path(&db)).unwrap();
+        let h = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            read_request(&mut c);
+            write!(c, "HTTP/1.0 500 Internal Server Error\r\n\r\nfailed: https://k:s3cr3t@s3.example.com/b?sig=abc").unwrap();
+        });
+        let e = ask(&socket_path(&db), "/list").unwrap_err().to_string();
+        h.join().unwrap();
+        assert!(e.contains("https://s3.example.com/b?…") && !e.contains("s3cr3t") && !e.contains("sig=abc"), "{e}");
+    }
+
+    /// A listener whose backlog is full blocks `connect` itself: the question is given up on at the
+    /// deadline, the next is refused at once rather than leaving another thread behind, and once
+    /// the socket goes away the one left waiting ends.
+    #[test]
+    fn a_connect_that_hangs_leaves_one_question_waiting() {
+        use std::os::fd::AsRawFd;
+        let d = Dir::new();
+        let db = d.0.join("ledger.db");
+        let sock = socket_path(&db);
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 0) }, 0);
+        // Fill the backlog without blocking this thread.
+        let filler: Vec<_> = (0..2)
+            .filter_map(|_| {
+                let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+                let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+                addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                for (i, b) in sock.as_os_str().as_encoded_bytes().iter().enumerate() {
+                    addr.sun_path[i] = *b as libc::c_char;
+                }
+                let ok = unsafe {
+                    libc::connect(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_un>() as u32)
+                };
+                (ok == 0).then_some(fd)
+            })
+            .collect();
+        assert!(!filler.is_empty(), "the backlog took a connection");
+        let t = std::time::Instant::now();
+        let e = ask_within(&sock, "/list", Duration::from_millis(300)).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(2) && e.to_string().contains("didn't answer"), "{e}");
+        let e = ask_within(&sock, "/list", Duration::from_millis(300)).unwrap_err();
+        assert!(e.to_string().contains("hasn't answered an earlier question"), "refused at once: {e}");
+        assert!(e.downcast_ref::<NoAnswer>().is_some());
+        drop(l);
+        for fd in filler {
+            unsafe { libc::close(fd) };
+        }
+        let gone = std::time::Instant::now();
+        while asking().lock().unwrap().contains(&sock) {
+            assert!(gone.elapsed() < Duration::from_secs(5), "the waiting question never ended");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A Litestream that takes the connection and never replies reads as not answering, not as
+    /// not running.
+    #[test]
+    fn a_litestream_that_doesnt_reply_isnt_answering() {
+        let d = Dir::new();
+        let db = d.0.join("ledger.db");
+        let _held = std::os::unix::net::UnixListener::bind(socket_path(&db)).unwrap();
+        let st = status_of(&store(), &db, 1_763_200_000_000).unwrap();
+        assert_eq!(st.state, StreamState::Stopped);
+        let e = st.error.unwrap();
+        assert_eq!(e, "Litestream isn't answering: Litestream didn't answer on its control socket within 3 s", "{e}");
+        // The question's own read timed out at the deadline too: nothing is left waiting for long.
+        let t = std::time::Instant::now();
+        while asking().lock().unwrap().contains(&socket_path(&db)) {
+            assert!(t.elapsed() < Duration::from_secs(2), "the question left waiting outlived the deadline");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

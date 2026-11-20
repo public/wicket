@@ -29,11 +29,20 @@ limits: { per_hour: 6 }            # the default; at most 60
 - **The source.** `schedule` takes five cron fields (minute, hour, day of month, month, day of
   week, with `*`, lists, ranges and steps) and a time zone from the host's zoneinfo (`UTC` by
   default). A schedule that can never fire (`0 0 31 2 *`) is refused. Use
-  `timer: { at: 2026-11-20T07:00:00Z }` or `timer: { after: 2h }` instead for one firing.
+  `timer: { at: 2026-11-20T07:00:00Z }` or `timer: { after: 2h }` instead for one firing. Once
+  a timer has fired (or its time has passed) it is `done`: it stays listed until you remove it,
+  and a new trigger of the same name replaces it.
+- **Daylight saving.** A schedule with fixed hours (`30 1 * * *`) fires once a day across a
+  change, as cron does. When the clocks go back it fires the first time the clock shows its time.
+  When they skip its time it fires at the first minute after the gap. A schedule that runs every
+  hour (`*/15 * * * *`) goes by the clock as it is: through both copies of a repeated hour, and
+  not at all for minutes that don't exist.
 - **The action.** `wake` wakes a hibernated agent. With a `message` beside it, the message is the
   woken agent's next turn (leave `message.to` out). A `message` on its own goes to the agent whose
   principal is in `to` (`spiffe://…`). The agent reads it as its next turn, and a hibernated agent
-  is woken to read it.
+  is woken to read it. A `to` is found again at each firing: whichever live agent holds that
+  principal then (the newest, if several do). A `wake` stays pinned to the agent found when you
+  made the trigger.
 - **The agent is found when you create the trigger.** It must be a live agent of this
   installation (not ended). A name must be the only live agent of that name; otherwise use its id
   (`wicket agents`). `wake` is kept as the agent's id, so another agent given the same name later
@@ -83,12 +92,17 @@ nested fields with dots (`pr.number`).
   newest record, and a record more than 15 minutes old when read (the reconciler was down) is
   passed over.
 - **Chains of triggers.** Each turn a trigger queues records the triggers that led to it. A
-  record of the run that read the turn carries those triggers on. A trigger never fires on a
-  record its own firing led to, however many triggers came between (A wakes B, B wakes A, stops
-  at the second A), and no record fires a fifth trigger in a row. These are skipped and audited
-  (`trigger.skipped`). Only what a trigger queued is followed. If an agent a trigger woke goes on
-  to message another agent itself, that is the agent's doing, and the second agent's records
-  don't carry the chain.
+  record of the run that read the turn carries those triggers on: every trigger that ever queued
+  a turn for that run, and the length of the longest single chain among them.
+  - **No loops.** A trigger never fires on a record of a run any of its own turns reached (A wakes
+    B, B wakes A, stops at the second A). So a trigger about an agent's own records, which also
+    messages that agent, fires once per activation.
+  - **No long chains.** No record fires a trigger at the end of a chain of four. Four unrelated
+    schedules messaging one agent are four chains of one, not one of four.
+  - These are skipped and audited (`trigger.skipped`).
+  - **Only what a trigger queued is followed.** An agent a trigger woke that messages another
+    agent, or spawns a child, does so itself: the other agent's or the child's records don't carry
+    the chain. A loop through them is bounded only by each trigger's `per_hour`.
 - **Quoted input.** Because body fields can hold an agent's words, every text field these
   triggers fill into a message is a JSON string, `"…"`. Quote marks inside are escaped, a long
   value is cut inside its quotes, and the turn ends by saying the quoted text is the event's data,
@@ -106,8 +120,18 @@ wicket trigger renew morning-triage --lasts 30d           # 30 more days from no
 A trigger you make fires with your authority, so it asks no one. It is audited
 (`trigger.created`, with the agent it reaches). Before every firing wicket checks again that you
 may still have it fire. It checks `operators.yaml` and, on a host with wicketd, its policy's run
-class for your unix user. If you can't, the trigger is paused, with the reason audited. One owner
-may keep at most 100 triggers.
+class for your unix user. If you can't, the trigger is paused, with the reason audited.
+
+If wicket can't tell (the user database or a group lookup fails, or a policy file doesn't read),
+that firing is skipped, audited at most once an hour, and the trigger stays active. For wicket's
+own events that trigger alone is held at the record before: other triggers go on hearing what
+follows, and once its owner checks out it hears the records it missed (except those that are
+more than 15 minutes old by then, which it passes over). One limit: the system call that lists a user's groups can't report a failed lookup, and
+a short list reads as not being in a group, which pauses the trigger.
+
+One owner may keep at most 100 live triggers (done timers aren't counted). Renewing a live trigger
+changes only when it lapses, not which minutes it fires for. Renewing one that had lapsed brings it
+back from now, as resuming does: the time it was lapsed isn't caught up.
 
 ## See what it would do
 
@@ -144,7 +168,7 @@ resume or renew it, since it fires as its owner.
   (`trigger.skipped`). Later skips that hour are counted on it, shown as `+N more` in
   `wicket trigger show`.
 - **A timer's time passed.** If the time came while the trigger was paused, or the reconciler was
-  down for more than 15 minutes, the timer is recorded as skipped once, and doesn't fire.
+  down for more than 15 minutes, the timer is recorded as skipped once, doesn't fire, and is done.
 - **The agent is hibernating.** A message goes through its current run, so the agent is woken
   again once it has hibernated. A wake with no message queues a short turn saying so, to the same
   effect.

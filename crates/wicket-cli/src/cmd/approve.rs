@@ -45,7 +45,6 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     "{id} is an ask for a public name: wicket names show {id}, then wicket names approve {id}"
                 )));
             }
-            let ttl = wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
             let t = grant::Terms { uses: if unlimited { None } else { Some(uses) }, ttl, prefix: prefix.clone(), zone_wide };
@@ -187,7 +186,6 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Grant { cmd: GrantCmd::Renew { id, ttl } } => {
-            let ttl = wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
             let mut l = Ledger::open(&ledger_path())?;
             let grant::Decided::Renewed { what, until } = grant::decide(
                 &mut l,
@@ -365,7 +363,7 @@ pub enum GrantCmd {
         /// A grant id (`g-…`), a request id (`r-…`: the grant made for it), or a running box's run id.
         id: String,
         /// The new lifetime, from now.
-        #[arg(long, default_value = "10m")]
-        ttl: String,
+        #[arg(long, default_value = "10m", value_parser = wicket_core::time::duration_arg)]
+        ttl: std::time::Duration,
     },
 }

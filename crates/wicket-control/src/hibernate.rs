@@ -398,6 +398,32 @@ pub fn resolve(l: &Ledger, who: &str) -> Result<AgentRow> {
     }
 }
 
+/// Why `wake` would refuse a hibernated agent now, if it would: its last box may still be running
+/// (the fence), a run in its chain was revoked, it isn't restorable, it has no state to wake from,
+/// or its budget is spent. The checks `wake` makes before it claims, without its records: what a
+/// trigger asks before it counts a wake as done (#578).
+pub fn would_refuse(l: &Ledger, a: &AgentRow) -> Result<Option<String>> {
+    if let Some((node, until)) = crate::noderun::fenced_until(&a.run, wicket_feed::now_ms()) {
+        return Ok(Some(format!(
+            "its last activation (run {}) may still be running on node {node}, until {}",
+            a.run,
+            crate::noderun::fmt_ms(until)
+        )));
+    }
+    for (r, _) in l.agent_runs(&a.id)? {
+        if let Some((rv, _, rby, why)) = l.revoked_in_chain(&r)? {
+            return Ok(Some(format!("{rv}'s identity was revoked by {rby} ({why})")));
+        }
+    }
+    if !a.restorable {
+        return Ok(Some(a.note.clone().unwrap_or_else(|| "it is not restorable".into())));
+    }
+    if a.head.is_none() {
+        return Ok(Some("it has never hibernated: there is nothing to wake".into()));
+    }
+    Ok(exhausted(a))
+}
+
 /// Why an agent may not be woken again because its zone's budget is spent, over all its
 /// activations: model requests, output or input tokens, or `limits.timeout` (its total time in a
 /// box). A wake never resets a budget.
@@ -638,6 +664,7 @@ pub fn scheduled_node(l: &Ledger, c: &Candidate, need: &[String]) -> wicket_plac
         labels: l.node_labels(&c.name).unwrap_or_default(),
         taints: l.node_taints(&c.name).unwrap_or_default(),
         ca,
+        protocol: crate::noderun::known_protocol(&c.name),
         // What runs there and the volumes it holds: `OnNodes::fill`.
         ..Default::default()
     }
@@ -824,7 +851,10 @@ impl Waiting {
     /// What `m`'s box asks for.
     pub fn of(m: &wicket_core::Manifest) -> Waiting {
         Waiting {
-            req: wicket_placement::schedule::Request::of(m),
+            req: wicket_placement::schedule::Request {
+                min_protocol: crate::noderun::protocol_needed(&m.zone),
+                ..wicket_placement::schedule::Request::of(m)
+            },
             need: wicket_core::splice::ca_hosts(&m.zone, &[]),
             tenant: m.tenant.0.clone(),
             zone: m.zone.name.clone(),

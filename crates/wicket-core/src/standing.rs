@@ -44,7 +44,7 @@ pub fn narrow<'a>(host: &str, ops: impl IntoIterator<Item = (&'a str, &'a str, u
         .collect();
     let keep = (STANDING_PAIRS / methods.len()).max(1);
     let paths: Vec<String> = paths.iter().take(keep).cloned().collect();
-    Some(ReachRule { host: host.to_string(), methods, paths, allow_dangerous: false }.canonical())
+    Some(ReachRule { host: host.to_string(), methods, paths, allow_dangerous: false, decode_slash: vec![] }.canonical())
 }
 
 /// `path` as a glob that matches only itself: each glob metacharacter in a class of its own.
@@ -64,7 +64,13 @@ mod tests {
     /// tested here, not proved).
     #[test]
     fn a_literal_glob_matches_only_its_path() {
-        let rule = |p: &str| ReachRule { host: "a.test".into(), methods: vec!["GET".into()], paths: vec![p.into()], allow_dangerous: true };
+        let rule = |p: &str| ReachRule {
+            host: "a.test".into(),
+            methods: vec!["GET".into()],
+            paths: vec![p.into()],
+            allow_dangerous: true,
+            decode_slash: vec![],
+        };
         let op = |p: &str| Op::egress(&TenantId::single(), &RunId(String::new()), "z", "GET", "a.test", p);
         let paths = ["/a*b", "/a?b", "/[x]", "/a]b", "/a{b,c}", "/**", "/a/*", "/a\\b", "/*/x"];
         let others = ["/aXb", "/ab", "/x", "/a/b", "/a", "/ac", "/abc", "/a{b", "/a/", "/y/x", "/ab]"];

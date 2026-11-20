@@ -849,6 +849,23 @@ impl Lock {
         }
         Ok(Lock(f))
     }
+
+    /// [`Lock::take`] without waiting: None if another process holds it now.
+    pub fn try_take() -> Result<Option<Lock>> {
+        use std::os::fd::AsRawFd;
+        let p = crate::data_dir().join("reconcile.lock");
+        std::fs::create_dir_all(crate::data_dir())?;
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&p)?;
+        // SAFETY: flock on a file descriptor this function owns.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            return Err(e).context("locking reconcile.lock");
+        }
+        Ok(Some(Lock(f)))
+    }
 }
 
 /// Docker on an enrolled node, over its pinned ssh.
@@ -945,6 +962,18 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
         }
         Err(e) => done.push(Done { kind: "error", target: "services".into(), detail: format!("{e:#}") }),
     }
+    // Audit retention on the host (#582): over its size limit, the audit table's oldest records
+    // (ones every sink has, behind a checkpoint one acknowledged) are pruned and the space given
+    // back. Never without a sink and the state store.
+    match crate::statesync::audit_retention(&ledger, !dry_run) {
+        Ok(r) if r.pruned > 0 || r.waiting.is_some() => done.push(Done {
+            kind: if r.pruned > 0 { "audit_pruned" } else { "audit_retention" },
+            target: "ledger".into(),
+            detail: wicket_home::audit_export::retention_line(&r),
+        }),
+        Ok(_) => {}
+        Err(e) => done.push(Done { kind: "error", target: "audit retention".into(), detail: format!("{e:#}") }),
+    }
     // The ledger's own upkeep (#582): settled rows of runs long ended to the archive, planner
     // statistics, and a WAL checkpoint.
     if !dry_run {
@@ -1009,10 +1038,13 @@ fn triggers_pass(
 /// Whether a trigger's owner may still have it fire (#578): `operators.yaml`
 /// ([`wicket_control::triggers::operator_may`]) and, on a host where wicketd decides who may do
 /// what, wicketd's policy as it stands now: the run class that keeping one needed, for the unix
-/// user the owner is. A user removed from the host, or from the policy's groups, has their
-/// triggers paused. Root and wicket's own user keep theirs, as wicketd lets them do anything.
-fn trigger_owner_may(t: &wicket_store::Trigger) -> std::result::Result<(), String> {
+/// user the owner is. A user removed from the host, or from the policy's groups, is a definite no
+/// (the trigger is paused). A lookup that fails (the user database doesn't answer, a policy file
+/// doesn't read) is `Unknown`: that firing is skipped, and the trigger kept. Root and wicket's own
+/// user keep theirs, as wicketd lets them do anything.
+fn trigger_owner_may(t: &wicket_store::Trigger) -> std::result::Result<(), wicket_control::triggers::NotOwner> {
     use crate::daemon::policy;
+    use wicket_control::triggers::NotOwner;
     wicket_control::triggers::operator_may(t)?;
     let installed = std::path::Path::new(policy::POLICY_PATH).exists() || std::path::Path::new(crate::daemon::SOCKET_PATH).exists();
     if !installed {
@@ -1020,16 +1052,18 @@ fn trigger_owner_may(t: &wicket_store::Trigger) -> std::result::Result<(), Strin
         return Ok(());
     }
     let Some(wicket_identity::Principal::Operator { via, name, .. }) = wicket_identity::Principal::parse(&t.owner) else {
-        return Err(format!("{} is not an operator's principal", t.owner));
+        return Err(NotOwner::No(format!("{} is not an operator's principal", t.owner)));
     };
     if via != "unix" {
-        return Err(format!("{} isn't a unix user, whom wicketd's policy names", t.owner));
+        return Err(NotOwner::No(format!("{} isn't a unix user, whom wicketd's policy names", t.owner)));
     }
-    let peer = crate::daemon::proto::user_as_peer(&name).ok_or_else(|| format!("there is no user {name} on this host"))?;
-    let rules = policy::Policy::load(std::path::Path::new(policy::POLICY_PATH)).map_err(|e| format!("{e:#}"))?;
+    let peer = crate::daemon::proto::user_as_peer(&name)
+        .map_err(NotOwner::Unknown)?
+        .ok_or_else(|| NotOwner::No(format!("there is no user {name} on this host")))?;
+    let rules = policy::Policy::load(std::path::Path::new(policy::POLICY_PATH)).map_err(|e| NotOwner::Unknown(format!("{e:#}")))?;
     // SAFETY: a plain getter.
     let me = unsafe { libc::geteuid() };
-    policy::authorize(&peer, policy::Class::Run, &rules, me).map(|_| ())
+    policy::authorize(&peer, policy::Class::Run, &rules, me).map(|_| ()).map_err(NotOwner::No)
 }
 
 /// Runs, leases, the capacity leases' machines (with placement.yaml) and boxes.
@@ -1070,7 +1104,9 @@ pub fn print(done: &[Done], dry_run: bool) {
     }
     let changed = done
         .iter()
-        .filter(|d| !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held" | "store_gc"))
+        .filter(|d| {
+            !matches!(d.kind, "ignored" | "kept_warm" | "left_alone" | "unreachable" | "placed_held" | "store_gc" | "audit_retention")
+        })
         .count();
     say!("reconcile: {changed} change(s){}", if dry_run { " (dry run: nothing changed)" } else { "" });
 }

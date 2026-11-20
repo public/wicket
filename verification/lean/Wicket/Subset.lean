@@ -272,10 +272,16 @@ def forbidKept (p c : Zone) : Bool :=
 
 def injectKept (p c : Zone) : Bool := c.inject.all (fun i => p.inject.contains i)
 
+/-- Each segment a child's rule decodes, some rule of the parent covering its host decodes too
+(#664): per rule, whatever its methods and paths, as a zone decodes for a host from every rule
+naming it. -/
+def decodeKept (p c : Zone) : Bool :=
+  c.reach.all (fun r => r.decode.all (fun n => p.reach.any (fun q => hostCovers q.host r.host && q.decode.contains n)))
+
 /-- `reach_violations(p, c)` is empty. -/
 def reachOk (p c : Zone) : Bool :=
   !(p.hide && !c.hide) && !(p.wildcardsForbid && !c.wildcardsForbid) && decide (c.maxNames ≤ p.maxNames) &&
-    reachCovered p c && forbidKept p c && injectKept p c
+    reachCovered p c && forbidKept p c && injectKept p c && decodeKept p c
 
 /-- `reach_within(outer, inner)` (links, design §4.3). -/
 def reachWithin (outer inner : Zone) : Bool :=
@@ -320,7 +326,7 @@ theorem reach_covered {p c : Zone} (h : reachCovered p c = true) {o : Op} (hp : 
 theorem reach_sound {p c : Zone} (h : reachOk p c = true) {o : Op} (hp : AbsPath o.path)
     (hc : evaluate c o = .allow) : evaluate p o = .allow := by
   simp only [reachOk, Bool.and_eq_true] at h
-  obtain ⟨⟨⟨⟨⟨_, _⟩, _⟩, hreach⟩, hforbid⟩, _⟩ := h
+  obtain ⟨⟨⟨⟨⟨⟨_, _⟩, _⟩, hreach⟩, hforbid⟩, _⟩, _⟩ := h
   rw [allow_iff] at hc ⊢
   obtain ⟨hu, hf, hr⟩ := hc
   refine ⟨hu, ?_, reach_covered hreach hp hr⟩
@@ -332,7 +338,7 @@ theorem reach_sound {p c : Zone} (h : reachOk p c = true) {o : Op} (hp : AbsPath
 theorem forbidden_sound {p c : Zone} (h : reachOk p c = true) {o : Op} (hp : AbsPath o.path)
     (hpf : evaluate p o = .forbidden) : evaluate c o = .forbidden := by
   simp only [reachOk, Bool.and_eq_true] at h
-  obtain ⟨⟨_, hforbid⟩, _⟩ := h
+  obtain ⟨⟨⟨_, hforbid⟩, _⟩, _⟩ := h
   unfold evaluate at hpf ⊢
   split
   · rfl
@@ -515,7 +521,7 @@ theorem check_within {a : Ask} {b : Bounds} (h : check a b = true) : Within a.zo
   obtain ⟨⟨⟨⟨⟨⟨⟨⟨hiso, hreach⟩, hllm⟩, hlim⟩, _⟩, _⟩, hesc⟩, _⟩, _⟩ := h
   have hr := hreach
   simp only [reachOk, Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq] at hr
-  obtain ⟨⟨⟨⟨⟨hhide, hwild⟩, hnames⟩, _⟩, _⟩, hinj⟩ := hr
+  obtain ⟨⟨⟨⟨⟨⟨hhide, hwild⟩, hnames⟩, _⟩, _⟩, hinj⟩, _⟩ := hr
   simp only [escalationOk, Bool.and_eq_true, Bool.not_eq_true'] at hesc
   simp only [limitsOk, Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq] at hlim
   obtain ⟨⟨⟨⟨⟨⟨hmem, hcpu⟩, hout⟩, hstop⟩, hpids⟩, _⟩, hauth⟩ := hlim

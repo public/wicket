@@ -31,6 +31,9 @@ pub mod kind {
     // daemon → client
     pub const WELCOME: u8 = b'W';
     pub const ERROR: u8 = b'E';
+    /// The command turned away with the caller's exit code (#574): 4 bytes, big-endian, then the
+    /// reason as text. Sent only to a client whose hello says it reads it (`codes`).
+    pub const REFUSE: u8 = b'R';
     pub const EXIT: u8 = b'X';
 }
 
@@ -54,6 +57,9 @@ pub struct Hello {
     pub manifest_name: Option<String>,
     #[serde(default)]
     pub program_source: Option<String>,
+    /// Whether the client reads a `REFUSE` frame (#574); one before it gets `ERROR`, the text only.
+    #[serde(default)]
+    pub codes: bool,
 }
 
 /// The daemon's answer once it has let the caller in.
@@ -252,17 +258,21 @@ pub fn peer(s: &UnixStream) -> Result<Peer> {
 }
 
 /// The user called `name` as the host knows them now: their uid, primary gid and groups, as a peer
-/// with those credentials would be seen (no process: `pid` 0). None if there is no such user.
-/// What a trigger's owner is checked as before it fires (#578).
-pub fn user_as_peer(name: &str) -> Option<Peer> {
-    let c = std::ffi::CString::new(name).ok()?;
+/// with those credentials would be seen (no process: `pid` 0). Ok(None) if there is no such user;
+/// Err if the user or group database couldn't answer (an NSS outage is not a missing user). What a
+/// trigger's owner is checked as before it fires (#578).
+pub fn user_as_peer(name: &str) -> Result<Option<Peer>, String> {
+    let Ok(c) = std::ffi::CString::new(name) else { return Ok(None) };
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 16384];
     let mut out: *mut libc::passwd = std::ptr::null_mut();
     // SAFETY: getpwnam_r fills `pw` with pointers into `buf`, which outlives their use here.
     let r = unsafe { libc::getpwnam_r(c.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
-    if r != 0 || out.is_null() {
-        return None;
+    if r != 0 {
+        return Err(format!("looking up user {name}: {}", std::io::Error::from_raw_os_error(r)));
+    }
+    if out.is_null() {
+        return Ok(None);
     }
     let (uid, gid) = (pw.pw_uid, pw.pw_gid);
     let mut n: libc::c_int = 256;
@@ -272,15 +282,21 @@ pub fn user_as_peer(name: &str) -> Option<Peer> {
         gids.resize(n.max(0) as usize, 0);
         // SAFETY: as above, with room for every group now.
         if unsafe { libc::getgrouplist(c.as_ptr(), gid, gids.as_mut_ptr(), &mut n) } < 0 {
-            return None;
+            return Err(format!("looking up user {name}'s groups"));
         }
     }
     gids.truncate(n.max(0) as usize);
     gids.push(gid);
     gids.sort_unstable();
     gids.dedup();
-    let groups = gids.into_iter().map(|g| (g, group_name(g).unwrap_or_default())).collect();
-    Some(Peer { pid: 0, uid, gid, user: name.to_string(), groups })
+    // A group the database can't name because it failed is an error, not "no name" (a policy names
+    // groups by name: an outage would read as not being in them). `getgrouplist` itself can't
+    // report an NSS failure: it may list fewer groups, which reads as a definite no.
+    let mut groups = Vec::with_capacity(gids.len());
+    for g in gids {
+        groups.push((g, group_name_checked(g)?.unwrap_or_default()));
+    }
+    Ok(Some(Peer { pid: 0, uid, gid, user: name.to_string(), groups }))
 }
 
 /// The name of `uid` in the user database.
@@ -295,6 +311,29 @@ pub fn user_name(uid: u32) -> Option<String> {
     }
     // SAFETY: pw_name is a NUL-terminated string in `buf`.
     Some(unsafe { std::ffi::CStr::from_ptr(pw.pw_name) }.to_string_lossy().into_owned())
+}
+
+/// The name of `gid` in the group database: Ok(None) if it has none, Err if the database
+/// couldn't answer.
+pub fn group_name_checked(gid: u32) -> Result<Option<String>, String> {
+    // A large group (many members, in LDAP) needs a larger buffer: grown on ERANGE, to 16 MiB.
+    let mut size = 64 * 1024;
+    loop {
+        let mut gr: libc::group = unsafe { std::mem::zeroed() };
+        let mut buf = vec![0 as libc::c_char; size];
+        let mut out: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: as user_name.
+        let r = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
+        match r {
+            0 if out.is_null() => return Ok(None),
+            // SAFETY: gr_name is a NUL-terminated string in `buf`.
+            0 => return Ok(Some(unsafe { std::ffi::CStr::from_ptr(gr.gr_name) }.to_string_lossy().into_owned())),
+            libc::ERANGE if size < 16 << 20 => size *= 4,
+            // "Not found", as some NSS modules say it.
+            libc::ENOENT | libc::ESRCH => return Ok(None),
+            r => return Err(format!("looking up group {gid}: {}", std::io::Error::from_raw_os_error(r))),
+        }
+    }
 }
 
 /// The name of `gid` in the group database.
@@ -322,26 +361,23 @@ pub fn group_id(name: &str) -> Option<u32> {
     (r == 0 && !out.is_null()).then_some(gr.gr_gid)
 }
 
-/// An `ERROR` frame's text starts with the caller's exit code in words (#574): `usage: ` (2),
-/// `refused: ` (3, the daemon's policy) or `try again: ` (75, the daemon is moving to a new build);
-/// with none, the command failed otherwise (1). A client before it shows the text as it is.
-const MARKS: [(wicket_home::exit::Code, &str); 3] = [
-    (wicket_home::exit::Code::Usage, "usage: "),
-    (wicket_home::exit::Code::Refused, "refused: "),
-    (wicket_home::exit::Code::TryAgain, "try again: "),
-];
-
-/// `why`, marked with `code` for the caller.
-pub fn marked(code: wicket_home::exit::Code, why: &str) -> String {
-    match MARKS.iter().find(|(c, _)| *c == code) {
-        Some((_, m)) => format!("{m}{why}"),
-        None => why.to_string(),
-    }
+/// A `REFUSE` frame's payload: `code`, then `why`.
+pub fn refuse_frame(code: wicket_home::exit::Code, why: &str) -> Vec<u8> {
+    let mut p = (code as i32).to_be_bytes().to_vec();
+    p.extend_from_slice(why.as_bytes());
+    p
 }
 
-/// The code an `ERROR` frame's text is marked with (`Failed` if none).
-pub fn mark_of(text: &str) -> wicket_home::exit::Code {
-    MARKS.iter().find(|(_, m)| text.starts_with(m)).map(|(c, _)| *c).unwrap_or(wicket_home::exit::Code::Failed)
+/// A `REFUSE` frame's code and text (a code it doesn't know is `Failed`).
+pub fn parse_refuse(p: &[u8]) -> (wicket_home::exit::Code, String) {
+    use wicket_home::exit::Code;
+    let (head, text) = p.split_at(p.len().min(4));
+    let n = <[u8; 4]>::try_from(head).map(i32::from_be_bytes).unwrap_or(1);
+    let code = [Code::Usage, Code::Refused, Code::NotFound, Code::NeedsApproval, Code::Revoked, Code::TryAgain]
+        .into_iter()
+        .find(|c| *c as i32 == n)
+        .unwrap_or(Code::Failed);
+    (code, String::from_utf8_lossy(text).into_owned())
 }
 
 #[cfg(test)]

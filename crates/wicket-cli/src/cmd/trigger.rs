@@ -16,7 +16,7 @@ pub enum TriggerCmd {
         #[arg(long)]
         file: PathBuf,
         /// How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew`.
-        #[arg(long, default_value = tr::DEFAULT_LASTS)]
+        #[arg(long, default_value = tr::DEFAULT_LASTS, value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
     },
     /// Triggers that aren't removed: each with its state, source, action and next firing.
@@ -30,7 +30,7 @@ pub enum TriggerCmd {
     /// Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root).
     Renew {
         trigger: String,
-        #[arg(long, default_value = tr::DEFAULT_LASTS)]
+        #[arg(long, default_value = tr::DEFAULT_LASTS, value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
     },
     /// Remove a trigger: it fires nothing again.
@@ -61,6 +61,7 @@ fn c(s: &str) -> String {
 fn state(t: &wicket_store::Trigger, now: i64) -> String {
     match (t.status.as_str(), t.approval.as_str(), t.until) {
         ("paused", _, _) => "paused".into(),
+        ("done", _, _) => "done (its timer has fired)".into(),
         (_, "pending", _) => "waiting for approval".into(),
         (_, _, Some(u)) if u <= now => format!("lapsed {}", when(u)),
         (_, _, Some(u)) => format!("active, until {}", when(u)),
@@ -133,7 +134,9 @@ fn lasts(s: &str) -> Result<Option<i64>> {
     match s {
         "forever" => Ok(None),
         d => {
-            let d = wicket_core::time::parse_duration(d).context("bad --lasts (a duration such as 30d, or forever)")?;
+            // As clap checked it (#574): a duration, or a number of seconds.
+            let d = wicket_core::time::duration_arg(d)
+                .map_err(|e| wicket_home::exit::usage(format!("bad --lasts {d:?} (a duration such as 30d, or forever): {e}")))?;
             Ok(Some(wicket_store::now() + d.as_secs() as i64))
         }
     }
@@ -150,7 +153,7 @@ fn find(l: &Ledger, op: &operators::Operator, which: &str) -> Result<wicket_stor
         return Ok(t.clone());
     }
     match named.len() {
-        0 => bail!("no trigger {which}"),
+        0 => Err(wicket_home::exit::not_found(format!("no trigger {which}"))),
         1 => Ok(named.into_iter().next().expect("one")),
         n => bail!("{n} triggers are named {which} (owners {}): name it by its id", {
             named.iter().map(|t| c(&t.owner)).collect::<Vec<_>>().join(", ")

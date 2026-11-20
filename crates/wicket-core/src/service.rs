@@ -1,8 +1,8 @@
 //! Per-node services (#579 step 3): a program that runs on every matching node, which the boxes on
-//! that node use through a link (`zone.uses`). A pull-through cache (npm, an OCI registry mirror) is
+//! that node use through a link (`zone.uses`). A pull-through cache (of a package registry, an OCI registry mirror) is
 //! the example: one instance per node and tenant, fetching under its own reach.
 //!
-//! **Using a service is having its reach.** A box that uses an npm cache can, through it, make the
+//! **Using a service is having its reach.** A box that uses a package cache can, through it, make the
 //! cache fetch whatever the box names on the cache's upstream: package names are a channel out. So a
 //! box may use a service only if its own authority covers the service's reach (the link's subset
 //! rule, [`crate::link`]), or a human approves that link; and a spawned box may use only the services
@@ -33,7 +33,7 @@ pub struct ServiceSpec {
     /// The port its users connect to (`<name>.wicket.internal:<port>`).
     pub port: u16,
     /// Environment its users get, `{host}` and `{port}` replaced: what points their tools at it
-    /// (`npm_config_registry: http://{host}:{port}/`). Only names wicket doesn't control.
+    /// (`PKG_REGISTRY: http://{host}:{port}/`). Only names wicket doesn't control.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "crate::yaml::null_as_default")]
     pub env: BTreeMap<String, String>,
     /// What happens to its volumes when its node is released: `drop` (a cache) or `keep`.
@@ -140,9 +140,9 @@ mod tests {
 
     #[test]
     fn a_service_is_per_tenant_unless_its_installer_says_public_only() {
-        let s = spec("port: 4873\nenv: { npm_config_registry: 'http://{host}:{port}/' }").unwrap();
+        let s = spec("port: 4873\nenv: { PKG_REGISTRY: 'http://{host}:{port}/' }").unwrap();
         assert_eq!((s.tenancy, s.drain, s.per_node), (Tenancy::PerTenant, Drain::Drop, true));
-        assert_eq!(s.user_env("npm-cache")["npm_config_registry"], "http://npm-cache.wicket.internal:4873/");
+        assert_eq!(s.user_env("pkg-cache")["PKG_REGISTRY"], "http://pkg-cache.wicket.internal:4873/");
         assert!(spec("port: 4873\ntenancy: shared").unwrap_err().contains("public_only"));
         assert_eq!(spec("port: 4873\ntenancy: shared\npublic_only: true").unwrap().tenancy, Tenancy::Shared);
         assert!(spec("port: 0").is_err());
@@ -175,10 +175,10 @@ mod tests {
 
     #[test]
     fn service_names() {
-        for ok in ["npm-cache", "oci-mirror", "a", "crates2"] {
+        for ok in ["pkg-cache", "oci-mirror", "a", "crates2"] {
             assert!(check_name(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "Npm", "-a", "a-", "a.b", "a_b", "1a", "wicket", &"a".repeat(41)] {
+        for bad in ["", "Pkg", "-a", "a-", "a.b", "a_b", "1a", "wicket", &"a".repeat(41)] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
     }

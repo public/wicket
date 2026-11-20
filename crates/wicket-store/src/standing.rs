@@ -213,7 +213,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Standing, String, String)> {
             zone: r.get(3)?,
             principal: r.get(4)?,
             zone_digest: r.get(17)?,
-            rule: ReachRule { host: String::new(), methods: vec![], paths: vec![], allow_dangerous: false },
+            rule: ReachRule { host: String::new(), methods: vec![], paths: vec![], allow_dangerous: false, decode_slash: vec![] },
             reason: r.get(6)?,
             evidence: Evidence::default(),
             status: r.get(8)?,

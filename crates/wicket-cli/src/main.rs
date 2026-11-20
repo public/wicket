@@ -172,7 +172,7 @@ enum Cmd {
         no_wait: bool,
         /// With TEXT: stop following its turn after this long (it stays queued). Seconds, or a
         /// duration (`90s`, `5m`).
-        #[arg(long, value_parser = seconds_or_duration)]
+        #[arg(long, value_parser = wicket_core::time::duration_arg)]
         timeout: Option<Duration>,
     },
     /// Hibernate a long-lived agent at its next quiet point.
@@ -183,7 +183,7 @@ enum Cmd {
     Hibernate {
         run: String,
         /// How long to wait for the outcome: seconds, or a duration (`90s`, `5m`).
-        #[arg(long, default_value = "120s", value_parser = seconds_or_duration)]
+        #[arg(long, default_value = "120s", value_parser = wicket_core::time::duration_arg)]
         wait: Duration,
     },
     /// Internal: wake a hibernated agent (rebuild its box, restore its state, resume its harness
@@ -198,7 +198,7 @@ enum Cmd {
         #[arg(long, hide = true)]
         by: Option<String>,
         /// How long to wait in the queue when no node may take it now (#579); 0: fail at once.
-        #[arg(long, default_value = "30m", value_parser = seconds_or_duration)]
+        #[arg(long, default_value = "30m", value_parser = wicket_core::time::duration_arg)]
         wait: Duration,
     },
     /// A live view of nodes, runs, pending requests and leases (read-only).
@@ -267,8 +267,8 @@ enum Cmd {
         #[arg(long)]
         unlimited: bool,
         /// Grant lifetime.
-        #[arg(long, default_value = "10m")]
-        ttl: String,
+        #[arg(long, default_value = "10m", value_parser = wicket_core::time::duration_arg)]
+        ttl: std::time::Duration,
         /// Grant a path prefix of the requested path instead of the exact path.
         #[arg(long)]
         prefix: Option<String>,
@@ -426,8 +426,8 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
         /// Keep running, one pass per interval (e.g. 30s).
-        #[arg(long)]
-        every: Option<String>,
+        #[arg(long, value_parser = wicket_core::time::duration_arg)]
+        every: Option<std::time::Duration>,
     },
     /// Capacity leases: the nodes agents asked for.
     ///
@@ -515,28 +515,78 @@ enum Cmd {
     },
 }
 
-/// A flag that took a number of seconds and takes a duration too (#574), so it reads as the
-/// others do: `120` is still 120 seconds.
-fn seconds_or_duration(s: &str) -> std::result::Result<Duration, String> {
-    match s.parse::<u64>() {
-        Ok(n) => Ok(Duration::from_secs(n)),
-        Err(_) => wicket_core::time::parse_duration(s).map_err(|e| e.to_string()),
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run().await {
-        // As a `main` returning the error would print it, then the code for its kind (#574).
-        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("Error: {e:?}\n"));
+fn main() {
+    let first = std::env::args().nth(1);
+    let rt = runtime(first.as_deref()).expect("a tokio runtime");
+    if let Err(e) = rt.block_on(run()) {
+        // As a `main` returning the error would print it (not a run's own status, which its run
+        // has told already), then the code for its kind (#574).
+        if e.downcast_ref::<wicket_home::exit::Status>().is_none() {
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("Error: {e:?}\n"));
+        }
         std::process::exit(exit_code(&e));
     }
 }
 
-/// The exit code for `e` (#574; docs/reference/cli.md lists them): [`wicket_home::exit::code_of`],
-/// the one classifier, else 1.
+/// The commands that supervise a run for its whole life, one process each (`wicket run`, `attach`,
+/// `wrap`, and `wake`, which supervises the woken agent): what a host runs hundreds of at once.
+fn supervises(first_arg: Option<&str>) -> bool {
+    matches!(first_arg, Some("run" | "attach" | "wrap" | "wake"))
+}
+
+/// Worker threads a supervisor's runtime has (#582 step 4), unless `WICKET_SUPERVISOR_WORKERS`
+/// says otherwise. Its work is relaying sockets and waiting on its box. Any multi-thread runtime
+/// runs `block_in_place` (one worker would too); the second worker is a spare, so a task that is
+/// slow on one doesn't stall the relays, without one thread per core per supervisor.
+pub(crate) const SUPERVISOR_WORKERS: usize = 2;
+
+/// The most `WICKET_SUPERVISOR_WORKERS` may ask for.
+pub(crate) const SUPERVISOR_WORKERS_MAX: usize = 64;
+
+/// The most blocking-pool threads a supervisor may have at once; idle ones end after tokio's
+/// keep-alive. They do its ledger and file work, and each `block_in_place` takes one while it
+/// lasts: a worker that blocks (`wicket_proxy`'s wait for a granted request's audit commit) hands
+/// its place to a pool thread. Those waits are milliseconds, on the audit writer's own thread, so
+/// one that finds the pool full only runs with a worker fewer until a wait ends: it can't deadlock.
+pub(crate) const SUPERVISOR_BLOCKING: usize = 32;
+
+/// `WICKET_SUPERVISOR_WORKERS` read: the workers to run, and a warning if the value was refused
+/// (not a number, 0) or capped.
+fn supervisor_workers(v: Option<&str>) -> (usize, Option<String>) {
+    let Some(v) = v else { return (SUPERVISOR_WORKERS, None) };
+    match v.trim().parse::<usize>() {
+        Ok(0) | Err(_) => (
+            SUPERVISOR_WORKERS,
+            Some(format!(
+                "WICKET_SUPERVISOR_WORKERS={v:?} isn't a number of workers (1 to {SUPERVISOR_WORKERS_MAX}): using {SUPERVISOR_WORKERS}"
+            )),
+        ),
+        Ok(n) if n > SUPERVISOR_WORKERS_MAX => (
+            SUPERVISOR_WORKERS_MAX,
+            Some(format!("WICKET_SUPERVISOR_WORKERS={n} is over {SUPERVISOR_WORKERS_MAX}: using {SUPERVISOR_WORKERS_MAX}")),
+        ),
+        Ok(n) => (n, None),
+    }
+}
+
+/// The runtime for this process: a small one for a supervisor, tokio's default (a worker per core)
+/// for everything else.
+fn runtime(first_arg: Option<&str>) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut b = tokio::runtime::Builder::new_multi_thread();
+    if supervises(first_arg) {
+        let (workers, warning) = supervisor_workers(std::env::var("WICKET_SUPERVISOR_WORKERS").ok().as_deref());
+        if let Some(w) = warning {
+            eprintln!("wicket: {w}");
+        }
+        b.worker_threads(workers).max_blocking_threads(SUPERVISOR_BLOCKING);
+    }
+    b.enable_all().build()
+}
+
+/// The exit code for `e` (#574; docs/reference/cli.md lists them): [`wicket_home::exit::status_of`],
+/// the one classifier.
 fn exit_code(e: &anyhow::Error) -> i32 {
-    wicket_home::exit::code_of(e).unwrap_or(wicket_home::exit::Code::Failed) as i32
+    wicket_home::exit::status_of(e)
 }
 
 async fn run() -> Result<()> {
@@ -605,6 +655,55 @@ async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Threads this process has now (Linux: its tasks).
+    fn threads() -> usize {
+        std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// The threads a runtime adds once every worker has run (no blocking work yet), and its
+    /// workers as tokio counts them.
+    fn threads_added(build: impl FnOnce() -> tokio::runtime::Runtime) -> (usize, usize) {
+        let before = threads();
+        let rt = build();
+        let workers = rt.metrics().num_workers();
+        let added = rt.block_on(async {
+            let tasks: Vec<_> = (0..256).map(|_| tokio::spawn(async { tokio::task::yield_now().await })).collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+            threads() - before
+        });
+        drop(rt);
+        (added, workers)
+    }
+
+    /// #582 step 4: a supervisor's runtime has two workers (and at most 32 blocking threads), not
+    /// one worker per core and up to 512 blocking threads: what it costs doesn't grow with the
+    /// host's cores. Other commands keep tokio's default.
+    #[test]
+    fn a_supervisor_runs_a_small_runtime() {
+        assert!(crate::supervises(Some("run")) && crate::supervises(Some("attach")) && crate::supervises(Some("wake")));
+        assert!(!crate::supervises(Some("serve")) && !crate::supervises(Some("reconcile")) && !crate::supervises(None));
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let (small, small_workers) = threads_added(|| crate::runtime(Some("run")).unwrap());
+        let (default, default_workers) = threads_added(|| crate::runtime(Some("serve")).unwrap());
+        assert_eq!(small_workers, crate::SUPERVISOR_WORKERS);
+        assert_eq!(crate::supervisor_workers(None), (crate::SUPERVISOR_WORKERS, None));
+        assert_eq!(crate::supervisor_workers(Some("4")), (4, None));
+        for bad in ["0", "many", "-1", ""] {
+            let (n, w) = crate::supervisor_workers(Some(bad));
+            assert_eq!(n, crate::SUPERVISOR_WORKERS, "{bad:?}");
+            assert!(w.unwrap().contains("isn't a number of workers"), "{bad:?}");
+        }
+        let (n, w) = crate::supervisor_workers(Some("1000"));
+        assert_eq!(n, crate::SUPERVISOR_WORKERS_MAX);
+        assert!(w.unwrap().contains("is over"));
+        assert_eq!(default_workers, cores);
+        // The threads each added are printed, not asserted: a runtime's threads end after it is
+        // dropped, so a count taken around another runtime can be off by a few.
+        eprintln!("worker threads: supervisor runtime {small_workers} (added {small}), default runtime {default_workers} (added {default}), on {cores} cores");
+    }
+
     /// #574: `wicket --help` lists every visible command once, in its area, and nothing else.
     #[test]
     fn every_command_is_in_one_area() {
