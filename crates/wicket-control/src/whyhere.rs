@@ -41,7 +41,9 @@ pub fn explain(run: &str, at_ms: i64, record: &str, now_ms: i64) -> Result<Strin
             ranked.len() + v["ranked_more"].as_u64().unwrap_or(0) as usize,
             v["candidates"].as_u64().unwrap_or(0)
         )),
-        (None, Some(b)) => out.push_str(&format!("{run}: waiting behind {b}, which waited first and fits a node now ({ago} s ago)\n")),
+        (None, Some(b)) => out.push_str(&format!(
+            "{run}: waiting behind {b}, which goes first (it took an earlier place in line, or it is one of this tenant's of a higher priority) and fits a node now ({ago} s ago)\n"
+        )),
         (None, None) => out.push_str(&format!(
             "{run}: no node may take it (of {} candidates), decided {ago} s ago\n",
             v["candidates"].as_u64().unwrap_or(0)
@@ -63,6 +65,33 @@ pub fn explain(run: &str, at_ms: i64, record: &str, now_ms: i64) -> Result<Strin
             .collect();
         asked.push_str(&format!("; tolerates {}", s.join(", ")));
     }
+    if let Some(p) = r["priority"].as_i64().filter(|p| *p != 0) {
+        asked.push_str(&format!("; priority {p}"));
+    }
+    if r["preemptible"].as_bool() == Some(true) {
+        asked.push_str("; preemptible");
+    }
+    // Affinity: `near service npm-cache (required)`, `away from zone research`.
+    let terms = |k: &str, what: &[&str], word: &str| -> Vec<String> {
+        r[k].as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| {
+                        let (kind, name) = what.iter().find_map(|w| t[*w].as_str().map(|n| (*w, n)))?;
+                        let req = if t["required"].as_bool() == Some(true) { " (required)" } else { "" };
+                        Some(format!("{word} {kind} {name}{req}"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let aff: Vec<String> = terms("affinity", &["service", "volume"], "near")
+        .into_iter()
+        .chain(terms("anti_affinity", &["zone", "principal"], "away from"))
+        .collect();
+    if !aff.is_empty() {
+        asked.push_str(&format!("; {}", aff.join(", ")));
+    }
     let hosts = list("ca_hosts");
     if !hosts.is_empty() {
         asked.push_str(&format!("; its node's CA must cover {}", hosts.join(", ")));
@@ -70,7 +99,11 @@ pub fn explain(run: &str, at_ms: i64, record: &str, now_ms: i64) -> Result<Strin
     out.push_str(&asked);
     out.push('\n');
     if !ranked.is_empty() {
-        out.push_str(&format!("  ranked (bin-packed, best first): {}{}\n", ranked.join(", "), more("ranked_more")));
+        let preferred = ["affinity", "anti_affinity"]
+            .iter()
+            .any(|k| r[*k].as_array().is_some_and(|a| a.iter().any(|t| t["required"].as_bool() != Some(true))));
+        let how = if preferred { "most preferences met, then bin-packed" } else { "bin-packed" };
+        out.push_str(&format!("  ranked ({how}, best first): {}{}\n", ranked.join(", "), more("ranked_more")));
     }
     if let Some(refused) = v["refused"].as_array().filter(|a| !a.is_empty()) {
         out.push_str(&format!("  refused{}:\n", more("refused_more")));
@@ -89,11 +122,33 @@ mod tests {
     use wicket_placement::schedule::{Decision, Refusal, Request};
 
     #[test]
+    fn priority_and_affinity_read_in_what_it_asked_for() {
+        use wicket_core::placement::{Affinity, AntiAffinity};
+        let req = Request {
+            vcpus: 1.0,
+            memory_mib: 512,
+            priority: 5,
+            preemptible: true,
+            affinity: vec![Affinity { service: Some("npm-cache".into()), ..Default::default() }],
+            anti_affinity: vec![AntiAffinity { zone: Some("research".into()), required: true, ..Default::default() }],
+            ..Request::default()
+        };
+        let d = Decision { node: Some("n1".into()), ranked: vec!["n1".into()], refused: vec![] };
+        let rec = decision_record(&Waiting { req, ..Default::default() }, &Bound { decision: d, behind: None }, 1);
+        let t = explain("run_x", 0, &rec, 0).unwrap();
+        assert!(
+            t.contains("asked for: 1 vCPU, 512 MiB; priority 5; preemptible; near service npm-cache, away from zone research (required)\n"),
+            "{t}"
+        );
+        assert!(t.contains("ranked (most preferences met, then bin-packed, best first): n1"), "{t}");
+    }
+
+    #[test]
     fn a_decision_reads_as_where_why_and_why_not() {
         let mut req = Request { vcpus: 1.0, memory_mib: 2048, ..Request::default() };
         req.node_selector.insert("gpu".into(), "a100".into());
         req.tolerations.push(wicket_core::placement::Taint::parse("dedicated").unwrap());
-        let ask = Waiting { req, need: vec!["api.example.com".into()] };
+        let ask = Waiting { req, need: vec!["api.example.com".into()], ..Default::default() };
         let d = Decision {
             node: Some("n1".into()),
             ranked: vec!["n1".into(), "n3".into()],

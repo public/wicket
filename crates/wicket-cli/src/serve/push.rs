@@ -41,7 +41,7 @@ pub const MIN_INTERVAL: i64 = 30;
 /// The `Topic` every push carries, so a push service holding undelivered pushes for a device keeps
 /// only the latest. (Also the notification's tag, so the device shows one.)
 pub const TOPIC: &str = "wicket-pending";
-/// The `Topic` (and tag) of node health alerts (#377): apart from the pending ones, so neither
+/// The `Topic` (and tag) of health alerts (#377, #635): apart from the pending ones, so neither
 /// replaces the other.
 pub const HEALTH_TOPIC: &str = "wicket-health";
 /// The push services the console sends to: (host, whether subdomains of it are meant instead).
@@ -466,7 +466,7 @@ impl HealthNotifier {
         // A device that takes no details is told how many, not what (the pending pushes' rule).
         let texts: Vec<String> = new.iter().map(|a| wicket_core::text::clip(&a.text, MAX_SUMMARY)).collect();
         let n = new.len();
-        let bare = if n == 1 { "1 node health alert".to_string() } else { format!("{n} node health alerts") };
+        let bare = if n == 1 { "1 health alert".to_string() } else { format!("{n} health alerts") };
         subs.iter()
             .map(|s| {
                 let body = if s.details { texts.join("; ") } else { bare.clone() };
@@ -899,7 +899,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|o| o.topic == HEALTH_TOPIC));
         assert_eq!(body(&out[0])["body"], "node n1: n1/disk");
-        assert_eq!(body(&out[1])["body"], "1 node health alert");
+        assert_eq!(body(&out[1])["body"], "1 health alert");
         assert!(h.tick(&[a("n1/disk")], &subs).is_empty(), "still full: not again");
         let out = h.tick(&[a("n1/disk"), a("n1/feed")], &subs);
         assert_eq!(body(&out[0])["body"], "node n1: n1/feed", "only what is new");

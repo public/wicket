@@ -303,6 +303,90 @@ pub fn progress(
     (stream.is_some() || !audit.is_empty() || !errors.is_empty()).then_some(Progress { stream, audit, errors })
 }
 
+/// The ledger stream not current for longer than this is an alert (and a push).
+pub const STREAM_ALERT_SECS: i64 = 300;
+/// An audit sink whose oldest unacknowledged record has waited longer than this is an alert.
+pub const AUDIT_ALERT_SECS: i64 = 300;
+/// So is one behind by more records than this, however recent.
+pub const AUDIT_ALERT_RECORDS: i64 = 10_000;
+
+/// A config that can't be read for longer than this is an alert: nothing is streamed or exported
+/// as configured meanwhile.
+pub const CONFIG_ALERT_SECS: i64 = 300;
+
+/// What the alerts remember between reads of the progress: when the ledger's stream was last
+/// current (a stopped or restarting Litestream doesn't say), and since when a config can't be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Watch {
+    /// The last sync seen while the stream was streaming, or when watching started.
+    pub stream_current_ms: i64,
+    /// Since when [`Progress::errors`] has been non-empty, without a break.
+    pub errors_since_ms: Option<i64>,
+}
+
+impl Watch {
+    pub fn new(now_ms: i64) -> Watch {
+        Watch { stream_current_ms: now_ms, errors_since_ms: None }
+    }
+
+    /// Notes one read at `now_ms`.
+    pub fn observe(&mut self, p: Option<&Progress>, now_ms: i64) {
+        if let Some(st) = p.and_then(|p| p.stream.as_ref()).filter(|s| s.state == StreamState::Streaming) {
+            self.stream_current_ms = self.stream_current_ms.max(st.last_sync_ms.unwrap_or(now_ms));
+        }
+        self.errors_since_ms = match p.is_some_and(|p| !p.errors.is_empty()) {
+            true => Some(self.errors_since_ms.unwrap_or(now_ms)),
+            false => None,
+        };
+    }
+}
+
+/// The health alerts `p` raises at `now_ms` (#635), which the console shows and pushes as it does a
+/// node's: once each until it clears.
+/// - The ledger stream, in any state but streaming, not current for [`STREAM_ALERT_SECS`]: since
+///   Litestream's last sync if it reports one, else since `w` last saw one.
+/// - An audit sink (not a manual one) whose oldest unacknowledged record has waited
+///   [`AUDIT_ALERT_SECS`], or that is [`AUDIT_ALERT_RECORDS`] behind.
+/// - A config that couldn't be read for [`CONFIG_ALERT_SECS`].
+///
+/// Keys start `control:`, which a node's name can't. Texts carry no error: they reach lock
+/// screens, and an error can quote a collector's reply. The console's rows have the errors.
+pub fn alerts(p: &Progress, w: &Watch, now_ms: i64) -> Vec<crate::health::Alert> {
+    let ago = |ms: i64| crate::audit_export::ago(ms / 1000);
+    let mut out = Vec::new();
+    if let Some(st) = p.stream.as_ref().filter(|s| s.state != StreamState::Streaming) {
+        let current = st.last_sync_ms.unwrap_or(w.stream_current_ms);
+        if now_ms - current > STREAM_ALERT_SECS * 1000 {
+            let since = match st.last_sync_ms {
+                Some(t) => format!("last sync {} ago", ago(now_ms - t)),
+                None => format!("not current for {}", ago(now_ms - current)),
+            };
+            out.push(crate::health::Alert {
+                key: "control:state-store/stream".into(),
+                text: format!("the state store: the ledger stream is {} ({since})", st.state.as_str()),
+            });
+        }
+    }
+    for s in p.audit.iter().filter(|s| !s.manual) {
+        if s.behind_secs > AUDIT_ALERT_SECS || s.behind > AUDIT_ALERT_RECORDS {
+            out.push(crate::health::Alert {
+                key: format!("control:audit/{}", s.sink),
+                text: format!("audit sink {}: {} records behind (oldest {})", s.sink, s.behind, crate::audit_export::ago(s.behind_secs)),
+            });
+        }
+    }
+    if let Some(since) = w.errors_since_ms.filter(|t| !p.errors.is_empty() && now_ms - t > CONFIG_ALERT_SECS * 1000) {
+        out.push(crate::health::Alert {
+            key: "control:state-store/config".into(),
+            text: format!(
+                "the state store or audit sinks: a config can't be read for {}: `wicket state check` says why",
+                ago(now_ms - since)
+            ),
+        });
+    }
+    out
+}
+
 /// [`progress`] with this installation's configs, at the ledger `l` opened from `ledger`.
 pub fn installed_progress(l: &wicket_store::Ledger, ledger: &Path, now_ms: i64) -> Option<Progress> {
     progress(l, ledger, StateStore::load(), crate::audit_export::SinksConfig::load(), now_ms)
@@ -414,6 +498,112 @@ mod tests {
         std::fs::remove_file(socket_path(&db)).unwrap();
         let st = status_of(&s, &db, synced + 200_000).unwrap();
         assert_eq!((st.state, st.error.as_deref()), (StreamState::Stopped, Some("monitor error: calc pos: connection refused")));
+    }
+
+    fn stream(state: StreamState, last_sync_ms: Option<i64>, now: i64) -> StreamStatus {
+        StreamStatus {
+            endpoint: "https://s3.example.com".into(),
+            bucket: "b-1".into(),
+            lineage: None,
+            state,
+            last_sync_ms,
+            behind_secs: last_sync_ms.map(|t| (now - t) / 1000),
+            lag_secs: 60,
+            error: Some("calc pos: connection refused".into()),
+            error_ms: Some(now - 1000),
+        }
+    }
+
+    fn sink(name: &str, behind: i64, behind_secs: i64, manual: bool) -> crate::audit_export::SinkStatus {
+        crate::audit_export::SinkStatus {
+            sink: name.into(),
+            kind: if manual { "jsonl" } else { "store" },
+            seq: 1,
+            head: 1 + behind,
+            behind,
+            behind_secs,
+            checkpoint_at: 0,
+            holder: None,
+            error: Some("PUT https://c.example/v1/logs: 401: token rejected".into()),
+            manual,
+        }
+    }
+
+    fn progress_of(s: Option<StreamStatus>, audit: Vec<crate::audit_export::SinkStatus>, errors: &[&str]) -> Progress {
+        Progress { stream: s, audit, errors: errors.iter().map(|e| e.to_string()).collect() }
+    }
+
+    fn keys(p: &Progress, w: &Watch, now: i64) -> Vec<String> {
+        alerts(p, w, now).into_iter().map(|a| a.key).collect()
+    }
+
+    const NOW: i64 = 1_763_200_000_000;
+
+    #[test]
+    fn a_stream_behind_past_five_minutes_of_its_last_sync_is_an_alert() {
+        // Watching for an hour, and the stream current all along until it lagged.
+        let mut w = Watch::new(NOW - 3_600_000);
+        w.observe(Some(&progress_of(Some(stream(StreamState::Streaming, Some(NOW - 330_000), NOW - 329_000)), vec![], &[])), NOW - 329_000);
+        assert_eq!(w.stream_current_ms, NOW - 330_000, "the sync it saw, not the poll's time");
+        // Lagging, last sync 4 min 59 s ago: no alert; 5 min 1 s: one, saying when, no error text.
+        let lag = |since| progress_of(Some(stream(StreamState::Lagging, Some(NOW - since), NOW)), vec![], &[]);
+        assert!(keys(&lag(299_000), &w, NOW).is_empty());
+        let a = alerts(&lag(301_000), &w, NOW);
+        assert_eq!(a[0].key, "control:state-store/stream");
+        assert_eq!(a[0].text, "the state store: the ledger stream is lagging (last sync 5 min ago)");
+        // Streaming again: cleared.
+        assert!(keys(&progress_of(Some(stream(StreamState::Streaming, Some(NOW - 1_000), NOW)), vec![], &[]), &w, NOW).is_empty());
+    }
+
+    /// Litestream crash-looping (restarted every few seconds, never syncing): polls see it stopped
+    /// and starting in turn, and it is alerted 5 min after its last sync, not never.
+    #[test]
+    fn a_crash_looping_litestream_is_alerted() {
+        let start = NOW - 600_000;
+        let mut w = Watch::new(start - 60_000);
+        let last_sync = start - 10_000;
+        w.observe(Some(&progress_of(Some(stream(StreamState::Streaming, Some(last_sync), start)), vec![], &[])), start);
+        let mut first_alert = None;
+        for i in 0..200 {
+            let now = start + i * 3_000;
+            let state = if i % 2 == 0 { StreamState::Stopped } else { StreamState::Starting };
+            let p = progress_of(Some(stream(state, None, now)), vec![], &[]);
+            w.observe(Some(&p), now);
+            if !keys(&p, &w, now).is_empty() && first_alert.is_none() {
+                first_alert = Some(now);
+            }
+        }
+        let at = first_alert.expect("alerted within 10 minutes");
+        assert!(at - last_sync > 300_000 && at - last_sync <= 303_000, "5 min after the last sync: {}", at - last_sync);
+        let p = progress_of(Some(stream(StreamState::Stopped, None, start + 600_000)), vec![], &[]);
+        assert!(alerts(&p, &w, start + 600_000)[0].text.contains("stopped (not current for 10 min)"));
+    }
+
+    #[test]
+    fn a_sink_behind_is_an_alert_unless_it_is_fed_by_hand() {
+        let w = Watch::new(NOW);
+        assert!(keys(&progress_of(None, vec![sink("store", 24, 299, false)], &[]), &w, NOW).is_empty());
+        let a = alerts(&progress_of(None, vec![sink("store", 24, 301, false)], &[]), &w, NOW);
+        assert_eq!((a[0].key.as_str(), a[0].text.as_str()), ("control:audit/store", "audit sink store: 24 records behind (oldest 5 min)"));
+        assert!(!a[0].text.contains("token"), "no error in a push");
+        assert_eq!(keys(&progress_of(None, vec![sink("store", 10_001, 2, false)], &[]), &w, NOW), ["control:audit/store"]);
+        assert!(keys(&progress_of(None, vec![sink("stdout", 50_000, 86_400, true)], &[]), &w, NOW).is_empty(), "manual: never");
+    }
+
+    #[test]
+    fn a_config_that_cant_be_read_is_an_alert_after_five_minutes_and_clears() {
+        let mut w = Watch::new(NOW - 3_600_000);
+        let bad = progress_of(None, vec![], &["state-store.yaml can't be read: `wicket state check` says why"]);
+        w.observe(Some(&bad), NOW - 299_000);
+        assert!(keys(&bad, &w, NOW).is_empty());
+        w.observe(Some(&bad), NOW + 2_000);
+        assert_eq!(keys(&bad, &w, NOW + 2_000), ["control:state-store/config"]);
+        let good = progress_of(None, vec![sink("store", 0, 0, false)], &[]);
+        w.observe(Some(&good), NOW + 5_000);
+        assert_eq!(w.errors_since_ms, None);
+        assert!(keys(&good, &w, NOW + 5_000).is_empty(), "cleared");
+        w.observe(Some(&bad), NOW + 8_000);
+        assert!(keys(&bad, &w, NOW + 9_000).is_empty(), "back: the delay starts again");
     }
 
     #[test]
