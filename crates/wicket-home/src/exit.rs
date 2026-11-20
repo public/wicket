@@ -24,6 +24,8 @@ pub enum Code {
     /// It needs an approval nobody has given yet: a spend no capacity grant covers and no operator
     /// decided within --wait, an update no trusted key signed and no operator approved.
     NeedsApproval = 5,
+    /// The run was revoked: an operator ended its authority, and wicket stopped its box.
+    Revoked = 6,
     /// Try again shortly: the daemon is moving to a new build and took no command (sysexits'
     /// EX_TEMPFAIL). Nothing was done, so retrying is safe.
     TryAgain = 75,
@@ -73,6 +75,28 @@ pub fn needs_approval(msg: impl Into<String>) -> anyhow::Error {
 /// [`Code::Usage`].
 pub fn usage(msg: impl Into<String>) -> anyhow::Error {
     exit(Code::Usage, msg)
+}
+
+/// A run's own status to exit with, as it is (#574): `wicket wrap` passing on the wrapped program's
+/// code, a run ended by a signal exiting 128 + its number. Its run has said what happened already,
+/// so `wicket` prints nothing more for it.
+#[derive(Debug)]
+pub struct Status(pub i32);
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit status {}", self.0)
+    }
+}
+
+impl std::error::Error for Status {}
+
+/// What `wicket` exits with for `e`: a [`Status`] as it is, else [`code_of`]'s code, else 1.
+pub fn status_of(e: &anyhow::Error) -> i32 {
+    match e.downcast_ref::<Status>() {
+        Some(s) => s.0,
+        None => code_of(e).unwrap_or(Code::Failed) as i32,
+    }
 }
 
 /// The exit code `e` says, if it says one (#574): the innermost error in its chain that does (an

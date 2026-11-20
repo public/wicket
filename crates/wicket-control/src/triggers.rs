@@ -145,27 +145,51 @@ fn zone(tz: &str) -> Result<jiff::tz::TimeZone> {
 /// Whether `t`'s owner may still keep it, as `operators.yaml` says: an operator of its tenant and
 /// this installation's trust domain, whose authority isn't `nothing`. (wicketd's policy is the
 /// CLI's to add to it: the reconciler's [`OwnerCheck`].)
-pub fn operator_may(t: &Trigger) -> std::result::Result<(), String> {
+pub fn operator_may(t: &Trigger) -> std::result::Result<(), NotOwner> {
     let Some(wicket_identity::Principal::Operator { tenant, via, name, .. }) = wicket_identity::Principal::parse(&t.owner) else {
-        return Err(format!("{} is not an operator's principal", t.owner));
+        return Err(NotOwner::No(format!("{} is not an operator's principal", t.owner)));
     };
     if tenant != t.tenant {
-        return Err(format!("{} is not an operator of tenant {}", t.owner, t.tenant));
+        return Err(NotOwner::No(format!("{} is not an operator of tenant {}", t.owner, t.tenant)));
     }
-    let policy = crate::operators::Policy::load(&crate::operators::policy_path()).map_err(|e| format!("{e:#}"))?;
+    let policy = crate::operators::Policy::load(&crate::operators::policy_path()).map_err(|e| NotOwner::Unknown(format!("{e:#}")))?;
     let o = Operator::new(&t.tenant, &via, &name, String::new(), &policy);
     if o.id != t.owner {
-        return Err(format!("{} is not this installation's operator (its trust domain is now that of {})", t.owner, o.id));
+        return Err(NotOwner::No(format!("{} is not this installation's operator (its trust domain is now that of {})", t.owner, o.id)));
     }
     if matches!(o.authority, Authority::Nothing) {
-        return Err(format!("operator {} may decide nothing (operators.yaml)", t.owner));
+        return Err(NotOwner::No(format!("operator {} may decide nothing (operators.yaml)", t.owner)));
     }
     Ok(())
 }
 
+/// Why an owner check didn't pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotOwner {
+    /// A definite no (the user is gone, or no longer in the policy's groups): the trigger is
+    /// paused.
+    No(String),
+    /// It couldn't be told (the user database didn't answer, a policy file doesn't read): this
+    /// firing is skipped and audited, and the trigger is left as it is for the next pass.
+    Unknown(String),
+}
+
 /// Whether a trigger's owner may still have it fire: checked before every firing. The reconciler's
 /// adds wicketd's policy (the run class keeping one needed) to [`operator_may`].
-pub type OwnerCheck<'a> = &'a dyn Fn(&Trigger) -> std::result::Result<(), String>;
+pub type OwnerCheck<'a> = &'a dyn Fn(&Trigger) -> std::result::Result<(), NotOwner>;
+
+/// What a failed owner check does: pauses the trigger on a definite no; skips (audited) and leaves
+/// it be when the check couldn't be made.
+fn owner_failed(l: &Ledger, t: &Trigger, e: NotOwner) -> Result<Fired> {
+    match e {
+        NotOwner::No(why) => pause_for(l, t, &format!("its owner may no longer have it fire: {why}")),
+        NotOwner::Unknown(why) => {
+            let why = format!("its owner couldn't be checked, so it didn't fire this time: {why}");
+            audit(l, "trigger.skipped", &json!({ "trigger": t.id, "name": t.name, "owner": t.owner, "status": "skipped", "detail": why }))?;
+            Ok(Fired { trigger: t.id.clone(), name: t.name.clone(), status: "skipped".into(), detail: why })
+        }
+    }
+}
 
 /// The live agent `who` names in `tenant`: a principal (`spiffe://…`, the newest live agent of
 /// that zone and name), an agent's id, or a long-lived agent's name (the only live one of that
@@ -181,15 +205,15 @@ pub fn find_agent(l: &Ledger, tenant: &str, who: &str) -> Result<AgentRow> {
         }
         let mut named: Vec<AgentRow> = l.agents(tenant)?.into_iter().filter(|a| live(a) && a.zone == zone && a.name == agent).collect();
         named.sort_by_key(|a| a.created_at);
-        return named.pop().with_context(|| format!("no live long-lived agent {who}"));
+        return named.pop().ok_or_else(|| wicket_home::exit::not_found(format!("no live long-lived agent {who}")));
     }
     if wicket_store::valid_agent_id(who) {
-        let a = l.agent(who)?.filter(|a| a.tenant == tenant).with_context(|| format!("no agent {who}"))?;
+        let a = l.agent(who)?.filter(|a| a.tenant == tenant).ok_or_else(|| wicket_home::exit::not_found(format!("no agent {who}")))?;
         return Ok(a);
     }
     let mut named: Vec<AgentRow> = l.agents(tenant)?.into_iter().filter(|a| live(a) && a.name == who).collect();
     match named.len() {
-        0 => bail!("no live long-lived agent named {who}"),
+        0 => Err(wicket_home::exit::not_found(format!("no live long-lived agent named {who}"))),
         1 => Ok(named.remove(0)),
         n => bail!("{n} live agents are named {who} (in zones {}): name it by its id (wicket agents)", {
             named.iter().map(|a| a.zone.as_str()).collect::<Vec<_>>().join(", ")
@@ -224,12 +248,18 @@ pub fn create(l: &Ledger, op: &Operator, spec: &TriggerSpec, until: Option<i64>,
     let now = wicket_store::now();
     check_runnable(spec, now)?;
     let t = TenantId::single();
-    if l.triggers(&t.0, Some(&op.id))?.len() >= wicket_store::MAX_TRIGGERS_PER_OWNER {
+    let mine = l.triggers(&t.0, Some(&op.id))?;
+    if mine.iter().filter(|x| x.status != "done").count() >= wicket_store::MAX_TRIGGERS_PER_OWNER {
         bail!("{} already keeps {} triggers, the most one owner may: remove one first", op.id, wicket_store::MAX_TRIGGERS_PER_OWNER);
     }
     let mut spec = spec.clone();
     let agent = pin_target(l, &t.0, &op.id, &mut spec)?;
+    let replaced = mine.into_iter().find(|x| x.status == "done" && x.name == spec.trigger);
     let id = l.create_trigger(&t.0, &op.id, &spec, &op.label, false, until)?;
+    if let Some(old) = replaced {
+        let body = json!({ "trigger": old.id, "name": old.name, "owner": old.owner, "by": op.label, "principal": op.id, "why": format!("replaced by {id}, a new trigger of its name") });
+        audit(l, "trigger.deleted", &body)?;
+    }
     let record = json!({
         "trigger": id, "name": spec.trigger, "owner": op.id, "by": op.label, "via": via,
         "source": source_text(&spec), "action": action_text(&spec), "until": until, "approval": "none",
@@ -244,7 +274,7 @@ pub fn create(l: &Ledger, op: &Operator, spec: &TriggerSpec, until: Option<i64>,
 }
 
 fn get(l: &Ledger, id: &str) -> Result<Trigger> {
-    l.trigger(id)?.filter(|t| t.status != "deleted").with_context(|| format!("no trigger {id}"))
+    l.trigger(id)?.filter(|t| t.status != "deleted").ok_or_else(|| wicket_home::exit::not_found(format!("no trigger {id}")))
 }
 
 /// A human's approval of a trigger that waits for one.
@@ -298,6 +328,9 @@ pub fn resume(l: &Ledger, by: &Operator, root: bool, id: &str) -> Result<Trigger
 pub fn renew(l: &Ledger, by: &Operator, root: bool, id: &str, until: Option<i64>) -> Result<Trigger> {
     let t = get(l, id)?;
     owner_or_root(&t, by, root)?;
+    if t.status == "done" {
+        bail!("trigger {id} is done (its timer has fired): make a new one");
+    }
     l.renew_trigger(id, until)?;
     let record = json!({ "trigger": id, "name": t.name, "owner": t.owner, "by": by.label, "principal": by.id, "until": until });
     audit(l, "trigger.renewed", &record)?;
@@ -333,6 +366,12 @@ fn matches_at(cron: &wicket_core::trigger::Cron, dt: jiff::civil::DateTime) -> b
 /// runs every hour (`*` hours, `*/15 * * * *`) goes by the clock as it is: through both copies of
 /// a repeated hour, and nothing for minutes that don't exist.
 pub fn schedule_minutes(cron: &wicket_core::trigger::Cron, tz: &jiff::tz::TimeZone, from: i64, to: i64) -> Vec<i64> {
+    schedule_slots(cron, tz, from, to).into_iter().map(|(m, _)| m).collect()
+}
+
+/// [`schedule_minutes`], each with how many of the schedule's wall-clock times it stands for: one,
+/// or for the minute after a skipped hour, the skipped times it matched as well as its own.
+pub fn schedule_slots(cron: &wicket_core::trigger::Cron, tz: &jiff::tz::TimeZone, from: i64, to: i64) -> Vec<(i64, usize)> {
     let fixed_hours = cron.hours.len() < 24;
     let local = |m: i64| jiff::Timestamp::from_second(m).ok().map(|ts| ts.to_zoned(tz.clone()));
     let mut out = vec![];
@@ -344,6 +383,7 @@ pub fn schedule_minutes(cron: &wicket_core::trigger::Cron, tz: &jiff::tz::TimeZo
         };
         let dt = z.datetime();
         let mut hit = matches_at(cron, dt);
+        let mut stands = usize::from(hit);
         if fixed_hours {
             let before = local(m - 60).map(|p| (p.offset(), p.datetime()));
             match before {
@@ -352,7 +392,10 @@ pub fn schedule_minutes(cron: &wicket_core::trigger::Cron, tz: &jiff::tz::TimeZo
                 Some((off, prev)) if z.offset() > off => {
                     let mut skipped = prev.checked_add(jiff::Span::new().minutes(1)).ok();
                     while let Some(t) = skipped.filter(|t| *t < dt) {
-                        hit |= matches_at(cron, t);
+                        if matches_at(cron, t) {
+                            hit = true;
+                            stands += 1;
+                        }
                         skipped = t.checked_add(jiff::Span::new().minutes(1)).ok();
                     }
                 }
@@ -365,7 +408,7 @@ pub fn schedule_minutes(cron: &wicket_core::trigger::Cron, tz: &jiff::tz::TimeZo
             }
         }
         if hit {
-            out.push(m);
+            out.push((m, stands.max(1)));
         }
         m += 60;
     }
@@ -417,9 +460,9 @@ fn due(l: &Ledger, t: &Trigger, now: i64) -> Result<Due> {
         Source::Schedule { cron, tz } => {
             let c = wicket_core::trigger::Cron::parse(cron).map_err(anyhow::Error::msg)?;
             let z = zone(tz)?;
-            let slots = schedule_minutes(&c, &z, floor.max(last.unwrap_or(i64::MIN)), now);
+            let slots = schedule_slots(&c, &z, floor.max(last.unwrap_or(i64::MIN)), now);
             Ok(match slots.last() {
-                Some(s) => Due::Fire { slot: *s, missed: slots.len() - 1 },
+                Some((s, _)) => Due::Fire { slot: *s, missed: slots.iter().map(|(_, n)| n).sum::<usize>() - 1 },
                 None => Due::Nothing,
             })
         }
@@ -481,8 +524,8 @@ fn one(l: &Ledger, t: &Trigger, now: i64, dry_run: bool, wake: Waker<'_>, owner:
             _ => done("due", "its timer's time passed: skipped, and done (dry run)".into()),
         }));
     }
-    if let Err(why) = owner(t) {
-        return pause_for(l, t, &format!("its owner may no longer have it fire: {why}")).map(Some);
+    if let Err(e) = owner(t) {
+        return owner_failed(l, t, e).map(Some);
     }
     match d {
         Due::Fire { slot, missed } => fire(l, t, slot, missed, wake),
@@ -940,8 +983,8 @@ fn wicket_pass(l: &Ledger, now: i64, dry_run: bool, wake: Waker<'_>, owner: Owne
             for t in hearing {
                 let ok = *checked.entry(t.id.clone()).or_insert_with(|| match owner(&t) {
                     Ok(()) => true,
-                    Err(why) => {
-                        match pause_for(l, &t, &format!("its owner may no longer have it fire: {why}")) {
+                    Err(e) => {
+                        match owner_failed(l, &t, e) {
                             Ok(f) => out.push(f),
                             Err(e) => out.push(failed(&t, &e)),
                         }
@@ -1058,7 +1101,7 @@ fn deliver(l: &Ledger, t: &Trigger, fields: &Value, chain: &[String]) -> Result<
             }
         }
         "hibernated" if agent.restorable => {
-            if let Some(why) = crate::hibernate::exhausted(&agent) {
+            if let Some(why) = crate::hibernate::would_refuse(l, &agent)? {
                 bail!("agent {} can't be woken: {why}", agent.id);
             }
             // A wake on its own queues a short turn too: the woken run carries the trigger's
@@ -1131,6 +1174,10 @@ mod tests {
         assert_eq!(schedule_minutes(&cron("*/15 * * * *"), &london, a, b).len(), 8);
         let (a, b) = (utc("2026-03-29T00:00:00Z") - 1, utc("2026-03-29T01:00:00Z"));
         assert_eq!(schedule_minutes(&cron("*/15 * * * *"), &london, a, b).len(), 5);
+        // `0 1-3` on March's day: 01:00 is skipped, so the 02:00 BST firing stands for two times.
+        let (a, b) = day("2026-03-29");
+        let slots = schedule_slots(&cron("0 1-3 * * *"), &london, a, b);
+        assert_eq!(slots, [(utc("2026-03-29T01:00:00Z"), 2), (utc("2026-03-29T02:00:00Z"), 1)]);
         // UTC has no changes: nothing moves.
         let (a, b) = day("2026-03-29");
         assert_eq!(schedule_minutes(&cron("30 1 * * *"), &jiff::tz::TimeZone::UTC, a, b), [utc("2026-03-29T01:30:00Z")]);
@@ -1144,7 +1191,7 @@ mod tests {
         Operator { id: "spiffe://local/t/t0/op/unix/bob".into(), label: "unix:bob".into(), authority: Authority::Anything }
     }
 
-    fn anyone(_: &Trigger) -> std::result::Result<(), String> {
+    fn anyone(_: &Trigger) -> std::result::Result<(), NotOwner> {
         Ok(())
     }
 
@@ -1170,7 +1217,8 @@ mod tests {
             claim_until: 0,
         })
         .unwrap();
-        assert!(l.set_agent_state(&agent, 1, "hibernated", None).unwrap());
+        // Hibernated with state to wake from, as its first hibernation leaves it.
+        assert!(l.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
         agent
     }
 
@@ -1296,7 +1344,7 @@ mod tests {
         let s = spec("trigger: t\nsource: { schedule: { cron: '* * * * *' } }\naction: { wake: captain }\n");
         let (id, _) = create(&l, &operator(), &s, None, "test").unwrap();
         let t = l.trigger(&id).unwrap().unwrap();
-        let gone = |_: &Trigger| -> std::result::Result<(), String> { Err("alex is no longer in wicket-operators".into()) };
+        let gone = |_: &Trigger| -> std::result::Result<(), NotOwner> { Err(NotOwner::No("alex is no longer in wicket-operators".into())) };
         let got = pass(&l, next_minute(t.created_at), false, &no_wake, &gone).unwrap();
         assert_eq!(got[0].status, "paused", "{got:?}");
         assert!(got[0].detail.contains("no longer in wicket-operators"));
@@ -1311,9 +1359,9 @@ mod tests {
         // operators.yaml's part: an operator of another tenant isn't one.
         let mut foreign = l.trigger(&id).unwrap().unwrap();
         foreign.owner = "spiffe://local/t/t9/op/unix/alex".into();
-        assert!(operator_may(&foreign).unwrap_err().contains("tenant"));
+        assert!(matches!(operator_may(&foreign), Err(NotOwner::No(why)) if why.contains("tenant")));
         foreign.owner = "spiffe://local/t/t0/z/z/a/a".into();
-        assert!(operator_may(&foreign).is_err());
+        assert!(matches!(operator_may(&foreign), Err(NotOwner::No(_))));
     }
 
     /// M4 and M5: the agent is resolved when the trigger is made: an unknown name, `self` for an
@@ -1697,10 +1745,72 @@ mod tests {
         let (id, _) = create(&l, &operator(), &s, None, "test").unwrap();
         l.audit(&TenantId::single(), None, "run.end", &json!({ "status": "ok" })).unwrap();
         l.audit(&TenantId::single(), None, "run.end", &json!({ "status": "ok" })).unwrap();
-        let gone = |_: &Trigger| -> std::result::Result<(), String> { Err("removed from wicket-operators".into()) };
+        let gone = |_: &Trigger| -> std::result::Result<(), NotOwner> { Err(NotOwner::No("removed from wicket-operators".into())) };
         let got = pass(&l, wicket_store::now(), false, &no_wake, &gone).unwrap();
         assert_eq!(got.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(), ["paused"], "{got:?}");
         assert!(l.firings(&id, None).unwrap().is_empty());
+    }
+
+    /// #662 follow-ups: an owner check that can't be made (the user database didn't answer)
+    /// skips the firing and leaves the trigger active, so it fires once the check works; renewing
+    /// doesn't move the minute a schedule fires after; a wake `wicket wake` would refuse (no state
+    /// to wake from) is a failure, not a start.
+    #[test]
+    fn owner_lookups_renewals_and_refused_wakes() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        let s = spec("trigger: t\nsource: { schedule: { cron: '* * * * *' } }\naction: { wake: captain }\n");
+        let (id, _) = create(&l, &operator(), &s, None, "test").unwrap();
+        let t = l.trigger(&id).unwrap().unwrap();
+        let at = next_minute(t.created_at);
+        let nss = |_: &Trigger| -> std::result::Result<(), NotOwner> { Err(NotOwner::Unknown("looking up user alex: timed out".into())) };
+        let got = pass(&l, at, false, &no_wake, &nss).unwrap();
+        assert_eq!((got[0].status.as_str(), l.trigger(&id).unwrap().unwrap().status.as_str()), ("skipped", "active"), "{got:?}");
+        assert!(kinds(&l).contains(&"trigger.skipped".into()));
+        assert_eq!(pass(&l, at, false, &no_wake, &anyone).unwrap()[0].status, "started", "the same minute, once the check works");
+        let before = l.trigger(&id).unwrap().unwrap().updated_at;
+        renew(&l, &operator(), false, &id, Some(at + 86400)).unwrap();
+        assert_eq!(l.trigger(&id).unwrap().unwrap().updated_at, before, "a renewal isn't a change of state");
+        // An agent marked hibernated with no state to wake from: wicket wake would refuse it.
+        let empty = wicket_store::new_agent_id();
+        l.create_agent(&wicket_store::NewAgent {
+            id: &empty,
+            tenant: "t0",
+            zone: "rel",
+            name: "empty",
+            run: "run_e",
+            session_id: "s",
+            manifest: "m",
+            image: "i",
+            workspace: None,
+            claim_until: 0,
+        })
+        .unwrap();
+        assert!(l.set_agent_state(&empty, 1, "hibernated", None).unwrap());
+        let (e, _) =
+            create(&l, &operator(), &spec("trigger: e\nsource: { schedule: { cron: '* * * * *' } }\naction: { wake: empty }\n"), None, "t")
+                .unwrap();
+        let got = pass(&l, at + 60, false, &no_wake, &anyone).unwrap();
+        let f = got.iter().find(|f| f.trigger == e).unwrap();
+        assert_eq!(f.status, "failed", "{got:?}");
+        assert!(f.detail.contains("never hibernated"), "{f:?}");
+    }
+
+    /// A done timer replaced by a new one of its name is recorded as deleted; a done timer isn't
+    /// renewed.
+    #[test]
+    fn a_done_timer_is_replaced_on_the_record() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        let s = spec("trigger: later\nsource: { timer: { after: 1h } }\naction: { wake: captain }\n");
+        let (id, _) = create(&l, &operator(), &s, None, "t").unwrap();
+        let t = l.trigger(&id).unwrap().unwrap();
+        pass(&l, t.created_at + 3700, false, &no_wake, &anyone).unwrap();
+        assert_eq!(l.trigger(&id).unwrap().unwrap().status, "done");
+        assert!(renew(&l, &operator(), false, &id, None).unwrap_err().to_string().contains("done"));
+        create(&l, &operator(), &s, None, "t").unwrap();
+        let rec = l.audit_tail(5).unwrap().into_iter().find(|r| r.2 == "trigger.deleted").expect("recorded");
+        assert!(rec.4.contains(&id) && rec.4.contains("replaced"), "{}", rec.4);
     }
 
     /// Sources and limits this version doesn't fire or enforce are refused, not kept silently.

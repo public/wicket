@@ -40,7 +40,9 @@ limits: { per_hour: 6 }            # the default; at most 60
 - **The action.** `wake` wakes a hibernated agent. With a `message` beside it, the message is the
   woken agent's next turn (leave `message.to` out). A `message` on its own goes to the agent whose
   principal is in `to` (`spiffe://…`). The agent reads it as its next turn, and a hibernated agent
-  is woken to read it.
+  is woken to read it. A `to` is found again at each firing: whichever live agent holds that
+  principal then (the newest, if several do). A `wake` stays pinned to the agent found when you
+  made the trigger.
 - **The agent is found when you create the trigger.** It must be a live agent of this
   installation (not ended). A name must be the only live agent of that name; otherwise use its id
   (`wicket agents`). `wake` is kept as the agent's id, so another agent given the same name later
@@ -113,8 +115,11 @@ wicket trigger renew morning-triage --lasts 30d           # 30 more days from no
 A trigger you make fires with your authority, so it asks no one. It is audited
 (`trigger.created`, with the agent it reaches). Before every firing wicket checks again that you
 may still have it fire. It checks `operators.yaml` and, on a host with wicketd, its policy's run
-class for your unix user. If you can't, the trigger is paused, with the reason audited. One owner
-may keep at most 100 triggers.
+class for your unix user. If you can't, the trigger is paused, with the reason audited. If wicket
+can't tell (the user database doesn't answer, or a policy file doesn't read), that firing is
+skipped and audited, and the trigger stays active for the next pass. One owner may keep at most
+100 live triggers (done timers aren't counted). Renewing a trigger changes only when it lapses,
+not which minutes it fires for.
 
 ## See what it would do
 
