@@ -41,6 +41,11 @@ pub const ALL_BURST: f64 = 100.0;
 /// before anything else is looked at.
 pub const FAILURES_PER_MIN: f64 = 30.0;
 pub const FAILURES_BURST: f64 = 10.0;
+/// One address's bodies to one trigger that were too slow, found no room, or didn't verify: past
+/// this burst (refilled at this rate) its next requests to that trigger are 429 before any of the
+/// body is read, so a leaked URL can't keep the trigger's body share full (#714 fifth review).
+pub const SLOW_PER_MIN: f64 = 2.0;
+pub const SLOW_BURST: f64 = 4.0;
 /// The most addresses whose failures are remembered (oldest forgotten first).
 const FAILURE_ADDRESSES: usize = 4096;
 
@@ -73,6 +78,12 @@ impl Bucket {
         let dt = now.saturating_duration_since(self.at).as_secs_f64();
         self.tokens = (self.tokens + dt * per_min / 60.0).min(burst);
         self.at = now;
+    }
+
+    /// Whether a token is left, taking none.
+    fn left(&mut self, per_min: f64, burst: f64, now: Instant) -> bool {
+        self.fill(per_min, burst, now);
+        self.tokens >= 1.0
     }
 
     fn take(&mut self, per_min: f64, burst: f64, now: Instant) -> bool {
@@ -124,6 +135,8 @@ pub struct Intake {
     failures: Mutex<HashMap<String, Bucket>>,
     /// Bad signatures, by trigger: they never slow down another address's delivery.
     bad_signatures: Mutex<HashMap<String, Bucket>>,
+    /// Bodies too slow, without room, or unverified, by trigger and address (`slow_key`).
+    slow: Mutex<HashMap<String, Bucket>>,
     /// Deliveries handed to the node, by (trigger, body hash) and (trigger, delivery id).
     seen: Mutex<HashMap<(String, String), Instant>>,
     refused: Mutex<IntakeRefused>,
@@ -141,12 +154,18 @@ impl Default for Intake {
             all: Mutex::new(Bucket::full(ALL_BURST, Instant::now())),
             failures: Default::default(),
             bad_signatures: Default::default(),
+            slow: Default::default(),
             seen: Default::default(),
             refused: Default::default(),
             bodies: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET_KIB)),
             shares: Default::default(),
         }
     }
+}
+
+/// A trigger and a client address (an IPv6 address by its /64), as `slow` is keyed.
+fn slow_key(trigger: &str, ip: IpAddr) -> String {
+    format!("{trigger} {}", crate::serve::limits::ip_key(ip))
 }
 
 /// Takes a token from `key`'s failure bucket in `m` (bounded: the oldest forgotten first), and
@@ -166,6 +185,7 @@ impl Intake {
         let served: Vec<String> = t.iter().map(|x| x.trigger.clone()).collect();
         self.buckets.lock().expect("buckets").retain(|k, _| served.contains(k));
         self.bad_signatures.lock().expect("bad").retain(|k, _| served.contains(k));
+        self.slow.lock().expect("slow").retain(|k, _| served.iter().any(|t| k.starts_with(&format!("{t} "))));
         *self.table.write().expect("table") = t;
         self.ready.store(ready, std::sync::atomic::Ordering::Relaxed);
     }
@@ -235,6 +255,25 @@ impl Intake {
         m.insert(a, at);
         m.insert(b, at);
         false
+    }
+
+    /// Whether address `ip` may send `trigger` a body: not if too many of its bodies to it lately
+    /// were too slow, found no room, or didn't verify.
+    pub fn may_send(&self, trigger: &str, ip: IpAddr, at: Instant) -> bool {
+        let mut m = self.slow.lock().expect("slow");
+        m.get_mut(&slow_key(trigger, ip)).is_none_or(|b| b.left(SLOW_PER_MIN, SLOW_BURST, at))
+    }
+
+    /// Charges a body that was too slow, found no room, or didn't verify to its address and trigger.
+    pub fn charge_slow(&self, trigger: &str, ip: IpAddr, at: Instant) {
+        let mut m = self.slow.lock().expect("slow");
+        let key = slow_key(trigger, ip);
+        if m.len() >= FAILURE_ADDRESSES && !m.contains_key(&key) {
+            if let Some(oldest) = m.iter().min_by_key(|(_, b)| b.at).map(|(k, _)| k.clone()) {
+                m.remove(&oldest);
+            }
+        }
+        m.entry(key).or_insert_with(|| Bucket::full(SLOW_BURST, at)).take(SLOW_PER_MIN, SLOW_BURST, at);
     }
 
     /// Gives back a reservation.
@@ -558,6 +597,12 @@ async fn handle(
         Err(Outcome::Answer(code, word)) => return Ok(answer(code, word)),
         Err(Outcome::Spool(_)) => unreachable!("admit spools nothing"),
     };
+    // An address whose bodies to this trigger keep timing out, finding no room or failing to verify
+    // is refused before its body is read (#714 fifth review).
+    if !i.may_send(&t.trigger, ip, at) {
+        i.refused.lock().expect("refused").rate += 1;
+        return Ok(answer(StatusCode::TOO_MANY_REQUESTS, "slow down"));
+    }
     let too_big = req
         .headers()
         .get(hyper::header::CONTENT_LENGTH)
@@ -574,25 +619,34 @@ async fn handle(
     // review, R1). A body that times out is its trigger's and its address's failure.
     let headers = req.headers().clone();
     let read = tokio::time::timeout(body_timeout, read_body(&i, &t.trigger, ip, req.into_body())).await;
-    let body = match read {
+    // The body's room is held until it is answered: it stays in memory through verify and the
+    // hand-over.
+    let (body, _room) = match read {
         Ok(Ok(b)) => b,
         Ok(Err(BodyError::TooLarge)) => {
             i.refused.lock().expect("refused").other += 1;
             return Ok(answer(StatusCode::PAYLOAD_TOO_LARGE, "too large"));
         }
-        Ok(Err(BodyError::Busy)) => return Ok(answer(StatusCode::SERVICE_UNAVAILABLE, "busy")),
+        Ok(Err(BodyError::Busy)) => {
+            i.refused.lock().expect("refused").other += 1;
+            i.charge_slow(&t.trigger, ip, at);
+            return Ok(answer(StatusCode::SERVICE_UNAVAILABLE, "busy"));
+        }
         Ok(Err(BodyError::Broken)) | Err(_) => {
             i.refused.lock().expect("refused").other += 1;
-            let key = crate::serve::limits::ip_key(ip);
-            charge(&mut i.failures.lock().expect("failures"), &key, at);
-            charge(&mut i.bad_signatures.lock().expect("bad"), &t.trigger, at);
+            i.charge_slow(&t.trigger, ip, at);
             return Ok(answer(StatusCode::REQUEST_TIMEOUT, "too slow"));
         }
     };
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(String::from);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     Ok(match i.verify(&t, &header, &body, now, at) {
-        Outcome::Answer(code, word) => answer(code, word),
+        Outcome::Answer(code, word) => {
+            if code == StatusCode::UNAUTHORIZED {
+                i.charge_slow(&t.trigger, ip, at);
+            }
+            answer(code, word)
+        }
         Outcome::Spool(e) => {
             // Reserved at verify, so concurrent replays don't each charge the bucket (#714 fourth
             // review, R2); given back unless the node takes it.
@@ -669,7 +723,12 @@ impl Drop for Room<'_> {
 }
 
 /// Reads a request's body, at most [`ik::MAX_BODY`], taking room in the budget as it arrives.
-async fn read_body(i: &Intake, trigger: &str, ip: IpAddr, mut body: hyper::body::Incoming) -> std::result::Result<Vec<u8>, BodyError> {
+async fn read_body<'a>(
+    i: &'a Intake,
+    trigger: &str,
+    ip: IpAddr,
+    mut body: hyper::body::Incoming,
+) -> std::result::Result<(Vec<u8>, Room<'a>), BodyError> {
     let mut room =
         Room { i, trigger: format!("t:{trigger}"), address: format!("a:{}", crate::serve::limits::ip_key(ip)), kib: 0, permits: vec![] };
     let mut out: Vec<u8> = Vec::new();
@@ -685,7 +744,7 @@ async fn read_body(i: &Intake, trigger: &str, ip: IpAddr, mut body: hyper::body:
         }
         out.extend_from_slice(&data);
     }
-    Ok(out)
+    Ok((out, room))
 }
 
 /// Checks `wicket node intake`'s arguments: a certificate needs its key.

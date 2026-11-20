@@ -126,6 +126,39 @@ fn concurrent_copies_spool_once() {
     assert_eq!(spooled, 1);
 }
 
+/// #714 fifth review: one trigger's full share doesn't stop another trigger's body (from another
+/// address); a second address to the full trigger is refused.
+#[tokio::test]
+async fn one_triggers_full_share_leaves_the_others_room() {
+    let i = Intake::default();
+    let room = |t: &str, a: &str| super::Room { i: &i, trigger: format!("t:{t}"), address: format!("a:{a}"), kib: 0, permits: vec![] };
+    let mut full = room("trg_1", "1.2.3.4");
+    assert!(full.grow(super::BODY_SHARE_KIB as u32).await);
+    let mut other = room("trg_2", "5.6.7.8");
+    assert!(other.grow(1024).await, "another trigger gets through");
+    let mut more = room("trg_1", "5.6.7.8");
+    assert!(!more.grow(1).await, "the full trigger's share");
+    drop(full);
+    assert!(more.grow(1).await, "given back when dropped");
+}
+
+/// #714 fifth review: an address whose bodies to a trigger keep failing is refused before its body
+/// is read, for that trigger only; others' addresses and triggers aren't.
+#[test]
+fn a_slow_address_is_refused_before_its_body() {
+    let i = Intake::default();
+    let (a, b): (std::net::IpAddr, std::net::IpAddr) = ("1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap());
+    let at = Instant::now();
+    for _ in 0..super::SLOW_BURST as usize {
+        assert!(i.may_send("trg_1", a, at));
+        i.charge_slow("trg_1", a, at);
+    }
+    assert!(!i.may_send("trg_1", a, at));
+    assert!(i.may_send("trg_2", a, at), "another trigger");
+    assert!(i.may_send("trg_1", b, at), "another address");
+    assert!(i.may_send("trg_1", a, at + Duration::from_secs(31)), "refilled");
+}
+
 /// GitHub: its own signature header; events and repositories it doesn't listen to are 202 and
 /// dropped; repository names ignore case; the fields are the normalised ones.
 #[test]
@@ -501,7 +534,9 @@ async fn the_server_is_bounded() {
     ninth.write_all(&chunk[..64 * 1024]).await.unwrap();
     let mut out = String::new();
     let _ = tokio::time::timeout(Duration::from_secs(5), ninth.read_to_string(&mut out)).await;
-    assert!(out.starts_with("HTTP/1.1 503"), "past the address's share: {out}");
+    // 503 past the share; or 429 before the body, since the dropped half-sent bodies above were
+    // charged to this address (#714 fifth review).
+    assert!(out.starts_with("HTTP/1.1 503") || out.starts_with("HTTP/1.1 429"), "past the address's share: {out}");
     drop(sending);
     let lim = crate::serve::net::Limits {
         header_timeout: Duration::from_millis(300),

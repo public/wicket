@@ -103,8 +103,14 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
      little. One trigger, and one client address, has at most 8 MiB of it; a body that would go
      past either share, or finds no room within 2 s, is answered 503. A leaked URL can't take the
      whole budget from the node's other triggers, and half-sent bodies can't exhaust intake's
-     memory (`MemoryMax=256M`). A body that doesn't arrive within the body timeout is answered
-     408 and counted as a failure of its address and of its trigger;
+     memory (`MemoryMax=256M`). A body keeps its room until it is answered. A body that
+     doesn't arrive within the body timeout is answered 408.
+     - An address whose bodies to a trigger keep being 408, 503 (no room) or 401 (4 at once,
+       then 2 a minute) gets 429 for its next requests to that trigger before any of the body is
+       read. Other addresses, and its requests to other triggers, aren't slowed down.
+     - **A leaked URL can still degrade its own trigger:** from many addresses, slow bodies can keep
+       its share full, so its real deliveries get 503. The node's other triggers keep their room.
+       The remedy is `wicket trigger rotate-url`, which shuts out the old URL;
   3. the signature (401 otherwise; bad signatures are counted by trigger, and past 30 a minute
      answered 429, without slowing down a signed delivery):
      - GitHub's `X-Hub-Signature-256: sha256=<hex>`, the HMAC-SHA256 of the raw body under the
