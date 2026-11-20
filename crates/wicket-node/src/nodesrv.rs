@@ -1492,6 +1492,11 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     // What an image reference is comes from the node's cache while no image has changed since it
     // was inspected (#287); the pin is checked against it all the same.
     checks.end();
+    // Held from here until the box is live (`wire`), so no image sweep removes it meanwhile (#191).
+    let _image_held = match &bs.image_pin {
+        Some(pin) => Some(imagegc::hold(&node.paths.root, pin, (node.clock)()).await),
+        None => None,
+    };
     let ident = match &bs.image_pin {
         Some(pin) => {
             let by_ref = docker.image_identity_cached(&node.idents, &bs.image).await?.filter(|i| i.is(pin));
@@ -1499,10 +1504,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
                 Some(i) => Some(i),
                 None => docker.image_identity_cached(&node.idents, pin).await?.filter(|i| i.is(pin)),
             };
-            let i = by_digest.with_context(|| format!("image {} (pinned to {pin}) is not on node {}", bs.image, node.name))?;
-            // Started from: an image this node imported is kept for another while (#191).
-            imagegc::used(&node.paths.root, pin, (node.clock)());
-            i
+            by_digest.with_context(|| format!("image {} (pinned to {pin}) is not on node {}", bs.image, node.name))?
         }
         None => docker
             .image_identity_cached(&node.idents, &bs.image)

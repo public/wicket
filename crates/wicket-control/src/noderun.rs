@@ -1085,7 +1085,8 @@ fn want_ca_hosts(sh: &Shared) -> Vec<String> {
 
 /// Makes sure node `node` has image `pin` (#191): if it hasn't, this host's runtime exports it as an
 /// OCI image layout, and the node verifies it against the pin before importing it. If this host
-/// hasn't it either, nothing is sent, and the node refuses the box as before.
+/// hasn't it either, it fails saying so: the image can't reach the node (it may have removed it
+/// once unused, #191).
 ///
 /// With `pull` (the image's registry is allowed in `images.yaml`), the node pulls it from there
 /// itself first, host-side; if that fails, this host sends it if it can.
@@ -1123,8 +1124,11 @@ pub async fn deliver_image(
                 e.context(format!("pulling it from {}, and this host hasn't it to send", pull.map(|p| p.host.as_str()).unwrap_or("")))
             );
         }
-        say!("[wicket] node {node} hasn't image {pin}, and this host hasn't it to send");
-        return Ok(());
+        // Not here either (a node may have removed an image it was given once unused, #191): said
+        // plainly, rather than the node's refusal later.
+        bail!(
+            "node {node} hasn't image {image} ({pin}), and this host hasn't it to send: load it here (docker pull {image}), or list its registry in images.yaml so the node pulls it"
+        );
     }
     say!("[wicket] sending image {image} ({pin}) to node {node}");
     let t0 = std::time::Instant::now();

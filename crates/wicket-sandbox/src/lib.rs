@@ -870,12 +870,15 @@ impl Docker {
         }
         let out = self.command_with(["image".to_string(), "rm".into(), "--".into(), image.into()]).stdin(Stdio::null()).output().await?;
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let lower = err.to_ascii_lowercase();
         Ok(if out.status.success() {
             ImageRemoval::Removed
-        } else if err.to_ascii_lowercase().contains("no such image") {
+        } else if lower.contains("no such image") {
             ImageRemoval::Absent
-        } else {
+        } else if ["conflict", "being used", "must be forced", "referenced in multiple"].iter().any(|w| lower.contains(w)) {
             ImageRemoval::Kept(err)
+        } else {
+            bail!("docker image rm {image}: {err}")
         })
     }
 
