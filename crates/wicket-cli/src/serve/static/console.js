@@ -8,6 +8,8 @@ const strip = s => String(s ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u061c\u2
 // local wall-clock time ("19:20", "Wed 19:20", "21 Nov 19:20") and the exact UTC value as a tooltip.
 // Counted from the server's clock (`skewSecs`, from each poll), so a phone's wrong clock doesn't matter.
 let skewSecs = 0;
+// The last state polled: the authority view reads the standing rules and runs from it.
+let lastState = null;
 const nowSecs = () => Date.now() / 1000 + skewSecs;
 const plural = (n, one, many) => n + " " + (n === 1 ? one : (many || one + "s"));
 function rel(t, now) {
@@ -321,7 +323,8 @@ const act = (kind, body) => {
 
 // The requesting agent's identity, verified by the console against wicket's issuer. Approve is
 // disabled when an agent's identity does not verify: you can't approve without knowing who for.
-function renderAgent(c, id) {
+// `more`, if given, takes the on-behalf-of chain: on a request card it sits under Details.
+function renderAgent(c, id, more) {
   const w = el("div", "agent");
   if (id.verified) {
     // The agent by name; its full identity behind a tap (#574, item 5).
@@ -339,7 +342,7 @@ function renderAgent(c, id) {
       layoutAt = performance.now();
     };
     w.append(el("span", "ok", "✓ "), name, document.createTextNode(" · zone " + strip(id.zone)));
-    w.append(el("div", "chain", "On behalf of: " + (id.acting_for || []).map(strip).join(" → ")));
+    (more || w).append(el("div", "chain", "On behalf of: " + (id.acting_for || []).map(strip).join(" → ")));
     w.append(idline);
     c.append(w); return true;
   }
@@ -372,41 +375,89 @@ function renderWho(list) {
 }
 const r0 = rs => rs[0];
 
+// What a request asks for, in words (#621): an HTTP request as its method and URL; wicket's own kinds
+// (on wicket.internal) as a sentence, with the raw op on a small line under it. A capacity lease's
+// terms are in the reason wicket wrote for it ("capacity lease <id>: <terms>. Asked by the agent: <why>").
+// A long id in a sentence: its head and tail (the whole op is on the raw line under Details).
+const shortText = id => id.length > 18 ? id.slice(0, 10) + "\u2026" + id.slice(-6) : id;
+function asks(p) {
+  const raw = strip(p.method + " " + p.host + p.path);
+  if (p.host !== "wicket.internal") return { what: raw + (p.scope_prefix ? "\u2026  (every path under it)" : ""), raw: "", why: strip(p.reason), internal: false };
+  const seg = String(p.path || "").split("/").filter(Boolean).map(strip);
+  let what = raw, why = strip(p.reason);
+  if (p.method === "CAPACITY") {
+    const m = /^capacity lease ([^:]+): ([\s\S]*?)\. Asked by the agent: ([\s\S]*)$/.exec(String(p.reason || ""));
+    what = m ? "Lease a node: " + strip(m[2]) : "Lease a node (" + seg.slice(1).join("/") + ")";
+    if (m) why = strip(m[3]);
+  } else if (p.method === "SPAWN" && seg[0] === "zones") what = "Start a child agent" + (seg[2] ? " named " + seg[2] : "") + " in zone " + seg[1];
+  else if (p.method === "LINK" && seg[0] === "links") what = "Link " + shortText(seg[1]) + " \u2192 " + shortText(seg[2]) + (seg[3] ? ", port " + seg[3] : "");
+  else if (p.method === "UPDATE" && seg[0] === "self") what = "Install wicket build " + String(seg[1] || "").slice(0, 12) + "\u2026";
+  return { what, raw, why, internal: true };
+}
+
 // Pending cards are kept by request id: a card whose content hasn't changed is the same element
 // from one poll to the next, so its buttons don't move or get replaced under the cursor. When the
 // cards do move, `layoutAt` is set and taps are ignored for a moment.
 const cards = new Map();
+// A long id shortened in the middle, its head and tail kept (#574 review): what is copied is the
+// whole id, and the whole id is its title.
+function idEl(id) {
+  id = strip(id);
+  const e = el("span", "id-short");
+  e.title = id;
+  if (id.length <= 18) { e.textContent = id; return e; }
+  e.append(el("span", "id-head", id.slice(0, -6)), el("span", "id-tail", id.slice(-6)));
+  return e;
+}
+// A URL broken only after its slashes and dots, so it wraps at a segment, not mid-word.
+function wrapped(cls, text) {
+  const e = el("div", cls);
+  for (const part of String(text).split(/(?<=[/.?&])/)) { e.append(document.createTextNode(part)); e.append(el("wbr")); }
+  return e;
+}
+function fillMeta(meta, p) { meta.replaceChildren(document.createTextNode(p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 run "), idEl(p.run)); }
 function pendingCard(s, p) {
   const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run]);
   const had = cards.get(p.id);
-  if (had && had.key === key) { had.meta.textContent = p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 " + strip(p.run) + " \u00b7 " + ago(s.now, p.created_at); return had.node; }
+  if (had && had.key === key) { had.age.textContent = rel(p.created_at, s.now); return had.node; }
+  // It leads with what is asked, who asks, the risk and the decision (#574 review); the rest (on
+  // whose behalf, who in the box asked, the ids, how a push is granted) is under Details.
   const c = el("div", "card req"); c.dataset.id = p.id;
-  const head = el("div"); head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)));
-  c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path) + (p.scope_prefix ? "\u2026  (every path under it)" : "")));
-  c.append(el("div", "why", strip(p.reason)));
-  const idOk = renderAgent(c, p.identity || {});
-  c.append(renderWho(p.attribution || []));
-  const meta = el("div", "meta", p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 " + strip(p.run) + " \u00b7 " + ago(s.now, p.created_at));
-  c.append(meta);
+  const head = el("div", "req-head");
+  const age = timeEl(p.created_at, rel(p.created_at, s.now)); age.className = "age";
+  head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)), age);
+  const a = asks(p);
+  c.append(head, a.internal ? el("div", "what said", a.what) : wrapped("what", a.what));
+  c.append(el("div", "why", a.why));
+  const more = el("details", "more req-more");
+  more.append(el("summary", "", "Details"));
+  const idOk = renderAgent(c, p.identity || {}, more);
+  if (a.raw) more.append(el("div", "mono quiet raw", a.raw));
+  more.append(renderWho(p.attribution || []));
+  const meta = el("div", "meta");
+  fillMeta(meta, p);
+  more.append(meta);
   const b = el("div", "buttons");
   // The first button's words are the server's terms for it (`once_terms`): a git push is granted
   // as a window whatever is picked, and the card mustn't say otherwise.
   const ot = p.once_terms || { uses: 1, ttl_secs: 600 };
   const window_ = ot.uses !== 1;
+  // wicket's own kinds are one decision each: their lifetime means nothing to the operator (#621).
   const onceLabel = window_ ? "Approve this push (any number of uses for " + span(ot.ttl_secs) + ")"
-    : p.scope_prefix ? "Approve prefix once (expires in 10 min)" : "Approve once (expires in 10 min)";
+    : a.internal ? "Approve" : p.scope_prefix ? "Approve prefix once (expires in 10 min)" : "Approve once (expires in 10 min)";
   const once = el("button", "approve", onceLabel); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
   const hour = el("button", "", p.scope_prefix ? "Approve prefix for 1 hour (any number of uses)" : "Approve for 1 hour (any number of uses)"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
   const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
   if (!idOk) { once.disabled = true; hour.disabled = true; }
   // A push to a host that isn't github.com can be R2, but it is still granted as the window: no
   // hour button, which would promise what the grant doesn't give (#597 re-review).
-  if (window_ || p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
+  if (a.internal) b.append(once, deny);
+  else if (window_ || p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") {
     b.append(once, deny);
-    c.append(el("div", "meta", window_ ? "A push is approved as one window: any number of uses for " + span(ot.ttl_secs) + ", for its ref discovery and upload." : "R3 and R4 are approved one use at a time."));
+    more.append(el("div", "note", window_ ? "A push is approved as one window: any number of uses for " + span(ot.ttl_secs) + ", for its ref discovery and upload." : "R3 and R4 are approved one use at a time."));
   } else b.append(once, hour, deny);
-  c.append(b);
-  cards.set(p.id, { key, node: c, meta });
+  c.append(b, more);
+  cards.set(p.id, { key, node: c, meta, age });
   return c;
 }
 
@@ -428,6 +479,7 @@ function renderCounts(waiting, alerts) {
 }
 
 function renderPending(s) {
+  pendingLoaded = true;
   const box = document.getElementById("pending");
   const live = new Set(s.pending.map(p => p.id));
   for (const id of [...cards.keys()]) if (!live.has(id)) cards.delete(id);
@@ -639,12 +691,33 @@ function capacityRow(g) {
   const b = el("div", "buttons");
   const renew = el("button", "approve", "Renew");
   renew.onclick = () => signed({ action: "capacity_renew", id: g.id, ttl_secs: capacityTtl() });
-  const revoke = el("button", "deny", "Revoke");
-  revoke.onclick = async () => { try { toast((await post("/api/capacity/revoke", { id: g.id })).ok); } catch (e) { toastError(e); } refresh(); };
+  const revoke = revokeButton(b, "Revoke capacity grant " + strip(g.id) + "? Nothing more is approved under it, from now.", async () => {
+    try { toast((await post("/api/capacity/revoke", { id: g.id })).ok); } catch (e) { toastError(e); }
+    refresh();
+  });
   b.append(renew, revoke);
   d.append(head, what, used, rest, ends, b);
   return d;
 }
+// Revoke on a capacity grant or a standing rule (#640): unsigned, since it only narrows, but asked in
+// the page first, and set apart from Renew. The question replaces the row's buttons until answered.
+function revokeButton(box, question, go) {
+  const revoke = el("button", "deny apart", "Revoke\u2026");
+  revoke.onclick = () => {
+    if (!settled()) { toast("The list just changed: check the row and tap again."); return; }
+    const keep = [...box.children];
+    const q = el("div", "callout warn ask", question);
+    const yes = el("button", "deny", "Revoke");
+    const no = el("button", "", "Cancel");
+    // The question moved the row: a second tap of a double tap mustn't land on its Revoke.
+    yes.onclick = async () => { if (!settled()) return; yes.disabled = true; await go(); };
+    no.onclick = () => { box.replaceChildren(...keep); };
+    box.replaceChildren(q, yes, no);
+    layoutAt = performance.now();
+  };
+  return revoke;
+}
+
 // Standing reach (#572). A rule as a manifest would carry it.
 function ruleText(r) {
   r = r || {};
@@ -701,12 +774,10 @@ function standingRuleRow(r) {
   const renew = el("button", "approve", "Renew (30 days)");
   renew.onclick = () => signedSettled({ action: "standing_renew", id: r.id });
   renew.disabled = !r.live;
-  const revoke = el("button", "deny", "Revoke");
-  revoke.onclick = async () => {
-    if (!settled()) { toast("The list just changed: check the row and tap again."); return; }
-    try { toast((await post("/api/standing/revoke", { id: r.id })).ok); } catch (e) { toast(e.message); }
+  const revoke = revokeButton(b, "Revoke standing reach " + strip(r.id) + "? Runs it allows lose it at once.", async () => {
+    try { toast((await post("/api/standing/revoke", { id: r.id })).ok); } catch (e) { toastError(e); }
     refresh();
-  };
+  });
   b.append(renew, revoke);
   d.append(head, el("div", "meta", "for " + to + " · " + until + " · by " + strip(r.decided_by)), b);
   return d;
@@ -756,7 +827,7 @@ function renderRun(s, x) {
   const meta = el("div", "meta");
   meta.append(timeEl(x.started_at, "started " + rel(x.started_at, s.now)));
   if (x.ended_at) meta.append(document.createTextNode(" \u00b7 "), timeEl(x.ended_at, "ended " + rel(x.ended_at, s.now)));
-  meta.append(document.createTextNode(" \u00b7 "), el("span", "mono quiet", strip(x.id)));
+  meta.append(document.createTextNode(" \u00b7 "), idEl(x.id));
   left.append(meta);
   const links = el("div", "links");
   // An ACP run's live session (#327): its own page, opened with a passkey there.
@@ -969,11 +1040,19 @@ function openNotifications() {
 }
 // Opened from a notification: scroll to the pending list and mark the request (if still waiting).
 let openId = "";
+// The card itself is scrolled to, clear of the sticky header (#644); a request no longer waiting
+// (decided on another device, or expired) is said to be, with where to look.
+let pendingLoaded = false;
 function openPending(id) {
   openId = id || "";
-  const box = document.getElementById("pending");
-  if (box && box.scrollIntoView) box.scrollIntoView();
   for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
+  const card = openId && cards.get(openId);
+  const target = card ? card.node : document.getElementById("waiting") || document.getElementById("pending");
+  if (target && target.scrollIntoView) target.scrollIntoView({ block: "start" });
+  if (openId && !card && pendingLoaded) {
+    toast(strip(openId) + " is no longer waiting: it was decided or expired. Recent decisions, under Runs, has it.", false, true);
+    openId = "";
+  }
 }
 function fromHash() {
   const h = (typeof location !== "undefined" && location.hash) || "";
@@ -1005,7 +1084,8 @@ async function boot() {
   const auth = document.getElementById("auth"), con = document.getElementById("console");
   auth.replaceChildren();
   const nav = document.getElementById("nav");
-  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; if (nav) nav.hidden = false; await refresh(); fromHash(); renderPush(); return; }
+  if (me.who.state === "operator") { sessionEnded = false; auth.hidden = true; con.hidden = false; if (nav) nav.hidden = false; await refresh(); fromHash(); renderPush(); return; }
+  if (sessionEnded) auth.append(el("div", "callout warn", "Your console session ended. Sign in again."));
   con.hidden = true; auth.hidden = false;
   if (nav) nav.hidden = true;
   document.getElementById("tenant").textContent = "";
@@ -1043,38 +1123,77 @@ const kv = (k, v) => { const d = el("div", "row"); d.append(el("span", "meta", k
 const when = t => at(t);
 const whenMs = ms => ms ? at(ms / 1000) : "\u2014";
 
+// A run's authority (#651): what it can reach first (its zone's rules, its live grants, the standing
+// rules that apply to it, each with when it ends), then what its node holds, and the token's
+// internals (blocks, every grant, the zone's Cedar) folded under Details. Every string is text.
+const methodsText = m => (m || []).map(strip).join(", ") || "GET, HEAD";
+const pathsText = p => (p || ["/**"]).map(strip).join(" ");
+function reachLine(text, end, note) {
+  const d = el("div", "reach");
+  d.append(el("div", "mono", text));
+  const m = el("div", "meta");
+  if (end !== undefined) m.append(end);
+  if (note) m.append(document.createTextNode((end !== undefined ? " \u00b7 " : "") + note));
+  if (m.children.length || m.textContent) d.append(m);
+  return d;
+}
 async function showAuthority(run) {
-  const body = openDetail("authority of " + run);
+  const body = openDetail("Authority of " + strip(run));
   try {
     const a = await getJson("/api/runs/" + encodeURIComponent(run) + "/authority");
-    const out = [];
-    out.push(kv("status", a.status + (a.revoked ? " · identity revoked by " + a.revoked.by + ": " + a.revoked.reason : "")));
-    out.push(kv("node", a.node + (a.feed ? " · its feed at epoch " + a.feed.epoch : "")));
-    out.push(kv("policy", (a.policy.version || "no org policy") + (a.policy.version ? (a.policy.current ? " (current)" : " (not the installed " + (a.policy.installed || "none") + ")") : "")));
-    if (a.deadline) out.push(kv("authority until", whenMs(a.deadline.until_ms) + (a.deadline.stopped ? " · box stopped" : "")));
-    if (a.holdings) {
-      out.push(kv("secrets on its node", a.holdings.secrets.length ? a.holdings.secrets.join(", ") + " (names only)" : "none"));
-      const s = a.holdings.slice;
-      out.push(kv("budget slice", s ? s.requests + " requests, " + s.output_tokens + " output tokens" + (s.input_tokens != null ? ", " + s.input_tokens + " input tokens" : "") : "none"));
-    }
     const t = a.token || {};
-    if (!t.held) { out.push(el("div", "note", "No token: " + strip(t.why))); body.replaceChildren(...out); return; }
-    out.push(kv("token", "box " + t.box_path + " · epoch " + t.epoch + " · zone " + t.zone + " · minted by " + t.issued_by + (t.loads === true ? " · loads" : " · does NOT load: " + (t.loads.error || ""))));
-    for (const b of t.blocks) {
-      const h = el("div", "row");
-      h.append(el("span", b.revoked ? "blocked" : "ok", "block " + b.index + " · " + b.kind + (b.revoked ? " · REVOKED" : "")),
-        el("span", "meta", "revocation " + b.revocation_fingerprint + (b.signed_by ? " · signed by " + b.signed_by : "")));
-      out.push(h, el("pre", "src", b.source));
+    const out = [];
+    const now = nowSecs();
+    // What it can reach.
+    out.push(el("h4", "", "Can reach"));
+    const reach = [];
+    for (const r of t.reach || []) reach.push(reachLine(strip(r.host) + " \u00b7 " + methodsText(r.methods) + " \u00b7 " + pathsText(r.paths), undefined,
+      "its zone's rule" + (r.allow_dangerous ? "; dangerous requests (R3, R4) too" : "")));
+    for (const g of (t.grants || []).filter(g => !g.revoked && (!g.expires_at || g.expires_at > now))) {
+      const end = el("span"); end.append(document.createTextNode("grant " + strip(g.id) + ", ends "), timeEl(g.expires_at));
+      reach.push(reachLine(strip(g.method + " " + g.host + g.path), end,
+        (g.uses == null ? "any number of uses" : plural(g.uses, "use") + " (counted on the node)") + " \u00b7 approved by " + strip(g.approved_by || "?") +
+        (g.reached_node === false ? " \u00b7 not yet on its node" : "")));
     }
-    if (t.grants.length) {
-      out.push(el("div", "meta", "grants"));
-      for (const g of t.grants) {
-        out.push(kv(g.id, g.method + " " + g.host + g.path + " · " + (g.uses == null ? "unlimited uses" : g.uses + " uses (counted on the node)") +
-          " · until " + when(g.expires_at) + " · approved by " + (g.approved_by || "?") + " at " + when(g.approved_at) +
-          (g.revoked ? " · revoked" : "") + (g.reached_node === false ? " · not yet on its node" : "")));
+    const st = (lastState && lastState.standing && lastState.standing.rules) || [];
+    const row = ((lastState && lastState.runs) || []).find(x => x.id === run) || {};
+    for (const r of st.filter(r => r.live && (r.for === "zone" ? r.zone === t.zone : row.agent && String(r.principal || "").endsWith("/z/" + row.zone + "/a/" + row.agent)))) {
+      const end = el("span"); end.append(document.createTextNode("standing reach " + strip(r.id) + ", "), r.expires_at ? timeEl(r.expires_at, "ends " + at(r.expires_at)) : document.createTextNode("until revoked"));
+      reach.push(reachLine(strip(r.rule.host) + " \u00b7 " + methodsText(r.rule.methods) + " \u00b7 " + pathsText(r.rule.paths), end, r.for === "zone" ? "for its zone" : "for this agent"));
+    }
+    if (!t.held) reach.push(el("div", "note", "No token now: " + strip(t.why)));
+    else if (!reach.length) reach.push(el("div", "empty", "Nothing beyond what its zone forbids: every request waits for a decision."));
+    out.push(...reach);
+    // The run, and what its node holds for it.
+    out.push(el("h4", "", "Run"));
+    out.push(kv("status", strip(a.status) + (a.revoked ? " \u00b7 identity revoked by " + strip(a.revoked.by) + ": " + strip(a.revoked.reason) : "")));
+    out.push(kv("node", strip(a.node) + (a.feed ? " \u00b7 its feed at epoch " + strip(a.feed.epoch) : "")));
+    out.push(kv("policy", (a.policy.version ? strip(a.policy.version) + (a.policy.current ? " (current)" : " (not the installed " + strip(a.policy.installed || "none") + ")") : "no org policy")));
+    if (a.deadline) out.push(kv("authority ends", whenMs(a.deadline.until_ms) + (a.deadline.stopped ? " \u00b7 box stopped" : "")));
+    if (a.holdings) {
+      out.push(kv("secrets on its node", a.holdings.secrets.length ? a.holdings.secrets.map(strip).join(", ") + " (names only)" : "none"));
+      const sl = a.holdings.slice;
+      out.push(kv("budget slice", sl ? num(sl.requests) + " requests, " + num(sl.output_tokens) + " output tokens" + (sl.input_tokens != null ? ", " + num(sl.input_tokens) + " input tokens" : "") : "none"));
+    }
+    if (t.held) {
+      const det = el("details", "more");
+      det.append(el("summary", "", "Details: the token, its blocks and grants, the zone's Cedar"));
+      det.append(kv("token", "box " + strip(t.box_path) + " \u00b7 epoch " + strip(t.epoch) + " \u00b7 zone " + strip(t.zone) + " \u00b7 minted by " + strip(t.issued_by) +
+        (t.loads === true ? " \u00b7 loads" : " \u00b7 does NOT load: " + strip((t.loads || {}).error || ""))));
+      for (const b of t.blocks || []) {
+        const h = el("div", "row");
+        h.append(el("span", b.revoked ? "blocked" : "ok", "block " + b.index + " \u00b7 " + strip(b.kind) + (b.revoked ? " \u00b7 REVOKED" : "")),
+          el("span", "meta", "revocation " + strip(b.revocation_fingerprint) + (b.signed_by ? " \u00b7 signed by " + strip(b.signed_by) : "")));
+        det.append(h, el("pre", "src", b.source));
       }
+      for (const g of t.grants || []) {
+        det.append(kv(g.id, g.method + " " + g.host + g.path + " \u00b7 " + (g.uses == null ? "unlimited uses" : g.uses + " uses (counted on the node)") +
+          " \u00b7 ends " + when(g.expires_at) + " \u00b7 approved by " + (g.approved_by || "?") + " at " + when(g.approved_at) +
+          (g.revoked ? " \u00b7 revoked" : "") + (g.reached_node === false ? " \u00b7 not yet on its node" : "")));
+      }
+      if (t.zone_cedar) det.append(el("div", "meta", "zone policy (Cedar, generated from the manifest)"), el("pre", "src", t.zone_cedar));
+      out.push(det);
     }
-    if (t.zone_cedar) { out.push(el("div", "meta", "zone policy (Cedar, generated from the manifest)"), el("pre", "src", t.zone_cedar)); }
     body.replaceChildren(...out);
   } catch (e) { body.replaceChildren(el("div", "blocked", strip(e.message))); }
 }
@@ -1148,6 +1267,18 @@ function renderManifests(s) {
   box.append(add);
 }
 
+// A box's limits as words (#651): "memory 2GiB · 2 CPUs · timeout 1h", the rest after.
+function limitsText(l) {
+  if (!l || typeof l !== "object") return strip(l);
+  const parts = [];
+  if (l.memory) parts.push("memory " + strip(l.memory));
+  if (l.cpus) parts.push(plural(l.cpus, "CPU"));
+  if (l.timeout) parts.push("timeout " + strip(l.timeout));
+  if (l.authority) parts.push("authority " + strip(l.authority));
+  if (l.pids) parts.push(num(l.pids) + " processes");
+  if (l.output) parts.push("output " + strip(l.output) + (l.on_output_full ? " (then " + strip(l.on_output_full) + ")" : ""));
+  return parts.join(" \u00b7 ") || JSON.stringify(l);
+}
 function grantsView(g) {
   const out = [];
   out.push(kvRow("task", g.task || "(none)"));
@@ -1161,7 +1292,7 @@ function grantsView(g) {
   for (const i of g.inject) out.push(kvRow("inject", "secret " + i.secret + " → " + i.host + " " + i.header + (i.secret_set ? "" : " · NOT SET in the vault") + (i.bound_to_host ? "" : " · not bound to this host") + (i.optional ? " · optional" : ""), i.secret_set && i.bound_to_host ? "mono" : "pend"));
   if (g.llm) out.push(kvRow("model", g.llm.provider + " via " + g.llm.upstream + " · secret " + g.llm.secret + (g.llm.secret_set ? "" : " (NOT SET)") + " · " + g.llm.max_requests + " requests, " + g.llm.max_output_tokens + " output tokens" + (g.llm.max_input_tokens != null ? ", " + g.llm.max_input_tokens + " input tokens" : "") + (g.llm.models ? " · models: " + (g.llm.models.length ? g.llm.models.join(", ") : "none") : "")));
   for (const v of g.volumes) out.push(kvRow("volume", JSON.stringify(v)));
-  out.push(kvRow("limits", JSON.stringify(g.limits)));
+  out.push(kvRow("limits", limitsText(g.limits)));
   const o = g.org_policy;
   if (o) out.push(kvRow("org policy " + o.version, o.error ? o.error : o.mints ? "allows this zone (groups: " + (o.groups || []).join(", ") + ")" : "REFUSES it: " + o.refused, o.mints ? "ok" : "blocked"));
   return out;
@@ -1386,6 +1517,8 @@ function decidedRow(x) {
 // When the console last heard from wicket, and a line saying so while it can't (#574): what is on
 // the page is as of then, and the poll goes on.
 let lastHeard = 0;
+// A poll answered 401 or 403 after the page was signed in: the sign-in card says why it is back (#618).
+let sessionEnded = false;
 function showStale(why) {
   const b = document.getElementById("stale");
   if (!b) return;
@@ -1415,7 +1548,7 @@ async function refreshOnce() {
   if (gen !== pollGen) return;
   // Only the server saying the session is gone signs the page out; anything else is a moment's
   // trouble, said as such, and the poll carries on.
-  if (r.status === 401 || r.status === 403) { boot(); return; }
+  if (r.status === 401 || r.status === 403) { sessionEnded = true; boot(); return; }
   if (!r.ok) { showStale("HTTP " + r.status); return; }
   lastHeard = Date.now();
   showStale(null);
@@ -1423,6 +1556,7 @@ async function refreshOnce() {
     const s = await r.json();
     if (ceremony || gen !== pollGen) return; // a sheet opened, or a decision was made, while this poll was in flight
     if (typeof s.now === "number") skewSecs = s.now - Date.now() / 1000;
+    lastState = s;
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
     renderPending(s);
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
@@ -1430,7 +1564,7 @@ async function refreshOnce() {
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
     renderRows("placed", s.placed || [], placedRow, "No leased nodes.");
-    renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
+    renderKeyed("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();
     const st = s.standing || {};
     // Standing asks wait with the requests, under a heading of their own, shown only when there are some.

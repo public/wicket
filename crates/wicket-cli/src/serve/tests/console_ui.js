@@ -42,6 +42,7 @@ let state = null;
 // A hostile string an agent chose (a grant's path): it must stay text.
 const HOSTILE = "/x<img src=x onerror=alert(1)>";
 const authority = { status: "running", node: "local", policy: { version: null }, token: { held: true, box_path: "run_a", epoch: 0, zone: "z", issued_by: "the authority root", loads: true,
+  reach: [{ host: "api.example.com", methods: ["GET"], paths: ["/v1/**"], allow_dangerous: false }],
   blocks: [{ index: 0, kind: "zone", source: "check if reach(\"" + HOSTILE + "\");", signed_by: null, revocation_fingerprint: "0123456789abcdef", revoked: false }],
   grants: [{ id: "g-1", method: "POST", host: "h", path: HOSTILE, uses: 2, expires_at: 1, approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true }] } };
 const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
@@ -377,6 +378,16 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   const text = ids["detail-body"].textContent;
   assert.ok(text.includes(HOSTILE) && text.includes("block 0 · zone") && text.includes("approved by passkey:laptop"), text);
   assert.ok(ids["detail-body"].all(n => n.tagName === "img").length === 0, "no element from an agent's string");
+  // #651: it leads with what the run can reach; the token's internals are under Details.
+  assert.ok(text.startsWith("Can reachapi.example.com \u00b7 GET \u00b7 /v1/**its zone's rule"), text);
+  assert.ok(ids["detail-body"].all(n => n.tagName === "details").length === 1, "the token folded under Details");
+  // #621: wicket's own kinds as sentences, the raw op apart; an HTTP request as it is.
+  const asked = p => JSON.parse(run("JSON.stringify(asks(" + JSON.stringify({ host: "wicket.internal", reason: "r", ...p }) + "))"));
+  assert.deepStrictEqual([asked({ method: "SPAWN", path: "/zones/research/reader" }).what, asked({ method: "LINK", path: "/links/run_a/run_b/8080" }).what,
+    asked({ method: "UPDATE", path: "/self/" + "ab".repeat(32) }).what, asked({ method: "CAPACITY", path: "/capacity/l-1", reason: "capacity lease l-1: 2 vCPU, 4096 MiB, for 8h, on vultr, at most $0.05/h, worst case $0.40 (reserved now). Asked by the agent: nightly" })],
+    ["Start a child agent named reader in zone research", "Link run_a \u2192 run_b, port 8080", "Install wicket build abababababab\u2026",
+      { what: "Lease a node: 2 vCPU, 4096 MiB, for 8h, on vultr, at most $0.05/h, worst case $0.40 (reserved now)", raw: "CAPACITY wicket.internal/capacity/l-1", why: "nightly", internal: true }]);
+  assert.deepStrictEqual(JSON.parse(run('JSON.stringify(asks({ method: "GET", host: "h", path: "/x", reason: "y", scope_prefix: false }))')), { what: "GET h/x", raw: "", why: "y", internal: false });
   run("showExplain(7)"); await flush(); await flush();
   assert.ok(ids["detail-body"].textContent.includes("block 0: check if " + HOSTILE), ids["detail-body"].textContent);
   assert.ok(calls.some(c => c.path === "/api/explain/7"));
@@ -542,7 +553,19 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual([began().pop().body.action, began().slice(-1)[0].body.id, began().slice(-1)[0].body.ttl_secs], ["capacity_renew", "g-cap1", 28800]);
   assert.ok(ids["confirm-what"].textContent.startsWith("Renew capacity grant g-cap1"), ids["confirm-what"].textContent);
   ids["confirm-cancel"].listeners.click(); await flush();
-  await capRow.all(n => n.tagName === "button" && n.textContent === "Revoke")[0].click(); await flush();
+  // #640: Revoke asks in the page first; nothing is sent until its own button, and Cancel puts the row back.
+  const capBtn = t => capRow.all(n => n.tagName === "button" && n.textContent === t)[0];
+  capBtn("Revoke\u2026").click(); await flush();
+  assert.ok(capRow.textContent.includes("Revoke capacity grant g-cap1?"), capRow.textContent);
+  assert.strictEqual(calls.filter(c => c.path === "/api/capacity/revoke").length, 0, "nothing sent on the first tap");
+  capBtn("Cancel").click();
+  assert.ok(capBtn("Renew") && !capRow.textContent.includes("Revoke capacity grant"), "Cancel restores the row");
+  await advance(1000);
+  capBtn("Revoke\u2026").click(); await flush();
+  await capBtn("Revoke").click(); await flush();
+  assert.strictEqual(calls.filter(c => c.path === "/api/capacity/revoke").length, 0, "a tap just after the question appeared is ignored");
+  await advance(1000);
+  await capBtn("Revoke").click(); await flush();
   assert.deepStrictEqual(calls.filter(c => c.path === "/api/capacity/revoke").map(c => c.body), [{ id: "g-cap1" }]);
   const inputs = ids["capacity-form"].all(n => n.tagName === "input");
   assert.strictEqual(inputs.length, 7);
@@ -682,6 +705,9 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await advance(1000);
   const sr = ids["standing-rules"];
   assert.ok(sr.textContent.includes("until revoked") && sr.textContent.includes("by passkey:laptop"), sr.textContent);
+  sr.all(n => n.tagName === "button" && n.textContent === "Revoke\u2026")[0].click(); await flush();
+  assert.ok(sr.textContent.includes("Runs it allows lose it at once."), sr.textContent);
+  await advance(1000);
   await sr.all(n => n.tagName === "button" && n.textContent === "Revoke")[0].click(); await flush();
   assert.deepStrictEqual(calls.filter(c => c.path === "/api/standing/revoke").map(c => c.body), [{ id: "s-2" }]);
   console.log("console standing reach: ok");

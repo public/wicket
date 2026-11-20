@@ -39,8 +39,8 @@ function pending(now) {
     },
     {
       id: "r-a004", tenant: T, run: run("SCALE"), zone: "build-farm", method: "CAPACITY", host: "wicket.internal",
-      path: "/capacity/node/ci-runner-large-02", risk: "R3ExternalOrIrreversible", status: "pending",
-      reason: "Lease one more build node for the nightly matrix", created_at: now - 1500, attribution: [], scope_prefix: false,
+      path: "/capacity/l-17", risk: "R3ExternalOrIrreversible", status: "pending",
+      reason: "capacity lease l-17: 2 vCPU, 4096 MiB, isolation Gvisor or stronger, region lhr preferred, for 8h, on vultr, at most $0.036/h, worst case $0.288 (reserved now). Asked by the agent: Lease one more build node for the nightly matrix", created_at: now - 1500, attribution: [], scope_prefix: false,
       identity: verified("build-farm", "scheduler"), once_terms: { uses: 1, ttl_secs: 600 }, args_sha256: "c0ffee",
     },
     {
@@ -233,6 +233,7 @@ function authority(id) {
     deadline: { until_ms: Date.now() + 3600000, stopped: false },
     holdings: { secrets: ["ANTHROPIC_API_KEY"], slice: { requests: 200, output_tokens: 400000, input_tokens: null } },
     token: { held: true, box_path: id, epoch: 4, zone: "release", issued_by: "the authority root", loads: true,
+      reach: [{ host: "github.com", methods: ["GET", "POST"], paths: ["/acme/storefront.git/**"], allow_dangerous: false }, { host: "api.github.com", methods: ["GET", "HEAD"], paths: ["/**"], allow_dangerous: false }],
       blocks: [{ index: 0, kind: "zone", source: "check if reach(\"github.com\", \"POST\", $p), $p.starts_with(\"/acme/\");", signed_by: null, revocation_fingerprint: "0123456789abcdef", revoked: false }],
       grants: [{ id: "g-51", method: "GET", host: "api.github.com", path: "/repos/acme/storefront/releases", uses: null, expires_at: Math.floor(Date.now() / 1000) + 3000, approved_by: "passkey:phone", approved_at: Math.floor(Date.now() / 1000) - 600, revoked: false, reached_node: true }],
       zone_cedar: "permit(principal, action, resource) when { resource.host == \"github.com\" };" } };

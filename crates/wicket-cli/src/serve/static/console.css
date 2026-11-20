@@ -292,3 +292,31 @@ code.block { display: block; margin-top: var(--s2); padding: var(--s2); user-sel
   .logline .text { grid-column: 1 / -1; }
 }
 .decided { padding: var(--s3) 0; border-bottom: 1px solid var(--line); } .decided:first-child { padding-top: var(--s1); } .decided:last-child { border-bottom: 0; }
+
+/* ---- a request card, short (#574 review): the ask, who, the risk and the buttons; the rest under Details ---- */
+.req-head { display: flex; justify-content: space-between; align-items: center; gap: var(--s2); }
+.req-head .age { color: var(--quiet); font-size: var(--t-sm); white-space: nowrap; }
+.req .what { font-size: var(--t-md); overflow-wrap: normal; word-break: normal; }
+.req .what.said { font-family: var(--sans); font-weight: 600; }
+.req .agent { border-top: 0; padding-top: 0; margin-top: var(--s2); }
+.req details.req-more { margin-top: var(--s3); padding-top: 0; }
+.req details.req-more > summary { min-height: 36px; color: var(--soft); }
+.req details.req-more[open] > summary { margin-bottom: var(--s1); }
+.req details.req-more .chain { color: var(--soft); font-size: var(--t-sm); }
+.raw { margin-top: var(--s1); }
+/* A long id, cut in the middle on screen and copied whole. */
+.id-short { display: inline-flex; max-width: 100%; vertical-align: bottom; font-family: var(--mono); font-size: .95em; }
+.id-short .id-head { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 4ch; max-width: 10ch; }
+.id-short .id-tail { white-space: nowrap; }
+summary:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: 2px; border-radius: 6px; }
+details.more > summary { list-style: none; gap: var(--s2); }
+details.more > summary::-webkit-details-marker { display: none; }
+details.more > summary::before { content: "\25B8"; display: inline-block; width: 1em; transition: transform .12s; }
+details.more[open] > summary::before { transform: rotate(90deg); }
+/* Revoke sits apart from Renew (#640). */
+.buttons .apart { margin-left: auto; }
+.callout.ask { flex: 1 1 100%; margin: 0; }
+.reach { padding: var(--s2) 0; border-bottom: 1px solid var(--line); } .reach:last-of-type { border-bottom: 0; }
+#detail-body h4 { margin: var(--s4) 0 var(--s1); font-size: var(--t-sm); text-transform: uppercase; letter-spacing: .05em; color: var(--soft); }
+#detail-body h4:first-child { margin-top: 0; }
+#auth .callout { margin: 0 0 var(--s3); }
