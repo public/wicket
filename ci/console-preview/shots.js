@@ -3,7 +3,7 @@
 //
 //   node ci/console-preview/shots.js BASE_URL OUT_DIR [SCENARIO...]
 //
-// Each scenario (default: full empty signedout sheet) at 1440x900 (desktop) and 390x844 (phone,
+// Each scenario (default: inbox agents agent activity settings empty signedout sheet) at 1440x900 (desktop) and 390x844 (phone,
 // deviceScaleFactor 2), in light and dark, full page. "sheet" is the full fixture with the first
 // card's approval sheet open. Needs Playwright (preinstalled in CI images and wicket's dev boxes).
 const { chromium } = require("playwright");
@@ -12,7 +12,10 @@ const path = require("path");
 
 const [base, out, ...want] = process.argv.slice(2);
 if (!base || !out) { console.error("usage: shots.js BASE_URL OUT_DIR [SCENARIO...]"); process.exit(2); }
-const scenarios = want.length ? want : ["full", "empty", "signedout", "sheet"];
+const scenarios = want.length ? want : ["inbox", "agents", "agent", "activity", "settings", "empty", "signedout", "sheet"];
+// A scenario is a fixture and a view: "agents" is the full fixture at #agents.
+const VIEWS = { inbox: ["full", ""], full: ["full", ""], agents: ["full", "#agents"], agent: ["full", "#agent/run_01JDRELEASEQQQQQQQQQQQQQQQ"],
+  activity: ["full", "#activity"], settings: ["full", "#settings"], sheet: ["full", ""] };
 const views = { desktop: { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 }, phone: { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true } };
 const SETTLE_MS = 1200; // past the console's own settle time (800 ms), so buttons are live
 
@@ -27,8 +30,8 @@ const SETTLE_MS = 1200; // past the console's own settle time (800 ms), so butto
         const page = await ctx.newPage();
         page.on("console", m => { if (m.type() === "error" && !/Failed to load resource/.test(m.text())) errors.push(`${sc}/${vname}/${scheme}: ${m.text()}`); });
         page.on("pageerror", e => errors.push(`${sc}/${vname}/${scheme}: ${e.message}`));
-        const fixture = sc === "sheet" ? "full" : sc;
-        await page.goto(base + "?fixture=" + fixture, { waitUntil: "load" });
+        const [fixture, hash] = VIEWS[sc] || [sc, ""];
+        await page.goto(base + "?fixture=" + fixture + hash, { waitUntil: "load" });
         await page.waitForTimeout(SETTLE_MS);
         const file = path.join(out, `${sc}-${vname}-${scheme}.png`);
         if (sc === "sheet") {

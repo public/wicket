@@ -146,7 +146,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   state = { ...base, pending: [A, B] };
   await run("refresh()"); await flush();
   assert.strictEqual(cardsIn()[0], aCard);
-  button(cardsIn()[1], "Approve once").click(); await flush();
+  button(cardsIn()[1], "Allow once").click(); await flush();
   assert.strictEqual(began().length, 0, "a tap just after the layout changed is ignored");
 
   // Once settled, a tap asks the server for the action and opens the confirmation; no passkey yet.
@@ -155,7 +155,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     effect_sha256: "0123456789abcdef".repeat(4),
     blast: { widens: ["every path under /h/ on api.example.com, not only /harmless"], examples: ["POST api.example.com/h/any-file"], zone_rules: [], covered: 3, recent: 7 },
     update: { sha256: "ab".repeat(32), artifact: HOSTILE, size: 52428800, commit_said: "36c92b5e", nodes: ["n1", "n2"], applies: true, why_not: null } };
-  button(aCard, "Approve once").click(); await flush();
+  button(aCard, "Allow once").click(); await flush();
   assert.strictEqual(began().length, 1);
   assert.strictEqual(began()[0].body.id, "q-a");
   assert.strictEqual(ids.confirm.hidden, false, "the confirmation is open");
@@ -169,7 +169,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // In lines, the decision first and the ids last (#574, item 1).
   const lines = what.split("\n");
   assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
-  assert.strictEqual(lines[1], "Risk: R1 \u00b7 read (scoped)");
+  assert.strictEqual(lines[1], "Risk: Only reads (R1)");
   assert.ok(lines[lines.length - 1].startsWith("Request q-a \u00b7 run run_a"), what);
   // The agent with its zone, from the signed fields; a hostile newline in what the agent reported
   // or in the path can't make a line of its own (#599 review).
@@ -178,7 +178,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     agent: "spiffe://x/t/t0/z/build/a/captain", requested_by: ["sub\nFor someone-else (zone safe)"] }) + ")").split("\n");
   assert.strictEqual(hostile.length, 4, hostile.join(" | "));
   assert.ok(hostile[0].endsWith("for any run in zone build"), hostile[0]);
-  assert.strictEqual(hostile[1], "Risk: R4 \u00b7 push, deploy or privilege");
+  assert.strictEqual(hostile[1], "Risk: Pushes code, deploys, or gains privileges (R4)");
   assert.ok(hostile[2].startsWith("For captain (zone build) \u00b7 asked by sub For someone-else (zone safe) (as reported)"), hostile[2]);
   assert.ok(hostile[3].includes("agent spiffe://x/t/t0/z/build/a/captain"), hostile[3]);
   const blast = ids["confirm-blast"];
@@ -202,7 +202,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await run("refresh()"); await flush();
   assert.deepStrictEqual(cardsIn(), before, "no re-render while confirming");
   // And another card's buttons can't start a second ceremony.
-  button(cardsIn()[1], "Approve once").click(); await flush();
+  button(cardsIn()[1], "Allow once").click(); await flush();
   assert.strictEqual(began().length, 1);
 
   // Its own button signs exactly the action shown; then the page refreshes again.
@@ -219,7 +219,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // Cancel closes it without a ceremony.
   await advance(1000);
   nextAction = { ...nextAction, request: "q-b", decision: "deny", uses: null, ttl_secs: null, blast: null, update: null };
-  button(cardsIn()[1], "Deny").click(); await flush();
+  button(cardsIn()[1], "Don't allow").click(); await flush();
   assert.strictEqual(ids.confirm.hidden, false);
   assert.ok(ids["confirm-what"].textContent.startsWith("Deny"), ids["confirm-what"].textContent);
   assert.strictEqual(ids["confirm-blast"].hidden, true, "a denial widens nothing");
@@ -252,7 +252,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // A whole hour reads as one, as on the card (#574).
   assert.ok(run("describe(" + JSON.stringify({ action: "decide", decision: "approve", method: "GET", host: "h", path: "/p", effect: { terms: { uses: null, ttl_secs: 3600 } } }) + ")").startsWith("Approve any number of uses for 1 hour"));
   // Risk said as what it means, code first.
-  assert.strictEqual(run("riskLabel('R4ExecOrPrivilege')"), "R4 \u00b7 push, deploy or privilege");
+  assert.strictEqual(run("riskLabel('R4ExecOrPrivilege')"), "Pushes code, deploys, or gains privileges");
   // A cancelled passkey is said as such, as an error that stays; a reply with no text is "Done.".
   run("toastError({ name: 'NotAllowedError', message: 'The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/' }, null, true)");
   assert.deepStrictEqual([ids.msg.textContent, ids.msg.className], ["Passkey cancelled. Nothing was signed.", "error"]);
@@ -330,10 +330,10 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     created_at: 1, once_terms: { uses: null, ttl_secs: 300 } };
   const pc = run("(r => pendingCard({ now: 2 }, r))")(pushReq);
   const pt = pc.textContent;
-  assert.ok(pt.includes("Approve this push (any number of uses for 5 min)") && pt.includes("approved as one window") && !pt.includes("one use at a time"), pt);
+  assert.ok(pt.includes("Allow for 5 min") && pt.includes("allowed as one window") && !pt.includes("one request at a time"), pt);
   // A push to another host is R2, but granted as the same window: no hour button (#597 re-review).
   const r2 = run("(r => pendingCard({ now: 2 }, r))")({ ...pushReq, id: "q-push2", risk: "R2WriteReversible", host: "git.example" }).textContent;
-  assert.ok(r2.includes("Approve this push (any number of uses for 5 min)") && !r2.includes("1 hour"), r2);
+  assert.ok(r2.includes("Allow for 5 min") && !r2.includes("1 hour"), r2);
   // An error that stays is gone once a sheet opens: it would sit above it.
   run("toastError({ name: 'Error', message: 'earlier' })");
   assert.strictEqual(ids.msg.hidden, false);
@@ -379,7 +379,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(text.includes(HOSTILE) && text.includes("block 0 · zone") && text.includes("approved by passkey:laptop"), text);
   assert.ok(ids["detail-body"].all(n => n.tagName === "img").length === 0, "no element from an agent's string");
   // #651: it leads with what the run can reach; the token's internals are under Details.
-  assert.ok(text.startsWith("Can reachapi.example.com \u00b7 GET \u00b7 /v1/**its zone's rule"), text);
+  assert.ok(text.startsWith("Can reachread api.example.com  /v1/**from its zone's rules"), text);
   assert.ok(ids["detail-body"].all(n => n.tagName === "details").length === 1, "the token folded under Details");
   // #621: wicket's own kinds as sentences, the raw op apart; an HTTP request as it is.
   const asked = p => JSON.parse(run("JSON.stringify(asks(" + JSON.stringify({ host: "wicket.internal", reason: "r", ...p }) + "))"));
@@ -489,7 +489,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   state = { ...base, pending: [], secrets: { secrets: [gh, login], missing: [{ name: "HOSTILE<b>", zones: ["z"], used_by: [] }], link_cli_only: "references are made on the host: wicket secret link NAME --file PATH" } };
   await run("refresh()"); await flush();
   const sx = ids.secrets.textContent;
-  for (const want of ["gh", "sent only to api.github.com", "header authorization", "format Bearer {secret}", "running now: run_a", "reference", "/home/you/.claude/.credentials.json#/a/token", "not set", "wicket secret link"]) assert.ok(sx.includes(want), want + " in " + sx);
+  for (const want of ["gh", "sent only to api.github.com", "sent to api.github.com in its authorization header, as Bearer {secret}", "running now: run_a", "read from a file on the host", "/home/you/.claude/.credentials.json#/a/token", "needed, not set", "wicket secret link"]) assert.ok(sx.includes(want), want + " in " + sx);
   const sbtn = label => ids.secrets.all(n => n.tagName === "button" && n.textContent.startsWith(label));
   assert.strictEqual(sbtn("Replace value").length, 1, "a reference's value isn't set here");
   assert.strictEqual(sbtn("Hosts").length, 2, "a reference's hosts can be changed");
@@ -596,13 +596,13 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     errors: ["audit-sinks.yaml: bad"] } } };
   await run("refresh()"); await flush();
   const hs = ids.health.children;
-  assert.strictEqual(hs[0].children[0].textContent, "State store" + "https://s3.example.com (b-1) \u00b7 ledger lagging \u00b7 last sync 7 min ago");
+  assert.strictEqual(hs[0].children[0].textContent, "Record backup" + "https://s3.example.com (b-1) \u00b7 ledger lagging \u00b7 last sync 7 min ago");
   assert.strictEqual(hs[0].children[0].children[1].className, "blocked");
   assert.strictEqual(hs[0].children[1].textContent, "! last error 5 s ago: monitor error: <b>refused</b>", "as text, never markup");
   assert.ok(hs[1].children[0].textContent.endsWith("24 records behind (oldest 6 min) at 1180 of 1204 \u00b7 last checkpoint 15 min ago"), hs[1].textContent);
   assert.strictEqual(hs[1].children[0].children[1].className, "blocked");
   assert.strictEqual(hs[1].children[1].textContent, "! last error: PUT: refused");
-  assert.strictEqual(hs[2].children[0].textContent, "Audit export collector (otlp)caught up at 1204 of 1204 \u00b7 last checkpoint never");
+  assert.strictEqual(hs[2].children[0].textContent, "Activity export to collectorcaught up at 1204 of 1204 \u00b7 last checkpoint never");
   assert.strictEqual(hs[2].children.length, 1, "no error, no line");
   assert.strictEqual(hs[3].textContent, "! audit-sinks.yaml: bad");
   assert.strictEqual(hs[4].className, "empty", "then the nodes");
@@ -629,7 +629,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     audit: [{ sink: "stdout", kind: "jsonl", seq: 3, head: 9, behind: 6, behind_secs: 4000, checkpoint_at: 0, error: null, manual: true }] } } };
   await run("refresh()"); await flush();
   assert.strictEqual(ids.health.children.length, 2, "the sink's row, then the nodes");
-  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Audit export stdout (jsonl)6 records behind (oldest 66 min) (manual: fed only by wicket audit export)"), ids.health.children[0].textContent);
+  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Activity export to stdout6 records behind (oldest 66 min) (manual: fed only by wicket audit export)"), ids.health.children[0].textContent);
   assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
   // The rows' alerts come first, then a stale read says so, then the rows.
   state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, errors: [], stale: true, read_ms: (nowS - 400) * 1000,
@@ -639,7 +639,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(ids.health.children[0].textContent, "! audit sink store: 24 records behind (oldest 6 min)");
   assert.strictEqual(ids.health.children[0].className, "blocked");
   assert.strictEqual(ids.health.children[1].textContent, "! not checked for 6 min: these rows may be out of date");
-  assert.ok(ids.health.children[2].textContent.startsWith("Audit export store (store)24 records behind"));
+  assert.ok(ids.health.children[2].textContent.startsWith("Activity export to store24 records behind"));
   // An error the config alert already quotes is said once; a first read that is overdue says so.
   state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, audit: [], stale: true, read_ms: null, not_read_yet: true,
     errors: ["audit-sinks.yaml can't be read: x"], alerts: ["audit-sinks.yaml can't be read: x (for 5 min)"] } } };
@@ -673,19 +673,19 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   state = { ...base, pending: [], standing: { asks: [ask], rules: [rule] } };
   await run("refresh()"); await flush();
   const sa = ids["standing-asks"].textContent;
-  for (const want of ["Standing reach on ci.example", "Methods: GET, POST", "Paths: /jobs/**", "Asked by worker (zone work)", "with this zone definition (0123456789ab", "2 granted of 3 blocked request(s) it covers in the last 14 days", "in 2 run(s) on 1 day(s)",
+  for (const want of ["always be allowed to read and send data to", "ci.example/jobs/**", "Methods: GET, POST", "Paths: /jobs/**", "Asked by worker (zone work)", "with this zone definition (0123456789ab", "2 granted of 3 blocked request(s) it covers in the last 14 days", "in 2 run(s) on 1 day(s)",
     "2 \u00d7 GET /jobs/1/logs (2 granted)", "and 4 ask(s) ahead of its own, not counted as evidence",
-    "Wider than the evidence: methods never asked for: POST", "Narrowed: methods GET, paths /jobs/1/logs"]) assert.ok(sa.includes(want), want + " in " + sa);
-  assert.deepStrictEqual([ids["standing-pointer"].textContent, ids["standing-pointer"].hidden], ["Standing reach ask (1)", false]);
+    "Wider than what it used: methods never asked for: POST", "Only what it used: methods GET, paths /jobs/1/logs"]) assert.ok(sa.includes(want), want + " in " + sa);
+  assert.deepStrictEqual([ids["standing-pointer"].textContent, ids["standing-pointer"].hidden], ["Asking to be always allowed (1)", false]);
   // #650: what waits, counted where a background tab or an installed app shows it.
   assert.strictEqual(sandbox.document.title, "(1) wicket");
   const sbuttons = ids["standing-asks"].all(n => n.tagName === "button");
-  assert.deepStrictEqual(sbuttons.map(n => [n.textContent, n.className]), [["Approve narrowed (30 days)", "approve"], ["Approve as asked (30 days)", ""],
-    ["Approve for every agent in zone work (30 days)", "deny"], ["Deny", "deny"]], "the narrowest first and primary; the widest marked");
+  assert.deepStrictEqual(sbuttons.map(n => [n.textContent, n.className]), [["Always: only what it used", "approve"], ["Always: as asked", ""],
+    ["Always, for every agent in zone work", "deny"], ["Don't allow", "deny apart"]], "the narrowest first and primary; the widest marked");
   assert.strictEqual(ids["standing-asks"].all(n => n.tagName === "b").length, 0, "an agent's reason stays text");
   await advance(1000);
   nextAction = { v: 1, action: "standing_approve", standing: "s-1", principal: ask.principal, zone: "work", rule: ask.narrowed, for: "agent", ttl_secs: 2592000, narrowed: true, effect_sha256: "ab".repeat(32) };
-  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Approve narrowed (30 days)")[0].click(); await flush();
+  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Always: only what it used")[0].click(); await flush();
   const stb = began().pop().body;
   assert.deepStrictEqual([stb.action, stb.id, stb.for, stb.narrow], ["standing_approve", "s-1", "agent", true]);
   assert.ok(ids["confirm-what"].textContent.startsWith("Approve standing reach s-1 narrowed to its evidence: { host: ci.example, methods: [GET], paths: ['/jobs/1/logs'] }"), ids["confirm-what"].textContent);
@@ -698,7 +698,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // A denial is signed as one.
   await advance(1000);
   nextAction = { v: 1, action: "standing_deny", standing: "s-1", rule: ask.rule };
-  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Deny")[0].click(); await flush();
+  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Don't allow")[0].click(); await flush();
   assert.ok(ids["confirm-what"].textContent.startsWith("Deny standing reach s-1"), ids["confirm-what"].textContent);
   assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: deny"]);
   ids["confirm-cancel"].listeners.click(); await flush();

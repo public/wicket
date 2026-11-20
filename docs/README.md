@@ -70,6 +70,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Security model](explanation/security-model.md) and [what wicket doesn't protect](explanation/limits.md)
 - [Approvals bound to their effect](explanation/approvals-bound-to-effects.md): what an approval signs, its blast radius, and holding until decided
 - [Why gVisor](explanation/why-gvisor.md)
+- [The console's design](explanation/console-design.md): who uses it, the jobs it serves, its structure and words
 - [Performance of the network path](explanation/performance.md)
 - [One feed publisher per node](explanation/feed-publisher.md)
 - [How updates work](explanation/updates.md)

@@ -282,7 +282,7 @@ code.block { display: block; margin-top: var(--s2); padding: var(--s2); user-sel
 
 /* The activity log (#646): time, tag, sentence, in columns that stay put. */
 .log { font-family: var(--sans); font-size: var(--t-sm); white-space: normal; }
-.logline { display: grid; grid-template-columns: 3.5rem 6.5rem minmax(0, 1fr); gap: var(--s3); align-items: baseline; padding: var(--s1) 0; }
+.logline { display: grid; grid-template-columns: 3.5rem 8rem minmax(0, 1fr); gap: var(--s3); align-items: baseline; padding: var(--s1) 0; }
 .logline > time { color: var(--quiet); font: var(--t-xs)/1.5 var(--mono); }
 .logline .tag { font: 600 var(--t-xs)/1.5 var(--mono); text-transform: uppercase; color: var(--quiet); overflow-wrap: anywhere; }
 .logline .tag.ok { color: var(--good); } .logline .tag.pend { color: var(--warn); } .logline .tag.blocked { color: var(--bad); }
@@ -320,3 +320,75 @@ details.more[open] > summary::before { transform: rotate(90deg); }
 #detail-body h4 { margin: var(--s4) 0 var(--s1); font-size: var(--t-sm); text-transform: uppercase; letter-spacing: .05em; color: var(--soft); }
 #detail-body h4:first-child { margin-top: 0; }
 #auth .callout { margin: 0 0 var(--s3); }
+
+/* ==== The redesign (docs/explanation/console-design.md): an inbox and three views ==== */
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+nav a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--accent); }
+.view { margin-top: var(--s5); }
+.view-head { display: flex; justify-content: space-between; align-items: center; gap: var(--s3); margin-bottom: var(--s3); }
+.view-head h2 { margin: 0; }
+.back { display: inline-flex; align-items: center; min-height: var(--tap); font-weight: 600; text-decoration: none; }
+
+/* The Inbox's first line, and its two columns on a wide screen. */
+.status { font-size: var(--t-lg); font-weight: 600; margin: 0 0 var(--s4); }
+.status a { text-decoration: none; color: var(--ink); border-bottom: 2px solid var(--line-strong); }
+.status a.warn { color: var(--warn); border-color: var(--warn-line); } .status a.bad { color: var(--bad); border-color: var(--bad-line); }
+.status .ok { color: var(--good); }
+.grid.inbox { grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 1100px) { .grid.inbox { grid-template-columns: minmax(0, 2.4fr) minmax(0, 1fr); } }
+.grid.inbox .deck { grid-template-columns: repeat(auto-fill, minmax(min(100%, 440px), 1fr)); }
+#view-inbox h3.sub:first-child { margin-top: 0; }
+.problem { display: block; padding: var(--s3) var(--s3) var(--s3) var(--s5); margin: var(--s2) 0; border-radius: var(--radius-sm); text-decoration: none;
+  color: var(--ink); font-size: var(--t-sm); position: relative; border: 1px solid var(--line); }
+.problem::before { content: ""; position: absolute; left: var(--s3); top: 1.05em; width: 8px; height: 8px; border-radius: 50%; background: var(--quiet); }
+.problem.bad { background: var(--bad-bg); border-color: var(--bad-line); } .problem.bad::before { background: var(--bad); }
+.problem.warn { background: var(--warn-bg); border-color: var(--warn-line); } .problem.warn::before { background: var(--warn); }
+
+/* A request: labelled fields, then the choices. */
+dl.fields { display: grid; grid-template-columns: 5.5rem minmax(0, 1fr); gap: var(--s2) var(--s3); margin: var(--s3) 0 0; }
+dl.fields dt { color: var(--quiet); font-size: var(--t-sm); padding-top: 1px; }
+dl.fields dd { margin: 0; min-width: 0; }
+dl.fields dd.said { font-weight: 650; }
+dl.fields dd.why { color: var(--soft); }
+.where .host { font: 600 var(--t-md)/1.4 var(--mono); overflow-wrap: anywhere; }
+.where .path { font: var(--t-sm)/1.45 var(--mono); color: var(--soft); word-break: normal; overflow-wrap: anywhere; }
+.where .meta { margin: 0; }
+.who-ask .bad { color: var(--bad); font-weight: 650; }
+.req .risk { font-size: var(--t-xs); }
+.buttons.ladder { margin-top: var(--s4); }
+.req.always { border-left-color: var(--accent); }
+.req.opened { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+/* Activity: filters, and an explanation under its line. */
+.filters { display: flex; flex-wrap: wrap; gap: var(--s2); margin-bottom: var(--s3); }
+button.chip { min-height: 36px; border-radius: 999px; padding: var(--s1) var(--s4); font-weight: 600; }
+button.chip[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.explained { margin: var(--s1) 0 var(--s2) 12rem; padding: var(--s2) var(--s3); border-left: 3px solid var(--accent); background: var(--surface-2); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; font-size: var(--t-sm); }
+
+/* An agent's page. */
+#agent-head { margin: var(--s2) 0 var(--s4); }
+#agent-head .row { border: 0; padding: 0; }
+#agent-head h2.run-name { font-size: var(--t-xl); margin: 0; }
+#view-agent .card + .card { margin-top: var(--s4); }
+#runs a.run-name { color: var(--ink); text-decoration: none; }
+#runs a.run-name:hover { text-decoration: underline; }
+
+/* A phone: the views in a bar at the bottom, within reach of the thumb. */
+@media (max-width: 560px) {
+  nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 6; max-width: none; justify-content: space-around; gap: 0;
+    background: color-mix(in srgb, var(--surface) 94%, transparent); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); }
+  nav a, nav a:first-child { flex: 1; justify-content: center; margin: 0; padding: 0 var(--s1); border-bottom: 0; border-top: 2px solid transparent; min-height: 52px; }
+  nav a[aria-current="page"] { border-top-color: var(--accent); border-bottom: 0; }
+  :root { --header-h: 56px; }
+  main { padding-bottom: calc(80px + env(safe-area-inset-bottom)); }
+  #msg { bottom: calc(68px + env(safe-area-inset-bottom)); }
+  dl.fields { grid-template-columns: 4.6rem minmax(0, 1fr); }
+  .explained { margin-left: 0; }
+  .status { font-size: var(--t-md); }
+}
+button.idname { font: 700 var(--t-md)/1.3 var(--sans); padding: 0; min-height: 0; border: 0; border-radius: 4px; background: none; color: var(--ink);
+  text-decoration: underline dotted; text-underline-offset: 3px; }
+button.idname:hover { background: none; }
+.who-ask .idline { color: var(--quiet); font: var(--t-xs)/1.4 var(--mono); margin-top: 2px; overflow-wrap: anywhere; }
+.mono.inline { display: inline; }
