@@ -149,6 +149,9 @@ impl Gateway {
         if id.starts_with("s-") {
             return self.await_standing(id, timeout).await;
         }
+        if id.starts_with("n-") {
+            return self.await_name(id, timeout).await;
+        }
         let start = Instant::now();
         let _waiting = Waiting::start(&self.ctx);
         let mut granted_at: Option<Instant> = None;
@@ -536,6 +539,50 @@ impl Gateway {
 
     /// `await_grant` on a standing ask (#572, its `s-` id, from `request_access` with scope
     /// standing): this run's agent's own ask (any run of it may wait), answered as it is decided.
+    /// `await_grant` on a public name's ask (#575): its human's decision.
+    async fn await_name(&self, id: &str, timeout: Duration) -> (String, bool) {
+        let start = Instant::now();
+        let _waiting = Waiting::start(&self.ctx);
+        loop {
+            let (n, me) = {
+                let l = self.ctx.ledger.lock().expect("ledger");
+                (l.name(id), l.identity(&self.ctx.run.0).ok().flatten().map(|i| i.spiffe_id))
+            };
+            let Ok(n) = n else { return (format!("no request {id}"), true) };
+            if n.tenant != self.ctx.tenant.0 || me.as_deref() != Some(n.principal.as_str()) {
+                return (format!("request {id} is not this agent's"), true);
+            }
+            match n.status.as_str() {
+                "live" => {
+                    let holder = match n.holder.as_deref() {
+                        Some(h) if h == self.ctx.run.0 => "this run holds it".to_string(),
+                        Some(h) => format!("run {h} holds it"),
+                        None => "the next run it binds will hold it".to_string(),
+                    };
+                    let until = n
+                        .expires_at
+                        .map(|e| format!("until {}", wicket_core::time::unix_rfc3339(e)))
+                        .unwrap_or_else(|| "until revoked, or its run ends".into());
+                    return (
+                        format!("granted: {id} was approved: the public name {} for port {}, {until}; {holder}. Until wicket publishes public records (not yet), it is a record only.", n.label, n.port),
+                        false,
+                    );
+                }
+                "denied" => return (format!("denied: {id} was denied. Do not ask for it again."), false),
+                "withdrawn" => return (format!("withdrawn: {id} is no longer pending."), false),
+                "ended" => return (format!("ended: {id} was approved and has ended ({}).", n.end_reason.unwrap_or_default()), false),
+                _ => {}
+            }
+            if start.elapsed() >= timeout {
+                return (
+                    format!("pending: {id} is still waiting for a decision after {}s. You may call await_grant again.", timeout.as_secs()),
+                    false,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     async fn await_standing(&self, id: &str, timeout: Duration) -> (String, bool) {
         let start = Instant::now();
         let _waiting = Waiting::start(&self.ctx);

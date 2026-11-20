@@ -234,14 +234,16 @@ pub fn tools() -> Value {
         },
         {
             "name": "request_name",
-            "description": "Give a TCP port of this box a stable internal name other boxes of your tenant can find it by: <name>.<your zone>.wicket.internal. It grants nothing: whoever connects to it is decided as connect decides (your parent and boxes your accept_from lists at once, others once a human approves). The name is yours until this run ends. Public names (on the internet) aren't available yet.",
+            "description": "Give a TCP port of this box a stable name. kind internal (the default): <name>.<your zone>.wicket.internal, which other boxes of your tenant find it by; it grants nothing, since whoever connects is decided as connect decides (your parent and boxes your accept_from lists at once, others once a human approves), and it is yours until this run ends. kind public: a name on the internet, which only a human approves, since anyone could then connect to the port and read what it serves; you get a request_id (n-...) for await_grant. scope standing asks for it for every later run of your workload, not just this one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "one DNS label: a-z, 0-9 and '-', at most 63 characters" },
                     "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-                    "kind": { "type": "string", "enum": ["internal"], "default": "internal" },
-                    "reason": { "type": "string", "description": "what it serves, for the record" }
+                    "kind": { "type": "string", "enum": ["internal", "public"], "default": "internal" },
+                    "scope": { "type": "string", "enum": ["run", "standing"], "default": "run", "description": "public names only: this run, or every later run of your workload" },
+                    "service": { "type": "string", "description": "public names only: the SRV service label, such as http (the default)" },
+                    "reason": { "type": "string", "description": "what it serves, for the record and for the human who decides" }
                 },
                 "required": ["name", "port"],
                 "additionalProperties": false

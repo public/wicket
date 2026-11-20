@@ -8,8 +8,11 @@
 //! free in the zone, and room in the workload's limit. It is held by the run that asked and ends
 //! with it (`Ledger::run_ended`).
 //!
-//! Public names (records in a real zone, a host port on the node) need a human's approval and come
-//! with the reconciler: until then this tool refuses them.
+//! A public name (`<label>.<boxes domain>`: records in a real zone, a host port on the node) is an
+//! ask a human decides (`wicket names approve`, [`wicket_control`'s `names`]): anyone on the
+//! internet could connect to the port and read what the box serves. The ask is a ledger row
+//! (`Ledger::ask_public`), its id (`n-…`) one `await_grant` waits on. Until the reconciler and the
+//! node's listener come (#575 step 4b, 4c), an approved name is a record only.
 
 use serde_json::Value;
 use wicket_core::link as policy;
@@ -26,6 +29,12 @@ pub const INTERNAL_PER_WORKLOAD: usize = 3;
 const MAX_REASON: usize = 200;
 
 pub fn request_name(ctx: &RunCtx, args: &Value) -> Reply {
+    if args.get("kind").and_then(Value::as_str) == Some("public") {
+        return match ask_public(ctx, args) {
+            Ok(s) => (s, false),
+            Err(e) => (format!("not requested: {e}"), true),
+        };
+    }
     match request_inner(ctx, args) {
         Ok(s) => (s, false),
         Err(e) => (format!("not registered: {e}"), true),
@@ -40,8 +49,7 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
     };
     match args.get("kind").and_then(Value::as_str).unwrap_or("internal") {
         "internal" => {}
-        "public" => return Err("public names aren't available yet: ask for an internal one".into()),
-        k => return Err(format!("`kind` is internal, not {k:?}")),
+        k => return Err(format!("`kind` is internal or public, not {k:?}")),
     }
     wicket_names::check_shape(label, false).map_err(|e| e.to_string())?;
     let reason: String = args.get("reason").and_then(Value::as_str).unwrap_or("").chars().take(MAX_REASON).collect();
@@ -129,6 +137,68 @@ fn request_inner(ctx: &RunCtx, args: &Value) -> Result<String, String> {
     Ok(format!(
         "registered {fqdn} ({}) for port {port} of this box. Other boxes of your tenant reach it with connect(name: \"{label}.{zone}\"): {who}. Listen on 127.0.0.1:{port} (or 0.0.0.0). The name is yours until this run ends.",
         n.id
+    ))
+}
+
+/// A box's ask for a public name: filed for a human, never decided here. The label is checked
+/// against the reserved labels and their lookalikes (`wicket_names::check_label`), since a public
+/// name is in a real zone beside the console's.
+fn ask_public(ctx: &RunCtx, args: &Value) -> Result<String, String> {
+    let label = args.get("name").and_then(Value::as_str).ok_or("`name` is required")?;
+    let port = match args.get("port").and_then(Value::as_u64) {
+        Some(p) if (1..=65535).contains(&p) => p as u16,
+        _ => return Err("`port` is required: 1-65535".into()),
+    };
+    wicket_names::check_label(label, &wicket_names::Rules::default()).map_err(|e| e.to_string())?;
+    let service = args.get("service").and_then(Value::as_str).unwrap_or("http");
+    wicket_names::check_shape(service, false).map_err(|e| format!("`service`: {e}"))?;
+    let scope = match args.get("scope").and_then(Value::as_str).unwrap_or("run") {
+        "run" => NameScope::Run,
+        "standing" => NameScope::Standing,
+        s => return Err(format!("`scope` is run or standing, not {s:?}")),
+    };
+    let reason: String = args.get("reason").and_then(Value::as_str).unwrap_or("").chars().take(MAX_REASON).collect();
+    let spec = ctx.zone.spec();
+    let digest = wicket_store::zone_digest(spec);
+    let l = ctx.ledger.lock().expect("ledger");
+    let principal = l
+        .identity(&ctx.run.0)
+        .map_err(|e| e.to_string())?
+        .filter(|i| i.tenant == ctx.tenant.0)
+        .map(|i| i.spiffe_id)
+        .ok_or("this box has no identity, so it can't hold a name")?;
+    let ask = NameAsk {
+        tenant: &ctx.tenant,
+        run: &ctx.run,
+        zone: &spec.name,
+        zone_digest: &digest,
+        principal: &principal,
+        label,
+        port,
+        service: Some(service),
+        reason: &reason,
+        scope,
+    };
+    let (id, fresh) = l.ask_public(&ask).map_err(|e| e.to_string())?;
+    if fresh {
+        let body = serde_json::json!({ "id": id, "label": label, "kind": "public", "port": port, "service": service,
+            "scope": scope.as_str(), "reason": reason });
+        if let Err(e) = l.audit(&ctx.tenant, Some(&ctx.run), "name.requested", &body) {
+            let _ = l.deny_name(&id, "wicket:audit-failed");
+            return Err(format!("the audit record could not be written ({e})"));
+        }
+    }
+    drop(l);
+    ctx.emit(wicket_proxy::Event::Tool {
+        name: "request_name".into(),
+        detail: format!("asked for public name {label} (port {port}): {id}"),
+    });
+    let lasting = match scope {
+        NameScope::Run => "for this run",
+        NameScope::Standing => "for every later run of your workload",
+    };
+    Ok(format!(
+        "needs approval: request {id} asks a human for the public name {label} (port {port}, {lasting}). Call await_grant with {id}. Until wicket publishes public records (not yet), an approved name is a record only."
     ))
 }
 
