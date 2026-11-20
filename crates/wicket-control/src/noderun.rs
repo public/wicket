@@ -1883,8 +1883,20 @@ pub fn confirm_stopped(run_dir: &Path) {
 /// An operator releases run `run_dir`'s fence without its node (#676): for a run its node can't
 /// confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end. Marked as if the
 /// node had confirmed, with who did it; the caller audits it (`run.fence_released`).
-pub fn release_fence(run_dir: &Path, by: &str) -> Result<()> {
-    let mut a = read_authority(run_dir).unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
+///
+/// `expected` is the authority record the decision was made on: its node and `until_ms`, or None
+/// if the run had none (#708). Refused if the record is no longer that (renewed, confirmed, or
+/// written since), so a renewal between the decision and this write isn't overwritten.
+pub fn release_fence(run_dir: &Path, by: &str, expected: Option<(&str, i64)>) -> Result<()> {
+    let now = read_authority(run_dir);
+    let current = now.as_ref().filter(|a| !a.stopped).map(|a| (a.node.as_str(), a.until_ms));
+    if now.as_ref().is_some_and(|a| a.stopped) || current != expected {
+        anyhow::bail!(
+            "{}'s authority record changed since the fence was shown (renewed, or its node confirmed the box stopped): look again",
+            run_dir.display()
+        );
+    }
+    let mut a = now.unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
     a.stopped = true;
     a.released_by = Some(by.to_string());
     write_authority(run_dir, &a)
@@ -2992,7 +3004,7 @@ mod tests {
         assert!(fenced_in(&d, 2_000, None).is_none(), "no record of either kind: no box was started");
         std::fs::write(d.join("ctl/run.json"), b"not json").unwrap();
         // An operator releases it (#676): the fence lifts, the record says who.
-        release_fence(&d, "root@cli").unwrap();
+        release_fence(&d, "root@cli", None).unwrap();
         assert!(fenced_in(&d, 2_000, None).is_none(), "released");
         assert_eq!(read_authority(&d).unwrap().released_by.as_deref(), Some("root@cli"));
         std::fs::remove_file(d.join("ctl/authority.json")).unwrap();

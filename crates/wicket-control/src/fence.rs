@@ -59,6 +59,10 @@ pub struct Fence {
     pub release_refused: Option<String>,
     /// What releasing it releases, bound into the release ([`effect`]).
     pub effect_sha256: String,
+    /// The run's authority record as it was read (its node and `until_ms`), if it had one: what
+    /// the release expects to find, so a renewal since isn't overwritten.
+    #[serde(skip)]
+    pub authority: Option<(String, i64)>,
 }
 
 /// Run `run`'s fence at `now_ms`, its directory under `runs_dir`; None if it isn't fenced (or there
@@ -72,7 +76,8 @@ pub fn fence_of(l: &Ledger, runs_dir: &Path, run: &str, now_ms: i64) -> Result<O
     // The ledger names a run's node even when its authority record was lost ("its node"); a run with
     // neither has no node on record: its box is starting (its run record is written before its
     // authority and node), or never started on one.
-    let recorded = read_authority(&dir).is_some();
+    let authority = read_authority(&dir).filter(|a| !a.stopped).map(|a| (a.node, a.until_ms));
+    let recorded = authority.is_some();
     let node = match (recorded, l.run_node(run)?) {
         (true, _) => Some(node),
         (false, n) => n,
@@ -137,6 +142,7 @@ pub fn fence_of(l: &Ledger, runs_dir: &Path, run: &str, now_ms: i64) -> Result<O
         why,
         release_refused,
         effect_sha256,
+        authority,
     }))
 }
 
@@ -253,7 +259,9 @@ pub fn release(l: &Ledger, runs_dir: &Path, by: &Decider, r: Release) -> Result<
     // leaves the fence in place (decided, not done), never lifted with nothing on record.
     l.audit(&tenant, Some(&run), "run.fence_released", &record)
         .map_err(|e| anyhow::Error::from(e).context("the release could not be recorded, so it wasn't made"))?;
-    if let Err(e) = release_fence(&runs_dir.join(r.run), &label) {
+    // The authority record the fence was read from, or none: a renewal written since isn't overwritten.
+    let expected = f.authority.as_ref().map(|(n, u)| (n.as_str(), *u));
+    if let Err(e) = release_fence(&runs_dir.join(r.run), &label, expected) {
         let failed = serde_json::json!({ "node": f.node, "by": label, "error": format!("{e:#}") });
         if let Err(a) = l.audit(&tenant, Some(&run), "run.fence_release_failed", &failed) {
             say_err!("[wicket] recording that run {}'s fence release failed: {a}", r.run);
@@ -482,5 +490,35 @@ mod tests {
             assert_eq!(std::fs::read(&file).ok(), original, "the authority record is as it was");
             assert_eq!(fence_of(&l, &d.0, RUN, NOW).unwrap().map(|x| x.fenced_until_ms), Some(f.fenced_until_ms), "still fenced");
         }
+    }
+
+    /// The review of #708: the write that lifts the fence checks the authority record it was decided
+    /// on, so a renewal (or the node's confirmation) between the decision and the write isn't
+    /// overwritten; a run that had no record expects none.
+    #[test]
+    fn a_release_doesnt_overwrite_a_renewal() {
+        let d = Runs::new("renewed");
+        let dir = d.0.join(RUN);
+        std::fs::create_dir_all(dir.join("ctl")).unwrap();
+        let rec = |until_ms| crate::noderun::AuthorityRecord { node: "n1".into(), until_ms, ..Default::default() };
+        crate::noderun::write_authority(&dir, &rec(NOW + 3_600_000)).unwrap();
+        let shown = Some(("n1", NOW + 3_600_000));
+        // Renewed since it was shown: refused, and the renewal stands.
+        crate::noderun::write_authority(&dir, &rec(NOW + 7_200_000)).unwrap();
+        let e = release_fence(&dir, "passkey:laptop", shown).unwrap_err();
+        assert!(e.to_string().contains("changed since the fence was shown"), "{e}");
+        let a = read_authority(&dir).unwrap();
+        assert_eq!((a.until_ms, a.stopped), (NOW + 7_200_000, false), "the renewal stands");
+        assert!(release_fence(&dir, "passkey:laptop", None).is_err(), "a record where none was expected");
+        // As shown: released.
+        release_fence(&dir, "passkey:laptop", Some(("n1", NOW + 7_200_000))).unwrap();
+        assert!(read_authority(&dir).unwrap().stopped);
+        assert!(release_fence(&dir, "passkey:laptop", Some(("n1", NOW + 7_200_000))).is_err(), "already released");
+        // No record, none expected: released (a record is created, stopped).
+        let d2 = Runs::new("renewed-none");
+        std::fs::create_dir_all(d2.0.join(RUN).join("ctl")).unwrap();
+        assert!(release_fence(&d2.0.join(RUN), "root", Some(("n1", 1))).is_err(), "a record expected, none there");
+        release_fence(&d2.0.join(RUN), "root", None).unwrap();
+        assert!(read_authority(&d2.0.join(RUN)).unwrap().stopped);
     }
 }

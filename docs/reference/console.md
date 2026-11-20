@@ -78,7 +78,9 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   fences whose node can never end them: the node is revoked or no longer enrolled. An enrolled node's
   silence isn't enough: its health is recorded only while a supervisor here is attached to it, and an
   offline node keeps acting on its boxes' tokens until they end. For a node that will never run its
-  boxes again, revoke it (`wicket node revoke`), then release. A run with no node on record (its box
+  boxes again, revoke it (`wicket node revoke`), then release. Revoking a node doesn't stop a box
+  already running there: it keeps acting on its tokens until they end, so for a fence with an end,
+  waiting it out is the safe path. A run with no node on record (its box
   still starting) isn't listed either. Each row shows the node, when it last reported, when the
   fence ends (or that it lasts until the node confirms), and why. **Release…** asks for a reason;
   the passkey signs the run, its node, the node's status and last report, the fence's end, the
@@ -89,7 +91,10 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   It is audited as `run.fence_released` with your passkey and operator identity, the record root's
   command writes too (`granter` `human` or `root`, `via` `console` or `cli`). The record is written
   before the fence is lifted: if it can't be written, nothing is released, and if the fence can't
-  be lifted after it (`run.fence_release_failed`), the fence still holds. The box may still be
+  be lifted after it (`run.fence_release_failed`, also when its authority record changed since you
+  were shown it, a renewal say), the fence still holds. A crash between the two leaves a
+  `run.fence_released` record with the fence not lifted: the run is still on the card, and can be
+  released again. The box may still be
   running: release a fence only for a node that will never run it again.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
