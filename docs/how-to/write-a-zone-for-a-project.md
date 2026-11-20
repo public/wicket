@@ -38,7 +38,7 @@ narrowly as the work allows; `*` matches one path segment and `**` any number:
 
 ```yaml
   reach:
-    - { host: registry.npmjs.org }                                  # GET and HEAD, every path
+    - { host: registry.npmjs.org, decode_slash: [1] }               # GET and HEAD, every path; scoped packages (/@scope%2fname)
     - { host: api.github.com, paths: ["/repos/acme/app", "/repos/acme/app/**"] }
     - { host: github.com, methods: [GET, POST],                     # git fetch over HTTPS
         paths: ["/acme/app.git/info/refs", "/acme/app.git/git-upload-pack"] }

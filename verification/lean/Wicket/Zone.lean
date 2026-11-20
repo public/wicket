@@ -21,6 +21,8 @@ structure Reach where
   methods : List Str
   paths : List Str
   dangerous : Bool
+  /-- `decode_slash` (#664): the segments in which an encoded slash is decided as `/`. -/
+  decode : List Nat := []
   deriving Repr
 
 structure Forbid where

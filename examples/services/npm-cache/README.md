@@ -23,8 +23,12 @@ In a box's zone:
 zone:
   uses: [npm-cache]
   reach:
-    - { host: registry.npmjs.org, methods: [GET, HEAD], paths: ["/**"] }
+    - { host: registry.npmjs.org, methods: [GET, HEAD], paths: ["/**"], decode_slash: [1] }
 ```
+
+`decode_slash: [1]` matches the cache's own rule: npm names a scoped package `/@scope%2fname`,
+and wicket decides that path as `/@scope/name` only where a rule says so (#664). A zone without it
+doesn't cover the cache's reach, so its link waits for a human.
 
 - The box gets `npm_config_registry=http://npm-cache.wicket.internal:4873/`, so `npm` and `npx`
   use the cache with no change to the box's own commands.

@@ -203,6 +203,7 @@ fn top_json() {
         pending: 1,
         leases: vec![LeaseLine { id: "lease_1".into(), not_after: Some(1000), ..Default::default() }],
         progress: None,
+        audit: None,
     };
     let v = crate::top::control_json(&f);
     assert_eq!((v["nodes"][0]["connected"].as_bool(), v["leases"][0]["not_after_ms"].as_i64()), (Some(true), Some(1_000_000)));

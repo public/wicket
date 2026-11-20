@@ -70,6 +70,7 @@ pub fn r(host: &str, methods: &[&str], paths: &[&str], dangerous: bool) -> Reach
         methods: methods.iter().map(|s| s.to_string()).collect(),
         paths: paths.iter().map(|s| s.to_string()).collect(),
         allow_dangerous: dangerous,
+        decode_slash: vec![],
     }
 }
 
@@ -179,7 +180,7 @@ pub fn leaf_grant(leaf: usize) -> Grant {
 }
 
 pub fn http(method: &str, host: &str, path: &str, risk: RiskClass) -> Action {
-    Action::Http { host: host.into(), method: method.into(), path: path.into(), risk, inject: Some(GH_INJECT.into()) }
+    Action::Http { host: host.into(), method: method.into(), path: path.into(), risk, inject: Some(GH_INJECT.into()), decoded: vec![] }
 }
 
 pub fn base_request(leaf: usize) -> Request {
@@ -354,7 +355,8 @@ pub fn http_request(box_id: &str, o: &wicket_core::Op) -> Request {
 /// Metadata and private hosts are decided before evaluation, so there is nothing to check for them.
 pub fn decide_compiled(l: &Loaded, r: &Request) -> Decision {
     let d = l.decide(r);
-    let early = matches!(&r.action, Action::Http { host, .. } if wicket_core::never_reachable(host).is_some());
+    let early = matches!(&r.action, Action::Http { host, decoded, .. }
+        if wicket_core::never_reachable(host).is_some() || (!decoded.is_empty() && !l.decodes()));
     assert!(early || !l.last_fell_back(), "decided in the generic engine, not the compiled evaluator: {r:?}");
     d
 }

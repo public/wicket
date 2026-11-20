@@ -52,7 +52,7 @@ fn is_false(b: &bool) -> bool {
 /// The highest priority, and minus it the lowest.
 pub const MAX_PRIORITY: i32 = 1000;
 
-/// One thing a box wants on its node: `{service: npm-cache}` or `{volume: data}`. Preferred (a node
+/// One thing a box wants on its node: `{service: pkg-cache}` or `{volume: data}`. Preferred (a node
 /// with it ranks first) unless `required` (a node without it is out).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,11 +305,11 @@ mod tests {
     #[test]
     fn priorities_and_affinity_are_checked() {
         let y = |s: &str| crate::yaml::from_str::<PlacementSpec>(s);
-        let p = y("priority: 10\npreemptible: true\naffinity: [{service: npm-cache}, {volume: data, required: true}]\n\
+        let p = y("priority: 10\npreemptible: true\naffinity: [{service: pkg-cache}, {volume: data, required: true}]\n\
                    anti_affinity: [{zone: research}, {principal: 'spiffe://w.test/t/t0/z/x/a/b', required: true}]")
         .unwrap();
         assert!(p.check().is_ok(), "{:?}", p.check());
-        assert_eq!(p.affinity[0].near(), Some(Near::Service("npm-cache".into())));
+        assert_eq!(p.affinity[0].near(), Some(Near::Service("pkg-cache".into())));
         assert_eq!(p.affinity[1].near(), Some(Near::Volume("data".into())));
         assert!(p.affinity[1].required && !p.affinity[0].required);
         assert_eq!(p.anti_affinity[1].away(), Some(Away::Principal("spiffe://w.test/t/t0/z/x/a/b".into())));

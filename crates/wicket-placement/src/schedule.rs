@@ -49,9 +49,17 @@ pub struct Request {
     pub affinity: Vec<Affinity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anti_affinity: Vec<AntiAffinity>,
+    /// The node protocol its record needs (#664: a zone that decides an encoded slash needs 19); 0:
+    /// any. The caller sets it: placement doesn't know the node protocol's versions.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub min_protocol: u32,
 }
 
 fn is_zero(n: &i32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
@@ -70,6 +78,7 @@ impl Request {
             preemptible: m.placement.preemptible,
             affinity: m.placement.affinity.clone(),
             anti_affinity: m.placement.anti_affinity.clone(),
+            min_protocol: 0,
         }
     }
 
@@ -116,6 +125,8 @@ pub struct Node {
     /// The zones of the boxes on it, and their principals' ids.
     pub zones: BTreeSet<String>,
     pub principals: BTreeSet<String>,
+    /// The protocol it last talked to the control host, if it has connected.
+    pub protocol: Option<u32>,
 }
 
 impl Node {
@@ -169,6 +180,11 @@ pub enum Refusal {
     Near(Near),
     /// It runs a box the box requires to be away from.
     Away(Away),
+    /// Its protocol (None: not known yet) is below what the box's record needs.
+    Protocol {
+        needs: u32,
+        has: Option<u32>,
+    },
 }
 
 impl fmt::Display for Refusal {
@@ -182,6 +198,8 @@ impl fmt::Display for Refusal {
             Refusal::Ca(h) => write!(f, "its CA doesn't cover {} and its policy keeps them out", h.join(", ")),
             Refusal::Near(n) => write!(f, "no {n} here, which the box requires"),
             Refusal::Away(a) => write!(f, "runs a box of {a}, which the box requires to be away from"),
+            Refusal::Protocol { needs, has: Some(h) } => write!(f, "talks protocol {h}, and the box's zone needs {needs}"),
+            Refusal::Protocol { needs, has: None } => write!(f, "its protocol isn't known yet, and the box's zone needs {needs}"),
         }
     }
 }
@@ -242,6 +260,9 @@ pub fn filter(req: &Request, node: &Node) -> Vec<Refusal> {
         if node.runs(&a) {
             out.push(Refusal::Away(a));
         }
+    }
+    if req.min_protocol > 0 && node.protocol.is_none_or(|p| p < req.min_protocol) {
+        out.push(Refusal::Protocol { needs: req.min_protocol, has: node.protocol });
     }
     out
 }
@@ -637,6 +658,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #682 re-review: a box whose record needs a node protocol (a zone that decodes a slash, 19)
+    /// isn't placed on a node below it, or on one whose protocol isn't known yet.
+    #[test]
+    fn a_box_needing_a_protocol_skips_older_and_unknown_nodes() {
+        let req = Request { vcpus: 1.0, memory_mib: 512, min_protocol: 19, ..Default::default() };
+        let mut old = node("old", 4.0, 0.0, 4096, 0);
+        old.protocol = Some(18);
+        let unknown = node("unknown", 4.0, 0.0, 4096, 0);
+        let mut new = node("new", 2.0, 0.0, 2048, 0);
+        new.protocol = Some(19);
+        let d = schedule(&req, &[old.clone(), unknown.clone(), new.clone()], Strategy::default(), None);
+        assert_eq!(d.node.as_deref(), Some("new"), "{d:?}");
+        assert_eq!(
+            d.why_not(),
+            "old (talks protocol 18, and the box's zone needs 19), unknown (its protocol isn't known yet, and the box's zone needs 19)"
+        );
+        let plain = Request { min_protocol: 0, ..req };
+        assert!(filter(&plain, &old).is_empty() && filter(&plain, &unknown).is_empty(), "a plain box goes anywhere");
     }
 
     #[test]

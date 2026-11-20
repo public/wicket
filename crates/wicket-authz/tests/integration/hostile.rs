@@ -185,6 +185,7 @@ fn the_step_budget_bounds_what_passes() {
         path: format!("/{}", "x".repeat(4000)),
         risk: wicket_core::RiskClass::R1ReadScoped,
         inject: None,
+        decoded: vec![],
     };
     let start = Instant::now();
     let d = l.decide(&r);
@@ -201,6 +202,7 @@ fn the_step_budget_bounds_what_passes() {
         path: "/abcd".into(),
         risk: wicket_core::RiskClass::R1ReadScoped,
         inject: None,
+        decoded: vec![],
     };
     assert_eq!(l.decide(&r), Decision::Allow);
     assert!(l.last_steps() <= STEP_BUDGET);

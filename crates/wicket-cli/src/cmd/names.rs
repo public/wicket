@@ -127,7 +127,9 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
                 println!(
                     "  for:       {}\n  lasts:     {}",
                     match bound {
-                        wicket_store::StandingBound::Agent => format!("{} (each later run of it)", c(&n.principal, 200)),
+                        wicket_store::StandingBound::Agent => {
+                            format!("{} (this run; later runs once wicket gives standing names to them, not yet)", c(&n.principal, 200))
+                        }
                         wicket_store::StandingBound::Zone => format!("every agent of zone {}", c(&n.zone, 200)),
                     },
                     ttl.map(|t| wicket_core::time::format_duration(t).to_string()).unwrap_or_else(|| "until revoked".into())
@@ -138,7 +140,7 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
                 bail!("not approved");
             }
-            nm::approve(&l, &human()?, &id, &terms, Some(&shown), serde_json::json!({ "via": "cli" }))?;
+            nm::approve(&l, &human()?, &id, &terms, &shown, serde_json::json!({ "via": "cli" }))?;
             println!(
                 "approved {id}: the public name {} (port {}). wicket doesn't publish public records yet: it is a record only.",
                 c(&n.label, 63),

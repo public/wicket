@@ -102,6 +102,8 @@ pub struct Link {
     pub build: String,
     pub proto: u32,
     task: tokio::task::JoinHandle<()>,
+    /// This connection, noted with its protocol while it lasts (#691).
+    _live: crate::noderun::LiveSession,
 }
 
 impl Drop for Link {
@@ -127,10 +129,18 @@ impl Link {
             nonce,
             scope: scope.into(),
         };
-        let authed = crate::nodeauth::control(&mut rd, &mut wr, node, ledger, &issuer, hello)
-            .await
-            .map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
+        let authed = match crate::nodeauth::control(&mut rd, &mut wr, node, ledger, &issuer, hello).await {
+            Ok(a) => a,
+            Err(e) => {
+                // Refused (identity, revocation, protocol): what it talks isn't known now (#691).
+                if matches!(e, crate::nodeauth::HsError::Refused(_)) {
+                    crate::noderun::forget_protocol(node);
+                }
+                return Err(anyhow::anyhow!("node {node}: {e}"));
+            }
+        };
         let proto = authed.proto;
+        let live = crate::noderun::note_session(node, proto);
         let (capacity, runs, orphaned, build) = match authed.welcome {
             Msg::Welcome { capacity, runs, orphaned, build, .. } => (capacity, runs, orphaned.map(|o| *o).unwrap_or_default(), build),
             _ => (None, vec![], vec![], String::new()),
@@ -155,6 +165,6 @@ impl Link {
             writer.abort();
             c.set_out(None);
         });
-        Ok(Link { calls, capacity, runs, orphaned, build, proto, task })
+        Ok(Link { calls, capacity, runs, orphaned, build, proto, task, _live: live })
     }
 }
