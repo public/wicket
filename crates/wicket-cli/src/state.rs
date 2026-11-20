@@ -413,6 +413,7 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     std::fs::rename(&tmp, &db)?;
     let l = wicket_store::Ledger::open(&db)?;
     l.verify_audit().context("the restored ledger's audit chain")?;
+    wicket_home::audit_export::verify_local_anchor(&l).context("the restored ledger's audit chain")?;
     let (head, _) = l.audit_head()?.unwrap_or((0, String::new()));
     println!("[wicket] the ledger is restored from lineage {}: its audit chain verifies, up to record {head}", from.id);
     // This host streams as a lineage of its own from now on; the one it came from is superseded.

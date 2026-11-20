@@ -67,6 +67,8 @@ pub fn route(cmd: &Cmd) -> Route {
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
         Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } => Forward(Read),
+        // Rewriting the ledger (#582) is a host maintenance step.
+        Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Forward(Privileged),
         Cmd::Pending { .. } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
@@ -351,6 +353,7 @@ mod tests {
             (&["pending"], Route::Forward(Read)),
             (&["links"], Route::Forward(Read)),
             (&["audit", "--verify"], Route::Forward(Read)),
+            (&["audit", "compact", "--yes"], Route::Forward(Privileged)),
             (&["doctor"], Route::Forward(Read)),
             (&["approve", "R1"], Route::Forward(Privileged)),
             (&["approve", "R1", "--unlimited", "--ttl", "1h"], Route::Forward(Privileged)),

@@ -948,15 +948,11 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     // Audit retention on the host (#582): over its size limit, the audit table's oldest records
     // (ones every sink has, behind a checkpoint one acknowledged) are pruned and the space given
     // back. Never without a sink and the state store.
-    match wicket_home::audit_export::retention_pass(&ledger, dry_run) {
-        Ok(r) if r.pruned > 0 || r.vacuumed || r.waiting.is_some() => done.push(Done {
+    match crate::statesync::audit_retention(&ledger, !dry_run) {
+        Ok(r) if r.pruned > 0 || r.waiting.is_some() => done.push(Done {
             kind: if r.pruned > 0 { "audit_pruned" } else { "audit_retention" },
             target: "ledger".into(),
-            detail: format!(
-                "{}{}",
-                if r.vacuumed { "switched the ledger to auto_vacuum=incremental (a one-off VACUUM); " } else { "" },
-                wicket_home::audit_export::retention_line(&r)
-            ),
+            detail: wicket_home::audit_export::retention_line(&r),
         }),
         Ok(_) => {}
         Err(e) => done.push(Done { kind: "error", target: "audit retention".into(), detail: format!("{e:#}") }),

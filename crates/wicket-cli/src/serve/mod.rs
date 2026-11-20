@@ -1968,7 +1968,7 @@ fn dashboard(state: &State) -> Result<Value> {
         "standing": standing::view(&l, &t.0)?,
         "audit": audit,
         // The audit table against its limit on this host, and the prune checkpoint (#582).
-        "audit_retention": wicket_home::audit_export::retention_status(&l).ok().map(|r| json!({
+        "audit_retention": crate::statesync::audit_retention(&l, false).ok().map(|r| json!({
             "line": wicket_home::audit_export::retention_line(&r),
             "enabled": r.enabled,
             "bytes": r.usage.bytes,

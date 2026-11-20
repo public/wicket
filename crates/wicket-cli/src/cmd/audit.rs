@@ -14,6 +14,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     "--json lists the audit records: not with export (`wicket audit export --status` shows the sinks)",
                 ));
             }
+            if let Some(AuditCmd::Compact { yes }) = cmd {
+                return compact(yes);
+            }
             if let Some(AuditCmd::Export { once, checkpoint, status }) = cmd {
                 // The exporter blocks (its own runtime, file and HTTP writes): off the async runtime.
                 return std::thread::spawn(move || audit_export_cmd(once, checkpoint, status))
@@ -22,27 +25,25 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             }
             let l = Ledger::open(&ledger_path())?;
             if verify {
-                println!("audit chain OK: {} records", l.verify_audit()?);
-                // After a prune (#582) the chain starts at a checkpoint a sink acknowledged: its
-                // signature, and that it signed the record kept there, are checked too.
-                if let Some(a) = l.audit_anchor()? {
-                    let key = match &issuer_jwk {
-                        Some(p) => wicket_identity::verifying_key_from_jwk(&serde_json::from_slice(&std::fs::read(p)?)?)?,
-                        None => issuer()?.verifying_key(),
-                    };
-                    let p =
-                        wicket_identity::verify_checkpoint(&a.jws, &key).context("the audit chain's anchor checkpoint doesn't verify")?;
-                    if p["seq"].as_i64() != Some(a.seq) || p["head"].as_str() != Some(a.hash.as_str()) {
-                        bail!(
-                            "the audit chain's anchor checkpoint signs seq {} head {}, not the record kept at seq {}",
-                            p["seq"],
-                            p["head"],
-                            a.seq
-                        );
+                let n = l.verify_audit()?;
+                // After a prune (#582) the chain starts at a checkpoint a durable sink acknowledged:
+                // its signature, and that it signed the record kept there, are checked first.
+                let anchor = match l.audit_anchor()? {
+                    Some(a) => {
+                        let key = match &issuer_jwk {
+                            Some(p) => wicket_identity::verifying_key_from_jwk(&serde_json::from_slice(&std::fs::read(p)?)?)?,
+                            None => issuer()?.verifying_key(),
+                        };
+                        audit_export::verify_anchor(&l, &key)?;
+                        Some(a)
                     }
+                    None => None,
+                };
+                println!("audit chain OK: {n} records");
+                if let Some(a) = anchor {
                     println!(
-                        "  from its anchor at seq {} (a checkpoint sink {} acknowledged, signed at {}): {} older record(s) pruned here, kept in the sinks",
-                        a.seq, a.sink, p["ts"], a.pruned
+                        "  from its anchor at seq {} (a signed checkpoint sink {} acknowledged): {} older record(s) pruned here, kept in the sinks",
+                        a.seq, a.sink, a.pruned
                     );
                 }
                 let (ok, bad) = verify_signed_decisions(&l)?;
@@ -122,12 +123,71 @@ fn audit_json((seq, ts, kind, run, body): wicket_store::AuditRow) -> serde_json:
     serde_json::json!({ "seq": seq, "ts": ts, "kind": kind, "run": run, "body": body })
 }
 
+/// `wicket audit compact`: switches the ledger to `auto_vacuum = incremental` with one `VACUUM`
+/// (#582), so audit retention gives pruned space back to the file system from then on. The whole
+/// file is rewritten under an exclusive lock, so wicket's services must be stopped (a reconcile
+/// pass, the console or a run writing would wait past their budget); it needs as much free space
+/// again as the file, and takes about a minute per 2.5 GB.
+fn compact(yes: bool) -> Result<()> {
+    let path = ledger_path();
+    let l = Ledger::open(&path)?;
+    if l.auto_vacuum_incremental()? {
+        println!("{}: already gives pruned space back (auto_vacuum = incremental): nothing to do", path.display());
+        return Ok(());
+    }
+    let size = l.file_bytes()?;
+    let free = free_bytes(path.parent().unwrap_or(std::path::Path::new("/")))?;
+    if free < 2 * size {
+        bail!(
+            "compacting needs about twice the ledger's size free ({} MB, with its WAL): {} MB is free beside {}",
+            2 * size / 1_000_000,
+            free / 1_000_000,
+            path.display()
+        );
+    }
+    println!(
+        "compacting {} ({} MB): one VACUUM, about a minute per 2.5 GB, under an exclusive lock. Stop wicket's services first \
+         (systemctl stop wicket-console wicket-reconcile wicketd, or end `wicket serve` and `wicket reconcile`).",
+        path.display(),
+        size / 1_000_000
+    );
+    if !yes && !confirm("compact now?")? {
+        bail!("not compacted");
+    }
+    // No reconcile pass meanwhile, on this host.
+    let _lock = crate::reconcile::Lock::take()?;
+    let t = std::time::Instant::now();
+    l.make_auto_vacuum_incremental()?;
+    println!("compacted in {:.1} s: {} MB now", t.elapsed().as_secs_f64(), l.file_bytes()? / 1_000_000);
+    Ok(())
+}
+
+/// Bytes free on the file system holding `dir`.
+fn free_bytes(dir: &std::path::Path) -> Result<i64> {
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statvfs fills `st`; `c` is a NUL-terminated path.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("statvfs");
+    }
+    Ok((st.f_bavail as i64).saturating_mul(st.f_frsize as i64))
+}
+
 #[derive(Subcommand)]
 pub enum AuditCmd {
     /// Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or
     /// $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which
     /// feed the sinks too; each sink is fed by one process at a time. The only process that writes
     /// to a `path: "-"` (stdout) sink.
+    /// Switch the ledger to giving pruned audit space back (`auto_vacuum = incremental`), with one
+    /// VACUUM (#582). Stop wicket's services first: the whole file is rewritten under an exclusive
+    /// lock (about a minute per 2.5 GB), and it needs as much free space again. Ledgers made by
+    /// this build don't need it.
+    Compact {
+        /// Don't ask for confirmation at a terminal.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     Export {
         /// One pass, then exit (non-zero if a sink failed).
         #[arg(long)]

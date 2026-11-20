@@ -82,6 +82,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket standing renew`](#wicket-standing-renew)
   - [`wicket standing revoke`](#wicket-standing-revoke)
 - [`wicket audit`](#wicket-audit)
+  - [`wicket audit compact`](#wicket-audit-compact)
   - [`wicket audit export`](#wicket-audit-export)
 - [`wicket node`](#wicket-node)
   - [`wicket node token`](#wicket-node-token)
@@ -844,8 +845,9 @@ Show or verify the hash-chained audit log, or export it to the configured sinks
 Usage: wicket audit [OPTIONS] [COMMAND]
 
 Commands:
-  export  Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which feed the sinks too; each sink is fed by one process at a time. The only process that writes to a `path: "-"` (stdout) sink
-  help    Print this message or the help of the given subcommand(s)
+  compact  Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which feed the sinks too; each sink is fed by one process at a time. The only process that writes to a `path: "-"` (stdout) sink. Switch the ledger to giving pruned audit space back (`auto_vacuum = incremental`), with one VACUUM (#582). Stop wicket's services first: the whole file is rewritten under an exclusive lock (about a minute per 2.5 GB), and it needs as much free space again. Ledgers made by this build don't need it
+  export   
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
       --tail <TAIL>              [default: 40]
@@ -856,11 +858,21 @@ Options:
   -h, --help                     Print help
 ```
 
+### `wicket audit compact`
+
+```text
+Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which feed the sinks too; each sink is fed by one process at a time. The only process that writes to a `path: "-"` (stdout) sink. Switch the ledger to giving pruned audit space back (`auto_vacuum = incremental`), with one VACUUM (#582). Stop wicket's services first: the whole file is rewritten under an exclusive lock (about a minute per 2.5 GB), and it needs as much free space again. Ledgers made by this build don't need it
+
+Usage: wicket audit compact [OPTIONS]
+
+Options:
+  -y, --yes   Don't ask for confirmation at a terminal
+  -h, --help  Print help
+```
+
 ### `wicket audit export`
 
 ```text
-Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which feed the sinks too; each sink is fed by one process at a time. The only process that writes to a `path: "-"` (stdout) sink
-
 Usage: wicket audit export [OPTIONS]
 
 Options:

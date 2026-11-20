@@ -255,7 +255,7 @@ pub struct LeaseLine {
 pub fn control_frame(l: &wicket_store::Ledger, runs_dir: &Path, now_ms: i64) -> Result<ControlFrame> {
     let tenant = wicket_core::TenantId::single();
     let mut f = ControlFrame { now_ms, ..Default::default() };
-    f.audit = wicket_home::audit_export::retention_status(l).ok().map(|r| wicket_home::audit_export::retention_line(&r));
+    f.audit = crate::statesync::audit_retention(l, false).ok().map(|r| wicket_home::audit_export::retention_line(&r));
     let mut by_node: HashMap<String, (Vec<LinkRecord>, usize)> = HashMap::new();
     let agents = l.agents(&tenant.0)?;
     // A long-lived agent's run on its way to hibernating (or waking) says so.
