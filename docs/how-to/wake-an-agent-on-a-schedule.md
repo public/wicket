@@ -29,7 +29,14 @@ limits: { per_hour: 6 }            # the default; at most 60
 - **The source.** `schedule` takes five cron fields (minute, hour, day of month, month, day of
   week, with `*`, lists, ranges and steps) and a time zone from the host's zoneinfo (`UTC` by
   default). A schedule that can never fire (`0 0 31 2 *`) is refused. Use
-  `timer: { at: 2026-11-20T07:00:00Z }` or `timer: { after: 2h }` instead for one firing.
+  `timer: { at: 2026-11-20T07:00:00Z }` or `timer: { after: 2h }` instead for one firing. Once
+  a timer has fired (or its time has passed) it is `done`: it stays listed until you remove it,
+  and a new trigger of the same name replaces it.
+- **Daylight saving.** A schedule with fixed hours (`30 1 * * *`) fires once a day across a
+  change, as cron does. When the clocks go back it fires the first time the clock shows its time.
+  When they skip its time it fires at the first minute after the gap. A schedule that runs every
+  hour (`*/15 * * * *`) goes by the clock as it is: through both copies of a repeated hour, and
+  not at all for minutes that don't exist.
 - **The action.** `wake` wakes a hibernated agent. With a `message` beside it, the message is the
   woken agent's next turn (leave `message.to` out). A `message` on its own goes to the agent whose
   principal is in `to` (`spiffe://…`). The agent reads it as its next turn, and a hibernated agent
@@ -144,7 +151,7 @@ resume or renew it, since it fires as its owner.
   (`trigger.skipped`). Later skips that hour are counted on it, shown as `+N more` in
   `wicket trigger show`.
 - **A timer's time passed.** If the time came while the trigger was paused, or the reconciler was
-  down for more than 15 minutes, the timer is recorded as skipped once, and doesn't fire.
+  down for more than 15 minutes, the timer is recorded as skipped once, doesn't fire, and is done.
 - **The agent is hibernating.** A message goes through its current run, so the agent is woken
   again once it has hibernated. A wake with no message queues a short turn saying so, to the same
   effect.

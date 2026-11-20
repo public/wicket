@@ -321,16 +321,51 @@ pub struct Fired {
     pub detail: String,
 }
 
-/// The minutes in `(from, to]` a schedule matches, in its zone.
+/// Whether `cron` matches a local wall-clock time.
+fn matches_at(cron: &wicket_core::trigger::Cron, dt: jiff::civil::DateTime) -> bool {
+    cron.matches(dt.minute() as u8, dt.hour() as u8, dt.day() as u8, dt.month() as u8, dt.weekday().to_sunday_zero_offset() as u8)
+}
+
+/// The minutes in `(from, to]` a schedule matches, in its zone, read as cron reads wall-clock
+/// time across a daylight-saving change. A schedule with fixed hours (`30 1 * * *`) fires once a
+/// day either way: in an hour the clocks go back over, only the first time the wall clock shows
+/// its minute; in an hour the clocks skip, at the first minute after the gap. A schedule that
+/// runs every hour (`*` hours, `*/15 * * * *`) goes by the clock as it is: through both copies of
+/// a repeated hour, and nothing for minutes that don't exist.
 pub fn schedule_minutes(cron: &wicket_core::trigger::Cron, tz: &jiff::tz::TimeZone, from: i64, to: i64) -> Vec<i64> {
+    let fixed_hours = cron.hours.len() < 24;
+    let local = |m: i64| jiff::Timestamp::from_second(m).ok().map(|ts| ts.to_zoned(tz.clone()));
     let mut out = vec![];
     let mut m = (from.div_euclid(60) + 1) * 60;
     while m <= to {
-        if let Ok(ts) = jiff::Timestamp::from_second(m) {
-            let z = ts.to_zoned(tz.clone());
-            if cron.matches(z.minute() as u8, z.hour() as u8, z.day() as u8, z.month() as u8, z.weekday().to_sunday_zero_offset() as u8) {
-                out.push(m);
+        let Some(z) = local(m) else {
+            m += 60;
+            continue;
+        };
+        let dt = z.datetime();
+        let mut hit = matches_at(cron, dt);
+        if fixed_hours {
+            let before = local(m - 60).map(|p| (p.offset(), p.datetime()));
+            match before {
+                // The clocks went forward between the last minute and this one: the wall-clock
+                // minutes skipped fire here, as cron runs them.
+                Some((off, prev)) if z.offset() > off => {
+                    let mut skipped = prev.checked_add(jiff::Span::new().minutes(1)).ok();
+                    while let Some(t) = skipped.filter(|t| *t < dt) {
+                        hit |= matches_at(cron, t);
+                        skipped = t.checked_add(jiff::Span::new().minutes(1)).ok();
+                    }
+                }
+                // A wall-clock time shown a second time (the clocks went back): fired the first time.
+                _ if hit => {
+                    let first = tz.to_ambiguous_timestamp(dt).earlier().map(|t| t.as_second());
+                    hit = first.map_or(true, |f| f == m);
+                }
+                _ => {}
             }
+        }
+        if hit {
+            out.push(m);
         }
         m += 60;
     }
@@ -369,6 +404,8 @@ enum Due {
     Stale {
         slot: i64,
     },
+    /// A timer that has fired (or been skipped) already: marked done.
+    Spent,
 }
 
 /// What `t` has due at `now`: a schedule's minutes after its floor (its last recorded minute,
@@ -388,6 +425,7 @@ fn due(l: &Ledger, t: &Trigger, now: i64) -> Result<Due> {
         }
         Source::Timer { .. } => match timer_due(&t.spec, t.created_at)? {
             Some(d) if d <= now && last.is_none() => Ok(if d > floor { Due::Fire { slot: d, missed: 0 } } else { Due::Stale { slot: d } }),
+            Some(d) if d <= now => Ok(Due::Spent),
             _ => Ok(Due::Nothing),
         },
         _ => Ok(Due::Nothing),
@@ -420,7 +458,12 @@ pub fn pass(l: &Ledger, now: i64, dry_run: bool, wake: Waker<'_>, owner: OwnerCh
 
 fn one(l: &Ledger, t: &Trigger, now: i64, dry_run: bool, wake: Waker<'_>, owner: OwnerCheck<'_>) -> Result<Option<Fired>> {
     let d = due(l, t, now)?;
-    if d == Due::Nothing {
+    if d == Due::Nothing || (d == Due::Spent && dry_run) {
+        return Ok(None);
+    }
+    if d == Due::Spent {
+        // Spent before timers were marked done when they fired: only narrows, so no owner check.
+        finish(l, t, "its timer has fired")?;
         return Ok(None);
     }
     let done = |status: &str, detail: String| Fired { trigger: t.id.clone(), name: t.name.clone(), status: status.into(), detail };
@@ -435,7 +478,7 @@ fn one(l: &Ledger, t: &Trigger, now: i64, dry_run: bool, wake: Waker<'_>, owner:
                     if missed > 0 { format!(", {missed} earlier missed") } else { String::new() }
                 ),
             ),
-            _ => done("due", "its timer's time passed: skipped (dry run)".into()),
+            _ => done("due", "its timer's time passed: skipped, and done (dry run)".into()),
         }));
     }
     if let Err(why) = owner(t) {
@@ -443,8 +486,12 @@ fn one(l: &Ledger, t: &Trigger, now: i64, dry_run: bool, wake: Waker<'_>, owner:
     }
     match d {
         Due::Fire { slot, missed } => fire(l, t, slot, missed, wake),
-        Due::Stale { slot } => stale(l, t, slot),
-        Due::Nothing => Ok(None),
+        Due::Stale { slot } => {
+            let f = stale(l, t, slot)?;
+            finish(l, t, "its timer's time passed")?;
+            Ok(f)
+        }
+        Due::Nothing | Due::Spent => Ok(None),
     }
 }
 
@@ -574,10 +621,22 @@ fn fire(l: &Ledger, t: &Trigger, slot: i64, missed: usize, wake: Waker<'_>) -> R
     if let Some(agent) = woken {
         wake(&agent, &format!("trigger {}", t.name));
     }
-    if fired.as_ref().is_some_and(|f| f.status == "failed") {
+    if matches!(t.spec.source, Source::Timer { .. }) {
+        // A timer fires once, whatever came of it.
+        finish(l, t, "its timer has fired")?;
+    } else if fired.as_ref().is_some_and(|f| f.status == "failed") {
         pause_if_failing(l, t)?;
     }
     Ok(fired)
+}
+
+/// Marks a timer done (L5): it fires nothing again and stays listed until removed or replaced.
+/// Audited as `trigger.done`, once.
+fn finish(l: &Ledger, t: &Trigger, why: &str) -> Result<()> {
+    if l.finish_trigger(&t.id)? {
+        audit(l, "trigger.done", &json!({ "trigger": t.id, "name": t.name, "owner": t.owner, "why": why }))?;
+    }
+    Ok(())
 }
 
 /// Pauses `t` if its last [`FAILURES_TO_PAUSE`] firings all failed.
@@ -1047,6 +1106,36 @@ mod tests {
         assert!(zone("Mars/Olympus").is_err());
     }
 
+    /// L1: across the daylight-saving changes in Europe/London (2026: clocks forward 29 March
+    /// 01:00 GMT, back 25 October 02:00 BST), a fixed-hours schedule fires once a day: once in the
+    /// repeated hour, and right after the skipped one. An every-hour schedule goes by the clock.
+    #[test]
+    fn a_schedule_fires_once_across_daylight_saving() {
+        let utc = |s: &str| s.parse::<jiff::Timestamp>().unwrap().as_second();
+        let london = zone("Europe/London").unwrap();
+        let cron = |c: &str| wicket_core::trigger::Cron::parse(c).unwrap();
+        let day = |d: &str| (utc(&format!("{d}T00:00:00Z")) - 3600, utc(&format!("{d}T00:00:00Z")) + 82800);
+        // October: 01:30 comes twice (BST, then GMT); it fires the first time.
+        let (a, b) = day("2026-10-25");
+        assert_eq!(schedule_minutes(&cron("30 1 * * *"), &london, a, b), [utc("2026-10-25T00:30:00Z")]);
+        // March: 01:30 doesn't exist; it fires at 02:00 BST, the first minute after the gap.
+        let (a, b) = day("2026-03-29");
+        assert_eq!(schedule_minutes(&cron("30 1 * * *"), &london, a, b), [utc("2026-03-29T01:00:00Z")]);
+        // 02:00 itself is unaffected, and a job outside the change is too.
+        assert_eq!(schedule_minutes(&cron("0 2 * * *"), &london, a, b), [utc("2026-03-29T01:00:00Z")]);
+        assert_eq!(schedule_minutes(&cron("0 9 * * *"), &london, a, b), [utc("2026-03-29T08:00:00Z")]);
+        // Several skipped minutes still fire once.
+        assert_eq!(schedule_minutes(&cron("0,30 1 * * *"), &london, a, b), [utc("2026-03-29T01:00:00Z")]);
+        // Every quarter-hour goes by the clock: eight in October's repeated hour, none in March's gap.
+        let (a, b) = (utc("2026-10-25T00:00:00Z") - 1, utc("2026-10-25T02:00:00Z") - 1);
+        assert_eq!(schedule_minutes(&cron("*/15 * * * *"), &london, a, b).len(), 8);
+        let (a, b) = (utc("2026-03-29T00:00:00Z") - 1, utc("2026-03-29T01:00:00Z"));
+        assert_eq!(schedule_minutes(&cron("*/15 * * * *"), &london, a, b).len(), 5);
+        // UTC has no changes: nothing moves.
+        let (a, b) = day("2026-03-29");
+        assert_eq!(schedule_minutes(&cron("30 1 * * *"), &jiff::tz::TimeZone::UTC, a, b), [utc("2026-03-29T01:30:00Z")]);
+    }
+
     fn operator() -> Operator {
         Operator { id: "spiffe://local/t/t0/op/unix/alex".into(), label: "unix:alex".into(), authority: Authority::Anything }
     }
@@ -1302,7 +1391,19 @@ mod tests {
         assert!(pass(&l, t.created_at + 3600, false, &no_wake, &anyone).unwrap().is_empty());
         assert_eq!(next_due(&t, t.created_at), Some(t.created_at + 7200));
         assert_eq!(pass(&l, t.created_at + 7300, false, &no_wake, &anyone).unwrap().len(), 1);
+        assert_eq!(l.trigger(&id).unwrap().unwrap().status, "done", "spent: done");
         assert!(pass(&l, t.created_at + 9000, false, &no_wake, &anyone).unwrap().is_empty(), "once");
+        assert!(resume(&l, &operator(), false, &id).is_err(), "a done timer isn't resumed");
+        assert!(kinds(&l).contains(&"trigger.done".into()));
+        // One spent before timers were marked done: marked on the next pass.
+        let (old, _) =
+            create(&l, &operator(), &spec("trigger: old\nsource: { timer: { after: 1h } }\naction: { wake: captain }\n"), None, "t")
+                .unwrap();
+        let ot = l.trigger(&old).unwrap().unwrap();
+        let slot = ot.created_at + 3600;
+        l.record_trigger_event("t0", "timer", "timer", &format!("{old}@{slot}"), &json!({ "slot": slot }), "x", "wicket").unwrap();
+        assert!(pass(&l, ot.created_at + 3700, false, &no_wake, &anyone).unwrap().is_empty());
+        assert_eq!(l.trigger(&old).unwrap().unwrap().status, "done");
         let past = spec("trigger: past\nsource: { timer: { at: '2020-01-01T00:00:00Z' } }\naction: { wake: captain }\n");
         assert!(create(&l, &operator(), &past, None, "t").unwrap_err().to_string().contains("passed"));
         let mars = spec("trigger: mars\nsource: { schedule: { cron: '0 7 * * *', tz: Mars/Olympus } }\naction: { wake: captain }\n");
@@ -1314,7 +1415,10 @@ mod tests {
         // Down for two hours: its time is long past.
         let got = pass(&l, lt.created_at + 3 * 3600, false, &no_wake, &anyone).unwrap();
         assert_eq!(got.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(), ["skipped"], "{got:?}");
+        assert_eq!(l.trigger(&late).unwrap().unwrap().status, "done");
         assert!(pass(&l, lt.created_at + 4 * 3600, false, &no_wake, &anyone).unwrap().is_empty(), "once");
+        // Its name is free again.
+        create(&l, &operator(), &spec("trigger: late\nsource: { timer: { after: 1h } }\naction: { wake: captain }\n"), None, "t").unwrap();
     }
 
     fn record(seq: i64, kind: &str, run: Option<&str>, body: Value) -> wicket_store::AuditRecord {

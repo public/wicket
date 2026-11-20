@@ -73,7 +73,7 @@ pub struct Trigger {
     pub owner: String,
     pub name: String,
     pub spec: TriggerSpec,
-    /// `active`, `paused` or `deleted`.
+    /// `active`, `paused`, `done` (a timer that has fired) or `deleted`.
     pub status: String,
     /// `none` (it widened nothing), `pending` (it waits for a human), or `approved`.
     pub approval: String,
@@ -175,6 +175,11 @@ impl Ledger {
         spec.check().map_err(StoreError::Refused)?;
         let tid = id("t");
         let t = now();
+        // A spent timer of the same name gives way: it is kept as deleted.
+        self.conn.execute(
+            "UPDATE triggers SET status = 'deleted', updated_at = ?4 WHERE tenant = ?1 AND owner = ?2 AND name = ?3 AND status = 'done'",
+            params![tenant, owner, spec.trigger, t],
+        )?;
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO triggers (id, tenant, owner, name, spec, status, approval, created_at, created_by, until, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?9, ?7)",
@@ -218,13 +223,23 @@ impl Ledger {
             return Err(StoreError::Refused(format!("a trigger is active, paused or deleted, not {status}")));
         }
         let n = self.conn.execute(
-            "UPDATE triggers SET status = ?2, updated_at = ?3 WHERE id = ?1 AND status != 'deleted'",
+            "UPDATE triggers SET status = ?2, updated_at = ?3 WHERE id = ?1 AND status != 'deleted' AND (status != 'done' OR ?2 = 'deleted')",
             params![id, status, now()],
         )?;
         if n != 1 {
-            return Err(StoreError::Refused(format!("no trigger {id}, or it is deleted")));
+            return Err(StoreError::Refused(format!("no trigger {id}, or it is deleted, or done (a done timer is only removed)")));
         }
         Ok(())
+    }
+
+    /// Marks an active or paused trigger `done`: a timer that has fired (or whose time passed). It
+    /// fires nothing again, stays listed until removed, and a new trigger of its name replaces it.
+    /// False if it was already done or deleted.
+    pub fn finish_trigger(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE triggers SET status = 'done', updated_at = ?2 WHERE id = ?1 AND status IN ('active', 'paused')",
+            params![id, now()],
+        )? == 1)
     }
 
     /// Moves a live trigger's lapse to `until` (None: until removed).
@@ -690,6 +705,26 @@ mod tests {
         assert_eq!(l.prune_triggers(now() + 10).unwrap(), 4, "the skipped firing and three events no firing waits on");
         assert_eq!(l.firings("t-1", None).unwrap().iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), [q.as_str()]);
         assert_eq!(l.last_trigger_slot("t0", "t-1").unwrap(), Some(180), "a waiting firing's event stays");
+    }
+
+    /// A spent timer is done: not live, not paused or resumed, only removed; a new trigger of its
+    /// name replaces it.
+    #[test]
+    fn a_done_trigger_gives_way() {
+        let l = Ledger::open_in_memory().unwrap();
+        let s: TriggerSpec =
+            wicket_core::yaml::from_str("trigger: later\nsource: { timer: { after: 1h } }\naction: { wake: self }\n").unwrap();
+        let a = l.create_trigger("t0", "op", &s, "x", false, None).unwrap();
+        assert!(l.create_trigger("t0", "op", &s, "x", false, None).is_err(), "the name is taken");
+        assert!(l.finish_trigger(&a).unwrap());
+        assert!(!l.finish_trigger(&a).unwrap(), "once");
+        let t = l.trigger(&a).unwrap().unwrap();
+        assert!(t.status == "done" && !t.live(0));
+        assert!(l.set_trigger_status(&a, "active").is_err() && l.set_trigger_status(&a, "paused").is_err());
+        assert_eq!(l.triggers("t0", None).unwrap().len(), 1, "listed until removed");
+        let b = l.create_trigger("t0", "op", &s, "x", false, None).unwrap();
+        assert_eq!(l.trigger(&a).unwrap().unwrap().status, "deleted");
+        assert_eq!(l.triggers("t0", None).unwrap().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [b.as_str()]);
     }
 
     /// Work is claimed by one live run at a time, released by it (or all of a run's at its end),
