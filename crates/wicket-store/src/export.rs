@@ -38,7 +38,7 @@ pub struct ExportCursor {
 }
 
 impl Ledger {
-    fn ensure_export_row(&self, sink: &str) -> Result<()> {
+    pub(crate) fn ensure_export_row(&self, sink: &str) -> Result<()> {
         self.conn.execute("INSERT OR IGNORE INTO audit_export (sink) VALUES (?1)", params![sink])?;
         Ok(())
     }

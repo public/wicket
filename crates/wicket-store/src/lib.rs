@@ -1797,13 +1797,17 @@ impl Ledger {
             .optional()?)
     }
 
-    /// Recomputes the whole chain: from seq 1, or after a prune (#582) from the anchor, whose
-    /// record must be the first kept and hash to what the anchor's checkpoint signed (its own
-    /// `prev` is the deleted record's, taken as stored). Returns the number of records verified.
+    /// Recomputes the whole chain: from seq 1, or after a prune (#582) from the anchor on (kinds
+    /// the host keeps below it aren't chained), whose record must be the first and hash to what
+    /// the anchor's checkpoint signed (its own `prev` is a deleted record's, taken as stored). An
+    /// anchor over no records fails. The anchor's signature is the caller's to check (it needs the
+    /// issuer key: `wicket_home::audit_export::verify_anchor`). Returns the number of records
+    /// verified.
     pub fn verify_audit(&self) -> Result<i64> {
         let anchor = self.audit_anchor()?;
-        let mut st = self.conn.prepare("SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit ORDER BY seq")?;
-        let mut rows = st.query([])?;
+        let from = anchor.as_ref().map(|a| a.seq).unwrap_or(i64::MIN);
+        let mut st = self.conn.prepare("SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit WHERE seq >= ?1 ORDER BY seq")?;
+        let mut rows = st.query(params![from])?;
         let mut prev = CHAIN_ZERO.to_string();
         let mut n = 0;
         while let Some(r) = rows.next()? {
@@ -1823,6 +1827,11 @@ impl Ledger {
             }
             prev = h;
             n += 1;
+        }
+        if n == 0 {
+            if let Some(a) = &anchor {
+                return Err(StoreError::ChainBroken(a.seq));
+            }
         }
         Ok(n)
     }
