@@ -186,3 +186,26 @@ fn an_overtaken_snapshot_off_the_nodes_chain_is_a_fork() {
     r.accept(&a_snapshot, T0 + 302).expect("superseded");
     assert_eq!(r.stats.superseded, 1);
 }
+
+/// #589, the case the first fix left: A's older snapshot arrives after B's snapshot but before B's
+/// statement. It was signed before B's snapshot, so it is superseded, not a rollback; B's statement
+/// then lands and the node is fresh.
+#[test]
+fn a_snapshot_overtaken_before_the_other_runs_statement_is_superseded() {
+    let (mut cp, mut r) = setup();
+    let base = r.state().unwrap().epoch;
+    let a_snapshot = cp.p.snapshot(T0 + 100);
+    let mut b = other(&cp, cp.p.last_issued());
+    b.commit(vec![add(grant("g-b", &read(), T0 + 3_600_000))], T0 + 200).unwrap();
+    let b_snapshot = b.snapshot(T0 + 250);
+    let b_statement = b.statement(T0 + 300);
+    r.accept(&b_snapshot, T0 + 300).unwrap();
+    let held = (r.state().unwrap().epoch, r.state().unwrap().head.clone());
+    assert_eq!(held.0, base + 1);
+    r.accept(&a_snapshot, T0 + 301).expect("overtaken before B's statement: superseded, not a rollback");
+    assert_eq!((r.state().unwrap().epoch, r.state().unwrap().head.clone()), held, "nothing moved back");
+    r.accept(&b_statement, T0 + 302).unwrap();
+    assert_eq!(r.stats.superseded, 1);
+    assert!(r.stats.refused.is_empty(), "{:?}", r.stats.refused);
+    assert_eq!(r.mode(T0 + 302), Mode::Fresh);
+}
