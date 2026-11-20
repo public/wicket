@@ -1753,7 +1753,7 @@ mod tests {
         // operator releases the fence: then it ends.
         pass_at(&w, &mut l, &asked, false, NOW + 366 * 86_400).await;
         assert_eq!(l.run_status("run_unknown").unwrap().as_deref(), Some("running"));
-        crate::noderun::release_fence(&unknown_dir(), "root@cli").unwrap();
+        crate::noderun::release_fence(&unknown_dir(), "root@cli", None).unwrap();
         pass_at(&w, &mut l, &asked, false, NOW + 366 * 86_400).await;
         assert_eq!(l.run_status("run_unknown").unwrap().as_deref(), Some(LOST));
         let _ = std::fs::remove_dir_all(unknown_dir());
