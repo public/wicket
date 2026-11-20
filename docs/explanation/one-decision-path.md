@@ -30,9 +30,9 @@ run's is a tunnel target any more (`llm` went with slice 1, `egress` with slice 
 | `run.rs` → `Llm::new` on `ctl/llm.sock` | nothing: since #152 the node's model proxy holds the credential (fetched with `SecretFetch`) and calls the model itself; `Llm::relayed`'s relay runs only when the vault isn't sourced, which never happens on a node | **removed in slice 1** |
 | `noderun::ask` / `check_node_ask` / `check_node_op` | raises a pending request for a node's ask, after checking the op belongs to the run's own tenant, run and zone | this is issuance, not a decision: it stays (a peer message only asks) |
 | `noderun::sync_grants` | turns ledger grants into Biscuit grant blocks (`LiveGrant`) on the feed, and renewals into re-minted blocks | publication, not a decision: since slice 3 it only publishes (every egress grant, whatever its host), and the ledger only records issuance. `Ledger::consume_grant` refuses an egress op. wicket's own SPAWN and LINK grants are used where the spawn or link is made, on the control host, by `Ledger::use_effect_grant` with #369's binding to the call's arguments (`spawn.rs`, `wicket-gateway/src/link.rs`) |
-| `run.rs` → `control::Supervised`, `wicket-home/src/control.rs` `Prompts` (#363) | a driven harness's tool-permission prompts: `Ledger::consume_grant` on `TOOL wicket.internal /tools/<tool>/<digest>`, `denied_recently`, then `pending_for` | **per tool call, on the control host**: the last per-request decision there, and `consume_grant`'s last caller outside tests. While the control host is unreachable a prompt waits. Step 4 below |
-| `wicket-gateway` `send_message` (connected) and `nodegw::send_local` (cut off) | who may message whom: parent or child, the receiver's `accept_from`, its org layer | **decided twice**, by the control host from identities and records, and by the node from both boxes' tokens. Step 3 below |
-| `run.rs` → `Llm::with_quota` | the run's model budget: its total, its children's carve-outs, the slices it leases its node, the node's `Spent` merged in | quota issuance, not a per-call decision; but it builds the whole model proxy (`wicket_proxy::llm::Llm`) to use its counter. Step 2 below |
+| `run.rs` → `control::Supervised`, `wicket-home/src/control.rs` `Prompts` (#363) | a driven harness's tool-permission prompts: `Ledger::consume_grant` on `TOOL wicket.internal /tools/<tool>/<digest>`, `denied_recently`, then `pending_for` | **per tool call, on the control host**: the last per-request decision there, and `consume_grant`'s last caller outside tests. While the control host is unreachable a prompt waits. Step 8 below |
+| `wicket-gateway` `send_message` (connected) and `nodegw::send_local` (cut off) | who may message whom: parent or child, the receiver's `accept_from`, its org layer | **decided twice**, by the control host from identities and records, and by the node from both boxes' tokens. Step 7 below |
+| `run.rs` → `wicket_core::budget::Budget` | the run's model budget: its total, its children's carve-outs, the slices it leases its node, the node's `Spent` merged in | quota issuance, not a per-call decision. **Since step 6** a type of its own: the control host builds no model proxy |
 | `nodesrv.rs` `shares_host` branches | transport only: where the box is laid out, the run's sockets reached directly, host directories mounted, the CA loaded unconstrained (`NodeCa::load_any`) | the built-in node shares the host's filesystem; none of these is a decision |
 
 The node side, for comparison: `NodeDecider` (egress, from the replica), `nodegw.rs` (`whoami`,
@@ -126,15 +126,15 @@ node's own `Llm`.
    control host terminates no TLS, so a box trusts the installation root alone (`BoxStart.ca_pem`
    is sent empty, for nodes at 13 that read it).
 
-## What's left (2026-11-19)
+## What's left (2026-11-20)
 
-Slices 1-5 removed every per-request path #257 named. Read again on main, the control host still:
+Slices 1-5 removed every per-request path #257 named, and step 6 the model proxy the control host
+still built for its budget counter. Read again on main, the control host still:
 
 - **decides a driven harness's tool prompts** per call (`wicket-home`'s `Prompts`, #363);
-- **decides message delivery twice**, once on the control host while the box's node is connected,
-  once on the node while cut off;
-- **builds the model proxy for a budget counter**: the run's `Llm` counts, carves, leases slices
-  and merges `Spent`, and calls no model since slice 1.
+- **decides message delivery twice**, once on the control host while the box's node is connected
+  (`wicket-gateway`'s `send_message`, from `accept_from` and the org layer), once on the node while
+  cut off (`nodegw::send_local`).
 
 What stays on the control host is issuance and lifecycle, as #253 keeps them: spawns it places
 (and its check of a node-started child it adopts), links (both boxes' records, made there), an
@@ -143,16 +143,94 @@ agent's `decide`, capacity and update requests (the money check, #256), `finish`
 `await_grant` and `pending_requests`), and the model budget's total. The `shares_host` branches
 are transport. The steps:
 
-6. **The run's budget without the model proxy.** `run.rs` keeps the counter, carve-outs, slices
-   and `Spent` merges in a budget type of their own, and no longer builds `Llm`. No protocol.
+6. **The run's budget without the model proxy (done, #563).** `wicket_core::budget::Budget` keeps
+   the counter, carve-outs, slices and `Spent` merges; `run.rs` builds no `Llm`. No protocol.
 7. **One message decision, at the receiver's node.** It decides delivery from the receiver's
    token (its `accept_from`, its org layer) and the sender's principal as the control host routes
    it; the control host stores, routes and gives receipts. A protocol bump.
-8. **Tool prompts on the node.** TOOL grants published by `sync_grants` like egress ones; the node
-   answers a prompt from its replica and asks by `Msg::Ask`, queued while cut off. `run.rs`'s
-   `Supervised` keeps interrupts and mode changes, which are commands. Then `consume_grant` and
-   `denied_recently` have no production caller. A protocol bump, and a design point first: how the
-   node reads the harness's control lines.
+8. **Tool prompts on the node.** Protocol 22. The design point follows.
+
+### Step 8: how the node reads the harness's control lines
+
+A tool prompt is not an enforcement point. The harness runs in the box, and the box is hostile
+(design §2, principle 1): a prompt is the harness asking its host whether to make a call it could
+make anyway, inside the box. What leaves the box is decided at the node's gates whatever the
+answer. So the prompt's answer is UX and audit, and it is decided where the box's other asks are,
+on its node, and keeps working while the node is cut off.
+
+**Who reads which lines.** The harness's control protocol has two directions, and they never
+share a request id:
+
+- requests the **harness** starts (Claude Code's `can_use_tool` and its cancel): the prompts.
+  An ACP agent's permission requests go through wicket's ACP client, not a `Controller`, and
+  are not part of this step. The **node** reads these. It runs the harness's
+  `Controller` (`wicket_agent::harness::Harness::controller`, the adapter's, so the node stays
+  harness-agnostic, principle 16) on the box's stdout lines as it reads them from the box, before
+  they go over the channel. It answers them by writing to the box's stdin.
+- requests **wicket** starts (interrupt, permission mode): commands from an operator. The
+  **control host** keeps them, as `run.rs`'s `Supervised` does today, and reads their responses
+  from the relayed stdout. `Supervised` loses `Prompts` and keeps `interrupt`, `set_mode` and
+  `Answered`.
+
+Each side gives the other's lines to its `Controller` too, which ignores a response or request it
+didn't start (it does today: an unknown `request_id` is no event).
+
+**Stdin, written from two ends.** The box's stdin is one byte stream that the control host
+writes and numbers (`stdin_next`, `accept_at`: a replay below the offset reached is dropped; #445
+records an operator prompt by its offset). The node's answers go into the same stream, so they
+are numbered in it: the node writes an answer only at a line boundary of what it has taken from
+the control host, and reports it as `Msg::StdinWrote { run, at, len }`. The control host adds
+`len` to its offset (`written`), so its next bytes are numbered after the answer, and a replay
+after a reconnect still lines up. A node's answer while cut off is reported when the run's
+channel comes back, before any new stdin is accepted from the control host (`Resume` waits for
+it).
+
+**The decision, on the node.** For a prompt the adapter left to wicket (`refused: None`), the
+node:
+
+1. in `bypassPermissions` (the box's mode, see below), answers `allow` at once. This is #423's
+   rule: the harness was told to ask no one, and some calls still prompt (a heredoc writing a
+   file); a human isn't asked about a call the harness's own mode allows;
+2. otherwise looks for a live grant on `TOOL wicket.internal /tools/<tool>/<digest>` in its
+   replica, as it does for an egress op (the token's grant blocks, a prefix block for
+   `/tools/<tool>/`), and uses it, counting the use on the node;
+3. otherwise, if the zone may not ask (`escalation.request: false`, from the box's record),
+   answers `deny`;
+4. otherwise asks with `Msg::Ask` (the op, the card's text as `why`), queued while cut off as
+   any other node ask (#153). The control host answers as for an egress ask: a pending request,
+   or `denied` when exactly this call was denied in the last minutes (`noderun.rs`'s ask path
+   already calls `denied_recently`). The node waits for the grant on its feed, as
+   `await_grant` does, and answers `deny` when the request is denied or expires, read from the
+   replica's revocations and the `Asked` answer.
+
+A cancel from the harness withdraws the node's wait; the request stays pending on the record, as
+today.
+
+**The mode.** `BoxStart` carries the box's permission mode at start (the driven plan's
+`bypassPermissions`, or a driven remote session's `permission_mode()`). A `/mode` change is
+still a command written by the control host; with it the control host sends
+`Msg::PromptMode { run, mode }`, so the node's rule follows the harness's mode. The node takes
+the change when the harness's `control_response` to it is a success, which it sees on stdout;
+until then the old mode holds.
+
+**Grants.** `sync_grants` publishes TOOL grants as it publishes egress ones: one block each,
+under `MAX_GRANTS`, a prefix grant as a prefix block (protocol 16). wicket's other reserved
+methods (SPAWN, LINK, CAPACITY, UPDATE, NAME) stay the control host's: it uses them where the
+effect is made. So `Ledger::consume_grant` loses its last production caller and goes;
+`denied_recently` stays, for the ask path.
+
+**Audit.** The node writes `run.agent_prompt` records with the same fields as today (`tool`,
+`kind`, `detail`, `answer`, `why`, `request`), shipped with its other audit records. The
+operator's `[wicket] ...` lines for prompts come from the node's audit, as the control host shows
+other node-side events.
+
+**Protocol 22 (`NODE_PROMPTS`).** Adds `BoxStart::prompt_mode`, `Msg::StdinWrote` and
+`Msg::PromptMode`. The control host gives a box's prompts to its node only over a connection that
+talks 22 or later; below it, it keeps `Supervised`'s `Prompts` for that box. That fallback goes
+when `PROTOCOL_SKEW` puts 22 at the floor.
+
+**Not changed.** The adapters' own rule (control files, mode changes, questions refused before
+wicket decides), the request's op, risk and card, and what an approval looks like to a human.
 
 Each slice has to pass the node e2e flow (`ci/node-e2e.sh`, also run by `ci/acceptance.sh --nodes local`) and the acceptance
 suite unchanged.
