@@ -244,8 +244,9 @@ fn feed_lock(dir: &Path) -> Result<std::fs::File> {
 }
 
 /// The protocol node `name` last talked to this control host (`<data dir>/nodes/<name>/protocol`,
-/// written at each connection's welcome), if one has connected: what decides, before anything is
-/// published to its feed or it is chosen for a box, whether it can read a record (#664).
+/// written at each connection's welcome, and cleared when a connection drops or is refused), if
+/// known: with [`live_protocols`], what decides, before anything is published to its feed or it is
+/// chosen for a box, whether it can read a record (#664, #691).
 pub fn known_protocol(name: &str) -> Option<u32> {
     let dir = crate::data_dir().join("nodes").join(name);
     std::fs::read_to_string(dir.join("protocol")).ok()?.trim().parse().ok()
@@ -263,6 +264,58 @@ pub fn note_protocol(name: &str, proto: u32) {
     if !ok || std::fs::rename(&tmp, dir.join("protocol")).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// Forgets node `name`'s protocol: a connection to it dropped, or was refused, so what it talks
+/// now isn't known until one connects again (a node restarted on an older build, #691).
+pub fn forget_protocol(name: &str) {
+    let _ = std::fs::remove_file(crate::data_dir().join("nodes").join(name).join("protocol"));
+}
+
+/// One live connection to a node, noted while it lasts (`<data dir>/nodes/<name>/sessions/<pid>-<n>`,
+/// holding its protocol; removed when dropped): what [`live_protocols`] reads, in every process.
+pub struct LiveSession(PathBuf);
+
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Notes a connection to node `name` that talks `proto`: the node's protocol, and this live session.
+pub fn note_session(name: &str, proto: u32) -> LiveSession {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    note_protocol(name, proto);
+    let dir = crate::data_dir().join("nodes").join(name).join("sessions");
+    let path = dir.join(format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+    let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, proto.to_string()));
+    LiveSession(path)
+}
+
+/// The protocols node `name`'s live connections talk, from every process on this host (the notes
+/// of processes no longer running are removed).
+pub fn live_protocols(name: &str) -> Vec<u32> {
+    let dir = crate::data_dir().join("nodes").join(name).join("sessions");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
+    let mut out = vec![];
+    for e in rd.flatten() {
+        let file = e.file_name().to_string_lossy().into_owned();
+        let pid = file.split('-').next().and_then(|p| p.parse::<u32>().ok());
+        if pid.is_none_or(|p| !Path::new(&format!("/proc/{p}")).exists()) {
+            let _ = std::fs::remove_file(e.path());
+            continue;
+        }
+        if let Some(v) = std::fs::read_to_string(e.path()).ok().and_then(|v| v.trim().parse().ok()) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// What node `name` is known to talk now: the lowest of its live connections' protocols, or with
+/// none live its note.
+fn node_protocol_now(name: &str) -> Option<u32> {
+    live_protocols(name).into_iter().min().or_else(|| known_protocol(name))
 }
 
 /// The protocol a node must talk to be sent `zone`'s record: [`wicket_chan::chan::DECODE_SLASH`]
@@ -283,7 +336,7 @@ pub fn check_protocol(name: &str, zone: &wicket_core::ZoneSpec) -> Result<()> {
     if need == 0 {
         return Ok(());
     }
-    match known_protocol(name) {
+    match node_protocol_now(name) {
         Some(p) if p >= need => Ok(()),
         known => bail!(
             "zone {} decides an encoded slash (decode_slash), which needs a node at protocol {need}, and node {name} {}: \
@@ -291,7 +344,10 @@ pub fn check_protocol(name: &str, zone: &wicket_core::ZoneSpec) -> Result<()> {
             zone.name,
             match known {
                 Some(p) => format!("talks {p}"),
-                None => "hasn't connected yet (its protocol isn't known)".to_string(),
+                None if name == crate::localnode::NAME => {
+                    "is running a build whose protocol isn't known yet (it is noted at its next connection: run a box without decode_slash there, or restart it with this build)".to_string()
+                }
+                None => "hasn't connected since it was last cut off (its protocol isn't known)".to_string(),
             }
         ),
     }
@@ -743,6 +799,9 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         };
         let mut changes: Vec<Change<BoxAuthority>> = ended.into_iter().map(|name| Change::DropZone { name }).collect();
         changes.push(Change::PutZone { zone: authority });
+        // Again under the feed's lock, just before the record goes in: the node's live sessions
+        // (any process's) may have connected at an older protocol since the check above (#691).
+        check_protocol(&name, &s.zone)?;
         publisher.commit(changes, now).context("publishing the box's token")?;
         publisher.epoch()
     };
@@ -1156,6 +1215,12 @@ async fn manage(
     loop {
         let r = session(&sh, &mut io, &mut p, &mut ready, &mut started, target_epoch).await;
         *sh.ctl.link.lock().expect("link") = None;
+        // Cut off (not the box's end): the node may come back on another build, so its protocol is
+        // known again only from a new connection's welcome (#691).
+        // The local node whose serve is still this build's (checked, not assumed) is known still.
+        if !p.exited && !(sh.node == crate::localnode::NAME && crate::localnode::serve_is_this_build()) {
+            forget_protocol(&sh.node);
+        }
         // Cut off: since now, or since it was (a retry that fails again keeps the time).
         if p.link.connected || p.link.since_ms == 0 {
             let now = wicket_feed::now_ms();
@@ -1258,22 +1323,24 @@ async fn session(
             }
             Err(e @ HsError::Timeout(_)) => return Err(e.into()),
             Err(HsError::Refused(why)) => {
-                // Refused either way (identity, revocation, protocol): not worth retrying.
+                // Refused either way (identity, revocation, protocol): not worth retrying. What it
+                // talks isn't known now.
+                forget_protocol(&sh.node);
                 p.ever = false;
                 bail!("{why}")
             }
         };
         break (from, to, child, authed, shaking);
     };
-    let (feed, runs) = match authed.welcome {
+    // `_live` notes this connection's protocol until it drops (#691).
+    let (feed, runs, _live) = match authed.welcome {
         Msg::Welcome { feed, runs, proto, capacity, .. } => {
             let now = wicket_feed::now_ms();
             p.link = wicket_node::status::LinkRecord { connected: true, since_ms: now, updated_ms: now, capacity, ..p.link.clone() };
             p.link.save(&sh.dir);
             p.proto = proto;
             sh.ctl.proto.store(proto, Ordering::SeqCst);
-            note_protocol(&sh.node, proto);
-            (feed, runs)
+            (feed, runs, note_session(&sh.node, proto))
         }
         _ => unreachable!("nodeauth::control returns a welcome"),
     };
