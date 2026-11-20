@@ -84,6 +84,14 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   the value.
 - **issue and renew a capacity grant** (`capacity_grant`, `capacity_renew`): see
   [capacity grants](#capacity-grants). Revoking one needs only the session.
+- **send a message to an agent** (`send_message`, #252), as `wicket message send` does: the passkey
+  signs the recipient, the text, its priority and the message it answers, and wicket sends it as
+  `spiffe://<domain>/t/<tenant>/op/passkey/<name>`, signed with a short-lived operator identity. The
+  rules are the CLI's: an agent that acts for you, whose `accept_from` names you, or that wrote to
+  you. Anything else is refused (409), with a receipt. `GET /api/messages` is your inbox (verified,
+  unread first), your receipts and the agents you may write to; `POST /api/messages/read` with
+  `{"ids": [...]}` marks your own messages read, with the session alone. A message grants nothing:
+  prompting an agent is its session.
 - **release a run's fence** (`release_fence`, #690), the console's path beside root's `wicket node
   release-fence`. A run is fenced while its box may still be running on a node that hasn't confirmed
   it stopped (see [the wake fence](nodes.md)): its agent isn't woken and the run isn't ended. Every
