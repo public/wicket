@@ -156,6 +156,11 @@ pub struct Stats {
     /// Statements that verified but were signed before the newest one held, and deltas held
     /// already (another publisher's catch-up carried them first): not applied (#300).
     pub superseded: u64,
+    /// Of those, snapshots below the epoch held, signed before it (#589): another run's catch-up
+    /// overtaken on its way, or an old snapshot replayed. Counted apart, and the last one said, so
+    /// a replay stays visible where it used to be refused as a rollback.
+    pub superseded_snapshots: u64,
+    pub last_superseded_snapshot: Option<String>,
     pub last_refusal: Option<String>,
 }
 
@@ -461,11 +466,30 @@ impl<P: Policy> Replica<P> {
         let r = self.plan(frame, now).and_then(|p| {
             if matches!(p, Plan::Superseded) {
                 self.stats.superseded += 1;
+                if frame.kind == FrameKind::Snap {
+                    self.stats.superseded_snapshots += 1;
+                    self.stats.last_superseded_snapshot = Some(self.superseded_snapshot(&frame.jws));
+                }
             }
             self.commit(p)
         });
         self.count(Some(frame.kind), &r);
         r
+    }
+
+    /// What a superseded snapshot was, for its record: its epoch and when it was signed, against
+    /// the epoch held. It verified already.
+    fn superseded_snapshot(&self, jws: &str) -> String {
+        #[derive(Deserialize)]
+        struct Signed {
+            epoch: u64,
+            issued_at: i64,
+        }
+        let held = self.state.as_ref().map_or(0, |s| s.epoch);
+        match crate::jws::payload_unverified::<Signed>(jws) {
+            Some(s) => format!("snapshot epoch {} signed at {} ms, below the epoch held ({held})", s.epoch, s.issued_at),
+            None => format!("snapshot below the epoch held ({held})"),
+        }
     }
 
     fn count(&mut self, kind: Option<FrameKind>, r: &Result<(), Refusal>) {
