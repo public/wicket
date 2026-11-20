@@ -137,6 +137,7 @@ mod tests {
             node: "local".into(),
             principal: Value::Null,
             act: None,
+            kind: None,
         };
         i.issue(&spec, 1000, 600, &k.public())
     }

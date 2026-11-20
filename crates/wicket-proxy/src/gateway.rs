@@ -36,7 +36,7 @@ fn capacity_tool() -> Value {
                 "vcpus": { "type": "integer", "minimum": 1, "default": 1 },
                 "memory_mib": { "type": "integer", "minimum": 128, "default": 1024 },
                 "isolation": { "type": "string", "enum": ["process", "gvisor", "vm"], "default": "gvisor" },
-                "region": { "type": "string", "description": "a preference, e.g. lhr" },
+                "region": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$", "description": "a preference: a provider's region name, e.g. lhr (1 to 32 lowercase letters, digits and hyphens)" },
                 "duration_minutes": { "type": "integer", "minimum": 1, "maximum": 1440 },
                 "max_hourly_usd": { "description": "the most the node may cost per hour, e.g. 0.02" },
                 "reason": { "type": "string", "description": "what you need it for" },

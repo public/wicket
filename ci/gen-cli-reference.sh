@@ -96,7 +96,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket message inbox --json` | `message_id`, `kind`, `from` (the sender's principal id, as its envelope verified), `agent`, `zone` and `run` (an agent sender's; null for an operator), `acting_for` (the chain the sender acts for), `reply_to`, `priority` (`now`, `next`, `later`), `in_reply_to`, `sent_at`, `read_at` (null: unread until now), `body` (the sender's data) |
 | `wicket message inbox --json`, a message that doesn't verify | `message_id`, `dropped` (why) |
 | `wicket message receipts --json` | `message_id`, `to`, `state` (`delivered`, `read`, `held`, `refused`, `expired`), `why`, `release` (a held message: who can release it), `run`, `sent_at`, `read_at`, `expires_at`, `priority`, `in_reply_to` |
-| `wicket message principals --json` | `id`, `kind` (`agent`), `agent`, `zone`, `relation` (`acts for you`, `accepts you`), `state` (`running`, `busy`, `idle`, `waiting`, `hibernated`, `offline`) |
+| `wicket message principals --json` | `id`, `kind` (`agent`, `program`), `agent`, `zone`, `relation` (`acts for you`, `accepts you`), `state` (`running`, `busy`, `idle`, `waiting`, `hibernated`, `offline`) |
 | `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
 | `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
 | an agent's `used` | `requests`, `input_tokens`, `output_tokens`, `secs` |

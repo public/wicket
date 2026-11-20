@@ -613,6 +613,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
         attach: false,
         adopt: None,
         stop: None,
+        place_wait: None,
     };
     if let Err(e) = crate::run::run(opts).await {
         let l = Ledger::open(&ledger_path())?;
@@ -1347,23 +1348,64 @@ pub fn from_index(names: &[String], health: &[(String, i64, String)], now_ms: i6
     (found, ask)
 }
 
-/// Where a woken agent's box goes: every enrolled, active node (this host's own among them) not held
-/// by a capacity lease, its room read from its last report in the ledger ([`from_index`]) or, with
-/// none fresh, asked of it (within 10 s); filtered by the box's requests, labels, taints and CA
-/// coverage, then bin-packed (`wicket_placement::schedule`).
+/// Whether `node` may take a box that runs up to `needs_secs` from `now` (s), by the leases of the
+/// placed (paid) nodes in `placed` (name, lease end): one that isn't placed always may; a placed one
+/// only if its lease outlasts the box (#579).
+pub fn lasts_for(placed: &[(String, i64)], node: &str, now: i64, needs_secs: i64) -> bool {
+    placed.iter().filter(|(n, _)| n == node).all(|(_, until)| *until > now.saturating_add(needs_secs))
+}
+
+/// Where a woken agent's box goes ([`place_box`]).
 async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str>, wait: std::time::Duration) -> Result<Option<String>> {
     let m = wicket_agent::load(&agent.manifest)?;
-    let mut me = Waiting::of(&m);
     // The agent is the same principal across its runs: its last run's identity names it.
-    me.principal = Ledger::open(&ledger_path())?.identity(&agent.run)?.map(|i| i.spiffe_id);
+    let principal = Ledger::open(&ledger_path())?.identity(&agent.run)?.map(|i| i.spiffe_id);
+    let who = Placing { what: format!("agent {}", agent.id), claim: Some((agent.id.clone(), generation)), wait_flag: "wicket wake --wait" };
+    place_box(&who, &m, principal, run, last, wait).await
+}
+
+/// What is being placed ([`place_box`]): how it is named in what wicket says (`agent agt_…`,
+/// `run run_…`), the agent claim a wake renews while it waits, and the flag that sets the wait.
+pub struct Placing {
+    pub what: String,
+    pub claim: Option<(String, i64)>,
+    pub wait_flag: &'static str,
+}
+
+/// Where `m`'s box goes (#579): every enrolled, active node (this host's own among them) not held
+/// by a capacity lease, its room read from its last report in the ledger ([`from_index`]) or, with
+/// none fresh, asked of it (within 10 s); filtered by the box's requests, labels, taints, CA
+/// coverage and affinity, then bin-packed (`wicket_placement::schedule`). With none that may take
+/// it now, it waits in the queue for up to `wait` (and may preempt, by its priority). None: no node
+/// is available at all.
+pub async fn place_box(
+    who: &Placing,
+    m: &wicket_core::Manifest,
+    principal: Option<String>,
+    run: &RunId,
+    last: Option<&str>,
+    wait: std::time::Duration,
+) -> Result<Option<String>> {
+    let mut me = Waiting::of(m);
+    me.principal = principal;
+    let what = &who.what;
     let req = me.req.clone();
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
     crate::localnode::ensure(&ledger).await?;
+    // A placed (paid) node whose lease ends before the box would is left out: it would be stopped at
+    // the lease's end, and nothing may hold a paid node past it.
+    let needs_secs = m.zone.limits.timeout()?.as_secs() as i64;
     let index = || -> Result<(Vec<Candidate>, Vec<String>)> {
         let l = ledger.lock().expect("ledger");
         let leased: Vec<String> = l.leases(wicket_store::LIVE_LEASES)?.into_iter().filter_map(|x| x.node_name).collect();
-        let names: Vec<String> =
-            l.nodes()?.into_iter().filter(|n| n.status == "active" && !leased.contains(&n.name)).map(|n| n.name).collect();
+        let placed: Vec<(String, i64)> = l.placed_nodes(&["active"])?.into_iter().map(|p| (p.name, p.lease_until)).collect();
+        let now = wicket_store::now();
+        let names: Vec<String> = l
+            .nodes()?
+            .into_iter()
+            .filter(|n| n.status == "active" && !leased.contains(&n.name) && lasts_for(&placed, &n.name, now, needs_secs))
+            .map(|n| n.name)
+            .collect();
         Ok(from_index(&names, &l.node_health()?, wicket_feed::now_ms()))
     };
     let ask = |names: Vec<String>| {
@@ -1380,11 +1422,11 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
                     match r {
                         Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap, at_ms: wicket_feed::now_ms() }),
                         Ok(Err(e)) => {
-                            say!("[wicket] node {n} is not available for the wake: {e:#}");
+                            say!("[wicket] node {n} is not available for {what}: {e:#}");
                             None
                         }
                         Err(_) => {
-                            say!("[wicket] node {n} is not available for the wake: no answer within 10 s");
+                            say!("[wicket] node {n} is not available for {what}: no answer within 10 s");
                             None
                         }
                     }
@@ -1427,8 +1469,7 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
             let _ = end_wait(&l, run, &me, wicket_feed::now_ms(), true);
             drop(l);
             say!(
-                "[wicket] placing agent {} on node {n} (best fit of {} it may go on, of {} available{})",
-                agent.id,
+                "[wicket] placing {what} on node {n} (best fit of {} it may go on, of {} available{})",
                 b.decision.ranked.len(),
                 cands.len(),
                 if told { format!(", after {} s in the queue", started.elapsed().as_secs()) } else { String::new() }
@@ -1448,8 +1489,7 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
             drop(l);
             // No silent overcommit (#377): each node would refuse the box itself.
             bail!(
-                "no available node may take agent {} ({} vCPU, {} MiB needed){}: {why}",
-                agent.id,
+                "no available node may take {what} ({} vCPU, {} MiB needed){}: {why}",
                 req.vcpus,
                 req.memory_mib,
                 if told { format!(" after {} s in the queue", started.elapsed().as_secs()) } else { String::new() }
@@ -1458,7 +1498,9 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
         {
             let l = ledger.lock().expect("ledger");
             l.wait_for_placement(&run.0, &waiting, wicket_feed::now_ms())?;
-            l.renew_agent_claim(&agent.id, generation, wicket_store::now() + BUSY_CLAIM_SECS)?;
+            if let Some((agent, generation)) = &who.claim {
+                l.renew_agent_claim(agent, *generation, wicket_store::now() + BUSY_CLAIM_SECS)?;
+            }
         }
         // #579 step 4: a preemption it made holds its room while the agents hibernate, and is given
         // up on past the deadline.
@@ -1474,9 +1516,8 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
                 }
                 Settled::Abandoned(left) => {
                     say!(
-                        "[wicket] gave up preempting {} for agent {}: not hibernated within {} s (audited; the room is released)",
+                        "[wicket] gave up preempting {} for {what}: not hibernated within {} s (audited; the room is released)",
                         left.join(", "),
-                        agent.id,
                         PREEMPT_DEADLINE.as_secs()
                     );
                     spare.extend(left);
@@ -1484,16 +1525,14 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
                 }
                 Settled::Taken(left) => {
                     say!(
-                        "[wicket] gave up preempting for agent {}: another wake asked {} to stop since (audited; the room is released)",
-                        agent.id,
+                        "[wicket] gave up preempting for {what}: another wake asked {} to stop since (audited; the room is released)",
                         left.join(", "),
                     );
                     pending = None;
                 }
                 Settled::Declined(left) => {
                     say!(
-                        "[wicket] gave up preempting for agent {}: {} declined to hibernate (audited; the room is released)",
-                        agent.id,
+                        "[wicket] gave up preempting for {what}: {} declined to hibernate (audited; the room is released)",
                         left.join(", "),
                     );
                     spare.extend(left);
@@ -1524,9 +1563,8 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
                 if !with.is_empty() {
                     if let Some(p) = preempt_for(&ledger.lock().expect("ledger"), run, &me, &with, now, &spare, false)? {
                         say!(
-                            "[wicket] preempting {} on node {n} for agent {} (priority {} over at most {}): asked to hibernate within {} s, audited; the room is held for it",
+                            "[wicket] preempting {} on node {n} for {what} (priority {} over at most {}): asked to hibernate within {} s, audited; the room is held for it",
                             p.victims.join(", "),
-                            agent.id,
                             req.priority,
                             p.max_priority,
                             PREEMPT_DEADLINE.as_secs(),
@@ -1539,9 +1577,9 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
         }
         if !told {
             say!(
-                "[wicket] queued: no node may take agent {} now ({why}); waiting up to {} s (wicket wake --wait 0 to fail instead)",
-                agent.id,
-                wait.as_secs()
+                "[wicket] queued: no node may take {what} now ({why}); waiting up to {} s ({} 0 to fail instead)",
+                wait.as_secs(),
+                who.wait_flag
             );
             told = true;
         }
@@ -2271,8 +2309,9 @@ mod tests {
     }
 
     /// #579 step 4 (review): giving up withdraws only preemption's own request. Its supervisor,
-    /// which may have taken the request already, checks `preemption_pending` before it hibernates
-    /// and drops it; an operator's own `wicket hibernate` is never withdrawn.
+    /// which may have taken the request already, finds the mark cleared (`preemption_mark`, through
+    /// `preempted_hibernate`) before it hibernates and drops it; an operator's own `wicket hibernate`
+    /// is never withdrawn.
     #[test]
     fn giving_up_withdraws_only_preemptions_own_request() {
         let mut l = Ledger::open_in_memory().unwrap();
@@ -2553,6 +2592,17 @@ mod tests {
             .map(|a| (a.kind, serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["why"].as_str().unwrap_or_default().to_string()))
             .collect();
         assert_eq!(kinds, [("placement.preempt_abandoned".to_string(), "another wake asked it to stop since".to_string())]);
+    }
+
+    /// #579 (review): a placed node whose lease ends before the box would is no candidate.
+    #[test]
+    fn a_placed_node_is_a_candidate_only_while_its_lease_outlasts_the_box() {
+        let placed = vec![("p1".to_string(), 1_000), ("p2".to_string(), 5_000)];
+        assert!(lasts_for(&placed, "n1", 900, 3_600), "not placed: no lease to outlast");
+        assert!(!lasts_for(&placed, "p1", 900, 3_600), "its lease ends before the box would");
+        assert!(!lasts_for(&placed, "p1", 1_000, 0), "past its lease");
+        assert!(lasts_for(&placed, "p2", 900, 3_600));
+        assert!(!lasts_for(&placed, "p2", 900, 4_100), "ends exactly then: not outlasted");
     }
 
     /// #579 step 4 (review): a wake that fails, by any path, withdraws every preemption made for it.

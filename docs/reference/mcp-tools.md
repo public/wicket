@@ -186,7 +186,7 @@ ends.
 |---|---|---|
 | `timeout_seconds` | integer, 1–600 | 300 |
 
-A message shows `message_id`, `from` (verified: its principal `id`, agent, zone, run and relation),
+A message shows `message_id`, `from` (verified: its principal `id`, agent, zone, run, relation and `kind`, `agent` or `program`),
 `reply_to` (the principal to answer, with `in_reply_to` set to `message_id`), `priority`,
 `in_reply_to` (if it answers one of yours) and `body`. Taking it makes its sender's receipt `read`.
 One wicket drops (its signature doesn't verify, or the org policy doesn't let this zone hear from
@@ -230,7 +230,7 @@ messages are waiting.
 
 Discovery and presence (#252): the principals this one may talk to, from what the ledger knows. No
 arguments. Each entry has its principal `id` (stable across its restarts and wakes: what
-`send_message` takes), `kind` (`agent`, `human`; `program` once programs have identities, #255),
+`send_message` takes), `kind` (`agent`, `program` or `operator`; a program's identity document says it is one, signed, #255),
 agent name and zone, `relation` (`parent`, `child`, `peer`, `operator`), and two flags:
 `may_send_to` (its `accept_from` lists this principal or its zone, or it is the parent or a child,
 or the operator this agent acts for)
@@ -375,7 +375,7 @@ runs on it stops.
 | `vcpus` | integer ≥ 1 | 1 | |
 | `memory_mib` | integer ≥ 128 | 1024 | |
 | `isolation` | `process`, `gvisor` or `vm` | `gvisor` | |
-| `region` | string | | a preference, e.g. `lhr` |
+| `region` | string | | a preference: a provider's region name, e.g. `lhr` (1 to 32 lowercase letters, digits and hyphens; anything else is refused) |
 | `duration_minutes` | integer, 1–1440 | | |
 | `max_hourly_usd` | number or string | | the most the node may cost per hour |
 | `reason` | string | | |
