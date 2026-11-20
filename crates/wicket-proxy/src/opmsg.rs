@@ -38,16 +38,27 @@ const MAX_REPLY_ID: usize = 64;
 /// Whether this message answers one (`in_reply_to`), checked whatever else lets it go (#252
 /// review): it must name a message `other` sent `me` in `tenant`. So the id a recipient is shown is
 /// one wicket recorded between those two, never text the sender chose. Err: it names none.
-fn reply(l: &Ledger, tenant: &str, in_reply_to: Option<&str>, other: &str, me: &str) -> std::result::Result<bool, SendError> {
+fn reply(
+    l: &Ledger,
+    tenant: &str,
+    in_reply_to: Option<&str>,
+    other: &str,
+    me: &str,
+) -> std::result::Result<bool, (&'static str, SendError)> {
     let Some(m) = in_reply_to else { return Ok(false) };
     let shaped = m.len() <= MAX_REPLY_ID && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    let found = shaped
-        && l.message_row(m)
-            .map_err(|e| e.to_string())?
-            .is_some_and(|r| r.tenant == tenant && r.to_principal.as_deref() == Some(me) && r.from_principal.as_deref() == Some(other));
+    // A ledger that can't be read is its own reason, not a bad reply.
+    let row = match shaped {
+        true => {
+            l.message_row(m).map_err(|e| ("ledger", SendError::Failed(format!("the ledger can't be read to check in_reply_to: {e}"))))?
+        }
+        false => None,
+    };
+    let found =
+        row.is_some_and(|r| r.tenant == tenant && r.to_principal.as_deref() == Some(me) && r.from_principal.as_deref() == Some(other));
     if !found {
         let shown = if shaped { m.to_string() } else { "(not a message id)".into() };
-        return Err(format!("in_reply_to {shown} is not a message {other} sent you").into());
+        return Err(("in_reply_to", format!("in_reply_to {shown} is not a message {other} sent you").into()));
     }
     Ok(true)
 }
@@ -64,15 +75,15 @@ fn audited_reply(
     extra: serde_json::Value,
 ) -> std::result::Result<bool, SendError> {
     match reply(l, &tenant.0, in_reply_to, other, me) {
-        Err(e) => {
-            let mut rec = json!({ "from": me, "to": other, "why": "in_reply_to", "in_reply_to_bytes": in_reply_to.map(str::len) });
+        Err((why, e)) => {
+            let mut rec = json!({ "from": me, "to": other, "why": why, "in_reply_to_bytes": in_reply_to.map(str::len) });
             if let (Some(r), Some(x)) = (rec.as_object_mut(), extra.as_object()) {
                 r.extend(x.clone());
             }
             l.audit(tenant, run, "message.refused", &rec).map_err(|e| format!("not sent: the audit record could not be written ({e})"))?;
             Err(e)
         }
-        ok => ok,
+        Ok(r) => Ok(r),
     }
 }
 

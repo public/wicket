@@ -248,6 +248,10 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         let (s, _, body) = get(&f.t, &p).await;
         assert!(leaks(&body, &n).is_empty(), "{p} ({s}) leaks {:?}", leaks(&body, &n));
     }
+    // The POST views too (#252): marking messages read answers with ids, never more.
+    let r = f.t.post("/api/messages/read", serde_json::json!({ "ids": ["m-1", f.gid] }));
+    let body = r.body.to_string();
+    assert!(leaks(&body, &n).is_empty(), "/api/messages/read ({}) leaks {:?}", r.status, leaks(&body, &n));
     // Signed out: the same views refuse, and say nothing.
     for p in ["/api/policy", "/api/runs/run_01authz0000000000000000000/authority", "/api/explain/1"] {
         let (s, _, body) = super::http::call(&f.t.state, "GET", p, &[], b"").await;
