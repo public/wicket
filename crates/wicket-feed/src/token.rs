@@ -13,8 +13,9 @@
 //! - **What the token decides, and what it doesn't.** Every allow comes from the token. The record's
 //!   [`BoxAuthority::zone`] (the zone block 0 was minted from) is used only for things that can't
 //!   widen authority: the pre-TLS host verdict (an early refusal), which hosts the node forwards to
-//!   the control host (injected credentials), and the run's limits. A zone that disagrees with the
-//!   token can only refuse more.
+//!   the control host (injected credentials), the run's limits, and which encoded slashes the proxy
+//!   decodes (`decode_slash`, #664: a decoded request still needs the token to allow each segment).
+//!   A zone that disagrees with the token can only refuse more.
 //! - **Grants** are the token's own third-party blocks. The record's [`BoxAuthority::grants`] carries
 //!   what the token can't: each grant's use cap (counted on the node, `uses.log`), and the request it
 //!   names, used only to pick which grant to try. The token's grant rule needs a `uses_left` fact,

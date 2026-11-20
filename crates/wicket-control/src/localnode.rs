@@ -81,6 +81,8 @@ pub async fn ensure(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
     start_serve(&dir)?;
     for _ in 0..200 {
         if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            // This build's serve: it talks this build's protocol (until a connection says).
+            crate::noderun::note_protocol(NAME, crate::chan::PROTOCOL);
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;

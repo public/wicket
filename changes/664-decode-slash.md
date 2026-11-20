@@ -13,6 +13,8 @@ type: Changed
     every link of the token allows. Anywhere else an encoded slash is refused.
   - **Widening:** a spawned or linked zone may use it only where its parent's rule for the host
     does. Standing reach never carries it, and a reach rule must name methods and paths.
-  - **Protocol 19:** a zone using it runs only on nodes at protocol 19 or later.
+  - **Protocol 19:** a zone using it runs only on nodes known to talk protocol 19 or later (a
+    node that hasn't connected since the update is refused until it has). Other boxes' tokens
+    don't change, so they still run on nodes at 17 and 18.
   - The npm-cache example sets `decode_slash: [1]` on `registry.npmjs.org`. **A zone that fetches
     scoped npm packages needs the same**, or `/@scope%2fname` is refused.
