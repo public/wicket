@@ -202,11 +202,11 @@ fn node_list_json() {
         revoked_at: None,
     })
     .unwrap();
-    let v4: std::net::Ipv4Addr = "1.2.3.4".parse().unwrap();
+    let v4: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
     l.set_node_addresses("local", wicket_store::AddressChange::Set(v4), wicket_store::AddressChange::Keep, "ann").unwrap();
     let v = wicket_control::enrol::list_json(&l).unwrap();
     assert_eq!((v[0]["name"].as_str(), v[0]["ca"].is_null()), (Some("local"), true), "{v:#}");
-    assert_eq!((v[0]["public_ipv4"].as_str(), v[0]["public_ipv6"].is_null()), (Some("1.2.3.4"), true), "{v:#}");
+    assert_eq!((v[0]["public_ipv4"].as_str(), v[0]["public_ipv6"].is_null()), (Some("1.1.1.1"), true), "{v:#}");
     documented_as("`wicket node list --json`", &v);
 }
 

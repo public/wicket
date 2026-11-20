@@ -2340,7 +2340,7 @@ mod node_tests {
     fn a_nodes_public_addresses() {
         use crate::{AddressChange as A, NodeAddresses};
         let mut l = Ledger::open_in_memory().unwrap();
-        let (v4, v6): (std::net::Ipv4Addr, std::net::Ipv6Addr) = ("1.2.3.4".parse().unwrap(), "2a00::1".parse().unwrap());
+        let (v4, v6): (std::net::Ipv4Addr, std::net::Ipv6Addr) = ("1.1.1.1".parse().unwrap(), "2a00::1".parse().unwrap());
         assert!(
             matches!(l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("not enrolled"))
         );
@@ -2365,7 +2365,7 @@ mod node_tests {
         let last: serde_json::Value = serde_json::from_str(&rec[2].body).unwrap();
         assert_eq!(
             (last["ipv4"].clone(), last["was_ipv4"].as_str(), last["by"].as_str()),
-            (serde_json::Value::Null, Some("1.2.3.4"), Some("ann"))
+            (serde_json::Value::Null, Some("1.1.1.1"), Some("ann"))
         );
     }
 

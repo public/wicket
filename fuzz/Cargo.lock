@@ -3441,6 +3441,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wicket-core",
+ "wicket-names",
 ]
 
 [[package]]
@@ -3510,6 +3511,7 @@ dependencies = [
  "wicket-gateway",
  "wicket-home",
  "wicket-identity",
+ "wicket-names",
  "wicket-node",
  "wicket-placement",
  "wicket-policy",
@@ -3763,6 +3765,7 @@ dependencies = [
  "wicket-feed",
  "wicket-fwd",
  "wicket-identity",
+ "wicket-names",
  "wicket-store",
  "x509-parser",
 ]
