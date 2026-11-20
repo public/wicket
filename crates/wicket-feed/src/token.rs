@@ -71,6 +71,28 @@ pub struct BoxAuthority {
     /// that host wholesale. It narrows splicing only; every allow still comes from the token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org: Option<authz::OrgLayer>,
+    /// The host ports the box's public names are published on (#575 step 4c): the node listens on
+    /// each while the box holds authority and the port's own end hasn't passed, and copies bytes
+    /// into the box's port. Omitted when empty, so an entry without any is what an older node
+    /// reads; one with any goes only to a node at protocol 21 (`wicket_chan::chan::PORTS`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PublishedPort>,
+}
+
+/// A public name's host port on the box's node (#575 step 4c).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedPort {
+    /// The name's id (`n-…`), for the node's audit records.
+    pub name: String,
+    /// The name's label, for the node's audit records.
+    pub label: String,
+    /// The port the node listens on (TCP), in the node's range.
+    pub host_port: u16,
+    /// The box's own port, dialed in the box for each connection.
+    pub box_port: u16,
+    /// When the port stops being published (Unix ms): the name's end, or the box's authority's.
+    pub until_ms: i64,
 }
 
 /// An online authority issuing key, certified by the (offline) authority root (#154): tokens whose
@@ -646,6 +668,7 @@ impl Issuer {
             grants: vec![],
             issuer_cert: self.issuer_cert.clone(),
             org: self.org.clone(),
+            ports: vec![],
         })
     }
 
@@ -685,6 +708,7 @@ impl Issuer {
             grants: listed,
             issuer_cert: self.issuer_cert.clone(),
             org: self.org.clone(),
+            ports: vec![],
         })
     }
 }

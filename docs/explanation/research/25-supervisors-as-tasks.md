@@ -194,8 +194,8 @@ reconcile┴─ wicket attach (D) ─ssh─┘   wicket supervise #k, epoch e  (
 
 - A host has one **node link** per node in its shard: one connection (one ssh session, one
   `node attach` process on the node) over which every run on that node talks.
-- **The node-link protocol (proposed; the first free version when it's built, 22 or later, since 20
-  is #651's DNS host ports and 21 #578's webhook intake): `Run { run, frame }`.**
+- **The node-link protocol (proposed; the first free version when it's built, 21 or later, since 20
+  is #578's webhook intake): `Run { run, frame }`.**
   - It wraps today's per-run frames, so `Msg::Data`, `Started`, `Exited`, `Call`, `Ask`, `Audit` and
     the rest are unchanged inside it.
   - The handshake is scoped to a host and carries its **shard grant** (`scope: "host:<k>"`; §3.1):
@@ -648,7 +648,7 @@ rolled back by running the previous build.
    - The protocol is unchanged.
 3. **One channel per node** (the node-link protocol, §2.2).
    - A node link per node in the host, with today's per-run channel for nodes below the node-link
-     version (22 or later, §2.2).
+     version (21 or later, §2.2).
    - The node side demultiplexes.
    - Feed deltas are batched across runs on a node.
 4. **Dynamic shards.** Hand-off by lease, the shard reconciler, the global reconciler's slow pass, and

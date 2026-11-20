@@ -1,0 +1,12 @@
+[package]
+name = "wicket-sources"
+description = "Webhook trigger sources behind an adapter trait (#740): how each source's deliveries are verified, named and normalised, with the generic webhook and GitHub as its first two adapters."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wicket-core.workspace = true
+serde_json.workspace = true
+hex.workspace = true

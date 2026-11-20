@@ -870,6 +870,7 @@ mod tests {
                 node: "local".into(),
                 principal: serde_json::json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}),
                 act: None,
+                kind: None,
             };
             let jws = self.issuer.issue(&spec, wicket_store::now(), 3600, &key.public());
             let claims = wicket_identity::verify_identity(&jws, &self.issuer.verifying_key(), wicket_store::now()).unwrap();
@@ -988,6 +989,16 @@ mod tests {
         assert!(!err && text.contains("needs approval"), "{text}");
         let audit = w.ledger.lock().unwrap().audit_tail(30).unwrap();
         assert!(audit.iter().any(|a| a.2 == "name.registered" && a.4.contains("api.build.wicket.internal")));
+
+        // Revoked: the link web opened by the name closes with it (#668, item 6).
+        {
+            let l = w.ledger.lock().unwrap();
+            let nid = l.internal_name(&TenantId::single(), "build", "api").unwrap().unwrap().id;
+            l.revoke_name(&nid, "ann").unwrap();
+            let row = l.link(&id).unwrap().unwrap();
+            assert_eq!(row.status, "closed");
+            assert!(row.close_reason.as_deref().is_some_and(|r| r.contains("api.build was revoked")), "{:?}", row.close_reason);
+        }
 
         // The run ends: so does the name, and the label is free.
         w.ledger.lock().unwrap().run_ended(&RunId("run_api".into()), "succeeded", "").unwrap();

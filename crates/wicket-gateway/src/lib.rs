@@ -286,8 +286,12 @@ impl Gateway {
             if !may_send && !may_receive {
                 continue;
             }
+            // What it is, as its identity document says (#252, #255): an agent or a program.
+            let kind = wicket_identity::verify_identity(&r.jws, &me.issuer, r.issued_at)
+                .map(|c| c.workload_kind().to_string())
+                .unwrap_or_else(|_| "agent".into());
             out.push(json!({
-                "id": r.spiffe_id, "kind": "agent", "agent": r.agent, "zone": r.zone, "relation": relation,
+                "id": r.spiffe_id, "kind": kind, "agent": r.agent, "zone": r.zone, "relation": relation,
                 "state": l.presence(&self.tenant(), &r.spiffe_id).unwrap_or_else(|_| "offline".into()),
                 "may_send_to": may_send, "may_hear_from": may_receive,
             }));
@@ -596,6 +600,9 @@ impl Gateway {
     async fn await_standing(&self, id: &str, timeout: Duration) -> (String, bool) {
         let start = Instant::now();
         let _waiting = Waiting::start(&self.ctx);
+        let mut granted_at: Option<Instant> = None;
+        let mut binds_run: Option<bool> = None;
+        let mut on_node = wicket_store::StandingOnNode::NotHanded;
         loop {
             let (s, me) = {
                 let l = self.ctx.ledger.lock().expect("ledger");
@@ -608,19 +615,47 @@ impl Gateway {
             let now = wicket_store::now();
             // Granted for this run only if the rule binds it: its agent (or zone) under this zone's
             // definition (#572 re-review, N4).
-            let binds = s.live(now) && {
-                let spec = self.ctx.zone.spec();
-                let l = self.ctx.ledger.lock().expect("ledger");
-                l.standing_for_run(&self.ctx.tenant, &self.ctx.run, &spec.name, &wicket_store::zone_digest(spec))
-                    .map(|v| v.iter().any(|x| x.id == s.id))
-                    .unwrap_or(false)
-            };
+            // Once, not on every poll while the rule is on its way (#752 review, F5).
+            let binds = s.live(now)
+                && *binds_run.get_or_insert_with(|| {
+                    let spec = self.ctx.zone.spec();
+                    let l = self.ctx.ledger.lock().expect("ledger");
+                    l.standing_for_run(&self.ctx.tenant, &self.ctx.run, &spec.name, &wicket_store::zone_digest(spec))
+                        .map(|v| v.iter().any(|x| x.id == s.id))
+                        .unwrap_or(false)
+                });
             match s.status.as_str() {
                 "approved" if s.live(now) && !binds => {
                     return (
                         format!("approved, not for this run: standing reach {id} was approved, for a zone definition this run's zone no longer has (its reach or forbids changed since). Ask again from this run if you still need it."),
                         false,
                     )
+                }
+                // The box's retry must find the rule on its node, as for a grant (`await_grant`):
+                // answer once the node has it (at most 15 s), or, if the run's process hasn't
+                // handed it over, after a few of its ticks (it may never: an older node, no room
+                // in the token). Never past the caller's timeout.
+                "approved"
+                    if s.live(now) && {
+                        let since = granted_at.get_or_insert_with(Instant::now).elapsed();
+                        // Read first, so the answer says where the rule is even at the timeout.
+                        on_node = self
+                            .ctx
+                            .ledger
+                            .lock()
+                            .expect("ledger")
+                            .standing_on_node(&self.ctx.run.0, id)
+                            .unwrap_or(wicket_store::StandingOnNode::NotHanded);
+                        start.elapsed() < timeout
+                            && match on_node {
+                            wicket_store::StandingOnNode::InFlight => since < Duration::from_secs(15),
+                            wicket_store::StandingOnNode::NotHanded => since < HAND_OFF,
+                                wicket_store::StandingOnNode::There => false,
+                            }
+                    } =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
                 "approved" if s.live(now) => {
                     let until = s
@@ -631,9 +666,19 @@ impl Gateway {
                         Some(wicket_store::StandingBound::Zone) => format!("every agent of zone {}", s.zone),
                         _ => "you, in this run and your later ones".into(),
                     };
+                    // Said as it is on the box's node (#752 review, F6).
+                    let where_ = match on_node {
+                        wicket_store::StandingOnNode::There => "Your box's node has it.",
+                        wicket_store::StandingOnNode::InFlight => {
+                            "It is on its way to your box's node: a request it covers may be held for a few seconds more."
+                        }
+                        wicket_store::StandingOnNode::NotHanded => {
+                            "It isn't in your box's token: its node may speak a wicket protocol older than 17, or the token may be full, and until it is there a request it covers is held as pending."
+                        }
+                    };
                     return (
                         format!(
-                            "granted: standing reach {id} was approved for {to}, {until}: {} {} {}. Make the requests it covers; don't ask for them again. (It applies on a node that speaks wicket protocol 17.)",
+                            "granted: standing reach {id} was approved for {to}, {until}: {} {} {}. Make the requests it covers; don't ask for them again. {where_}",
                             s.rule.methods.join(","),
                             s.rule.host,
                             s.rule.paths.join(" ")
@@ -887,7 +932,7 @@ fn deliver(
     let v = json!({
         "message_id": id,
         "kind": kind,
-        "from": { "agent": sender.agent, "zone": sender.zone, "run": sender.run, "id": sender.sub, "relation": relation,
+        "from": { "agent": sender.agent, "zone": sender.zone, "run": sender.run, "id": sender.sub, "relation": relation, "kind": sender.workload_kind(),
                   "acting_for": sender.chain(), "verified_by": "wicket" },
         // Where an answer goes (#252): send_message to it, with in_reply_to this message's id.
         "reply_to": payload.get("reply_to").cloned().unwrap_or_else(|| json!(sender.sub)),
@@ -972,7 +1017,17 @@ fn capacity_ask(args: &Value) -> Result<wicket_proxy::CapacityAsk, String> {
         vcpus: args.get("vcpus").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 256) as u32,
         memory_mib: args.get("memory_mib").and_then(|v| v.as_u64()).unwrap_or(1024).clamp(128, 1 << 22),
         isolation: args.get("isolation").and_then(|v| v.as_str()).unwrap_or("gvisor").to_string(),
-        region: args.get("region").and_then(|v| v.as_str()).map(String::from),
+        region: match args.get("region") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(r)) => {
+                let r = r.trim().to_string();
+                // Checked again where the request is written (capacity::ask): here, early, so the
+                // agent hears why at once (#731).
+                wicket_proxy::check_region(&r)?;
+                Some(r)
+            }
+            Some(_) => return Err("`region` is a string: a provider's region name (e.g. ewr)".into()),
+        },
         duration_secs: minutes as i64 * 60,
         max_hourly_usd: max,
         reason,
@@ -1020,6 +1075,21 @@ mod tests {
     impl World {
         /// Starts an agent run with a wicket-issued identity and returns its context.
         fn agent(&self, tenant: &str, zone: &str, name: &str, run: &str, parent: Option<&str>, accept_from: &[&str]) -> RunCtx {
+            self.workload(tenant, zone, name, run, parent, accept_from, None)
+        }
+
+        /// [`World::agent`], or a program with `kind` `program` in its identity (#255).
+        #[allow(clippy::too_many_arguments)]
+        fn workload(
+            &self,
+            tenant: &str,
+            zone: &str,
+            name: &str,
+            run: &str,
+            parent: Option<&str>,
+            accept_from: &[&str],
+            kind: Option<&str>,
+        ) -> RunCtx {
             let yaml = format!(
                 "tenant: {tenant}\ntask: t\nagent: {{ name: {name} }}\nzone: {{ name: {zone}, llm: {{}}, accept_from: {accept_from:?} }}\n"
             );
@@ -1036,6 +1106,7 @@ mod tests {
                 node: "local".into(),
                 principal: serde_json::json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}),
                 act: None,
+                kind: kind.map(String::from),
             };
             let jws = self.issuer.issue(&spec, wicket_store::now(), 3600, &key.public());
             let claims = wicket_identity::verify_identity(&jws, &self.issuer.verifying_key(), wicket_store::now()).unwrap();
@@ -1099,6 +1170,21 @@ mod tests {
         let revoked = l.revoked(&m.from_run).unwrap().is_some();
         drop(l);
         deliver(&ctx.identity.as_ref().unwrap().current(), &ctx.run.0, &[], &m, revoked)
+    }
+
+    /// #252, #255: a program's message says it is a program, from its signed identity.
+    #[test]
+    fn a_programs_message_says_it_is_a_program() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let lead = w.agent("t0", "research", "lead", "run_lead", None, &[]);
+        let prog = w.workload("t0", "jobs", "nightly", "run_prog", None, &["research"], Some("program"));
+        let asked = lead.send_message(&to(&id_of(&prog)), "message", json!("status?")).unwrap();
+        let v: Value = serde_json::from_str(&take(&prog).0).unwrap();
+        assert_eq!(v["from"]["kind"], "agent");
+        let opts = wicket_proxy::SendOpts { in_reply_to: Some(&asked.id), ..Default::default() };
+        prog.send(&to(&id_of(&lead)), "message", json!("green"), opts).unwrap();
+        let v: Value = serde_json::from_str(&take(&lead).0).unwrap();
+        assert_eq!((v["from"]["kind"].as_str(), v["body"].as_str()), (Some("program"), Some("green")));
     }
 
     /// #70, #250: a message to a hibernated agent's principal wakes it, and its next activation
@@ -1271,6 +1357,8 @@ mod tests {
         let ops = w.agent("t0", "ops", "deployer", "run_ops", None, &["research"]);
         let _audit = w.agent("t0", "audit", "auditor", "run_audit", None, &[]);
         let _stranger = w.agent("t0", "elsewhere", "stranger", "run_x", None, &[]);
+        // A program is a principal too (#255), named by its signed identity's kind.
+        let prog = w.workload("t0", "jobs", "nightly", "run_prog", None, &["research"], Some("program"));
         let _other_tenant = w.agent("t1", "ops", "deployer", "run_t1", None, &["research"]);
         w.ledger.lock().unwrap().set_run_activity("run_child", Some("busy")).unwrap();
         w.ledger.lock().unwrap().run_ended(&RunId("run_audit".into()), "succeeded", "{}").unwrap();
@@ -1286,6 +1374,8 @@ mod tests {
             (o["may_send_to"].as_bool(), o["may_hear_from"].as_bool(), o["state"].as_str()),
             (Some(true), Some(false), Some("running"))
         );
+        let p = by(&id_of(&prog)).expect("a program that accepts research");
+        assert_eq!((p["kind"].as_str(), p["may_send_to"].as_bool()), (Some("program"), Some(true)), "{text}");
         let a = by("spiffe://test.local/t/t0/z/audit/a/auditor").expect("a zone its accept_from names");
         assert_eq!(
             (a["may_send_to"].as_bool(), a["may_hear_from"].as_bool(), a["state"].as_str()),
@@ -1398,6 +1488,7 @@ mod tests {
             node: "local".into(),
             principal: spec.claims.principal.clone(),
             act: None,
+            kind: None,
         };
         let fake_id = rogue.issue(&fake_spec, wicket_store::now(), 3600, &k.public());
         let env = wicket_identity::sign_envelope(
@@ -1436,6 +1527,7 @@ mod tests {
             node: "local".into(),
             principal: me.claims.principal.clone(),
             act: None,
+            kind: None,
         };
         let old_id = w.issuer.issue(&spec, now - 4200, 600, &old_key.public());
         let backdated = wicket_identity::sign_envelope(
@@ -1467,6 +1559,19 @@ mod tests {
         assert!(capacity_ask(&json!({ "duration_minutes": 0, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(capacity_ask(&json!({ "duration_minutes": 100000, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(wicket_proxy::gateway::tools().as_array().unwrap().iter().any(|t| t["name"] == "request_capacity"));
+        // #731: a region is a provider's region name, or nothing; a string, trimmed.
+        let with = |r: Value| {
+            let mut a = json!({ "duration_minutes": 10, "max_hourly_usd": "0.01", "reason": "x" });
+            a["region"] = r;
+            capacity_ask(&a)
+        };
+        assert_eq!(with(json!(null)).unwrap().region, None);
+        assert_eq!(with(json!(" lhr ")).unwrap().region.as_deref(), Some("lhr"));
+        assert_eq!(with(json!("us-east-1")).unwrap().region.as_deref(), Some("us-east-1"));
+        assert!(with(json!(7)).unwrap_err().contains("a string"));
+        for bad in ["lhr\nfor 1 minute", "lhr\u{202e}", "lhr, at no cost", "\u{43b}hr", "LHR", ""] {
+            assert!(with(json!(bad)).unwrap_err().contains("region name"), "{bad:?}");
+        }
     }
 
     /// #231: `await_grant` answers "granted" only once the box's node has the grant: not between the
@@ -1511,6 +1616,62 @@ mod tests {
         assert!(!err && text.starts_with("granted"), "{text}");
         assert!((HAND_OFF..Duration::from_secs(5)).contains(&t.elapsed()), "{:?}", t.elapsed());
         assert!(text.contains("for one use") && text.contains("Retry the same request now"), "{text}");
+    }
+
+    /// #572: `await_grant` on a standing ask answers "granted" once the run's node has the rule, not
+    /// as soon as a human approved it: the box's next request must find it there (the attack
+    /// matrix's `standing-below` met a node a feed epoch behind). Never handed over: after the
+    /// hand-off wait.
+    #[tokio::test]
+    async fn await_grant_on_a_standing_ask_answers_once_the_node_has_the_rule() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let gw = Gateway { ctx: w.agent("t0", "z", "worker", "run_s", None, &[]) };
+        w.ledger.lock().unwrap().run_started(&TenantId("t0".into()), &RunId("run_s".into()), "z", "worker").ok();
+        let approved = |host: &str| {
+            let l = w.ledger.lock().unwrap();
+            let me = l.identity("run_s").unwrap().unwrap().spiffe_id;
+            let rule: wicket_core::manifest::ReachRule = wicket_core::yaml::from_str(&format!("{{ host: {host} }}")).unwrap();
+            let digest = wicket_store::zone_digest(gw.ctx.zone.spec());
+            let (id, _) = l.ask_standing(&TenantId("t0".into()), &RunId("run_s".into()), "z", &digest, &me, &rule, "x").unwrap();
+            let terms = wicket_store::StandingTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: Some(3600) };
+            l.approve_standing(&id, &rule, &terms, "ann", None).unwrap();
+            id
+        };
+        // Handed over after 400 ms and published; the node has it 400 ms later.
+        let id = approved("ci.example");
+        let (ledger, rule) = (w.ledger.clone(), id.clone());
+        let handing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            ledger.lock().unwrap().standing_handed("run_s", "n1", std::slice::from_ref(&rule)).unwrap();
+            ledger.lock().unwrap().standing_published("run_s", 3).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            ledger.lock().unwrap().node_feed_at("n1", 3).unwrap();
+        });
+        let t = Instant::now();
+        let (text, err) = gw.await_grant(&json!({ "request_id": id, "timeout_seconds": 10 })).await;
+        let took = t.elapsed();
+        handing.join().unwrap();
+        assert!(!err && text.starts_with("granted: standing reach"), "{text}");
+        assert!(took >= Duration::from_millis(800), "answered after {took:?}, before the node had the rule");
+        assert!(text.contains("Your box's node has it."), "{text}");
+        // Never handed over: answered after the hand-off wait.
+        let id = approved("other.example");
+        let t = Instant::now();
+        let (text, err) = gw.await_grant(&json!({ "request_id": id, "timeout_seconds": 10 })).await;
+        assert!(!err && text.starts_with("granted: standing reach"), "{text}");
+        assert!((HAND_OFF..Duration::from_secs(5)).contains(&t.elapsed()), "{:?}", t.elapsed());
+        assert!(text.contains("isn't in your box's token"), "{text}");
+        // Published and never confirmed: the caller's timeout (5 s) ends the wait, not the 15 s.
+        let id = approved("third.example");
+        {
+            let l = w.ledger.lock().unwrap();
+            l.standing_handed("run_s", "n1", std::slice::from_ref(&id)).unwrap();
+            l.standing_published("run_s", 9).unwrap();
+        }
+        let t = Instant::now();
+        let (text, err) = gw.await_grant(&json!({ "request_id": id, "timeout_seconds": 5 })).await;
+        assert!(!err && text.starts_with("granted: standing reach") && text.contains("on its way"), "{text}");
+        assert!((Duration::from_secs(5)..Duration::from_secs(8)).contains(&t.elapsed()), "{:?}", t.elapsed());
     }
 
     /// `await_grant`'s answer names the grant's terms (a one-use grant isn't for probing) and says
