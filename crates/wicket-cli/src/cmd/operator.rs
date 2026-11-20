@@ -22,8 +22,6 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     }
                 }
                 OperatorCmd::EnrolLink { ttl, origin } => {
-                    let ttl =
-                        wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
                     if ttl.is_zero() || ttl > Duration::from_secs(3600) {
                         return Err(wicket_home::exit::usage("--ttl must be more than 0 and at most 1h"));
                     }
@@ -103,8 +101,8 @@ pub enum OperatorCmd {
     /// replacement after `reset`). The only way to add a passkey: a signed-in console session can't.
     EnrolLink {
         /// How long the link stays usable (at most 1h).
-        #[arg(long, default_value = "10m")]
-        ttl: String,
+        #[arg(long, default_value = "10m", value_parser = wicket_core::time::duration_arg)]
+        ttl: std::time::Duration,
         /// The console's origin, to print the whole link (otherwise just its path).
         #[arg(long)]
         origin: Option<String>,

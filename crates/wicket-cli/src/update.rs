@@ -1901,6 +1901,22 @@ pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Re
 mod tests {
     use super::*;
 
+    /// #574: an artifact no trusted key signed and no operator approved needs an approval (exit
+    /// 5); a signature that doesn't verify is refused (3).
+    #[test]
+    fn an_unapproved_update_needs_an_approval() {
+        use wicket_home::exit::{code_of, Code};
+        let dir = std::env::temp_dir().join(format!("wicket-unapproved-{}", wicket_core::new_ulid()));
+        std::fs::create_dir_all(dir.join("stage")).unwrap();
+        let artifact = dir.join("wicket");
+        std::fs::write(&artifact, b"not wicket").unwrap();
+        let ledger = Mutex::new(Ledger::open_in_memory().unwrap());
+        let e = accept(&ledger, &artifact, None, &dir.join("stage"), None).err().expect("not accepted");
+        assert_eq!(code_of(&e), Some(Code::NeedsApproval), "{e:#}");
+        assert!(format!("{e:#}").contains("no operator has approved"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #487: a handed run counts as adopted when it runs under a live supervisor, whoever started
     /// it (the reconciler service, often, before the update's own pass): not by what that pass says.
     #[test]
