@@ -786,3 +786,28 @@ fn renewals_reach_the_node_in_the_rebuilt_token() {
     assert_ne!(r.decide(&hook, past), Decision::Allow(Allowed::Grant("g1".into())));
     assert_eq!(kind(&r.decide(&read("r1"), past)), "allow");
 }
+
+/// #575 step 4c: a record without published ports is what an older node reads, byte for byte (the
+/// field is omitted); one with ports carries them, and an older node's strict parse refuses it.
+#[test]
+fn a_record_without_ports_serializes_as_before() {
+    let issuing = SigningKey::generate();
+    let now = now_ms();
+    let z = zone("zp", &["/repos/acme/**"]);
+    let i = Issuer::root(&issuing, TENANT, "trigger:t", "p", 0, &z, &[], secs(now) + 3600, vec![]).unwrap();
+    let a = i.publish(&SigningKey::generate(), &[]).unwrap();
+    let text = serde_json::to_string(&a).unwrap();
+    assert!(!text.contains("ports"), "{text}");
+    let back: BoxAuthority = serde_json::from_str(&text).unwrap();
+    assert!(back.ports.is_empty());
+    let mut with = a.clone();
+    with.ports =
+        vec![wicket_feed::PublishedPort { name: "n-1".into(), label: "demo".into(), host_port: 20001, box_port: 3000, until_ms: 5 }];
+    let text = serde_json::to_string(&with).unwrap();
+    assert!(text.contains("\"ports\":[{\"name\":\"n-1\""), "{text}");
+    let back: BoxAuthority = serde_json::from_str(&text).unwrap();
+    assert_eq!(back.ports, with.ports);
+    // What an older node's record type (without the field, deny_unknown_fields) makes of it.
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(v.as_object_mut().unwrap().remove("ports").is_some());
+}

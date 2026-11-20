@@ -10,7 +10,7 @@ const USAGE: &str = "\
 usage: wicket-fwd --listen IP:PORT=/path/to/unix.sock [--listen ...] [--udp IP:PORT=/path/to/unix.sock ...]
                   [--max-conns N] [--copy rw|splice] [--buf BYTES] [--bind-timeout SECS] [--verbose]
                   [--control [--mkdir DIR ...] [--try-mkdir DIR ...] [--bundle OUT=IN,IN... ...] [--times-to PATH]]
-       wicket-fwd --dial IP:PORT [--copy rw|splice] [--buf BYTES]
+       wicket-fwd --dial IP:PORT [--copy rw|splice] [--buf BYTES] [--idle-secs SECS] [--after-close-secs SECS]
        wicket-fwd --stdin-from /path/to/unix.sock -- CMD [ARGS...]
 
 Relays each TCP connection accepted on IP:PORT to a new connection on the unix socket.
@@ -30,8 +30,17 @@ Relays each TCP connection accepted on IP:PORT to a new connection on the unix s
   --bundle        (--control) OUT written as the concatenation of the INs (absolute paths); fatal
   --times-to      (--control) where the step times are written (best effort)
   --dial          instead: one TCP connection to IP:PORT, relayed to stdin/stdout (links between boxes)
+  --idle-secs     (--dial) exit once no bytes have moved either way for this long (default: never)
+  --after-close-secs
+                  (--dial) exit this long after stdin's end of file, even if IP:PORT keeps its side
+                  open (default: never; a node's host ports give both, #796 re-review)
   --stdin-from    instead: runs CMD with its stdin fed from wicket's node over the unix socket,
                   reconnecting if the node restarts; exits with CMD's exit code";
+
+/// The environment's `--idle-secs` for a `--dial` (see `parse`).
+const IDLE_ENV: &str = "WICKET_FWD_IDLE_SECS";
+/// The environment's `--after-close-secs` for a `--dial`.
+const AFTER_CLOSE_ENV: &str = "WICKET_FWD_AFTER_CLOSE_SECS";
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<(Config, Option<Prepare>), String> {
     let mut cfg = Config::default();
@@ -56,6 +65,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Config, Option<Prepa
             "--try-mkdir" => prep.try_mkdirs.push(absolute(&flag, value()?)?),
             "--bundle" => prep.bundles.push(entry::parse_bundle(&value()?)?),
             "--times-to" => prep.times_to = Some(absolute(&flag, value()?)?),
+            "--idle-secs" => cfg.dial_limits.idle = Some(secs(&flag, &value()?)?),
+            "--after-close-secs" => cfg.dial_limits.after_close = Some(secs(&flag, &value()?)?),
             "--dial" => {
                 let v = value()?;
                 cfg.dial = Some(v.trim().parse().map_err(|_| format!("--dial {v:?}: not an IP:PORT (names aren't resolved)"))?);
@@ -71,6 +82,21 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Config, Option<Prepa
         return Err("--max-conns must be at least 1 and --buf between 4096 and 64 MiB".into());
     }
     spec::check_distinct(&cfg.listens)?;
+    if cfg.dial.is_none() && cfg.dial_limits != wicket_fwd::DialLimits::default() {
+        return Err("--idle-secs and --after-close-secs are for --dial".into());
+    }
+    // The same limits from the environment, for a --dial not given the flags (#796 re-review): a
+    // node passes them so (`docker exec -e`), which an older wicket-fwd in an older box image
+    // ignores and still relays, where it would refuse a flag it doesn't know.
+    if cfg.dial.is_some() {
+        for (var, slot) in [(IDLE_ENV, &mut cfg.dial_limits.idle), (AFTER_CLOSE_ENV, &mut cfg.dial_limits.after_close)] {
+            if slot.is_none() {
+                if let Ok(v) = std::env::var(var) {
+                    *slot = Some(secs(var, &v)?);
+                }
+            }
+        }
+    }
     if control && cfg.dial.is_some() {
         return Err("--control is for listeners, not --dial".into());
     }
@@ -87,6 +113,15 @@ fn absolute(flag: &str, v: String) -> Result<std::path::PathBuf, String> {
     } else {
         Err(format!("{flag} {v:?}: not an absolute path"))
     }
+}
+
+/// A positive number of seconds, at most a day.
+fn secs(flag: &str, v: &str) -> Result<Duration, String> {
+    let n: f64 = number(flag, v)?;
+    if !(n > 0.0 && n <= 86_400.0) {
+        return Err(format!("{flag} {v:?}: not between 0 and 86400 seconds"));
+    }
+    Ok(Duration::from_secs_f64(n))
 }
 
 fn number<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
@@ -120,7 +155,7 @@ fn main() -> ExitCode {
         }
     };
     if let Some(addr) = cfg.dial {
-        return match wicket_fwd::dial(addr, cfg.copy, cfg.buf_size) {
+        return match wicket_fwd::dial_bounded(addr, cfg.copy, cfg.buf_size, cfg.dial_limits) {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
                 wicket_fwd::log(format_args!("dial {addr}: {e}"));
@@ -181,6 +216,10 @@ mod tests {
         assert!(parse(args("--listen 127.0.0.1:1=/s")).unwrap().1.is_none());
         let (d, _) = parse(args("--dial 127.0.0.1:9222 --copy rw")).unwrap();
         assert_eq!(d.dial, Some("127.0.0.1:9222".parse().unwrap()));
+        assert_eq!(d.dial_limits, wicket_fwd::DialLimits::default(), "no limits unless given (links)");
+        let (d, _) = parse(args("--dial 127.0.0.1:9222 --idle-secs 300 --after-close-secs=0.5")).unwrap();
+        assert_eq!(d.dial_limits.idle, Some(Duration::from_secs(300)));
+        assert_eq!(d.dial_limits.after_close, Some(Duration::from_millis(500)));
     }
 
     #[test]
@@ -197,6 +236,11 @@ mod tests {
             "--dial localhost:80",
             "--dial 127.0.0.1:80 --listen 127.0.0.1:1=/s",
             "--dial 127.0.0.1:80 --control",
+            "--listen 127.0.0.1:1=/s --idle-secs 5",
+            "--listen 127.0.0.1:1=/s --after-close-secs 5",
+            "--dial 127.0.0.1:80 --idle-secs 0",
+            "--dial 127.0.0.1:80 --idle-secs x",
+            "--dial 127.0.0.1:80 --after-close-secs -1",
             "--listen 127.0.0.1:1=/s --mkdir /a",
             "--listen 127.0.0.1:1=/s --control --mkdir a",
             "--listen 127.0.0.1:1=/s --control --bundle /o",

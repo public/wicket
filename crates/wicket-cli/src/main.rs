@@ -39,6 +39,7 @@ mod cli_reference;
 mod cmd;
 mod daemon;
 mod doctor;
+mod intake;
 mod invariants;
 mod mock;
 mod pin;
@@ -56,6 +57,7 @@ mod webauthn;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 pub(crate) use cmd::approve::GrantCmd;
+pub(crate) use cmd::approve::RequestCmd;
 // Re-verifies signed console actions offline; the console's tests check their records with it.
 #[cfg(test)]
 pub(crate) use cmd::audit::verify_signed_decisions;
@@ -91,7 +93,7 @@ const AREAS: &[(&str, &[&str])] = &[
         "Runs and agents",
         &["run", "session", "top", "agents", "hibernate", "trigger", "wrap", "links", "unlink", "zone", "program", "image"],
     ),
-    ("Approvals and grants", &["pending", "approve", "deny", "grant", "standing", "names", "audit"]),
+    ("Approvals and grants", &["pending", "request", "approve", "deny", "grant", "standing", "names", "audit"]),
     ("Nodes and placement", &["node", "lease", "service", "why-here", "reconcile"]),
     (
         "The installation",
@@ -145,7 +147,8 @@ enum Cmd {
         #[arg(long)]
         image: Option<String>,
         /// Run the box on an enrolled node (its name; its host key is pinned), through its `wicket
-        /// node serve`. Default: this host's own node, `local`.
+        /// node serve`. Default: where the scheduler places it among the enrolled nodes, this host's
+        /// own (`local`) among them; with --workspace-dir, this host's own.
         #[arg(long)]
         node: Option<String>,
         /// ssh identity for --node (default: the one it was enrolled with).
@@ -154,6 +157,10 @@ enum Cmd {
         /// Internal: the run id to use (set by the console starting a run).
         #[arg(long, hide = true)]
         run_id: Option<String>,
+        /// Without --node: how long to wait in the queue when no node may take it now (#579); 0:
+        /// fail at once.
+        #[arg(long, default_value = "0", value_parser = wicket_core::time::duration_arg)]
+        wait: Duration,
     },
     /// Open a running agent's session in this terminal: watch it, and send it prompts.
     ///
@@ -282,6 +289,11 @@ enum Cmd {
     },
     /// Deny a pending request.
     Deny { id: String },
+    /// Pending requests: `wicket request list` is `wicket pending`.
+    Request {
+        #[command(subcommand)]
+        cmd: RequestCmd,
+    },
     /// Links between boxes (expose/connect/link), newest first.
     Links {
         #[arg(long, default_value_t = 40)]
@@ -638,6 +650,7 @@ async fn run() -> Result<()> {
         c @ (Cmd::Pending { .. } | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await
         }
+        Cmd::Request { cmd: RequestCmd::List { json } } => cmd::approve::dispatch(Cmd::Pending { json }).await,
         Cmd::Names { cmd } => cmd::names::dispatch(cmd).await,
         Cmd::Standing { cmd } => cmd::standing::dispatch(cmd).await,
         Cmd::Trigger { cmd } => cmd::trigger::dispatch(cmd).await,
@@ -751,6 +764,8 @@ mod tests {
         use clap::Parser;
         for (old, new) in [
             (&["wicket", "secret", "rm", "x"][..], &["wicket", "secret", "remove", "x"][..]),
+            (&["wicket", "pending", "--json"], &["wicket", "request", "list", "--json"]),
+            (&["wicket", "pending"], &["wicket", "request", "list"]),
             (&["wicket", "standing", "approve", "s-1", "--lasts", "7d"], &["wicket", "standing", "approve", "s-1", "--ttl", "7d"]),
             (&["wicket", "standing", "renew", "s-1", "--lasts", "forever"], &["wicket", "standing", "renew", "s-1", "--ttl", "forever"]),
         ] {
@@ -760,8 +775,9 @@ mod tests {
         }
         // What each parsed to, field by field.
         fn fields(c: crate::Cmd) -> String {
-            use crate::{Cmd, SecretCmd, StandingCmd};
+            use crate::{Cmd, RequestCmd, SecretCmd, StandingCmd};
             match c {
+                Cmd::Pending { json } | Cmd::Request { cmd: RequestCmd::List { json } } => format!("pending json={json}"),
                 Cmd::Secret { cmd: SecretCmd::Rm { name } } => format!("secret remove {name}"),
                 Cmd::Standing { cmd: StandingCmd::Approve { id, bound, lasts, narrow, yes } } => {
                     format!("standing approve {id} for={bound} ttl={lasts} narrow={narrow} yes={yes}")
