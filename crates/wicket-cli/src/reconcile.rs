@@ -1118,6 +1118,10 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     // Triggers (#578) first: the schedules' minutes and the timers that came due since the last
     // pass, whatever the nodes and machines below make of this one.
     let mut done = triggers_pass(&ledger, now, dry_run, &wicket_control::hibernate::trigger_wake, &trigger_owner_may);
+    // Webhook intake (#578 step 4): what the intake nodes verified since the last pass.
+    if !dry_run {
+        done.extend(intake_pass(&ledger, now).await);
+    }
     let asked = node_runs(&ledger, dry_run).await?;
     let local = Docker::from_env();
     done.extend(machines_pass(&mut ledger, asked, &local, now, dry_run).await?);
@@ -1315,6 +1319,33 @@ fn triggers_pass(
             })
             .collect(),
         Err(e) => vec![Done { kind: "error", target: "triggers".into(), detail: format!("{e:#}") }],
+    }
+}
+
+/// Webhook intake's pass ([`wicket_control::triggers::intake::pass`]), as the pass's report.
+async fn intake_pass(ledger: &Ledger, now: i64) -> Vec<Done> {
+    let link_ledger = match Ledger::open(&crate::ledger_path()) {
+        Ok(l) => std::sync::Arc::new(std::sync::Mutex::new(l)),
+        Err(e) => return vec![Done { kind: "error", target: "intake".into(), detail: format!("{e:#}") }],
+    };
+    match wicket_control::triggers::intake::pass(ledger, &link_ledger, now, &wicket_control::hibernate::trigger_wake, &trigger_owner_may)
+        .await
+    {
+        Ok(fired) => fired
+            .into_iter()
+            .map(|f| Done {
+                kind: match f.status.as_str() {
+                    "started" => "trigger_fired",
+                    "queued" => "trigger_queued",
+                    "skipped" => "trigger_skipped",
+                    "paused" => "trigger_paused",
+                    _ => "trigger_failed",
+                },
+                target: if f.trigger.is_empty() { f.name } else { format!("trigger {} ({})", f.name, f.trigger) },
+                detail: f.detail,
+            })
+            .collect(),
+        Err(e) => vec![Done { kind: "error", target: "intake".into(), detail: format!("{e:#}") }],
     }
 }
 

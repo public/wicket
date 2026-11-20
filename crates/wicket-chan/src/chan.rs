@@ -45,7 +45,7 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 2, a connection talks
-/// 19, 20 or 21; the checks of versions 15 to 18 stay until they go in a change of their own; the checks for features of 14 and
+/// 19, 20 or 21; the checks of versions 15 to 19 stay until changes of their own take them out; the checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
@@ -71,10 +71,14 @@ pub const NAMES: u32 = 18;
 /// record (an older node's strict parse refuses the record, and its whole feed with it). The
 /// control host never sends a zone using it over a connection below this.
 pub const DECODE_SLASH: u32 = 19;
+/// The first protocol version with webhook intake (#578 step 4): the control host sends a node
+/// [`Msg::IntakeSync`] and the node answers [`Msg::IntakeEvents`]. Only a node at this version is
+/// chosen for a webhook trigger's intake.
+pub const INTAKE: u32 = 20;
 /// The first protocol version whose nodes read a box's published host ports (#575 step 4c: the
 /// `ports` of its `BoxAuthority`) and listen on them. An older node's strict parse refuses an entry
 /// with any (and its whole feed with it), so the control host puts ports in a box's record only for
-/// a node at this version or later. 20 is #714's.
+/// a node at this version or later.
 pub const PORTS: u32 = 21;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
@@ -140,6 +144,7 @@ const _: () = {
     assert!(STANDING <= PROTOCOL);
     assert!(NAMES <= PROTOCOL);
     assert!(DECODE_SLASH <= PROTOCOL);
+    assert!(INTAKE <= PROTOCOL);
     assert!(PORTS <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
@@ -641,7 +646,31 @@ pub enum Msg {
         from: crate::registry::Source,
     },
 
+    /// Webhook intake (#578 step 4, protocol [`INTAKE`]): the triggers this node's intake serves
+    /// (the whole table, replacing the last), and the events the control host has recorded, which
+    /// the node deletes from its spool. Answered with [`Msg::IntakeEvents`].
+    IntakeSync {
+        id: u64,
+        triggers: Vec<wicket_core::intake::IntakeTrigger>,
+        ack: Vec<String>,
+        /// Every trigger still assigned to the node, `triggers`' and those left out of it this time
+        /// (a secret that didn't read): the node drops spooled events only for triggers not here.
+        #[serde(default)]
+        serving: Vec<String>,
+        /// Triggers whose events the control host holds this pass (their owner couldn't be
+        /// checked): kept in the spool and not sent, so they don't crowd out the others'.
+        #[serde(default)]
+        hold: Vec<String>,
+    },
     // ---- node → control host ----
+    /// Answer to [`Msg::IntakeSync`]: spooled events, oldest first (bounded), and what intake
+    /// refused since the last sync.
+    IntakeEvents {
+        id: u64,
+        events: Vec<wicket_core::intake::IntakeEvent>,
+        refused: wicket_core::intake::IntakeRefused,
+        error: Option<String>,
+    },
     /// Answer to [`Msg::BoxCtl`] or [`Msg::Listen`].
     BoxCtlDone {
         id: u64,
@@ -1289,16 +1318,16 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build has no checks for features of protocol 16 or before: with [`PROTOCOL_SKEW`]
-    /// 2 and protocol 19 (#664), every connection talks 17, 18 or 19. 15's message reads (#445)
+    /// With [`PROTOCOL_SKEW`] 2 and protocol 21 (#575 step 4c), every connection talks 19, 20 or
+    /// 21. 15's message reads (#445)
     /// and 16's prefix grants (#257 4a) are on every connection (15's keeps its check until it goes
     /// in a change of its own); 21's published ports (#575 step 4c) keep theirs while a peer at
     /// 19 or 20 can connect. A node below 19 is refused: it updates before the control host.
     #[test]
     fn no_connection_talks_below_protocol_19() {
         assert_eq!(
-            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, PORTS),
-            (21, 2, 15, 16, 17, 18, 19, 21)
+            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, INTAKE, PORTS),
+            (21, 2, 15, 16, 17, 18, 19, 20, 21)
         );
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
@@ -1310,7 +1339,26 @@ mod tests {
         assert_eq!((negotiate(22, PROTOCOL), negotiate(23, PROTOCOL)), (Ok(21), Ok(21)));
         assert!(negotiate(19, PROTOCOL).unwrap() < PORTS, "a node at 19 gets no published ports");
         assert!(negotiate(20, PROTOCOL).unwrap() < PORTS, "nor one at 20");
+        assert!(negotiate(19, PROTOCOL).unwrap() < INTAKE, "a node at 19 is no intake node");
         assert!(negotiate(PROTOCOL, 18).is_err() && negotiate(18, PROTOCOL).is_err());
+    }
+
+    /// #578 step 4: an intake trigger's secret never shows in a debug print.
+    #[test]
+    fn an_intake_triggers_secret_isnt_printed() {
+        let t = wicket_core::intake::IntakeTrigger {
+            trigger: "trg_1".into(),
+            kind: "github".into(),
+            token_sha256: "ab".into(),
+            secret: "hunter2".into(),
+            repo: Some("acme/app".into()),
+            events: vec!["check_suite".into()],
+            unavailable: false,
+        };
+        assert!(!format!("{t:?}").contains("hunter2"));
+        let m = Msg::IntakeSync { id: 1, triggers: vec![t.clone()], ack: vec!["s1".into()], serving: vec!["trg_1".into()], hold: vec![] };
+        let back: Msg = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert!(matches!(back, Msg::IntakeSync { triggers, .. } if triggers == [t]));
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start

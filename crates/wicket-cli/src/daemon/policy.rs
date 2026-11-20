@@ -87,7 +87,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // `session` do now. Pausing and removing one only narrows.
         Cmd::Trigger { cmd } => match cmd {
             TriggerCmd::List | TriggerCmd::Show { .. } | TriggerCmd::Fire { .. } => Forward(Read),
-            TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } => Forward(Run),
+            TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } | TriggerCmd::RotateUrl { .. } => Forward(Run),
             TriggerCmd::Pause { .. } | TriggerCmd::Rm { .. } => Forward(Revoke),
         },
         Cmd::Secret { cmd } => match cmd {
@@ -97,7 +97,10 @@ pub fn route(cmd: &Cmd) -> Route {
             // Setting a secret changes what the proxies present upstream, linking one makes the
             // wicket user read a file the caller names, and binding one to hosts decides where it
             // may go.
-            SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } | SecretCmd::Rm { .. } => Forward(Privileged),
+            // Making one a verify secret (#578) decides which deliveries a trigger believes.
+            SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } | SecretCmd::Verify { .. } | SecretCmd::Rm { .. } => {
+                Forward(Privileged)
+            }
         },
         // Reads a directory the caller names, as the wicket user.
         // Reads Docker, as the wicket user: what `wicket zone pin` resolves tags through.
@@ -144,7 +147,7 @@ pub fn route(cmd: &Cmd) -> Route {
             // Lifts a run's fence while its box may still run (#676); the command itself also
             // refuses anyone but root.
             NodeCmd::ReleaseFence { .. } => Forward(Privileged),
-            NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } => Local,
+            NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } | NodeCmd::Intake { .. } => Local,
         },
         // Applying an org policy changes what every box may do, and revokes runs.
         Cmd::Policy { cmd } => match cmd {
@@ -385,6 +388,7 @@ mod tests {
             (&["secret", "set", "claude-oauth"], Route::Forward(Privileged)),
             (&["secret", "set", "gh", "--hosts", "api.github.com"], Route::Forward(Privileged)),
             (&["secret", "hosts", "gh", "--hosts", "*.attacker.example"], Route::Forward(Privileged)),
+            (&["secret", "verify", "gh-hook"], Route::Forward(Privileged)),
             (&["secret", "link", "x", "--file", "/etc/shadow"], Route::Forward(Privileged)),
             (&["image"], Route::Forward(Privileged)),
             (&["program", "digest", "."], Route::Local),
@@ -405,6 +409,7 @@ mod tests {
             (&["node", "token"], Route::Forward(Privileged)),
             (&["node", "revoke", "n1"], Route::Forward(Privileged)),
             (&["node", "serve"], Route::Local),
+            (&["node", "intake", "--listen", "0.0.0.0:8443"], Route::Local),
             (&["node", "attach"], Route::Local),
             (&["node", "list", "--provider"], Route::Forward(Privileged)),
             (&["node", "plans"], Route::Forward(Privileged)),

@@ -222,6 +222,9 @@ impl StoreError {
 /// Version 34 (expand, #575 step 4b; 33 is #637's) adds `node_addresses`: each node's public
 /// addresses as its operator set them, where its boxes' public names point, and `names.domain`, the
 /// boxes domain a public name was approved under. Older builds don't read them; the floor stays 17.
+/// Version 35 (expand, #578 step 4; 33 and 34 are other features') adds `trigger_intake`: each
+/// webhook trigger's intake node and the sha256 of its URL's token. Older builds don't read it;
+/// the floor stays where it was.
 /// Version 36 (expand, after 35; 33 to 35 are #637's, #716's and #714's) adds `request_claims`
 /// (#715 review): what the agent claimed when it asked (an update's reason and commit), kept apart
 /// from the request's reason so the console can show the agent's words as the agent's. Older builds
