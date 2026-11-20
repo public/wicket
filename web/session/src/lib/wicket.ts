@@ -1,5 +1,5 @@
 // The console's API as the session view uses it: its signed actions (a passkey assertion per action,
-// as the console's own page does), opening a run's ACP session socket, and wicket's escalations.
+// as the console's own page does), opening a run's ACP session socket, and wicket's requests.
 // Framework-free: the Vue components and the node check (check/check.ts) both import it.
 
 /** The console's POST: its CSRF header, JSON both ways. */
@@ -87,10 +87,79 @@ export function describe(a: Record<string, any>): string {
       (a.scope === 'zone' ? ` · any run in zone ${s(a.zone)}` : '') +
       ` · ${riskLabel(a.risk)} · request ${s(a.request)} · run ${s(a.run)}` +
       (a.agent ? ` · agent ${s(a.agent)}` : '') +
-      ((a.requested_by || []).length ? ` (${a.requested_by.map(s).join(', ')})` : '')
+      ((a.requested_by || []).length ? ` · asked by ${a.requested_by.map(s).join(', ')} (as reported)` : '') +
+      (a.effect_sha256 ? ` · effect ${s(a.effect_sha256).slice(0, 16)}` : '')
     );
   }
   return s(a.action);
+}
+
+/** A paragraph of the sheet: a heading line and, under it, a list (either may be empty). */
+export interface Section {
+  title: string;
+  items: string[];
+}
+
+/** #369, as the console's sheet shows it (console.js `renderBlast`): what else an approval that
+ * widens would allow. From the begun action's `blast`, which the passkey signs with the decision. */
+export function blastSections(b: any): Section[] {
+  if (!b) return [];
+  const out: Section[] = [];
+  const list = (title: string, xs: unknown) => {
+    if (Array.isArray(xs) && xs.length) out.push({ title, items: xs.map(strip) });
+  };
+  list('This approval is wider than the one request:', b.widens);
+  list('It would also allow, for example:', b.examples);
+  out.push({ title: `It would have covered ${Number(b.covered) || 0} of this run’s last ${Number(b.recent) || 0} egress requests.`, items: [] });
+  list('The zone already reaches this host by:', b.zone_rules);
+  return out;
+}
+
+/** #465, as the console's sheet shows it (console.js `renderUpdate`): approving an agent's update
+ * request installs its build. From the begun action's `update`, signed with the decision. */
+export function updateSections(u: any): Section[] {
+  if (!u) return [];
+  const sha = `${strip(u.sha256).slice(0, 16)}…`;
+  if (!u.applies) {
+    return [{ title: `Approving accepts the build with sha256 ${sha} once, but doesn’t install it: ${strip(u.why_not || '')}`, items: [] }];
+  }
+  const items = [
+    u.node
+      ? `artifact: the file with sha256 ${sha} in the run’s /workspace/out on node ${strip(u.node)}, fetched from there when you approve (not installed if it isn’t there)`
+      : `artifact: ${strip(u.artifact)} (${((Number(u.size) || 0) / 1048576).toFixed(1)} MiB) from the run’s /workspace/out, sha256 ${sha}`,
+    `commit: ${u.commit_said ? `${strip(u.commit_said)} (as the agent says; not checked)` : 'the agent didn’t say'}`,
+    `reaches: the control host${(u.nodes || []).length ? `, then nodes ${u.nodes.map(strip).join(', ')} (the first is the canary)` : ', and no nodes'}`,
+  ];
+  return [{ title: 'Approving installs this build now, blue/green with its health gate; a failed gate rolls back.', items }];
+}
+
+/** A request's ledger status in words, the console's decided list's (allowed, refused), and the
+ * class its card takes (#647): `granted` is how the ledger records an approval; `withdrawn`, a
+ * request whose run ended before anyone decided. */
+export function requestState(status: unknown): { word: string; cls: string } {
+  switch (String(status)) {
+    case 'pending':
+      return { word: 'waiting for you', cls: 'pending' };
+    case 'granted':
+      return { word: 'allowed', cls: 'approved' };
+    case 'denied':
+      return { word: 'refused', cls: 'denied' };
+    case 'expired':
+      return { word: 'expired', cls: 'expired' };
+    case 'withdrawn':
+      return { word: 'withdrawn: the run ended first', cls: 'withdrawn' };
+    default:
+      return { word: strip(status), cls: 'other' };
+  }
+}
+
+/** A request's reason, labelled as the agent's words, as the console's card labels it (console.js
+ * `asks`): a wicket.internal request's text mixes wicket's words with the agent's, and is never
+ * shown as wicket's. */
+export function reasonLine(e: { host: string; reason: string }): string {
+  if (!e.reason) return '';
+  const q = `“${strip(e.reason)}”`;
+  return e.host === 'wicket.internal' ? `The request's text, with the agent's words in it: ${q}` : `Why: ${q}`;
 }
 
 /** The run's ACP socket, and the subprotocols that carry the open's ticket. */

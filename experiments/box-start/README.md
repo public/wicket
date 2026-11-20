@@ -189,6 +189,39 @@ next section.
 
 ### On a host with Docker
 
-Not run in this round: the box this was measured in has no Docker. Run `measure.sh` there, `-n 20`,
-with and without `--isolation runc`, and on an enrolled node (`--node`); `docker.run.runtime` is
-runsc's sandbox and gofer boot, the number #287's step 3 turns on.
+`measure.sh` with a real Docker hasn't been run on a node yet. What has been measured is Docker and
+the runtimes alone, without wicket: `runtime.sh` reads `docker.run.runtime` the way the node does,
+from Docker's `Created` and `State.StartedAt`, and also `State.FinishedAt`, for a container
+running `true` with no network.
+
+```sh
+experiments/box-start/runtime.sh -n 20 --label <host>        # runsc and runc; --runtime NAME for one
+```
+
+**2026-11-20, in a cloud sandbox, not a node** (a Firecracker VM, 4 vCPU, 15 GiB, cgroup v1, Docker
+29.10.0 with the containerd snapshotter, gVisor release-20261116.0 with `--host-uds=open` as CI
+installs it, its default platform; nothing else running). 20 starts per runtime after a warm-up,
+`logs/runtime-ccr-firecracker-20261120T160300Z.jsonl`. Median (p90), ms:
+
+| runtime | `docker.run.runtime` (Created → StartedAt) | Created → FinishedAt (`true` has run and exited) | `docker run -d`, the CLI's wall time |
+|---|---:|---:|---:|
+| runsc | 18.5 (21.1) | 94.8 (109.9) | 124.1 (142.2) |
+| runc | 17.9 (20.2) | 102.6 (119.7) | 144.8 (162.6) |
+
+- `docker.run.runtime` is ~18 ms for both. With runsc, `State.StartedAt` comes when `runsc start`
+  returns, before the sandboxed process has run: the rest of gVisor's boot is after it, in
+  `box.entry.runtime` and `box.entry.init` (148 ms on the control host's node, #287's step-3
+  measurement), and here in Created → FinishedAt.
+- Created → FinishedAt includes Docker noticing the exit (the shim, containerd, dockerd's event), so
+  it is an upper bound on the start: under ~110 ms at p90 for runsc here, no slower than runc.
+- This VM isn't a node: no KVM platform, cgroup v1, a different disk. A node's numbers can differ;
+  the procedure below is how to get them.
+
+**On a node** (still to do, by the coordinator):
+1. On the node, alone: `experiments/box-start/runtime.sh -n 20 --label <node>`.
+2. On the control host: `experiments/box-start/measure.sh -n 20 --node <node>`, and again with
+   `--isolation runc`. Read `node.start.docker.run.runtime`, `box.entry.runtime` and
+   `box.entry.init` from both.
+3. For runsc's own settings, change `runtimeArgs` in `/etc/docker/daemon.json` (e.g. `--directfs=false`,
+   `--platform=kvm` where `/dev/kvm` exists), restart Docker, and repeat step 1.
+4. Add the rows to the table above and to [performance](../../docs/explanation/performance.md#docker-runsc-or-a-restore-287-step-3).

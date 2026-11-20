@@ -26,7 +26,24 @@ CREATE TABLE IF NOT EXISTS standing (
   effect_sha256 TEXT, revoked_at INTEGER, revoked_by TEXT, zone_digest TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS standing_status ON standing (tenant, status);
+CREATE TABLE IF NOT EXISTS standing_on_node (
+  run TEXT NOT NULL, rule TEXT NOT NULL, node TEXT NOT NULL, epoch INTEGER,
+  PRIMARY KEY (run, rule)
+);
+CREATE INDEX IF NOT EXISTS standing_on_node_node ON standing_on_node (node, epoch);
 "#;
+
+/// Where a standing rule is on its way into one run's token (#572): what `await_grant` on it waits
+/// for, as it waits for a grant to reach the box's node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnNode {
+    /// Not handed to the run's node (yet, or ever: an older node, or no room in the token).
+    NotHanded,
+    /// Handed to the node and published, not yet confirmed there.
+    InFlight,
+    /// The node reported a feed epoch that holds it.
+    There,
+}
 
 /// How far back the evidence for an ask looks.
 pub const EVIDENCE_SECS: i64 = 14 * 24 * 3600;
@@ -488,9 +505,107 @@ impl Ledger {
     }
 }
 
+impl Ledger {
+    /// Standing rules `rules` go into `run`'s token for `node`, not yet published. A rule handed
+    /// again (renewed) is on its way again. Nothing for a run that isn't running (#752 review, F4:
+    /// `run_ended` forgets its rows, and none may come back after).
+    pub fn standing_handed(&self, run: &str, node: &str, rules: &[String]) -> Result<()> {
+        for r in rules {
+            self.conn.execute(
+                "INSERT INTO standing_on_node (run, rule, node, epoch)
+                 SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?1 AND status = 'running')
+                 ON CONFLICT (run, rule) DO UPDATE SET node = excluded.node, epoch = excluded.epoch",
+                params![run, r, node, i64::MAX],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `run`'s token went out in feed epoch `epoch`: every standing rule handed and not yet
+    /// published went with it (#752 review, F2: also one handed in a tick whose commit failed).
+    pub fn standing_published(&self, run: &str, epoch: i64) -> Result<()> {
+        self.conn.execute("UPDATE standing_on_node SET epoch = ?2 WHERE run = ?1 AND epoch = ?3", params![run, epoch, i64::MAX])?;
+        Ok(())
+    }
+
+    /// `run`'s token was published again without its standing blocks (a start or re-attach builds
+    /// it from grants alone): each of its rules is on its way again, until the next sync puts it
+    /// back (#752 review, F1).
+    pub fn standing_requeued(&self, run: &str) -> Result<()> {
+        self.conn.execute("UPDATE standing_on_node SET epoch = ?2 WHERE run = ?1", params![run, i64::MAX])?;
+        Ok(())
+    }
+
+    /// `run`'s token holds no standing rules (none bind it, or its node can't take them).
+    pub fn standing_none(&self, run: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM standing_on_node WHERE run = ?1", params![run])?;
+        Ok(())
+    }
+
+    /// Standing rules `rules` left `run`'s token.
+    pub fn standing_withdrawn(&self, run: &str, rules: &[String]) -> Result<()> {
+        for r in rules {
+            self.conn.execute("DELETE FROM standing_on_node WHERE run = ?1 AND rule = ?2", params![run, r])?;
+        }
+        Ok(())
+    }
+
+    /// Where standing rule `rule` is on its way into `run`'s token.
+    pub fn standing_on_node(&self, run: &str, rule: &str) -> Result<OnNode> {
+        let e: Option<Option<i64>> = self
+            .conn
+            .query_row("SELECT epoch FROM standing_on_node WHERE run = ?1 AND rule = ?2", params![run, rule], |r| r.get(0))
+            .optional()?;
+        Ok(match e {
+            None => OnNode::NotHanded,
+            Some(Some(_)) => OnNode::InFlight,
+            Some(None) => OnNode::There,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #572: a standing rule's way into a run's token: handed, published, confirmed by the node's
+    /// feed report; taken out or the run ended, forgotten.
+    #[test]
+    fn a_rules_way_onto_a_node() {
+        let l = Ledger::open_in_memory().unwrap();
+        let run = RunId("run_s".into());
+        l.run_started(&TenantId::single(), &run, "z", "a").unwrap();
+        let r = vec!["s-1".to_string()];
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::NotHanded);
+        l.standing_handed("run_s", "n1", &r).unwrap();
+        l.node_feed_at("n1", 99).unwrap();
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::InFlight, "not published yet: no report confirms it");
+        l.standing_published("run_s", 5).unwrap();
+        l.node_feed_at("n1", 4).unwrap();
+        l.node_feed_at("n2", 9).unwrap();
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::InFlight);
+        l.node_feed_at("n1", 5).unwrap();
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::There);
+        // Renewed: on its way again.
+        l.standing_handed("run_s", "n1", &r).unwrap();
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::InFlight);
+        l.standing_withdrawn("run_s", &r).unwrap();
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::NotHanded);
+        // Published again without its standing blocks (a re-attach): on its way again.
+        l.standing_handed("run_s", "n1", &r).unwrap();
+        l.standing_published("run_s", 7).unwrap();
+        l.node_feed_at("n1", 7).unwrap();
+        l.standing_requeued("run_s").unwrap();
+        l.node_feed_at("n1", 8).unwrap();
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::InFlight, "not There after a token without it");
+        l.standing_none("run_s").unwrap();
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::NotHanded);
+        l.standing_handed("run_s", "n1", &r).unwrap();
+        l.run_ended(&run, "succeeded", "").unwrap();
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::NotHanded);
+        l.standing_handed("run_s", "n1", &r).unwrap();
+        assert_eq!(l.standing_on_node("run_s", "s-1").unwrap(), OnNode::NotHanded, "an ended run's rule isn't handed again");
+    }
 
     fn ledger() -> Ledger {
         Ledger::open_in_memory().unwrap()

@@ -45,8 +45,9 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 2, a connection talks
-/// 21, 22 or 23, so only the versions above 20 have a check here (20 to 22 are reserved for work
-/// in flight elsewhere: #714, DNS step 4c, #257); the checks for features of 14 and
+/// 21, 22 or 23, so only the versions above 20 have a check here (22 is reserved for the #257
+/// session's work in flight); the checks of versions 15 to 19 stay until changes of their own take
+/// them out; the checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
@@ -72,6 +73,15 @@ pub const NAMES: u32 = 18;
 /// record (an older node's strict parse refuses the record, and its whole feed with it). The
 /// control host never sends a zone using it over a connection below this.
 pub const DECODE_SLASH: u32 = 19;
+/// The first protocol version with webhook intake (#578 step 4): the control host sends a node
+/// [`Msg::IntakeSync`] and the node answers [`Msg::IntakeEvents`]. Only a node at this version is
+/// chosen for a webhook trigger's intake.
+pub const INTAKE: u32 = 20;
+/// The first protocol version whose nodes read a box's published host ports (#575 step 4c: the
+/// `ports` of its `BoxAuthority`) and listen on them. An older node's strict parse refuses an entry
+/// with any (and its whole feed with it), so the control host puts ports in a box's record only for
+/// a node at this version or later.
+pub const PORTS: u32 = 21;
 /// The first protocol version whose nodes take a zone's optional `inject` rule while its secret
 /// isn't set (#415): such a node treats the rule's host as credentialed (plain HTTP to it refused)
 /// and injects only over HTTPS, holds a refusal of the secret for the run, and takes a
@@ -142,6 +152,8 @@ const _: () = {
     assert!(STANDING <= PROTOCOL);
     assert!(NAMES <= PROTOCOL);
     assert!(DECODE_SLASH <= PROTOCOL);
+    assert!(INTAKE <= PROTOCOL);
+    assert!(PORTS <= PROTOCOL);
     assert!(LIVE_SECRETS <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
@@ -516,6 +528,11 @@ pub enum Msg {
     SecretRevoke {
         run: String,
         name: String,
+        /// Resent by a new connection, not because the secret changed (#415): the node drops the
+        /// run's own copy only, not the uses it shared with children the node started while cut
+        /// off (they can't fetch until the control host takes them over). An older node ignores it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resend: bool,
     },
     Kill {
         run: String,
@@ -647,7 +664,31 @@ pub enum Msg {
         from: crate::registry::Source,
     },
 
+    /// Webhook intake (#578 step 4, protocol [`INTAKE`]): the triggers this node's intake serves
+    /// (the whole table, replacing the last), and the events the control host has recorded, which
+    /// the node deletes from its spool. Answered with [`Msg::IntakeEvents`].
+    IntakeSync {
+        id: u64,
+        triggers: Vec<wicket_core::intake::IntakeTrigger>,
+        ack: Vec<String>,
+        /// Every trigger still assigned to the node, `triggers`' and those left out of it this time
+        /// (a secret that didn't read): the node drops spooled events only for triggers not here.
+        #[serde(default)]
+        serving: Vec<String>,
+        /// Triggers whose events the control host holds this pass (their owner couldn't be
+        /// checked): kept in the spool and not sent, so they don't crowd out the others'.
+        #[serde(default)]
+        hold: Vec<String>,
+    },
     // ---- node → control host ----
+    /// Answer to [`Msg::IntakeSync`]: spooled events, oldest first (bounded), and what intake
+    /// refused since the last sync.
+    IntakeEvents {
+        id: u64,
+        events: Vec<wicket_core::intake::IntakeEvent>,
+        refused: wicket_core::intake::IntakeRefused,
+        error: Option<String>,
+    },
     /// Answer to [`Msg::BoxCtl`] or [`Msg::Listen`].
     BoxCtlDone {
         id: u64,
@@ -1295,21 +1336,45 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build's checks start above 20: with [`PROTOCOL_SKEW`] 2 and protocol 23 (#415),
-    /// every connection talks 21, 22 or 23. The checks for 15 to 19 stay until each goes in a change
-    /// of its own; 23's live secrets keep theirs while a peer at 21 or 22 can connect.
+    /// With [`PROTOCOL_SKEW`] 2 and protocol 23 (#415), every connection talks 21, 22 or 23 (22 is
+    /// reserved for the #257 session). The checks for 15 to 21 stay until changes of their own take
+    /// them out; 23's live secrets keep theirs while a peer at 21 or 22 can connect. A node below
+    /// 21 is refused: it updates before the control host.
     #[test]
     fn no_connection_talks_below_protocol_21() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, LIVE_SECRETS), (23, 2, 23));
+        assert_eq!(
+            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, INTAKE, PORTS, LIVE_SECRETS),
+            (23, 2, 15, 16, 17, 18, 19, 20, 21, 23)
+        );
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
                 Ok(at) => assert!((21..=23).contains(&at) && (21..=25).contains(&theirs), "{theirs} -> {at}"),
                 Err(_) => assert!(!(21..=25).contains(&theirs), "{theirs} refused"),
             }
         }
+        // And a node at 24 or 25 talking to a control host at 23 from the other side.
         assert_eq!((negotiate(24, PROTOCOL), negotiate(25, PROTOCOL)), (Ok(23), Ok(23)));
-        assert!(negotiate(22, PROTOCOL).unwrap() < LIVE_SECRETS, "a node at 22 gets no unset optional rule");
+        assert!(negotiate(21, PROTOCOL).unwrap() < LIVE_SECRETS, "a node at 21 gets no unset optional rule");
+        assert!(negotiate(22, PROTOCOL).unwrap() < LIVE_SECRETS, "nor one at 22");
         assert!(negotiate(PROTOCOL, 20).is_err() && negotiate(20, PROTOCOL).is_err());
+    }
+
+    /// #578 step 4: an intake trigger's secret never shows in a debug print.
+    #[test]
+    fn an_intake_triggers_secret_isnt_printed() {
+        let t = wicket_core::intake::IntakeTrigger {
+            trigger: "trg_1".into(),
+            kind: "github".into(),
+            token_sha256: "ab".into(),
+            secret: "hunter2".into(),
+            repo: Some("acme/app".into()),
+            events: vec!["check_suite".into()],
+            unavailable: false,
+        };
+        assert!(!format!("{t:?}").contains("hunter2"));
+        let m = Msg::IntakeSync { id: 1, triggers: vec![t.clone()], ack: vec!["s1".into()], serving: vec!["trg_1".into()], hold: vec![] };
+        let back: Msg = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert!(matches!(back, Msg::IntakeSync { triggers, .. } if triggers == [t]));
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start

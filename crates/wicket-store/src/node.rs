@@ -202,6 +202,8 @@ impl Ledger {
 
     pub fn node_feed_at(&self, node: &str, epoch: i64) -> Result<()> {
         self.conn.execute("UPDATE grants SET node_epoch = NULL WHERE node = ?1 AND node_epoch <= ?2", params![node, epoch])?;
+        // And the standing rules published to it (#572).
+        self.conn.execute("UPDATE standing_on_node SET epoch = NULL WHERE node = ?1 AND epoch <= ?2", params![node, epoch])?;
         Ok(())
     }
 

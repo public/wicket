@@ -11,6 +11,13 @@
 //! handle. When a change gives one of those tables a new kind of row, or a release moves the floor,
 //! copy the queries of the build before it here first, then make the change: this test then says
 //! whether the old queries still see only what they understand.
+//!
+//! **The same rule outside the ledger.** A node feed's box records (`wicket_feed::BoxAuthority`)
+//! gained `ports` (#575 step 4c, protocol 21). It is omitted when empty, but a build before 21 parses
+//! a record strictly, so it can't open a feed whose checkpoint, or a record after it, holds one.
+//! `wicket self rollback`, and the update gate's automatic rollback, refuse a target below 21 while
+//! any feed does (`wicket_control::noderun::feeds_holding_ports`); the automatic one keeps the new
+//! build and says so.
 
 use crate::*;
 

@@ -204,7 +204,7 @@ wicket node revoke n1
   try (no request waits on a dead link), audited once per run, secret and outage. Each new connection
   revokes every secret released to the run (a revoke sent on a link that died may not have arrived,
   and a re-attached supervisor reads what an earlier one released from `ctl/holdings.json`): the node
-  fetches again what it uses. A revoke ends a child's uses shared from the run too, and an answer a
+  fetches again what it uses (a resent revoke leaves the uses shared with children the node started while cut off). A revoke for a change ends a child's uses shared from the run too, and an answer a
   revoke overtook is not taken. Only a node at protocol 23 is sent an optional rule whose secret
   isn't set; an older one gets the zone without it, as before (#415). While the node is cut off, the
   secrets it holds keep working; one first needed then fails with "credential … not cached on this node;
@@ -366,6 +366,27 @@ these on its own:
 
 Once supervisors are tasks in a few processes, with one channel per node (step 5), the session
 count stops growing with boxes.
+
+## Webhook intake ([#578](https://github.com/public/wicket/issues/578))
+
+A node labelled `wicket.intake=true` takes webhook and GitHub deliveries for the triggers the
+control host assigns to it, with `wicket node intake` beside its `wicket node serve`
+([fire a trigger from a webhook](../how-to/trigger-from-a-webhook.md),
+[why it runs on a node](../explanation/trigger-intake.md)).
+
+- **Intake runs as its own user**, `wicket-intake`, under `deploy/node/wicket-intake.service`.
+  - It reaches `serve` only through `node.json`'s `intake_socket` (`/run/wicket-intake/intake.sock`).
+  - `serve` answers only the uid in `node.json`'s `intake_uid`, checked on every connection
+    (`SO_PEERCRED`).
+  - Without them (a test node), `serve` takes intake as its own user, on `ctl/intake.sock`.
+- **What `serve` keeps.** Intake's table (each trigger's URL token sha256 and verify secret) is in
+  memory only, as the control host last sent it.
+  - Until it has one, intake answers 503.
+  - It spools verified deliveries in `intake/spool/`, at most 10,000 or 64 MiB, each for 24 h at
+    most, until the control host has recorded them.
+- **Protocol 20.** The node must talk protocol 20 or later to be chosen.
+- **The local node** (the control host's own machine) is chosen only with
+  `wicket trigger create --allow-local-intake`.
 
 ## Health, admission and disk ([#377](https://github.com/public/wicket/issues/377))
 

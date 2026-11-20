@@ -757,7 +757,7 @@ impl Bridge {
             let esc = json!({ "id": r.id, "method": r.method, "host": r.host, "path": r.path, "risk": r.risk,
                               "reason": wicket_core::text::clip(&r.reason, 500), "prefix": r.scope_prefix, "status": "pending",
                               "decide": "/api/decide/begin" });
-            let title = format!("wicket escalation {}: {} {}{}", r.id, r.method, r.host, r.path);
+            let title = format!("wicket request {}: {} {}{}", r.id, r.method, r.host, r.path);
             out.push(self.update(json!({
                 "sessionUpdate": "tool_call", "toolCallId": tc, "title": title, "kind": "fetch", "status": "pending",
                 "rawInput": { "method": r.method, "host": r.host, "path": r.path, "risk": r.risk, "reason": r.reason },
@@ -783,7 +783,8 @@ impl Bridge {
         for id in gone {
             self.shown.remove(&id);
             let status = l.request(&id).map(|r| r.status).unwrap_or_else(|_| "unknown".into());
-            let done = if status == "approved" { "completed" } else { "failed" };
+            // The ledger records an approval as `granted` (#647): its tool call completes.
+            let done = if status == "granted" { "completed" } else { "failed" };
             out.push(self.update(json!({
                 "sessionUpdate": "tool_call_update", "toolCallId": format!("{RESERVED_ID}escalation:{id}"), "status": done,
                 "_meta": { "wicket": { "escalation": { "id": id, "status": status } } },
