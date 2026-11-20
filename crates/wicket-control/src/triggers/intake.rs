@@ -434,7 +434,15 @@ async fn sync_node(
     let mut checked: HashMap<String, bool> = HashMap::new();
     for t in &triggers {
         if let Some(tr) = ledger.trigger(&t.trigger)? {
-            if matches!(owner(&tr), Err(NotOwner::Unknown(_))) {
+            if let Err(NotOwner::Unknown(why)) = owner(&tr) {
+                // Said here, since its events never come back to be held one by one (#714 fourth
+                // review R3).
+                out.push(Fired {
+                    trigger: tr.id.clone(),
+                    name: tr.name.clone(),
+                    status: "skipped".into(),
+                    detail: format!("its owner can't be checked now ({why}): held"),
+                });
                 checked.insert(t.trigger.clone(), false);
             }
         }

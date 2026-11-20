@@ -229,13 +229,8 @@ impl Intake {
         hit
     }
 
-    /// Remembers a delivery the node took.
-    pub fn remember(&self, e: &IntakeEvent, at: Instant) {
-        self.remember_keys(&e.trigger, &e.raw_sha256, &e.delivery, at);
-    }
-
-    /// Remembers a verified delivery by its trigger, hash and id: one the node took, or one intake
-    /// dropped (an event or repository not listened to), so that its replays cost nothing.
+    /// Remembers a verified delivery by its trigger, hash and id: one going to the node, or one
+    /// intake dropped (an event or repository not listened to), so that its replays cost nothing.
     fn remember_keys(&self, trigger: &str, raw: &str, delivery: &str, at: Instant) {
         let mut m = self.seen.lock().expect("seen");
         while m.len() + 2 > SEEN_MAX {

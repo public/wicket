@@ -147,8 +147,7 @@ fn rates_count_what_they_should() {
     let mut ok = 0;
     for n in 0..30 {
         let id = format!("d-{n}");
-        if let Outcome::Spool(e) = i.verify(&t, &generic(1, &id, b"{}"), b"{}", 1, at) {
-            i.remember(&e, at);
+        if let Outcome::Spool(_) = i.verify(&t, &generic(1, &id, b"{}"), b"{}", 1, at) {
             ok += 1;
         }
     }
@@ -176,8 +175,7 @@ fn a_replayed_body_doesnt_use_up_the_trigger() {
         headers(&[(ik::GITHUB_SIGNATURE, github_sig(b)), (ik::GITHUB_EVENT, "check_suite".into()), (ik::GITHUB_DELIVERY, id.into())])
     };
     let captured = body(0);
-    let Outcome::Spool(e) = i.verify(&t, &h(&captured, "g-0"), &captured, 5, at) else { panic!("refused") };
-    i.remember(&e, at);
+    assert!(matches!(i.verify(&t, &h(&captured, "g-0"), &captured, 5, at), Outcome::Spool(_)), "refused");
     for n in 1..50 {
         assert_eq!(
             i.verify(&t, &h(&captured, &format!("replay-{n}")), &captured, 5, at),
@@ -232,7 +230,6 @@ fn the_same_generic_body_later_is_a_new_delivery() {
         i.verify(&t, &h, b"{}", ts, at)
     };
     let Outcome::Spool(a) = send(1000) else { panic!("refused") };
-    i.remember(&a, at);
     assert_eq!(send(1000), Outcome::Answer(StatusCode::ACCEPTED, "already had it"), "the same send again");
     let Outcome::Spool(b) = send(1060) else { panic!("a minute later: a new delivery") };
     assert_ne!(a.delivery, b.delivery);
