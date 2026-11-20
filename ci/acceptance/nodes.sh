@@ -283,7 +283,7 @@ offline_flow() {
   check "  after the restart, still cut off: model calls fail clearly, plain egress goes on past 155 s" \
     '[ "$(span $((t_rs + 5000)) "$t_restore" model=503:credential)" -ge 5 ] && [ "$(span $((t_cut + 155000)) "$t_restore" " write=[0-9]+:- ")" -ge 1 ]'
   check "  a wake while cut off is refused: the box may still run there, until its authority ends" \
-    'grep -q "can.t be woken yet" "$work/wake-cut.log" && grep -q "may still be running on node $NODE" "$work/wake-cut.log" && grep -q "can be woken from" "$work/wake-cut.log"'
+    'grep -q "not woken yet" "$work/wake-cut.log" && grep -q "may still be running on node $NODE" "$work/wake-cut.log" && grep -q "can be woken from" "$work/wake-cut.log"'
   check "  an out-of-reach request was queued on the node while it was cut off" '[ "$(span "$t_cut" "$t_restore" ":queued")" -ge 1 ]'
   wait_for 40 '[ "$(span "$t_restore" 99999999999999 model=200:)" -ge 1 ]' || true
   check "  reconnected, the credential is fetched again and model calls work" '[ "$(span "$t_restore" 99999999999999 model=200:)" -ge 1 ]'
@@ -316,6 +316,6 @@ offline_flow() {
   check "  and its run ended" '! kill -0 "$run_pid" 2>/dev/null'
   # The node reported the box stopped: the fence is down (what wake says next is about the agent).
   w wake "$r" >"$work/wake-after.log" 2>&1 || true
-  check "  once the node reported the box stopped, a wake is no longer fenced" '! grep -q "can.t be woken yet" "$work/wake-after.log" && w audit --tail 3000 | grep agent.wake_refused | grep -q "$r"'
+  check "  once the node reported the box stopped, a wake is no longer fenced" '! grep -q "not woken yet" "$work/wake-after.log" && w audit --tail 3000 | grep agent.wake_refused | grep -q "$r"'
   check "  and still nothing of the credential on disk" '! grep -rlsF "$value" "$nd"'
 }

@@ -432,10 +432,15 @@ The answer is a request id, `n-…`, for `await_grant`.
 
 - The label is checked as above, and also against reserved labels and their lookalikes (`console`,
   `c0nsole`, `www`, `api`, `admin` and others).
-- `scope: standing` asks for it for every later run of the workload, as standing reach does.
+- `scope: standing` asks for it for the workload, as standing reach does. The asking run holds it
+  once approved; later runs don't take it up yet (#575 step 4b).
 - `service` is the SRV record's service label (default `http`).
 - At most 3 asks of an agent wait at once.
+- The reason is recorded as the agent's (`asked by the agent: …`).
+- After a denial, the agent can't ask for the same name again for 15 minutes. A standing ask nobody
+  decides is withdrawn after 14 days.
 - Audited as `name.requested`, and the decision as `decision`.
+- An agent's `decide` never decides it.
 
 wicket doesn't publish public records yet, so an approved public name is a record only, until the
 DNS reconciler and the node's listener come (#575).

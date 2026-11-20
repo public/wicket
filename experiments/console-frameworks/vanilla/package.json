@@ -1,0 +1,9 @@
+{
+  "name": "console-proto-vanilla",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The console's three screens in plain DOM code, no framework: bundled and minified with esbuild, as the frameworks' builds are",
+  "scripts": { "build": "node build.mjs" },
+  "devDependencies": { "esbuild": "0.28.2" }
+}

@@ -102,6 +102,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket node serve`](#wicket-node-serve)
   - [`wicket node top`](#wicket-node-top)
   - [`wicket node forget`](#wicket-node-forget)
+  - [`wicket node release-fence`](#wicket-node-release-fence)
   - [`wicket node set`](#wicket-node-set)
   - [`wicket node renew-ca`](#wicket-node-renew-ca)
 - [`wicket lease`](#wicket-lease)
@@ -994,20 +995,21 @@ Nodes (#16, #37), machines that run boxes: leased from a provider (create, relea
 Usage: wicket node <COMMAND>
 
 Commands:
-  token     Print a one-time join token for a node (stored hashed; single use)
-  enrol     Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
-  list      List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a node from `wicket node create` or a capacity lease), with any leased node not enrolled
-  create    Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Its money is reserved first against placement.yaml's limits (with every lease's); then its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
-  release   Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
-  plans     List a provider's (Vultr's) plans in a region, with their hourly price
-  revoke    Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
-  install   Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node` systemd user service that runs `wicket node serve` there
-  serve     On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
-  top       On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
-  forget    Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
-  set       Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`
-  renew-ca  Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
-  help      Print this message or the help of the given subcommand(s)
+  token          Print a one-time join token for a node (stored hashed; single use)
+  enrol          Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
+  list           List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a node from `wicket node create` or a capacity lease), with any leased node not enrolled
+  create         Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Its money is reserved first against placement.yaml's limits (with every lease's); then its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
+  release        Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
+  plans          List a provider's (Vultr's) plans in a region, with their hourly price
+  revoke         Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
+  install        Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node` systemd user service that runs `wicket node serve` there
+  serve          On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
+  top            On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
+  forget         Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
+  release-fence  Release a run's fence without its node (root only, audited as `run.fence_released`): for a run whose node can't confirm its box stopped (unreachable or revoked) and whose fence wouldn't otherwise end, as when its records don't say when its authority ends. Its agent can then be woken. The box may still be running on its node
+  set            Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`
+  renew-ca       Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
+  help           Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -1225,6 +1227,21 @@ Arguments:
 Options:
       --force  Delete them even though the run's work was never collected
   -h, --help   Print help
+```
+
+### `wicket node release-fence`
+
+```text
+Release a run's fence without its node (root only, audited as `run.fence_released`): for a run whose node can't confirm its box stopped (unreachable or revoked) and whose fence wouldn't otherwise end, as when its records don't say when its authority ends. Its agent can then be woken. The box may still be running on its node
+
+Usage: wicket node release-fence --reason <REASON> <RUN>
+
+Arguments:
+  <RUN>  The run
+
+Options:
+      --reason <REASON>  Why: it goes on the audit record
+  -h, --help             Print help
 ```
 
 ### `wicket node set`
@@ -2283,7 +2300,8 @@ out of turns (`agent.max_turns`) has failed: Claude Code exits non-zero then, an
 code when the program ended by itself with a non-zero one (a crash or an outside signal included),
 and otherwise as `wicket run` does: a box wicket or its node stopped (a timeout, an expired
 authority, out of memory) is 1. `wicket wake`, which wicket runs itself, exits 3 when the agent is
-already being woken or is running.
+already being woken or is running, or its last activation may still be running on a node this host
+can't confirm stopped (until that activation's authority ends).
 
 A command the daemon runs passes its code back through it; one a signal ended exits 128 + the
 signal's number, as a shell reports it. If the daemon restarts while a command
