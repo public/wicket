@@ -76,6 +76,14 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   [capacity grants](#capacity-grants). Revoking one needs only the session.
 - **approve, deny, renew and revoke names, and set a node's public addresses** (`name_approve`,
   `name_deny`, `name_renew`, `name_revoke`, `node_addresses`): see [names](#names).
+- **send a message to an agent** (`send_message`, #252), as `wicket message send` does: the passkey
+  signs the recipient, the text, its priority and the message it answers, and wicket sends it as
+  `spiffe://<domain>/t/<tenant>/op/passkey/<name>`, signed with a short-lived operator identity. The
+  rules are the CLI's: an agent that acts for you, whose `accept_from` names you, or that wrote to
+  you. Anything else is refused (409), with a receipt. `GET /api/messages` is your inbox (verified,
+  unread first), your receipts and the agents you may write to; `POST /api/messages/read` with
+  `{"ids": [...]}` marks your own messages read, with the session alone. A message grants nothing:
+  prompting an agent is its session.
 - **release a run's fence** (`release_fence`, #690), the console's path beside root's `wicket node
   release-fence`. A run is fenced while its box may still be running on a node that hasn't confirmed
   it stopped (see [the wake fence](nodes.md)): its agent isn't woken and the run isn't ended. Every
@@ -286,8 +294,18 @@ ci/session-view.sh                                  # needs Node 20.19+ or 22.12
 WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
 ```
 
+**Its views are moving to [lit-html](https://lit.dev/docs/libraries/standalone-templates/)** (#574),
+one at a time: the Inbox first (`static/inbox.js`). lit-html's published modules are committed under
+`static/vendor/lit-html/`, unchanged, with their version, licence and hashes in `VENDOR.toml`
+(`ci/vendor-lit.sh` updates them; `ci/vendor-check.py` checks them). The console's modules import it
+by name (`import { html } from "lit-html"`), and `build.rs` rewrites each such import to the vendored
+file's path, so the browser needs no import map and the CSP stays `script-src 'self'`; any other bare
+import fails the build. The console's modules and
+lit-html's are served from one directory named by their hash, `/static/m.<hash>/`, each with
+Subresource Integrity, so the browser loads them without a bundler.
+
 **The console's own script** (`crates/wicket-cli/src/serve/static/console.js`) is minified when wicket
-is built, by `crates/wicket-cli/build.rs` with [Oxc](https://oxc.rs)'s minifier (Rust crates, pinned
+is built, as are its modules, by `crates/wicket-cli/build.rs` with [Oxc](https://oxc.rs)'s minifier (Rust crates, pinned
 exactly in the workspace's `Cargo.toml`), so a plain `cargo build` needs no Node: about 25 KB gzipped
 instead of 38 KB. Local names are shortened and top-level names kept. `WICKET_CONSOLE_UNMINIFIED=1
 cargo build` embeds it as written, to read in a browser's debugger. The page's tests run on both

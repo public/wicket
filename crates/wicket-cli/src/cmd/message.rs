@@ -183,6 +183,39 @@ pub(crate) fn principals_json(
     Ok(serde_json::Value::Array(out))
 }
 
+/// The messages in operator `me`'s inbox ([`Ledger::operator_inbox`]), each with what verifying
+/// it found: what it says, or why it is dropped.
+pub(crate) fn verified_inbox(
+    l: &Ledger,
+    tenant: &TenantId,
+    me: &str,
+    issuer: &wicket_identity::VerifyingKey,
+    read: bool,
+    limit: usize,
+) -> Result<Vec<(wicket_store::InboxMessage, std::result::Result<opmsg::Received, String>)>> {
+    let mut out = vec![];
+    for m in l.operator_inbox(&tenant.0, me, read, limit)? {
+        let revoked = !m.from_run.is_empty() && l.revoked_in_chain(&m.from_run)?.is_some();
+        let r = opmsg::verify_received(&m, me, issuer, revoked);
+        out.push((m, r));
+    }
+    Ok(out)
+}
+
+/// Operator `me` has read `m` (through `via`: `cli` or `console`): its sender's receipt says read,
+/// or, if it didn't verify, refused with why, with its audit record in the same transaction
+/// ([`Ledger::operator_read_recorded`]). False: it was already read.
+pub(crate) fn mark_read(
+    l: &Ledger,
+    tenant: &TenantId,
+    me: &str,
+    m: &wicket_store::InboxMessage,
+    verified: &std::result::Result<opmsg::Received, String>,
+    via: &str,
+) -> Result<bool> {
+    Ok(l.operator_read_recorded(tenant, me, m, verified.as_ref().err().map(String::as_str), via)?)
+}
+
 pub async fn dispatch(c: MessageCmd) -> Result<()> {
     let tenant = TenantId::single();
     let (id, via, name) = me(&tenant)?;
@@ -193,7 +226,7 @@ pub async fn dispatch(c: MessageCmd) -> Result<()> {
             let issuer = issuer()?;
             let ledger = std::sync::Mutex::new(Ledger::open(&ledger_path())?);
             let waker: wicket_proxy::Waker = std::sync::Arc::new(|a: &str, by: &str| hibernate::trigger_wake(a, by));
-            let op = OperatorSender { tenant: &tenant, via: &via, name: &name };
+            let op = OperatorSender { tenant: &tenant, via: &via, name: &name, signed: None };
             let opts = SendOpts { priority, in_reply_to: in_reply_to.as_deref() };
             let sent = opmsg::send_as_operator(&ledger, &issuer, op, &to, "message", serde_json::json!(text.join(" ")), opts, Some(&waker));
             let l = ledger.into_inner().map_err(|_| anyhow::anyhow!("ledger lock"))?;
@@ -222,12 +255,7 @@ pub async fn dispatch(c: MessageCmd) -> Result<()> {
         MessageCmd::Inbox { all, peek, limit, json } => {
             let l = Ledger::open(&ledger_path())?;
             let issuer = issuer()?.verifying_key();
-            let mut got = vec![];
-            for m in l.operator_inbox(&tenant.0, &id, all, limit)? {
-                let revoked = !m.from_run.is_empty() && l.revoked_in_chain(&m.from_run)?.is_some();
-                let r = opmsg::verify_received(&m, &id, &issuer, revoked);
-                got.push((m, r));
-            }
+            let got = verified_inbox(&l, &tenant, &id, &issuer, all, limit)?;
             let shown: Vec<_> = got.iter().map(|(m, r)| r.clone().map_err(|why| (m.id.clone(), why))).collect();
             // Shown first; marked read (with its audit record, once) only after.
             if json {
@@ -237,7 +265,7 @@ pub async fn dispatch(c: MessageCmd) -> Result<()> {
             }
             if !peek {
                 for (m, r) in got.iter().filter(|(m, _)| m.read_at.is_none()) {
-                    l.operator_read_recorded(&tenant, &id, m, r.as_ref().err().map(String::as_str), "cli")?;
+                    mark_read(&l, &tenant, &id, m, r, "cli")?;
                 }
             }
             Ok(())
