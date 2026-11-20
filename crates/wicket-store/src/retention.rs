@@ -107,7 +107,8 @@ impl Ledger {
     /// The checkpoints recorded, newest first.
     pub fn checkpoints(&self) -> Result<Vec<Checkpoint>> {
         let mut st = self.conn.prepare("SELECT sink, seq, head, ts, jws FROM audit_checkpoints ORDER BY seq DESC, sink")?;
-        let rows = st.query_map([], |r| Ok(Checkpoint { sink: r.get(0)?, seq: r.get(1)?, head: r.get(2)?, ts: r.get(3)?, jws: r.get(4)? }))?;
+        let rows =
+            st.query_map([], |r| Ok(Checkpoint { sink: r.get(0)?, seq: r.get(1)?, head: r.get(2)?, ts: r.get(3)?, jws: r.get(4)? }))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -208,10 +209,10 @@ impl Ledger {
             limit = limit.min(self.peek_export_cursor(s)?.seq);
         }
         // Wicket's own events (#578): what a trigger hasn't read yet stays.
-        let has_triggers: bool = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'trigger_cursors'", [], |r| r.get::<_, i64>(0))?
-            > 0;
+        let has_triggers: bool =
+            self.conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'trigger_cursors'", [], |r| {
+                r.get::<_, i64>(0)
+            })? > 0;
         if has_triggers {
             if let Some(c) = self.conn.query_row("SELECT MIN(seq) FROM trigger_cursors", [], |r| r.get::<_, Option<i64>>(0))? {
                 limit = limit.min(c);
@@ -364,7 +365,11 @@ mod tests {
         assert_eq!(l.prune_point(&[], 90, far).unwrap(), None, "no sink, no prune");
         let cp = l.prune_point(&["a", "b"], 90, far).unwrap().unwrap();
         l.begin_prune(&cp).unwrap();
-        assert_eq!(l.verify_audit().unwrap(), 62, "verifies from the anchor (its record to the audit.pruned one) before anything is deleted");
+        assert_eq!(
+            l.verify_audit().unwrap(),
+            62,
+            "verifies from the anchor (its record to the audit.pruned one) before anything is deleted"
+        );
         assert_eq!(l.prune_chunk(5).unwrap(), 5);
         assert_eq!(l.verify_audit().unwrap(), 62, "and half-way");
         while l.prune_chunk(7).unwrap() > 0 {}
