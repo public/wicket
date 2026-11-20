@@ -225,7 +225,7 @@ pre.src { font: var(--t-xs)/1.5 var(--mono); white-space: pre-wrap; overflow-wra
 #confirm-what .rest { white-space: pre-line; margin-top: var(--s1); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .blast { margin-top: var(--s3); padding: var(--s3); border-radius: var(--radius-sm); background: var(--warn-bg); border: 1px solid var(--warn-line); font-size: var(--t-sm); }
-.blast .meta { color: var(--soft); margin: 0; }
+.blast .meta { color: var(--ink); margin: 0; } /* warning headings in full ink (#698 review) */
 .blast ul { margin: var(--s1) 0 var(--s2); padding-left: var(--s5); }
 #confirm-state { margin-top: var(--s3); }
 #confirm .buttons { margin-top: var(--s4); }
