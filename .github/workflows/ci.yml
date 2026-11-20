@@ -347,9 +347,7 @@ jobs:
   session-view:
     name: Session view bundle
     needs: select
-    # When the view, its build or the serve code that embeds it changes (the `session-view` suite,
-    # #219).
-    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' session-view ')) }}
+    if: ${{ !cancelled() && needs.select.outputs.rust != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:

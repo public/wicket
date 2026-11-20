@@ -28,19 +28,13 @@ paths = ["examples/policy/**", "ci/policy-diff.sh"]
 # every full run (the nightly run, a push to main without a green base, full-ci).
 [suite.deny]
 packages = []
-paths = ["Cargo.lock", "deny.toml"]
+# Every manifest too: deny.toml forbids wildcard versions, and the licences are in the manifests.
+paths = ["**/Cargo.toml", "**/Cargo.lock", "deny.toml"]
 
 [suite.dep-age]
 packages = []
-paths = [
-  "Cargo.lock", "fuzz/Cargo.lock", "ci/*/Cargo.lock", "web/session/package-lock.json",
-  "examples/**/package-lock.json", "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml",
-]
-
-# The console's session view (#327): its sources and build, and the serve code that embeds it.
-[suite.session-view]
-packages = []
-paths = ["web/session/**", "ci/session-view.sh", "ci/install-node.sh", "crates/wicket-cli/build.rs", "crates/wicket-cli/src/serve/*.rs"]
+# Every lockfile, as ci/dep-age.py checks every one (a new lockfile included).
+paths = ["**/Cargo.lock", "**/package-lock.json", "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml"]
 
 [suite.lean]
 packages = ["wicket-authz"]

@@ -128,10 +128,9 @@ wicket.
 - **Fuzzing** runs in the nightly run only (#219): every target there, and none on pull requests,
   pushes or the merge queue. `fuzz.yml` also runs every target for longer each night.
 - **The cheap checks of a few files** run when those files change, and in every full run (#219):
-  cargo deny when `Cargo.lock` or `deny.toml` changes, the dependency cooldown when a lockfile does,
-  the SymCC policy diffs when a policy or the policy crates do, and the session view's bundle when
-  the view, its build or the serve code embedding it does. They are suites in
-  `ci/determinator/suites.toml` like the others.
+  cargo deny when a `Cargo.toml`, a `Cargo.lock` or `deny.toml` changes, the dependency cooldown when
+  any lockfile does, and the SymCC policy diffs when a policy or the policy crates do. They are
+  suites in `ci/determinator/suites.toml` like the others.
 - **Node and update suites** (`node-e2e`, `acceptance --nodes local`, `update`) run nightly in
   `acceptance.yml`, and in local gates when a change selects them. They don't run on pull requests.
 - **No AI attribution**: commit messages, and a pull request's title and body, carry no AI
@@ -140,7 +139,7 @@ wicket.
   `ci/preflight.sh`). Naming a harness wicket runs is fine. Turn on the same check for your own
   commits once per clone: `git config core.hooksPath .githooks`.
 - **Supply chain**: `cargo deny --locked check` (`deny.toml`: RustSec advisories, licences, banned
-  crates and sources) runs when `Cargo.lock` or `deny.toml` changes, and nightly, so an advisory
+  crates and sources) runs when a `Cargo.toml`, a `Cargo.lock` or `deny.toml` changes, and nightly, so an advisory
   published against an unchanged lockfile is seen (#326, #219). Run it locally with `cargo install --locked cargo-deny@0.20.2`.
 - **Mutation testing** of the decision code (`ci/mutants.sh`) runs weekly in `mutants.yml`, not on
   pull requests: a mutant the tests don't catch fails it unless `ci/mutants.accepted` says why it is

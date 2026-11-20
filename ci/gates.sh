@@ -101,13 +101,6 @@ fi
 if has dep-age; then
   hstep "dependency cooldown (7 days)" python3 -I ci/dep-age.py --base "$base"
 fi
-if has session-view; then
-  if command -v npm >/dev/null; then
-    hstep "session view bundle" ci/session-view.sh
-  else
-    log "session view: skipped, Node and npm are not installed; CI runs it"
-  fi
-fi
 
 # ---- end to end ----
 export WICKET=${WICKET:-target/debug/wicket}
