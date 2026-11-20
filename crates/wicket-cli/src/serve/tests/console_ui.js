@@ -524,7 +524,17 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   state = { ...base, pending: [], capacity: [grant] };
   await run("refresh()"); await flush();
   const capRow = ids.capacity.children[0];
-  assert.ok(capRow.textContent.includes("g-cap1") && capRow.textContent.includes("left 1 node(s)") && capRow.textContent.includes("vc2-1c-2gb in lhr"), capRow.textContent);
+  // #639: in lines, plain money, proper plurals, and the principal by its short name.
+  for (const want of ["g-cap1", "Allows: 2 nodes at once of vc2-1c-2gb in lhr, up to $0.05/h and $1.00 a day", "Used today: 1 node, $0.014/h, $0.02",
+    "Left today: 1 node, $0.036/h, $0.98", "Ends ", "granted by passkey:laptop"]) assert.ok(capRow.textContent.includes(want), want + " in " + capRow.textContent);
+  assert.ok(capRow.textContent.startsWith(grant.principal), "a name with a slash in it is shown whole: " + capRow.textContent);
+  assert.deepStrictEqual([run('principalName("spiffe://x/t/t0/op/unix/alex")'), run('principalName("spiffe://x/t/t0/z/build/a/sched")')], ["unix/alex", "sched (zone build)"]);
+  // #645: one time format, relative to the server's clock, with the local time.
+  assert.deepStrictEqual([run("rel(100, 100)"), run("rel(130, 100)"), run("rel(100, 400)"), run("rel(100 + 8 * 3600, 100)"), run("rel(0, 3 * 86400)")],
+    ["just now", "in 30 s", "5 min ago", "in 8 h", "3 days ago"]);
+  assert.match(run("at(1700000000, 1700000000 + 7200)"), /^\d\d:\d\d \(2 h ago\)$|^[A-Z][a-z]{2} \d\d:\d\d \(2 h ago\)$/);
+  assert.strictEqual(run("at(0)"), "\u2014");
+  assert.deepStrictEqual(["$0.0500", "$1.0000", "$0.0140", "$12.3400", "n/a"].map(v => run("money(" + JSON.stringify(v) + ")")), ["$0.05", "$1.00", "$0.014", "$12.34", "n/a"]);
   assert.strictEqual(ids.capacity.all(n => n.tagName === "img").length, 0, "a principal stays text");
   await advance(1000);
   nextAction = { v: 1, action: "capacity_renew", grant: "g-cap1", principal: grant.principal, terms: grant.terms, ttl_secs: 28800 };
@@ -596,7 +606,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     audit: [{ sink: "stdout", kind: "jsonl", seq: 3, head: 9, behind: 6, behind_secs: 4000, checkpoint_at: 0, error: null, manual: true }] } } };
   await run("refresh()"); await flush();
   assert.strictEqual(ids.health.children.length, 2, "the sink's row, then the nodes");
-  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Audit export stdout (jsonl)6 records behind (oldest 66 min) (manual: fed only by `wicket audit export`)"), ids.health.children[0].textContent);
+  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Audit export stdout (jsonl)6 records behind (oldest 66 min) (manual: fed only by wicket audit export)"), ids.health.children[0].textContent);
   assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
   // The rows' alerts come first, then a stale read says so, then the rows.
   state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, errors: [], stale: true, read_ms: (nowS - 400) * 1000,

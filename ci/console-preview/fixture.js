@@ -100,11 +100,11 @@ function audit(now) {
     { seq: 9003, ts: now - 6900, kind: "op", run: run("PLANNER"), body: { kind: "llm", requests: 3, model: "claude-model-x", status: 200, input_tokens: 12345, output_tokens: 567 } },
     egress(9004, now - 6000, run("DOCS"), "DELETE", "api.docs-host.example.com", "/v2/spaces/engineering-handbook/pages/old-draft", "forbidden"),
     { seq: 9005, ts: now - 5000, kind: "decision", run: run("DOCS"), body: { decision: "deny", request: "r-6d77", by: "passkey:phone", signed: true } },
-    { seq: 9006, ts: now - 4000, kind: "standing.revoked", run: null, body: { id: "s-3", by: "passkey:laptop" } },
-    { seq: 9007, ts: now - 3500, kind: "decision.refused", run: run("TRIAGE"), body: { request: "r-6c10", by: "passkey:tablet", why: "outside its authority" } },
-    { seq: 9008, ts: now - 3000, kind: "capacity.requested", run: run("SCALE"), body: { plan: "vc2-2c-4gb", region: "lhr" } },
+    { seq: 9006, ts: now - 4000, kind: "standing.revoked", run: null, body: { standing: "s-3", by: "passkey:laptop", rule: { host: "deb.example.org", methods: ["GET"], paths: ["/**"] }, bound: "zone" } },
+    { seq: 9007, ts: now - 3500, kind: "decision.refused", run: run("TRIAGE"), body: { target: "r-6c10", decision: "approve", by: "passkey:tablet", granter: "human", why: "R4 is above this operator's highest risk (R2)" } },
+    { seq: 9008, ts: now - 3000, kind: "capacity.requested", run: run("SCALE"), body: { request: "r-a004", principal: "spiffe://wicket.example/t/acme/op/unix/alex", ask: "1 × vc2-2c-4gb in lhr", backend: "vultr", lifetime_secs: 28800, purpose: "nightly matrix" } },
     { seq: 9009, ts: now - 2500, kind: "node.audit", run: run("SCALE"), body: { node: "node-a", body: JSON.stringify({ kind: "egress", method: "GET", host: "deb.example.org", path: "/dists/stable/InRelease", outcome: "spliced" }) } },
-    { seq: 9010, ts: now - 2000, kind: "grant.revoked", run: run("TRIAGE"), body: { grant: "g-41", by: "passkey:phone" } },
+    { seq: 9010, ts: now - 2000, kind: "grant.revoked", run: run("TRIAGE"), body: { grant: "g-41", by: "passkey:phone", node: "local" } },
     { seq: 9011, ts: now - 1500, kind: "session.prompt", run: run("RELEASE"), body: { by: "passkey:phone", chars: 212, via: "console", signed: true } },
     { seq: 9012, ts: now - 1200, kind: "identity.revoked", run: run("ROGUE"), body: { by: "passkey:phone", reason: "posting outside its brief", signed: true } },
     { seq: 9013, ts: now - 900, kind: "run.console_start", run: run("RELEASE"), body: { root: "manifests", manifest: "release.yaml", by: "passkey:phone" } },
@@ -112,8 +112,10 @@ function audit(now) {
     { seq: 9015, ts: now - 400, kind: "op", run: run("SCALE"), body: { kind: "box", what: "oom", detail: "the box was killed for memory (2 GiB)" } },
     { seq: 9016, ts: now - 300, kind: "run.exit_cause", run: run("FAILED"), body: { code: 137, cause: "killed: out of memory" } },
     { seq: 9017, ts: now - 200, kind: "run.end", run: run("NIGHTLY"), body: { status: "exited", model_requests: 41 } },
-    { seq: 9018, ts: now - 100, kind: "lease.requested", run: run("SCALE"), body: {} },
+    { seq: 9018, ts: now - 100, kind: "lease.requested", run: run("SCALE"), body: { lease: "l-17", request: "r-a004", provider: "vultr", spec: { plan: "vc2-2c-4gb", region: "lhr" }, hourly_cap_usd_micros: 36000, reserved_usd_micros: 288000, duration_secs: 28800 } },
     egress(9019, now - 50, run("TRIAGE"), "GET", "registry.npmjs.org", "/@acme-internal/ui-kit", "allow"),
+    { seq: 9020, ts: now - 40, kind: "node.audit", run: run("SCALE"), body: { node: "node-ams-02", body: JSON.stringify({ kind: "box.restart", why: "health gate" }) } },
+    { seq: 9021, ts: now - 30, kind: "operator.passkey_added", run: null, body: { name: "tablet", via: "enrol link" } },
   ];
   return a;
 }
