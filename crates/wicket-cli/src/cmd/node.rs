@@ -267,7 +267,9 @@ pub enum NodeCmd {
     /// of yours that covers it, otherwise waiting for an operator.
     Create(Box<nodecreate::CreateArgs>),
     /// Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and
-    /// revoke its enrolment.
+    /// revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the
+    /// provider is asked, then `placement.node_released` or `placement.node_release_failed`, the
+    /// records the console's release of a node past its lease writes too.
     Release {
         #[command(flatten)]
         common: nodecreate::Common,

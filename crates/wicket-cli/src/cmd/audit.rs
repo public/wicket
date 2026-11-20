@@ -354,6 +354,7 @@ pub(crate) fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
                     && (kind != "run.console_start" || (same("manifest_sha256") && same("principal") && same("task")))
                     && (kind != "manifest.saved" || (same("name") && same("sha256") && same("previous_sha256")))
                     && (!kind.starts_with("operator.push_") || (same("device") && same("details") && same("credential")))
+                    && (kind != "placement.node_release_decided" || (same("id") && same("effect_sha256")))
             };
             if !matches {
                 bail!("record does not match the signed {}", if kind == "decision" { "decision" } else { "action" });

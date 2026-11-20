@@ -593,9 +593,29 @@ fn instance_id(l: &Ledger, arg: &str) -> Result<String> {
 
 /// `wicket node release`: destroys an owned node now (by its instance id, or the name `create` gave
 /// it), refusing anything without the owner tag, and revokes its enrolment.
+/// A node the ledger has as placed and active goes through [`crate::noderelease`], as the
+/// console's release does (#710): the decision is audited first, as root's, then the release.
 pub async fn release(common: Common, id: String) -> Result<()> {
     let o = owner(&common);
     let p = Placer::new(provider(&common, VultrConfig::default())?, envelope::DenyAll, o);
+    let mut l = Ledger::open(&crate::ledger_path())?;
+    let now = wicket_store::now();
+    if crate::noderelease::view(&l, &id, now)?.is_some() {
+        let by = crate::grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?);
+        let d = crate::noderelease::Decision {
+            by: &by,
+            root: true,
+            shown: None,
+            why: "wicket node release",
+            extra: serde_json::json!({ "via": "cli" }),
+        };
+        let (n, seq) = crate::noderelease::decide(&l, &id, &d, now)?;
+        let said = crate::noderelease::release(&mut l, &p, &n, &crate::operator(), seq, retire_enrolment).await?;
+        say!("{said}");
+        return Ok(());
+    }
+    drop(l);
+    // An instance the ledger doesn't have as an active placed node (a create that failed half way).
     let id = NodeId(instance_id(&Ledger::open(&crate::ledger_path())?, &id)?);
     let node = p.get(&id).await?;
     match p.release(&id, ReleaseMode::Now).await? {

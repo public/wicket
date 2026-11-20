@@ -38,6 +38,7 @@ pub mod names;
 pub mod node;
 pub mod nodecall;
 pub mod nodecreate;
+pub mod noderelease;
 pub mod noderun;
 pub mod operators;
 pub mod policy;
