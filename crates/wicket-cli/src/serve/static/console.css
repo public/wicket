@@ -263,3 +263,42 @@ pre.src { font: var(--t-xs)/1.5 var(--mono); white-space: pre-wrap; overflow-wra
 }
 /* With no standing asks, the requests' own empty line says enough. */
 #standing-pointer[hidden] + #standing-asks > .empty { display: none; }
+
+/* ---- rows with a head line (#641, #639, #649): a name, quiet details, a state pill ---- */
+.run-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--s2); }
+.run-head .meta { margin: 0; }
+.run-name { font-weight: 650; overflow-wrap: anywhere; }
+.quiet { color: var(--quiet); }
+.mono.quiet { font-size: var(--t-xs); }
+.pill { display: inline-flex; align-items: center; font-size: var(--t-xs); font-weight: 650; padding: 1px 8px; border-radius: 999px; white-space: nowrap;
+  background: var(--surface-2); border: 1px solid var(--line); color: var(--soft); align-self: center; }
+.pill.good { color: var(--good); background: var(--good-bg); border-color: var(--good-line); }
+.pill.bad { color: var(--bad); background: var(--bad-bg); border-color: var(--bad-line); }
+.pill.warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-line); }
+.pill.info { color: var(--accent); background: var(--accent-bg); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); }
+.links { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s4); margin-top: var(--s1); font-size: var(--t-sm); }
+.links a, .links button.link { font-weight: 600; }
+.lease { padding: var(--s3) 0; border-bottom: 1px solid var(--line); } .lease:first-child { padding-top: var(--s1); } .lease:last-child { border-bottom: 0; }
+.callout { margin-top: var(--s2); padding: var(--s2) var(--s3); border-radius: var(--radius-sm); font-size: var(--t-sm); }
+.callout.warn { background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--ink); }
+code.block { display: block; margin-top: var(--s2); padding: var(--s2); user-select: all; -webkit-user-select: all; }
+#decided .row > :last-child { flex-shrink: 0; }
+
+/* The activity log (#646): time, tag, sentence, in columns that stay put. */
+.log { font-family: var(--sans); font-size: var(--t-sm); white-space: normal; }
+.logline { display: grid; grid-template-columns: 3.5rem 6.5rem minmax(0, 1fr); gap: var(--s3); align-items: baseline; padding: var(--s1) 0; }
+.logline > time { color: var(--quiet); font: var(--t-xs)/1.5 var(--mono); }
+.logline .tag { font: 600 var(--t-xs)/1.5 var(--mono); text-transform: uppercase; color: var(--quiet); overflow-wrap: anywhere; }
+.logline .tag.ok { color: var(--good); } .logline .tag.pend { color: var(--warn); } .logline .tag.blocked { color: var(--bad); }
+.logline .text { color: var(--soft); overflow-wrap: anywhere; }
+@media (max-width: 560px) {
+  .logline { grid-template-columns: auto minmax(0, 1fr); gap: 0 var(--s2); }
+  .logline .text { grid-column: 1 / -1; }
+}
+.decided { padding: var(--s3) 0; border-bottom: 1px solid var(--line); } .decided:first-child { padding-top: var(--s1); } .decided:last-child { border-bottom: 0; }
+/* A principal's short name, its full identity a tap away (#707 review). */
+button.idname { font: 650 var(--t-md)/1.3 var(--sans); padding: 0; min-height: 0; border: 0; border-radius: 4px; background: none; color: var(--ink);
+  text-decoration: underline dotted; text-underline-offset: 3px; }
+button.idname:hover { background: none; }
+.principal .idline { color: var(--quiet); font: var(--t-xs)/1.4 var(--mono); margin-top: 2px; overflow-wrap: anywhere; }
+@media (pointer: coarse) { button.idname { min-height: 32px; } }
