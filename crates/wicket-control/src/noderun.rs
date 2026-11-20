@@ -2146,17 +2146,26 @@ pub struct Held {
 /// the ledger's hard end of its box's authority holds it, plus 1 s and the skew, as
 /// `Ledger::agent_fenced_until` has it. The cap rather than the latest renewal: a renewal the
 /// standby's copy hasn't caught up with may have moved the box's end on.
-pub fn held_until(l: &wicket_store::Ledger, run: &str, now_ms: i64, fenced: Option<(String, i64)>, has_record: bool) -> Option<Held> {
+///
+/// A ledger that can't be read is an error, never "not held": the caller doesn't end a run whose
+/// box it couldn't rule out.
+pub fn held_until(
+    l: &wicket_store::Ledger,
+    run: &str,
+    now_ms: i64,
+    fenced: Option<(String, i64)>,
+    has_record: bool,
+) -> anyhow::Result<Option<Held>> {
     if let Some((node, until_ms)) = fenced {
-        return Some(Held { node, until_ms, by_ledger: false });
+        return Ok(Some(Held { node, until_ms, by_ledger: false }));
     }
     if has_record {
-        return None;
+        return Ok(None);
     }
-    let (_, cap) = l.run_authority(run).ok().flatten()?;
+    let Some((_, cap)) = l.run_authority(run)? else { return Ok(None) };
     let until_ms = cap.saturating_add(1 + wicket_store::WAKE_SKEW_SECS).saturating_mul(1000);
-    let node = l.run_node(run).ok().flatten().unwrap_or_else(|| "its node".into());
-    (now_ms < until_ms).then_some(Held { node, until_ms, by_ledger: true })
+    let node = l.run_node(run)?.unwrap_or_else(|| "its node".into());
+    Ok((now_ms < until_ms).then_some(Held { node, until_ms, by_ledger: true }))
 }
 
 /// How long a hold lasts, in words: its end, or, for a fence this host can't bound, until its node

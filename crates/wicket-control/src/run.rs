@@ -1425,11 +1425,13 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         if record.is_some() {
             let held = known_attach_failures(&ledger.lock().expect("ledger"), &run.0, &dir).map(|f| attach_backoff_secs(f.count));
             if let Some(secs) = held {
-                let (ledger, tenant, run, dir) = (ledger.clone(), m.tenant.clone(), run.0.clone(), dir.clone());
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(secs.unsigned_abs())).await;
-                    attach_recovered(&ledger.lock().expect("ledger"), &tenant, &run, &dir);
-                });
+                clear_after_hold(
+                    ledger.clone(),
+                    m.tenant.clone(),
+                    run.0.clone(),
+                    dir.clone(),
+                    std::time::Duration::from_secs(secs.unsigned_abs()),
+                );
             }
         }
         timings.since("box_start", box_lap);
@@ -2751,6 +2753,26 @@ pub fn record_attach_failure(l: &Ledger, run: &str, run_dir: &Path, why: &str, a
     (now, audit)
 }
 
+/// Clears `run`'s failed takeovers once this takeover has held its box for `hold` (#676), unless
+/// another failure was recorded meanwhile (another process's, or this one's as it failed): those
+/// count on.
+fn clear_after_hold(
+    ledger: Arc<Mutex<Ledger>>,
+    tenant: wicket_core::TenantId,
+    run: String,
+    run_dir: std::path::PathBuf,
+    hold: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let before = known_attach_failures(&ledger.lock().expect("ledger"), &run, &run_dir);
+    tokio::spawn(async move {
+        tokio::time::sleep(hold).await;
+        let l = ledger.lock().expect("ledger");
+        if known_attach_failures(&l, &run, &run_dir) == before {
+            attach_recovered(&l, &tenant, &run, &run_dir);
+        }
+    })
+}
+
 /// A takeover of `run` (in `run_dir`) has held its box for one backoff interval (#676): its failed
 /// ones, if any, are cleared and audited as over (`run.attach_recovered`), so the reconciler no
 /// longer backs off from it.
@@ -2795,7 +2817,12 @@ fn attach_failed_in(l: &Ledger, run: &str, run_dir: &Path, why: &str, now_ms: i6
     // node after MAX_ATTACH_FAILURES.
     let cap_ms = l.run_authority(run).ok().flatten().map(|(_, cap)| cap.saturating_mul(1000));
     let fenced = crate::noderun::fenced_in(run_dir, now_ms, cap_ms);
-    if let Some(h) = crate::noderun::held_until(l, run, now_ms, fenced, crate::noderun::has_run_record(run_dir)) {
+    let held = match crate::noderun::held_until(l, run, now_ms, fenced, crate::noderun::has_run_record(run_dir)) {
+        Ok(h) => h,
+        // Not ended on a ledger it couldn't read: the reconciler tries again.
+        Err(_) => return,
+    };
+    if let Some(h) = held {
         let (failures, audit) = record_attach_failure(l, run, run_dir, &clipped, now_ms / 1000);
         if audit {
             let _ = l.audit(
@@ -3017,6 +3044,32 @@ mod tests {
         assert_eq!(known_attach_failures(&l, "run_a", &d), None);
         attach_recovered(&l, &t, "run_b", &e);
         assert_eq!(known_attach_failures(&l, "run_b", &e), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #676: a takeover's failures are cleared only once it has held its box for its hold, and not
+    /// if another failure was recorded meanwhile.
+    #[tokio::test]
+    async fn failures_clear_only_after_the_box_was_held() {
+        let d = std::env::temp_dir().join(format!("wicket-attach-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        let l = Arc::new(Mutex::new(Ledger::open_in_memory().unwrap()));
+        let t = wicket_core::TenantId::single();
+        let n = wicket_store::now();
+        record_attach_failure(&l.lock().unwrap(), "run_a", &d, "no node", n);
+        let h = clear_after_hold(l.clone(), t.clone(), "run_a".into(), d.clone(), std::time::Duration::from_millis(50));
+        assert!(known_attach_failures(&l.lock().unwrap(), "run_a", &d).is_some(), "not before its hold");
+        h.await.unwrap();
+        assert_eq!(known_attach_failures(&l.lock().unwrap(), "run_a", &d), None);
+        assert!(l.lock().unwrap().last_run_audit("run_a", &["run.attach_recovered"]).unwrap().is_some());
+
+        // A failure recorded during the hold: it counts on.
+        record_attach_failure(&l.lock().unwrap(), "run_a", &d, "no node", n + 1);
+        let h = clear_after_hold(l.clone(), t, "run_a".into(), d.clone(), std::time::Duration::from_millis(50));
+        record_attach_failure(&l.lock().unwrap(), "run_a", &d, "no node", n + 2);
+        h.await.unwrap();
+        assert_eq!(known_attach_failures(&l.lock().unwrap(), "run_a", &d).map(|f| f.count), Some(2));
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -168,7 +168,9 @@ where
             adopt: crate::run::spawn_attach,
             fenced: crate::noderun::fenced_until,
             attach_failures: run_attach_failures,
-            has_run_record,
+            has_run_record: |run| {
+                crate::run::check_run_id(run).is_ok() && crate::noderun::has_run_record(&crate::data_dir().join("runs").join(run))
+            },
             now,
             dry_run,
             done: vec![],
@@ -363,7 +365,7 @@ where
     /// box's authority ([`crate::noderun::held_until`], the rule a failed takeover holds by too).
     fn may_still_run(&self, run: &str) -> Result<Option<String>> {
         let fenced = (self.fenced)(self.ledger, run, self.now.saturating_mul(1000));
-        let held = crate::noderun::held_until(self.ledger, run, self.now.saturating_mul(1000), fenced, (self.has_run_record)(run));
+        let held = crate::noderun::held_until(self.ledger, run, self.now.saturating_mul(1000), fenced, (self.has_run_record)(run))?;
         Ok(held.map(|h| match (h.by_ledger, h.until_ms) {
             (true, u) => {
                 format!("it has no run record here, and the ledger has its box authorized there until {}", crate::noderun::fmt_ms(u))
@@ -1033,11 +1035,6 @@ fn node_docker(name: &str) -> Option<Docker> {
 fn run_attach_failures(l: &Ledger, run: &str) -> Option<crate::run::AttachFailures> {
     crate::run::check_run_id(run).ok()?;
     crate::run::known_attach_failures(l, run, &crate::data_dir().join("runs").join(run))
-}
-
-/// Whether this host has the run's record.
-fn has_run_record(run: &str) -> bool {
-    crate::run::check_run_id(run).is_ok() && crate::data_dir().join("runs").join(run).join("ctl/run.json").exists()
 }
 
 /// When a run's box must have stopped (Unix seconds), from the run's record (none for a run without
@@ -2157,6 +2154,36 @@ mod tests {
         assert!(l.running_runs().unwrap().is_empty());
         assert_eq!(l.lease(&lease).unwrap().unwrap().status, "ended");
         assert!(w.placer.provider().list_tagged(&Owner::new("example").tag()).await.unwrap().is_empty(), "no allocation left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #676: a lease that ends while its run's box couldn't be stopped (the kill didn't take) keeps
+    /// the run this host has no record of while the ledger has its box authorized, as it does when
+    /// its node's boxes can't be listed.
+    #[tokio::test]
+    async fn a_lease_end_whose_kill_did_not_stop_the_box_holds_its_run() {
+        let dir = std::env::temp_dir().join(format!("wicket-rec-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = cfg("static");
+        let mut w = World::new(StaticHosts::persistent(c.static_hosts.clone(), dir.join("static.json")));
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_parent", "alive:1");
+        let lease = approved_lease(&mut l, &c, "run_parent");
+        w.pass(&mut l, NOW, false).await;
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "active");
+        started(&l, "run_held", "alive:2");
+        l.set_run_lease("run_held", &lease).unwrap();
+        l.set_run_authority("run_held", NOW + 100, NOW + 600).unwrap();
+        let sticky = FakeBoxes::with(&[("b-held", "run_held", "node-machine:7:7")]);
+        *sticky.ignores_kills.lock().unwrap() = true;
+        w.nodes.insert("n1".into(), sticky);
+        // Its holder's process is gone: the run is lost and its lease ends.
+        l.set_run_owner("run_parent", "dead:1").unwrap();
+        let d = w.pass(&mut l, NOW + 60, false).await;
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "ended");
+        assert_eq!(w.nodes["n1"].killed(), vec!["b-held".to_string()]);
+        assert!(d.iter().any(|x| x.kind == "unreachable" && x.target == "run_held" && x.detail.contains("couldn't be stopped")), "{d:?}");
+        assert_eq!(l.run_status("run_held").unwrap().as_deref(), Some("running"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
