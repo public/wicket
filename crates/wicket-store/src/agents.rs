@@ -410,6 +410,19 @@ impl Ledger {
         )?)
     }
 
+    /// The peer messages waiting for `run` that ask to be read `now` (#252), oldest first: each
+    /// one's id and its sender's principal. Whether one may interrupt a turn is the supervisor's
+    /// call ([`wicket_core::message::interrupts`]).
+    pub fn urgent_messages(&self, run: &str) -> Result<Vec<(String, Option<String>)>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, from_principal FROM messages WHERE to_run = ?1 AND {} AND delivered_at IS NULL AND taken_at IS NULL
+               AND priority = 'now' ORDER BY created_at, rowid",
+            crate::PEER
+        ))?;
+        let rows = st.query_map(params![run], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Prompts and notices queued for `run` and not yet handed to it.
     pub fn waiting_prompts(&self, run: &str) -> Result<i64> {
         Ok(self.conn.query_row(

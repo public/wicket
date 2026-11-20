@@ -421,10 +421,14 @@ mod tests {
         l.run_started(&t, &RunId("run_1".into()), "z", "peer").unwrap();
         l.put_identity(&row(&t, "run_1", p)).unwrap();
         for (id, pr) in [("m-1", Priority::Later), ("m-2", Priority::Next), ("m-3", Priority::Now), ("m-4", Priority::Next)] {
-            l.post_message(id, &t, "run_s", p, None, "e", &MessageMeta { priority: pr, ..Default::default() }).unwrap();
+            l.post_message(id, &t, "run_s", p, None, "e", &MessageMeta { priority: pr, from_principal: Some("s"), ..Default::default() }).unwrap();
         }
+        // What may interrupt a turn: the `now` ones, with who sent them (#252).
+        assert_eq!(l.urgent_messages("run_1").unwrap(), vec![("m-3".to_string(), Some("s".to_string()))]);
+        assert!(l.urgent_messages("run_other").unwrap().is_empty());
         let order: Vec<String> = std::iter::from_fn(|| l.take_message("run_1").unwrap().map(|m| m.id)).collect();
         assert_eq!(order, ["m-3", "m-2", "m-4", "m-1"]);
+        assert!(l.urgent_messages("run_1").unwrap().is_empty(), "read: nothing left to interrupt for");
     }
 
     /// #252: presence from what the ledger knows, and one row per principal.

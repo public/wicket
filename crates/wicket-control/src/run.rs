@@ -896,6 +896,14 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         }
         d
     };
+    // Who may interrupt this agent's turn with a `now` message (#252): its parent and the operator
+    // it acts for ([`wicket_core::message::interrupts`]).
+    let (parent_principal, acting_for) = {
+        let l = ledger.lock().expect("ledger");
+        let parent = parent_run.as_deref().and_then(|p| l.identity(p).ok().flatten()).map(|i| i.spiffe_id);
+        let op = identity.as_ref().and_then(|c| c.current().claims.principal.get("sub").and_then(|s| s.as_str()).map(String::from));
+        (parent, op)
+    };
     // The installation's org policy for this box (#51): compiled once, into its token at mint and
     // for the control host's own checks (forwarded hosts, injections, spawns, messages).
     let org_policy = crate::policy::for_run(&run.0, record.is_some())?;
@@ -1759,6 +1767,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     let live_children = || children.lock().map(|k| k.iter().filter(|(_, s)| !s.thread.is_finished()).count()).unwrap_or(0);
     let mut finish_asked = asked.finish;
     let mut notified_msgs = 0i64;
+    // The `now` messages that have interrupted (or tried to interrupt) a turn: each does once.
+    let mut interrupted: std::collections::HashSet<String> = Default::default();
     // The turn state last reported as the run's presence (#252).
     let mut reported_turn: Option<bool> = None;
     let mut superseded = false;
@@ -2169,6 +2179,45 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                         }
                     }
                 }
+                // A `now` message from its parent or its operator interrupts the running turn (#252),
+                // as an operator's cancel does; the notice below tells the agent at the turn's end.
+                // From anyone else it waits for the turn.
+                if turn_running && !finish_asked {
+                    let urgent = ledger.lock().ok().and_then(|l| l.urgent_messages(&run.0).ok()).unwrap_or_default();
+                    let first = urgent.into_iter().find(|(id, from)| {
+                        !interrupted.contains(id)
+                            && wicket_core::message::interrupts("now", from.as_deref(), parent_principal.as_deref(), acting_for.as_deref())
+                    });
+                    if let Some((id, from)) = first {
+                        use tokio::io::AsyncWriteExt;
+                        interrupted.insert(id.clone());
+                        let out = match (acp.as_mut(), control.as_mut()) {
+                            (Some(c), _) => c.cancel(),
+                            (None, Some(c)) => c.interrupt(),
+                            _ => vec![],
+                        };
+                        let sent = !out.is_empty();
+                        if sent {
+                            say!("[wicket] an urgent message ({id}) from {}: interrupting the running turn", from.as_deref().unwrap_or("?"));
+                            if let Some(c) = &acp {
+                                let _ = write_json(&acp_state, c);
+                            }
+                            let input: String = out.iter().map(|l| format!("{l}\n")).collect();
+                            if let Some(log) = acp_log.as_mut() {
+                                log.wrote(transcript_f.offset(), &input);
+                            }
+                            if let Some(si) = stdin.as_mut() {
+                                if si.write_all(input.as_bytes()).await.is_err() {
+                                    stdin = None;
+                                }
+                            }
+                        }
+                        if let Ok(l) = ledger.lock() {
+                            let outcome = if sent { "interrupted" } else { "this run's harness can't be interrupted" };
+                            let _ = l.audit(&m.tenant, Some(&run), "run.turn_interrupt", &serde_json::json!({ "message": id, "from": from, "outcome": outcome }));
+                        }
+                    }
+                }
                 // A peer's message waiting while the agent is between turns: tell it (wicket's own
                 // words; the message itself is read with await_message). Not once it asked to finish.
                 let waiting = ledger.lock().ok().and_then(|l| l.waiting_messages(&run.0).ok()).unwrap_or(0);
@@ -2177,7 +2226,9 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 }
                 if !turn_running && !finish_asked && waiting > notified_msgs {
                     use tokio::io::AsyncWriteExt;
-                    let t = format!("[wicket] {waiting} message(s) from other agents (or your parent's next brief) are waiting: read them with wicket's await_message tool.");
+                    let urgent = ledger.lock().ok().and_then(|l| l.urgent_messages(&run.0).ok()).map_or(0, |u| u.len());
+                    let urgent = if urgent > 0 { format!(" ({urgent} asked to be read now)") } else { String::new() };
+                    let t = format!("[wicket] {waiting} message(s) from other agents, your operator or your parent{urgent} are waiting: read them with wicket's await_message tool.");
                     say!("{t}");
                     if let Some(si) = stdin.as_mut() {
                         if let Some(log) = acp_log.as_mut() {

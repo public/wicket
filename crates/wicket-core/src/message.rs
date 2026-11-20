@@ -68,6 +68,15 @@ pub fn refusal(to: &str, sender_zone: &str, sender: Option<&str>) -> String {
     }
 }
 
+/// Whether a message sent at `priority` by `sender` may interrupt its recipient's running turn
+/// (#252): only a `now` message from someone with a say over the recipient's work, its parent
+/// (`parent`, its principal) or the operator it acts for (`operator`). From anyone else a `now`
+/// message waits for the turn like a `next` one: a peer that may write to an agent can't keep
+/// stopping its work.
+pub fn interrupts(priority: &str, sender: Option<&str>, parent: Option<&str>, operator: Option<&str>) -> bool {
+    priority == "now" && sender.is_some() && (sender == parent || sender == operator)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +90,15 @@ mod tests {
             sender: Some("spiffe://d/t/t0/z/za/a/alice"),
             reply: false,
         }
+    }
+
+    #[test]
+    fn only_a_parent_or_its_operator_interrupts() {
+        let (p, o, peer) = (Some("spiffe://d/t/t0/z/za/a/lead"), Some("spiffe://d/t/t0/op/unix/alice"), Some("spiffe://d/t/t0/z/zb/a/x"));
+        assert!(interrupts("now", p, p, o) && interrupts("now", o, p, o));
+        assert!(!interrupts("now", peer, p, o), "a peer waits for the turn");
+        assert!(!interrupts("next", p, p, o) && !interrupts("later", o, p, o), "only now");
+        assert!(!interrupts("now", None, None, None), "an unknown sender never matches no parent");
     }
 
     #[test]
