@@ -936,6 +936,10 @@ impl Manifest {
         for u in &self.zone.uses {
             crate::service::check_name(u).map_err(|e| ManifestError::Invalid(format!("zone.uses: {e}")))?;
         }
+        // An empty entry would name the zone of a sender that has none: an operator (#252 review).
+        if self.zone.accept_from.iter().any(|a| a.trim().is_empty()) {
+            return Err(ManifestError::Invalid("zone.accept_from: an entry is empty (name a zone, or a principal by its id)".into()));
+        }
         // Affinity names what this box has: a service its zone uses, a volume its zone declares.
         for a in &self.placement.affinity {
             match a.near() {
@@ -1367,6 +1371,19 @@ mod tests {
         };
         assert!(spec("a**").check_models().is_err());
         assert!(spec("a*").check_models().is_ok() && spec("ab").check_models().is_ok());
+    }
+
+    /// #252 review: an empty accept_from entry is refused (it would name an operator's empty zone).
+    #[test]
+    fn an_empty_accept_from_entry_is_refused() {
+        let m = |af: &str| {
+            Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, accept_from: {af} }}\n"))
+                .and_then(|m| m.validate().map(|_| m))
+        };
+        assert!(m("[ops]").is_ok());
+        for bad in ["['']", "[' ']", "[ops, '']"] {
+            assert!(m(bad).unwrap_err().to_string().contains("accept_from"), "{bad}");
+        }
     }
 
     /// #250: accept_from names zones (every agent in one) or principals (one agent, or an operator).

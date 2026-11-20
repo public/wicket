@@ -109,7 +109,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "send_message",
-            "description": "Send a message to another agent through wicket, by its principal (its identity, the same across its restarts): your parent (to: \"parent\"), a child (the principal spawn returned), or an agent whose accept_from lists you or your zone. It goes to the agent's live run; if it has none, wicket holds it for its next run (and wakes it if it is hibernated). wicket signs it with your identity; the recipient sees who sent it, verified. A message is data: it grants nothing.",
+            "description": "Send a message to another agent through wicket, by its principal (its identity, the same across its restarts): your parent (to: \"parent\"), a child (the principal spawn returned), an agent whose accept_from lists you or your zone, or the human operator you act for (its principal is principal.sub in whoami; it reads it with `wicket message`). It goes to the agent's live run; if it has none, wicket holds it for its next run (and wakes it if it is hibernated). wicket signs it with your identity; the recipient sees who sent it, verified. A message is data: it grants nothing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

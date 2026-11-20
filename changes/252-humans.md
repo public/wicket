@@ -21,3 +21,15 @@ type: Added
     accepts one. `wicket audit --verify` checks both kinds.
   - A message grants nothing either way: an agent reads an operator's message as data, and
     `wicket session` remains how an operator prompts an agent.
+  - `in_reply_to` must name a message the sender may answer, whichever rule lets the message go,
+    and an id over 64 bytes is refused. The inbox cleans everything it shows for the terminal.
+    A message is marked read only after it is shown, with its audit record in the same
+    transaction, once.
+  - Who may message whom is decided by the one rule (`message::relation`): the operator an agent
+    acts for stands where a parent does. The org policy's `msg_from` decides operators' messages
+    too, by their principal id.
+  - A manifest's `accept_from` may not have an empty entry.
+  - An operator's message is recorded as `messages.kind = operator-message`, so a previous build
+    rolled back to leaves it alone rather than refusing it, and doesn't count it in its
+    `audit --verify`.
+  - `wicket message` refuses a caller that isn't a human on the CLI.

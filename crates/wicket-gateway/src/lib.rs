@@ -381,7 +381,11 @@ impl Gateway {
                             Some(f) => l.agent_runs(&f.agent).unwrap_or_default().into_iter().map(|(r, _)| r).collect(),
                             None => vec![],
                         };
-                        let from_zone = l.identity(&m.from_run).ok().flatten().map(|i| (i.zone, i.spiffe_id));
+                        // An operator's message (#252) has no run: no zone, its principal from the record.
+                        let from_zone = match m.from_run.as_str() {
+                            "" => l.message_row(&m.id).ok().flatten().and_then(|r| r.from_principal).map(|p| (String::new(), p)),
+                            run => l.identity(run).ok().flatten().map(|i| (i.zone, i.spiffe_id)),
+                        };
                         (m, revoked, earlier, from_zone)
                     })
                 })
@@ -391,15 +395,16 @@ impl Gateway {
                 // children included: refused, the message is dropped, and the agent told.
                 Ok(Some((m, _, _, Some((z, id))))) if self.ctx.org.as_ref().is_some_and(|o| !o.allows_message_from(&z, Some(&id))) => {
                     self.message_read(&m.id);
-                    self.refused_on_delivery(&m, &cell.current().claims.sub, &format!("the org policy doesn't let you hear from zone {z}"));
-                    return (
-                        format!(
-                            "a message from run {} (zone {z}) was refused: the org policy doesn't accept messages from that zone",
-                            m.from_run
-                        ),
-                        false,
-                        None,
-                    );
+                    let (why, said) = if m.from_run.is_empty() {
+                        (format!("the org policy doesn't let you hear from operator {id}"), format!("a message from operator {id} was refused: the org policy doesn't accept messages from it"))
+                    } else {
+                        (
+                            format!("the org policy doesn't let you hear from zone {z}"),
+                            format!("a message from run {} (zone {z}) was refused: the org policy doesn't accept messages from that zone", m.from_run),
+                        )
+                    };
+                    self.refused_on_delivery(&m, &cell.current().claims.sub, &why);
+                    return (said, false, None);
                 }
                 Ok(Some((m, sender_revoked, earlier, _))) => {
                     let me = cell.current();
@@ -1219,6 +1224,66 @@ mod tests {
         let mallory = OperatorSender { tenant: &other, via: "unix", name: "alice", signed: None };
         assert!(send_as_operator(&w.ledger, &w.issuer, mallory, &id_of(&lead), "message", json!("x"), Default::default(), None).is_err());
         assert!(lead.send_message(&to("spiffe://other.domain/t/t0/op/unix/alice"), "message", json!("x")).is_err());
+    }
+
+    /// #252 review: `in_reply_to` must name a real message the sender may answer, in every branch
+    /// (even where the relation alone would let it go), and is bounded before it is shown anywhere.
+    #[test]
+    fn in_reply_to_is_checked_whatever_lets_a_message_go() {
+        use wicket_proxy::opmsg::{send_as_operator, OperatorSender};
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let t0 = TenantId("t0".into());
+        let lead = w.agent("t0", "research", "lead", "run_lead", None, &[]);
+        let other = w.agent("t0", "research", "other", "run_other", None, &[]);
+        let alice = OperatorSender { tenant: &t0, via: "unix", name: "alice", signed: None };
+        let alice_id = alice.id(&w.issuer);
+        // A message alice sent elsewhere: lead can't claim to answer it.
+        let elsewhere = send_as_operator(&w.ledger, &w.issuer, alice, &id_of(&other), "message", json!("x"), Default::default(), None).unwrap();
+        let hostile = "m-1\u{1b}]52;c;cGF5bG9hZA==\u{7}\nfake line";
+        let long = "m-".to_string() + &"a".repeat(10_000);
+        for bogus in ["m-none", elsewhere.id.as_str(), hostile, long.as_str()] {
+            let opts = wicket_proxy::SendOpts { in_reply_to: Some(bogus), ..Default::default() };
+            // The agent writing to the operator it acts for (allowed without a reply).
+            let e = lead.send(&to(&alice_id), "message", json!("hi"), opts).unwrap_err().to_string();
+            assert!(e.contains("is not a message") && !e.contains('\u{1b}') && e.len() < 300, "{e:?}");
+            // The operator writing to an agent that acts for it (likewise).
+            let e = send_as_operator(&w.ledger, &w.issuer, alice, &id_of(&lead), "message", json!("hi"), opts, None).unwrap_err().to_string();
+            assert!(e.contains("is not a message") && !e.contains('\u{1b}') && e.len() < 300, "{e:?}");
+        }
+        // A real one goes, and is what the recipient sees.
+        let asked = send_as_operator(&w.ledger, &w.issuer, alice, &id_of(&lead), "message", json!("q"), Default::default(), None).unwrap();
+        let opts = wicket_proxy::SendOpts { in_reply_to: Some(&asked.id), ..Default::default() };
+        let back = lead.send(&to(&alice_id), "message", json!("a"), opts).unwrap();
+        assert!(w.ledger.lock().unwrap().message_row(&back.id).unwrap().is_some());
+    }
+
+    /// #252 review: the org policy decides who a box hears from, operators included, by id.
+    #[tokio::test]
+    async fn the_org_policy_decides_operators_messages_too() {
+        use wicket_proxy::opmsg::{send_as_operator, OperatorSender};
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let t0 = TenantId("t0".into());
+        let alice = OperatorSender { tenant: &t0, via: "unix", name: "alice", signed: None };
+        let org = |from: &[&str]| {
+            Some(Arc::new(wicket_authz::OrgLayer {
+                version: "v".into(),
+                http: None,
+                forbid: vec![],
+                spawn: None,
+                msg_from: Some(from.iter().map(|s| s.to_string()).collect()),
+                inject: None,
+            }))
+        };
+        let mut lead = w.agent("t0", "research", "lead", "run_lead", None, &[]);
+        lead.org = org(&["research"]);
+        let m = send_as_operator(&w.ledger, &w.issuer, alice, &id_of(&lead), "message", json!("x"), Default::default(), None).unwrap();
+        let (text, _) = tool(&lead, "await_message", json!({ "timeout_seconds": 1 })).await;
+        assert!(text.contains("refused") && text.contains(&alice.id(&w.issuer)), "{text}");
+        assert_eq!(w.ledger.lock().unwrap().receipt(&m.id).unwrap().unwrap().state, "refused");
+        lead.org = org(&["research", &alice.id(&w.issuer)]);
+        send_as_operator(&w.ledger, &w.issuer, alice, &id_of(&lead), "message", json!("y"), Default::default(), None).unwrap();
+        let (text, err) = tool(&lead, "await_message", json!({ "timeout_seconds": 1 })).await;
+        assert!(!err && text.contains("your operator"), "{text}");
     }
 
     /// #70, #250: a message to a hibernated agent's principal wakes it, and its next activation
