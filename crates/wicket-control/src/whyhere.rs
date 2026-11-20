@@ -9,20 +9,27 @@ use wicket_store::Ledger;
 pub fn why_here(run: &str, json: bool) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     let Some((at_ms, record)) = l.placement_decision(run)? else {
-        return Err(wicket_home::exit::not_found(format!(
-            "no placement decision is recorded for {run}: it ran on this host's own node, on a node named for it whose room \
-             wasn't known from a report, or its decision is over a week old"
-        )));
+        return Err(wicket_home::exit::not_found(format!("no placement decision is recorded for {run}: {NO_DECISION}")));
     };
     if json {
-        let mut v: serde_json::Value = serde_json::from_str(&record)?;
-        v["run"] = serde_json::json!(run);
-        v["at_ms"] = serde_json::json!(at_ms);
-        println!("{}", serde_json::to_string_pretty(&v)?);
+        println!("{}", serde_json::to_string_pretty(&record_json(run, at_ms, &record)?)?);
         return Ok(());
     }
     print!("{}", explain(run, at_ms, &record, wicket_feed::now_ms())?);
     Ok(())
+}
+
+/// Why no decision is recorded for a run (`wicket why-here`, and the console's placement view).
+pub const NO_DECISION: &str =
+    "it ran on this host's own node, on a node named for it whose room wasn't known from a report, or its decision is over a week old";
+
+/// The decision recorded for `run` at `at_ms`, as `wicket why-here --json` prints it: the record,
+/// with the run and when it was decided.
+pub fn record_json(run: &str, at_ms: i64, record: &str) -> Result<serde_json::Value> {
+    let mut v: serde_json::Value = serde_json::from_str(record)?;
+    v["run"] = serde_json::json!(run);
+    v["at_ms"] = serde_json::json!(at_ms);
+    Ok(v)
 }
 
 /// The text `why_here` prints.

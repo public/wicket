@@ -221,6 +221,17 @@ that stays a signed action.
 key. Each view is built from named fields, never by serializing a stored record, and a test fetches
 every console endpoint and scans each answer for the token, any 24-byte run of its bytes (base64url,
 base64 and hex, except runs inside a public key), identity JWSs and private keys.
+## Placement view
+
+Why a run went where it did ([#579](https://github.com/public/wicket/issues/579)), read-only and behind
+an operator's session: `GET /api/runs/<run>/placement` returns the run's `status` and `node`, and the
+placement decision recorded when its node was chosen (`decision`: the request, the node, the nodes it
+may go on in order, every reason each other node was out, or the waiting run it went behind, as
+`wicket why-here --json` prints it, with `run` and `at_ms`) with `text`, the explanation `wicket
+why-here` prints. A run with no decision recorded (on a node named for it whose room wasn't known from a
+report, or decided over a week ago) has `decision: null` and `why`. An unknown run is not found.
+[Nodes: placement](nodes.md#placement) says how a node is chosen.
+
 ## Manifests
 
 The **Manifests** section lists the manifests runs can be started from (#172). The installation's
