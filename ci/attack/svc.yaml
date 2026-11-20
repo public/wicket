@@ -1,0 +1,17 @@
+# A per-node service (#579) the attacker's zone uses (ci/attack-matrix.sh installs it): it serves a
+# canary, and its reach (www.iana.org) is wider than the attacker's, so the attacker's link to it
+# needs a human, who never comes.
+task: Serve a canary to the boxes allowed to use it.
+program:
+  name: atk-svc
+  command: [python3, -I, -m, http.server, "4873", --bind, 0.0.0.0, --directory, /workspace/www]
+  source: svc
+service:
+  port: 4873
+  env: { ATK_SVC_URL: "http://{host}:{port}/" }
+zone:
+  name: atk-svc
+  isolation: gvisor
+  reach:
+    - { host: www.iana.org, methods: [GET] }
+  limits: { memory: 256m, cpus: 1, timeout: 30m }

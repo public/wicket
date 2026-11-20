@@ -145,6 +145,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
+    /// An allow by a standing rule (#572) is checked against that rule: approved before the request,
+    /// covering it, bound to the run's principal, not lapsed. Before #326's attack matrix it read as
+    /// a grant "never issued".
+    #[test]
+    fn a_standing_allow_must_match_an_approved_standing_rule() {
+        let l = Ledger::open_in_memory().unwrap();
+        let (t, run) = (TenantId::single(), RunId(RUN.into()));
+        l.run_started(&t, &run, "z", "a").unwrap();
+        l.audit(&t, Some(&run), "run.start", &json!({ "zone": "z", "agent": "a", "reach": 1 })).unwrap();
+        let d = tmp("standing");
+        let who = format!("spiffe://inv.test/t/{}/z/z/a/a", t.0);
+        let rule: wicket_core::manifest::ReachRule = wicket_core::yaml::from_str("{ host: ci.example, paths: ['/logs/**'] }").unwrap();
+        let (id, _) = l.ask_standing(&t, &run, "z", "digest", &who, &rule, "logs").unwrap();
+        // Pending: nothing it allowed was allowed.
+        egress(&l, "GET", "ci.example", "/logs/1", "allow", &format!("grant {id}"));
+        let f = findings(&l, &d);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].contains("which was never approved (it is pending)"), "{f:?}");
+        let terms = wicket_store::StandingTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: Some(3600) };
+        l.approve_standing(&id, &rule, &terms, "test", None).unwrap();
+        // Approved (within the clock skew of the request above, so that one stands too): a request it
+        // covers is fine; one outside it, or by an id never issued, isn't.
+        egress(&l, "GET", "ci.example", "/logs/2", "allow", &format!("grant {id} (counted on the node)"));
+        egress(&l, "GET", "ci.example", "/secrets", "allow", &format!("grant {id}"));
+        egress(&l, "GET", "ci.example", "/logs/3", "allow", "grant s-never");
+        let f = findings(&l, &d);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f[0].contains("/secrets") && f[0].contains("which is for GET,HEAD ci.example/logs/**"), "{f:?}");
+        assert!(f[1].contains("s-never, which was never issued"), "{f:?}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn a_reach_allow_is_checked_against_the_zone_when_wicket_kept_it() {
         let l = ledger();

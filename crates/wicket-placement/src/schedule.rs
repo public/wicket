@@ -19,8 +19,8 @@
 //! or spread (the most). Ties go to `last` (where the box ran before), then to the name, so the same
 //! inputs always give the same node.
 //!
-//! **Queue** ([`queue_cmp`]): runs waiting for a node are served by priority, highest first, and
-//! first come, first served within one.
+//! **Queue** ([`queue_order`]): runs waiting for a node are served first come, first served across
+//! tenants; within a tenant, its own runs fill its places in line by priority, highest first.
 //!
 //! **Preemption** ([`preempt`]): when no node may take a box, which boxes to stop to make room: only
 //! those whose manifest marks them preemptible and whose priority is below the box's, the fewest on
@@ -283,22 +283,49 @@ pub fn schedule(req: &Request, nodes: &[Node], strategy: Strategy, last: Option<
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Waiter {
     pub run: String,
+    /// Whose run it is: its priority counts only against its own tenant's runs.
+    pub tenant: String,
     pub priority: i32,
     /// When it first waited (ms).
     pub at_ms: i64,
 }
 
-/// The order waiting runs are served in: the highest priority first, first come, first served
-/// within one, then by run id (so it is total).
-pub fn queue_cmp(a: &Waiter, b: &Waiter) -> Ordering {
+/// Within one tenant: the highest priority first, first come, first served within one, then by run.
+fn within_tenant(a: &Waiter, b: &Waiter) -> Ordering {
     b.priority.cmp(&a.priority).then(a.at_ms.cmp(&b.at_ms)).then_with(|| a.run.cmp(&b.run))
+}
+
+/// The order waiting runs are served in, fair across tenants: each tenant's runs keep the places in
+/// line they took (first come, first served across tenants), and priority decides only which of a
+/// tenant's own runs fills each of its places. So a priority, which a manifest declares, never moves
+/// another tenant's runs. Total and deterministic: a tie between tenants goes to the tenant's name.
+pub fn queue_order(waiting: &[Waiter]) -> Vec<&Waiter> {
+    let mut by_tenant: BTreeMap<&str, Vec<&Waiter>> = BTreeMap::new();
+    for w in waiting {
+        by_tenant.entry(w.tenant.as_str()).or_default().push(w);
+    }
+    // (place, tenant, rank within the tenant): the rank breaks a tie between two of a tenant's places
+    // taken at the same time, so its order there is still by priority.
+    let mut placed: Vec<(i64, &str, usize, &Waiter)> = vec![];
+    for (tenant, mut runs) in by_tenant {
+        let mut places: Vec<i64> = runs.iter().map(|w| w.at_ms).collect();
+        places.sort_unstable();
+        runs.sort_by(|a, b| within_tenant(a, b));
+        for (rank, (at, w)) in places.into_iter().zip(runs).enumerate() {
+            placed.push((at, tenant, rank, w));
+        }
+    }
+    placed.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    placed.into_iter().map(|(_, _, _, w)| w).collect()
 }
 
 /// The waiters served before `me`, in the order they're served (`me` itself, if listed, is not).
 pub fn ahead<'a>(me: &Waiter, waiting: &'a [Waiter]) -> Vec<&'a Waiter> {
-    let mut v: Vec<&Waiter> = waiting.iter().filter(|w| w.run != me.run && queue_cmp(w, me) == Ordering::Less).collect();
-    v.sort_by(|a, b| queue_cmp(a, b));
-    v
+    let mut all: Vec<Waiter> = waiting.iter().filter(|w| w.run != me.run).cloned().collect();
+    all.push(me.clone());
+    let order: Vec<String> = queue_order(&all).into_iter().map(|w| w.run.clone()).collect();
+    let mine = order.iter().position(|r| r == &me.run).unwrap_or(order.len());
+    order[..mine].iter().filter_map(|r| waiting.iter().find(|w| &w.run == r)).collect()
 }
 
 /// A box running on a node, as preemption sees it.
@@ -346,7 +373,8 @@ fn without(node: &Node, gone: &[&Running]) -> Node {
 /// Only room is made: a node that is out for any other reason (its disk, a label, a taint, its CA,
 /// an affinity) stays out. On each node the boxes it may stop are taken lowest priority first (then
 /// the most memory, then the most vCPUs, then by run id) until it fits, and then any it fits without
-/// is put back, so every one chosen is needed. Of the nodes it can be made to fit on, the one whose
+/// is put back, so every one chosen is needed (no victim can be kept; not necessarily the fewest
+/// boxes that would make room). Of the nodes it can be made to fit on, the one whose
 /// highest-priority victim is lowest, then with the fewest victims, then by name.
 pub fn preempt(req: &Request, nodes: &[Node], running: &BTreeMap<String, Vec<Running>>, strategy: Strategy) -> Option<Preemption> {
     if schedule(req, nodes, strategy, None).node.is_some() {
@@ -656,40 +684,84 @@ mod tests {
         assert_eq!(d.refused[0].1, vec![Refusal::Away(Away::Principal("spiffe://w.test/t/t0/z/research/a/r".into()))]);
     }
 
-    #[test]
-    fn the_queue_serves_the_highest_priority_first_and_fifo_within_one() {
-        let w = |run: &str, priority, at_ms| Waiter { run: run.into(), priority, at_ms };
-        let q = vec![w("a", 0, 10), w("b", 5, 30), w("c", 0, 5), w("d", 5, 20), w("e", -1, 1)];
-        let order = |me: &Waiter| ahead(me, &q).into_iter().map(|w| w.run.as_str()).collect::<Vec<_>>();
-        assert_eq!(order(&w("new", -9, 99)), ["d", "b", "c", "a", "e"]);
-        assert_eq!(order(&q[0]), ["d", "b", "c"], "a waits behind every higher one and the older at its own");
-        assert!(order(&w("urgent", 6, 99)).is_empty(), "a higher priority goes first, however late");
+    fn w(run: &str, tenant: &str, priority: i32, at_ms: i64) -> Waiter {
+        Waiter { run: run.into(), tenant: tenant.into(), priority, at_ms }
     }
 
-    /// For many random queues: the order is total and antisymmetric, a run is never served before
-    /// one of higher priority, and within a priority the one waiting longer goes first.
+    #[test]
+    fn priority_orders_a_tenants_own_runs_and_tenants_keep_their_places() {
+        let order = |q: &[Waiter]| queue_order(q).into_iter().map(|w| w.run.as_str()).collect::<Vec<_>>().join(" ");
+        // One tenant: by priority, FIFO within one.
+        let one = vec![w("a", "t0", 0, 10), w("b", "t0", 5, 30), w("c", "t0", 0, 5), w("d", "t0", 5, 20), w("e", "t0", -1, 1)];
+        assert_eq!(order(&one), "d b c a e");
+        // t1 took places at 2 and 40. Marking its late run 1000 puts it in t1's first place, and
+        // moves nothing of t0's: t0's runs fill t0's places (1, 5, 10, 20, 30) as before.
+        let mut two = one.clone();
+        two.push(w("x", "t1", 0, 2));
+        two.push(w("y", "t1", 1000, 40));
+        assert_eq!(order(&two), "d y b c a e x");
+        let ahead_of = |me: &Waiter| ahead(me, &two).into_iter().map(|w| w.run.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            ahead_of(&w("new", "t1", 1000, 99)),
+            ["d", "y", "b", "c", "a", "e"],
+            "at 1000, still behind every place taken before it"
+        );
+        assert!(ahead_of(&w("new", "t0", 1000, 99)).is_empty(), "first of t0's own");
+        assert_eq!(ahead_of(&two[0]), ["d", "y", "b", "c"], "a is t0's fourth run: its place is 20");
+    }
+
+    /// For many random queues over a few tenants: the order is a permutation and doesn't depend on
+    /// the order listed; within a tenant a higher priority goes first, and FIFO within one; each
+    /// tenant's runs hold exactly the places in line it took; with no priorities it is plain first
+    /// come, first served; and a tenant changing its own runs' priorities moves no other tenant's
+    /// run. `ahead` is exactly the runs before `me` in that order.
     #[test]
     fn queue_properties() {
         for seed in 1..=2000u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let q: Vec<Waiter> = (0..rng.below(12))
-                .map(|i| Waiter { run: format!("r{i}"), priority: rng.below(4) as i32 - 1, at_ms: rng.below(6) as i64 })
+                .map(|i| w(&format!("r{i}"), ["t0", "t1", "t2"][rng.below(3) as usize], rng.below(4) as i32 - 1, rng.below(6) as i64))
                 .collect();
-            for a in &q {
-                for b in &q {
-                    assert_eq!(queue_cmp(a, b), queue_cmp(b, a).reverse(), "seed {seed}");
-                    assert_eq!(queue_cmp(a, b) == Ordering::Equal, a.run == b.run, "seed {seed}: total");
-                }
-                let before = ahead(a, &q);
-                for b in &q {
-                    let served_first = before.iter().any(|x| x.run == b.run);
-                    if b.priority != a.priority {
-                        assert_eq!(served_first, b.priority > a.priority, "seed {seed}: by priority");
-                    } else if b.at_ms != a.at_ms {
-                        assert_eq!(served_first, b.at_ms < a.at_ms, "seed {seed}: FIFO within one");
+            let order: Vec<&Waiter> = queue_order(&q);
+            assert_eq!(order.len(), q.len(), "seed {seed}");
+            let mut shuffled = q.clone();
+            for i in (1..shuffled.len()).rev() {
+                shuffled.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            let names = |o: Vec<&Waiter>| o.into_iter().map(|w| w.run.clone()).collect::<Vec<_>>();
+            assert_eq!(names(queue_order(&shuffled)), names(order.clone()), "seed {seed}: whatever the order listed");
+            for (i, a) in order.iter().enumerate() {
+                for b in &order[i + 1..] {
+                    if a.tenant == b.tenant {
+                        assert!(
+                            a.priority > b.priority || (a.priority == b.priority && a.at_ms <= b.at_ms),
+                            "seed {seed}: within a tenant, by priority then FIFO"
+                        );
                     }
                 }
-                assert!(before.windows(2).all(|w| queue_cmp(w[0], w[1]) == Ordering::Less), "seed {seed}: in order");
+            }
+            let flat: Vec<Waiter> = q.iter().map(|x| Waiter { priority: 0, ..x.clone() }).collect();
+            let fifo = queue_order(&flat);
+            assert!(fifo.windows(2).all(|p| p[0].at_ms <= p[1].at_ms), "seed {seed}: no priorities, first come, first served");
+            // Each tenant holds exactly the places in line it took: priorities change which of its
+            // runs is where, never which places are its.
+            let tenants = |o: &[&Waiter]| o.iter().map(|w| w.tenant.clone()).collect::<Vec<_>>();
+            assert_eq!(tenants(&order), tenants(&fifo), "seed {seed}: the places are the tenants' own");
+            // t0 re-ranks its own runs: every other tenant's run stays where it was.
+            let mut bumped = q.clone();
+            for x in bumped.iter_mut().filter(|x| x.tenant == "t0") {
+                x.priority = rng.below(2001) as i32 - 1000;
+            }
+            let before = names(order.clone());
+            let after = names(queue_order(&bumped));
+            for (i, r) in before.iter().enumerate() {
+                if q.iter().any(|x| &x.run == r && x.tenant != "t0") {
+                    assert_eq!(&after[i], r, "seed {seed}: t0's priorities moved {r}");
+                }
+            }
+            for me in &q {
+                let want: Vec<String> = before.iter().take_while(|r| *r != &me.run).cloned().collect();
+                assert_eq!(names(ahead(me, &q)), want, "seed {seed}");
             }
         }
     }

@@ -20,7 +20,7 @@
 //!     a harness's default model host for its default model secret.
 //!   - `secret_hosts` replaces a secret's hosts, as `wicket secret hosts`: a secret is sent only to
 //!     hosts it is bound to. A reference's hosts can be changed here too.
-//!   - `delete_secret` removes it (a reference: only the reference), as `wicket secret rm`; the signed
+//!   - `delete_secret` removes it (a reference: only the reference), as `wicket secret remove`; the signed
 //!     JSON names the zones and running runs that use it, which the page shows before signing.
 //! - **References** (`wicket secret link`) name a path on the host, so making one stays CLI-only.
 //! - **Unsigned** asks (`/api/secrets/*`, the endpoints a session alone might try) are refused and
@@ -204,7 +204,7 @@ pub fn prepare(state: &State, kind: &str, body: &Value) -> Result<(Change, Value
             if reference {
                 return Err(err(
                     StatusCode::CONFLICT,
-                    format!("{name} is a reference to a file on the host; replacing it with a stored value is done on the host (wicket secret rm, then wicket secret set)"),
+                    format!("{name} is a reference to a file on the host; replacing it with a stored value is done on the host (wicket secret remove, then wicket secret set)"),
                 ));
             }
             let digest = str_field(body, "value_sha256").unwrap_or("");

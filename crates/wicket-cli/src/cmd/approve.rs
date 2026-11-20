@@ -8,8 +8,11 @@ use crate::*;
 /// Runs one of this group's commands.
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
-        Cmd::Pending => {
+        Cmd::Pending { json } => {
             let l = Ledger::open(&ledger_path())?;
+            if json {
+                return crate::cmd::print_json(&pending_json(&l)?);
+            }
             let p = l.pending(&TenantId::single())?;
             if p.is_empty() {
                 println!("no pending requests");
@@ -26,13 +29,16 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Approve { id, uses, unlimited, ttl, prefix, yes, zone_wide } => {
             if id.starts_with("s-") {
-                bail!("{id} is a standing ask: wicket standing show {id}, then wicket standing approve {id}");
+                return Err(wicket_home::exit::usage(format!(
+                    "{id} is a standing ask: wicket standing show {id}, then wicket standing approve {id}"
+                )));
             }
-            let ttl = wicket_core::time::parse_duration(&ttl).context("bad --ttl")?;
+            let ttl = wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
             let t = grant::Terms { uses: if unlimited { None } else { Some(uses) }, ttl, prefix: prefix.clone(), zone_wide };
-            grant::check_terms(&req, &t)?;
+            // Terms the request doesn't allow are refused (exit 3, #574).
+            grant::check_terms(&req, &t).map_err(|e| wicket_home::exit::refused(format!("{e:#}")))?;
             // What is approved is what wicket recorded, shown before the grant exists: a hint printed
             // from a node's or an agent's text can name the wrong request (#121).
             print!("{}", show_request(&l, &req));
@@ -45,7 +51,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 print!("{}", crate::effect::render(&b));
             }
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
-                bail!("not approved");
+                return Err(wicket_home::exit::refused("not approved: declined at the confirmation"));
             }
             let grant::Decided::Approved { grant: gid, lease, uses: made_uses, ttl } = grant::decide(
                 &mut l,
@@ -79,9 +85,12 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Links { tail } => {
+        Cmd::Links { tail, json } => {
             let l = Ledger::open(&ledger_path())?;
             let rows = l.links(&TenantId::single(), tail)?;
+            if json {
+                return crate::cmd::print_json(&links_json(&rows));
+            }
             if rows.is_empty() {
                 println!("no links");
             }
@@ -104,7 +113,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Unlink { id } => {
             let l = Ledger::open(&ledger_path())?;
-            let r = l.link(&id)?.with_context(|| format!("no link {id}"))?;
+            let r = l.link(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no link {id}")))?;
             if l.close_link(&id, &operator(), "cut by the operator")? {
                 l.audit(
                     &TenantId::single(),
@@ -120,7 +129,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Deny { id } => {
             if id.starts_with("s-") {
-                bail!("{id} is a standing ask: wicket standing deny {id}");
+                return Err(wicket_home::exit::usage(format!("{id} is a standing ask: wicket standing deny {id}")));
             }
             let mut l = Ledger::open(&ledger_path())?;
             if let grant::Decided::Denied { lease: Some(lease) } = grant::decide(
@@ -135,9 +144,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             println!("denied {id}");
             Ok(())
         }
-        Cmd::Grant { cmd: GrantCmd::List { all, tail } } => {
+        Cmd::Grant { cmd: GrantCmd::List { all, tail, json } } => {
             let l = Ledger::open(&ledger_path())?;
             let rows = l.grants(&TenantId::single(), all, tail)?;
+            if json {
+                let now = wicket_store::now();
+                return crate::cmd::print_json(&grants_json(&rows, now));
+            }
             if rows.is_empty() {
                 println!("no {}grants", if all { "" } else { "live " });
             }
@@ -149,7 +162,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Grant { cmd: GrantCmd::Revoke { id } } => {
             let l = Ledger::open(&ledger_path())?;
-            let g = l.grant(&id)?.with_context(|| format!("no grant {id}"))?;
+            let g = l.grant(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no grant {id}")))?;
             l.revoke_grant(&id)?;
             l.audit(&TenantId::single(), None, "grant.revoked", &serde_json::json!({ "grant": id, "by": operator(), "node": g.node }))?;
             match &g.node {
@@ -159,7 +172,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Grant { cmd: GrantCmd::Renew { id, ttl } } => {
-            let ttl = wicket_core::time::parse_duration(&ttl).context("bad --ttl")?;
+            let ttl = wicket_core::time::parse_duration(&ttl).map_err(|e| wicket_home::exit::usage(format!("bad --ttl {ttl:?}: {e}")))?;
             let mut l = Ledger::open(&ledger_path())?;
             let grant::Decided::Renewed { what, until } = grant::decide(
                 &mut l,
@@ -186,6 +199,72 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         _ => unreachable!("dispatched to the wrong command group"),
     }
+}
+
+/// `wicket pending --json`: the pending requests (`"kind": "request"`), then the pending standing
+/// asks (`"kind": "standing"`), as `wicket pending` lists them.
+pub(crate) fn pending_json(l: &Ledger) -> Result<serde_json::Value> {
+    let t = TenantId::single();
+    let mut out: Vec<serde_json::Value> = l
+        .pending(&t)?
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "kind": "request", "id": r.id, "run": r.run, "zone": r.zone, "method": r.method, "host": r.host,
+                "path": r.path, "prefix": r.scope_prefix, "risk": r.risk, "reason": r.reason, "created_at": r.created_at,
+                "attribution": r.attribution,
+            })
+        })
+        .collect();
+    for s in l.standing_with_status(&t, "pending")? {
+        out.push(serde_json::json!({
+            "kind": "standing", "id": s.id, "run": s.run, "zone": s.zone, "principal": s.principal,
+            "rule": crate::cmd::standing::rule_json(&s.rule), "reason": s.reason, "created_at": s.created_at,
+        }));
+    }
+    Ok(serde_json::Value::Array(out))
+}
+
+/// `wicket links --json`.
+pub(crate) fn links_json(rows: &[wicket_store::LinkRow]) -> serde_json::Value {
+    serde_json::Value::Array(rows.iter().map(link_json).collect())
+}
+
+/// `wicket grant list --json`.
+pub(crate) fn grants_json(rows: &[wicket_store::GrantListing], now: i64) -> serde_json::Value {
+    serde_json::Value::Array(rows.iter().map(|r| grant_json(r, now)).collect())
+}
+
+/// One link of `wicket links --json`.
+fn link_json(r: &wicket_store::LinkRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.id, "status": r.status, "from_run": r.from_run, "to_run": r.to_run, "name": r.name,
+        "host": format!("{}.{}", r.name, wicket_core::link::DOMAIN), "port": r.port, "by_run": r.by_run, "basis": r.basis,
+        "created_at": r.created_at, "closed_at": r.closed_at, "close_reason": r.close_reason,
+    })
+}
+
+/// One grant of `wicket grant list --json`. `quota` is set for a quota grant (its resource and
+/// amount: micro-USD for money), else null; `uses_left` null is unlimited (and for a quota).
+fn grant_json(r: &wicket_store::GrantListing, now: i64) -> serde_json::Value {
+    let g = &r.grant;
+    let quota = match (g.quota(), g.amount) {
+        (Some(res), Some(n)) => serde_json::json!({ "resource": res, "amount": n }),
+        _ => serde_json::Value::Null,
+    };
+    let state = if g.revoked {
+        "revoked"
+    } else if g.expires_at <= now {
+        "expired"
+    } else {
+        "live"
+    };
+    serde_json::json!({
+        "id": g.id, "state": state, "zone": g.zone, "run": g.run, "method": g.method, "host": g.host, "path": g.path,
+        "prefix": g.prefix, "quota": quota, "uses_left": if g.amount.is_some() { None } else { g.uses_left },
+        "expires_at": g.expires_at, "node": g.node, "request": g.request_id, "decided_by": r.decided_by,
+        "created_at": r.created_at,
+    })
 }
 
 /// One line of `wicket grant list`: what it grants (a quota's resource and amount, or an approval's
@@ -250,6 +329,9 @@ pub enum GrantCmd {
         all: bool,
         #[arg(long, default_value_t = 40)]
         tail: usize,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Revoke a grant. A grant handed to a node is revoked there through its feed by the run that
     /// published it (at once if the node is reachable).
