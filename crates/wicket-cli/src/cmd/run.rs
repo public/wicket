@@ -107,8 +107,9 @@ fn exit_for(end: &run::RunEnd, wrap: bool) -> Result<()> {
         return Err(Exit { code: Code::Revoked, msg: "the run was revoked".into() }.into());
     }
     // The wrapped program's own code, when it exited by itself with one: not a box wicket stopped
-    // (timeout, hibernate, superseded), whose code is the stop's.
-    if wrap && end.status.starts_with("failed (exit status") {
+    // (timeout, hibernate, superseded, or its node: authority, backstop, out of memory), whose code
+    // is the stop's.
+    if wrap && exited_by_itself(&end.status) {
         if let Some(c) = end.code.filter(|c| *c != 0) {
             return Err(Status(c).into());
         }
@@ -116,6 +117,18 @@ fn exit_for(end: &run::RunEnd, wrap: bool) -> Result<()> {
     match run::box_failed(&end.status) {
         true => bail!("the run ended: {}", end.status),
         false => Ok(()),
+    }
+}
+
+/// Whether a failed run's box exited by itself: `failed (exit status: N)`, or with a cause that
+/// isn't wicket's (a crash, a signal from elsewhere). Not when its node stopped it (`stopped by
+/// wicket: …`), the kernel killed it for memory (`killed: …`), or the runtime failed: those codes
+/// are the stop's, not the program's.
+fn exited_by_itself(status: &str) -> bool {
+    let Some(rest) = status.strip_prefix("failed (exit status") else { return false };
+    match rest.split_once("; ") {
+        None => true,
+        Some((_, cause)) => !["stopped by wicket", "killed:", "the container runtime failed"].iter().any(|p| cause.starts_with(p)),
     }
 }
 
@@ -146,5 +159,12 @@ mod tests {
         assert_eq!(exit(&end("hibernated", None, Some(137)), true), 0);
         assert_eq!(exit(&end("superseded", None, Some(255)), true), 0);
         assert_eq!(exit(&end("failed (/tmp over its cap)", None, Some(137)), true), 1);
+        // A box its node stopped, or the kernel killed for memory: wicket's stop, 1.
+        assert_eq!(exit(&end("failed (exit status: 137; stopped by wicket: past its timeout (30m))", None, Some(137)), true), 1);
+        assert_eq!(exit(&end("failed (exit status: 137; stopped by wicket: its authority expired)", None, Some(137)), true), 1);
+        assert_eq!(exit(&end("failed (exit status: 137; killed: out of memory (limit 512 MiB))", None, Some(137)), true), 1);
+        assert_eq!(exit(&end("failed (exit status: 125; the container runtime failed: x)", None, Some(125)), true), 1);
+        // A crash or a signal from elsewhere is the program's own end: its code.
+        assert_eq!(exit(&end("failed (exit status: 139; crashed: signal 11 (SIGSEGV))", None, Some(139)), true), 139);
     }
 }
