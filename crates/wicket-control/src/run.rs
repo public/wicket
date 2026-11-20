@@ -323,11 +323,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     run_to_end(o).await.map(|_| ())
 }
 
-/// Whether a run's final status (as [`run_to_end`] returns it) is its box failing: a non-zero exit,
-/// out of memory, over a cap, or its timeout. `wicket run` and `wicket wrap` exit 1 then (#574).
 /// Whether an urgent message would reach the agent if it read it now (#252 review): its sender
 /// isn't revoked, the org policy lets this box hear from it, and its envelope verifies for this
-/// principal, as `await_message` checks. Only such a message may interrupt a turn.
+/// principal, as `await_message` checks. An agent's envelope must come from the run that sent it;
+/// an operator's (#252) has no run, and the org policy names it by its id. Only such a message may
+/// interrupt a turn.
 fn would_deliver(
     l: &wicket_store::Ledger,
     u: &wicket_store::UrgentMessage,
@@ -336,26 +336,27 @@ fn would_deliver(
     org: Option<&wicket_authz::OrgLayer>,
 ) -> bool {
     let (Some(issuer), Some(me)) = (issuer, me) else { return false };
-    if l.revoked_in_chain(&u.from_run).ok().flatten().is_some() {
+    let Ok((sender, p)) = wicket_identity::verify_any_envelope(&u.envelope, issuer, u.created_at) else { return false };
+    let from = sender.principal();
+    let (zone, ok) = match &sender {
+        wicket_identity::Sender::Agent(c) => (c.zone.clone(), c.run == u.from_run),
+        wicket_identity::Sender::Operator(_) => (String::new(), u.from_run.is_empty()),
+    };
+    if !ok
+        || p.get("to").and_then(|v| v.as_str()) != Some(me)
+        || p.get("jti").and_then(|v| v.as_str()) != Some(u.id.as_str())
+        || u.from_principal.as_deref() != Some(from)
+    {
         return false;
     }
-    let sender = l.identity(&u.from_run).ok().flatten();
-    if let (Some(o), Some(i)) = (org, &sender) {
-        if !o.allows_message_from(&i.zone, Some(&i.spiffe_id)) {
-            return false;
-        }
+    if !u.from_run.is_empty() && l.revoked_in_chain(&u.from_run).ok().flatten().is_some() {
+        return false;
     }
-    match wicket_identity::verify_envelope(&u.envelope, issuer, u.created_at) {
-        Ok((c, p)) => {
-            c.run == u.from_run
-                && p.get("to").and_then(|v| v.as_str()) == Some(me)
-                && p.get("jti").and_then(|v| v.as_str()) == Some(u.id.as_str())
-                && u.from_principal.as_deref() == Some(c.sub.as_str())
-        }
-        Err(_) => false,
-    }
+    org.is_none_or(|o| o.allows_message_from(&zone, Some(from)))
 }
 
+/// Whether a run's final status (as [`run_to_end`] returns it) is its box failing: a non-zero exit,
+/// out of memory, over a cap, or its timeout. `wicket run` and `wicket wrap` exit 1 then (#574).
 pub fn box_failed(status: &str) -> bool {
     status.starts_with("failed") || status == "timeout"
 }
@@ -3387,6 +3388,26 @@ mod tests {
             inject: None,
         };
         assert!(!would_deliver(&l, &msg("m-5", me), Some(&k), Some(me), Some(&org)), "the org policy");
+        // An operator's `now` message (#252): no run; verified as the operator's, and the org
+        // policy names it by its id.
+        let ok = wicket_identity::AgentKey::generate();
+        let odoc = issuer.issue_operator(&t.0, "unix", "alice", now, 300, &ok.public());
+        let alice = wicket_identity::operator_id("w.test", &t.0, "unix", "alice");
+        let op_msg = wicket_store::UrgentMessage {
+            id: "m-op".into(),
+            from_run: String::new(),
+            from_principal: Some(alice.clone()),
+            envelope: wicket_identity::sign_operator_envelope(&ok, &odoc, &serde_json::json!({ "jti": "m-op", "iat": now, "to": me })),
+            created_at: now,
+        };
+        assert!(would_deliver(&l, &op_msg, Some(&k), Some(me), None));
+        assert!(!would_deliver(&l, &op_msg, Some(&k), Some(me), Some(&org)), "the org policy, by the operator's id");
+        let with_alice = wicket_authz::OrgLayer { msg_from: Some(vec!["ops".into(), alice.clone()]), ..org.clone() };
+        assert!(would_deliver(&l, &op_msg, Some(&k), Some(me), Some(&with_alice)));
+        assert!(
+            !would_deliver(&l, &wicket_store::UrgentMessage { from_run: "run_p".into(), ..op_msg.clone() }, Some(&k), Some(me), None),
+            "an operator's envelope from a run"
+        );
         l.revoke("run_p", "test", "gone").unwrap();
         assert!(!would_deliver(&l, &msg("m-6", me), Some(&k), Some(me), None), "a revoked sender");
     }
