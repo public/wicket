@@ -979,6 +979,19 @@ pub fn preempt_for(
 /// ever withdrawn (an operator's `wicket hibernate` asks plain `hibernate`).
 pub const PREEMPT_WANT: &str = "hibernate:preempt";
 
+/// Preemption asks `v` no more for `for_run` (its request made at `asked_ms`, if given): its mark
+/// is cleared if it is still that request's, and its tagged hibernate request withdrawn unless
+/// another wake has asked since (one past this one's deadline may have), whose request stands.
+fn ask_no_more(l: &Ledger, v: &str, for_run: &str, asked_ms: Option<i64>, now_ms: i64) -> Result<()> {
+    l.clear_preempted(v, for_run, asked_ms)?;
+    if l.preemption_mark(v, now_ms)?.is_none() {
+        if let Some((agent, _)) = l.agent_of_run(v)? {
+            l.withdraw_agent_want(&agent, PREEMPT_WANT)?;
+        }
+    }
+    Ok(())
+}
+
 /// Gives up on the victims in `left` of `run`'s preemption `p` (#579 step 4): each is asked no
 /// more (its pending request withdrawn, and preemption's mark cleared, which its supervisor checks
 /// before it hibernates for preemption), the room held for `run` is released, and each is audited as
@@ -997,10 +1010,7 @@ pub fn abandon_preemption(
 ) -> Result<()> {
     let tenant = wicket_core::TenantId(ask.tenant.clone());
     for v in left {
-        if let Some((agent, _)) = l.agent_of_run(v)? {
-            l.withdraw_agent_want(&agent, PREEMPT_WANT)?;
-        }
-        l.clear_preempted(v)?;
+        ask_no_more(l, v, &run.0, Some(asked_ms), now_ms)?;
         l.audit(
             &tenant,
             Some(&RunId(v.clone())),
@@ -1017,24 +1027,23 @@ pub fn abandon_preemption(
 }
 
 /// A wake stops waiting (#579 step 4): placed (`placed`: its new reservation stays), or given up.
-/// Victims of its pending preemption that still run are asked no more ([`abandon_preemption`], with
-/// `why`); given up, the room it held is released too. Returns the victims given up on.
-pub fn end_wait(
-    l: &Ledger,
-    run: &RunId,
-    ask: &Waiting,
-    pending: Option<&(wicket_placement::schedule::Preemption, i64)>,
-    now_ms: i64,
-    placed: bool,
-) -> Result<Vec<String>> {
+/// Every box preemption still asks to stop for it, by the ledger's marks rather than only its
+/// pending plan, is asked no more (its tagged request withdrawn, its mark cleared, audited as
+/// `placement.preempt_abandoned`); given up, the room it held is released too. Returns the
+/// victims given up on.
+pub fn end_wait(l: &Ledger, run: &RunId, ask: &Waiting, now_ms: i64, placed: bool) -> Result<Vec<String>> {
     l.immediate(|l| {
-        let mut left = vec![];
-        if let Some((p, asked_ms)) = pending {
-            left = still_running(l, p)?;
-            if !left.is_empty() {
-                let why = if placed { "the wake was placed without them" } else { "the wake gave up waiting" };
-                abandon_preemption(l, run, ask, p, &left, *asked_ms, now_ms, why, false)?;
-            }
+        let left = l.preempted_for(&run.0)?;
+        let tenant = wicket_core::TenantId(ask.tenant.clone());
+        let why = if placed { "the wake was placed without them" } else { "the wake gave up waiting" };
+        for v in &left {
+            ask_no_more(l, v, &run.0, None, now_ms)?;
+            l.audit(
+                &tenant,
+                Some(&RunId(v.clone())),
+                "placement.preempt_abandoned",
+                &serde_json::json!({ "run": v, "for": run.0, "why": why, "by": PREEMPT_BY, "at_ms": now_ms }),
+            )?;
         }
         if !placed {
             l.placement_released(&run.0)?;
@@ -1067,10 +1076,82 @@ pub fn preempted_hibernate(
     if !m.asker_alive {
         return Err("the wake that asked for room is gone");
     }
-    if live_children > 0 {
+    // Its supervisor's own count, or the ledger's (a supervisor that re-attached holds none).
+    if live_children.max(m.running_children) > 0 {
         return Err("it has a child running, which hibernating would stop");
     }
     Ok(())
+}
+
+/// Who a supervisor's pending hibernate is for (#579 step 4): whether one is asked, whether it is
+/// preemption's and no one else's (so it may be declined or withdrawn), and the same carried
+/// through a linger for a quiet box. An operator's `wicket hibernate` or the agent's own request
+/// always takes precedence: once one is asked, the hibernate is no longer preemption's, in a linger
+/// too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HibAsk {
+    /// A hibernate is asked, not yet begun.
+    pub asked: bool,
+    /// ...and only preemption asked for it.
+    pub for_preemption: bool,
+    /// A linger for a quiet box hibernates for preemption only.
+    pub linger_for_preemption: bool,
+    /// A linger for a quiet box is on (for whoever asked).
+    pub lingering: bool,
+}
+
+impl HibAsk {
+    /// A hibernate asked: by preemption (`by_preemption`), or by an operator or the agent.
+    pub fn ask(&mut self, by_preemption: bool) {
+        // Nothing else asked: no request pending but preemption's, and no linger but its.
+        let only_preemption = (!self.asked || self.for_preemption) && (!self.lingering || self.linger_for_preemption);
+        self.for_preemption = by_preemption && only_preemption;
+        if !by_preemption {
+            self.linger_for_preemption = false;
+        }
+        self.asked = true;
+    }
+
+    /// Preemption's pending request is declined or withdrawn: it is asked no more. A linger goes
+    /// on, and is checked again before it hibernates ([`HibAsk::linger_over`]).
+    pub fn decline(&mut self) {
+        debug_assert!(self.for_preemption);
+        self.asked = false;
+        self.for_preemption = false;
+    }
+
+    /// The quiet point takes the request: whether it is preemption's only.
+    pub fn take(&mut self) -> bool {
+        self.asked = false;
+        std::mem::take(&mut self.for_preemption)
+    }
+
+    /// The box wasn't quiet: a linger begins, for preemption only if `for_preemption`.
+    pub fn linger(&mut self, for_preemption: bool) {
+        self.linger_for_preemption = for_preemption && !self.asked;
+        self.lingering = true;
+    }
+
+    /// A linger for a hibernate ends without hibernating (the agent asked to finish since).
+    pub fn linger_ends(&mut self) {
+        self.linger_for_preemption = false;
+        self.lingering = false;
+    }
+
+    /// A turn began during the linger: the hibernate is asked again for its end, still only
+    /// preemption's if both the linger and anything asked since were.
+    pub fn turn_began_in_linger(&mut self) {
+        let lp = std::mem::take(&mut self.linger_for_preemption);
+        self.lingering = false;
+        self.for_preemption = lp && (!self.asked || self.for_preemption);
+        self.asked = true;
+    }
+
+    /// The linger is over and it may hibernate now: whether that is for preemption only.
+    pub fn linger_over(&mut self) -> bool {
+        self.lingering = false;
+        std::mem::take(&mut self.linger_for_preemption)
+    }
 }
 
 /// Withdraws every preemption made for `run` whose victims still run (#579 step 4): what a wake
@@ -1080,10 +1161,7 @@ pub fn withdraw_preemptions_for(l: &Ledger, run: &RunId, tenant: &wicket_core::T
     l.immediate(|l| {
         let left = l.preempted_for(&run.0)?;
         for v in &left {
-            if let Some((agent, _)) = l.agent_of_run(v)? {
-                l.withdraw_agent_want(&agent, PREEMPT_WANT)?;
-            }
-            l.clear_preempted(v)?;
+            ask_no_more(l, v, &run.0, None, now_ms)?;
             l.audit(
                 tenant,
                 Some(&RunId(v.clone())),
@@ -1117,6 +1195,9 @@ pub enum Settled {
     /// These didn't stop by the deadline: they are given up on for this wait, their hibernate
     /// request withdrawn, and the room released.
     Abandoned(Vec<String>),
+    /// These declined to hibernate (a child running, say): the whole plan is given up on, every
+    /// victim's request withdrawn and the room released; only these are spared in this wait.
+    Declined(Vec<String>),
 }
 
 /// Checks on a preemption `run` made on `p.node` at `asked_ms` (#579 step 4). While its victims
@@ -1138,17 +1219,18 @@ pub fn settle_preemption(
         if left.is_empty() {
             return Ok(Settled::Done);
         }
-        // A victim whose supervisor declined (its mark cleared: a child running, say) won't stop.
-        let mut declined = vec![];
-        for v in &left {
-            if !l.preemption_pending(v)? {
-                declined.push(v.clone());
-            }
-        }
+        // A victim whose supervisor declined (its mark cleared: a child running, say) won't stop,
+        // so the plan won't make its room: give up on all of it, not only on the decliners, so no
+        // other victim hibernates for room that won't come. Only the decliners are spared in this
+        // wait; the others may be chosen again.
+        let (declined, rest): (Vec<String>, Vec<String>) =
+            left.into_iter().partition(|v| !l.preemption_pending(v, &run.0, asked_ms).unwrap_or(false));
         if !declined.is_empty() {
-            abandon_preemption(l, run, ask, p, &declined, asked_ms, now_ms, "it declined to hibernate", true)?;
-            return Ok(Settled::Abandoned(declined));
+            abandon_preemption(l, run, ask, p, &declined, asked_ms, now_ms, "it declined to hibernate", false)?;
+            abandon_preemption(l, run, ask, p, &rest, asked_ms, now_ms, "another of the plan's boxes declined to hibernate", true)?;
+            return Ok(Settled::Declined(declined));
         }
+        let left = rest;
         if now_ms - asked_ms < PREEMPT_DEADLINE.as_millis() as i64 {
             l.reserve_placement(&run.0, &p.node, ask.req.vcpus, ask.req.memory_mib, now_ms)?;
             return Ok(Settled::Waiting);
@@ -1331,7 +1413,7 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
             let l = ledger.lock().expect("ledger");
             let _ = l.stop_waiting(&run.0);
             // Agents it asked to hibernate and still running aren't needed now.
-            let _ = end_wait(&l, run, &me, pending.as_ref(), wicket_feed::now_ms(), true);
+            let _ = end_wait(&l, run, &me, wicket_feed::now_ms(), true);
             drop(l);
             say!(
                 "[wicket] placing agent {} on node {n} (best fit of {} it may go on, of {} available{})",
@@ -1351,7 +1433,7 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
             let _ = l.stop_waiting(&run.0);
             // Room it held for itself after preempting goes back, and agents it asked to hibernate
             // are asked no more.
-            let _ = end_wait(&l, run, &me, pending.as_ref(), wicket_feed::now_ms(), false);
+            let _ = end_wait(&l, run, &me, wicket_feed::now_ms(), false);
             drop(l);
             // No silent overcommit (#377): each node would refuse the box itself.
             bail!(
@@ -1385,6 +1467,15 @@ async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str
                         left.join(", "),
                         agent.id,
                         PREEMPT_DEADLINE.as_secs()
+                    );
+                    spare.extend(left);
+                    pending = None;
+                }
+                Settled::Declined(left) => {
+                    say!(
+                        "[wicket] gave up preempting for agent {}: {} declined to hibernate (audited; the room is released)",
+                        agent.id,
+                        left.join(", "),
                     );
                     spare.extend(left);
                     pending = None;
@@ -2171,10 +2262,10 @@ mod tests {
         let ask = asking("t0", 5);
         let run = RunId("run_new".into());
         let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
-        assert!(l.preemption_pending("run_batch").unwrap(), "what its supervisor checks");
+        assert!(l.preemption_pending("run_batch", "run_new", now).unwrap(), "what its supervisor checks");
         let past = now + PREEMPT_DEADLINE.as_millis() as i64 + 1;
         assert!(matches!(settle_preemption(&l, &run, &ask, &p, now, past).unwrap(), Settled::Abandoned(_)));
-        assert!(!l.preemption_pending("run_batch").unwrap(), "its supervisor drops the request it took");
+        assert!(!l.preemption_pending("run_batch", "run_new", now).unwrap(), "its supervisor drops the request it took");
         assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
 
         // An operator asked first: preemption doesn't replace that request, and giving up leaves it.
@@ -2197,11 +2288,10 @@ mod tests {
         let n1 = crowded(&mut l, now);
         let ask = asking("t0", 5);
         let run = RunId("run_new".into());
-        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
-        let pending = (p, now);
-        assert_eq!(end_wait(&l, &run, &ask, Some(&pending), now + 1_000, false).unwrap(), ["run_batch"]);
+        preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        assert_eq!(end_wait(&l, &run, &ask, now + 1_000, false).unwrap(), ["run_batch"]);
         assert_eq!(l.placement("run_new").unwrap().unwrap().state, "released", "the room goes back");
-        assert!(!l.preemption_pending("run_batch").unwrap());
+        assert!(!l.preemption_pending("run_batch", "run_new", now).unwrap());
         assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
         let why: Vec<String> = l
             .audit_records_after(0, 100)
@@ -2213,15 +2303,15 @@ mod tests {
         assert_eq!(why, ["the wake gave up waiting"]);
         // No preemption pending: giving up still releases what it held.
         l.reserve_placement("run_x", "n1", 1.0, 1024, now).unwrap();
-        assert!(end_wait(&l, &RunId("run_x".into()), &ask, None, now, false).unwrap().is_empty());
+        assert!(end_wait(&l, &RunId("run_x".into()), &ask, now, false).unwrap().is_empty());
         assert_eq!(l.placement("run_x").unwrap().unwrap().state, "released");
 
         // Placed: the victims are asked no more, and its reservation stays.
         let mut l = Ledger::open_in_memory().unwrap();
         let n1 = crowded(&mut l, now);
-        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
         l.reserve_placement("run_new", "n2", 1.0, 1024, now + 2).unwrap();
-        assert_eq!(end_wait(&l, &run, &ask, Some(&(p, now)), now + 3, true).unwrap(), ["run_batch"]);
+        assert_eq!(end_wait(&l, &run, &ask, now + 3, true).unwrap(), ["run_batch"]);
         assert_eq!(l.placement("run_new").unwrap().unwrap().state, "reserved");
         assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
     }
@@ -2233,7 +2323,8 @@ mod tests {
     #[test]
     fn the_supervisor_hibernates_for_preemption_only_while_it_is_still_wanted() {
         let now = 1_000_000_000;
-        let mark = |asked_ms, asker_alive| wicket_store::PreemptMark { asked_ms, for_run: Some("run_w".into()), asker_alive };
+        let mark =
+            |asked_ms, asker_alive| wicket_store::PreemptMark { asked_ms, for_run: Some("run_w".into()), asker_alive, running_children: 0 };
         let fresh = mark(now - 1_000, true);
         assert_eq!(preempted_hibernate(true, Some(&fresh), 0, now), Ok(()), "still wanted");
         // An operator's (or the agent's own) hibernate goes ahead whatever preemption says.
@@ -2247,6 +2338,90 @@ mod tests {
         assert!(preempted_hibernate(true, Some(&stale), 0, now).unwrap_err().contains("older than"), "stale");
         assert!(preempted_hibernate(true, Some(&mark(now - 1_000, false)), 0, now).unwrap_err().contains("gone"), "its wake died");
         assert!(preempted_hibernate(true, Some(&fresh), 1, now).unwrap_err().contains("child"), "a child spawned since");
+        let seen = wicket_store::PreemptMark { running_children: 1, ..fresh.clone() };
+        assert!(preempted_hibernate(true, Some(&seen), 0, now).unwrap_err().contains("child"), "one only the ledger knows of");
+    }
+
+    /// #579 step 4 (review): who a pending hibernate is for, through a linger. An operator's or
+    /// the agent's own request is never handed back to preemption, so a withdrawal can't drop it.
+    #[test]
+    fn an_operators_hibernate_is_never_taken_for_preemptions() {
+        // Preemption alone, through a linger and a turn that began in it: still preemption's.
+        let mut h = HibAsk::default();
+        h.ask(true);
+        assert!(h.take());
+        h.linger(true);
+        h.turn_began_in_linger();
+        assert_eq!(h, HibAsk { asked: true, for_preemption: true, ..Default::default() });
+        h.decline();
+        assert_eq!(h, HibAsk::default());
+
+        // An operator asks during preemption's linger: the linger hibernates for the operator.
+        for operator_first in [false, true] {
+            let mut h = HibAsk::default();
+            h.ask(true);
+            let for_preemption = h.take();
+            h.linger(for_preemption);
+            if operator_first {
+                h.ask(false);
+                h.turn_began_in_linger();
+            } else {
+                h.ask(false);
+            }
+            assert!(!h.for_preemption, "the operator's request stands");
+            assert!(!h.linger_over(), "and the linger is no longer preemption's");
+        }
+
+        // Preemption asks after an operator: still the operator's.
+        let mut h = HibAsk::default();
+        h.ask(false);
+        h.ask(true);
+        assert!(!h.take());
+        // ...and through a linger begun while another request is already asked.
+        let mut h = HibAsk::default();
+        h.ask(true);
+        let fp = h.take();
+        h.ask(false);
+        h.linger(fp);
+        assert!(!h.linger_over());
+
+        // Preemption asks again during its own linger: still preemption's.
+        let mut h = HibAsk::default();
+        h.ask(true);
+        let fp = h.take();
+        h.linger(fp);
+        h.ask(true);
+        h.turn_began_in_linger();
+        assert!(h.for_preemption);
+
+        // Preemption asks during an operator's linger: the linger is the operator's, and so is the
+        // hibernate after a turn that began in it.
+        let mut h = HibAsk::default();
+        h.ask(false);
+        let fp = h.take();
+        h.linger(fp);
+        h.ask(true);
+        assert!(!h.for_preemption, "nothing to decline: the operator's hibernate goes ahead");
+        h.turn_began_in_linger();
+        assert!(!h.for_preemption);
+
+        // Preemption's request declined while its own linger is on: the linger is checked again.
+        let mut h = HibAsk::default();
+        h.ask(true);
+        let fp = h.take();
+        h.linger(fp);
+        h.ask(true);
+        h.decline();
+        assert!(!h.asked);
+        assert!(h.linger_over(), "the linger re-checks before it hibernates");
+
+        // The agent asks to finish: the linger ends, nothing for preemption is left.
+        let mut h = HibAsk::default();
+        h.ask(true);
+        let fp = h.take();
+        h.linger(fp);
+        h.linger_ends();
+        assert_eq!(h, HibAsk::default());
     }
 
     /// #579 step 4 (review): the ledger's side of that decision. The mark names the run it is for
@@ -2268,10 +2443,71 @@ mod tests {
         assert!(!l.preemption_mark("run_batch", now + 1).unwrap().unwrap().asker_alive);
         l.reserve_placement("run_new", "n1", 1.0, 1024, now).unwrap();
         // The supervisor declines (a child spawned since, say): it clears the mark.
-        l.clear_preempted("run_batch").unwrap();
-        assert_eq!(settle_preemption(&l, &run, &ask, &p, now, now + 2_000).unwrap(), Settled::Abandoned(vec!["run_batch".into()]));
+        assert!(!l.clear_preempted("run_batch", "run_other", None).unwrap(), "another wake's clear leaves this mark");
+        assert!(!l.clear_preempted("run_batch", "run_new", Some(now - 1)).unwrap(), "so does an older request's");
+        assert!(l.clear_preempted("run_batch", "run_new", Some(now)).unwrap());
+        assert_eq!(settle_preemption(&l, &run, &ask, &p, now, now + 2_000).unwrap(), Settled::Declined(vec!["run_batch".into()]));
         assert_eq!(l.placement("run_new").unwrap().unwrap().state, "released");
         assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
+    }
+
+    /// #579 step 4 (review): one victim declining gives up on the whole plan, so no other victim
+    /// hibernates for room that won't come; only the decliner is spared in this wait. And a later
+    /// wake's request on a victim stands when an earlier wake gives up on it.
+    #[test]
+    fn a_decline_gives_up_on_the_whole_plan_and_spares_later_requests() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let now = (wicket_store::now() - 5) * 1000;
+        let n1 = crowded(&mut l, now);
+        let t0 = wicket_core::TenantId("t0".into());
+        l.run_started(&t0, &RunId("run_batch2".into()), "z", "a").unwrap();
+        l.set_run_node("run_batch2", "n1").unwrap();
+        l.record_run_terms("run_batch2", 1.0, 1024, 0, true, now).unwrap();
+        l.create_agent(&wicket_store::NewAgent {
+            id: "agt_batch2",
+            tenant: "t0",
+            zone: "z",
+            name: "agt_batch2",
+            run: "run_batch2",
+            session_id: "s",
+            manifest: "m",
+            image: "img",
+            workspace: None,
+            claim_until: wicket_store::now() + 30,
+        })
+        .unwrap();
+        let mut ask = asking("t0", 5);
+        (ask.req.vcpus, ask.req.memory_mib) = (2.0, 2048);
+        let run = RunId("run_new".into());
+        let p = preempt_for(&l, &run, &ask, std::slice::from_ref(&n1), now, &[], false).unwrap().unwrap();
+        assert_eq!(p.victims, ["run_batch", "run_batch2"], "both are needed");
+        // run_batch's supervisor declines: it clears its own mark.
+        assert!(l.clear_preempted("run_batch", "run_new", Some(now)).unwrap());
+        assert_eq!(settle_preemption(&l, &run, &ask, &p, now, now + 2_000).unwrap(), Settled::Declined(vec!["run_batch".into()]));
+        assert!(l.preemption_mark("run_batch2", now + 2_000).unwrap().is_none(), "the other victim is asked no more");
+        assert_eq!(l.agent("agt_batch2").unwrap().unwrap().want, None);
+        assert_eq!(l.placement("run_new").unwrap().unwrap().state, "released");
+        let why: Vec<String> = l
+            .audit_records_after(0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.kind == "placement.preempt_abandoned")
+            .map(|a| serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["why"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(why, ["it declined to hibernate", "another of the plan's boxes declined to hibernate"]);
+
+        // A later wake asks run_batch2 after run_new's request went past its deadline: run_new
+        // giving up on it leaves the later request, its mark and its hibernate request.
+        let later = now + PREEMPT_DEADLINE.as_millis() as i64 + 1;
+        l.want_agent_if_unasked("agt_batch2", PREEMPT_WANT).unwrap();
+        l.mark_preempted("run_batch2", now, "run_new").unwrap();
+        l.mark_preempted("run_batch2", later, "run_late").unwrap();
+        abandon_preemption(&l, &run, &ask, &p, &["run_batch2".into()], now, later, "it didn't hibernate by the deadline", true).unwrap();
+        let m = l.preemption_mark("run_batch2", later).unwrap().unwrap();
+        assert_eq!((m.asked_ms, m.for_run.as_deref()), (later, Some("run_late")));
+        assert_eq!(l.agent("agt_batch2").unwrap().unwrap().want.as_deref(), Some(PREEMPT_WANT), "the later request stands");
+        assert!(end_wait(&l, &run, &ask, later, false).unwrap().is_empty(), "run_new has asked nothing of it since");
+        assert_eq!(l.agent("agt_batch2").unwrap().unwrap().want.as_deref(), Some(PREEMPT_WANT));
     }
 
     /// #579 step 4 (review): a wake that fails, by any path, withdraws every preemption made for it.
@@ -2286,7 +2522,7 @@ mod tests {
         let t0 = wicket_core::TenantId("t0".into());
         assert_eq!(withdraw_preemptions_for(&l, &run, &t0, now + 1, "the wake failed").unwrap(), ["run_batch"]);
         assert!(l.preempted_for("run_new").unwrap().is_empty());
-        assert!(!l.preemption_pending("run_batch").unwrap());
+        assert!(!l.preemption_pending("run_batch", "run_new", now).unwrap());
         assert_eq!(l.agent("agt_batch").unwrap().unwrap().want, None);
         assert_eq!(l.placement("run_new").unwrap().unwrap().state, "released");
     }
