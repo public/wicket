@@ -257,6 +257,20 @@ WebKit: it writes what `wicket serve` sends (`wicket dev console-assets DIR`: th
 its headers) and serves that against the preview's mock API, failing on any error, CSP violation or
 Trusted Types report, a card replaced by an unchanged poll, or a page that scrolls sideways.
 
+**Every file under `/static/` is named by its content's hash** (`console.<hash>.js`,
+`icon-192.<hash>.png`, `manifest.<hash>.webmanifest`, …) and sent with `Cache-Control: public,
+max-age=31536000, immutable`, so a browser keeps it until a new build names a new file. `build.rs`
+writes those names into what refers to them: the pages, the manifest (its icons) and the service
+worker (its notification icon). Only the pages (`/`, `/session`) and `/sw.js` keep fixed names and
+are asked for anew each time.
+
+**Text files are Brotli-compressed when wicket is built** (quality 11, window 24) and embedded next to
+the originals. A browser that sends `Accept-Encoding: br` (current Chrome, Firefox and Safari all do,
+over HTTPS and on loopback) gets the compressed copy with `Content-Encoding: br`; any other gets the
+original. Responses with a copy carry `Vary: accept-encoding`. The page and its files go from about
+136 KB to 39 KB (the script alone from 76 KB to 21 KB; gzip -9 would give 24 KB). Images, which are
+already compressed, have no copy. zstd isn't used: Safari decodes it only from macOS and iOS 26.3.
+
 Not yet: answering the agent's own permission requests from the page (wicket's policy answers
 them, #67), images and resources in prompts, and the box tree, budgets and hibernate controls
 next to the session (#327's later slices).

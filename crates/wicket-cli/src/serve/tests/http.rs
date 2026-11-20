@@ -144,7 +144,8 @@ async fn unauthenticated_requests_reach_only_the_sign_in_surface() {
         if let Some(c) = &c {
             h.push(("cookie", c.as_str()));
         }
-        for path in ["/", "/session", "/session?run=run_secret", "/manifest.webmanifest", "/static/icon.svg", "/static/icon-192.png"] {
+        let (manifest, svg, png) = (served("/static/manifest."), served("/static/icon."), served("/static/icon-192."));
+        for path in ["/", "/session", "/session?run=run_secret", manifest.as_str(), svg.as_str(), png.as_str()] {
             let (status, _, body) = call(&t.state, "GET", path, &h, b"").await;
             assert_eq!(status, StatusCode::OK, "{path}");
             for s in secrets {
@@ -236,7 +237,7 @@ async fn every_response_carries_the_security_headers() {
 
 #[test]
 fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
-    let page = std::str::from_utf8(&ASSETS.page).unwrap();
+    let page = std::str::from_utf8(&ASSETS.page.body).unwrap();
     assert!(!page.contains("<style") && !page.contains("style="), "inline style");
     assert!(!page.split_whitespace().any(|w| w.starts_with("on") && w.contains('=')), "inline event handlers");
     let scripts: Vec<&str> = page.match_indices("<script").map(|(i, _)| &page[i..]).collect();
@@ -293,7 +294,8 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
         assert!(!js.contains(bad), "console.js uses {bad}");
     }
     // The manifest is valid, and every icon it names is served.
-    let m: Value = serde_json::from_slice(&ASSETS.files["/manifest.webmanifest"].body).unwrap();
+    let manifest = served("/static/manifest.");
+    let m: Value = serde_json::from_slice(&ASSETS.files[&manifest].body).unwrap();
     assert_eq!((m["display"].as_str(), m["start_url"].as_str()), (Some("standalone"), Some("/")));
     for icon in m["icons"].as_array().unwrap() {
         let src = icon["src"].as_str().unwrap();
@@ -305,7 +307,63 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
             assert_eq!(icon["sizes"].as_str().unwrap(), format!("{w}x{w}"));
         }
     }
-    assert!(page.contains("rel=\"manifest\" href=\"/manifest.webmanifest\"") && page.contains("apple-touch-icon"));
+    assert!(page.contains(&format!("rel=\"manifest\" href=\"{manifest}\"")) && page.contains("apple-touch-icon"));
+    // #574: every file under /static/ is named by its content's hash (the icons and the manifest
+    // too), and what names them (the manifest, the service worker, the page) names them so.
+    for (path, a) in ASSETS.files.iter().filter(|(p, _)| p.starts_with("/static/") && !p.starts_with("/static/m.")) {
+        let hash = &hex::encode(sha2::Sha256::digest(&a.body))[..16];
+        assert!(path.contains(&format!(".{hash}.")), "{path} is named by its hash");
+        assert!(a.immutable, "{path}");
+    }
+    let sw = std::str::from_utf8(&ASSETS.files["/sw.js"].body).unwrap();
+    assert!(
+        sw.contains(&format!("\"{}\"", served("/static/icon-192."))) && !sw.contains("\"/static/icon-192.png\""),
+        "the service worker names the hashed icon"
+    );
+    assert!(!ASSETS.files["/sw.js"].immutable, "the service worker keeps its name and is asked for anew");
+}
+
+/// The path a file starting with `prefix` is served at (named by its hash, #574).
+fn served(prefix: &str) -> String {
+    ASSETS.files.keys().find(|k| k.starts_with(prefix)).unwrap_or_else(|| panic!("nothing served at {prefix}…")).clone()
+}
+
+/// #574: the static files are Brotli-compressed at build time, and sent so to a browser that accepts
+/// `br`; the original to one that doesn't say so (or refuses it with q=0). Either way the response
+/// varies by Accept-Encoding, and the copy decodes to the original.
+#[tokio::test]
+async fn static_files_are_sent_brotli_compressed_to_browsers_that_accept_it() {
+    let t = setup("brotli");
+    let js = ASSETS.files.keys().find(|k| k.starts_with("/static/console.") && k.ends_with(".js")).unwrap().clone();
+    for path in ["/", "/sw.js", js.as_str()] {
+        let original = if path == "/" { &ASSETS.page } else { &ASSETS.files[path] };
+        let br = original.br.as_ref().expect("a text file has a smaller Brotli copy");
+        assert!(br.len() < original.body.len() / 2, "{path}: {} -> {}", original.body.len(), br.len());
+        let mut decoded = vec![];
+        brotli_decompressor::BrotliDecompress(&mut &br[..], &mut decoded).unwrap();
+        assert_eq!(decoded, original.body, "{path}: the copy decodes to the original");
+        for (accept, want) in [
+            ("gzip, deflate, br, zstd", Some("br")),
+            ("br", Some("br")),
+            ("*", Some("br")),
+            ("gzip", None),
+            ("br;q=0, gzip", None),
+            ("", None),
+        ] {
+            let h: Vec<(&str, &str)> = if accept.is_empty() { vec![] } else { vec![("accept-encoding", accept)] };
+            let req =
+                h.iter().fold(Request::builder().method("GET").uri(path).header("host", "localhost:8787"), |r, (k, v)| r.header(*k, *v));
+            let r = route(req.body(Full::new(Bytes::new())).unwrap(), &t.state, PEER.parse().unwrap()).await;
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert_eq!(r.headers().get("content-encoding").map(|v| v.to_str().unwrap()), want, "{path} with {accept:?}");
+            assert_eq!(r.headers()["vary"], "accept-encoding", "{path}");
+            let body = r.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body, if want.is_some() { br.clone() } else { original.body.clone() }, "{path} with {accept:?}");
+        }
+    }
+    // A PNG isn't made smaller: no copy, no Vary.
+    assert!(ASSETS.files[&served("/static/icon-192.")].br.is_none());
+    assert!(crate::serve::web::accepts(Some("gzip;q=1.0, br;q=0.5"), "br") && !crate::serve::web::accepts(Some("*;q=0"), "br"));
 }
 
 /// #327: the session view's page, as embedded (the built bundle, or the placeholder a build without
@@ -313,8 +371,12 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
 /// and no eval in the bundle (the CSP would refuse it).
 #[tokio::test]
 async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
-    use crate::serve::web::{SESSION_CSS, SESSION_JS, SESSION_VIEW_BUILT};
-    let page = std::str::from_utf8(&ASSETS.session_page).unwrap();
+    use crate::serve::web::SESSION_VIEW_BUILT;
+    let page = std::str::from_utf8(&ASSETS.session_page.body).unwrap();
+    let file = |ext: &str| {
+        ASSETS.files.iter().find(|(k, _)| k.starts_with("/static/session.") && k.ends_with(ext)).map(|(_, a)| a.body.clone()).unwrap()
+    };
+    let (session_js, session_css) = (file(".js"), file(".css"));
     assert!(!page.contains("{{"), "every placeholder filled");
     assert!(!page.contains("<style") && !page.contains("style="), "inline style");
     let scripts: Vec<&str> = page.match_indices("<script").map(|(i, _)| &page[i..]).collect();
@@ -332,7 +394,9 @@ async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
     assert_eq!(h["content-security-policy"], CSP);
     assert_eq!(h["cache-control"], "no-store");
     assert_eq!(body, page, "the same page for every run: it reads the run from its URL");
-    for (ext, ctype, bytes) in [("js", "text/javascript; charset=utf-8", SESSION_JS), ("css", "text/css; charset=utf-8", SESSION_CSS)] {
+    for (ext, ctype, bytes) in
+        [("js", "text/javascript; charset=utf-8", &session_js[..]), ("css", "text/css; charset=utf-8", &session_css[..])]
+    {
         let digest = sha2::Sha256::digest(bytes);
         let path = format!("/static/session.{}.{ext}", &hex::encode(digest)[..16]);
         let sri = format!("sha256-{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest));
@@ -344,7 +408,7 @@ async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
         assert_eq!(h["content-security-policy"], CSP);
         assert_eq!(body.as_bytes(), bytes);
     }
-    let js = std::str::from_utf8(SESSION_JS).unwrap();
+    let js = std::str::from_utf8(&session_js).unwrap();
     for bad in ["eval(", "new Function", "document.write"] {
         assert!(!js.contains(bad), "the session bundle uses {bad}");
     }

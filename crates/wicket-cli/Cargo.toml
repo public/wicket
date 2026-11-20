@@ -72,12 +72,20 @@ ciborium = "0.2"
 ring = "0.17"
 
 [dev-dependencies]
+# To check the Brotli copies the console serves decode to the originals.
+brotli-decompressor = "6"
 wicket-chan = { workspace = true, features = ["testkit"] }
 wicket-home = { workspace = true, features = ["testkit"] }
 wicket-placement = { workspace = true, features = ["mock"] }
 getrandom = { workspace = true, features = ["sys_rng"] }
 
 [build-dependencies]
+# The console's static files, named by hash and Brotli-compressed at build time, embedded beside the
+# originals (#574).
+brotli = { version = "=9.1.1", default-features = false, features = ["std"] }
+sha2.workspace = true
+base64.workspace = true
+hex.workspace = true
 oxc_allocator.workspace = true
 oxc_ast.workspace = true
 oxc_codegen.workspace = true
