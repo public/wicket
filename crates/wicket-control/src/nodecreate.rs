@@ -597,7 +597,7 @@ fn instance_id(l: &Ledger, arg: &str) -> Result<String> {
 /// console's release does (#710): decided as root's (or, not as root, as the operator's within its
 /// authority) on the effect printed, audited first, then released with the node's own placer (its
 /// owner and API key), not `common`'s.
-pub async fn release(common: Common, id: String, reason: Option<String>, root: bool) -> Result<()> {
+pub async fn release(common: Common, id: String, reason: Option<String>, root: bool, yes: bool) -> Result<()> {
     use crate::noderelease as nr;
     let mut l = Ledger::open(&crate::ledger_path())?;
     let now = wicket_store::now();
@@ -613,6 +613,13 @@ pub async fn release(common: Common, id: String, reason: Option<String>, root: b
             nr::Decider::Operator { by: &granter, console: false }
         };
         say!("releasing {}: this {}", n.name, n.consequence());
+        // Decided on what was just printed: asked first on a terminal, unless --yes.
+        if !yes
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && !wicket_home::confirm(&format!("release {} as shown above?", n.name))?
+        {
+            return Err(wicket_home::exit::refused("not released: declined at the confirmation"));
+        }
         let shown = n.effect_sha256();
         let why = reason.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("wicket node release");
         let d = nr::Decision { by, shown: &shown, why, extra: serde_json::json!({ "via": "cli" }) };

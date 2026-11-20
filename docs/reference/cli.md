@@ -1282,6 +1282,8 @@ Options:
           The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
       --reason <REASON>
           Why: it goes on the audit record
+  -y, --yes
+          Don't ask before releasing it (a terminal is asked, as shown, first)
   -h, --help
           Print help
 ```
