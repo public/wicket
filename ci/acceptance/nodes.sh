@@ -163,7 +163,7 @@ multihost() {
       'cf helper | grep -q "^started agent helper as run run_[a-z0-9]* on node ${node_name:-?}" && cf helper | grep -q "d-"'
     check "  its report on its task came back as a message from its child" \
       '[ "$(cf report1 | jq -r .from.relation)" = "your child" ] && [ "$(cf report1 | jq -r .body.turn)" = 1 ] && cf report1 | jq -r .body.delegation | grep -q "^d-"'
-    check "  continue_child gave it another brief on that node" 'cf continued | grep -q "^continued d-"'
+    check "  continue_child gave it another brief on that node" 'cf continued | grep -q "^continued helper (d-[a-z0-9]*) with turn 2"'
     check "  and its report on that one came back too, the same delegation" \
       '[ "$(cf report2 | jq -r .body.turn)" = 2 ] && [ "$(cf report2 | jq -r .body.delegation)" = "$(cf report1 | jq -r .body.delegation)" ]'
     check "  the delegation records both reports" 'cf delegations | grep -q "$(cf report1 | jq -r .body.delegation)"'
