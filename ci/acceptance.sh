@@ -617,7 +617,7 @@ restart_start() {   # $1: label, then wicket run options
 restart_flow() {
   log "a control-host restart: boxes survive, reconcile adopts their runs"
   local runs=() labels=() boxes=() r l b
-  r=$(restart_start local); runs+=("$r"); labels+=(local)
+  r=$(restart_start local --node local); runs+=("$r"); labels+=(local)
   if [ "$nodes" = local ]; then r=$(restart_start node --node "$NODE"); runs+=("$r"); labels+=("$NODE"); fi
   for r in "${runs[@]}"; do boxes+=("$(box_of "$r")"); done
   restart_runs=("${runs[@]}")
@@ -850,7 +850,7 @@ CEDAR
   wroot policy apply "$work/org.cedar" >"$work/policy-apply.log" 2>&1 || cat "$work/policy-apply.log"
   v1=$(sed -n 's/^org policy \([0-9a-f]*\) applied.*/\1/p' "$work/policy-apply.log")
   check "wicket policy apply installs the org policy" '[ -n "$v1" ] && w policy show | grep -q "org policy $v1"'
-  HOME=$HOMEW "$W" run "$(manifest org)" --image "$IMAGE_TAG" >"$work/org.log" 2>&1 &
+  HOME=$HOMEW "$W" run "$(manifest org)" --image "$IMAGE_TAG" --node local >"$work/org.log" 2>&1 &
   org_pid=$!
   pids+=("$org_pid")
   wait_for 90 'grep -q acc-org-done "$work/org.log" 2>/dev/null' || true

@@ -60,7 +60,7 @@ An instance wicket started offers its `port` under the service's name once its b
 
 ## `placement`
 
-What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. Today it decides where a woken agent goes ([nodes](nodes.md#placement)); `wicket run --node` and a spawn's placement hint name the node themselves.
+What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. It decides where a fresh `wicket run` without `--node` and a woken agent go ([nodes](nodes.md#placement)), when another node than this host's own is enrolled; `wicket run --node` (`local` included) and a spawn's placement hint name the node themselves.
 
 | field | type | default | meaning |
 |---|---|---|---|

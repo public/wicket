@@ -20,9 +20,9 @@ operators' approvals, and reconciles counts and audit afterwards; it isn't asked
 
 ## The control host is a node too
 
-Every box runs on a node through `wicket node serve` (#146). `wicket run` without `--node` places the box on
-the control host's own built-in node, `local`, which is served by the same runtime and reached over its unix
-socket instead of ssh. The control host makes and enrols it the first time a run needs it
+Every box runs on a node through `wicket node serve` (#146). The control host's own built-in node, `local`,
+is served by the same runtime and reached over its unix socket instead of ssh; `wicket run` without `--node`
+places a box there when it is the only node, or when the scheduler chooses it ([placement](#placement)). The control host makes and enrols it the first time a run needs it
 (`<data dir>/local-node/`: its own node key, an identity certificate, and a node CA, each renewed by the
 control host itself), and starts its `serve` on demand: one, detached, exiting after 10 minutes with no boxes
 and no connections (`WICKET_LOCAL_NODE_IDLE_SECS`); `wicket self update` has it re-execute itself as the new
@@ -428,8 +428,22 @@ control host assigns to it, with `wicket node intake` beside its `wicket node se
 ## Placement
 
 Where a box goes ([#579](https://github.com/public/wicket/issues/579)): `wicket run --node` or a spawn's
-placement hint names a node; otherwise a run goes on this host's own node. A woken agent is placed by the
-scheduler, `wicket-placement::schedule`, a pure function of what the control host knows when it decides:
+placement hint names a node. Otherwise a fresh run (`wicket run`, a run the console starts) and a woken
+agent are placed by the scheduler, `wicket-placement::schedule`, a pure function of what the control host
+knows when it decides, among every enrolled, active node not held by a capacity lease, this host's own
+(`local`) among them:
+
+- **Which runs are placed.** That's a decision: every fresh, top-level run with no node named goes through
+  the scheduler, as a wake does, so its manifest's requests, labels, taints, CA coverage, affinity and
+  priority decide where it goes the same way wherever it was started. What keeps its node: a node named
+  (`--node`, a lease's); a re-attach (its box is there); a spawn, which goes where its parent runs unless its
+  placement hint says otherwise; and the two that use this host's own directories, a wrapped session
+  (`wicket wrap`) and an in-place `--workspace-dir`, which stay on `local`. With no other enrolled, active node
+  but `local`, the scheduler isn't asked: every fresh run goes there, as before, whatever its placement
+  terms. A placed (paid) node is a candidate only while its lease outlasts the box's timeout, so a run
+  never holds one past its lease. A fresh run doesn't wait by default: `wicket run` fails at once,
+  saying why each node is out, when no node may take its box now; `wicket run --wait 10m` waits in the queue
+  as a wake does (and may preempt, by its priority).
 
 - **Capacity, from the ledger.** Each node's latest health report (every 30 s, on every connection to it;
   stored once per node at most every 20 s) carries its capacity, and a wake reads it there. A node with no
@@ -531,11 +545,11 @@ scheduler, `wicket-placement::schedule`, a pure function of what the control hos
     stopping one for room would lose it.
   - Each box's limits and priority are recorded at its start (`run_terms`, ledger schema 33); a box
     started by an older build has none and is never preempted. A named node (`--node`) and a spawn never
-    preempt.
+    preempt; a fresh run preempts only while it waits (`wicket run --wait`).
 - **Score.** Of the nodes left, those meeting the most preferences first; then bin-pack: the one left with the least memory, then the fewest vCPUs, once
   the box is on it. Where the agent ran before breaks a tie, then the name, so the same inputs always give
   the same node. A spread strategy exists in the function for later.
-- **Refusal.** With no node left the wake is refused, naming every node and every reason it was out
+- **Refusal.** With no node left the run or wake is refused, naming every node and every reason it was out
   (`n1 (tainted dedicated=ci, not tolerated), n2 (0.5 vCPU, 512 MiB free)`). The node's own admission
   stays the last word: it may still refuse the box it was given.
 
