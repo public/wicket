@@ -316,3 +316,122 @@ fn dial_relays_stdin_and_stdout_with_half_close() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("dial 127.0.0.1:"));
 }
+
+/// A server on 127.0.0.1 that holds each connection open, never closing its side (as a service
+/// that ignores half-close), and runs `each` on it first.
+fn holding_server(each: impl Fn(&mut TcpStream) + Send + 'static) -> SocketAddr {
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for c in server.incoming() {
+            let mut c = c.unwrap();
+            each(&mut c);
+            held.push(c);
+        }
+    });
+    addr
+}
+
+/// `wicket-fwd --dial addr` with `extra` flags, stdin and stdout piped.
+fn dialer(addr: SocketAddr, extra: &[&str]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_wicket-fwd"))
+        .args(["--dial", &addr.to_string()])
+        .args(extra)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Waits up to `limit` for `child` to exit: how long it took, or None (and it is killed).
+fn exits_within(child: &mut std::process::Child, limit: Duration) -> Option<Duration> {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if child.try_wait().unwrap().is_some() {
+            return Some(start.elapsed());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// #796 re-review, H2: with `--idle-secs`, a dial that moves no bytes either way exits, though
+/// both its stdin and the box's side stay open; bytes moving put the limit off.
+#[test]
+fn dial_exits_when_idle() {
+    let addr = holding_server(|_| {});
+    let mut child = dialer(addr, &["--idle-secs", "0.4", "--copy", "rw"]);
+    let _stdin = child.stdin.take().unwrap(); // held open
+    let took = exits_within(&mut child, Duration::from_secs(5)).expect("exits when idle");
+    assert!(took >= Duration::from_millis(300), "{took:?}");
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert!(err.contains("idle"), "{err}");
+
+    // A server that sends a byte every 100 ms for 1.2 s, then nothing.
+    let addr = holding_server(|c| {
+        for _ in 0..12 {
+            c.write_all(b".").unwrap();
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let start = Instant::now();
+    let mut child = dialer(addr, &["--idle-secs", "0.4"]);
+    let _stdin = child.stdin.take().unwrap();
+    exits_within(&mut child, Duration::from_secs(5)).expect("exits once the bytes stop");
+    assert!(start.elapsed() >= Duration::from_millis(1200), "bytes moving keep it: {:?}", start.elapsed());
+    let mut out = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+    assert_eq!(out.len(), 12);
+}
+
+/// #796 re-review, H2: with `--after-close-secs`, a dial exits that long after its stdin ends,
+/// though the box's side stays open (and no idle limit is near).
+#[test]
+fn dial_exits_after_stdin_closes() {
+    let addr = holding_server(|_| {});
+    // With an idle limit far off, and alone (copying either way).
+    for extra in [&["--idle-secs", "60"][..], &["--copy", "rw"][..]] {
+        let mut child = dialer(addr, &[&["--after-close-secs", "0.3"][..], extra].concat());
+        thread::sleep(Duration::from_millis(500));
+        assert!(child.try_wait().unwrap().is_none(), "running while stdin is open ({extra:?})");
+        child.stdin.take().unwrap().write_all(b"x").unwrap(); // and closed
+        let took = exits_within(&mut child, Duration::from_secs(5)).expect("exits after stdin closes");
+        assert!(took >= Duration::from_millis(250), "{took:?}");
+        let mut err = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+        assert!(err.contains("stdin closed"), "{err}");
+    }
+}
+
+/// Without the flags (links between boxes), a dial keeps running after its stdin ends while the
+/// box's side is open: half-close, as before.
+#[test]
+fn dial_without_limits_waits_for_the_box_side() {
+    let addr = holding_server(|_| {});
+    let mut child = dialer(addr, &[]);
+    drop(child.stdin.take());
+    assert_eq!(exits_within(&mut child, Duration::from_millis(1500)), None, "still running");
+}
+
+/// #796 re-review: a node passes the limits as environment variables (`docker exec -e`), which an
+/// older wicket-fwd ignores and a newer one honours like the flags.
+#[test]
+fn dial_takes_its_limits_from_the_environment() {
+    let addr = holding_server(|_| {});
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wicket-fwd"))
+        .args(["--dial", &addr.to_string()])
+        .env("WICKET_FWD_AFTER_CLOSE_SECS", "0.3")
+        .env("WICKET_FWD_IDLE_SECS", "60")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    exits_within(&mut child, Duration::from_secs(5)).expect("exits after stdin closes, by the environment's limit");
+}

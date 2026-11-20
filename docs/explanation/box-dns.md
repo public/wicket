@@ -225,12 +225,17 @@ restarts: a port in its range (`publish.json` in its directory, written by `wick
 a node with the `names.public.nodes` labels; without it the node publishes nothing), unexpired,
 claimed by one box, whose authority holds on the node. It listens on one IPv6 socket that takes
 IPv4 too (IPv4 alone where IPv6 is off), and dials each connection into the box (`wicket-fwd`)
-once its first byte has come (within 10 s), closing it after 5 minutes without a byte either way.
-Per name it holds at most 64 at once and takes 128 new per 2 s, 8 per peer address; per node, 256
-at once and 256 new per 2 s. The limits are checked before anything else, and refusals are counted,
-not recorded one by one; under load, a tick's ended connections are one `name.conn` record. It
-publishes only while its feed is fresh, or offline within its grace, and the box's authority holds
-there as for any other decision (not revoked, its issuing key certified). A port
+once its first byte has come (within 10 s; until then a connection costs only its socket, and at
+most 16 per name, 6 per peer, wait so). Per name it holds at most 32 relays, 8 per peer (an IPv6
+/64 counts as one peer), and takes 128 new per 2 s; per node, 256 at once (so 8 names at their cap
+fill it) and 256 new per 2 s. A relay ends after 5 minutes without a byte, 30 s after the peer
+closes its side, or after an hour; the box's `wicket-fwd` is given the same idle and after-close
+limits (as environment variables, which an older one ignores), so a service that ignores
+half-close doesn't keep it. The limits are checked before anything else, refusals are counted per
+kind, not recorded one by one, and each connection is recorded as it starts and as it ends
+(`name.conn`, `phase`), aggregated per tick under load. It publishes only while its feed is fresh,
+or offline within its grace, and the box's authority holds there as for any other decision (not
+revoked, its issuing key certified). A port
 that stops being published closes within 2 s of the node's feed saying so, with its connections,
 before DNS catches up; a node cut off from its control host can't hear of a revoke, and closes the
 port when the box's authority or the name's end passes. **Layer 4
@@ -376,9 +381,11 @@ not, with the stranded records and the names waiting, recorded when it differs f
 `name.record` (each create, update or delete a provider is about to make, `state: intended`, and
 each record forgotten, `state: forgotten`), `name.applied` (how a provider's apply ended, and how
 many changes it made) and `name.conflict`. The node's (step 4c, shipped as node audit records):
-`name.port.opened`, `name.port.closed` (with why), `name.port.failed` (a port it couldn't bind, or
-one two boxes claim, recorded once), `name.conn` (per connection: the peer, bytes each way, how
-long) and `name.conn.refused` (connections over the per-name limit, counted each tick). Still to
+`name.port.opened`, `name.port.closed` (with why), `name.port.failed` (a port it couldn't bind, one
+two boxes claim, or one outside its range, recorded once, under the claiming run), `name.conn` (per
+connection, `phase: start` and `phase: end` with one `conn` id: the peer, bytes each way, how long,
+and `cut` with `why` when the node ended it; per tick, one aggregate record under load) and
+`name.conn.refused` (counted each tick, by limit: per port, peer, node, waiting, silent, failed). Still to
 come with step 6: `name.challenge`.
 
 `wicket names list` and the console's **Names** card list every name: kind, full name, owner (the

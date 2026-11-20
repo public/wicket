@@ -17,15 +17,24 @@
 //!
 //! **What is recorded,** as node audit records shipped to the control host:
 //! `name.port.opened`, `name.port.closed` (with why), `name.port.failed` (a port it couldn't bind,
-//! once until it binds, filed under each claiming run), and `name.conn` per connection (the peer,
-//! bytes each way, how long, whether the port's end cut it), or one aggregate `name.conn` per tick
-//! when more than [`CONN_RECORDS`] ended in it. Connections let go without a relay (over a limit,
-//! silent past [`FIRST_BYTE`], or a relay that couldn't start) are counted in `name.conn.refused`.
+//! once until it binds, filed under each claiming run), and `name.conn` twice per connection
+//! (#796 re-review, M4): `"phase": "start"` once its relay is running (the peer and a connection id
+//! unique across the node's restarts), and `"phase": "end"` with the same id, bytes each way, how
+//! long, and `cut` with why when the node cut it (the port's end, or [`LIFETIME`]). So a connection
+//! the node never recorded the end of (it restarted) is still on record, and a long one is visible
+//! while it lasts. Records are written each [`TICK`]; past [`CONN_RECORDS`] in one tick, that tick's
+//! starts and ends are one aggregate `name.conn` instead. Connections let go without a relay (over
+//! a limit, silent past [`FIRST_BYTE`], or a relay that couldn't start) are counted in
+//! `name.conn.refused`.
 //!
-//! **Limits** (#796 review, H2): per port ([`MAX_CONNS`], [`MAX_NEW_PER_TICK`]), per peer address
-//! on a port ([`MAX_PER_PEER`]), and over the node ([`MAX_NODE_EXECS`], [`MAX_NODE_NEW_PER_TICK`]),
-//! all checked before anything costs more; no exec is spawned before a connection's first byte, and
-//! one idle for [`IDLE`] is closed.
+//! **Limits** (#796 review and re-review, H2): per port ([`MAX_CONNS`], and at most a
+//! [`PORT_SHARE`]th of the node's relays; [`MAX_NEW_PER_TICK`]), per peer on a port
+//! ([`MAX_PER_PEER`], an IPv6 peer counted by its /64), and over the node ([`MAX_NODE_EXECS`],
+//! [`MAX_NODE_NEW_PER_TICK`]), all checked before anything costs more. No exec is spawned before a
+//! connection's first byte, and connections still waiting for it have their own small caps
+//! ([`MAX_WAITING`], [`MAX_WAITING_PER_PEER`]). A relay ends when it carries nothing for [`IDLE`],
+//! [`AFTER_CLOSE`] after its peer's half-close, and at [`LIFETIME`] whatever it carries; the
+//! `wicket-fwd` in the box is given the first two too, so it ends on its own.
 
 use super::*;
 use std::collections::HashSet;
@@ -39,8 +48,13 @@ use std::time::Duration;
 pub const PUBLISH_FILE: &str = "publish.json";
 /// How often the node looks again at what it publishes.
 pub const TICK: Duration = Duration::from_secs(2);
-/// The most connections one name's port holds at once.
-pub const MAX_CONNS: usize = 64;
+/// The most connections one name's port holds at once: at most a [`PORT_SHARE`]th of the node's
+/// relays ([`Limits::port_cap`]), so no few names hold them all (#796 re-review, H2).
+pub const MAX_CONNS: usize = 32;
+/// A port holds at most this fraction (1/n) of the node's relays at once: it takes this many names,
+/// each at its cap, to fill the node.
+pub const PORT_SHARE: usize = 8;
+const _: () = assert!(MAX_CONNS <= MAX_NODE_EXECS / PORT_SHARE);
 /// The most new connections one name's port takes per [`TICK`]: each costs a `docker exec` and an
 /// audit record, and the internet can make them as fast as it likes.
 pub const MAX_NEW_PER_TICK: u64 = 128;
@@ -68,7 +82,7 @@ pub fn publish_range(dir: &std::path::Path) -> Result<Option<std::ops::RangeIncl
         return Err(bad());
     }
     // Never one of wicket's own ports (#796 review, M2): a box's name would take it from wicket.
-    if let Some(w) = wicket_names::WICKET_PORTS.iter().find(|w| (a..=b).contains(*w)) {
+    if let Some(w) = wicket_names::own_ports().iter().find(|w| (a..=b).contains(*w)) {
         return Err(format!("{}: ports {:?} holds {w}, one of wicket's own ports", p.display(), s.ports));
     }
     Ok(Some(a..=b))
@@ -80,16 +94,24 @@ pub fn publish_range(dir: &std::path::Path) -> Result<Option<std::ops::RangeIncl
 /// spawns anything, or takes the replica's lock, for a connection a limit already refuses.
 #[derive(Clone, Debug)]
 pub(super) struct Limits {
-    /// The most connections one port holds at once ([`MAX_CONNS`]).
+    /// The most connections one port holds at once ([`MAX_CONNS`]; see [`Limits::port_cap`]).
     pub max_conns: usize,
     /// The most new connections one port takes per [`TICK`] ([`MAX_NEW_PER_TICK`]).
     pub max_new_per_tick: u64,
-    /// The most connections one peer address holds at once on one port.
+    /// The most connections one peer (an IPv4 address, an IPv6 /64) holds at once on one port.
     pub per_peer: usize,
     /// How long a connection may send nothing before it is closed, with no exec spawned for it.
     pub first_byte: Duration,
+    /// The most connections on one port still waiting for their first byte.
+    pub waiting: usize,
+    /// The most of those from one peer.
+    pub waiting_per_peer: usize,
     /// How long a connection may carry no bytes either way before it is closed.
     pub idle: Duration,
+    /// How long a relay may go on after its peer's half-close.
+    pub after_close: Duration,
+    /// How long a relay may last, whatever it carries.
+    pub lifetime: Duration,
     /// The most `docker exec` relays the node runs at once, over all its ports.
     pub node_execs: usize,
     /// The most new `docker exec` relays the node starts per [`TICK`], over all its ports.
@@ -99,12 +121,28 @@ pub(super) struct Limits {
     pub conn_records: usize,
 }
 
-/// The most connections one peer address holds at once on one port.
+/// The most connections one peer holds at once on one port.
 pub const MAX_PER_PEER: usize = 8;
 /// How long a connection may send nothing before it is closed (no exec is spawned until it does).
 pub const FIRST_BYTE: Duration = Duration::from_secs(10);
+/// The most connections on one port waiting for their first byte at once (#796 re-review, H2):
+/// half the port's [`MAX_CONNS`], so silent ones never hold the rest, which only connections that
+/// spoke can. A client's first bytes follow its handshake at once, so a speaking connection waits
+/// here for moments, not seconds.
+pub const MAX_WAITING: usize = 16;
+const _: () = assert!(MAX_WAITING < MAX_CONNS && MAX_WAITING_PER_PEER <= MAX_WAITING);
+/// The most of those from one peer: a browser's burst to one host (six connections at once) must
+/// fit, since a burst's connections are all accepted before any is read from. 1 or 2 refused four
+/// of six such connections in a local test.
+pub const MAX_WAITING_PER_PEER: usize = 6;
 /// How long a connection may carry no bytes either way before it is closed.
 pub const IDLE: Duration = Duration::from_secs(5 * 60);
+/// How long a relay goes on after its peer's half-close, for the box's answer (#796 re-review, H2):
+/// a peer that sends a byte and closes doesn't hold a relay for as long as the service ignores it.
+pub const AFTER_CLOSE: Duration = Duration::from_secs(30);
+/// How long a relay may last at all (#796 re-review, H2): one byte every few minutes doesn't hold
+/// a slot for good. A connection cut here is recorded `cut`, why `lifetime`.
+pub const LIFETIME: Duration = Duration::from_secs(60 * 60);
 /// The most relays (`docker exec`s) the node runs at once, over all its ports.
 pub const MAX_NODE_EXECS: usize = 256;
 /// The most new relays the node starts per [`TICK`], over all its ports.
@@ -119,11 +157,24 @@ impl Default for Limits {
             max_new_per_tick: MAX_NEW_PER_TICK,
             per_peer: MAX_PER_PEER,
             first_byte: FIRST_BYTE,
+            waiting: MAX_WAITING,
+            waiting_per_peer: MAX_WAITING_PER_PEER,
             idle: IDLE,
+            after_close: AFTER_CLOSE,
+            lifetime: LIFETIME,
             node_execs: MAX_NODE_EXECS,
             node_new_per_tick: MAX_NODE_NEW_PER_TICK,
             conn_records: CONN_RECORDS,
         }
+    }
+}
+
+impl Limits {
+    /// The most connections one port holds at once (#796 re-review, H2): its own cap, and no more
+    /// than a [`PORT_SHARE`]th of the node's relays, so no fewer than that many names fill the node
+    /// (at least one, for a node with very few).
+    pub fn port_cap(&self) -> usize {
+        self.max_conns.min(self.node_execs / PORT_SHARE).max(1)
     }
 }
 
@@ -385,7 +436,7 @@ fn bind(port: u16) -> std::io::Result<(tokio::net::TcpListener, bool)> {
     Ok((tokio::net::TcpListener::from_std(s.into())?, v4_only))
 }
 
-/// A peer's address without its IPv6 mapping: the address limits count by, and records name.
+/// A peer's address without its IPv6 mapping: the address records name.
 fn canonical(a: SocketAddr) -> SocketAddr {
     match a.ip() {
         std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -393,6 +444,19 @@ fn canonical(a: SocketAddr) -> SocketAddr {
             None => a,
         },
         _ => a,
+    }
+}
+
+/// The peer limits count by (#796 re-review, H2): an IPv4 address (a v4-mapped one as IPv4), or
+/// an IPv6 address's /64, the least a site is given: one host holds a whole /64 as easily as one
+/// address in it.
+fn peer_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.into(),
+            None => std::net::Ipv6Addr::from(u128::from(v6) & !(u128::from(u64::MAX))).into(),
+        },
+        v4 => v4,
     }
 }
 
@@ -417,6 +481,8 @@ fn held(node: &Node, c: &Claim) -> bool {
 /// A live connection's counts, read when it ends, however it ends.
 struct ConnStats {
     peer: SocketAddr,
+    /// What the peer limits count it under ([`peer_key`]).
+    key: std::net::IpAddr,
     started: std::time::Instant,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
@@ -438,36 +504,81 @@ enum Dropped {
     Port,
     /// Over its peer's limit.
     Peer,
+    /// Over the port's (or its peer's) connections waiting for their first byte.
+    Waiting,
     /// Over the node's relays.
     Node,
     /// It sent nothing within [`Limits::first_byte`] (or closed first).
     Silent,
     /// Its relay couldn't start (no running box, or `docker exec` failed to spawn).
     Failed,
+    /// The port closed before its relay started.
+    Closed,
 }
 
 #[derive(Default)]
 struct Counts {
     port: u64,
     peer: u64,
+    waiting: u64,
     node: u64,
     silent: u64,
     failed: u64,
+    closed: u64,
+}
+
+/// How a relayed connection ended, when the node ended it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// Either side closed: nothing to say.
+    Done,
+    /// No bytes either way for [`Limits::idle`].
+    Idle,
+    /// [`Limits::after_close`] after its peer's half-close.
+    AfterClose,
+    /// It reached [`Limits::lifetime`]: cut.
+    Lifetime,
+    /// Its port closed: cut.
+    PortClosed,
+}
+
+impl Why {
+    fn cut(self) -> bool {
+        matches!(self, Why::Lifetime | Why::PortClosed)
+    }
+
+    fn says(self) -> Option<&'static str> {
+        match self {
+            Why::Done => None,
+            Why::Idle => Some("idle"),
+            Why::AfterClose => Some("after close"),
+            Why::Lifetime => Some("lifetime"),
+            Why::PortClosed => Some("port closed"),
+        }
+    }
+}
+
+/// One record of this tick: a relay started, or one ended.
+enum Event {
+    Start { id: u64, key: std::net::IpAddr, peer: String },
+    End(Ended),
 }
 
 /// One ended connection, for its `name.conn` record.
 struct Ended {
-    ip: std::net::IpAddr,
+    id: u64,
+    key: std::net::IpAddr,
     peer: String,
     bytes_in: u64,
     bytes_out: u64,
     ms: u64,
-    cut: bool,
+    why: Why,
 }
 
-/// This tick's ended connections past [`Limits::conn_records`], as totals.
+/// This tick's records past [`Limits::conn_records`], as totals.
 #[derive(Default)]
 struct Folded {
+    started: u64,
     conns: u64,
     cut: u64,
     bytes_in: u64,
@@ -475,18 +586,79 @@ struct Folded {
     peers: HashSet<std::net::IpAddr>,
 }
 
+impl Folded {
+    fn add(&mut self, e: &Event) {
+        match e {
+            Event::Start { key, .. } => {
+                self.started += 1;
+                self.peers.insert(*key);
+            }
+            Event::End(e) => {
+                self.conns += 1;
+                self.cut += u64::from(e.why.cut());
+                self.bytes_in += e.bytes_in;
+                self.bytes_out += e.bytes_out;
+                self.peers.insert(e.key);
+            }
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.started + self.conns > 0
+    }
+}
+
+/// A taken connection, as the port's log holds it.
+struct Live {
+    stats: Arc<ConnStats>,
+    /// Not yet sent its first byte: counted against [`Limits::waiting`].
+    waiting: bool,
+    /// Its relay is running, and its start is on record: its end will be.
+    started: bool,
+}
+
 #[derive(Default)]
 struct LogState {
     next: u64,
-    live: HashMap<u64, Arc<ConnStats>>,
+    live: HashMap<u64, Live>,
+    /// By [`peer_key`], the port's connections, and those of them still waiting.
     peers: HashMap<std::net::IpAddr, usize>,
-    /// This tick's ended connections, one by one while there are few.
-    ended: Vec<Ended>,
+    waiting_peers: HashMap<std::net::IpAddr, usize>,
+    waiting: usize,
+    /// This tick's records in order, one by one while there are few (a start before its end).
+    events: Vec<Event>,
     /// Or, once there are more, all of them as totals (H2).
     folded: Folded,
     dropped: Counts,
     /// Closed: its live connections are recorded as cut, and nothing more is taken.
     closed: bool,
+}
+
+fn dec(m: &mut HashMap<std::net::IpAddr, usize>, k: std::net::IpAddr) {
+    if let Some(n) = m.get_mut(&k) {
+        *n -= 1;
+        if *n == 0 {
+            m.remove(&k);
+        }
+    }
+}
+
+impl LogState {
+    /// No longer waiting for its first byte.
+    fn unwait(&mut self, l: &mut Live) {
+        if std::mem::take(&mut l.waiting) {
+            self.waiting -= 1;
+            dec(&mut self.waiting_peers, l.stats.key);
+        }
+    }
+
+    /// Takes `id` out, with what it counted for: the caller records it.
+    fn remove(&mut self, id: u64) -> Option<Live> {
+        let mut l = self.live.remove(&id)?;
+        self.unwait(&mut l);
+        dec(&mut self.peers, l.stats.key);
+        Some(l)
+    }
 }
 
 /// What one port's connections record, shared by its task, its connections and [`tick`]. Whoever
@@ -498,148 +670,194 @@ struct PortLog {
     claim: Claim,
     port: u16,
     limits: Arc<Limits>,
+    /// When the port opened (node clock, ms): connection ids are `<opened>.<n>`, so they don't
+    /// repeat when the node restarts and opens the port again (#796 re-review, M4).
+    opened: i64,
     st: Mutex<LogState>,
 }
 
 impl PortLog {
     fn new(node: Arc<Node>, claim: Claim, port: u16, limits: Arc<Limits>) -> Self {
-        PortLog { node, claim, port, limits, st: Mutex::new(LogState::default()) }
+        let opened = (node.clock)();
+        PortLog { node, claim, port, limits, opened, st: Mutex::new(LogState::default()) }
+    }
+
+    fn conn_id(&self, n: u64) -> String {
+        format!("{}.{n}", self.opened)
     }
 
     /// Counts a connection let go before it was taken.
     fn refuse(&self, why: Dropped) {
-        let mut st = self.st.lock().expect("port log");
+        Self::count(&mut self.st.lock().expect("port log"), why);
+    }
+
+    fn count(st: &mut LogState, why: Dropped) {
         let d = &mut st.dropped;
         match why {
             Dropped::Port => d.port += 1,
             Dropped::Peer => d.peer += 1,
+            Dropped::Waiting => d.waiting += 1,
             Dropped::Node => d.node += 1,
             Dropped::Silent => d.silent += 1,
             Dropped::Failed => d.failed += 1,
+            Dropped::Closed => d.closed += 1,
         }
     }
 
-    /// Takes a connection from `from`, if its peer is under its limit (checked with the port's
-    /// own, before anything costs more): its id and counts.
+    /// Takes a connection from `from`, if its port and its peer are under their limits (checked
+    /// before anything costs more): its id and counts. It waits for its first byte until
+    /// [`PortLog::spoke`].
     fn take(&self, from: SocketAddr) -> Result<(u64, Arc<ConnStats>), Dropped> {
+        let l = &self.limits;
         let mut st = self.st.lock().expect("port log");
-        if st.closed || st.live.len() >= self.limits.max_conns {
+        if st.closed || st.live.len() >= l.port_cap() {
             return Err(Dropped::Port);
         }
-        let ip = from.ip();
-        if st.peers.get(&ip).copied().unwrap_or(0) >= self.limits.per_peer {
+        let key = peer_key(from.ip());
+        if st.peers.get(&key).copied().unwrap_or(0) >= l.per_peer {
             return Err(Dropped::Peer);
         }
-        *st.peers.entry(ip).or_default() += 1;
+        // Silent sockets can't fill the port (#796 re-review, H2).
+        if st.waiting >= l.waiting || st.waiting_peers.get(&key).copied().unwrap_or(0) >= l.waiting_per_peer {
+            return Err(Dropped::Waiting);
+        }
+        *st.peers.entry(key).or_default() += 1;
+        *st.waiting_peers.entry(key).or_default() += 1;
+        st.waiting += 1;
         st.next += 1;
         let id = st.next;
         let stats = Arc::new(ConnStats {
             peer: from,
+            key,
             started: std::time::Instant::now(),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
             last_ms: AtomicU64::new(0),
         });
-        st.live.insert(id, stats.clone());
+        st.live.insert(id, Live { stats: stats.clone(), waiting: true, started: false });
         Ok((id, stats))
+    }
+
+    /// A taken connection's first byte arrived: no longer counted as waiting.
+    fn spoke(&self, id: u64) {
+        let mut st = self.st.lock().expect("port log");
+        if let Some(mut l) = st.live.remove(&id) {
+            st.unwait(&mut l);
+            st.live.insert(id, l);
+        }
+    }
+
+    /// Its relay is running: its start goes on record (M4). False if the port closed meanwhile
+    /// (the connection is gone: the caller stops its relay).
+    fn start(&self, id: u64) -> bool {
+        let mut st = self.st.lock().expect("port log");
+        let Some(l) = st.live.get_mut(&id) else { return false };
+        l.started = true;
+        let ev = Event::Start { id, key: l.stats.key, peer: peer(l.stats.peer) };
+        self.record(&mut st, ev);
+        true
     }
 
     /// Lets go of a taken connection that never got a relay: counted, not recorded one by one.
     fn let_go(&self, id: u64, why: Dropped) {
         let mut st = self.st.lock().expect("port log");
-        if let Some(s) = st.live.remove(&id) {
-            Self::unpeer(&mut st, s.peer.ip());
-            drop(st);
-            self.refuse(why);
+        if st.remove(id).is_some() {
+            Self::count(&mut st, why);
         }
     }
 
-    /// A relayed connection's end: recorded, unless [`PortLog::close`] recorded it already.
-    fn end(&self, id: u64) {
+    /// A connection's end: recorded if its start was, unless [`PortLog::close`] recorded it
+    /// already; one that never started is counted as let go.
+    fn end(&self, id: u64, why: Why) {
         let mut st = self.st.lock().expect("port log");
-        if let Some(s) = st.live.remove(&id) {
-            Self::unpeer(&mut st, s.peer.ip());
-            self.ended(&mut st, &s, false);
+        if let Some(l) = st.remove(id) {
+            self.ended(&mut st, id, &l, why);
         }
     }
 
-    fn unpeer(st: &mut LogState, ip: std::net::IpAddr) {
-        if let Some(n) = st.peers.get_mut(&ip) {
-            *n -= 1;
-            if *n == 0 {
-                st.peers.remove(&ip);
-            }
+    fn ended(&self, st: &mut LogState, id: u64, l: &Live, why: Why) {
+        if !l.started {
+            return Self::count(st, if why == Why::PortClosed { Dropped::Closed } else { Dropped::Failed });
         }
-    }
-
-    fn ended(&self, st: &mut LogState, s: &ConnStats, cut: bool) {
+        let s = &l.stats;
         let e = Ended {
-            ip: s.peer.ip(),
+            id,
+            key: s.key,
             peer: peer(s.peer),
             bytes_in: s.bytes_in.load(Ordering::SeqCst),
             bytes_out: s.bytes_out.load(Ordering::SeqCst),
             ms: s.started.elapsed().as_millis() as u64,
-            cut,
+            why,
         };
-        let fold = |f: &mut Folded, e: &Ended| {
-            f.conns += 1;
-            f.cut += u64::from(e.cut);
-            f.bytes_in += e.bytes_in;
-            f.bytes_out += e.bytes_out;
-            f.peers.insert(e.ip);
-        };
-        if st.folded.conns == 0 && st.ended.len() < self.limits.conn_records {
-            st.ended.push(e);
-            return;
-        }
-        // Past the per-tick records: this tick's connections become one aggregate (H2).
-        for old in std::mem::take(&mut st.ended) {
-            fold(&mut st.folded, &old);
-        }
-        fold(&mut st.folded, &e);
+        self.record(st, Event::End(e));
     }
 
-    /// Writes this tick's records: each ended connection (`name.conn`), or one aggregate of them
-    /// when there were more than [`Limits::conn_records`], and what was let go
-    /// (`name.conn.refused`).
+    fn record(&self, st: &mut LogState, ev: Event) {
+        if !st.folded.any() && st.events.len() < self.limits.conn_records {
+            st.events.push(ev);
+            return;
+        }
+        // Past the per-tick records: this tick's starts and ends become one aggregate (H2).
+        for old in std::mem::take(&mut st.events) {
+            st.folded.add(&old);
+        }
+        st.folded.add(&ev);
+    }
+
+    /// Writes this tick's records: each start and end (`name.conn`), or one aggregate of them when
+    /// there were more than [`Limits::conn_records`], and what was let go (`name.conn.refused`).
     fn flush(&self) {
-        let (ended, folded, d) = {
+        let (events, folded, d) = {
             let mut st = self.st.lock().expect("port log");
-            (std::mem::take(&mut st.ended), std::mem::take(&mut st.folded), std::mem::take(&mut st.dropped))
+            (std::mem::take(&mut st.events), std::mem::take(&mut st.folded), std::mem::take(&mut st.dropped))
         };
         let c = &self.claim;
-        for e in ended {
-            let mut body = serde_json::json!({
-                "name": c.name, "label": c.label, "port": self.port, "peer": e.peer,
-                "bytes_in": e.bytes_in, "bytes_out": e.bytes_out, "ms": e.ms,
-            });
-            if e.cut {
-                body["cut"] = true.into();
-            }
+        for ev in events {
+            let body = match ev {
+                Event::Start { id, peer, .. } => serde_json::json!({
+                    "name": c.name, "label": c.label, "port": self.port, "phase": "start",
+                    "conn": self.conn_id(id), "peer": peer,
+                }),
+                Event::End(e) => {
+                    let mut body = serde_json::json!({
+                        "name": c.name, "label": c.label, "port": self.port, "phase": "end",
+                        "conn": self.conn_id(e.id), "peer": e.peer,
+                        "bytes_in": e.bytes_in, "bytes_out": e.bytes_out, "ms": e.ms,
+                    });
+                    if e.why.cut() {
+                        body["cut"] = true.into();
+                    }
+                    if let Some(w) = e.why.says() {
+                        body["why"] = w.into();
+                    }
+                    body
+                }
+            };
             self.node.audit_note(&c.run, "name.conn", body);
         }
-        if folded.conns > 0 {
+        if folded.any() {
             self.node.audit_note(
                 &c.run,
                 "name.conn",
                 serde_json::json!({
                     "name": c.name, "label": c.label, "port": self.port, "aggregate": true,
-                    "conns": folded.conns, "cut": folded.cut, "bytes_in": folded.bytes_in, "bytes_out": folded.bytes_out,
-                    "peers": folded.peers.len(),
+                    "started": folded.started, "conns": folded.conns, "cut": folded.cut,
+                    "bytes_in": folded.bytes_in, "bytes_out": folded.bytes_out, "peers": folded.peers.len(),
                 }),
             );
         }
-        let refused = d.port + d.peer + d.node;
-        if refused + d.silent + d.failed > 0 {
+        let refused = d.port + d.peer + d.waiting + d.node;
+        if refused + d.silent + d.failed + d.closed > 0 {
             let l = &self.limits;
             self.node.audit_note(
                 &c.run,
                 "name.conn.refused",
                 serde_json::json!({
                     "name": c.name, "label": c.label, "port": self.port,
-                    "refused": refused, "over_port": d.port, "over_peer": d.peer, "over_node": d.node,
-                    "silent": d.silent, "failed": d.failed,
-                    "max_conns": l.max_conns, "max_new_per_tick": l.max_new_per_tick, "max_per_peer": l.per_peer,
+                    "refused": refused, "over_port": d.port, "over_peer": d.peer, "waiting": d.waiting, "over_node": d.node,
+                    "silent": d.silent, "failed": d.failed, "closed": d.closed,
+                    "max_conns": l.port_cap(), "max_new_per_tick": l.max_new_per_tick, "max_per_peer": l.per_peer,
+                    "max_waiting": l.waiting, "max_waiting_per_peer": l.waiting_per_peer,
                 }),
             );
         }
@@ -653,22 +871,24 @@ impl PortLog {
                 return;
             }
             st.closed = true;
-            st.peers.clear();
-            let live: Vec<Arc<ConnStats>> = std::mem::take(&mut st.live).into_values().collect();
-            for s in live {
-                self.ended(&mut st, &s, true);
+            let ids: Vec<u64> = st.live.keys().copied().collect();
+            for id in ids {
+                if let Some(l) = st.remove(id) {
+                    self.ended(&mut st, id, &l, Why::PortClosed);
+                }
             }
         }
         self.flush();
     }
 }
 
-/// A taken connection, given back to its port's log however its task ends (an abort included).
-struct Taken(Arc<PortLog>, u64);
+/// A taken connection, given back to its port's log however its task ends (an abort included):
+/// with how it ended, if its relay said.
+struct Taken(Arc<PortLog>, u64, Why);
 
 impl Drop for Taken {
     fn drop(&mut self) {
-        self.0.end(self.1);
+        self.0.end(self.1, self.2);
     }
 }
 
@@ -722,7 +942,7 @@ async fn serve(node: Arc<Node>, l: tokio::net::TcpListener, c: Claim, log: Arc<P
                         continue;
                     }
                 };
-                let taken = Taken(log.clone(), id);
+                let taken = Taken(log.clone(), id, Why::Done);
                 if !held(&node, &c) {
                     log.let_go(id, Dropped::Port);
                     drop(taken);
@@ -745,25 +965,49 @@ async fn serve(node: Arc<Node>, l: tokio::net::TcpListener, c: Claim, log: Arc<P
     conns.abort_all();
 }
 
-/// One connection: once its first byte arrives, a `docker exec -i <box> wicket-fwd --dial
-/// 127.0.0.1:<box_port>`, and the bytes copied both ways until either side ends or none move for
-/// [`Limits::idle`].
+/// Seconds for a `wicket-fwd` flag.
+fn secs(d: Duration) -> String {
+    d.as_secs_f64().to_string()
+}
+
+/// The command run in the box for one connection: `wicket-fwd --dial` to the box's port.
+fn dial_argv(box_port: u16) -> Vec<String> {
+    vec!["wicket-fwd".into(), "--dial".into(), format!("127.0.0.1:{box_port}")]
+}
+
+/// The `docker exec` options for one connection (#796 re-review, H2): the node's idle and
+/// after-close limits for the box's `wicket-fwd`, so it ends by itself even when the box's service
+/// never closes its side (Docker doesn't end an exec's process when its client goes). As
+/// environment variables, not flags: a `wicket-fwd` in a box image from before them ignores them
+/// and still relays, unbounded, where it would refuse a flag it doesn't know.
+fn exec_opts(l: &Limits) -> Vec<String> {
+    vec![
+        "-i".into(),
+        "-e".into(),
+        format!("WICKET_FWD_IDLE_SECS={}", secs(l.idle)),
+        "-e".into(),
+        format!("WICKET_FWD_AFTER_CLOSE_SECS={}", secs(l.after_close)),
+    ]
+}
+
+/// One connection: once its first byte arrives, a `docker exec -i <box>` of [`dial_argv`], and the
+/// bytes copied both ways until either side ends, none move for [`Limits::idle`],
+/// [`Limits::after_close`] passes after the peer's half-close, or [`Limits::lifetime`] passes.
 ///
-/// Killing the `docker exec` client (kill_on_drop, or at the idle bound) ends the relay here, but
-/// not necessarily the `wicket-fwd` in the box: Docker doesn't kill an exec's process when its
-/// client goes. What should end it (inferred from `wicket-fwd`'s source, not measured, and maybe
-/// otherwise under gVisor) is its stdin closing with the attach, which half-closes its connection
-/// to the box's port; `--dial` then exits once the box's service closes its side. It has no idle
-/// bound of its own, so a service that never closes keeps that one process in the box (within the
-/// box's own limits, not the node's) until it does (#796 review, H2: a gap, to be bounded in
-/// wicket-fwd itself).
-async fn relay(node: Arc<Node>, s: tokio::net::TcpStream, box_port: u16, taken: Taken, stats: Arc<ConnStats>, execs: Arc<Execs>) {
+/// Killing the `docker exec` client (kill_on_drop, or at a limit) ends the relay here, but not
+/// necessarily the `wicket-fwd` in the box: Docker doesn't kill an exec's process when its client
+/// goes. That one has its own limits (`WICKET_FWD_IDLE_SECS`, `WICKET_FWD_AFTER_CLOSE_SECS`, #796 re-review, H2): a
+/// service that ignores half-close no longer keeps it, once its stdin ends or nothing moves. What
+/// is still inferred, not measured (and maybe otherwise under gVisor): that its stdin ends when the
+/// client is killed. If it didn't, a service that keeps sending would keep it past a node-side cut
+/// (lifetime, the port's end) until its writes to the gone client fail.
+async fn relay(node: Arc<Node>, s: tokio::net::TcpStream, box_port: u16, mut taken: Taken, stats: Arc<ConnStats>, execs: Arc<Execs>) {
     let log = taken.0.clone();
     let limits = log.limits.clone();
     // No exec until the peer has said something: one that sends nothing costs only its socket.
     let mut b = [0u8; 1];
     match tokio::time::timeout(limits.first_byte, s.peek(&mut b)).await {
-        Ok(Ok(n)) if n > 0 => {}
+        Ok(Ok(n)) if n > 0 => log.spoke(taken.1),
         _ => return log.let_go(taken.1, Dropped::Silent),
     }
     let Some(_slot) = execs.take(&limits) else { return log.let_go(taken.1, Dropped::Node) };
@@ -772,37 +1016,57 @@ async fn relay(node: Arc<Node>, s: tokio::net::TcpStream, box_port: u16, taken: 
     let Some((name, user)) = found else { return log.let_go(taken.1, Dropped::Failed) };
     let child = node
         .docker
-        .exec(&name, &user, &["-i"], &["wicket-fwd".to_string(), "--dial".into(), format!("127.0.0.1:{box_port}")])
+        .exec(&name, &user, &exec_opts(&limits).iter().map(String::as_str).collect::<Vec<_>>(), &dial_argv(box_port))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn();
     let Ok(mut child) = child else { return log.let_go(taken.1, Dropped::Failed) };
+    if !log.start(taken.1) {
+        // The port closed meanwhile.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return;
+    }
     if let (Some(mut w), Some(mut r)) = (child.stdin.take(), child.stdout.take()) {
         let (mut cr, mut cw) = s.into_split();
         let st = &stats;
+        let half_closed = tokio::sync::Notify::new();
         let up = async {
             let _ = pump(&mut cr, &mut w, st, &st.bytes_in).await;
             drop(w);
+            half_closed.notify_one();
         };
         let down = async {
             let _ = pump(&mut r, &mut cw, st, &st.bytes_out).await;
             let _ = cw.shutdown().await;
         };
-        let idle = async {
-            loop {
-                let since = st.started.elapsed().saturating_sub(Duration::from_millis(st.last_ms.load(Ordering::SeqCst)));
-                if since >= limits.idle {
-                    return;
+        let bounds = async {
+            let lifetime = tokio::time::sleep_until(tokio::time::Instant::from_std(st.started + limits.lifetime));
+            let after_close = async {
+                half_closed.notified().await;
+                tokio::time::sleep(limits.after_close).await;
+            };
+            let idle = async {
+                loop {
+                    let since = st.started.elapsed().saturating_sub(Duration::from_millis(st.last_ms.load(Ordering::SeqCst)));
+                    if since >= limits.idle {
+                        return;
+                    }
+                    tokio::time::sleep(limits.idle - since).await;
                 }
-                tokio::time::sleep(limits.idle - since).await;
+            };
+            tokio::select! {
+                _ = lifetime => Why::Lifetime,
+                _ = after_close => Why::AfterClose,
+                _ = idle => Why::Idle,
             }
         };
-        tokio::select! {
-            _ = async { tokio::join!(up, down) } => {}
-            _ = idle => {}
-        }
+        taken.2 = tokio::select! {
+            _ = async { tokio::join!(up, down) } => Why::Done,
+            why = bounds => why,
+        };
     }
     let _ = child.start_kill();
     let _ = child.wait().await;
@@ -844,59 +1108,158 @@ mod tests {
         assert_eq!(canonical(mapped).ip(), "192.0.2.7".parse::<std::net::IpAddr>().unwrap());
     }
 
-    /// H2, M4: whoever takes a connection out records it once; more ended in a tick than
+    /// A connection taken, spoken and started, as a relay does.
+    fn go(log: &PortLog, from: SocketAddr) -> (u64, Arc<ConnStats>) {
+        let (id, s) = log.take(from).unwrap();
+        log.spoke(id);
+        assert!(log.start(id));
+        (id, s)
+    }
+
+    fn conn_records(node: &Node) -> Vec<(String, serde_json::Value)> {
+        let rows = node.audit.lock().unwrap().audit_tail(200).unwrap();
+        rows.into_iter().filter(|r| r.2.starts_with("name.conn")).map(|r| (r.2, serde_json::from_str(&r.4).unwrap())).collect()
+    }
+
+    /// H2, M4: whoever takes a connection out records it once; more starts and ends in a tick than
     /// `conn_records` are one aggregate record, and those cut by the port's end are counted.
     #[test]
     fn many_ends_in_a_tick_are_one_aggregate_record() {
         let inst = crate::nodeauth::testkit::Install::new("ports-aggregate");
         let node = super::super::tests::test_node(&inst);
         let claim = Claim { run: "run_agg".into(), name: "n-0".into(), label: "demo".into(), box_port: 3000, until_ms: i64::MAX };
-        let limits = Arc::new(Limits { conn_records: 2, per_peer: 3, ..Limits::default() });
+        let limits = Arc::new(Limits { conn_records: 4, per_peer: 3, waiting_per_peer: 3, ..Limits::default() });
         let log = PortLog::new(node.clone(), claim, 20999, limits);
-        let kinds = || -> Vec<(String, serde_json::Value)> {
-            let rows = node.audit.lock().unwrap().audit_tail(100).unwrap();
-            rows.into_iter().filter(|r| r.2.starts_with("name.conn")).map(|r| (r.2, serde_json::from_str(&r.4).unwrap())).collect()
-        };
+        let kinds = || conn_records(&node);
         let from = |n: u8| -> SocketAddr { format!("192.0.2.{n}:4000").parse().unwrap() };
-        // Two ends: one record each.
+        // Two connections: a start and an end record each.
         for n in [1, 2] {
-            let (id, s) = log.take(from(n)).unwrap();
+            let (id, s) = go(&log, from(n));
             s.moved(&s.bytes_in, 3);
-            log.end(id);
+            log.end(id, Why::Done);
         }
         log.flush();
-        assert_eq!(kinds().len(), 2, "{:?}", kinds());
-        // Three ends, two from one address: one aggregate.
+        assert_eq!(kinds().len(), 4, "{:?}", kinds());
+        // Three more, two from one address: six records, past four, so one aggregate.
         for n in [1, 1, 2] {
-            let (id, s) = log.take(from(n)).unwrap();
+            let (id, s) = go(&log, from(n));
             s.moved(&s.bytes_out, 5);
-            log.end(id);
-            log.end(id); // a second end of the same connection records nothing
+            log.end(id, Why::Done);
+            log.end(id, Why::Done); // a second end of the same connection records nothing
         }
         log.flush();
         let k = kinds();
-        assert_eq!(k.len(), 3, "{k:?}");
-        let agg = &k[2].1;
+        assert_eq!(k.len(), 5, "{k:?}");
+        let agg = &k[4].1;
         assert_eq!(
-            (agg["aggregate"].clone(), agg["conns"].clone(), agg["peers"].clone(), agg["bytes_out"].clone()),
-            (true.into(), 3.into(), 2.into(), 15.into()),
+            (agg["aggregate"].clone(), agg["started"].clone(), agg["conns"].clone(), agg["peers"].clone(), agg["bytes_out"].clone()),
+            (true.into(), 3.into(), 3.into(), 2.into(), 15.into()),
             "{agg}"
         );
         // The per-peer cap, and the port's end recording what it cuts (and taking no more).
-        let held: Vec<_> = (0..3).map(|_| log.take(from(9)).unwrap()).collect();
+        let held: Vec<_> = (0..3).map(|_| go(&log, from(9))).collect();
         assert!(matches!(log.take(from(9)), Err(Dropped::Peer)));
         log.refuse(Dropped::Peer);
+        log.flush(); // the three starts
         log.close();
         for (id, _) in &held {
-            log.end(*id);
+            log.end(*id, Why::Done);
         }
         assert!(matches!(log.take(from(8)), Err(Dropped::Port)), "closed");
         let k = kinds();
-        // Three cut, past the two records: one aggregate of them.
-        let cut = k.iter().find(|(kind, b)| kind == "name.conn" && b["cut"] == 3).expect("cut");
-        assert_eq!((cut.1["conns"].clone(), cut.1["peers"].clone()), (3.into(), 1.into()), "{k:?}");
+        let cut: Vec<_> = k.iter().filter(|(kind, b)| kind == "name.conn" && b["cut"] == true).collect();
+        assert_eq!(cut.len(), 3, "{k:?}");
+        assert!(cut.iter().all(|(_, b)| b["why"] == "port closed" && b["phase"] == "end"), "{cut:?}");
         let refused = k.iter().find(|(kind, _)| kind == "name.conn.refused").expect("refused");
         assert_eq!(refused.1["over_peer"], 1, "{k:?}");
+    }
+
+    /// M4 (#796 re-review): a relay's start is on record (with its id) before its end, and each
+    /// end carries its start's id; a connection that never started is counted, not recorded.
+    #[test]
+    fn a_start_is_recorded_before_its_end_with_the_same_id() {
+        let inst = crate::nodeauth::testkit::Install::new("ports-start");
+        let node = super::super::tests::test_node(&inst);
+        let claim = Claim { run: "run_st".into(), name: "n-0".into(), label: "demo".into(), box_port: 3000, until_ms: i64::MAX };
+        let log = PortLog::new(node.clone(), claim, 20998, Arc::new(Limits::default()));
+        let from: SocketAddr = "192.0.2.5:4000".parse().unwrap();
+        let (a, _) = go(&log, from);
+        log.flush();
+        let k = conn_records(&node);
+        assert_eq!(k.len(), 1, "the live one's start: {k:?}");
+        assert_eq!((k[0].1["phase"].clone(), k[0].1["peer"].clone()), ("start".into(), "192.0.2.5:4000".into()));
+        let id = k[0].1["conn"].as_str().unwrap().to_string();
+        assert!(id.starts_with(&format!("{}.", log.opened)), "{id}");
+        // One started and ended in the same tick: start, then end.
+        let (b, _) = go(&log, from);
+        log.end(b, Why::Lifetime);
+        log.end(a, Why::Done);
+        // And one taken that never got a relay.
+        let (c, _) = log.take(from).unwrap();
+        log.end(c, Why::Done);
+        log.flush();
+        let k = conn_records(&node);
+        let phases: Vec<(String, String)> = k[1..]
+            .iter()
+            .filter(|(kind, _)| kind == "name.conn")
+            .map(|(_, b)| (b["phase"].as_str().unwrap().into(), b["conn"].as_str().unwrap().into()))
+            .collect();
+        let bid = log.conn_id(b);
+        assert_eq!(phases, [("start".into(), bid.clone()), ("end".into(), bid), ("end".into(), id)], "{k:?}");
+        let life = k.iter().find(|(_, b)| b["why"] == "lifetime").expect("lifetime");
+        assert_eq!(life.1["cut"], true);
+        let refused = k.iter().find(|(kind, _)| kind == "name.conn.refused").expect("refused");
+        assert_eq!(refused.1["failed"], 1, "{k:?}");
+    }
+
+    /// H2 (#796 re-review): peers are counted by IPv4 address (a v4-mapped one as IPv4) and by
+    /// IPv6 /64.
+    #[test]
+    fn peers_are_counted_by_address_or_ipv6_64() {
+        let k = |s: &str| peer_key(s.parse().unwrap());
+        assert_eq!(k("192.0.2.7"), k("::ffff:192.0.2.7"));
+        assert_ne!(k("192.0.2.7"), k("192.0.2.8"));
+        assert_eq!(k("2001:db8:1:2::1"), k("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_eq!(k("2001:db8:1:2::1"), "2001:db8:1:2::".parse::<std::net::IpAddr>().unwrap());
+        assert_ne!(k("2001:db8:1:2::1"), k("2001:db8:1:3::1"));
+    }
+
+    /// H2 (#796 re-review): a port holds at most a `PORT_SHARE`th of the node's relays, at least one.
+    #[test]
+    fn a_ports_share_of_the_node_is_bounded() {
+        let d = Limits::default();
+        assert_eq!(d.port_cap(), MAX_CONNS);
+        assert!(d.port_cap() * PORT_SHARE <= d.node_execs, "{PORT_SHARE} names at their cap fit the node");
+        assert_eq!(Limits { node_execs: 80, ..Limits::default() }.port_cap(), 10);
+        assert_eq!(Limits { max_conns: 4, ..Limits::default() }.port_cap(), 4);
+        assert_eq!(Limits { node_execs: 2, ..Limits::default() }.port_cap(), 1);
+    }
+
+    /// H2 (#796 re-review): connections waiting for their first byte are capped per port and per
+    /// peer; one that speaks frees its place.
+    #[test]
+    fn waiting_connections_are_capped() {
+        let inst = crate::nodeauth::testkit::Install::new("ports-waiting");
+        let node = super::super::tests::test_node(&inst);
+        let claim = Claim { run: "run_w".into(), name: "n-0".into(), label: "demo".into(), box_port: 3000, until_ms: i64::MAX };
+        let log = PortLog::new(node, claim, 20997, Arc::new(Limits { waiting: 3, waiting_per_peer: 2, ..Limits::default() }));
+        let v6 = |n: u8| -> SocketAddr { format!("[2001:db8::{n}]:4000").parse().unwrap() };
+        let (a, _) = log.take(v6(1)).unwrap();
+        let _b = log.take(v6(2)).unwrap();
+        assert!(matches!(log.take(v6(3)), Err(Dropped::Waiting)), "two waiting from one /64");
+        let _c = log.take("192.0.2.1:4000".parse().unwrap()).unwrap();
+        assert!(matches!(log.take("192.0.2.2:4000".parse().unwrap()), Err(Dropped::Waiting)), "three on the port");
+        log.spoke(a);
+        log.take(v6(4)).expect("a place freed by one speaking");
+        log.let_go(a, Dropped::Silent);
+    }
+
+    /// H2 (#796 re-review): the box's `wicket-fwd` is given the node's idle and after-close limits.
+    #[test]
+    fn the_dial_carries_the_limits() {
+        let l = Limits { idle: Duration::from_millis(1500), ..Limits::default() };
+        assert_eq!(dial_argv(3000), ["wicket-fwd", "--dial", "127.0.0.1:3000"]);
+        assert_eq!(exec_opts(&l), ["-i", "-e", "WICKET_FWD_IDLE_SECS=1.5", "-e", "WICKET_FWD_AFTER_CLOSE_SECS=30"]);
     }
 
     /// L4: a port another listener holds is not tried on IPv4 alone (it is taken there too); IPv6

@@ -3939,7 +3939,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
     }
 
     /// A node for the host-port tests (#575 step 4c, #796 review): a fake `docker exec` that echoes
-    /// and appends a line to `execs` each time it runs, a clock the test moves (`skew`, ms), and a
+    /// and appends its arguments as a line to `execs` each time it runs, a clock the test moves (`skew`, ms), and a
     /// feed whose records the test publishes ([`PortsFeed::put`]) and revokes.
     struct PortsFeed {
         inst: Install,
@@ -3957,7 +3957,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             let inst = Install::new(name);
             let execs = inst.dir.join("execs");
             let docker = inst.dir.join("fake-docker");
-            std::fs::write(&docker, format!("#!/bin/sh\necho x >> '{}'\nexec cat\n", execs.display())).unwrap();
+            std::fs::write(&docker, format!("#!/bin/sh\necho \"$*\" >> '{}'\nexec cat\n", execs.display())).unwrap();
             std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
             let mut node = test_node(&inst);
             let skew = Arc::new(AtomicI64::new(0));
@@ -4183,7 +4183,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         drop(relayed(port).await);
         // (Whether they land in one serve tick is timing: ports' own test checks the aggregate.)
-        let n = f.await_audit("name.conn", |b| b["aggregate"] == true || b.get("peer").is_some()).await;
+        let n = f.await_audit("name.conn", |b| b["aggregate"] == true || b["phase"] == "end").await;
         assert!(n["port"] == port, "{n}");
     }
 
@@ -4236,8 +4236,115 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         ports::tick(&f.node, Some(&range), &mut st);
         let mut c = relayed(port).await;
         assert!(ends(&mut c).await, "closed for carrying nothing");
-        let rec = f.await_audit("name.conn", |b| b.get("peer").is_some()).await;
+        let rec = f.await_audit("name.conn", |b| b["phase"] == "end").await;
         assert_eq!((rec["bytes_in"].clone(), rec["bytes_out"].clone()), (4.into(), 4.into()), "{rec}");
+        assert_eq!((rec["why"].clone(), rec.get("cut")), ("idle".into(), None), "{rec}");
+    }
+
+    /// #796 re-review, M4: a relayed connection's start is on record while it is live, with the
+    /// peer and an id; its end, after, carries the same id. The exec in the box is given the node's
+    /// idle and after-close limits (H2).
+    #[tokio::test]
+    async fn a_connections_start_is_recorded_while_it_is_live() {
+        let mut f = PortsFeed::new("nodesrv-ports-start");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let c = relayed(port).await;
+        let start = f.await_audit("name.conn", |b| b["phase"] == "start").await;
+        assert!(start["peer"].as_str().unwrap().starts_with("127.0.0.1:"), "{start}");
+        assert!(f.audit().iter().all(|(_, _, b)| b["phase"] != "end"), "live: no end yet");
+        let argv = std::fs::read_to_string(&f.execs).unwrap();
+        assert!(
+            argv.contains("-e WICKET_FWD_IDLE_SECS=300 -e WICKET_FWD_AFTER_CLOSE_SECS=30")
+                && argv.contains("wicket-fwd --dial 127.0.0.1:3000"),
+            "{argv}"
+        );
+        drop(c);
+        let end = f.await_audit("name.conn", |b| b["phase"] == "end").await;
+        assert_eq!(end["conn"], start["conn"], "{end}");
+        let a = f.audit();
+        let at = |phase: &str| a.iter().position(|(_, _, b)| b["phase"] == phase).unwrap();
+        assert!(at("start") < at("end"), "{a:?}");
+    }
+
+    /// #796 re-review, H2: connections waiting for their first byte have their own cap per peer:
+    /// past it a silent one is refused at once and counted, and the waiting ones don't stop a
+    /// connection that speaks once they are gone.
+    #[tokio::test]
+    async fn silent_connections_from_one_peer_are_capped() {
+        let mut f = PortsFeed::new("nodesrv-ports-waiting");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().first_byte = std::time::Duration::from_millis(800);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut quiet = vec![];
+        for _ in 0..ports::MAX_WAITING_PER_PEER {
+            quiet.push(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut over = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let started = std::time::Instant::now();
+        assert!(ends(&mut over).await, "refused");
+        assert!(started.elapsed() < std::time::Duration::from_millis(600), "at once, not at the first-byte timeout");
+        let r = f.await_audit("name.conn.refused", |b| b["waiting"] == 1).await;
+        assert_eq!(r["max_waiting_per_peer"], ports::MAX_WAITING_PER_PEER, "{r}");
+        for mut q in quiet {
+            assert!(ends(&mut q).await, "closed for saying nothing");
+        }
+        drop(relayed(port).await);
+        assert_eq!(f.execs(), 1, "no exec for the silent ones");
+    }
+
+    /// #796 re-review, H2: at default limits, a browser's burst of six connections from one
+    /// address, each speaking at once, is relayed: the waiting cap doesn't refuse it.
+    #[tokio::test]
+    async fn a_burst_of_speaking_connections_is_relayed() {
+        let mut f = PortsFeed::new("nodesrv-ports-burst");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let burst: Vec<_> = (0..6).map(|_| tokio::spawn(relayed(port))).collect();
+        for c in burst {
+            c.await.expect("relayed");
+        }
+        assert_eq!(f.execs(), 6);
+    }
+
+    /// #796 re-review, H2: a relay that keeps moving bytes is still cut at its lifetime, and
+    /// recorded `cut`, why `lifetime`.
+    #[tokio::test]
+    async fn a_relay_is_cut_at_its_lifetime() {
+        let mut f = PortsFeed::new("nodesrv-ports-lifetime");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().lifetime = std::time::Duration::from_millis(1200);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        // A byte every 200 ms: never idle.
+        let mut buf = [0u8; 1];
+        let mut cut = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if c.write_all(b".").await.is_err()
+                || !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), c.read(&mut buf)).await, Ok(Ok(1)))
+            {
+                cut = true;
+                break;
+            }
+        }
+        assert!(cut, "cut at its lifetime");
+        let end = f.await_audit("name.conn", |b| b["phase"] == "end").await;
+        assert_eq!((end["cut"].clone(), end["why"].clone()), (true.into(), "lifetime".into()), "{end}");
+        assert!(end["ms"].as_u64().unwrap() >= 1200, "{end}");
     }
 
     fn add_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {

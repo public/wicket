@@ -12,8 +12,11 @@ type: Added
     own copy of the feed: it closes a port within 2 s of its feed saying the name is revoked, and
     when the box's authority or the name's end passes, the last also while the control host is
     out of reach (a node that can't hear of a revoke keeps the port until one of those ends). It copies each connection's bytes into the
-    box's port once its first byte has come, at most 64 at once and 8 per peer per name and 256 per
-    node, closing idle ones after 5 minutes: layer 4 only, no TLS, no HTTP, no routing by name.
+    box's port once its first byte has come (layer 4 only: no TLS, no HTTP, no routing by name).
+    Per name: at most 32 at once, 8 per peer (an IPv6 /64 counts as one), 16 still silent (6 per
+    peer); per node, 256 at once. A relay ends after 5 minutes idle, 30 s after the peer closes its
+    side, or after an hour, and the box's `wicket-fwd` ends by itself the same way. Each connection
+    is recorded when it starts and when it ends (`name.conn`), aggregated under load.
     Audited on the node as `name.port.opened`, `name.port.closed`, `name.port.failed`,
     `name.conn` and `name.conn.refused`.
   - A node publishes only the ports in its `publish.json`, which `wicket node install` writes for
