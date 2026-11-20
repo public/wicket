@@ -104,6 +104,25 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   `run.fence_released` record with the fence not lifted: the run is still on the card, and can be
   released again. The box may still be
   running: release a fence only for a node that will never run it again.
+- **release a server past its lease** (`node_release`, #710), the console's path beside root's
+  `wicket node release`. A server `wicket node create` made is released by the reconciler once its
+  lease ends, unless a run still runs on it or keeps files a fetch didn't bring back: then it is kept,
+  and billing, until someone releases it. The action takes its instance id (or name) and a reason;
+  begin refuses no reason (400), a server that isn't an active placed server here (404), one whose
+  lease hasn't ended (409: the reconciler releases it then), and an operator whose authority in
+  [`operators.yaml`](configuration.md#operatorsyaml) doesn't cover `capacity` at R4 (403), before
+  the passkey is asked for. The passkey signs the server, its lease's end, the runs still running
+  there, its service instances, the runs whose files go with it, what releasing does in words, the reason and the effect's
+  sha256; a server whose runs or lease changed since you were shown it is refused (audited
+  `decision.refused`). The decision is audited first (`placement.node_release_decided`, with your
+  passkey and operator identity, the record root's command writes too, `granter` `human` or `root`,
+  `via` `console` or `cli`); if it can't be written, nothing is released. Then, in the background, with the server's own provider key: if it is still what you signed and still
+  active, its service instances are stopped, the provider destroys it, the runs on it are revoked,
+  and `placement.node_released` (with the decision's sequence) is written and its enrolment revoked.
+  Otherwise `placement.node_release_failed` (it is as it was) or
+  `placement.node_release_already_ended` (another release got there first). Files it keeps are
+  forgotten only when this release destroyed it. The page's button waits for the Lit servers card
+  (#758); until then the action is there for the page and for scripts.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
@@ -254,6 +273,20 @@ that stays a signed action.
 key. Each view is built from named fields, never by serializing a stored record, and a test fetches
 every console endpoint and scans each answer for the token, any 24-byte run of its bytes (base64url,
 base64 and hex, except runs inside a public key), identity JWSs and private keys.
+## Placement view
+
+Why a run went where it did ([#579](https://github.com/public/wicket/issues/579)), read-only and behind
+an operator's session: `GET /api/runs/<run>/placement` returns the run's `status` and `node` (`local` for
+this host's own), the placement decision recorded when its node was chosen, and `text`, the explanation
+`wicket why-here` prints. `decision` is built from named fields of placement's record, never the record
+whole: `at_ms`, `node` (or `behind`, the waiting run it went behind), `candidates`, the `request`
+(`vcpus`, `memory_mib`, `priority`, `preemptible`, `node_selector`, `tolerations`, `affinity`,
+`anti_affinity`), `ca_hosts`, `ranked` (the nodes it may go on, best first) and `refused` (each other
+node with every reason it was out), at most 10 of each (`ranked_more`, `refused_more`). A run with no
+decision recorded (on a node named for it whose room wasn't known from a report, or decided over a week
+ago) has `decision: null` and `why`. A run that doesn't exist, or another tenant's, is not found, as for
+its authority view. [Nodes: placement](nodes.md#placement) says how a node is chosen.
+
 ## Manifests
 
 The **Manifests** section lists the manifests runs can be started from (#172). The installation's

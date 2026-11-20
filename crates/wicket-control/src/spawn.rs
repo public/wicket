@@ -536,7 +536,7 @@ fn delegate(c: &SpawnCtx, child: &RunId, child_principal: &str, name: &str, brie
 /// limits, image and children. Agent-chosen strings are stripped and clipped, and the lists bounded,
 /// so nothing pushes a line out of view or rewrites it.
 fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String]) -> String {
-    use wicket_core::text::{clip, shown};
+    use wicket_core::text::shown;
     let z = &cm.zone;
     let list = |items: Vec<String>, max: usize| {
         let n = items.len();
@@ -630,8 +630,8 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
     let or_none = |s: String| if s.is_empty() { "none".to_string() } else { s };
     format!(
         "start {kind} {} in zone {}, beyond this agent's own. It exceeds: {}. It gets: {model}; {inject}; reach {}; forbid {}; unlisted hosts {:?}; isolation {:?}; image {}; may start images {}; accepts messages from {}; volumes {}; memory {}, cpus {}, pids {}, timeout {}; may start {children} box(es).",
-        clip(name, 40),
-        clip(&z.name, 200),
+        shown(name, 40),
+        shown(&z.name, 200),
         // Each violation's values are `shown` where it is written (subset.rs): bounded, and never
         // clipped again here.
         list(violations.to_vec(), 16),

@@ -48,6 +48,17 @@ pub fn shown(s: &str, n: usize) -> String {
     }
 }
 
+/// Values someone other than wicket chose, as a list in a sentence wicket writes (#731 review): each
+/// [`shown`] within `each`, at most `max` of them, then how many more.
+pub fn shown_list<'a>(items: impl IntoIterator<Item = &'a String>, each: usize, max: usize) -> String {
+    let all: Vec<&String> = items.into_iter().collect();
+    let mut v: Vec<String> = all.iter().take(max).map(|s| shown(s, each)).collect();
+    if all.len() > max {
+        v.push(format!("and {} more", all.len() - max));
+    }
+    v.join(", ")
+}
+
 /// `s` with every URL in it cut to its scheme, host, port and path: user info (`user:pass@`), the
 /// query and the fragment dropped, as tokens and signed parameters travel there. A URL that doesn't
 /// parse, or where more than one '@' could end the user info, is cut to its scheme (`https://…`).
@@ -144,6 +155,19 @@ mod tests {
             let s = shown(&format!("a{lookalike}b"), 200);
             assert!(s.is_ascii() && s.starts_with('"') && s.ends_with('"') && s.matches('"').count() == 2, "{s}");
         }
+    }
+
+    /// #731 review: a list of others' values (a parent zone's images, models, forbid paths) is
+    /// bounded in number, each value shown, never joined raw.
+    #[test]
+    fn an_others_list_is_bounded_and_each_value_shown() {
+        let v: Vec<String> = ["a", "b, c", "d"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(shown_list(&v, 10, 8), r#"a, "b, c", d"#);
+        assert_eq!(shown_list(&v, 10, 2), r#"a, "b, c", and 1 more"#);
+        let many: Vec<String> = (0..1000).map(|i| format!("image-{i}")).collect();
+        let s = shown_list(&many, 120, 8);
+        assert!(s.ends_with("image-7, and 992 more") && s.len() < 200, "{s}");
+        assert_eq!(shown_list(&[], 10, 8), "");
     }
 
     #[test]

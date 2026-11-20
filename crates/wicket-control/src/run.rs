@@ -580,16 +580,16 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         (_, Some(p)) => (p.name.clone(), "program".to_string()),
         _ => unreachable!("validated"),
     };
-    // An optional injection whose secret isn't set is as if it weren't there (#175): dropped from
-    // the zone every enforcement point sees (this run's proxies, the node's feed and routing), so
-    // its host's requests go without it, and the host is spliced if reach allows it wholesale.
-    let unset_injections = m.zone.drop_unset_optional_injections(|s| vault.get(s).is_ok());
-    for i in &unset_injections {
-        say!("[wicket] optional secret {:?} is not set: requests to {} go without it", i.secret, i.host);
-    }
+    // The zone's injections are fixed at start, their secrets looked up at each request (#415): an
+    // optional one whose secret isn't set yet stays in the zone, and its host's requests go without
+    // it until it is set (#175). A required one must be set to start.
     for i in &m.zone.inject {
-        if let Err(e) = vault.get(&i.secret) {
-            return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host));
+        match vault.get(&i.secret) {
+            Err(_) if i.optional => {
+                say!("[wicket] optional secret {:?} is not set: requests to {} go without it until it is", i.secret, i.host)
+            }
+            Err(e) => return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host)),
+            Ok(_) => {}
         }
     }
     // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
@@ -786,15 +786,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 "session_id": long_lived.then(|| session.id.clone()), "resumed": session.resume,
             }),
         )?;
-        // One note per run for each optional injection left out (#175), not one per request.
-        for i in &unset_injections {
-            l.audit(
-                &m.tenant,
-                Some(&run),
-                "inject.skipped",
-                &serde_json::json!({ "host": i.host, "secret": i.secret, "why": "optional secret not set" }),
-            )?;
-        }
     }
 
     // No CA of the run's (#257 slice 5): the control host terminates no TLS, so a box trusts only
@@ -2492,8 +2483,12 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 // Loudly (#300): the box's work isn't here. Its node keeps it (not forgotten).
                 let msg = format!("fetching the box's files from node {node_name} failed: {e:#} (the node keeps them)");
                 // The run holds its node until they are collected: the reconciler doesn't release
-                // it with them (#324).
-                let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
+                // it with them (#324). Unless a supervisor before this one fetched them already
+                // (this one took the run over after its fetch, #590): then the files are here.
+                let here = ledger.lock().expect("ledger").files_collected(&run.0).unwrap_or(false);
+                if !here {
+                    let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
+                }
                 say!("[wicket] {msg}");
                 say_err!("[wicket] {msg}");
                 let _ = ledger.lock().expect("ledger").audit(

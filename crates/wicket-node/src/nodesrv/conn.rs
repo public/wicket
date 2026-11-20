@@ -333,7 +333,8 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     l.set_slice(Some(slice));
                 }
             }
-            Msg::SecretRevoke { run, name } => node.secrets.revoke(&run, &name),
+            Msg::SecretRevoke { run, name, resend: false } => node.secrets.revoke(&run, &name),
+            Msg::SecretRevoke { run, name, resend: true } => node.secrets.revoke_resent(&run, &name),
             m @ Msg::SecretFetched { .. } => {
                 let Msg::SecretFetched { id, .. } = &m else { unreachable!() };
                 if let Some(tx) = node.asks.lock().expect("asks").remove(id) {
