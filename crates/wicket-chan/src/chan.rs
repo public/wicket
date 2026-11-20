@@ -45,11 +45,11 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 2, a connection talks
-/// 16, 17 or 18, so only the versions above 15 have a check here; the checks for features of 14 and
+/// 19, 20 or 21; the checks of versions 15 to 18 stay until they go in a change of their own; the checks for features of 14 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health, the control host's tools as [`Msg::Call`], CA renewal) went once
 /// every peer had them.
-pub const PROTOCOL: u32 = 19;
+pub const PROTOCOL: u32 = 21;
 /// The first protocol version whose nodes say when a box has had a message the control host gave
 /// it (#445): [`Msg::MessageRead`]. Until then the control host counts a message read when it
 /// hands it over.
@@ -71,6 +71,11 @@ pub const NAMES: u32 = 18;
 /// record (an older node's strict parse refuses the record, and its whole feed with it). The
 /// control host never sends a zone using it over a connection below this.
 pub const DECODE_SLASH: u32 = 19;
+/// The first protocol version whose nodes read a box's published host ports (#575 step 4c: the
+/// `ports` of its `BoxAuthority`) and listen on them. An older node's strict parse refuses an entry
+/// with any (and its whole feed with it), so the control host puts ports in a box's record only for
+/// a node at this version or later. 20 is #714's.
+pub const PORTS: u32 = 21;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -134,6 +139,8 @@ const _: () = {
     assert!(PREFIX_GRANTS <= PROTOCOL);
     assert!(STANDING <= PROTOCOL);
     assert!(NAMES <= PROTOCOL);
+    assert!(DECODE_SLASH <= PROTOCOL);
+    assert!(PORTS <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -1285,22 +1292,25 @@ mod tests {
     /// Why this build has no checks for features of protocol 16 or before: with [`PROTOCOL_SKEW`]
     /// 2 and protocol 19 (#664), every connection talks 17, 18 or 19. 15's message reads (#445)
     /// and 16's prefix grants (#257 4a) are on every connection (15's keeps its check until it goes
-    /// in a change of its own); 17's standing reach (#572), 18's names (#575) and 19's decoded
-    /// slashes keep theirs while a peer at 17 or 18 can connect.
+    /// in a change of its own); 21's published ports (#575 step 4c) keep theirs while a peer at
+    /// 19 or 20 can connect. A node below 19 is refused: it updates before the control host.
     #[test]
-    fn no_connection_talks_below_protocol_17() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH), (19, 2, 15, 16, 17, 18, 19));
+    fn no_connection_talks_below_protocol_19() {
+        assert_eq!(
+            (PROTOCOL, PROTOCOL_SKEW, MESSAGE_READ, PREFIX_GRANTS, STANDING, NAMES, DECODE_SLASH, PORTS),
+            (21, 2, 15, 16, 17, 18, 19, 21)
+        );
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((17..=19).contains(&at) && (17..=21).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(17..=21).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((19..=21).contains(&at) && (19..=23).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(19..=23).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 20 or 21 talking to a control host at 19 from the other side.
-        assert_eq!((negotiate(20, PROTOCOL), negotiate(21, PROTOCOL)), (Ok(19), Ok(19)));
-        assert!(negotiate(17, PROTOCOL).unwrap() < NAMES, "a node at 17 sends no RequestName");
-        assert!(negotiate(18, PROTOCOL).unwrap() < DECODE_SLASH, "a node at 18 gets no zone that decodes a slash");
-        assert!(negotiate(PROTOCOL, 16).is_err() && negotiate(16, PROTOCOL).is_err());
+        // And a node at 22 or 23 talking to a control host at 21 from the other side.
+        assert_eq!((negotiate(22, PROTOCOL), negotiate(23, PROTOCOL)), (Ok(21), Ok(21)));
+        assert!(negotiate(19, PROTOCOL).unwrap() < PORTS, "a node at 19 gets no published ports");
+        assert!(negotiate(20, PROTOCOL).unwrap() < PORTS, "nor one at 20");
+        assert!(negotiate(PROTOCOL, 18).is_err() && negotiate(18, PROTOCOL).is_err());
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start
