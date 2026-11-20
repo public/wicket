@@ -220,3 +220,39 @@ async fn a_vm_zone_gets_no_vultr_offer() {
 fn now() -> i64 {
     wicket_placement::model::now()
 }
+
+/// A short machine listing would read as machines gone (and their leases' nodes as released): a
+/// page without `instances` or `meta`, or a count other than `meta.total`, fails the listing, the
+/// placer's too, on the first page or a later one.
+#[tokio::test]
+async fn a_page_short_of_instances_or_meta_fails_the_listing() {
+    let tags = vec!["wicket-owner-example".to_string()];
+    let inst = |i: u32| wicket_placement::mock::instance(&format!("00000000-0000-0000-0000-00000000000{i}"), &tags);
+    let meta = |total: u64, next: &str| json!({ "total": total, "links": { "next": next, "prev": "" } });
+    let cases: Vec<(&str, Option<&str>, serde_json::Value)> = vec![
+        ("the first page without instances", None, json!({ "meta": meta(5, "c2") })),
+        ("a later page without instances", Some("c2"), json!({ "meta": meta(5, "c4") })),
+        ("an empty body", Some("c2"), serde_json::Value::Null),
+        ("instances not a list", None, json!({ "instances": null, "meta": meta(5, "c2") })),
+        ("no meta", Some("c2"), json!({ "instances": [] })),
+        ("meta without a total", None, json!({ "instances": [inst(0), inst(1)], "meta": { "links": { "next": "c2" } } })),
+        ("meta not an object", Some("c4"), json!({ "instances": [inst(4)], "meta": [] })),
+        ("the last page short", Some("c4"), json!({ "instances": [], "meta": meta(5, "") })),
+        ("the total changed while paging", Some("c2"), json!({ "instances": [inst(2), inst(3)], "meta": meta(4, "c4") })),
+    ];
+    for (what, cursor, body) in cases {
+        let (base, st) = serve().await;
+        st.lock().unwrap().instances = (0..5).map(inst).collect();
+        let c = client(&base).with_per_page(2);
+        // Whole, it lists.
+        assert_eq!(c.list_instances(Some("wicket-owner-example")).await.unwrap().len(), 5, "{what}");
+        let cursor = cursor.map(str::to_string);
+        st.lock().unwrap().fail_when = Some(Box::new(move |s| {
+            let at = s.query.iter().find(|(k, _)| k == "cursor").map(|(_, v)| v.clone());
+            (s.method == "GET" && s.path == "/v2/instances" && at == cursor).then(|| (200, body.clone()))
+        }));
+        assert!(c.list_instances(Some("wicket-owner-example")).await.is_err(), "{what}");
+        let p = Placer::new(VultrProvider::new(c, config()), Yes(Arc::default()), Owner::new("example"));
+        assert!(p.list().await.is_err(), "{what}: the placer's listing fails, not empty");
+    }
+}

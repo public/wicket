@@ -29,7 +29,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `names.public.zone` | DNS domain | required | The boxes domain. A delegated subzone is recommended, so the provider's credential touches nothing else. Not under `wicket.internal`. |
 | `names.public.credential` | vault secret name | none | The provider's credential, by name, read from the vault at each `wicket reconcile` pass. `vultr` needs one (a Vultr API key: `wicket secret set dns-boxes --hosts api.vultr.com`); the `noop` provider takes none. |
 | `names.public.owner` | 8–32 lower-case hex characters | required | This installation's owner id, written in its owner records. Random and made once (`openssl rand -hex 8`): no host name or other detail in it. |
-| `names.public.ttl` | seconds, 30–3600 | `60` | The records' TTL. |
+| `names.public.ttl` | seconds, 30–3600 (60 or more with `vultr`, which raises a lower one to 60) | `60` | The records' TTL. |
 | `names.public.per_workload` | integer ≥ 1 | `1` | The most live public names one workload holds at once. An ask beyond it is refused, and so is an approval. |
 | `names.public.reserved` | list of labels | `[]` | Labels no box gets, besides wicket's own (`wicket`, `console`, `www`, `api`, `admin`, `mail`, `ns`). Their lookalikes (`5tatus` for `status`) are refused too. |
 | `names.public.console_host` | host name | none | The console's host name: its first label is reserved too, and, for a host under the boxes zone, the label directly under the zone. |

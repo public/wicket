@@ -360,7 +360,7 @@ deletes a record wicket doesn't own, and applying it makes the owned records the
   is an error, not an empty zone. Vultr names records relative to the zone, an SRV's priority
   apart from its `weight port target`, and TXT data in quotes; it reads and writes those as
   wicket's absolute names and `priority weight port target`. Its record types: A, AAAA, SRV, TXT;
-  its lowest TTL 30 s. Its id is `vultr:<the first 12 hex digits of the key's SHA-256>`: it names
+  its lowest TTL 60 s (Vultr raises a lower one to 60, so `names.public.ttl` is refused below it). Its id is `vultr:<the first 12 hex digits of the key's SHA-256>`: it names
   the account without the key. So a rotated key is another provider to the ledger: the records the
   old key made are stranded (and their names conflicts) until it is back to withdraw them, so
   withdraw them first (remove the names, or let a pass with the old key run) or keep the key.
@@ -409,13 +409,29 @@ zone delegated to Vultr (`test-boxes.example.com` here), on the control host:
    addresses or the zone) and shows the plan; it writes nothing.
 5. Ask for and approve a public name on a node with the label and a public address, then
    `wicket reconcile`: the zone gains `_wicket.<label>` TXT, `<label>` A (and AAAA, SRV), each
-   `name_record` line saying `applied by vultr:<id>`. Check them with `dig @ns1.vultr.com`.
-6. Revoke the name (`wicket names revoke`) and `wicket reconcile` again: its records go, the owner
-   record last. Delete the zone when done.
+   `name_record` line saying `applied by vultr:<id>`. Check them with `dig @ns1.vultr.com`, and
+   the SRV's target with `dig @ns1.vultr.com SRV _http._tcp.<label>.test-boxes.example.com`: it
+   must be `<label>.test-boxes.example.com.`, not that name with the zone appended again.
+6. `wicket reconcile` again: it must plan nothing (no `name_record` lines). A plan here means a
+   record lists differently from how it was written (a TTL Vultr changed, a name, quoting).
+7. Count the records through the API, since `dig` shows one of two identical records:
+   `curl -s -H "Authorization: Bearer $KEY" https://api.vultr.com/v2/domains/test-boxes.example.com/records | jq '.meta.total, (.records | length)'`
+   (both the same, and each record wicket wrote there once; with more than 100 records follow
+   `.meta.links.next`).
+8. Add a record wicket doesn't own by hand (Vultr's console: `manual` TXT, say). It must stay as
+   it is through every pass below; check it with the API listing after each.
+9. Move the box: `wicket node set <node> --public-ipv4 <new address>` (an address of the node's
+   own, or the box run on another node), then `wicket reconcile`: the A record is updated in place
+   (a PATCH, the same record id in the API listing, still one A record), and a further pass plans
+   nothing.
+10. Revoke the name (`wicket names revoke`) and `wicket reconcile` again: its records go, the owner
+    record last, and only the hand-made record is left. Delete the zone when done.
 
 Check against the real API what the mock assumes (`crates/wicket-control/src/vultrdns.rs` lists it):
-the apex as an empty name, TXT data quoted, an SRV's `data` as `weight port target`, and that a 30 s
-TTL is accepted.
+the apex as an empty name, TXT data quoted, an SRV's `data` as `weight port target` with its
+target fully qualified, that a 60 s TTL lists as written (step 6 shows a TTL Vultr changed), and that
+`meta.total` counts a filtered listing (`GET /instances?tag=…`) rather than the whole account:
+a listing whose count isn't its `meta.total` fails.
 
 ## Certificates the box gets itself
 

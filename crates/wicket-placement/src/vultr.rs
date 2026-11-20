@@ -8,7 +8,9 @@
 //! - `GET /instances/{id}` → `{"instance": {id, main_ip, date_created, status, power_status,
 //!   server_status, plan, region, label, tags, vcpu_count, ram, …}}`; `404` when gone
 //! - `GET /instances?tag=T&per_page=N[&cursor=C]` → `{"instances": [...], "meta": {…}}`: paged with
-//!   `meta.links.next` until it is empty
+//!   `meta.links.next` until it is empty; every page must have its list and `meta`, and the count
+//!   must match `meta.total`, or the listing fails ([`Client::paged`]): a short listing would read
+//!   as machines gone
 //! - `PATCH /instances/{id}` with `{"user_data": …}` (to drop the boot host key after enrolment)
 //! - `DELETE /instances/{id}` → `204`; `404` counts as already gone
 //!
@@ -177,16 +179,23 @@ pub struct CreateInstance {
     pub activation_email: bool,
 }
 
+/// A listing page's `meta`: both fields required, so a page without them fails the listing rather
+/// than ending it.
 #[derive(Deserialize)]
 struct Meta {
-    #[serde(default)]
+    /// The whole listing's length, the same on every page. Checked against the live API for
+    /// `GET /plans` (2026-11-20, no key needed): `type=all` gave 140 of 140, `type=vc2` 12 on each
+    /// of three pages of 5, so a filter applies to it. That `tag=` on `GET /instances` does too is
+    /// assumed (it needs a key); if not, the listing fails rather than reading short.
+    total: u64,
     links: Links,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 struct Links {
+    /// The next page's cursor; empty (or null) on the last page.
     #[serde(default)]
-    next: String,
+    next: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -230,6 +239,11 @@ impl Client {
     pub fn with_per_page(mut self, n: u32) -> Self {
         self.per_page = n.clamp(1, 500);
         self
+    }
+
+    /// The base URL requests go to (`API_BASE`, or a mock's).
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     /// The key the client sends.
@@ -284,11 +298,17 @@ impl Client {
         }
     }
 
-    /// Every page of a listing: `field` from each, following `meta.links.next`. Any page failing
-    /// (a 404 too) fails the whole listing.
+    /// Every page of a listing: `field` from each, following `meta.links.next`. Never a partial
+    /// `Ok`: any page failing (a 404 too), a page whose `field` is missing or isn't a list (an empty
+    /// body), a `meta` missing or not as Vultr gives it, or a count that doesn't match `meta.total`
+    /// fails the whole listing. Vultr gives the listing's total on every page (`{"total": N,
+    /// "links": {"next", "prev"}}`), so each page's must equal the first's (a listing that changed
+    /// while it was read fails too; the next pass reads it again), and the items gathered must
+    /// number it. A short listing would read as records or machines gone.
     pub async fn paged<T: for<'de> Deserialize<'de>>(&self, path: &str, field: &str, query: &[(&str, String)]) -> anyhow::Result<Vec<T>> {
         let mut out = vec![];
         let mut cursor = String::new();
+        let mut total: Option<u64> = None;
         for _ in 0..1000 {
             let mut q = query.to_vec();
             q.push(("per_page", self.per_page.to_string()));
@@ -296,12 +316,29 @@ impl Client {
                 q.push(("cursor", cursor.clone()));
             }
             let v = self.call(reqwest::Method::GET, path, &q, None).await?.with_context(|| format!("Vultr API GET {path}: not found"))?;
-            let items: Vec<T> = serde_json::from_value(v.get(field).cloned().unwrap_or(serde_json::Value::Array(vec![])))
-                .with_context(|| format!("Vultr API GET {path}: unexpected {field}"))?;
+            let list = match v.get(field) {
+                Some(l @ serde_json::Value::Array(_)) => l.clone(),
+                Some(_) => bail!("Vultr API GET {path}: {field} is not a list"),
+                None => bail!("Vultr API GET {path}: a page has no {field}"),
+            };
+            let items: Vec<T> = serde_json::from_value(list).with_context(|| format!("Vultr API GET {path}: unexpected {field}"))?;
             out.extend(items);
-            let meta: Option<Meta> = v.get("meta").cloned().and_then(|m| serde_json::from_value(m).ok());
-            cursor = meta.map(|m| m.links.next).unwrap_or_default();
+            let meta: Meta =
+                serde_json::from_value(v.get("meta").cloned().with_context(|| format!("Vultr API GET {path}: a page has no meta"))?)
+                    .with_context(|| format!("Vultr API GET {path}: unexpected meta"))?;
+            match total {
+                None => total = Some(meta.total),
+                Some(t) if t != meta.total => {
+                    bail!("Vultr API GET {path}: the listing's total changed from {t} to {} while paging", meta.total)
+                }
+                Some(_) => {}
+            }
+            cursor = meta.links.next.unwrap_or_default();
             if cursor.is_empty() {
+                let t = total.unwrap_or_default();
+                if out.len() as u64 != t {
+                    bail!("Vultr API GET {path}: {} {field} listed, but meta.total is {t}", out.len());
+                }
                 return Ok(out);
             }
         }

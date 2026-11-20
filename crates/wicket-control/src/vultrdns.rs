@@ -7,7 +7,8 @@
 //!   [`ProviderError::Zone`]).
 //! - `GET /domains/{zone}/records?per_page=500[&cursor=C]` → `{"records": [{id, type, name, data,
 //!   priority, ttl}], "meta": {"total", "links": {"next", "prev"}}}`, paged to the end. A page
-//!   failing fails the listing ([`ProviderError::List`]): never a partial `Ok`.
+//!   failing, a page without `records` or `meta`, or a count other than `meta.total` fails the
+//!   listing ([`ProviderError::List`]): never a partial `Ok`.
 //! - `POST /domains/{zone}/records` with `{name, type, data, ttl, priority?}` → `{"record": {…}}`.
 //! - `PATCH /domains/{zone}/records/{id}` with `{data, ttl, priority?}`.
 //! - `DELETE /domains/{zone}/records/{id}`; `404` counts as already gone.
@@ -16,7 +17,9 @@
 //! `_wicket.demo`; the apex as `""`, or `"@"`, both read as the apex; a name ending in a dot as
 //! absolute); wicket's are absolute, lower case, without the trailing dot. An SRV's `data` is
 //! `weight port target`, its priority a field of its own; wicket's value is
-//! `priority weight port target`. TXT data is written quoted (an owner record's `;` would start a
+//! `priority weight port target`. The target is sent fully qualified (`demo.boxes.example.com.`:
+//! octodns-vultr sends it so, and its fixtures of Vultr's listings hold SRV targets with the dot),
+//! and read with or without the dot. TXT data is written quoted (an owner record's `;` would start a
 //! comment in a zone file) and read with or without quotes. Any other type is listed as
 //! [`RecordType::Other`]. A listed field that doesn't parse (a priority absent, or `-1`, on an A
 //! record) is read leniently, so one odd record can't fail the whole listing.
@@ -24,15 +27,20 @@
 //! **Assumed, not yet checked against the real API** (the tests run against a local mock; an
 //! operator's manual check is in `docs/explanation/box-dns.md`): the apex's name is `""`; TXT data
 //! may be sent quoted and is listed as sent or unquoted; an SRV's `data` is `weight port target`
-//! with `priority` apart; a 30 s TTL is accepted; create answers `{"record": {…}}` (as the govultr
-//! client reads it). The field names and the request bodies are govultr's.
+//! with `priority` apart, its target with a trailing dot taken as absolute; a 30 s TTL is
+//! accepted (octodns-vultr says Vultr clamps TTLs below 60 rather than refusing them: a clamped
+//! TTL would list as 60 and be planned as an update at every pass); create answers
+//! `{"record": {…}}` (as the govultr client reads it); `meta.total` counts the zone's records, as
+//! it counts plans (checked live) and as octodns-vultr's fixtures show it. The field names and the
+//! request bodies are govultr's.
 //!
 //! **Apply** lists the zone afresh, maps each record to its Vultr id, and makes the plan's changes
-//! in order, keeping the map current (a create's new id, an update's new value; a delete removes
-//! every record with that name, type and value). It stops at the first failure with
-//! [`ProviderError::Partial`] (how many changes were made), or [`ProviderError::Failed`] for an
-//! authorization failure on the first. A record to update or delete that the listing lacks stops
-//! it there too. `429` is retried with backoff, and `5xx` except after a POST: a create retried
+//! in order, keeping the map current (a create's new id, an update's new value). A zone may hold
+//! one name, type and value twice: a delete removes every such record, and an update deletes the
+//! others and patches the first, so either leaves exactly what the plan wants. It stops at the
+//! first failure with [`ProviderError::Partial`] (how many changes were made), or
+//! [`ProviderError::Failed`] for an authorization failure on the first. A record to update or
+//! delete that the listing lacks stops it there too. `429` is retried with backoff, and `5xx` except after a POST: a create retried
 //! after a `5xx` could make a second record. The reconciler recorded the create before applying,
 //! so the next pass's listing shows whether it happened and plans from there.
 //!
@@ -49,12 +57,16 @@ use std::collections::BTreeMap;
 use wicket_names::{Applied, Caps, Change, DnsProvider, Plan, ProviderError, Record, RecordType, Zone};
 use wicket_placement::vultr::{ApiError, ApiKey, Client};
 
-/// The host the key goes to: what its vault secret's `.hosts` should name.
+/// The host the key goes to: what its vault secret's `.hosts` should name. [`VultrDns::new`] (the
+/// provider the reconciler builds from the vault) refuses a client whose base URL is anything but
+/// `https://` at this host, before any request carries the key.
 pub const API_HOST: &str = "api.vultr.com";
 
 /// The lowest TTL wicket sends Vultr (s). Vultr documents none that we could find; 30 is wicket's
 /// own floor (`names.public.ttl`).
-pub const MIN_TTL: u32 = 30;
+/// Vultr raises a lower TTL to 60 silently, by octodns-vultr's account (its `MIN_TTL = 60`), so a
+/// record written at 30 would list at 60 and be planned again every pass: 60 is refused below.
+pub const MIN_TTL: u32 = 60;
 
 /// Vultr's DNS, for whichever zone the reconciler asks about (a zone change withdraws the old
 /// zone's records with the same provider).
@@ -89,13 +101,22 @@ enum Stop {
 type Key = (String, RecordType, String);
 
 impl VultrDns {
-    /// A provider writing with `key`, at Vultr's API.
+    /// A provider writing with `key`, at Vultr's API: its client's base URL is checked to be
+    /// `https://` [`API_HOST`], so the key goes nowhere else.
     pub fn new(key: ApiKey) -> Result<VultrDns> {
-        Ok(VultrDns::with_client(Client::new(key)?.with_per_page(500)))
+        let client = Client::new(key)?.with_per_page(500);
+        at_api_host(client.base())?;
+        Ok(VultrDns::over(client))
     }
 
-    /// A provider over `client` (another base URL, retry or page size in tests).
-    pub fn with_client(client: Client) -> VultrDns {
+    /// A provider over `client` (a mock's base URL, retry or page size), its host not checked:
+    /// tests only, so every provider outside them is built by [`VultrDns::new`].
+    #[cfg(test)]
+    pub(crate) fn with_client(client: Client) -> VultrDns {
+        VultrDns::over(client)
+    }
+
+    fn over(client: Client) -> VultrDns {
         let id = format!("vultr:{}", client.key().fingerprint());
         VultrDns { client, id }
     }
@@ -137,6 +158,13 @@ impl VultrDns {
         e.downcast_ref::<ApiError>().is_some_and(|a| a.status == 401 || a.status == 403)
     }
 
+    /// Deletes record `id`; a `404` counts as already gone.
+    async fn delete(&self, base: &str, id: &str) -> Result<(), Stop> {
+        let path = format!("{base}/records/{}", segment(id).map_err(Stop::Missing)?);
+        self.client.call(reqwest::Method::DELETE, &path, &[], None).await.map_err(Stop::Api)?;
+        Ok(())
+    }
+
     async fn change(&self, zone: &Zone, base: &str, c: &Change, ids: &mut BTreeMap<Key, Vec<String>>) -> Result<(), Stop> {
         let rid = |ids: &BTreeMap<Key, Vec<String>>, r: &Record| -> Result<String, Stop> {
             ids.get(&r.key())
@@ -156,7 +184,19 @@ impl VultrDns {
                 }
             }
             Change::Update { from, to } => {
+                // Duplicates of `from` (Vultr lets a zone hold the same name, type and value
+                // twice): the first is patched, the others deleted first, so the zone ends with
+                // exactly the wanted record, as a delete leaves none. Deleting first means a
+                // failure part way still lists `from`, so the next pass plans this update again.
                 let id = rid(ids, from)?;
+                let extras: Vec<String> =
+                    ids.get(&from.key()).map(|v| v.iter().filter(|x| **x != id).cloned().collect()).unwrap_or_default();
+                for x in extras {
+                    self.delete(base, &x).await?;
+                    if let Some(v) = ids.get_mut(&from.key()) {
+                        v.retain(|y| *y != x);
+                    }
+                }
                 let body = to_vultr(zone, to).map_err(Stop::Missing)?;
                 let path = format!("{base}/records/{}", segment(&id).map_err(Stop::Missing)?);
                 let out = self.client.call(reqwest::Method::PATCH, &path, &[], Some(&body)).await.map_err(Stop::Api)?;
@@ -176,9 +216,7 @@ impl VultrDns {
                     rid(ids, r)?;
                 }
                 for id in all {
-                    let path = format!("{base}/records/{}", segment(&id).map_err(Stop::Missing)?);
-                    // `None`: a 404, already gone.
-                    self.client.call(reqwest::Method::DELETE, &path, &[], None).await.map_err(Stop::Api)?;
+                    self.delete(base, &id).await?;
                     if let Some(v) = ids.get_mut(&r.key()) {
                         v.retain(|x| *x != id);
                     }
@@ -222,6 +260,15 @@ impl DnsProvider for VultrDns {
     }
 }
 
+/// Whether `base` is `https://` [`API_HOST`] (no other host, port or userinfo).
+fn at_api_host(base: &str) -> Result<()> {
+    let u = reqwest::Url::parse(base).map_err(|e| anyhow::anyhow!("the Vultr API base URL doesn't parse: {e}"))?;
+    let ok =
+        u.scheme() == "https" && u.host_str() == Some(API_HOST) && u.port().is_none() && u.username().is_empty() && u.password().is_none();
+    anyhow::ensure!(ok, "the Vultr API key goes only to https://{API_HOST}, not {}", u.host_str().unwrap_or("?"));
+    Ok(())
+}
+
 /// A Vultr record id as a path segment: anything that could change the path is refused.
 fn segment(id: &str) -> Result<&str, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -253,6 +300,8 @@ fn to_vultr(zone: &Zone, r: &Record) -> Result<serde_json::Value, String> {
             [p, w, port, target] => {
                 let p: u16 = p.parse().map_err(|_| format!("SRV {} has priority {p:?}", r.name))?;
                 body["priority"] = p.into();
+                // Fully qualified: a target without the dot may be read relative to the zone.
+                let target = if target.ends_with('.') { target.to_string() } else { format!("{target}.") };
                 body["data"] = format!("{w} {port} {target}").into();
             }
             _ => return Err(format!("SRV {} has value {:?}, not `priority weight port target`", r.name, r.value)),
@@ -381,6 +430,92 @@ mod tests {
         assert!(matches!(p.list(&zone()).await, Err(ProviderError::List(e)) if e.contains("HTTP 500")));
     }
 
+    /// A short listing would read as records gone: a page without its list or `meta`, or a count
+    /// other than `meta.total`, fails the listing, on the first page or a later one.
+    #[tokio::test]
+    async fn a_page_short_of_records_or_meta_fails_the_listing() {
+        let five: Vec<Value> = (0..5).map(|i| record(&format!("r{i}"), "A", &format!("n{i}"), &ip(i).to_string(), 0, 60)).collect();
+        let meta = |total: u64, next: &str| json!({ "total": total, "links": { "next": next, "prev": "" } });
+        let page1 = || json!([five_slice(0), five_slice(1)]);
+        fn five_slice(i: u8) -> Value {
+            record(&format!("r{i}"), "A", &format!("n{i}"), &ip(i).to_string(), 0, 60)
+        }
+        let cases: Vec<(&str, Option<&str>, Value)> = vec![
+            ("the first page without records", None, json!({ "meta": meta(5, "c2") })),
+            ("a later page without records", Some("c2"), json!({ "meta": meta(5, "c4") })),
+            ("an empty body", Some("c2"), Value::Null),
+            ("records not a list", None, json!({ "records": {}, "meta": meta(5, "c2") })),
+            ("no meta", Some("c2"), json!({ "records": [] })),
+            ("meta without a total", None, json!({ "records": page1(), "meta": { "links": { "next": "c2" } } })),
+            ("meta without links", Some("c4"), json!({ "records": [five_slice(4)], "meta": { "total": 5 } })),
+            ("meta not an object", None, json!({ "records": page1(), "meta": "x" })),
+            ("the last page short", Some("c4"), json!({ "records": [], "meta": meta(5, "") })),
+            ("the total changed while paging", Some("c2"), json!({ "records": [five_slice(2), five_slice(3)], "meta": meta(6, "c4") })),
+            ("a total above the count, all on one page", None, json!({ "records": page1(), "meta": meta(3, "") })),
+        ];
+        for (what, cursor, body) in cases {
+            let (p, st) = served(five.clone()).await;
+            let cursor = cursor.map(str::to_string);
+            st.lock().unwrap().fail_when = Some(Box::new(move |s| {
+                let at = s.query.iter().find(|(k, _)| k == "cursor").map(|(_, v)| v.clone());
+                (s.path.ends_with("/records") && at == cursor).then(|| (200, body.clone()))
+            }));
+            assert!(matches!(p.list(&zone()).await, Err(ProviderError::List(_))), "{what}");
+            let pl = Plan { changes: vec![Change::Delete(Record::a("n9.boxes.example.com", ip(9), 60))], conflicts: vec![] };
+            assert!(matches!(p.apply(&zone(), &pl).await, Err(ProviderError::List(_))), "{what}: apply lists first");
+            assert!(writes(&st).is_empty(), "{what}: nothing written");
+        }
+        // The same zone listed whole passes.
+        let (p, _st) = served(five).await;
+        assert_eq!(p.list(&zone()).await.unwrap().len(), 5);
+    }
+
+    /// Vultr lets a zone hold one name, type and value twice; an update leaves exactly the wanted
+    /// record, as a delete leaves none.
+    #[tokio::test]
+    async fn an_update_of_a_duplicated_record_leaves_exactly_one() {
+        let n = "demo.boxes.example.com";
+        let dup = |ttl| vec![record("r1", "A", "demo", &ip(1).to_string(), 0, ttl), record("r2", "A", "demo", &ip(1).to_string(), 0, ttl)];
+        // A new value: the first patched, the other deleted (before the patch).
+        let (p, st) = served(dup(60)).await;
+        let pl = Plan { changes: vec![Change::Update { from: Record::a(n, ip(1), 60), to: Record::a(n, ip(2), 60) }], conflicts: vec![] };
+        assert_eq!(p.apply(&zone(), &pl).await.unwrap(), Applied { applied: true, changes: 1 });
+        assert_eq!(p.list(&zone()).await.unwrap(), vec![Record::a(n, ip(2), 60)]);
+        let w = writes(&st);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert_eq!(w[0].0, "DELETE");
+        assert!(w[0].1.ends_with("/records/r2") && w[1].0 == "PATCH" && w[1].1.ends_with("/records/r1"), "{w:?}");
+        // A TTL only (the same key): one left, with the new TTL.
+        let (p, _st) = served(dup(60)).await;
+        let pl = Plan { changes: vec![Change::Update { from: Record::a(n, ip(1), 60), to: Record::a(n, ip(1), 120) }], conflicts: vec![] };
+        p.apply(&zone(), &pl).await.unwrap();
+        assert_eq!(p.list(&zone()).await.unwrap(), vec![Record::a(n, ip(1), 120)]);
+        // The extra's delete failing: Partial at 0, `from` still listed for the next pass to update.
+        let (p, st) = served(dup(60)).await;
+        st.lock().unwrap().fail_when = Some(Box::new(|s| (s.method == "DELETE").then(|| (500, json!({"error": "boom"})))));
+        let pl = Plan { changes: vec![Change::Update { from: Record::a(n, ip(1), 60), to: Record::a(n, ip(2), 60) }], conflicts: vec![] };
+        assert!(matches!(p.apply(&zone(), &pl).await, Err(ProviderError::Partial { done: 0, .. })));
+        st.lock().unwrap().fail_when = None;
+        assert!(p.list(&zone()).await.unwrap().contains(&Record::a(n, ip(1), 60)));
+    }
+
+    #[test]
+    fn the_key_goes_only_to_the_api_host() {
+        assert!(at_api_host(wicket_placement::vultr::API_BASE).is_ok());
+        assert!(VultrDns::new(ApiKey::new(KEY)).is_ok());
+        for bad in [
+            "http://api.vultr.com/v2",
+            "https://api.vultr.com.example.net/v2",
+            "https://example.net/api.vultr.com/v2",
+            "https://api.vultr.com:8443/v2",
+            "https://user@api.vultr.com/v2",
+            "https://example.net/v2?h=api.vultr.com",
+            "not a url",
+        ] {
+            assert!(at_api_host(bad).is_err(), "{bad}");
+        }
+    }
+
     #[tokio::test]
     async fn a_zone_the_account_doesnt_serve_is_a_zone_error() {
         let (p, _st) = served(vec![]).await;
@@ -411,7 +546,7 @@ mod tests {
             let srv = recs.iter().find(|r| r["type"] == "SRV").unwrap();
             assert_eq!(
                 (srv["name"].as_str(), srv["data"].as_str(), srv["priority"].as_u64()),
-                (Some("_http._tcp.demo"), Some("0 20001 demo.boxes.example.com"), Some(0))
+                (Some("_http._tcp.demo"), Some("0 20001 demo.boxes.example.com."), Some(0))
             );
         }
         // What it made lists as what was planned: the next plan is empty.

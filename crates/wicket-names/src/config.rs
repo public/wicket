@@ -279,6 +279,11 @@ impl PublicConfig {
             }
             _ => {}
         }
+        // Vultr raises a TTL below 60 to 60 (#815 review), so the records would never list as
+        // written and every pass would plan them again.
+        if self.provider == ProviderKind::Vultr && self.ttl < 60 {
+            bad.push(format!("names.public.ttl {} is below 60, the lowest the vultr provider keeps", self.ttl));
+        }
         bad
     }
 }
@@ -339,6 +344,18 @@ mod tests {
         let unit = "[Service]\nExecStart=/usr/local/lib/wicket-intake/wicket node intake --listen=0.0.0.0:7443 --socket /x\n";
         assert_eq!(own_ports_from(Some(env), Some(unit)), vec![7443, 9443]);
         assert_eq!(own_ports_from(Some("WICKET_CONSOLE_ARGS=--origin https://c.example.com"), None), vec![INTAKE_PORT, CONSOLE_PORT]);
+    }
+
+    /// #815 review: Vultr keeps no TTL below 60, so the vultr provider is refused one.
+    #[test]
+    fn the_vultr_provider_needs_a_ttl_of_60_or_more() {
+        let with = |ttl: u32| {
+            parse(&format!(
+                r#"{{ "public": {{ "provider": "vultr", "credential": "dns-boxes", "zone": "boxes.example.com", "owner": "a1b2c3d4", "ttl": {ttl} }} }}"#
+            ))
+        };
+        assert!(with(30).check_with(&[CONSOLE_PORT, INTAKE_PORT]).unwrap_err().contains("below 60"));
+        assert_eq!(with(60).check_with(&[CONSOLE_PORT, INTAKE_PORT]), Ok(()));
     }
 
     #[test]
