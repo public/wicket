@@ -9,7 +9,7 @@
 #
 # Open http://127.0.0.1:8790/?fixture=NAME, with NAME one of full (the default), empty, signedout,
 # bootstrap, stale (the poll fails after the first) or expired (the session ends after the first).
-# --shots takes each scenario (default: full empty signedout sheet; sheet is an approval sheet open)
+# --shots takes each scenario (default: inbox agents agent activity settings empty signedout sheet)
 # at 1440x900 and on a 390x844 phone (deviceScaleFactor 2), light and dark, and fails if the page
 # logs an error (a CSP violation, say) or scrolls sideways. Needs Node, and Playwright for --shots.
 set -euo pipefail
