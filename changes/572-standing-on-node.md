@@ -1,5 +1,5 @@
 ---
-area: Identity, spawn and links
+area: Approvals and the console
 type: Fixed
 ---
 - `await_grant` on a standing ask ([#572](https://github.com/public/wicket/issues/572)) answers
