@@ -5,8 +5,8 @@
 //!   for: no reason or one too long (400), a node that isn't an active placed node of this
 //!   installation (404), a node whose lease hasn't ended (409: the reconciler releases it then),
 //!   and an operator whose `operators.yaml` scope doesn't cover `capacity` at R4 (403).
-//! - The signed JSON names the node, its lease's end, the runs still running there and those whose
-//!   files a fetch didn't collect, what releasing it does in words, the reason, and the effect's
+//! - The signed JSON names the node, its lease's end, the runs still running there, its service instances, and
+//!   the runs whose files a fetch didn't collect, what releasing it does in words, the reason, and the effect's
 //!   sha256 ([`wicket_control::noderelease::PastLease::effect`]).
 //! - At finish, the decision is made on that effect: a node whose runs or lease changed since is
 //!   refused (and audited). It is audited (`placement.node_release_decided`, with the signed
@@ -50,7 +50,7 @@ pub(super) fn build(state: &State, l: &Ledger, oc: &OperatorCredential, body: &V
     let effect_sha256 = n.effect_sha256();
     let v = json!({
         "v": 1, "action": "node_release", "tenant": state.tenant.0, "id": n.id, "name": n.name, "backend": n.backend,
-        "lease_until": n.lease_until, "running": n.running, "uncollected": n.uncollected,
+        "lease_until": n.lease_until, "running": n.running, "services": n.services, "uncollected": n.uncollected,
         "consequence": n.consequence(), "reason": reason, "effect": n.effect(), "effect_sha256": effect_sha256,
     });
     Ok((Action::NodeRelease { id: n.id, reason: reason.into(), effect_sha256 }, v))
@@ -68,9 +68,8 @@ pub(super) fn apply(
 ) -> Result<String> {
     let by = super::fence::human(state, oc)?;
     let d = nr::Decision {
-        by: &by,
-        root: false,
-        shown: Some(effect),
+        by: nr::Decider::Operator { by: &by, console: true },
+        shown: effect,
         why: reason,
         extra: json!({ "action": "node_release", "via": "console", "signed": signed }),
     };
@@ -95,8 +94,9 @@ pub(super) fn release_in_background(ledger: std::path::PathBuf, r: Release) -> R
     let p = crate::nodecreate::release_placer(&r.node.owner, &r.node.api_key_secret)?;
     tokio::spawn(async move {
         let done = match Ledger::open(&ledger) {
-            Ok(mut l) => nr::release(&mut l, &p, &r.node, &r.by, r.seq, crate::nodecreate::retire_enrolment).await,
-            Err(e) => Err(e.into()),
+            // Its own failures, before or after the destroy, are audited by `release` itself.
+            Ok(mut l) => nr::release(&mut l, &p, &r.node, &r.by, r.seq, crate::nodecreate::retire_enrolment, wicket_store::now()).await,
+            Err(e) => Err(anyhow::Error::from(e).context("the ledger can't be opened, so nothing was released")),
         };
         match done {
             Ok(said) => tracing::info!("console release: {said}"),

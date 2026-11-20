@@ -71,6 +71,23 @@ fn a_node_past_its_lease_is_released_with_a_passkey_on_what_was_shown() {
     assert!(released.lock().unwrap().is_empty());
     assert!(t.audit_kinds().iter().any(|(k, b)| k == "decision.refused" && b["decision"] == "release_node"));
 
+    // The lease moved between begin and signing (the node was made again): stale too.
+    let b = begin(&t, "i-past", "x");
+    placed(&t.ledger(), "i-past", "placed-a", now - 30);
+    let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
+    let signed = t.sign(&ch);
+    assert_refused(&t.post("/api/action/finish", signed), StatusCode::CONFLICT, "changed after you were shown it");
+    assert!(released.lock().unwrap().is_empty());
+
+    // A service instance on it is shown and signed: it is stopped before the machine goes.
+    let l = t.ledger();
+    l.run_started(&TenantId::single(), &RunId("run_svc".into()), "z", "cache").unwrap();
+    l.record_service_instance("run_svc", "cache", "placed-a", &TenantId::single().0, "sha", now).unwrap();
+    drop(l);
+    let b = begin(&t, "i-past", "x");
+    assert_eq!(b.body["action"]["services"], json!(["cache:run_svc"]), "{:?}", b.body);
+    assert!(b.body["action"]["consequence"].as_str().unwrap().contains("stops the service instances cache:run_svc"));
+
     // Signed on the node as it is now: decided, audited first, then released.
     let r = t.act(json!({ "action": "node_release", "id": "i-past", "reason": "done with it" }));
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);

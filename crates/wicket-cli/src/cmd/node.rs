@@ -45,7 +45,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             NodeCmd::Create(args) => nodecreate::create(*args).await,
-            NodeCmd::Release { common, id } => nodecreate::release(common, id).await,
+            NodeCmd::Release { common, id, reason } => nodecreate::release(common, id, reason, wicket_home::cli_is_root()).await,
             NodeCmd::Plans { common, region, plan_type } => nodecreate::plans(common, region, plan_type).await,
             NodeCmd::Revoke { name } => {
                 let mut l = Ledger::open(&ledger_path())?;
@@ -275,6 +275,9 @@ pub enum NodeCmd {
         common: nodecreate::Common,
         /// The provider's instance id, or the node's name.
         id: String,
+        /// Why: it goes on the audit record.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// List a provider's (Vultr's) plans in a region, with their hourly price.
     Plans {

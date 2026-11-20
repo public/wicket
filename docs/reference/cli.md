@@ -1135,6 +1135,8 @@ Options:
           The vault secret holding the Vultr API key [default: vultr-api-key]
       --owner <OWNER>
           The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
+      --reason <REASON>
+          Why: it goes on the audit record
   -h, --help
           Print help
 ```
