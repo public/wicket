@@ -12,7 +12,9 @@
 //! - **`work_claims`:** a run's claim on a piece of work (`github.com/acme/app#123`), live while
 //!   the run is, and what `owner_of` reads.
 //! - **`trigger_cursors`:** how far a source that reads a sequence has read: wicket's own events,
-//!   by the audit chain's seq.
+//!   by the audit chain's seq (source `wicket`). A `held:<trigger id>` row is one trigger held
+//!   back while its owner can't be checked: the seq it has heard to, which it catches up from
+//!   once the check works (the row is then deleted), while `wicket` moves on for the others.
 //! - **`trigger_causes`:** the triggers that led to each turn a trigger queued (its message id),
 //!   so an event of the run that read it knows which triggers caused it, and none fires twice in
 //!   one chain.
@@ -544,9 +546,12 @@ impl Ledger {
         Ok(())
     }
 
-    /// The newest audit record written before `ts`, if any.
-    pub fn audit_seq_before(&self, ts: i64) -> Result<Option<i64>> {
-        Ok(self.conn.query_row("SELECT MAX(seq) FROM audit WHERE ts < ?1", params![ts], |r| r.get(0))?)
+    /// The newest audit record in `(after, upto]` written before `ts`, if any. The seq range keeps
+    /// it to a range of the primary key (there is no index on `ts`).
+    pub fn audit_seq_before(&self, ts: i64, after: i64, upto: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(seq) FROM audit WHERE seq > ?2 AND seq <= ?3 AND ts < ?1", params![ts, after, upto], |r| r.get(0))?)
     }
 
     pub fn trigger_event(&self, id: &str) -> Result<Option<TriggerEvent>> {

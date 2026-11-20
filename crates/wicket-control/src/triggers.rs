@@ -978,20 +978,38 @@ fn wicket_pass(l: &Ledger, now: i64, dry_run: bool, wake: Waker<'_>, owner: Owne
     // Triggers held back by an owner that couldn't be checked: each catches up on its own records
     // once the check works, while the shared cursor moves on for every other trigger.
     if !dry_run {
-        for (id, held) in l.trigger_holds(&tenant)? {
+        let holds = l.trigger_holds(&tenant)?;
+        // Catching up reads at most a pass's worth of records, all holds together; a hold not
+        // caught up moves to where it got and goes on next pass.
+        let mut budget = AUDIT_PER_PASS;
+        // The newest record past the cutoff behind the shared cursor, looked up once a pass (over
+        // seqs after the oldest hold) and only if some trigger is still held.
+        let mut stale: Option<Option<i64>> = None;
+        let oldest = holds.iter().map(|(_, s)| *s).min().unwrap_or(seq);
+        for (id, held) in holds {
             let Some(t) = listening.iter().find(|t| t.id == id).cloned() else {
                 l.release_trigger_hold(&tenant, &id)?;
                 continue;
             };
             match owner(&t) {
                 Ok(()) => {
-                    out.extend(hear(l, &tenant, std::slice::from_ref(&t), held, seq, now, wake, None)?);
-                    l.release_trigger_hold(&tenant, &id)?;
+                    let (fired, reached) = hear(l, &tenant, std::slice::from_ref(&t), held, seq, now, wake, None, &mut budget)?;
+                    out.extend(fired);
+                    if reached >= seq {
+                        l.release_trigger_hold(&tenant, &id)?;
+                    } else {
+                        l.hold_trigger(&tenant, &id, reached)?;
+                        listening.retain(|x| x.id != id);
+                    }
                 }
                 Err(e @ NotOwner::Unknown(_)) => {
                     // What passed the cutoff meanwhile is passed over for this trigger alone.
-                    if let Some(stale) = l.audit_seq_before(now - EVENT_STALE_SECS)?.filter(|s| *s > held) {
-                        l.hold_trigger(&tenant, &id, stale.min(seq))?;
+                    let stale = match stale {
+                        Some(s) => s,
+                        None => *stale.insert(l.audit_seq_before(now - EVENT_STALE_SECS, oldest, seq)?),
+                    };
+                    if let Some(stale) = stale.filter(|s| *s > held) {
+                        l.hold_trigger(&tenant, &id, stale)?;
                     }
                     match owner_failed(l, &t, e) {
                         Ok(f) => out.push(f),
@@ -1016,7 +1034,8 @@ fn wicket_pass(l: &Ledger, now: i64, dry_run: bool, wake: Waker<'_>, owner: Owne
         return Ok(out);
     }
     if dry_run {
-        out.extend(hear(l, &tenant, &listening, seq, head, now, wake, Some(owner))?.into_iter().map(|mut f| {
+        let mut all = usize::MAX;
+        out.extend(hear(l, &tenant, &listening, seq, head, now, wake, Some(owner), &mut all)?.0.into_iter().map(|mut f| {
             f.status = "due".into();
             f
         }));
@@ -1058,7 +1077,8 @@ fn raw_kinds(listening: &[Trigger]) -> Vec<&'static str> {
 }
 
 /// `triggers` hear the records of their kinds in `(from, to]`, without the shared cursor: a held
-/// trigger catching up (`owner` None: already checked), or a dry run's report.
+/// trigger catching up (`owner` None: already checked), or a dry run's report. Reads at most
+/// `budget` records, taking them from it, and returns what fired and the seq it read to.
 #[allow(clippy::too_many_arguments)]
 fn hear(
     l: &Ledger,
@@ -1069,15 +1089,24 @@ fn hear(
     now: i64,
     wake: Waker<'_>,
     owner: Option<OwnerCheck<'_>>,
-) -> Result<Vec<Fired>> {
+    budget: &mut usize,
+) -> Result<(Vec<Fired>, i64)> {
     let mut listening = triggers.to_vec();
     let raw = raw_kinds(&listening);
     let mut out = vec![];
     let mut at = from;
     let dry = owner.is_some();
-    while !raw.is_empty() && at < to {
-        let recs = l.audit_records_of_kinds(at, to, &raw, AUDIT_BATCH)?;
-        let Some(last) = recs.last().map(|r| r.seq) else { break };
+    if raw.is_empty() {
+        return Ok((out, to));
+    }
+    while at < to {
+        if *budget == 0 {
+            return Ok((out, at));
+        }
+        let n = AUDIT_BATCH.min(*budget);
+        let recs = l.audit_records_of_kinds(at, to, &raw, n)?;
+        let Some(last) = recs.last().map(|r| r.seq) else { return Ok((out, to)) };
+        *budget -= recs.len();
         if dry {
             for r in &recs {
                 let Some((kind, fields)) = wicket_event(l, r)? else { continue };
@@ -1094,11 +1123,12 @@ fn hear(
             out.extend(hear_records(l, tenant, &mut listening, &recs, now, wake, None, false)?);
         }
         at = last;
-        if recs.len() < AUDIT_BATCH {
-            break;
+        // Fewer than asked for: nothing of these kinds is left before `to`.
+        if recs.len() < n {
+            return Ok((out, to));
         }
     }
-    Ok(out)
+    Ok((out, to))
 }
 
 /// The triggers among `listening` that hear record `r`: of its kind, live when it was written,
@@ -1131,6 +1161,7 @@ fn hear_records(
     shared: bool,
 ) -> Result<Vec<Fired>> {
     let mut out = vec![];
+    // Within a batch; a trigger that fails its check leaves `listening`, which lasts the pass.
     let mut checked: std::collections::HashMap<String, bool> = Default::default();
     for r in recs.iter().filter(|r| r.tenant == tenant) {
         let Some((kind, fields)) = wicket_event(l, r)? else { continue };
@@ -1164,6 +1195,10 @@ fn hear_records(
             }
             firing.push(t);
         }
+        // A trigger paused or held here hears nothing more this pass: dropped before anything
+        // else, so a record it alone hears doesn't check it again (and move its hold past what it
+        // missed) in this batch or the pass's next.
+        listening.retain(|t| checked.get(&t.id) != Some(&false));
         if firing.is_empty() {
             continue;
         }
@@ -1211,8 +1246,8 @@ fn hear_records(
                 }
             }
         }
-        // A trigger paused or held here hears nothing more this pass.
-        listening.retain(|t| checked.get(&t.id) != Some(&false) && l.trigger(&t.id).ok().flatten().is_some_and(|x| x.status == "active"));
+        // Nor one its firing paused (too many failures).
+        listening.retain(|t| l.trigger(&t.id).ok().flatten().is_some_and(|x| x.status == "active"));
     }
     Ok(out)
 }
@@ -1971,6 +2006,38 @@ mod tests {
         let got = pass(&l, wicket_store::now(), false, &no_wake, &anyone).unwrap();
         assert_eq!(by(&stuck, &got), ["started", "started"], "{got:?}");
         assert!(by(&fine, &got).is_empty(), "nothing twice for the other");
+    }
+
+    /// #683 re-review: a held trigger that alone hears records in a later batch of the same pass
+    /// isn't checked again there, so its hold stays before the first record it missed. Catching
+    /// up reads at most a pass's worth, and goes on next pass from where it got.
+    #[test]
+    fn a_hold_lasts_the_pass_and_catching_up_is_capped() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        hibernated_agent(&mut l, "captain");
+        assert!(pass(&l, wicket_store::now(), false, &no_wake, &anyone).unwrap().is_empty());
+        let s = spec("trigger: lone\nsource: { wicket: { kinds: [run.end] } }\naction: { wake: captain }\n");
+        let (id, _) = create(&l, &operator(), &s, None, "t").unwrap();
+        let first = l.audit(&TenantId::single(), None, "run.end", &json!({})).unwrap();
+        for _ in 0..AUDIT_BATCH + 4 {
+            l.audit(&TenantId::single(), None, "run.end", &json!({})).unwrap();
+        }
+        let nss = |_: &Trigger| -> std::result::Result<(), NotOwner> { Err(NotOwner::Unknown("timed out".into())) };
+        let head = l.audit_head().unwrap().unwrap().0;
+        let got = pass(&l, wicket_store::now(), false, &no_wake, &nss).unwrap();
+        assert_eq!(got.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(), ["skipped"], "checked once in the pass");
+        assert_eq!(l.trigger_holds("t0").unwrap(), [(id.clone(), first - 1)], "held before the first record it missed");
+        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), Some(head));
+        // The catch-up reads (first - 1, head] in a pass's budget.
+        let mut budget = 3;
+        let t = l.trigger(&id).unwrap().unwrap();
+        let (_, reached) =
+            hear(&l, "t0", std::slice::from_ref(&t), first - 1, head, wicket_store::now(), &no_wake, None, &mut budget).unwrap();
+        assert_eq!((reached, budget), (first + 2, 0), "three records, then stopped");
+        let mut budget = AUDIT_PER_PASS;
+        let (_, reached) =
+            hear(&l, "t0", std::slice::from_ref(&t), reached, head, wicket_store::now(), &no_wake, None, &mut budget).unwrap();
+        assert_eq!(reached, head, "the rest, to the end");
     }
 
     /// #662 follow-ups: an owner check that can't be made (the user database didn't answer)
