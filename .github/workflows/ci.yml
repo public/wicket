@@ -472,6 +472,9 @@ jobs:
         shard: [1, 2, 3, 4]
     env:
       KANI_VERSION: 0.68.0
+      # Kani's release bundle (CBMC and its own compiler), which `cargo kani setup` would download
+      # unchecked: fetched here and checked first (#722). Update with KANI_VERSION.
+      KANI_BUNDLE_SHA256: 32e2b484d73ede0bbf64a2cf0879c4259422497d8aec4ee67d448de9ae7843d3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -484,7 +487,11 @@ jobs:
       - name: Install Kani
         run: |
           cargo install --locked kani-verifier --version "$KANI_VERSION"
-          cargo kani setup
+          f=kani-$KANI_VERSION-x86_64-unknown-linux-gnu.tar.gz
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$f" "https://github.com/model-checking/kani/releases/download/kani-$KANI_VERSION/$f"
+          echo "$KANI_BUNDLE_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          cargo kani setup --use-local-bundle "$RUNNER_TEMP/$f"
+          rm "$RUNNER_TEMP/$f"
       - env:
           SHARD: ${{ matrix.shard }}
         run: ci/kani.sh --shard "$SHARD/4"

@@ -22,14 +22,15 @@ What the profile sets, beyond the generic ACP posture:
   - `disallowedTools`: `WebSearch`, plus `Agent` and `Task` when `in_box_subagents: false`;
   - the manifest's `model`.
 
-Build the image (the adapter's version and registry integrity are pinned in the Dockerfile), then run:
+Build the image (the adapter and every package it needs are pinned by integrity in `package-lock.json`,
+installed with `npm ci --ignore-scripts`), then run:
 
 ```sh
 docker build -t wicket/claude-code-acp:poc examples/acp-claude   # --network host where builds have no DNS
 wicket run examples/acp-claude/manifest.yaml --workdir path/to/repo
 ```
 
-The image has been built with 0.104.1, with the integrity check passing. Against that version, the
+The image has been built with 0.104.1 from that lockfile. Against that version, the
 adapter applies the client's `_meta.claudeCode.options` after its own defaults, so `settingSources`,
 `strictMcpConfig` and `model` replace them; it merges `disallowedTools` with its own. wicket refuses to run this example on a subscription unless the installation allows it:
 `acp.allow_subscription_backed_claude_adapter: true` in `/etc/wicket/wicket.yaml`

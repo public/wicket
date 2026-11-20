@@ -37,7 +37,14 @@ jobs:
           key: ${{ hashFiles('Cargo.toml') }}
       - name: Install gVisor as a Docker runtime
         run: |
-          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          # gVisor's apt signing key, accepted only if it is the one key with the fingerprint pinned
+          # here (#722; docs/explanation/supply-chain.md): a key fetched at run time could be anyone's,
+          # and a second key appended to it would be trusted too.
+          fpr=6F1DF85E3A71C24918E727D56FC6D554E32BD943
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gvisor.key" https://gvisor.dev/archive.key
+          got=$(gpg --show-keys --with-colons "$RUNNER_TEMP/gvisor.key" | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { print $10; p = 0 }')
+          [ "$got" = "$fpr" ] || { echo "::error::gVisor's apt key is not the pinned $fpr: got ${got:-nothing}"; exit 1; }
+          sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg <"$RUNNER_TEMP/gvisor.key"
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
             | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
           for i in 1 2 3 4; do
