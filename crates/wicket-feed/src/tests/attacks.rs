@@ -94,6 +94,9 @@ fn a02_replayed_old_delta() {
     assert_eq!(r.mode(T0 + 20), Mode::Fresh);
 }
 
+/// An old snapshot replayed after the node moved on is never applied (#589): signed no later than
+/// the deltas the node holds, it is dropped as superseded, as a replayed statement is, not taken
+/// as a rollback. One signed after them is refused (`restored_backup_is_refused_until_regenesis`).
 #[test]
 fn a03_old_signed_snapshot() {
     let (mut cp, mut r) = setup();
@@ -102,7 +105,11 @@ fn a03_old_signed_snapshot() {
         let d = cp.p.commit(vec![add(grant(&format!("g-{i}"), &read(), T0 + 3_600_000))], T0 + i).unwrap();
         r.accept(&d, T0 + 5).unwrap();
     }
-    refused(&mut r, old, T0 + 20, "rollback");
+    let held = (r.state().unwrap().epoch, r.state().unwrap().head.clone());
+    r.accept(&old, T0 + 20).expect("superseded");
+    assert_eq!((r.state().unwrap().epoch, r.state().unwrap().head.clone()), held, "never applied");
+    assert_eq!(r.stats.superseded, 1);
+    assert!(r.stats.refused.is_empty(), "{:?}", r.stats.refused);
 }
 
 #[test]

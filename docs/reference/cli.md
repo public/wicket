@@ -1976,7 +1976,7 @@ Usage: wicket policy <COMMAND>
 Commands:
   show   The org policy's version, and the running runs minted under another
   check  Validate and compile an org policy without installing it
-  apply  Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy)
+  apply  Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy). The console applies one the same way, signed with a passkey on what --dry-run shows
   zone   A zone's policy as Cedar, generated from a manifest (what its boxes' tokens are compiled from)
   help   Print this message or the help of the given subcommand(s)
 
@@ -2014,7 +2014,7 @@ Options:
 ### `wicket policy apply`
 
 ```text
-Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy)
+Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy). The console applies one the same way, signed with a passkey on what --dry-run shows
 
 Usage: wicket policy apply [OPTIONS] <FILE>
 
@@ -2024,6 +2024,7 @@ Arguments:
 Options:
       --entities <ENTITIES>  
       --keep-runs            Leave running runs on the policy they were minted under until they end
+      --dry-run              Change nothing: print what applying it would do (its version and the one it replaces, what it changes against the applied policy for each running zone and group, whether it mints for every running run's zone, and the runs it would revoke) and the effect the console signs
   -h, --help                 Print help
 ```
 
