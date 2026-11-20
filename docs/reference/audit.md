@@ -51,8 +51,8 @@ batch: 500
 # (only with a durable sink and the state store streaming: see Retention below). Default 2.
 host_gb: 2
 sinks:
-  # JSON lines, for journald, Vector or Fluent Bit. path "-" means stdout; only
-  # `wicket audit export` writes to stdout.
+  # JSON lines, for journald, Vector or Fluent Bit. The path must be absolute; "-" means
+  # stdout, which only `wicket audit export` writes to.
   - name: local-file
     type: jsonl
     path: /var/log/wicket/audit.jsonl

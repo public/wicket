@@ -292,11 +292,10 @@ impl Ledger {
             let from: i64 = l.conn.query_row("SELECT COALESCE(MIN(seq), 0) FROM audit", [], |r| r.get(0))?;
             // The restores kept below the cut, by seq and hash: below the anchor nothing chains
             // them, so this (chained) record is what vouches for them (`trusted_restores`).
-            let restored: Vec<(i64, String)> = {
-                let mut st = l.conn.prepare("SELECT seq, hash FROM audit WHERE kind = 'state.restored' AND seq < ?1 ORDER BY seq")?;
-                let rows = st.query_map(params![cp.seq], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
+            // Only those the chain vouches for now, by the anchor before this one: one forged below
+            // that, which nothing chains, isn't listed and so isn't laundered by this prune.
+            let restored: Vec<(i64, String)> =
+                l.trusted_restores()?.into_iter().filter(|r| r.seq < cp.seq).map(|r| (r.seq, r.hash)).collect();
             l.conn.execute(
                 "INSERT INTO audit_anchor (id, seq, hash, jws, sink, pruned_at, pruned) VALUES (1, ?1, ?2, ?3, ?4, ?5, 0)
                  ON CONFLICT (id) DO UPDATE SET seq = ?1, hash = ?2, jws = ?3, sink = ?4, pruned_at = ?5",
@@ -315,40 +314,46 @@ impl Ledger {
         }
     }
 
-    /// The `state.restored` records the chain vouches for: those from the anchor on (chained), and
-    /// those kept below it that the newest `audit.pruned` record lists by seq and hash and whose
-    /// own fields still hash to it. One inserted or changed below the anchor isn't among them.
+    /// The `state.restored` records the chain vouches for: those from the anchor on that are chained
+    /// (their fields hash to their hash, and the next record's `prev` is it), and those kept below
+    /// it that the newest `audit.pruned` record lists by seq and hash and whose own fields still
+    /// hash to it. One inserted or changed below the anchor isn't among them, nor one inserted out
+    /// of the chain above it.
     pub fn trusted_restores(&self) -> Result<Vec<crate::AuditRecord>> {
         let anchor = self.audit_anchor()?.map(|a| a.seq).unwrap_or(0);
         let all = self.audit_of_kind("state.restored")?;
-        if anchor == 0 {
-            return Ok(all);
+        let listed: Vec<(i64, String)> = match anchor {
+            0 => vec![],
+            _ => self
+                .audit_of_kind("audit.pruned")?
+                .iter()
+                .rfind(|r| r.seq >= anchor)
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+                .and_then(|v| serde_json::from_value(v["kept_restores"].clone()).ok())
+                .unwrap_or_default(),
+        };
+        let own_hash = |r: &crate::AuditRecord| {
+            crate::chain_hash_v2(
+                &r.prev,
+                &crate::ChainFields { seq: r.seq, ts: r.ts, tenant: &r.tenant, run: r.run.as_deref(), kind: &r.kind, body: &r.body },
+            ) == r.hash
+        };
+        let mut out = vec![];
+        for r in all {
+            let ok = if r.seq >= anchor {
+                let next: Option<String> = self
+                    .conn
+                    .query_row("SELECT prev FROM audit WHERE seq > ?1 ORDER BY seq LIMIT 1", params![r.seq], |x| x.get(0))
+                    .optional()?;
+                own_hash(&r) && next.is_none_or(|p| p == r.hash)
+            } else {
+                listed.iter().any(|(s, h)| *s == r.seq && *h == r.hash) && own_hash(&r)
+            };
+            if ok {
+                out.push(r);
+            }
         }
-        let listed: Vec<(i64, String)> = self
-            .audit_of_kind("audit.pruned")?
-            .iter()
-            .rfind(|r| r.seq >= anchor)
-            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
-            .and_then(|v| serde_json::from_value(v["kept_restores"].clone()).ok())
-            .unwrap_or_default();
-        Ok(all
-            .into_iter()
-            .filter(|r| {
-                r.seq >= anchor
-                    || (listed.iter().any(|(s, h)| *s == r.seq && *h == r.hash)
-                        && crate::chain_hash_v2(
-                            &r.prev,
-                            &crate::ChainFields {
-                                seq: r.seq,
-                                ts: r.ts,
-                                tenant: &r.tenant,
-                                run: r.run.as_deref(),
-                                kind: &r.kind,
-                                body: &r.body,
-                            },
-                        ) == r.hash)
-            })
-            .collect())
+        Ok(out)
     }
 
     /// Deletes up to `rows` audit records before the anchor (all but [`KEPT_KINDS`]), in one short
@@ -613,6 +618,52 @@ mod tests {
         // The listed one changed in place.
         l.conn.execute("UPDATE audit SET body = '{\"rolled_back_after\":0}' WHERE seq = 11", []).unwrap();
         assert!(seqs(&l).is_empty(), "its fields no longer hash to what was listed");
+    }
+
+    /// #677 follow-up: a second prune lists only the restores the chain vouched for before it, so a
+    /// forged one below the first anchor isn't laundered into the second's list.
+    #[test]
+    fn a_second_prune_doesnt_launder_a_forged_restore() {
+        let l = Ledger::open_in_memory().unwrap();
+        chain(&l, 10);
+        l.audit(&TenantId::single(), None, "state.restored", &serde_json::json!({ "rolled_back_after": 4 })).unwrap();
+        chain(&l, 20);
+        let at = |l: &Ledger, s: i64| Checkpoint {
+            sink: "a".into(),
+            target: "t".into(),
+            seq: s,
+            head: l.audit_hash_at(s).unwrap().unwrap(),
+            ts: 0,
+            jws: String::new(),
+        };
+        prune(&l, &at(&l, 25));
+        let seqs = |l: &Ledger| l.trusted_restores().unwrap().iter().map(|r| r.seq).collect::<Vec<_>>();
+        // A restore forged below the first anchor, its own fields hashing as a real record's do.
+        let r = l.audit_record_at(11).unwrap().unwrap();
+        let body = r#"{"rolled_back_after":0}"#;
+        let hash = crate::chain_hash_v2(
+            &r.prev,
+            &crate::ChainFields { seq: 3, ts: r.ts, tenant: &r.tenant, run: None, kind: "state.restored", body },
+        );
+        l.conn
+            .execute(
+                "INSERT INTO audit (seq, ts, tenant, run, kind, body, prev, hash) VALUES (3, ?1, ?2, NULL, 'state.restored', ?3, ?4, ?5)",
+                params![r.ts, r.tenant, body, r.prev, hash],
+            )
+            .unwrap();
+        assert_eq!(seqs(&l), [11], "not trusted after the first prune");
+        chain(&l, 20);
+        let head = l.audit_head().unwrap().unwrap().0;
+        prune(&l, &at(&l, head - 5));
+        assert_eq!(seqs(&l), [11], "nor after the second");
+        let pruned = l.audit_of_kind("audit.pruned").unwrap();
+        let listed = &serde_json::from_str::<serde_json::Value>(&pruned.last().unwrap().body).unwrap()["kept_restores"];
+        assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+        // One inserted above the anchor, out of the chain, isn't trusted either.
+        let anchor = l.audit_anchor().unwrap().unwrap().seq;
+        let tail = l.audit_record_at(anchor + 1).unwrap().unwrap();
+        l.conn.execute("UPDATE audit SET kind = 'state.restored' WHERE seq = ?1", params![tail.seq]).unwrap();
+        assert_eq!(seqs(&l), [11], "its fields don't hash to its hash");
     }
 
     /// A sink pointed at another target starts again, and its checkpoints are forgotten.

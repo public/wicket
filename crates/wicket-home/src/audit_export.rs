@@ -253,6 +253,15 @@ impl SinksConfig {
             if s.durable && matches!(&s.kind, SinkKind::Jsonl { path } if path == "-") {
                 bail!("sink {:?}: standard output isn't durable (nothing keeps what it prints)", s.name);
             }
+            // Processes in different working directories would write two files under one cursor.
+            if let SinkKind::Jsonl { path } = &s.kind {
+                if path != "-" && !Path::new(path).is_absolute() {
+                    bail!(
+                        "sink {:?}: a jsonl path must be absolute ({path:?}): every wicket process exporting it shares one cursor",
+                        s.name
+                    );
+                }
+            }
         }
         if c.batch == 0 {
             bail!("batch must be at least 1");
@@ -374,8 +383,9 @@ pub fn retention_with(l: &Ledger, cfg: std::result::Result<&SinksConfig, &str>, 
         match s.target() {
             Ok(t) => targets.push((s.name.as_str(), t)),
             Err(e) => {
-                r.waiting = Some(format!("over its limit, but where sink {} points can't be told ({e:#}): nothing pruned", s.name));
-                return Ok(r);
+                // Nothing new pruned; what an earlier prune left was resumed above, so settle it.
+                r.waiting = Some(format!("over its limit, but where sink {} points can't be told ({e:#}): nothing new pruned", s.name));
+                return settle(l, r);
             }
         }
     }
@@ -1119,13 +1129,31 @@ pub fn spawn_background() {
             return;
         }
     };
-    let issuer = crate::issuer().map_err(|e| eprintln!("wicket: audit checkpoints are off (no issuer key: {e})")).ok();
+    // Checked (and said) once; loaded again for each try below (an issuer isn't `Clone`).
+    let signs = crate::issuer().map_err(|e| eprintln!("wicket: audit checkpoints are off (no issuer key: {e})")).is_ok();
     let path = crate::ledger_path();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<std::sync::mpsc::SyncSender<()>>();
     let _ = std::thread::Builder::new().name("wicket-audit-export".into()).spawn(move || {
-        let mut x = match Exporter::new(&path, cfg, issuer) {
-            Ok(x) => x,
-            Err(e) => return eprintln!("wicket: audit export is off: {e:#}"),
+        // A ledger busy at the start (a migration, a long write elsewhere) is waited out, not taken
+        // as export being off for the life of the process; a stop still ends it meanwhile.
+        let mut wait = Duration::from_secs(1);
+        let mut x = loop {
+            let issuer = if signs { crate::issuer().ok() } else { None };
+            match Exporter::new(&path, cfg.clone(), issuer) {
+                Ok(x) => break x,
+                Err(e) if is_busy(&e) => {
+                    eprintln!("wicket: audit export waits for the ledger ({e:#}); trying again in {} s", wait.as_secs());
+                    match stop_rx.recv_timeout(wait) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => wait = (wait * 2).min(Duration::from_secs(60)),
+                        Ok(done) => {
+                            let _ = done.send(());
+                            return;
+                        }
+                        Err(_) => return,
+                    }
+                }
+                Err(e) => return eprintln!("wicket: audit export is off: {e:#}"),
+            }
         };
         loop {
             x.pass(false);
@@ -1145,6 +1173,21 @@ pub fn spawn_background() {
     if let Ok(mut s) = BACKGROUND.lock() {
         *s = Some(stop_tx);
     }
+}
+
+/// Whether `e` is SQLite saying another connection holds the database (busy or locked): worth
+/// trying again.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        let sql = c.downcast_ref::<rusqlite::Error>().or_else(|| match c.downcast_ref::<wicket_store::StoreError>() {
+            Some(wicket_store::StoreError::Sql(s)) => Some(s),
+            _ => None,
+        });
+        matches!(
+            sql.and_then(rusqlite::Error::sqlite_error_code),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    })
 }
 
 static BACKGROUND: Mutex<Option<std::sync::mpsc::Sender<std::sync::mpsc::SyncSender<()>>>> = Mutex::new(None);
@@ -1337,6 +1380,23 @@ mod tests {
         assert!(matches!(&c.sinks[1].kind, SinkKind::Otlp { headers, .. } if headers["x-tenant"] == "t"));
         assert!(SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: x}\n  - {name: a, type: jsonl, path: y}\n").is_err());
         assert!(SinksConfig::parse("sinks:\n  - {name: a, type: kafka}\n").is_err());
+        // #677 follow-up: a relative path would be another file in each working directory.
+        let e = SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: audit.jsonl}\n").unwrap_err().to_string();
+        assert!(e.contains("must be absolute"), "{e}");
+        assert!(SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: /var/log/a.jsonl}\n").is_ok());
+        assert!(SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: '-'}\n").is_ok());
+    }
+
+    /// #677 follow-up: a busy or locked ledger at the exporter's start is tried again, anything
+    /// else isn't.
+    #[test]
+    fn a_busy_ledger_is_worth_trying_again() {
+        let sql = |code| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+        let busy = anyhow::Error::from(wicket_store::StoreError::Sql(sql(rusqlite::ffi::SQLITE_BUSY))).context("opening the ledger");
+        assert!(is_busy(&busy));
+        assert!(is_busy(&anyhow::Error::from(sql(rusqlite::ffi::SQLITE_LOCKED))));
+        assert!(!is_busy(&anyhow::Error::from(sql(rusqlite::ffi::SQLITE_CORRUPT))));
+        assert!(!is_busy(&anyhow::anyhow!("database is busy, said someone")));
     }
 
     #[test]
