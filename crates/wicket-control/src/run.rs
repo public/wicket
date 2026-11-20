@@ -537,18 +537,42 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // starts it by its id.
     let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
     let image_name = image.to_string();
-    if record.is_none() && wake.is_none() {
-        // The operator's policy first (`images.yaml`'s `require_digests`): a tag is refused before
-        // anything is asked of a grant.
-        crate::images_policy::require_pinned(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
-        // The one "may this digest run" check (#258): a pinned image is accepted by a grant on its
-        // digest, which the operator running the manifest records. A child's image is pinned to
-        // its parent's, as its parent's zone allows (decided where it is spawned): not regranted.
-        if let (Some(pin), None) = (&image_pin, &parent_run) {
-            let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
-            let u = crate::digest::accept_image(&Ledger::open(&ledger_path())?, &m.tenant, &m.zone.name, image, pin, &by)?;
-            say!("[wicket] image {image} accepted by grant {} from {}", u.grant, u.decided_by);
+    // The run's id, before anything is admitted, so what admitting it audits names it.
+    let run = match run_id {
+        Some(id) => {
+            check_run_id(&id).with_context(|| "--run-id".to_string())?;
+            RunId(id)
         }
+        None => RunId::new(),
+    };
+    // The image, admitted before anything is asked of a grant or a node (`imagetrust::admit`): the
+    // operator's `require_digests`, then the `trust` policy's signatures (#191), then the grant on
+    // its digest (#258). The signature that verified it is what `run.image` records.
+    let mut signed: Option<wicket_chan::signature::Verified> = None;
+    if crate::imagetrust::admits(record.is_some(), wake.is_some()) {
+        let default_image = crate::image::effective(crate::image::DEFAULT);
+        let policy = crate::images_policy::load_with_keys()?;
+        let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
+        let ledger = Ledger::open(&ledger_path())?;
+        let cache = crate::imagetrust::cache_dir();
+        let admit = crate::imagetrust::Admit {
+            policy: &policy,
+            ledger: &ledger,
+            manifest: &m,
+            run: &run,
+            image,
+            default_image: &default_image,
+            parent: parent_run.as_deref(),
+            by: &by,
+            cache: Some(&cache),
+        };
+        signed = crate::imagetrust::admit(admit, |name, hosts| {
+            for h in hosts {
+                vault.get_for(name, h)?;
+            }
+            vault.get(name)
+        })
+        .await?;
     }
     // The workload's name, and what runs it: an agent's harness, or a program's command.
     let (workload, workload_runs) = match (&m.agent, &m.program) {
@@ -571,13 +595,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
     // its pinned ssh (a revoked one is refused), or this host's own built-in node over its unix socket.
     timings.since("checks", lap);
-    let run = match run_id {
-        Some(id) => {
-            check_run_id(&id).with_context(|| "--run-id".to_string())?;
-            RunId(id)
-        }
-        None => RunId::new(),
-    };
     // #579: a fresh run with no node named goes where the scheduler places it, as a woken agent
     // does: this host's own node is one candidate among the enrolled ones. With no other node
     // enrolled, it goes on this host's own, as before, whatever its placement terms.
@@ -1533,7 +1550,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     &m.tenant,
                     Some(&run),
                     "run.image",
-                    &serde_json::json!({ "image": image_name, "digest": d, "pinned": image_pin }),
+                    &crate::imagetrust::run_image_body(&image_name, d, image_pin.as_deref(), signed.as_ref()),
                 )?;
                 say!("  image {image_name} started as {d}");
             }

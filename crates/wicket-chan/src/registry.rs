@@ -133,6 +133,14 @@ impl Client {
 
     /// GETs `path` under the registry, answering a token challenge once.
     async fn get(&mut self, path: &str, accept: &str) -> Result<reqwest::Response> {
+        match self.get_opt(path, accept).await? {
+            Some(r) => Ok(r),
+            None => bail!("GET {}/v2/{}/{path}: {}", self.src.base(), self.src.repository, reqwest::StatusCode::NOT_FOUND),
+        }
+    }
+
+    /// As [`Client::get`], with None for a 404.
+    async fn get_opt(&mut self, path: &str, accept: &str) -> Result<Option<reqwest::Response>> {
         let url = format!("{}/v2/{}/{path}", self.src.base(), self.src.repository);
         for attempt in 0..2 {
             let r = self
@@ -146,10 +154,13 @@ impl Client {
                 self.challenge(&challenge).await?;
                 continue;
             }
+            if r.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
             if !r.status().is_success() {
                 bail!("GET {url}: {}", r.status());
             }
-            return Ok(r);
+            return Ok(Some(r));
         }
         bail!("GET {url}: refused after authenticating")
     }
@@ -216,6 +227,19 @@ impl Client {
             bail!("the registry's manifest {digest} does not match its digest");
         }
         Ok(body)
+    }
+
+    /// A small body, at most [`crate::oci::SMALL_MAX`] bytes; None for a 404.
+    async fn small(&mut self, path: &str, accept: &str) -> Result<Option<Vec<u8>>> {
+        let Some(mut r) = self.get_opt(path, accept).await? else { return Ok(None) };
+        let mut body = vec![];
+        while let Some(c) = r.chunk().await? {
+            body.extend_from_slice(&c);
+            if body.len() as u64 > crate::oci::SMALL_MAX {
+                bail!("{path} is too large");
+            }
+        }
+        Ok(Some(body))
     }
 
     /// Blob `digest` into `path`, hashed as it is written; it must be `size` bytes.
@@ -316,6 +340,44 @@ pub async fn pull(src: &Source, pin: &str, name: Option<&str>, cred: Option<&str
     }
     let (d, pin, name) = (dir.to_path_buf(), pin.to_string(), name.map(String::from));
     tokio::task::spawn_blocking(move || crate::oci::finish(&d, &have, &pin, name.as_deref())).await?
+}
+
+/// The most layers a signature artifact may name.
+const SIGNATURE_LAYERS_MAX: usize = 64;
+
+/// The signature artifact tagged `tag` in `src`'s repository (#191), with every layer it names,
+/// each checked against its digest; None if there is no such tag. Fetched by tag, since a
+/// signature can't be named by a digest before it is found: what it holds is checked by its scheme
+/// ([`crate::signature`]), and its manifest's digest is what the audit records.
+pub async fn signature(src: &Source, tag: &str, cred: Option<&str>) -> Result<Option<crate::signature::Artifact>> {
+    if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) || tag.len() > 128 {
+        bail!("{tag:?} is not a tag");
+    }
+    let mut c = Client::new(src.clone(), cred)?;
+    let Some(manifest) = c.small(&format!("manifests/{tag}"), &crate::oci::MANIFEST_TYPES.join(", ")).await? else {
+        return Ok(None);
+    };
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&manifest)));
+    let v: serde_json::Value = serde_json::from_slice(&manifest).with_context(|| format!("{tag} is not a manifest"))?;
+    let descs = v["layers"].as_array().with_context(|| format!("{tag} is not a manifest with layers"))?;
+    if descs.len() > SIGNATURE_LAYERS_MAX {
+        bail!("{tag} names more than {SIGNATURE_LAYERS_MAX} layers");
+    }
+    let (mut layers, mut total) = (vec![], 0u64);
+    for d in descs {
+        let bd = d["digest"].as_str().filter(|x| crate::oci::hex_of(x).is_some()).context("a descriptor without a sha256 digest")?;
+        let size = d["size"].as_u64().context("a descriptor without a size")?;
+        total = total.saturating_add(size);
+        if total > crate::oci::SMALL_MAX {
+            bail!("{tag}'s layers are too large for signatures");
+        }
+        let body = c.small(&format!("blobs/{bd}"), "*/*").await?.with_context(|| format!("{tag}'s layer {bd} is not in the registry"))?;
+        if body.len() as u64 != size || format!("sha256:{}", hex::encode(Sha256::digest(&body))) != bd {
+            bail!("the registry's blob {bd} does not match its digest");
+        }
+        layers.push(body);
+    }
+    Ok(Some(crate::signature::Artifact { digest, manifest, layers }))
 }
 
 #[cfg(any(test, feature = "testkit"))]
@@ -499,6 +561,31 @@ mod tests {
         pull(&src, &img.index, None, None, &d, 1 << 30).await.unwrap();
         assert!(cdn.hits.lock().unwrap().iter().all(|h| h.contains("/blobs/")) && !cdn.hits.lock().unwrap().is_empty());
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_signature_is_fetched_by_its_tag_with_its_layers_checked() {
+        use crate::signature::testkit::{artifact, payload};
+        let d = sha(b"the image");
+        let pl = payload(&d, "r/x");
+        let (md, m, layers) = artifact(&pl, b"sig");
+        let tag = format!("sha256-{}.sig", &d[7..]);
+        let mut blobs: HashMap<String, Vec<u8>> = layers.into_iter().collect();
+        blobs.insert(tag.clone(), m.clone());
+        let fake = testkit::serve("team/agent", blobs.clone(), None).await;
+        let src = Source { host: fake.addr.to_string(), repository: "team/agent".into(), ..Default::default() };
+        let a = signature(&src, &tag, None).await.unwrap().unwrap();
+        assert_eq!((a.digest.as_str(), a.layers.len()), (md.as_str(), 1));
+        assert_eq!(a.layers[0], pl);
+        // No such tag: unsigned, not an error.
+        assert!(signature(&src, "sha256-00.sig", None).await.unwrap().is_none());
+        assert!(signature(&src, "../x", None).await.is_err());
+        // A layer that doesn't match its digest.
+        blobs.insert(sha(&pl), b"other".to_vec());
+        let fake = testkit::serve("team/agent", blobs, None).await;
+        let src = Source { host: fake.addr.to_string(), ..src };
+        let e = signature(&src, &tag, None).await.unwrap_err();
+        assert!(format!("{e:#}").contains("does not match its digest"), "{e:#}");
     }
 
     #[tokio::test]

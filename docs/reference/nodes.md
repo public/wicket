@@ -602,6 +602,66 @@ from the control host first (#191):
   on its node. Tagged images are not sent: a tag is resolved where the box starts. `wicket self update`
   still loads its own agent image onto nodes by tag.
 
+### Image signatures
+
+`images.yaml`'s `trust` ([files](files.md)) says which keys must have signed which images (#191). It is
+checked on the control host when a run is admitted, after `require_digests` and before anything is asked
+of a grant or a node, never in the box. Without a `trust` section nothing is asked: no signature is
+fetched or checked, and images run as before.
+
+```yaml
+registries:
+  - host: registry.example.com
+trust:
+  default: require-signed        # or allow-unsigned: for images no rule matches
+  rules:
+    - repositories: ["registry.example.com/team/*"]
+      keys: [keys/team.pub]      # PEM public keys, under the data dir
+      require: signed            # the default; allow-unsigned checks and records a signature if there is one
+```
+
+- **What is checked.** The run's image and every entry of its zone's `images` (a node may start children
+  from them itself, #164), except the installation's own agent image. The first rule whose repository
+  matches decides. Under `require: signed` an image runs only if one of the rule's keys signed exactly its
+  digest; a tag is refused, since a signature names a digest. Keys are read and parsed when a run is
+  admitted: a missing or unreadable key, or a rule with no keys, refuses new runs until it is fixed. A
+  box already admitted (re-attached to, or a long-lived agent waking) doesn't read them.
+- **Names are normalised before matching.** Hosts are lowercased and lose `:443`, and Docker Hub's names
+  are one. Once any rule requires signatures, a pinned image whose name maps to no registry in
+  `registries` (a bare `sha256:…` included) is refused, so how an image is spelled can't dodge a rule.
+- **Only `default: require-signed` holds every image to a signature.** Under `default: allow-unsigned`,
+  rules cover the repositories they name, and an image elsewhere on a listed registry runs unsigned.
+  Rules don't match zones: a zone's name is the manifest's own choice, so it is no boundary.
+- **Why the control host.** A signature binds a key to a digest, and the node already checks the image's
+  bytes against that digest. The control host holds the policy and is the authority nodes trust, so this
+  covers every node alike, images already on one included, with no change to the channel. It must reach
+  the registry; if it can't, an image that must be signed is refused.
+- **Formats.** Behind a scheme interface (`wicket_chan::signature::Scheme`). The one there is is cosign's
+  signatures made with a key, in its tag format: the `sha256-<hex>.sig` tag in the image's repository,
+  whose "simple signing" payload names the digest, signed with ECDSA P-256 (cosign's default) or
+  Ed25519. They are fetched from the image's registry with its `secret`, if it has one (bound to the
+  registry's host and `auth_hosts`), within 60 s for all of a run's images together. A signature
+  that verified is cached under the data dir (`cache/signatures/`) for 10 minutes, by the digest and the
+  rule's keys: changing the keys checks afresh, and a signature withdrawn from the registry stops
+  admitting runs within 10 minutes.
+- **Signing for it.** cosign 3 writes a Sigstore bundle as an OCI 1.1 referrer by default, which wicket
+  doesn't read yet. Sign in the tag format, by digest:
+
+  ```sh
+  cosign generate-key-pair                       # cosign.key, cosign.pub (put cosign.pub under the data dir)
+  cosign sign --key cosign.key --new-bundle-format=false --use-signing-config=false \
+    registry.example.com/team/agent@sha256:…     # add --tlog-upload=false to skip Rekor, which wicket doesn't check
+  ```
+- **Recorded.** `image.signature` in the audit for each image checked, tied to the run: the image, its
+  digest and zone, the `rule` that decided, whether it was `required` and `refused`, and either
+  `verified` (scheme, the key's fingerprint, `sha256:` of its SPKI encoding, and the signature artifact's
+  digest; `cached` if from the cache) or `why` none verified, also when it runs unsigned. Reading the
+  registry's credential is audited as `image.secret_fetch`. The run's `run.image` carries its image's
+  `signature` ([audit](audit.md#record-kinds)).
+- **Not yet.** Keyless signing (Fulcio, OIDC identities), Rekor transparency-log checks, the Sigstore bundle
+  cosign 3 attaches as an OCI 1.1 referrer, Notary v2 signatures, attestation policies, and checking
+  `docker-reference` against the repository. A long-lived agent's wake isn't checked again.
+
 ## Creating nodes (`wicket node create`)
 
 `crates/wicket-placement` is the placement interface (#37): request capacity (CPU, memory, isolation tier,
