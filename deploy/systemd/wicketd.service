@@ -23,8 +23,11 @@ NoNewPrivileges=yes
 # starts is a process in this unit's cgroup. TasksMax counts their threads (about 6 each, a
 # two-worker runtime and its blocking pool), so 262144 covers 10,000 supervisors with room; the
 # kernel's pid_max must allow as many (see the docs). LimitNOFILE is per process: a supervisor's
-# sockets, logs and ledger, and wicketd's callers' descriptors.
+# sockets, logs and ledger, and wicketd's callers' descriptors. LimitNPROC (RLIMIT_NPROC) counts
+# every thread of the wicket user, wherever it runs: systemd's default (about 31,000) would stop
+# about 5,000 supervisors, long before TasksMax.
 LimitNOFILE=1048576
+LimitNPROC=infinity
 TasksMax=262144
 ProtectSystem=full
 Restart=on-failure

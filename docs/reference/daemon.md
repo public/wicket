@@ -98,13 +98,17 @@ sized for many boxes ([#582](https://github.com/public/wicket/issues/582) step 4
 |---|---|---|
 | `TasksMax` | 262144 | It counts every thread in the unit's cgroup. systemd's default is 15% of the kernel's pid limit, often 4915, about 800 supervisors. A supervisor has about 6 threads: the main one, its runtime's 2 workers and a few blocking-pool threads (at most 32). So 262144 covers the 10,000 boxes #582's step 4 aims at, with room. |
 | `LimitNOFILE` | 1048576 | Per process. A supervisor holds its box's sockets, its logs and the ledger, and wicketd holds its callers' descriptors. The default of 1,024 is the first limit a busy wicketd hits. |
+| `LimitNPROC` | infinity | `RLIMIT_NPROC` counts every thread of the `wicket` user, in every unit. systemd's default (about 31,000 on a typical host) would stop about 5,000 supervisors, long before `TasksMax`. A supervisor you start by hand as the wicket user (`sudo -u wicket wicket run`) has your login's limit instead (`ulimit -u`). |
 
-A supervisor's tokio runtime has 2 worker threads (`WICKET_SUPERVISOR_WORKERS` changes it), not
-one per core: on a 32-core host, 100 supervisors used to start 3,200 workers, and now start 200.
-Other commands keep tokio's default.
+A supervisor's tokio runtime has 2 worker threads, not one per core: on a 32-core host, 100
+supervisors used to start 3,200 workers, and now start 200. `WICKET_SUPERVISOR_WORKERS` changes
+it, from 1 to 64; another value is refused with a warning and 2 used. Other commands keep tokio's
+default.
 
-The kernel's limits must allow as many threads. On hosts with few CPUs `kernel.pid_max` defaults
-to 32768. For thousands of boxes, raise it and `kernel.threads-max`:
+The units' new limits arrive with the units: `deploy/install.sh` on the control host. The
+kernel's limits must also allow as many threads. `kernel.pid_max` defaults vary by distribution
+and size: 32768 on many small hosts, 4194304 on Ubuntu 24.04 (check with `sysctl kernel.pid_max
+kernel.threads-max`). For thousands of boxes, raise them if they're lower:
 
 ```sh
 printf 'kernel.pid_max = 4194304\nkernel.threads-max = 4194304\n' | sudo tee /etc/sysctl.d/60-wicket.conf

@@ -535,22 +535,50 @@ fn supervises(first_arg: Option<&str>) -> bool {
 }
 
 /// Worker threads a supervisor's runtime has (#582 step 4), unless `WICKET_SUPERVISOR_WORKERS`
-/// says otherwise. Its work is relaying sockets and waiting on its box: two workers keep a slow
-/// task from stalling the rest (and `block_in_place` working), without one thread per core per
-/// supervisor.
+/// says otherwise. Its work is relaying sockets and waiting on its box. Any multi-thread runtime
+/// runs `block_in_place` (one worker would too); the second worker is a spare, so a task that is
+/// slow on one doesn't stall the relays, without one thread per core per supervisor.
 pub(crate) const SUPERVISOR_WORKERS: usize = 2;
 
-/// The most blocking-pool threads a supervisor may have at once (ledger and file work); idle ones
-/// end after tokio's keep-alive.
+/// The most `WICKET_SUPERVISOR_WORKERS` may ask for.
+pub(crate) const SUPERVISOR_WORKERS_MAX: usize = 64;
+
+/// The most blocking-pool threads a supervisor may have at once; idle ones end after tokio's
+/// keep-alive. They do its ledger and file work, and each `block_in_place` takes one while it
+/// lasts: a worker that blocks (`wicket_proxy`'s wait for a granted request's audit commit) hands
+/// its place to a pool thread. Those waits are milliseconds, on the audit writer's own thread, so
+/// one that finds the pool full only runs with a worker fewer until a wait ends: it can't deadlock.
 pub(crate) const SUPERVISOR_BLOCKING: usize = 32;
+
+/// `WICKET_SUPERVISOR_WORKERS` read: the workers to run, and a warning if the value was refused
+/// (not a number, 0) or capped.
+fn supervisor_workers(v: Option<&str>) -> (usize, Option<String>) {
+    let Some(v) = v else { return (SUPERVISOR_WORKERS, None) };
+    match v.trim().parse::<usize>() {
+        Ok(0) | Err(_) => (
+            SUPERVISOR_WORKERS,
+            Some(format!(
+                "WICKET_SUPERVISOR_WORKERS={v:?} isn't a number of workers (1 to {SUPERVISOR_WORKERS_MAX}): using {SUPERVISOR_WORKERS}"
+            )),
+        ),
+        Ok(n) if n > SUPERVISOR_WORKERS_MAX => (
+            SUPERVISOR_WORKERS_MAX,
+            Some(format!("WICKET_SUPERVISOR_WORKERS={n} is over {SUPERVISOR_WORKERS_MAX}: using {SUPERVISOR_WORKERS_MAX}")),
+        ),
+        Ok(n) => (n, None),
+    }
+}
 
 /// The runtime for this process: a small one for a supervisor, tokio's default (a worker per core)
 /// for everything else.
 fn runtime(first_arg: Option<&str>) -> std::io::Result<tokio::runtime::Runtime> {
     let mut b = tokio::runtime::Builder::new_multi_thread();
     if supervises(first_arg) {
-        let workers = std::env::var("WICKET_SUPERVISOR_WORKERS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0);
-        b.worker_threads(workers.unwrap_or(SUPERVISOR_WORKERS)).max_blocking_threads(SUPERVISOR_BLOCKING);
+        let (workers, warning) = supervisor_workers(std::env::var("WICKET_SUPERVISOR_WORKERS").ok().as_deref());
+        if let Some(w) = warning {
+            eprintln!("wicket: {w}");
+        }
+        b.worker_threads(workers).max_blocking_threads(SUPERVISOR_BLOCKING);
     }
     b.enable_all().build()
 }
@@ -660,6 +688,16 @@ mod tests {
         let (small, small_workers) = threads_added(|| crate::runtime(Some("run")).unwrap());
         let (default, default_workers) = threads_added(|| crate::runtime(Some("serve")).unwrap());
         assert_eq!(small_workers, crate::SUPERVISOR_WORKERS);
+        assert_eq!(crate::supervisor_workers(None), (crate::SUPERVISOR_WORKERS, None));
+        assert_eq!(crate::supervisor_workers(Some("4")), (4, None));
+        for bad in ["0", "many", "-1", ""] {
+            let (n, w) = crate::supervisor_workers(Some(bad));
+            assert_eq!(n, crate::SUPERVISOR_WORKERS, "{bad:?}");
+            assert!(w.unwrap().contains("isn't a number of workers"), "{bad:?}");
+        }
+        let (n, w) = crate::supervisor_workers(Some("1000"));
+        assert_eq!(n, crate::SUPERVISOR_WORKERS_MAX);
+        assert!(w.unwrap().contains("is over"));
         assert_eq!(default_workers, cores);
         // The threads each added are printed, not asserted: a runtime's threads end after it is
         // dropped, so a count taken around another runtime can be off by a few.
