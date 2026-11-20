@@ -1326,9 +1326,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
                 let now = wicket_feed::now_ms();
                 let (found, _) = crate::hibernate::from_index(std::slice::from_ref(&node_name), &l.node_health()?, now);
                 if !found.is_empty() {
-                    let req = wicket_placement::schedule::Request::of(&m);
-                    let need = wicket_core::splice::ca_hosts(&m.zone, &[]);
-                    let d = crate::hibernate::bind(&l, &run, &crate::hibernate::Waiting { req, need }, &found, None, now, false)?.decision;
+                    let ask = crate::hibernate::Waiting::of(&m);
+                    let d = crate::hibernate::bind(&l, &run, &ask, &found, None, now, false)?.decision;
                     // Refused for room only, the node's own admission decides: its report may
                     // still count a box that has ended.
                     let room_only = d.refused.iter().all(|(_, why)| {

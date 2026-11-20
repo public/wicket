@@ -47,7 +47,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 })
                 .await
             }
-            NodeCmd::List { provider, common } => {
+            NodeCmd::List { provider, common, json } => {
+                if json {
+                    return crate::cmd::print_json(&enrol::list_json(&Ledger::open(&ledger_path())?)?);
+                }
                 enrol::list()?;
                 if provider {
                     println!();
@@ -246,6 +249,9 @@ pub enum NodeCmd {
         provider: bool,
         #[command(flatten)]
         common: nodecreate::Common,
+        /// The enrolled nodes as JSON instead of text (not with --provider).
+        #[arg(long, conflicts_with = "provider")]
+        json: bool,
     },
     /// Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and
     /// pinned at creation. Its money is reserved first against placement.yaml's limits (with every

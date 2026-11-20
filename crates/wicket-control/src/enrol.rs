@@ -620,6 +620,24 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
+/// `wicket node list --json`: the enrolled nodes (revoked ones too), with their active CA and
+/// identity certificate (null: none), labels and taints. Times are Unix seconds.
+pub fn list_json(l: &Ledger) -> Result<serde_json::Value> {
+    let mut out = vec![];
+    for n in l.nodes()? {
+        let cert = |not_after: i64, serial: &str| serde_json::json!({ "serial": serial, "not_after": not_after });
+        let ca = l.node_cas(&n.name)?.into_iter().find(|c| c.status == "active").map(|c| cert(c.not_after, &c.serial));
+        let id = l.node_certs(&n.name)?.into_iter().find(|c| c.status == "active").map(|c| cert(c.not_after, &c.serial));
+        out.push(serde_json::json!({
+            "name": n.name, "status": n.status, "target": n.target, "host_key_fp": n.host_key_fp, "hosts": n.hosts,
+            "enrolled_at": n.enrolled_at, "revoked_at": n.revoked_at, "ca": ca, "identity": id,
+            "labels": l.node_labels(&n.name)?,
+            "taints": l.node_taints(&n.name)?.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(serde_json::Value::Array(out))
+}
+
 pub fn pinned_node(nodes_dir: &Path, row: &NodeRow, ssh_key: Option<&Path>) -> Result<Node> {
     let pin = Pin::for_node(nodes_dir, &row.name);
     if !pin.known_hosts.exists() {

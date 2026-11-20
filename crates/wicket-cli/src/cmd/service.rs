@@ -47,8 +47,11 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             println!("service {name} removed: {n} instance(s) stopped, and no new one starts");
             Ok(())
         }
-        ServiceCmd::List => {
+        ServiceCmd::List { json } => {
             let services = l.services()?;
+            if json {
+                return crate::cmd::print_json(&services_json(&services));
+            }
             if services.is_empty() {
                 println!("no services installed (wicket service add <manifest>)");
             }
@@ -60,6 +63,19 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
     }
 }
 
+/// `wicket service list --json`.
+pub(crate) fn services_json(rows: &[wicket_store::ServiceRow]) -> serde_json::Value {
+    serde_json::Value::Array(rows.iter().map(service_json).collect())
+}
+
+/// One service of `wicket service list --json`.
+fn service_json(s: &wicket_store::ServiceRow) -> serde_json::Value {
+    serde_json::json!({
+        "name": s.name, "sha256": s.sha256, "manifest": s.manifest, "tenant": s.tenant, "added_by": s.added_by,
+        "added_at": s.added_at,
+    })
+}
+
 #[derive(Subcommand)]
 pub enum ServiceCmd {
     /// Install a per-node service: a program manifest with a `service:` section. Its manifest and
@@ -69,5 +85,9 @@ pub enum ServiceCmd {
     /// Uninstall one: its instances stop, and no new one starts.
     Remove { name: String },
     /// The installed services.
-    List,
+    List {
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
