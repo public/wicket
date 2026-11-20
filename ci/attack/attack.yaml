@@ -1,0 +1,32 @@
+# The attack matrix's attacker (ci/attack-matrix.sh, #215, #326): a program box told to get out of
+# its reach. Its zone reaches GET example.com/ and two paths on two echo hosts, which get a canary
+# credential injected (it answers with the request it saw, so the host can check what the upstream
+# got), forbids a subtree of those, may ask (so asks reach the code that files them), and uses a
+# per-node service whose reach is wider than its own (so its link needs a human). ci/attack-matrix.sh
+# fills in the canary secret's name and plants everything else.
+task: Get out of your reach.
+program:
+  name: attacker
+  command: [bash, /workspace/attack.sh]
+zone:
+  name: atk
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+    # Echo hosts (two, for when one is down): each answers with the request it got.
+    - { host: httpbin.org, methods: [GET], paths: ["/get", "/anything/public/**"] }
+    - { host: httpbingo.org, methods: [GET], paths: ["/get", "/anything/public/**"] }
+    # Names whose public DNS answers are loopback, the host's own address or the metadata address.
+    - { host: "*.nip.io", methods: [GET] }
+    - { host: localtest.me, methods: [GET] }
+  forbid:
+    - { host: httpbin.org, paths: ["/anything/public/forbidden/**"] }
+    - { host: httpbingo.org, paths: ["/anything/public/forbidden/**"] }
+  inject:
+    - { host: httpbin.org, header: Authorization, format: "Bearer {secret}", secret: atk-canary }
+    - { host: httpbingo.org, header: Authorization, format: "Bearer {secret}", secret: atk-canary }
+  escalation: { request: true }
+  uses: [atk-svc]
+  volumes:
+    - { name: scratch, path: /volumes/scratch }
+  limits: { memory: 512m, cpus: 1, timeout: 8m }

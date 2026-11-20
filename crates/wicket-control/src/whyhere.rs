@@ -2,17 +2,17 @@
 //! from the decision placement recorded when it chose (`placement_decisions`).
 
 use crate::ledger_path;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use wicket_store::Ledger;
 
 /// The decision recorded for `run`, as text (or the record itself with `json`).
 pub fn why_here(run: &str, json: bool) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     let Some((at_ms, record)) = l.placement_decision(run)? else {
-        bail!(
+        return Err(wicket_home::exit::not_found(format!(
             "no placement decision is recorded for {run}: it ran on this host's own node, on a node named for it whose room \
              wasn't known from a report, or its decision is over a week old"
-        );
+        )));
     };
     if json {
         let mut v: serde_json::Value = serde_json::from_str(&record)?;

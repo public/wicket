@@ -390,11 +390,11 @@ pub fn trigger_wake(agent: &str, by: &str) {
 /// An agent named by its id or by any of its runs.
 pub fn resolve(l: &Ledger, who: &str) -> Result<AgentRow> {
     if wicket_store::valid_agent_id(who) {
-        return l.agent(who)?.with_context(|| format!("no agent {who}"));
+        return l.agent(who)?.ok_or_else(|| wicket_home::exit::not_found(format!("no agent {who}")));
     }
     match l.agent_of_run(who)? {
-        Some((id, _)) => Ok(l.agent(&id)?.with_context(|| format!("no agent {id}"))?),
-        None => bail!("{who} is not an agent or a run of one"),
+        Some((id, _)) => Ok(l.agent(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no agent {id}")))?),
+        None => Err(wicket_home::exit::not_found(format!("{who} is not an agent or a run of one"))),
     }
 }
 
@@ -541,7 +541,8 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>, wait: std
         let Some(generation) = l.claim_wake(&a.id, &run.0, wicket_store::now() + BUSY_CLAIM_SECS)? else {
             let a = l.agent(&a.id)?.unwrap_or(a);
             say!("[wicket] agent {} not woken: it is {} (generation {}, run {})", a.id, a.state, a.generation, a.run);
-            std::process::exit(2);
+            // Refused (#574): something else has it; 2 is a usage error.
+            std::process::exit(wicket_home::exit::Code::Refused as i32);
         };
         let by = by.unwrap_or_else(|| format!("wicket wake by {}", crate::cli_principal()["id"].as_str().unwrap_or("operator")));
         if let Some(t) = &text {
