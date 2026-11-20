@@ -133,6 +133,12 @@ pub async fn doctor(image: &str) -> Result<()> {
     // A pruned chain (#582) starts at a signed checkpoint: its signature is checked too.
     wicket_home::audit_export::verify_local_anchor(&l)?;
     r.good(format!("ledger: {} (audit chain OK, {n} records)", ledger_path().display()));
+    // An audit sink left out of the sinks file (a relative jsonl path) isn't fed.
+    if let Ok(Some(c)) = wicket_home::audit_export::SinksConfig::load() {
+        for w in &c.skipped {
+            r.good(format!("warning: audit sinks: {w}"));
+        }
+    }
     console(&mut r, &l, system).await;
     if let Ok(all) = d.boxes().await {
         let orphans: Vec<_> = all.iter().filter(|b| stale_box(&l, b)).map(|b| b.name.as_str()).collect();

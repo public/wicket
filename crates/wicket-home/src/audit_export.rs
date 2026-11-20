@@ -98,6 +98,10 @@ pub struct SinksConfig {
     #[serde(default = "default_host_gb")]
     pub host_gb: f64,
     pub sinks: Vec<SinkSpec>,
+    /// Sinks left out, and why (a `jsonl` sink with a relative path: each process would write
+    /// another file under one cursor). The others are fed as usual.
+    #[serde(skip)]
+    pub skipped: Vec<String>,
 }
 
 /// The audit table's default limit on the host, in GB (see the docs for why).
@@ -241,7 +245,18 @@ pub fn stored_objects(sink: &str) -> Result<Vec<Value>> {
 
 impl SinksConfig {
     pub fn parse(text: &str) -> Result<SinksConfig> {
-        let c: SinksConfig = wicket_core::yaml::from_str(text)?;
+        let mut c: SinksConfig = wicket_core::yaml::from_str(text)?;
+        // Processes in different working directories would write two files under one cursor: such
+        // a sink is left out (and said, by `wicket doctor` and `wicket self health`), the rest kept.
+        let mut skipped = vec![];
+        c.sinks.retain(|s| match &s.kind {
+            SinkKind::Jsonl { path } if path != "-" && !Path::new(path).is_absolute() => {
+                skipped.push(format!("sink {:?}: its jsonl path {path:?} isn't absolute, so it isn't fed (make it absolute)", s.name));
+                false
+            }
+            _ => true,
+        });
+        c.skipped = skipped;
         let mut seen = std::collections::BTreeSet::new();
         for s in &c.sinks {
             if s.name.is_empty() || !seen.insert(s.name.clone()) {
@@ -252,15 +267,6 @@ impl SinksConfig {
             }
             if s.durable && matches!(&s.kind, SinkKind::Jsonl { path } if path == "-") {
                 bail!("sink {:?}: standard output isn't durable (nothing keeps what it prints)", s.name);
-            }
-            // Processes in different working directories would write two files under one cursor.
-            if let SinkKind::Jsonl { path } = &s.kind {
-                if path != "-" && !Path::new(path).is_absolute() {
-                    bail!(
-                        "sink {:?}: a jsonl path must be absolute ({path:?}): every wicket process exporting it shares one cursor",
-                        s.name
-                    );
-                }
             }
         }
         if c.batch == 0 {
@@ -276,7 +282,17 @@ impl SinksConfig {
     pub fn load() -> Result<Option<SinksConfig>> {
         let p = sinks_path();
         match std::fs::read_to_string(&p) {
-            Ok(t) => Ok(Some(SinksConfig::parse(&t).with_context(|| format!("{}", p.display()))?)),
+            Ok(t) => {
+                let c = SinksConfig::parse(&t).with_context(|| format!("{}", p.display()))?;
+                // Said once a process: a reconciler loads this every pass.
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !c.skipped.is_empty() && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    for w in &c.skipped {
+                        eprintln!("wicket: warning: {}: {w}", p.display());
+                    }
+                }
+                Ok(Some(c))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("{}", p.display())),
         }
@@ -1134,27 +1150,20 @@ pub fn spawn_background() {
     let path = crate::ledger_path();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<std::sync::mpsc::SyncSender<()>>();
     let _ = std::thread::Builder::new().name("wicket-audit-export".into()).spawn(move || {
-        // A ledger busy at the start (a migration, a long write elsewhere) is waited out, not taken
-        // as export being off for the life of the process; a stop still ends it meanwhile.
-        let mut wait = Duration::from_secs(1);
-        let mut x = loop {
-            let issuer = if signs { crate::issuer().ok() } else { None };
-            match Exporter::new(&path, cfg.clone(), issuer) {
-                Ok(x) => break x,
-                Err(e) if is_busy(&e) => {
-                    eprintln!("wicket: audit export waits for the ledger ({e:#}); trying again in {} s", wait.as_secs());
-                    match stop_rx.recv_timeout(wait) {
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => wait = (wait * 2).min(Duration::from_secs(60)),
-                        Ok(done) => {
-                            let _ = done.send(());
-                            return;
-                        }
-                        Err(_) => return,
+        let make = || {
+            let issuer = match signs {
+                true => match crate::issuer() {
+                    Ok(i) => Some(i),
+                    Err(e) => {
+                        eprintln!("wicket: audit checkpoints are off for now (the issuer key didn't read: {e:#})");
+                        None
                     }
-                }
-                Err(e) => return eprintln!("wicket: audit export is off: {e:#}"),
-            }
+                },
+                false => None,
+            };
+            Exporter::new(&path, cfg.clone(), issuer)
         };
+        let Some(mut x) = start_waiting_out_busy(make, &stop_rx, Duration::from_secs(1), BUSY_TRIES) else { return };
         loop {
             x.pass(false);
             match stop_rx.recv_timeout(Duration::from_secs(1)) {
@@ -1173,6 +1182,43 @@ pub fn spawn_background() {
     if let Ok(mut s) = BACKGROUND.lock() {
         *s = Some(stop_tx);
     }
+}
+
+/// How many times the background exporter tries to start on a busy ledger (1 s, doubling to a
+/// minute: about 25 minutes) before it gives up for the life of the process, saying so.
+pub const BUSY_TRIES: u32 = 30;
+
+/// `make` until it works, waiting out a busy ledger: `first` and doubling to a minute, at most
+/// `tries` times, each said. A stop (`stop`) meanwhile is answered and ends it, as does any other
+/// error. The exporter, if it started.
+fn start_waiting_out_busy<T>(
+    mut make: impl FnMut() -> Result<T>,
+    stop: &std::sync::mpsc::Receiver<std::sync::mpsc::SyncSender<()>>,
+    first: Duration,
+    tries: u32,
+) -> Option<T> {
+    let mut wait = first;
+    for n in 1..=tries {
+        match make() {
+            Ok(x) => return Some(x),
+            Err(e) if is_busy(&e) && n < tries => {
+                eprintln!("wicket: audit export waits for the ledger ({e:#}); try {n} of {tries}, again in {} s", wait.as_secs_f64());
+                match stop.recv_timeout(wait) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => wait = (wait * 2).min(Duration::from_secs(60)),
+                    Ok(done) => {
+                        let _ = done.send(());
+                        return None;
+                    }
+                    Err(_) => return None,
+                }
+            }
+            Err(e) => {
+                eprintln!("wicket: audit export is off: {e:#}");
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// Whether `e` is SQLite saying another connection holds the database (busy or locked): worth
@@ -1371,11 +1417,65 @@ mod tests {
         assert!(matches!(&c.sinks[1].kind, SinkKind::Otlp { headers, .. } if headers["x-tenant"] == "t"));
         assert!(SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: x}\n  - {name: a, type: jsonl, path: y}\n").is_err());
         assert!(SinksConfig::parse("sinks:\n  - {name: a, type: kafka}\n").is_err());
-        // #677 follow-up: a relative path would be another file in each working directory.
-        let e = SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: audit.jsonl}\n").unwrap_err().to_string();
-        assert!(e.contains("must be absolute"), "{e}");
+        // #677 follow-up: a relative path would be another file in each working directory. That
+        // sink alone is left out, and said; a durable sink beside it is still fed.
+        let c = SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: audit.jsonl}\n  - {name: s, type: store}\n").unwrap();
+        assert_eq!(c.sinks.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["s"]);
+        assert!(c.skipped[0].contains("isn't absolute"), "{:?}", c.skipped);
         assert!(SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: /var/log/a.jsonl}\n").is_ok());
         assert!(SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: '-'}\n").is_ok());
+    }
+
+    /// #694 review: the busy retry is bounded, and a stop meanwhile ends it.
+    #[test]
+    fn a_busy_start_is_tried_a_bounded_number_of_times() {
+        fn busy<T>() -> Result<T> {
+            let sql = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None);
+            Err(wicket_store::StoreError::Sql(sql).into())
+        }
+        let (_tx, rx) = std::sync::mpsc::channel::<std::sync::mpsc::SyncSender<()>>();
+        let mut calls = 0;
+        let r = start_waiting_out_busy(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    busy()
+                } else {
+                    Ok(calls)
+                }
+            },
+            &rx,
+            Duration::from_millis(1),
+            5,
+        );
+        assert_eq!(r, Some(3), "busy twice, then started");
+        let mut calls = 0;
+        let r = start_waiting_out_busy::<()>(
+            || {
+                calls += 1;
+                busy()
+            },
+            &rx,
+            Duration::from_millis(1),
+            4,
+        );
+        assert_eq!((r, calls), (None, 4), "given up after its tries");
+        let mut calls = 0;
+        let r = start_waiting_out_busy::<()>(
+            || {
+                calls += 1;
+                Err(anyhow::anyhow!("no such file"))
+            },
+            &rx,
+            Duration::from_millis(1),
+            4,
+        );
+        assert_eq!((r, calls), (None, 1), "another error isn't retried");
+        let (tx, rx) = std::sync::mpsc::channel::<std::sync::mpsc::SyncSender<()>>();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(done_tx).unwrap();
+        assert_eq!(start_waiting_out_busy::<()>(busy::<()>, &rx, Duration::from_secs(5), 4), None, "a stop ends the wait");
+        assert!(done_rx.try_recv().is_ok(), "and is answered");
     }
 
     /// #677 follow-up: a busy or locked ledger at the exporter's start is tried again, anything
@@ -1580,6 +1680,36 @@ mod tests {
         ] {
             assert!(SinksConfig::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// #694 review: a pass that resumes an earlier prune but can't tell where a durable sink points
+    /// (a store sink with no state store) still settles: what it deleted is counted and the usage
+    /// read again, and nothing new is pruned.
+    #[test]
+    fn a_resumed_prune_settles_though_a_target_cant_be_told() {
+        let d = TmpDir::new("settle");
+        let l = open_batched(&d.0.join("ledger.db")).unwrap();
+        write_records(&l, 0, 3000);
+        let cp = wicket_store::AuditCheckpoint {
+            sink: "s".into(),
+            target: "t".into(),
+            seq: 2800,
+            head: l.audit_hash_at(2800).unwrap().unwrap(),
+            ts: 0,
+            jws: String::new(),
+        };
+        l.begin_prune(&cp).unwrap();
+        let cfg = SinksConfig::parse("host_gb: 0.00001\nsinks:\n  - {name: s, type: store}\n").unwrap();
+        let file_before = l.file_bytes().unwrap();
+        let r = retention_with(&l, Ok(&cfg), Some(i64::MAX), true).unwrap();
+        assert!(r.pruned > 0, "the earlier prune's deletes went on");
+        assert!(r.waiting.as_deref().unwrap_or("").contains("can't be told"), "{:?}", r.waiting);
+        assert_eq!(r.usage.rows, l.audit_usage().unwrap().rows, "the usage read again");
+        assert!(l.auto_vacuum_incremental().unwrap());
+        assert!(l.file_bytes().unwrap() < file_before, "the freed pages went back");
+        assert_eq!(r.file_bytes, l.file_bytes().unwrap(), "and the file's size was read again");
+        assert!(l.audit_record_at(1).unwrap().is_none(), "the records behind the anchor are gone");
+        assert_eq!(l.audit_anchor().unwrap().unwrap().seq, 2800, "nothing new pruned");
     }
 
     #[test]

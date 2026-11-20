@@ -1817,6 +1817,40 @@ impl Ledger {
     /// checkpoint, with the records before it deleted, is caught. The anchor's signature is the caller's to check (it needs the
     /// issuer key: `wicket_home::audit_export::verify_anchor`). Returns the number of records
     /// verified.
+    /// Verifies the chain from the anchor (or its first record) up to and including `to`: each
+    /// record's fields hash to its hash, and each names the one before as `prev`. What a prune
+    /// vouches for below `to` must be in a chain that holds (#677 follow-up: a record changed in
+    /// place, or one link re-pointed, would otherwise be vouched for and its evidence deleted).
+    pub fn verify_audit_to(&self, to: i64) -> Result<i64> {
+        let anchor = self.audit_anchor()?;
+        let from = anchor.as_ref().map(|a| a.seq).unwrap_or(i64::MIN);
+        let mut st = self
+            .conn
+            .prepare("SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq")?;
+        let mut rows = st.query(params![from, to])?;
+        let mut prev = CHAIN_ZERO.to_string();
+        let mut n = 0;
+        while let Some(r) = rows.next()? {
+            let (seq, ts, tenant, run, kind, body, p, h): (i64, i64, String, Option<String>, String, String, String, String) =
+                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?);
+            if n == 0 {
+                if let Some(a) = &anchor {
+                    if seq != a.seq || h != a.hash {
+                        return Err(StoreError::ChainBroken(seq));
+                    }
+                    prev = p.clone();
+                }
+            }
+            let f = ChainFields { seq, ts, tenant: &tenant, run: run.as_deref(), kind: &kind, body: &body };
+            if p != prev || chain_hash_v2(&prev, &f) != h {
+                return Err(StoreError::ChainBroken(seq));
+            }
+            prev = h;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub fn verify_audit(&self) -> Result<i64> {
         let anchor = self.audit_anchor()?;
         let from = anchor.as_ref().map(|a| a.seq).unwrap_or(i64::MIN);

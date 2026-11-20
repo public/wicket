@@ -1583,6 +1583,12 @@ pub async fn health(nodes: Vec<String>, canary: Option<PathBuf>, image: String) 
     let n = ledger.lock().expect("ledger").verify_audit().context("the audit chain")?;
     wicket_home::audit_export::verify_local_anchor(&ledger.lock().expect("ledger")).context("the audit chain")?;
     println!("ledger: ok ({n} audit records verify)");
+    // An audit sink left out of the sinks file (a relative jsonl path) is said, not failed on.
+    if let Ok(Some(c)) = wicket_home::audit_export::SinksConfig::load() {
+        for w in &c.skipped {
+            println!("audit sinks: warning: {w}");
+        }
+    }
     let rt = wicket_sandbox::Docker::from_env().runtimes().await.context("docker")?;
     println!("docker: ok ({})", rt.join(", "));
     for n in &nodes {
