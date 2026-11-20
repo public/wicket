@@ -87,7 +87,7 @@ export function describe(a: Record<string, any>): string {
       (a.scope === 'zone' ? ` · any run in zone ${s(a.zone)}` : '') +
       ` · ${riskLabel(a.risk)} · request ${s(a.request)} · run ${s(a.run)}` +
       (a.agent ? ` · agent ${s(a.agent)}` : '') +
-      ((a.requested_by || []).length ? ` (${a.requested_by.map(s).join(', ')})` : '') +
+      ((a.requested_by || []).length ? ` · asked by ${a.requested_by.map(s).join(', ')} (as reported)` : '') +
       (a.effect_sha256 ? ` · effect ${s(a.effect_sha256).slice(0, 16)}` : '')
     );
   }
@@ -133,16 +133,17 @@ export function updateSections(u: any): Section[] {
   return [{ title: 'Approving installs this build now, blue/green with its health gate; a failed gate rolls back.', items }];
 }
 
-/** A request's ledger status in words, and the class its card takes (#647): `granted` is how the
- * ledger records an approval; `withdrawn`, a request whose run ended before anyone decided. */
+/** A request's ledger status in words, the console's decided list's (allowed, refused), and the
+ * class its card takes (#647): `granted` is how the ledger records an approval; `withdrawn`, a
+ * request whose run ended before anyone decided. */
 export function requestState(status: unknown): { word: string; cls: string } {
   switch (String(status)) {
     case 'pending':
       return { word: 'waiting for you', cls: 'pending' };
     case 'granted':
-      return { word: 'approved', cls: 'approved' };
+      return { word: 'allowed', cls: 'approved' };
     case 'denied':
-      return { word: 'denied', cls: 'denied' };
+      return { word: 'refused', cls: 'denied' };
     case 'expired':
       return { word: 'expired', cls: 'expired' };
     case 'withdrawn':
@@ -150,6 +151,15 @@ export function requestState(status: unknown): { word: string; cls: string } {
     default:
       return { word: strip(status), cls: 'other' };
   }
+}
+
+/** A request's reason, labelled as the agent's words, as the console's card labels it (console.js
+ * `asks`): a wicket.internal request's text mixes wicket's words with the agent's, and is never
+ * shown as wicket's. */
+export function reasonLine(e: { host: string; reason: string }): string {
+  if (!e.reason) return '';
+  const q = `“${strip(e.reason)}”`;
+  return e.host === 'wicket.internal' ? `The request's text, with the agent's words in it: ${q}` : `Why: ${q}`;
 }
 
 /** The run's ACP socket, and the subprotocols that carry the open's ticket. */

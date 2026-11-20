@@ -6,7 +6,7 @@
 // a turn. Exits non-zero on the first failure.
 import { createApp, nextTick } from 'vue';
 import App from '../src/App.vue';
-import { blastSections, requestState, updateSections } from '../src/lib/wicket';
+import { blastSections, describe, reasonLine, requestState, updateSections } from '../src/lib/wicket';
 
 const RUN = 'run_s';
 const fail = (why: string): never => {
@@ -180,7 +180,7 @@ if (diff?.textContent !== 'b') fail('the diff');
 await until('the escalation card', () => text().includes('Request waiting for you'));
 if (!text().includes('wicket request · waiting for you')) fail("the request's card names it a request, its status in words");
 if (!text().includes('wicket enforces this one')) fail('which ask wicket enforces');
-if (!text().includes('GET api.example.com/v1') || !text().includes('needs the API') || !text().includes('R1 · read')) fail('the escalation described');
+if (!text().includes('GET api.example.com/v1') || !text().includes('Why: “needs the API”') || !text().includes('R1 · read')) fail('the escalation described, its reason as the agent\'s words');
 if (button('Always allow')) fail('an "always" option offered');
 await tap('Approve once (passkey)');
 await until('the decision described', () => text().includes('Approve once for 10 min: GET api.example.com/v1'));
@@ -208,7 +208,7 @@ if (!posts.some((p) => p.path === '/api/decide/finish')) fail('the decision sign
 if (assertions !== 2) fail(`passkey assertions: ${assertions}`);
 await until('the escalation approved', () => document.querySelector('.escalation.approved') !== null);
 if (text().includes('Request waiting for you')) fail('the answered prompt still shown');
-if (!text().includes('wicket request · approved')) fail('the approval in words');
+if (!text().includes('wicket request · allowed')) fail('the approval in words');
 
 // A prompt, through the endpoint.
 const ta = document.querySelector('.composer textarea') as HTMLTextAreaElement;
@@ -230,11 +230,15 @@ await tap('Stop');
 if (!sent.some((m) => m.method === 'session/cancel' && m.params.sessionId === RUN)) fail('session/cancel sent');
 await until('the cancelled turn', () => text().includes('the turn ended: cancelled'));
 
+// A wicket.internal request's text is the agent's words mixed with wicket's, never wicket's alone.
+if (reasonLine({ host: 'wicket.internal', reason: 'start agent x' }) !== 'The request\'s text, with the agent\'s words in it: “start agent x”') fail('the mixed text labelled');
+if (reasonLine({ host: 'h', reason: '' }) !== '') fail('no reason, no line');
+if (!describe({ action: 'decide', decision: 'deny', method: 'GET', host: 'h', path: '/', risk: 'R0Read', request: 'r', run: 'x', requested_by: ['sub'] }).includes(' · asked by sub (as reported)')) fail('who asked, as reported');
 // The sheet's other cases, and each status in words (#647, #652).
 if (blastSections(null).length || updateSections(undefined).length) fail('a sheet section with nothing to show');
 const notApplied = updateSections({ sha256: 'ef'.repeat(32), applies: false, why_not: 'no file in the outbox' });
 if (notApplied.length !== 1 || !notApplied[0].title.includes("doesn’t install it: no file in the outbox")) fail(`an update that won't apply: ${JSON.stringify(notApplied)}`);
-for (const [st, word, cls] of [['pending', 'waiting for you', 'pending'], ['granted', 'approved', 'approved'], ['denied', 'denied', 'denied'], ['withdrawn', 'withdrawn: the run ended first', 'withdrawn']]) {
+for (const [st, word, cls] of [['pending', 'waiting for you', 'pending'], ['granted', 'allowed', 'approved'], ['denied', 'refused', 'denied'], ['withdrawn', 'withdrawn: the run ended first', 'withdrawn']]) {
   const r = requestState(st);
   if (r.word !== word || r.cls !== cls) fail(`${st}: ${JSON.stringify(r)}`);
 }
