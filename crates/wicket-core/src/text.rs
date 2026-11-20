@@ -61,13 +61,16 @@ pub fn redact_urls(s: &str) -> String {
 fn redact_one(scheme: &str, token: &str) -> String {
     let opaque = format!("{scheme}://…");
     let Ok(u) = url::Url::parse(token) else { return opaque };
+    // Split the raw token as the url crate would, '\\' standing for '/' (it does for http(s)).
     let after = &token[scheme.len() + 3..];
+    let auth_end = after.find(['/', '\\', '?', '#']).unwrap_or(after.len());
+    let (auth, rest) = after.split_at(auth_end);
     let before_query = &after[..after.find(['?', '#']).unwrap_or(after.len())];
-    let auth_end = before_query.find('/').unwrap_or(before_query.len());
-    let (auth, path) = before_query.split_at(auth_end);
-    // More than one '@' that could end the user info, or user info (a ':') with an '@' only later
-    // in the path (`u:1234/56@host`): which part is the secret can't be told.
-    if before_query.matches('@').count() > 1 || (!auth.contains('@') && auth.contains(':') && path.contains('@')) {
+    // Which '@' ends the user info must be plain, or nothing is shown: more than one before the
+    // query, or none in the authority but one later (`to?ken@host`, `u:1234#56@host`), unless that
+    // one starts a path segment (`/@types/node`). When unsure, redact more.
+    let later_at = rest.char_indices().any(|(i, c)| c == '@' && !matches!(rest[..i].chars().last(), Some('/')));
+    if before_query.matches('@').count() > 1 || (!auth.contains('@') && later_at) {
         return opaque;
     }
     let Some(host) = u.host_str() else { return opaque };
@@ -98,15 +101,21 @@ mod tests {
             ("https://u:1234/56@host/x", "https://…"),
             ("s3://bucket:prefix/obj@v2", "s3://…"),
             ("https://u:p@host:9000/b/k?X-Amz-Signature=s", "https://host:9000/b/k?…"),
-            ("https://h/p?token=sec@ret", "https://h/p?…"),
-            ("https://h/p?sig=AbC/dEf@x.y&q=1", "https://h/p?…"),
+            ("https://h/p?token=sec@ret", "https://…"),
+            ("https://h/p?sig=AbC/dEf@x.y&q=1", "https://…"),
             ("https://registry.npmjs.org/@types/node", "https://registry.npmjs.org/@types/node"),
-            ("https://h/x?email=a@b.com", "https://h/x?…"),
-            ("s3://bucket/key@v1", "s3://bucket/key@v1"),
+            ("https://h/x?email=a@b.com", "https://…"),
+            ("s3://bucket/key@v1", "s3://…"),
             ("http://localhost:7070/list", "http://localhost:7070/list"),
             ("http://[::1]/x", "http://[::1]/x"),
-            ("http://[::1]/p?token=sec@ret", "http://[::1]/p?…"),
-            ("http://[2001:db8::1]/a?x=sec@ret", "http://[2001:db8::1]/a?…"),
+            ("http://[::1]/p?token=sec@ret", "http://…"),
+            ("http://[2001:db8::1]/a?x=sec@ret", "http://…"),
+            ("https://to?ken@host/", "https://…"),
+            ("https://u:1234?56@host/x", "https://…"),
+            ("https://u:1234#56@host/x", "https://…"),
+            ("https://AKIA:1234\\56@host/x", "https://…"),
+            ("https://u:p@host/@scope/pkg", "https://…"),
+            ("https://h/p?q=1", "https://h/p?…"),
             ("https://a@b@host/x", "https://…"),
             ("https://", "https://…"),
         ] {
