@@ -21,8 +21,8 @@
   <div class="bar"><h1>wicket</h1><span id="tenant"></span></div>
   <!-- In-page sections, most urgent first (#574): what needs a decision, then health, then activity. -->
   <nav id="nav" aria-label="Sections" hidden>
-    <a href="#waiting">Waiting<span class="count" id="nav-waiting" hidden></span></a>
-    <a href="#nodes">Health<span class="count bad" id="nav-health" hidden></span></a>
+    <a href="#waiting" data-label="Waiting">Waiting<span class="count" id="nav-waiting" hidden></span></a>
+    <a href="#nodes" data-label="Health">Health<span class="count bad" id="nav-health" hidden></span></a>
     <a href="#runs-section">Runs</a>
     <a href="#activity">Activity</a>
     <a href="#manage">Manage</a>
@@ -121,7 +121,9 @@
     <div id="confirm-what" class="what"></div>
     <div id="confirm-blast" class="blast" hidden></div>
     <div id="confirm-update" class="blast" hidden></div>
-    <div id="confirm-state" class="meta" aria-live="polite"></div>
+    <!-- The countdown is shown, not announced; state changes are announced in the live region. -->
+    <div id="confirm-state" class="meta"></div>
+    <div id="confirm-announce" class="sr-only" aria-live="polite"></div>
     <div class="buttons"><button type="button" id="confirm-go"></button><button type="button" id="confirm-cancel">Cancel</button></div>
   </div>
 </div>

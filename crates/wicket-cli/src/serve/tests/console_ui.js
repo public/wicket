@@ -169,6 +169,9 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   const lines = what.split("\n");
   assert.ok(lines[0].startsWith("Approve once for 10 min: POST api.example.com/harmless"), lines[0]);
   assert.strictEqual(lines[1], "Risk: R1 \u00b7 read (scoped)");
+  // The decision and its target are one element, the lead, styled strongly; its text is unchanged (#698 review).
+  assert.strictEqual(ids["confirm-what"].children[0].className, "lead");
+  assert.strictEqual(ids["confirm-what"].children[0].textContent, lines[0]);
   assert.ok(lines[lines.length - 1].startsWith("Request q-a \u00b7 run run_a"), what);
   // The agent with its zone, from the signed fields; a hostile newline in what the agent reported
   // or in the path can't make a line of its own (#599 review).
