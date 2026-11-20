@@ -28,6 +28,12 @@
 //!   at most the newer one's), so dropping it loses nothing, and refusing it would report an honest
 //!   interleaving as a replay. A replayed statement gets the same treatment: it can never take
 //!   effect, which is what replay protection is for. Counted in [`Stats::superseded`].
+//! - **A snapshot already overtaken** (#589): a snapshot below the epoch held that was signed
+//!   before the newest statement held is superseded too. Two runs that said hello to a node at the
+//!   same epoch both catch it up; the second to arrive finds the node moved on by the other's frames,
+//!   signed after its own under the publishers' shared lock. One signed after the newest statement
+//!   (a restored control plane's, say) is a `rollback`, as is any older snapshot before a statement
+//!   is held.
 //! - **A delta already held** (#300, #324): each run commits its own deltas and sends them over its
 //!   own connection, but another run's catch-up may carry them first. A delta at an epoch the node
 //!   holds whose hash is the head it recorded at that epoch (the ring of [`crate::HEADS_KEPT`]) is
@@ -524,6 +530,13 @@ impl<P: Policy> Replica<P> {
         if let Some(st) = &self.state {
             if s.version == st.version {
                 if s.epoch < st.epoch {
+                    // Signed before the newest statement held (#589): another run's frames,
+                    // signed after it under the same lock, reached the node first (each run has
+                    // its own connection). It carries nothing the node lacks: superseded, as a
+                    // statement signed before the floor is. One signed after is a rollback.
+                    if s.issued_at < self.issued_floor {
+                        return Ok(Plan::Superseded);
+                    }
                     return Err(Refusal::Rollback(format!("snapshot epoch {} < held {}", s.epoch, st.epoch)));
                 }
                 if s.epoch == st.epoch {

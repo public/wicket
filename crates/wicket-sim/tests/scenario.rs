@@ -400,6 +400,22 @@ fn placement_seed_32200188_counts_a_held_nodes_billing() {
     nightly_placement_seed(32_200_188);
 }
 
+/// #589: two runs said hello to one node at the same epoch and both caught it up; the second's
+/// snapshot, overtaken by the first's frames, was refused as a rollback. It is superseded.
+#[test]
+fn placement_seed_32300607_takes_an_overtaken_snapshot_as_superseded() {
+    nightly_placement_seed(32_300_607);
+}
+
+/// #590: as #397, with the work collected by the supervisor before a control-host crash: the one
+/// that took the run over failed to fetch it again and held the node for work this host had. (The
+/// seed's trajectory moved with the feed's checkpoints, a542451; the reconciler's
+/// `a_collected_run_holds_no_node_whatever_a_later_fetch_said` holds the fix.)
+#[test]
+fn placement_seed_32300777_releases_a_node_whose_work_was_collected() {
+    nightly_placement_seed(32_300_777);
+}
+
 /// #398: the start race on a partitioned node.
 #[test]
 fn placement_seed_32000183_starts_no_box_past_a_lease() {
