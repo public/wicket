@@ -1850,7 +1850,7 @@ pub fn record_authority(run_dir: &Path, node: &str, until_ms: i64) -> Result<()>
     write_authority(run_dir, &AuthorityRecord { node: node.into(), until_ms, stopped, released_by: None })
 }
 
-fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
+pub(crate) fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
     use std::io::Write;
     let p = authority_file(run_dir);
     let dir = p.parent().expect("ctl");
