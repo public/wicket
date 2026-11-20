@@ -66,6 +66,7 @@ step "terms" ci/check-terms.sh
 step "Markdown links" ci/check-doc-links.sh
 step "plugin and skills" python3 -I ci/check-plugin.py
 step "changelog fragment (against $base)" python3 -I ci/changelog.py check --base "$base"
+step "no AI attribution in commits (against $base)" python3 -I ci/no-attribution.py --range "$base..HEAD"
 step "lockfiles (workspace and fuzz/)" lockfiles
 
 if ! mb=$(git merge-base "$base" HEAD 2>/dev/null); then

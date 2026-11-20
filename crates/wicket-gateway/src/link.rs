@@ -1175,6 +1175,16 @@ mod tests {
         assert!(err && text.contains("not this agent's"), "{text}");
         let audit = w.ledger.lock().unwrap().audit_tail(30).unwrap();
         assert!(audit.iter().any(|a| a.2 == "name.requested" && a.4.contains(&id)));
+        // No agent decides it, its own parent's included (#680 review, L4).
+        let (text, err) = gw.call_tool("decide", serde_json::json!({ "decision": "approve", "request_id": id })).await;
+        assert!(err && text.contains("decided by a human"), "{text}");
+        // The reason is marked as the agent's (#680 review, L3).
+        assert!(w.ledger.lock().unwrap().name(&id).unwrap().reason.starts_with(wicket_store::AGENT_ASKS_PREFIX));
+        // An internal name takes neither scope standing nor a service.
+        let (text, err) = crate::names::request_name(&api, &serde_json::json!({ "name": "x", "port": 1, "scope": "standing" }));
+        assert!(err && text.contains("`scope` is for public names"), "{text}");
+        let (text, err) = crate::names::request_name(&api, &serde_json::json!({ "name": "x", "port": 1, "service": "http" }));
+        assert!(err && text.contains("`service` is for public names"), "{text}");
     }
 
     #[tokio::test]
