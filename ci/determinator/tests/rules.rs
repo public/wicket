@@ -286,7 +286,8 @@ fn the_toolchain_cargo_and_ci_select_everything() {
 #[test]
 fn the_lockfile_selects_what_its_change_rebuilds() {
     // Compared with itself, the lockfile changes no crate's build; wicket-policy's test reads it.
-    check(&["Cargo.lock"], &["wicket-policy", "wicket-policy-diff", "wicket-control", "wicket-cli"], &with(CLI, &["policy", "fuzz-manifest", "deny", "dep-age"]));
+    // It may bump Oxc, which build.rs minifies the console with: the browser test runs (#574).
+    check(&["Cargo.lock"], &["wicket-policy", "wicket-policy-diff", "wicket-control", "wicket-cli"], &with(CLI, &["policy", "fuzz-manifest", "deny", "dep-age", "console-browsers"]));
     // A crate's manifest is its crate's (and its simulated build's).
     // wicket-home classifies placement's errors into exit codes (#574), so it and wicket-node (and
     // the node suites) come with it.

@@ -26,6 +26,8 @@ paths = [
 paths = [
   "crates/wicket-cli/src/serve/static/**", "crates/wicket-cli/src/serve/web.rs", "crates/wicket-cli/build.rs",
   "ci/console-browsers.sh", "ci/console-browsers/**", "ci/console-preview/**",
+  # The build's own dependencies: an Oxc bump changes what build.rs makes of the console.
+  "Cargo.toml", "Cargo.lock",
 ]
 
 [suite.policy]

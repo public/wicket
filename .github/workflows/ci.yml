@@ -659,7 +659,7 @@ jobs:
   # a ready head's run (what it runs today) can pass. A job added to this workflow goes in `needs`.
   verdict:
     name: CI verdict (full)
-    needs: [select, select-tests, public, deny, dep-age, rust, fuzz-replay, fuzz-target, fuzz, session-view, policy, lean, tla-shard, tla, kani-shard, kani, simulation, smoke, acceptance]
+    needs: [select, select-tests, public, deny, dep-age, rust, fuzz-replay, fuzz-target, fuzz, session-view, console-browsers, policy, lean, tla-shard, tla, kani-shard, kani, simulation, smoke, acceptance]
     # Not for a run that was cancelled (a newer push superseded it): its verdict is skipped, which
     # doesn't pass either.
     if: ${{ !cancelled() }}
