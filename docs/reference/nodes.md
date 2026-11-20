@@ -196,7 +196,10 @@ wicket node revoke n1
   dropped, the process not dumpable (`PR_SET_DUMPABLE` 0), never logged. A run's use of a secret lasts
   until its authority ends, or the upstream token's own expiry if earlier; the node drops a secret when
   the last run that used it ends, and when the control host says it changed, was rebound or removed
-  (checked every 2 s while connected; the next use fetches it again). While the node is cut off, the
+  (checked every 2 s while connected; the next use fetches it again). A secret the zone uses but the
+  vault doesn't hold yet (an optional `inject` rule's, #415) is refused once: the node keeps that answer
+  for the run, never asking per request, until the control host says the secret is now set (the same
+  check, 2 s) or for 30 s if it doesn't say; the control host audits the refusal once while it lasts. While the node is cut off, the
   secrets it holds keep working; one first needed then fails with "credential … not cached on this node;
   control host unreachable" (audited as `node.secret_unavailable`) until the control host is back. A
   restart of `serve` while cut off loses the cache: model calls and injected hosts stop until reconnect,

@@ -217,7 +217,7 @@ rulesets or branch protection).
 | `header` | string | required | The one header it goes in (`Authorization`). |
 | `format` | string | `{secret}` | The header's value. `{secret}` is the secret; `{basic:USER}` is `base64(USER:secret)`, so `Basic {basic:x-access-token}` is HTTP Basic with a token as password. Must contain one of the two. |
 | `secret` | string | required | The vault secret's name. Its host binding must cover `host`, or the run is refused. |
-| `optional` | boolean | `false` | If the secret isn't in the vault, send requests to the host without it instead of refusing to start. |
+| `optional` | boolean | `false` | If the secret isn't in the vault, send requests to the host without it instead of refusing to start. The secret is read at each request, so one set later is used from the next (#415). |
 
 A credential is only ever sent over HTTPS: plain HTTP to a host with an inject rule is refused.
 

@@ -1164,6 +1164,9 @@ struct Progress {
     slice: Option<wicket_proxy::llm::Slice>,
     /// The secrets released to the node for this run, and what each was (to tell a change).
     fetched: std::collections::HashMap<String, String>,
+    /// The secrets the run's zone uses that were refused to its node (an optional one not set yet,
+    /// #415): the node is told when one can be released, and a refusal is audited once while it lasts.
+    refused: HashSet<String>,
     /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
     remint_failed: i64,
     /// What changed in the ledger since this connection's loops last looked (#582 step 2), and when
@@ -1204,6 +1207,7 @@ async fn manage(
         slice_sent: false,
         slice: None,
         fetched: std::collections::HashMap::new(),
+        refused: HashSet::new(),
         remint_failed: 0,
         watch: wicket_store::ChangeWatch::new(),
         grants_full: std::time::Instant::now(),
@@ -2333,6 +2337,7 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
     let (ok, why) = match &r {
         Ok(f) => {
             if for_pull.is_none() {
+                p.refused.remove(name);
                 p.fetched.insert(name.to_string(), crate::nodesecrets::digest(f));
                 save_holdings(sh, p);
             }
@@ -2340,6 +2345,11 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
         }
         Err(e) => (false, Some(e.clone())),
     };
+    // A secret the zone uses but can't have yet (#415): the node holds the refusal for a while, and
+    // is told when it can be released. Audited when first refused, not at each ask while it lasts.
+    if !ok && for_pull.is_none() && crate::nodesecrets::zone_uses(&sh.zone, &sh.swaps, name) && !p.refused.insert(name.to_string()) {
+        return Msg::SecretFetched { id, secret: None, error: why };
+    }
     let _ = sh.ledger.lock().expect("ledger").audit(
         &sh.tenant,
         Some(&sh.run),
@@ -2352,23 +2362,49 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
     }
 }
 
-/// Secrets this run's node fetched that have since changed, been rebound or removed on this host:
-/// the node is told to drop them (#152).
+/// Secrets this run's node fetched that have since changed, been rebound or removed on this host,
+/// and secrets refused to it that can now be released (#415): the node is told to drop what it holds
+/// of each, or knows of it, and the next use fetches it again (#152).
 fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
-    let mut out = vec![];
-    let names: Vec<String> = p.fetched.keys().cloned().collect();
-    for name in names {
-        let now = crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, &name, sh.ctl.authority_until())
+    let release = |name: &str| {
+        crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, name, sh.ctl.authority_until())
             .ok()
-            .map(|f| crate::nodesecrets::digest(&f));
-        if now.as_deref() != p.fetched.get(&name).map(String::as_str) {
-            p.fetched.remove(&name);
-            save_holdings(sh, p);
-            say!("[wicket] secret {name} changed on this host: node {} drops its copy for {}", sh.node, sh.run);
-            out.push(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name }));
-        }
+            .map(|f| crate::nodesecrets::digest(&f))
+    };
+    let (changed, fetched_changed) = changed_secrets(&mut p.fetched, &mut p.refused, release);
+    if fetched_changed {
+        save_holdings(sh, p);
     }
-    out
+    changed
+        .into_iter()
+        .map(|name| {
+            say!("[wicket] secret {name} changed on this host: node {} fetches it again for {}", sh.node, sh.run);
+            Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name })
+        })
+        .collect()
+}
+
+/// The names to tell a node changed, given what `release` would release now (its digest, or None if
+/// refused): each fetched one whose digest differs, and each refused one now released. Both are
+/// forgotten here, so the node's next fetch records them again. Also whether `fetched` changed.
+fn changed_secrets(
+    fetched: &mut std::collections::HashMap<String, String>,
+    refused: &mut HashSet<String>,
+    release: impl Fn(&str) -> Option<String>,
+) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = fetched.iter().filter(|(n, d)| release(n).as_deref() != Some(d.as_str())).map(|(n, _)| n.clone()).collect();
+    out.sort();
+    for n in &out {
+        fetched.remove(n);
+    }
+    let fetched_changed = !out.is_empty();
+    let mut now_set: Vec<String> = refused.iter().filter(|n| release(n).is_some()).cloned().collect();
+    now_set.sort();
+    for n in &now_set {
+        refused.remove(n);
+    }
+    out.extend(now_set);
+    (out, fetched_changed)
 }
 
 /// The op a node asks about, as the control host classifies it, and why it needs a grant, as this
@@ -2841,6 +2877,26 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 
 #[cfg(test)]
 mod tests {
+    /// #415: the control host tells a run's node of a secret it fetched that changed or went, and of
+    /// one it was refused that can now be released; each once, until the node fetches it again.
+    #[test]
+    fn a_node_is_told_of_secrets_changed_removed_or_newly_set() {
+        let vault = std::cell::RefCell::new(std::collections::HashMap::from([("held".to_string(), "d1".to_string())]));
+        let release = |n: &str| vault.borrow().get(n).cloned();
+        let mut fetched = std::collections::HashMap::from([("held".to_string(), "d1".to_string())]);
+        let mut refused = HashSet::from(["later".to_string()]);
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), (vec![], false), "nothing changed");
+        vault.borrow_mut().insert("later".into(), "d2".into());
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), (vec!["later".to_string()], false), "set since it was refused");
+        assert!(refused.is_empty());
+        vault.borrow_mut().insert("held".into(), "d3".into());
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), (vec!["held".to_string()], true), "rotated");
+        assert!(fetched.is_empty());
+        fetched.insert("held".into(), "d3".into());
+        vault.borrow_mut().remove("held");
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), (vec!["held".to_string()], true), "removed");
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), (vec![], false), "told once");
+    }
 
     /// A failed renewal keeps the publisher only on a valid certificate of the version on disk.
     #[test]

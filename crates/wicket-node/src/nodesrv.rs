@@ -874,10 +874,14 @@ impl Node {
                         n.audit_note(&run, "node.secret_fetched", serde_json::json!({ "secret": name }));
                         return Ok(*f);
                     }
-                    Some(Msg::SecretFetched { error: Some(e), .. }) => format!("credential {name} refused by the control host: {e}"),
-                    _ => format!("credential {name} not cached on this node; control host unreachable"),
+                    Some(Msg::SecretFetched { error: Some(e), .. }) => {
+                        crate::nodesecrets::Unfetched::Refused(format!("credential {name} refused by the control host: {e}"))
+                    }
+                    _ => crate::nodesecrets::Unfetched::Unreachable(format!(
+                        "credential {name} not cached on this node; control host unreachable"
+                    )),
                 };
-                n.audit_note(&run, "node.secret_unavailable", serde_json::json!({ "secret": name, "why": why }));
+                n.audit_note(&run, "node.secret_unavailable", serde_json::json!({ "secret": name, "why": why.to_string() }));
                 Err(why)
             })
         })

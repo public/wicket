@@ -391,20 +391,17 @@ mod tests {
 
     const ALL: &str = "[GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]";
 
-    /// #175: an optional injection whose secret isn't set is dropped from the zone, so a host it was
-    /// the only injection for is spliced when reach allows it wholesale; a set or required one stays.
+    /// #415: an injection is inspected whether or not its secret is set now: the zone is fixed at
+    /// start and the secret looked up per request, so one set while the run lasts is injected. An
+    /// optional rule's host is never spliced for want of its secret.
     #[test]
-    fn a_host_whose_only_injection_is_unset_and_optional_is_spliced() {
+    fn a_host_with_an_optional_injection_is_inspected_whether_or_not_its_secret_is_set() {
         let body = format!(
-            "  reach: [{{host: static.example, methods: {ALL}}}, {{host: other.example, methods: {ALL}}}]\n  inject:\n    - {{host: static.example, header: Authorization, secret: unset, optional: true}}\n    - {{host: other.example, header: Authorization, secret: set, optional: true}}\n    - {{host: other.example, header: X-Key, secret: required}}"
+            "  reach: [{{host: static.example, methods: {ALL}}}, {{host: other.example, methods: {ALL}}}]\n  inject:\n    - {{host: static.example, header: Authorization, secret: unset, optional: true}}"
         );
-        let mut z = zone(&body);
-        assert!(!inspection(&z, "static.example").is_spliced(), "inspected while the rule is there");
-        let dropped = z.drop_unset_optional_injections(|s| s == "set");
-        assert_eq!(dropped.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["unset"]);
-        assert_eq!(z.inject.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["set", "required"]);
-        assert_eq!(inspection(&z, "static.example"), Inspection::Spliced { rule: 0 });
-        assert!(!inspection(&z, "other.example").is_spliced(), "still injected");
+        let z = zone(&body);
+        assert!(!inspection(&z, "static.example").is_spliced());
+        assert_eq!(inspection(&z, "other.example"), Inspection::Spliced { rule: 1 });
     }
 
     #[test]

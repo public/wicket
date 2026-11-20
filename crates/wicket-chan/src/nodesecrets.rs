@@ -13,6 +13,12 @@
 //!   or the upstream token's own expiry if earlier. The node drops a secret when the last run that
 //!   used it ends or can no longer use it, and when the control host says it changed or was removed
 //!   (it checks every 2 s while connected): the next use fetches it again.
+//! - **Refused, not set yet** (#415). A run's zone is fixed at start, but the vault isn't: an optional
+//!   injection whose secret isn't set yet is refused by the control host, and the node remembers that
+//!   for the run (never a value) for [`REFUSAL_HELD_MS`], so a run's requests don't each ask again.
+//!   The control host says when such a secret becomes available (as a change, [`crate::chan::Msg::SecretRevoke`]),
+//!   and the next use fetches it; a control host that doesn't say is asked again once the refusal is
+//!   that old.
 //! - **Cut off.** A secret already held keeps working; one first needed while the control host is
 //!   unreachable fails clearly, and is audited, until it is back. A restart of `serve` while cut off
 //!   loses the cache: credentialed hosts and model calls stop until the control host is back, while
@@ -70,6 +76,12 @@ pub fn zone_secrets(zone: &wicket_core::ZoneSpec) -> BTreeMap<String, Vec<String
         m.entry(r.secret.clone()).or_default().push(r.host.clone());
     }
     m
+}
+
+/// Whether `zone`, or one of the run's credential swaps, uses vault secret `name` (#415: the control
+/// host tracks a refusal of only such a name).
+pub fn zone_uses(zone: &wicket_core::ZoneSpec, swaps: &[wicket_proxy::CredentialSwap], name: &str) -> bool {
+    zone_secrets(zone).contains_key(name) || swaps.iter().any(|s| matches!(&s.real, wicket_proxy::SwapSource::Vault(n) if n == name))
 }
 
 /// The control host's side: whether run `run` (in `zone`) may have `name` on its node, and if so the
@@ -177,8 +189,30 @@ struct Entry {
     users: HashMap<String, i64>,
 }
 
+/// Why a node didn't get a secret from its control host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unfetched {
+    /// The control host answered no: the zone doesn't use it, the vault doesn't hold it (yet), or its
+    /// binding doesn't cover the hosts the zone uses it for. Remembered for the run a while (#415).
+    Refused(String),
+    /// It couldn't be asked, or didn't answer: the next use asks again.
+    Unreachable(String),
+}
+
+impl std::fmt::Display for Unfetched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unfetched::Refused(w) | Unfetched::Unreachable(w) => f.write_str(w),
+        }
+    }
+}
+
 /// How a node fetches a secret for a run: over the run's own connection to its control host.
-pub type Fetcher = Arc<dyn Fn(String, String) -> futures_util::future::BoxFuture<'static, Result<Fetched, String>> + Send + Sync>;
+pub type Fetcher = Arc<dyn Fn(String, String) -> futures_util::future::BoxFuture<'static, Result<Fetched, Unfetched>> + Send + Sync>;
+
+/// How long a node takes a control host's refusal of a secret for a run as its answer (#415), unless
+/// the control host says sooner that the secret changed: it does within about 2 s.
+pub const REFUSAL_HELD_MS: i64 = 30_000;
 
 /// One fetch in flight for a run and a secret.
 type Inflight = Arc<tokio::sync::Mutex<()>>;
@@ -189,6 +223,8 @@ pub struct Cache {
     clock: wicket_proxy::decide::Clock,
     /// One fetch at a time per run and secret: concurrent first uses share it.
     inflight: Mutex<HashMap<(String, String), Inflight>>,
+    /// Secrets the control host refused a run (#415), by run and name: when, and why. Never a value.
+    refused: Mutex<HashMap<(String, String), (i64, String)>>,
 }
 
 /// Where a self-update's re-exec finds the cache handed over (#162): a sealed memfd's descriptor.
@@ -212,7 +248,12 @@ impl Drop for Handed {
 
 impl Cache {
     pub fn new(clock: wicket_proxy::decide::Clock) -> Arc<Cache> {
-        Arc::new(Cache { entries: Mutex::new(HashMap::new()), clock, inflight: Mutex::new(HashMap::new()) })
+        Arc::new(Cache {
+            entries: Mutex::new(HashMap::new()),
+            clock,
+            inflight: Mutex::new(HashMap::new()),
+            refused: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Keeps this process's memory out of core dumps and `ptrace` attach by other processes of the
@@ -263,8 +304,10 @@ impl Cache {
     }
 
     /// Run `run` no longer uses `name` (the control host says it changed or was removed): dropped if
-    /// no run uses it any more.
+    /// no run uses it any more. A refusal of it is forgotten too (it may have been set since, #415):
+    /// the next use asks again.
     pub fn revoke(&self, run: &str, name: &str) {
+        self.refused.lock().expect("refused").remove(&(run.to_string(), name.to_string()));
         let mut m = self.entries.lock().expect("cache");
         if let Some(e) = m.get_mut(name) {
             e.users.remove(run);
@@ -276,6 +319,7 @@ impl Cache {
 
     /// A run has ended: every secret only it used is dropped.
     pub fn release(&self, run: &str) {
+        self.refused.lock().expect("refused").retain(|(r, _), _| r != run);
         let mut m = self.entries.lock().expect("cache");
         m.retain(|_, e| {
             e.users.remove(run);
@@ -436,12 +480,25 @@ impl RunSecrets {
         if !again && wicket_proxy::vault::SecretSource::has(self, name) {
             return Ok(());
         }
+        let key = (self.run.clone(), name.to_string());
+        let now = (self.cache.clock)();
+        if !again {
+            // Refused a moment ago (#415): the same answer, without asking again on every request.
+            if let Some((_, why)) = self.cache.refused.lock().expect("refused").get(&key).filter(|(at, _)| now - at < REFUSAL_HELD_MS) {
+                bail!("{why}");
+            }
+        }
         match (self.fetch)(self.run.clone(), name.to_string()).await {
             Ok(f) if f.name == name => {
+                self.cache.refused.lock().expect("refused").remove(&key);
                 self.cache.put(&self.run, &f);
                 Ok(())
             }
             Ok(_) => bail!("the control host sent another secret"),
+            Err(Unfetched::Refused(why)) => {
+                self.cache.refused.lock().expect("refused").insert(key, (now, why.clone()));
+                bail!("{why}")
+            }
             Err(e) => bail!("{e}"),
         }
     }
@@ -654,9 +711,9 @@ mod tests {
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 if up.load(Ordering::SeqCst) == 0 {
-                    return Err("credential not cached on this node; control host unreachable".into());
+                    return Err(Unfetched::Unreachable("credential not cached on this node; control host unreachable".into()));
                 }
-                release(&z, &v, &name, 60_000)
+                release(&z, &v, &name, 60_000).map_err(Unfetched::Refused)
             })
         })
     }
@@ -725,6 +782,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
+    /// #415: a secret set, rotated or removed after a run started reaches the run's node without a
+    /// restart. Unset, the control host's refusal is held for the run (not asked per request) until
+    /// the control host says it changed; then the next use takes the new state: set, rotated, gone.
+    #[tokio::test]
+    async fn a_secret_set_rotated_or_removed_after_start_follows_the_vault() {
+        let d = tmp("follow");
+        let v = Vault::new(d.join("vault"));
+        let z = zone(
+            "name: za\ninject: [{ host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: gh, optional: true }]\n",
+        );
+        let now = Arc::new(AtomicI64::new(1_000));
+        let clock: wicket_proxy::decide::Clock = {
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let (up, calls) = (Arc::new(AtomicI64::new(1)), Arc::new(AtomicU64::new(0)));
+        let cache = Cache::new(clock);
+        let a = Vault::from_source(cache.source(RA, fetcher(v.clone(), z, up, calls.clone())));
+        // Not set: refused once, and that answer held for the run's next uses.
+        for _ in 0..5 {
+            assert!(a.ensure("gh").await.is_err());
+            assert!(!a.has("gh"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a refusal isn't asked again per request");
+        // Set: the control host says so (as a change), and the next use carries it.
+        v.set("gh", VALUE).unwrap();
+        v.set_hosts("gh", &["api.github.com".into()]).unwrap();
+        cache.revoke(RA, "gh");
+        a.ensure("gh").await.unwrap();
+        assert_eq!(a.get_for("gh", "api.github.com").unwrap(), VALUE);
+        // Rotated: dropped on the control host's word, and the new value fetched.
+        v.set("gh", "ghp_wicket-test-rotated").unwrap();
+        cache.revoke(RA, "gh");
+        assert!(!a.has("gh"));
+        a.ensure("gh").await.unwrap();
+        assert_eq!(a.get_for("gh", "api.github.com").unwrap(), "ghp_wicket-test-rotated");
+        // Removed: gone at once, and refused from then on.
+        v.remove("gh").unwrap();
+        cache.revoke(RA, "gh");
+        assert!(!a.has("gh") && a.get("gh").is_err());
+        assert!(a.ensure("gh").await.is_err());
+        assert!(cache.names().is_empty());
+        // A control host that never says: the refusal is asked about again once it is old.
+        let asked = calls.load(Ordering::SeqCst);
+        v.set("gh", VALUE).unwrap();
+        v.set_hosts("gh", &["api.github.com".into()]).unwrap();
+        assert!(a.ensure("gh").await.is_err(), "held");
+        now.fetch_add(REFUSAL_HELD_MS, Ordering::SeqCst);
+        a.ensure("gh").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), asked + 1);
+        // A run's refusals end with it.
+        v.remove("gh").unwrap();
+        cache.revoke(RA, "gh");
+        assert!(a.ensure("gh").await.is_err());
+        cache.release(RA);
+        assert!(cache.refused.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     fn grep_tree(d: &Path, needle: &str) -> bool {
         let Ok(rd) = std::fs::read_dir(d) else { return false };
         rd.flatten().any(|e| {
@@ -750,7 +866,7 @@ mod tests {
         let mut g = f.clone();
         g.not_after = 20_000;
         cache.put(RB, &g);
-        let fail: Fetcher = Arc::new(|_, _| Box::pin(async { Err("unreachable".to_string()) }));
+        let fail: Fetcher = Arc::new(|_, _| Box::pin(async { Err(Unfetched::Unreachable("unreachable".into())) }));
         let a = Vault::from_source(cache.source(RA, fail.clone()));
         let b = Vault::from_source(cache.source(RB, fail));
         assert!(a.has("m") && b.has("m"));
@@ -777,7 +893,7 @@ mod tests {
         assert_eq!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC, 0, "inherited by the exec");
         let next = Cache::new(Arc::new(|| 1_000));
         assert_eq!(next.import(fd).unwrap(), 1);
-        let v = Vault::from_source(next.source(RA, Arc::new(|_, _| Box::pin(async { Err("no".to_string()) }))));
+        let v = Vault::from_source(next.source(RA, Arc::new(|_, _| Box::pin(async { Err(Unfetched::Unreachable("no".into())) }))));
         assert_eq!(v.get_for("m", "h").unwrap(), VALUE);
         // Anything but a sealed memfd is refused.
         let plain = std::fs::File::open("/dev/null").unwrap();
