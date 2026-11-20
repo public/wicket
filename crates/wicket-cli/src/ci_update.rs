@@ -206,17 +206,23 @@ pub struct Build {
     pub behind: u64,
 }
 
-/// The successful push runs of the workflow on `main` (newest first) that published a signed build.
+/// The events whose runs of the workflow on `main` build what is signed: a push, the schedule that
+/// builds main's head when the pushes since the last build were batched, and a manual run. The
+/// signature's claims, not the event, are what make a build acceptable; this only says where to look.
+const BUILD_EVENTS: [&str; 3] = ["push", "schedule", "workflow_dispatch"];
+
+/// The successful runs of the workflow on `main` (newest first), by [`BUILD_EVENTS`], that published
+/// a signed build.
 async fn published(gh: &Gh, c: &CiConfig, commit: Option<&str>) -> Result<Vec<(String, u64, u64, u64)>> {
     let file = c.workflow.rsplit('/').next().unwrap_or(&c.workflow);
     let filter = commit.map(|s| format!("&head_sha={s}")).unwrap_or_default();
-    let runs = gh.get(&format!("/actions/workflows/{file}/runs?branch=main&event=push&status=success&per_page=30{filter}")).await?;
+    let runs = gh.get(&format!("/actions/workflows/{file}/runs?branch=main&status=success&per_page=100{filter}")).await?;
     let mut out = vec![];
     for r in runs["workflow_runs"].as_array().cloned().unwrap_or_default() {
         let (Some(id), Some(sha)) = (r["id"].as_u64(), r["head_sha"].as_str()) else { continue };
         if r["path"].as_str() != Some(c.workflow.as_str())
             || r["head_branch"].as_str() != Some("main")
-            || r["event"].as_str() != Some("push")
+            || !r["event"].as_str().is_some_and(|e| BUILD_EVENTS.contains(&e))
         {
             continue;
         }
@@ -571,8 +577,9 @@ mod tests {
     }
 
     /// #190: `latest` is the newest signed build by main's history (a re-run of an old commit
-    /// doesn't win, a branch's build is never taken); a commit is taken only on main; artifacts are
-    /// fetched with the token from the API and without it from the store it redirects to.
+    /// doesn't win, a branch's build is never taken); a commit is taken only on main; a build by the
+    /// schedule or a manual run counts as a push's does, a run by any other event doesn't; artifacts
+    /// are fetched with the token from the API and without it from the store it redirects to.
     #[tokio::test]
     async fn builds_are_resolved_by_main_s_history_and_fetched_without_leaking_the_token() {
         let (head, old, branch) = (sha('a'), sha('b'), sha('c'));
@@ -581,7 +588,7 @@ mod tests {
         let base2 = base.clone();
         let (api, seen) = fake_api(move |path| {
             let json = |v: serde_json::Value| (200, vec![("content-type".into(), "application/json".into())], v.to_string().into_bytes());
-            let run = |id: u64, sha: &str| serde_json::json!({ "id": id, "head_sha": sha, "head_branch": "main", "event": "push", "path": ".github/workflows/build.yml" });
+            let run = |id: u64, sha: &str, event: &str| serde_json::json!({ "id": id, "head_sha": sha, "head_branch": "main", "event": event, "path": ".github/workflows/build.yml" });
             let arts = |sha: &str, a: u64| {
                 let name = format!("wicket-0.0.1-{}-x86_64-linux.tar.gz", &sha[..12]);
                 serde_json::json!({ "artifacts": [{ "id": a, "name": name, "expired": false }, { "id": a + 1, "name": format!("{name}.sig"), "expired": false }] })
@@ -589,14 +596,16 @@ mod tests {
             let p = path.split('?').next().unwrap_or("");
             match p {
                 "/repos/acme/wicket/actions/workflows/build.yml/runs" => {
-                    // Newest run first: an old commit's re-run, a branch build, then main's head.
-                    let all = vec![run(99, &o2), run(50, &b2), run(10, &h2)];
+                    // Newest run first: an old commit's re-run, a run of main's head by an event that
+                    // doesn't build (ignored), a branch build, then main's head built by the schedule.
+                    let all = vec![run(99, &o2, "push"), run(77, &h2, "issue_comment"), run(50, &b2, "workflow_dispatch"), run(10, &h2, "schedule")];
                     let want = path.split("head_sha=").nth(1).map(|s| s.split('&').next().unwrap_or("").to_string());
                     let runs: Vec<_> = all.into_iter().filter(|r| want.as_deref().is_none_or(|w| r["head_sha"] == w)).collect();
                     json(serde_json::json!({ "workflow_runs": runs }))
                 }
                 "/repos/acme/wicket/actions/runs/99/artifacts" => json(arts(&o2, 990)),
                 "/repos/acme/wicket/actions/runs/50/artifacts" => json(arts(&b2, 500)),
+                "/repos/acme/wicket/actions/runs/77/artifacts" => json(arts(&h2, 770)),
                 "/repos/acme/wicket/actions/runs/10/artifacts" => json(arts(&h2, 100)),
                 p if p.starts_with("/repos/acme/wicket/compare/main...") => {
                     let c = p.rsplit("...").next().unwrap_or("");

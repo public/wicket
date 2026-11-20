@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# A newer event for the same pull request (a push, an edit, a label) supersedes a run still going:
+# only the latest state matters, and each run reads it whole.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fragment:
     name: Changelog fragment

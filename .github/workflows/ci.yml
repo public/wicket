@@ -17,8 +17,11 @@ on:
 permissions:
   contents: read
 
+# One group per pull request and one for main's pushes; the nightly full run has a group of its own.
+# A group holds one running and one pending run, and a newer pending one replaces the older: the
+# nightly run, waiting behind a push to main, would otherwise be replaced by the next push.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

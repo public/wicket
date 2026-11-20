@@ -1,7 +1,7 @@
 # Update from CI-signed builds
 
-Every merge to `main` is built and tested in CI. A reviewer then approves its signing in the
-repository's `release` environment, and installations update to that signed build: by hand with
+`main` is built and tested in CI, a batch of merges at a time. A reviewer then approves its signing
+in the repository's `release` environment, and installations update to that signed build: by hand with
 `wicket self update --from-ci`, or on their own with the `wicket-follow` timer. Nothing reaches an
 installation without that approval. [How updates work](../explanation/updates.md#builds-ci-signed)
 explains the trust model.
@@ -35,7 +35,15 @@ unless the environment has required reviewers and a branch rule.
    replace it, on a schedule or if it may have leaked.
 
 The workflow is `.github/workflows/build.yml`. Its `build` job builds the archive (`ci/package.sh`,
-reproducible) and runs the gates on every push to `main`. Its `sign` job waits for a reviewer, who sees
+reproducible) and runs the gates, for one commit of `main` at a time:
+
+- a push to `main` is built if no build of `main` ran in the last 6 hours and none is running;
+- every 6 hours, the schedule builds `main`'s head if it isn't built yet, so the last merges of a
+  batch are built too;
+- **Actions → Signed build → Run workflow** (on `main`) builds `main`'s head at once.
+
+A commit that is built already is never built again. Installations find a build made by any of the
+three: the signature's claims, not the event that started the run, are what is checked. Its `sign` job waits for a reviewer, who sees
 the commit, the gates and the archive's sha256 (in the `build` job's log). Approving gives the job the
 key; it signs the archive's sha256 together with the commit, `refs/heads/main`, the repository, the
 workflow, the run and the environment, using openssl only. Nothing from the repository or the build
