@@ -150,6 +150,39 @@ jobs:
           # Every commit reachable from the one under test (not other branches, which have their own runs).
           ./gitleaks git --redact --no-banner --log-opts="HEAD" --config .gitleaks.toml .
 
+  # The workflows and actions themselves (#726): zizmor's audits (template injection, permissions,
+  # unpinned or impostor actions, credentials left for later steps, cache poisoning, dangerous
+  # triggers). A pinned release, checksum-verified. Any finding fails; an accepted one is listed with
+  # its reason in .github/zizmor.yml.
+  workflows:
+    name: Workflow audit (zizmor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      ZIZMOR_VERSION: 1.32.0
+      ZIZMOR_SHA256: bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: zizmor
+        env:
+          # Its online audits (impostor commits, known-vulnerable actions, ref confusion) read
+          # public repositories through the API.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f=zizmor-x86_64-unknown-linux-gnu.tar.gz
+          curl -sSfL -o "$RUNNER_TEMP/$f" "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/$f"
+          echo "${ZIZMOR_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" zizmor
+          z=$RUNNER_TEMP/zizmor
+          "$z" --version
+          # The findings in the log, then again as annotations on the pull request.
+          if ! "$z" --no-progress --format plain .; then
+            "$z" --no-progress --format github . || true
+            exit 1
+          fi
+
   # Supply chain (#326): cargo deny (deny.toml) on every pull request, push and nightly run:
   # RustSec advisories (vulnerable, unsound or yanked crates), licences, banned crates and sources.
   # Nightly too, so an advisory published against an unchanged lockfile is seen. Duplicate
@@ -221,21 +254,28 @@ jobs:
           echo "${NEXTEST_SHA256}  $f" | sha256sum -c -
           tar xzf "$f" -C ~/.cargo/bin cargo-nextest
       - run: cargo fmt --all -- --check
+      # The selection reaches the shell through the environment, never expanded into the script
+      # (zizmor's template-injection, #726). $ARGS is unquoted on purpose: it is several arguments.
       - if: ${{ steps.pkgs.outputs.args != '' }}
-        run: cargo clippy ${{ steps.pkgs.outputs.args }} --all-targets --locked -- -D warnings
+        env:
+          ARGS: ${{ steps.pkgs.outputs.args }}
+        run: cargo clippy $ARGS --all-targets --locked -- -D warnings
       - name: Tests (nextest; a test that passed only on a retry is reported as flaky)
         if: ${{ steps.pkgs.outputs.args != '' }}
         env:
+          ARGS: ${{ steps.pkgs.outputs.args }}
           FILTER: ${{ steps.pkgs.outputs.filter }}
         run: |
           set -o pipefail
-          cargo nextest run ${{ steps.pkgs.outputs.args }} -E "$FILTER" --locked --profile ci 2>&1 | tee nextest.log
+          cargo nextest run $ARGS -E "$FILTER" --locked --profile ci 2>&1 | tee nextest.log
           if grep -q FLAKY nextest.log; then
             { echo "### Flaky tests (passed on a retry)"; grep FLAKY nextest.log | sed 's/^/    /'; } >>"$GITHUB_STEP_SUMMARY"
           fi
       - name: Doctests (nextest doesn't run them)
         if: ${{ steps.pkgs.outputs.doc_args != '' }}
-        run: cargo test ${{ steps.pkgs.outputs.doc_args }} --locked --doc
+        env:
+          DOC_ARGS: ${{ steps.pkgs.outputs.doc_args }}
+        run: cargo test $DOC_ARGS --locked --doc
 
   # #323: the fuzz targets a change selects (ci/determinator/suites.toml's fuzz targets; none selected
   # says `none`, no selection says nothing: every target), 60 s each. In groups of up to three, one
@@ -395,7 +435,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: ci/tla.sh --shard "${{ matrix.shard }}/2"
+      - env:
+          SHARD: ${{ matrix.shard }}
+        run: ci/tla.sh --shard "$SHARD/2"
 
   tla:
     name: TLA+ models (TLC)
@@ -443,7 +485,9 @@ jobs:
         run: |
           cargo install --locked kani-verifier --version "$KANI_VERSION"
           cargo kani setup
-      - run: ci/kani.sh --shard "${{ matrix.shard }}/4"
+      - env:
+          SHARD: ${{ matrix.shard }}
+        run: ci/kani.sh --shard "$SHARD/4"
 
   kani:
     name: Kani proofs and loom

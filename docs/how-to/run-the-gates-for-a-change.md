@@ -130,6 +130,14 @@ wicket.
 - **Supply chain**: `cargo deny --locked check` (`deny.toml`: RustSec advisories, licences, banned
   crates and sources) runs on every pull request, every push and nightly, whatever the change selects
   (#326). Run it locally with `cargo install --locked cargo-deny@0.20.2`.
+- **Workflow audit**: [zizmor](https://docs.zizmor.sh) over `.github/` (template injection, permissions,
+  unpinned or impostor actions, credentials left for later steps, cache poisoning) runs on every pull
+  request and push (#726). A finding fails the job; an accepted one is listed, with its reason, in
+  `.github/zizmor.yml`. Run it locally with `zizmor .` (the version is `ZIZMOR_VERSION` in `ci.yml`).
+- **Pin updates**: Renovate (`.github/renovate.json`) proposes new action SHAs, image digests, tool
+  versions and lockfiles weekly, and security fixes at once, each as a pull request for review; none is
+  merged automatically. Where a pin has a hash beside its version, the pull request is labelled
+  `needs hash`: record the new hash, compared with what the project publishes, or CI fails.
 - **Mutation testing** of the decision code (`ci/mutants.sh`) runs weekly in `mutants.yml`, not on
   pull requests: a mutant the tests don't catch fails it unless `ci/mutants.accepted` says why it is
   equivalent. Results and how to run it: [verification/mutants](../../verification/mutants/README.md).

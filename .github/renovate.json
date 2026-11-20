@@ -1,0 +1,337 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Proposes updates to wicket's pins (#726): action SHAs, image digests, CI tool versions and the lockfiles. Every update is a pull request for review; nothing merges automatically. docs/explanation/supply-chain.md lists what each pin is checked against.",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(chore)"
+  ],
+  "automerge": false,
+  "platformAutomerge": false,
+  "dependencyDashboard": {
+    "enabled": true
+  },
+  "timezone": "UTC",
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "prConcurrentLimit": 6,
+  "prHourlyLimit": 2,
+  "minimumReleaseAge": "3 days",
+  "labels": [
+    "dependencies"
+  ],
+  "ignorePaths": [
+    "**/node_modules/**",
+    "third_party/**",
+    "experiments/**",
+    "refs/**"
+  ],
+  "vulnerabilityAlerts": {
+    "description": "Security fixes are proposed as soon as they are known, still for review.",
+    "schedule": [
+      "at any time"
+    ],
+    "minimumReleaseAge": null,
+    "automerge": false
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on monday"
+    ],
+    "automerge": false
+  },
+  "docker": {
+    "pinDigests": true
+  },
+  "github-actions": {
+    "pinDigests": true
+  },
+  "customManagers": [
+    {
+      "description": "Images pinned as name:tag@sha256:digest in scripts and composite actions (ci/base-images.sh, the runsc self-test's busybox).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ci/base-images\\.sh$/",
+        "/^\\.github/actions/[^/]+/action\\.yml$/"
+      ],
+      "matchStrings": [
+        "(?<depName>[a-z0-9][a-z0-9./-]*):(?<currentValue>[A-Za-z0-9][\\w.-]*)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "description": "gVisor's release archive in the gVisor action (its sha512 sits next to the version).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/actions/gvisor-setup/action\\.yml$/"
+      ],
+      "matchStrings": [
+        "\\bversion=(?<currentValue>\\d{8}\\.\\d+)"
+      ],
+      "depNameTemplate": "google/gvisor",
+      "datasourceTemplate": "github-tags",
+      "extractVersionTemplate": "^release-(?<version>\\d{8}\\.\\d+)$",
+      "versioningTemplate": "loose"
+    },
+    {
+      "description": "gitleaks (ci.yml).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "GITLEAKS_VERSION: (?<currentValue>\\S+)\\s"
+      ],
+      "depNameTemplate": "gitleaks/gitleaks",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "description": "zizmor (ci.yml).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "ZIZMOR_VERSION: (?<currentValue>\\S+)\\s"
+      ],
+      "depNameTemplate": "zizmorcore/zizmor",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "description": "cargo-nextest (ci.yml).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "NEXTEST_VERSION: (?<currentValue>\\S+)\\s"
+      ],
+      "depNameTemplate": "nextest-rs/nextest",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^cargo-nextest-(?<version>.+)$"
+    },
+    {
+      "description": "cargo-deny (ci.yml).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "CARGO_DENY_VERSION: (?<currentValue>\\S+)\\s"
+      ],
+      "depNameTemplate": "cargo-deny",
+      "datasourceTemplate": "crate"
+    },
+    {
+      "description": "cargo-mutants (mutants.yml).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/mutants\\.yml$/"
+      ],
+      "matchStrings": [
+        "CARGO_MUTANTS_VERSION: (?<currentValue>\\S+)\\s"
+      ],
+      "depNameTemplate": "cargo-mutants",
+      "datasourceTemplate": "crate"
+    },
+    {
+      "description": "cargo-fuzz (ci/fuzz.sh).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ci/fuzz\\.sh$/"
+      ],
+      "matchStrings": [
+        "CARGO_FUZZ_VERSION=(?<currentValue>\\S+)\\s"
+      ],
+      "depNameTemplate": "cargo-fuzz",
+      "datasourceTemplate": "crate"
+    },
+    {
+      "description": "Kani (ci.yml): the kani-verifier crate; the release bundle's sha256 changes with it.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "KANI_VERSION: (?<currentValue>\\S+)\\s"
+      ],
+      "depNameTemplate": "kani-verifier",
+      "datasourceTemplate": "crate"
+    },
+    {
+      "description": "Node.js for the session view's build (ci.yml, build.yml, release.yml).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.yml$/"
+      ],
+      "matchStrings": [
+        "NODE_VERSION: (?<currentValue>\\S+)\\s"
+      ],
+      "depNameTemplate": "node",
+      "datasourceTemplate": "node-version"
+    },
+    {
+      "description": "Lean: ci/lean.sh and verification/lean/lean-toolchain, together.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ci/lean\\.sh$/",
+        "/^verification/lean/lean-toolchain$/"
+      ],
+      "matchStrings": [
+        "LEAN_VERSION=(?<currentValue>\\d[\\w.-]*)\\s",
+        "leanprover/lean4:v(?<currentValue>\\d[\\w.-]*)"
+      ],
+      "depNameTemplate": "leanprover/lean4",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "description": "TLA+ tools (ci/tla.sh).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^ci/tla\\.sh$/"
+      ],
+      "matchStrings": [
+        "tlaplus/tlaplus/releases/download/v(?<currentValue>[\\d.]+)/tla2tools\\.jar"
+      ],
+      "depNameTemplate": "tlaplus/tlaplus",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "description": "Claude Code in the agent image (its sha512s sit next to the version).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^images/claude-code/Dockerfile$/"
+      ],
+      "matchStrings": [
+        "ARG CLAUDE_CODE_VERSION=(?<currentValue>\\S+)"
+      ],
+      "depNameTemplate": "@anthropic-ai/claude-code",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "description": "The Rust toolchain: rust-toolchain.toml and the self-hosting example.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^rust-toolchain\\.toml$/",
+        "/^examples/self-hosting/Dockerfile$/"
+      ],
+      "matchStrings": [
+        "channel = \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\"",
+        "ARG RUST_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-tags"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Pins whose hash sits next to the version: Renovate changes the version only. CI fails on the old hash until a reviewer records the new one, compared with what the project publishes (never fetched at run time).",
+      "matchDepNames": [
+        "google/gvisor",
+        "gitleaks/gitleaks",
+        "zizmorcore/zizmor",
+        "nextest-rs/nextest",
+        "kani-verifier",
+        "node",
+        "leanprover/lean4",
+        "tlaplus/tlaplus",
+        "@anthropic-ai/claude-code"
+      ],
+      "addLabels": [
+        "needs hash"
+      ],
+      "prBodyNotes": [
+        "**This pin has a hash next to its version.** Renovate changed the version only: record the new sha256/sha512 beside it (compare it with the checksum the project publishes), or CI fails. docs/explanation/supply-chain.md has each pin's source."
+      ]
+    },
+    {
+      "description": "Kani: its release bundle's sha256 (KANI_BUNDLE_SHA256, where present) changes with the crate's version.",
+      "matchDepNames": [
+        "kani-verifier"
+      ],
+      "prBodyNotes": [
+        "Update the Kani release bundle's sha256 with the version (kani-<version>-x86_64-unknown-linux-gnu.tar.gz)."
+      ]
+    },
+    {
+      "description": "Node stays on the 22 line the session view is built and tested with.",
+      "matchDepNames": [
+        "node"
+      ],
+      "matchDatasources": [
+        "node-version"
+      ],
+      "allowedVersions": "/^22\\./"
+    },
+    {
+      "description": "The node base image stays on 22 too; its tag floats, so Renovate proposes new digests.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchDepNames": [
+        "node"
+      ],
+      "allowedVersions": "/^22-/"
+    },
+    {
+      "description": "One Rust release, one pull request: the toolchain, the forwarder's base image and the self-hosting example.",
+      "matchDepNames": [
+        "rust-lang/rust",
+        "rust"
+      ],
+      "groupName": "Rust toolchain"
+    },
+    {
+      "description": "The install tests' distributions stay on the releases deploy/install.sh supports; only their digests move.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchDepNames": [
+        "ubuntu",
+        "debian",
+        "busybox"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Crate updates within their ranges, one weekly pull request.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "Rust crates (minor and patch)"
+    },
+    {
+      "description": "npm updates for the session view and the examples, one weekly pull request each.",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "npm packages (minor and patch)",
+      "additionalBranchPrefix": "{{packageFileDir}}-"
+    },
+    {
+      "description": "GitHub Actions, one weekly pull request.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions"
+    }
+  ]
+}
