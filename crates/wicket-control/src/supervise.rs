@@ -156,8 +156,9 @@ pub enum Action {
     /// Fence `holder` ([`Ledger::fence_shard`] with `gone`), then, only if that worked, kill it
     /// (unless gone) and start a fresh host, in that order.
     Fence { shard: String, holder: String, gone: bool },
-    /// Held, its lease live, by a process wicketd doesn't know (wicketd restarted): wait for it to
-    /// heartbeat, stop, or lapse. Never fenced on that alone.
+    /// Held by a running process wicketd didn't start (wicketd restarted), or one it can't tell
+    /// about, whose lease is live, lapsed only briefly, or lapsed with every other: wait for it to
+    /// renew, stop or lapse alone past [`STALL_WINDOW_SECS`] (then it is fenced).
     Watch(String),
 }
 
@@ -195,8 +196,9 @@ impl Fencer {
     ///   lease has lapsed for [`STALL_WINDOW_SECS`]: fence. Its heartbeat is off the ledger, so a
     ///   ledger stall alone (heartbeats answering) fences no one, and a single wedged host is fenced
     ///   with no other host to compare it with;
-    /// - a process wicketd didn't start that runs, or that it can't tell about while its lease is
-    ///   live: watch; one it can't tell about whose lease lapsed alone for the window: fence.
+    /// - a process wicketd didn't start that runs, or that it can't tell about: watched while its
+    ///   lease is live, lapsed only briefly, or lapsed with every other; fenced once its lease has
+    ///   lapsed alone for [`STALL_WINDOW_SECS`].
     pub fn decide(
         &mut self,
         shards: &[String],
@@ -241,11 +243,11 @@ impl Fencer {
                         out.push(fence(false));
                     }
                 }
-                None => match holder_alive(&holder) {
-                    None if long(&self.alone_since, s) => out.push(fence(false)),
-                    None if rec.lease_until <= now => {}
-                    _ => out.push(Action::Watch(s.clone())),
-                },
+                // Running (or can't tell) but not wicketd's: watched while its lease is live or lapsed only
+                // briefly, or lapsed together with every other (a stall); fenced once lapsed alone past
+                // the window, as there is no heartbeat to say its runtime moves.
+                None if long(&self.alone_since, s) => out.push(fence(false)),
+                None => out.push(Action::Watch(s.clone())),
             }
         }
         out
@@ -354,22 +356,47 @@ mod tests {
     }
 
     #[test]
-    fn after_wicketd_restarts_running_holders_are_watched_and_gone_ones_fenced() {
-        let mut f = Fencer::default();
-        let hosts = [host("0", 130), host("1", 130)];
-        // Their processes live on; wicketd just didn't start them: watched, lapsed or not.
-        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), &alive, 101), [Action::Watch("0".into()), Action::Watch("1".into())]);
-        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), &alive, 200), [Action::Watch("0".into()), Action::Watch("1".into())]);
-        // Can't tell (an owner label from elsewhere): watched while live; fenced only once lapsed
-        // alone for the window.
-        let mut f = Fencer::default();
-        let hosts = [host("0", 130), host("1", 150)];
-        assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), &unknown, 131), [Action::Watch("1".into())]);
-        let hosts = [host("0", 130), host("1", 170)];
-        assert_eq!(
-            f.decide(&shards(), &hosts, &BTreeMap::new(), &unknown, 131 + STALL_WINDOW_SECS),
-            [fence("0", false), Action::Watch("1".into())]
-        );
+    fn after_wicketd_restarts_a_running_holder_is_watched_until_its_lease_lapses_alone() {
+        for holder_alive in [alive as fn(&str) -> Option<bool>, unknown] {
+            let mut f = Fencer::default();
+            // Both live: watched.
+            let hosts = [host("0", 130), host("1", 130)];
+            assert_eq!(
+                f.decide(&shards(), &hosts, &BTreeMap::new(), &holder_alive, 101),
+                [Action::Watch("0".into()), Action::Watch("1".into())]
+            );
+            // 0 lapses while 1 renews: watched through the window, then fenced (not gone).
+            let hosts = [host("0", 130), host("1", 150)];
+            assert_eq!(
+                f.decide(&shards(), &hosts, &BTreeMap::new(), &holder_alive, 131),
+                [Action::Watch("0".into()), Action::Watch("1".into())]
+            );
+            let hosts = [host("0", 130), host("1", 170)];
+            assert_eq!(
+                f.decide(&shards(), &hosts, &BTreeMap::new(), &holder_alive, 131 + STALL_WINDOW_SECS - 1),
+                [Action::Watch("0".into()), Action::Watch("1".into())]
+            );
+            assert_eq!(
+                f.decide(&shards(), &hosts, &BTreeMap::new(), &holder_alive, 131 + STALL_WINDOW_SECS),
+                [fence("0", false), Action::Watch("1".into())]
+            );
+        }
+    }
+
+    #[test]
+    fn holders_wicketd_cant_tell_about_are_watched_when_every_lease_has_lapsed() {
+        // A stall, or every holder elsewhere: nothing to tell one from the other, so no fence, however
+        // long, until one renews and another doesn't.
+        for holder_alive in [alive as fn(&str) -> Option<bool>, unknown] {
+            let mut f = Fencer::default();
+            let hosts = [host("0", 100), host("1", 100)];
+            for now in [101, 200, 5_000] {
+                assert_eq!(
+                    f.decide(&shards(), &hosts, &BTreeMap::new(), &holder_alive, now),
+                    [Action::Watch("0".into()), Action::Watch("1".into())]
+                );
+            }
+        }
     }
 
     #[test]
