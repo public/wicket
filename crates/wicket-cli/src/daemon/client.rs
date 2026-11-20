@@ -140,7 +140,8 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
     proto::write_json(&mut w, kind::HELLO, &hello)?;
     let welcome: Welcome = match proto::read_frame(&mut r)? {
         Some((kind::WELCOME, p)) => serde_json::from_slice(&p)?,
-        Some((kind::ERROR, p)) => bail!("wicketd: {}", String::from_utf8_lossy(&p)),
+        // Its policy refused the command (exit 3), or it failed otherwise (1).
+        Some((kind::ERROR, p)) => return Err(daemon_error(&p)),
         _ => bail!("wicketd closed the connection"),
     };
     let mut client_ok = true;
@@ -159,7 +160,8 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
             loop {
                 match proto::read_frame(&mut r)? {
                     Some((kind::EXIT, p)) if p.len() == 4 => return Ok(i32::from_be_bytes(p[..4].try_into().expect("4 bytes"))),
-                    Some((kind::ERROR, p)) => bail!("wicketd: {}", String::from_utf8_lossy(&p)),
+                    // Its policy refused the command (exit 3), or it failed otherwise (1).
+                    Some((kind::ERROR, p)) => return Err(daemon_error(&p)),
                     Some(_) => {}
                     // A restart by the service manager (#455): the command itself goes on.
                     None => bail!(
@@ -239,4 +241,31 @@ fn doctor(sock: &Path, w: &Welcome) -> bool {
         println!("docker: not reachable by you (good)");
     }
     ok
+}
+
+/// The daemon's `ERROR` frame as this command's error, with the exit code it is marked with
+/// (#574, [`proto::mark_of`]).
+fn daemon_error(p: &[u8]) -> anyhow::Error {
+    let text = String::from_utf8_lossy(p);
+    wicket_home::exit::Exit { code: proto::mark_of(&text), msg: format!("wicketd: {text}") }.into()
+}
+
+#[cfg(test)]
+mod tests {
+    /// #574: the daemon's policy refusal exits 3; its other errors (moving to a new build, fds or
+    /// uploads that didn't arrive) exit 1.
+    #[test]
+    fn only_the_policys_refusal_is_refused() {
+        use super::proto::marked;
+        use wicket_home::exit::{code_of, Code};
+        let refused = super::daemon_error(marked(Code::Refused, "needs root, or a passkey in the console").as_bytes());
+        assert_eq!(code_of(&refused), Some(Code::Refused));
+        assert!(refused.to_string().contains("needs root"), "{refused}");
+        let moving = super::daemon_error(marked(Code::TryAgain, "wicketd is moving to a new build: try again in a few seconds").as_bytes());
+        assert_eq!(code_of(&moving), Some(Code::TryAgain));
+        let usage = super::daemon_error(marked(Code::Usage, "unexpected argument").as_bytes());
+        assert_eq!(code_of(&usage), Some(Code::Usage));
+        let other = super::daemon_error(marked(Code::Failed, "the caller's stdin, stdout and stderr did not arrive").as_bytes());
+        assert_eq!(code_of(&other), Some(Code::Failed));
+    }
 }

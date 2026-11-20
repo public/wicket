@@ -11,6 +11,11 @@
 //!   failed, or dead-lettered, and what it started or sent. At most one per (trigger, event).
 //! - **`work_claims`:** a run's claim on a piece of work (`github.com/acme/app#123`), live while
 //!   the run is, and what `owner_of` reads.
+//! - **`trigger_cursors`:** how far a source that reads a sequence has read: wicket's own events,
+//!   by the audit chain's seq.
+//! - **`trigger_causes`:** the triggers that led to each turn a trigger queued (its message id),
+//!   so an event of the run that read it knows which triggers caused it, and none fires twice in
+//!   one chain.
 //!
 //! The scheduler, intake and engine that fill these come later (the design's steps 2 to 5).
 
@@ -41,6 +46,12 @@ CREATE TABLE IF NOT EXISTS work_claims (
   key TEXT NOT NULL, tenant TEXT NOT NULL, run TEXT NOT NULL, claimed_at INTEGER NOT NULL, released_at INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS work_claims_live ON work_claims (tenant, key) WHERE released_at IS NULL;
+CREATE TABLE IF NOT EXISTS trigger_causes (
+  message TEXT PRIMARY KEY, trigger TEXT NOT NULL, chain TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trigger_cursors (
+  tenant TEXT NOT NULL, source TEXT NOT NULL, seq INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (tenant, source)
+);
 "#;
 
 /// How long triggers' settled firings and the events they fired on are kept (as the design keeps
@@ -265,7 +276,8 @@ impl Ledger {
             "DELETE FROM trigger_events WHERE received_at < ?1 AND id NOT IN (SELECT event FROM trigger_firings)",
             params![before],
         )?;
-        Ok(f + e)
+        let c = self.conn.execute("DELETE FROM trigger_causes WHERE created_at < ?1", params![before])?;
+        Ok(f + e + c)
     }
 
     /// A human's approval of a trigger that waited for one.
@@ -325,6 +337,110 @@ impl Ledger {
             )
             .optional()?
             .is_some())
+    }
+
+    /// Records the chain of triggers (ids) that queued `message`, this trigger last.
+    pub fn record_trigger_cause(&self, message: &str, trigger: &str, chain: &[String]) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO trigger_causes (message, trigger, chain, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![message, trigger, serde_json::to_string(chain)?, now()],
+        )?;
+        Ok(())
+    }
+
+    /// The triggers that led to what `run` did up to `at`: every trigger in the chains of the
+    /// turns triggers queued for it (or for its agent, moved to it when it woke) by then, sorted.
+    pub fn trigger_chain(&self, run: &str, at: i64) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT c.chain FROM trigger_causes c JOIN messages m ON m.id = c.message WHERE m.to_run = ?1 AND c.created_at <= ?2",
+        )?;
+        let rows = st.query_map(params![run, at], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut all: Vec<String> = rows.iter().flat_map(|c| serde_json::from_str::<Vec<String>>(c).unwrap_or_default()).collect();
+        all.sort();
+        all.dedup();
+        Ok(all)
+    }
+
+    /// Who a run is, as a trigger may filter on it: its zone, its agent's name, and its principal
+    /// (None for a run with no identity), from the ledger, not from anything the run wrote.
+    pub fn run_scope(&self, run: &str) -> Result<Option<(String, String, Option<String>)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT r.zone, r.agent, i.spiffe_id FROM runs r LEFT JOIN identities i ON i.run = r.id WHERE r.id = ?1",
+                params![run],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Audit records after `seq` and up to `upto`, of these kinds, oldest first, at most `limit`:
+    /// what the triggers engine reads, without the records no trigger listens to.
+    pub fn audit_records_of_kinds(&self, seq: i64, upto: i64, kinds: &[&str], limit: usize) -> Result<Vec<crate::AuditRecord>> {
+        let marks = (0..kinds.len()).map(|i| format!("?{}", i + 4)).collect::<Vec<_>>().join(", ");
+        let mut st = self.conn.prepare(&format!(
+            "SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit WHERE seq > ?1 AND seq <= ?2 AND kind IN ({marks}) ORDER BY seq LIMIT ?3"
+        ))?;
+        let mut args: Vec<rusqlite::types::Value> = vec![seq.into(), upto.into(), (limit as i64).into()];
+        args.extend(kinds.iter().map(|k| rusqlite::types::Value::Text(k.to_string())));
+        let rows = st.query_map(rusqlite::params_from_iter(args), |r| {
+            Ok(crate::AuditRecord {
+                seq: r.get(0)?,
+                ts: r.get(1)?,
+                tenant: r.get(2)?,
+                run: r.get(3)?,
+                kind: r.get(4)?,
+                body: r.get(5)?,
+                prev: r.get(6)?,
+                hash: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Runs `f` inside a savepoint of the caller's transaction: its writes are kept if it returns
+    /// Ok and undone if it returns Err, the transaction's other writes kept either way.
+    pub fn savepoint<T, E: From<StoreError>>(&self, f: impl FnOnce(&Ledger) -> std::result::Result<T, E>) -> std::result::Result<T, E> {
+        self.conn.execute_batch("SAVEPOINT one_trigger").map_err(|e| E::from(e.into()))?;
+        let r = f(self);
+        let end = if r.is_ok() { "RELEASE one_trigger" } else { "ROLLBACK TO one_trigger; RELEASE one_trigger" };
+        match (r, self.conn.execute_batch(end)) {
+            (Ok(v), Ok(())) => Ok(v),
+            (Ok(_), Err(e)) => Err(E::from(e.into())),
+            (Err(e), _) => Err(e),
+        }
+    }
+
+    /// Makes every firing of `trigger` fail to be recorded, as a store error would: for tests of
+    /// what one trigger's error does to the rest.
+    #[cfg(feature = "testkit")]
+    pub fn fail_firings_for_test(&self, trigger: &str) {
+        let t: String = trigger.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+        self.conn
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail_{n} BEFORE INSERT ON trigger_firings WHEN NEW.trigger = '{t}' BEGIN SELECT RAISE(ABORT, 'refused for the test'); END;",
+                n = t.replace('-', "_")
+            ))
+            .expect("a temp trigger");
+    }
+
+    /// How far a source that reads a sequence (wicket's own events: the audit chain's seq) has
+    /// read, if it has started.
+    pub fn trigger_cursor(&self, tenant: &str, source: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT seq FROM trigger_cursors WHERE tenant = ?1 AND source = ?2", params![tenant, source], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Moves a source's cursor on to `seq`. It never moves back.
+    pub fn set_trigger_cursor(&self, tenant: &str, source: &str, seq: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO trigger_cursors (tenant, source, seq, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (tenant, source) DO UPDATE SET seq = MAX(seq, excluded.seq), updated_at = excluded.updated_at",
+            params![tenant, source, seq, now()],
+        )?;
+        Ok(())
     }
 
     pub fn trigger_event(&self, id: &str) -> Result<Option<TriggerEvent>> {
@@ -526,6 +642,12 @@ mod tests {
         assert!(l.trigger_event_known("t0", "github", "d-1").unwrap());
         assert!(!l.trigger_event_known("t0", "github", "d-2").unwrap());
         assert!(!l.trigger_event_known("t0", "webhook", "d-1").unwrap(), "per source");
+        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), None);
+        l.set_trigger_cursor("t0", "wicket", 7).unwrap();
+        l.set_trigger_cursor("t0", "wicket", 5).unwrap();
+        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), Some(7), "never back");
+        l.set_trigger_cursor("t0", "wicket", 9).unwrap();
+        assert_eq!(l.trigger_cursor("t0", "wicket").unwrap(), Some(9));
         let (f, fresh) = l.record_firing("t-1", &e, "queued", None).unwrap();
         assert!(fresh);
         assert_eq!(l.record_firing("t-1", &e, "queued", None).unwrap(), (f.clone(), false), "once per trigger and event");

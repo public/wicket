@@ -300,6 +300,18 @@ pub fn box_image(named: Option<&str>, m: &Manifest) -> Result<String> {
 }
 
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
+    run_to_end(o).await.map(|_| ())
+}
+
+/// Whether a run's final status (as [`run_to_end`] returns it) is its box failing: a non-zero exit,
+/// out of memory, over a cap, or its timeout. `wicket run` and `wicket wrap` exit 1 then (#574).
+pub fn box_failed(status: &str) -> bool {
+    status.starts_with("failed") || status == "timeout"
+}
+
+/// [`run`], returning the run's final status: `succeeded`, `failed (…)`, `timeout`, `hibernated`,
+/// `interrupted`, `revoked`, `superseded`…, as the run's record has it.
+pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
     let RunOpts {
         manifest: manifest_path,
         workdir,
@@ -2515,7 +2527,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if record.is_none() {
         let _ = save_timings(&dir, &timings);
     }
-    Ok(())
+    Ok(status)
 }
 
 /// Brings a kept box's files back from its node: its workspace (into the run's directory, or an

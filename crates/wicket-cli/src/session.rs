@@ -157,11 +157,11 @@ async fn awake(agent: &str) -> Result<String> {
 fn running(l: &Ledger, run: &str) -> Result<()> {
     match l.run_status(run)?.as_deref() {
         Some("running") => {}
-        Some(s) => bail!("{run} is {s}, not running"),
-        None => bail!("no run {run}"),
+        Some(s) => return Err(wicket_home::exit::refused(format!("{run} is {s}, not running"))),
+        None => return Err(wicket_home::exit::not_found(format!("no run {run}"))),
     }
     if let Some((r, ..)) = l.revoked_in_chain(run)? {
-        bail!("{run}'s identity is revoked (via {r})");
+        return Err(wicket_home::exit::refused(format!("{run}'s identity is revoked (via {r})")));
     }
     Ok(())
 }

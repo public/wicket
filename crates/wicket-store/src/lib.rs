@@ -185,6 +185,10 @@ pub enum StoreError {
 /// Version 28 (expand, after #582 step 2's 27) adds `names`, `host_ports` and `name_records`
 /// (#575): the names boxes hold, the host ports public names are published on, and the DNS records
 /// this installation created. Older builds don't read them; the floor stays 17.
+/// Version 29 (expand, after #575's 28) adds `trigger_cursors` and `trigger_causes` (#578 step 3):
+/// how far through the audit chain the triggers engine has read wicket's own events, and the
+/// chain of triggers behind each turn a trigger queued. Older builds don't read them; the floor
+/// stays 17.
 /// Version 30 (expand, after #575's 28; 29 is #578 step 3's) adds `placement_owners` (#579 step 4):
 /// whose box each reservation is for, so affinity counts a box being started. Older builds don't read
 /// it; the floor stays 17.
