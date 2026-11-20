@@ -53,7 +53,8 @@ fn lasts(s: &str) -> Result<Option<std::time::Duration>> {
     match s {
         "forever" => Ok(None),
         d => Ok(Some(
-            wicket_core::time::parse_duration(d)
+            // As clap checked it (#574): a duration, or a number of seconds.
+            wicket_core::time::duration_arg(d)
                 .map_err(|e| wicket_home::exit::usage(format!("bad --ttl {d:?} (a duration such as 30d, or forever): {e}")))?,
         )),
     }

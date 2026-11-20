@@ -19,4 +19,6 @@ type: Changed
 - "No trigger" and a trigger's "no agent" exit 4 (not found).
 - wicketd sends the exit code of a command it turns away in a field of its own (a new `REFUSE`
   frame, to a client that says it reads one), not as words at the start of the text, which the
-  text could imitate. An older client gets the text as before.
+  text could imitate. An older client gets the text as before. While a host updates, a client and
+  daemon of different builds lose the code: a refusal through an older daemon, or to an older
+  client, exits 1 with its text.

@@ -2354,7 +2354,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     hibernating = false;
                     set_state("failed", Some(&format!("hibernate failed: fetching its state from node {node_name}: {e:#}")));
                     status = format!("failed (hibernate: fetching its state: {e})");
-                } else {
+                } else if status != "revoked" {
+                    // A revoked run stays revoked (#574: exit 6); the failed fetch is audited above.
                     status = format!("failed (fetching its files from node {node_name}: {e})");
                 }
             }

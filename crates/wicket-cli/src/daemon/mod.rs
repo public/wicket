@@ -493,12 +493,12 @@ impl Daemon {
                 if *only_nodes {
                     argv.push("--only-nodes".into());
                 }
-                // Durations as clap parsed them, in ms: exact, and parsed again the same way.
+                // Durations as clap parsed them, in ns: exact, and parsed again the same way.
                 argv.extend([
                     "--window".into(),
-                    format!("{}ms", window.as_millis()),
+                    format!("{}ns", window.as_nanos()),
                     "--interval".into(),
-                    format!("{}ms", interval.as_millis()),
+                    format!("{}ns", interval.as_nanos()),
                 ]);
                 for c in check {
                     argv.extend(["--check".into(), c.clone()]);

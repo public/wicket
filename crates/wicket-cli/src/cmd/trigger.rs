@@ -131,7 +131,9 @@ fn lasts(s: &str) -> Result<Option<i64>> {
     match s {
         "forever" => Ok(None),
         d => {
-            let d = wicket_core::time::parse_duration(d).context("bad --lasts (a duration such as 30d, or forever)")?;
+            // As clap checked it (#574): a duration, or a number of seconds.
+            let d = wicket_core::time::duration_arg(d)
+                .map_err(|e| wicket_home::exit::usage(format!("bad --lasts {d:?} (a duration such as 30d, or forever): {e}")))?;
             Ok(Some(wicket_store::now() + d.as_secs() as i64))
         }
     }

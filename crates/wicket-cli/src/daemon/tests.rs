@@ -347,11 +347,11 @@ fn a_trusted_key_and_an_update_build_go_to_the_daemon_as_content() {
             built.to_str().unwrap(),
             "--nodes",
             "all",
-            // As clap parsed them, in ms: the same durations.
+            // As clap parsed them, in ns: the same durations, exactly.
             "--window",
-            "5000ms",
+            "5000000000ns",
             "--interval",
-            "2000ms",
+            "2000000000ns",
             "--check",
             "true",
             "--image",

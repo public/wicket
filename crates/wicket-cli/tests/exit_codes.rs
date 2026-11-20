@@ -66,6 +66,9 @@ fn every_kind_of_outcome_has_its_code() {
         (&["trigger", "renew", "t-nope", "--lasts", "5q"], 2),
         (&["self", "update", "x", "--window", "5q"], 2),
         (&["standing", "renew", "s-nope", "--ttl", "5q"], 2),
+        // A number alone is seconds, past the parser too: the ask is looked up (and isn't there).
+        (&["standing", "renew", "s-nope", "--ttl", "3600"], 4),
+        (&["trigger", "renew", "t-nope", "--lasts", "3600"], 4),
         (&["hibernate", "x", "--wait", "5q"], 2),
         (&["trigger", "show", "nope"], 4),
         (&["unlink", "lk-nope"], 4),
