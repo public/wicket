@@ -21,7 +21,10 @@ const AGENT = "#agent/run_01JDRELEASEQQQQQQQQQQQQQQQ";
 // (the enforced CSP's and the report-only Trusted Types policy's), recorded from before any script.
 async function watch(page) {
   const problems = [];
-  page.on("console", m => { if (m.type() === "error") problems.push("console: " + m.text()); });
+  // WebKit logs a report-only policy without a `report-to` as an error, though it still raises
+  // securitypolicyviolation events (checked below): that one message isn't a problem of the page's.
+  const reportOnly = /delivered in report-only mode, but does not specify a 'report-to'/;
+  page.on("console", m => { if (m.type() === "error" && !reportOnly.test(m.text())) problems.push("console: " + m.text()); });
   page.on("pageerror", e => problems.push("error: " + e.message));
   await page.addInitScript(() => {
     window.__violations = [];
