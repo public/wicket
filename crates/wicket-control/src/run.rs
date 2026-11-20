@@ -323,6 +323,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     run_to_end(o).await.map(|_| ())
 }
 
+/// The operator a run acts for (#252): its principal's `sub`, when that is an operator's id.
+fn operator_of(principal: &serde_json::Value) -> Option<String> {
+    let sub = principal.get("sub")?.as_str()?;
+    matches!(wicket_identity::Principal::parse(sub), Some(wicket_identity::Principal::Operator { .. })).then(|| sub.to_string())
+}
+
 /// Whether an urgent message would reach the agent if it read it now (#252 review): its sender
 /// isn't revoked, the org policy lets this box hear from it, and its envelope verifies for this
 /// principal, as `await_message` checks. An agent's envelope must come from the run that sent it;
@@ -953,6 +959,27 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 // that no run holds, under the zone's name as the ask stored it.
                 for n in crate::names::claim_for_run(&l, &m.tenant, &run, &claims.sub, &m.zone) {
                     say!("[wicket] {run} holds its standing name {} ({}, port {})", n.label, n.id, n.port);
+                }
+                // A human delegating (#252): an agent an operator started (not a wake, not a child)
+                // is that operator's delegation: its report on its task goes to the operator's
+                // inbox, and `wicket message continue` gives it another brief.
+                if let (None, Some(_), None) = (&parent_run, &m.agent, &wake) {
+                    if let Some(op) = operator_of(&claims.principal) {
+                        let id = wicket_proxy::delegate::delegation_id(&run.0);
+                        let recorded = l.record_delegation(&wicket_store::NewDelegation {
+                            id: &id,
+                            tenant: &m.tenant.0,
+                            parent_run: "",
+                            parent_principal: &op,
+                            child_run: &run.0,
+                            child_principal: &claims.sub,
+                            name: wname,
+                            brief: &wicket_agent::clip(&m.task, wicket_store::MAX_BRIEF_RECORD),
+                        });
+                        l.audit(&m.tenant, Some(&run), "delegation.started", &serde_json::json!({
+                            "delegation": id, "by": op, "child": claims.sub, "child_run": run.0, "name": wname, "recorded": recorded.is_ok(),
+                        }))?;
+                    }
                 }
             }
             Some(Arc::new(wicket_proxy::IdentityCell::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() })))

@@ -69,7 +69,7 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } | Cmd::Authority { .. } => Forward(Read),
         // A message reaches an agent as a session's prompt would (it can wake one); reading your
         // own inbox, receipts and who you may write to touches only your own messages (#252).
-        Cmd::Message { cmd: crate::MessageCmd::Send { .. } } => Forward(Run),
+        Cmd::Message { cmd: crate::MessageCmd::Send { .. } | crate::MessageCmd::Continue { .. } } => Forward(Run),
         Cmd::Message { .. } => Forward(Read),
         // Rewriting the ledger (#582) needs wicketd stopped: never through it.
         Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(

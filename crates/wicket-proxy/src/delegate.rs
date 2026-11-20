@@ -59,7 +59,12 @@ impl RunCtx {
             "delegation": d.id, "turn": d.turn, "status": if is_error { "turn_failed" } else { "turn_ended" }, "report": report,
             "note": "the child's turn on this brief ended; its session stays open. continue_child with this delegation (or its name) to give it another brief, with its context intact.",
         });
-        let sent = self.send_message(&Recipient::Parent, "report", body);
+        // To the parent run's principal; a human's delegation (#252) has no parent run, and its
+        // report goes to the operator's inbox.
+        let sent = match d.parent_run.as_str() {
+            "" => self.send_message(&Recipient::Principal(&d.parent_principal), "report", body),
+            _ => self.send_message(&Recipient::Parent, "report", body),
+        };
         let l = self.ledger.lock().ok()?;
         Some(match sent {
             Ok(s) => {

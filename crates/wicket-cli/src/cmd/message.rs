@@ -61,6 +61,29 @@ pub enum MessageCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Give an agent you started another brief, once its report on the last one is in your inbox:
+    /// its session wakes with it, its context intact (what continue_child is for an agent).
+    Continue {
+        /// The agent: its name, principal or delegation id (d-…, as `wicket message delegations`
+        /// shows it).
+        agent: String,
+        /// The brief, as one string.
+        #[arg(required = true)]
+        brief: Vec<String>,
+        /// How soon you want it read: now, next or later.
+        #[arg(long, default_value = "next")]
+        priority: String,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The agents you started and delegated to, newest first: each one's state (working on a
+    /// brief, reported, or ended) and how many briefs it has had.
+    Delegations {
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The operator running this command, as wicketd's peer credentials named it: its id and how
@@ -151,6 +174,15 @@ pub(crate) fn receipts_json(rs: &[wicket_store::Receipt]) -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+/// One delegation as `wicket message continue --json` and `wicket message delegations --json`
+/// print it.
+pub(crate) fn delegation_json(d: &wicket_store::Delegation) -> serde_json::Value {
+    serde_json::json!({
+        "id": d.id, "name": d.name, "agent": d.child_principal, "run": d.child_run, "state": d.state, "turn": d.turn,
+        "brief_message": d.brief_message, "report_message": d.report_message, "created_at": d.created_at, "updated_at": d.updated_at,
+    })
 }
 
 /// The agents `me` may write to, and what each is to it.
@@ -287,6 +319,45 @@ pub async fn dispatch(c: MessageCmd) -> Result<()> {
                     wicket_agent::clip(&r.to, 200),
                     r.state,
                     r.why.map(|w| format!(": {}", wicket_agent::clip(&w, 400))).unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        MessageCmd::Continue { agent, brief, priority, json } => {
+            let priority = wicket_store::Priority::parse(&priority)
+                .ok_or_else(|| wicket_home::exit::usage(format!("--priority is now, next or later, not {priority:?}")))?;
+            let issuer = issuer()?;
+            let ledger = std::sync::Mutex::new(Ledger::open(&ledger_path())?);
+            let waker: wicket_proxy::Waker = std::sync::Arc::new(|a: &str, by: &str| hibernate::trigger_wake(a, by));
+            let op = OperatorSender { tenant: &tenant, via: &via, name: &name, signed: None };
+            match opmsg::continue_as_operator(&ledger, &issuer, op, &agent, serde_json::json!(brief.join(" ")), priority, Some(&waker)) {
+                Ok((s, d)) => {
+                    if json {
+                        return crate::cmd::print_json(&delegation_json(&d));
+                    }
+                    println!("continued {} ({}) with brief {}: {} sent to it; its report comes to your inbox", d.name, d.id, d.turn, s.id);
+                    Ok(())
+                }
+                Err(e) => Err(wicket_home::exit::refused(e)),
+            }
+        }
+        MessageCmd::Delegations { json } => {
+            let l = Ledger::open(&ledger_path())?;
+            let rows: Vec<_> = l.delegations_of(&tenant.0, &id, 50)?.into_iter().filter(|d| d.parent_run.is_empty()).collect();
+            if json {
+                return crate::cmd::print_json(&serde_json::Value::Array(rows.iter().map(delegation_json).collect()));
+            }
+            if rows.is_empty() {
+                println!("no delegations: an agent you start with `wicket run` is one");
+            }
+            for d in rows {
+                println!(
+                    "{}  {}  {}  brief {}  {}",
+                    d.id,
+                    wicket_agent::clip(&d.name, 64),
+                    d.state,
+                    d.turn,
+                    wicket_agent::clip(&d.child_principal, 200)
                 );
             }
             Ok(())

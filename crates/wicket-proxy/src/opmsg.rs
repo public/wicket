@@ -348,3 +348,76 @@ pub fn verify_received(
         body: payload.get("body").cloned().unwrap_or(serde_json::Value::Null),
     })
 }
+
+/// A human continuing a delegation (#252): what `continue_child` is for an agent. Operator `op`
+/// gives the agent it started (`child`: its name, principal or delegation id) another brief, once
+/// its report on the last one has come: a signed `brief` message, which wakes its session with its
+/// context intact. Only the operator that delegated may continue it; anyone else is refused on the
+/// record (`delegation.refused`), without saying whose it is. The brief grants nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn continue_as_operator(
+    ledger: &Mutex<Ledger>,
+    issuer: &wicket_identity::Issuer,
+    op: OperatorSender,
+    child: &str,
+    brief: serde_json::Value,
+    priority: wicket_store::Priority,
+    waker: Option<&Waker>,
+) -> std::result::Result<(Sent, wicket_store::Delegation), String> {
+    let me = op.id(issuer);
+    let tenant = op.tenant;
+    let refuse = |why: String| -> String {
+        if let Ok(l) = ledger.lock() {
+            let mut rec = json!({ "child": wicket_core::text::clip(child, 200), "by": me, "why": why });
+            if let (Some(r), Some(x)) = (rec.as_object_mut(), provenance(&op).as_object()) {
+                r.extend(x.clone());
+            }
+            let _ = l.audit(tenant, None, "delegation.refused", &rec);
+        }
+        format!("not continued: {why}")
+    };
+    let found = ledger.lock().map_err(|_| "ledger lock".to_string())?.find_delegation(&tenant.0, child).map_err(|e| e.to_string())?;
+    let Some(d) = found.iter().find(|d| d.parent_principal == me && d.parent_run.is_empty()).cloned() else {
+        return Err(if found.is_empty() {
+            refuse(format!(
+                "no agent {:?} was delegated to in this tenant; start one with `wicket run`",
+                wicket_core::text::clip(child, 200)
+            ))
+        } else {
+            refuse(format!("{:?} is not yours: only the operator who started it may continue it", wicket_core::text::clip(child, 200)))
+        });
+    };
+    let live = ledger.lock().ok().and_then(|l| l.run_status(&d.child_run).ok().flatten());
+    if d.state == "ended" || live.as_deref() != Some("running") {
+        return Err(format!(
+            "not continued: {} ({}) has ended (its run is {}); its context is gone with it. Start a new one with `wicket run`.",
+            d.name,
+            d.id,
+            live.unwrap_or_else(|| "unknown".into())
+        ));
+    }
+    if d.state == "working" {
+        return Err(format!(
+            "not continued: {} is still working on brief {} of {}; its report comes to your inbox (`wicket message inbox`). To add to its brief now, `wicket message send {}`.",
+            d.name, d.turn, d.id, d.child_principal
+        ));
+    }
+    let body = json!({ "delegation": d.id, "turn": d.turn + 1, "brief": brief });
+    let sent = send_as_operator(ledger, issuer, op, &d.child_principal, "brief", body, SendOpts { priority, in_reply_to: None }, waker)
+        .map_err(|e| match e {
+            SendError::Refused { id, why, .. } => format!("not continued: its brief {id} was refused: {why}"),
+            SendError::Failed(e) => format!("not continued: {e}"),
+        })?;
+    let l = ledger.lock().map_err(|_| "ledger lock".to_string())?;
+    if !l.delegation_continued(&d.id, &sent.id).map_err(|e| e.to_string())? {
+        let _ = l.withdraw_message(&sent.id);
+        return Err(format!("not continued: {} changed meanwhile (reported or ended); look again with `wicket message delegations`", d.id));
+    }
+    let mut rec = json!({ "delegation": d.id, "turn": d.turn + 1, "message": sent.id, "child": d.child_principal, "child_run": d.child_run, "by": me });
+    if let (Some(r), Some(x)) = (rec.as_object_mut(), provenance(&op).as_object()) {
+        r.extend(x.clone());
+    }
+    l.audit(tenant, None, "delegation.continued", &rec).map_err(|e| e.to_string())?;
+    let d = l.delegation(&d.id).map_err(|e| e.to_string())?.unwrap_or(d);
+    Ok((sent, d))
+}

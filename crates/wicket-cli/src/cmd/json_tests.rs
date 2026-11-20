@@ -550,3 +550,24 @@ fn policy_show_and_node_fences_json() {
     // Another tenant's views list nothing of this one's.
     assert!(crate::serve::fence::view_in(&d.join("runs"), "t9", &l, &[]).unwrap().is_empty());
 }
+
+/// #252: a human's delegation, as `wicket message delegations --json` prints it.
+#[test]
+fn message_delegations_json() {
+    let (_d, l) = super::test_ledger("delegations");
+    l.record_delegation(&wicket_store::NewDelegation {
+        id: "d-1",
+        tenant: "default",
+        parent_run: "",
+        parent_principal: "spiffe://w.test/t/default/op/unix/alice",
+        child_run: "run_1",
+        child_principal: "spiffe://w.test/t/default/z/work/a/worker",
+        name: "worker",
+        brief: "the task",
+    })
+    .unwrap();
+    let rows = l.delegations_of("default", "spiffe://w.test/t/default/op/unix/alice", 10).unwrap();
+    let v = serde_json::Value::Array(rows.iter().map(super::message::delegation_json).collect());
+    assert_eq!((v[0]["state"].as_str(), v[0]["turn"].as_i64()), (Some("working"), Some(1)), "{v:#}");
+    documented_as("`wicket message delegations --json` (and `wicket message continue --json`, one)", &v);
+}
