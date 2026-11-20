@@ -133,6 +133,32 @@ enters the context window, so compaction can't erode it.
     The user's credentials never reach the agent. A separate mandate subsystem is deferred (§16, §22).
 13. **A program is an agent without a model** (#255). It gets the same sandbox, egress control and audit,
     and by default it may not ask for more. Approving one is a grant on its digest (§17).
+14. **The core stays general** (owner, 2026-11-09 and 2026-11-19). wicket runs any kind of software
+    process, so nothing for one use case is built into the core: no "dev" zones or images, and nothing
+    specific to one package manager or service (#664 replaced npm's special case with a general reach-rule
+    option). Use-case configuration (images, manifests, services such as a package cache) lives in
+    `examples/` or in the project that uses wicket.
+15. **Decide at the edge** (owner, 2026-11-12). Authorization decisions are made where the box runs, on
+    its node. The control plane issues authority (tokens, grants, the feed) and takes human approvals;
+    it doesn't decide requests in the path (#257).
+16. **Harness-agnostic** (owner, 2026-11-12). Claude Code is the first harness, not the only one: what is
+    specific to a harness lives in its adapter (§6.1), and model routes are per provider. Core features
+    don't assume one harness's event stream, tools or settings.
+17. **Defer to external access controls** (owner, 2026-11-14). Where the service a box calls can scope a
+    credential or enforce a rule itself (scoped tokens, a forge's branch rules), wicket uses that rather
+    than re-checking it in the proxy. Deep inspection of a request needs a strong reason.
+18. **Everything is a principal** (owner, 2026-11-14). Humans, agents and workloads follow the same rules:
+    they ask, are granted narrowly and are audited the same way. Agents ask each other, and a grant to
+    an agent is as narrow, timed and revocable as one to a human.
+19. **Every operator action in the console and the CLI** (owner, 2026-11-20). Whenever it makes sense, an
+    action an operator can take is available both in the web console (signed with a passkey and bound to
+    the effect it shows, §14.1) and in the CLI (with `--json` for scripts). Host-only actions are the
+    exception and say why: those that name files on the host, and bootstrapping the first passkey
+    (#713).
+20. **wicket manages names, not traffic** (owner, 2026-11-19). Boxes' public and internal DNS entries
+    point straight at the node that runs them, as in Kubernetes. wicket manages the records through
+    pluggable providers; it doesn't proxy public traffic, terminate TLS or route by name. A node's
+    listener for a box's port is a byte relay or DNAT (#575, [box DNS](box-dns.md)).
 
 ### 2.1 Build versus reuse (owner, 2026-11-10)
 
