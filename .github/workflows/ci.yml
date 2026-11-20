@@ -549,7 +549,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/gvisor-setup
+      - uses: $/.github/actions/gvisor-setup
         with:
           save-cache: "true"
       - name: Build the agent image
@@ -597,7 +597,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/gvisor-setup
+      - uses: $/.github/actions/gvisor-setup
       - name: Build the agent image
         run: target/debug/wicket image
       - name: Acceptance
