@@ -106,7 +106,14 @@ fn a_github_delivery_keeps_its_fields() {
     let t = i.admit(&path, IP, at).unwrap();
     let Outcome::Spool(e) = i.verify(&t, &h("check_suite", &body), &body, 5, at) else { panic!("refused") };
     assert_eq!((e.kind.as_str(), e.fields["pr"]["number"].as_i64()), ("check_suite", Some(9)));
-    assert_eq!(i.verify(&t, &h("push", &body), &body, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not listened to"));
+    // The same body again is a duplicate (#714 fourth review R2: reserved when it verified).
+    assert_eq!(i.verify(&t, &h("check_suite", &body), &body, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "already had it"));
+    let pushed =
+        serde_json::to_vec(&serde_json::json!({ "after": "abc", "commits": [], "repository": { "full_name": "Acme/App" } })).unwrap();
+    assert_eq!(i.verify(&t, &h("push", &pushed), &pushed, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not listened to"));
+    // Forgotten when the node refuses it, so GitHub's redelivery is taken.
+    i.forget(&e);
+    assert!(matches!(i.verify(&t, &h("check_suite", &body), &body, 5, at), Outcome::Spool(_)), "after forget");
     let elsewhere = serde_json::to_vec(&serde_json::json!({ "check_suite": {}, "repository": { "full_name": "evil/app" } })).unwrap();
     assert_eq!(i.verify(&t, &h("check_suite", &elsewhere), &elsewhere, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "another repository"));
     // The generic header doesn't sign a GitHub delivery.
@@ -413,21 +420,48 @@ async fn the_server_is_bounded() {
     // A slow body: its headers whole, then too little: 408.
     let slow_body = format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{{");
     assert!(send(s.addr, slow_body.as_bytes()).await.starts_with("HTTP/1.1 408"));
-    // The body budget: bodies held half-sent past it make the next request wait, then get 503.
+    // #714 fourth review R1: room is taken as bytes arrive. Bodies announced at 1 MiB that send a
+    // byte hold almost nothing, so a signed delivery still goes through; one address past its share
+    // (8 MiB of bodies it is actually sending) gets 503 for the next.
     drop(s);
     let lim = crate::serve::net::Limits { max_connections: 64, per_ip_connections: 64, body_timeout: Duration::from_secs(10), ..limits() };
     let s = served("budget", &token, lim).await;
     let mut holding = vec![];
-    for _ in 0..(BODY_BUDGET_KIB / 1024) {
+    for _ in 0..32 {
         let mut c = tokio::net::TcpStream::connect(s.addr).await.unwrap();
         c.write_all(format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{{", ik::MAX_BODY).as_bytes()).await.unwrap();
         holding.push(c);
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let busy =
-        send(s.addr, format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}").as_bytes()).await;
-    assert!(busy.starts_with("HTTP/1.1 503"), "{busy}");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let body: &[u8] = b"{}";
+    let signed = vec![
+        (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", now, "d-r1", body)),
+        (ik::GENERIC_TIMESTAMP, now.to_string()),
+        (ik::GENERIC_DELIVERY, "d-r1".to_string()),
+    ];
+    let ok = send(s.addr, &post(&path, &signed, body)).await;
+    assert!(ok.starts_with("HTTP/1.1 202"), "held 1-byte bodies don't take the room: {ok}");
     drop(holding);
+    let mut sending = vec![];
+    let chunk = vec![b'x'; ik::MAX_BODY - 1];
+    for _ in 0..8 {
+        let mut c = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+        c.write_all(format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n", ik::MAX_BODY).as_bytes()).await.unwrap();
+        c.write_all(&chunk).await.unwrap();
+        sending.push(c);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut ninth = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+    ninth
+        .write_all(format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", ik::MAX_BODY).as_bytes())
+        .await
+        .unwrap();
+    ninth.write_all(&chunk[..64 * 1024]).await.unwrap();
+    let mut out = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), ninth.read_to_string(&mut out)).await;
+    assert!(out.starts_with("HTTP/1.1 503"), "past the address's share: {out}");
+    drop(sending);
     let lim = crate::serve::net::Limits {
         header_timeout: Duration::from_millis(300),
         body_timeout: Duration::from_millis(300),

@@ -98,10 +98,13 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
      - Behind a reverse proxy named with `--trusted-proxy`, the client's address is the one it
        forwards (as the console's, #123);
   2. the body: at most 1 MiB. 413 from its announced length, or as soon as it runs past, read no
-     further. Every request's body takes room in a budget of 32 MiB for bodies in flight (its
-     announced length, or 1 MiB), before any of it is read. One that finds no room within 2 s is
-     answered 503, so connections holding half-sent bodies can't exhaust intake's memory
-     (`MemoryMax=256M`);
+     further. A body takes room in a budget of 32 MiB for bodies in flight as its bytes arrive,
+     not by its announced length, so connections that announce a large body and send little hold
+     little. One trigger, and one client address, has at most 8 MiB of it; a body that would go
+     past either share, or finds no room within 2 s, is answered 503. A leaked URL can't take the
+     whole budget from the node's other triggers, and half-sent bodies can't exhaust intake's
+     memory (`MemoryMax=256M`). A body that doesn't arrive within the body timeout is answered
+     408 and counted as a failure of its address and of its trigger;
   3. the signature (401 otherwise; bad signatures are counted by trigger, and past 30 a minute
      answered 429, without slowing down a signed delivery):
      - GitHub's `X-Hub-Signature-256: sha256=<hex>`, the HMAC-SHA256 of the raw body under the
@@ -114,7 +117,9 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
   4. a delivery it saw verified in the last 24 hours, whether it handed it on or dropped it: by its
      body (GitHub's) or its signed message (a generic webhook's), or by its id. Answered 202,
      neither spooled nor counted against the trigger, so a replayed body can't use up the trigger's
-     rate. This memory is intake's own, and lost when it restarts; the control host's dedup (§3)
+     rate. A delivery is remembered as soon as it verifies, so a replay arriving while it is still
+     being handed on is a duplicate too; if the node refuses it (503), it is forgotten, so the
+     sender's retry is taken. This memory is intake's own, and lost when it restarts; the control host's dedup (§3)
      still holds then;
   5. for GitHub:
      - the `X-GitHub-Event` is one the trigger listens to;
@@ -158,8 +163,8 @@ service of its own user, `wicket-intake`, on the node (`deploy/node/wicket-intak
   (`trigger_intake`), deleted ones included until the node has been sent a table without them:
   - it syncs and records what comes back;
   - then it syncs again with the acks, until the spool is empty or the pass's caps are reached:
-    2,000 events, 10 syncs or 20 s a node. A slow or hostile node can't stall the pass, and one
-    node's failure is its own.
+    2,000 acked events, 10 syncs that acked something, or 20 s a node. A slow or hostile node
+    can't stall the pass, and one node's failure is its own.
 - **Delivery is at least once.** An event the control host recorded but didn't ack comes again. The
   ledger records an event once per `(source, delivery)` (`trigger_events`, as for every source), so
   it fires once.

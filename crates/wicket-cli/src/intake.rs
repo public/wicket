@@ -17,7 +17,7 @@
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::collections::HashMap;
@@ -127,8 +127,9 @@ pub struct Intake {
     /// Deliveries handed to the node, by (trigger, body hash) and (trigger, delivery id).
     seen: Mutex<HashMap<(String, String), Instant>>,
     refused: Mutex<IntakeRefused>,
-    /// Room for bodies being read, in KiB.
+    /// Room for bodies being read, in KiB, and what each trigger's and address's requests hold of it.
     bodies: Arc<tokio::sync::Semaphore>,
+    shares: Mutex<HashMap<String, usize>>,
 }
 
 impl Default for Intake {
@@ -143,6 +144,7 @@ impl Default for Intake {
             seen: Default::default(),
             refused: Default::default(),
             bodies: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET_KIB)),
+            shares: Default::default(),
         }
     }
 }
@@ -244,9 +246,11 @@ impl Intake {
         m.insert((trigger.to_string(), format!("d:{delivery}")), at);
     }
 
-    /// With the body: the signature, a delivery seen before, then (verified and new) the trigger's
-    /// rate, then GitHub's event and repository. `header` gets a header by its lower-case name;
-    /// `now` is Unix s.
+    /// With the body: the signature, a delivery seen before, GitHub's event, body shape and
+    /// repository (one not listened to is remembered and dropped), then the trigger's rate. A
+    /// delivery to spool has its keys reserved here, so a concurrent replay is a duplicate; `forget`
+    /// gives them back if the node refuses it. `header` gets a header by its lower-case name; `now`
+    /// is Unix s.
     pub fn verify(&self, t: &IntakeTrigger, header: &dyn Fn(&str) -> Option<String>, body: &[u8], now: i64, at: Instant) -> Outcome {
         let github = t.kind == "github";
         let delivery_header = header(if github { ik::GITHUB_DELIVERY } else { ik::GENERIC_DELIVERY });
@@ -335,6 +339,8 @@ impl Intake {
                 return Outcome::Answer(StatusCode::TOO_MANY_REQUESTS, "slow down");
             }
         }
+        // Reserved now: a concurrent replay of it is "already had it" (forgotten if the node refuses).
+        self.remember_keys(&t.trigger, &raw, &delivery, at);
         Outcome::Spool(Box::new(IntakeEvent {
             id: String::new(),
             trigger: t.trigger.clone(),
@@ -345,6 +351,13 @@ impl Intake {
             raw_sha256: raw,
             bytes: body.len() as u64,
         }))
+    }
+
+    /// Forgets a delivery reserved at verify that the node didn't take.
+    pub fn forget(&self, e: &IntakeEvent) {
+        let mut m = self.seen.lock().expect("seen");
+        m.remove(&(e.trigger.clone(), format!("b:{}", e.raw_sha256)));
+        m.remove(&(e.trigger.clone(), format!("d:{}", e.delivery)));
     }
 }
 
@@ -543,26 +556,24 @@ async fn handle(
         i.refused.lock().expect("refused").other += 1;
         return Ok(answer(StatusCode::PAYLOAD_TOO_LARGE, "too large"));
     }
-    // Room for the body in the budget, before any of it is read: its announced length, or the cap.
-    let announced = req
-        .headers()
-        .get(hyper::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(ik::MAX_BODY);
-    let kib = announced.min(ik::MAX_BODY).div_ceil(1024).max(1) as u32;
-    let Ok(Ok(_room)) = tokio::time::timeout(BODY_BUDGET_WAIT, i.bodies.clone().acquire_many_owned(kib)).await else {
-        return Ok(answer(StatusCode::SERVICE_UNAVAILABLE, "busy"));
-    };
+    // The body, read with room in the budget taken as its bytes arrive, not by its announced length,
+    // within a share for its trigger and for its address: a leaked URL that announces big bodies and
+    // sends nothing holds nothing, and can't take the room every other trigger needs (#714 fourth
+    // review, R1). A body that times out is its trigger's and its address's failure.
     let headers = req.headers().clone();
-    let body = match tokio::time::timeout(body_timeout, Limited::new(req.into_body(), announced.min(ik::MAX_BODY)).collect()).await {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(_)) => {
+    let read = tokio::time::timeout(body_timeout, read_body(&i, &t.trigger, ip, req.into_body())).await;
+    let body = match read {
+        Ok(Ok(b)) => b,
+        Ok(Err(BodyError::TooLarge)) => {
             i.refused.lock().expect("refused").other += 1;
             return Ok(answer(StatusCode::PAYLOAD_TOO_LARGE, "too large"));
         }
-        Err(_) => {
+        Ok(Err(BodyError::Busy)) => return Ok(answer(StatusCode::SERVICE_UNAVAILABLE, "busy")),
+        Ok(Err(BodyError::Broken)) | Err(_) => {
             i.refused.lock().expect("refused").other += 1;
+            let key = crate::serve::limits::ip_key(ip);
+            charge(&mut i.failures.lock().expect("failures"), &key, at);
+            charge(&mut i.bad_signatures.lock().expect("bad"), &t.trigger, at);
             return Ok(answer(StatusCode::REQUEST_TIMEOUT, "too slow"));
         }
     };
@@ -571,15 +582,95 @@ async fn handle(
     Ok(match i.verify(&t, &header, &body, now, at) {
         Outcome::Answer(code, word) => answer(code, word),
         Outcome::Spool(e) => match ask(&sock, &serde_json::json!({ "op": "deliver", "event": e })).await {
-            Ok(v) if v["ok"] == true => {
-                // Only once the node has it: one it refused may be sent again, and taken then.
-                i.remember(&e, at);
-                answer(StatusCode::ACCEPTED, "accepted")
+            // Remembered at verify, so concurrent replays don't each charge the bucket (#714 fourth
+            // review, R2).
+            Ok(v) if v["ok"] == true => answer(StatusCode::ACCEPTED, "accepted"),
+            // Full, or the node not up: forgotten again, so the sender's retry is taken.
+            _ => {
+                i.forget(&e);
+                answer(StatusCode::SERVICE_UNAVAILABLE, "try later")
             }
-            // Full, or the node not up: the sender tries again later.
-            _ => answer(StatusCode::SERVICE_UNAVAILABLE, "try later"),
         },
     })
+}
+
+/// The most of the body budget one trigger's requests, or one address's, may hold at once (KiB).
+pub const BODY_SHARE_KIB: usize = 8 * 1024;
+
+#[derive(Debug)]
+enum BodyError {
+    TooLarge,
+    /// No room in the budget, or past the trigger's or the address's share.
+    Busy,
+    Broken,
+}
+
+/// Room taken in the body budget for one request: its permits, and its count in its trigger's and
+/// its address's shares, given back when it is dropped.
+struct Room<'a> {
+    i: &'a Intake,
+    trigger: String,
+    address: String,
+    kib: u32,
+    permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Room<'_> {
+    /// Takes `kib` more, within the shares: false (nothing taken) if past either, or if the budget
+    /// has no room within a moment.
+    async fn grow(&mut self, kib: u32) -> bool {
+        {
+            let mut shares = self.i.shares.lock().expect("shares");
+            let (t, a) = (shares.get(&self.trigger).copied().unwrap_or(0), shares.get(&self.address).copied().unwrap_or(0));
+            if t + kib as usize > BODY_SHARE_KIB || a + kib as usize > BODY_SHARE_KIB {
+                return false;
+            }
+            *shares.entry(self.trigger.clone()).or_default() += kib as usize;
+            *shares.entry(self.address.clone()).or_default() += kib as usize;
+        }
+        self.kib += kib;
+        match tokio::time::timeout(BODY_BUDGET_WAIT, self.i.bodies.clone().acquire_many_owned(kib)).await {
+            Ok(Ok(p)) => {
+                self.permits.push(p);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Drop for Room<'_> {
+    fn drop(&mut self) {
+        let mut shares = self.i.shares.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for k in [&self.trigger, &self.address] {
+            if let Some(n) = shares.get_mut(k.as_str()) {
+                *n = n.saturating_sub(self.kib as usize);
+                if *n == 0 {
+                    shares.remove(k.as_str());
+                }
+            }
+        }
+    }
+}
+
+/// Reads a request's body, at most [`ik::MAX_BODY`], taking room in the budget as it arrives.
+async fn read_body(i: &Intake, trigger: &str, ip: IpAddr, mut body: hyper::body::Incoming) -> std::result::Result<Vec<u8>, BodyError> {
+    let mut room =
+        Room { i, trigger: format!("t:{trigger}"), address: format!("a:{}", crate::serve::limits::ip_key(ip)), kib: 0, permits: vec![] };
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else { return Err(BodyError::Broken) };
+        let Ok(data) = frame.into_data() else { continue };
+        if out.len() + data.len() > ik::MAX_BODY {
+            return Err(BodyError::TooLarge);
+        }
+        let need = ((out.len() + data.len()).div_ceil(1024) as u32).saturating_sub(room.kib);
+        if need > 0 && !room.grow(need).await {
+            return Err(BodyError::Busy);
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok(out)
 }
 
 /// Checks `wicket node intake`'s arguments: a certificate needs its key.
