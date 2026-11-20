@@ -6,8 +6,8 @@ long-lived supervisor processes, with one channel per node, periodic writes batc
 transactions, and a sharded, event-driven reconciler. It is a design only, with no code changes.
 
 Context:
-- #582 (the analysis and its order of changes): steps 1–3 are merged, and step 4 (#689: file and
-  task limits, a small runtime per supervisor) is in review;
+- #582 (the analysis and its order of changes): steps 1–4 are merged (step 4, #689: file and task
+  limits, a small runtime per supervisor);
 - [the feed publisher note](../feed-publisher.md) (step 3, which left cross-run batching to this
   step);
 - [one decision path](../one-decision-path.md) (#257: only the node decides);
@@ -44,7 +44,7 @@ lists what is still to decide in §8 and the open items in §9.
   - a feed lock and refresh every second;
   - an agent's claim written every 5 s, in its own transaction;
   - a token compiled by every publisher on the node for each delta.
-  - Each is cheap. Together they grow with boxes, not with work. Step 4 (#689, in review) raises the
+  - Each is cheap. Together they grow with boxes, not with work. Step 4 (#689) raised the
     limits these hit; this step removes most of them.
 - **Proposal: `wicket supervise`.**
   - A few long-lived **supervisor hosts** each run many runs as tasks. Runs are sharded **by node**,
@@ -159,7 +159,7 @@ reconcile┴─ wicket attach (D) ─ssh─┘   wicket supervise #k, epoch e  (
 
 - **`wicket supervise`** is a new long-lived process. There are a few of them, all on the control
   host's one machine in this version.
-  - wicketd starts them (§5.2), as the `wicket` user, under the unit limits step 4 proposes (#689).
+  - wicketd starts them (§5.2), as the `wicket` user, under step 4's unit limits (#689).
   - Each owns a **shard**: a set of nodes, and with them every run placed on them.
   - It holds the shard under a lease with an **epoch** (§3.1).
 - **A run task** is today's per-run code, `run_to_end` and `noderun`'s `manage` and `session`, on the
@@ -217,7 +217,7 @@ reconcile┴─ wicket attach (D) ─ssh─┘   wicket supervise #k, epoch e  (
     a single owner one run's delta could reach the node over another run's dead connection.
   - If the link is down, the node treats it as it treats a lost session now: the feed's TTL and
     bounded autonomy decide (§3.2).
-- **`MaxSessions` stops mattering.** It is one session per node per host, so the 512 #689 proposes
+- **`MaxSessions` stops mattering.** It is one session per node per host, so step 4's 512 (#689)
   becomes a ceiling nothing reaches.
 
 ### 2.3 Periodic writes in shared transactions
@@ -586,7 +586,7 @@ rolled back by running the previous build.
 - the 1 s tick of §2.3;
 - defaults as in §1, with step 4's runtime (#689).
 
-| | today: steps 1–3, plus step 4 (#689) | step 5 | how |
+| | today: steps 1–4 | step 5 | how |
 |---|---|---|---|
 | Supervisor processes on the control host | 10,000 | 8 | one host per shard |
 | `wicket node attach` processes on each node | about 100 | 1 | one link per node |
