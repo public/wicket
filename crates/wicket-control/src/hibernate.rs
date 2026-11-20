@@ -1032,17 +1032,26 @@ pub async fn hibernate(who: &str, wait_secs: u64) -> Result<()> {
     }
 }
 
+/// `wicket agents --json`: one object per long-lived agent.
+pub fn agents_json(rows: &[wicket_store::AgentRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|a| serde_json::json!({
+                "id": a.id, "name": a.name, "zone": a.zone, "state": a.state, "generation": a.generation, "run": a.run,
+                "session_id": a.session_id, "bundle_bytes": a.bundle_bytes, "head": a.head, "restorable": a.restorable, "note": a.note,
+                "workspace": a.workspace, "updated_at": a.updated_at,
+                "used": { "requests": a.used_requests, "input_tokens": a.used_input_tokens, "output_tokens": a.used_output_tokens, "secs": a.used_secs },
+            }))
+            .collect(),
+    )
+}
+
 /// `wicket agents`.
 pub fn list(json: bool) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     let rows = l.agents(&TenantId::single().0)?;
     if json {
-        say!("{}", serde_json::to_string_pretty(&rows.iter().map(|a| serde_json::json!({
-            "id": a.id, "name": a.name, "zone": a.zone, "state": a.state, "generation": a.generation, "run": a.run,
-            "session_id": a.session_id, "bundle_bytes": a.bundle_bytes, "head": a.head, "restorable": a.restorable, "note": a.note,
-            "workspace": a.workspace, "updated_at": a.updated_at,
-            "used": { "requests": a.used_requests, "input_tokens": a.used_input_tokens, "output_tokens": a.used_output_tokens, "secs": a.used_secs },
-        })).collect::<Vec<_>>())?);
+        say!("{}", serde_json::to_string_pretty(&agents_json(&rows))?);
         return Ok(());
     }
     if rows.is_empty() {
