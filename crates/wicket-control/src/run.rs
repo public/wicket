@@ -344,6 +344,9 @@ pub struct RunEnd {
 
 /// [`run`], returning how it ended.
 pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
+    // #579: which runs the scheduler places, from the options as given (`--node local` names this
+    // host's own node: it pins the run there).
+    let fresh = Fresh::of(&o);
     let RunOpts {
         manifest: manifest_path,
         workdir,
@@ -576,23 +579,24 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         None => RunId::new(),
     };
     // #579: a fresh run with no node named goes where the scheduler places it, as a woken agent
-    // does: this host's own node is one candidate among the enrolled ones.
-    let fresh = Fresh {
-        named_node: node.is_some(),
-        reattach: record.is_some(),
-        wrapped: wrap.is_some(),
-        wake: wake.is_some(),
-        adopted: adopt.is_some(),
-        child: parent_run.is_some(),
-        lease: lease.is_some(),
-        in_place_workspace: workspace_dir.is_some(),
+    // does: this host's own node is one candidate among the enrolled ones. With no other node
+    // enrolled, it goes on this host's own, as before, whatever its placement terms.
+    let others = || -> Result<bool> {
+        Ok(Ledger::open(&ledger_path())?.nodes()?.iter().any(|n| n.status == "active" && n.name != crate::localnode::NAME))
     };
+    // The room the scheduler reserved for it is given back if the run fails before its start
+    // settles it (bound, or released below).
+    let mut held_room = HeldRoom(None);
     let scheduled: Option<String> = match place_wait.filter(|_| placed_by_scheduler(&fresh)) {
+        Some(_) if !others()? => None,
         None => None,
         Some(wait) => {
             let who = crate::hibernate::Placing { what: format!("run {run}"), claim: None, wait_flag: "wicket run --wait" };
             match crate::hibernate::place_box(&who, &m, None, &run, None, wait).await {
-                Ok(n) => n.filter(|n| n != crate::localnode::NAME),
+                Ok(n) => {
+                    held_room.0 = Some(run.0.clone());
+                    n.filter(|n| n != crate::localnode::NAME)
+                }
                 Err(e) => {
                     // Boxes it asked to hibernate for room are asked no more, and room it held goes
                     // back.
@@ -1476,6 +1480,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         })
         .await;
         // The room it reserved (#579): counted until the node reports the box, or given back.
+        held_room.0 = None;
         {
             let l = ledger.lock().expect("ledger");
             let _ = match &nb {
@@ -3049,6 +3054,20 @@ impl tokio::io::AsyncWrite for Counted {
     }
 }
 
+/// The room the scheduler reserved for a run (#579), given back when dropped while it holds the
+/// run: the run failed before its start settled the reservation.
+struct HeldRoom(Option<String>);
+
+impl Drop for HeldRoom {
+    fn drop(&mut self) {
+        if let Some(run) = self.0.take() {
+            if let Ok(l) = Ledger::open(&ledger_path()) {
+                let _ = l.placement_released(&run);
+            }
+        }
+    }
+}
+
 /// What a run is, for whether the scheduler places it ([`placed_by_scheduler`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Fresh {
@@ -3060,6 +3079,24 @@ pub(crate) struct Fresh {
     pub child: bool,
     pub lease: bool,
     pub in_place_workspace: bool,
+}
+
+impl Fresh {
+    /// What `o` asks for: a node named (`local` included, which pins the run to this host's own), a
+    /// re-attach, a wrapped session, a wake, an adopted child, a spawn, a lease's run, an in-place
+    /// workspace.
+    pub(crate) fn of(o: &RunOpts<'_>) -> Fresh {
+        Fresh {
+            named_node: o.node.is_some(),
+            reattach: o.attach,
+            wrapped: o.wrap.is_some(),
+            wake: o.wake.is_some(),
+            adopted: o.adopt.is_some(),
+            child: o.parent_run.is_some(),
+            lease: o.lease.is_some(),
+            in_place_workspace: o.workspace_dir.is_some(),
+        }
+    }
 }
 
 /// Whether the scheduler places a run (#579): a fresh, top-level run with no node named. A node named
@@ -3077,7 +3114,11 @@ pub(crate) fn placed_by_scheduler(f: &Fresh) -> bool {
 fn preemption_declined(ledger: &Mutex<Ledger>, tenant: &wicket_core::TenantId, run: &RunId, live_children: usize) -> Option<String> {
     let now = wicket_feed::now_ms();
     let l = ledger.lock().ok()?;
-    let mark = l.preemption_mark(&run.0, now).ok().flatten();
+    // A ledger that can't be read declines (preemption can ask again), and says why.
+    let mark = l.preemption_mark(&run.0, now).unwrap_or_else(|e| {
+        say!("[wicket] couldn't read what preemption asks of this run: {e:#}");
+        None
+    });
     let why = crate::hibernate::preempted_hibernate(true, mark.as_ref(), live_children, now).err()?;
     // No mark: preemption gave up on it already (and audited that), or this supervisor declined it
     // already (a re-check out of a linger): it declines, with nothing more to record.
@@ -3147,6 +3188,38 @@ fn same_remote_session(a: &str, b: &str) -> bool {
 mod tests {
 
     use super::*;
+
+    /// #579 (review): built from the run options as given: `--node local` pins a run to this host's
+    /// own node; only a bare `wicket run` is placed.
+    #[test]
+    fn a_run_with_node_local_is_not_placed_by_the_scheduler() {
+        let opts = |node: Option<&'static str>, workspace_dir: Option<&'static Path>| RunOpts {
+            manifest: Path::new("m.yaml"),
+            workdir: None,
+            workspace_dir,
+            task: None,
+            image: None,
+            node,
+            ssh_key: None,
+            run_id: None,
+            parent_run: None,
+            lease: None,
+            wrap: None,
+            wake: None,
+            attach: false,
+            adopt: None,
+            stop: None,
+            place_wait: Some(std::time::Duration::ZERO),
+        };
+        assert!(placed_by_scheduler(&Fresh::of(&opts(None, None))), "a bare wicket run");
+        assert!(!placed_by_scheduler(&Fresh::of(&opts(Some(crate::localnode::NAME), None))), "--node local pins it");
+        assert!(!placed_by_scheduler(&Fresh::of(&opts(Some("n1"), None))));
+        assert!(!placed_by_scheduler(&Fresh::of(&opts(None, Some(Path::new("/w"))))), "an in-place workspace");
+        let child = RunOpts { parent_run: Some("run_p".into()), ..opts(None, None) };
+        assert!(!placed_by_scheduler(&Fresh::of(&child)), "a spawn");
+        let attach = RunOpts { attach: true, ..opts(None, None) };
+        assert!(!placed_by_scheduler(&Fresh::of(&attach)), "a re-attach");
+    }
 
     /// #579: the scheduler places a fresh, top-level run with no node named, and nothing else.
     #[test]

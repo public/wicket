@@ -1348,6 +1348,13 @@ pub fn from_index(names: &[String], health: &[(String, i64, String)], now_ms: i6
     (found, ask)
 }
 
+/// Whether `node` may take a box that runs up to `needs_secs` from `now` (s), by the leases of the
+/// placed (paid) nodes in `placed` (name, lease end): one that isn't placed always may; a placed one
+/// only if its lease outlasts the box (#579).
+pub fn lasts_for(placed: &[(String, i64)], node: &str, now: i64, needs_secs: i64) -> bool {
+    placed.iter().filter(|(n, _)| n == node).all(|(_, until)| *until > now.saturating_add(needs_secs))
+}
+
 /// Where a woken agent's box goes ([`place_box`]).
 async fn place(agent: &AgentRow, run: &RunId, generation: i64, last: Option<&str>, wait: std::time::Duration) -> Result<Option<String>> {
     let m = wicket_agent::load(&agent.manifest)?;
@@ -1385,11 +1392,20 @@ pub async fn place_box(
     let req = me.req.clone();
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
     crate::localnode::ensure(&ledger).await?;
+    // A placed (paid) node whose lease ends before the box would is left out: it would be stopped at
+    // the lease's end, and nothing may hold a paid node past it.
+    let needs_secs = m.zone.limits.timeout()?.as_secs() as i64;
     let index = || -> Result<(Vec<Candidate>, Vec<String>)> {
         let l = ledger.lock().expect("ledger");
         let leased: Vec<String> = l.leases(wicket_store::LIVE_LEASES)?.into_iter().filter_map(|x| x.node_name).collect();
-        let names: Vec<String> =
-            l.nodes()?.into_iter().filter(|n| n.status == "active" && !leased.contains(&n.name)).map(|n| n.name).collect();
+        let placed: Vec<(String, i64)> = l.placed_nodes(&["active"])?.into_iter().map(|p| (p.name, p.lease_until)).collect();
+        let now = wicket_store::now();
+        let names: Vec<String> = l
+            .nodes()?
+            .into_iter()
+            .filter(|n| n.status == "active" && !leased.contains(&n.name) && lasts_for(&placed, &n.name, now, needs_secs))
+            .map(|n| n.name)
+            .collect();
         Ok(from_index(&names, &l.node_health()?, wicket_feed::now_ms()))
     };
     let ask = |names: Vec<String>| {
@@ -2293,8 +2309,9 @@ mod tests {
     }
 
     /// #579 step 4 (review): giving up withdraws only preemption's own request. Its supervisor,
-    /// which may have taken the request already, checks `preemption_pending` before it hibernates
-    /// and drops it; an operator's own `wicket hibernate` is never withdrawn.
+    /// which may have taken the request already, finds the mark cleared (`preemption_mark`, through
+    /// `preempted_hibernate`) before it hibernates and drops it; an operator's own `wicket hibernate`
+    /// is never withdrawn.
     #[test]
     fn giving_up_withdraws_only_preemptions_own_request() {
         let mut l = Ledger::open_in_memory().unwrap();
@@ -2575,6 +2592,17 @@ mod tests {
             .map(|a| (a.kind, serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["why"].as_str().unwrap_or_default().to_string()))
             .collect();
         assert_eq!(kinds, [("placement.preempt_abandoned".to_string(), "another wake asked it to stop since".to_string())]);
+    }
+
+    /// #579 (review): a placed node whose lease ends before the box would is no candidate.
+    #[test]
+    fn a_placed_node_is_a_candidate_only_while_its_lease_outlasts_the_box() {
+        let placed = vec![("p1".to_string(), 1_000), ("p2".to_string(), 5_000)];
+        assert!(lasts_for(&placed, "n1", 900, 3_600), "not placed: no lease to outlast");
+        assert!(!lasts_for(&placed, "p1", 900, 3_600), "its lease ends before the box would");
+        assert!(!lasts_for(&placed, "p1", 1_000, 0), "past its lease");
+        assert!(lasts_for(&placed, "p2", 900, 3_600));
+        assert!(!lasts_for(&placed, "p2", 900, 4_100), "ends exactly then: not outlasted");
     }
 
     /// #579 step 4 (review): a wake that fails, by any path, withdraws every preemption made for it.

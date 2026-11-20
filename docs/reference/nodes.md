@@ -417,8 +417,10 @@ knows when it decides, among every enrolled, active node not held by a capacity 
   priority decide where it goes the same way wherever it was started. What keeps its node: a node named
   (`--node`, a lease's); a re-attach (its box is there); a spawn, which goes where its parent runs unless its
   placement hint says otherwise; and the two that use this host's own directories, a wrapped session
-  (`wicket wrap`) and an in-place `--workspace-dir`, which stay on `local`. With no enrolled node but
-  `local`, every run goes there, as before. A fresh run doesn't wait by default: `wicket run` fails at once,
+  (`wicket wrap`) and an in-place `--workspace-dir`, which stay on `local`. With no other enrolled, active node
+  but `local`, the scheduler isn't asked: every fresh run goes there, as before, whatever its placement
+  terms. A placed (paid) node is a candidate only while its lease outlasts the box's timeout, so a run
+  never holds one past its lease. A fresh run doesn't wait by default: `wicket run` fails at once,
   saying why each node is out, when no node may take its box now; `wicket run --wait 10m` waits in the queue
   as a wake does (and may preempt, by its priority).
 

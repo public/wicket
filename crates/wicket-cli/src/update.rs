@@ -1619,6 +1619,9 @@ pub async fn health(nodes: Vec<String>, canary: Option<PathBuf>, image: String) 
                 .arg("run")
                 .arg(&m)
                 .args(["--image", &image])
+                // This host's own node: the canary checks this build here, wherever a bare run
+                // would be placed (#579).
+                .args(["--node", crate::localnode::NAME])
                 .stdin(std::process::Stdio::null())
                 .output(),
         )
