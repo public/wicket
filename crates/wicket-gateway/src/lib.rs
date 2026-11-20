@@ -1017,7 +1017,17 @@ fn capacity_ask(args: &Value) -> Result<wicket_proxy::CapacityAsk, String> {
         vcpus: args.get("vcpus").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 256) as u32,
         memory_mib: args.get("memory_mib").and_then(|v| v.as_u64()).unwrap_or(1024).clamp(128, 1 << 22),
         isolation: args.get("isolation").and_then(|v| v.as_str()).unwrap_or("gvisor").to_string(),
-        region: args.get("region").and_then(|v| v.as_str()).map(String::from),
+        region: match args.get("region") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(r)) => {
+                let r = r.trim().to_string();
+                // Checked again where the request is written (capacity::ask): here, early, so the
+                // agent hears why at once (#731).
+                wicket_proxy::check_region(&r)?;
+                Some(r)
+            }
+            Some(_) => return Err("`region` is a string: a provider's region name (e.g. ewr)".into()),
+        },
         duration_secs: minutes as i64 * 60,
         max_hourly_usd: max,
         reason,
@@ -1549,6 +1559,19 @@ mod tests {
         assert!(capacity_ask(&json!({ "duration_minutes": 0, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(capacity_ask(&json!({ "duration_minutes": 100000, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(wicket_proxy::gateway::tools().as_array().unwrap().iter().any(|t| t["name"] == "request_capacity"));
+        // #731: a region is a provider's region name, or nothing; a string, trimmed.
+        let with = |r: Value| {
+            let mut a = json!({ "duration_minutes": 10, "max_hourly_usd": "0.01", "reason": "x" });
+            a["region"] = r;
+            capacity_ask(&a)
+        };
+        assert_eq!(with(json!(null)).unwrap().region, None);
+        assert_eq!(with(json!(" lhr ")).unwrap().region.as_deref(), Some("lhr"));
+        assert_eq!(with(json!("us-east-1")).unwrap().region.as_deref(), Some("us-east-1"));
+        assert!(with(json!(7)).unwrap_err().contains("a string"));
+        for bad in ["lhr\nfor 1 minute", "lhr\u{202e}", "lhr, at no cost", "\u{43b}hr", "LHR", ""] {
+            assert!(with(json!(bad)).unwrap_err().contains("region name"), "{bad:?}");
+        }
     }
 
     /// #231: `await_grant` answers "granted" only once the box's node has the grant: not between the
