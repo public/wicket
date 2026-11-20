@@ -260,24 +260,24 @@
       ]
     },
     {
-      "description": "Node stays on the 22 line the session view is built and tested with.",
+      "description": "Node stays on the Active LTS line the session view is built and tested with (26, #732).",
       "matchDepNames": [
         "node"
       ],
       "matchDatasources": [
         "node-version"
       ],
-      "allowedVersions": "/^22\\./"
+      "allowedVersions": "/^26\\./"
     },
     {
-      "description": "The node base image stays on 22 too; its tag floats, so Renovate proposes new digests.",
+      "description": "The node base image stays on 26 too (#732); Renovate proposes new digests for its tag.",
       "matchDatasources": [
         "docker"
       ],
       "matchDepNames": [
         "node"
       ],
-      "allowedVersions": "/^22-/"
+      "allowedVersions": "/^26[.-]/"
     },
     {
       "description": "One Rust release, one pull request: the toolchain, the forwarder's base image and the self-hosting example.",
