@@ -355,7 +355,11 @@ has a name's records as the zone last listed them, and its last connections.
 - **Ledger schema 31** (#668): `name_exposures`, the ports a run's names exposed (not the box
   itself), which a name's move may take away once no other name of the run names the port.
 - **Ledger schema 34** (step 4b): `node_addresses`, each node's public addresses as its operator set
-  them (`wicket node set --public-ipv4 … --public-ipv6 …`), audited `node.addresses`.
+  them (`wicket node set --public-ipv4 … --public-ipv6 …`), audited `node.addresses`. They are
+  deleted when the node is revoked or enrolled again (its address may be someone else's by then),
+  are set only on an active node, and are one node's each, since host ports are allocated per
+  node. Also `names.domain`: the boxes domain a public name was approved under, so a change of
+  `names.public.zone` doesn't move live names into a zone nobody approved them in.
 - **Protocol 18:** `request_name` is a control-host tool (`ControlTool::RequestName`), asked by a
   node only of a control host at 18. Public names will add the feed's published ports (name, run,
   node, host port, box port, until) for the nodes that listen on them, and a node's report of a

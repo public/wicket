@@ -24,6 +24,11 @@ fn usd(m: i64) -> String {
     MicroUsd(m.max(0) as u64).to_string()
 }
 
+/// A micro-USD amount as the console shows money (`$0.0500`).
+pub(super) fn usd_of(m: i64) -> String {
+    usd(m)
+}
+
 /// A principal as the card takes it: an identity (`spiffe://…`), or an operator as `unix/<user>` or
 /// `passkey/<name>`, made into the identity it has here.
 pub fn principal(tenant: &str, s: &str) -> Result<String, String> {

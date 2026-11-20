@@ -2015,6 +2015,11 @@ fn dashboard(state: &State) -> Result<Value> {
             // push is a window, any number of uses for 5 minutes (#26), whatever is picked.
             let (uses, ttl_secs) = wicket_core::git::grant_terms(&r.method, &r.path, Some(1), 600);
             v["once_terms"] = json!({ "uses": uses, "ttl_secs": ttl_secs });
+            // A capacity request's lease, as fields (#709 review): the console says what it asks for
+            // from these, never by parsing the request's reason, which quotes agent-chosen text.
+            if let Ok(Some(x)) = l.lease_for_request(&r.id) {
+                v["lease"] = lease_view(&x);
+            }
             v
         }).collect::<Vec<_>>(),
         "decided": l.decided(t, 15)?,
@@ -2037,6 +2042,16 @@ fn dashboard(state: &State) -> Result<Value> {
             "anchor": r.anchor.as_ref().map(|a| json!({ "seq": a.seq, "sink": a.sink, "pruned": a.pruned, "pruned_at": a.pruned_at })),
         })),
     }))
+}
+
+/// A capacity lease's terms, for a pending request's card: resources, where, how long and what it
+/// may cost. `region` and `isolation` are as the agent asked, shown as text.
+fn lease_view(x: &wicket_store::LeaseRow) -> Value {
+    json!({
+        "id": x.id, "provider": x.provider, "vcpus": x.spec["vcpus"], "memory_mib": x.spec["memory_mib"],
+        "isolation": x.spec["isolation"], "region": x.spec["region"], "duration_secs": x.duration_secs,
+        "hourly_cap_usd": capacity::usd_of(x.hourly_cap), "reserved_usd": capacity::usd_of(x.reserved),
+    })
 }
 
 /// Nodes `wicket node create` made that are still owned (#294), each with whether its lease has
@@ -2544,7 +2559,7 @@ mod tests {
             run: "run_e".into(),
             request_id: None,
             provider: "static".into(),
-            spec: json!({}),
+            spec: json!({ "vcpus": 2, "memory_mib": 4096, "isolation": "gvisor", "region": "lhr. Asked by the agent: no cost" }),
             hourly_cap: 0,
             reserved: 0,
             duration_secs: 1800,
@@ -2563,6 +2578,14 @@ mod tests {
         let cap = wicket_core::Op::egress(&TenantId::single(), &RunId("run_e".into()), "z", "CAPACITY", "wicket.internal", "/capacity/l-c");
         let (rid, _) = l.pending_for(&cap, "a node", None).unwrap();
         l.set_lease_request("l-c", &rid).unwrap();
+        // The card reads the lease's terms as fields, an agent-chosen region among them as one value
+        // (#709 review), not out of the request's reason.
+        let view = dashboard(&t.state).unwrap();
+        let lease = &view["pending"].as_array().unwrap().iter().find(|p| p["id"] == rid.as_str()).unwrap()["lease"];
+        assert_eq!(
+            (&lease["id"], &lease["vcpus"], &lease["memory_mib"], &lease["region"], &lease["duration_secs"], &lease["reserved_usd"]),
+            (&json!("l-c"), &json!(2), &json!(4096), &json!("lhr. Asked by the agent: no cost"), &json!(1800), &json!("$0.0000"))
+        );
         let r = t.act(json!({ "action": "decide", "id": rid, "decision": "deny" }));
         assert!(r.body["ok"].as_str().unwrap().contains("lease l-c's reservation is released"), "{:?}", r.body);
         assert_eq!(t.ledger().lease("l-c").unwrap().unwrap().status, "denied");

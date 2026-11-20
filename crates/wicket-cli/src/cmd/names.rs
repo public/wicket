@@ -153,6 +153,9 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
                 bail!("not approved");
             }
+            // The settings as they are now, after the prompt (#716 review, F7): a boxes domain
+            // changed meanwhile changes the effect, and the decision on the one shown is refused.
+            let names = settings()?;
             nm::approve(&l, &human()?, &id, &terms, &shown, &names, serde_json::json!({ "via": "cli" }))?;
             println!(
                 "approved {id}: the public name {} (port {}). `wicket reconcile` publishes its records through provider {} once a run holds it on a node with a public address{}.",
@@ -212,6 +215,7 @@ mod tests {
             ended_at: None,
             ended_by: None,
             end_reason: None,
+            domain: None,
         };
         let public: wicket_names::PublicConfig =
             serde_json::from_value(serde_json::json!({ "provider": "noop", "zone": "boxes.example.com", "owner": "a1b2c3d4" })).unwrap();

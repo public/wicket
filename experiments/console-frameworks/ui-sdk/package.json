@@ -1,0 +1,15 @@
+{
+  "name": "wicket-console-ui-sdk-check",
+  "private": true,
+  "version": "0.0.0",
+  "license": "MIT",
+  "description": "Vercel UI SDK web components under the console CSP: size and CSP check",
+  "scripts": {
+    "check": "node check.cjs"
+  },
+  "dependencies": {
+    "@ui-sdk/core": "0.1.0-beta.13",
+    "@ui-sdk/web": "0.1.0-beta.13",
+    "esbuild": "0.28.2"
+  }
+}
