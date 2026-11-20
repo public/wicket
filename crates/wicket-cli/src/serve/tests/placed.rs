@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn placed(l: &Ledger, id: &str, name: &str, end: i64) {
+pub(super) fn placed(l: &Ledger, id: &str, name: &str, end: i64) {
     l.record_placed_node(&wicket_store::PlacedNodeRow {
         id: id.into(),
         backend: "vultr".into(),

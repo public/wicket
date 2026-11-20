@@ -770,7 +770,6 @@ fn field_b64(v: &Value, k: &str) -> Option<Vec<u8>> {
     v.get(k).and_then(|s| s.as_str()).and_then(|s| unb64u(s).ok())
 }
 
-/// Options for an action's assertion: any of the operator's passkeys may sign.
 /// The options for an action's passkey assertion: only the session's own passkey may sign it
 /// ([`action_finish`] refuses any other, #802).
 fn assertion_options(state: &State, key: &str, cred: &str) -> Value {
@@ -1546,6 +1545,11 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     let Some((_, SessionKind::Operator { cred: session_cred })) = sess.as_ref().filter(|_| same_session) else {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
     };
+    // Every signed action is the session's operator's (#802). An assertion that names another
+    // passkey is refused before it is verified, so the other passkey's sign counter isn't touched.
+    if let Some(named) = body.get("id").and_then(Value::as_str).filter(|n| *n != session_cred.as_str()) {
+        return refuse_other_passkey(state, named, session_cred, &action_json);
+    }
     let a = match verify_assertion(state, ch, body) {
         Ok(a) => a,
         Err(r) => {
@@ -1562,20 +1566,9 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
             return r;
         }
     };
-    // Every signed action is the session's operator's (#802): another enrolled passkey's signature,
-    // on this session's challenge, would act as that passkey while the page and the signed JSON
-    // name the session's. Refused, and audited, before anything action-specific.
+    // And the passkey that verified is the one named (verify_assertion looks it up by that id).
     if a.oc.id != *session_cred {
-        if let Ok(l) = state.ledger() {
-            let _ = l.audit(
-                &state.tenant,
-                None,
-                "operator.action_refused",
-                &json!({ "credential": a.oc.id, "session_credential": session_cred, "action": action_json,
-                         "reason": "signed with another passkey than the session's" }),
-            );
-        }
-        return err(StatusCode::FORBIDDEN, "sign with the passkey you signed in with");
+        return refuse_other_passkey(state, &a.oc.id, session_cred, &action_json);
     }
     let mut signed = json!({
         "credential": a.oc.id, "rp_id": state.rp.rp_id, "origin": state.rp.origin,
@@ -1611,6 +1604,22 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
         Ok(msg) => ok(json!({ "ok": msg })),
         Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
     }
+}
+
+/// Refuses a signed action whose assertion names another passkey than the session's (#802), and
+/// audits it (`operator.action_refused`; `credential` is the id the assertion named). Nothing else is
+/// done or written.
+fn refuse_other_passkey(state: &State, named: &str, session_cred: &str, action_json: &str) -> Reply {
+    if let Ok(l) = state.ledger() {
+        let _ = l.audit(
+            &state.tenant,
+            None,
+            "operator.action_refused",
+            &json!({ "credential": named.chars().take(200).collect::<String>(), "session_credential": session_cred, "action": action_json,
+                     "reason": "signed with another passkey than the session's" }),
+        );
+    }
+    err(StatusCode::FORBIDDEN, "sign with the passkey you signed in with")
 }
 
 /// Applies a signed action and audits it with the operator's passkey and the signed triple.
