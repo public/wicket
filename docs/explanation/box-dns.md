@@ -430,8 +430,11 @@ zone delegated to Vultr (`test-boxes.example.com` here), on the control host:
 Check against the real API what the mock assumes (`crates/wicket-control/src/vultrdns.rs` lists it):
 the apex as an empty name, TXT data quoted, an SRV's `data` as `weight port target` with its
 target fully qualified, that a 60 s TTL lists as written (step 6 shows a TTL Vultr changed), and that
-`meta.total` counts a filtered listing (`GET /instances?tag=…`) rather than the whole account:
-a listing whose count isn't its `meta.total` fails.
+`meta.total` counts a filtered listing (`GET /instances?tag=…`) rather than the whole account.
+A DNS records listing whose count isn't its `meta.total` fails; for the tag-filtered instance
+listing, until this is confirmed, a mismatch is only logged (the listing must still be whole in
+shape), so placement isn't stopped by a total that counts the whole account. Once confirmed, make
+that listing `Totals::Checked` too (the TODO in `wicket-placement`'s `vultr.rs`).
 
 ## Certificates the box gets itself
 

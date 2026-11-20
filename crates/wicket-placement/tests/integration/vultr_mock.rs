@@ -237,8 +237,6 @@ async fn a_page_short_of_instances_or_meta_fails_the_listing() {
         ("no meta", Some("c2"), json!({ "instances": [] })),
         ("meta without a total", None, json!({ "instances": [inst(0), inst(1)], "meta": { "links": { "next": "c2" } } })),
         ("meta not an object", Some("c4"), json!({ "instances": [inst(4)], "meta": [] })),
-        ("the last page short", Some("c4"), json!({ "instances": [], "meta": meta(5, "") })),
-        ("the total changed while paging", Some("c2"), json!({ "instances": [inst(2), inst(3)], "meta": meta(4, "c4") })),
     ];
     for (what, cursor, body) in cases {
         let (base, st) = serve().await;
@@ -254,5 +252,21 @@ async fn a_page_short_of_instances_or_meta_fails_the_listing() {
         assert!(c.list_instances(Some("wicket-owner-example")).await.is_err(), "{what}");
         let p = Placer::new(VultrProvider::new(c, config()), Yes(Arc::default()), Owner::new("example"));
         assert!(p.list().await.is_err(), "{what}: the placer's listing fails, not empty");
+    }
+    // A count that doesn't match meta.total is logged, not refused, for the tag-filtered listing
+    // (#815 review: whether Vultr's total there counts only the tagged instances isn't verified).
+    for (what, cursor, body) in [
+        ("the last page short of the total", Some("c4"), json!({ "instances": [inst(4)], "meta": meta(9, "") })),
+        ("the total changed while paging", Some("c2"), json!({ "instances": [inst(2), inst(3)], "meta": meta(4, "c4") })),
+    ] {
+        let (base, st) = serve().await;
+        st.lock().unwrap().instances = (0..5).map(inst).collect();
+        let c = client(&base).with_per_page(2);
+        let cursor = cursor.map(str::to_string);
+        st.lock().unwrap().fail_when = Some(Box::new(move |s| {
+            let at = s.query.iter().find(|(k, _)| k == "cursor").map(|(_, v)| v.clone());
+            (s.method == "GET" && s.path == "/v2/instances" && at == cursor).then(|| (200, body.clone()))
+        }));
+        assert_eq!(c.list_instances(Some("wicket-owner-example")).await.unwrap().len(), 5, "{what}");
     }
 }

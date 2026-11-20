@@ -181,6 +181,18 @@ pub struct CreateInstance {
 
 /// A listing page's `meta`: both fields required, so a page without them fails the listing rather
 /// than ending it.
+/// How far a paged listing trusts `meta.total` (#815 review).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Totals {
+    /// It must stay the same on every page and equal the items gathered, or the listing fails:
+    /// where Vultr's total is known to count exactly the listing (DNS records, plans).
+    Checked,
+    /// A mismatch is logged, not refused; the listing must still be whole in shape (every page has
+    /// its list and a `meta`, and the cursor chain ends): where that isn't verified yet (the
+    /// tag-filtered instance listing).
+    Logged,
+}
+
 #[derive(Deserialize)]
 struct Meta {
     /// The whole listing's length, the same on every page. Checked against the live API for
@@ -306,6 +318,17 @@ impl Client {
     /// while it was read fails too; the next pass reads it again), and the items gathered must
     /// number it. A short listing would read as records or machines gone.
     pub async fn paged<T: for<'de> Deserialize<'de>>(&self, path: &str, field: &str, query: &[(&str, String)]) -> anyhow::Result<Vec<T>> {
+        self.paged_counted(path, field, query, Totals::Checked).await
+    }
+
+    /// [`Client::paged`], with how far `meta.total` is trusted (#815 review): see [`Totals`].
+    pub async fn paged_counted<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        field: &str,
+        query: &[(&str, String)],
+        totals: Totals,
+    ) -> anyhow::Result<Vec<T>> {
         let mut out = vec![];
         let mut cursor = String::new();
         let mut total: Option<u64> = None;
@@ -328,7 +351,7 @@ impl Client {
                     .with_context(|| format!("Vultr API GET {path}: unexpected meta"))?;
             match total {
                 None => total = Some(meta.total),
-                Some(t) if t != meta.total => {
+                Some(t) if t != meta.total && totals == Totals::Checked => {
                     bail!("Vultr API GET {path}: the listing's total changed from {t} to {} while paging", meta.total)
                 }
                 Some(_) => {}
@@ -337,7 +360,15 @@ impl Client {
             if cursor.is_empty() {
                 let t = total.unwrap_or_default();
                 if out.len() as u64 != t {
-                    bail!("Vultr API GET {path}: {} {field} listed, but meta.total is {t}", out.len());
+                    match totals {
+                        Totals::Checked => bail!("Vultr API GET {path}: {} {field} listed, but meta.total is {t}", out.len()),
+                        Totals::Logged => {
+                            eprintln!(
+                                "[wicket] Vultr API GET {path}: {} {field} listed, but meta.total is {t} (not refused: see Totals::Logged)",
+                                out.len()
+                            )
+                        }
+                    }
                 }
                 return Ok(out);
             }
@@ -346,6 +377,7 @@ impl Client {
     }
 
     pub async fn list_plans(&self, kind: &str) -> anyhow::Result<Vec<Plan>> {
+        // meta.total follows the type filter and matches the count (checked live, #815 review).
         self.paged("/plans", "plans", &[("type", kind.to_string())]).await
     }
 
@@ -368,7 +400,11 @@ impl Client {
 
     pub async fn list_instances(&self, tag: Option<&str>) -> anyhow::Result<Vec<Instance>> {
         let q: Vec<(&str, String)> = tag.map(|t| vec![("tag", t.to_string())]).unwrap_or_default();
-        self.paged("/instances", "instances", &q).await
+        // TODO(#815): check live whether meta.total on `GET /instances?tag=` counts only the tagged
+        // instances (box-dns.md's manual check asks); then make this Totals::Checked. Until then a
+        // mismatch is logged, not refused: if the total counted the whole account, a refusal would
+        // stop placement listing, releasing or reaping its machines on every pass.
+        self.paged_counted("/instances", "instances", &q, Totals::Logged).await
     }
 
     /// Replaces the instance's user data (base64-encoded here).
