@@ -241,6 +241,9 @@ impl Ledger {
             ("expired", Some(format!("no run of {to} read it within {} days", MESSAGE_HOLD_SECS / 86_400)), None, None, None)
         } else if running(&to_run)? {
             ("delivered", None, None, Some(to_run), None)
+        } else if crate::inbox::is_operator(&to) {
+            // In the operator's inbox (#252): it has no run to wait for.
+            ("delivered", None, None, None, None)
         } else {
             let (why, release) = self.held_why(&tenant, &to)?;
             ("held", Some(why), Some(release), None, Some(at + MESSAGE_HOLD_SECS))

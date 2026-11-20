@@ -311,7 +311,7 @@ pub(crate) fn verify_identities_and_messages(l: &Ledger) -> Result<(usize, usize
     }
     for (id, env, at) in l.envelopes()? {
         // Each message at the time wicket recorded it: the sender's identity must have been valid then.
-        match wicket_identity::verify_envelope(&env, &key, at) {
+        match wicket_identity::verify_any_envelope(&env, &key, at) {
             Ok((_, p)) if p.get("jti").and_then(|j| j.as_str()) == Some(id.as_str()) => ok += 1,
             Ok(_) => {
                 println!("  message {id}: FAILED: id does not match its envelope");

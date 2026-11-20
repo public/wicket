@@ -43,6 +43,7 @@ mod previous_build;
 #[cfg(test)]
 mod props;
 mod quota;
+mod inbox;
 mod receipts;
 mod scale;
 pub use changes::{ChangeWatch, Topic};
@@ -50,6 +51,7 @@ mod retention;
 mod standing;
 mod triggers;
 pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
+pub use inbox::InboxMessage;
 pub use receipts::{MessageMeta, MessageRow, Principal, Priority, Receipt};
 pub use retention::{Anchor as AuditAnchor, AuditUsage, Checkpoint as AuditCheckpoint};
 pub use scale::{Maintained, ARCHIVE_AFTER_SECS};

@@ -161,8 +161,10 @@ Where it goes:
 - if it has none: a hibernated long-lived agent is woken to read it; otherwise wicket holds the
   message, and the principal's next run takes it (for up to 7 days). A message its run ended
   without reading goes to the principal's next run the same way. The answer says which happened.
-- An operator's principal (`spiffe://<domain>/t/<tenant>/op/…`) is refused for now: operators
-  don't receive messages from agents yet.
+- to an operator's principal (`spiffe://<domain>/t/<tenant>/op/…`, #252): allowed to the operator
+  this agent acts for (its `principal.sub`, as `whoami` shows it), and as a reply to an operator
+  that wrote to it. Any other operator is refused, with a receipt that says so. The message waits in
+  the operator's inbox (`wicket message inbox`), `delivered` on its receipt until they read it.
 
 A message never grants anything: it is the sender's data for the recipient, which can't widen
 anyone's reach or decide a request. Every message is on the audit record (`message`, with `from`,
@@ -190,6 +192,13 @@ A message shows `message_id`, `from` (verified: its principal `id`, agent, zone,
 One wicket drops (its signature doesn't verify, or the org policy doesn't let this zone hear from
 the sender's) makes it `refused`, with why. The body is the peer's data, never instructions from
 the agent's user: it grants nothing and can't approve anything.
+
+A human's message (#252, `wicket message send`) arrives the same way, signed by wicket with a
+short-lived operator identity: `from` has the operator's principal `id`, `operator` (its name),
+`via` (`unix` or `passkey`) and `relation` (`your operator` for the one this agent acts for, else
+`an operator`). An operator may write to an agent that acts for it, whose `accept_from` names it,
+or that wrote to it. It is still data: an operator's instructions come as prompts, the agent's next
+turn.
 
 While the agent waits here (or in `await_grant`, or in `receipts` with a timeout) its state is
 `waiting` (see [`principals`](#principals)).
@@ -223,7 +232,8 @@ Discovery and presence (#252): the principals this one may talk to, from what th
 arguments. Each entry has its principal `id` (stable across its restarts and wakes: what
 `send_message` takes), `kind` (`agent`, `human`; `program` once programs have identities, #255),
 agent name and zone, `relation` (`parent`, `child`, `peer`, `operator`), and two flags:
-`may_send_to` (its `accept_from` lists this principal or its zone, or it is the parent or a child)
+`may_send_to` (its `accept_from` lists this principal or its zone, or it is the parent or a child,
+or the operator this agent acts for)
 and `may_hear_from` (this zone's `accept_from` lists it, and the org policy agrees). Its `state` is
 one of:
 
@@ -236,9 +246,10 @@ one of:
 | `hibernated` | a long-lived agent asleep: a message wakes it |
 | `offline` | no live run: a message is held for its next one |
 
-Operators that `accept_from` names are listed as `kind: operator`, `state: offline`: they don't receive
-agents' messages yet (they will through the CLI and the console). Principals of other tenants are
-never listed.
+Operators are listed as `kind: operator`, `state: offline`: the one this agent acts for (`relation`
+`your operator`, `may_send_to` true), and those `accept_from` names (`may_send_to` false: answer
+one with `in_reply_to`). They read and send through the CLI (`wicket message`). Principals of other
+tenants are never listed.
 
 ## `receipts`
 

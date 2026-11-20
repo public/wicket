@@ -22,6 +22,9 @@ pub use ed25519_dalek::{SigningKey, VerifyingKey};
 
 pub mod jws;
 pub mod node;
+mod operator;
+
+pub use operator::{sign_operator_envelope, verify_any_envelope, verify_operator, OperatorClaims, Sender, OPERATOR_TYP};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdError {

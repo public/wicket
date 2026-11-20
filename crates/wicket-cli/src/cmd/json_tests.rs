@@ -271,3 +271,68 @@ fn top_json() {
     assert_eq!(keys(&n["health"]["memory"]), ["available_mib", "committed_mib", "total_mib"]);
     documented_as("`wicket top --json`, a run's `spent`", &v["runs"][0]["spent"]);
 }
+
+/// #252: an agent acting for operator alice, with a wicket-issued identity, and a message from it
+/// in alice's inbox.
+fn agent_writes_to_alice(l: &mut wicket_store::Ledger, issuer: &wicket_identity::Issuer) -> (String, String) {
+    let t = TenantId::single();
+    let alice = wicket_identity::operator_id(&issuer.trust_domain, &t.0, "unix", "alice");
+    let key = wicket_identity::AgentKey::generate();
+    let spec = wicket_identity::IdentitySpec {
+        tenant: t.0.clone(),
+        zone: "work".into(),
+        agent: "worker".into(),
+        run: "run_w".into(),
+        parent_run: None,
+        manifest_sha256: "m".into(),
+        image: "img".into(),
+        node: "local".into(),
+        principal: serde_json::json!({ "type": "human", "id": "alice", "via": "cli", "sub": alice }),
+        act: None,
+    };
+    let now = wicket_store::now();
+    let jws = issuer.issue(&spec, now, 600, &key.public());
+    let claims = wicket_identity::verify_identity(&jws, &issuer.verifying_key(), now).unwrap();
+    l.run_started(&t, &RunId("run_w".into()), "work", "worker").unwrap();
+    l.put_identity(&wicket_store::IdentityRow {
+        run: "run_w".into(),
+        tenant: t.0.clone(),
+        spiffe_id: claims.sub.clone(),
+        zone: "work".into(),
+        agent: "worker".into(),
+        parent_run: None,
+        accept_from: vec![],
+        jws: jws.clone(),
+        issued_at: now,
+    })
+    .unwrap();
+    let payload = serde_json::json!({ "jti": "m-1", "iat": now, "kind": "message", "to": alice, "body": "done", "reply_to": claims.sub, "priority": "next" });
+    let env = wicket_identity::sign_envelope(&key, &jws, &payload);
+    let meta = wicket_store::MessageMeta { from_principal: Some(&claims.sub), ..Default::default() };
+    l.post_message("m-1", &t, "run_w", &alice, None, &env, &meta).unwrap();
+    (alice, claims.sub)
+}
+
+#[test]
+fn message_inbox_receipts_and_principals_json() {
+    let (_d, mut l) = super::test_ledger("message");
+    let issuer = wicket_identity::Issuer::generate("w.test");
+    let (alice, worker) = agent_writes_to_alice(&mut l, &issuer);
+    let t = TenantId::single();
+    let m = &l.operator_inbox(&t.0, &alice, false, 10).unwrap()[0];
+    let got = vec![wicket_proxy::opmsg::verify_received(m, &alice, &issuer.verifying_key(), false).map_err(|e| (m.id.clone(), e))];
+    let v = super::message::inbox_json(&got);
+    assert_eq!((v[0]["from"].as_str(), v[0]["body"].as_str()), (Some(worker.as_str()), Some("done")), "{v:#}");
+    documented_as("`wicket message inbox --json`", &v);
+    let bad = super::message::inbox_json(&[Err(("m-2".into(), "its signature does not verify".into()))]);
+    documented_as("`wicket message inbox --json`, a message that doesn't verify", &bad);
+    // The agent's receipt for it, as the agent reads it; an operator's own read the same way.
+    let v = super::message::receipts_json(&l.receipts_from(&t.0, &worker, &[], 10).unwrap());
+    assert_eq!(v[0]["state"], "delivered", "{v:#}");
+    documented_as("`wicket message receipts --json`", &v);
+    let v = super::message::principals_json(&l, &t, &alice, &issuer.verifying_key()).unwrap();
+    assert_eq!((v[0]["id"].as_str(), v[0]["relation"].as_str()), (Some(worker.as_str()), Some("acts for you")), "{v:#}");
+    documented_as("`wicket message principals --json`", &v);
+    let bob = wicket_identity::operator_id("w.test", &t.0, "unix", "bob");
+    assert_eq!(super::message::principals_json(&l, &t, &bob, &issuer.verifying_key()).unwrap(), serde_json::json!([]));
+}

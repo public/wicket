@@ -12,7 +12,8 @@ reference](manifest.md)).
 ## Output for scripts
 
 The commands that list things take `--json`: `pending`, `top`, `agents`, `links`, `grant list`,
-`standing list`, `node list`, `service list` and `audit`. With it, stdout holds one JSON document
+`standing list`, `node list`, `service list`, `audit`, `message inbox`, `message receipts` and
+`message principals`. With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -34,6 +35,10 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
 | `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts`, `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
+| `wicket message inbox --json` | `message_id`, `kind`, `from` (the sender's principal id, as its envelope verified), `agent`, `zone` and `run` (an agent sender's; null for an operator), `acting_for` (the chain the sender acts for), `reply_to`, `priority` (`now`, `next`, `later`), `in_reply_to`, `sent_at`, `read_at` (null: unread until now), `body` (the sender's data) |
+| `wicket message inbox --json`, a message that doesn't verify | `message_id`, `dropped` (why) |
+| `wicket message receipts --json` | `message_id`, `to`, `state` (`delivered`, `read`, `held`, `refused`, `expired`), `why`, `release` (a held message: who can release it), `run`, `sent_at`, `read_at`, `expires_at`, `priority`, `in_reply_to` |
+| `wicket message principals --json` | `id`, `kind` (`agent`), `agent`, `zone`, `relation` (`acts for you`, `accepts you`), `state` (`running`, `busy`, `idle`, `waiting`, `hibernated`, `offline`) |
 | `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
 | `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
 | an agent's `used` | `requests`, `input_tokens`, `output_tokens`, `secs` |
@@ -47,6 +52,11 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 
 - [`wicket run`](#wicket-run)
 - [`wicket session`](#wicket-session)
+- [`wicket message`](#wicket-message)
+  - [`wicket message send`](#wicket-message-send)
+  - [`wicket message inbox`](#wicket-message-inbox)
+  - [`wicket message receipts`](#wicket-message-receipts)
+  - [`wicket message principals`](#wicket-message-principals)
 - [`wicket top`](#wicket-top)
 - [`wicket agents`](#wicket-agents)
 - [`wicket hibernate`](#wicket-hibernate)
@@ -180,6 +190,7 @@ Usage: wicket <COMMAND>
 Runs and agents:
   run        Run a task manifest: one workload (an agent, or a program) in one zone
   session    Open a running agent's session in this terminal: watch it, and send it prompts
+  message    Messages with agents: send, read your inbox, follow receipts
   top        A live view of nodes, runs, pending requests and leases (read-only)
   agents     Long-lived agents: state, generation, current run and bundle size
   hibernate  Hibernate a long-lived agent at its next quiet point
@@ -271,6 +282,85 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+```
+
+## `wicket message`
+
+```text
+Messages with agents: send, read your inbox, follow receipts.
+
+Messages with agents (#252), as an operator: the same signed envelopes, rules and receipts agents have with each other. You may write to an agent that acts for you, whose accept_from names you, or that wrote to you; an agent may write to you if it acts for you. A message is data and grants nothing: `wicket session` prompts an agent.
+
+Usage: wicket message <COMMAND>
+
+Commands:
+  send        Send a signed message to an agent: one that acts for you, whose accept_from names you, or that wrote to you (--in-reply-to). Prints its id and receipt
+  inbox       Messages agents sent you, verified, unread first by priority. They are marked read (their senders' receipts say so) unless --peek
+  receipts    The receipts of the messages you sent, newest first: delivered, read, held (why, and who can release it), refused (why) or expired
+  principals  The agents you may write to, with their state: those that act for you or whose accept_from names you
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `wicket message send`
+
+```text
+Send a signed message to an agent: one that acts for you, whose accept_from names you, or that wrote to you (--in-reply-to). Prints its id and receipt
+
+Usage: wicket message send [OPTIONS] <TO> <TEXT>...
+
+Arguments:
+  <TO>       The agent's principal id (`spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>`, as `wicket message principals` lists it)
+  <TEXT>...  The message: its words, as one string body
+
+Options:
+      --priority <PRIORITY>        How soon you want it read: now, next or later [default: next]
+      --in-reply-to <IN_REPLY_TO>  The id of the agent's message this answers
+      --json                       JSON instead of text
+  -h, --help                       Print help
+```
+
+### `wicket message inbox`
+
+```text
+Messages agents sent you, verified, unread first by priority. They are marked read (their senders' receipts say so) unless --peek
+
+Usage: wicket message inbox [OPTIONS]
+
+Options:
+      --all            Also list the ones you have read
+      --peek           Don't mark them read
+      --limit <LIMIT>  [default: 50]
+      --json           JSON instead of text
+  -h, --help           Print help
+```
+
+### `wicket message receipts`
+
+```text
+The receipts of the messages you sent, newest first: delivered, read, held (why, and who can release it), refused (why) or expired
+
+Usage: wicket message receipts [OPTIONS]
+
+Options:
+      --limit <LIMIT>  [default: 40]
+      --json           JSON instead of text
+  -h, --help           Print help
+```
+
+### `wicket message principals`
+
+```text
+The agents you may write to, with their state: those that act for you or whose accept_from names you
+
+Usage: wicket message principals [OPTIONS]
+
+Options:
+      --json  JSON instead of text
+  -h, --help  Print help
 ```
 
 ## `wicket top`

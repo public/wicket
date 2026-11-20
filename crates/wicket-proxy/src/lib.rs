@@ -13,6 +13,7 @@ pub mod gateway;
 pub mod h3;
 pub mod link;
 pub mod llm;
+pub mod opmsg;
 pub mod provider;
 pub mod secret_helper;
 pub mod sockpath;
@@ -399,7 +400,7 @@ impl RunCtx {
             Recipient::Principal(id) => match wicket_identity::Principal::parse(id) {
                 Some(wicket_identity::Principal::Agent { .. }) => (id.to_string(), None),
                 Some(wicket_identity::Principal::Operator { .. }) => {
-                    return Err(format!("{id} is an operator: operators don't receive messages from agents yet (#250); write to your result instead").into())
+                    return opmsg::agent_to_operator(self, &me, &mut l, id, kind, body, opts, size, now);
                 }
                 None => {
                     return Err(format!(
@@ -413,26 +414,7 @@ impl RunCtx {
             Some(r) if r.tenant == self.tenant.0 => r,
             _ => return Err(format!("no agent {principal}: none has run as it in this tenant").into()),
         };
-        // The run it is for: the preferred one while it runs, else the principal's live run. A
-        // long-lived agent (#70) with none is woken to read it if it is hibernated; any other
-        // principal's message is held for its next run.
-        let running = |l: &wicket_store::Ledger, r: &str| l.run_status(r).ok().flatten().as_deref() == Some("running");
-        let mut to_run = match prefer.clone().filter(|p| running(&l, p)) {
-            Some(p) => Some(p),
-            None => l.live_run_of(&self.tenant.0, &principal).map_err(|e| e.to_string())?,
-        };
-        let mut wake: Option<String> = None;
-        if to_run.is_none() {
-            let agent = match l.agent_of_run(&rec.run).map_err(|e| e.to_string())? {
-                Some((id, _)) => l.agent(&id).map_err(|e| e.to_string())?,
-                None => None,
-            };
-            match agent {
-                Some(a) if a.restorable && a.state == "hibernated" && self.waker.is_some() => wake = Some(a.id),
-                Some(a) if a.restorable && wicket_store::AGENT_HELD.contains(&a.state.as_str()) => to_run = Some(a.run),
-                _ => {}
-            }
-        }
+        let (to_run, wake) = route(&l, &self.tenant.0, &principal, &rec, prefer.clone(), self.waker.is_some())?;
         // A reply (#252): to a message this principal sent us, which gave its reply address.
         let replies = match opts.in_reply_to {
             None => false,
@@ -555,6 +537,38 @@ impl RunCtx {
         let _ = self.events.send(ev);
         Ok(())
     }
+}
+
+/// The run a message to agent `principal` (whose latest identity is `rec`) is for: `prefer` while
+/// it runs, else the principal's live run. A long-lived agent (#70) with none is woken to read it
+/// if it is hibernated and `can_wake` (the second value: the agent to wake); any other principal's
+/// message is held for its next run (None).
+pub(crate) fn route(
+    l: &wicket_store::Ledger,
+    tenant: &str,
+    principal: &str,
+    rec: &wicket_store::IdentityRow,
+    prefer: Option<String>,
+    can_wake: bool,
+) -> std::result::Result<(Option<String>, Option<String>), String> {
+    let running = |r: &str| l.run_status(r).ok().flatten().as_deref() == Some("running");
+    let mut to_run = match prefer.filter(|p| running(p)) {
+        Some(p) => Some(p),
+        None => l.live_run_of(tenant, principal).map_err(|e| e.to_string())?,
+    };
+    let mut wake: Option<String> = None;
+    if to_run.is_none() {
+        let agent = match l.agent_of_run(&rec.run).map_err(|e| e.to_string())? {
+            Some((id, _)) => l.agent(&id).map_err(|e| e.to_string())?,
+            None => None,
+        };
+        match agent {
+            Some(a) if a.restorable && a.state == "hibernated" && can_wake => wake = Some(a.id),
+            Some(a) if a.restorable && wicket_store::AGENT_HELD.contains(&a.state.as_str()) => to_run = Some(a.run),
+            _ => {}
+        }
+    }
+    Ok((to_run, wake))
 }
 
 /// Whether an event's audit record must be committed before the request it describes goes ahead:
