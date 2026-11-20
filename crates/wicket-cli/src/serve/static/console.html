@@ -16,81 +16,92 @@
 <script src="{{js}}" integrity="{{js_sri}}" defer></script>
 </head>
 <body>
-<a class="skip" href="#waiting">Skip to what is waiting</a>
+<a class="skip" href="#main">Skip to the page</a>
+<!-- The console is organised by what the operator is there to do (docs/explanation/console-design.md):
+     decide what waits and see what is wrong (Inbox), follow agents (Agents), find out what happened
+     (Activity), and set things up (Settings). -->
 <header class="top">
   <div class="bar"><h1>wicket</h1><span id="tenant"></span></div>
-  <!-- In-page sections, most urgent first (#574): what needs a decision, then health, then activity. -->
-  <nav id="nav" aria-label="Sections" hidden>
-    <a href="#waiting" data-label="Waiting">Waiting<span class="count" id="nav-waiting" hidden></span></a>
-    <a href="#nodes" data-label="Health">Health<span class="count bad" id="nav-health" hidden></span></a>
-    <a href="#runs-section">Runs</a>
-    <a href="#activity">Activity</a>
-    <a href="#manage">Manage</a>
+  <nav id="nav" aria-label="Views" hidden>
+    <a href="#inbox" data-view="inbox" data-label="Inbox" data-noun="request">Inbox<span class="count" id="nav-waiting" hidden></span></a>
+    <a href="#agents" data-view="agents">Agents</a>
+    <a href="#activity" data-view="activity">Activity</a>
+    <a href="#settings" data-view="settings" data-label="Settings" data-noun="problem">Settings<span class="count bad" id="nav-health" hidden></span></a>
   </nav>
 </header>
 <div class="banner" id="stale" role="status" hidden></div>
-<main>
+<main id="main">
   <div id="auth" class="card narrow" hidden></div>
   <div id="console" hidden>
 
-  <section id="waiting" aria-labelledby="waiting-h">
-    <h2 id="waiting-h">Waiting for you</h2>
-    <div id="pending" class="deck"></div>
-    <!-- Standing reach (#572): an agent's ask, decided once with the ledger's evidence (passkey-signed). -->
-    <h3 class="sub" id="standing-pointer" hidden></h3>
-    <div id="standing-asks" class="deck"></div>
-  </section>
-
-  <section id="nodes" aria-labelledby="nodes-h">
-    <h2 id="nodes-h">Health</h2>
-    <div class="grid two">
-      <div class="card"><h3>Nodes and the state store</h3><div id="health"></div></div>
-      <div class="card"><h3>Leased nodes</h3><div id="placed"></div></div>
-    </div>
-  </section>
-
-  <section id="runs-section" aria-labelledby="runs-h">
-    <h2 id="runs-h">Runs</h2>
-    <div class="grid main-side">
-      <div class="stack">
-        <div class="card flush" id="runs"></div>
-        <!-- A run's authority, or an explained decision (#173): read-only, opened from a row. -->
-        <div class="card" id="detail" hidden>
-          <div class="card-head"><span id="detail-title" class="mono"></span><button type="button" id="detail-close">Close</button></div>
-          <div id="detail-body"></div>
-        </div>
-        <form class="card" id="runform" hidden>
-          <label id="runform-title" for="runform-text"></label>
-          <textarea id="runform-text"></textarea>
-          <div class="buttons"><button type="submit" id="runform-go"></button><button type="button" id="runform-cancel">Cancel</button></div>
-        </form>
+  <!-- Inbox: one line of how things are, what needs a decision, and what is wrong. -->
+  <section class="view" id="view-inbox" aria-labelledby="inbox-h">
+    <h2 id="inbox-h" class="sr-only">Inbox</h2>
+    <p class="status" id="status" aria-live="polite"></p>
+    <div class="grid inbox">
+      <div>
+        <h3 class="sub" id="waiting-h">Needs you</h3>
+        <div id="pending" class="deck"></div>
+        <!-- An agent's ask to be always allowed something (#572): a request like the others. -->
+        <h3 class="sub" id="standing-pointer" hidden></h3>
+        <div id="standing-asks" class="deck"></div>
       </div>
-      <div class="stack">
-        <div class="card"><h3>Start a run</h3><div id="start"></div></div>
-        <div class="card"><h3>Recent decisions</h3><div id="decided"></div></div>
+      <div>
+        <h3 class="sub">Problems</h3>
+        <div id="problems" class="card flush"></div>
       </div>
     </div>
   </section>
 
-  <section id="activity" aria-labelledby="activity-h">
+  <!-- Agents: who is working, waiting, finished or failed; each opens its own page. -->
+  <section class="view" id="view-agents" aria-labelledby="agents-h" hidden>
+    <div class="view-head"><h2 id="agents-h">Agents</h2><button type="button" class="approve" id="start-open">Start an agent…</button></div>
+    <div class="card" id="start-card" hidden><h3>Start an agent</h3><div id="start"></div></div>
+    <div class="card flush" id="runs"></div>
+  </section>
+
+  <!-- One agent: what it does, what it can reach, what it did; its session; stop it. -->
+  <section class="view" id="view-agent" aria-labelledby="detail-title" hidden>
+    <a class="back" href="#agents">‹ Agents</a>
+    <div id="agent-head"></div>
+    <form class="card" id="runform" hidden>
+      <label id="runform-title" for="runform-text"></label>
+      <textarea id="runform-text"></textarea>
+      <div class="buttons"><button type="submit" id="runform-go"></button><button type="button" id="runform-cancel">Cancel</button></div>
+    </form>
+    <!-- What it can reach, and the token behind it (#173, #651): read-only. Explained decisions open here too. -->
+    <div class="card" id="detail">
+      <div class="card-head"><h3 id="detail-title"></h3><button type="button" id="detail-close" hidden>Close</button></div>
+      <div id="detail-body"></div>
+    </div>
+    <div class="card"><h3>Recent activity</h3><div class="log" id="agent-log"></div></div>
+  </section>
+
+  <!-- Activity: what happened, newest first, in sentences, with what was decided. -->
+  <section class="view" id="view-activity" aria-labelledby="activity-h" hidden>
     <h2 id="activity-h">Activity</h2>
-    <div class="card">
-      <p class="note top-note" id="audit-retention"></p>
-      <div class="log" id="audit"></div>
+    <div class="filters" id="filters" role="group" aria-label="Show"></div>
+    <div class="grid main-side">
+      <div class="card"><p class="note top-note" id="audit-retention"></p><div class="log" id="audit"></div></div>
+      <div class="card"><h3>Recent decisions</h3><div id="decided"></div></div>
     </div>
   </section>
 
-  <section id="manage" aria-labelledby="manage-h">
-    <h2 id="manage-h">Manage</h2>
+  <!-- Settings: what is set up once and changed rarely. -->
+  <section class="view" id="view-settings" aria-labelledby="settings-h" hidden>
+    <h2 id="settings-h">Settings</h2>
     <div class="grid two">
       <div class="stack">
-        <!-- Standing reach (#572): the approved rules, renewed (signed) or revoked (session only). -->
-        <div class="card" id="standing"><h3>Standing reach</h3><div id="standing-rules"></div></div>
-        <!-- Standing capacity grants (#256): issuing and renewing one is passkey-signed; revoking isn't. -->
-        <div class="card"><h3>Capacity</h3><div id="capacity"></div>
-          <details class="more"><summary>Issue a capacity grant</summary><div id="capacity-form"></div></details>
+        <div class="card" id="standing"><h3>Always allowed</h3><p class="note top-note">What agents may do without asking each time.</p><div id="standing-rules"></div></div>
+        <div class="card"><h3>Spending limits</h3><p class="note top-note">What may rent servers without asking each time, and how much it may spend.</p><div id="capacity"></div>
+          <details class="more"><summary>Add a spending limit</summary><div id="capacity-form"></div></details>
         </div>
-        <div class="card"><h3>Secrets</h3><div id="secrets"></div></div>
+        <div class="card"><h3>Servers and the record backup</h3><div id="health"></div></div>
+        <div class="card"><h3>Rented servers</h3><div id="placed"></div></div>
+        <div class="card"><h3>Notifications</h3><div id="push"></div></div>
+      </div>
+      <div class="stack">
+        <div class="card"><h3>API keys and passwords</h3><div id="secrets"></div></div>
         <!-- Store, rebind or delete a secret: every change is passkey-signed. Outside the list, so the refresh
              doesn't wipe what is being typed; the value field is cleared as soon as it is submitted. -->
         <form class="card" id="secret-edit" autocomplete="off" hidden>
@@ -98,17 +109,14 @@
           <div id="secret-edit-body"></div>
           <div class="buttons"><button type="submit" id="secret-edit-go"></button><button type="button" id="secret-edit-cancel">Cancel</button></div>
         </form>
-      </div>
-      <div class="stack">
-        <div class="card"><h3>Manifests</h3><div id="manifests"></div></div>
+        <div class="card"><h3>Task setups</h3><p class="note top-note">What an agent is started with: its task, what it may reach, its limits.</p><div id="manifests"></div></div>
         <!-- A manifest, viewed and edited (#172): every save is passkey-signed. -->
         <div class="card" id="mfedit" hidden>
           <div class="card-head"><span id="mfedit-title" class="mono"></span><button type="button" id="mfedit-close">Close</button></div>
           <div id="mfedit-body"></div>
         </div>
-        <div class="card"><h3>Policy</h3><div id="policy"></div></div>
-        <div class="card"><h3>Notifications</h3><div id="push"></div></div>
-        <div class="card"><h3>Operator</h3><div id="operator"></div></div>
+        <div class="card"><h3>Organisation rules</h3><div id="policy"></div></div>
+        <div class="card"><h3>Your passkeys</h3><div id="operator"></div></div>
       </div>
     </div>
   </section>

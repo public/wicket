@@ -4,7 +4,7 @@ type: Changed
 ---
 - A request card leads with what is asked, who asks, the risk and the buttons. On whose behalf, who
   in the box asked, the ids and how a push is granted are under **Details**, and a run id is cut in
-  the middle on screen but copied whole (#574 review).
+  the middle on screen; a tap shows the whole id to select and copy (#574 review).
 - wicket's own requests read as sentences: "Lease a node: 2 vCPU, 4096 MiB, … at most $0.036/h",
   "Start a child agent named reader in zone research", "Link run_a → run_b, port 8080", "Install
   wicket build 9f86d081884c…", with the raw request under Details and one **Approve**
