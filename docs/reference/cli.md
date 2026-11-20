@@ -2266,8 +2266,10 @@ without reading the message (which goes to stderr, after `Error: `).
 or timed out; 6 when it was revoked; 128 + the signal when it was interrupted. An agent that runs
 out of turns (`agent.max_turns`) has failed: Claude Code exits non-zero then, and the run's last
 `[agent] finished` line says `error_max_turns`. `wicket wrap` exits with the wrapped program's own
-code when that isn't 0, and otherwise as `wicket run` does. `wicket wake`, which wicket runs
-itself, exits 3 when the agent is already being woken or is running.
+code when the program ended by itself with a non-zero one (a crash or an outside signal included),
+and otherwise as `wicket run` does: a box wicket or its node stopped (a timeout, an expired
+authority, out of memory) is 1. `wicket wake`, which wicket runs itself, exits 3 when the agent is
+already being woken or is running.
 
 A command the daemon runs passes its code back through it; one a signal ended exits 128 + the
 signal's number, as a shell reports it. If the daemon restarts while a command
