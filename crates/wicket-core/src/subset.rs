@@ -216,18 +216,25 @@ fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
                         && q.methods.iter().any(|qm| qm.eq_ignore_ascii_case(m))
                         && path_covered(&q.paths, path)
                         && (!r.allow_dangerous || q.allow_dangerous)
-                        // Deciding an encoded slash decoded reaches requests the parent refuses.
-                        && r.decode_slash.iter().all(|n| q.decode_slash.contains(n))
                 });
                 if !covered {
                     v.push(format!(
-                        "reach rule {i}: {m} {}{path} is not within this zone's reach{}{}",
+                        "reach rule {i}: {m} {}{path} is not within this zone's reach{}",
                         r.host,
-                        if r.allow_dangerous { " (with allow_dangerous)" } else { "" },
-                        if r.decode_slash.is_empty() { String::new() } else { format!(" (with decode_slash {:?})", r.decode_slash) }
+                        if r.allow_dangerous { " (with allow_dangerous)" } else { "" }
                     ));
                 }
             }
+        }
+    }
+    // Deciding an encoded slash decoded reaches requests the parent refuses, and a zone decides it
+    // for a host from every rule that names the host (`decode_slash_for`), whatever its methods and
+    // paths. So per rule, not per method and path: each segment a child's rule decodes, some rule of
+    // the parent covering that host decodes too (#664 review).
+    for (i, r) in c.reach.iter().enumerate() {
+        let parent: Vec<u8> = p.reach.iter().filter(|q| host_covers(&q.host, &r.host)).flat_map(|q| q.decode_slash.iter().copied()).collect();
+        if let Some(n) = r.decode_slash.iter().find(|n| !parent.contains(n)) {
+            v.push(format!("reach rule {i}: decode_slash segment {n} for {}: this zone doesn't decide an encoded slash there", r.host));
         }
     }
     // The parent's forbid rules bind the child too: each forbidden path must stay forbidden, by a child
@@ -406,6 +413,18 @@ pub(crate) mod tests {
         assert!(reach_within(&both, &first).is_ok());
         assert!(reach_within(&first, &both).is_err());
         assert!(reach_within(&first, &plain).is_ok(), "deciding less is within");
+        // A rule of no methods or paths can't carry it past the check: refused when kept, in each
+        // spelling, and the check is per host whatever its methods and paths.
+        for empty in ["methods: []", "paths: []", "methods: null"] {
+            let y = format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{{ host: pkgs.example, {empty}, decode_slash: [1] }}]\n");
+            assert!(Manifest::from_yaml(&y).is_err(), "{empty}");
+        }
+        let parent = z("{ host: pkgs.example, paths: ['/a/**'] }");
+        let mut child = parent.clone();
+        let mut sneaky = first.reach[0].clone();
+        sneaky.paths = vec!["/a/**".into()];
+        child.reach.push(sneaky);
+        assert!(reach_within(&parent, &child).unwrap_err().iter().any(|e| e.contains("decode_slash")));
     }
 
     /// #325 made `host_matches` and `host_covers` allocation-free for Kani: they agree with the

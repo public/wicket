@@ -1027,6 +1027,11 @@ impl Manifest {
             if r.host.is_empty() || r.host.contains('/') {
                 return Err(ManifestError::Invalid(format!("bad reach host {:?}", r.host)));
             }
+            // A rule that names no method or no path allows nothing, yet would still carry its
+            // host's `decode_slash` (#664 review): refused.
+            if r.methods.is_empty() || r.paths.is_empty() {
+                return Err(ManifestError::Invalid(format!("reach rule for {}: name at least one method and one path", r.host)));
+            }
             for p in &r.paths {
                 check_path_glob("reach", p)?;
             }
