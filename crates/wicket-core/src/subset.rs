@@ -525,12 +525,12 @@ pub(crate) mod tests {
     /// parent uses, and no human approval widens that.
     #[test]
     fn a_child_uses_only_services_its_parent_uses() {
-        let p = zone("  uses: [npm-cache, oci-mirror]\n");
-        assert!(unapprovable(&zone("  uses: [npm-cache]\n"), &p).is_empty());
+        let p = zone("  uses: [pkg-cache, oci-mirror]\n");
+        assert!(unapprovable(&zone("  uses: [pkg-cache]\n"), &p).is_empty());
         assert!(unapprovable(&zone(""), &p).is_empty(), "none");
-        let v = unapprovable(&zone("  uses: [npm-cache, crates-mirror]\n"), &p);
+        let v = unapprovable(&zone("  uses: [pkg-cache, crates-mirror]\n"), &p);
         assert_eq!(v, vec!["use service crates-mirror: only the services this zone uses can be passed on".to_string()]);
-        assert_eq!(unapprovable(&zone("  uses: [npm-cache]\n"), &zone("")).len(), 1, "a parent that uses none");
+        assert_eq!(unapprovable(&zone("  uses: [pkg-cache]\n"), &zone("")).len(), 1, "a parent that uses none");
     }
 
     /// What no approval can give is named field by field: each of the route's three, and each of an

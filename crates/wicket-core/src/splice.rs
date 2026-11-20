@@ -490,7 +490,7 @@ mod tests {
             "api.github.com",
             "s3.amazonaws.com",
             "api.anthropic.com",
-            "registry.npmjs.org",
+            "pkgs.example",
             "models.example",
         ];
         let segs = [
@@ -532,8 +532,8 @@ mod tests {
             format!("{{host: api.github.com, methods: {ALL}, allow_dangerous: true}}"),
             format!("{{host: '*.amazonaws.com', methods: {ALL}}}"),
             format!("{{host: api.anthropic.com, methods: {ALL}, allow_dangerous: true}}"),
-            "{host: registry.npmjs.org}".to_string(),
-            format!("{{host: registry.npmjs.org, methods: {ALL}, paths: ['/pub/**']}}"),
+            "{host: pkgs.example}".to_string(),
+            format!("{{host: pkgs.example, methods: {ALL}, paths: ['/pub/**']}}"),
             format!("{{host: models.example, methods: {ALL}}}"),
         ];
         let extras = [
@@ -579,9 +579,7 @@ mod tests {
         let segs = ["repos", "o", "r", "graphql", "hooks", "merge", "contents", ".github", "git", "refs", "info", "git-receive-pack", "x"];
         let mut rng = Rng(42);
         let (t, r) = (TenantId::single(), RunId("r".into()));
-        for host in
-            ["static.example", "github.com.evil.example", "evilgithub.com", "gitlab.com", "registry.npmjs.org", "amazonaws.com.example"]
-        {
+        for host in ["static.example", "github.com.evil.example", "evilgithub.com", "gitlab.com", "pkgs.example", "amazonaws.com.example"] {
             for _ in 0..500 {
                 let path: String = (0..1 + (rng.0 % 6) as usize).map(|_| format!("/{}", rng.pick(&segs))).collect();
                 for m in HTTP_METHODS {

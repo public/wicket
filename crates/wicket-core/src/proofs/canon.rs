@@ -1,14 +1,16 @@
-//! Canonical paths (`canon::canonical_path`: `plain_fault`, `escape_fault`, `npm_scoped`):
-//! Wicket/Canon.lean.
+//! Canonical paths (`canon::canonical_path` and `canonical_path_decoding`: `plain_fault`,
+//! `escape_fault`, `slash_escape`): Wicket/Canon.lean.
 //!
-//! Lean's `canonicalPath_plain` holds of the Rust by construction: `canonical_path` returns a path
-//! only once `check_plain` (whose decision is `plain_fault`, proved here to be `plainOk`) accepted
-//! exactly that path. Not harnessed: `npm_scoped` (#143), whose `str` splitting and searching took
-//! CBMC past 4 GiB at 7 bytes; its unit tests cover it.
+//! Lean's `canonicalPathDecoding_plain` (and so `canonicalPath_plain`) holds of the Rust by
+//! construction: `canonical_path_decoding` returns a path only once `check_plain` (whose decision is
+//! `plain_fault`, proved here to be `plainOk`) accepted exactly that path, decoded or not. What a
+//! rule's `decode_slash` (#664) decodes is `slash_escape`'s, harnessed here; the `str` splitting
+//! around it (`decode_slash`) is left to its unit tests and the Lean oracle, as CBMC ran past 4 GiB
+//! on `str` splitting at 7 bytes.
 //! The Lean definitions are restated here over bytes, as Rust checks them, and Kani checks the Rust
 //! against them.
 
-use super::{escape_fault, plain_fault, prefix_covers};
+use super::{escape_fault, plain_fault, prefix_covers, slash_escape};
 use crate::proofs::AnyStr;
 
 /// Segments: `/`, `.`, a letter, `;`, `\`, `{` (which a URL parser would escape), and the escape
@@ -113,6 +115,36 @@ fn plain_ok(p: &[u8]) -> bool {
 fn check_escapes_is_escapes_ok() {
     let p = AnyStr::<E>::new(ESC);
     assert_eq!(escape_fault(p.bytes()).is_none(), escapes_ok(p.bytes()));
+}
+
+/// `slash_escape` (Lean's `slashEscape`) finds a segment's only encoded slash, `%2f` or `%2F`, and
+/// only between two non-empty parts: so a decoded segment has no other encoded slash left in it,
+/// and neither part is empty.
+#[kani::proof]
+#[kani::unwind(9)]
+fn slash_escape_finds_the_only_encoded_slash() {
+    let s = AnyStr::<7>::new(b"%2fFa.");
+    let b = s.bytes();
+    let esc = |j: usize| j + 2 < b.len() && b[j] == b'%' && b[j + 1] == b'2' && (b[j + 2] == b'f' || b[j + 2] == b'F');
+    let mut count = 0;
+    let mut first = b.len();
+    let mut j = 0;
+    while j < b.len() {
+        if esc(j) {
+            count += 1;
+            if first == b.len() {
+                first = j;
+            }
+        }
+        j += 1;
+    }
+    match slash_escape(b) {
+        Some(at) => {
+            assert!(esc(at) && at > 0 && at + 3 < b.len());
+            assert!(count == 1 && first == at, "the only one");
+        }
+        None => assert!(count != 1 || first == 0 || first + 3 >= b.len(), "refused only when none, several, or at an edge"),
+    }
 }
 
 /// `check_plain` is exactly Lean's `plainOk` (on paths starting with `/`, as `canonical_path` passes

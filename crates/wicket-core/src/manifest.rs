@@ -1236,11 +1236,11 @@ mod tests {
         let m = |placement: &str| {
             super::Manifest::from_yaml(&format!(
                 "task: t\nprogram: {{ name: p, command: [x] }}\nplacement: {placement}\n\
-                 zone: {{ name: z, uses: [npm-cache], volumes: [{{ name: data, path: /volumes/data, keep: true }}, \
+                 zone: {{ name: z, uses: [pkg-cache], volumes: [{{ name: data, path: /volumes/data, keep: true }}, \
                  {{ name: scratch, path: /volumes/scratch }}] }}\n"
             ))
         };
-        let ok = m("{ priority: 5, affinity: [{ service: npm-cache }, { volume: data, required: true }] }").unwrap();
+        let ok = m("{ priority: 5, affinity: [{ service: pkg-cache }, { volume: data, required: true }] }").unwrap();
         assert_eq!(ok.placement.priority, 5);
         assert_eq!(super::Manifest::from_yaml(&crate::yaml::to_string(&ok).unwrap()).unwrap().placement, ok.placement);
         assert!(m("{ affinity: [{ service: crates-mirror }] }").unwrap_err().to_string().contains("not one zone.uses names"));
@@ -1254,9 +1254,9 @@ mod tests {
     #[test]
     fn a_service_and_its_users() {
         let svc = super::Manifest::from_yaml(concat!(
-            "task: cache\nprogram: { name: npm-cache, command: [verdaccio] }\n",
-            "service: { port: 4873, env: { npm_config_registry: 'http://{host}:{port}/' } }\n",
-            "zone: { name: npm-cache, reach: [{ host: registry.npmjs.org, methods: [GET, HEAD], paths: ['/**'] }] }\n"
+            "task: cache\nprogram: { name: pkg-cache, command: [cache-server] }\n",
+            "service: { port: 4873, env: { PKG_REGISTRY: 'http://{host}:{port}/' } }\n",
+            "zone: { name: pkg-cache, reach: [{ host: pkgs.example, methods: [GET, HEAD], paths: ['/**'] }] }\n"
         ))
         .unwrap();
         assert_eq!(svc.service.as_ref().unwrap().port, 4873);
@@ -1265,9 +1265,9 @@ mod tests {
         let agent_svc = "task: t\nagent: { name: a }\nservice: { port: 1 }\nzone: { name: z, llm: {} }\n";
         assert!(super::Manifest::from_yaml(agent_svc).unwrap_err().to_string().contains("a service is a program"));
         let user =
-            super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, uses: [npm-cache] }\n").unwrap();
-        assert_eq!(user.zone.uses, ["npm-cache"]);
-        assert!(super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, uses: [Npm] }\n").is_err());
+            super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, uses: [pkg-cache] }\n").unwrap();
+        assert_eq!(user.zone.uses, ["pkg-cache"]);
+        assert!(super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, uses: [Pkg] }\n").is_err());
         let plain = super::Manifest::from_yaml("task: t\nprogram: { name: p, command: [x] }\nzone: { name: z }\n").unwrap();
         let y = crate::yaml::to_string(&plain).unwrap();
         assert!(!y.contains("uses") && !y.contains("service"), "{y}");
