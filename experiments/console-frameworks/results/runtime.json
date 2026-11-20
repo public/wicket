@@ -8,15 +8,6 @@
   "kept": true,
   "errors": []
  },
- "lit": {
-  "card_ms": 1152.1000000005588,
-  "fcp_ms": 1072,
-  "heap_kb": 2136.54296875,
-  "dom": 322,
-  "poll_ms": 2.3296,
-  "kept": true,
-  "errors": []
- },
  "lit-esbuild": {
   "card_ms": 1175.7000000001863,
   "fcp_ms": 1104,
@@ -26,12 +17,21 @@
   "kept": true,
   "errors": []
  },
- "preact": {
-  "card_ms": 1200.5,
-  "fcp_ms": 716,
-  "heap_kb": 2178.17578125,
-  "dom": 315,
-  "poll_ms": 8.872400000000003,
+ "lit-nobuild": {
+  "card_ms": 1288.2999999988824,
+  "fcp_ms": 1212,
+  "heap_kb": 2158.1328125,
+  "dom": 327,
+  "poll_ms": 2.1694,
+  "kept": true,
+  "errors": []
+ },
+ "lit": {
+  "card_ms": 1158.5,
+  "fcp_ms": 1060,
+  "heap_kb": 2136.65234375,
+  "dom": 322,
+  "poll_ms": 2.3414000000000006,
   "kept": true,
   "errors": []
  },
@@ -44,12 +44,12 @@
   "kept": true,
   "errors": []
  },
- "solid": {
-  "card_ms": 1294.1000000005588,
-  "fcp_ms": 796,
-  "heap_kb": 2805.15234375,
-  "dom": 483,
-  "poll_ms": 2.067200000000001,
+ "preact": {
+  "card_ms": 1200.5,
+  "fcp_ms": 716,
+  "heap_kb": 2178.17578125,
+  "dom": 315,
+  "poll_ms": 8.872400000000003,
   "kept": true,
   "errors": []
  },
@@ -62,6 +62,15 @@
   "kept": true,
   "errors": []
  },
+ "solid": {
+  "card_ms": 1294.1000000005588,
+  "fcp_ms": 796,
+  "heap_kb": 2805.15234375,
+  "dom": 483,
+  "poll_ms": 2.067200000000001,
+  "kept": true,
+  "errors": []
+ },
  "svelte": {
   "card_ms": 1684.2000000001863,
   "fcp_ms": 900,
@@ -71,12 +80,21 @@
   "kept": true,
   "errors": []
  },
+ "vanilla-nobuild": {
+  "card_ms": 1163.4000000003725,
+  "fcp_ms": 724,
+  "heap_kb": 1954.84765625,
+  "dom": 334,
+  "poll_ms": 2.3153999999999995,
+  "kept": true,
+  "errors": []
+ },
  "vanilla": {
-  "card_ms": 1142.6000000005588,
-  "fcp_ms": 616,
-  "heap_kb": 1946.36328125,
+  "card_ms": 1198.7000000011176,
+  "fcp_ms": 628,
+  "heap_kb": 1946.359375,
   "dom": 333,
-  "poll_ms": 1.9404,
+  "poll_ms": 2.1724,
   "kept": true,
   "errors": []
  },

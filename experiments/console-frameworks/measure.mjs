@@ -22,6 +22,10 @@ import { createRequire } from "node:module";
 const { chromium } = createRequire(import.meta.url)("playwright");
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+// UNTHROTTLED=1: the same runs with no CPU or network slowdown (a desktop on a local network), written
+// to results/runtime-unthrottled.json and results/raw-unthrottled/ instead.
+const UNTHROTTLED = process.env.UNTHROTTLED === "1";
+const RAW = UNTHROTTLED ? "raw-unthrottled" : "raw";
 const args = process.argv.slice(2);
 const RUNS = Number(args[0]) || 7;
 let names = args.slice(1);
@@ -45,8 +49,10 @@ async function once(browser, url) {
   const cdp = await ctx.newCDPSession(page);
   await cdp.send("Network.enable");
   await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
-  await cdp.send("Network.emulateNetworkConditions", { offline: false, latency: 150, downloadThroughput: 1.6e6 / 8, uploadThroughput: 750e3 / 8 });
-  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
+  if (!UNTHROTTLED) {
+    await cdp.send("Network.emulateNetworkConditions", { offline: false, latency: 150, downloadThroughput: 1.6e6 / 8, uploadThroughput: 750e3 / 8 });
+    await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
+  }
   await cdp.send("Performance.enable");
   await page.goto(url, { waitUntil: "commit" });
   await page.waitForSelector(".req button.approve", { timeout: 60000 });
@@ -67,7 +73,7 @@ async function once(browser, url) {
 
 const browser = await chromium.launch();
 const out = {};
-fs.mkdirSync(path.join(here, "results", "raw"), { recursive: true });
+fs.mkdirSync(path.join(here, "results", RAW), { recursive: true });
 let port = 8850;
 for (const name of names) {
   const srv = await serve(name, ++port);
@@ -76,14 +82,14 @@ for (const name of names) {
     await once(browser, `http://127.0.0.1:${port}/`); // warm the server and the browser binary, not the page's cache
     for (let i = 0; i < RUNS; i++) runs.push(await once(browser, `http://127.0.0.1:${port}/`));
   } finally { srv.kill(); }
-  fs.writeFileSync(path.join(here, "results", "raw", name + ".json"), JSON.stringify(runs, null, 1));
+  fs.writeFileSync(path.join(here, "results", RAW, name + ".json"), JSON.stringify(runs, null, 1));
   const pick = k => median(runs.map(r => r[k]));
   out[name] = { card_ms: pick("card_ms"), fcp_ms: pick("fcp_ms"), heap_kb: pick("heap_kb"), dom: pick("dom"), poll_ms: pick("poll_ms"),
     kept: runs.every(r => r.kept), errors: [...new Set(runs.flatMap(r => r.errors))] };
   console.error(name, JSON.stringify(out[name]));
 }
 await browser.close();
-fs.writeFileSync(path.join(here, "results", "runtime.json"), JSON.stringify(out, null, 1));
+fs.writeFileSync(path.join(here, "results", UNTHROTTLED ? "runtime-unthrottled.json" : "runtime.json"), JSON.stringify(out, null, 1));
 console.log("| candidate | first card (ms) | FCP (ms) | heap (KB) | elements | script per poll (ms) | cards kept | errors |");
 console.log("|---|---|---|---|---|---|---|---|");
 for (const [n, r] of Object.entries(out)) console.log(`| ${n} | ${Math.round(r.card_ms)} | ${Math.round(r.fcp_ms)} | ${Math.round(r.heap_kb)} | ${r.dom} | ${r.poll_ms.toFixed(1)} | ${r.kept ? "yes" : "NO"} | ${r.errors.length ? r.errors.join("; ") : "none"} |`);

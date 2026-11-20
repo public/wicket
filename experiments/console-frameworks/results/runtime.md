@@ -10,3 +10,12 @@
 | svelte | 1684 | 900 | 2533 | 317 | 10.4 | yes | none |
 | vanilla | 1143 | 616 | 1946 | 333 | 1.9 | yes | none |
 | vue | 1654 | 976 | 2658 | 318 | 2.2 | yes | none |
+
+A later run (same profile) of the two no-build variants, with Lit and plain JS again beside them:
+
+| candidate | first card (ms) | FCP (ms) | heap (KB) | elements | script per poll (ms) | cards kept | errors |
+|---|---|---|---|---|---|---|---|
+| lit-nobuild | 1288 | 1212 | 2158 | 327 | 2.2 | yes | none |
+| vanilla-nobuild | 1163 | 724 | 1955 | 334 | 2.3 | yes | none |
+| lit | 1159 | 1060 | 2137 | 322 | 2.3 | yes | none |
+| vanilla | 1199 | 628 | 1946 | 333 | 2.2 | yes | none |

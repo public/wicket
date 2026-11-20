@@ -9,7 +9,9 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const fx = createRequire(import.meta.url)(path.join(here, "../../ci/console-preview/fixture.js"));
+// A copy of the console preview's made-up data (ci/console-preview/fixture.js, from the #574 console
+// branches), so the experiment runs on its own.
+const fx = createRequire(import.meta.url)(path.join(here, "fixture.js"));
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; " +
   "manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const [which, portArg] = process.argv.slice(2);
