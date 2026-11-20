@@ -174,9 +174,13 @@ enum Cmd {
         /// Print one frame and exit (also what a stdout that isn't a terminal gets, every 2 s, without it).
         #[arg(long)]
         once: bool,
+        /// One frame as JSON, then exit (implies --once).
+        #[arg(long)]
+        json: bool,
     },
     /// Long-lived agents: state, generation, current run and bundle size.
     Agents {
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -210,7 +214,11 @@ enum Cmd {
     ///
     /// List pending requests: what boxes asked for that their zones don't allow, waiting for a grant
     /// or a denial.
-    Pending,
+    Pending {
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Approve a pending request. The grant is never wider than the request.
     Approve {
         id: String,
@@ -240,6 +248,9 @@ enum Cmd {
     Links {
         #[arg(long, default_value_t = 40)]
         tail: usize,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Cut a link between boxes: its relay closes it and drops its connections within seconds.
     Unlink { id: String },
@@ -278,6 +289,9 @@ enum Cmd {
         /// signed with. Default: this installation's issuer key.
         #[arg(long, requires = "against")]
         issuer_jwk: Option<PathBuf>,
+        /// The records as JSON instead of text.
+        #[arg(long, conflicts_with = "verify")]
+        json: bool,
         #[command(subcommand)]
         cmd: Option<AuditCmd>,
     },
@@ -499,8 +513,8 @@ async fn main() -> Result<()> {
         | Cmd::Wake { .. }
         | Cmd::Agents { .. }
         | Cmd::WhyHere { .. }) => cmd::run::dispatch(c).await,
-        Cmd::Top { once } => top::control_top(once).await,
-        c @ (Cmd::Pending | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
+        Cmd::Top { once, json } => top::control_top(once, json).await,
+        c @ (Cmd::Pending { .. } | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await
         }
         Cmd::Names { cmd } => cmd::names::dispatch(cmd).await,

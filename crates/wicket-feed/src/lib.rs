@@ -51,7 +51,7 @@ pub mod token;
 
 pub use format::{Change, Delta, Frame, FrameKind, Fresh, Grant, Hello, KeyCert, RevokeKind, Revoked, Snapshot, GENESIS, MAX_FRAME_BYTES};
 pub use jws::{kid, sha, sign, sign_as, TYP_AUTHZ_KEY, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
-pub use publisher::{read_state, PublishError, Publisher, PublisherConfig};
+pub use publisher::{read_state, PublishError, Publisher, PublisherConfig, Refreshed, CHECKPOINT, CHECKPOINT_EVERY};
 pub use replica::{Allowed, Decision, Escalation, LoadError, Mode, Replica, ReplicaConfig, Stats};
 pub use state::{Policy, State, Zone};
 pub use token::{explain, AuthzKeyCert, BoxAuthority, CompiledAuthority, Explained, Issuer, LiveGrant, TokenGrant};
