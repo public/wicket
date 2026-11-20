@@ -35,20 +35,17 @@ runs:
         # gVisor's release archive, pinned by version and sha512 (#219): no apt repository, whose
         # mid-sync retries (20, 40 and 60 s sleeps) made this step 255-359 s on some runs, against
         # about 90 s; and the same runsc in every job. A release has no bare runsc binary any more,
-        # only gvisor.tar.bz2 (and .zstd) with their .sha512 files. To update: the version, and the
-        # sha512 from https://storage.googleapis.com/gvisor/releases/release/<version>/x86_64/gvisor.tar.bz2.sha512.
+        # only gvisor.tar.bz2 (and .zstd) with their .sha512 files, and no signature. The sha512 is
+        # kept here, never fetched at run time from the server that serves the archive (#722). To
+        # update: the version, and the sha512 of the archive, compared with the release's
+        # gvisor.tar.bz2.sha512 by whoever updates it (docs/explanation/supply-chain.md).
         version=20261116.0
         # From the release's published gvisor.tar.bz2.sha512 (checked against it on #566's run).
         sha512=c87d792d5842efb70c38ee822124cfe0821a547715e7abcf3f2b14997cd02784edaa0b91e238ec5c27a25a1b9e00bf98113398eb62a0778d8d20d4e222f8b0e0
         url=https://storage.googleapis.com/gvisor/releases/release/$version/x86_64/gvisor.tar.bz2
         dl=$(mktemp -d)
         curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors -o "$dl/gvisor.tar.bz2" "$url"
-        if [ -z "$sha512" ]; then
-          published=$(curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors "$url.sha512" | cut -d' ' -f1)
-          echo "$published  $dl/gvisor.tar.bz2" | sha512sum -c -
-          echo "::notice title=gvisor $version gvisor.tar.bz2 sha512 (to pin in .github/actions/gvisor-setup)::$published"
-          sha512=$published
-        fi
+        [ -n "$sha512" ] || { echo "::error::no sha512 pinned for gVisor $version"; exit 1; }
         echo "$sha512  $dl/gvisor.tar.bz2" | sha512sum -c -
         # What the archive holds, for the log; then its one runsc, wherever it sits in it.
         listing=$(tar -tjf "$dl/gvisor.tar.bz2")
