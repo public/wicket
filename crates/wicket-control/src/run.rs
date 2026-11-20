@@ -321,6 +321,37 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
 
 /// Whether a run's final status (as [`run_to_end`] returns it) is its box failing: a non-zero exit,
 /// out of memory, over a cap, or its timeout. `wicket run` and `wicket wrap` exit 1 then (#574).
+/// Whether an urgent message would reach the agent if it read it now (#252 review): its sender
+/// isn't revoked, the org policy lets this box hear from it, and its envelope verifies for this
+/// principal, as `await_message` checks. Only such a message may interrupt a turn.
+fn would_deliver(
+    l: &wicket_store::Ledger,
+    u: &wicket_store::UrgentMessage,
+    issuer: Option<&wicket_identity::VerifyingKey>,
+    me: Option<&str>,
+    org: Option<&wicket_authz::OrgLayer>,
+) -> bool {
+    let (Some(issuer), Some(me)) = (issuer, me) else { return false };
+    if l.revoked_in_chain(&u.from_run).ok().flatten().is_some() {
+        return false;
+    }
+    let sender = l.identity(&u.from_run).ok().flatten();
+    if let (Some(o), Some(i)) = (org, &sender) {
+        if !o.allows_message_from(&i.zone, Some(&i.spiffe_id)) {
+            return false;
+        }
+    }
+    match wicket_identity::verify_envelope(&u.envelope, issuer, u.created_at) {
+        Ok((c, p)) => {
+            c.run == u.from_run
+                && p.get("to").and_then(|v| v.as_str()) == Some(me)
+                && p.get("jti").and_then(|v| v.as_str()) == Some(u.id.as_str())
+                && u.from_principal.as_deref() == Some(c.sub.as_str())
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn box_failed(status: &str) -> bool {
     status.starts_with("failed") || status == "timeout"
 }
@@ -898,12 +929,14 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     };
     // Who may interrupt this agent's turn with a `now` message (#252): its parent and the operator
     // it acts for ([`wicket_core::message::interrupts`]).
-    let (parent_principal, acting_for) = {
+    let (parent_principal, acting_for, my_principal) = {
         let l = ledger.lock().expect("ledger");
         let parent = parent_run.as_deref().and_then(|p| l.identity(p).ok().flatten()).map(|i| i.spiffe_id);
         let op = identity.as_ref().and_then(|c| c.current().claims.principal.get("sub").and_then(|s| s.as_str()).map(String::from));
-        (parent, op)
+        (parent, op, identity.as_ref().map(|c| c.current().claims.sub.clone()))
     };
+    // The issuer's key, to check an urgent message's envelope as delivery would before it interrupts.
+    let issuer_key = crate::issuer().ok().map(|i| i.verifying_key());
     // The installation's org policy for this box (#51): compiled once, into its token at mint and
     // for the control host's own checks (forwarded hosts, injections, spawns, messages).
     let org_policy = crate::policy::for_run(&run.0, record.is_some())?;
@@ -1767,8 +1800,13 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     let live_children = || children.lock().map(|k| k.iter().filter(|(_, s)| !s.thread.is_finished()).count()).unwrap_or(0);
     let mut finish_asked = asked.finish;
     let mut notified_msgs = 0i64;
-    // The `now` messages that have interrupted (or tried to interrupt) a turn: each does once.
+    // The `now` messages seen while a turn ran: each is weighed once (#252 review), so a burst of
+    // them interrupts one turn, not one each.
     let mut interrupted: std::collections::HashSet<String> = Default::default();
+    // When each sender last interrupted a turn: at most once per INTERRUPT_EVERY_SECS.
+    let mut last_interrupt: std::collections::HashMap<String, std::time::Instant> = Default::default();
+    // Whether the running turn is an operator's prompt: only that operator may interrupt it.
+    let mut prompt_turn = false;
     // The turn state last reported as the run's presence (#252).
     let mut reported_turn: Option<bool> = None;
     let mut superseded = false;
@@ -2095,6 +2133,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                         }
                     }
                     turn_running = true;
+                    prompt_turn = true;
                 }
                 // A `session/cancel` from the console's session view (#327): the running turn, if any.
                 // Prompts still queued behind it stay queued.
@@ -2183,14 +2222,38 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 // as an operator's cancel does; the notice below tells the agent at the turn's end.
                 // From anyone else it waits for the turn.
                 if turn_running && !finish_asked {
-                    let urgent = ledger.lock().ok().and_then(|l| l.urgent_messages(&run.0).ok()).unwrap_or_default();
-                    let first = urgent.into_iter().find(|(id, from)| {
-                        !interrupted.contains(id)
-                            && wicket_core::message::interrupts("now", from.as_deref(), parent_principal.as_deref(), acting_for.as_deref())
+                    let urgent: Vec<_> = ledger
+                        .lock()
+                        .ok()
+                        .and_then(|l| l.urgent_messages(&run.0).ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|u| !interrupted.contains(&u.id))
+                        .collect();
+                    // Weighed once: whether or not one of these interrupts, none does again.
+                    interrupted.extend(urgent.iter().map(|u| u.id.clone()));
+                    let now_i = std::time::Instant::now();
+                    let first = urgent.into_iter().find(|u| {
+                        let sender = u.from_principal.as_deref();
+                        let rested = sender.is_none_or(|s| {
+                            last_interrupt.get(s).is_none_or(|t| {
+                                now_i.duration_since(*t).as_secs() >= wicket_core::message::INTERRUPT_EVERY_SECS
+                            })
+                        });
+                        rested
+                            && wicket_core::message::interrupts("now", sender, parent_principal.as_deref(), acting_for.as_deref(), prompt_turn)
+                            && ledger.lock().is_ok_and(|l| {
+                                would_deliver(&l, u, issuer_key.as_ref(), my_principal.as_deref(), org_layer.as_deref())
+                            })
+                    });
+                    let first = first.map(|u| {
+                        if let Some(s) = &u.from_principal {
+                            last_interrupt.insert(s.clone(), now_i);
+                        }
+                        (u.id, u.from_principal)
                     });
                     if let Some((id, from)) = first {
                         use tokio::io::AsyncWriteExt;
-                        interrupted.insert(id.clone());
                         let out = match (acp.as_mut(), control.as_mut()) {
                             (Some(c), _) => c.cancel(),
                             (None, Some(c)) => c.interrupt(),
@@ -2242,6 +2305,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     }
                     notified_msgs = waiting;
                     turn_running = true;
+                    prompt_turn = false;
                 }
                 // A hibernate asked only to make room (#579 step 4): not if preemption gave up, the
                 // request is stale or its wake gone, or a child runs (hibernating would stop it).
@@ -3133,6 +3197,71 @@ fn same_remote_session(a: &str, b: &str) -> bool {
 mod tests {
 
     use super::*;
+
+    /// #252 review: only a message delivery would accept may interrupt a turn: its envelope
+    /// verifies for this principal, from the run that sent it, and its sender isn't revoked.
+    #[test]
+    fn only_a_deliverable_urgent_message_interrupts() {
+        use wicket_core::{RunId, TenantId};
+        let issuer = wicket_identity::Issuer::generate("w.test");
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let key = wicket_identity::AgentKey::generate();
+        let now = wicket_store::now();
+        let spec = wicket_identity::IdentitySpec {
+            tenant: t.0.clone(),
+            zone: "z".into(),
+            agent: "lead".into(),
+            run: "run_p".into(),
+            parent_run: None,
+            manifest_sha256: "m".into(),
+            image: "img".into(),
+            node: "local".into(),
+            principal: serde_json::Value::Null,
+            act: None,
+        };
+        let jws = issuer.issue(&spec, now, 600, &key.public());
+        let sub = wicket_identity::spiffe_id("w.test", &t.0, "z", "lead");
+        l.run_started(&t, &RunId("run_p".into()), "z", "lead").unwrap();
+        l.put_identity(&wicket_store::IdentityRow {
+            run: "run_p".into(),
+            tenant: t.0.clone(),
+            spiffe_id: sub.clone(),
+            zone: "z".into(),
+            agent: "lead".into(),
+            parent_run: None,
+            accept_from: vec![],
+            jws: jws.clone(),
+            issued_at: now,
+        })
+        .unwrap();
+        let me = "spiffe://w.test/t/default/z/z/a/child";
+        let msg = |id: &str, to: &str| wicket_store::UrgentMessage {
+            id: id.into(),
+            from_run: "run_p".into(),
+            from_principal: Some(sub.clone()),
+            envelope: wicket_identity::sign_envelope(&key, &jws, &serde_json::json!({ "jti": id, "iat": now, "to": to })),
+            created_at: now,
+        };
+        let k = issuer.verifying_key();
+        assert!(would_deliver(&l, &msg("m-1", me), Some(&k), Some(me), None));
+        assert!(!would_deliver(&l, &msg("m-2", "spiffe://w.test/t/default/z/z/a/other"), Some(&k), Some(me), None), "someone else's");
+        let mut forged = msg("m-3", me);
+        forged.from_principal = Some("spiffe://w.test/t/default/op/unix/alice".into());
+        assert!(!would_deliver(&l, &forged, Some(&k), Some(me), None), "a sender its envelope doesn't name");
+        assert!(!would_deliver(&l, &msg("m-4", me), Some(&wicket_identity::Issuer::generate("w.test").verifying_key()), Some(me), None));
+        let org = wicket_authz::OrgLayer {
+            version: "v".into(),
+            http: None,
+            forbid: vec![],
+            spawn: None,
+            msg_from: Some(vec!["ops".into()]),
+            inject: None,
+        };
+        assert!(!would_deliver(&l, &msg("m-5", me), Some(&k), Some(me), Some(&org)), "the org policy");
+        l.revoke("run_p", "test", "gone").unwrap();
+        assert!(!would_deliver(&l, &msg("m-6", me), Some(&k), Some(me), None), "a revoked sender");
+    }
 
     /// #676: failed takeovers are counted across tries, a new reason is told apart from a repeat
     /// (the audit records only a change), and the wait between tries doubles from a minute to at

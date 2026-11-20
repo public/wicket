@@ -70,12 +70,19 @@ pub fn refusal(to: &str, sender_zone: &str, sender: Option<&str>) -> String {
 
 /// Whether a message sent at `priority` by `sender` may interrupt its recipient's running turn
 /// (#252): only a `now` message from someone with a say over the recipient's work, its parent
-/// (`parent`, its principal) or the operator it acts for (`operator`). From anyone else a `now`
-/// message waits for the turn like a `next` one: a peer that may write to an agent can't keep
-/// stopping its work.
-pub fn interrupts(priority: &str, sender: Option<&str>, parent: Option<&str>, operator: Option<&str>) -> bool {
-    priority == "now" && sender.is_some() && (sender == parent || sender == operator)
+/// (`parent`, its principal) or the operator it acts for (`operator`). A turn an operator's prompt
+/// started (`prompt_turn`) is the operator's: only that operator interrupts it, never the parent.
+/// From anyone else a `now` message waits for the turn like a `next` one: a peer that may write to
+/// an agent can't stop its work.
+pub fn interrupts(priority: &str, sender: Option<&str>, parent: Option<&str>, operator: Option<&str>, prompt_turn: bool) -> bool {
+    let from_operator = sender.is_some() && sender == operator;
+    let from_parent = sender.is_some() && sender == parent;
+    priority == "now" && (from_operator || (from_parent && !prompt_turn))
 }
+
+/// How often one sender may interrupt one recipient's turns (#252 review): at most once in this
+/// many seconds, however many `now` messages it sends.
+pub const INTERRUPT_EVERY_SECS: u64 = 60;
 
 #[cfg(test)]
 mod tests {
@@ -95,10 +102,12 @@ mod tests {
     #[test]
     fn only_a_parent_or_its_operator_interrupts() {
         let (p, o, peer) = (Some("spiffe://d/t/t0/z/za/a/lead"), Some("spiffe://d/t/t0/op/unix/alice"), Some("spiffe://d/t/t0/z/zb/a/x"));
-        assert!(interrupts("now", p, p, o) && interrupts("now", o, p, o));
-        assert!(!interrupts("now", peer, p, o), "a peer waits for the turn");
-        assert!(!interrupts("next", p, p, o) && !interrupts("later", o, p, o), "only now");
-        assert!(!interrupts("now", None, None, None), "an unknown sender never matches no parent");
+        assert!(interrupts("now", p, p, o, false) && interrupts("now", o, p, o, false));
+        assert!(!interrupts("now", peer, p, o, false), "a peer waits for the turn");
+        assert!(!interrupts("next", p, p, o, false) && !interrupts("later", o, p, o, false), "only now");
+        assert!(!interrupts("now", None, None, None, false), "an unknown sender never matches no parent");
+        // An operator's prompt turn is the operator's to interrupt, not the parent's.
+        assert!(interrupts("now", o, p, o, true) && !interrupts("now", p, p, o, true));
     }
 
     #[test]

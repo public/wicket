@@ -6,6 +6,9 @@ type: Added
   ([#252](https://github.com/public/wicket/issues/252)). A `now` message from an agent's parent, or
   from the operator it acts for, interrupts its running turn, as an operator's cancel does: ACP's
   `session/cancel`, or a driven harness's interrupt. Each message does so once, and the interrupt is
-  audited as `run.turn_interrupt`. From any other sender, `now` waits for the turn to end: a peer
+  audited as `run.turn_interrupt`. So a parent can interrupt its child's work; a turn an
+  operator's prompt started only that operator interrupts. Only a message delivery would accept
+  interrupts (sender not revoked, org policy, envelope), a burst interrupts one turn, and one sender
+  interrupts at most once a minute. From any other sender, `now` waits for the turn to end: a peer
   that may write to an agent can't keep stopping its work. Between turns, wicket's notice to the
   agent says how many of its waiting messages asked to be read now.
