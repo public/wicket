@@ -1,0 +1,16 @@
+# A second per-node service (#579), which the peer's zone uses and the attacker's doesn't
+# (ci/attack-matrix.sh installs it): its instance runs on the node, serving a canary, and the attacker
+# may neither link to it nor reach its name.
+task: Serve a canary to the peer only.
+program:
+  name: atk-svc2
+  command: [python3, -I, -m, http.server, "4874", --bind, 0.0.0.0, --directory, /workspace/www]
+  source: svc
+service:
+  port: 4874
+zone:
+  name: atk-svc2
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  limits: { memory: 256m, cpus: 1, timeout: 30m }

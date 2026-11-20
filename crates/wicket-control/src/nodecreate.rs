@@ -347,7 +347,7 @@ impl CapacityApprover {
         };
         if self.wait.is_zero() {
             Ledger::open(&self.ledger)?.deny(&id, "wicket:no-wait")?;
-            return Ok(Approval::Denied(format!("no capacity grant covers it, and --wait 0 (request {id} withdrawn)")));
+            return Ok(Approval::Undecided(format!("no capacity grant covers it, and --wait 0 (request {id} withdrawn)")));
         }
         say!(
             "waiting up to {} for an operator to decide request {id} (wicket approve {id}, or the console)",
@@ -370,7 +370,7 @@ impl CapacityApprover {
                     "decision",
                     &serde_json::json!({ "request": id, "decision": "deny", "by": "wicket:timed-out" }),
                 )?;
-                return Ok(Approval::Denied(format!(
+                return Ok(Approval::Undecided(format!(
                     "nobody decided request {id} within {}",
                     wicket_core::time::format_duration(self.wait)
                 )));
@@ -388,11 +388,11 @@ impl SpendApprover for CapacityApprover {
         match self.reserve(r) {
             Ok(Ok(())) => {}
             Ok(Err(refused)) => return Approval::Denied(format!("over this installation's money limit: {refused}")),
-            Err(e) => return Approval::Denied(format!("reserving its money failed: {e:#}")),
+            Err(e) => return Approval::Failed(format!("reserving its money failed: {e:#}")),
         }
         let a = match self.decide(r).await {
             Ok(a) => a,
-            Err(e) => Approval::Denied(format!("the capacity request failed: {e:#}")),
+            Err(e) => Approval::Failed(format!("the capacity request failed: {e:#}")),
         };
         if a != Approval::Approved {
             if let Ok(l) = Ledger::open(&self.ledger) {
@@ -1157,7 +1157,7 @@ mod tests {
         // A second node is beyond the grant (one at once): it waits for an operator, and nobody
         // deciding is a denial. Nothing is created.
         let e = p.acquire(&request("n2")).await.unwrap_err();
-        assert!(matches!(&e, PlacementError::NotApproved(w) if w.contains("nobody decided")), "{e:?}");
+        assert!(matches!(&e, PlacementError::Undecided(w) if w.contains("nobody decided")), "{e:?}");
         assert_eq!(st.lock().unwrap().instances.len(), 1);
         let r2 = requests(&path).into_iter().find(|r| r.path == "/capacity/node/n2").unwrap();
         assert_eq!(r2.status, "denied");
