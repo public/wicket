@@ -767,15 +767,29 @@ where
 
     // The pre-auth surface: the page, its static files, sign-in, the enrolment link.
     if method == Method::GET {
+        // The page, a run's session view (#327: a static page, as `/` is; it asks for a passkey to
+        // open), and the files they load: each as build.rs made it, Brotli-compressed for a browser
+        // that accepts it (#574).
+        let accept = req.headers().get(http::header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok());
+        let send = |a: &web::Asset| {
+            let (body, encoding) = a.for_encoding(accept);
+            let mut r = resp(StatusCode::OK, a.ctype, body);
+            if a.br.is_some() {
+                r.headers_mut().insert(http::header::VARY, http::HeaderValue::from_static("accept-encoding"));
+            }
+            if let Some(e) = encoding {
+                r.headers_mut().insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static(e));
+            }
+            r
+        };
         if path == "/" {
-            return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.page.clone());
+            return send(&web::ASSETS.page);
         }
-        // A run's session view (#327): a static page, as `/` is; it asks for a passkey to open.
         if path == "/session" {
-            return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.session_page.clone());
+            return send(&web::ASSETS.session_page);
         }
         if let Some(a) = web::ASSETS.files.get(&path) {
-            let mut r = resp(StatusCode::OK, a.ctype, a.body.clone());
+            let mut r = send(a);
             let cache = if a.immutable {
                 "public, max-age=31536000, immutable"
             } else if path == "/sw.js" {
