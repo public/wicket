@@ -3120,8 +3120,6 @@ pub fn forget_refused(l: &wicket_store::Ledger, node: &str, run: &str) -> Option
     ))
 }
 
-/// `wicket node forget <run>`: lets the run's node delete its files, its workspace among them
-/// (#377). Refused while the run's work isn't collected, unless `force`; a forced delete is audited.
 /// `wicket node release-fence <run>` (#676): root releases a run's fence without its node, for a
 /// run its node can't confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end.
 /// Refused to anyone but root, and for a run that isn't fenced. Audited as `run.fence_released`
@@ -3148,6 +3146,8 @@ pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> a
     Ok(())
 }
 
+/// `wicket node forget <run>`: lets the run's node delete its files, its workspace among them
+/// (#377). Refused while the run's work isn't collected, unless `force`; a forced delete is audited.
 pub async fn forget_command(run: &str, force: bool, by: &str) -> anyhow::Result<()> {
     crate::run::check_run_id(run)?;
     let ledger = Arc::new(Mutex::new(wicket_store::Ledger::open(&crate::ledger_path())?));

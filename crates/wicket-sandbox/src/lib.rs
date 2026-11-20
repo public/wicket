@@ -963,14 +963,32 @@ impl Docker {
         Ok(())
     }
 
+    /// Kills box `name` (SIGKILL). A box that has already stopped, or is gone, is no error; any other
+    /// failure is, Docker's or (for a node's Docker) ssh's, so a caller never takes a kill that
+    /// didn't happen for a stopped box (#676).
     pub async fn kill(&self, name: &str) -> Result<()> {
         let _t = self.span("kill");
         if let Some(e) = self.engine().await {
-            let _ = e.call(Method::POST, &format!("/containers/{}/kill", engine::enc(name, false)), None).await?;
+            let (status, body) = e.call(Method::POST, &format!("/containers/{}/kill", engine::enc(name, false)), None).await?;
+            // 404: no such box; 409: it isn't running.
+            if status.is_success() || status == StatusCode::NOT_FOUND || status == StatusCode::CONFLICT {
+                return Ok(());
+            }
+            bail!("docker kill failed: {} ({status})", engine::message(&body));
+        }
+        let out = self
+            .command_with(["kill".to_string(), name.into()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("docker kill")?;
+        let err = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() || err.contains("is not running") || err.contains("No such container") {
             return Ok(());
         }
-        let _ = self.command_with(["kill".to_string(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
-        Ok(())
+        bail!("docker kill failed ({}): {}", out.status, err.trim());
     }
 
     /// Writes image `image` (a reference or a digest) on stdout as an OCI image layout archive
@@ -1683,6 +1701,20 @@ mod tests {
         assert!(e.starts_with("docker run failed: Conflict."), "{e}");
         let e = fake.docker().wait("wicket-x").await.unwrap_err().to_string();
         assert!(e.contains("already in use"), "{e}");
+    }
+
+    /// #676: a kill Docker refused is an error, so it isn't taken for a stopped box; one of a box
+    /// that already stopped, or is gone, is not.
+    #[tokio::test]
+    async fn a_failed_kill_is_an_error() {
+        for (code, ok) in [(204, true), (404, true), (409, true), (500, false)] {
+            let fake = FakeEngine::start("kill", move |_, _, _| Reply::Json(code, serde_json::json!({"message": "it went wrong"})));
+            let r = fake.docker().kill("wicket-x").await;
+            assert_eq!(r.is_ok(), ok, "{code}: {r:?}");
+            if let Err(e) = r {
+                assert!(e.to_string().contains("it went wrong"), "{e}");
+            }
+        }
     }
 
     #[tokio::test]

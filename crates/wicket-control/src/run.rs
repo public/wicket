@@ -400,12 +400,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
         (None, None) => std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?,
     };
     let mut m = wicket_agent::load(&raw)?;
-    // A takeover that got this far clears its run's failed ones (#676).
-    if record.is_some() {
-        if let Some(run) = &run_id {
-            let _ = std::fs::remove_file(attach_file(&data_dir().join("runs").join(run)));
-        }
-    }
     if let Some(t) = task {
         if m.agent.is_none() {
             bail!("--task applies to agent manifests only");
@@ -1403,6 +1397,10 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<String> {
             };
         }
         let nb = nb?;
+        // A takeover that has its box clears its run's failed ones (#676).
+        if record.is_some() {
+            attach_recovered(&ledger.lock().expect("ledger"), &m.tenant, &run.0, &dir);
+        }
         timings.since("box_start", box_lap);
         // #579 step 3: a per-node service offers its port, under its name, to the boxes that use it;
         // a box that uses services is linked to their instances on its node once they run.
@@ -2686,14 +2684,43 @@ pub fn attach_failures(run_dir: &Path) -> Option<AttachFailures> {
     serde_json::from_slice(&std::fs::read(attach_file(run_dir)).ok()?).ok()
 }
 
-/// One more failed takeover of the run in `run_dir`, at `at` (Unix s): the count so far, and whether
-/// its reason is new (the audit records only a change).
-pub fn record_attach_failure(run_dir: &Path, why: &str, at: i64) -> Result<(AttachFailures, bool)> {
-    let before = attach_failures(run_dir).unwrap_or_default();
-    let changed = before.why != why;
+/// The failed takeovers of `run` (in `run_dir`) as far as they are known: its record beside the run,
+/// or the last `run.attach_failed` audit if that is newer (the record couldn't be written), unless a
+/// takeover has had its box since (`run.attach_recovered`).
+pub fn known_attach_failures(l: &Ledger, run: &str, run_dir: &Path) -> Option<AttachFailures> {
+    let audited = match l.last_run_audit(run, &["run.attach_failed", "run.attach_recovered"]) {
+        Ok(Some((k, ts, b))) if k == "run.attach_failed" => Some(AttachFailures {
+            count: b["failures"].as_u64().map_or(1, |c| u32::try_from(c).unwrap_or(u32::MAX)),
+            last_at: ts,
+            why: b["why"].as_str().unwrap_or_default().to_string(),
+        }),
+        _ => None,
+    };
+    match (attach_failures(run_dir), audited) {
+        (Some(f), Some(a)) if a.last_at > f.last_at => Some(a),
+        (Some(f), _) => Some(f),
+        (None, a) => a,
+    }
+}
+
+/// One more failed takeover of `run` (in `run_dir`), at `at` (Unix s): the count so far, and
+/// whether it is to be audited. Each reason is audited once; and if the record beside the run can't
+/// be written, once per backoff interval, so the audit carries the count the reconciler backs off by.
+pub fn record_attach_failure(l: &Ledger, run: &str, run_dir: &Path, why: &str, at: i64) -> (AttachFailures, bool) {
+    let before = known_attach_failures(l, run, run_dir).unwrap_or_default();
     let now = AttachFailures { count: before.count.saturating_add(1), last_at: at, why: why.to_string() };
-    write_json(&attach_file(run_dir), &now)?;
-    Ok((now, changed))
+    let written = write_json(&attach_file(run_dir), &now).is_ok();
+    let audit = before.why != why || (!written && at >= before.last_at.saturating_add(attach_backoff_secs(before.count)));
+    (now, audit)
+}
+
+/// A takeover of `run` (in `run_dir`) has its box (#676): its failed ones, if any, are cleared and
+/// audited as over (`run.attach_recovered`), so the reconciler no longer backs off from it.
+fn attach_recovered(l: &Ledger, tenant: &wicket_core::TenantId, run: &str, run_dir: &Path) {
+    if let Some(f) = known_attach_failures(l, run, run_dir) {
+        let _ = std::fs::remove_file(attach_file(run_dir));
+        let _ = l.audit(tenant, Some(&RunId(run.to_string())), "run.attach_recovered", &serde_json::json!({ "after_failures": f.count }));
+    }
 }
 
 /// How long the reconciler waits after a run's `count`th failed takeover before it tries again (s):
@@ -2721,11 +2748,8 @@ pub fn attach_failed(run: &str, e: &anyhow::Error) {
             // off, and stops the box through its node after MAX_ATTACH_FAILURES.
             if let Some((node, until)) = crate::noderun::fenced_until(&l, run, wicket_feed::now_ms()) {
                 let dir = data_dir().join("runs").join(run);
-                let (failures, changed) = match record_attach_failure(&dir, &clipped, wicket_store::now()) {
-                    Ok(r) => r,
-                    Err(_) => (AttachFailures { count: 1, ..Default::default() }, true),
-                };
-                if changed {
+                let (failures, audit) = record_attach_failure(&l, run, &dir, &clipped, wicket_store::now());
+                if audit {
                     let fenced = match until {
                         crate::noderun::UNKNOWN_END => "until the node confirms the box stopped".to_string(),
                         u => crate::noderun::fmt_ms(u),
@@ -2897,22 +2921,52 @@ fn same_remote_session(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
-    /// #676: failed takeovers are counted, a new reason is told apart from a repeat (the audit
-    /// records only a change), and the wait between tries doubles from a minute to at most an hour.
+    /// #676: failed takeovers are counted across tries, a new reason is told apart from a repeat
+    /// (the audit records only a change), and the wait between tries doubles from a minute to at
+    /// most an hour. A record that can't be written is carried by the audit instead, once per wait;
+    /// a takeover that has its box clears them.
     #[test]
     fn failed_takeovers_are_counted_and_backed_off() {
         let d = std::env::temp_dir().join(format!("wicket-attach-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("ctl")).unwrap();
-        assert_eq!(attach_failures(&d), None);
-        let (f, changed) = record_attach_failure(&d, "no manifest", 100).unwrap();
-        assert_eq!((f.count, changed), (1, true));
-        let (f, changed) = record_attach_failure(&d, "no manifest", 200).unwrap();
-        assert_eq!((f.count, f.last_at, changed), (2, 200, false), "the same reason isn't audited again");
-        let (f, changed) = record_attach_failure(&d, "no node", 300).unwrap();
-        assert_eq!((f.count, changed), (3, true));
-        assert_eq!(attach_failures(&d), Some(f));
+        let l = Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId::single();
+        // The audit's times are the clock's: the records' are after them.
+        let n = wicket_store::now();
+        let audit = |f: &AttachFailures| {
+            l.audit(&t, Some(&RunId("run_a".into())), "run.attach_failed", &serde_json::json!({ "why": f.why, "failures": f.count }))
+                .unwrap();
+        };
+        assert_eq!(known_attach_failures(&l, "run_a", &d), None);
+        let (f, a) = record_attach_failure(&l, "run_a", &d, "no manifest", n + 100);
+        assert_eq!((f.count, a), (1, true));
+        audit(&f);
+        let (f, a) = record_attach_failure(&l, "run_a", &d, "no manifest", n + 200);
+        assert_eq!((f.count, f.last_at, a), (2, n + 200, false), "the same reason isn't audited again");
+        let (f, a) = record_attach_failure(&l, "run_a", &d, "no node", n + 300);
+        assert_eq!((f.count, a), (3, true));
+        assert_eq!(attach_failures(&d), Some(f.clone()));
         assert_eq!([1, 2, 3, 6, 7, 40].map(attach_backoff_secs), [60, 120, 240, 1920, 3600, 3600]);
+
+        // Its record can't be written (a file where its directory should be): the audit carries the
+        // count, and is written again only once the wait since it has passed.
+        let e = d.join("unwritable");
+        std::fs::write(&e, "").unwrap();
+        let (f, a) = record_attach_failure(&l, "run_b", &e, "no node", n);
+        assert_eq!((f.count, a), (1, true));
+        l.audit(&t, Some(&RunId("run_b".into())), "run.attach_failed", &serde_json::json!({ "why": f.why, "failures": f.count })).unwrap();
+        let known = known_attach_failures(&l, "run_b", &e).unwrap();
+        assert_eq!((known.count, known.why.as_str()), (1, "no node"), "read back from the audit");
+        assert!(!record_attach_failure(&l, "run_b", &e, "no node", known.last_at + 10).1, "within its wait: not audited");
+        let (f, a) = record_attach_failure(&l, "run_b", &e, "no node", known.last_at + 60);
+        assert_eq!((f.count, a), (2, true), "past it: audited with the next count");
+
+        // A takeover that has its box clears them, its record and the audit's alike.
+        attach_recovered(&l, &t, "run_a", &d);
+        assert_eq!(known_attach_failures(&l, "run_a", &d), None);
+        attach_recovered(&l, &t, "run_b", &e);
+        assert_eq!(known_attach_failures(&l, "run_b", &e), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 
