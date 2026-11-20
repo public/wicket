@@ -37,6 +37,21 @@ function timeEl(t, text) {
   return e;
 }
 const ago = (now, t) => rel(t, now);
+// A relative time that stays true in a row kept across polls: refreshRel() rewrites every one.
+const relEls = new Set();
+function relEl(t, prefix, now) {
+  const e = timeEl(t, (prefix || "") + rel(t, now));
+  e.dataset.rel = String(t); e.dataset.prefix = prefix || "";
+  relEls.add(e);
+  return e;
+}
+function refreshRel() {
+  for (const e of relEls) {
+    if (e.isConnected === false) { relEls.delete(e); continue; }
+    const text = e.dataset.prefix + rel(Number(e.dataset.rel));
+    if (e.textContent !== text) e.textContent = text;
+  }
+}
 const riskClass = r => ({ R0Read: "r0", R1ReadScoped: "r1", R2WriteReversible: "r2", R3ExternalOrIrreversible: "r3", R4ExecOrPrivilege: "r4" })[r] || "r4";
 // What a risk class means to whoever decides, with its code (docs/reference/risk-classes.md, #574).
 // Risk as what could happen (docs/explanation/console-design.md); the class's code only under Details.
@@ -62,6 +77,25 @@ function principalName(p) {
   if (ag) return strip(ag[2]) + " (zone " + strip(ag[1]) + ")";
   return strip(x);
 }
+// A principal as an element (#707 review): the short name as a button that shows the full identity
+// under it on a tap (a phone has no hover), and as its title.
+function principalEl(p) {
+  const w = el("span", "principal");
+  const full = strip(p), short = principalName(p);
+  if (short === full) { w.append(el("span", "run-name", full)); return w; }
+  const b = el("button", "idname", short);
+  b.type = "button"; b.title = full;
+  if (b.setAttribute) b.setAttribute("aria-expanded", "false");
+  const line = el("div", "idline", full); line.hidden = true;
+  b.onclick = () => { line.hidden = !line.hidden; if (b.setAttribute) b.setAttribute("aria-expanded", String(!line.hidden)); layoutAt = performance.now(); };
+  w.append(b, line);
+  return w;
+}
+// Server text with RFC 3339 UTC times in it (a node's health, a refusal's reason) in the rows' local
+// time; the original stays in the element's title (#707 review).
+const UTC_TIME = /\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?Z\b/g;
+const localTimes = text => strip(text).replace(UTC_TIME, m => { const t = Date.parse(m) / 1000; return isNaN(t) ? m : clock(t); });
+function serverText(tag, cls, text) { const e = el(tag, cls, localTimes(text)); if (UTC_TIME.test(String(text))) e.title = strip(text); UTC_TIME.lastIndex = 0; return e; }
 // A sentence with `commands` in backticks as code spans (#648): the rest stays text.
 function codeText(tag, cls, text) {
   const e = el(tag, cls);
@@ -227,7 +261,12 @@ async function openSheet(body, extra) {
   if (sheet !== sheetToken) return;
   // An error that stays sits above the sheet (#597): it goes when the sheet opens.
   document.getElementById("msg").hidden = true;
-  document.getElementById("confirm-what").textContent = describe(begin.action);
+  // The decision (describe's first line) in an element of its own, styled strongly; the rest, the
+  // target among it, in full ink. The text, newline included, is describe's exactly (#698 review).
+  const said = describe(begin.action), cut = said.indexOf("\n");
+  const lead = el("div", "lead", cut < 0 ? said : said.slice(0, cut));
+  document.getElementById("confirm-what").replaceChildren(lead, ...(cut < 0 ? [] : [document.createTextNode("\n"), el("div", "rest", said.slice(cut + 1))]));
+  announce("");
   renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   state.textContent = "";
@@ -248,6 +287,7 @@ async function openSheet(body, extra) {
     if (left > 0) { state.textContent = "Expires in " + Math.floor(left / 60000) + ":" + String(Math.floor(left / 1000) % 60).padStart(2, "0"); return; }
     clearInterval(expiryTimer);
     state.textContent = "This expired before it was signed. Nothing was signed.";
+    announce(state.textContent);
     go.textContent = "Ask again"; go.className = "approve"; go.disabled = false;
     go.onclick = () => { go.disabled = true; state.textContent = "Preparing\u2026"; openSheet(body, extra); };
   };
@@ -258,6 +298,7 @@ async function openSheet(body, extra) {
     go.dataset.waiting = "1";
     clearInterval(expiryTimer);
     state.textContent = "Waiting for your passkey\u2026";
+    announce(state.textContent);
     try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
     catch (e) { toastError(e, null, true); }
     closeConfirm();
@@ -265,6 +306,8 @@ async function openSheet(body, extra) {
   document.getElementById("confirm").hidden = false;
   go.focus();
 }
+// What a screen reader is told about the sheet: state changes only, not the countdown's every second.
+function announce(t) { const a = document.getElementById("confirm-announce"); if (a) a.textContent = t; }
 // #369: what else an approval that widens would allow, shown before the passkey is asked for.
 function renderBlast(box, b) {
   box.replaceChildren();
@@ -528,7 +571,14 @@ function pendingCard(s, p) {
 // browser has one, the installed app's badge; and how many health alerts, beside Health in the nav.
 let shownCount = -1;
 function renderCounts(waiting, alerts) {
-  const set = (id, v) => { const e = document.getElementById(id); if (e) { e.textContent = v ? String(v) : ""; e.hidden = !v; } };
+  // Each count with its link's accessible name: "Waiting, 10 items" (#698 review).
+  const set = (id, v) => {
+    const e = document.getElementById(id);
+    if (!e) return;
+    e.textContent = v ? String(v) : ""; e.hidden = !v;
+    const a = e.parentNode;
+    if (a && a.setAttribute && a.dataset) { if (v) a.setAttribute("aria-label", a.dataset.label + ", " + plural(v, a.dataset.noun || "item")); else a.removeAttribute("aria-label"); }
+  };
   set("nav-waiting", waiting);
   set("nav-health", alerts);
   const h = document.getElementById("waiting-h");
@@ -678,9 +728,9 @@ function healthRow(n) {
   const w = el("div", "hrow");
   const d = el("div", "row");
   d.append(el("span", "mono", strip(n.node)));
-  d.append(el("span", (n.alerts || []).length ? "blocked" : "", strip(n.summary) + " · reported " + whenMs(n.received_ms)));
+  d.append(serverText("span", (n.alerts || []).length ? "blocked" : "", n.summary + " · reported " + whenMs(n.received_ms)));
   w.append(d);
-  for (const a of n.alerts || []) w.append(el("div", "blocked", "! " + strip(a)));
+  for (const a of n.alerts || []) w.append(serverText("div", "blocked", "! " + a));
   return w;
 }
 
@@ -701,7 +751,7 @@ function stateStoreRows(p, nowMs) {
   };
   // What is alerted (and pushed, if notifications are on) first, so a sink past its threshold
   // doesn't look like one a few records behind; then whether these rows are current.
-  for (const a of p.alerts || []) out.push(el("div", "blocked", "! " + strip(a)));
+  for (const a of p.alerts || []) out.push(serverText("div", "blocked", "! " + a));
   if (p.not_read_yet) out.push(el("div", "pend", "! not read yet: the console hasn't managed a first read of the state store"));
   else if (p.stale) out.push(el("div", "pend", "! not checked for " + secs((nowMs - (p.read_ms || 0)) / 1000) + ": these rows may be out of date"));
   const st = p.stream;
@@ -724,7 +774,7 @@ function stateStoreRows(p, nowMs) {
     out.push(row("Activity export to " + strip(a.sink), a.error ? "blocked" : a.behind && !a.manual ? "pend" : "", text, a.error ? "last error: " + strip(a.error) : null));
   }
   // An error already alerted on (the config alert quotes it) isn't said twice.
-  for (const e of p.errors || []) if (!(p.alerts || []).some(a => a.startsWith(e))) out.push(el("div", "blocked", "! " + strip(e)));
+  for (const e of p.errors || []) if (!(p.alerts || []).some(a => a.startsWith(e))) out.push(serverText("div", "blocked", "! " + e));
   return out;
 }
 
@@ -758,7 +808,7 @@ function capacityRow(g) {
   const t = g.terms || {}, u = g.used || {}, left = g.left || {};
   const d = el("div", "row cap");
   const head = el("div", "run-head");
-  const who = el("span", "run-name", principalName(g.principal)); who.title = strip(g.principal);
+  const who = principalEl(g.principal);
   head.append(who, el("span", "mono quiet", strip(g.id)));
   const nodes = n => plural(Number(n) || 0, "node");
   const what = el("div", "meta", "Allows: " + nodes(t.nodes) + " at once of " + (t.plans || []).map(strip).join(" or ") + " in " + (t.regions || []).map(strip).join(", ") +
@@ -865,7 +915,7 @@ function standingRuleRow(r) {
   const rr = r.rule || {};
   const reads = (rr.methods || []).every(m => /^(GET|HEAD|OPTIONS)$/i.test(m));
   const to = r.for === "zone" ? "every agent in zone " + strip(r.zone) : principalName(r.principal);
-  head.append(el("span", "run-name", to), el("span", "", " may " + verbsOf(rr.methods) + " "), el("span", "mono", strip(rr.host)));
+  head.append(r.for === "zone" ? el("span", "run-name", to) : principalEl(r.principal), el("span", "", " may " + verbsOf(rr.methods) + " "), el("span", "mono", strip(rr.host)));
   head.title = "standing reach " + strip(r.id) + ": " + ruleText(r.rule);
   const until = r.expires_at ? (r.live ? "ends " + when(r.expires_at) : "lapsed " + when(r.expires_at)) : "until revoked";
   const b = el("div", "buttons");
@@ -923,12 +973,12 @@ function renderRun(s, x, page) {
   head.append(el("span", "meta", " \u00b7 zone " + strip(x.zone)));
   const status = x.revoked ? "revoked" : String(x.status || "");
   const tone = ({ running: "good", revoked: "bad", failed: "bad", hibernated: "info" })[status] || "";
-  const waiting = ((s && s.pending) || []).some(p => p.run === x.id);
+  const waiting = x.waiting !== undefined ? x.waiting : ((s && s.pending) || []).some(p => p.run === x.id);
   head.append(el("span", "pill " + (waiting ? "warn" : tone), waiting ? "waiting for you" : ({ running: "working", exited: "finished", revoked: "stopped by you", hibernated: "asleep" })[status] || strip(status)));
   left.append(head);
   const meta = el("div", "meta");
-  meta.append(timeEl(x.started_at, "started " + rel(x.started_at, s.now)));
-  if (x.ended_at) meta.append(document.createTextNode(" \u00b7 "), timeEl(x.ended_at, "ended " + rel(x.ended_at, s.now)));
+  meta.append(relEl(x.started_at, "started ", s.now));
+  if (x.ended_at) meta.append(document.createTextNode(" \u00b7 "), relEl(x.ended_at, "ended ", s.now));
   meta.append(document.createTextNode(" \u00b7 "), idEl(x.id));
   left.append(meta);
   const links = el("div", "links");
@@ -982,6 +1032,10 @@ function renderAgentLog() {
   const box = document.getElementById("agent-log");
   if (!box || view !== "agent") return;
   const mine = ((lastState && lastState.audit) || []).filter(op => op.run === agentRun).slice().reverse();
+  // Rebuilt only when its records changed, so a line (and its "why?") stays put across polls.
+  const key = agentRun + ":" + mine.map(op => op.seq).join(",");
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
   box.replaceChildren(...(mine.length ? mine.map(line) : [el("div", "empty", "Nothing recorded for it in the latest activity.")]));
 }
 
@@ -1355,13 +1409,13 @@ async function showExplain(seq, into) {
     const r = x.recorded, n = x.against_token_now;
     const out = [
       kv("request", r.method + " " + r.host + r.path + " (" + (r.risk || "?") + ")"),
-      kv("recorded", String(r.outcome) + " on " + r.decided_on + " at " + when(r.at) + ": " + strip(r.detail)),
+      kv("recorded", String(r.outcome) + " on " + r.decided_on + " at " + when(r.at) + ": " + localTimes(r.detail)),
       kv("run", x.run + " · policy " + (x.policy || "none")),
     ];
     if (n.available) {
       out.push(kv("token now", n.decision), el("pre", "src", n.why), kv("zone says", n.zone_says));
       out.push(el("div", "note", "Against the run's token as its node's feed holds it now: grants and policy may have changed since it was decided."));
-    } else out.push(el("div", "note", "Can't evaluate it now: " + strip(n.why)));
+    } else out.push(el("div", "note", "Can't evaluate it now: " + localTimes(n.why)));
     body.replaceChildren(...out);
   } catch (e) { body.replaceChildren(el("div", "blocked", strip(e.message))); }
 }
@@ -1772,7 +1826,9 @@ async function refreshOnce() {
     renderPending(s);
     renderStatus(s);
     renderProblems(s);
-    renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
+    // Kept across polls, as the pending cards are (#715 review): a row is rebuilt only when its run, or
+    // whether it waits for you, changed.
+    renderKeyed("runs", s.runs.map(x => ({ ...x, waiting: s.pending.some(p => p.run === x.id) })), x => renderRun(s, x), "No runs yet.");
     renderRows("health", ((s.health || {}).nodes) || [], healthRow, "No node has reported its health yet.");
     if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     if (s.health && s.health.state_store) document.getElementById("health").prepend(...stateStoreRows(s.health.state_store, s.now * 1000));
@@ -1793,6 +1849,7 @@ async function refreshOnce() {
     renderRows("decided", s.decided, decidedRow, "No decisions yet.");
     renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
     renderFilters(); applyFilter();
+    refreshRel();
     renderAgentHead(); renderAgentLog();
     const ar = document.getElementById("audit-retention");
     if (ar) ar.textContent = s.audit_retention ? strip(s.audit_retention.line) : "";

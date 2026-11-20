@@ -23,10 +23,10 @@
 <header class="top">
   <div class="bar"><h1>wicket</h1><span id="tenant"></span></div>
   <nav id="nav" aria-label="Views" hidden>
-    <a href="#inbox" data-view="inbox">Inbox<span class="count" id="nav-waiting" hidden></span></a>
+    <a href="#inbox" data-view="inbox" data-label="Inbox" data-noun="request">Inbox<span class="count" id="nav-waiting" hidden></span></a>
     <a href="#agents" data-view="agents">Agents</a>
     <a href="#activity" data-view="activity">Activity</a>
-    <a href="#settings" data-view="settings">Settings<span class="count bad" id="nav-health" hidden></span></a>
+    <a href="#settings" data-view="settings" data-label="Settings" data-noun="problem">Settings<span class="count bad" id="nav-health" hidden></span></a>
   </nav>
 </header>
 <div class="banner" id="stale" role="status" hidden></div>
@@ -129,7 +129,9 @@
     <div id="confirm-what" class="what"></div>
     <div id="confirm-blast" class="blast" hidden></div>
     <div id="confirm-update" class="blast" hidden></div>
-    <div id="confirm-state" class="meta" aria-live="polite"></div>
+    <!-- The countdown is shown, not announced; state changes are announced in the live region. -->
+    <div id="confirm-state" class="meta"></div>
+    <div id="confirm-announce" class="sr-only" aria-live="polite"></div>
     <div class="buttons"><button type="button" id="confirm-go"></button><button type="button" id="confirm-cancel">Cancel</button></div>
   </div>
 </div>

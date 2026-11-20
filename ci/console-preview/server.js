@@ -17,6 +17,7 @@ const STATIC = path.join(__dirname, "../../crates/wicket-cli/src/serve/static");
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; " +
   "manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const port = Number(process.argv[2] || process.env.PORT || 8790);
+const T0 = Date.now();
 
 const types = { ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 const cookie = req => Object.fromEntries((req.headers.cookie || "").split(/;\s*/).filter(Boolean).map(c => c.split("=")));
@@ -80,7 +81,8 @@ http.createServer((req, res) => {
     const n = (polls.get(scenario) || 0) + 1; polls.set(scenario, n);
     if (scenario === "stale" && n > 1) return json(res, { error: "bad gateway" }, 502);
     if (scenario === "expired" && n > 1) return json(res, { error: "sign in" }, 401);
-    return json(res, scenario === "empty" ? fx.empty(Date.now()) : fx.state(Date.now()));
+    // Timestamps fixed at the server's start, as a ledger's are; only `now` moves.
+    return json(res, { ...(scenario === "empty" ? fx.empty(T0) : fx.state(T0)), now: Math.floor(Date.now() / 1000) });
   }
   if (p === "/api/push") return json(res, scenario === "empty" ? { ...fx.push, devices: [] } : fx.push);
   if (p === "/api/policy") return json(res, fx.policy);
