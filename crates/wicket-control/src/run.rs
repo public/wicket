@@ -1432,6 +1432,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
             spawn: spawn_ctx.clone(),
             adopt: adopter.clone(),
             timings: timings.clone(),
+            names: names_settings.clone(),
         })
         .await;
         // The room it reserved (#579): counted until the node reports the box, or given back.

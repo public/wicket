@@ -934,6 +934,28 @@ impl Ledger {
         Ok(p)
     }
 
+    /// A port `name` holds on a node other than `node`, if any: the one its box had before it
+    /// moved, preferred on the new node if free there (the design's "sticky").
+    pub fn port_elsewhere(&self, name: &str, node: &str, proto: &str) -> Result<Option<u16>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT port FROM host_ports WHERE name = ?1 AND node != ?2 AND proto = ?3 ORDER BY held_since DESC LIMIT 1",
+                params![name, node, proto],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// `name` lets go of its ports on every node but `node` (it moved there): each is quarantined,
+    /// as [`Ledger::release_ports`] does.
+    pub fn release_ports_elsewhere(&self, name: &str, node: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE host_ports SET name = NULL, released_at = ?3, free_after = NULL WHERE name = ?1 AND node != ?2",
+            params![name, node, now()],
+        )?)
+    }
+
     /// The port `name` holds at `node`, if any.
     pub fn port_of(&self, name: &str, node: &str, proto: &str) -> Result<Option<u16>> {
         Ok(self
