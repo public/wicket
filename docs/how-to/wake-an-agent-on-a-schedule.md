@@ -4,8 +4,7 @@ A trigger is your standing intent, kept in the ledger: "when this happens, do th
 covers the triggers that tell time: a schedule (cron, in a time zone) or a one-off timer that wakes
 a long-lived agent or gives it a message. It also covers triggers on wicket's own events (a run
 ending, an agent waking, a decision): see [on wicket's own events](#on-wickets-own-events).
-Webhooks and GitHub events come in later steps of
-[#578](https://github.com/public/wicket/issues/578); this version refuses them.
+For webhooks and GitHub events, see [fire a trigger from a webhook](trigger-from-a-webhook.md).
 
 Triggers fire from the reconciler, so run it on a timer (`wicket reconcile --every 1m`, as the
 install sets up). Each pass looks at the minutes a schedule matched since the last one it fired

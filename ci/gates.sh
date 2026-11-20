@@ -90,6 +90,18 @@ if [ "$rust" = 1 ] && [ ${#pkgs[@]} -gt 0 ]; then
   fi
 fi
 
+# ---- the cheap checks of a few files (#219), as CI runs them when those change ----
+if has deny; then
+  if command -v cargo-deny >/dev/null; then
+    hstep "cargo deny" cargo deny --locked check
+  else
+    log "cargo deny: skipped, cargo-deny is not installed (cargo install --locked cargo-deny); CI runs it"
+  fi
+fi
+if has dep-age; then
+  hstep "dependency cooldown (7 days)" python3 -I ci/dep-age.py --base "$base"
+fi
+
 # ---- end to end ----
 export WICKET=${WICKET:-target/debug/wicket}
 if has policy && [ "$rust" = 1 ]; then

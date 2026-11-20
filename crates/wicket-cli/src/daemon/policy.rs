@@ -12,8 +12,8 @@
 
 use super::Peer;
 use crate::{
-    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd,
-    ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
+    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, RequestCmd, SecretCmd,
+    SelfCmd, ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -71,7 +71,7 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(
             "`wicket audit compact` runs with wicketd stopped, as the wicket user: sudo systemctl stop wicketd wicket-console wicket-reconcile; sudo -u wicket WICKET_HOME=/var/lib/wicket wicket audit compact",
         ),
-        Cmd::Pending { .. } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
+        Cmd::Pending { .. } | Cmd::Request { cmd: RequestCmd::List { .. } } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
         // Renewing a grant or a box's authority grants more time: a decision, as approving is.
@@ -87,7 +87,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // `session` do now. Pausing and removing one only narrows.
         Cmd::Trigger { cmd } => match cmd {
             TriggerCmd::List | TriggerCmd::Show { .. } | TriggerCmd::Fire { .. } => Forward(Read),
-            TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } => Forward(Run),
+            TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } | TriggerCmd::RotateUrl { .. } => Forward(Run),
             TriggerCmd::Pause { .. } | TriggerCmd::Rm { .. } => Forward(Revoke),
         },
         Cmd::Secret { cmd } => match cmd {
@@ -97,7 +97,10 @@ pub fn route(cmd: &Cmd) -> Route {
             // Setting a secret changes what the proxies present upstream, linking one makes the
             // wicket user read a file the caller names, and binding one to hosts decides where it
             // may go.
-            SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } | SecretCmd::Rm { .. } => Forward(Privileged),
+            // Making one a verify secret (#578) decides which deliveries a trigger believes.
+            SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } | SecretCmd::Verify { .. } | SecretCmd::Rm { .. } => {
+                Forward(Privileged)
+            }
         },
         // Reads a directory the caller names, as the wicket user.
         // Reads Docker, as the wicket user: what `wicket zone pin` resolves tags through.
@@ -124,7 +127,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // Both stop things, and a reconcile pass can create machines a lease needs.
         Cmd::Reconcile { .. } | Cmd::Attach { .. } => Forward(Privileged),
         Cmd::Lease { cmd } => match cmd {
-            LeaseCmd::List => Forward(Read),
+            LeaseCmd::List { .. } => Forward(Read),
             LeaseCmd::Release { .. } => Forward(Revoke),
         },
         Cmd::Node { cmd } => match cmd {
@@ -141,10 +144,12 @@ pub fn route(cmd: &Cmd) -> Route {
             | NodeCmd::Install { .. } => Forward(Privileged),
             // Deletes a run's files on its node, perhaps uncollected work.
             NodeCmd::Forget { .. } => Forward(Privileged),
+            // Writes the node's feed as the wicket user, under its lock (#575 step 4c).
+            NodeCmd::FeedCheckpoint { .. } => Forward(Privileged),
             // Lifts a run's fence while its box may still run (#676); the command itself also
             // refuses anyone but root.
             NodeCmd::ReleaseFence { .. } => Forward(Privileged),
-            NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } => Local,
+            NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } | NodeCmd::Intake { .. } => Local,
         },
         // Applying an org policy changes what every box may do, and revokes runs.
         Cmd::Policy { cmd } => match cmd {
@@ -385,6 +390,7 @@ mod tests {
             (&["secret", "set", "claude-oauth"], Route::Forward(Privileged)),
             (&["secret", "set", "gh", "--hosts", "api.github.com"], Route::Forward(Privileged)),
             (&["secret", "hosts", "gh", "--hosts", "*.attacker.example"], Route::Forward(Privileged)),
+            (&["secret", "verify", "gh-hook"], Route::Forward(Privileged)),
             (&["secret", "link", "x", "--file", "/etc/shadow"], Route::Forward(Privileged)),
             (&["image"], Route::Forward(Privileged)),
             (&["program", "digest", "."], Route::Local),
@@ -405,6 +411,7 @@ mod tests {
             (&["node", "token"], Route::Forward(Privileged)),
             (&["node", "revoke", "n1"], Route::Forward(Privileged)),
             (&["node", "serve"], Route::Local),
+            (&["node", "intake", "--listen", "0.0.0.0:8443"], Route::Local),
             (&["node", "attach"], Route::Local),
             (&["node", "list", "--provider"], Route::Forward(Privileged)),
             (&["node", "plans"], Route::Forward(Privileged)),

@@ -62,7 +62,15 @@ fi
 $docker run --rm --name "$name" --network host \
   -v "$repo:/src:ro" -v "$pkg:/pkg:ro" -v "$sock:/run/host-docker.sock" -v "$data:$data" \
   -e IMAGE="$image" -e GITHUB_ACTIONS="${GITHUB_ACTIONS:-}" "$base" bash -euo pipefail -c '
-apt-get update -q >/dev/null && apt-get install -y -q sudo jq curl socat python3 >/dev/null
+# The archive answers some nights only on a second try (#753: the 11-19 run found none of its
+# mirrors): a few tries, then the failure says which it was.
+for try in 1 2 3 4 5; do
+  if apt-get -o Acquire::Retries=3 update -q >/dev/null && apt-get -o Acquire::Retries=3 install -y -q sudo jq curl socat python3 >/dev/null; then
+    break
+  fi
+  [ "$try" -lt 5 ] || { echo "::error title=acceptance (installed) setup::the Ubuntu archive could not be reached for the test system packages (5 tries)"; exit 1; }
+  sleep 20
+done
 useradd --create-home you
 echo "you ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/you
 mkdir /opt/pkg && tar -C /opt/pkg -xzf /pkg/wicket-*-x86_64-linux.tar.gz
