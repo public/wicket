@@ -329,6 +329,25 @@ pub fn protocol_needed(zone: &wicket_core::ZoneSpec) -> u32 {
     }
 }
 
+/// Readies `zone` for a node talking `proto` (None: not known), given which secrets `is_set` (#415).
+/// At [`wicket_chan::chan::LIVE_SECRETS`] or later every rule goes. Otherwise, a node whose protocol
+/// isn't known included (a re-attach whose note was lost: what the node's feed holds can't tell a
+/// node at 23 from one below that had every secret set), it is taken as older: its optional
+/// `inject` rules whose secrets aren't set now are dropped, and returned. That fails narrow: such a
+/// host's requests go without the secret for the run's life, and the session is never ended for
+/// it. Also whether the zone goes out with optional rules whatever their secrets, which only a node
+/// at that protocol may then carry.
+pub fn zone_for_node(
+    zone: &mut ZoneSpec,
+    proto: Option<u32>,
+    is_set: impl Fn(&str) -> bool,
+) -> (Vec<wicket_core::manifest::InjectRule>, bool) {
+    match proto.is_some_and(|p| p >= wicket_chan::chan::LIVE_SECRETS) {
+        true => (vec![], zone.inject.iter().any(|i| i.optional)),
+        false => (zone.drop_unset_optional_injections(is_set), false),
+    }
+}
+
 /// Refuses to publish `zone`'s record to node `name` unless the node is known to read it: decided
 /// before the record goes in the node's feed, which every session to the node carries (#664).
 pub fn check_protocol(name: &str, zone: &wicket_core::ZoneSpec) -> Result<()> {
@@ -649,6 +668,9 @@ pub struct Start {
 }
 
 struct Shared {
+    /// The zone was published with its optional `inject` rules whatever their secrets (#415): only a
+    /// node at protocol 23 may carry its record.
+    optional_rules: bool,
     node: String,
     tenant: TenantId,
     run: RunId,
@@ -734,15 +756,27 @@ fn mint_token(
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
 pub async fn start(s: Start) -> Result<NodeBox> {
+    let mut s = s;
     let t = s.timings.clone();
     let keys = t.span("token.keys");
     let name = s.node.clone();
+    // A node below protocol 23 would take an optional rule whose secret isn't set as no credential
+    // for its host until a fetch, letting plain HTTP to it through (#415). It gets the zone as
+    // before: without such rules, whose hosts then go without them for the run's whole life.
     // Before anything is minted or published: the record goes in the node's feed, which every
     // session to it carries, so a node that can't read it is never sent it (#664).
     check_protocol(&name, &s.zone)?;
     let issuer = Arc::new(crate::issuer()?);
     let cfg = feed_config();
     let feed = SharedFeed::open(&name, cfg.clone())?;
+    let (dropped, optional_rules) = zone_for_node(&mut s.zone, node_protocol_now(&name), |n| s.vault.has(n));
+    for i in dropped {
+        say!(
+            "[wicket] node {name} doesn't take secrets set later (protocol 23): requests to {} go without {:?} for this run",
+            i.host,
+            i.secret
+        );
+    }
     let now = wicket_feed::now_ms();
     let paths = crate::enrol::Paths::installation();
     // Every grant has a lifetime (#153), block 0 included: the zone's `limits.authority` (default
@@ -788,7 +822,6 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         _ => vec![],
     };
     // What the node attenuates a child's token from, deciding its spawns (#164).
-    let mut s = s;
     if let Some(sp) = s.start.edge.as_mut().and_then(|e| e.spawn.as_mut()) {
         use base64::Engine;
         sp.base = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_issuer.base.to_bytes()?);
@@ -855,6 +888,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         stdin_base: std::sync::OnceLock::new(),
     });
     let shared = Arc::new(Shared {
+        optional_rules,
         node: name.clone(),
         tenant: s.tenant,
         run: s.run,
@@ -1195,6 +1229,9 @@ struct Progress {
     slice: Option<wicket_proxy::llm::Slice>,
     /// The secrets released to the node for this run, and what each was (to tell a change).
     fetched: std::collections::HashMap<String, String>,
+    /// The secrets the run's zone uses that were refused to its node (an optional one not set yet,
+    /// #415): the node is told when one can be released, and a refusal is audited once while it lasts.
+    refused: HashSet<String>,
     /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
     remint_failed: i64,
     /// What changed in the ledger since this connection's loops last looked (#582 step 2), and when
@@ -1236,7 +1273,10 @@ async fn manage(
         proto: 0,
         slice_sent: false,
         slice: None,
-        fetched: std::collections::HashMap::new(),
+        // What an earlier supervisor of the run released to its node (#415): the node may still hold
+        // it, so the first connection tells it to fetch each again, and changes are followed from then.
+        fetched: released_before(&sh.dir),
+        refused: HashSet::new(),
         remint_failed: 0,
         watch: wicket_store::ChangeWatch::new(),
         grants_full: std::time::Instant::now(),
@@ -1418,6 +1458,18 @@ async fn session(
             wicket_chan::chan::DECODE_SLASH
         );
     }
+    // The same for a node that has gone back below protocol 23 since its zone went out with its
+    // optional rules whatever their secrets (#415): it would let plain HTTP to such a host through.
+    if p.proto < wicket_chan::chan::LIVE_SECRETS && sh.optional_rules {
+        p.ever = false;
+        bail!(
+            "node {} talks protocol {}, and run {}'s zone went out with optional secrets read per request, which needs {}: update the node (wicket self update --nodes)",
+            sh.node,
+            p.proto,
+            sh.run,
+            wicket_chan::chan::LIVE_SECRETS
+        );
+    }
     let now = wicket_feed::now_ms();
     let catching = std::time::Instant::now();
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
@@ -1431,6 +1483,12 @@ async fn session(
     p.slice_sent = false;
     if let Some(f) = slice_due(sh, p) {
         send(f);
+    }
+    // A revoke sent on a link that died may never have arrived, and an earlier supervisor's are
+    // unknown here (#415): every secret released to the run, and every refusal, is revoked again,
+    // and the node fetches what it uses.
+    for name in revoke_all(&mut p.fetched, &p.refused) {
+        send(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name, resend: true }));
     }
     if first {
         sh.timings.since("budget.slice", slicing);
@@ -2377,15 +2435,20 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
         None => crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, name, sh.ctl.authority_until()),
     };
     let (ok, why) = match &r {
-        Ok(f) => {
-            if for_pull.is_none() {
-                p.fetched.insert(name.to_string(), crate::nodesecrets::digest(f));
-                save_holdings(sh, p);
-            }
-            (true, None)
-        }
+        Ok(_) => (true, None),
         Err(e) => (false, Some(e.clone())),
     };
+    if for_pull.is_none() {
+        let digest = r.as_ref().ok().map(crate::nodesecrets::digest);
+        let uses = crate::nodesecrets::zone_uses(&sh.zone, &sh.swaps, name);
+        let audit = record_answer(&mut p.fetched, &mut p.refused, name, digest, uses);
+        if ok {
+            save_holdings(sh, p);
+        }
+        if !audit {
+            return Msg::SecretFetched { id, secret: None, error: why };
+        }
+    }
     let _ = sh.ledger.lock().expect("ledger").audit(
         &sh.tenant,
         Some(&sh.run),
@@ -2398,21 +2461,90 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
     }
 }
 
-/// Secrets this run's node fetched that have since changed, been rebound or removed on this host:
-/// the node is told to drop them (#152).
-fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
-    let mut out = vec![];
-    let names: Vec<String> = p.fetched.keys().cloned().collect();
-    for name in names {
-        let now = crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, &name, sh.ctl.authority_until())
-            .ok()
-            .map(|f| crate::nodesecrets::digest(&f));
-        if now.as_deref() != p.fetched.get(&name).map(String::as_str) {
-            p.fetched.remove(&name);
-            save_holdings(sh, p);
-            say!("[wicket] secret {name} changed on this host: node {} drops its copy for {}", sh.node, sh.run);
-            out.push(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name }));
+/// Records the answer to a node's fetch of `name` for the run: `released`'s digest, or None if it was
+/// refused, of a name the run's zone or swaps `uses` or not. Whether to audit it: a release always;
+/// a refusal of a name the zone uses only when first refused (#415: an optional rule's secret not
+/// set yet is asked about again after a while, and is tracked so the node can be told when it's set).
+fn record_answer(
+    fetched: &mut std::collections::HashMap<String, String>,
+    refused: &mut HashSet<String>,
+    name: &str,
+    released: Option<String>,
+    uses: bool,
+) -> bool {
+    match released {
+        Some(d) => {
+            refused.remove(name);
+            fetched.insert(name.to_string(), d);
+            true
         }
+        None if uses => refused.insert(name.to_string()),
+        None => true,
+    }
+}
+
+/// What an earlier supervisor of the run in `run_dir` released to its node, from its holdings (#415),
+/// each marked [`REVOKED`]: the node may hold it, so the first connection revokes it.
+fn released_before(run_dir: &Path) -> std::collections::HashMap<String, String> {
+    read_holdings(run_dir).map(|h| h.secrets.into_iter().map(|n| (n, REVOKED.to_string())).collect()).unwrap_or_default()
+}
+
+/// What [`Progress::fetched`] holds for a secret revoked and not fetched since (#415): no release's
+/// digest, so it is never taken for one, and the name is revoked again on the next connection.
+const REVOKED: &str = "revoked";
+
+/// Secrets this run's node fetched that have since changed, been rebound or removed on this host,
+/// and secrets refused to it that can now be released (#415): the node is told to drop what it holds
+/// of each, or knows of it, and the next use fetches it again (#152).
+fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
+    let release = |name: &str| {
+        crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, name, sh.ctl.authority_until())
+            .ok()
+            .map(|f| crate::nodesecrets::digest(&f))
+    };
+    changed_secrets(&mut p.fetched, &mut p.refused, release)
+        .into_iter()
+        .map(|name| {
+            say!("[wicket] secret {name} changed on this host: node {} fetches it again for {}", sh.node, sh.run);
+            Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name, resend: false })
+        })
+        .collect()
+}
+
+/// The names to tell a node changed, given what `release` would release now (its digest, or None if
+/// refused): each fetched one whose digest differs (then marked [`REVOKED`] until fetched again), and
+/// each refused one now released (forgotten, so its next refusal is recorded again).
+fn changed_secrets(
+    fetched: &mut std::collections::HashMap<String, String>,
+    refused: &mut HashSet<String>,
+    release: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = fetched
+        .iter()
+        .filter(|(n, d)| d.as_str() != REVOKED && release(n).as_deref() != Some(d.as_str()))
+        .map(|(n, _)| n.clone())
+        .collect();
+    out.sort();
+    for n in &out {
+        fetched.insert(n.clone(), REVOKED.into());
+    }
+    let mut now_set: Vec<String> = refused.iter().filter(|n| release(n).is_some()).cloned().collect();
+    now_set.sort();
+    for n in &now_set {
+        refused.remove(n);
+    }
+    out.extend(now_set);
+    out
+}
+
+/// What a new connection revokes (#415): every secret released to the run, each marked [`REVOKED`]
+/// until the node fetches it again, and every refusal, which the node then asks about again.
+fn revoke_all(fetched: &mut std::collections::HashMap<String, String>, refused: &HashSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = fetched.keys().chain(refused.iter()).cloned().collect();
+    out.sort();
+    out.dedup();
+    for d in fetched.values_mut() {
+        *d = REVOKED.into();
     }
     out
 }
@@ -3106,6 +3238,105 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 
 #[cfg(test)]
 mod tests {
+    /// #415: the control host tells a run's node of a secret it fetched that changed or went, and of
+    /// one it was refused that can now be released; each once, until the node fetches it again.
+    #[test]
+    fn a_node_is_told_of_secrets_changed_removed_or_newly_set() {
+        let vault = std::cell::RefCell::new(std::collections::HashMap::from([("held".to_string(), "d1".to_string())]));
+        let release = |n: &str| vault.borrow().get(n).cloned();
+        let mut fetched = std::collections::HashMap::from([("held".to_string(), "d1".to_string())]);
+        let mut refused = HashSet::from(["later".to_string()]);
+        assert!(changed_secrets(&mut fetched, &mut refused, release).is_empty(), "nothing changed");
+        vault.borrow_mut().insert("later".into(), "d2".into());
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["later"], "set since it was refused");
+        assert!(refused.is_empty());
+        vault.borrow_mut().insert("held".into(), "d3".into());
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["held"], "rotated");
+        assert_eq!(fetched["held"], REVOKED, "kept, marked, until fetched again");
+        assert!(changed_secrets(&mut fetched, &mut refused, release).is_empty(), "told once per connection");
+        fetched.insert("held".into(), "d3".into());
+        vault.borrow_mut().remove("held");
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["held"], "removed");
+    }
+
+    /// #415: a refusal of a secret the zone uses is audited once while it lasts and tracked; one of
+    /// a name it doesn't use is audited each time and never tracked (a node can't grow the set); a
+    /// release is always audited, and ends the refusal.
+    #[test]
+    fn a_refusal_is_recorded_once_and_a_release_ends_it() {
+        let (mut fetched, mut refused) = (std::collections::HashMap::new(), HashSet::new());
+        assert!(record_answer(&mut fetched, &mut refused, "late", None, true), "first refusal: audited");
+        assert!(!record_answer(&mut fetched, &mut refused, "late", None, true), "again: not");
+        assert!(record_answer(&mut fetched, &mut refused, "other", None, false));
+        assert!(record_answer(&mut fetched, &mut refused, "other", None, false), "not the zone's: each time");
+        assert_eq!(refused, HashSet::from(["late".to_string()]));
+        assert!(record_answer(&mut fetched, &mut refused, "late", Some("d".into()), true));
+        assert!(refused.is_empty() && fetched["late"] == "d");
+        assert!(record_answer(&mut fetched, &mut refused, "late", None, true), "refused again after a release: audited");
+    }
+
+    /// #415, skew: a node below protocol 23, or one whose protocol isn't known yet, gets the zone
+    /// without an optional rule whose secret isn't set (it would take the host as having no
+    /// credential, and let plain HTTP through); a node at 23 gets every rule, and its session then
+    /// needs 23.
+    #[test]
+    fn an_older_node_gets_no_optional_rule_whose_secret_is_unset() {
+        let zone = || -> ZoneSpec {
+            wicket_core::yaml::from_str(
+                "name: z\ninject:\n  - { host: a.example, header: Authorization, secret: unset, optional: true }\n  - { host: b.example, header: Authorization, secret: set, optional: true }\n  - { host: c.example, header: X-Key, secret: required }\n",
+            )
+            .unwrap()
+        };
+        let is_set = |n: &str| n != "unset";
+        for proto in [None, Some(wicket_chan::chan::LIVE_SECRETS - 1)] {
+            let mut z = zone();
+            let (dropped, optional_rules) = zone_for_node(&mut z, proto, is_set);
+            assert_eq!(dropped.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["unset"], "{proto:?}");
+            assert_eq!(z.inject.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["set", "required"]);
+            assert!(!optional_rules);
+        }
+        let mut z = zone();
+        let (dropped, optional_rules) = zone_for_node(&mut z, Some(wicket_chan::chan::LIVE_SECRETS), is_set);
+        assert!(dropped.is_empty() && z.inject.len() == 3 && optional_rules);
+        // Re-attached with the node's protocol note lost: taken as older, whatever the feed holds,
+        // so the session is never ended for it, and a rule whose secret isn't set now stays out.
+        let mut z = zone();
+        let (dropped, optional_rules) = zone_for_node(&mut z, None, |_| true);
+        assert!(dropped.is_empty() && z.inject.len() == 3 && !optional_rules, "every secret set: nothing dropped, no 23 needed");
+    }
+
+    /// #415: a re-attached supervisor starts from what an earlier one recorded it released
+    /// (`ctl/holdings.json`), each marked revoked, so its first connection revokes them all; a run
+    /// with no holdings starts from nothing.
+    #[test]
+    fn a_reattached_supervisor_revokes_what_an_earlier_one_released() {
+        let dir = std::env::temp_dir().join(format!("wicket-holdings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(released_before(&dir).is_empty());
+        std::fs::create_dir_all(dir.join("ctl")).unwrap();
+        let h = Holdings { secrets: vec!["gh".into(), "model".into()], slice: None, updated_ms: 1 };
+        std::fs::write(dir.join("ctl").join("holdings.json"), serde_json::to_vec(&h).unwrap()).unwrap();
+        let mut fetched = released_before(&dir);
+        assert_eq!(fetched.len(), 2);
+        assert!(fetched.values().all(|d| d == REVOKED));
+        assert_eq!(revoke_all(&mut fetched, &HashSet::new()), ["gh", "model"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #415: a revoke sent on a link that died may not have arrived, and a re-attached supervisor
+    /// doesn't know what an earlier one sent: a new connection revokes every secret released to the
+    /// run (whether changed, marked revoked or seeded from its holdings) and every refusal.
+    #[test]
+    fn a_new_connection_revokes_every_secret_released_to_the_run() {
+        let mut fetched =
+            std::collections::HashMap::from([("live".to_string(), "d1".to_string()), ("lost".to_string(), REVOKED.to_string())]);
+        let refused = HashSet::from(["later".to_string(), "live".to_string()]);
+        assert_eq!(revoke_all(&mut fetched, &refused), ["later", "live", "lost"]);
+        assert!(fetched.values().all(|d| d == REVOKED));
+        // Marked revoked, a name isn't taken as changed again on the same connection.
+        let mut none = HashSet::new();
+        assert!(changed_secrets(&mut fetched, &mut none, |_| Some("d1".into())).is_empty());
+    }
 
     /// #575 step 4c: a run's published ports are its public names that may be published on its
     /// node, each with a port from the range, kept when asked again, the same port on a node the

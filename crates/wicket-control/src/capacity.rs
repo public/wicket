@@ -328,8 +328,11 @@ pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId
     let rid = filed.id().to_string();
     // The agent's own words, apart from wicket's (#715, #731), for the console to quote as its.
     if matches!(filed, wicket_store::Filed::New(_) | wicket_store::Filed::Existing(_)) {
-        // Not a failure of the ask: the request is filed and the lease linked below either way.
-        let _ = l.set_request_claims(&rid, &serde_json::json!({ "reason": a.reason, "region": a.region }));
+        // Not a failure of the ask: the request is filed and the lease linked below either way. The
+        // card then shows only wicket's sentence, so say why the agent's words are missing.
+        if let Err(e) = l.set_request_claims(&rid, &serde_json::json!({ "reason": a.reason, "region": a.region })) {
+            tracing::warn!(request = %rid, error = %e, "the agent's own words could not be stored with its capacity ask");
+        }
     }
     l.set_lease_request(&id, &rid)?;
     l.audit(

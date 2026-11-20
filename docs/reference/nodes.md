@@ -196,7 +196,17 @@ wicket node revoke n1
   dropped, the process not dumpable (`PR_SET_DUMPABLE` 0), never logged. A run's use of a secret lasts
   until its authority ends, or the upstream token's own expiry if earlier; the node drops a secret when
   the last run that used it ends, and when the control host says it changed, was rebound or removed
-  (checked every 2 s while connected; the next use fetches it again). While the node is cut off, the
+  (checked every 2 s while connected; the next use fetches it again). A secret the zone uses but the
+  vault doesn't hold yet (an optional `inject` rule's, #415) is refused once: the node keeps that answer
+  for the run, never asking per request, until the control host says the secret is now set (the same
+  check, 2 s) or for 30 s if it doesn't say; the control host audits the refusal once while it lasts.
+  While the control host can't be asked, a run's fetch of a secret fails at once for 2 s after each
+  try (no request waits on a dead link), audited once per run, secret and outage. Each new connection
+  revokes every secret released to the run (a revoke sent on a link that died may not have arrived,
+  and a re-attached supervisor reads what an earlier one released from `ctl/holdings.json`): the node
+  fetches again what it uses (a resent revoke leaves the uses shared with children the node started while cut off). A revoke for a change ends a child's uses shared from the run too, and an answer a
+  revoke overtook is not taken. Only a node at protocol 23 is sent an optional rule whose secret
+  isn't set; an older one gets the zone without it, as before (#415). While the node is cut off, the
   secrets it holds keep working; one first needed then fails with "credential … not cached on this node;
   control host unreachable" (audited as `node.secret_unavailable`) until the control host is back. A
   restart of `serve` while cut off loses the cache: model calls and injected hosts stop until reconnect,
