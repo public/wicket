@@ -16,6 +16,9 @@ It uses **passkeys**:
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision
   (request, method, host, path, decision, uses, lifetime). The server checks it, uses it once, and stores the
   signed record, so `wicket audit --verify` re-verifies every decision offline;
+- **every action is signed by the session's own passkey** (#802): the challenge offers only the passkey
+  you signed in with, and a signature by any other enrolled passkey is refused (403) and audited
+  (`operator.action_refused`), whatever the action, before anything is done;
 - **signing takes two steps.** A tap on Approve, Deny, Send, Revoke or Start asks the server for the exact
   action. The page then shows that action in a confirmation pinned to the top of the screen, above where a
   phone's passkey sheet opens, and only its own button starts the passkey ceremony. The authenticator's sheet

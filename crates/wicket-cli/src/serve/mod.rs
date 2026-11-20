@@ -28,7 +28,9 @@
 //!    keys) and turn its details on (removing a device or turning details off only narrow, and need
 //!    only the session). The server builds the JSON from its own reading of the
 //!    ledger and disk at `begin`, keeps it with the challenge, and at `finish` verifies the signature,
-//!    consumes the challenge (single use, 2-minute expiry, bound to the session that asked for it),
+//!    consumes the challenge (single use, 2-minute expiry, bound to the session that asked for it,
+//!    and signed by that session's own passkey: begin offers only it, and another enrolled passkey's
+//!    signature is refused and audited, #802),
 //!    re-checks what may have changed in between (the manifest's bytes, the run still running, the
 //!    request still pending and its agent still verified), applies the action, and writes the signed
 //!    triple (clientDataJSON, authenticatorData, signature) into the audit log, so
@@ -755,8 +757,11 @@ fn field_b64(v: &Value, k: &str) -> Option<Vec<u8>> {
 }
 
 /// Options for an action's assertion: any of the operator's passkeys may sign.
-fn assertion_options(state: &State, key: &str) -> Value {
-    let allow: Vec<Value> = creds(state).unwrap_or_default().iter().map(|c| json!({ "type": "public-key", "id": c.id })).collect();
+/// The options for an action's passkey assertion: only the session's own passkey may sign it
+/// ([`action_finish`] refuses any other, #802).
+fn assertion_options(state: &State, key: &str, cred: &str) -> Value {
+    let allow: Vec<Value> =
+        creds(state).unwrap_or_default().iter().filter(|c| c.id == cred).map(|c| json!({ "type": "public-key", "id": c.id })).collect();
     json!({ "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": allow, "userVerification": "required", "timeout": 120000 })
 }
 
@@ -1507,7 +1512,7 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
     };
     // How long the challenge has left (#574 review), not when it ends: the page counts from when
     // this arrives, so a phone whose clock is minutes out still counts the server's two minutes.
-    ok(json!({ "action": v, "publicKey": assertion_options(state, &key), "expires_in_ms": CHALLENGE_TTL.as_millis() as u64 }))
+    ok(json!({ "action": v, "publicKey": assertion_options(state, &key, &cred), "expires_in_ms": CHALLENGE_TTL.as_millis() as u64 }))
 }
 
 fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Value) -> Reply {
@@ -1518,9 +1523,9 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     let Purpose::Action { action_json, nonce, action } = p.purpose else {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
     };
-    if !same_session || !matches!(sess, Some((_, SessionKind::Operator { .. }))) {
+    let Some((_, SessionKind::Operator { cred: session_cred })) = sess.as_ref().filter(|_| same_session) else {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
-    }
+    };
     let a = match verify_assertion(state, ch, body) {
         Ok(a) => a,
         Err(r) => {
@@ -1537,6 +1542,21 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
             return r;
         }
     };
+    // Every signed action is the session's operator's (#802): another enrolled passkey's signature,
+    // on this session's challenge, would act as that passkey while the page and the signed JSON
+    // name the session's. Refused, and audited, before anything action-specific.
+    if a.oc.id != *session_cred {
+        if let Ok(l) = state.ledger() {
+            let _ = l.audit(
+                &state.tenant,
+                None,
+                "operator.action_refused",
+                &json!({ "credential": a.oc.id, "session_credential": session_cred, "action": action_json,
+                         "reason": "signed with another passkey than the session's" }),
+            );
+        }
+        return err(StatusCode::FORBIDDEN, "sign with the passkey you signed in with");
+    }
     let mut signed = json!({
         "credential": a.oc.id, "rp_id": state.rp.rp_id, "origin": state.rp.origin,
         "nonce": b64u(&nonce), "client_data_json": b64u(&a.cdj), "authenticator_data": b64u(&a.ad), "signature": b64u(&a.sig),
@@ -2274,6 +2294,7 @@ mod tests {
     mod placement;
     mod secrets;
     mod session;
+    mod signer;
 
     /// The health section's state store (#635): the stream and each sink, as the CLI computes them,
     /// and a config that can't be read said, not a failed dashboard.
