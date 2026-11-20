@@ -4,7 +4,8 @@
     ci/dep-age.py [--base REV] [--min-days N] [--exceptions FILE]
 
 Compares every Cargo.lock and package-lock.json in the repository (outside experiments/, refs/ and
-third_party/) with the same file at REV (default origin/main). Each crates.io or npm package version
+third_party/), and every VENDOR.toml (a package committed as files, as lit-html is in the console),
+with the same file at REV (default origin/main). Each crates.io or npm package version
 that the change adds must have been published at least MIN_DAYS (default 7) ago, by the registry's own
 publish time. A younger one fails the check unless ci/dep-age-exceptions.toml lists it, with the
 advisory that makes it urgent and the reason: the policy's one exception, a fix for a serious,
@@ -58,12 +59,23 @@ def npm_packages(text: str) -> set[tuple[str, str, str]]:
     return out
 
 
-PARSERS = {"Cargo.lock": cargo_packages, "package-lock.json": npm_packages}
+def vendored_packages(text: str) -> set[tuple[str, str, str]]:
+    """(ecosystem, name, version) of a vendored package's VENDOR.toml (#574: lit-html, committed as files)."""
+    if not text:
+        return set()
+    v = tomllib.loads(text)
+    eco = {"npm": "npm", "crates.io": "crates.io"}.get(v.get("ecosystem", ""))
+    if not eco or not v.get("name") or not v.get("version"):
+        raise ValueError("VENDOR.toml needs ecosystem (npm or crates.io), name and version")
+    return {(eco, v["name"], v["version"])}
+
+
+PARSERS = {"Cargo.lock": cargo_packages, "package-lock.json": npm_packages, "VENDOR.toml": vendored_packages}
 
 
 def lockfiles() -> list[str]:
     files = subprocess.run(
-        ["git", "ls-files", "--", "*Cargo.lock", "*package-lock.json"], check=True, capture_output=True, text=True
+        ["git", "ls-files", "--", "*Cargo.lock", "*package-lock.json", "*VENDOR.toml"], check=True, capture_output=True, text=True
     ).stdout.split()
     return [f for f in files if not f.startswith(SKIP_DIRS)]
 

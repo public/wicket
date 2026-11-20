@@ -175,7 +175,7 @@ jobs:
         run: cargo deny --locked check
 
   # Dependency cooldown (design §2, principle 21): every crates.io or npm version a change adds to a
-  # lockfile was published at least 7 days ago, or ci/dep-age-exceptions.toml lists it with the
+  # lockfile or a VENDOR.toml was published at least 7 days ago, or ci/dep-age-exceptions.toml lists it with the
   # actively exploited vulnerability it fixes. Pull requests and the merge queue (a push has no base).
   dep-age:
     name: Dependency cooldown (7 days)
@@ -193,6 +193,10 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: python3 -I ci/dep-age.py --base "$BASE"
+      # Packages committed as files (VENDOR.toml, #574: lit-html in the console) are exactly what
+      # their manifest records, byte for byte; their versions' age is the step above's.
+      - name: Vendored files match their VENDOR.toml
+        run: python3 -I ci/vendor-check_test.py && python3 -I ci/vendor-check.py
 
   rust:
     name: Format, clippy and tests
