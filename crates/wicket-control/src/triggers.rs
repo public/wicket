@@ -2256,7 +2256,7 @@ mod tests {
                 kind: "check_suite".into(),
                 delivery: format!("g-{n}"),
                 received_at: at,
-                fields: wicket_core::intake::github_fields("check_suite", &body),
+                fields: wicket_sources::github::github_fields("check_suite", &body),
                 raw_sha256: wicket_core::intake::body_sha256(format!("sha-{n}").as_bytes()),
                 bytes: 1,
             }

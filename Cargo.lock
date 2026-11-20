@@ -4043,6 +4043,7 @@ dependencies = [
  "wicket-policy",
  "wicket-proxy",
  "wicket-sandbox",
+ "wicket-sources",
  "wicket-store",
  "x509-parser",
  "zeroize",
@@ -4081,6 +4082,7 @@ dependencies = [
  "wicket-policy",
  "wicket-proxy",
  "wicket-sandbox",
+ "wicket-sources",
  "wicket-store",
 ]
 
@@ -4356,6 +4358,15 @@ dependencies = [
  "wicket-placement",
  "wicket-proxy",
  "wicket-store",
+]
+
+[[package]]
+name = "wicket-sources"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "serde_json",
+ "wicket-core",
 ]
 
 [[package]]

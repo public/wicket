@@ -1,6 +1,7 @@
 use super::*;
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use wicket_sources::{generic as gw, github as gh};
 
 const IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
@@ -27,9 +28,9 @@ fn headers(h: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
 
 fn generic(ts: i64, id: &str, body: &[u8]) -> impl Fn(&str) -> Option<String> {
     headers(&[
-        (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", ts, id, body)),
-        (ik::GENERIC_TIMESTAMP, ts.to_string()),
-        (ik::GENERIC_DELIVERY, id.to_string()),
+        (gw::GENERIC_SIGNATURE, gw::generic_signature(b"s3cret-s3cret-s3cret", ts, id, body)),
+        (gw::GENERIC_TIMESTAMP, ts.to_string()),
+        (gw::GENERIC_DELIVERY, id.to_string()),
     ])
 }
 
@@ -57,7 +58,7 @@ fn a_generic_delivery_is_checked_in_order() {
     assert_eq!(i.admit(&format!("/hook/trg_2/{token}"), IP, at), Err(Outcome::Answer(StatusCode::NOT_FOUND, "not found")));
     assert_eq!(i.admit("/hook/trg_1", IP, at), Err(Outcome::Answer(StatusCode::NOT_FOUND, "not found")));
     let forged =
-        headers(&[(ik::GENERIC_SIGNATURE, ik::generic_signature(b"other", 1000, "d-1", body)), (ik::GENERIC_TIMESTAMP, "1000".into())]);
+        headers(&[(gw::GENERIC_SIGNATURE, gw::generic_signature(b"other", 1000, "d-1", body)), (gw::GENERIC_TIMESTAMP, "1000".into())]);
     assert_eq!(i.verify(&t, &forged, body, 1000, at), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"));
     let r = i.take_refused();
     assert_eq!((r.token, r.signature), (3, 1));
@@ -72,14 +73,14 @@ fn a_captured_generic_delivery_cant_be_replayed() {
     let i = ready(vec![trig("webhook", &token)]);
     let t = i.admit(&format!("/hook/trg_1/{token}"), IP, Instant::now()).unwrap();
     let body = br#"{"a":1}"#;
-    let sig = ik::generic_signature(b"s3cret-s3cret-s3cret", 1000, "d-1", body);
+    let sig = gw::generic_signature(b"s3cret-s3cret-s3cret", 1000, "d-1", body);
     let replay = |id: &str, now: i64| {
-        let h = headers(&[(ik::GENERIC_SIGNATURE, sig.clone()), (ik::GENERIC_TIMESTAMP, "1000".into()), (ik::GENERIC_DELIVERY, id.into())]);
+        let h = headers(&[(gw::GENERIC_SIGNATURE, sig.clone()), (gw::GENERIC_TIMESTAMP, "1000".into()), (gw::GENERIC_DELIVERY, id.into())]);
         i.verify(&t, &h, body, now, Instant::now())
     };
     assert!(matches!(replay("d-1", 1000), Outcome::Spool(_)));
     assert_eq!(replay("d-2", 1000), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"), "a new id");
-    assert_eq!(replay("d-1", 1000 + ik::GENERIC_WINDOW_SECS + 1), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"), "later");
+    assert_eq!(replay("d-1", 1000 + gw::GENERIC_WINDOW_SECS + 1), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"), "later");
 }
 
 /// #714 fifth review: a delivery's reservation is given back if its hand-over to the node is
@@ -174,9 +175,9 @@ fn a_github_delivery_keeps_its_fields() {
     .unwrap();
     let h = |event: &str, body: &[u8]| {
         headers(&[
-            (ik::GITHUB_SIGNATURE, github_sig(body)),
-            (ik::GITHUB_EVENT, event.into()),
-            (ik::GITHUB_DELIVERY, format!("{event}-{}", ik::body_sha256(body))),
+            (gh::GITHUB_SIGNATURE, github_sig(body)),
+            (gh::GITHUB_EVENT, event.into()),
+            (gh::GITHUB_DELIVERY, format!("{event}-{}", ik::body_sha256(body))),
         ])
     };
     let at = Instant::now();
@@ -194,7 +195,7 @@ fn a_github_delivery_keeps_its_fields() {
     let elsewhere = serde_json::to_vec(&serde_json::json!({ "check_suite": {}, "repository": { "full_name": "evil/app" } })).unwrap();
     assert_eq!(i.verify(&t, &h("check_suite", &elsewhere), &elsewhere, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "another repository"));
     // The generic header doesn't sign a GitHub delivery.
-    let generic = headers(&[(ik::GENERIC_SIGNATURE, github_sig(&body)), (ik::GITHUB_EVENT, "check_suite".into())]);
+    let generic = headers(&[(gw::GENERIC_SIGNATURE, github_sig(&body)), (gh::GITHUB_EVENT, "check_suite".into())]);
     assert_eq!(i.verify(&t, &generic, &body, 5, at), Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature"));
 }
 
@@ -249,7 +250,7 @@ fn a_replayed_body_doesnt_use_up_the_trigger() {
     let body =
         |n: u32| serde_json::to_vec(&serde_json::json!({ "n": n, "check_suite": {}, "repository": { "full_name": "acme/app" } })).unwrap();
     let h = |b: &[u8], id: &str| {
-        headers(&[(ik::GITHUB_SIGNATURE, github_sig(b)), (ik::GITHUB_EVENT, "check_suite".into()), (ik::GITHUB_DELIVERY, id.into())])
+        headers(&[(gh::GITHUB_SIGNATURE, github_sig(b)), (gh::GITHUB_EVENT, "check_suite".into()), (gh::GITHUB_DELIVERY, id.into())])
     };
     let captured = body(0);
     assert!(matches!(i.verify(&t, &h(&captured, "g-0"), &captured, 5, at), Outcome::Spool(_)), "refused");
@@ -274,7 +275,7 @@ fn unlistened_replays_dont_starve_the_trigger() {
     let at = Instant::now();
     let star = serde_json::to_vec(&serde_json::json!({ "action": "created", "repository": { "full_name": "acme/app" } })).unwrap();
     let h = |b: &[u8], event: &str, id: &str| {
-        headers(&[(ik::GITHUB_SIGNATURE, github_sig(b)), (ik::GITHUB_EVENT, event.into()), (ik::GITHUB_DELIVERY, id.into())])
+        headers(&[(gh::GITHUB_SIGNATURE, github_sig(b)), (gh::GITHUB_EVENT, event.into()), (gh::GITHUB_DELIVERY, id.into())])
     };
     assert_eq!(i.verify(&t, &h(&star, "star", "s-0"), &star, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not listened to"));
     for n in 1..40 {
@@ -301,8 +302,8 @@ fn the_same_generic_body_later_is_a_new_delivery() {
     let at = Instant::now();
     let send = |ts: i64| {
         let h = headers(&[
-            (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", ts, "", b"{}")),
-            (ik::GENERIC_TIMESTAMP, ts.to_string()),
+            (gw::GENERIC_SIGNATURE, gw::generic_signature(b"s3cret-s3cret-s3cret", ts, "", b"{}")),
+            (gw::GENERIC_TIMESTAMP, ts.to_string()),
         ]);
         i.verify(&t, &h, b"{}", ts, at)
     };
@@ -440,9 +441,9 @@ async fn the_service_hands_verified_deliveries_to_its_node() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let h = |id: &str, body: &[u8]| {
         vec![
-            (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", now, id, body)),
-            (ik::GENERIC_TIMESTAMP, now.to_string()),
-            (ik::GENERIC_DELIVERY, id.to_string()),
+            (gw::GENERIC_SIGNATURE, gw::generic_signature(b"s3cret-s3cret-s3cret", now, id, body)),
+            (gw::GENERIC_TIMESTAMP, now.to_string()),
+            (gw::GENERIC_DELIVERY, id.to_string()),
         ]
     };
     let path = format!("/hook/trg_1/{token}");
@@ -450,7 +451,7 @@ async fn the_service_hands_verified_deliveries_to_its_node() {
     assert!(ok.starts_with("HTTP/1.1 202"), "{ok}");
     assert!(!ok.contains("failed"), "the payload isn't echoed: {ok}");
     let mut forged = h("d-1", body);
-    forged[0].1 = ik::generic_signature(b"other", now, "d-1", body);
+    forged[0].1 = gw::generic_signature(b"other", now, "d-1", body);
     assert!(send(s.addr, &post(&path, &forged, body)).await.starts_with("HTTP/1.1 401"));
     let get = send(s.addr, format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").as_bytes()).await;
     assert!(get.starts_with("HTTP/1.1 405"), "{get}");
@@ -510,9 +511,9 @@ async fn the_server_is_bounded() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let body: &[u8] = b"{}";
     let signed = vec![
-        (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", now, "d-r1", body)),
-        (ik::GENERIC_TIMESTAMP, now.to_string()),
-        (ik::GENERIC_DELIVERY, "d-r1".to_string()),
+        (gw::GENERIC_SIGNATURE, gw::generic_signature(b"s3cret-s3cret-s3cret", now, "d-r1", body)),
+        (gw::GENERIC_TIMESTAMP, now.to_string()),
+        (gw::GENERIC_DELIVERY, "d-r1".to_string()),
     ];
     let ok = send(s.addr, &post(&path, &signed, body)).await;
     assert!(ok.starts_with("HTTP/1.1 202"), "held 1-byte bodies don't take the room: {ok}");
@@ -574,17 +575,85 @@ async fn bad_signatures_dont_slow_down_their_address() {
     for n in 0..8 {
         let id = format!("bad-{n}");
         let forged = vec![
-            (ik::GENERIC_SIGNATURE, ik::generic_signature(b"wrong-wrong-wrong-wrong", now, &id, body)),
-            (ik::GENERIC_TIMESTAMP, now.to_string()),
-            (ik::GENERIC_DELIVERY, id.clone()),
+            (gw::GENERIC_SIGNATURE, gw::generic_signature(b"wrong-wrong-wrong-wrong", now, &id, body)),
+            (gw::GENERIC_TIMESTAMP, now.to_string()),
+            (gw::GENERIC_DELIVERY, id.clone()),
         ];
         assert!(send(s.addr, &post(&path, &forged, body)).await.starts_with("HTTP/1.1 401"));
     }
     let signed = vec![
-        (ik::GENERIC_SIGNATURE, ik::generic_signature(b"s3cret-s3cret-s3cret", now, "good", body)),
-        (ik::GENERIC_TIMESTAMP, now.to_string()),
-        (ik::GENERIC_DELIVERY, "good".to_string()),
+        (gw::GENERIC_SIGNATURE, gw::generic_signature(b"s3cret-s3cret-s3cret", now, "good", body)),
+        (gw::GENERIC_TIMESTAMP, now.to_string()),
+        (gw::GENERIC_DELIVERY, "good".to_string()),
     ];
     let ok = send(s.addr, &post(&path, &signed, body)).await;
     assert!(ok.starts_with("HTTP/1.1 202"), "{ok}");
+}
+
+/// #740: a second source is an adapter of its own, outside core, and intake's rules hold for it as
+/// they do for the built-in ones: the token first, its own signature (a bad one charged to the
+/// trigger), the deliveries seen, its own checks before the rate, and fields within the caps. This
+/// one (a forge that signs `<hex>` with no prefix, in its own headers) uses only what
+/// `wicket_core::intake` shares; nothing of core knows it.
+#[test]
+fn a_second_adapter_needs_nothing_of_core() {
+    use std::borrow::Cow;
+    use wicket_core::trigger::Source;
+    use wicket_sources::{Adapter, Adapters, Header, Hook, Signed};
+
+    struct Forge;
+    impl Adapter for Forge {
+        fn kind(&self) -> &'static str {
+            "forge"
+        }
+        // Its `Source` variant would go in the trigger document; none here, so it serves none.
+        fn hook<'a>(&self, _: &'a Source) -> Option<Hook<'a>> {
+            None
+        }
+        fn verify<'b>(&self, secret: &[u8], header: Header<'_>, body: &'b [u8], _: i64) -> Option<Signed<'b>> {
+            let sig = hex::decode(header("x-forge-signature")?.trim()).ok()?;
+            (secret.len() >= ik::MIN_SECRET && ik::same(&sig, &ik::hmac_sha256(secret, body)))
+                .then(|| Signed { delivery: header("x-forge-delivery"), message: Cow::Borrowed(body) })
+        }
+        fn normalise(&self, t: &IntakeTrigger, header: Header<'_>, body: &[u8]) -> Result<(String, serde_json::Value), Unfit> {
+            let event = header("x-forge-event").unwrap_or_default();
+            if !t.events.contains(&event) {
+                return Err(Unfit::NotListened("not listened to"));
+            }
+            let v: serde_json::Value = serde_json::from_slice(body).map_err(|_| Unfit::Malformed("not json"))?;
+            let title = v["title"].as_str().map(|s| ik::keep_text(s, 256)).unwrap_or_default();
+            Ok((event, serde_json::json!({ "title": title })))
+        }
+        fn listens(&self, hook: &Hook<'_>, kind: &str) -> bool {
+            hook.events.iter().any(|e| e == kind)
+        }
+    }
+
+    let token = ik::new_token().unwrap();
+    let i = Intake::with_adapters(Adapters::builtin().with(Forge));
+    let forge = IntakeTrigger { kind: "forge".into(), events: vec!["merge".into()], ..trig("webhook", &token) };
+    i.set_table(vec![forge], true);
+    let at = Instant::now();
+    let t = i.admit(&format!("/hook/trg_1/{token}"), IP, at).expect("served: its adapter is known");
+    let body = br#"{"title":"fix \u001b[31mit"}"#;
+    let h = |event: &str, id: &str, sig: String| {
+        headers(&[("x-forge-signature", sig), ("x-forge-event", event.into()), ("x-forge-delivery", id.into())])
+    };
+    let sig = hex::encode(ik::hmac_sha256(b"s3cret-s3cret-s3cret", body));
+    let Outcome::Spool(e) = i.verify(&t, &h("merge", "f-1", sig.clone()), body, 5, at) else { panic!("refused") };
+    assert_eq!((e.kind.as_str(), e.delivery.as_str(), e.fields["title"].as_str()), ("merge", "f-1", Some("fix  [31mit")));
+    assert!(ik::fields_within(&e.fields));
+    assert_eq!(i.verify(&t, &h("merge", "f-2", sig.clone()), body, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "already had it"));
+    let other = br#"{"title":"x"}"#;
+    let other_sig = hex::encode(ik::hmac_sha256(b"s3cret-s3cret-s3cret", other));
+    assert_eq!(i.verify(&t, &h("star", "f-3", other_sig), other, 5, at), Outcome::Answer(StatusCode::ACCEPTED, "not listened to"));
+    assert_eq!(
+        i.verify(&t, &h("merge", "f-4", format!("sha256={sig}")), other, 5, at),
+        Outcome::Answer(StatusCode::UNAUTHORIZED, "bad signature")
+    );
+    assert_eq!(i.take_refused().signature, 1);
+    // Without its adapter, a trigger of its kind isn't served: try later, nobody's failure.
+    let plain = ready(vec![IntakeTrigger { kind: "forge".into(), ..trig("webhook", &token) }]);
+    assert_eq!(plain.admit(&format!("/hook/trg_1/{token}"), IP, at), Err(Outcome::Answer(StatusCode::SERVICE_UNAVAILABLE, "try later")));
+    assert_eq!(plain.take_refused().total(), 0);
 }
