@@ -1899,13 +1899,25 @@ pub fn fenced_in(run_dir: &Path, now_ms: i64) -> Option<(String, i64)> {
 }
 
 /// When a run's box must have stopped by its timeout (Unix ms), from its run record (`ctl/run.json`):
-/// its start, its zone's timeout, and a long-lived agent's node backstop (120 s).
+/// its start, its zone's timeout, and a long-lived agent's node backstop (120 s). None if there is no
+/// run record (no box was started). If the record is there but its start or timeout can't be read
+/// (a stored manifest a later version no longer loads is read leniently, `stored_timeout`; one that
+/// doesn't parse at all isn't), [`UNKNOWN_END`]: the box may run for as long as it was given, which
+/// this host can't tell, so it is fenced until its node confirms it stopped (#676: fail closed).
 fn timeout_end(run_dir: &Path) -> Option<i64> {
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(run_dir.join("ctl/run.json")).ok()?).ok()?;
-    let m = wicket_agent::load(v["manifest"].as_str()?).ok()?;
-    let secs = i64::try_from(m.zone.limits.timeout().ok()?.as_secs()).ok()?;
-    Some(v["started_ms"].as_i64()? + secs * 1000 + 120_000)
+    let bytes = std::fs::read(run_dir.join("ctl/run.json")).ok()?;
+    Some(read_timeout_end(&bytes).unwrap_or(UNKNOWN_END))
 }
+
+fn read_timeout_end(run_json: &[u8]) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_slice(run_json).ok()?;
+    let secs = i64::try_from(wicket_core::manifest::stored_timeout(v["manifest"].as_str()?)?.as_secs()).ok()?;
+    v["started_ms"].as_i64()?.checked_add(secs.checked_mul(1000)?)?.checked_add(120_000)
+}
+
+/// A fence's end when this host can't tell when a box's authority ends (#676): never, until its node
+/// confirms the box stopped.
+pub const UNKNOWN_END: i64 = i64::MAX;
 
 /// What this host has released to a run's node, secrets and budget slices (#152), kept beside the run
 /// (`ctl/holdings.json`) for `wicket node list`: the secrets the node fetched for the run (by name,
@@ -2877,6 +2889,38 @@ mod tests {
         record_authority(&d, "n1", 200_000).unwrap();
         assert!(fenced_in(&d, 50_000).is_some(), "a new authority is fenced again");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// #676: a run record whose manifest a later version no longer loads still fences until its
+    /// timeout (read leniently); one whose timeout can't be read at all fences until its node
+    /// confirms the box stopped, never not at all.
+    #[test]
+    fn a_run_record_that_no_longer_loads_still_fences() {
+        let d = std::env::temp_dir().join(format!("wicket-fence-676-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        let write = |manifest: &str| {
+            std::fs::write(
+                d.join("ctl/run.json"),
+                serde_json::to_vec(&serde_json::json!({ "manifest": manifest, "started_ms": 1_000 })).unwrap(),
+            )
+            .unwrap()
+        };
+        // A forbid glob without its leading `/`: refused since #674, accepted when the run started.
+        let old = "task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, limits: { timeout: 5m }, forbid: [{ host: a.test, paths: ['**/x'] }] }\n";
+        assert!(wicket_agent::load(old).is_err(), "the manifest no longer loads");
+        write(old);
+        let end = 1_000 + 300_000 + 120_000 + WAKE_SKEW_MS;
+        assert_eq!(fenced_in(&d, 2_000).map(|f| f.1), Some(end), "fenced until its timeout, read leniently");
+        assert!(fenced_in(&d, end).is_none());
+        // Not even YAML: when its authority ends can't be told, so the fence holds at any time.
+        write("{ not: [yaml");
+        assert_eq!(fenced_in(&d, i64::MAX - 1).map(|f| f.1), Some(UNKNOWN_END));
+        std::fs::write(d.join("ctl/run.json"), b"not json").unwrap();
+        assert_eq!(fenced_in(&d, 2_000).map(|f| f.1), Some(UNKNOWN_END), "an unreadable record fences too");
+        confirm_stopped(&d);
+        assert!(fenced_in(&d, 2_000).is_none(), "until the node confirms the box stopped");
+        let _ = std::fs::remove_dir_all(&d);
     }
     use wicket_core::RiskClass;
 

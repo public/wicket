@@ -283,13 +283,17 @@ where
                     // Still authorized on its node (#153): the box may be running there, so the run
                     // isn't lost yet, whatever the node's status, until its authority has ended.
                     if let Some((_, until)) = (self.fenced)(&run, self.now.saturating_mul(1000)) {
+                        let left = if until == crate::noderun::UNKNOWN_END {
+                            // #676: its record doesn't say when its authority ends, so it is kept
+                            // until its node can be asked.
+                            "when its authority there ends can't be read from its run record, so it is kept until the node confirms the box stopped".to_string()
+                        } else {
+                            format!("it is still authorized there until {}", crate::noderun::fmt_ms(until))
+                        };
                         self.note(
                             "unreachable",
                             &run,
-                            &format!(
-                                "its supervisor is gone and node {node} can't be asked about it; it is still authorized there until {}: left for a later pass",
-                                crate::noderun::fmt_ms(until)
-                            ),
+                            &format!("its supervisor is gone and node {node} can't be asked about it; {left}: left for a later pass"),
                         );
                         continue;
                     }
@@ -861,15 +865,18 @@ fn node_docker(name: &str) -> Option<Docker> {
 }
 
 /// When a run's box must have stopped (Unix seconds), from the run's record (none for a run without
-/// one): its box's start plus its zone's timeout, after which its node also holds no authority for it
+/// one, or whose start or timeout can't be read): its box's start plus its zone's timeout, after which its node also holds no authority for it
 /// (#153: block 0 never outlasts the timeout), plus [`FENCE_MARGIN_SECS`]. A run on a node that can't
 /// be asked is ended only after this, so nothing replaces a box its node may still be running.
 fn run_deadline(run: &str) -> Option<i64> {
     crate::run::check_run_id(run).ok()?;
     let v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(crate::data_dir().join("runs").join(run).join("ctl/run.json")).ok()?).ok()?;
-    let m = wicket_agent::load(v["manifest"].as_str()?).ok()?;
-    Some(v["started_ms"].as_i64()? / 1000 + m.zone.limits.timeout().ok()?.as_secs() as i64 + FENCE_MARGIN_SECS)
+    // Read leniently: a stored manifest a later version no longer loads still says how long its box
+    // ran (#676). None (not overdue) if even that can't be read: a run is never ended as past a
+    // deadline this host can't tell.
+    let timeout = wicket_core::manifest::stored_timeout(v["manifest"].as_str()?)?;
+    Some(v["started_ms"].as_i64()? / 1000 + i64::try_from(timeout.as_secs()).ok()? + FENCE_MARGIN_SECS)
 }
 
 /// Past a run's timeout, how long before its node is certainly done with it: a long-lived agent's
@@ -1458,12 +1465,19 @@ mod tests {
         asked.insert("n3".to_string(), None);
         /// #153: run_fenced's box is still authorized on its (revoked, unreachable) node until
         /// NOW + 60 s, so it may still run there.
+        /// #676: run_unknown's record doesn't say when its authority ends (its manifest can't be
+        /// read), so it is fenced until its node confirms the box stopped.
         fn fenced(run: &str, now_ms: i64) -> Option<(String, i64)> {
+            if run == "run_unknown" {
+                return Some(("n3".to_string(), crate::noderun::UNKNOWN_END));
+            }
             (run == "run_fenced" && now_ms < (NOW + 60) * 1000).then(|| ("n3".to_string(), (NOW + 60) * 1000))
         }
-        l.run_started(&TenantId::single(), &RunId("run_fenced".into()), "z", "a").unwrap();
-        l.set_run_owner("run_fenced", "dead:1:1").unwrap();
-        l.set_run_node("run_fenced", "n3").unwrap();
+        for run in ["run_fenced", "run_unknown"] {
+            l.run_started(&TenantId::single(), &RunId(run.into()), "z", "a").unwrap();
+            l.set_run_owner(run, "dead:1:1").unwrap();
+            l.set_run_node(run, "n3").unwrap();
+        }
         async fn pass_at(
             w: &World<Fake>,
             l: &mut Ledger,
@@ -1503,8 +1517,16 @@ mod tests {
             "{d:?}"
         );
         assert_eq!(audited(&l, "reconcile.run_adopted"), 1);
+        assert!(
+            d.iter()
+                .any(|x| x.kind == "unreachable" && x.target == "run_unknown" && x.detail.contains("can't be read from its run record")),
+            "{d:?}"
+        );
         pass_at(&w, &mut l, &asked, false, NOW + 61).await;
         assert_eq!(l.run_status("run_fenced").unwrap().as_deref(), Some(LOST));
+        // A year on, its node still unreachable and revoked: never ended without the fence (#676).
+        pass_at(&w, &mut l, &asked, false, NOW + 366 * 86_400).await;
+        assert_eq!(l.run_status("run_unknown").unwrap().as_deref(), Some("running"));
     }
 
     /// #474: a long-lived agent's first box never starts on its node, so its run is lost straight

@@ -241,6 +241,15 @@ fix, which TLC refuses:
 | `RequeueOnReconnect = TRUE` (done, #453) | after #451 (and before #453), a supervisor gave again its in-flight messages only on its first resume of a run it took over. If the link to the box's node dropped after `await_message` answered and before `MessageRead` arrived, while the supervisor lived on, the message stayed in flight, neither waiting nor read, until a later supervisor. Now every reconnect gives again what was given on the link that dropped (`noderun.rs` `requeue_on_resume`), and an answer that can't be sent gives its message back (`Ledger::requeue_message`); the node drops a repeat its box has had | `fail_lifecycle_reconnect_stuck`: `NoMessageStuck` |
 | `EndAgentOnLost = TRUE` (done, #474) | before #474, the reconciler ended a run as `lost` (its supervisor gone, its node with no box for it: a box that never started, say, `BoxFails`) but left its agent `active`, its claim lapsed, with nothing to renew it or read its messages. Now `Ledger::run_lost` ends the run and, if it was the agent's current activation, the agent: back to `hibernated` (restorable from its last head) if it has one, else `ended` | `fail_lifecycle_agent_left_active`: `ActiveHasRun` |
 
+The model reads each box's authority end as known (`AuthTtl` from its start, renewed). In the code
+the reconciler reads it from the run's authority record, or when that is missing from the run's
+record (`noderun.rs` `fenced_in`, `timeout_end`; `reconcile.rs` `run_deadline`). Where neither
+says it, the run is fenced until its node confirms the box stopped, never ended unfenced (#676):
+the stored manifest's timeout is read leniently (`manifest::stored_timeout`, so a manifest a later
+version refuses still gives it), and a record that can't be read at all fences forever
+(`UNKNOWN_END`). That keeps the model's assumption true: `Lost` never happens before the authority
+it would have read has ended.
+
 Every switch is now the code (#444, #445, #446, #453, #474), so `RunLifecycle.cfg` is main, and each
 `fail_lifecycle_*` variant is the code before one fix. `NoMessageTwice` holds in every variant: with
 `AckAfterHand` a message is queued again after a crash, and the box's record of what it has had
