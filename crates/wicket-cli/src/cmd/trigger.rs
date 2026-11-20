@@ -15,7 +15,7 @@ pub enum TriggerCmd {
         #[arg(long)]
         file: PathBuf,
         /// How long it lasts, or `forever`: until removed. Renew it with `wicket trigger renew`.
-        #[arg(long, default_value = tr::DEFAULT_LASTS)]
+        #[arg(long, default_value = tr::DEFAULT_LASTS, value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
     },
     /// Triggers that aren't removed: each with its state, source, action and next firing.
@@ -29,7 +29,7 @@ pub enum TriggerCmd {
     /// Move a trigger's lapse to --lasts from now (or `forever`): only its owner (or root).
     Renew {
         trigger: String,
-        #[arg(long, default_value = tr::DEFAULT_LASTS)]
+        #[arg(long, default_value = tr::DEFAULT_LASTS, value_parser = wicket_core::time::duration_or_forever_arg)]
         lasts: String,
     },
     /// Remove a trigger: it fires nothing again.
@@ -148,7 +148,7 @@ fn find(l: &Ledger, op: &operators::Operator, which: &str) -> Result<wicket_stor
         return Ok(t.clone());
     }
     match named.len() {
-        0 => bail!("no trigger {which}"),
+        0 => Err(wicket_home::exit::not_found(format!("no trigger {which}"))),
         1 => Ok(named.into_iter().next().expect("one")),
         n => bail!("{n} triggers are named {which} (owners {}): name it by its id", {
             named.iter().map(|t| c(&t.owner)).collect::<Vec<_>>().join(", ")

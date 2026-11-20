@@ -204,6 +204,7 @@ async fn a_caller_that_lies_about_its_program_source_is_refused() {
         dir_fd: false,
         manifest_name: Some("m.yaml".into()),
         program_source: None,
+        codes: false,
     };
     proto::write_json(&mut w, kind::HELLO, &hello).unwrap();
     assert_eq!(proto::read_frame(&mut r).unwrap().unwrap().0, kind::WELCOME);
@@ -281,6 +282,7 @@ fn staged(args: &[&str], cwd: &Path) -> (Vec<String>, PathBuf, Result<()>, (uplo
         dir_fd: false,
         manifest_name: None,
         program_source: None,
+        codes: false,
     };
     let peer = proto::Peer { pid: 1, uid: 0, gid: 0, user: "root".into(), groups: vec![] };
     let mut plan = d.plan(&peer, &Basis::Root, &cmd, &hello, None).unwrap();
@@ -345,10 +347,11 @@ fn a_trusted_key_and_an_update_build_go_to_the_daemon_as_content() {
             built.to_str().unwrap(),
             "--nodes",
             "all",
+            // As clap parsed them, in ms: the same durations.
             "--window",
-            "5s",
+            "5000ms",
             "--interval",
-            "2s",
+            "2000ms",
             "--check",
             "true",
             "--image",
@@ -555,4 +558,56 @@ fn stopping_followed_supervisors_during_a_handover_ends_within_a_bound() {
         }
         drop(clients);
     }
+}
+
+/// A raw hello to the daemon, from a client that reads coded refusals: the frame it answers with.
+fn hello_answer(f: &Fixture, argv: &[&str]) -> (u8, Vec<u8>) {
+    let s = UnixStream::connect(&f.sock).unwrap();
+    proto::send_fds(&s, &[0, 1, 2]).unwrap();
+    let (mut w, mut r) = (s.try_clone().unwrap(), s.try_clone().unwrap());
+    let hello = Hello {
+        version: "0".into(),
+        argv: argv.iter().map(|a| a.to_string()).collect(),
+        cwd: "/".into(),
+        log: None,
+        dir_fd: false,
+        manifest_name: None,
+        program_source: None,
+        codes: true,
+    };
+    proto::write_json(&mut w, kind::HELLO, &hello).unwrap();
+    proto::read_frame(&mut r).unwrap().unwrap()
+}
+
+/// #574: what the daemon turns away says why in its code, a field of its own: a command line that
+/// doesn't parse is a usage error (2), an unreadable policy a failure (1), whoever asks.
+#[tokio::test]
+async fn admit_says_usage_and_failure_apart_from_refusal() {
+    use wicket_home::exit::Code;
+    let f = daemon();
+    let (k, p) = hello_answer(&f, &["pending", "--no-such-flag"]);
+    assert_eq!(k, kind::REFUSE);
+    let (code, text) = proto::parse_refuse(&p);
+    assert_eq!(code, Code::Usage, "{text}");
+    assert!(text.contains("--no-such-flag"), "{text}");
+    std::fs::write(f.dir.0.join("policy.yaml"), "read: [this is: not a policy").unwrap();
+    let (k, p) = hello_answer(&f, &["pending"]);
+    assert_eq!(k, kind::REFUSE);
+    let (code, text) = proto::parse_refuse(&p);
+    assert_eq!(code, Code::Failed, "{text}");
+    assert!(text.contains("policy is unreadable"), "{text}");
+}
+
+/// #574: while the daemon moves to a new build it takes no command, and says try again (75);
+/// a caller whose stdio didn't come is a failure (1).
+#[test]
+fn a_draining_daemon_says_try_again() {
+    use wicket_home::exit::Code;
+    assert_eq!(turned_away(true, 3, false).map(|t| t.0), Some(Code::TryAgain));
+    assert_eq!(turned_away(false, 2, false).map(|t| t.0), Some(Code::Failed));
+    assert_eq!(turned_away(false, 3, true).map(|t| t.0), Some(Code::Failed));
+    assert_eq!(turned_away(false, 4, true), None);
+    // And a client reads it as 75 from the frame.
+    let e = client::daemon_error_for_test(&proto::refuse_frame(Code::TryAgain, "moving"));
+    assert_eq!(wicket_home::exit::code_of(&e), Some(Code::TryAgain));
 }

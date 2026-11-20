@@ -228,8 +228,8 @@ enum Cmd {
         #[arg(long)]
         unlimited: bool,
         /// Grant lifetime.
-        #[arg(long, default_value = "10m")]
-        ttl: String,
+        #[arg(long, default_value = "10m", value_parser = wicket_core::time::duration_arg)]
+        ttl: std::time::Duration,
         /// Grant a path prefix of the requested path instead of the exact path.
         #[arg(long)]
         prefix: Option<String>,
@@ -376,8 +376,8 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
         /// Keep running, one pass per interval (e.g. 30s).
-        #[arg(long)]
-        every: Option<String>,
+        #[arg(long, value_parser = wicket_core::time::duration_arg)]
+        every: Option<std::time::Duration>,
     },
     /// Capacity leases: the nodes agents asked for.
     ///
@@ -466,16 +466,19 @@ enum Cmd {
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        // As a `main` returning the error would print it, then the code for its kind (#574).
-        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("Error: {e:?}\n"));
+        // As a `main` returning the error would print it (not a run's own status, which its run
+        // has told already), then the code for its kind (#574).
+        if e.downcast_ref::<wicket_home::exit::Status>().is_none() {
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("Error: {e:?}\n"));
+        }
         std::process::exit(exit_code(&e));
     }
 }
 
-/// The exit code for `e` (#574; docs/reference/cli.md lists them): [`wicket_home::exit::code_of`],
-/// the one classifier, else 1.
+/// The exit code for `e` (#574; docs/reference/cli.md lists them): [`wicket_home::exit::status_of`],
+/// the one classifier.
 fn exit_code(e: &anyhow::Error) -> i32 {
-    wicket_home::exit::code_of(e).unwrap_or(wicket_home::exit::Code::Failed) as i32
+    wicket_home::exit::status_of(e)
 }
 
 async fn run() -> Result<()> {
