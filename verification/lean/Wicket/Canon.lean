@@ -69,11 +69,10 @@ def plainOk (p : Str) : Bool :=
 
 /-- Where a segment's encoded slashes (`%2F`, `%2f`) start, scanning as `slash_escape` does. -/
 def slashEscs : Str → Nat → List Nat
+  | '%' :: '2' :: 'f' :: rest, i => i :: slashEscs rest (i + 3)
+  | '%' :: '2' :: 'F' :: rest, i => i :: slashEscs rest (i + 3)
+  | _ :: t, i => slashEscs t (i + 1)
   | [], _ => []
-  | c :: t, i =>
-    match c, t with
-    | '%', '2' :: d :: rest => if d == 'f' || d == 'F' then i :: slashEscs rest (i + 3) else slashEscs t (i + 1)
-    | _, _ => slashEscs t (i + 1)
 
 /-- `slash_escape`: the segment's only encoded slash, if it has one, between two non-empty parts. -/
 def slashEscape (seg : Str) : Option Nat :=
