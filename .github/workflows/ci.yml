@@ -506,6 +506,14 @@ jobs:
       - name: Smoke test
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') }}
         run: WICKET=target/debug/wicket H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/smoke.sh
+      # #215, #326: a program box told to get out of its reach, with values planted where it must not
+      # get to; fails naming any attempt that got through (ci/attack/expected.tsv).
+      - name: Attack matrix
+        if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') }}
+        # tcpdump: the matrix captures the host's DNS traffic to check no label the box chose left by it.
+        run: |
+          command -v tcpdump >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q tcpdump; }
+          WICKET=target/debug/wicket ci/attack-matrix.sh
       - name: Hibernate and wake
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' hibernate ') }}
         run: WICKET=target/debug/wicket ci/hibernate.sh

@@ -131,7 +131,10 @@ async fn an_operator_cannot_approve_deny_or_enrol_a_passkey() {
         &["image"],
         &["reconcile"],
     ] {
-        let e = call(&f, args, None).await.unwrap_err().to_string();
+        let err = call(&f, args, None).await.unwrap_err();
+        // The policy's refusal: exit 3 (#574).
+        assert_eq!(wicket_home::exit::code_of(&err), Some(wicket_home::exit::Code::Refused), "{args:?}: {err}");
+        let e = err.to_string();
         assert!(e.contains("needs root") && e.contains("passkey"), "{args:?}: {e}");
     }
     // Refusals are in the audit log.

@@ -163,15 +163,15 @@ impl Layout {
         if let Some(acct) = &self.untrusted {
             let opened = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).unwrap_or_else(|_| artifact.to_path_buf());
             if let Some(why) = mode_writable(&opened, &m, acct).or_else(|| opened.parent().and_then(|d| writable_by(d, acct))) {
-                bail!(
+                return Err(wicket_home::exit::refused(format!(
                     "refused: root makes its copy only from an artifact the {WICKET_USER} user can't write, and {why}. Use the artifact as you got it (the release archive, or the build), not a copy of wicket's"
-                );
+                )));
             }
         }
         std::fs::create_dir_all(&self.copies).with_context(|| self.copies.display().to_string())?;
         std::fs::set_permissions(&self.copies, std::fs::Permissions::from_mode(0o755))?;
         if let Some(why) = self.untrusted.as_ref().and_then(|a| writable_by(&self.copies, a)) {
-            bail!("refused: root's copies must be root's alone, and {why}");
+            return Err(wicket_home::exit::refused(format!("refused: root's copies must be root's alone, and {why}")));
         }
         let stage = self.copies.join(format!(".admit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&stage);
