@@ -1226,12 +1226,34 @@ async fn names_pass(ledger: &Ledger, now: i64, dry_run: bool) -> Vec<Done> {
         wicket_names::ProviderKind::Noop => {
             wicket_control::namesync::pass(ledger, &public, &wicket_names::NoopProvider::new(), now, dry_run).await
         }
+        wicket_names::ProviderKind::Vultr => {
+            // Read from the vault at each pass, here on the control host (#575 step 5a).
+            let vault = wicket_proxy::vault::Vault::new(wicket_proxy::vault::Vault::default_dir());
+            match names_vultr(&public, &vault) {
+                Ok(p) => wicket_control::namesync::pass(ledger, &public, &p, now, dry_run).await,
+                Err(d) => return vec![d],
+            }
+        }
     };
     let r = match pass {
         Ok(r) => r,
         Err(e) => return vec![Done { kind: "error", target: format!("names in {}", public.domain()), detail: format!("{e:#}") }],
     };
     names_report(&r, dry_run)
+}
+
+/// The Vultr DNS provider with the API key in the vault secret `names.public.credential` names,
+/// or the `error` line saying why there is none (a missing secret stops the names pass, not the
+/// rest of the reconcile).
+fn names_vultr(
+    public: &wicket_names::PublicConfig,
+    vault: &wicket_proxy::vault::Vault,
+) -> std::result::Result<wicket_control::vultrdns::VultrDns, Done> {
+    let target = format!("names in {}", public.domain());
+    let Some(secret) = public.credential.as_deref() else {
+        return Err(Done { kind: "error", target, detail: "names.public.credential is needed for provider vultr".into() });
+    };
+    wicket_control::vultrdns::VultrDns::from_vault(vault, secret).map_err(|e| Done { kind: "error", target, detail: format!("{e:#}") })
 }
 
 fn names_report(r: &wicket_control::namesync::Report, dry_run: bool) -> Vec<Done> {
@@ -2905,5 +2927,29 @@ mod tests {
         let d = placed_pass(&mut l, &w.placer, retire, end + 60, false).await.unwrap();
         assert!(d.is_empty(), "{d:?}");
         assert_eq!(l.placed_node("theirs").unwrap().unwrap().status, "active");
+    }
+
+    /// #575 step 5a: provider vultr reads its key from the vault by the credential's name; a
+    /// missing secret is an error line, naming the secret and never a value.
+    #[test]
+    fn names_vultr_reads_its_key_from_the_vault() {
+        let dir = std::env::temp_dir().join(format!("wicket-names-vultr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = wicket_proxy::vault::Vault::new(dir.clone());
+        let public: wicket_names::NamesConfig = serde_json::from_value(serde_json::json!({
+            "public": { "provider": "vultr", "zone": "boxes.example.com", "owner": "a1b2c3d4", "credential": "dns-boxes" }
+        }))
+        .unwrap();
+        let mut public = public.public.unwrap();
+        let d = names_vultr(&public, &vault).err().expect("no secret yet");
+        assert_eq!((d.kind, d.target.as_str()), ("error", "names in boxes.example.com"));
+        assert!(d.detail.contains("dns-boxes") && d.detail.contains("not set"), "{}", d.detail);
+        vault.set("dns-boxes", "test-key-not-a-real-one").unwrap();
+        let Ok(p) = names_vultr(&public, &vault) else { panic!("the key is set") };
+        use wicket_names::DnsProvider;
+        assert!(p.id().starts_with("vultr:") && !p.id().contains("test-key"), "{}", p.id());
+        public.credential = None;
+        assert!(names_vultr(&public, &vault).err().unwrap().detail.contains("credential is needed"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

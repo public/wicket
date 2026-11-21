@@ -1307,4 +1307,101 @@ mod tests {
         assert_eq!(r.freed, vec![("n1".to_string(), old)]);
         assert!(p.records().iter().any(|r| r.value == n2.to_string()) && !p.records().iter().any(|r| r.value == V4.to_string()));
     }
+
+    /// The Vultr provider (#575 step 5a) against the local Vultr mock: a name is published (owner
+    /// TXT, A, SRV), follows its box to another node, and is withdrawn owner-last on revoke.
+    async fn vultr(zones: &[&str]) -> (crate::vultrdns::VultrDns, wicket_placement::mock::Shared) {
+        use wicket_placement::vultr::{ApiKey, Client, Retry};
+        let (base, st) = wicket_placement::mock::serve().await;
+        for z in zones {
+            st.lock().unwrap().domains.insert(z.to_string(), vec![]);
+        }
+        let c = Client::with_base(&base, ApiKey::new(wicket_placement::mock::KEY))
+            .unwrap()
+            .with_per_page(2)
+            .with_retry(Retry { attempts: 2, base: std::time::Duration::from_millis(1) });
+        (crate::vultrdns::VultrDns::with_client(c), st)
+    }
+
+    fn vultr_public() -> PublicConfig {
+        let mut c = public();
+        c.provider = wicket_names::ProviderKind::Vultr;
+        c.credential = Some("dns-boxes".into());
+        c
+    }
+
+    fn mock_records(st: &wicket_placement::mock::Shared, zone: &str) -> Vec<serde_json::Value> {
+        st.lock().unwrap().domains.get(zone).cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn vultr_publishes_moves_and_withdraws_a_name() {
+        let (l, run, id) = ledger_srv();
+        let (p, st) = vultr(&[BOXES]).await;
+        let pc = vultr_public();
+        let r = pass_t(&l, &pc, &p, wicket_store::now(), false).await.unwrap();
+        assert!(r.applied && r.errors().next().is_none(), "{:?}", r.zones);
+        let mut types: Vec<String> = mock_records(&st, BOXES).iter().map(|r| r["type"].as_str().unwrap().to_string()).collect();
+        types.sort();
+        assert_eq!(types, ["A", "SRV", "TXT"]);
+        assert_eq!(l.owned_records_by(&Zone::new(BOXES), p.id()).unwrap().len(), 3);
+        // In sync: the listing round-trips to what was planned.
+        let again = pass_t(&l, &pc, &p, wicket_store::now(), false).await.unwrap();
+        assert!(again.plan.is_empty(), "{:?}", again.plan);
+        // A dry run lists and plans, and writes nothing.
+        let seen = st.lock().unwrap().seen.len();
+        pass_t(&l, &pc, &p, wicket_store::now(), true).await.unwrap();
+        assert!(st.lock().unwrap().seen[seen..].iter().all(|s| s.method == "GET"));
+
+        // The box moves to n2: its A record is updated to n2's address.
+        let old = l.port_of(&id, "n1", PROTO).unwrap().unwrap();
+        enrol_bare(&l, "n2");
+        let n2 = Ipv4Addr::new(8, 8, 8, 8);
+        l.set_node_addresses("n2", AddressChange::Set(n2), AddressChange::Keep, "op").unwrap();
+        l.set_run_node(&run.0, "n2").unwrap();
+        l.allocate_port("n2", PROTO, &id, 20000..=20999, Some(old)).unwrap();
+        l.release_ports_elsewhere(&id, "n2").unwrap();
+        let r = pass_t(&l, &pc, &p, wicket_store::now(), false).await.unwrap();
+        assert!(r.applied, "{:?}", r.zones);
+        assert!(r.plan.changes.iter().any(|c| matches!(c, Change::Update { to, .. } if to.value == n2.to_string())), "{:?}", r.plan);
+        assert!(st.lock().unwrap().seen.iter().any(|s| s.method == "PATCH"));
+        assert!(mock_records(&st, BOXES).iter().any(|r| r["type"] == "A" && r["data"] == n2.to_string().as_str()));
+
+        // Revoked: every record goes, the owner record's DELETE last.
+        let txt_id = mock_records(&st, BOXES).iter().find(|r| r["type"] == "TXT").unwrap()["id"].as_str().unwrap().to_string();
+        crate::names::revoke(&l, "op", &id).unwrap();
+        let r = pass_t(&l, &pc, &p, wicket_store::now(), false).await.unwrap();
+        assert!(r.applied, "{:?}", r.zones);
+        assert!(mock_records(&st, BOXES).is_empty());
+        let deletes: Vec<String> = st.lock().unwrap().seen.iter().filter(|s| s.method == "DELETE").map(|s| s.path.clone()).collect();
+        assert_eq!(deletes.len(), 3);
+        assert!(deletes.last().unwrap().ends_with(&txt_id), "{deletes:?}");
+        assert!(l.owned_records_by(&Zone::new(BOXES), p.id()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn vultr_withdraws_an_old_zone_and_a_bare_listing_trips_the_breaker() {
+        let (l, _run, _) = ledger();
+        let (p, st) = vultr(&[BOXES, "other.example.com"]).await;
+        let pc = vultr_public();
+        pass_t(&l, &pc, &p, wicket_store::now(), false).await.unwrap();
+        assert_eq!(mock_records(&st, BOXES).len(), 2);
+        // A listing that lacks every record it made (emptied by hand, or a bad read): nothing is
+        // forgotten, and it is said.
+        let kept = mock_records(&st, BOXES);
+        st.lock().unwrap().domains.insert(BOXES.into(), vec![]);
+        let later = wicket_store::now() + FORGET_AFTER_SECS + 60;
+        let r = pass_t(&l, &pc, &p, later, false).await.unwrap();
+        assert!(r.zones[0].forgotten.is_empty());
+        assert!(r.errors().any(|(_, e)| e.contains("has none of the 2 record(s)")), "{:?}", r.zones);
+        assert_eq!(l.owned_records_by(&Zone::new(BOXES), p.id()).unwrap().len(), 2, "none forgotten");
+        // The pass made them again; the zone changes: the old zone's records are withdrawn.
+        assert_eq!(mock_records(&st, BOXES).len(), kept.len());
+        let mut moved = pc.clone();
+        moved.zone = "other.example.com".into();
+        let r = pass_t(&l, &moved, &p, later, false).await.unwrap();
+        assert!(r.stranded.is_empty() && r.errors().next().is_none(), "{:?} {:?}", r.stranded, r.zones);
+        assert!(mock_records(&st, BOXES).is_empty(), "{:?}", mock_records(&st, BOXES));
+        assert!(l.owned_zones().unwrap().is_empty());
+    }
 }
