@@ -450,6 +450,17 @@ that stays a signed action.
 key. Each view is built from named fields, never by serializing a stored record, and a test fetches
 every console endpoint and scans each answer for the token, any 24-byte run of its bytes (base64url,
 base64 and hex, except runs inside a public key), identity JWSs and private keys.
+## Lists from the host
+
+Read-only, behind the session like the rest of the page (#713). Each answers with what its CLI
+command's `--json` prints ([the CLI reference](cli.md#output-for-scripts) lists the fields), through
+the same function: `GET /api/grants` (`wicket grant list --all`, the last 200), `/api/links`
+(`wicket links`, the last 200), `/api/triggers` (`wicket trigger list`), `/api/nodes`
+(`wicket node list`), `/api/services` (`wicket service list`), `/api/identities` (`wicket identity
+list`) and `/api/sessions` (`wicket operator sessions`). None carries a token, a signature, a key,
+a trigger's document or a session's token: an identity is its verified fields, and a session its
+token's hash's first 16 hex digits, which nothing signs in with.
+
 ## Placement view
 
 Why a run went where it did ([#579](https://github.com/public/wicket/issues/579)), read-only and behind

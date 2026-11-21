@@ -226,11 +226,89 @@ async fn the_policy_page_shows_the_applied_cedar_its_versions_and_runs() {
     assert_eq!(p["runs"][0]["status"], "current", "{p}");
 }
 
+/// The issuer the leak scan's identities are signed with: `verify_signed` checks against it.
+static TEST_ISSUER: std::sync::OnceLock<wicket_identity::Issuer> = std::sync::OnceLock::new();
+
+fn verify_signed(l: &wicket_store::Ledger, run: &str) -> Value {
+    wicket_home::verified_identity_by(l, run, None, || {
+        Ok(TEST_ISSUER.get_or_init(|| wicket_identity::Issuer::generate("wicket.test")).verifying_key())
+    })
+}
+
 #[tokio::test]
 async fn authority_views_never_carry_a_token_signature_secret_or_key() {
-    let f = fixture("leak");
+    let mut f = fixture("leak");
     super::nodes::enrol(&mut f.t.ledger(), "n1", &TenantId::single().0, &["api.example.com"]);
-    let n = needles(&f);
+    let mut n = needles(&f);
+    // A node enrolled with keys and a join token of its own (#713 review): only its host key's
+    // fingerprint may be shown.
+    {
+        let mut l = f.t.ledger();
+        let tok = l.create_node_token(&TenantId::single(), "n2", 600).unwrap();
+        let node = wicket_store::NodeRow {
+            name: "n2".into(),
+            tenant: TenantId::single().0,
+            target: "wicket@node2".into(),
+            host_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIleakyhostkeyleakyhostkeyleaky".into(),
+            host_key_fp: "SHA256:fingerprint-n2".into(),
+            node_key: "4e6f64654b65794c65616b4e6f64654b65794c65616b4e6f64654b65794c6561".into(),
+            ssh_key: Some("an ssh key leakysshkeyleakysshkey".into()),
+            hosts: vec!["api.example.com".into()],
+            enrolled_at: wicket_store::now(),
+            status: "active".into(),
+            revoked_at: None,
+        };
+        let ca = wicket_store::NodeCaRow {
+            serial: "n2-01".into(),
+            node: "n2".into(),
+            issued_at: wicket_store::now(),
+            not_after: wicket_store::now() + 86_400,
+            hosts: vec!["api.example.com".into()],
+            status: "active".into(),
+        };
+        l.enrol_node(&tok, &node, &ca).unwrap();
+        n.extend([tok, node.host_key.clone(), node.node_key.clone(), "leakysshkey".into()]);
+    }
+    // A real identity, signed by the issuer this view checks against: shown verified, its document
+    // never.
+    let signed_run = RunId::new();
+    {
+        let issuer = TEST_ISSUER.get_or_init(|| wicket_identity::Issuer::generate("wicket.test"));
+        let key = wicket_identity::AgentKey::generate();
+        let spec = wicket_identity::IdentitySpec {
+            tenant: TenantId::single().0,
+            zone: ZONE.into(),
+            agent: "signed".into(),
+            run: signed_run.0.clone(),
+            parent_run: None,
+            manifest_sha256: "m".into(),
+            image: "img".into(),
+            node: "local".into(),
+            principal: json!({ "type": "human", "id": "alex", "via": "cli" }),
+            act: None,
+            kind: None,
+        };
+        let now = wicket_store::now();
+        let jws = issuer.issue(&spec, now, 600, &key.public());
+        let claims = wicket_identity::verify_identity(&jws, &issuer.verifying_key(), now).unwrap();
+        let l = f.t.ledger();
+        l.run_started(&TenantId::single(), &signed_run, ZONE, "signed").unwrap();
+        l.put_identity(&wicket_store::IdentityRow {
+            run: signed_run.0.clone(),
+            tenant: TenantId::single().0,
+            spiffe_id: claims.sub,
+            zone: ZONE.into(),
+            agent: "signed".into(),
+            parent_run: None,
+            accept_from: vec![],
+            jws: jws.clone(),
+            issued_at: now,
+        })
+        .unwrap();
+        n.push(jws.split('.').nth(2).unwrap().to_string());
+        n.push(jws);
+    }
+    f.t.state.identity = verify_signed;
     // A public name of the run with the token, approved, with a connection its node shipped
     // (#575 review, L6): the names views scanned are real ones, not an empty card.
     let _h = super::names_card::Hooks;
@@ -275,7 +353,60 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
             wicket_feed::now_ms(),
         )
         .unwrap();
+    // The host-only lists the console shows now (#713), each with something in it: a link, a
+    // webhook trigger (its URL token never shown), a service; the run's grant, identity and node,
+    // and this session, are the fixture's.
+    {
+        let l = f.t.ledger();
+        l.add_link(&wicket_store::LinkRow {
+            id: "lk-1".into(),
+            tenant: TenantId::single().0,
+            from_run: RUN.into(),
+            to_run: RUN.into(),
+            port: 8080,
+            name: "api".into(),
+            addr: "10.0.0.2".into(),
+            by_run: RUN.into(),
+            basis: "child".into(),
+            status: "open".into(),
+            created_at: 1,
+            closed_at: None,
+            closed_by: None,
+            close_reason: None,
+        })
+        .unwrap();
+        let spec: wicket_core::trigger::TriggerSpec = wicket_core::yaml::from_str(
+            "trigger: hook\nsource: { webhook: { verify: { hmac_sha256: hook-key } } }\naction: { wake: agent }\n",
+        )
+        .unwrap();
+        let tid = l.create_trigger("t0", "spiffe://wicket.local/t/t0/op/passkey/laptop", &spec, "passkey:laptop", false, None).unwrap();
+        // Its URL's token (what a delivery presents): neither it nor its hash is ever shown.
+        let url_token = "hooktoken-0123456789abcdef0123456789abcdef";
+        let url_sha = hex::encode(sha2::Sha256::digest(url_token.as_bytes()));
+        l.set_trigger_intake(&tid, "local", &url_sha).unwrap();
+        n.extend([url_token.to_string(), url_sha]);
+        l.add_service("npm-cache", "/data/services/npm-cache/manifest.yaml", &"ab".repeat(32), "t0", "root").unwrap();
+    }
+    let host_lists = ["/api/grants", "/api/links", "/api/triggers", "/api/nodes", "/api/services", "/api/identities", "/api/sessions"];
+    let (_, ids, _) = get(&f.t, "/api/identities").await;
+    let signed = ids.as_array().unwrap().iter().find(|i| i["run"] == signed_run.0.as_str()).cloned().unwrap_or_default();
+    assert_eq!(signed["identity"]["verified"], true, "the signed identity verifies: {ids}");
+    for p in host_lists {
+        let (s, v, body) = get(&f.t, p).await;
+        assert_eq!(s, StatusCode::OK, "{p}: {body}");
+        assert!(v.as_array().is_some_and(|a| !a.is_empty()), "{p} lists something: {body}");
+        // A session's token, or its whole hash, is never in a view.
+        let sid = f.t.sid.clone().unwrap();
+        assert!(!body.contains(&sid) && !body.contains(&super::super::session_id(&sid)), "{p} shows a session token or its hash");
+    }
     let paths = [
+        "/api/grants".to_string(),
+        "/api/links".into(),
+        "/api/triggers".into(),
+        "/api/nodes".into(),
+        "/api/services".into(),
+        "/api/identities".into(),
+        "/api/sessions".into(),
         "/api/me".to_string(),
         "/api/state".into(),
         "/api/policy".into(),
@@ -356,4 +487,77 @@ fn the_cli_prints_the_same_views_with_a_held_token() {
     crate::cmd::json_tests::documented_as("`wicket audit explain --json`", &x);
     let text = crate::cmd::authority::explain_text(&x);
     assert!(text.contains("against its token now: allow:"), "{text}");
+}
+
+/// #713 review: the host's lists are the console's tenant's. Another tenant's grant, link, trigger,
+/// node, service, identity and console session are in none of them.
+#[tokio::test]
+async fn the_host_lists_are_the_consoles_tenants_only() {
+    let f = fixture("tenants");
+    let other = TenantId("t9".into());
+    let theirs = RunId("run_01other00000000000000000000".into());
+    {
+        let mut l = f.t.ledger();
+        l.run_started(&other, &theirs, "z9", "theirs").unwrap();
+        let op = wicket_core::Op::egress(&other, &theirs, "z9", "GET", "their.example", "/x");
+        let (rid, _) = l.pending_for(&op, "theirs", None).unwrap();
+        let a =
+            wicket_store::Approval { uses: Some(1), ttl: std::time::Duration::from_secs(600), path_prefix: None, decided_by: "op".into() };
+        l.approve(&rid, &a).unwrap();
+        l.add_link(&wicket_store::LinkRow {
+            id: "lk-theirs".into(),
+            tenant: other.0.clone(),
+            from_run: theirs.0.clone(),
+            to_run: theirs.0.clone(),
+            port: 9,
+            name: "theirs".into(),
+            addr: "10.9.9.9".into(),
+            by_run: theirs.0.clone(),
+            basis: "child".into(),
+            status: "open".into(),
+            created_at: 1,
+            closed_at: None,
+            closed_by: None,
+            close_reason: None,
+        })
+        .unwrap();
+        let spec: wicket_core::trigger::TriggerSpec =
+            wicket_core::yaml::from_str("trigger: theirs\nsource: { webhook: { verify: { hmac_sha256: k } } }\naction: { wake: agent }\n")
+                .unwrap();
+        l.create_trigger("t9", "spiffe://wicket.local/t/t9/op/unix/theirs", &spec, "unix:theirs", false, None).unwrap();
+        super::nodes::enrol(&mut l, "n-theirs", "t9", &["their.example"]);
+        l.add_service("svc-theirs", "/data/services/theirs.yaml", &"cd".repeat(32), "t9", "root").unwrap();
+        l.put_identity(&wicket_store::IdentityRow {
+            run: theirs.0.clone(),
+            tenant: other.0.clone(),
+            spiffe_id: "spiffe://wicket.local/t/t9/z/z9/a/theirs".into(),
+            zone: "z9".into(),
+            agent: "theirs".into(),
+            parent_run: None,
+            accept_from: vec![],
+            jws: "eyJ0aGVpcnMifQ.dGhlaXJz.dGhlaXJz".into(),
+            issued_at: 1,
+        })
+        .unwrap();
+        l.add_console_session(
+            &other,
+            &wicket_store::ConsoleSession {
+                id: "9e".repeat(32),
+                kind: "operator".into(),
+                credential: Some("cred-theirs".into()),
+                client: "192.0.2.99".into(),
+                created_at: wicket_store::now(),
+                last_seen_at: wicket_store::now(),
+                expires_at: wicket_store::now() + 3600,
+            },
+        )
+        .unwrap();
+    }
+    for p in ["/api/grants", "/api/links", "/api/triggers", "/api/nodes", "/api/services", "/api/identities", "/api/sessions"] {
+        let (s, _, body) = get(&f.t, p).await;
+        assert_eq!(s, StatusCode::OK, "{p}: {body}");
+        for theirs in ["their.example", "lk-theirs", "t9", "n-theirs", "svc-theirs", &theirs.0, "9e9e9e9e", "cred-theirs"] {
+            assert!(!body.contains(theirs), "{p} shows another tenant's {theirs}: {body}");
+        }
+    }
 }
