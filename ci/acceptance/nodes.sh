@@ -227,6 +227,26 @@ escape_flow() {
 # reconnect the credential is fetched again. Then its secret is removed from the vault: the node
 # drops it within seconds and model calls stop. At its authority's end (5 min from the run's start)
 # the node stops the box.
+# #573: a box whose reach names an inspected host its node's CA wasn't enrolled for works there
+# without a `wicket node renew-ca`: with the node's CA policy `auto`, the control host widens the CA
+# to it at runtime, and the change is on the record (`node.ca_widened`) and in `wicket node ca`.
+widen_flow() {
+  log "a node's CA widened at runtime to a box's reach, on $NODE"
+  local before; before=$(w node ca "$NODE" --json 2>/dev/null | jq -r '.ca.hosts // [] | join(",")')
+  check "  $NODE's CA doesn't cover www.example.org to begin with ($before)" '! tr , "\n" <<<"$before" | grep -qx www.example.org'
+  wroot node set "$NODE" --ca-hosts auto >"$work/widen-set.log" 2>&1 || cat "$work/widen-set.log"
+  local ws; ws=$(workdir widen)
+  HOME=$HOMEW "$W" run "$(manifest widen)" --workdir "$ws" --image "$IMAGE_TAG" --node "$NODE" >"$work/widen.log" 2>&1 || true
+  local r; r=$(run_id_of "$work/widen.log")
+  our_runs+=("$r")
+  local out; out=$(data "runs/$r/workspace/out/widen.log" 2>/dev/null || cat "$nodehome/.local/share/wicket-node/runs/$r/workspace/out/widen.log" 2>/dev/null || true)
+  echo "   ${out:-no answer recorded}"
+  check "  a box reaching www.example.org there gets it, with no renew-ca (run ${r:-?})" '[ "$out" = "www.example.org 200" ]'
+  check "  and $NODE's CA covers it now" 'w node ca "$NODE" --json | jq -e ".ca.hosts | index(\"www.example.org\")" >/dev/null'
+  check "  and the widening is on the record (node.ca_widened)" 'w audit --tail 2000 | grep node.ca_widened | grep -q www.example.org'
+  wroot node set "$NODE" --ca-hosts fixed >>"$work/widen-set.log" 2>&1 || true
+}
+
 offline_flow() {
   log "a node on its own: a 165 s partition, a serve restart in it, the box stopped at its authority's end"
   local value=mock-model-credential
