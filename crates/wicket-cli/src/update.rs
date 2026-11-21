@@ -1520,6 +1520,21 @@ fn reexec_serve(local: &Path, bin: &Path) -> Option<String> {
 /// ledger whose newer rows it may not understand, so the expand/contract rule
 /// (docs/explanation/updates.md, "Migrations") only has to hold for the seconds of a handover.
 pub fn stop_stale_supervisors(ledger: &Ledger, bin: &Path) -> Result<Vec<String>> {
+    // Without this build's own binary nothing can be told apart, and every old build's supervisor
+    // would stay (#475): the handover fails, on the record, rather than leave them quietly (#844).
+    let want = match std::fs::canonicalize(bin) {
+        Ok(w) => w,
+        Err(e) => {
+            let why = format!("this build's binary {} can't be read ({e})", bin.display());
+            let _ = ledger.audit(
+                &TenantId::single(),
+                None,
+                "self.handover_failed",
+                &serde_json::json!({ "why": why, "by": crate::operator() }),
+            );
+            anyhow::bail!("handing runs over to this build: {why}; no supervisor was stopped");
+        }
+    };
     let mut killed = vec![];
     for (run, owner) in ledger.running_runs()? {
         let Some(o) = owner else { continue };
@@ -1530,13 +1545,20 @@ pub fn stop_stale_supervisors(ledger: &Ledger, bin: &Path) -> Result<Vec<String>
         if pid == std::process::id() {
             continue;
         }
-        match build_of(pid, bin) {
+        match build_of(pid, &want) {
             Build::Other => {}
             Build::Same | Build::Gone => continue,
             // Fail safe (#844): a supervisor this can't tell about is left to the health gate,
-            // never stopped on a guess.
+            // never stopped on a guess; on the record, so one that stays on an old build is seen.
             Build::Unknown(why) => {
                 say(format!("run {run}'s supervisor (pid {pid}) is left running: {why}"));
+                let tenant = ledger.run_tenant(&run).ok().flatten().unwrap_or_else(TenantId::single);
+                let _ = ledger.audit(
+                    &tenant,
+                    Some(&wicket_core::RunId(run.clone())),
+                    "self.supervisor_unknown",
+                    &serde_json::json!({ "run": run, "pid": pid, "why": why }),
+                );
                 continue;
             }
         }
@@ -1564,21 +1586,18 @@ enum Build {
     Other,
     /// Exited, not yet reaped (a zombie): it supervises nothing.
     Gone,
-    /// It can't be told, and why: its binary, or `bin`, can't be read.
+    /// It can't be told, and why: its binary can't be read.
     Unknown(String),
 }
 
-/// Which build process `pid` runs (#844): another only when its binary is read and differs from
-/// `bin`'s. A process whose binary can't be read is unknown, not another (stopping a supervisor of
-/// this build on a failed read would cost its run a takeover for nothing), and a zombie is gone.
-fn build_of(pid: u32, bin: &Path) -> Build {
+/// Which build process `pid` runs (#844), against this build's binary `want` (canonical): another
+/// only when its binary is read and differs. A process whose binary can't be read is unknown, not
+/// another (stopping a supervisor of this build on a failed read would cost its run a takeover for
+/// nothing), and a zombie is gone.
+fn build_of(pid: u32, want: &Path) -> Build {
     if proc_state(pid) == Some('Z') {
         return Build::Gone;
     }
-    let want = match std::fs::canonicalize(bin) {
-        Ok(w) => w,
-        Err(e) => return Build::Unknown(format!("this build's binary {} can't be read ({e})", bin.display())),
-    };
     match std::fs::read_link(format!("/proc/{pid}/exe")) {
         Ok(exe) if exe == want => Build::Same,
         Ok(_) => Build::Other,
@@ -2256,9 +2275,24 @@ mod tests {
         assert!(c.wait().is_ok());
         // No such process: its binary can't be read.
         assert!(matches!(build_of(u32::MAX, &sh), Build::Unknown(w) if w.contains("its binary can't be read")));
-        // This build's own binary can't be read: nothing can be told apart.
         let me = std::process::id();
-        assert!(matches!(build_of(me, Path::new("/nonexistent/wicket")), Build::Unknown(w) if w.contains("this build's binary")));
+        // This build's own binary can't be read: the handover fails, on the record, and stops nothing.
+        let l = Ledger::open_in_memory().unwrap();
+        let e = stop_stale_supervisors(&l, Path::new("/nonexistent/wicket")).unwrap_err();
+        assert!(format!("{e:#}").contains("no supervisor was stopped"), "{e:#}");
+        assert_eq!(l.audit_of_kind("self.handover_failed").unwrap().len(), 1);
+        // A live process whose binary can't be read (pid 1, to anyone but root): left running, and
+        // on the record, so a supervisor kept on an old build this way is seen later.
+        if std::fs::read_link("/proc/1/exe").is_err() {
+            let l = Ledger::open_in_memory().unwrap();
+            l.run_started(&TenantId::single(), &wicket_core::RunId("run_init".into()), "z", "claude").unwrap();
+            l.set_run_owner("run_init", &crate::owner::owner_label_of(1).unwrap()).unwrap();
+            assert!(stop_stale_supervisors(&l, &sh).unwrap().is_empty(), "not stopped on a guess");
+            let r = l.audit_of_kind("self.supervisor_unknown").unwrap();
+            let b: serde_json::Value = serde_json::from_str(&r[0].body).unwrap();
+            assert_eq!((b["run"].as_str(), b["pid"].as_u64()), (Some("run_init"), Some(1)), "{b}");
+            assert!(b["why"].as_str().unwrap().contains("its binary can't be read"), "{b}");
+        }
         // Read and compared: this process is its own build, and not /bin/sh's (unless it is).
         let exe = std::fs::canonicalize("/proc/self/exe").unwrap();
         assert_eq!(build_of(me, &exe), Build::Same);
