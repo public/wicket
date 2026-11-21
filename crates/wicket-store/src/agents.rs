@@ -377,7 +377,7 @@ impl Ledger {
     /// takeover of its lapsed claim would have woken it from); one that never did is `ended`. Its
     /// new state, or None when `run` wasn't an agent's current activation.
     pub fn run_lost(&self, run: &str, why: &str) -> Result<Option<String>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::write_tx(&self.conn)?;
         let state = self.lose_run(run, why)?;
         tx.commit()?;
         Ok(state)
@@ -389,7 +389,7 @@ impl Ledger {
     /// at all: never to a run that ended on its own, and never skipped for one this ended. Whether it
     /// was ended.
     pub fn run_lost_if_running(&self, run: &str, why: &str, then: impl FnOnce(&Ledger) -> Result<()>) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::write_tx(&self.conn)?;
         let status: Option<String> = tx.query_row("SELECT status FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?;
         let running = status.as_deref() == Some("running");
         if running {

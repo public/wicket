@@ -251,7 +251,7 @@ impl Ledger {
         if !valid_digest(digest) {
             return Ok(None);
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::write_tx(&self.conn)?;
         let Some((grant, uses, decided_by, held)) = covering(&tx, tenant, digest, action, scope)? else {
             return Ok(None);
         };

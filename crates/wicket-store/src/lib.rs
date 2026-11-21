@@ -82,7 +82,7 @@ pub use hosts::{lapsed_alone, SupervisorHost, Taken as ShardTaken};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("sqlite: {0}")]
+    #[error("{}", sql_message(.0))]
     Sql(#[from] rusqlite::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
@@ -679,13 +679,36 @@ fn live_grant(tx: &rusqlite::Transaction<'_>, m: &GrantMatch<'_>) -> Result<Opti
         .optional()?)
 }
 
+/// An SQLite error in words: a ledger another process kept locked past the busy wait says so, and
+/// what to do (#830).
+fn sql_message(e: &rusqlite::Error) -> String {
+    match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => format!(
+            "the ledger is busy: another wicket process (wicketd, the console, the reconciler or a run) held its write lock for longer than this one waits ({} s); try again (sqlite: {e})",
+            BUSY_WAIT.as_secs()
+        ),
+        _ => format!("sqlite: {e}"),
+    }
+}
+
+/// How long a ledger connection waits for another's write lock.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+
+/// A transaction that writes, begun `IMMEDIATE` (#830): its write lock is waited for up front, under
+/// the busy timeout, and what it reads is the newest commit. A deferred one that reads, then writes,
+/// is refused at once (`SQLITE_BUSY`, without the busy handler) when another connection wrote in
+/// between, which is what `wicket self update` met while wicketd wrote.
+pub(crate) fn write_tx(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+}
+
 impl Ledger {
     pub fn open(path: &Path) -> Result<Ledger> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_WAIT)?;
         // Before any table exists, so a new ledger gives freed pages back (#582); on an existing
         // one it changes nothing until a VACUUM (`make_auto_vacuum_incremental`).
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
@@ -731,7 +754,7 @@ impl Ledger {
     /// against the target build's).
     pub fn schema_of(path: &Path) -> Result<Schema> {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_WAIT)?;
         let exists: bool = conn
             .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'", [], |r| r.get::<_, i64>(0))?
             > 0;
@@ -816,7 +839,7 @@ impl Ledger {
     pub fn run_ended(&self, run: &RunId, status: &str, detail: &str) -> Result<usize> {
         // One transaction (#575 review, H1): a run ends whole or not at all. Inside a caller's
         // (`run_lost`'s), these writes join it.
-        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let own = if self.conn.is_autocommit() { Some(crate::write_tx(&self.conn)?) } else { None };
         let n = self.run_ended_in(run, status, detail)?;
         if let Some(own) = own {
             own.commit()?;
@@ -976,7 +999,7 @@ impl Ledger {
     /// over, once its node says how far it got. A prompt the node has part of stays taken: giving
     /// it again would send its start twice. The prompts given again.
     pub fn requeue_prompts(&self, run: &str, stdin_received: u64) -> Result<Vec<String>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::write_tx(&self.conn)?;
         let ids: Vec<String> = {
             let mut st = tx.prepare(&format!(
                 "SELECT id FROM messages WHERE to_run = ?1 AND {TURNS} AND delivered_at IS NOT NULL
@@ -1656,7 +1679,7 @@ impl Ledger {
     /// using it: for what an issued grant covers (the console, tests). A grant already handed to a
     /// node isn't found: its uses are counted there.
     pub fn grant_covering(&self, op: &Op) -> Result<Option<String>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::write_tx(&self.conn)?;
         let found = live_grant(&tx, &GrantMatch::for_op(op))?;
         tx.commit()?;
         Ok(found.map(|(gid, _)| gid))
@@ -2791,6 +2814,49 @@ mod node_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #830: a transaction that reads, then writes, while another connection commits in between:
+    /// begun deferred, its write is refused at once (what `wicket self update` met while wicketd
+    /// wrote); begun as [`write_tx`] begins it, it waits for the lock and sees the newest commit.
+    #[test]
+    fn a_writing_transaction_waits_for_another_writer() {
+        let dir = std::env::temp_dir().join(format!("wicket-busy-{}", wicket_core::new_ulid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ledger.db");
+        let l = Ledger::open(&p).unwrap();
+        l.conn.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        let other = Connection::open(&p).unwrap();
+        other.busy_timeout(Duration::from_secs(5)).unwrap();
+        // Deferred: its snapshot is older than the other's commit, so it can't become a writer.
+        let tx = l.conn.unchecked_transaction().unwrap();
+        let _: i64 = tx.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+        other.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        let t0 = std::time::Instant::now();
+        let e = tx.execute("INSERT INTO t VALUES (2)", []).unwrap_err();
+        assert!(e.to_string().contains("locked") || e.to_string().contains("busy"), "{e}");
+        let said = StoreError::from(e).to_string();
+        assert!(said.starts_with("the ledger is busy: another wicket process") && said.contains("try again"), "{said}");
+        assert!(t0.elapsed() < Duration::from_secs(1), "refused without waiting: {:?}", t0.elapsed());
+        drop(tx);
+        // IMMEDIATE: waits for the other's lock, then reads what it committed.
+        let p2 = p.clone();
+        let (held, released) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let c = Connection::open(&p2).unwrap();
+            c.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (3);").unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            c.execute_batch("COMMIT").unwrap();
+        });
+        released.recv().unwrap();
+        let tx = write_tx(&l.conn).unwrap();
+        let n: i64 = tx.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+        tx.execute("INSERT INTO t VALUES (4)", []).unwrap();
+        tx.commit().unwrap();
+        h.join().unwrap();
+        assert_eq!(n, 2, "it read the other's commit (rows 1 and 3)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn op(path: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "POST", "github.com", path)
