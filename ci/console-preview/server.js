@@ -30,6 +30,7 @@ const port = Number(args[0] || process.env.PORT || 8790);
 // serve/web.rs's by hand.
 // The session page's policy is its own (#739); the rest share the console's.
 const { "session-content-security-policy": SESSION_CSP, ...HEADERS } = ASSETS ? JSON.parse(fs.readFileSync(path.join(ASSETS, "headers.json"), "utf8")) : { "content-security-policy": CSP };
+if (ASSETS && !SESSION_CSP) { console.error(path.join(ASSETS, "headers.json") + " has no session-content-security-policy: write it with this wicket's `wicket dev console-assets`"); process.exit(2); }
 const T0 = Date.now();
 
 const types = { ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };

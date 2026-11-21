@@ -83,9 +83,15 @@ async function check(engine, name, opts) {
     // console.js's policy, which makes nothing but /sw.js: the page's own button, so the call site is
     // what is checked (#739). Then: wicket-sw can't be made a second time, nor a policy the CSP
     // doesn't list.
-    if (await page.evaluate(() => !navigator.serviceWorker)) console.log(`${engine} ${name}: no service workers here, registering not checked`);
-    else {
-      await page.evaluate(() => { location.hash = "#settings"; });
+    // The page offers the button only where push works (console.js's pushSupported: a service worker,
+    // PushManager and Notification); elsewhere it says how to get it (WebKit at phone size, here).
+    await page.evaluate(() => { location.hash = "#settings"; });
+    const push = await page.evaluate(() => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window);
+    if (!push) {
+      await page.waitForFunction(() => document.getElementById("push").textContent.includes("can't receive notifications here"), null, { timeout: 5000 })
+        .catch(() => fail("no push here, and the page doesn't say so"));
+      console.log(`${engine} ${name}: no push here, registering not checked`);
+    } else {
       await page.locator("#push button", { hasText: "Enable notifications" }).click();
       await page.waitForFunction(() => window.__swArgs.length > 0, null, { timeout: 5000 }).catch(() => fail("Enable notifications didn't register the service worker"));
       const args = await page.evaluate(() => window.__swArgs);
@@ -93,6 +99,8 @@ async function check(engine, name, opts) {
     }
     const policies = await page.evaluate(() => {
       if (!window.trustedTypes) return "ok";
+      // The page's own wicket-sw first (it is made on first use), so the duplicate is a second one.
+      swUrl();
       for (const name of ["wicket-sw", "not-listed"]) {
         try { window.trustedTypes.createPolicy(name, { createScriptURL: u => u }); return `a policy named ${name} was made`; } catch (e) { /* refused, as it should be */ }
       }
