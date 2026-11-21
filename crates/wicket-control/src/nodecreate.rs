@@ -144,6 +144,18 @@ pub fn retire_enrolment(ledger: &mut Ledger, n: &NodeHandle) -> Result<bool> {
     Ok(true)
 }
 
+/// After a release whose first try didn't revoke its enrolment: revokes node `name`'s, if it is
+/// still enrolled and was enrolled before the release ended at `ended_at` (so it is that machine,
+/// not one enrolled under its name since). Returns whether it revoked.
+pub fn retire_enrolment_named(ledger: &mut Ledger, name: &str, ended_at: i64) -> Result<bool> {
+    let enrolled = ledger.node(name)?.filter(|r| r.status != "revoked" && r.enrolled_at <= ended_at);
+    if enrolled.is_none() {
+        return Ok(false);
+    }
+    crate::enrol::revoke(ledger, &crate::enrol::Paths::installation().nodes_dir, name)?;
+    Ok(true)
+}
+
 fn usd(micros: i64) -> String {
     MicroUsd(micros.max(0) as u64).to_string()
 }
@@ -597,7 +609,7 @@ fn instance_id(l: &Ledger, arg: &str) -> Result<String> {
 /// console's release does (#710): decided as root's (or, not as root, as the operator's within its
 /// authority) on the effect printed, audited first, then released with the node's own placer (its
 /// owner and API key), not `common`'s.
-pub async fn release(common: Common, id: String, reason: Option<String>, root: bool) -> Result<()> {
+pub async fn release(common: Common, id: String, reason: Option<String>, root: bool, yes: bool) -> Result<()> {
     use crate::noderelease as nr;
     let mut l = Ledger::open(&crate::ledger_path())?;
     let now = wicket_store::now();
@@ -613,12 +625,34 @@ pub async fn release(common: Common, id: String, reason: Option<String>, root: b
             nr::Decider::Operator { by: &granter, console: false }
         };
         say!("releasing {}: this {}", n.name, n.consequence());
+        // Decided on what was just printed: asked first on a terminal, unless --yes.
+        if !yes
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && !wicket_home::confirm(&format!("release {} as shown above?", n.name))?
+        {
+            return Err(wicket_home::exit::refused("not released: declined at the confirmation"));
+        }
         let shown = n.effect_sha256();
         let why = reason.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("wicket node release");
         let d = nr::Decision { by, shown: &shown, why, extra: serde_json::json!({ "via": "cli" }) };
         let (n, seq) = nr::decide(&l, &id, &d, now)?;
-        let said = nr::release(&mut l, &p, &n, &crate::operator(), seq, retire_enrolment, now).await?;
+        let said = nr::release(&mut l, &p, &n, &crate::operator(), seq, retire_enrolment_named, now).await?;
         say!("{said}");
+        return Ok(());
+    }
+    // A node the ledger has as released: its release is finished if its ledger side didn't (a step
+    // failed, or the process stopped), and never released again through the provider. By instance
+    // id, or by name the latest release of a node so named (names are reused).
+    let released = l.placed_nodes(&["released"])?;
+    let row = released
+        .iter()
+        .find(|r| r.id == id)
+        .or_else(|| released.iter().filter(|r| r.name == id).max_by_key(|r| (r.ended_at, r.created_at)));
+    if let Some(row) = row {
+        match nr::finish_incomplete(&mut l, &row.id, &crate::operator(), retire_enrolment_named)? {
+            Some(said) => say!("{said}"),
+            None => say!("{} ({}) was already released: nothing is left to finish", row.name, row.id),
+        }
         return Ok(());
     }
     drop(l);
@@ -627,6 +661,12 @@ pub async fn release(common: Common, id: String, reason: Option<String>, root: b
     // An instance the ledger doesn't have as an active placed node (a create that failed half way).
     let id = NodeId(instance_id(&Ledger::open(&crate::ledger_path())?, &id)?);
     let node = p.get(&id).await?;
+    // Asked first too, on a terminal, unless --yes: it is destroyed now.
+    let what = node.as_ref().map(|n| format!("{} ({id})", n.name)).unwrap_or_else(|| id.0.clone());
+    say!("releasing {what}: the ledger doesn't have it as an active placed node; this destroys the machine now, whatever runs on it");
+    if !yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) && !wicket_home::confirm(&format!("release {what}?"))? {
+        return Err(wicket_home::exit::refused("not released: declined at the confirmation"));
+    }
     match p.release(&id, ReleaseMode::Now).await? {
         Released::AlreadyGone => say!("{id} is already gone"),
         r => say!("{id}: {r:?}"),

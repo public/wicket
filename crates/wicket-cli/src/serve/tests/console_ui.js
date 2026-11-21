@@ -129,28 +129,25 @@ const advance = async ms => { now += ms; const due = timers.filter(t => t.at <= 
 const req = (id, risk, path) => ({ id, risk, method: "POST", host: "api.example.com", path, scope_prefix: false, reason: "r", identity: { verified: true, agent: "lead", zone: "z", acting_for: [], id: "spiffe://x" }, attribution: [], zone: "z", run: "run_a", created_at: 0 });
 const A = req("q-a", "R1ReadScoped", "/harmless"), B = req("q-b", "R3ExternalOrIrreversible", "/dangerous"), X = req("q-x", "R1ReadScoped", "/other");
 const base = { now: 10, tenant: "t0", runs: [], manifests: [], decided: [], audit: [], passkeys: [] };
-const cardsIn = () => ids.pending.children;
-const idOf = c => c.all(n => n.className === "meta")[0].textContent.split(" ")[0];
-const button = (card, label) => card.all(n => n.tagName === "button" && n.textContent.startsWith(label))[0];
 const began = () => calls.filter(c => c.path === "/api/action/begin");
 
 (async () => {
   state = { ...base, pending: [X, A, B] };
   sandbox.ready(); await flush(); await flush(); await flush();
-  assert.deepStrictEqual(cardsIn().map(idOf), ["q-x", "q-a", "q-b"]);
-  const aCard = cardsIn()[1];
   await advance(2000);
+  // The cards themselves are drawn by inbox.js with lit-html (#574), which needs a real DOM: that
+  // they stay put across polls, move only when the list does, and say what the server grants is
+  // ci/console-browsers/inbox.mjs's. Here, their buttons' path: act(), with its settle guard.
 
-  // A poll that changes nothing keeps the same elements (and so the same buttons).
-  await run("refresh()"); await flush();
-  assert.strictEqual(cardsIn()[1], aCard, "an unchanged card is not rebuilt");
-  await advance(2000);
+  // Without inbox.js (here, as when the module fails to load), the cards' place says the requests
+  // can't be shown, rather than that nothing is waiting.
+  assert.ok(ids.pending.textContent.includes("The requests can't be shown"), ids.pending.textContent);
 
-  // The card above A goes: B's button is now where A's was. A tap right then is ignored.
+  // The cards just moved (inbox.js says so): a tap right then is ignored.
   state = { ...base, pending: [A, B] };
   await run("refresh()"); await flush();
-  assert.strictEqual(cardsIn()[0], aCard);
-  button(cardsIn()[1], "Allow once (expires in 10 min)").click(); await flush();
+  run("layoutMoved()");
+  run("act('approve', { id: 'q-b', uses: 1, ttl_secs: 600 })"); await flush();
   assert.strictEqual(began().length, 0, "a tap just after the layout changed is ignored");
 
   // Once settled, a tap asks the server for the action and opens the confirmation; no passkey yet.
@@ -159,7 +156,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     effect_sha256: "0123456789abcdef".repeat(4),
     blast: { widens: ["every path under /h/ on api.example.com, not only /harmless"], examples: ["POST api.example.com/h/any-file"], zone_rules: [], covered: 3, recent: 7 },
     update: { sha256: "ab".repeat(32), artifact: HOSTILE, size: 52428800, commit_said: "36c92b5e", nodes: ["n1", "n2"], applies: true, why_not: null } };
-  button(aCard, "Allow once (expires in 10 min)").click(); await flush();
+  run("act('approve', { id: 'q-a', uses: 1, ttl_secs: 600 })"); await flush();
   assert.strictEqual(began().length, 1);
   assert.strictEqual(began()[0].body.id, "q-a");
   assert.strictEqual(ids.confirm.hidden, false, "the confirmation is open");
@@ -203,13 +200,10 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-go"].click(); await flush();
   assert.strictEqual(ceremonies, 0);
 
-  // While it is open, polls change nothing on the page, even if the agent reshuffles the cards.
-  const before = cardsIn().slice();
+  // While it is open, another card's buttons can't start a second ceremony (that polls don't redraw
+  // the cards meanwhile is inbox.mjs's).
   state = { ...base, pending: [X, B, A] };
-  await run("refresh()"); await flush();
-  assert.deepStrictEqual(cardsIn(), before, "no re-render while confirming");
-  // And another card's buttons can't start a second ceremony.
-  button(cardsIn()[1], "Allow once (expires in 10 min)").click(); await flush();
+  run("act('approve', { id: 'q-b', uses: 1, ttl_secs: 600 })"); await flush();
   assert.strictEqual(began().length, 1);
 
   // Its own button signs exactly the action shown; then the page refreshes again.
@@ -221,12 +215,11 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(fin[0].body.challenge, "Y2g");
   assert.strictEqual(ids.confirm.hidden, true);
   await flush();
-  assert.deepStrictEqual(cardsIn().map(idOf), ["q-x", "q-b", "q-a"]);
 
   // Cancel closes it without a ceremony.
   await advance(1000);
   nextAction = { ...nextAction, request: "q-b", decision: "deny", uses: null, ttl_secs: null, blast: null, update: null };
-  button(cardsIn()[1], "Don't allow").click(); await flush();
+  run("act('deny', { id: 'q-b' })"); await flush();
   assert.strictEqual(ids.confirm.hidden, false);
   assert.ok(ids["confirm-what"].textContent.startsWith("Deny"), ids["confirm-what"].textContent);
   assert.strictEqual(ids["confirm-blast"].hidden, true, "a denial widens nothing");
@@ -332,16 +325,6 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual([began().length, ids.confirm.hidden], [afterCancel + 1, false], "and the next tap opens a sheet as usual");
   ids["confirm-cancel"].listeners.click(); await flush();
   skew = 0;
-  // A push's card says the window it is granted as, from the server's terms (#574 review).
-  const pushReq = { id: "q-push", risk: "R4ExecOrPrivilege", method: "POST", host: "github.com", path: "/acme/app.git/git-receive-pack", scope_prefix: false,
-    reason: "push", identity: { verified: true, agent: "a", zone: "z", acting_for: [], id: "spiffe://x/a/a" }, attribution: [], zone: "z", run: "run_a",
-    created_at: 1, once_terms: { uses: null, ttl_secs: 300 } };
-  const pc = run("(r => pendingCard({ now: 2 }, r))")(pushReq);
-  const pt = pc.textContent;
-  assert.ok(pt.includes("Allow for 5 min") && pt.includes("allowed as one window") && !pt.includes("one request at a time"), pt);
-  // A push to another host is R2, but granted as the same window: no hour button (#597 re-review).
-  const r2 = run("(r => pendingCard({ now: 2 }, r))")({ ...pushReq, id: "q-push2", risk: "R2WriteReversible", host: "git.example" }).textContent;
-  assert.ok(r2.includes("Allow for 5 min") && !r2.includes("1 hour"), r2);
   // An error that stays is gone once a sheet opens: it would sit above it.
   run("toastError({ name: 'Error', message: 'earlier' })");
   assert.strictEqual(ids.msg.hidden, false);
@@ -377,12 +360,6 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(run("settled()"), false, "taps wait a moment after the card grows");
   toggle.click();
   assert.deepStrictEqual([idl.hidden, toggle.getAttribute("aria-expanded")], [true, "false"]);
-  // #709 review: how far a grant reaches is said on the card, not under Details.
-  for (const card of cardsIn()) {
-    const onCard = card.children.filter(n => n.className === "who"), det = card.all(n => n.tagName === "details")[0];
-    assert.ok(onCard.length === 1 && onCard[0].textContent.includes("could use the grant"), card.textContent);
-    assert.ok(!det.textContent.includes("could use the grant"), "not only under Details");
-  }
   console.log("console approval flow: ok");
 
   // #173: a run's authority and an explained decision open read-only in the detail card, and an
@@ -536,11 +513,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   const mineRow = ids.push.all(n => n.className === "row push-dev" && n.textContent.includes("(this device)"))[0];
   await mineRow.all(n => n.tagName === "button" && n.textContent === "Remove")[0].click(); await settle();
   assert.strictEqual(subscribed, null, "removing this device unsubscribes the browser");
-  // A tap on a notification while the console is open marks that request's card.
-  state = { ...base, pending: [A, B] };
-  await run("refresh()"); await flush();
-  swListener({ data: { open: "q-b" } });
-  assert.deepStrictEqual(cardsIn().map(c => c.className), ["card req", "card req opened"]);
+  // A tap on a notification while the console is open marks that request's card: inbox.mjs's.
   console.log("console notifications: ok");
 
   // Secrets: listed by name, kind, hosts and users; a value is typed into a password field cleared on
@@ -839,6 +812,33 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await run("refresh()"); await flush();
   assert.ok(ids.fenced.textContent.startsWith("None: no agent's box is held"), ids.fenced.textContent);
   console.log("console fenced runs: ok");
+
+  // #711: Add a device signs an enrol_link; the sheet says who the device is enrolled as, and the
+  // link the server returns is shown once in the passkeys card.
+  state = { ...base, pending: [], passkeys: [{ id: "cred-1", name: "laptop" }] };
+  await run("refresh()"); await flush();
+  await advance(1000);
+  assert.ok(!ids.operator.textContent.includes("run `wicket operator enrol-link` on the host and open"), ids.operator.textContent);
+  nextAction = { v: 1, action: "enrol_link", tenant: "t0", credential: "cred-1", name: "laptop", enrols_as: "passkey/laptop", ttl_secs: 300, uses: 1 };
+  ids.operator.all(n => n.tagName === "button" && n.textContent === "Add a device")[0].click(); await flush();
+  assert.strictEqual(began().pop().body.action, "enrol_link");
+  const ew = ids["confirm-what"].textContent;
+  assert.ok(ew.startsWith("Make a one-time link that enrols another device as laptop (passkey/laptop, the same operator and authority)") && ew.includes("for 5 minutes"), ew);
+  run("showEnrolLink({ link: 'https://c.example/enrol?t=abc', expires_in_secs: 300 })");
+  ids["confirm-cancel"].listeners.click(); await flush();
+  await run("refresh()"); await flush();
+  assert.ok(ids.operator.textContent.includes("https://c.example/enrol?t=abc"), ids.operator.textContent);
+  // Signing out forgets the link: whoever signs in next on this tab doesn't see it.
+  ids.operator.all(n => n.tagName === "button" && n.textContent === "Sign out")[0].click(); await flush();
+  assert.strictEqual(run("enrolLink"), null);
+  await run("refresh()"); await flush();
+  assert.ok(!ids.operator.textContent.includes("https://c.example/enrol?t=abc"), ids.operator.textContent);
+  // boot() forgets it too, however it is reached.
+  run("showEnrolLink({ link: 'https://c.example/enrol?t=def', expires_in_secs: 300 })");
+  await run("boot()"); await flush();
+  assert.strictEqual(run("enrolLink"), null);
+  assert.ok(!ids.operator.textContent.includes("t=def"), ids.operator.textContent);
+  console.log("console enrol a device: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open
   // console is told, and one notification says so; tapping it opens the console's notifications.

@@ -72,15 +72,21 @@ const ROUTES: &[&str] = &[
     "/api/runs",
     "/api/manifests/manifests/a.yaml",
     "/api/manifests/check",
+    "/api/messages",
+    "/api/messages/read",
     "/api/policy/preview",
     "/api/policy",
     "/api/runs/run_01authz0000000000000000000/authority",
     "/api/runs/run_01authz0000000000000000000/placement",
     "/api/explain/1",
+    "/api/nodes/n1/ca",
+    "/api/nodes/nope/ca",
     "/api/push",
     "/api/push/subscribe",
     "/api/push/remove",
     "/api/push/details",
+    "/api/names",
+    "/api/names/n-1",
     "/api",
     "/admin",
     "/.env",
@@ -142,7 +148,8 @@ async fn unauthenticated_requests_reach_only_the_sign_in_surface() {
         if let Some(c) = &c {
             h.push(("cookie", c.as_str()));
         }
-        for path in ["/", "/session", "/session?run=run_secret", "/manifest.webmanifest", "/static/icon.svg", "/static/icon-192.png"] {
+        let (manifest, svg, png) = (served("/static/manifest."), served("/static/icon."), served("/static/icon-192."));
+        for path in ["/", "/session", "/session?run=run_secret", manifest.as_str(), svg.as_str(), png.as_str()] {
             let (status, _, body) = call(&t.state, "GET", path, &h, b"").await;
             assert_eq!(status, StatusCode::OK, "{path}");
             for s in secrets {
@@ -234,12 +241,43 @@ async fn every_response_carries_the_security_headers() {
 
 #[test]
 fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
-    let page = std::str::from_utf8(&ASSETS.page).unwrap();
+    let page = std::str::from_utf8(&ASSETS.page.body).unwrap();
     assert!(!page.contains("<style") && !page.contains("style="), "inline style");
     assert!(!page.split_whitespace().any(|w| w.starts_with("on") && w.contains('=')), "inline event handlers");
     let scripts: Vec<&str> = page.match_indices("<script").map(|(i, _)| &page[i..]).collect();
-    assert_eq!(scripts.len(), 1);
+    assert_eq!(scripts.len(), 2, "console.js, then the modules' entry (#574)");
     assert!(scripts[0].starts_with("<script src=\"/static/console.") && scripts[0].contains("></script>"), "{}", scripts[0]);
+    assert!(scripts[1].starts_with("<script type=\"module\" src=\"/static/m.") && scripts[1].contains("></script>"), "{}", scripts[1]);
+    // The modules (#574): one directory named by a hash over them all, each file preloaded or loaded
+    // with its Subresource Integrity, and none of the console's own using a raw HTML or code sink
+    // (lit-html's one `innerHTML` is through its Trusted Types policy, #739).
+    let modules: Vec<_> = ASSETS.files.iter().filter(|(p, _)| p.starts_with("/static/m.")).collect();
+    assert!(modules.len() >= 5, "inbox.js and lit-html's four modules: {:?}", modules.iter().map(|m| m.0).collect::<Vec<_>>());
+    let dir = modules[0].0.split('/').nth(2).unwrap();
+    for (path, a) in &modules {
+        assert_eq!(path.split('/').nth(2), Some(dir), "one directory");
+        let sri = format!("sha256-{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sha2::Sha256::digest(&a.body)));
+        assert!(page.contains(&format!("=\"{path}\" integrity=\"{sri}\"")), "{path} with its integrity");
+        assert!(a.immutable);
+        if !path.contains("/vendor/") {
+            let js = std::str::from_utf8(&a.body).unwrap();
+            for bad in [
+                "innerHTML",
+                "outerHTML",
+                "insertAdjacentHTML",
+                "eval(",
+                "new Function",
+                "document.write",
+                ".cssText",
+                "unsafeHTML",
+                "unsafeStatic",
+                "unsafeSVG",
+                "unsafeMathML",
+            ] {
+                assert!(!js.contains(bad), "{path} uses {bad}");
+            }
+        }
+    }
     assert!(!page.contains("{{"), "every placeholder filled");
     for (path, a) in ASSETS.files.iter().filter(|(p, _)| p.starts_with("/static/console.")) {
         let digest = sha2::Sha256::digest(&a.body);
@@ -260,7 +298,8 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
         assert!(!js.contains(bad), "console.js uses {bad}");
     }
     // The manifest is valid, and every icon it names is served.
-    let m: Value = serde_json::from_slice(&ASSETS.files["/manifest.webmanifest"].body).unwrap();
+    let manifest = served("/static/manifest.");
+    let m: Value = serde_json::from_slice(&ASSETS.files[&manifest].body).unwrap();
     assert_eq!((m["display"].as_str(), m["start_url"].as_str()), (Some("standalone"), Some("/")));
     for icon in m["icons"].as_array().unwrap() {
         let src = icon["src"].as_str().unwrap();
@@ -272,7 +311,67 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
             assert_eq!(icon["sizes"].as_str().unwrap(), format!("{w}x{w}"));
         }
     }
-    assert!(page.contains("rel=\"manifest\" href=\"/manifest.webmanifest\"") && page.contains("apple-touch-icon"));
+    assert!(page.contains(&format!("rel=\"manifest\" href=\"{manifest}\"")) && page.contains("apple-touch-icon"));
+    // #574: every file under /static/ is named by its content's hash (the icons and the manifest
+    // too), and what names them (the manifest, the service worker, the page) names them so.
+    for (path, a) in ASSETS.files.iter().filter(|(p, _)| p.starts_with("/static/") && !p.starts_with("/static/m.")) {
+        let hash = &hex::encode(sha2::Sha256::digest(&a.body))[..16];
+        assert!(path.contains(&format!(".{hash}.")), "{path} is named by its hash");
+        assert!(a.immutable, "{path}");
+    }
+    let sw = std::str::from_utf8(&ASSETS.files["/sw.js"].body).unwrap();
+    assert!(
+        sw.contains(&format!("\"{}\"", served("/static/icon-192."))) && !sw.contains("\"/static/icon-192.png\""),
+        "the service worker names the hashed icon"
+    );
+    assert!(!ASSETS.files["/sw.js"].immutable, "the service worker keeps its name and is asked for anew");
+}
+
+/// The path a file starting with `prefix` is served at (named by its hash, #574).
+fn served(prefix: &str) -> String {
+    ASSETS.files.keys().find(|k| k.starts_with(prefix)).unwrap_or_else(|| panic!("nothing served at {prefix}…")).clone()
+}
+
+/// #574: the static files are Brotli-compressed at build time, and sent so to a browser that accepts
+/// `br`; the original to one that doesn't say so (or refuses it with q=0). Either way the response
+/// varies by Accept-Encoding, and the copy decodes to the original.
+#[tokio::test]
+async fn static_files_are_sent_brotli_compressed_to_browsers_that_accept_it() {
+    let t = setup("brotli");
+    let js = ASSETS.files.keys().find(|k| k.starts_with("/static/console.") && k.ends_with(".js")).unwrap().clone();
+    for path in ["/", "/sw.js", js.as_str()] {
+        let original = if path == "/" { &ASSETS.page } else { &ASSETS.files[path] };
+        let br = original.br.as_ref().expect("a text file has a smaller Brotli copy");
+        assert!(br.len() < original.body.len() / 2, "{path}: {} -> {}", original.body.len(), br.len());
+        let mut decoded = vec![];
+        brotli_decompressor::BrotliDecompress(&mut &br[..], &mut decoded).unwrap();
+        assert_eq!(decoded, original.body, "{path}: the copy decodes to the original");
+        for (accept, want) in [
+            ("gzip, deflate, br, zstd", Some("br")),
+            ("br", Some("br")),
+            ("*", Some("br")),
+            ("gzip", None),
+            ("br;q=0, gzip", None),
+            ("", None),
+        ] {
+            let h: Vec<(&str, &str)> = if accept.is_empty() { vec![] } else { vec![("accept-encoding", accept)] };
+            let req =
+                h.iter().fold(Request::builder().method("GET").uri(path).header("host", "localhost:8787"), |r, (k, v)| r.header(*k, *v));
+            let r = route(req.body(Full::new(Bytes::new())).unwrap(), &t.state, PEER.parse().unwrap()).await;
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert_eq!(r.headers().get("content-encoding").map(|v| v.to_str().unwrap()), want, "{path} with {accept:?}");
+            assert_eq!(r.headers()["vary"], "accept-encoding", "{path}");
+            let body = r.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body, if want.is_some() { br.clone() } else { original.body.clone() }, "{path} with {accept:?}");
+        }
+    }
+    // Any file with a copy, images too, decodes to the original.
+    for (path, a) in ASSETS.files.iter().filter_map(|(p, a)| a.br.as_ref().map(|br| (p, (a, br)))) {
+        let mut decoded = vec![];
+        brotli_decompressor::BrotliDecompress(&mut &a.1[..], &mut decoded).unwrap();
+        assert_eq!(decoded, a.0.body, "{path}");
+    }
+    assert!(crate::serve::web::accepts(Some("gzip;q=1.0, br;q=0.5"), "br") && !crate::serve::web::accepts(Some("*;q=0"), "br"));
 }
 
 /// #327: the session view's page, as embedded (the built bundle, or the placeholder a build without
@@ -280,8 +379,12 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
 /// and no eval in the bundle (the CSP would refuse it).
 #[tokio::test]
 async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
-    use crate::serve::web::{SESSION_CSS, SESSION_JS, SESSION_VIEW_BUILT};
-    let page = std::str::from_utf8(&ASSETS.session_page).unwrap();
+    use crate::serve::web::SESSION_VIEW_BUILT;
+    let page = std::str::from_utf8(&ASSETS.session_page.body).unwrap();
+    let file = |ext: &str| {
+        ASSETS.files.iter().find(|(k, _)| k.starts_with("/static/session.") && k.ends_with(ext)).map(|(_, a)| a.body.clone()).unwrap()
+    };
+    let (session_js, session_css) = (file(".js"), file(".css"));
     assert!(!page.contains("{{"), "every placeholder filled");
     assert!(!page.contains("<style") && !page.contains("style="), "inline style");
     let scripts: Vec<&str> = page.match_indices("<script").map(|(i, _)| &page[i..]).collect();
@@ -299,7 +402,9 @@ async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
     assert_eq!(h["content-security-policy"], CSP);
     assert_eq!(h["cache-control"], "no-store");
     assert_eq!(body, page, "the same page for every run: it reads the run from its URL");
-    for (ext, ctype, bytes) in [("js", "text/javascript; charset=utf-8", SESSION_JS), ("css", "text/css; charset=utf-8", SESSION_CSS)] {
+    for (ext, ctype, bytes) in
+        [("js", "text/javascript; charset=utf-8", &session_js[..]), ("css", "text/css; charset=utf-8", &session_css[..])]
+    {
         let digest = sha2::Sha256::digest(bytes);
         let path = format!("/static/session.{}.{ext}", &hex::encode(digest)[..16]);
         let sri = format!("sha256-{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest));
@@ -311,7 +416,7 @@ async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
         assert_eq!(h["content-security-policy"], CSP);
         assert_eq!(body.as_bytes(), bytes);
     }
-    let js = std::str::from_utf8(SESSION_JS).unwrap();
+    let js = std::str::from_utf8(&session_js).unwrap();
     for bad in ["eval(", "new Function", "document.write"] {
         assert!(!js.contains(bad), "the session bundle uses {bad}");
     }
@@ -705,6 +810,151 @@ async fn a_host_link_enrols_one_passkey_audited_with_the_link_and_client() {
     let (status, ch) = register_begin_as(&t, &boot).await;
     assert_eq!((status, ch), (StatusCode::UNAUTHORIZED, None));
     assert!(open_link(&t, PEER, &link).await.is_none());
+}
+
+/// #711: a signed-in operator makes a link for another device with a passkey signature; it is
+/// single use, short-lived, shown once, audited, and enrols the same operator, never another.
+#[tokio::test]
+async fn a_signed_in_operator_makes_a_link_that_enrols_the_same_operator_on_another_device() {
+    let mut t = setup("enrol-console");
+    for ttl in [0, 59, 601] {
+        let r = t.begin(json!({ "action": "enrol_link", "ttl_secs": ttl }));
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{ttl}: {:?}", r.body);
+    }
+    let b = t.begin(json!({ "action": "enrol_link" }));
+    assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+    assert_eq!(b.body["action"]["enrols_as"], "passkey/laptop");
+    assert_eq!(b.body["action"]["ttl_secs"], 300);
+    assert_eq!(b.body["action"]["uses"], 1);
+    assert!(audits(&t, "operator.enrol_link_issued").is_empty(), "nothing is made before it is signed");
+
+    let r = t.act(json!({ "action": "enrol_link", "ttl_secs": 120 }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let path = r.body["path"].as_str().unwrap().to_string();
+    assert_eq!(r.body["link"].as_str().unwrap(), format!("{ORIGIN}{path}"));
+    assert_eq!(r.body["expires_in_secs"], 120);
+    let issued = audits(&t, "operator.enrol_link_issued");
+    assert_eq!(issued.len(), 1);
+    let token = path.strip_prefix("/enrol?t=").unwrap();
+    assert!(!issued[0].to_string().contains(token), "the token is never on the record");
+    assert_eq!((issued[0]["via"].as_str(), issued[0]["name"].as_str()), (Some("console"), Some("laptop")));
+    assert!(issued[0]["signed"]["signature"].is_string());
+    assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (1, 0), "re-verifies offline");
+
+    // The new device asks to be "second phone"; it is enrolled as laptop, the operator who made it.
+    let boot = open_link(&t, PEER, &path).await.expect("the link works once");
+    let ch = register_begin_as(&t, &boot).await.1.unwrap();
+    let key = SigningKey::generate();
+    let (status, _, body) = post_json(&t.state, "/api/register/finish", Some(&boot), &attestation(&ch, &key, b"cred-2")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let creds = t.ledger().operator_credentials(&TenantId::single()).unwrap();
+    assert!(creds.iter().any(|c| c.id == b64u(b"cred-2") && c.name == "laptop"), "{creds:?}");
+    let added = audits(&t, "operator.passkey_added");
+    assert_eq!((added[0]["made_by"].as_str(), added[0]["asked_name"].as_str()), (Some(t.cred.as_str()), Some("second phone")));
+    assert!(open_link(&t, PEER, &path).await.is_none(), "single use");
+
+    // A link whose maker is revoked before it is used enrols nothing.
+    let r = t.act(json!({ "action": "enrol_link" }));
+    let path = r.body["path"].as_str().unwrap().to_string();
+    t.ledger().reset_operator_credentials(&TenantId::single()).unwrap();
+    let boot = open_link(&t, PEER, &path).await.unwrap();
+    let ch = register_begin_as(&t, &boot).await.1.unwrap();
+    let (status, _, body) = post_json(&t.state, "/api/register/finish", Some(&boot), &attestation(&ch, &key, b"cred-3")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("no longer enrolled"), "{body}");
+    assert!(!t.ledger().operator_credentials_all(&TenantId::single()).unwrap().iter().any(|c| c.id == b64u(b"cred-3")));
+}
+
+/// #777 review: a signed action is the session's own passkey's. Another enrolled passkey's
+/// signature on this session's challenge is refused and audited, for every action.
+#[tokio::test]
+async fn only_the_sessions_own_passkey_signs_its_actions() {
+    let mut t = setup("signer");
+    let other = SigningKey::generate();
+    let p = other.verifying_key().to_sec1_point(false);
+    t.ledger()
+        .add_operator_credential(
+            &TenantId::single(),
+            &OperatorCredential {
+                id: b64u(b"cred-2"),
+                name: "admin".into(),
+                x: p.x().unwrap().as_slice().try_into().unwrap(),
+                y: p.y().unwrap().as_slice().try_into().unwrap(),
+                sign_count: 0,
+            },
+        )
+        .unwrap();
+    for body in [json!({ "action": "enrol_link" }), json!({ "action": "revoke", "run": "run_x", "reason": "x" })] {
+        let b = t.begin(body.clone());
+        if b.status != StatusCode::OK {
+            // revoke needs an identity: give it one.
+            t.running("run_x", "lead");
+        }
+        let b = t.begin(body);
+        assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+        let allow = b.body["publicKey"]["allowCredentials"].as_array().unwrap();
+        assert_eq!(allow.len(), 1, "only the session's passkey is offered: {allow:?}");
+        assert_eq!(allow[0]["id"], t.cred.as_str());
+        let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
+        // Signed by the other passkey, as the other passkey.
+        let (key, cred) = (std::mem::replace(&mut t.key, other.clone()), std::mem::replace(&mut t.cred, b64u(b"cred-2")));
+        let a = t.sign(&ch);
+        t.key = key;
+        t.cred = cred;
+        let r = t.post("/api/action/finish", a);
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{:?}", r.body);
+        assert!(r.body["error"].as_str().unwrap().contains("the passkey you signed in with"), "{:?}", r.body);
+    }
+    let refused = audits(&t, "operator.action_refused");
+    assert_eq!(refused.len(), 2);
+    assert_eq!(
+        (refused[0]["credential"].as_str(), refused[0]["session_credential"].as_str()),
+        (Some(b64u(b"cred-2").as_str()), Some(t.cred.as_str()))
+    );
+    assert!(audits(&t, "operator.enrol_link_issued").is_empty() && audits(&t, "identity.revoked").is_empty(), "nothing was done");
+    // The session's own passkey still signs.
+    let r = t.act(json!({ "action": "enrol_link" }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+}
+
+/// #777 review, low: ttl_secs is a whole number; a link with no record, or whose maker was revoked,
+/// enrols nothing, the refusal is audited, and the link's session ends.
+#[tokio::test]
+async fn an_enrolment_link_without_a_live_maker_enrols_nothing_and_ends_its_session() {
+    let mut t = setup("enrol-refused");
+    for ttl in [json!(300.5), json!("300"), json!(true)] {
+        let r = t.begin(json!({ "action": "enrol_link", "ttl_secs": ttl }));
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{ttl}: {:?}", r.body);
+    }
+    // A session for a link with no record.
+    let boot = token_of(&set_session(&t.state, SessionKind::Bootstrap { link: "f".repeat(64) }, LOCAL).unwrap());
+    let ch = register_begin_as(&t, &boot).await.1.unwrap();
+    let key = SigningKey::generate();
+    let (status, _, body) = post_json(&t.state, "/api/register/finish", Some(&boot), &attestation(&ch, &key, b"cred-9")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("no record"), "{body}");
+    // A console link whose maker is revoked: refused, audited, and its session ended.
+    let path = t.act(json!({ "action": "enrol_link" })).body["path"].as_str().unwrap().to_string();
+    t.ledger().reset_operator_credentials(&TenantId::single()).unwrap();
+    let boot = open_link(&t, PEER, &path).await.unwrap();
+    let ch = register_begin_as(&t, &boot).await.1.unwrap();
+    let (status, _, _) = post_json(&t.state, "/api/register/finish", Some(&boot), &attestation(&ch, &key, b"cred-8")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let failed = audits(&t, "operator.enrol_failed");
+    assert!(failed.iter().any(|f| f["reason"].as_str().unwrap_or("").contains("no longer enrolled")), "{failed:?}");
+    assert!(failed.iter().any(|f| f["reason"].as_str().unwrap_or("").contains("no record")), "{failed:?}");
+    // Each refusal names the client, as the success record does.
+    assert!(
+        failed.iter().filter(|f| !f["reason"].as_str().unwrap_or("").contains("invalid")).all(|f| f["client"].is_string()),
+        "{failed:?}"
+    );
+    assert_eq!(register_begin_as(&t, &boot).await.0, StatusCode::UNAUTHORIZED, "the link's session ended");
+    assert!(t
+        .ledger()
+        .operator_credentials_all(&TenantId::single())
+        .unwrap()
+        .iter()
+        .all(|c| c.id != b64u(b"cred-8") && c.id != b64u(b"cred-9")));
 }
 
 #[tokio::test]

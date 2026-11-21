@@ -25,11 +25,11 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `acp.allow_subscription_backed_claude_adapter` | boolean | `false` | Whether Claude Code may run through its ACP adapter (`agent.acp.profile: claude-agent-acp`) on the zone's Claude subscription. The adapter runs the `claude` binary through the Claude Agent SDK, and whether a subscription may back that is the owner's reading of the subscription's terms ([research 21 §2.6](../explanation/research/21-agent-client-protocol.md#26-claude-code-over-acp-stays-the-fallback-not-the-default)). While it is `false`, such a run is refused when it starts, and so is a wake. |
 | `names.internal.per_workload` | integer ≥ 1 | `3` | The most live internal names one workload (an agent's principal) holds at once. |
 | `names.public` | mapping | absent | Public names for boxes (`<label>.<zone>`, [box DNS](../explanation/box-dns.md)). Absent: this installation publishes none, and `request_name` with `kind: public` is refused. |
-| `names.public.provider` | `noop` | required | Who publishes the zone's records. `noop` publishes nothing and records each plan; `vultr` and `rfc2136` are to come. |
+| `names.public.provider` | `noop` or `vultr` | required | Who publishes the zone's records. `noop` publishes nothing and records each plan; `vultr` writes them with Vultr's DNS API ([providers](../explanation/box-dns.md#providers)); `rfc2136` is to come. |
 | `names.public.zone` | DNS domain | required | The boxes domain. A delegated subzone is recommended, so the provider's credential touches nothing else. Not under `wicket.internal`. |
-| `names.public.credential` | vault secret name | none | The provider's credential, by name. The `noop` provider takes none. |
+| `names.public.credential` | vault secret name | none | The provider's credential, by name, read from the vault at each `wicket reconcile` pass. `vultr` needs one (a Vultr API key: `wicket secret set dns-boxes --hosts api.vultr.com`); the `noop` provider takes none. |
 | `names.public.owner` | 8–32 lower-case hex characters | required | This installation's owner id, written in its owner records. Random and made once (`openssl rand -hex 8`): no host name or other detail in it. |
-| `names.public.ttl` | seconds, 30–3600 | `60` | The records' TTL. |
+| `names.public.ttl` | seconds, 30–3600 (60 or more with `vultr`, which raises a lower one to 60) | `60` | The records' TTL. |
 | `names.public.per_workload` | integer ≥ 1 | `1` | The most live public names one workload holds at once. An ask beyond it is refused, and so is an approval. |
 | `names.public.reserved` | list of labels | `[]` | Labels no box gets, besides wicket's own (`wicket`, `console`, `www`, `api`, `admin`, `mail`, `ns`). Their lookalikes (`5tatus` for `status`) are refused too. |
 | `names.public.console_host` | host name | none | The console's host name: its first label is reserved too, and, for a host under the boxes zone, the label directly under the zone. |
@@ -77,11 +77,17 @@ default: anything            # for operators not listed: anything (the default),
 operators:
   unix/alice: anything
   passkey/laptop:
-    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority, fence, policy
+    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority, fence, policy, node
     hosts: ["*.example.com"] # for http requests: these hosts only (absent: any)
     max_risk: R2             # the highest risk it may decide (absent: any)
   unix/auditor: nothing      # may list requests, decides none
 ```
+
+Kind `node` (at R4) is setting a node's public addresses, in the console or with
+`wicket node set --public-ipv4/--public-ipv6`: a public name's records point at them. With
+`default: anything`, or no `operators.yaml` at all, every passkey and every CLI operator may set
+them, as they may decide public names (`name`); list the operators, or give the default a scope,
+to narrow it.
 
 `capacity` covers a CAPACITY request and, at R4, releasing a placed server past its lease from the console
 (#710): it stops the boxes still running there and loses the files it keeps.

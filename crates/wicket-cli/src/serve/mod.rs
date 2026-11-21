@@ -2,12 +2,15 @@
 //! to be reachable directly from the internet.
 //!
 //! Security flow:
-//! 1. **Enrolment** is host-only. At start-up, *only if no operator passkey exists yet*, a one-time
-//!    enrolment link is printed on the host; `wicket operator enrol-link` prints a fresh one at any
-//!    time (another device, a lost passkey). Links are kept in the ledger by the hash of their token,
-//!    are single-use, expire (10 minutes by default), and the session one opens can do one thing:
-//!    register one passkey. It cannot view runs or decide anything. A signed-in operator session
-//!    cannot enrol a passkey, so a stolen session cookie can't add one.
+//! 1. **Enrolment** starts on the host. At start-up, *only if no operator passkey exists yet*, a
+//!    one-time enrolment link is printed on the host; `wicket operator enrol-link` prints a fresh one
+//!    at any time (another device, a lost passkey). A signed-in operator can also make one for
+//!    another device of theirs ([`enrol`], #711): a passkey-signed action, at most 10 minutes, and the
+//!    passkey it enrols is the same operator (its maker's name), never more. Links are kept in the
+//!    ledger by the hash of their token, are single-use, expire (10 minutes by default), and the
+//!    session one opens can do one thing: register one passkey. It cannot view runs or decide
+//!    anything. A signed-in operator session cannot register a passkey itself, and a stolen session
+//!    cookie can't make a link.
 //! 2. **Sign-in** is a passkey assertion (user verification required; no password, no fallback),
 //!    rate-limited and locked out per client address and per passkey ([`limits`]), with one uniform
 //!    error and every failure and lockout audited. It gives a session (`__Host-` cookie: Secure,
@@ -60,10 +63,14 @@
 mod acme;
 mod authority;
 mod capacity;
+mod enrol;
 mod fence;
 pub(crate) mod limits;
 mod manifests;
+mod messages;
+mod names;
 pub(crate) mod net;
+mod nodes;
 mod orgpolicy;
 mod placed;
 mod placement;
@@ -124,8 +131,9 @@ const MAX_REASON: usize = 500;
 const DENIED: &str = r#"{"error":"sign in with your passkey"}"#;
 /// The one answer to a failed sign-in, whatever failed.
 const SIGN_IN_FAILED: &str = "sign-in failed";
-/// Why a session that didn't come from an enrolment link can't register a passkey.
-const ENROL_ON_HOST: &str = "adding a passkey needs a one-time enrolment link: run `wicket operator enrol-link` on the host";
+/// Why a session that didn't come from an enrolment link can't register a passkey, and where links
+/// come from: a signed-in operator makes one with Add a device (#711); the host makes the first.
+const ENROL_ON_HOST: &str = "adding a passkey needs a one-time enrolment link: signed in, use Add a device under Your passkeys and open the link on the new device; with no passkey yet, run `wicket operator enrol-link` on the host";
 
 #[derive(Clone, Debug, PartialEq)]
 enum SessionKind {
@@ -218,11 +226,54 @@ enum Action {
         id: String,
         ttl_secs: Option<u64>,
     },
+    /// Make a one-time link that enrols another device as this operator (#711).
+    EnrolLink {
+        ttl_secs: u64,
+    },
+    /// Send a message to an agent as the passkey's operator (#252), as `wicket message send` does.
+    SendMessage {
+        /// The passkey of the session it was begun in: the one it is from, which must sign it.
+        credential: String,
+        to: String,
+        text: String,
+        priority: wicket_store::Priority,
+        in_reply_to: Option<String>,
+    },
     /// Release a run's fence without its node (#690), on the effect the passkey signed.
     ReleaseFence {
         run: String,
         reason: String,
         effect: String,
+    },
+    /// Approve an ask for a public name (#575 step 4d): for the agent or its zone, for `ttl_secs`
+    /// (None: until revoked, or a run-scoped name), on the effect and the target (the asking run's
+    /// node and its addresses) the passkey signed.
+    NameApprove {
+        id: String,
+        bound: wicket_store::StandingBound,
+        ttl_secs: Option<u64>,
+        effect: String,
+        target: Box<Value>,
+    },
+    NameDeny {
+        id: String,
+    },
+    /// Move a live standing name's lapse to `ttl_secs` from now (None: until revoked), if it still
+    /// lapses at `previous`, as shown.
+    NameRenew {
+        id: String,
+        ttl_secs: Option<u64>,
+        previous: Option<i64>,
+    },
+    NameRevoke {
+        id: String,
+    },
+    /// Set or clear a node's public addresses, if they are still `old`, as shown.
+    NodeAddresses {
+        node: String,
+        ipv4: wicket_store::AddressChange<std::net::Ipv4Addr>,
+        ipv6: wicket_store::AddressChange<std::net::Ipv6Addr>,
+        old: wicket_store::NodeAddresses,
     },
     /// Apply an org policy (#712), on the preview the passkey signed.
     PolicyApply(Box<orgpolicy::PolicyApply>),
@@ -320,6 +371,9 @@ struct State {
     progress: Mutex<(i64, bool, Option<crate::statesync::Progress>)>,
     /// What the alerts remember between reads, and the alerts the last read raised (#635).
     progress_alerts: Mutex<(crate::statesync::Watch, Vec<crate::health::Alert>)>,
+    /// The installation's issuer, which signs an operator's messages and verifies its inbox
+    /// ([`messages`], #252). None: messages are unavailable here.
+    issuer: Option<Arc<wicket_identity::Issuer>>,
 }
 
 impl State {
@@ -370,6 +424,7 @@ impl State {
             push,
             progress: Mutex::new((wicket_feed::now_ms(), false, None)),
             progress_alerts: Mutex::new((crate::statesync::Watch::new(wicket_feed::now_ms()), Vec::new())),
+            issuer: None,
         }
     }
 }
@@ -428,6 +483,13 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         |l, run| crate::verified_identity(l, run, None),
     );
     state.updater = Box::new(move |request, log| apply_update_detached(&update_exe, request, log));
+    state.issuer = match crate::issuer() {
+        Ok(i) => Some(Arc::new(i)),
+        Err(e) => {
+            tracing::warn!("console messages are off: {e:#}");
+            None
+        }
+    };
     state.policy_applier = Box::new(move |a| orgpolicy::apply_detached(&policy_exe, a));
     let release_ledger = ledger_path();
     state.releaser = Box::new(move |r| placed::release_in_background(release_ledger.clone(), r));
@@ -538,10 +600,20 @@ fn random_hex(n: usize) -> String {
 /// Issues a single-use enrolment link valid for `ttl_secs` and returns its token (the link is
 /// `ORIGIN/enrol?t=TOKEN`). Only the token's hash is stored. Audited.
 pub fn issue_enrol_link(l: &Ledger, tenant: &TenantId, ttl_secs: i64, by: &str) -> Result<String> {
+    issue_enrol_link_with(l, tenant, ttl_secs, by, json!({}))
+}
+
+/// [`issue_enrol_link`], with `extra` on its audit record (the console's signed assertion). The
+/// link is recorded only once its audit record is.
+fn issue_enrol_link_with(l: &Ledger, tenant: &TenantId, ttl_secs: i64, by: &str, extra: Value) -> Result<String> {
     let token = random_hex(24);
     let id = session_id(&token);
+    let mut rec = json!({ "link": &id[..16], "ttl_secs": ttl_secs, "by": by });
+    if let (Some(r), Value::Object(x)) = (rec.as_object_mut(), extra) {
+        r.extend(x);
+    }
+    l.audit(tenant, None, "operator.enrol_link_issued", &rec)?;
     l.add_enrol_link(tenant, &id, wicket_store::now() + ttl_secs, by)?;
-    l.audit(tenant, None, "operator.enrol_link_issued", &json!({ "link": &id[..16], "ttl_secs": ttl_secs, "by": by }))?;
     Ok(token)
 }
 
@@ -806,15 +878,29 @@ where
 
     // The pre-auth surface: the page, its static files, sign-in, the enrolment link.
     if method == Method::GET {
+        // The page, a run's session view (#327: a static page, as `/` is; it asks for a passkey to
+        // open), and the files they load: each as build.rs made it, Brotli-compressed for a browser
+        // that accepts it (#574).
+        let accept = req.headers().get(http::header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok());
+        let send = |a: &web::Asset| {
+            let (body, encoding) = a.for_encoding(accept);
+            let mut r = resp(StatusCode::OK, a.ctype, body);
+            if a.br.is_some() {
+                r.headers_mut().insert(http::header::VARY, http::HeaderValue::from_static("accept-encoding"));
+            }
+            if let Some(e) = encoding {
+                r.headers_mut().insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static(e));
+            }
+            r
+        };
         if path == "/" {
-            return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.page.clone());
+            return send(&web::ASSETS.page);
         }
-        // A run's session view (#327): a static page, as `/` is; it asks for a passkey to open.
         if path == "/session" {
-            return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.session_page.clone());
+            return send(&web::ASSETS.session_page);
         }
         if let Some(a) = web::ASSETS.files.get(&path) {
-            let mut r = resp(StatusCode::OK, a.ctype, a.body.clone());
+            let mut r = send(a);
             let cache = if a.immutable {
                 "public, max-age=31536000, immutable"
             } else if path == "/sw.js" {
@@ -851,9 +937,32 @@ where
                 },
                 _ => denied(),
             },
+            // Messages with agents (#252): this operator's inbox, receipts and who it may write to.
+            "/api/messages" => match &sess {
+                Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
+                    Some(oc) => to_response(messages::view(state, &oc)),
+                    None => denied(),
+                },
+                _ => denied(),
+            },
             // Notifications: the VAPID public key and this operator's devices.
             "/api/push" => match &sess {
                 Some((_, SessionKind::Operator { cred })) => to_response(push_view(state, cred)),
+                _ => denied(),
+            },
+            // The Names card (#575 step 4d): an operator's session only.
+            "/api/names" => match &sess {
+                Some((_, SessionKind::Operator { .. })) => match state.ledger().and_then(|l| names::view(state, &l)) {
+                    Ok(v) => to_response(ok(v)),
+                    Err(e) => to_response(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+                },
+                _ => denied(),
+            },
+            p if p.starts_with("/api/names/") => match &sess {
+                Some((_, SessionKind::Operator { .. })) => match names::detail(state, &p["/api/names/".len()..]) {
+                    Ok(v) => to_response(ok(v)),
+                    Err(r) => to_response(r),
+                },
                 _ => denied(),
             },
             // A manifest, viewed (#172): an operator's session only.
@@ -867,9 +976,9 @@ where
                 },
                 _ => denied(),
             },
-            // Read-only views of authority (#173), and why a run went where it did (#579): an
-            // operator's session only.
-            p => match (authority::get(state, p).or_else(|| placement::get(state, p)), &sess) {
+            // Read-only views of authority (#173), of nodes (#573), and why a run went where it did
+            // (#579): an operator's session only.
+            p => match (authority::get(state, p).or_else(|| nodes::get(state, p)).or_else(|| placement::get(state, p)), &sess) {
                 (Some(r), Some((_, SessionKind::Operator { .. }))) => match r {
                     Ok(v) => to_response(ok(v)),
                     Err(e) => to_response(err(StatusCode::NOT_FOUND, e)),
@@ -1038,6 +1147,13 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
             Some((_, SessionKind::Operator { cred })) => secrets::unsigned(state, cred, p, body),
             _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
         },
+        "/api/messages/read" => match &sess {
+            Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
+                Some(oc) => messages::read(state, &oc, body),
+                None => err(StatusCode::UNAUTHORIZED, "the passkey you signed in with is no longer enrolled"),
+            },
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
         "/api/standing/revoke" => match &sess {
             Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
                 Some(oc) => standing::revoke(state, &oc, body),
@@ -1098,21 +1214,31 @@ fn register_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &V
     }
     match state.rp.verify_registration(&unb64u(ch).unwrap_or_default(), &cdj, &att) {
         Ok(c) => {
-            let name = body.get("name").and_then(|n| n.as_str()).unwrap_or("passkey").chars().take(40).collect::<String>();
-            let oc = OperatorCredential { id: b64u(&c.id), name, x: c.x, y: c.y, sign_count: c.sign_count };
+            let asked = body.get("name").and_then(|n| n.as_str()).unwrap_or("passkey").chars().take(40).collect::<String>();
             let l = match state.ledger() {
                 Ok(l) => l,
                 Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             };
+            let client = l.console_session(&state.tenant, sid, wicket_store::now()).ok().flatten().map(|s| s.client);
+            // A console link enrols its maker's operator again, on this device (#711).
+            let (name, made_by) = match enrol::enrolled_name(state, &l, link, &asked, client.as_deref()) {
+                Ok(x) => x,
+                Err(r) => {
+                    // The link was used: its session has nothing left to do.
+                    let _ = l.end_console_session(sid, "enrolment refused");
+                    return r;
+                }
+            };
+            let oc = OperatorCredential { id: b64u(&c.id), name, x: c.x, y: c.y, sign_count: c.sign_count };
             if let Err(e) = l.add_operator_credential(&state.tenant, &oc) {
                 return err(StatusCode::CONFLICT, e);
             }
-            let client = l.console_session(&state.tenant, sid, wicket_store::now()).ok().flatten().map(|s| s.client);
             let _ = l.audit(
                 &state.tenant,
                 None,
                 "operator.passkey_added",
-                &json!({ "credential": oc.id, "name": oc.name, "via": "enrolment link", "link": &link[..16.min(link.len())], "client": client }),
+                &json!({ "credential": oc.id, "name": oc.name, "via": "enrolment link", "link": &link[..16.min(link.len())], "client": client,
+                         "made_by": made_by, "asked_name": (made_by.is_some() && asked != oc.name).then_some(&asked) }),
             );
             // The enrolment session has done its one job: end it, so the next step is a real sign-in.
             let _ = l.end_console_session(sid, "enrolled");
@@ -1478,10 +1604,17 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         Some("standing_deny") => standing::build_deny(state, &l, body),
         Some("standing_renew") => standing::build_renew(state, &l, body),
         Some("release_fence") => fence::build_release(state, oc, &l, body),
+        Some("name_approve") => names::build_approve(state, oc, &l, body),
+        Some("name_deny") => names::build_deny(state, oc, &l, body),
+        Some("name_renew") => names::build_renew(state, oc, &l, body),
+        Some("name_revoke") => names::build_revoke(state, &l, body),
+        Some("node_addresses") => names::build_node_addresses(state, oc, &l, body),
         Some("policy_apply") => orgpolicy::build(state, &l, oc, body),
         Some("node_release") => placed::build(state, &l, oc, body),
+        Some("enrol_link") => enrol::build(state, oc, body),
+        Some("send_message") => messages::build_send(state, oc, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence, node_release or policy_apply",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence, node_release, policy_apply, name_approve, name_deny, name_renew, name_revoke, node_addresses, enrol_link or send_message",
         )),
     }
 }
@@ -1574,13 +1707,25 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
         "credential": a.oc.id, "rp_id": state.rp.rp_id, "origin": state.rp.origin,
         "nonce": b64u(&nonce), "client_data_json": b64u(&a.cdj), "authenticator_data": b64u(&a.ad), "signature": b64u(&a.sig),
     });
-    // Decisions keep the field name they have always had, so older records and verifiers agree.
-    let field = if matches!(*action, Action::Decide { .. }) { "decision_json" } else { "action_json" };
+    // Decisions keep the field name they have always had, so older records and verifiers agree. A
+    // decision on a public name (#575 step 4d) is one too: its record is a `decision`, and its
+    // signed JSON says the decision, as a request's does.
+    let field = if matches!(*action, Action::Decide { .. } | Action::NameApprove { .. } | Action::NameDeny { .. }) {
+        "decision_json"
+    } else {
+        "action_json"
+    };
     signed[field] = action_json.into();
     if let Action::OpenSession { run } = &*action {
         return match session::open(state, run, &a.oc, &console_session, signed) {
             Ok(v) => ok(v),
             Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
+        };
+    }
+    if let Action::EnrolLink { ttl_secs } = &*action {
+        return match state.ledger().and_then(|l| enrol::apply(state, &l, &a.oc, *ttl_secs, signed)) {
+            Ok(v) => ok(v),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         };
     }
     if let Action::Secret(c) = &*action {
@@ -1597,6 +1742,16 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
                     Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
                 }
             }
+            Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
+        };
+    }
+    if let Action::SendMessage { credential, to, text, priority, in_reply_to } = &*action {
+        // From the session's own passkey (#252 review): another one enrolled can't sign "from" it.
+        if &a.oc.id != credential {
+            return err(StatusCode::FORBIDDEN, "this message is from the passkey you signed in with: sign it with that one");
+        }
+        return match messages::apply_send(state, &a.oc, to, text, *priority, in_reply_to.as_deref(), signed) {
+            Ok(msg) => ok(json!({ "ok": msg })),
             Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
         };
     }
@@ -1694,7 +1849,9 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             ))
         }
         Action::OpenSession { .. } => unreachable!("action_finish opens sessions"),
+        Action::EnrolLink { .. } => unreachable!("action_finish makes enrolment links"),
         Action::Secret(_) => unreachable!("action_finish applies secret actions"),
+        Action::SendMessage { .. } => unreachable!("action_finish sends messages"),
         Action::SaveManifest(save) => {
             manifests::apply(state, save)?;
             let signed_action: Value =
@@ -1778,6 +1935,13 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::StandingDeny { id } => standing::apply_deny(state, &l, oc, id, signed),
         Action::StandingRenew { id, ttl_secs } => standing::apply_renew(state, &l, oc, id, *ttl_secs, signed),
         Action::ReleaseFence { run, reason, effect } => fence::apply_release(state, &l, oc, run, reason, effect, signed),
+        Action::NameApprove { id, bound, ttl_secs, effect, target } => {
+            names::apply_approve(state, &l, oc, id, *bound, *ttl_secs, effect, target, signed)
+        }
+        Action::NameDeny { id } => names::apply_deny(state, &l, oc, id, signed),
+        Action::NameRenew { id, ttl_secs, previous } => names::apply_renew(state, &l, oc, id, *ttl_secs, *previous, signed),
+        Action::NameRevoke { id } => names::apply_revoke(&l, oc, id, signed),
+        Action::NodeAddresses { node, ipv4, ipv6, old } => names::apply_node_addresses(state, &l, oc, node, *ipv4, *ipv6, old, signed),
         Action::PolicyApply(a) => orgpolicy::apply(state, &l, oc, a, signed),
         Action::NodeRelease { id, reason, effect_sha256 } => placed::apply(state, &l, oc, id, reason, effect_sha256, signed),
     }
@@ -2046,7 +2210,7 @@ fn dashboard(state: &State) -> Result<Value> {
                 "now": wicket_store::now(), "tenant": state.tenant.0, "ledger_error": "the ledger can't be read",
                 "pending": [], "decided": [], "runs": [], "manifests": list_manifests(state), "secrets": secrets::view(state),
                 "passkeys": [], "placed": [], "health": health_view(state, wicket_feed::now_ms())?.0, "capacity": [],
-                "standing": { "asks": [], "rules": [] }, "fenced": [], "audit": [],
+                "standing": { "asks": [], "rules": [] }, "fenced": [], "names": names::empty(), "audit": [],
             }));
         }
     };
@@ -2116,6 +2280,12 @@ fn dashboard(state: &State) -> Result<Value> {
         "capacity": capacity::view(&l, &t.0)?,
         "standing": standing::view(&l, &t.0)?,
         "fenced": fence::view(state, &l, &recent)?,
+        // The Names card (#575 step 4d): a names setting that can't be read is the card's to say,
+        // not a reason the page can't load.
+        "names": names::view(state, &l).unwrap_or_else(|e| {
+            tracing::warn!("dashboard: the names card: {e:#}");
+            json!({ "names": [], "public": null, "settings_error": format!("{e:#}"), "warning": wicket_control::names::WARNING })
+        }),
         "audit": audit,
         // The audit table against its limit on this host, and the prune checkpoint (#582).
         "audit_retention": crate::statesync::audit_retention(&l, false).ok().map(|r| json!({
@@ -2319,6 +2489,9 @@ mod tests {
     mod http;
     mod https;
     mod manifests;
+    mod messages;
+    mod names_card;
+    mod nodes;
     mod notify;
     mod orgpolicy;
     mod placed;

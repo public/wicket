@@ -132,7 +132,13 @@ wicket node revoke n1
     grant whose host the policy keeps out by the time it is published is said in the run's output and audited
     `node.ca_want_refused`. Otherwise the node answers "not requested", naming
     `wicket node set <node> --ca-hosts` (#571);
-  - revoking a node, or enrolling a machine under its name again, clears its policy and wants.
+  - revoking a node, or enrolling a machine under its name again, clears its policy and wants;
+  - `wicket node ca <node>` (`--json`) and the console (`GET /api/nodes/<node>/ca`) show the same view: the
+    hosts the active CA is constrained to and those the node was enrolled with, its policy, what live runs want
+    of it (each `covered`, `at the next renewal`, `refused by the node's CA policy` or `over the cap`), what the
+    next renewal signs, and its last 20 widenings from the audit log. `wicket node list` shows the active CA's
+    hosts (and the enrolled ones when they differ), the policy and the wants its CA doesn't cover yet; its
+    `--json` has `ca.hosts`, `ca_policy` and `ca_wants`.
 
   The default is `fixed`: the CA keeps the operator's hosts, as before, and a box start says which hosts it would
   need. The local node's CA is unconstrained, so none of this applies to it.
@@ -501,7 +507,8 @@ knows when it decides, among every enrolled, active node not held by a capacity 
   records where a public name of a box on the node points (`none` clears one; audited `node.addresses`,
   ledger schema 34). Only addresses on the public internet are taken: for a node behind NAT that forwards
   its port range one to one, the router's. They are the operator's alone: a node never sets its own, since
-  a node that could name its address could point a name at someone else's server. A node with neither
+  a node that could name its address could point a name at someone else's server, and only an operator
+  whose authority covers kind `node` (`operators.yaml`, at R4) may set them. A node with neither
   can't publish.
 - **Filter.** Out are: a node that starts no box (`full`); one without the vCPUs and memory the box's limits
   ask for, by its report and its admission's room ([above](#health-admission-and-disk-377)); a label or

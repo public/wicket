@@ -43,8 +43,10 @@ paths = ["**/Cargo.toml", "**/Cargo.lock", "deny.toml"]
 
 [suite.dep-age]
 packages = []
-# Every lockfile, as ci/dep-age.py checks every one (a new lockfile included).
-paths = ["**/Cargo.lock", "**/package-lock.json", "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml"]
+# Every lockfile, as ci/dep-age.py checks every one (a new lockfile included); and the vendored
+# packages (VENDOR.toml, #574), whose ages it checks and whose files the job's vendor check compares.
+paths = ["**/Cargo.lock", "**/package-lock.json", "ci/dep-age.py", "ci/dep-age_test.py", "ci/dep-age-exceptions.toml",
+  "**/VENDOR.toml", "crates/wicket-cli/src/serve/static/vendor/**", "ci/vendor-check.py", "ci/vendor-check_test.py", "ci/vendor-lit.sh"]
 
 [suite.lean]
 packages = ["wicket-authz"]
@@ -139,6 +141,8 @@ paths = [
   "ci/acceptance.sh", "ci/acceptance/**",
   "crates/wicket-control/src/noderun.rs", "crates/wicket-control/src/nodecall.rs",
   "crates/wicket-control/src/enrol.rs",
+  # The agent-to-agent protocol across nodes (#252, messages_flow).
+  "crates/wicket-gateway/**", "crates/wicket-cli/src/cmd/message.rs",
 ]
 
 [suite.update]

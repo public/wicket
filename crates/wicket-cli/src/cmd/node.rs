@@ -50,7 +50,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             NodeCmd::Create(args) => nodecreate::create(*args).await,
-            NodeCmd::Release { common, id, reason } => nodecreate::release(common, id, reason, wicket_home::cli_is_root()).await,
+            NodeCmd::Release { common, id, reason, yes } => nodecreate::release(common, id, reason, wicket_home::cli_is_root(), yes).await,
             NodeCmd::Plans { common, region, plan_type } => nodecreate::plans(common, region, plan_type).await,
             NodeCmd::Revoke { name } => {
                 let mut l = Ledger::open(&ledger_path())?;
@@ -58,6 +58,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 println!("revoked node {name}; its CA serials {} go on the feed's revocation list", serials.join(", "));
                 Ok(())
             }
+            NodeCmd::Ca { name, json } => ca(&name, json),
             NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => enrol::renew_ca(&name, hosts, ca_ttl, cert_ttl).await,
             NodeCmd::Set { name, ca_hosts, labels, taints, public_ipv4, public_ipv6 } => {
                 set(&name, ca_hosts.as_deref(), &labels, &taints, public_ipv4.as_deref(), public_ipv6.as_deref())
@@ -99,6 +100,97 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
+}
+
+/// `wicket node ca`: a node's CA, as the console's node view shows it (#573).
+fn ca(name: &str, json: bool) -> Result<()> {
+    let l = Ledger::open(&ledger_path())?;
+    let now = wicket_store::now();
+    let v = enrol::ca_view(&l, name, now)?.ok_or_else(|| wicket_home::exit::not_found(format!("no node {name} was enrolled")))?;
+    if json {
+        return crate::cmd::print_json(&v);
+    }
+    print!("{}", ca_text(&v));
+    Ok(())
+}
+
+/// [`enrol::ca_view`] as text.
+fn ca_text(v: &serde_json::Value) -> String {
+    use std::fmt::Write;
+    let s = |x: &serde_json::Value| x.as_str().unwrap_or("").to_string();
+    let list = |x: &serde_json::Value| {
+        let xs: Vec<String> = x.as_array().into_iter().flatten().filter_map(|h| h.as_str().map(String::from)).collect();
+        if xs.is_empty() {
+            "none".to_string()
+        } else {
+            xs.join(", ")
+        }
+    };
+    let time = |x: &serde_json::Value| x.as_i64().map(wicket_core::time::unix_rfc3339).unwrap_or_default();
+    let mut o = String::new();
+    let _ = writeln!(o, "node {} ({})", s(&v["name"]), s(&v["status"]));
+    match v["ca"].as_object() {
+        Some(_) => {
+            let c = &v["ca"];
+            let end = if c["expired"].as_bool() == Some(true) { "EXPIRED" } else { "until" };
+            let _ = writeln!(
+                o,
+                "CA {} issued {}, {end} {}: hosts {}",
+                s(&c["serial"]),
+                time(&c["issued_at"]),
+                time(&c["not_after"]),
+                list(&c["hosts"])
+            );
+        }
+        None => {
+            let _ = writeln!(o, "no active CA");
+        }
+    }
+    let _ = writeln!(o, "enrolled with: {}", list(&v["enrolled_hosts"]));
+    let policy: wicket_store::CaHosts = serde_json::from_value(v["policy"].clone()).unwrap_or(wicket_store::CaHosts::Fixed);
+    let _ = writeln!(o, "policy: {}", enrol::ca_policy_line(&policy));
+    let wants = v["wants"].as_array().cloned().unwrap_or_default();
+    if wants.is_empty() {
+        let _ = writeln!(o, "wanted by live runs: nothing beyond its hosts");
+    } else {
+        let _ = writeln!(o, "wanted by live runs:");
+        for w in wants {
+            let _ = writeln!(o, "  {}  {}  since {}  {}: {}", s(&w["host"]), s(&w["run"]), time(&w["at"]), s(&w["state"]), s(&w["why"]));
+        }
+    }
+    if let Some(n) = v["next_renewal"].as_object() {
+        let dropped = list(&n["dropped"]);
+        let _ = writeln!(
+            o,
+            "next renewal signs: {}{}",
+            list(&n["hosts"]),
+            if dropped == "none" { String::new() } else { format!(" (over the cap: {dropped})") }
+        );
+    }
+    let widenings = v["widenings"].as_array().cloned().unwrap_or_default();
+    if widenings.is_empty() {
+        let _ = writeln!(o, "widenings: none on record");
+    } else {
+        let _ = writeln!(o, "widenings, newest first:");
+        for w in widenings {
+            let by: Vec<String> = w["wanted_by"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|b| format!("{} for {} ({})", s(&b["host"]), s(&b["run"]), s(&b["why"])))
+                .collect();
+            let by = if by.is_empty() { String::new() } else { format!("; wanted by {}", by.join(", ")) };
+            let _ = writeln!(
+                o,
+                "  {}  CA {}: added {}; removed {}{by}",
+                time(&w["at"]),
+                s(&w["ca_serial"]),
+                list(&w["added"]),
+                list(&w["removed"])
+            );
+        }
+    }
+    o
 }
 
 /// What `--label` and `--taint` say: set or remove, by key.
@@ -165,10 +257,10 @@ fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String],
         return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
     }
     if ipv4.is_some() || ipv6.is_some() {
-        let a = l.set_node_addresses(name, v4, v6, &operator()).map_err(|e| match e {
-            wicket_store::StoreError::Refused(m) => wicket_home::exit::refused(m),
-            e => e.into(),
-        })?;
+        // The authority the console's change needs (kind `node` at R4, #575 review, L5), checked
+        // and any refusal audited as the console's are.
+        let by = wicket_control::grant::Granter::Human(crate::operators::Operator::cli(&wicket_core::TenantId::single().0)?);
+        let a = wicket_control::names::set_node_addresses(&l, &by, name, None, v4, v6, serde_json::json!({ "via": "cli" }))?;
         let show = |a: Option<String>| a.unwrap_or_else(|| "none".into());
         println!("node {name}: public IPv4 {}, IPv6 {}", show(a.ipv4.map(|a| a.to_string())), show(a.ipv6.map(|a| a.to_string())));
     }
@@ -213,6 +305,32 @@ fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String],
 mod set_tests {
     use super::*;
     use wicket_core::placement::Taint;
+
+    /// `wicket node ca` says each want's state and the widenings, from the view the console shows.
+    #[test]
+    fn a_nodes_ca_reads_as_text() {
+        let v = serde_json::json!({
+            "name": "n1", "status": "active",
+            "ca": { "serial": "ab12", "issued_at": 0, "not_after": 0, "expired": true, "hosts": ["api.example.com", "a.example.org"] },
+            "enrolled_hosts": ["api.example.com"], "policy": { "mode": "auto" },
+            "wants": [{ "host": "b.example.org", "run": "run_a", "why": "reach", "at": 0, "state": "at the next renewal" }],
+            "next_renewal": { "hosts": ["api.example.com", "b.example.org"], "dropped": ["c.example.org"] },
+            "widenings": [{ "at": 0, "ca_serial": "ab12", "added": ["a.example.org"], "removed": [],
+                            "wanted_by": [{ "host": "a.example.org", "run": "run_a", "why": "reach" }] }],
+        });
+        let t = ca_text(&v);
+        for want in [
+            "node n1 (active)",
+            "CA ab12 issued 1970-01-01T00:00:00Z, EXPIRED 1970-01-01T00:00:00Z: hosts api.example.com, a.example.org",
+            "enrolled with: api.example.com",
+            "policy: auto (to every inspected host its boxes need)",
+            "  b.example.org  run_a  since 1970-01-01T00:00:00Z  at the next renewal: reach",
+            "next renewal signs: api.example.com, b.example.org (over the cap: c.example.org)",
+            "CA ab12: added a.example.org; removed none; wanted by a.example.org for run_a (reach)",
+        ] {
+            assert!(t.contains(want), "{want:?} in:\n{t}");
+        }
+    }
 
     #[test]
     fn labels_and_taints_parse_as_set_or_remove() {
@@ -302,7 +420,9 @@ pub enum NodeCmd {
     /// Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and
     /// revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the
     /// provider is asked, then `placement.node_released` or `placement.node_release_failed`, the
-    /// records the console's release of a node past its lease writes too.
+    /// records the console's release of a node past its lease writes too. On a node already released
+    /// it finishes a release whose ledger side didn't (`placement.node_release_finished`), or says
+    /// there is nothing left; the provider isn't asked again.
     Release {
         #[command(flatten)]
         common: nodecreate::Common,
@@ -311,6 +431,9 @@ pub enum NodeCmd {
         /// Why: it goes on the audit record.
         #[arg(long)]
         reason: Option<String>,
+        /// Don't ask before releasing it (a terminal is asked, as shown, first).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// List a provider's (Vultr's) plans in a region, with their hourly price.
     Plans {
@@ -452,6 +575,16 @@ pub enum NodeCmd {
         /// The node's public IPv6 address, or `none`.
         #[arg(long)]
         public_ipv6: Option<String>,
+    },
+    /// A node's CA (#573): the hosts its active CA is constrained to and those it was enrolled
+    /// with, how it may be widened at runtime (`wicket node set --ca-hosts`), what live runs want of
+    /// it and whether its CA covers each, what the next renewal signs, and its last widenings
+    /// (`node.ca_widened`). The console's node view shows the same.
+    Ca {
+        name: String,
+        /// Print it as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity
     /// certificate for its node key, over its pinned ssh: also how a node whose identity certificate

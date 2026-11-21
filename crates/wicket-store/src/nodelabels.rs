@@ -44,7 +44,7 @@ pub enum AddressChange<T> {
 }
 
 impl<T: Copy> AddressChange<T> {
-    fn apply(self, old: Option<T>) -> Option<T> {
+    pub fn apply(self, old: Option<T>) -> Option<T> {
         match self {
             AddressChange::Keep => old,
             AddressChange::Set(v) => Some(v),
@@ -115,6 +115,22 @@ impl Ledger {
         ipv6: AddressChange<std::net::Ipv6Addr>,
         by: &str,
     ) -> Result<NodeAddresses> {
+        self.set_node_addresses_checked(node, None, ipv4, ipv6, by, serde_json::json!({}))
+    }
+
+    /// [`Ledger::set_node_addresses`], refused unless the node's addresses are `expected` when the
+    /// write lock is held (the console's signed change binds the addresses it showed, #575 step
+    /// 4d), with `extra` on the audit record. The record is written first, in the same write: a
+    /// change that can't be recorded isn't made.
+    pub fn set_node_addresses_checked(
+        &self,
+        node: &str,
+        expected: Option<&NodeAddresses>,
+        ipv4: AddressChange<std::net::Ipv4Addr>,
+        ipv6: AddressChange<std::net::Ipv6Addr>,
+        by: &str,
+        extra: serde_json::Value,
+    ) -> Result<NodeAddresses> {
         for ip in [
             if let AddressChange::Set(a) = ipv4 { Some(std::net::IpAddr::V4(a)) } else { None },
             if let AddressChange::Set(a) = ipv6 { Some(std::net::IpAddr::V6(a)) } else { None },
@@ -134,12 +150,17 @@ impl Ledger {
                 return Err(crate::StoreError::Refused(format!("node {node} is {}, not active", row.status)));
             }
             let old = l.node_addresses(node)?;
+            if expected.is_some_and(|e| *e != old) {
+                return Err(crate::StoreError::Refused(format!("node {node}'s public addresses changed since you were shown them: look again")));
+            }
             let new = NodeAddresses { ipv4: ipv4.apply(old.ipv4), ipv6: ipv6.apply(old.ipv6) };
             if new == old {
                 return Ok(new);
             }
             // One address, one node (#716 review, F4): host ports are allocated per node, so two
             // nodes behind one address would both hand out the same port.
+            // Which node (perhaps another tenant's) isn't said: the reply reaches a console or CLI
+            // of this node's tenant (#575 review, L2).
             let other: Option<String> = l
                 .conn
                 .query_row(
@@ -150,19 +171,23 @@ impl Ledger {
                     |r| r.get(0),
                 )
                 .optional()?;
-            if let Some(other) = other {
-                return Err(crate::StoreError::Refused(format!("node {other} already has that public address")));
+            if other.is_some() {
+                return Err(crate::StoreError::Refused("that public address is already another node's".into()));
             }
+            let mut body = serde_json::json!({
+                "name": node, "ipv4": new.ipv4.map(|a| a.to_string()), "ipv6": new.ipv6.map(|a| a.to_string()),
+                "was_ipv4": old.ipv4.map(|a| a.to_string()), "was_ipv6": old.ipv6.map(|a| a.to_string()), "by": by,
+            });
+            if let (Some(b), serde_json::Value::Object(x)) = (body.as_object_mut(), extra) {
+                b.extend(x);
+            }
+            // On the record first, in the same write: a change that can't be recorded isn't made.
+            l.audit(&wicket_core::TenantId(row.tenant), None, "node.addresses", &body)?;
             l.conn.execute(
                 "INSERT INTO node_addresses (node, ipv4, ipv6, set_at, set_by) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(node) DO UPDATE SET ipv4 = excluded.ipv4, ipv6 = excluded.ipv6, set_at = excluded.set_at, set_by = excluded.set_by",
                 params![node, new.ipv4.map(|a| a.to_string()), new.ipv6.map(|a| a.to_string()), crate::now(), by],
             )?;
-            let body = serde_json::json!({
-                "name": node, "ipv4": new.ipv4.map(|a| a.to_string()), "ipv6": new.ipv6.map(|a| a.to_string()),
-                "was_ipv4": old.ipv4.map(|a| a.to_string()), "was_ipv6": old.ipv6.map(|a| a.to_string()), "by": by,
-            });
-            l.audit(&wicket_core::TenantId(row.tenant), None, "node.addresses", &body)?;
             Ok(new)
         })
     }

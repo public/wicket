@@ -85,7 +85,7 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Standing { cmd: StandingCmd::Approve { .. } | StandingCmd::Deny { .. } | StandingCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Standing { cmd: StandingCmd::Revoke { .. } } => Forward(Revoke),
         Cmd::Names { cmd: NamesCmd::List { .. } | NamesCmd::Show { .. } } => Forward(Read),
-        Cmd::Names { cmd: NamesCmd::Approve { .. } | NamesCmd::Deny { .. } } => Forward(Privileged),
+        Cmd::Names { cmd: NamesCmd::Approve { .. } | NamesCmd::Deny { .. } | NamesCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Names { cmd: NamesCmd::Revoke { .. } } => Forward(Revoke),
         // A trigger wakes and messages agents later, as its owner (the caller): what `wake` and
         // `session` do now. Pausing and removing one only narrows.
@@ -135,7 +135,7 @@ pub fn route(cmd: &Cmd) -> Route {
             LeaseCmd::Release { .. } => Forward(Revoke),
         },
         Cmd::Node { cmd } => match cmd {
-            NodeCmd::List { provider: false, .. } => Forward(Read),
+            NodeCmd::List { provider: false, .. } | NodeCmd::Ca { .. } => Forward(Read),
             // Uses the provider's API key from the vault.
             NodeCmd::List { provider: true, .. } | NodeCmd::Plans { .. } => Forward(Privileged),
             // Spends money (a CAPACITY request decided by a grant or an operator), or destroys a machine.

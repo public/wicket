@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
 mod agents;
+pub use agents::UrgentMessage;
 mod capgrant;
 pub use capgrant::{covers as capacity_covers, CapacityAsk, CapacityGrant, CapacityTerms, CapacityUsed, CAPACITY_GRANT_PATH};
 mod delegations;
@@ -368,6 +369,50 @@ pub struct Request {
     /// The sha256 of the arguments it asks with, for the kinds whose effect depends on more than
     /// the target (spawn, link, capacity, update: #369, [`wicket_core::effect::args_sha256`]).
     pub args_sha256: Option<String>,
+}
+
+/// Inserts a message row (for [`Ledger::post_message`]): to `to_run`, or the principal's live run,
+/// or held. Returns the run it is for.
+#[allow(clippy::too_many_arguments)]
+fn insert_message(
+    conn: &rusqlite::Connection,
+    id: &str,
+    tenant: &TenantId,
+    from_run: &str,
+    to: &str,
+    to_run: Option<&str>,
+    envelope: &str,
+    meta: &MessageMeta,
+) -> Result<Option<String>> {
+    let to_run = match to_run {
+        Some(r) => Some(r.to_string()),
+        None => conn
+            .query_row(
+                "SELECT i.run FROM identities i JOIN runs r ON r.id = i.run
+                 WHERE i.tenant = ?1 AND i.spiffe_id = ?2 AND r.status = 'running' ORDER BY i.issued_at DESC, i.rowid DESC LIMIT 1",
+                params![tenant.0, to],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?,
+    };
+    conn.execute(
+        "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            id,
+            tenant.0,
+            from_run,
+            to_run.as_deref().unwrap_or(""),
+            envelope,
+            now(),
+            to,
+            meta.from_principal,
+            meta.priority.as_str(),
+            meta.in_reply_to,
+            if meta.operator { KIND_OPERATOR_MESSAGE } else { KIND_MESSAGE }
+        ],
+    )?;
+    Ok(to_run)
 }
 
 #[derive(Debug, Clone)]
@@ -1265,36 +1310,49 @@ impl Ledger {
         meta: &MessageMeta,
     ) -> Result<Option<String>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let to_run = match to_run {
-            Some(r) => Some(r.to_string()),
-            None => tx
-                .query_row(
-                    "SELECT i.run FROM identities i JOIN runs r ON r.id = i.run
-                     WHERE i.tenant = ?1 AND i.spiffe_id = ?2 AND r.status = 'running' ORDER BY i.issued_at DESC, i.rowid DESC LIMIT 1",
-                    params![tenant.0, to],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?,
-        };
-        tx.execute(
-            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                id,
-                tenant.0,
-                from_run,
-                to_run.as_deref().unwrap_or(""),
-                envelope,
-                now(),
-                to,
-                meta.from_principal,
-                meta.priority.as_str(),
-                meta.in_reply_to,
-                if meta.operator { KIND_OPERATOR_MESSAGE } else { KIND_MESSAGE }
-            ],
-        )?;
+        let to_run = insert_message(&tx, id, tenant, from_run, to, to_run, envelope, meta)?;
         tx.commit()?;
         Ok(to_run)
+    }
+
+    /// [`Ledger::post_message`] with its audit record in the same transaction (#252 review): the
+    /// message is never in an inbox without its record, so nothing can take it unaudited.
+    /// `record` is the audit body; this sets its `to_run` and `held` to where the message went.
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_message_audited(
+        &mut self,
+        id: &str,
+        tenant: &TenantId,
+        from_run: &str,
+        to: &str,
+        to_run: Option<&str>,
+        envelope: &str,
+        meta: &MessageMeta,
+        audit_run: Option<&RunId>,
+        mut record: serde_json::Value,
+    ) -> Result<Option<String>> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let r = (|| -> Result<Option<String>> {
+            let routed = insert_message(&self.conn, id, tenant, from_run, to, to_run, envelope, meta)?;
+            record["to_run"] = serde_json::json!(routed);
+            record["held"] = serde_json::json!(routed.is_none());
+            // Inside this transaction, the record joins it.
+            self.audit(tenant, audit_run, "message", &record)?;
+            Ok(routed)
+        })();
+        match r {
+            Ok(routed) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(routed),
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Records a message for run `to_run` only (tests, and envelopes made outside the gateway).
@@ -1782,6 +1840,14 @@ impl Ledger {
         Ok(())
     }
 
+    /// Who made enrolment link `id` of `tenant` (`created_by`), used or not. None: no such link.
+    pub fn enrol_link_by(&self, tenant: &TenantId, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT created_by FROM console_enrol_links WHERE tenant = ?1 AND id = ?2", params![tenant.0, id], |r| r.get(0))
+            .optional()?)
+    }
+
     /// Uses the enrolment link `id` at `at` from `client`, atomically: true only if it exists for
     /// `tenant`, has not been used, and has not expired. A link works at most once.
     pub fn use_enrol_link(&self, tenant: &TenantId, id: &str, at: i64, client: &str) -> Result<bool> {
@@ -1892,6 +1958,15 @@ impl Ledger {
             .conn
             .query_row("SELECT body FROM audit WHERE run IS NULL AND kind = ?1 ORDER BY seq DESC LIMIT 1", params![kind], |r| r.get(0))
             .optional()?)
+    }
+
+    /// The newest `limit` records of `kind`, newest first: a bounded read of the log's tail by the
+    /// `audit_kind` index, for views that look for a few recent records with no index of their own
+    /// (a name's last connections, #575 step 4d).
+    pub fn audit_newest_of_kind(&self, kind: &str, limit: usize) -> Result<Vec<AuditRow>> {
+        let mut st = self.conn.prepare("SELECT seq, ts, kind, run, body FROM audit WHERE kind = ?1 ORDER BY seq DESC LIMIT ?2")?;
+        let rows = st.query_map(params![kind, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Recomputes the whole chain: from seq 1, or after a prune (#582) from the anchor on (kinds
@@ -2495,21 +2570,58 @@ mod node_tests {
         );
     }
 
+    /// #575 step 4d: the console's change of a node's addresses is made only on the addresses it
+    /// showed, and its record (with what the caller adds) is written in the same write, first.
+    #[test]
+    fn a_checked_address_change_binds_the_addresses_shown() {
+        use crate::{AddressChange as A, NodeAddresses};
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "01")).unwrap();
+        let (a, b) = (std::net::Ipv4Addr::new(1, 1, 1, 1), std::net::Ipv4Addr::new(8, 8, 8, 8));
+        let none = NodeAddresses::default();
+        let x = serde_json::json!({ "action": "node_addresses" });
+        l.set_node_addresses_checked("n1", Some(&none), A::Set(a), A::Keep, "ann", x.clone()).unwrap();
+        // Shown none, but it has one now: refused, and nothing written.
+        let e = l.set_node_addresses_checked("n1", Some(&none), A::Set(b), A::Keep, "ann", x.clone()).unwrap_err();
+        assert!(matches!(&e, StoreError::Refused(m) if m.contains("changed since")), "{e}");
+        assert_eq!(l.node_addresses("n1").unwrap().ipv4, Some(a));
+        let rec = l.audit_of_kind("node.addresses").unwrap();
+        assert_eq!(rec.len(), 1);
+        assert!(rec[0].body.contains("\"action\":\"node_addresses\""), "{}", rec[0].body);
+        // A record that can't be written: no change.
+        l.fail_audit_inserts_for_tests().unwrap();
+        let shown = NodeAddresses { ipv4: Some(a), ipv6: None };
+        assert!(l.set_node_addresses_checked("n1", Some(&shown), A::Set(b), A::Keep, "ann", x).is_err());
+        assert_eq!(l.node_addresses("n1").unwrap().ipv4, Some(a), "not made");
+    }
+
+    /// #575 step 4d: the newest records of a kind, newest first and bounded.
+    #[test]
+    fn the_newest_records_of_a_kind() {
+        let l = Ledger::open_in_memory().unwrap();
+        for i in 0..5 {
+            l.audit(&TenantId::single(), None, if i % 2 == 0 { "node.audit" } else { "other" }, &serde_json::json!({ "i": i })).unwrap();
+        }
+        let got = l.audit_newest_of_kind("node.audit", 2).unwrap();
+        assert_eq!(got.iter().map(|r| r.4.clone()).collect::<Vec<_>>(), vec!["{\"i\":4}".to_string(), "{\"i\":2}".to_string()]);
+    }
+
     /// #716 review, F2 and F4: a node's addresses go with its enrolment, a revoked node gets none,
     /// and no two active nodes share one.
     #[test]
     fn node_addresses_follow_the_enrolment_and_are_one_nodes() {
         use crate::AddressChange as A;
         let mut l = Ledger::open_in_memory().unwrap();
-        let v4: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let v4 = std::net::Ipv4Addr::new(1, 1, 1, 1);
         for (n, serial) in [("n1", "01"), ("n2", "02")] {
             let t = l.create_node_token(&TenantId::single(), n, 3600).unwrap();
             l.enrol_node(&t, &node(n), &ca(n, serial)).unwrap();
         }
         l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann").unwrap();
         assert!(
-            matches!(l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("n1")),
-            "another active node has it"
+            matches!(l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("already another node's") && !m.contains("n1")),
+            "another active node has it, unnamed"
         );
         l.revoke_node("n1").unwrap();
         assert!(l.node_addresses("n1").unwrap().is_empty(), "revoked: no address");
@@ -2764,6 +2876,8 @@ mod tests {
         l.add_enrol_link(&t, "l2", at + 600, "host").unwrap();
         l.add_enrol_link(&t, "old", at - 1, "host").unwrap();
         assert!(!l.use_enrol_link(&TenantId("other".into()), "l1", at, "192.0.2.1").unwrap(), "another tenant's");
+        assert_eq!(l.enrol_link_by(&t, "l1").unwrap().as_deref(), Some("host"));
+        assert_eq!(l.enrol_link_by(&TenantId("other".into()), "l1").unwrap(), None);
         assert!(!l.use_enrol_link(&t, "nope", at, "192.0.2.1").unwrap(), "unknown");
         assert!(!l.use_enrol_link(&t, "old", at, "192.0.2.1").unwrap(), "expired");
         assert!(!l.use_enrol_link(&t, "l2", at + 600, "192.0.2.1").unwrap(), "expired at its expiry");

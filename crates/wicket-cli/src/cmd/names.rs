@@ -11,9 +11,19 @@ pub enum NamesCmd {
     List {
         #[arg(long)]
         all: bool,
+        /// Print JSON (docs/reference/cli.md, "Output for scripts"): each name's state and why,
+        /// full name, owner, target and lifetime, as the console's Names card has them.
+        #[arg(long)]
+        json: bool,
     },
     /// One name or ask: the label, port, who asked, and, for a public name, what approving it means.
-    Show { id: String },
+    Show {
+        id: String,
+        /// Print JSON: the name as `list --json` has it, with its records as the ledger lists them,
+        /// the last reconcile's plan for it and its last connections.
+        #[arg(long)]
+        json: bool,
+    },
     /// Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each
     /// later run of it takes it up when it starts), or --for zone (every agent of its zone), for --lasts.
     Approve {
@@ -30,8 +40,29 @@ pub enum NamesCmd {
     },
     /// Deny an ask for a public name.
     Deny { id: String },
+    /// Renew a live standing name: it lapses --lasts from now. A run-scoped name lasts as its run
+    /// does, and one past its lifetime is asked for again.
+    Renew {
+        id: String,
+        /// How long from now (at most 366d), or `forever`: until revoked.
+        #[arg(long, default_value = "30d")]
+        lasts: String,
+    },
     /// Revoke a live name, public or internal: it ends now, whoever holds it.
     Revoke { id: String },
+}
+
+/// A `--lasts` value: a duration, or `forever` (None).
+fn lasts_of(lasts: &str) -> Result<Option<std::time::Duration>> {
+    match lasts {
+        "forever" => Ok(None),
+        d => Ok(Some(wicket_core::time::parse_duration(d).context("bad --lasts (a duration such as 30d, or forever)")?)),
+    }
+}
+
+/// What the JSON views read, on this host now.
+fn view_ctx<'a>(l: &'a Ledger, settings: &'a crate::names_view::Settings) -> crate::names_view::Ctx<'a> {
+    crate::names_view::Ctx { l, settings, listens: &wicket_control::namesync::node_listens, now: wicket_store::now() }
 }
 
 fn when(t: i64) -> String {
@@ -93,7 +124,7 @@ fn settings() -> Result<wicket_names::NamesConfig> {
 pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
     let human = || -> Result<grant::Granter> { Ok(grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?)) };
     match cmd {
-        NamesCmd::List { all } => {
+        NamesCmd::List { all, json } => {
             let l = Ledger::open(&ledger_path())?;
             let t = TenantId::single();
             let now = wicket_store::now();
@@ -104,6 +135,10 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
                     rows.extend(l.names_with_status(&t, s)?);
                 }
             }
+            if json {
+                let settings = wicket_agent::acp::names_settings();
+                return super::print_json(&crate::names_view::rows(&view_ctx(&l, &settings), &rows)?.into());
+            }
             if rows.is_empty() {
                 println!("no names");
             }
@@ -112,10 +147,23 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
             }
             Ok(())
         }
-        NamesCmd::Show { id } => {
+        NamesCmd::Show { id, json } => {
             let l = Ledger::open(&ledger_path())?;
+            if json {
+                let settings = wicket_agent::acp::names_settings();
+                return super::print_json(&crate::names_view::detail(&view_ctx(&l, &settings), &l.name(&id)?)?);
+            }
             let names = settings()?;
             print!("{}", show(&l.name(&id)?, names.public.as_ref()));
+            Ok(())
+        }
+        NamesCmd::Renew { id, lasts } => {
+            let l = Ledger::open(&ledger_path())?;
+            let n = nm::renew(&l, &human()?, &id, lasts_of(&lasts)?, serde_json::json!({ "via": "cli" }))?;
+            match n.expires_at {
+                Some(u) => println!("renewed {id} until {}", when(u)),
+                None => println!("renewed {id} until revoked"),
+            }
             Ok(())
         }
         NamesCmd::Approve { id, bound, lasts, yes } => {
@@ -126,10 +174,7 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
                 "zone" => wicket_store::StandingBound::Zone,
                 x => bail!("--for is agent or zone, not {x:?}"),
             };
-            let ttl = match lasts.as_str() {
-                "forever" => None,
-                d => Some(wicket_core::time::parse_duration(d).context("bad --lasts (a duration such as 30d, or forever)")?),
-            };
+            let ttl = lasts_of(&lasts)?;
             let terms = nm::terms(bound, ttl)?;
             let names = settings()?;
             let public = nm::public_settings(&names)?;
@@ -164,6 +209,7 @@ pub async fn dispatch(cmd: NamesCmd) -> Result<()> {
                 public.provider.as_str(),
                 match public.provider {
                     wicket_names::ProviderKind::Noop => " (noop: the plan is only recorded, nothing is published)",
+                    wicket_names::ProviderKind::Vultr => "",
                 }
             );
             Ok(())

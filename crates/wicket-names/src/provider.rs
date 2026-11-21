@@ -54,6 +54,10 @@ pub enum ProviderError {
     Zone(String),
     #[error("the provider refused the change: {0}")]
     Failed(String),
+    /// The zone's listing couldn't be read whole (a page failed, or the reply wasn't one): never
+    /// a partial listing (#575 step 5a).
+    #[error("the provider couldn't list the zone: {0}")]
+    List(String),
     /// A provider whose apply isn't atomic made the plan's first `done` changes, in order, and
     /// then stopped: the caller records those as made (#748, F8).
     #[error("the provider made {done} of the plan's changes, then stopped: {why}")]
