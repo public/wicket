@@ -1,6 +1,7 @@
 //! #582 step 5: wicketd's host manager against real `wicket supervise` processes. It starts every
 //! shard's host, hears their heartbeats, fences one that dies (a higher epoch) and starts a fresh
-//! one, and a host stopped with SIGTERM frees its shard with the clean-stop marker.
+//! one, and a host stopped with SIGTERM frees its shard with the clean-stop marker. With no shards
+//! (`supervise.hosts: 0`), it stops every host left.
 
 use std::time::{Duration, Instant};
 use wicket_control::supervise::{HostIo, Manager, ProcIo};
@@ -109,4 +110,19 @@ fn the_manager_starts_hosts_fences_a_dead_one_and_starts_it_again() {
     for s in ["0", "1"] {
         assert!(ledger.supervisor_host(s).unwrap().unwrap().stopping, "shard {s}'s clean-stop marker");
     }
+
+    // `supervise.hosts: 0` after a restart: a manager with no shards stops the hosts left.
+    let left = wait_for("both hosts started again", || {
+        m.tick(&ledger, io, wicket_store::now());
+        let b = (io.heartbeat("0")?, io.heartbeat("1")?);
+        (b.0.owner != fresh.owner && b.1.owner != beats.1.owner).then_some(b)
+    });
+    let mut none = Manager::new(0);
+    wait_for("every host stopped", || {
+        let t = none.tick(&ledger, io, wicket_store::now());
+        assert!(t.started.is_empty() && t.errors.is_empty(), "{t:?}");
+        let free = ledger.supervisor_hosts().unwrap().iter().all(|h| h.owner.is_none());
+        (none.idle() && free).then_some(())
+    });
+    assert!(io.gone(&left.0.owner) && io.gone(&left.1.owner));
 }

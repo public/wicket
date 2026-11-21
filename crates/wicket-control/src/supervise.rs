@@ -768,10 +768,26 @@ impl Manager {
                 if io.gone(&owner) {
                     self.pending.remove(&s);
                 } else if at + START_GRACE_SECS <= now && beats.get(&s).is_none_or(|b| b.owner != owner) {
-                    // Never answered: given up on, and waited for before another starts.
-                    io.kill(&owner);
-                    self.dying.entry(s.clone()).or_default().push(owner);
+                    // Never answered: given up on. A host takes its shard before it binds its
+                    // socket, so a slow one may hold a live epoch: one the ledger names (read again
+                    // now, not from the start of the tick) is left to the rules for a holder never
+                    // heard from (below), which fence before they kill. One that doesn't hold it
+                    // is killed, and waited for before another starts. (One that takes the shard
+                    // between that read and the kill is a dead holder the rules fence as gone, and
+                    // no host starts for the shard until every thread of it has gone.)
                     self.pending.remove(&s);
+                    match l.supervisor_host(&s) {
+                        Ok(Some(h)) if h.owner.as_deref() == Some(owner.as_str()) => {}
+                        Ok(_) => {
+                            io.kill(&owner);
+                            self.dying.entry(s.clone()).or_default().push(owner);
+                        }
+                        Err(e) => {
+                            // Can't tell whether it holds the shard: neither killed nor forgotten.
+                            self.pending.insert(s.clone(), (owner, at));
+                            out.errors.push(format!("reading shard {s}'s holder: {e}"));
+                        }
+                    }
                 }
             }
             if let Some(hb) = beats.get(&s) {
@@ -787,6 +803,18 @@ impl Manager {
                 }
             }
         }
+        // A host started for a shard this manager no longer runs (`supervise.hosts` lowered, or a
+        // record from before): one that holds the shard is left to the rules for such holders
+        // (below); one that doesn't is killed and waited for, as one that never answered.
+        let gone_shards: Vec<String> = self.pending.keys().filter(|s| !self.shards.contains(s)).cloned().collect();
+        for s in gone_shards {
+            let Some((owner, _)) = self.pending.remove(&s) else { continue };
+            if io.gone(&owner) || hosts.iter().any(|h| h.host == s && h.owner.as_deref() == Some(owner.as_str())) {
+                continue;
+            }
+            io.kill(&owner);
+            self.dying.entry(s).or_default().push(owner);
+        }
         // A ledger stall shows in every host at once: each lease thread waits on it, so every
         // heartbeat says its lease isn't renewing. Taken as one only when wicketd's own write to the
         // ledger stalls too, and for at most STALL_EXEMPT_MAX_SECS: then a host whose runtime still
@@ -794,8 +822,16 @@ impl Manager {
         // runtime moves, and get no exemption.
         let all_lease_stuck = !beats.is_empty() && beats.values().all(|b| !b.lease_ok && !b.lost);
         let stalled = all_lease_stuck && io.ledger_stalled(l);
-        self.stall_since = if stalled { Some(self.stall_since.unwrap_or(now)) } else { None };
-        if self.stall_since.is_some_and(|since| since + STALL_EXEMPT_MAX_SECS > now) {
+        // First seen, kept while every lease thread stays stuck, so a probe that flaps between
+        // stalled and not doesn't restart the limit.
+        self.stall_since = if !all_lease_stuck {
+            None
+        } else if stalled {
+            Some(self.stall_since.unwrap_or(now))
+        } else {
+            self.stall_since
+        };
+        if stalled && self.stall_since.is_some_and(|since| since + STALL_EXEMPT_MAX_SECS > now) {
             for b in beats.values().filter(|b| b.v >= 1 && !b.runtime_stuck) {
                 if let Some(p) = self.procs.get_mut(&b.shard) {
                     p.ok_at = now;
@@ -814,18 +850,24 @@ impl Manager {
             }
         }
         // Holders of shards this manager doesn't run (`supervise.hosts` lowered): a gone one is
-        // fenced at once, so its nodes can move; a live one is asked to stop, and fenced and killed
-        // if it still runs STOP_SECS later. Those asked are reaped as they go.
+        // reaped (if it is wicketd's child) and fenced at once, so its nodes can move; a live one is
+        // asked to stop, and fenced and killed if it still runs STOP_SECS later. One this machine
+        // can't tell about is left alone. Those asked are reaped as they go.
         for h in &hosts {
             if self.shards.contains(&h.host) {
                 continue;
             }
             let Some(owner) = h.owner.clone() else { continue };
-            if io.alive(&owner) != Some(true) {
-                if let Ok(Some(_)) = l.fence_shard(&h.host, &owner, true, now) {
-                    out.fenced.push(h.host.clone());
+            match io.alive(&owner) {
+                Some(true) => {}
+                Some(false) => {
+                    io.gone(&owner);
+                    if let Ok(Some(_)) = l.fence_shard(&h.host, &owner, true, now) {
+                        out.fenced.push(h.host.clone());
+                    }
+                    continue;
                 }
-                continue;
+                None => continue,
             }
             match self.terminated.get(&owner).cloned() {
                 None => {
@@ -837,17 +879,29 @@ impl Manager {
                     self.terminated.insert(owner, (h.host.clone(), now));
                 }
                 Some((shard, at)) if at + STOP_SECS <= now => {
+                    // Forced (it may still renew its lease): recorded as dying, fenced, then killed,
+                    // and waited for as any killed host is. Once fenced it holds nothing, so it is
+                    // never fenced twice.
+                    if self.dying.get(&shard).is_some_and(|d| d.contains(&owner)) {
+                        continue;
+                    }
                     self.dying.entry(shard.clone()).or_default().push(owner.clone());
                     if !self.save(io, &mut out) {
                         self.forget_dying(&shard, &owner);
                         continue;
                     }
-                    if let Ok(Some(_)) = l.fence_shard(&shard, &owner, false, now) {
-                        io.kill(&owner);
-                        out.fenced.push(shard);
-                    } else {
-                        self.forget_dying(&shard, &owner);
-                        self.save(io, &mut out);
+                    match l.fence_shard(&shard, &owner, true, now) {
+                        Ok(Some(_)) => {
+                            io.kill(&owner);
+                            out.fenced.push(shard);
+                        }
+                        r => {
+                            if let Err(e) = r {
+                                out.errors.push(format!("fencing shard {shard}: {e}"));
+                            }
+                            self.forget_dying(&shard, &owner);
+                            self.save(io, &mut out);
+                        }
                     }
                 }
                 Some(_) => {}
@@ -934,6 +988,12 @@ impl Manager {
             }
         }
         out
+    }
+
+    /// Whether this manager has nothing left in hand: no host starting, dying or asked to stop. With
+    /// no shards (`supervise.hosts: 0`) and no holder left in the ledger, wicketd's manager ends.
+    pub fn idle(&self) -> bool {
+        self.pending.is_empty() && self.dying.is_empty() && self.terminated.is_empty()
     }
 
     fn forget_dying(&mut self, shard: &str, holder: &str) {
@@ -1876,12 +1936,104 @@ mod tests {
         assert_eq!(l.supervisor_host("2").unwrap().unwrap().owner, None, "free for its nodes to move");
         assert_eq!(t.stopped, ["3"]);
         assert_eq!(io.terminated, ["m:9:1"]);
+        // It goes on renewing its lease, so it never lapses.
+        let epoch = l.supervisor_host("3").unwrap().unwrap().epoch;
         for now in 102..101 + STOP_SECS {
+            assert!(l.renew_shard_lease("3", "m:9:1", epoch, LEASE_SECS, now).unwrap());
             assert!(!m.tick(&l, &mut io, now).fenced.contains(&"3".to_string()), "at {now}");
         }
         let t = m.tick(&l, &mut io, 101 + STOP_SECS);
         assert!(t.fenced.contains(&"3".to_string()), "{t:?}");
-        assert!(io.killed_labels().contains(&"m:9:1".to_string()), "{:?}", io.killed);
+        // Fenced (a higher epoch) before the kill.
+        assert!(io.killed.iter().any(|(o, e)| o == "m:9:1" && *e > Some(epoch)), "{:?}", io.killed);
         assert_eq!(l.supervisor_host("3").unwrap().unwrap().owner, None);
+        assert_eq!(io.record.dying.get("3").map(Vec::as_slice), Some(&["m:9:1".to_string()][..]));
+        // The record is written once, not every tick, while it dies; then it is reaped.
+        let saves = std::rc::Rc::new(std::cell::Cell::new(0));
+        let n = saves.clone();
+        io.on_save = Some(Box::new(move |_| n.set(n.get() + 1)));
+        for now in 102 + STOP_SECS..110 + STOP_SECS {
+            assert!(m.tick(&l, &mut io, now).fenced.is_empty());
+        }
+        assert_eq!(saves.get(), 0);
+        io.dies("m:9:1");
+        m.tick(&l, &mut io, 110 + STOP_SECS);
+        assert!(!io.record.dying.contains_key("3"), "{:?}", io.record);
+    }
+
+    #[test]
+    fn with_no_shards_it_stops_every_host_left_and_then_has_nothing_in_hand() {
+        // supervise.hosts set to 0: shard 0's holder is asked to stop, and a host started for
+        // shard 1 that never took it (from the record) is killed.
+        let l = rc_ledger();
+        let mut io = FakeIo::with(&l);
+        host_takes(&l, &mut io, "0", "m:1:1", 100);
+        io.running.insert("m:2:1".into());
+        io.record.started.insert("1".into(), "m:2:1".into());
+        let mut m = Manager::new(0);
+        let t = m.tick(&l, &mut io, 101);
+        assert_eq!(t.stopped, ["0"]);
+        assert!(t.started.is_empty());
+        assert_eq!(io.killed_labels(), ["m:2:1"]);
+        assert!(!m.idle());
+        io.dies("m:2:1");
+        // Shard 0's stops with its clean-stop marker.
+        let epoch = l.supervisor_host("0").unwrap().unwrap().epoch;
+        assert!(l.mark_shard_stopping("0", "m:1:1", epoch, 102).unwrap());
+        io.dies("m:1:1");
+        let t = m.tick(&l, &mut io, 103);
+        assert_eq!(t.fenced, ["0"], "a gone holder's shard is freed");
+        assert!(t.started.is_empty());
+        assert!(m.idle());
+        assert!(l.supervisor_hosts().unwrap().iter().all(|h| h.owner.is_none()));
+    }
+
+    #[test]
+    fn a_slow_starting_host_that_took_its_shard_is_fenced_before_it_is_killed() {
+        let l = rc_ledger();
+        let mut io = FakeIo::with(&l);
+        let mut m = Manager::new(1);
+        assert_eq!(m.tick(&l, &mut io, 100).started, ["0"]);
+        // It takes the shard but never binds its socket.
+        let epoch = l.take_shard("0", "m:1:1", &[], LEASE_SECS, 101).unwrap().epoch;
+        for now in 102..=100 + START_GRACE_SECS + 5 {
+            m.tick(&l, &mut io, now);
+        }
+        assert!(io.killed.is_empty(), "past the grace, but it holds a live epoch: {:?}", io.killed);
+        let at = (116..=400).find(|&now| m.tick(&l, &mut io, now).fenced == ["0"]).expect("fenced once its lease lapsed");
+        assert!(at >= 101 + LEASE_SECS, "{at}");
+        assert!(io.killed.iter().any(|(o, e)| o == "m:1:1" && *e > Some(epoch)), "fenced, then killed: {:?}", io.killed);
+    }
+
+    #[test]
+    fn a_flapping_stall_probe_doesnt_extend_the_exemption() {
+        let (l, mut io, mut m) = one_lease_stuck_host(true);
+        let at = (105..=900)
+            .step_by(5)
+            .find(|&now| {
+                io.stalled = now % 10 == 5;
+                m.tick(&l, &mut io, now).fenced == ["0"]
+            })
+            .expect("fenced in the end");
+        assert!(at <= 105 + STALL_EXEMPT_MAX_SECS + 2 * STALL_WINDOW_SECS + LEASE_SECS, "fenced at {at}");
+    }
+
+    #[test]
+    fn proc_io_sees_a_running_child_until_it_is_reaped() {
+        let mut io = ProcIo { exe: "/bin/false".into(), data_dir: std::env::temp_dir(), env: Vec::new(), spawned: Vec::new() };
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        std::mem::forget(child);
+        let owner = wicket_home::owner::owner_label_of(pid).unwrap();
+        // Running: waitpid says 0.
+        assert!(!io.gone(&owner));
+        assert_eq!(io.alive(&owner), Some(true));
+        io.kill(&owner);
+        let t = std::time::Instant::now();
+        while !io.gone(&owner) {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "never reaped");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(io.alive(&owner), Some(false));
     }
 }

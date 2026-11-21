@@ -36,7 +36,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `names.public.allow_idn` | boolean | `false` | Whether `xn--` labels are allowed. The lookalike check reads a label as written, `xn--` form and all, not as the Unicode it shows: with this on, a name can look like a reserved one in a browser. |
 | `names.public.nodes` | mapping of node labels | `{}` | The labels a node needs to publish public ports. |
 | `names.public.ports` | `low-high`, from 1024 | `20000-20999` | The host ports wicket allocates on each node. `wicket node install` writes them to the node's `publish.json` (for a node with the `names.public.nodes` labels), the only ports it listens on; its firewall must admit them. |
-| `supervise.hosts` | integer, 0–16 | `0` (off) | **Experimental.** Supervisor hosts wicketd runs ([daemon](daemon.md#supervisor-hosts), [#582](https://github.com/public/wicket/issues/582) step 5). `0`: none. Read when wicketd starts; on a lower N, wicketd stops the hosts above it. Hosts survive `systemctl stop wicketd`. They supervise no runs yet. |
+| `supervise.hosts` | integer, 0–16 | `0` (off) | **Experimental.** Supervisor hosts wicketd runs ([daemon](daemon.md#supervisor-hosts), [#582](https://github.com/public/wicket/issues/582) step 5). `0`: none (wicketd stops any an earlier setting left). Read when wicketd starts; on a lower N, wicketd stops the hosts above it. Hosts survive `systemctl stop wicketd`. They supervise no runs yet. |
 
 The `names` settings are checked as a whole when a run starts: one that can't work (a zone that
 isn't a domain, a malformed owner id, a TTL out of range) stops it, as an invalid file does. A

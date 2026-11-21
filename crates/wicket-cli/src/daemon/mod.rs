@@ -88,14 +88,14 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         let exe = d.exe.clone();
         std::thread::spawn(move || hand_over_runs(&exe, followed));
     }
-    // Supervisor hosts (#582 step 5), when the installation asks for them (`supervise.hosts`):
-    // started, heartbeated and fenced by this process alone, so two never race for a shard.
+    // Supervisor hosts (#582 step 5), when the installation asks for them (`supervise.hosts`), or
+    // to stop the ones an earlier setting left: started, heartbeated and fenced by this process
+    // alone, so two never race for a shard.
     match wicket_agent::acp::load_supervise(&wicket_agent::acp::settings_path()) {
-        Ok(s) if s.hosts > 0 => {
+        Ok(s) => {
             let (exe, data) = (d.exe.clone(), d.data_dir.clone());
             std::thread::Builder::new().name("supervisor-hosts".into()).spawn(move || manage_hosts(s.hosts, exe, data))?;
         }
-        Ok(_) => {}
         Err(e) => say_err!("wicketd: no supervisor hosts: {e}"),
     }
     // `wicket self update` moves the daemon to the new build last: on SIGHUP it re-executes itself
@@ -126,13 +126,36 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
 
 /// wicketd's host manager (#582 step 5): a [`Manager`](wicket_control::supervise::Manager) tick
 /// every few seconds, on a ledger connection of its own, reopened when it fails. Runs for wicketd's
-/// life; after a re-exec the new image adopts the hosts that answer on their sockets.
+/// life; after a re-exec the new image adopts the hosts that answer on their sockets. With
+/// `supervise.hosts: 0` it runs only while hosts an earlier setting started are left (a holder in
+/// the ledger, or the manager's record on disk): it stops them as it would any host above the
+/// setting, then ends, removing its record.
 fn manage_hosts(hosts: usize, exe: PathBuf, data_dir: PathBuf) {
     use wicket_control::supervise::{Manager, ProcIo, RENEW_SECS};
     let mut m = Manager::new(hosts);
+    let record = data_dir.join("supervise").join("manager.json");
     let mut io = ProcIo { exe, data_dir: data_dir.clone(), env: Vec::new(), spawned: Vec::new() };
     let mut ledger = None;
-    say_err!("wicketd: {hosts} supervisor host(s)");
+    // Whether any shard has a holder this machine can judge (one on another machine, if any, is
+    // left to that machine).
+    let held = |l: &Ledger| -> anyhow::Result<bool> {
+        Ok(l.supervisor_hosts()?.iter().filter_map(|h| h.owner.as_deref()).any(|o| wicket_home::owner::owner_alive(o).is_some()))
+    };
+    if hosts == 0 {
+        let l = match Ledger::open(&data_dir.join("ledger.db")) {
+            Ok(l) => l,
+            Err(e) => return say_err!("wicketd: supervisor hosts: the ledger: {e}"),
+        };
+        match held(&l) {
+            Ok(false) if !record.exists() => return,
+            Ok(_) => {}
+            Err(e) => return say_err!("wicketd: supervisor hosts: {e}"),
+        }
+        say_err!("wicketd: supervise.hosts is 0: stopping the supervisor hosts left from an earlier setting");
+        ledger = Some(l);
+    } else {
+        say_err!("wicketd: {hosts} supervisor host(s)");
+    }
     loop {
         if ledger.is_none() {
             ledger = Ledger::open(&data_dir.join("ledger.db")).map_err(|e| say_err!("wicketd: supervisor hosts: the ledger: {e}")).ok();
@@ -150,6 +173,14 @@ fn manage_hosts(hosts: usize, exe: PathBuf, data_dir: PathBuf) {
                     say_err!("wicketd: supervisor hosts: {e}");
                 }
                 ledger = None;
+            } else if hosts == 0 && m.idle() && matches!(held(l), Ok(false)) {
+                if let Err(e) =
+                    std::fs::remove_file(&record).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+                {
+                    say_err!("wicketd: supervisor hosts: removing {}: {e}", record.display());
+                }
+                say_err!("wicketd: every supervisor host has stopped");
+                return;
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(RENEW_SECS));

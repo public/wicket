@@ -87,13 +87,22 @@ pub fn owner_alive(label: &str) -> Option<bool> {
 
 /// Whether the process an owner label names is a zombie with nothing left of it: every thread gone,
 /// its parent not yet having reaped it.
-pub fn owner_zombie(label: &str) -> bool {
+#[cfg(test)]
+fn owner_zombie(label: &str) -> bool {
     local_label(label).is_some_and(|(pid, start)| stat(pid) == Some(('Z', start)) && threads(pid) <= 1)
 }
 
-/// How many threads a process has left (its `/proc/<pid>/task` entries, the main one included).
+/// How many threads a process has left, the main one included: the `Threads:` line of
+/// `/proc/<pid>/status`, one counter the kernel keeps (a count of `/proc/<pid>/task` entries can miss
+/// a live thread while a sibling exits mid-scan). 0 once the process is gone; a read that fails any
+/// other way, or a line that can't be parsed, counts as more than one, so the process reads as
+/// running: a kill that can't be confirmed isn't taken for one.
 fn threads(pid: u32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/task")).map(|d| d.count()).unwrap_or(0)
+    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(s) => s.lines().find_map(|l| l.strip_prefix("Threads:")).and_then(|n| n.trim().parse().ok()).unwrap_or(usize::MAX),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => usize::MAX,
+    }
 }
 
 /// An owner label of this machine's: its pid and start time.
@@ -197,22 +206,40 @@ mod tests {
     #[test]
     fn a_zombie_main_thread_with_a_live_thread_is_still_running() {
         // A process whose main thread has exited (pthread_exit) while another sleeps: its main thread
-        // reads Z, as a SIGKILLed one stuck in IO would.
-        let script =
-            "import threading,time,ctypes\nt=threading.Thread(target=time.sleep,args=(2,));t.start()\nctypes.CDLL(None).pthread_exit(None)";
-        let Ok(mut child) = std::process::Command::new("python3").args(["-c", script]).spawn() else {
-            eprintln!("no python3: skipped");
-            return;
-        };
-        let label = owner_label_of(child.id()).unwrap();
+        // reads Z, as a SIGKILLed one's does while a thread in uninterruptible IO lives on. The forked child has one thread, the leader,
+        // until it starts the sleeper.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let mut t: libc::pthread_t = 0;
+            extern "C" fn sleeper(_: *mut libc::c_void) -> *mut libc::c_void {
+                unsafe { libc::sleep(2) };
+                std::ptr::null_mut()
+            }
+            unsafe {
+                if libc::pthread_create(&mut t, std::ptr::null(), sleeper, std::ptr::null_mut()) != 0 {
+                    libc::_exit(1);
+                }
+                // The leader alone exits, as pthread_exit would, without unwinding through the test
+                // harness's frames.
+                libc::syscall(libc::SYS_exit, 0);
+                libc::_exit(1);
+            }
+        }
+        let pid = pid as u32;
+        let label = owner_label_of(pid).unwrap();
         let t = std::time::Instant::now();
-        while stat(child.id()).map(|(s, _)| s) != Some('Z') {
+        while stat(pid).map(|(s, _)| s) != Some('Z') {
             assert!(t.elapsed() < std::time::Duration::from_secs(5), "its main thread never exited");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(owner_alive(&label), Some(true), "a thread lives on");
         assert!(!owner_zombie(&label));
-        child.wait().unwrap();
+        assert_eq!(threads(pid), 2, "the zombie leader counts");
+        let mut st = 0;
+        assert_eq!(unsafe { libc::waitpid(pid as i32, &mut st, 0) }, pid as i32);
+        assert!(libc::WIFEXITED(st), "the sleeper ended it: {st}");
         assert_eq!(owner_alive(&label), Some(false));
+        assert_eq!(threads(pid), 0);
     }
 }
