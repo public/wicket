@@ -55,6 +55,16 @@ pub async fn forward(sock: &Path, cmd: &Cmd) -> Result<i32> {
     forward_with(sock, cmd, argv, [0, 1, 2]).await
 }
 
+/// The upload roles of the export files `audit --verify --against` names, in order (#713 review): at
+/// most this many through wicketd.
+pub(super) const AGAINST_ROLES: [&str; 8] =
+    ["against-0", "against-1", "against-2", "against-3", "against-4", "against-5", "against-6", "against-7"];
+
+/// Whether an `--against` names a state store's sink (`store:<sink>`), not a file.
+pub(super) fn is_store_sink(p: &Path) -> bool {
+    p.to_string_lossy().starts_with("store:")
+}
+
 /// The files `self trust-key` and `self update` name, which go as content as a run's do: the key,
 /// and the build with its signature (`--sig`, or the one beside it, if there is one). Read by the
 /// caller, who may be root with them in `/root`, where wicketd's user can't read. So do a
@@ -63,6 +73,16 @@ pub async fn forward(sock: &Path, cmd: &Cmd) -> Result<i32> {
 pub(super) fn self_uploads(cmd: &Cmd) -> Vec<(&'static str, PathBuf)> {
     match cmd {
         Cmd::Trigger { cmd: TriggerCmd::Create { file, .. } } => vec![("trigger", file.clone())],
+        // The exports `audit --verify` compares against, and the issuer key it checks them with,
+        // go as content too: an operator verifies an export they hold, and wicketd never reads a
+        // path its caller names.
+        Cmd::Audit { against, issuer_jwk, cmd: None, .. } => against
+            .iter()
+            .filter(|a| !is_store_sink(a))
+            .zip(AGAINST_ROLES)
+            .map(|(a, role)| (role, a.clone()))
+            .chain(issuer_jwk.iter().map(|j| ("issuer-jwk", j.clone())))
+            .collect(),
         // An edited manifest (#713), as a run's manifest goes.
         Cmd::Manifest { cmd: crate::ManifestCmd::Check { file, .. } | crate::ManifestCmd::Save { file, .. } } => {
             vec![("edit", file.clone())]
