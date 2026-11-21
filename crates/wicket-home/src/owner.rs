@@ -26,12 +26,19 @@ fn machine_id() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
-/// A process's start time in clock ticks since boot, or None if it doesn't exist.
-fn start_time(pid: u32) -> Option<u64> {
+/// A process's state (field 3: `R`, `S`, `D`, `Z` and the rest) and start time in clock ticks since
+/// boot, or None if it doesn't exist.
+fn stat(pid: u32) -> Option<(char, u64)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name (field 2) is in parentheses and may contain spaces: count from after it.
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(19)?.parse().ok()
+    let mut rest = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = rest.next()?.chars().next()?;
+    Some((state, rest.nth(18)?.parse().ok()?))
+}
+
+/// A process's start time in clock ticks since boot, or None if it doesn't exist.
+fn start_time(pid: u32) -> Option<u64> {
+    stat(pid).map(|(_, start)| start)
 }
 
 /// This process's owner label.
@@ -64,17 +71,26 @@ pub fn is_host_label(label: &str) -> bool {
 
 /// Whether the process an owner label names is still running: None if it's on another machine (or
 /// the label is unreadable), so this machine can't tell. A supervisor host's label is `Some(false)`:
-/// see the module's documentation.
+/// see the module's documentation. A zombie (exited, not yet reaped by its parent) isn't running.
 pub fn owner_alive(label: &str) -> Option<bool> {
     if is_host_label(label) {
         return Some(false);
     }
+    let (pid, start) = local_label(label)?;
+    Some(stat(pid).is_some_and(|(state, s)| s == start && state != 'Z'))
+}
+
+/// Whether the process an owner label names is a zombie: it exited and its parent hasn't reaped it.
+/// Only then may its parent reap it by pid, knowing it is that process.
+pub fn owner_zombie(label: &str) -> bool {
+    local_label(label).is_some_and(|(pid, start)| stat(pid) == Some(('Z', start)))
+}
+
+/// An owner label of this machine's: its pid and start time.
+fn local_label(label: &str) -> Option<(u32, u64)> {
     let mut f = label.splitn(3, ':');
     let (machine, pid, start) = (f.next()?, f.next()?.parse::<u32>().ok()?, f.next()?.parse::<u64>().ok()?);
-    if machine != machine_id() {
-        return None;
-    }
-    Some(start_time(pid) == Some(start))
+    (machine == machine_id()).then_some((pid, start))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -147,5 +163,24 @@ mod tests {
             assert!(!is_host_label(not), "{not}");
         }
         assert!(!is_host_label(&owner_label()));
+    }
+
+    #[test]
+    fn a_zombie_owner_is_gone_and_known_as_a_zombie_until_reaped() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let label = owner_label_of(pid).unwrap();
+        // Exited, not yet reaped: a zombie.
+        let t = std::time::Instant::now();
+        while !owner_zombie(&label) {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "never a zombie");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(owner_alive(&label), Some(false));
+        child.wait().unwrap();
+        assert!(!owner_zombie(&label));
+        assert_eq!(owner_alive(&label), Some(false));
+        assert_eq!(owner_alive(&owner_label()), Some(true));
+        assert!(!owner_zombie(&owner_label()));
     }
 }

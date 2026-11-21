@@ -151,8 +151,10 @@ impl Ledger {
             for node in nodes {
                 if let Some(other) = l.shard_of_node(node)?.filter(|o| o != host) {
                     if let Some(o) = l.supervisor_host(&other)?.filter(|o| o.owner.is_some() && !o.stopping) {
-                        if o.lease_until > now {
-                            return Err(StoreError::ShardHeld(other, o.lease_until - now));
+                        // A free take (a host process's own) never fences another shard's holder:
+                        // that is wicketd's fence, then its kill (note 25, §3.1).
+                        if o.lease_until > now || only_free {
+                            return Err(StoreError::ShardHeld(other, (o.lease_until - now).max(0)));
                         }
                         lapsed.push(other);
                     }
@@ -430,6 +432,18 @@ mod tests {
         assert_eq!(l.take_free_shard("0", B, &["n1"], 30, 200).unwrap().epoch, 3);
         assert!(l.mark_shard_stopping("0", B, 3, 201).unwrap());
         assert_eq!(l.take_free_shard("0", A, &["n1"], 30, 201).unwrap().epoch, 4, "a clean stop frees it at once");
+    }
+
+    #[test]
+    fn a_free_take_refuses_to_move_a_node_from_a_lapsed_holder() {
+        let l = ledger_with_runs();
+        l.take_shard("0", A, &["n1", "n2"], 30, 100).unwrap();
+        // Shard 0's holder lapsed long ago: a free take of a shard that wants n1 is refused, and
+        // shard 0 is left as it is (wicketd fences it, then kills it).
+        assert!(matches!(l.take_free_shard("1", B, &["n1"], 30, 500), Err(StoreError::ShardHeld(s, 0)) if s == "0"));
+        let rec = l.supervisor_host("0").unwrap().unwrap();
+        assert_eq!((rec.owner.as_deref(), rec.epoch), (Some(A), 1));
+        assert!(l.supervisor_host("1").unwrap().is_none());
     }
 
     #[test]

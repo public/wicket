@@ -19,10 +19,13 @@ struct Io(ProcIo);
 
 impl Drop for Io {
     fn drop(&mut self) {
-        for p in &self.0.spawned {
-            unsafe { libc::kill(*p as i32, libc::SIGKILL) };
+        for o in self.0.spawned.clone() {
+            let p = pid(&o);
+            if wicket_home::owner::owner_label_of(p as u32).as_deref() == Some(o.as_str()) {
+                unsafe { libc::kill(p, libc::SIGKILL) };
+            }
             let mut st = 0;
-            unsafe { libc::waitpid(*p as i32, &mut st, 0) };
+            unsafe { libc::waitpid(p, &mut st, 0) };
         }
     }
 }
@@ -100,7 +103,7 @@ fn the_manager_starts_hosts_fences_a_dead_one_and_starts_it_again() {
     for owner in [&fresh.owner, &beats.1.owner] {
         unsafe { libc::kill(pid(owner), libc::SIGTERM) };
     }
-    wait_for("both stopped", || (io.gone(pid(&fresh.owner) as u32) && io.gone(pid(&beats.1.owner) as u32)).then_some(()));
+    wait_for("both stopped", || (io.gone(&fresh.owner) && io.gone(&beats.1.owner)).then_some(()));
     for s in ["0", "1"] {
         assert!(ledger.supervisor_host(s).unwrap().unwrap().stopping, "shard {s}'s clean-stop marker");
     }
