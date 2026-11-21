@@ -287,6 +287,17 @@ pub struct ExitInfo {
 /// box writes; ends (`changed` is an error) when the stream does.
 pub type Written = tokio::sync::watch::Receiver<[u64; 2]>;
 
+/// Whether what a box writes is counted ([`Written`]), or why not.
+#[derive(Debug)]
+pub enum Counting {
+    Counted(Written),
+    /// Through Docker's CLI, or the attach failed: why, in words.
+    Uncounted(String),
+}
+
+/// How long Docker has to answer an attach.
+const ATTACH_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Counts the payload bytes of Docker's multiplexed stream (frames of an 8-byte header, the stream
 /// (1 stdout, 2 stderr) and a big-endian length, then that many bytes), however it is split.
 #[derive(Default)]
@@ -714,9 +725,10 @@ impl Docker {
     /// box's stdin is the node's to relay (its `sock/stdin.sock`), never Docker's.
     ///
     /// Through the Engine API, what the box writes is counted from before it starts ([`Written`]):
-    /// its attach stream is opened between create and start. None through the CLI, or if Docker
-    /// refused the attach (the box starts all the same).
-    pub async fn start_detached(&self, spec: &SandboxSpec, log_cap: u64) -> Result<Option<Written>> {
+    /// its attach stream is opened between create and start. If that fails and `must_count` (its
+    /// zone stops it on what it writes, #824), the box is removed before it ever ran, and the start
+    /// is an error; otherwise it starts uncounted, saying why. Through the CLI it is never counted.
+    pub async fn start_detached(&self, spec: &SandboxSpec, log_cap: u64, must_count: bool) -> Result<Counting> {
         let _t = self.span("run");
         if let Some(e) = self.engine().await {
             // `docker run -d` is these two calls (the CLI makes the same ones, after its own start).
@@ -727,12 +739,19 @@ impl Docker {
             }
             let id: serde_json::Value = serde_json::from_slice(&b).context("docker create's answer")?;
             let id = id["Id"].as_str().context("docker create: no Id")?;
-            let written = attach_written(e, id).await.ok();
+            let counting = match attach_written(e, id).await {
+                Ok(w) => Counting::Counted(w),
+                Err(err) if must_count => {
+                    let _ = e.call(Method::DELETE, &format!("/containers/{}?force=1", engine::enc(id, false)), None).await;
+                    bail!("docker run failed: its output can't be counted, and its zone stops it on what it writes (on_output_full: stop): {err:#}");
+                }
+                Err(err) => Counting::Uncounted(format!("{err:#}")),
+            };
             let (st, b) = e.call(Method::POST, &format!("/containers/{}/start", engine::enc(id, false)), None).await?;
             if !st.is_success() && st != StatusCode::NOT_MODIFIED {
                 bail!("docker run failed: {}", engine::message(&b));
             }
-            return Ok(written);
+            return Ok(counting);
         }
         let half = log_half(log_cap);
         let args: Vec<String> = self
@@ -755,14 +774,17 @@ impl Docker {
         if !out.status.success() {
             bail!("docker run failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
-        Ok(None)
+        Ok(Counting::Uncounted("through Docker's CLI, which can't attach before a box starts: what its node reads is counted".into()))
     }
 
     /// What a running box writes from now on ([`Written`]): for a box this node adopted, whose
-    /// count from its start went with the `serve` that started it. None through the CLI, or if
-    /// Docker refused the attach.
-    pub async fn written_from_now(&self, name: &str) -> Option<Written> {
-        attach_written(self.engine().await?, name).await.ok()
+    /// count from its start went with the `serve` that started it, or one whose attach dropped. An
+    /// error through the CLI, or if Docker refused the attach (a paused box can't be attached).
+    pub async fn written_from_now(&self, name: &str) -> Result<Written> {
+        match self.engine().await {
+            Some(e) => attach_written(e, name).await,
+            None => bail!("through Docker's CLI, which doesn't attach to count"),
+        }
     }
 
     /// A box's stdout and stderr as Docker still has them (from its start, unless rotated; or since
@@ -1356,7 +1378,10 @@ async fn logs_api(e: &engine::Engine, name: &str, since: Option<&str>, w: &mut [
 /// it answers, so a box started after this returns has every byte counted.
 async fn attach_written(e: &engine::Engine, id: &str) -> Result<Written> {
     use http_body_util::BodyExt;
-    let resp = e.send(Method::POST, &format!("/containers/{}/attach?stream=1&stdout=1&stderr=1", engine::enc(id, false)), None).await?;
+    let path = format!("/containers/{}/attach?stream=1&stdout=1&stderr=1", engine::enc(id, false));
+    let resp = tokio::time::timeout(ATTACH_WITHIN, e.send(Method::POST, &path, None))
+        .await
+        .map_err(|_| anyhow::anyhow!("docker attach: no answer within {} s", ATTACH_WITHIN.as_secs()))??;
     if !resp.status().is_success() {
         let b = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
         bail!("docker attach failed: {}", engine::message(&b));
@@ -1810,7 +1835,7 @@ mod tests {
         let t = Arc::new(Timings::new());
         let d = fake.docker().timed(t.clone());
         assert!(d.backend().await.starts_with("the Engine API at "));
-        d.start_detached(&spec(), 1 << 20).await.unwrap();
+        d.start_detached(&spec(), 1 << 20, false).await.unwrap();
         // What the CLI's flags ask for, as the API takes them.
         let c = fake.body_of("/containers/create");
         let h = &c["HostConfig"];
@@ -1857,7 +1882,7 @@ mod tests {
         let fake = FakeEngine::start("refused", |_, _, _| {
             Reply::Json(409, serde_json::json!({"message": "Conflict. The container name \"/wicket-x\" is already in use"}))
         });
-        let e = fake.docker().start_detached(&spec(), 1 << 20).await.unwrap_err().to_string();
+        let e = fake.docker().start_detached(&spec(), 1 << 20, false).await.unwrap_err().to_string();
         assert!(e.starts_with("docker run failed: Conflict."), "{e}");
         let e = fake.docker().wait("wicket-x").await.unwrap_err().to_string();
         assert!(e.contains("already in use"), "{e}");
@@ -1900,7 +1925,7 @@ mod tests {
             ("POST", "/containers/abc/start") => Reply::Status(204),
             _ => Reply::Json(500, serde_json::json!({"message": "unexpected"})),
         });
-        let mut w = fake.docker().start_detached(&spec(), 1 << 20).await.unwrap().expect("counted");
+        let Counting::Counted(mut w) = fake.docker().start_detached(&spec(), 1 << 20, true).await.unwrap() else { panic!("uncounted") };
         let seen: Vec<String> = fake.seen().into_iter().map(|(_, p)| p).collect();
         let at = |p: &str| seen.iter().position(|s| s.starts_with(p)).unwrap_or_else(|| panic!("{p} not in {seen:?}"));
         assert!(at("/containers/abc/attach") < at("/containers/abc/start"), "attached before it starts: {seen:?}");
@@ -1913,14 +1938,26 @@ mod tests {
         drop(tx);
         while w.changed().await.is_ok() {}
         assert_eq!(*w.borrow(), [1_000_000, 40]);
-        // Refused: the box starts, uncounted.
-        let fake = FakeEngine::start("attach-refused", |m, p, _| match (m, p) {
-            ("POST", "/containers/create?name=wicket-x") => Reply::Json(201, serde_json::json!({"Id": "abc", "Warnings": []})),
-            ("POST", "/containers/abc/start") => Reply::Status(204),
-            _ => Reply::Json(500, serde_json::json!({"message": "no attach here"})),
-        });
-        assert!(fake.docker().start_detached(&spec(), 1 << 20).await.unwrap().is_none());
+        // Refused: the box starts, uncounted, saying why; unless its zone stops it on what it writes,
+        // when it is removed before it ever ran and the start fails.
+        let refused = || {
+            FakeEngine::start("attach-refused", |m, p, _| match (m, p) {
+                ("POST", "/containers/create?name=wicket-x") => Reply::Json(201, serde_json::json!({"Id": "abc", "Warnings": []})),
+                ("POST", "/containers/abc/start") => Reply::Status(204),
+                ("DELETE", "/containers/abc?force=1") => Reply::Status(204),
+                _ => Reply::Json(500, serde_json::json!({"message": "no attach here"})),
+            })
+        };
+        let fake = refused();
+        let Counting::Uncounted(why) = fake.docker().start_detached(&spec(), 1 << 20, false).await.unwrap() else { panic!("counted") };
+        assert!(why.contains("no attach here"), "{why}");
         assert!(fake.seen().contains(&("POST".into(), "/containers/abc/start".into())));
+        let fake = refused();
+        let e = fake.docker().start_detached(&spec(), 1 << 20, true).await.expect_err("refused");
+        assert!(format!("{e:#}").contains("on_output_full: stop") && format!("{e:#}").contains("no attach here"), "{e:#}");
+        let seen = fake.seen();
+        assert!(seen.contains(&("DELETE".into(), "/containers/abc?force=1".into())), "removed: {seen:?}");
+        assert!(!seen.contains(&("POST".into(), "/containers/abc/start".into())), "never started: {seen:?}");
     }
 
     /// #676: a kill Docker refused is an error, so it isn't taken for a stopped box; one of a box

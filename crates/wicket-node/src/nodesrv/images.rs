@@ -444,6 +444,7 @@ sys.exit(2)
                 owner: Some(1),
                 record: rec,
                 counted: false,
+                output_stopped: false,
             },
         );
 
