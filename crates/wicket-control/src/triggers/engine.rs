@@ -37,7 +37,9 @@ pub const MANIFEST_COPY: &str = "trigger-manifest.yaml";
 pub const LOG: &str = "trigger.log";
 
 /// A run for the engine's launcher to start: `wicket run --run-id <run> [--task <task>]
-/// <manifest>`, with `principal` as its `WICKET_PRINCIPAL`, logging to `log`.
+/// <manifest>`, with `principal` as its `WICKET_PRINCIPAL` and `operator` as its
+/// `WICKET_OPERATOR` (how its decisions are labelled: the trigger and its owner, not the
+/// reconciler's user), logging to `log`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Launch {
     pub run: String,
@@ -45,6 +47,7 @@ pub struct Launch {
     pub manifest: PathBuf,
     pub task: Option<String>,
     pub principal: Value,
+    pub operator: String,
     pub log: PathBuf,
 }
 
@@ -75,17 +78,20 @@ pub fn pass(l: &Ledger, now: i64, dry_run: bool, eng: &Engine<'_>, owner: OwnerC
     Ok(out)
 }
 
-fn one(l: &Ledger, t: &Trigger, now: i64, dry_run: bool, eng: &Engine<'_>, owner: OwnerCheck<'_>) -> Result<Option<Fired>> {
-    let Some(f) = l.firings(&t.id, Some("queued"))?.into_iter().next() else { return Ok(None) };
+fn one(l: &Ledger, t: &Trigger, now: i64, dry_run: bool, eng: &Engine<'_>, owner: OwnerCheck<'_>) -> Result<Vec<Fired>> {
+    let mut out = if dry_run { vec![] } else { never_started(l, t, now)? };
+    let Some(f) = l.firings(&t.id, Some("queued"))?.into_iter().next() else { return Ok(out) };
     if l.firings_in_flight(&t.id, now - LAUNCH_GRACE_SECS)? >= t.spec.limits.concurrency as i64 {
-        return Ok(None);
+        return Ok(out);
     }
     let done = |status: &str, detail: String| Fired { trigger: t.id.clone(), name: t.name.clone(), status: status.into(), detail };
     if dry_run {
-        return Ok(Some(done("due", format!("{}, for firing {} (dry run)", action_text(&t.spec), f.id))));
+        out.push(done("due", format!("{}, for firing {} (dry run)", action_text(&t.spec), f.id)));
+        return Ok(out);
     }
     if let Err(e) = owner(t) {
-        return owner_failed(l, t, e).map(Some);
+        out.push(owner_failed(l, t, e)?);
+        return Ok(out);
     }
     let fired = match prepare(l, t, &f, eng) {
         Ok(p) => start(l, t, &f, p, eng)?,
@@ -108,7 +114,26 @@ fn one(l: &Ledger, t: &Trigger, now: i64, dry_run: bool, eng: &Engine<'_>, owner
     if fired.status == "failed" {
         pause_if_failing(l, t)?;
     }
-    Ok(Some(fired))
+    out.push(fired);
+    Ok(out)
+}
+
+/// The runs `t`'s firings launched more than [`LAUNCH_GRACE_SECS`] ago that never reached the
+/// ledger (`wicket run` failed before its run began: a secret it can't use, an image its zone
+/// doesn't allow, no node to place it on): each firing fails, audited, and counts toward pausing.
+fn never_started(l: &Ledger, t: &Trigger, now: i64) -> Result<Vec<Fired>> {
+    let mut out = vec![];
+    for f in l.firings_never_started(&t.id, now - LAUNCH_GRACE_SECS)? {
+        let run = f.run.clone().unwrap_or_default();
+        let why = format!("run {run} didn't start within {} minutes of its launch: see runs/{run}/{LOG}", LAUNCH_GRACE_SECS / 60);
+        l.update_firing(&f.id, "failed", Some(&why), None)?;
+        let mut r = record(t, &f, "failed", &why);
+        r["run"] = json!(run);
+        audit(l, "trigger.failed", &r)?;
+        pause_if_failing(l, t)?;
+        out.push(Fired { trigger: t.id.clone(), name: t.name.clone(), status: "failed".into(), detail: why });
+    }
+    Ok(out)
 }
 
 /// Why a firing wasn't started: refused (the manifest isn't the one the trigger pins: its sha256
@@ -202,9 +227,14 @@ fn start(l: &Ledger, t: &Trigger, f: &wicket_store::TriggerFiring, p: Prepared, 
     let done = |status: &str, detail: String| Fired { trigger: t.id.clone(), name: t.name.clone(), status: status.into(), detail };
     let run = wicket_core::RunId::new().0;
     let dir = eng.runs.join(&run);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let manifest = dir.join(MANIFEST_COPY);
-    std::fs::write(&manifest, &p.bytes).with_context(|| format!("writing {}", manifest.display()))?;
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&manifest, &p.bytes)) {
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("writing {}: {e}", manifest.display());
+        l.update_firing(&f.id, "failed", Some(&why), None)?;
+        audit(l, "trigger.failed", &record(t, f, "failed", &why))?;
+        return Ok(done("failed", why));
+    }
     let detail = format!("started run {run} from {} as {}", st.manifest, t.owner);
     let claimed = l.immediate(|l| -> Result<bool> {
         // Another pass may have taken it meanwhile (the reconciler's lock makes this unlikely).
@@ -227,7 +257,8 @@ fn start(l: &Ledger, t: &Trigger, f: &wicket_store::TriggerFiring, p: Prepared, 
         let _ = std::fs::remove_dir_all(&dir);
         return Ok(done("skipped", format!("firing {} was taken by another pass", f.id)));
     }
-    let launch = Launch { run: run.clone(), manifest, task: p.task, principal: p.principal, log: dir.join(LOG) };
+    let operator = format!("trigger {} ({}) for {}", t.name, t.id, t.owner);
+    let launch = Launch { run: run.clone(), manifest, task: p.task, principal: p.principal, operator, log: dir.join(LOG) };
     match (eng.launch)(&launch) {
         Ok(()) => Ok(done("started", detail)),
         Err(e) => {
@@ -381,7 +412,12 @@ mod tests {
         // A launch that never reached the ledger gives its place up after the grace.
         tick(&l, b, 2);
         assert!(h.pass(&l, b + 180, false).is_empty());
-        assert_eq!(h.pass(&l, wicket_store::now() + LAUNCH_GRACE_SECS + 1, false)[0].status, "started");
+        let got = h.pass(&l, wicket_store::now() + LAUNCH_GRACE_SECS + 1, false);
+        assert_eq!(got.iter().map(|f| f.status.as_str()).collect::<Vec<_>>(), ["failed", "started"], "{got:?}");
+        assert!(got[0].detail.contains("didn't start within 10 minutes"), "{got:?}");
+        let lost: Vec<_> = l.audit_of_kind("trigger.failed").unwrap();
+        assert_eq!(lost.len(), 1, "the launch that never began, audited");
+        assert_eq!(h.launched.borrow()[2].operator, format!("trigger build ({t}) for {}", alex().id));
     }
 
     /// The coordinator's #823 note: a manifest edited after the trigger pinned it is refused, not

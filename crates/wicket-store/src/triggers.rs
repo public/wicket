@@ -715,6 +715,17 @@ impl Ledger {
         )?)
     }
 
+    /// A trigger's `started` firings whose run was launched before `launched_before` and never
+    /// reached the ledger: launches that died before their run began.
+    pub fn firings_never_started(&self, trigger: &str, launched_before: i64) -> Result<Vec<Firing>> {
+        self.firings_where(
+            trigger,
+            Some("started"),
+            &format!("AND run IS NOT NULL AND updated_at < {launched_before} AND run NOT IN (SELECT id FROM runs) ORDER BY created_at, id"),
+            -1,
+        )
+    }
+
     /// A trigger's firings in `status`, oldest first.
     pub fn firings(&self, trigger: &str, status: Option<&str>) -> Result<Vec<Firing>> {
         self.firings_where(trigger, status, "ORDER BY created_at, id", -1)

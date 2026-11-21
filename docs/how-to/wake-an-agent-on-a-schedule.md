@@ -71,7 +71,8 @@ limits: { per_hour: 1, queue: 2 }
 ```
 
 - **The manifest.** `manifest` is `<root>/<name>` (`examples/claude.yaml`) or a name in the
-  `manifests` root, as `wicket manifest show` names it. `sha256` pins its bytes as they are now
+  `manifests` root, as `wicket manifest show` names it. The `examples` root is the `examples`
+  directory where the reconciler runs, so prefer the `manifests` root. `sha256` pins its bytes as they are now
   (`wicket manifest show` prints it).
 - **The pin is checked when the run starts.** If the file has changed since (an edit in the
   console or with `wicket manifest save`), the firing is refused: nothing starts, the firing fails,
