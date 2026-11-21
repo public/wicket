@@ -114,6 +114,11 @@ pub(crate) fn explain_text(v: &Value) -> String {
     out
 }
 
+/// `wicket policy show --json`: the console's policy view.
+pub fn policy() -> Result<()> {
+    super::print_json(&with_views(views::policy)?)
+}
+
 /// `wicket authority <run>`.
 pub fn run(run: &str, json: bool) -> Result<()> {
     let v = with_views(|x| views::run_authority(x, run))?;

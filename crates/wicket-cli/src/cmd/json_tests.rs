@@ -522,3 +522,31 @@ fn authority_text_cleans_what_agents_asked_for() {
     assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'), "{text:?}");
     assert!(text.contains("evil") && text.contains("      next\n"), "{text}");
 }
+
+/// #713: `wicket policy show --json` prints the console's policy view, and `wicket node fences
+/// --json` its Agents held on lost servers card.
+#[test]
+fn policy_show_and_node_fences_json() {
+    let (d, l) = super::test_ledger("fences");
+    let t = TenantId::single();
+    let ledger = d.join("ledger.db");
+    let views = crate::serve::authority::Views { ledger: &ledger, data: &d, tenant: &t, authz_root: None };
+    let p = crate::serve::authority::policy(&views).unwrap();
+    assert!(p["installed"].is_null() && p["current"].is_null(), "{p:#}");
+    documented_as("`wicket policy show --json`", &p);
+    // A run whose records can't say when its authority ends, on a node no longer enrolled.
+    let run = RunId::new();
+    std::fs::create_dir_all(d.join("runs").join(&run.0).join("ctl")).unwrap();
+    std::fs::write(d.join("runs").join(&run.0).join("ctl/run.json"), b"not json").unwrap();
+    l.run_started(&t, &run, "z", "lead").unwrap();
+    l.set_run_node(&run.0, "n1").unwrap();
+    let rows = serde_json::Value::from(crate::serve::fence::view_in(&d.join("runs"), &t.0, &l, &[]).unwrap());
+    assert_eq!((rows[0]["id"].as_str(), rows[0]["fence"]["node"].as_str()), (Some(run.0.as_str()), Some("n1")), "{rows:#}");
+    documented_as("`wicket node fences --json`", &rows);
+    documented_as("a run's `fence`", &rows[0]["fence"]);
+    let text = super::node::fence_line(&rows[0]["fence"]);
+    assert!(text.contains("node n1 (unknown, last reported never)") && text.contains("until its node confirms"), "{text}");
+    assert!(text.contains(&format!("wicket node release-fence {} --reason", run.0)), "{text}");
+    // Another tenant's views list nothing of this one's.
+    assert!(crate::serve::fence::view_in(&d.join("runs"), "t9", &l, &[]).unwrap().is_empty());
+}

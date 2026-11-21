@@ -26,6 +26,11 @@ fn runs_dir(state: &State) -> std::path::PathBuf {
 /// The fences of this console's tenant an operator could release, among the running runs and the
 /// `recent` ones.
 pub(super) fn view(state: &State, l: &Ledger, recent: &[String]) -> anyhow::Result<Vec<Value>> {
+    view_in(&runs_dir(state), &state.tenant.0, l, recent)
+}
+
+/// The card's rows from `runs_dir` for `tenant`: what `wicket node fences` (#713) lists too.
+pub(crate) fn view_in(runs_dir: &std::path::Path, tenant: &str, l: &Ledger, recent: &[String]) -> anyhow::Result<Vec<Value>> {
     let now = wicket_feed::now_ms();
     let mut seen = std::collections::BTreeSet::new();
     let mut out = vec![];
@@ -33,8 +38,8 @@ pub(super) fn view(state: &State, l: &Ledger, recent: &[String]) -> anyhow::Resu
         if !seen.insert(run.clone()) || wicket_control::run::check_run_id(&run).is_err() {
             continue;
         }
-        if let Some(f) = fence::fence_of(l, &runs_dir(state), &run, now)? {
-            if f.tenant == state.tenant.0 && f.release_refused.is_none() {
+        if let Some(f) = fence::fence_of(l, runs_dir, &run, now)? {
+            if f.tenant == tenant && f.release_refused.is_none() {
                 out.push(json!({ "id": f.run, "fence": f }));
             }
         }

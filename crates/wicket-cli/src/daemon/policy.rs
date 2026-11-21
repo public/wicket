@@ -150,7 +150,7 @@ pub fn route(cmd: &Cmd) -> Route {
             LeaseCmd::Release { .. } => Forward(Revoke),
         },
         Cmd::Node { cmd } => match cmd {
-            NodeCmd::List { provider: false, .. } | NodeCmd::Ca { .. } => Forward(Read),
+            NodeCmd::List { provider: false, .. } | NodeCmd::Ca { .. } | NodeCmd::Fences { .. } => Forward(Read),
             // Uses the provider's API key from the vault.
             NodeCmd::List { provider: true, .. } | NodeCmd::Plans { .. } => Forward(Privileged),
             // Spends money (a CAPACITY request decided by a grant or an operator), or destroys a machine.
@@ -172,7 +172,7 @@ pub fn route(cmd: &Cmd) -> Route {
         },
         // Applying an org policy changes what every box may do, and revokes runs.
         Cmd::Policy { cmd } => match cmd {
-            PolicyCmd::Show => Forward(Read),
+            PolicyCmd::Show { .. } => Forward(Read),
             PolicyCmd::Apply { .. } => Forward(Privileged),
             // Read files the caller names, in the caller's own process.
             PolicyCmd::Check { .. } | PolicyCmd::Zone { .. } => Local,
@@ -424,6 +424,8 @@ mod tests {
             (&["capacity", "renew", "g-1", "--ttl", "1h"], Route::Forward(Privileged)),
             (&["capacity", "revoke", "g-1"], Route::Forward(Revoke)),
             (&["authority", "r1", "--json"], Route::Forward(Read)),
+            (&["policy", "show", "--json"], Route::Forward(Read)),
+            (&["node", "fences", "--json"], Route::Forward(Read)),
             (&["manifest", "list", "--json"], Route::Forward(Read)),
             (&["manifest", "show", "examples/claude.yaml"], Route::Forward(Read)),
             (&["manifest", "check", "w.yaml", "--file", "w.yaml"], Route::Forward(Read)),
