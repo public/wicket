@@ -330,6 +330,9 @@ pub struct Launch {
     /// The image the box starts from (#171): the manifest's, as shown on the start card and signed.
     /// None for a program, whose image is its manifest's `program.image`.
     pub image: Option<String>,
+    /// How the run's decisions are labelled (`WICKET_OPERATOR`), when not this process's: a
+    /// trigger's run is labelled with the trigger and its owner (#578).
+    pub operator: Option<String>,
 }
 
 struct State {
@@ -541,10 +544,10 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     net::run(listener, acceptor, state).await
 }
 
-/// Starts `wicket run` for a console launch as its own process (its own process group, so stopping
-/// the console doesn't stop the run), logging to the run's directory. The run's principal is passed
+/// Starts `wicket run` for a console launch (or a trigger's, #578) as its own process (its own
+/// process group, so stopping the console doesn't stop the run), logging to the run's directory. The run's principal is passed
 /// in WICKET_PRINCIPAL (see crate::cli_principal).
-fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
+pub(crate) fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let log = std::fs::File::create(&l.log).with_context(|| format!("creating {}", l.log.display()))?;
     let mut cmd = std::process::Command::new(exe);
@@ -554,6 +557,9 @@ fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
     }
     if let Some(i) = &l.image {
         cmd.arg("--image").arg(i);
+    }
+    if let Some(o) = &l.operator {
+        cmd.env("WICKET_OPERATOR", o);
     }
     cmd.arg(&l.manifest)
         .env("WICKET_PRINCIPAL", l.principal.to_string())
@@ -1862,6 +1868,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 principal: principal.clone(),
                 log: log.clone(),
                 image: image.clone(),
+                operator: None,
             })?;
             Ok(format!("started {run} from {root}/{name} as {} (log: runs/{run}/console.log)", wicket_identity::principal_label(principal)))
         }
@@ -3113,6 +3120,7 @@ mod tests {
             principal,
             log: log.clone(),
             image: Some("img:rust".into()),
+            operator: None,
         };
         // A stand-in for the wicket binary that prints its arguments and principal.
         let exe = t.dir.join("fake-wicket");

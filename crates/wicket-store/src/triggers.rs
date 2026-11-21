@@ -16,8 +16,9 @@
 //!   back while its owner can't be checked: the seq it has heard to, which it catches up from
 //!   once the check works (the row is then deleted), while `wicket` moves on for the others.
 //! - **`trigger_causes`:** the triggers that led to each turn a trigger queued (its message id),
-//!   so an event of the run that read it knows which triggers caused it, and none fires twice in
-//!   one chain.
+//!   or to each run it queued for the engine (`firing:<firing id>`), so an event of the run that
+//!   read it, or was started for it, knows which triggers caused it, and none fires twice in one
+//!   chain.
 //!
 //! The scheduler, intake and engine that fill these come later (the design's steps 2 to 5).
 
@@ -410,11 +411,22 @@ impl Ledger {
         Ok(())
     }
 
+    /// Records what led to `firing`, a run `trigger` queued for the engine to start: as
+    /// [`Ledger::record_trigger_cause`] does for a turn, under the key `firing:<id>`, so the run
+    /// the engine starts for it carries the chain ([`Ledger::trigger_chain`]).
+    pub fn record_firing_cause(&self, firing: &str, trigger: &str, chain: &Chain) -> Result<()> {
+        self.record_trigger_cause(&format!("firing:{firing}"), trigger, chain)
+    }
+
     /// The triggers that led to what `run` did up to `at`: every trigger in the chains of the
-    /// turns triggers queued for it (or for its agent, moved to it when it woke) by then, sorted.
+    /// turns triggers queued for it (or for its agent, moved to it when it woke) by then, and of
+    /// the firing that started it, sorted.
     pub fn trigger_chain(&self, run: &str, at: i64) -> Result<Chain> {
         let mut st = self.conn.prepare(
-            "SELECT c.chain FROM trigger_causes c JOIN messages m ON m.id = c.message WHERE m.to_run = ?1 AND c.created_at <= ?2",
+            "SELECT c.chain FROM trigger_causes c JOIN messages m ON m.id = c.message WHERE m.to_run = ?1 AND c.created_at <= ?2
+             UNION ALL
+             SELECT c.chain FROM trigger_causes c JOIN trigger_firings f ON c.message = 'firing:' || f.id
+              WHERE f.run = ?1 AND c.created_at <= ?2",
         )?;
         let rows = st.query_map(params![run, at], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut out = Chain::default();
@@ -690,6 +702,30 @@ impl Ledger {
         Ok(())
     }
 
+    /// How many of the runs a trigger's firings started are still in flight: running, or started
+    /// at `launched_after` or later and not yet in the ledger (a run's row is written by the run
+    /// itself, once it is under way). What the engine's concurrency counts.
+    pub fn firings_in_flight(&self, trigger: &str, launched_after: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM trigger_firings f LEFT JOIN runs r ON r.id = f.run
+              WHERE f.trigger = ?1 AND f.status = 'started' AND f.run IS NOT NULL
+                AND (r.status = 'running' OR (r.id IS NULL AND f.updated_at >= ?2))",
+            params![trigger, launched_after],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// A trigger's `started` firings whose run was launched before `launched_before` and never
+    /// reached the ledger: launches that died before their run began.
+    pub fn firings_never_started(&self, trigger: &str, launched_before: i64) -> Result<Vec<Firing>> {
+        self.firings_where(
+            trigger,
+            Some("started"),
+            &format!("AND run IS NOT NULL AND updated_at < {launched_before} AND run NOT IN (SELECT id FROM runs) ORDER BY created_at, id"),
+            -1,
+        )
+    }
+
     /// A trigger's firings in `status`, oldest first.
     pub fn firings(&self, trigger: &str, status: Option<&str>) -> Result<Vec<Firing>> {
         self.firings_where(trigger, status, "ORDER BY created_at, id", -1)
@@ -931,6 +967,16 @@ mod tests {
         let m = l.add_prompt("run_1", "hi", "trigger:x", "op").unwrap();
         l.record_trigger_cause(&m, "t-e", &c).unwrap();
         assert_eq!(l.trigger_chain("run_1", now() + 10).unwrap().depth, 2);
+        // A run the engine started for a queued firing carries the firing's chain, once it is
+        // the firing's run; before that, no run has it.
+        let (e, _) = l.record_trigger_event("t0", "schedule", "tick", "d-start", &serde_json::json!({}), "x", "wicket").unwrap();
+        let (f, _) = l.record_firing("t-s", &e, "queued", None).unwrap();
+        l.record_firing_cause(&f, "t-s", &c).unwrap();
+        assert_eq!(l.trigger_chain("run_2", now() + 10).unwrap(), Chain::default());
+        l.update_firing(&f, "started", None, Some("run_2")).unwrap();
+        let s = l.trigger_chain("run_2", now() + 10).unwrap();
+        assert_eq!((s.ids.len(), s.depth), (5, 2), "{s:?}");
+        assert!(s.ids.contains(&"t-s".to_string()));
         assert_eq!(Chain::parse(r#"["a","b","c"]"#), Chain { ids: vec!["a".into(), "b".into(), "c".into()], depth: 3 });
         let id = l
             .create_trigger("t0", "op", &spec("trigger: t\nsource: { timer: { after: 1h } }\naction: { wake: self }\n"), "x", false, None)

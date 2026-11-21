@@ -42,6 +42,8 @@ limits: { per_hour: 6 }            # the default; at most 60
   is woken to read it. A `to` is found again at each firing: whichever live agent holds that
   principal then (the newest, if several do). A `wake` stays pinned to the agent found when you
   made the trigger.
+- **Or start a run.** `start: { manifest: triage.yaml, sha256: <its sha256>, task: '…' }` starts
+  a fresh run of a manifest instead (see [Start a run](#start-a-run)).
 - **The agent is found when you create the trigger.** It must be a live agent of this
   installation (not ended). A name must be the only live agent of that name; otherwise use its id
   (`wicket agents`). `wake` is kept as the agent's id, so another agent given the same name later
@@ -51,6 +53,44 @@ limits: { per_hour: 6 }            # the default; at most 60
   `missed` (how many earlier minutes it stands for).
 - **Limits.** `per_hour` and `queue` are enforced. `concurrency` and `debounce` aren't yet, so
   leave them out (they're refused).
+
+## Start a run
+
+A `start` action starts a new run of a manifest each time the trigger fires, instead of reaching
+an agent that already exists:
+
+```yaml
+trigger: nightly-triage
+source: { schedule: { cron: '0 2 * * *', tz: Europe/London } }
+action:
+  start:
+    manifest: triage.yaml
+    sha256: 3f7c…   # its sha256, as `wicket manifest show triage.yaml` prints it
+    task: 'Triage what came in before {{ event.at }}.'
+limits: { per_hour: 1, queue: 2 }
+```
+
+- **The manifest.** `manifest` is `<root>/<name>` (`examples/claude.yaml`) or a name in the
+  `manifests` root, as `wicket manifest show` names it. The `examples` root is the `examples`
+  directory where the reconciler runs, so prefer the `manifests` root. `sha256` pins its bytes as they are now
+  (`wicket manifest show` prints it).
+- **The pin is checked when the run starts.** If the file has changed since (an edit in the
+  console or with `wicket manifest save`), the firing is refused: nothing starts, the firing fails,
+  and a `trigger.refused` audit record names both digests. Restore the version it pinned
+  (`wicket manifest restore`), or make the trigger again with the new sha256. The run starts from a
+  copy of the verified bytes in its run directory (`runs/<run>/trigger-manifest.yaml`), so an edit
+  between the check and the start doesn't count either.
+- **It runs as you.** The run's principal is the trigger's owner, so it has your authority and
+  never more. Your authority is checked again when the run starts, not only when the trigger
+  fired.
+- **One at a time.** Each firing is queued, and each reconcile pass starts the oldest one waiting
+  while no run the trigger started is still running. Beyond `queue` waiting firings, the oldest is
+  dead-lettered. A paused trigger starts nothing; its waiting firings start once it is resumed.
+- **The task** replaces the manifest's, filled in from the event as a message is (an agent
+  manifest only). A program's `source` must be an absolute path, since the run doesn't start
+  from the manifest's own directory.
+- **Its log** is `runs/<run>/trigger.log`, and `wicket trigger show` lists the run each firing
+  started.
 
 ## On wicket's own events
 
@@ -160,6 +200,9 @@ resume or renew it, since it fires as its owner.
 
 ## When it can't fire
 
+- **The manifest changed.** A `start` firing whose manifest no longer has the pinned sha256 is
+  refused (`trigger.refused`) and fails. So does one whose manifest is gone or doesn't validate,
+  or whose run couldn't be launched (`trigger.failed`).
 - **The agent can't be reached.** The agent ended, or its budget is spent. The firing fails
   (`trigger.failed`), and after 5 failures in a row wicket pauses the trigger. Failed firings
   count toward `per_hour`.
@@ -176,7 +219,8 @@ resume or renew it, since it fires as its owner.
 
 - **Each firing** is a `trigger.fired`, `trigger.skipped` or `trigger.failed` audit record, with
   the trigger and the event. A fired record also names the agent, and the message's id, length and
-  sha256.
+  sha256; for a `start`, the run, the manifest and its sha256, and the task's length and sha256.
+  A refused start is a `trigger.refused` record with the pinned and the found sha256.
 - **Pauses** wicket makes itself are `trigger.paused` records `by: wicket`, with the reason.
 - **Woken agents.** The agent's `agent.wake` record says it was woken by `trigger <name>`. The
   message comes from `trigger:<name>`, with your principal as its sender.

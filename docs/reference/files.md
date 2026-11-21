@@ -68,6 +68,8 @@ All private keys are 0600 files. `wicket state kit` writes the ones that stay on
 | `acp-client.jsonl` | An ACP run's other side: what wicket wrote to the agent, each line at its transcript offset, up to `limits.output`. The console's [session view](console.md#sessions) reads it with the transcript. |
 | `agent.stderr.log` | The agent's stderr, the newest `limits.output` kept. |
 | `console.log` | The output of a run the console started. |
+| `trigger-manifest.yaml` | For a run a trigger started: the manifest bytes the trigger's sha256 pins, checked, which the run started from. |
+| `trigger.log` | The output of a run a trigger started. |
 | `ctl/run.json` | The run's record: what another supervisor needs to take it over. |
 | `ctl/progress.json` | Model spend and output offsets, saved as the run goes (every 3 s). |
 | `ctl/authority.json` | When the box's authority ends, and whether its node confirmed the box stopped. |

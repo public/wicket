@@ -1158,6 +1158,8 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     if !dry_run {
         done.extend(intake_pass(&ledger, now).await);
     }
+    // The trigger engine (#578 step 5): the runs `start` triggers queued, this pass's included.
+    done.extend(engine_pass(&ledger, now, dry_run));
     let asked = node_runs(&ledger, dry_run).await?;
     let local = Docker::from_env();
     done.extend(machines_pass(&mut ledger, asked, &local, now, dry_run).await?);
@@ -1377,6 +1379,75 @@ fn triggers_pass(
             })
             .collect(),
         Err(e) => vec![Done { kind: "error", target: "triggers".into(), detail: format!("{e:#}") }],
+    }
+}
+
+/// The trigger engine's pass ([`wicket_control::triggers::engine::pass`]), as the pass's report,
+/// with this installation's manifest roots, run directories and `wicket` binary.
+fn engine_pass(ledger: &Ledger, now: i64, dry_run: bool) -> Vec<Done> {
+    match wicket_node::reexec::self_exe() {
+        Ok(exe) => engine_pass_with(
+            ledger,
+            now,
+            dry_run,
+            &crate::serve::manifest_roots(),
+            &crate::data_dir().join("runs"),
+            &exe,
+            &trigger_owner_may,
+        ),
+        Err(e) => vec![Done { kind: "error", target: "trigger engine".into(), detail: format!("{e:#}") }],
+    }
+}
+
+/// [`engine_pass`] with its roots, run directories and binary given: a trigger's manifest is
+/// resolved as the console resolves one (`<root>/<name>`, or a name in the `manifests` root,
+/// [`crate::serve::manifests::resolve`]), and its run launched as the console launches one
+/// ([`crate::serve::launch_detached`]).
+fn engine_pass_with(
+    ledger: &Ledger,
+    now: i64,
+    dry_run: bool,
+    roots: &[(String, std::path::PathBuf)],
+    runs: &std::path::Path,
+    exe: &std::path::Path,
+    owner: wicket_control::triggers::OwnerCheck<'_>,
+) -> Vec<Done> {
+    use wicket_control::triggers::engine;
+    let read = |name: &str| -> Result<Vec<u8>> {
+        let (root, file) = name.split_once('/').unwrap_or((crate::serve::manifests::WRITABLE_ROOT, name));
+        Ok(crate::serve::manifests::resolve(roots, root, file)?.1)
+    };
+    let launch = |x: &engine::Launch| {
+        crate::serve::launch_detached(
+            exe,
+            &crate::serve::Launch {
+                run: x.run.clone(),
+                manifest: x.manifest.clone(),
+                task: x.task.clone(),
+                principal: x.principal.clone(),
+                log: x.log.clone(),
+                image: None,
+                operator: Some(x.operator.clone()),
+            },
+        )
+    };
+    let eng = engine::Engine { read: &read, runs, launch: &launch };
+    match engine::pass(ledger, now, dry_run, &eng, owner) {
+        Ok(fired) => fired
+            .into_iter()
+            .map(|f| Done {
+                kind: match f.status.as_str() {
+                    "started" => "trigger_started",
+                    "due" => "trigger_due",
+                    "skipped" => "trigger_skipped",
+                    "paused" => "trigger_paused",
+                    _ => "trigger_failed",
+                },
+                target: format!("trigger {} ({})", f.name, f.trigger),
+                detail: f.detail,
+            })
+            .collect(),
+        Err(e) => vec![Done { kind: "error", target: "trigger engine".into(), detail: format!("{e:#}") }],
     }
 }
 
@@ -3001,6 +3072,70 @@ mod tests {
         assert!(p.id().starts_with("vultr:") && !p.id().contains("test-key"), "{}", p.id());
         public.credential = None;
         assert!(names_vultr(&public, &vault).err().unwrap().detail.contains("credential is needed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #578 step 5's wiring: a trigger's manifest is read from the roots as the console reads one
+    /// (a bare name in `manifests`, `<root>/<name>` in another root), and its run is launched as
+    /// `wicket run --run-id <run> [--task …] <the verified copy>`, as its owner, labelled with
+    /// the trigger.
+    #[test]
+    fn the_engine_reads_from_the_roots_and_launches_wicket_run_as_the_owner() {
+        use sha2::Digest;
+        use wicket_control::operators::{Authority, Operator};
+        let dir = std::env::temp_dir().join(format!("wicket-rec-engine-{}", ulid_like()));
+        let (manifests, examples, runs) = (dir.join("manifests"), dir.join("examples"), dir.join("runs"));
+        for d in [&manifests, &examples, &runs] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let m = "agent:\n  name: triage\ntask: look\nzone:\n  name: rel\n  llm: { secret: model-key }\n  limits: { memory: 1g, cpus: 1, timeout: 1h }\n";
+        std::fs::write(manifests.join("triage.yaml"), m).unwrap();
+        std::fs::write(examples.join("other.yaml"), m).unwrap();
+        let exe = dir.join("fake-wicket");
+        std::fs::write(&exe, "#!/bin/sh\necho \"$@\"\necho \"$WICKET_PRINCIPAL\"\necho \"$WICKET_OPERATOR\"\n").unwrap();
+        std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let roots = vec![("manifests".to_string(), manifests.clone()), ("examples".to_string(), examples.clone())];
+
+        let l = Ledger::open_in_memory().unwrap();
+        let id = wicket_identity::operator_id(&wicket_control::operators::trust_domain(), "t0", "unix", "alex");
+        let op = Operator { id: id.clone(), label: "unix:alex".into(), authority: Authority::Anything };
+        let sha = hex::encode(sha2::Sha256::digest(m.as_bytes()));
+        let mut made = vec![];
+        for (name, manifest) in [("bare", "triage.yaml"), ("rooted", "examples/other.yaml")] {
+            let y = format!(
+                "trigger: {name}\nsource: {{ schedule: {{ cron: '* * * * *' }} }}\naction: {{ start: {{ manifest: {manifest}, sha256: {sha}, task: go }} }}\n"
+            );
+            let spec: wicket_core::trigger::TriggerSpec = wicket_core::yaml::from_str(&y).unwrap();
+            made.push(wicket_control::triggers::create(&l, &op, &spec, None, "test").unwrap().0);
+        }
+        let anyone = |_: &wicket_store::Trigger| Ok(());
+        let now = (wicket_store::now().div_euclid(60) + 1) * 60;
+        let queued = wicket_control::triggers::pass(&l, now, false, &|_: &str, _: &str| {}, &anyone).unwrap();
+        assert_eq!(queued.iter().filter(|f| f.status == "queued").count(), 2, "{queued:?}");
+
+        let done = engine_pass_with(&l, now, false, &roots, &runs, &exe, &anyone);
+        assert_eq!(done.iter().filter(|d| d.kind == "trigger_started").count(), 2, "{done:?}");
+        for t in &made {
+            let run = l.firings(t, Some("started")).unwrap()[0].run.clone().unwrap();
+            let rd = runs.join(&run);
+            let copy = rd.join(wicket_control::triggers::engine::MANIFEST_COPY);
+            assert_eq!(std::fs::read_to_string(&copy).unwrap(), m);
+            let want = format!("run --run-id {run} --task go {}\n", copy.display());
+            let log = rd.join(wicket_control::triggers::engine::LOG);
+            let mut got = String::new();
+            for _ in 0..100 {
+                got = std::fs::read_to_string(&log).unwrap_or_default();
+                if got.lines().count() >= 3 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(got.starts_with(&want), "{got:?}");
+            let lines: Vec<&str> = got.lines().collect();
+            let p: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!((p["id"].as_str(), p["via"].as_str(), p["trigger"].as_str()), (Some("alex"), Some("cli"), Some(t.as_str())));
+            assert_eq!(lines[2], format!("trigger {} ({t}) for {id}", if *t == made[0] { "bare" } else { "rooted" }));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

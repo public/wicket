@@ -262,6 +262,8 @@ a kind intake has no adapter for is answered 503, as one whose secret didn't rea
   #582 step 5's node links would give, can push instead.
 - **ACME.** Intake takes a certificate and key from files, or listens without TLS behind a reverse
   proxy that has them. It doesn't get its own certificate.
-- **Routing** (`claim_work`, `owner_of`), `start`, debounce, concurrency, the queue, retries and
-  dead letters are step 5. Until then a webhook trigger may `wake` or `message`, like the others.
+- **Routing** (`claim_work`, `owner_of`), debounce, concurrency above one and retries are still to
+  come in step 5. A webhook trigger may `wake` or `message` a named agent, or `start` a run (the
+  engine starts it as the trigger's owner, from the manifest bytes it pins; see
+  [wake an agent on a schedule](../how-to/wake-an-agent-on-a-schedule.md#start-a-run)).
 - **Polling GitHub** for installations with no inbound path is step 8.
