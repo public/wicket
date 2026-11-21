@@ -385,7 +385,7 @@ runs on it stops.
 | `region` | string | | a preference: a provider's region name, e.g. `lhr` (1 to 32 lowercase letters, digits and hyphens; anything else is refused) |
 | `duration_minutes` | integer, 1–1440 | | |
 | `max_hourly_usd` | number or string | | the most the node may cost per hour |
-| `reason` | string | | |
+| `reason` | string, required, at most 1000 characters | | |
 | `lease` | string | | instead of asking: wait for this lease |
 | `timeout_seconds` | integer, 1–900 | 300 | with `lease` |
 

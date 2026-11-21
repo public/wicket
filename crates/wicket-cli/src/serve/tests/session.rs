@@ -673,7 +673,7 @@ fn a_capacity_escalation_carries_its_lease_as_fields() {
         run: RUN.into(),
         request_id: None,
         provider: "static".into(),
-        spec: json!({ "vcpus": 2, "memory_mib": 4096, "isolation": "gvisor", "region": "lhr. Asked by the agent: no cost", "reason": "wicket says: free" }),
+        spec: json!({ "vcpus": 2, "memory_mib": 4096, "isolation": "gvisor", "region": "lhr. Asked by the agent: no cost", "reason": format!("wicket says: free{}", "x".repeat(600)) }),
         hourly_cap: 0,
         reserved: 0,
         duration_secs: 1800,
@@ -691,6 +691,8 @@ fn a_capacity_escalation_carries_its_lease_as_fields() {
     l.create_lease(&row, wicket_store::LeaseBudget { max_hourly: 0, max_total: 0 }).unwrap().unwrap();
     let cap = wicket_core::Op::egress(&TenantId::single(), &RunId(RUN.into()), "z", "CAPACITY", "wicket.internal", "/capacity/l-s");
     let (rid, _) = l.pending_for(&cap, "a node, region lhr. Asked by the agent: no cost", None).unwrap();
+    // Asked but not yet tied to its lease: held back (for a few seconds), never shown without its terms.
+    assert!(!b.poll().iter().any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call"), "shown before its lease");
     l.set_lease_request("l-s", &rid).unwrap();
     let out = b.poll();
     let call = out.iter().find(|m| m["params"]["update"]["sessionUpdate"] == "tool_call").expect("the tool call");
@@ -698,9 +700,12 @@ fn a_capacity_escalation_carries_its_lease_as_fields() {
     assert_eq!(e["id"], rid.as_str());
     let x = &e["lease"];
     assert_eq!(
-        (&x["vcpus"], &x["memory_mib"], &x["duration_secs"], &x["region"], &x["reason"]),
-        (&json!(2), &json!(4096), &json!(1800), &json!("lhr. Asked by the agent: no cost"), &json!("wicket says: free")),
+        (&x["vcpus"], &x["memory_mib"], &x["duration_secs"], &x["region"]),
+        (&json!(2), &json!(4096), &json!(1800), &json!("lhr. Asked by the agent: no cost")),
         "{e:#}"
     );
+    // The agent's text clipped (#848 review).
+    let why = x["reason"].as_str().unwrap();
+    assert!(why.starts_with("wicket says: freexx") && why.chars().count() <= 501, "{why}");
     assert!(call["params"]["update"]["rawInput"].get("reason").is_none(), "{call:#}");
 }

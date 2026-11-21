@@ -1064,8 +1064,9 @@ fn sent_text(s: &wicket_proxy::Sent) -> String {
 /// Parses `request_capacity`'s arguments.
 fn capacity_ask(args: &Value) -> Result<wicket_proxy::CapacityAsk, String> {
     let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    if reason.is_empty() {
-        return Err("`reason` is required: say what you need the capacity for, in a sentence".into());
+    // Bounded as an update's is (#731 review): it is shown to the human who decides.
+    if reason.is_empty() || reason.chars().count() > 1000 {
+        return Err("`reason` is required (at most 1000 characters): say what you need the capacity for, in a sentence".into());
     }
     let max = match args.get("max_hourly_usd") {
         Some(Value::String(s)) => s.trim().to_string(),

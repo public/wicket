@@ -204,31 +204,38 @@ export interface AskParts {
   mixed: string;
 }
 
+/** The agent's words for quoting (#731 review): cleaned, and with its own quote marks made plain,
+ * so its text can't close the page's quote and go on as if wicket were speaking. */
+export const said = (s: unknown) => strip(s).replace(/[\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a\u301d\u301e\uff02"]/g, "'");
+
+/** A status as a class: one of `known`, else `other` (#731 review: never a class an agent named). */
+export const statusClass = (s: unknown, known: readonly string[]) => (known.includes(String(s)) ? String(s) : 'other');
+
 const span = (secs: number) => (secs % 3600 === 0 ? `${secs / 3600} h` : secs % 60 === 0 ? `${secs / 60} min` : `${secs} s`);
 
 export function askParts(e: Escalation): AskParts {
   const raw = `${strip(e.method)} ${strip(e.host)}${strip(e.path)}`;
-  if (e.host !== 'wicket.internal') return { what: raw + (e.prefix ? '… (every path under it)' : ''), said: e.reason ? [['Why', strip(e.reason)]] : [], mixed: '' };
+  if (e.host !== 'wicket.internal') return { what: raw + (e.prefix ? '… (every path under it)' : ''), said: e.reason ? [['Why', said(e.reason)]] : [], mixed: '' };
   const x = e.lease;
   if (e.method === 'CAPACITY' && x) {
-    const said: [string, string][] = [];
-    if (x.region) said.push(['Region', strip(x.region)]);
-    if (x.reason) said.push(['Why', strip(x.reason)]);
+    const words: [string, string][] = [];
+    if (x.region) words.push(['Region', said(x.region)]);
+    if (x.reason) words.push(['Why', said(x.reason)]);
     const vcpus = Number(x.vcpus) || 0;
     return {
       what: `Lease a node: ${vcpus} vCPU${vcpus === 1 ? '' : 's'}, ${Number(x.memory_mib) || 0} MiB, ${strip(x.isolation || 'default')} isolation, for ${span(Number(x.duration_secs) || 0)} on ${strip(x.provider)}, at most ${strip(x.hourly_cap_usd)}/h, ${strip(x.reserved_usd)} reserved`,
-      said,
+      said: words,
       mixed: '',
     };
   }
   const c = e.claims;
   if (e.method === 'UPDATE' && c) {
-    const said: [string, string][] = [];
-    if (c.commit) said.push(['Commit', strip(c.commit)]);
-    if (c.reason) said.push(['Why', strip(c.reason)]);
-    return { what: `Install wicket build ${strip(e.path).split('/').filter(Boolean)[1]?.slice(0, 12) ?? ''}…`, said, mixed: '' };
+    const words: [string, string][] = [];
+    if (c.commit) words.push(['Commit', said(c.commit)]);
+    if (c.reason) words.push(['Why', said(c.reason)]);
+    return { what: `Install wicket build ${strip(e.path).split('/').filter(Boolean)[1]?.slice(0, 12) ?? ''}…`, said: words, mixed: '' };
   }
-  return { what: raw, said: [], mixed: e.reason ? strip(e.reason) : '' };
+  return { what: raw, said: [], mixed: e.reason ? said(e.reason) : '' };
 }
 
 /** The escalation a permission request or tool call carries, if it is wicket's. Only the endpoint

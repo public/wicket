@@ -50,8 +50,9 @@ async function choose(optionId: string, kind: string) {
     <template v-if="request.escalation">
       <div class="op">{{ parts?.what }}</div>
       <div class="meta">{{ riskLabel(request.escalation.risk) }} · request {{ request.escalation.id }}</div>
-      <div v-for="[label, words] in parts?.said ?? []" :key="label" class="why">{{ label }} (the agent's words): “{{ words }}”</div>
-      <div v-if="parts?.mixed" class="why">The request's text, with the agent's words in it: “{{ parts.mixed }}”</div>
+      <!-- The agent's words in an element of their own (#731 review): wicket's label beside it, never one run of text with it. -->
+      <div v-for="[label, words] in parts?.said ?? []" :key="label" class="why"><span class="whose">{{ label }}, the agent's words:</span> <q class="said">{{ words }}</q></div>
+      <div v-if="parts?.mixed" class="why"><span class="whose">The request's text, with the agent's words in it:</span> <q class="said">{{ parts.mixed }}</q></div>
     </template>
     <div v-else class="op">{{ request.toolCall.title }}</div>
     <div class="buttons">
@@ -79,4 +80,6 @@ async function choose(optionId: string, kind: string) {
 .why { color: var(--soft); font-size: 14px; margin-top: 6px; white-space: pre-wrap; }
 .buttons { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .buttons button { flex: 1 1 140px; }
+.said { display: block; margin: 2px 0 0 8px; padding-left: 8px; border-left: 3px solid var(--muted, #888); font-style: italic; white-space: pre-wrap; overflow-wrap: anywhere; }
+.whose { font-weight: 600; }
 </style>

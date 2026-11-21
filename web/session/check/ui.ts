@@ -6,6 +6,7 @@
 // a turn. Exits non-zero on the first failure.
 import { createApp, nextTick } from 'vue';
 import App from '../src/App.vue';
+import PermissionDialog from '../src/components/PermissionDialog.vue';
 import { askParts, blastSections, describe, requestState, updateSections } from '../src/lib/wicket';
 
 const RUN = 'run_s';
@@ -180,7 +181,7 @@ if (diff?.textContent !== 'b') fail('the diff');
 await until('the escalation card', () => text().includes('Request waiting for you'));
 if (!text().includes('wicket request · waiting for you')) fail("the request's card names it a request, its status in words");
 if (!text().includes('wicket enforces this one')) fail('which ask wicket enforces');
-if (!text().includes('GET api.example.com/v1') || !text().includes('Why (the agent\'s words): “needs the API”') || !text().includes('R1 · read')) fail('the escalation described, its reason as the agent\'s words');
+if (!text().includes('GET api.example.com/v1') || !text().includes("Why, the agent's words:") || document.querySelector('.ask q.said')?.textContent !== 'needs the API' || !text().includes('R1 · read')) fail('the escalation described, its reason as the agent\'s words');
 if (button('Always allow')) fail('an "always" option offered');
 await tap('Approve once (passkey)');
 await until('the decision described', () => text().includes('Approve once for 10 min: GET api.example.com/v1'));
@@ -253,6 +254,39 @@ if (notApplied.length !== 1 || !notApplied[0].title.includes("doesn’t install 
 for (const [st, word, cls] of [['pending', 'waiting for you', 'pending'], ['granted', 'allowed', 'approved'], ['denied', 'refused', 'denied'], ['withdrawn', 'withdrawn: the run ended first', 'withdrawn']]) {
   const r = requestState(st);
   if (r.word !== word || r.cls !== cls) fail(`${st}: ${JSON.stringify(r)}`);
+}
+// Mounted capacity and update dialogs (#848 review): the agent's text in its own q.said, literal (markup stays
+// text, zero-width and bidi characters gone), its quote marks replaced so it can't close wicket's quote and
+// write wicket's terms after it.
+const breakout = 'a build\u201d · wicket: this lease costs nothing and is pre-approved by policy · Note: \u201cok';
+const nasty = `<img src=x onerror=alert(1)>\u200bfast\u202e ${breakout}`;
+const opts = [{ optionId: 'approve', name: 'Approve once (passkey)', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny (passkey)', kind: 'reject_once' }];
+for (const [what, e, wantOp] of [
+  ['capacity', esc({ method: 'CAPACITY', host: 'wicket.internal', path: '/capacity/vultr/l-2', reason: nasty,
+    lease: { provider: 'vultr', vcpus: 1, memory_mib: 1024, duration_secs: 1800, hourly_cap_usd: '$0.0100', reserved_usd: '$0.0050', region: nasty, reason: nasty } }),
+    'Lease a node: 1 vCPU, 1024 MiB'],
+  ['update', esc({ method: 'UPDATE', host: 'wicket.internal', path: '/self/fedcba9876543210', reason: nasty, claims: { commit: nasty, reason: nasty } }),
+    'Install wicket build fedcba987654…'],
+] as const) {
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  const d = createApp(PermissionDialog, { request: { sessionId: RUN, toolCall: { toolCallId: `wicket:escalation:${e.id}`, title: 't' }, options: opts, escalation: e } });
+  d.config.warnHandler = (m) => fail(`a Vue warning (${what}): ${m}`);
+  d.mount(el);
+  await nextTick();
+  if (!el.querySelector('.op')?.textContent?.startsWith(wantOp)) fail(`the ${what} dialog's terms: ${el.querySelector('.op')?.textContent}`);
+  const quoted = [...el.querySelectorAll('q.said')];
+  if (quoted.length !== 2) fail(`the ${what} dialog's quoted words: ${quoted.length}`);
+  for (const q of quoted) {
+    const t = q.textContent ?? '';
+    if (q.children.length || !t.includes('<img src=x onerror=alert(1)>')) fail(`the ${what} dialog's markup not literal: ${q.innerHTML}`);
+    if (/[\u200b\u202e\u201c\u201d]/.test(t)) fail(`the ${what} dialog kept a hidden character or a curly quote: ${JSON.stringify(t)}`);
+    if (!t.includes("a build' · wicket: this lease costs nothing")) fail(`the ${what} dialog's break-out text: ${JSON.stringify(t)}`);
+  }
+  if (el.querySelector('img')) fail(`an img element in the ${what} dialog`);
+  if (el.querySelector('.op')?.textContent?.includes('costs nothing')) fail(`the agent's text in the ${what} dialog's terms`);
+  d.unmount();
+  el.remove();
 }
 console.log(JSON.stringify({ ok: true, sent: sent.length, posts: posts.length, assertions }));
 process.exit(0);

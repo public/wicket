@@ -17,6 +17,8 @@ const g = globalThis;
 const where = p => html`<div class="where"><span class="host">${strip(p.host)}</span>${p.path && p.path !== "/" ? wrapped("path", strip(p.path) + (p.scope_prefix ? "…" : "")) : nothing}${p.scope_prefix ? html`<div class="meta">and every page under it</div>` : nothing}</div>`;
 
 const field = (label, value, cls) => html`<dt>${label}</dt><dd class=${cls || ""}>${value}</dd>`;
+// The agent's words in wicket's quotes, its own quote marks replaced so they can't close wicket's (#848 review).
+const quoted = t => "“" + String(t).replace(/[“”„‟«»‹›〝〞＂"]/g, "'") + "”";
 
 // One request (labelled fields: who, wants to, where, why, risk; then the choices; the rest under
 // Details), as pendingCard drew it. Elements from console.js's helpers (who asks, its identity line,
@@ -57,7 +59,7 @@ function card(s, p) {
       ${field("Who", m.who)}
       ${a.internal ? field("Wants to", a.what.charAt(0).toLowerCase() + a.what.slice(1), "said")
         : html`${field("Wants to", verb(p) + " (" + strip(p.method) + ")", "said")}${field("Where", where(p))}`}
-      ${a.said.map(([label, text]) => field(label + (label === "Why" ? "" : ", as the agent says"), "“" + text + "”", label === "Why" ? "why" : "asked"))}
+      ${a.said.map(([label, text]) => field(label + (label === "Why" ? "" : ", as the agent says"), quoted(text), label === "Why" ? "why" : "asked"))}
       ${a.wicket ? field("wicket says", a.wicket, "why") : nothing}
     </dl>
     ${m.warn}
@@ -65,7 +67,7 @@ function card(s, p) {
     <details class="more req-more"><summary>Details</summary>
       ${id.verified ? html`<div class="chain">On behalf of: ${(id.acting_for || []).map(strip).join(" → ")}</div>` : nothing}
       <div class="mono raw">${strip(p.method + " " + p.host + p.path) + " · risk class " + riskCode(p.risk)}</div>
-      ${a.mixed ? html`<div class="meta">The request's text, with the agent's words in it: “${a.mixed}”</div>` : nothing}
+      ${a.mixed ? html`<div class="meta">The request's text, with the agent's words in it: ${quoted(a.mixed)}</div>` : nothing}
       ${m.list}
       <div class="meta">${p.id + " · zone " + strip(p.zone) + " · run "}${m.run}</div>
       ${note}

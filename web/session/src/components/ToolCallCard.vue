@@ -5,6 +5,10 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { ToolCallInfo } from '../lib/types';
+import { statusClass } from '../lib/wicket';
+
+// The tool call statuses ACP names: an agent's other value is `other`, never a class of its choosing (#731 review).
+const TOOL_STATUSES = ['pending', 'in_progress', 'completed', 'failed'] as const;
 
 const props = defineProps<{
   toolCall: ToolCallInfo;
@@ -43,7 +47,7 @@ const json = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v, null
 </script>
 
 <template>
-  <div class="tool" :class="toolCall.status">
+  <div class="tool" :class="statusClass(toolCall.status, TOOL_STATUSES)">
     <div class="head">
       <span class="kind" aria-hidden="true">{{ kindIcon }}</span>
       <span class="title">{{ toolCall.title || toolCall.toolCallId }}</span>
