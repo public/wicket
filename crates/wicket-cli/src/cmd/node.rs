@@ -96,7 +96,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 );
                 Ok(())
             }
-            NodeCmd::ReleaseFence { run, reason } => noderun::release_fence_command(&run, &reason, &operator(), wicket_home::cli_is_root()),
+            NodeCmd::ReleaseFence { run, reason, break_glass } => {
+                noderun::release_fence_command(&run, &reason, &operator(), break_glass.then_some(wicket_home::cli_is_root()))
+            }
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
@@ -532,16 +534,21 @@ pub enum NodeCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Release a run's fence without its node (root only, audited as `run.fence_released`): for a
-    /// run whose node can't confirm its box stopped (unreachable or revoked) and whose fence
-    /// wouldn't otherwise end, as when its records don't say when its authority ends. Its agent
-    /// can then be woken. The box may still be running on its node.
+    /// Release a run's fence without its node (audited as `run.fence_released`): for a run whose
+    /// node can't confirm its box stopped (revoked, or no longer enrolled) and whose fence wouldn't
+    /// otherwise end. Its agent can then be woken. The box may still be running on its node. As the
+    /// console releases one (#713): within your operators.yaml authority (`fence` at R4), and only a
+    /// fence whose node is revoked or gone. --break-glass, as root: any fence, whatever its node.
     ReleaseFence {
         /// The run.
         run: String,
         /// Why: it goes on the audit record.
         #[arg(long)]
         reason: String,
+        /// Root only: release any fence, an enrolled node's too, without the operators.yaml check
+        /// (audited with granter `root`).
+        #[arg(long)]
+        break_glass: bool,
     },
     /// On the node: join stdin and stdout to `node serve`'s control socket (what the control host
     /// runs over ssh).

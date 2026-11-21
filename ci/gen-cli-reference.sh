@@ -71,8 +71,8 @@ reference](manifest.md)).
 ## Output for scripts
 
 The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
-`agents`, `links`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `lease list`, `service list`, `audit`,
-`message inbox`, `message receipts` and `message principals`, and so do `names show` (one name: an object), `authority` (one run's) and `audit explain` (one record's). With it, stdout holds one JSON document
+`agents`, `links`, `manifest list`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `lease list`, `service list`, `audit`,
+`message inbox`, `message receipts` and `message principals`, and so do `names show` (one name: an object), `manifest show` and `manifest check` (one manifest's), `authority` (one run's) and `audit explain` (one record's). With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -91,6 +91,9 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | a standing `rule` | `host`, `methods`, `paths`, `allow_dangerous` |
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
+| `wicket manifest list --json` | `root`, `name`, `agent` and `program` (its agent's or program's name, or null), `zone`, `image` (the image its box starts from, or null) and `image_error` (why it has none), `hosts` (each `host` and its `mode`: `inspected` with `why`, or `spliced` with `rule`), `valid` |
+| `wicket manifest show --json` | `root`, `name`, `sha256`, `yaml` (the file), `valid`, `error` (why it doesn't validate, or null), `fields` (each `path`, its `value` and `default`: whether the file leaves it unset), `grants` (what it grants, as the console shows it; null if it doesn't validate), `writable` (in the `manifests` root), `history` (its saved versions, newest first: `version`, `saved_before`, `sha256_prefix`) |
+| `wicket manifest check --json` | `valid`, `error`, `sha256`, `saved_sha256` (the saved version's, or null), `diff` (against it: `new`, `widens`, `widening` and `changes`; null if it doesn't validate), `grants` and `fields` (as `manifest show --json` has them) |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
 | `wicket names list --json` | `id`, `kind` (`internal`, `public`), `status` (the ledger's: `pending`, `live`, `denied`, `withdrawn`, `ended`), `state` (wicket's: `pending`, `live`, `waiting`, `taken` in the zone by records wicket didn't make, `out_of_sync`, `lapsed`, `denied`, `withdrawn`, `ended`), `why` (wicket's words for the state, or null), `name` (the full name: `<label>.<zone>.wicket.internal`, or under the boxes domain; null for a public ask on an installation without public names), `scope` (`run`, `standing`), `for` (`agent`, `zone`, or null), `expires_at` (null: until revoked, or as its run lasts), `created_at`, `decided_by`, `decided_at`, `ended_at`, `end_reason`, `owner`, `target`, `agent` (what the agent wrote) |
 | a name's `owner` | `principal`, `zone`, `run` (the run that asked), `holder` (the run that holds it now, or null) |

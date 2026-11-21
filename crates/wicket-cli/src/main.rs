@@ -68,6 +68,7 @@ pub(crate) use cmd::dev::DevCmd;
 pub(crate) use cmd::identity::IdentityCmd;
 pub(crate) use cmd::image::ImageCmd;
 pub(crate) use cmd::itself::SelfCmd;
+pub(crate) use cmd::manifest::ManifestCmd;
 pub(crate) use cmd::message::MessageCmd;
 pub(crate) use cmd::names::NamesCmd;
 pub(crate) use cmd::node::LeaseCmd;
@@ -94,7 +95,22 @@ use wicket_store::Ledger;
 const AREAS: &[(&str, &[&str])] = &[
     (
         "Runs and agents",
-        &["run", "session", "message", "top", "agents", "hibernate", "trigger", "wrap", "links", "unlink", "zone", "program", "image"],
+        &[
+            "run",
+            "session",
+            "message",
+            "top",
+            "agents",
+            "hibernate",
+            "trigger",
+            "wrap",
+            "links",
+            "unlink",
+            "manifest",
+            "zone",
+            "program",
+            "image",
+        ],
     ),
     ("Approvals and grants", &["pending", "request", "approve", "deny", "grant", "capacity", "standing", "names", "authority", "audit"]),
     ("Nodes and placement", &["node", "lease", "service", "why-here", "reconcile"]),
@@ -485,6 +501,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CapacityCmd,
     },
+    /// Manifests runs start from: view, check, save and restore them.
+    ///
+    /// The manifests runs can be started from (#172), as the console's viewer and editor have them
+    /// (#713): list and show them, check an edited one against the saved version, and save or restore
+    /// one in the installation's `manifests` root, which keeps the version it replaces and audits the
+    /// save with what it widens.
+    Manifest {
+        #[command(subcommand)]
+        cmd: ManifestCmd,
+    },
     /// How a manifest's zone treats each host it reaches: inspected or spliced, and why.
     ///
     /// The zone view of a manifest: for each host its reach names, whether the egress proxy inspects
@@ -682,6 +708,7 @@ async fn run() -> Result<()> {
         | Cmd::WhyHere { .. }) => cmd::run::dispatch(c).await,
         Cmd::Authority { run, json } => cmd::authority::run(&run, json),
         Cmd::Capacity { cmd } => cmd::capacity::dispatch(cmd).await,
+        Cmd::Manifest { cmd } => cmd::manifest::dispatch(cmd).await,
         Cmd::Top { once, json } => top::control_top(once, json).await,
         c @ (Cmd::Pending { .. } | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await

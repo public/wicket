@@ -521,12 +521,39 @@ impl Daemon {
                 let argv = vec!["trigger".into(), "create".into(), "--file".into(), file, "--lasts".into(), lasts.clone()];
                 Plan { argv, cwd: self.data_dir.clone(), stage: Some(st), caller }
             }
+            // An edited manifest goes as content too (#713).
+            Cmd::Manifest { cmd: m @ (crate::ManifestCmd::Check { .. } | crate::ManifestCmd::Save { .. }) } => {
+                let st = upload::Stage::new(&stage_parent, vec![("edit".into(), "edit.yaml".into())])?;
+                let file = st.dir.join("edit.yaml").display().to_string();
+                let argv = match m {
+                    crate::ManifestCmd::Check { name, json, .. } => {
+                        let mut a = vec!["manifest".into(), "check".into(), name.clone(), "--file".into(), file];
+                        if *json {
+                            a.push("--json".into());
+                        }
+                        a
+                    }
+                    crate::ManifestCmd::Save { name, dry_run, .. } => {
+                        let mut a = vec!["manifest".into(), "save".into(), name.clone(), "--file".into(), file];
+                        if *dry_run {
+                            a.push("--dry-run".into());
+                        }
+                        a
+                    }
+                    _ => unreachable!("matched above"),
+                };
+                Plan { argv, cwd: self.data_dir.clone(), stage: Some(st), caller }
+            }
             Cmd::Trigger { cmd: crate::TriggerCmd::Fire { trigger: id, event: Some(_), .. } } => {
                 let st = upload::Stage::new(&stage_parent, vec![("event".into(), "event.json".into())])?;
                 let file = st.dir.join("event.json").display().to_string();
                 let argv = vec!["trigger".into(), "fire".into(), id.clone(), "--event".into(), file, "--dry-run".into()];
                 Plan { argv, cwd: self.data_dir.clone(), stage: Some(st), caller }
             }
+            // `wicket manifest` reads the manifest roots, one of which is `<cwd>/examples` (#713
+            // review): in the data directory, never a directory the caller chose, which could
+            // point wicket's user at files the caller can't read.
+            Cmd::Manifest { .. } => Plan { argv: hello.argv.clone(), cwd: self.data_dir.clone(), stage: None, caller },
             _ => Plan { argv: hello.argv.clone(), cwd: default_cwd(), stage: None, caller },
         })
     }
@@ -609,6 +636,7 @@ fn check_staged(cmd: &Cmd, hello: &Hello, st: &upload::Stage, vault_dir: &Path) 
         Cmd::Itself { cmd: crate::SelfCmd::Update { artifact: Some(_), .. } } => Some("artifact"),
         Cmd::Trigger { cmd: crate::TriggerCmd::Create { .. } } => Some("trigger"),
         Cmd::Trigger { cmd: crate::TriggerCmd::Fire { event: Some(_), .. } } => Some("event"),
+        Cmd::Manifest { cmd: crate::ManifestCmd::Check { .. } | crate::ManifestCmd::Save { .. } } => Some("edit"),
         _ => None,
     };
     if let Some(role) = one_file {

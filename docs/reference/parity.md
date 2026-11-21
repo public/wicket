@@ -65,9 +65,10 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 
 | Action | Console | CLI |
 | --- | --- | --- |
-| View a manifest, with its effective values and policy | `/api/manifests/<root>/<name>` | `wicket zone` (its hosts); the rest: none yet (#713) |
-| Check an edited manifest against the saved one | `/api/manifests/check` | none yet (#713) |
-| Save or restore a manifest version | `save_manifest`, `restore_manifest` | none yet (#713): editing the file on the host keeps no history and isn't audited |
+| List the manifests runs start from | `/api/state` (`manifests`) | `wicket manifest list` |
+| View a manifest, with its effective values and policy | `/api/manifests/<root>/<name>` | `wicket manifest show` (and `wicket zone`, its hosts) |
+| Check an edited manifest against the saved one | `/api/manifests/check` | `wicket manifest check` |
+| Save or restore a manifest version | `save_manifest`, `restore_manifest` | `wicket manifest save`, `restore` (editing the file by hand keeps no history and isn't audited) |
 | Pin a manifest's images by digest | none yet (#713) | `wicket zone pin` |
 | View the org policy, its versions and the runs under each | `/api/policy` | `wicket policy show` (its version and the runs); the versions' Cedar: none yet (#713) |
 | Preview or apply an org policy | `/api/policy/preview`, `policy_apply` | `wicket policy apply --dry-run`, `wicket policy apply` |
@@ -92,7 +93,8 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | List nodes | `/api/state` (`placed`: nodes `wicket node create` made); the rest: none yet (#713) | `wicket node list` |
 | A node's CA: hosts, policy, wants and widenings | `/api/nodes/<node>/ca` | `wicket node ca` |
 | Release a node `wicket node create` made | `node_release` | `wicket node release` |
-| Release a run's fence on a lost node | `release_fence` | `wicket node release-fence` (root only) |
+| Release a run's fence on a lost node | `release_fence` | `wicket node release-fence` (root, or without wicketd) |
+| Release any fence, an enrolled node's too | host-only: root's break-glass, for a node the console can't decide on (it may still be running the box) | `wicket node release-fence --break-glass` |
 | List runs fenced on lost nodes | `/api/state` (`fenced`) | none yet (#713) |
 | Create a node from a provider, or list its plans | none yet (#713) | `wicket node create`, `wicket node plans` |
 | Make a join token, enrol, revoke or forget a node, or renew its CA | none yet (#713) | `wicket node token`, `enrol`, `revoke`, `forget`, `renew-ca` |
