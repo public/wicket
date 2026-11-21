@@ -467,7 +467,11 @@ capacity grant or standing reach: each only takes something away): `POST /api/gr
 through its command's function (`wicket grant revoke`, `unlink`, `trigger pause`), for the
 console's tenant only (another tenant's id is not found), and is audited with the passkey's operator
 and `via: console`. A session is one of the operator's own, named as `/api/sessions` names it (at
-least its 16 hex digits); another passkey's is ended on the host (`wicket operator revoke-session`).
+least its 16 hex digits; a prefix two of its own share is ambiguous); another passkey's is ended on
+the host (`wicket operator revoke-session`). Ending the session the request came with signs it out:
+its cookie is cleared. Each answers 404 for an id it doesn't know (another tenant's among them), 409
+for one already so (a grant revoked, a link closed, a trigger paused: nothing is recorded again) or
+an ambiguous prefix, and 400 for an id that isn't one.
 
 ## Placement view
 

@@ -1172,8 +1172,8 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
         },
         // The host's narrowing actions (#713): the session alone, as revoking a capacity grant.
         p if views::posts(p) => match &sess {
-            Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
-                Some(oc) => views::post(state, &oc, p, body),
+            Some((sid, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
+                Some(oc) => views::post(state, &oc, sid, p, body),
                 None => err(StatusCode::UNAUTHORIZED, "the passkey you signed in with is no longer enrolled"),
             },
             _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),

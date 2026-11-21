@@ -85,7 +85,7 @@ pub(super) fn posts(path: &str) -> bool {
 /// One of [`posts`], for the operator `oc` signed in with: `{ "id" }`. Each goes through its CLI
 /// command's function, for the console's tenant only (another tenant's id is not found, as one that
 /// doesn't exist), and is audited with the operator and `via: console`.
-pub(super) fn post(state: &State, oc: &wicket_store::OperatorCredential, path: &str, body: &Value) -> super::Reply {
+pub(super) fn post(state: &State, oc: &wicket_store::OperatorCredential, current: &str, path: &str, body: &Value) -> super::Reply {
     use http::StatusCode;
     let Some(id) = super::str_field(body, "id").map(str::trim).filter(|i| !i.is_empty() && i.len() <= 128) else {
         return super::err(StatusCode::BAD_REQUEST, "id required");
@@ -98,23 +98,32 @@ pub(super) fn post(state: &State, oc: &wicket_store::OperatorCredential, path: &
     let via = serde_json::json!({ "via": "console" });
     let r: Result<String> = match path {
         "/api/grants/revoke" => crate::cmd::approve::revoke_grant(&l, &state.tenant, id, &by, via),
-        "/api/links/cut" => crate::cmd::approve::cut_link(&l, &state.tenant, id, &by, via).map(|cut| {
-            if cut {
-                format!("cut {id}; its relay closes it within a few seconds")
-            } else {
-                format!("{id} was already closed")
-            }
-        }),
+        "/api/links/cut" => crate::cmd::approve::cut_link(&l, &state.tenant, id, &by, via)
+            .map(|()| format!("cut {id}; its relay closes it within a few seconds")),
         "/api/triggers/pause" => pause_trigger(state, &l, oc, id),
-        "/api/sessions/end" => end_session(state, &l, oc, id, &by),
+        "/api/sessions/end" => match end_session(state, &l, oc, id, &by) {
+            // Ending this very session signs it out: its cookie goes too.
+            Ok(ended) if ended == current => {
+                return super::Reply {
+                    cookie: Some(super::clear_cookie()),
+                    ..super::ok(serde_json::json!({ "ok": "ended this session: signed out" }))
+                }
+            }
+            Ok(ended) => Ok(format!("ended console session {}", &ended[..16.min(ended.len())])),
+            Err(e) => Err(e),
+        },
         _ => return super::err(StatusCode::NOT_FOUND, "not found"),
     };
     match r {
         Ok(said) => super::ok(serde_json::json!({ "ok": said })),
         Err(e) => {
+            // Not found, refused (already so, or not this operator's to do), a bad request, or the
+            // installation's own failure.
             let status = match wicket_home::exit::code_of(&e) {
                 Some(wicket_home::exit::Code::NotFound) => StatusCode::NOT_FOUND,
-                _ => StatusCode::CONFLICT,
+                Some(wicket_home::exit::Code::Refused) => StatusCode::CONFLICT,
+                Some(wicket_home::exit::Code::Usage) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             super::err(status, format!("{e:#}"))
         }
@@ -132,23 +141,26 @@ fn pause_trigger(state: &State, l: &wicket_store::Ledger, oc: &wicket_store::Ope
     Ok(format!("paused trigger {} ({}): it fires nothing until resumed", crate::cmd::trigger::clean(&t.name), t.id))
 }
 
-/// Ends one of the operator's own console sessions, named as `/api/sessions` names it (the first 16
-/// hex digits of its token's hash): ending another passkey's needs the host
-/// (`wicket operator revoke-session`, root's).
+/// Ends one of the operator's own console sessions, named as `/api/sessions` names it (at least the
+/// first 16 hex digits of its token's hash; a prefix two of its sessions share is ambiguous):
+/// ending another passkey's needs the host (`wicket operator revoke-session`, root's). The whole id
+/// of the session it ended.
 fn end_session(state: &State, l: &wicket_store::Ledger, oc: &wicket_store::OperatorCredential, id: &str, by: &str) -> Result<String> {
+    // At least as much of its id as the list shows, so a short prefix can't pick one by chance.
+    if id.len() < 16 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(wicket_home::exit::usage(format!("{id:?}: a session as /api/sessions names it (16 hex digits)")));
+    }
     let own: Vec<_> = l
         .console_sessions(&state.tenant, wicket_store::now())?
         .into_iter()
         .filter(|s| s.kind == "operator" && s.credential.as_deref() == Some(oc.id.as_str()) && s.id.starts_with(id))
         .collect();
-    // At least as much of its id as the list shows, so a short prefix can't pick one by chance.
-    if id.len() < 16 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(wicket_home::exit::not_found(format!("no console session {id} of yours")));
-    }
-    let [s] = own.as_slice() else {
-        return Err(wicket_home::exit::not_found(format!("no console session {id} of yours")));
+    let s = match own.as_slice() {
+        [s] => s,
+        [] => return Err(wicket_home::exit::not_found(format!("no console session {id} of yours"))),
+        _ => return Err(wicket_home::exit::refused(format!("{id} is ambiguous: {} of your sessions start with it", own.len()))),
     };
     let ids = l.revoke_console_sessions(&state.tenant, Some(&s.id), by)?;
     l.audit(&state.tenant, None, "operator.sessions_revoked", &serde_json::json!({ "sessions": ids, "by": by, "via": "console" }))?;
-    Ok(format!("ended console session {}", &s.id[..16.min(s.id.len())]))
+    Ok(s.id.clone())
 }
