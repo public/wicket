@@ -618,13 +618,24 @@ function renderPending(s) {
 // What each view module draws: if it didn't load (a failed fetch, an old browser), each of these says
 // so, rather than look empty (no requests waiting, no agents).
 const VIEW_BOXES = { wicketInbox: ["pending", "standing-asks"], wicketAgents: ["runs", "start", "agent-head", "agent-log"], wicketActivity: ["audit", "decided"],
-  wicketSettings: ["standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"] };
+  wicketSettings: ["standing-rules", "capacity", "capacity-form", "health", "placed", "fenced", "secrets", "manifests", "policy", "operator"] };
+// Sign out (settings.js's button calls it too): the one-time enrolment link and any open question go
+// with the session (#711), and the page asks to sign in again.
+async function signOut() {
+  enrolLink = null;
+  if (globalThis.wicketSettings) globalThis.wicketSettings.reset();
+  try { await post("/api/logout"); } catch (e) { /* signed out anyway */ }
+  boot();
+}
 const UNLOADED = "This can't be shown: part of this page didn't load. Reload the page; if it stays, check the browser's console.";
 function drawn(mod, f, ...args) {
   if (!globalThis[mod]) {
     for (const id of VIEW_BOXES[mod] || []) {
       const box = document.getElementById(id);
-      if (box && !(box.textContent || "").startsWith("This can't be shown")) box.replaceChildren(el("div", "blocked", UNLOADED));
+      if (!box || (box.textContent || "").startsWith("This can't be shown")) continue;
+      box.replaceChildren(el("div", "blocked", UNLOADED));
+      // Signing out is a security control: it mustn't need a module to have loaded.
+      if (id === "operator") { const out = el("button", "", "Sign out"); out.onclick = signOut; const b = el("div", "buttons"); b.append(out); box.append(b); }
     }
     return;
   }
@@ -785,22 +796,6 @@ function submitRunForm(ev) {
 // (it lives only in this page: reloading drops it).
 let enrolLink = null;
 function showEnrolLink(j) { enrolLink = { link: String(j.link), until: Date.now() + (Number(j.expires_in_secs) || 0) * 1000 }; }
-function renderOperator(s) {
-  const box = document.getElementById("operator"); box.replaceChildren();
-  for (const k of s.passkeys) { const d = el("div", "row"); d.append(el("span", "", "passkey: " + strip(k.name)), el("span", "mono", String(k.id).slice(0, 16) + "…")); box.append(d); }
-  const b = el("div", "buttons");
-  const out = el("button", "", "Sign out"); out.onclick = async () => { enrolLink = null; if (globalThis.wicketSettings) globalThis.wicketSettings.reset(); try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
-  const add = el("button", "", "Add a device"); add.onclick = () => signed({ action: "enrol_link" });
-  b.append(add, out); box.append(b);
-  if (enrolLink && enrolLink.until > Date.now()) {
-    const d = el("div", "callout");
-    d.append(el("div", "", "Open this on the new device (once, until " + new Date(enrolLink.until).toLocaleTimeString() + "):"),
-      el("code", "block", enrolLink.link), copyButton(enrolLink.link));
-    box.append(d);
-  } else enrolLink = null;
-  box.append(codeText("div", "note", "Adding a device makes a one-time link, signed with your passkey; the new device is you, with your authority. Or on the host: `wicket operator enrol-link`.", ["wicket operator enrol-link"]));
-}
-
 // ---- notifications (Web Push) ----
 // The service worker (/sw.js) shows what the server pushes; a tap on a notification opens the console
 // at "#pending/<id>" or, if it is open, tells it which request to show. Permission is asked only from
@@ -1027,32 +1022,8 @@ function openDetail(title) {
   return body;
 }
 
-const kv = (k, v) => { const d = el("div", "row"); d.append(el("span", "meta", k), el("span", "mono", strip(v))); return d; };
-const when = t => at(t);
 const whenMs = ms => ms ? at(ms / 1000) : "\u2014";
 
-let policyShown = 0;
-async function renderPolicy() {
-  // The policy changes rarely: fetched at most every 30 s.
-  if (performance.now() - policyShown < 30000 && policyShown) return;
-  policyShown = performance.now();
-  const box = document.getElementById("policy");
-  try {
-    const p = await getJson("/api/policy");
-    const out = [];
-    if (!p.installed) out.push(el("div", "note", "No org policy applied: tokens carry their zone's policy only (wicket policy apply)."));
-    else {
-      out.push(kv("applied", p.installed + (p.current.matches_applied === false ? " · org.cedar was changed by hand: every mint is refused until it is applied" : "")));
-      out.push(el("pre", "src", p.current.cedar || ""));
-    }
-    for (const v of p.versions) {
-      const a = v.applied.length ? v.applied[v.applied.length - 1] : null;
-      out.push(kv("version " + v.version + (v.current ? " (current)" : ""), a ? "applied " + when(a.at) + " by " + a.by : "kept"));
-    }
-    for (const r of p.runs) out.push(kv(r.run, "zone " + r.zone + " · policy " + (r.policy || "none") + " · " + r.status));
-    box.replaceChildren(...out);
-  } catch (e) { box.replaceChildren(el("div", "blocked", strip(e.message))); }
-}
 
 // ---- manifests (#172): view, check as you type, save and restore as signed actions ----
 async function fetchJson(path) {
@@ -1062,25 +1033,6 @@ async function fetchJson(path) {
   return j;
 }
 const kvRow = (k, v, cls) => { const d = el("div", "row"); d.append(el("span", "meta", k), el("span", cls || "mono", strip(v))); return d; };
-
-function renderManifests(s) {
-  const box = document.getElementById("manifests");
-  const ms = s.manifests || [];
-  const key = JSON.stringify(ms.map(m => [m.root, m.name, m.valid]));
-  if (box.dataset.key === key) return;
-  box.dataset.key = key;
-  box.replaceChildren();
-  for (const m of ms) {
-    const d = el("div", "row");
-    d.append(el("span", m.valid ? "mono" : "blocked mono", strip(m.root + "/" + m.name) + (m.valid ? "" : " · invalid")));
-    const open = el("button", "link", m.root === "manifests" ? "view / edit" : "view");
-    open.onclick = () => openManifest(m.root, m.name);
-    d.append(open); box.append(d);
-  }
-  const add = el("button", "link", "new manifest");
-  add.onclick = () => openManifest("manifests", null);
-  box.append(add);
-}
 
 // A box's limits as words (#651): "memory 2GiB · 2 CPUs · timeout 1h", the rest after.
 function limitsText(l) {
@@ -1191,55 +1143,6 @@ async function saltedDigest(value) {
   const d = await crypto.subtle.digest("SHA-256", buf);
   buf.fill(0); v.fill(0);
   return { value_salt: hexOf(salt), value_sha256: hexOf(d) };
-}
-const utc = t => at(t);
-function secretUse(u) {
-  const where = "Used by " + u.manifest + " (zone " + u.zone + ")";
-  return strip(u.use === "llm" ? where + " as the model key" + (u.provider ? " (" + u.provider + ")" : "")
-    : where + ": sent to " + u.host + " in its " + u.header + " header" + (u.format ? ", as " + u.format : "") + (u.optional ? " (optional)" : ""));
-}
-let secretsKey = "";
-function renderSecrets(s) {
-  const box = document.getElementById("secrets");
-  if (!box) return;
-  const v = s.secrets || { secrets: [], missing: [] };
-  // Rebuilt only when it changes, so a button doesn't move under a tap.
-  const key = JSON.stringify(v);
-  if (key === secretsKey) return;
-  secretsKey = key;
-  box.replaceChildren();
-  for (const x of v.secrets || []) {
-    const d = el("div", "secret");
-    const head = el("div", "row");
-    head.append(el("span", "mono", strip(x.name)), el("span", "risk " + (x.kind === "reference" ? "r2" : "r0"), x.kind === "reference" ? "read from a file on the host" : "stored"));
-    d.append(head);
-    d.append(el("div", "meta", (x.hosts || []).length ? "sent only to " + x.hosts.map(strip).join(", ") : "bound to no host: sent nowhere"));
-    if (x.reference) d.append(el("div", "meta", "refers to " + strip(x.reference.file) + (x.reference.pointer ? "#" + strip(x.reference.pointer) : "") + ", read at each use"));
-    d.append(el("div", "meta", x.set_at ? "last set " + utc(x.set_at) : "last set: unknown"));
-    for (const u of x.used_by || []) d.append(el("div", "meta", secretUse(u)));
-    if (!(x.used_by || []).length) d.append(el("div", "meta", "no listed manifest uses it"));
-    if ((x.runs || []).length) d.append(el("div", "meta", "running now: " + x.runs.map(r => strip(r.run)).join(", ")));
-    const b = el("div", "buttons");
-    if (x.kind !== "reference") { const set = el("button", "", "Replace value\u2026"); set.onclick = () => openSecret("set", x); b.append(set); }
-    const h = el("button", "", "Hosts\u2026"); h.onclick = () => openSecret("hosts", x);
-    const rm = el("button", "deny", "Delete\u2026"); rm.onclick = () => openSecret("delete", x);
-    b.append(h, rm); d.append(b); box.append(d);
-  }
-  for (const m of v.missing || []) {
-    const d = el("div", "secret");
-    const head = el("div", "row");
-    head.append(el("span", "mono", strip(m.name)), el("span", "risk r3", "needed, not set"));
-    d.append(head);
-    for (const u of m.used_by || []) d.append(el("div", "meta", secretUse(u)));
-    const b = el("div", "buttons"); const set = el("button", "approve", "Set\u2026");
-    set.onclick = () => openSecret("set", { name: m.name, hosts: (m.used_by || []).filter(u => u.host).map(u => u.host), missing: true });
-    b.append(set); d.append(b); box.append(d);
-  }
-  if (!(v.secrets || []).length && !(v.missing || []).length) box.append(el("div", "empty", "No secrets in the vault."));
-  const b = el("div", "buttons"); const add = el("button", "", "New secret\u2026"); add.onclick = () => openSecret("set", null);
-  b.append(add); box.append(b);
-  box.append(el("div", "note", "Values are never shown, here or anywhere. " + strip(v.link_cli_only ||
-    "References (a file on the host, like a harness login) are made on the host: wicket secret link.")));
 }
 let secretMode = null;
 function secretInput(id, label, value, password) {
@@ -1400,15 +1303,11 @@ async function refreshOnce() {
     renderCounts(s.pending.length + n, problemList(s).length);
     inbox("renderStandingAsks", s);
     drawn("wicketAgents", "renderStart", s);
-    renderManifests(s);
-    renderSecrets(s);
     drawn("wicketActivity", "renderActivity", s);
     refreshRel();
     if (view === "agent") { drawn("wicketAgents", "renderAgentHead", s, agentRun); drawn("wicketAgents", "renderAgentLog", s, agentRun); }
     const ar = document.getElementById("audit-retention");
     if (ar) ar.textContent = s.audit_retention ? strip(s.audit_retention.line) : "";
-    renderOperator(s);
-    renderPolicy();
   } catch (e) { /* keep polling */ }
 }
 document.addEventListener("DOMContentLoaded", () => {
