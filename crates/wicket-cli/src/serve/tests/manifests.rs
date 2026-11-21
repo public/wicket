@@ -54,7 +54,10 @@ async fn a_manifest_shows_every_field_its_defaults_and_its_secrets_by_name() {
 #[test]
 fn the_authority_diff_says_what_changes_and_what_widens() {
     let t = with_manifest("diff");
-    let check = |yaml: &str| crate::serve::manifests::check(&crate::serve::manifests::Place::of(&t.state), &json!({ "name": "docs.yaml", "yaml": yaml })).unwrap();
+    let check = |yaml: &str| {
+        crate::serve::manifests::check(&crate::serve::manifests::Place::of(&t.state), &json!({ "name": "docs.yaml", "yaml": yaml }))
+            .unwrap()
+    };
     // A new reach rule: widens.
     let wider =
         BASE.replace("paths: ['/repos/acme/app/**'] }", "paths: ['/repos/acme/app/**'] }\n    - { host: api.example.com, methods: [GET] }");
@@ -183,7 +186,8 @@ fn the_cli_lists_shows_checks_saves_and_restores_as_the_console_does() {
     assert!(text.contains("injects secret gh (set) into authorization on api.github.com"), "{text}");
     assert!(text.contains("host api.github.com: inspected"), "{text}");
     // A check: what the edit adds, and that it widens.
-    let wider = BASE.replace("paths: ['/repos/acme/app/**'] }", "paths: ['/repos/acme/app/**'] }\n    - { host: api.example.com, methods: [GET] }");
+    let wider =
+        BASE.replace("paths: ['/repos/acme/app/**'] }", "paths: ['/repos/acme/app/**'] }\n    - { host: api.example.com, methods: [GET] }");
     let c = manifests::check(&p, &json!({ "name": "docs.yaml", "yaml": wider })).unwrap();
     documented_as("`wicket manifest check --json`", &c);
     let text = crate::cmd::manifest::diff_text(&c["diff"]);
@@ -194,7 +198,11 @@ fn the_cli_lists_shows_checks_saves_and_restores_as_the_console_does() {
     manifests::save_and_record(&p, &l, &TenantId::single(), &save, &action, "alex@cli", json!({ "via": "cli" })).unwrap();
     assert_eq!(std::fs::read_to_string(t.dir.join("manifests/docs.yaml")).unwrap(), wider);
     let r: Value = serde_json::from_str(&l.audit_latest_unscoped("manifest.saved").unwrap().unwrap()).unwrap();
-    assert_eq!((r["action"].as_str(), r["by"].as_str(), r["via"].as_str(), r["widens"].as_bool()), (Some("save_manifest"), Some("alex@cli"), Some("cli"), Some(true)), "{r}");
+    assert_eq!(
+        (r["action"].as_str(), r["by"].as_str(), r["via"].as_str(), r["widens"].as_bool()),
+        (Some("save_manifest"), Some("alex@cli"), Some("cli"), Some(true)),
+        "{r}"
+    );
     assert!(r.get("signed").is_none(), "{r}");
     // Saving the same bytes again changes nothing, and is refused.
     assert!(manifests::prepare(&p, "save_manifest", &json!({ "name": "docs.yaml", "yaml": wider }), "t0").is_err());

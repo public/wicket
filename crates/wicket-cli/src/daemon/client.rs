@@ -64,7 +64,9 @@ pub(super) fn self_uploads(cmd: &Cmd) -> Vec<(&'static str, PathBuf)> {
     match cmd {
         Cmd::Trigger { cmd: TriggerCmd::Create { file, .. } } => vec![("trigger", file.clone())],
         // An edited manifest (#713), as a run's manifest goes.
-        Cmd::Manifest { cmd: crate::ManifestCmd::Check { file, .. } | crate::ManifestCmd::Save { file, .. } } => vec![("edit", file.clone())],
+        Cmd::Manifest { cmd: crate::ManifestCmd::Check { file, .. } | crate::ManifestCmd::Save { file, .. } } => {
+            vec![("edit", file.clone())]
+        }
         Cmd::Trigger { cmd: TriggerCmd::Fire { event: Some(e), .. } } => vec![("event", e.clone())],
         Cmd::Itself { cmd: SelfCmd::TrustKey { public } } => vec![("key", public.clone())],
         Cmd::Itself { cmd: SelfCmd::Update { artifact: Some(a), sig, .. } } => {

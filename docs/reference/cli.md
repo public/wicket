@@ -240,7 +240,7 @@ Runs and agents:
   wrap       Run an agent command line that another program launches, inside a wicket box
   links      Links between boxes (expose/connect/link), newest first
   unlink     Cut a link between boxes: its relay closes it and drops its connections within seconds
-  manifest   Manifests runs start from: view, check, save and restore them, as the console's editor does
+  manifest   Manifests runs start from: view, check, save and restore them
   zone       How a manifest's zone treats each host it reaches: inspected or spliced, and why
   program    Programs: deterministic workloads that run without an agent
   image      Build the agent image
@@ -672,7 +672,7 @@ Options:
 ## `wicket manifest`
 
 ```text
-Manifests runs start from: view, check, save and restore them, as the console's editor does.
+Manifests runs start from: view, check, save and restore them.
 
 The manifests runs can be started from (#172), as the console's viewer and editor have them (#713): list and show them, check an edited one against the saved version, and save or restore one in the installation's `manifests` root, which keeps the version it replaces and audits the save with what it widens.
 

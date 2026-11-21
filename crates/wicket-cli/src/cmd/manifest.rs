@@ -156,7 +156,9 @@ pub(crate) fn show_text(v: &Value) -> String {
     }
     match g["org_policy"].as_object() {
         None => out.push_str("  org policy: none applied\n"),
-        Some(p) if p.get("error").is_some_and(|e| !e.is_null()) => out.push_str(&format!("  org policy {}: {}\n", s(&p["version"]), s(&p["error"]))),
+        Some(p) if p.get("error").is_some_and(|e| !e.is_null()) => {
+            out.push_str(&format!("  org policy {}: {}\n", s(&p["version"]), s(&p["error"])))
+        }
         Some(p) => out.push_str(&format!(
             "  org policy {}: {}\n",
             s(&p["version"]),
@@ -164,7 +166,11 @@ pub(crate) fn show_text(v: &Value) -> String {
         )),
     }
     for h in v["history"].as_array().into_iter().flatten() {
-        out.push_str(&format!("  saved version {} (replaced at {})\n", s(&h["version"]), wicket_core::time::unix_rfc3339(h["saved_before"].as_i64().unwrap_or(0))));
+        out.push_str(&format!(
+            "  saved version {} (replaced at {})\n",
+            s(&h["version"]),
+            wicket_core::time::unix_rfc3339(h["saved_before"].as_i64().unwrap_or(0))
+        ));
     }
     out
 }
@@ -175,14 +181,16 @@ fn save(kind: &str, body: Value, dry_run: bool) -> Result<()> {
     with_place(|p| {
         let (save, action) = manifests::prepare(p, kind, &body, &t.0).map_err(|e| wicket_home::exit::refused(format!("{e:#}")))?;
         let what = if kind == "restore_manifest" { "restoring" } else { "saving" };
-        print!("{what} {}/{} (sha256 {}…):\n{}", manifests::WRITABLE_ROOT, save.name, &save.sha256[..12], diff_text(&action));
+        // The action has the diff's fields; with nothing saved before, it is a new manifest.
+        let diff = json!({ "new": save.previous_sha256.is_none(), "widens": action["widens"], "widening": action["widening"], "changes": action["changes"] });
+        print!("{what} {}/{} (sha256 {}…):\n{}", manifests::WRITABLE_ROOT, save.name, &save.sha256[..12], diff_text(&diff));
         if dry_run {
             println!("(dry run: nothing written)");
             return Ok(());
         }
         let l = Ledger::open(&ledger_path())?;
         manifests::save_and_record(p, &l, &t, &save, &action, &operator(), json!({ "via": "cli" }))?;
-        println!("saved; the previous version is kept in its history");
+        println!("{}", if save.previous_sha256.is_some() { "saved; the previous version is kept in its history" } else { "saved" });
         Ok(())
     })
 }

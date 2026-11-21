@@ -12,8 +12,8 @@
 
 use super::Peer;
 use crate::{
-    CapacityCmd, Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, ManifestCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, RequestCmd,
-    SecretCmd, SelfCmd, ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
+    CapacityCmd, Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, ManifestCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd,
+    ProgramCmd, RequestCmd, SecretCmd, SelfCmd, ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
 };
 use serde::Deserialize;
 use std::path::Path;

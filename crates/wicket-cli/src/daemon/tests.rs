@@ -304,6 +304,22 @@ fn staged(args: &[&str], cwd: &Path) -> (Vec<String>, PathBuf, Result<()>, (uplo
     (plan.argv, at, checked, (st, dir))
 }
 
+/// #713: `manifest check` and `manifest save` name an edited manifest the caller may alone be able
+/// to read: it goes as content, and the command runs on the staged copy, its flags kept.
+#[test]
+fn an_edited_manifest_goes_to_the_daemon_as_content() {
+    let src = tmp();
+    std::fs::write(src.0.join("w.yaml"), "the edit").unwrap();
+    let f = src.0.join("w.yaml");
+    let (argv, stage, checked, _st) = staged(&["manifest", "save", "worker.yaml", "--file", f.to_str().unwrap(), "--dry-run"], &src.0);
+    checked.unwrap();
+    assert_eq!(argv, ["manifest", "save", "worker.yaml", "--file", stage.join("edit.yaml").to_str().unwrap(), "--dry-run"]);
+    assert_eq!(std::fs::read_to_string(stage.join("edit.yaml")).unwrap(), "the edit");
+    let (argv, stage, checked, _st) = staged(&["manifest", "check", "worker.yaml", "--file", f.to_str().unwrap(), "--json"], &src.0);
+    checked.unwrap();
+    assert_eq!(argv, ["manifest", "check", "worker.yaml", "--file", stage.join("edit.yaml").to_str().unwrap(), "--json"]);
+}
+
 /// #564: `self trust-key` and `self update` name files that may be root's alone (`/root/k.pub`),
 /// which wicketd, as the wicket user, can't read. They go as content, as a run's manifest does,
 /// and the command runs on the staged copies.

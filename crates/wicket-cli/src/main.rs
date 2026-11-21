@@ -67,8 +67,8 @@ pub(crate) use cmd::audit::AuditCmd;
 pub(crate) use cmd::dev::DevCmd;
 pub(crate) use cmd::identity::IdentityCmd;
 pub(crate) use cmd::image::ImageCmd;
-pub(crate) use cmd::manifest::ManifestCmd;
 pub(crate) use cmd::itself::SelfCmd;
+pub(crate) use cmd::manifest::ManifestCmd;
 pub(crate) use cmd::message::MessageCmd;
 pub(crate) use cmd::names::NamesCmd;
 pub(crate) use cmd::node::LeaseCmd;
@@ -95,7 +95,22 @@ use wicket_store::Ledger;
 const AREAS: &[(&str, &[&str])] = &[
     (
         "Runs and agents",
-        &["run", "session", "message", "top", "agents", "hibernate", "trigger", "wrap", "links", "unlink", "manifest", "zone", "program", "image"],
+        &[
+            "run",
+            "session",
+            "message",
+            "top",
+            "agents",
+            "hibernate",
+            "trigger",
+            "wrap",
+            "links",
+            "unlink",
+            "manifest",
+            "zone",
+            "program",
+            "image",
+        ],
     ),
     ("Approvals and grants", &["pending", "request", "approve", "deny", "grant", "capacity", "standing", "names", "authority", "audit"]),
     ("Nodes and placement", &["node", "lease", "service", "why-here", "reconcile"]),
