@@ -26,7 +26,7 @@ fn when_ms(v: &Value) -> String {
 }
 
 /// What `wicket authority` prints without --json.
-fn authority_text(v: &Value) -> String {
+pub(crate) fn authority_text(v: &Value) -> String {
     let mut out = format!("run {}  {}  on node {}\n", s(&v["run"]), s(&v["status"]), s(&v["node"]));
     let p = &v["policy"];
     out.push_str(&format!(
@@ -62,12 +62,13 @@ fn authority_text(v: &Value) -> String {
             "  block {} ({}){}{}  [{}]\n",
             s(&b["index"]),
             s(&b["kind"]),
-            b["signed_by"].as_str().map(|k| format!(", signed by {k}")).unwrap_or_default(),
+            b["signed_by"].as_str().map(|k| format!(", signed by {}", wicket_agent::clip(k, 200))).unwrap_or_default(),
             if b["revoked"] == true { ", REVOKED" } else { "" },
             s(&b["revocation_fingerprint"]),
         ));
+        // A block's source names the hosts and paths agents asked for (#731): cleaned, as every other field.
         for l in b["source"].as_str().unwrap_or("").lines() {
-            out.push_str(&format!("      {l}\n"));
+            out.push_str(&format!("      {}\n", wicket_agent::clip(l, 400)));
         }
     }
     for g in t["grants"].as_array().into_iter().flatten() {
@@ -86,7 +87,7 @@ fn authority_text(v: &Value) -> String {
 }
 
 /// What `wicket audit explain` prints without --json.
-fn explain_text(v: &Value) -> String {
+pub(crate) fn explain_text(v: &Value) -> String {
     let r = &v["recorded"];
     let mut out = format!(
         "record {}: {} {}{} for run {}\n  recorded: {} on {} ({})\n",
@@ -115,7 +116,7 @@ fn explain_text(v: &Value) -> String {
 
 /// `wicket authority <run>`.
 pub fn run(run: &str, json: bool) -> Result<()> {
-    let v = with_views(|x| views::run_authority(x, run)).map_err(|e| wicket_home::exit::not_found(format!("{e:#}")))?;
+    let v = with_views(|x| views::run_authority(x, run))?;
     if json {
         return super::print_json(&v);
     }
@@ -125,7 +126,7 @@ pub fn run(run: &str, json: bool) -> Result<()> {
 
 /// `wicket audit explain <seq>`.
 pub fn explain(seq: i64, json: bool) -> Result<()> {
-    let v = with_views(|x| views::explain(x, seq)).map_err(|e| wicket_home::exit::not_found(format!("{e:#}")))?;
+    let v = with_views(|x| views::explain(x, seq))?;
     if json {
         return super::print_json(&v);
     }

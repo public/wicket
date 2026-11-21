@@ -10,7 +10,6 @@
 
 use crate::serve::capacity;
 use crate::*;
-use wicket_placement::MicroUsd;
 use wicket_store::CapacityTerms;
 
 #[derive(Subcommand)]
@@ -60,8 +59,7 @@ pub enum CapacityCmd {
 }
 
 fn dollars(flag: &str, s: &str) -> Result<i64> {
-    let m = MicroUsd::parse_dollars(s).ok_or_else(|| wicket_home::exit::usage(format!("--{flag}: {s:?} is not a dollar amount")))?;
-    i64::try_from(m.0).map_err(|_| wicket_home::exit::usage(format!("--{flag}: too large")))
+    capacity::dollars_of(&format!("--{flag}"), s).map_err(wicket_home::exit::usage)
 }
 
 fn ttl_secs(ttl: Duration) -> Result<u64> {
@@ -119,10 +117,9 @@ pub async fn dispatch(c: CapacityCmd) -> Result<()> {
         }
         CapacityCmd::Grant { principal, nodes, max_hourly_usd, max_daily_usd, plans, regions, ttl } => {
             let p = capacity::principal(&t.0, &principal).map_err(wicket_home::exit::usage)?;
-            let clean = |v: Vec<String>| v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             let terms = CapacityTerms {
-                plans: clean(plans),
-                regions: clean(regions),
+                plans: capacity::names(plans.iter().map(String::as_str)),
+                regions: capacity::names(regions.iter().map(String::as_str)),
                 hourly: dollars("max-hourly-usd", &max_hourly_usd)?,
                 daily: dollars("max-daily-usd", &max_daily_usd)?,
                 nodes,
@@ -158,7 +155,7 @@ pub async fn dispatch(c: CapacityCmd) -> Result<()> {
                 &human()?,
                 &g.id,
                 &grant::Verdict::Renew(Duration::from_secs(secs)),
-                serde_json::json!({ "via": "cli", "previous_until": g.expires_at }),
+                serde_json::json!({ "via": "cli" }),
             )?
             else {
                 unreachable!("a renewal renews")

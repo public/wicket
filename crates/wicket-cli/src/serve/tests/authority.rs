@@ -337,3 +337,23 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{p}: {body}");
     }
 }
+
+/// #713: `wicket authority` and `wicket audit explain` print these views from the host. With a
+/// held token, the JSON has the fields the CLI reference lists, and the text names each block and
+/// grant.
+#[test]
+fn the_cli_prints_the_same_views_with_a_held_token() {
+    let f = fixture("cli");
+    let s = &f.t.state;
+    let views = crate::serve::authority::Views { ledger: &s.ledger, data: &s.data, tenant: &s.tenant, authz_root: s.authz_root.as_ref() };
+    let a = crate::serve::authority::run_authority(&views, RUN).unwrap();
+    assert_eq!((a["token"]["held"].as_bool(), a["feed"]["epoch"].is_u64()), (Some(true), true), "{a}");
+    crate::cmd::json_tests::documented_as("`wicket authority --json`", &a);
+    let text = crate::cmd::authority::authority_text(&a);
+    assert!(text.contains("block 0 (zone)") && text.contains("block 1 (grant), signed by"), "{text}");
+    assert!(text.contains(&format!("grant {}  POST api.example.com/v1/items  approved by passkey:laptop", f.gid)), "{text}");
+    let x = crate::serve::authority::explain(&views, f.op_seq).unwrap();
+    crate::cmd::json_tests::documented_as("`wicket audit explain --json`", &x);
+    let text = crate::cmd::authority::explain_text(&x);
+    assert!(text.contains("against its token now: allow:"), "{text}");
+}

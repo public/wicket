@@ -66,7 +66,7 @@ only: [the daemon](daemon.md#who-may-run-what) lists which commands need `sudo`.
 numbers with units (`90s`, `10m`, `1h`, `1h 30m`; the units in [the manifest
 reference](manifest.md)).
 
-Every operator action is in the console too, unless it's host-only by design: [console and CLI parity](parity.md).
+[Console and CLI parity](parity.md) lists where each operator action is: the console, the CLI, or only the host, and why.
 
 ## Output for scripts
 

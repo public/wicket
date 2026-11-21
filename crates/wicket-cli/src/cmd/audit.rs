@@ -11,7 +11,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         Cmd::Audit { tail, verify, against, issuer_jwk, json, cmd } => {
             if json && cmd.is_some() {
                 return Err(wicket_home::exit::usage(
-                    "--json lists the audit records: not with export (`wicket audit export --status` shows the sinks)",
+                    "--json lists the audit records: not with a subcommand (`wicket audit explain <seq> --json`; `wicket audit export --status` shows the sinks)",
                 ));
             }
             if let Some(AuditCmd::Explain { seq, json }) = cmd {

@@ -48,4 +48,4 @@ pub fn test_ledger(tag: &str) -> (std::path::PathBuf, wicket_store::Ledger) {
 }
 
 #[cfg(test)]
-mod json_tests;
+pub(crate) mod json_tests;
