@@ -208,9 +208,12 @@ wicket node revoke n1
   check, 2 s) or for 30 s if it doesn't say; the control host audits the refusal once while it lasts.
   While the control host can't be asked, a run's fetch of a secret fails at once for 2 s after each
   try (no request waits on a dead link), audited once per run, secret and outage. Each new connection
-  revokes every secret released to the run (a revoke sent on a link that died may not have arrived,
-  and a re-attached supervisor reads what an earlier one released from `ctl/holdings.json`): the node
-  fetches again what it uses (a resent revoke leaves the uses shared with children the node started while cut off). A revoke for a change ends a child's uses shared from the run too, and an answer a
+  sends again every revoke that may have been lost on a link that died (a secret revoked and not
+  fetched since), and checks at once for secrets that changed meanwhile. A secret the node holds as
+  released and unchanged stays with it, so after a self-update its new `serve` keeps the cache handed
+  over and fetches nothing again (#818). A re-attached supervisor reads what an earlier one released,
+  and each secret's digest, from `ctl/holdings.json`. A resent revoke leaves the uses shared with
+  children the node started while cut off. A revoke for a change ends a child's uses shared from the run too, and an answer a
   revoke overtook is not taken. Only a node at protocol 23 is sent an optional rule whose secret
   isn't set; an older one gets the zone without it, as before (#415). While the node is cut off, the
   secrets it holds keep working; one first needed then fails with "credential … not cached on this node;
