@@ -26,8 +26,9 @@ pub enum Code {
     NeedsApproval = 5,
     /// The run was revoked: an operator ended its authority, and wicket stopped its box.
     Revoked = 6,
-    /// Try again shortly: the daemon is moving to a new build and took no command (sysexits'
-    /// EX_TEMPFAIL). Nothing was done, so retrying is safe.
+    /// Try again shortly: the daemon is moving to a new build and took no command, or a supervisor
+    /// host's shard is still held by another (sysexits' EX_TEMPFAIL). Nothing was done, so retrying
+    /// is safe.
     TryAgain = 75,
 }
 
@@ -70,6 +71,11 @@ pub fn refused(msg: impl Into<String>) -> anyhow::Error {
 /// [`Code::NeedsApproval`].
 pub fn needs_approval(msg: impl Into<String>) -> anyhow::Error {
     exit(Code::NeedsApproval, msg)
+}
+
+/// [`Code::TryAgain`].
+pub fn try_again(msg: impl Into<String>) -> anyhow::Error {
+    exit(Code::TryAgain, msg)
 }
 
 /// [`Code::Usage`].

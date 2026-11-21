@@ -257,7 +257,8 @@ impl Fencer {
 // ---- The host process (`wicket supervise`, migration step 1, item 1) ----
 
 /// What a host answers on its heartbeat socket: one JSON line per connection, read from atomics
-/// only, so a ledger stall can't silence it (note 25, §3.1).
+/// only, so a ledger stall can't silence it (note 25, §3.1). `stuck` and `lease_ok` are sampled at
+/// each request: the progress counter is compared with what the previous request saw.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Heartbeat {
     pub shard: String,
@@ -266,13 +267,30 @@ pub struct Heartbeat {
     pub epoch: i64,
     /// Its runtime's progress counter.
     pub progress: u64,
-    /// The counter hasn't moved for [`STUCK_SECS`]: its runtime is wedged.
+    /// The host can't be trusted to hold its shard: its progress counter hasn't moved for
+    /// [`STUCK_SECS`], or its lease thread hasn't been through its loop for [`LEASE_STALE_RENEWALS`]
+    /// renewals (dead or wedged), or the lease thread found the shard taken.
     pub stuck: bool,
+    /// The lease thread has been through its loop recently (an attempt that failed on a busy ledger
+    /// counts: a stall isn't a dead thread).
+    pub lease_ok: bool,
+    /// The lease thread found the shard taken at a higher epoch.
+    pub lost: bool,
 }
 
 /// How long a host's progress counter may stand still before its heartbeat says it is stuck: three
 /// of its one-second ticks.
 pub const STUCK_SECS: u64 = 3;
+
+/// How many renewal intervals the lease thread may go without finishing a pass through its loop
+/// before the heartbeat says so: a pass is a sleep and one attempt, and an attempt on a busy ledger
+/// can take its 5 s busy timeout, so two would be too tight.
+pub const LEASE_STALE_RENEWALS: u32 = 3;
+
+/// Whether `shard` is a shard's name: a number, as [`shard_name`] makes them. It goes into a path.
+pub fn valid_shard(shard: &str) -> bool {
+    !shard.is_empty() && shard.len() <= 4 && shard.bytes().all(|b| b.is_ascii_digit())
+}
 
 /// Where shard `shard`'s host answers its heartbeat, under the data directory.
 pub fn heartbeat_socket(data_dir: &std::path::Path, shard: &str) -> std::path::PathBuf {
@@ -316,20 +334,49 @@ pub enum Ended {
     Lost,
 }
 
+/// The lease thread's liveness: when (ms after the host started) it last finished a pass.
+#[derive(Clone)]
+struct Pulse {
+    born: std::time::Instant,
+    at_ms: Arc<AtomicU64>,
+}
+
+impl Pulse {
+    fn new() -> Pulse {
+        Pulse { born: std::time::Instant::now(), at_ms: Arc::new(AtomicU64::new(0)) }
+    }
+    fn beat(&self) {
+        self.at_ms.store(self.born.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+    fn age(&self) -> std::time::Duration {
+        self.born.elapsed().saturating_sub(std::time::Duration::from_millis(self.at_ms.load(Ordering::Relaxed)))
+    }
+}
+
 /// A running host: holds its shard, renews its lease from a thread of its own, and answers its
 /// heartbeat from another. It supervises no runs yet (note 25, §5.1: runs move into hosts later).
 pub struct Host {
     pub lease: Lease,
     progress: Progress,
     lost: Arc<std::sync::atomic::AtomicBool>,
+    /// Ends the heartbeat thread.
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Ends the lease thread (its own flag, so a test can end it alone, as a panic would).
+    lease_stop: Arc<std::sync::atomic::AtomicBool>,
+    lease_thread: std::thread::JoinHandle<()>,
+    heartbeat_thread: Option<std::thread::JoinHandle<()>>,
+    /// The listener's fd, to wake its accept on a stop (`shutdown`).
+    listener_fd: std::os::fd::RawFd,
+    /// The socket this host bound: its path and inode, so only that one is ever unlinked (a
+    /// successor binds the same path).
+    sock: (std::path::PathBuf, u64, u64),
     ledger_path: std::path::PathBuf,
-    sock: std::path::PathBuf,
 }
 
 impl Host {
     /// Takes `shard` (with `nodes`) for this process as `owner`, then starts its lease and heartbeat
-    /// threads. Refused with [`StoreError::ShardHeld`] while another host's lease is live.
+    /// threads. Only a free shard ([`Ledger::take_free_shard`]): one held by another process, lapsed
+    /// or not, is refused with [`StoreError::ShardHeld`] and left to wicketd's fence.
     pub fn start(
         ledger_path: &std::path::Path,
         sock: &std::path::Path,
@@ -338,20 +385,26 @@ impl Host {
         nodes: &[&str],
         times: HostTimes,
     ) -> anyhow::Result<Host> {
+        anyhow::ensure!(valid_shard(shard), "{shard:?} isn't a shard (a number)");
         let progress = Progress::default();
         let lease = {
             let l = Ledger::open(ledger_path)?;
-            Lease::take(&l, shard, owner, nodes, progress.get(), wicket_store::now())?
+            let t = l.take_free_shard(shard, owner, nodes, LEASE_SECS, wicket_store::now())?;
+            Lease { shard: shard.into(), owner: owner.into(), epoch: t.epoch, seen: progress.get() }
         };
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lease_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pulse = Pulse::new();
         // The lease thread: its own ledger connection and its own small transaction, so a stalled
-        // batch elsewhere in the host can't lapse it. It leaves only when the shard is taken.
-        {
-            let (mut lease, progress, lost, stop, path) =
-                (lease.clone(), progress.clone(), lost.clone(), stop.clone(), ledger_path.to_path_buf());
+        // batch elsewhere in the host can't lapse it. It leaves only when the shard is taken, or on a
+        // stop. Every pass, renewed or not, moves its pulse.
+        let lease_thread = {
+            let (mut lease, progress, lost, stop, path, pulse) =
+                (lease.clone(), progress.clone(), lost.clone(), lease_stop.clone(), ledger_path.to_path_buf(), pulse.clone());
             std::thread::Builder::new().name(format!("lease-{shard}")).spawn(move || {
                 let mut l = None;
+                pulse.beat();
                 while !stop.load(Ordering::Relaxed) {
                     std::thread::sleep(times.renew);
                     if stop.load(Ordering::Relaxed) {
@@ -360,29 +413,36 @@ impl Host {
                     if l.is_none() {
                         l = Ledger::open(&path).ok();
                     }
-                    let Some(ledger) = &l else { continue };
-                    match lease.renew(ledger, progress.get(), wicket_store::now()) {
-                        Renewal::Lost => {
-                            lost.store(true, Ordering::Relaxed);
-                            break;
+                    if let Some(ledger) = &l {
+                        match lease.renew(ledger, progress.get(), wicket_store::now()) {
+                            Renewal::Lost => {
+                                lost.store(true, Ordering::Relaxed);
+                                pulse.beat();
+                                break;
+                            }
+                            Renewal::Failed => l = None,
+                            Renewal::Renewed | Renewal::Stuck => {}
                         }
-                        Renewal::Failed => l = None,
-                        Renewal::Renewed | Renewal::Stuck => {}
                     }
+                    pulse.beat();
                 }
-            })?;
-        }
+            })?
+        };
         // The heartbeat thread: atomics only, never the ledger.
-        {
-            if let Some(dir) = sock.parent() {
-                std::fs::create_dir_all(dir)?;
-                std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-            }
-            // This host holds the shard, so a socket left there is a dead holder's.
-            let _ = std::fs::remove_file(sock);
-            let listener = std::os::unix::net::UnixListener::bind(sock)?;
-            std::fs::set_permissions(sock, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-            let (beat, progress, stop) = (lease.clone(), progress.clone(), stop.clone());
+        if let Some(dir) = sock.parent() {
+            std::fs::create_dir_all(dir)?;
+            std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        }
+        // This host holds the shard (it was free), so a socket left there is a dead holder's.
+        let _ = std::fs::remove_file(sock);
+        let listener = std::os::unix::net::UnixListener::bind(sock)?;
+        std::fs::set_permissions(sock, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        let meta = std::os::unix::fs::MetadataExt::ino(&std::fs::symlink_metadata(sock)?);
+        let dev = std::os::unix::fs::MetadataExt::dev(&std::fs::symlink_metadata(sock)?);
+        let listener_fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
+        let heartbeat_thread = {
+            let (beat, progress, stop, lost, pulse) = (lease.clone(), progress.clone(), stop.clone(), lost.clone(), pulse.clone());
+            let stale = times.renew * LEASE_STALE_RENEWALS;
             std::thread::Builder::new().name(format!("heartbeat-{shard}")).spawn(move || {
                 let (mut last, mut moved_at) = (progress.get(), std::time::Instant::now());
                 for conn in listener.incoming() {
@@ -394,21 +454,36 @@ impl Host {
                     if now != last {
                         (last, moved_at) = (now, std::time::Instant::now());
                     }
+                    let lease_ok = pulse.age() < stale;
+                    let lost = lost.load(Ordering::Relaxed);
                     let hb = Heartbeat {
                         shard: beat.shard.clone(),
                         owner: beat.owner.clone(),
                         epoch: beat.epoch,
                         progress: now,
-                        stuck: moved_at.elapsed() >= times.stuck,
+                        stuck: moved_at.elapsed() >= times.stuck || !lease_ok || lost,
+                        lease_ok,
+                        lost,
                     };
                     // One write: a reader sees the whole line or nothing.
                     let mut line = serde_json::to_vec(&hb).unwrap_or_default();
                     line.push(b'\n');
                     let _ = std::io::Write::write_all(&mut conn, &line);
                 }
-            })?;
-        }
-        Ok(Host { lease, progress, lost, stop, ledger_path: ledger_path.to_path_buf(), sock: sock.to_path_buf() })
+            })?
+        };
+        Ok(Host {
+            lease,
+            progress,
+            lost,
+            stop,
+            lease_stop,
+            lease_thread,
+            heartbeat_thread: Some(heartbeat_thread),
+            listener_fd,
+            sock: (sock.to_path_buf(), dev, meta),
+            ledger_path: ledger_path.to_path_buf(),
+        })
     }
 
     /// The runtime's progress counter: a task on the host's runtime ticks it ([`Host::run`]).
@@ -423,7 +498,8 @@ impl Host {
 
     /// Runs the host until `stop` resolves (a signal) or its shard is lost: ticks the progress
     /// counter every `times.tick` on this runtime, then stops (writing the clean-stop marker unless
-    /// the shard was lost).
+    /// the shard was lost). A lease thread that ended without finding the shard lost (it panicked) is
+    /// an error: the host can no longer renew or learn that it was fenced.
     pub async fn run(self, times: HostTimes, stop: impl std::future::Future<Output = ()>) -> anyhow::Result<Ended> {
         tokio::pin!(stop);
         let mut tick = tokio::time::interval(times.tick);
@@ -434,6 +510,10 @@ impl Host {
                     if self.lost() {
                         break Ended::Lost;
                     }
+                    if self.lease_thread.is_finished() {
+                        self.quiet();
+                        anyhow::bail!("shard {}: its lease thread ended without losing the shard", self.lease.shard);
+                    }
                     self.progress.tick();
                 }
             }
@@ -441,16 +521,34 @@ impl Host {
         self.finish(ended)
     }
 
-    /// Stops the host's threads, and for a planned stop writes the clean-stop marker first.
-    pub fn finish(self, ended: Ended) -> anyhow::Result<Ended> {
+    /// Stops answering (the heartbeat thread is woken and ends) and unlinks the socket, only if it
+    /// is still the one this host bound.
+    fn quiet(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.lease_stop.store(true, Ordering::Relaxed);
+        // SAFETY: a plain syscall on this host's own listener; it wakes the blocked accept.
+        unsafe { libc::shutdown(self.listener_fd, libc::SHUT_RDWR) };
+        let (path, dev, ino) = &self.sock;
+        if let Ok(m) = std::fs::symlink_metadata(path) {
+            if std::os::unix::fs::MetadataExt::dev(&m) == *dev && std::os::unix::fs::MetadataExt::ino(&m) == *ino {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Stops the host: its heartbeat first (and its socket, if still its own), then, for a planned
+    /// stop, the clean-stop marker.
+    pub fn finish(mut self, ended: Ended) -> anyhow::Result<Ended> {
+        self.quiet();
+        if let Some(t) = self.heartbeat_thread.take() {
+            let _ = t.join();
+        }
         if ended == Ended::Stopped {
             let l = Ledger::open(&self.ledger_path)?;
-            l.mark_shard_stopping(&self.lease.shard, &self.lease.owner, self.lease.epoch, wicket_store::now())?;
+            if !l.mark_shard_stopping(&self.lease.shard, &self.lease.owner, self.lease.epoch, wicket_store::now())? {
+                say_err!("[supervise] shard {}: not marked stopping: it was taken at a higher epoch meanwhile", self.lease.shard);
+            }
         }
-        self.stop.store(true, Ordering::Relaxed);
-        // Wakes the heartbeat thread's accept so it sees the stop.
-        let _ = std::os::unix::net::UnixStream::connect(&self.sock);
-        let _ = std::fs::remove_file(&self.sock);
         Ok(ended)
     }
 }
@@ -660,11 +758,20 @@ mod tests {
         assert_eq!(f.decide(&shards(), &hosts, &BTreeMap::new(), &dead, 150)[0], Action::Start("0".into()));
     }
 
-    fn host_dir(tag: &str) -> std::path::PathBuf {
+    /// A test's directory, removed when it ends.
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn host_dir(tag: &str) -> TestDir {
         let d = std::env::temp_dir().join(format!("wsup-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        TestDir(d)
     }
 
     fn fast() -> HostTimes {
@@ -683,26 +790,37 @@ mod tests {
         }
     }
 
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// `host.run` with no stop signal, bounded by a deadline.
+    fn run_until_it_ends(host: Host) -> anyhow::Result<Ended> {
+        rt().block_on(async { tokio::time::timeout(std::time::Duration::from_secs(10), host.run(fast(), std::future::pending())).await })
+            .expect("the host ended within 10 s")
+    }
+
     #[test]
     fn a_host_holds_its_shard_answers_heartbeats_and_stops_cleanly() {
         let d = host_dir("clean");
-        let (db, sock) = (d.join("ledger.db"), heartbeat_socket(&d, "0"));
+        let (db, sock) = (d.0.join("ledger.db"), heartbeat_socket(&d.0, "0"));
         let host = Host::start(&db, &sock, "0", "m:1:1", &["n1"], fast()).unwrap();
         assert_eq!(host.lease.epoch, 1);
-        // A second host of the same shard is refused while this one's lease is live.
-        let other = Host::start(&db, &heartbeat_socket(&d, "0b"), "0", "m:2:2", &["n1"], fast());
+        // A second host of the same shard is refused while it is held.
+        let other = Host::start(&db, &heartbeat_socket(&d.0, "9"), "0", "m:2:2", &["n1"], fast());
         assert!(matches!(other.err().and_then(|e| e.downcast::<StoreError>().ok()), Some(StoreError::ShardHeld(..))));
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let runner = std::thread::spawn(move || {
-            rt.block_on(host.run(fast(), async {
+            rt().block_on(host.run(fast(), async {
                 let _ = rx.await;
             }))
         });
-        // Its heartbeat answers with its holder and epoch, and its runtime moving.
+        // Its heartbeat answers with its holder and epoch, its runtime moving, its lease thread alive.
         let first = heartbeat(&sock, std::time::Duration::from_secs(2)).unwrap();
         assert_eq!((first.shard.as_str(), first.owner.as_str(), first.epoch), ("0", "m:1:1", 1));
         wait_for("progress moves", || heartbeat(&sock, std::time::Duration::from_secs(2)).unwrap().progress > first.progress);
+        let hb = heartbeat(&sock, std::time::Duration::from_secs(2)).unwrap();
+        assert!(hb.lease_ok && !hb.stuck && !hb.lost, "{hb:?}");
         // Its lease is renewed (while its runtime moves) from its own thread.
         let l = Ledger::open(&db).unwrap();
         let taken = l.supervisor_host("0").unwrap().unwrap().updated_at;
@@ -713,39 +831,74 @@ mod tests {
         assert!(rec.stopping, "the clean-stop marker");
         assert!(!sock.exists());
         // Stopped cleanly: the shard is free to take at once.
-        assert_eq!(l.take_shard("0", "m:3:3", &["n1"], LEASE_SECS, wicket_store::now()).unwrap().epoch, 2);
+        assert_eq!(l.take_free_shard("0", "m:3:3", &["n1"], LEASE_SECS, wicket_store::now()).unwrap().epoch, 2);
     }
 
     #[test]
-    fn a_host_whose_shard_is_taken_leaves_without_writing() {
+    fn a_host_whose_shard_is_taken_leaves_without_writing_or_touching_its_successor() {
         let d = host_dir("lost");
-        let (db, sock) = (d.join("ledger.db"), heartbeat_socket(&d, "0"));
+        let (db, sock) = (d.0.join("ledger.db"), heartbeat_socket(&d.0, "0"));
         let host = Host::start(&db, &sock, "0", "m:1:1", &["n1"], fast()).unwrap();
-        // wicketd fences it (as if its process had exited), and a fresh host takes the shard.
+        // wicketd fences it, and a fresh host takes the shard and binds the same socket path.
         let l = Ledger::open(&db).unwrap();
         assert_eq!(l.fence_shard("0", "m:1:1", true, wicket_store::now()).unwrap(), Some(2));
-        l.take_shard("0", "m:9:9", &["n1"], LEASE_SECS, wicket_store::now()).unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let ended = rt.block_on(host.run(fast(), std::future::pending())).unwrap();
-        assert_eq!(ended, Ended::Lost);
+        l.take_free_shard("0", "m:9:9", &["n1"], LEASE_SECS, wicket_store::now()).unwrap();
+        std::fs::remove_file(&sock).unwrap();
+        let successor = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert_eq!(run_until_it_ends(host).unwrap(), Ended::Lost);
         let rec = l.supervisor_host("0").unwrap().unwrap();
         assert_eq!((rec.owner.as_deref(), rec.epoch, rec.stopping), (Some("m:9:9"), 3, false), "the new holder's record is untouched");
+        assert!(sock.exists(), "the successor's socket is left alone");
+        std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        successor.accept().unwrap();
+    }
+
+    #[test]
+    fn a_host_takes_only_a_free_shard_never_a_lapsed_holders() {
+        let d = host_dir("free");
+        let db = d.0.join("ledger.db");
+        let l = Ledger::open(&db).unwrap();
+        // Held by a process whose lease lapsed long ago: still not this host's to take.
+        l.take_shard("0", "m:5:5", &["n1"], LEASE_SECS, 1).unwrap();
+        let r = Host::start(&db, &heartbeat_socket(&d.0, "0"), "0", "m:1:1", &["n1"], fast());
+        assert!(matches!(r.err().and_then(|e| e.downcast::<StoreError>().ok()), Some(StoreError::ShardHeld(_, 0))));
+        // And a shard's name goes into a path: only numbers.
+        for bad in ["", "../x", "0/1", "a", "12345"] {
+            assert!(Host::start(&db, &heartbeat_socket(&d.0, "x"), bad, "m:1:1", &["n1"], fast()).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
     fn a_wedged_runtime_says_stuck_and_stops_renewing_while_the_heartbeat_answers() {
         let d = host_dir("stuck");
-        let (db, sock) = (d.join("ledger.db"), heartbeat_socket(&d, "0"));
+        let (db, sock) = (d.0.join("ledger.db"), heartbeat_socket(&d.0, "0"));
         // Started, but its runtime never runs (`run` isn't called): nothing ticks.
         let host = Host::start(&db, &sock, "0", "m:1:1", &["n1"], fast()).unwrap();
         let l = Ledger::open(&db).unwrap();
         let lease_until = l.supervisor_host("0").unwrap().unwrap().lease_until;
         heartbeat(&sock, std::time::Duration::from_secs(2)).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Over a second, so a renewal (whole seconds in the ledger) would show.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
         let hb = heartbeat(&sock, std::time::Duration::from_secs(2)).unwrap();
-        assert!(hb.stuck, "{hb:?}");
+        assert!(hb.stuck && hb.lease_ok && !hb.lost, "{hb:?}");
         assert_eq!(l.supervisor_host("0").unwrap().unwrap().lease_until, lease_until, "never renewed without progress");
-        assert!(!host.lost());
         host.finish(Ended::Lost).unwrap();
+    }
+
+    #[test]
+    fn a_dead_lease_thread_shows_in_the_heartbeat_and_ends_the_host() {
+        let d = host_dir("dead");
+        let (db, sock) = (d.0.join("ledger.db"), heartbeat_socket(&d.0, "0"));
+        let host = Host::start(&db, &sock, "0", "m:1:1", &["n1"], fast()).unwrap();
+        // The lease thread ends without losing the shard (as a panic in it would).
+        host.lease_stop.store(true, Ordering::Relaxed);
+        wait_for("the lease thread ends", || host.lease_thread.is_finished());
+        wait_for("the heartbeat says so", || {
+            let hb = heartbeat(&sock, std::time::Duration::from_secs(2)).unwrap();
+            !hb.lease_ok && hb.stuck && !hb.lost
+        });
+        let e = run_until_it_ends(host).unwrap_err();
+        assert!(e.to_string().contains("lease thread ended"), "{e}");
+        assert!(!sock.exists());
     }
 }
