@@ -120,19 +120,19 @@ fn assets(out: &Path) {
         h.update(b);
     }
     let dir = format!("/static/m.{}", &hex::encode(h.finalize())[..16]);
-    // lit-html's files preloaded (with their hashes, so the imports are checked too), then each of the
-    // console's own modules as a script of its own.
+    // What the views import (the console's shared module and lit-html's files) preloaded, with their
+    // hashes, so the imports are checked too; then each view as a script of its own.
     let mut module_tags = String::new();
-    for ((rel, b), _) in modules.iter().zip(MODULES).filter(|(_, (_, own))| !own) {
+    for ((rel, b), _) in modules.iter().zip(MODULES).filter(|(_, (_, kind))| !matches!(kind, Module::View)) {
         module_tags.push_str(&format!("<link rel=\"modulepreload\" href=\"{dir}/{rel}\" integrity=\"{}\">\n", sri(b)));
     }
-    let own: Vec<String> = modules
+    let views: Vec<String> = modules
         .iter()
         .zip(MODULES)
-        .filter(|(_, (_, own))| *own)
+        .filter(|(_, (_, kind))| matches!(kind, Module::View))
         .map(|((rel, b), _)| format!("<script type=\"module\" src=\"{dir}/{rel}\" integrity=\"{}\"></script>", sri(b)))
         .collect();
-    module_tags.push_str(&own.join("\n"));
+    module_tags.push_str(&views.join("\n"));
     let (sjs, scss) = (built("session.js"), built("session.css"));
     let (sjs_path, sjs_sri, scss_path, scss_sri) = (named("session", "js", &sjs), sri(&sjs), named("session", "css", &scss), sri(&scss));
     let icon_of = |rel: &str| icons.iter().find(|(from, _)| from == &format!("/static/{rel}")).map(|(_, to)| to.clone()).expect("an icon");
@@ -221,24 +221,35 @@ fn console(out: &Path) {
     // under one content-hashed directory, so their relative imports work as written.
     let modules = std::fs::create_dir_all(out.join("modules").join("vendor/lit-html/directives"));
     modules.unwrap_or_else(|e| panic!("{}: {e}", out.display()));
-    for (rel, own) in MODULES {
+    for (rel, kind) in MODULES {
+        let own = !matches!(kind, Module::Vendored);
         let (src, path) = read(rel);
         // The console's own modules import lit-html by its name; vendored files are left as they are.
-        let src = if *own { bare_imports(&src, &path, rel) } else { src };
-        let js = if *own && !plain { minify(&src, &path, true) } else { src };
+        let src = if own { bare_imports(&src, &path, rel) } else { src };
+        let js = if own && !plain { minify(&src, &path, true) } else { src };
         write(&out.join("modules").join(rel), js.as_bytes());
     }
 }
 
-/// The console's modules, relative to static/: the console's own (true: minified), then the
-/// vendored lit-html files they import (false: copied as they are).
-const MODULES: &[(&str, bool)] = &[
-    ("inbox.js", true),
-    ("agents.js", true),
-    ("vendor/lit-html/lit-html.js", false),
-    ("vendor/lit-html/directive.js", false),
-    ("vendor/lit-html/directive-helpers.js", false),
-    ("vendor/lit-html/directives/repeat.js", false),
+/// What a console module is: a view the page loads, shared code the views import (both the
+/// console's own, minified), or a vendored lit-html file (copied as it is).
+enum Module {
+    View,
+    Shared,
+    Vendored,
+}
+
+/// The console's modules, relative to static/.
+const MODULES: &[(&str, Module)] = &[
+    ("inbox.js", Module::View),
+    ("agents.js", Module::View),
+    ("activity.js", Module::View),
+    ("settings.js", Module::View),
+    ("ui.js", Module::Shared),
+    ("vendor/lit-html/lit-html.js", Module::Vendored),
+    ("vendor/lit-html/directive.js", Module::Vendored),
+    ("vendor/lit-html/directive-helpers.js", Module::Vendored),
+    ("vendor/lit-html/directives/repeat.js", Module::Vendored),
 ];
 
 /// The console's modules import lit-html by its package name, as `"lit-html"` or
@@ -279,7 +290,7 @@ fn bare_imports(src: &str, path: &Path, rel: &str) -> String {
         };
         // Only a file that is vendored and served (MODULES), so an import can't name one that isn't.
         let vendored = format!("vendor/lit-html/{file}");
-        if !MODULES.iter().any(|(rel, own)| !own && *rel == vendored) {
+        if !MODULES.iter().any(|(rel, kind)| matches!(kind, Module::Vendored) && *rel == vendored) {
             panic!(
                 "{}: import from {spec:?}: static/{vendored} isn't among the vendored modules build.rs serves (MODULES)",
                 path.display()

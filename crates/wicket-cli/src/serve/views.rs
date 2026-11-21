@@ -13,6 +13,14 @@ use super::State;
 use anyhow::Result;
 use serde_json::Value;
 
+/// The paths here, so a request without an operator's session is refused before any is built.
+pub(super) fn handles(path: &str) -> bool {
+    matches!(path, "/api/grants" | "/api/links" | "/api/triggers" | "/api/nodes" | "/api/services" | "/api/identities" | "/api/sessions")
+}
+
+/// How many identities the view lists: the newest.
+const IDENTITIES: usize = 200;
+
 /// The GET endpoints here, for an operator's session. None: not one of them.
 pub(super) fn get(state: &State, path: &str) -> Option<Result<Value>> {
     let view = match path {
@@ -43,19 +51,24 @@ fn triggers(state: &State, l: &wicket_store::Ledger) -> Result<Value> {
     Ok(crate::cmd::trigger::list_json(&l.triggers(&state.tenant.0, None)?, wicket_store::now()))
 }
 
-/// `wicket node list --json`: every enrolled node.
-fn nodes(_: &State, l: &wicket_store::Ledger) -> Result<Value> {
-    wicket_control::enrol::list_json(l)
+/// `wicket node list --json`: the tenant's enrolled nodes.
+fn nodes(state: &State, l: &wicket_store::Ledger) -> Result<Value> {
+    let nodes: Vec<_> = l.nodes()?.into_iter().filter(|n| n.tenant == state.tenant.0).collect();
+    wicket_control::enrol::list_json_of(l, &nodes)
 }
 
-/// `wicket service list --json`.
-fn services(_: &State, l: &wicket_store::Ledger) -> Result<Value> {
-    Ok(crate::cmd::service::services_json(&l.services()?))
+/// `wicket service list --json`: the tenant's.
+fn services(state: &State, l: &wicket_store::Ledger) -> Result<Value> {
+    let rows: Vec<_> = l.services()?.into_iter().filter(|s| s.tenant == state.tenant.0).collect();
+    Ok(crate::cmd::service::services_json(&rows))
 }
 
-/// `wicket identity list --json`.
-fn identities(_: &State, l: &wicket_store::Ledger) -> Result<Value> {
-    crate::cmd::identity::list_json(l)
+/// `wicket identity list --json`: the tenant's newest, checked as the console checks the identities
+/// it shows beside a request.
+fn identities(state: &State, l: &wicket_store::Ledger) -> Result<Value> {
+    let mut rows: Vec<_> = l.identities()?.into_iter().filter(|r| r.tenant == state.tenant.0).collect();
+    rows.drain(..rows.len().saturating_sub(IDENTITIES));
+    crate::cmd::identity::list_json(l, &rows, state.identity)
 }
 
 /// `wicket operator sessions --json`: the tenant's live console sessions.

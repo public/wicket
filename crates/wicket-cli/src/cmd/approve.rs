@@ -209,10 +209,10 @@ pub(crate) fn pending_text(l: &Ledger) -> Result<String> {
 }
 
 /// A usage error for `wicket approve|deny` (`verb`) on an id another command decides: a standing
-/// ask (`s-…`, `wicket standing`) or an ask for a public name (`n-…`, `wicket names`).
+/// request (`s-…`, `wicket standing`) or an ask for a public name (`n-…`, `wicket names`).
 pub(crate) fn elsewhere(id: &str, verb: &str) -> Option<anyhow::Error> {
     let (what, cmd) = match id {
-        i if i.starts_with("s-") => ("a standing ask", "standing"),
+        i if i.starts_with("s-") => ("a standing request", "standing"),
         i if i.starts_with("n-") => ("an ask for a public name", "names"),
         _ => return None,
     };

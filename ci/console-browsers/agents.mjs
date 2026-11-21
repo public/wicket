@@ -189,7 +189,7 @@ async function check(engine) {
     await bare.goto(url + "#agents");
     for (const id of ["runs", "start"]) await bare.waitForFunction(i => document.getElementById(i).textContent.includes("can't be shown"), id, { timeout: 10000 });
     await bare.evaluate(() => { location.hash = "#agent/run_a"; });
-    await bare.waitForFunction(() => document.getElementById("agent-head").textContent.includes("can't be shown"), null, { timeout: 10000 });
+    for (const id of ["agent-head", "agent-log"]) await bare.waitForFunction(i => document.getElementById(i).textContent.includes("can't be shown"), id, { timeout: 10000 });
     console.log(`${engine} agents: ok`);
   } finally {
     await browser.close();

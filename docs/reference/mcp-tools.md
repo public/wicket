@@ -117,7 +117,10 @@ is refused, saying so.
 |---|---|---|---|
 | `url` | string | required | e.g. `https://api.example.org/v2/items` |
 | `method` | string | `GET` | |
-| `scope` | `exact` or `prefix` | `exact` | `prefix`: every path under the URL's path, in whole segments (`/repos/acme/app` covers `/repos/acme/app/…`, not `/repos/acme/app-secrets`). |
+| `scope` | `exact`, `prefix` or `standing` | `exact` | `prefix`: every path under the URL's path, in whole segments (`/repos/acme/app` covers `/repos/acme/app/…`, not `/repos/acme/app-secrets`). `standing`: a standing request, for a [standing rule](../explanation/concepts.md#the-nouns) that the agent's later runs take up once a human approves it (`s-…`; protocol 17). |
+| `methods` | list of strings | `[GET]` | With `scope: standing`: the rule's methods. |
+| `paths` | list of globs | the URL's directory and everything under it | With `scope: standing`: the rule's paths. At most 16 method and path pairs. |
+| `dangerous` | boolean | `false` | With `scope: standing`: the rule's `allow_dangerous`. |
 | `reason` | string | required | One sentence: what it is for. |
 
 A grant never covers anything riskier than the request the operator was shown: approving an R2 prefix
@@ -199,6 +202,10 @@ short-lived operator identity: `from` has the operator's principal `id`, `operat
 `an operator`). An operator may write to an agent that acts for it, whose `accept_from` names it,
 or that wrote to it. It is still data: an operator's instructions come as prompts, the agent's next
 turn.
+
+An agent an operator started is that operator's delegation (#252): its report on its task goes to
+the operator's inbox, and the operator's next brief (`wicket message continue`) arrives as a `brief`
+from `your operator`, to work on as on the task.
 
 While the agent waits here (or in `await_grant`, or in `receipts` with a timeout) its state is
 `waiting` (see [`principals`](#principals)).
@@ -454,7 +461,7 @@ The answer is a request id, `n-…`, for `await_grant`.
 - `service` is the SRV record's service label (default `http`).
 - At most 3 asks of an agent wait at once.
 - The reason is recorded as the agent's (`asked by the agent: …`).
-- After a denial, the agent can't ask for the same name again for 15 minutes. A standing ask nobody
+- After a denial, the agent can't ask for the same name again for 15 minutes. A standing request nobody
   decides is withdrawn after 14 days.
 - Audited as `name.requested`, and the decision as `decision`.
 - An agent's `decide` never decides it.

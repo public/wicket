@@ -652,8 +652,13 @@ pub fn list() -> Result<()> {
 /// taints, public addresses (null: none), and the CA's policy and wants (#573). Times are Unix
 /// seconds.
 pub fn list_json(l: &Ledger) -> Result<serde_json::Value> {
+    list_json_of(l, &l.nodes()?)
+}
+
+/// As [`list_json`], of these nodes (the console's tenant's, say).
+pub fn list_json_of(l: &Ledger, nodes: &[wicket_store::NodeRow]) -> Result<serde_json::Value> {
     let mut out = vec![];
-    for n in l.nodes()? {
+    for n in nodes {
         let cert = |not_after: i64, serial: &str| serde_json::json!({ "serial": serial, "not_after": not_after });
         let ca = l.node_cas(&n.name)?.into_iter().find(|c| c.status == "active").map(|c| {
             let mut v = cert(c.not_after, &c.serial);

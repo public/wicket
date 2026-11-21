@@ -41,8 +41,6 @@ const calls = [];
 let state = null;
 // A hostile string an agent chose (a grant's path): it must stay text.
 const HOSTILE = "/x<img src=x onerror=alert(1)>";
-const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
-  against_token_now: { available: true, decision: "forbidden", why: "block 0: check if " + HOSTILE, zone_says: "Forbidden" } };
 let nextAction = null, begun = null;
 // Web Push: a fake browser (permission, service worker, push manager) and server (devices).
 let permAsked = 0, permAskedAt = -1, swRegistered = null, swListener = null, subscribed = null, pushDevices = [];
@@ -86,7 +84,6 @@ const fetch = async (path, opts) => {
   if (path === "/api/push/remove") { const b = JSON.parse(opts.body); pushDevices = pushDevices.filter(d => d.id !== b.id); return reply({ ok: "device removed" }); }
   if (path === "/api/push/details") { const b = JSON.parse(opts.body); for (const d of pushDevices) if (d.id === b.id) d.details = b.details; return reply({ ok: "ok" }); }
   if (path === "/api/policy") return reply({ installed: null, current: null, versions: [], runs: [] });
-  if (path.startsWith("/api/explain/")) return reply(explained);
   return reply({}, false);
 };
 let ceremonies = 0;
@@ -132,8 +129,9 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
 
   // Without inbox.js (here, as when the module fails to load), the cards' place says they can't be
   // shown, rather than that nothing is waiting.
-  // So for the Agents view without agents.js.
-  for (const id of ["pending", "runs", "start"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
+  // So for the Agents view without agents.js, Activity without activity.js, and Settings without
+  // settings.js.
+  for (const id of ["pending", "standing-asks", "runs", "start", "audit", "decided", "standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
 
   // The cards just moved (inbox.js says so): a tap right then is ignored.
   state = { ...base, pending: [A, B] };
@@ -354,9 +352,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual([idl.hidden, toggle.getAttribute("aria-expanded")], [true, "false"]);
   console.log("console approval flow: ok");
 
-  // #173: an explained decision opens read-only in the detail card, an agent's strings in it as
-  // text (the fake DOM has no innerHTML: only textContent exists). A run's authority is drawn by
-  // agents.js, checked in browsers (ci/console-browsers/agents.mjs).
+  // #173: a run's authority and an explained decision are drawn by agents.js and activity.js,
+  // checked in browsers (ci/console-browsers/agents.mjs and activity.mjs).
   // #621: wicket's own kinds as sentences, the raw op apart; an HTTP request as it is.
   const asked = p => JSON.parse(run("JSON.stringify(asks(" + JSON.stringify({ host: "wicket.internal", reason: "r", ...p }) + "))"));
   assert.deepStrictEqual([asked({ method: "SPAWN", path: "/zones/research/reader" }).what, asked({ method: "LINK", path: "/links/run_a/run_b/8080" }).what,
@@ -390,11 +387,6 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     isolation: "runc", region: "", duration_secs: 3600, hourly_cap_usd: "$0.1000", reserved_usd: "$0.1000", reason: "nightly build" } });
   assert.deepStrictEqual([capWhy.said, capWhy.mixed], [[["Why", "nightly build"]], null]);
   assert.deepStrictEqual(JSON.parse(run('JSON.stringify(asks({ method: "GET", host: "h", path: "/x", reason: "y", scope_prefix: false }))')), { what: "GET h/x", raw: "", said: [["Why", "y"]], wicket: null, mixed: null, internal: false });
-  run("showExplain(7)"); await flush(); await flush();
-  assert.ok(ids["detail-body"].textContent.includes("block 0: check if " + HOSTILE), ids["detail-body"].textContent);
-  assert.ok(calls.some(c => c.path === "/api/explain/7"));
-  ids["detail-close"].listeners.click();
-  assert.strictEqual(ids.detail.hidden, true);
   console.log("console authority views: ok");
 
   // #715 review: a Stop form opened for one agent never stops another. Leaving the page closes it,
@@ -540,18 +532,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console secrets: ok");
 
-  // The Capacity card (#256): each live grant with what it covers, uses and leaves; Renew is a
-  // signed action, Revoke only the session; the form issues one through a signed action.
-  const grant = { id: "g-cap1", principal: "spiffe://x/t/t0/op/unix/" + HOSTILE, decided_by: "passkey:laptop", expires_at: 5000, created_at: 1,
-    terms: { plans: ["vc2-1c-2gb"], regions: ["lhr"], hourly_usd: "$0.0500", daily_usd: "$1.0000", nodes: 2 },
-    used: { nodes: 1, hourly_usd: "$0.0140", daily_usd: "$0.0200" }, left: { nodes: 1, hourly_usd: "$0.0360", daily_usd: "$0.9800" } };
-  state = { ...base, pending: [], capacity: [grant] };
-  await run("refresh()"); await flush();
-  const capRow = ids.capacity.children[0];
-  // #639: in lines, plain money, proper plurals, and the principal by its short name.
-  for (const want of ["g-cap1", "Allows: 2 nodes at once of vc2-1c-2gb in lhr, up to $0.05/h and $1.00 a day", "Used today: 1 node, $0.014/h, $0.02",
-    "Left today: 1 node, $0.036/h, $0.98", "Ends ", "granted by passkey:laptop"]) assert.ok(capRow.textContent.includes(want), want + " in " + capRow.textContent);
-  assert.ok(capRow.textContent.startsWith(grant.principal), "a name with a slash in it is shown whole: " + capRow.textContent);
+  // The Capacity card (#256), its rows and form, are drawn by settings.js (checked in browsers,
+  // ci/console-browsers/settings.mjs); its words come from these helpers.
   assert.deepStrictEqual([run('principalName("spiffe://x/t/t0/op/unix/alex")'), run('principalName("spiffe://x/t/t0/z/build/a/sched")')], ["unix/alex", "sched (zone build)"]);
   // #645: one time format, relative to the server's clock, with the local time.
   assert.deepStrictEqual([run("rel(100, 100)"), run("rel(130, 100)"), run("rel(100, 400)"), run("rel(100 + 8 * 3600, 100)"), run("rel(0, 3 * 86400)")],
@@ -559,36 +541,16 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.match(run("at(1700000000, 1700000000 + 7200)"), /^\d\d:\d\d \(2 h ago\)$|^[A-Z][a-z]{2} \d\d:\d\d \(2 h ago\)$/);
   assert.strictEqual(run("at(0)"), "\u2014");
   assert.deepStrictEqual(["$0.0500", "$1.0000", "$0.0140", "$12.3400", "n/a"].map(v => run("money(" + JSON.stringify(v) + ")")), ["$0.05", "$1.00", "$0.014", "$12.34", "n/a"]);
-  assert.strictEqual(ids.capacity.all(n => n.tagName === "img").length, 0, "a principal stays text");
+  // Renewing and issuing a grant widen what may be spent: each is signed from a sheet that says so.
+  const terms = { plans: ["vc2-1c-2gb"], regions: ["lhr"], hourly_usd: "$0.0500", daily_usd: "$1.0000", nodes: 2 };
   await advance(1000);
-  nextAction = { v: 1, action: "capacity_renew", grant: "g-cap1", principal: grant.principal, terms: grant.terms, ttl_secs: 28800 };
-  capRow.all(n => n.tagName === "button" && n.textContent === "Renew")[0].click(); await flush();
-  assert.deepStrictEqual([began().pop().body.action, began().slice(-1)[0].body.id, began().slice(-1)[0].body.ttl_secs], ["capacity_renew", "g-cap1", 28800]);
+  nextAction = { v: 1, action: "capacity_renew", grant: "g-cap1", principal: "spiffe://x/t/t0/op/unix/alex", terms, ttl_secs: 28800 };
+  run('signed({ action: "capacity_renew", id: "g-cap1", ttl_secs: 28800 })'); await flush();
   assert.ok(ids["confirm-what"].textContent.startsWith("Renew capacity grant g-cap1"), ids["confirm-what"].textContent);
   ids["confirm-cancel"].listeners.click(); await flush();
-  // #640: Revoke asks in the page first; nothing is sent until its own button, and Cancel puts the row back.
-  const capBtn = t => capRow.all(n => n.tagName === "button" && n.textContent === t)[0];
-  capBtn("Revoke\u2026").click(); await flush();
-  assert.ok(capRow.textContent.includes("Revoke capacity grant g-cap1?"), capRow.textContent);
-  assert.strictEqual(calls.filter(c => c.path === "/api/capacity/revoke").length, 0, "nothing sent on the first tap");
-  capBtn("Cancel").click();
-  assert.ok(capBtn("Renew") && !capRow.textContent.includes("Revoke capacity grant"), "Cancel restores the row");
   await advance(1000);
-  capBtn("Revoke\u2026").click(); await flush();
-  await capBtn("Revoke").click(); await flush();
-  assert.strictEqual(calls.filter(c => c.path === "/api/capacity/revoke").length, 0, "a tap just after the question appeared is ignored");
-  await advance(1000);
-  await capBtn("Revoke").click(); await flush();
-  assert.deepStrictEqual(calls.filter(c => c.path === "/api/capacity/revoke").map(c => c.body), [{ id: "g-cap1" }]);
-  const inputs = ids["capacity-form"].all(n => n.tagName === "input");
-  assert.strictEqual(inputs.length, 7);
-  ["unix/alex", "vc2-1c-2gb", "lhr", "0.05", "1", "2", "4"].forEach((v, i) => { inputs[i].value = v; });
-  await advance(1000);
-  nextAction = { v: 1, action: "capacity_grant", principal: "spiffe://x/t/t0/op/unix/alex", terms: grant.terms, ttl_secs: 14400 };
-  ids["capacity-form"].all(n => n.tagName === "button" && n.textContent.startsWith("Grant"))[0].click(); await flush();
-  const g = began().pop().body;
-  assert.deepStrictEqual([g.action, g.principal, g.plans, g.regions, g.max_hourly_usd, g.max_daily_usd, g.nodes, g.ttl_secs],
-    ["capacity_grant", "unix/alex", "vc2-1c-2gb", "lhr", "0.05", "1", 2, 14400]);
+  nextAction = { v: 1, action: "capacity_grant", principal: "spiffe://x/t/t0/op/unix/alex", terms, ttl_secs: 14400 };
+  run('signed({ action: "capacity_grant", principal: "unix/alex", plans: "vc2-1c-2gb", regions: "lhr", max_hourly_usd: "0.05", max_daily_usd: "1", nodes: 2, ttl_secs: 14400 })'); await flush();
   assert.ok(ids["confirm-what"].textContent.startsWith("Grant spiffe://x/t/t0/op/unix/alex 2 node(s) at once"), ids["confirm-what"].textContent);
   ids["confirm-cancel"].listeners.click(); await flush();
   // #707 review: the rows' words, each kind of activity line, a past lease, a decided request.
@@ -606,11 +568,11 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     [{ kind: "run.fence_released", run: "run_f", body: { node: "n1", by: "passkey:laptop", signed: {}, why: "n1 was destroyed" } }, "run_f released from server n1 by laptop, signed with a passkey, though its box may still be running there: n1 was destroyed"],
     [{ kind: "run.fence_release_failed", run: "run_f", body: { node: "n1", by: "root", error: "renewed" } }, "run_f is still held: its release from server n1 couldn't be made: renewed"],
     [{ kind: "something.new", run: "run_z", body: {} }, "something.new \u00b7 run_z"],
-  ]) { const t = T("line(" + JSON.stringify({ seq: 1, ...op }) + ")"); assert.ok(t.endsWith(want), want + " in " + t); }
-  const lease = run('placedRow(' + JSON.stringify({ id: "uuid-1", name: "runner", past_lease: true, held_by: "run_h", lease_until: 1 }) + ')');
-  assert.ok(lease.textContent.includes("still billing: run run_h holds it") && lease.all(n => n.tagName === "code")[0].textContent === "wicket node release uuid-1", lease.textContent);
-  const dec = run('decidedRow(' + JSON.stringify({ id: "r-5", zone: "z", method: "GET", host: "h", path: "/p", status: "expired", created_at: 1 }) + ')');
-  assert.strictEqual(dec.all(n => (n.className || "").startsWith("pill"))[0].className, "pill ", "no \"undefined\" class");
+  ]) { const l = JSON.parse(run("JSON.stringify(sentence(" + JSON.stringify({ seq: 1, ...op }) + "))")); assert.ok((l.tag + l.text).endsWith(want), want + " in " + l.tag + l.text); }
+  // A decision on a run's request can be explained (activity.js draws its "why?"); others can't.
+  const eg = { seq: 2, kind: "op", run: "run_a", body: { kind: "egress", outcome: "forbidden", method: "GET", host: "h", path: "/p" } };
+  assert.deepStrictEqual(JSON.parse(run("JSON.stringify(sentence(" + JSON.stringify(eg) + "))")), { cat: "blocked", tag: "blocked", tone: "blocked", text: "run_a: read h/p", why: true });
+  assert.strictEqual(JSON.parse(run("JSON.stringify(sentence(" + JSON.stringify({ ...eg, run: null }) + "))")).why, false);
   // The full principal is a tap away, not only a hover.
   const pe = run('principalEl("spiffe://x/t/t0/z/build/a/sched")');
   const peBtn = pe.all(n => n.tagName === "button")[0], peLine = pe.all(n => n.className === "idline")[0];
@@ -620,72 +582,7 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(!/T\d\d:\d\d:\d\dZ/.test(run('localTimes("disk 40%, CA until 2023-11-14T22:13:20Z")')), "localised");
   console.log("console capacity: ok");
 
-  // Health alerts are lines under their node's row, not items squeezed into it (B7).
-  state = { ...base, pending: [], health: { nodes: [{ node: "n1", summary: "ok", received_ms: 1, alerts: ["disk 91% full"] }] } };
-  await run("refresh()"); await flush();
-  const hrow = ids.health.children[0];
-  assert.strictEqual(hrow.children[0].className, "row");
-  assert.ok(hrow.children[1].textContent === "! disk 91% full" && hrow.children[1].className === "blocked", hrow.textContent);
-  // The state store's sync and the audit export's progress (#635): a row each, above the nodes,
-  // lagging and failing ones marked, the last error under its row.
-  const nowS = 1763200000;
-  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: {
-    stream: { endpoint: "https://s3.example.com", bucket: "b-1", state: "lagging", last_sync_ms: (nowS - 420) * 1000, behind_secs: 420, error: "monitor error: <b>refused</b>", error_ms: (nowS - 5) * 1000 },
-    audit: [{ sink: "store", kind: "store", seq: 1180, head: 1204, behind: 24, behind_secs: 400, checkpoint_at: nowS - 900, error: "PUT: refused" },
-            { sink: "collector", kind: "otlp", seq: 1204, head: 1204, behind: 0, behind_secs: 0, checkpoint_at: 0, error: null }],
-    errors: ["audit-sinks.yaml: bad"] } } };
-  await run("refresh()"); await flush();
-  const hs = ids.health.children;
-  assert.strictEqual(hs[0].children[0].textContent, "Record backup" + "https://s3.example.com (b-1) \u00b7 ledger lagging \u00b7 last sync 7 min ago");
-  assert.strictEqual(hs[0].children[0].children[1].className, "blocked");
-  assert.strictEqual(hs[0].children[1].textContent, "! last error 5 s ago: monitor error: <b>refused</b>", "as text, never markup");
-  assert.ok(hs[1].children[0].textContent.endsWith("24 records behind (oldest 6 min) at 1180 of 1204 \u00b7 last checkpoint 15 min ago"), hs[1].textContent);
-  assert.strictEqual(hs[1].children[0].children[1].className, "blocked");
-  assert.strictEqual(hs[1].children[1].textContent, "! last error: PUT: refused");
-  assert.strictEqual(hs[2].children[0].textContent, "Activity export to collectorcaught up at 1204 of 1204 \u00b7 last checkpoint never");
-  assert.strictEqual(hs[2].children.length, 1, "no error, no line");
-  assert.strictEqual(hs[3].textContent, "! audit-sinks.yaml: bad");
-  assert.strictEqual(hs[4].className, "empty", "then the nodes");
-  // Streaming: no mark, and an error from before the last sync isn't shown; one since is.
-  const streaming = (error_ms) => ({ ...base, now: nowS, pending: [], health: { nodes: [], state_store: {
-    stream: { endpoint: "https://s3.example.com", bucket: "b-1", state: "streaming", last_sync_ms: (nowS - 2) * 1000, behind_secs: 2, error: "old trouble", error_ms },
-    audit: [], errors: [] } } });
-  state = streaming((nowS - 600) * 1000);
-  await run("refresh()"); await flush();
-  assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
-  assert.ok(ids.health.children[0].children[0].textContent.endsWith("ledger streaming \u00b7 last sync 2 s ago"));
-  assert.strictEqual(ids.health.children[0].children.length, 1, "an error recovered from isn't shown");
-  state = streaming((nowS - 1) * 1000);
-  await run("refresh()"); await flush();
-  assert.strictEqual(ids.health.children[0].children[1].textContent, "! last error 1 s ago: old trouble", "one after the last sync is");
-  // Starting: pending, saying how long it has had no sync.
-  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: {
-    stream: { endpoint: "https://s3.example.com", bucket: "b-1", state: "starting", last_sync_ms: null, behind_secs: 12, error: null, error_ms: null }, audit: [], errors: [] } } };
-  await run("refresh()"); await flush();
-  assert.strictEqual(ids.health.children[0].children[0].children[1].className, "pend");
-  assert.ok(ids.health.children[0].children[0].textContent.endsWith("ledger starting \u00b7 no sync yet in 12 s"));
-  // Sinks only (no state store): a row per sink and no state store row; a manual sink behind isn't marked.
-  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, errors: [],
-    audit: [{ sink: "stdout", kind: "jsonl", seq: 3, head: 9, behind: 6, behind_secs: 4000, checkpoint_at: 0, error: null, manual: true }] } } };
-  await run("refresh()"); await flush();
-  assert.strictEqual(ids.health.children.length, 2, "the sink's row, then the nodes");
-  assert.ok(ids.health.children[0].children[0].textContent.startsWith("Activity export to stdout6 records behind (oldest 66 min) (manual: fed only by wicket audit export)"), ids.health.children[0].textContent);
-  assert.strictEqual(ids.health.children[0].children[0].children[1].className, "");
-  // The rows' alerts come first, then a stale read says so, then the rows.
-  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, errors: [], stale: true, read_ms: (nowS - 400) * 1000,
-    alerts: ["audit sink store: 24 records behind (oldest 6 min)"],
-    audit: [{ sink: "store", kind: "store", seq: 1, head: 25, behind: 24, behind_secs: 400, checkpoint_at: 0, error: null, manual: false }] } } };
-  await run("refresh()"); await flush();
-  assert.strictEqual(ids.health.children[0].textContent, "! audit sink store: 24 records behind (oldest 6 min)");
-  assert.strictEqual(ids.health.children[0].className, "blocked");
-  assert.strictEqual(ids.health.children[1].textContent, "! not checked for 6 min: these rows may be out of date");
-  assert.ok(ids.health.children[2].textContent.startsWith("Activity export to store24 records behind"));
-  // An error the config alert already quotes is said once; a first read that is overdue says so.
-  state = { ...base, now: nowS, pending: [], health: { nodes: [], state_store: { stream: null, audit: [], stale: true, read_ms: null, not_read_yet: true,
-    errors: ["audit-sinks.yaml can't be read: x"], alerts: ["audit-sinks.yaml can't be read: x (for 5 min)"] } } };
-  await run("refresh()"); await flush();
-  assert.deepStrictEqual(ids.health.children.map(c => c.textContent),
-    ["! audit-sinks.yaml can't be read: x (for 5 min)", "! not read yet: the console hasn't managed a first read of the state store", "No node has reported its health yet."]);
+  // Health rows are drawn by settings.js (ci/console-browsers/settings.mjs).
   // One poll at a time (B9): a second asked for while one is in flight runs after it, not beside it.
   let inFlight = 0, most = 0;
   const realFetch = sandbox.fetch;
@@ -700,91 +597,42 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(calls.filter(c => c.path === "/api/state").length - before2, 2, "polled again after the decision");
   sandbox.fetch = realFetch;
   console.log("console health and polling: ok");
-  // Standing reach (#572): an ask shows its evidence and what it allows beyond it; approving it
-  // narrowed is signed from a confirmation that names the narrowed rule; a rule is revoked with
-  // the session only.
-  const ask = { id: "s-1", principal: "spiffe://x/t/t0/z/work/a/worker", zone: "work", run: "run_w", reason: "CI <b>logs</b>",
-    rule: { host: "ci.example", methods: ["GET", "POST"], paths: ["/jobs/**"], allow_dangerous: false },
-    zone_digest: "0123456789abcdef0123",
-    evidence: { requests: 3, granted: 2, denied: 1, undecided: 0, runs: 2, days: 1, own_asks: 4, ops: [{ method: "GET", path: "/jobs/1/logs", count: 2, granted: 2 }] },
-    beyond: ["methods never asked for: POST"],
-    narrowed: { host: "ci.example", methods: ["GET"], paths: ["/jobs/1/logs"], allow_dangerous: false }, created_at: 1700000000 };
-  const rule = { id: "s-2", principal: ask.principal, zone: "work", rule: ask.narrowed, for: "agent", expires_at: null, live: true, decided_by: "passkey:laptop" };
-  state = { ...base, pending: [], standing: { asks: [ask], rules: [rule] } };
+  // Standing reach (#572): its asks and rules are drawn by inbox.js and settings.js (checked in
+  // browsers, ci/console-browsers/settings.mjs). What waits is counted where a background tab or an
+  // installed app shows it (#650), asks included.
+  state = { ...base, pending: [], standing: { asks: [{ id: "s-1", principal: "spiffe://x/t/t0/z/work/a/worker", zone: "work", rule: { host: "h", methods: ["GET"], paths: ["/**"] }, evidence: {}, created_at: 1 }], rules: [] } };
   await run("refresh()"); await flush();
-  const sa = ids["standing-asks"].textContent;
-  // #715 review: the pill names the rule's methods; whether a POST changes data isn't guessed.
-  assert.ok(!sa.includes("Changes data") && !sa.includes("Only reads"), sa);
-  for (const want of ["always be allowed to read and send data to", "ci.example/jobs/**", "Methods: GET, POST", "Paths: /jobs/**", "Asked by worker (zone work)", "with this zone definition (0123456789ab", "2 granted of 3 blocked request(s) it covers in the last 14 days", "in 2 run(s) on 1 day(s)",
-    "2 \u00d7 GET /jobs/1/logs (2 granted)", "and 4 ask(s) ahead of its own, not counted as evidence",
-    "Wider than what it used: methods never asked for: POST", "Only what it used: methods GET, paths /jobs/1/logs"]) assert.ok(sa.includes(want), want + " in " + sa);
   assert.deepStrictEqual([ids["standing-pointer"].textContent, ids["standing-pointer"].hidden], ["Asking to be always allowed (1)", false]);
-  // #650: what waits, counted where a background tab or an installed app shows it.
   assert.strictEqual(sandbox.document.title, "(1) wicket");
-  const sbuttons = ids["standing-asks"].all(n => n.tagName === "button");
-  assert.deepStrictEqual(sbuttons.map(n => [n.textContent, n.className]), [["Always: only what it used", "approve"], ["Always: as asked", ""],
-    ["Always, for every agent in zone work", "deny"], ["Don't allow", "deny apart"]], "the narrowest first and primary; the widest marked");
-  assert.strictEqual(ids["standing-asks"].all(n => n.tagName === "b").length, 0, "an agent's reason stays text");
+  // Approving an ask narrowed to its evidence, and denying one, are signed from sheets that say what
+  // is allowed, and for how long, or that it is refused.
+  const askRule = { host: "ci.example", methods: ["GET", "POST"], paths: ["/jobs/**"], allow_dangerous: false };
+  const narrowed = { host: "ci.example", methods: ["GET"], paths: ["/jobs/1/logs"], allow_dangerous: false };
   await advance(1000);
-  nextAction = { v: 1, action: "standing_approve", standing: "s-1", principal: ask.principal, zone: "work", rule: ask.narrowed, for: "agent", ttl_secs: 2592000, narrowed: true, effect_sha256: "ab".repeat(32) };
-  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Always: only what it used")[0].click(); await flush();
-  const stb = began().pop().body;
-  assert.deepStrictEqual([stb.action, stb.id, stb.for, stb.narrow], ["standing_approve", "s-1", "agent", true]);
+  nextAction = { v: 1, action: "standing_approve", standing: "s-1", principal: "spiffe://x/t/t0/z/work/a/worker", zone: "work", rule: narrowed, for: "agent", ttl_secs: 2592000, narrowed: true, effect_sha256: "ab".repeat(32) };
+  run('signed({ action: "standing_approve", id: "s-1", for: "agent", narrow: true })'); await flush();
   assert.ok(ids["confirm-what"].textContent.startsWith("Approve standing reach s-1 narrowed to its evidence: { host: ci.example, methods: [GET], paths: ['/jobs/1/logs'] }"), ids["confirm-what"].textContent);
   assert.ok(ids["confirm-what"].textContent.includes("for 30 days"), ids["confirm-what"].textContent);
   ids["confirm-cancel"].listeners.click(); await flush();
-  // A poll with the same state keeps the same rows (a tap mid-poll lands where it was aimed).
-  const askNode = ids["standing-asks"].children[0];
-  await run("refresh()"); await flush();
-  assert.strictEqual(ids["standing-asks"].children[0], askNode, "rebuilt on an unchanged poll");
-  // A denial is signed as one.
   await advance(1000);
-  nextAction = { v: 1, action: "standing_deny", standing: "s-1", rule: ask.rule };
-  ids["standing-asks"].all(n => n.tagName === "button" && n.textContent === "Don't allow")[0].click(); await flush();
+  nextAction = { v: 1, action: "standing_deny", standing: "s-1", rule: askRule };
+  run('signed({ action: "standing_deny", id: "s-1" })'); await flush();
   assert.ok(ids["confirm-what"].textContent.startsWith("Deny standing reach s-1"), ids["confirm-what"].textContent);
   assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: deny"]);
   ids["confirm-cancel"].listeners.click(); await flush();
-  await advance(1000);
-  const sr = ids["standing-rules"];
-  assert.ok(sr.textContent.includes("until revoked") && sr.textContent.includes("by passkey:laptop"), sr.textContent);
-  sr.all(n => n.tagName === "button" && n.textContent === "Revoke\u2026")[0].click(); await flush();
-  assert.ok(sr.textContent.includes("Runs it allows lose it at once."), sr.textContent);
-  await advance(1000);
-  await sr.all(n => n.tagName === "button" && n.textContent === "Revoke")[0].click(); await flush();
-  assert.deepStrictEqual(calls.filter(c => c.path === "/api/standing/revoke").map(c => c.body), [{ id: "s-2" }]);
-  // #715 review: a rule that allows dangerous requests says so on its row.
-  assert.ok(!sr.textContent.includes("can't be undone"), sr.textContent);
-  const dangerRow = run("standingRuleRow(" + JSON.stringify({ ...rule, rule: { ...rule.rule, allow_dangerous: true } }) + ")");
-  assert.ok(dangerRow.textContent.includes("including requests that can't be undone"), dangerRow.textContent);
   console.log("console standing reach: ok");
-  // Fenced runs (#690): a run whose box may still be running on a node that won't confirm is listed
-  // with its node and why; Release… opens a reason form in its own row, kept across a poll, and the
-  // release is signed from a confirmation that says what it does, marked as dangerous.
+  // Fenced runs (#690): the row and its reason form are settings.js's (ci/console-browsers/settings.mjs).
+  // The release is signed from a confirmation that says what it does, marked as dangerous.
   const fenced = { id: "run_f", fence: { run: "run_f", node: "n1", node_status: "revoked", node_seen_ms: null, fenced_until_ms: null,
     source: "unknown", why: "node n1 is <b>revoked</b> and won't confirm it", effect_sha256: "cd".repeat(32) } };
-  state = { ...base, pending: [], fenced: [fenced] };
-  await run("refresh()"); await flush();
-  const fr = ids.fenced.textContent;
-  for (const want of ["run_f", "fenced until its node confirms the box stopped", "node n1 (revoked) \u00b7 never reported", "node n1 is <b>revoked</b>"]) assert.ok(fr.includes(want), want + " in " + fr);
-  assert.strictEqual(ids.fenced.all(n => n.tagName === "b").length, 0, "the reason stays text");
   await advance(1000);
-  ids.fenced.all(n => n.tagName === "button" && n.textContent === "Release\u2026")[0].click(); await flush();
-  const area = ids.fenced.all(n => n.tagName === "textarea")[0];
-  assert.ok(!area.parent.hidden && area.value === "", "the form opens empty: a reason is typed, not offered");
-  area.value = "n1 was destroyed";
-  // A poll that changes nothing keeps the row, and what was typed.
-  await run("refresh()"); await flush();
-  assert.strictEqual(ids.fenced.all(n => n.tagName === "textarea")[0], area, "kept across a poll");
   nextAction = { v: 1, action: "release_fence", run: "run_f", node: "n1", node_status: "revoked", fenced_until_ms: null, why: fenced.fence.why, reason: "n1 was destroyed", effect_sha256: "cd".repeat(32) };
-  ids.fenced.all(n => n.tagName === "button" && n.textContent === "Release")[0].click(); await flush();
+  run('signed({ action: "release_fence", run: "run_f", reason: "n1 was destroyed" })'); await flush();
   assert.deepStrictEqual((({ action, run, reason }) => [action, run, reason])(began().pop().body), ["release_fence", "run_f", "n1 was destroyed"]);
   const fw = ids["confirm-what"].textContent;
   assert.ok(fw.startsWith("Release run run_f's fence on node n1 (revoked, never reported), fenced until its node confirms the box stopped") && fw.includes("reason: n1 was destroyed") && fw.includes("effect cdcdcdcd"), fw);
   assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: release"]);
   ids["confirm-cancel"].listeners.click(); await flush();
-  state = { ...base, pending: [], fenced: [] };
-  await run("refresh()"); await flush();
-  assert.ok(ids.fenced.textContent.startsWith("None: no agent's box is held"), ids.fenced.textContent);
   console.log("console fenced runs: ok");
 
   // #711: Add a device signs an enrol_link; the sheet says who the device is enrolled as, and the

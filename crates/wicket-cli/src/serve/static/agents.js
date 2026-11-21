@@ -8,17 +8,9 @@
 // console.html's own and stays console.js's, as does every signed action.
 import { html, render, nothing } from "lit-html";
 import { repeat } from "lit-html/directives/repeat.js";
+import { draw, time, kv } from "./ui.js";
 
 const g = globalThis;
-
-// lit-html renders after what a container already holds: the first time, it is emptied.
-const owned = new WeakSet();
-function draw(value, box) {
-  if (!owned.has(box)) { box.replaceChildren(); owned.add(box); }
-  render(value, box);
-}
-
-const time = (t, text) => html`<time title=${t ? iso(t) : nothing} datetime=${t ? iso(t) : nothing}>${text === undefined ? at(t) : text}</time>`;
 
 // ---- a run, in the list and as the head of its page ----
 
@@ -92,18 +84,22 @@ function renderAgentHead(s, run) {
     : html`<h2>Agent</h2><p class="note">This agent run isn't in the latest list (only the 15 most recent are).</p>`, box);
 }
 
-// What it did: its records, newest first. A line is made once per record and kept, so it (and its
-// "why?") stays put across polls.
-const lines = new Map();
+// What it did: its records, newest first, each line as the Activity view draws it (activity.js),
+// kept by its record across polls, so it (and its "why?") stays put.
+let logOf = null;
 function renderAgentLog(s, run) {
   const box = document.getElementById("agent-log");
   if (!box) return;
+  logOf = [s, run];
   const mine = ((s && s.audit) || []).filter(op => op.run === run).slice().reverse();
-  const seqs = new Set(mine.map(op => op.seq));
-  for (const k of [...lines.keys()]) if (!seqs.has(k)) lines.delete(k);
-  const lineOf = op => { let e = lines.get(op.seq); if (!e) { e = line(op); lines.set(op.seq, e); } return e; };
-  draw(mine.length ? repeat(mine, op => op.seq, lineOf) : html`<div class="empty">Nothing recorded for it in the latest activity.</div>`, box);
+  const act = g.wicketActivity;
+  // An explanation opened or arrived: the agent's log is drawn again (while its page is open).
+  if (act && !act.redraws.has(redrawLog)) act.redraws.add(redrawLog);
+  // Its lines are activity.js's: without it, the log says it can't be shown, not that nothing happened.
+  draw(!act ? html`<div class="blocked">${UNLOADED}</div>`
+    : mine.length ? repeat(mine, op => op.seq, op => act.lineView(op, false)) : html`<div class="empty">Nothing recorded for it in the latest activity.</div>`, box);
 }
+function redrawLog() { if (logOf && view === "agent") renderAgentLog(...logOf); }
 
 // ---- what a run can reach (#173, #651) ----
 
@@ -112,7 +108,6 @@ function renderAgentLog(s, run) {
 // the zone's Cedar) folded under Details. Every string is text: block sources hold strings an agent
 // chose (a grant's path).
 const pathsText = p => (p || ["/**"]).map(strip).join(" ");
-const kv = (k, v) => html`<div class="row"><span class="meta">${k}</span><span class="mono">${strip(v)}</span></div>`;
 const whenMs = ms => ms ? at(ms / 1000) : "—";
 function reachLine(text, end, note) {
   const meta = end !== undefined || note ? html`<div class="meta">${end === undefined ? nothing : end}${note ? (end !== undefined ? " · " : "") + note : nothing}</div>` : nothing;

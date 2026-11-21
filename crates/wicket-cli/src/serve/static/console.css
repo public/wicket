@@ -372,6 +372,11 @@ dl.fields dd.why { color: var(--soft); }
 button.chip { min-height: 36px; border-radius: 999px; padding: var(--s1) var(--s4); font-weight: 600; }
 button.chip[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
 .explained { margin: var(--s1) 0 var(--s2) 12rem; padding: var(--s2) var(--s3); border-left: 3px solid var(--accent); background: var(--surface-2); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; font-size: var(--t-sm); }
+/* Its rows: the label whole on the left (the log breaks words anywhere), the value beside it. */
+.explained .row { display: grid; grid-template-columns: max-content minmax(0, 1fr); justify-content: start; align-items: baseline; padding: var(--s1) 0; }
+.explained .row > .meta { overflow-wrap: normal; white-space: nowrap; }
+.log > .explained { padding: var(--s2) var(--s3); }
+.explained pre.src { margin: var(--s1) 0; }
 
 /* An agent's page. */
 #agent-head { margin: var(--s2) 0 var(--s4); }

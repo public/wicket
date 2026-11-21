@@ -878,7 +878,7 @@ async fn ask_standing(node: &Arc<Node>, run: &str, args: &Value, host: &str, pat
         format!("{} {host} {}{}", rule.methods.join(","), rule.paths.join(" "), if rule.allow_dangerous { " (dangerous)" } else { "" });
     if !connected(node, run) {
         return (
-            format!("not requested: the control host is unreachable, and a standing ask isn't queued. Ask again for standing reach for {shown} once it is back; meanwhile, ask for what you need now with scope exact or prefix."),
+            format!("not requested: the control host is unreachable, and a standing request isn't queued. Ask again for standing reach for {shown} once it is back; meanwhile, ask for what you need now with scope exact or prefix."),
             false,
         );
     }
