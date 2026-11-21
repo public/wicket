@@ -184,7 +184,7 @@ fn the_simulation_follows_the_run_loops() {
     check(&["crates/wicket-chan/src/lib.rs"], &["wicket-chan", "wicket-home", "wicket-node", "wicket-control", "wicket-cli"], &with3(CLI, NODES, &["fuzz-chan"]));
     // The gateway's tools: the simulation calls them, as does the gateway fuzz target.
     let f = "crates/wicket-gateway/src/lib.rs";
-    check(&[f], &["wicket-gateway", "wicket-control", "wicket-cli", "wicket-sim"], &with(CLI, &["fuzz-gateway"]));
+    check(&[f], &["wicket-gateway", "wicket-control", "wicket-cli", "wicket-sim"], &with(CLI, &["fuzz-gateway", "acceptance-nodes"]));
     assert_eq!(select(&[f]).filter(), "rdeps(=wicket-gateway)");
     check(&["crates/wicket-cli/src/cmd/run.rs"], &["wicket-cli"], CLI);
 }

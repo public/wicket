@@ -141,6 +141,8 @@ paths = [
   "ci/acceptance.sh", "ci/acceptance/**",
   "crates/wicket-control/src/noderun.rs", "crates/wicket-control/src/nodecall.rs",
   "crates/wicket-control/src/enrol.rs",
+  # The agent-to-agent protocol across nodes (#252, messages_flow).
+  "crates/wicket-gateway/**", "crates/wicket-cli/src/cmd/message.rs",
 ]
 
 [suite.update]

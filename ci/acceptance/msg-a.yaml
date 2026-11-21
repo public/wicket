@@ -1,0 +1,11 @@
+# Acceptance, multi-host (ci/acceptance/nodes.sh, messages_flow, #252): msg-a, on the control
+# host's own node, messages msg-b on acc-n1 through the gateway and reads a message from its
+# operator. Its accept_from lists no one: msg-b may only answer it.
+task: Message msg-b and your operator.
+program:
+  name: msg-a
+  command: [bash, /workspace/a.sh]
+zone:
+  name: acc-msg-a
+  isolation: gvisor
+  limits: { memory: 256m, cpus: 1, timeout: 12m }
