@@ -1273,8 +1273,9 @@ async fn manage(
         proto: 0,
         slice_sent: false,
         slice: None,
-        // What an earlier supervisor of the run released to its node (#415): the node may still hold
-        // it, so the first connection tells it to fetch each again, and changes are followed from then.
+        // What an earlier supervisor of the run released to its node, with the digest each went with
+        // (#415, #818): the first connection revokes what changed since, or may be stale, and leaves
+        // the rest with the node.
         fetched: released_before(&sh.dir),
         refused: HashSet::new(),
         remint_failed: 0,
@@ -1487,11 +1488,17 @@ async fn session(
     // A revoke sent on a link that died may never have arrived (#415): those are sent again, with
     // every refusal. A secret the node holds as released stays (#818: after a self-update its new
     // process has it, handed over), unless it changed meanwhile, which is told now.
-    for name in revoke_lost(&p.fetched, &p.refused) {
-        send(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name, resend: true }));
+    let release = |name: &str| {
+        crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, name, sh.ctl.authority_until())
+            .ok()
+            .map(|f| crate::nodesecrets::digest(&f))
+    };
+    let revokes = connect_revokes(&mut p.fetched, &mut p.refused, release);
+    if revokes.iter().any(|(_, resend)| !resend) {
+        save_holdings(sh, p);
     }
-    for f in secrets_changed(sh, p) {
-        send(f);
+    for (name, resend) in revokes {
+        send(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name, resend }));
     }
     if first {
         sh.timings.since("budget.slice", slicing);
@@ -1765,6 +1772,12 @@ async fn on_frame(
                 if let Ok(f) = dropped {
                     send(Frame::Feed(f.to_line().trim_end().as_bytes().to_vec()));
                 }
+                // The node drops what it held for the run with its box: no digest of a secret is
+                // kept in the run's directory past it (#818).
+                for d in p.fetched.values_mut() {
+                    *d = REVOKED.into();
+                }
+                save_holdings(sh, p);
                 p.exited = true;
             }
             Msg::Event { run, event } if run == sh.run.0 => {
@@ -2342,12 +2355,25 @@ pub struct Holdings {
 }
 
 fn save_holdings(sh: &Shared, p: &Progress) {
-    let mut secrets: Vec<String> = p.fetched.keys().cloned().collect();
-    secrets.sort();
-    let digests = p.fetched.iter().filter(|(_, d)| d.as_str() != REVOKED).map(|(n, d)| (n.clone(), d.clone())).collect();
-    let h = Holdings { secrets, digests, slice: p.slice, updated_ms: wicket_feed::now_ms() };
+    let h = holdings_of(&p.fetched, p.slice, wicket_feed::now_ms());
     let f = sh.dir.join("ctl").join("holdings.json");
-    let _ = wicket_chan::files::replace(&f, "tmp", &serde_json::to_vec(&h).unwrap_or_default());
+    if let Err(e) = wicket_chan::files::replace(&f, "tmp", &serde_json::to_vec(&h).unwrap_or_default()) {
+        say_err!(
+            "[wicket] run {}'s holdings on node {} can't be written ({e:#}): a supervisor that takes it over revokes all it released",
+            sh.run,
+            sh.node
+        );
+    }
+}
+
+/// What a run's holdings record (#152, #818): the secrets released to its node, and the digest each
+/// went with, but none for one revoked and not fetched since ([`REVOKED`]), which a supervisor that
+/// takes the run over then revokes again.
+fn holdings_of(fetched: &std::collections::HashMap<String, String>, slice: Option<wicket_proxy::llm::Slice>, now_ms: i64) -> Holdings {
+    let mut secrets: Vec<String> = fetched.keys().cloned().collect();
+    secrets.sort();
+    let digests = fetched.iter().filter(|(_, d)| d.as_str() != REVOKED).map(|(n, d)| (n.clone(), d.clone())).collect();
+    Holdings { secrets, digests, slice, updated_ms: now_ms }
 }
 
 pub fn read_holdings(run_dir: &Path) -> Option<Holdings> {
@@ -2507,6 +2533,22 @@ fn released_before(run_dir: &Path) -> std::collections::HashMap<String, String> 
             (n, d)
         })
         .collect()
+}
+
+/// What a new connection revokes, given what `release` would release now (#415, #818): first again
+/// each revoke that may have been lost ([`revoke_lost`], `resend`), then each secret that changed
+/// meanwhile, or refused one now released ([`changed_secrets`], not `resend`: it cascades to the
+/// children the node shared it with). Not a secret the node holds as released and unchanged.
+fn connect_revokes(
+    fetched: &mut std::collections::HashMap<String, String>,
+    refused: &mut HashSet<String>,
+    release: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, bool)> {
+    let lost = revoke_lost(fetched, refused);
+    let changed = changed_secrets(fetched, refused, release);
+    // A refusal now released is in both: once, as resent (the node only forgets the refusal).
+    let changed: Vec<String> = changed.into_iter().filter(|n| !lost.contains(n)).collect();
+    lost.into_iter().map(|n| (n, true)).chain(changed.into_iter().map(|n| (n, false))).collect()
 }
 
 /// What [`Progress::fetched`] holds for a secret revoked and not fetched since (#415): no release's
@@ -3363,6 +3405,48 @@ mod tests {
         assert_eq!(changed_secrets(&mut fetched, &mut HashSet::new(), release), ["gh"]);
         assert_eq!(fetched["model"], "d-model");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #818, the lost-revoke path end to end: a secret that changes is revoked and marked, its
+    /// holdings then keep no digest for it, so a supervisor that takes the run over (from those
+    /// holdings) revokes it again on its first connection, as resent; one unchanged is left with the
+    /// node; one changed while cut off is revoked at connect as a change (which cascades), and a
+    /// refusal is resent once.
+    #[test]
+    fn a_revoke_lost_with_its_supervisor_is_sent_again_by_the_next() {
+        let vault = std::cell::RefCell::new(std::collections::HashMap::from([
+            ("gh".to_string(), "d1".to_string()),
+            ("model".to_string(), "m1".to_string()),
+        ]));
+        let release = |n: &str| vault.borrow().get(n).cloned();
+        let mut fetched = std::collections::HashMap::from([("gh".to_string(), "d1".to_string()), ("model".to_string(), "m1".to_string())]);
+        let mut refused = HashSet::new();
+        // gh rotates: the check revokes it (that revoke may die with the link) and marks it.
+        vault.borrow_mut().insert("gh".into(), "d2".into());
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["gh"]);
+        let h = holdings_of(&fetched, None, 1);
+        assert_eq!(h.secrets, ["gh", "model"]);
+        assert_eq!(h.digests, [("model".to_string(), "m1".to_string())].into(), "none kept for the revoked one");
+        // The next supervisor reads those holdings.
+        let dir = std::env::temp_dir().join(format!("wicket-lost-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ctl")).unwrap();
+        std::fs::write(dir.join("ctl").join("holdings.json"), serde_json::to_vec(&h).unwrap()).unwrap();
+        let mut fetched = released_before(&dir);
+        assert_eq!(fetched["gh"], REVOKED);
+        let _ = std::fs::remove_dir_all(dir);
+        // Meanwhile model was rebound, and an optional secret refused earlier got set.
+        vault.borrow_mut().insert("model".into(), "m2".into());
+        vault.borrow_mut().insert("late".into(), "l1".into());
+        let mut refused = HashSet::from(["late".to_string()]);
+        assert_eq!(
+            connect_revokes(&mut fetched, &mut refused, release),
+            [("gh".to_string(), true), ("late".to_string(), true), ("model".to_string(), false)]
+        );
+        // Nothing more to say on that connection, and an unchanged secret is never revoked.
+        assert!(connect_revokes(&mut fetched, &mut refused, release).iter().all(|(_, resend)| *resend));
+        let mut fetched = std::collections::HashMap::from([("model".to_string(), "m2".to_string())]);
+        assert!(connect_revokes(&mut fetched, &mut HashSet::new(), release).is_empty(), "left with the node");
     }
 
     /// #415 with #818: a new connection sends again the revokes that may have been lost (each secret
