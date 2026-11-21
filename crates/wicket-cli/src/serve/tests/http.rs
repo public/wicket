@@ -270,14 +270,16 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
     assert!(!page.contains("<style") && !page.contains("style="), "inline style");
     assert!(!page.split_whitespace().any(|w| w.starts_with("on") && w.contains('=')), "inline event handlers");
     let scripts: Vec<&str> = page.match_indices("<script").map(|(i, _)| &page[i..]).collect();
-    assert_eq!(scripts.len(), 2, "console.js, then the modules' entry (#574)");
+    assert_eq!(scripts.len(), 3, "console.js, then the console's modules: inbox.js and agents.js (#574)");
     assert!(scripts[0].starts_with("<script src=\"/static/console.") && scripts[0].contains("></script>"), "{}", scripts[0]);
-    assert!(scripts[1].starts_with("<script type=\"module\" src=\"/static/m.") && scripts[1].contains("></script>"), "{}", scripts[1]);
+    for s in &scripts[1..] {
+        assert!(s.starts_with("<script type=\"module\" src=\"/static/m.") && s.contains("></script>"), "{s}");
+    }
     // The modules (#574): one directory named by a hash over them all, each file preloaded or loaded
     // with its Subresource Integrity, and none of the console's own using a raw HTML or code sink
     // (lit-html's one `innerHTML` is through its Trusted Types policy, #739).
     let modules: Vec<_> = ASSETS.files.iter().filter(|(p, _)| p.starts_with("/static/m.")).collect();
-    assert!(modules.len() >= 5, "inbox.js and lit-html's four modules: {:?}", modules.iter().map(|m| m.0).collect::<Vec<_>>());
+    assert!(modules.len() >= 6, "inbox.js, agents.js and lit-html's four modules: {:?}", modules.iter().map(|m| m.0).collect::<Vec<_>>());
     let dir = modules[0].0.split('/').nth(2).unwrap();
     for (path, a) in &modules {
         assert_eq!(path.split('/').nth(2), Some(dir), "one directory");

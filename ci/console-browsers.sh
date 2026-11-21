@@ -2,8 +2,9 @@
 # The console in real browsers (#574): builds wicket, writes the console as `wicket serve` sends it
 # (`wicket dev console-assets`: minified, content-hashed, under its CSP with Trusted Types enforced),
 # serves that against the preview's mock API (ci/console-preview), and runs
-# ci/console-browsers/test.mjs (the whole page, and a run's session view) and inbox.mjs (the request
-# cards, with the API answered in the page) in each browser named (default: chromium firefox webkit).
+# ci/console-browsers/test.mjs (the whole page, and a run's session view), inbox.mjs (the request
+# cards, with the API answered in the page) and agents.mjs (the Agents view and an agent's page) in
+# each browser named (default: chromium firefox webkit).
 # With WICKET_SESSION_VIEW set (ci/session-view.sh prints it), wicket embeds the built session view
 # and that is what is checked; WICKET_SESSION_VIEW_REQUIRED=1 fails on the placeholder.
 #
@@ -41,3 +42,5 @@ node ci/console-browsers/test.mjs "http://127.0.0.1:$port/" "${browsers[@]}"
 # The Inbox's cards, with the API answered in the page (inbox.mjs): the checks that moved from
 # console_ui.js's fake DOM when the Inbox moved to lit-html.
 node ci/console-browsers/inbox.mjs "http://127.0.0.1:$port/" "${browsers[@]}"
+# The Agents view and an agent's page, the same way (agents.mjs).
+node ci/console-browsers/agents.mjs "http://127.0.0.1:$port/" "${browsers[@]}"
