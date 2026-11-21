@@ -42,7 +42,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use wicket_core::TenantId;
-use wicket_placement::{NodeId, PlacementError, Placer, Provider, ReleaseMode, Released, SpendApprover};
+use wicket_placement::{NodeId, Placer, Provider, ReleaseMode, Released, SpendApprover};
 use wicket_store::Ledger;
 
 /// The risk a release is decided at: it destroys running boxes and work a fetch didn't collect.
@@ -243,35 +243,42 @@ pub async fn release<Q: Provider, A: SpendApprover>(
     // Its service instances are stopped once the provider has answered (in `finish`), not before: a
     // release the provider refuses leaves the node, and them, as they were.
     let id = NodeId(n.id.clone());
-    // That the provider is asked, before it is (#812 review): if the destroy works but the node
-    // isn't then marked released (its process stops, or the write fails), the next release finds
-    // the machine gone, and this record says it was destroyed by a release, not by someone else.
-    let asking = l
-        .audit(
-            &TenantId::single(),
-            None,
-            "placement.node_release_destroying",
-            &json!({ "id": n.id, "name": n.name, "by": by, "decision": seq }),
-        )
-        .context("the release could not be recorded in the audit log, so nothing was released")?;
-    let r = async {
-        let node = p.get(&id).await?;
-        let r = p.release(&id, ReleaseMode::Now).await?;
-        Ok::<_, PlacementError>((node, r))
-    }
-    .await;
-    let (node, r) = match r {
-        Ok(x) => x,
+    let node = match p.get(&id).await {
+        Ok(node) => node,
         Err(e) => {
             failed(l, "placement.node_release_failed", &e.to_string());
             bail!("releasing {}: {e} (it is as it was)", n.name);
         }
     };
-    // Destroyed by this release, or by an earlier one that asked the provider and never finished;
-    // otherwise its own placer saw it gone, or never had it, and nothing was destroyed by a release
-    // (a machine the provider says is gone may be another account's).
+    // That the provider is asked to destroy a machine it has, before it is (#812 review): if the
+    // destroy works but the node isn't then marked released (its process stops, or the write
+    // fails), the next release finds the machine gone, and this record says a release destroyed
+    // it. Only once the provider says the machine is there: a release that finds it gone already
+    // destroyed nothing, and records nothing that says it did.
+    let asking = match &node {
+        Some(_) => Some(
+            l.audit(
+                &TenantId::single(),
+                None,
+                "placement.node_release_destroying",
+                &json!({ "id": n.id, "name": n.name, "by": by, "decision": seq }),
+            )
+            .context("the release could not be recorded in the audit log, so nothing was released")?,
+        ),
+        None => None,
+    };
+    let r = match p.release(&id, ReleaseMode::Now).await {
+        Ok(r) => r,
+        Err(e) => {
+            failed(l, "placement.node_release_failed", &e.to_string());
+            bail!("releasing {}: {e} (it is as it was)", n.name);
+        }
+    };
+    // Destroyed by this release, or by an earlier one that found the machine, asked the provider
+    // and never finished; otherwise its own placer saw it gone, or never had it, and nothing was
+    // destroyed by a release (a machine the provider says is gone may be another account's).
     let gone = r == Released::AlreadyGone || node.is_none();
-    let destroyed = !gone || destroyed_before(l, &n.id, asking)?;
+    let destroyed = !gone || destroyed_before(l, &n.id, asking.unwrap_or(i64::MAX))?;
     // `finish` records its own failures, once.
     finish(l, n, by, seq, destroyed, r, retire)
 }
@@ -344,10 +351,13 @@ impl Left {
 /// is done (`cleanup`). So once the name is enrolled again after `until`, nothing on it is the
 /// released machine's, and nothing counts but that machine's own enrolment, which is gone.
 pub fn left(l: &Ledger, name: &str, until: i64) -> Result<Left> {
-    let enrolment = l.node(name)?.filter(|r| r.status != "revoked");
+    // Whatever its status now: a machine enrolled again and then revoked leaves its row (enrolling
+    // replaces the name's row), and what ran on it is still not the released machine's.
+    let enrolment = l.node(name)?;
     if enrolment.as_ref().is_some_and(|r| r.enrolled_at > until) {
         return Ok(Left { runs: vec![], instances: vec![], uncollected: vec![], enrolled: false });
     }
+    let enrolled = enrolment.is_some_and(|r| r.status != "revoked" && r.enrolled_at <= until);
     // Service instances are runs too, stopped as instances and never ended as lost: one stopped
     // (revoked) is no longer live while its run still reads as running, so any instance's run is
     // left out, live or not.
@@ -360,7 +370,7 @@ pub fn left(l: &Ledger, name: &str, until: i64) -> Result<Left> {
     }
     let instances = live.into_iter().filter(|i| i.node == name && i.started_at <= until).collect();
     let uncollected = l.uncollected_runs_on_node_started_by(name, until)?;
-    Ok(Left { runs, instances, uncollected, enrolled: enrolment.is_some() })
+    Ok(Left { runs, instances, uncollected, enrolled })
 }
 
 /// What the ledger still had to do after a release's destroy, best effort: every step is tried, and
@@ -394,12 +404,14 @@ fn cleanup(l: &mut Ledger, name: &str, until: i64, by: &str, seq: Option<i64>, d
     // Its service instances went with it: stopped as the reconciler stops them (#579), audited.
     for i in &left.instances {
         match crate::services::stop(l, i, &why) {
-            Ok(()) => c.stopped.push(i.run.clone()),
+            Ok(true) => c.stopped.push(i.run.clone()),
+            Ok(false) => {}
             Err(e) => c.errors.push(format!("stopping service instance {}: {e:#}", i.run)),
         }
     }
-    // Files of runs a fetch didn't bring back went with it (#300): a human chose that. Only when
-    // this release destroyed it: a machine the provider says is gone may be another account's.
+    // Files of runs a fetch didn't bring back went with it (#300): a human chose that. Only when a
+    // release destroyed it (this one, or an earlier one that asked the provider and never finished,
+    // `destroyed_before`): a machine the provider says is gone may be another account's.
     if destroyed {
         match l.forget_uncollected_on_node_started_by(name, until) {
             Ok(n) => c.lost = n,
@@ -1020,40 +1032,75 @@ mod tests {
         assert!(decide(&l, "placed-b", &cli, NOW).is_ok());
     }
 
-    /// #812 re-review: a release whose destroy worked but which never marked the node released (its
-    /// process stopped) leaves the row active; the next release finds the machine gone, and counts
-    /// it as destroyed, because the earlier one recorded that it asked the provider. Not when that
-    /// earlier one was told no.
+    /// #812 and #819 reviews: a release whose destroy worked but which never marked the node released
+    /// (its process stopped, or the write failed) leaves the row active; the next release finds the
+    /// machine gone, and counts it as destroyed, because the first found the machine and recorded
+    /// that it asked the provider. Not when the first found it gone already (nothing recorded), nor
+    /// when the provider told the first no. Real releases each time; the row is made active again
+    /// between them, as a first release that couldn't mark it released leaves it.
     #[tokio::test]
-    async fn a_machine_gone_after_a_release_that_asked_and_never_finished_counts_as_destroyed() {
-        let (p, _st) = mock(&[]).await;
+    async fn a_machine_gone_after_a_release_that_destroyed_it_and_never_finished_counts_as_destroyed() {
+        let (p, st) = mock(&[("i-d", true), ("i-r", false)]).await;
         let mut l = Ledger::open_in_memory().unwrap();
         let by = human("default: anything\n");
-        for (id, name, refused) in [("i-gone", "placed-g", false), ("i-left", "placed-l", true)] {
-            placed(&l, id, name, NOW - 60);
+        let files = |l: &Ledger, name: &str| {
             let run = format!("run_files_{name}");
-            running(&l, &run, name);
-            l.run_ended(&wicket_core::RunId(run.clone()), "ok", "done").unwrap();
-            l.set_run_uncollected(&run, Some(name)).unwrap();
-            // An earlier release asked the provider (and, for i-left, was told no).
-            let asked = json!({ "id": id, "name": name, "by": "passkey:laptop", "decision": 1 });
-            l.audit(&TenantId::single(), None, "placement.node_release_destroying", &asked).unwrap();
-            if refused {
-                l.audit(
-                    &TenantId::single(),
-                    None,
-                    "placement.node_release_failed",
-                    &json!({ "id": id, "decision": 1, "error": "not owned" }),
-                )
-                .unwrap();
+            if l.run_status(&run).unwrap().is_none() {
+                running(l, &run, name);
+                l.run_ended(&wicket_core::RunId(run.clone()), "ok", "done").unwrap();
             }
-            let n = view(&l, id, NOW).unwrap().unwrap();
-            let (n, seq) = decide(&l, id, &console(&by, &n.effect_sha256()), NOW).unwrap();
-            release(&mut l, &p, &n, "passkey:laptop", seq, no_retire, NOW).await.unwrap();
-            let b: Value = serde_json::from_str(&l.audit_of_kind("placement.node_released").unwrap().pop().unwrap().body).unwrap();
-            assert_eq!(b["destroyed"].as_bool(), Some(!refused), "{id}: {b}");
-            assert_eq!(l.uncollected_runs_on_node(name).unwrap().is_empty(), !refused, "{id}: its files go only if a release destroyed it");
+            l.set_run_uncollected(&run, Some(name)).unwrap();
+        };
+        async fn once(
+            l: &mut Ledger,
+            p: &Placer<wicket_placement::vultr::VultrProvider, wicket_placement::envelope::DenyAll>,
+            by: &Granter,
+            id: &str,
+        ) -> Result<String> {
+            let n = view(l, id, NOW).unwrap().unwrap();
+            let (n, seq) = decide(l, id, &console(by, &n.effect_sha256()), NOW).unwrap();
+            release(l, p, &n, "passkey:laptop", seq, no_retire, NOW).await
         }
+        let destroyed = |l: &Ledger| -> Option<bool> {
+            serde_json::from_str::<Value>(&l.audit_of_kind("placement.node_released").unwrap().pop().unwrap().body).unwrap()["destroyed"]
+                .as_bool()
+        };
+
+        // Gone both times: the first release destroyed nothing and recorded nothing that says so.
+        placed(&l, "i-gone", "placed-g", NOW - 60);
+        files(&l, "placed-g");
+        once(&mut l, &p, &by, "i-gone").await.unwrap();
+        assert_eq!(destroyed(&l), Some(false));
+        placed(&l, "i-gone", "placed-g", NOW - 60);
+        once(&mut l, &p, &by, "i-gone").await.unwrap();
+        assert_eq!(destroyed(&l), Some(false), "a second release of a machine no release found isn't a destroy");
+        assert_eq!(l.uncollected_runs_on_node("placed-g").unwrap(), ["run_files_placed-g"], "its files are kept");
+        let asked = |l: &Ledger, id: &str| {
+            l.audit_of_kind("placement.node_release_destroying").unwrap().iter().filter(|r| r.body.contains(&format!("\"{id}\""))).count()
+        };
+        assert_eq!(asked(&l, "i-gone"), 0);
+
+        // Destroyed by the first, which then couldn't mark it released: the second finds it gone and
+        // counts it as destroyed, so the files that went with it go.
+        placed(&l, "i-d", "placed-d", NOW - 60);
+        once(&mut l, &p, &by, "i-d").await.unwrap();
+        assert!(deleted(&st, "i-d"));
+        assert_eq!(asked(&l, "i-d"), 1);
+        placed(&l, "i-d", "placed-d", NOW - 60);
+        files(&l, "placed-d");
+        once(&mut l, &p, &by, "i-d").await.unwrap();
+        assert_eq!(destroyed(&l), Some(true));
+        assert!(l.uncollected_runs_on_node("placed-d").unwrap().is_empty(), "its files went with it");
+
+        // The provider told the first no (not this installation's machine); it is gone by the second.
+        placed(&l, "i-r", "placed-r", NOW - 60);
+        files(&l, "placed-r");
+        assert!(once(&mut l, &p, &by, "i-r").await.is_err());
+        assert_eq!(l.placed_node("i-r").unwrap().unwrap().status, "active");
+        st.lock().unwrap().instances.retain(|i| i["id"] != "i-r");
+        once(&mut l, &p, &by, "i-r").await.unwrap();
+        assert_eq!(destroyed(&l), Some(false), "a refused release destroyed nothing");
+        assert_eq!(l.uncollected_runs_on_node("placed-r").unwrap(), ["run_files_placed-r"]);
     }
 
     /// Once the name is enrolled again after the release, nothing on it is the released machine's:
@@ -1062,15 +1109,21 @@ mod tests {
     fn a_name_enrolled_again_since_the_release_leaves_nothing_of_the_released_machine() {
         let mut l = Ledger::open_in_memory().unwrap();
         placed(&l, "i-1", "placed-a", NOW - 60);
+        // A run started before the release (and placed on the new machine after it).
+        running(&l, "run_queued", "placed-a");
         assert!(l.placed_node_ended("i-1", "released", &released_detail("alex", 1, true)).unwrap());
         let until = l.placed_node("i-1").unwrap().unwrap().ended_at.unwrap();
-        // A run started before the release, placed on the new machine after it.
-        running(&l, "run_queued", "placed-a");
         assert_eq!(left(&l, "placed-a", until).unwrap().runs, ["run_queued"], "not told apart by its start alone");
         enrol(&mut l, "placed-a", until + 1);
         assert!(left(&l, "placed-a", until).unwrap().is_empty(true));
         assert_eq!(finish_incomplete(&mut l, "i-1", "alex", retire_in_ledger).unwrap(), None);
         assert_eq!(l.run_status("run_queued").unwrap().as_deref(), Some("running"));
         assert_eq!(l.node("placed-a").unwrap().unwrap().status, "active", "the new machine's enrolment is kept");
+        // Revoked since, the new machine's row stays (#819 review): still nothing of the released one.
+        l.revoke_node("placed-a").unwrap();
+        let left_now = left(&l, "placed-a", until).unwrap();
+        assert!(left_now.is_empty(true) && left_now.runs.is_empty(), "{:?}", left_now.runs);
+        assert_eq!(finish_incomplete(&mut l, "i-1", "alex", retire_in_ledger).unwrap(), None);
+        assert_eq!(l.run_status("run_queued").unwrap().as_deref(), Some("running"));
     }
 }

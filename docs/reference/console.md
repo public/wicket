@@ -130,12 +130,14 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   `decision.refused`). The decision is audited first (`placement.node_release_decided`, with your
   passkey and operator identity, the record root's command writes too, `granter` `human` or `root`,
   `via` `console` or `cli`); if it can't be written, nothing is released. Then, in the background, with the server's own provider key: if it is still what you signed and still
-  active, the provider destroys it (recorded first, `placement.node_release_destroying`); then its
+  active, the provider destroys it (recorded just before, once the provider has it,
+  `placement.node_release_destroying`); then its
   service instances are stopped, the runs on it are ended as lost (and revoked, if they have an
   identity; a run that ended on its own meanwhile keeps how it ended), its enrolment is revoked, last
   and only once the rest is done, and then `placement.node_released` (with the decision's sequence) is
-  written. If one of those steps fails the others are still done, `placement.node_release_incomplete` says
-  which, and `wicket node release <id>` on the host finishes it; so does the reconciler, a few minutes
+  written. If one of the steps before the enrolment fails the others are still done and the
+  enrolment is kept (until it is revoked, nothing new runs on the server's name),
+  `placement.node_release_incomplete` says which, and `wicket node release <id>` on the host finishes it; so does the reconciler, a few minutes
   later, including after a restart in the middle of a release. A retry reads what the released server
   still has from the ledger, and only what was there before it was released: a new server given the
   same name since keeps its runs, services and files.

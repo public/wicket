@@ -419,8 +419,9 @@ pub enum NodeCmd {
     Create(Box<nodecreate::CreateArgs>),
     /// Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and
     /// revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the
-    /// provider is asked, then `placement.node_released` or `placement.node_release_failed`, the
-    /// records the console's release of a node past its lease writes too. On a node already released
+    /// provider is asked, `placement.node_release_destroying` just before it is asked to destroy the
+    /// machine, then `placement.node_released` or `placement.node_release_failed`, the records the
+    /// console's release of a node past its lease writes too. On a node already released
     /// it finishes a release whose ledger side didn't (`placement.node_release_finished`), or says
     /// there is nothing left; the provider isn't asked again.
     Release {

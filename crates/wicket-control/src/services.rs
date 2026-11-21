@@ -179,8 +179,9 @@ pub fn pass(l: &Ledger, dry_run: bool) -> Result<Passed> {
                 } else {
                     format!("no box on {} has used it for {} s", i.node, IDLE_SECS)
                 };
-                stop(l, &i, &why)?;
-                done.stopped.push((i.run.clone(), why));
+                if stop(l, &i, &why)? {
+                    done.stopped.push((i.run.clone(), why));
+                }
             }
         }
     }
@@ -234,11 +235,11 @@ pub fn remove(l: &Ledger, name: &str, by: &str) -> Result<usize> {
     Ok(live.len())
 }
 
-/// Stops an instance: its run is revoked (its supervisor stops its box), audited.
-pub fn stop(l: &Ledger, i: &wicket_store::Instance, why: &str) -> Result<()> {
-    // One stopped already (revoked: its box going) isn't stopped, or audited, again (#812 review).
+/// Stops an instance: its run is revoked (its supervisor stops its box), audited. Whether this
+/// stopped it: one stopped already (revoked: its box going) isn't stopped, or audited, again.
+pub fn stop(l: &Ledger, i: &wicket_store::Instance, why: &str) -> Result<bool> {
     if !l.revoke(&i.run, BY, why)? {
-        return Ok(());
+        return Ok(false);
     }
     l.audit(
         &wicket_core::TenantId::single(),
@@ -246,7 +247,7 @@ pub fn stop(l: &Ledger, i: &wicket_store::Instance, why: &str) -> Result<()> {
         "service.instance_stopped",
         &serde_json::json!({ "service": i.service, "node": i.node, "tenant": i.tenant, "run": i.run, "why": why }),
     )?;
-    Ok(())
+    Ok(true)
 }
 
 /// Starts an instance: `wicket run [--node <node>] --run-id <run> <snapshot manifest>`, detached,
