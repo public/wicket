@@ -430,7 +430,7 @@ pub struct EndState {
 /// - **Work collected before release** (`collected`). No placed node is released while a run's box
 ///   runs on it, or while a run's files on it are uncollected (a fetch failed, and nothing was
 ///   collected since). A run's uncollected files may go only with a node a human released, files and
-///   all (`wicket node release`, whose record counts the runs).
+///   all (`wicket node release`, whose record, or its retry's, counts the runs).
 /// - **No message delivered twice, and a refusal says so** (`messages`). No message is pushed to
 ///   a box twice (`node.message_pushed`, shipped by its node), none wicket refused is pushed at
 ///   all, and every refusal records why.
@@ -446,8 +446,10 @@ pub fn check_end_state(l: &Ledger) -> Result<EndState> {
             s.findings.push(finding("collected", &run, format!("node {name} was {status} while the run's box was running on it")));
         }
     }
+    // Files go with a human's release, or with the retry that finished one (#812 review).
     let mut forgot: HashSet<String> = HashSet::new();
-    for r in l.audit_of_kind("placement.node_released")? {
+    let records = l.audit_of_kind("placement.node_released")?.into_iter().chain(l.audit_of_kind("placement.node_release_finished")?);
+    for r in records {
         let b: Value = serde_json::from_str(&r.body).unwrap_or(Value::Null);
         if b["uncollected_runs_lost"].as_u64().unwrap_or(0) > 0 {
             forgot.extend(b["name"].as_str().map(String::from));

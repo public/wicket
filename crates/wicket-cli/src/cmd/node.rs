@@ -50,7 +50,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             NodeCmd::Create(args) => nodecreate::create(*args).await,
-            NodeCmd::Release { common, id, reason } => nodecreate::release(common, id, reason, wicket_home::cli_is_root()).await,
+            NodeCmd::Release { common, id, reason, yes } => nodecreate::release(common, id, reason, wicket_home::cli_is_root(), yes).await,
             NodeCmd::Plans { common, region, plan_type } => nodecreate::plans(common, region, plan_type).await,
             NodeCmd::Revoke { name } => {
                 let mut l = Ledger::open(&ledger_path())?;
@@ -420,7 +420,9 @@ pub enum NodeCmd {
     /// Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and
     /// revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the
     /// provider is asked, then `placement.node_released` or `placement.node_release_failed`, the
-    /// records the console's release of a node past its lease writes too.
+    /// records the console's release of a node past its lease writes too. On a node already released
+    /// it finishes a release whose ledger side didn't (`placement.node_release_finished`), or says
+    /// there is nothing left; the provider isn't asked again.
     Release {
         #[command(flatten)]
         common: nodecreate::Common,
@@ -429,6 +431,9 @@ pub enum NodeCmd {
         /// Why: it goes on the audit record.
         #[arg(long)]
         reason: Option<String>,
+        /// Don't ask before releasing it (a terminal is asked, as shown, first).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// List a provider's (Vultr's) plans in a region, with their hourly price.
     Plans {

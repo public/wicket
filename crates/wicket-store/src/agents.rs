@@ -378,9 +378,29 @@ impl Ledger {
     /// new state, or None when `run` wasn't an agent's current activation.
     pub fn run_lost(&self, run: &str, why: &str) -> Result<Option<String>> {
         let tx = self.conn.unchecked_transaction()?;
+        let state = self.lose_run(run, why)?;
+        tx.commit()?;
+        Ok(state)
+    }
+
+    /// [`Ledger::run_lost`], only if `run` is still running, checked and ended in one transaction: a
+    /// run that ended meanwhile keeps how it ended (#812 review). Whether it was ended.
+    pub fn run_lost_if_running(&self, run: &str, why: &str) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let status: Option<String> = tx.query_row("SELECT status FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?;
+        let running = status.as_deref() == Some("running");
+        if running {
+            self.lose_run(run, why)?;
+        }
+        tx.commit()?;
+        Ok(running)
+    }
+
+    /// The writes of [`Ledger::run_lost`], inside the caller's transaction.
+    fn lose_run(&self, run: &str, why: &str) -> Result<Option<String>> {
         self.run_ended(&wicket_core::RunId(run.to_string()), "lost", why)?;
         let note = format!("its run {run} was lost: {why}");
-        let n = tx.execute(
+        let n = self.conn.execute(
             "UPDATE agents SET state = CASE WHEN head IS NULL THEN 'ended' ELSE 'hibernated' END, claim_until = NULL, \
              want = NULL, note = ?2, updated_at = ?3 \
              WHERE run = ?1 AND state IN ('active', 'waking', 'hibernating') \
@@ -389,9 +409,8 @@ impl Ledger {
         )?;
         let state = match n {
             0 => None,
-            _ => tx.query_row("SELECT state FROM agents WHERE run = ?1", params![run], |r| r.get(0)).optional()?,
+            _ => self.conn.query_row("SELECT state FROM agents WHERE run = ?1", params![run], |r| r.get(0)).optional()?,
         };
-        tx.commit()?;
         Ok(state)
     }
 

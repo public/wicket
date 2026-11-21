@@ -15,16 +15,24 @@
 //! 2. [`release`], with the node's own placer (its owner and API key, as the reconciler's):
 //!    - the node must still be what was decided on, and still active, just before the provider is
 //!      asked (another release, or the reconciler, may have ended it);
-//!    - its service instances are stopped as the reconciler stops them (`service.instance_stopped`);
 //!    - the provider destroys the machine. A failure is audited `placement.node_release_failed`, and
-//!      the node is as it was;
-//!    - then the node is marked released. If something else ended it first, that is audited
+//!      the node and its services are as they were;
+//!    - the node is marked released, with the decision and whether this release destroyed it in the
+//!      row ([`released_detail`]). If something else ended it first, that is audited
 //!      (`placement.node_release_already_ended`) and nothing more is done;
-//!    - only on a confirmed destroy are the run files that went with it forgotten; the runs still on
-//!      it are revoked either way (their boxes went with the machine);
-//!    - `placement.node_released` (with `by`, the decision's sequence, what was stopped, revoked
-//!      and lost), and its enrolment is revoked. A failure after the destroy is audited
+//!    - then, each step tried whatever the others did (`cleanup`): its service instances are
+//!      stopped as the reconciler stops them (`service.instance_stopped`); only on a confirmed
+//!      destroy are the run files that went with it forgotten; the runs still running on it are
+//!      ended as lost (`reconcile.run_lost`) and revoked; its enrolment is revoked;
+//!    - `placement.node_released` (with `by`, the decision's sequence, what was stopped, revoked,
+//!      ended and lost). A step that failed is recorded with the rest as
 //!      `placement.node_release_incomplete`.
+//! 3. [`finish_incomplete`] finishes a release whose ledger side didn't (a failed step, or a crash
+//!    after the node was marked released): `wicket node release` on the node runs it, and the
+//!    reconciler runs it for every recent release ([`finish_released`]). It decides from the
+//!    ledger, not the audit log: what the released node still has ([`Left`]), counting only runs,
+//!    instances, files and an enrolment from before the release ended, so a machine given its name
+//!    since is never touched (`placement.node_release_finished`).
 
 use crate::grant::Granter;
 use anyhow::{bail, Context, Result};
@@ -49,7 +57,7 @@ pub struct PastLease {
     pub past_lease: bool,
     /// Runs still running on it (service instances aside: they never hold a node).
     pub running: Vec<String>,
-    /// Live service instances on it, as `service:run`: stopped before it is destroyed.
+    /// Live service instances on it, as `service:run`: stopped once the provider has destroyed it.
     pub services: Vec<String>,
     /// Ended runs whose files on it a fetch didn't bring back: they go with it.
     pub uncollected: Vec<String>,
@@ -75,7 +83,10 @@ impl PastLease {
     pub fn consequence(&self) -> String {
         let mut what = vec![format!("destroys server {} now", self.name)];
         if !self.running.is_empty() {
-            what.push(format!("stops the boxes of run {} still running there, and revokes them", self.running.join(", ")));
+            what.push(format!(
+                "stops the boxes of run {} still running there and ends those runs as lost (revoking the ones with an identity)",
+                self.running.join(", ")
+            ));
         }
         if !self.services.is_empty() {
             what.push(format!("stops the service instances {} there", self.services.join(", ")));
@@ -199,14 +210,15 @@ pub fn decide(l: &Ledger, id: &str, d: &Decision, now: i64) -> Result<(PastLease
 
 /// Releases placed node `n` with `p`, the node's own placer ([`crate::nodecreate::release_placer`]
 /// with its owner and API key), after [`decide`] recorded decision `seq`. See the module's header
-/// for the steps. Returns what happened, in words.
+/// for the steps. `retire` revokes the enrolment of the machine named so, enrolled by the time given
+/// ([`crate::nodecreate::retire_enrolment_named`]). Returns what happened, in words.
 pub async fn release<Q: Provider, A: SpendApprover>(
     l: &mut Ledger,
     p: &Placer<Q, A>,
     n: &PastLease,
     by: &str,
     seq: i64,
-    retire: fn(&mut Ledger, &wicket_placement::NodeHandle) -> Result<bool>,
+    retire: Retire,
     now: i64,
 ) -> Result<String> {
     let failed = |l: &Ledger, kind: &str, e: &str| {
@@ -225,13 +237,8 @@ pub async fn release<Q: Provider, A: SpendApprover>(
             bail!("{} was already released or ended", n.name);
         }
     }
-    // Drained first, as the reconciler does (#579): its service instances are stopped, audited.
-    let why = format!("its node {} is being released", n.name);
-    let mut stopped = vec![];
-    for i in l.live_service_instances()?.into_iter().filter(|i| i.node == n.name) {
-        crate::services::stop(l, &i, &why)?;
-        stopped.push(i.run);
-    }
+    // Its service instances are stopped once the provider has answered (in `finish`), not before: a
+    // release the provider refuses leaves the node, and them, as they were.
     let id = NodeId(n.id.clone());
     let r = async {
         let node = p.get(&id).await?;
@@ -246,78 +253,299 @@ pub async fn release<Q: Provider, A: SpendApprover>(
             bail!("releasing {}: {e} (it is as it was)", n.name);
         }
     };
-    let done = finish(l, n, by, seq, node, r, stopped, retire);
-    if let Err(e) = &done {
-        failed(l, "placement.node_release_incomplete", &format!("{e:#}"));
+    // Its own placer saw it gone, or never had it: no machine was destroyed by this release.
+    let destroyed = r != Released::AlreadyGone && node.is_some();
+    // `finish` records its own failures, once.
+    finish(l, n, by, seq, destroyed, r, retire)
+}
+
+/// Revokes the enrolment of the machine named so if it was enrolled by the time given, so it is the
+/// released machine and not one enrolled under its name since. Whether it revoked.
+pub type Retire = fn(&mut Ledger, &str, i64) -> Result<bool>;
+
+/// What a released node is recorded as released with, in its row (with the status, in one write):
+/// the decision and whether this release destroyed it, which a retry reads ([`finish_incomplete`]).
+pub fn released_detail(by: &str, seq: i64, destroyed: bool) -> String {
+    format!("released by {by} (decision {seq}, {})", if destroyed { "destroyed" } else { "already gone" })
+}
+
+/// The decision and whether it was destroyed, from a row [`released_detail`] wrote. None for a node
+/// released another way (the reconciler at its lease's end, or a machine the ledger didn't track).
+fn parse_released(detail: &str) -> Option<(i64, bool)> {
+    let (seq, how) = detail.rsplit_once(" (decision ")?.1.strip_suffix(')')?.split_once(", ")?;
+    let destroyed = match how {
+        "destroyed" => true,
+        "already gone" => false,
+        _ => return None,
+    };
+    Some((seq.parse().ok()?, destroyed))
+}
+
+/// What a node released at `until` still has in the ledger: what its release, or a retry, has left
+/// to undo. Only what was there by `until` counts: runs (by when they started), service instances,
+/// files and an enrolment under its name from later are a machine's given its name since.
+pub struct Left {
+    /// Its runs still running (service instances aside).
+    pub runs: Vec<String>,
+    pub instances: Vec<wicket_store::Instance>,
+    /// Ended runs whose files on it a fetch didn't bring back.
+    pub uncollected: Vec<String>,
+    /// Whether its enrolment is still live.
+    pub enrolled: bool,
+}
+
+impl Left {
+    /// Nothing left for a release (one that `destroyed` the machine also forgets its files).
+    pub fn is_empty(&self, destroyed: bool) -> bool {
+        self.runs.is_empty() && self.instances.is_empty() && (!destroyed || self.uncollected.is_empty()) && !self.enrolled
     }
-    done
+}
+
+/// What node `name`, released at `until`, still has ([`Left`]).
+pub fn left(l: &Ledger, name: &str, until: i64) -> Result<Left> {
+    // Service instances are runs too, stopped as instances and never ended as lost: one stopped
+    // (revoked) is no longer live while its run still reads as running, so any instance's run is
+    // left out, live or not.
+    let live = l.live_service_instances()?;
+    let mut runs = vec![];
+    for r in l.running_runs_on_node_started_by(name, until)? {
+        if l.service_instance_of(&r)?.is_none() {
+            runs.push(r);
+        }
+    }
+    let instances = live.into_iter().filter(|i| i.node == name && i.started_at <= until).collect();
+    let uncollected = l.uncollected_runs_on_node_started_by(name, until)?;
+    let enrolled = l.node(name)?.is_some_and(|r| r.status != "revoked" && r.enrolled_at <= until);
+    Ok(Left { runs, instances, uncollected, enrolled })
+}
+
+/// What the ledger still had to do after a release's destroy, best effort: every step is tried, and
+/// what failed is returned rather than stopping the rest.
+struct Cleanup {
+    stopped: Vec<String>,
+    lost: usize,
+    revoked: Vec<String>,
+    ended: Vec<String>,
+    retired: bool,
+    errors: Vec<String>,
+}
+
+/// The ledger's side of placed node `name`, destroyed (or gone) and marked released at `until`: what
+/// it still has ([`left`]) undone. Its service instances stopped, its uncollected run files
+/// forgotten (only if this release `destroyed` it), the runs still running on it ended as lost (and
+/// revoked if they have an identity), and its enrolment retired. Each step is tried whatever the
+/// others did; a run that ended in the meantime is left as it ended, and one revoked already isn't
+/// revoked again. If what it has can't be read, nothing is done (a service run would be taken for
+/// an agent's and ended as lost).
+fn cleanup(l: &mut Ledger, name: &str, until: i64, by: &str, seq: Option<i64>, destroyed: bool, retire: Retire) -> Cleanup {
+    let mut c = Cleanup { stopped: vec![], lost: 0, revoked: vec![], ended: vec![], retired: false, errors: vec![] };
+    let why = format!("its node {name} was released");
+    let left = match left(l, name, until) {
+        Ok(x) => x,
+        Err(e) => {
+            c.errors.push(format!("reading what is on it: {e:#}"));
+            return c;
+        }
+    };
+    // Its service instances went with it: stopped as the reconciler stops them (#579), audited.
+    for i in &left.instances {
+        match crate::services::stop(l, i, &why) {
+            Ok(()) => c.stopped.push(i.run.clone()),
+            Err(e) => c.errors.push(format!("stopping service instance {}: {e:#}", i.run)),
+        }
+    }
+    // Files of runs a fetch didn't bring back went with it (#300): a human chose that. Only when
+    // this release destroyed it: a machine the provider says is gone may be another account's.
+    if destroyed {
+        match l.forget_uncollected_on_node_started_by(name, until) {
+            Ok(n) => c.lost = n,
+            Err(e) => c.errors.push(format!("forgetting its uncollected run files: {e:#}")),
+        }
+    }
+    // Its runs' boxes went with the machine: each run still running there is ended as lost (its
+    // agent handed back, as a lost run's is, and `run.lost` triggers fire), and revoked if it has an
+    // identity. A run that ended on its own meanwhile (during the provider call, say) keeps how it
+    // ended: the check and the end are one transaction.
+    for run in left.runs {
+        let r = (|| -> Result<()> {
+            if l.run_status(&run)?.as_deref() != Some("running") {
+                return Ok(());
+            }
+            if l.identity(&run)?.is_some() && l.revoke(&run, by, &why)? {
+                l.audit(
+                    &TenantId::single(),
+                    Some(&wicket_core::RunId(run.clone())),
+                    "identity.revoked",
+                    &json!({ "run": run, "by": by, "reason": why, "decision": seq }),
+                )?;
+                c.revoked.push(run.clone());
+            }
+            if l.run_lost_if_running(&run, &why)? {
+                c.ended.push(run.clone());
+                l.audit(
+                    &TenantId::single(),
+                    Some(&wicket_core::RunId(run.clone())),
+                    "reconcile.run_lost",
+                    &json!({ "target": run, "detail": why, "by": by, "decision": seq }),
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = r {
+            c.errors.push(format!("ending run {run}: {e:#}"));
+        }
+    }
+    match retire(l, name, until) {
+        Ok(r) => c.retired = r,
+        Err(e) => c.errors.push(format!("revoking its enrolment: {e:#}")),
+    }
+    c
+}
+
+/// Records what a cleanup did (`placement.node_released`, or `placement.node_release_finished` for a
+/// retry) and, if any step failed, `placement.node_release_incomplete`. Returns what happened, in
+/// words, or Err if a step failed.
+#[allow(clippy::too_many_arguments)]
+fn record(
+    l: &Ledger,
+    kind: &str,
+    id: &str,
+    name: &str,
+    by: &str,
+    seq: Option<i64>,
+    destroyed: bool,
+    c: &Cleanup,
+    mut said: String,
+) -> Result<String> {
+    if c.lost > 0 {
+        said.push_str(&format!("; {} run(s)' uncollected files went with it", c.lost));
+    }
+    if !c.stopped.is_empty() {
+        said.push_str(&format!("; stopped service instance {}", c.stopped.join(", ")));
+    }
+    if !c.ended.is_empty() {
+        said.push_str(&format!("; ended run {} as lost", c.ended.join(", ")));
+    }
+    if c.retired {
+        said.push_str(&format!("; revoked node {name}"));
+    }
+    let rec = json!({ "id": id, "name": name, "uncollected_runs_lost": c.lost, "by": by, "decision": seq, "destroyed": destroyed,
+                      "services_stopped": c.stopped, "runs_revoked": c.revoked, "runs_ended": c.ended, "enrolment_retired": c.retired,
+                      "errors": c.errors });
+    let wrote = l.audit(&TenantId::single(), None, kind, &rec);
+    if c.errors.is_empty() {
+        wrote?;
+        return Ok(said);
+    }
+    // A record only: a retry decides from the ledger, so a failed write here loses nothing.
+    let _ = l.audit(
+        &TenantId::single(),
+        None,
+        "placement.node_release_incomplete",
+        &json!({ "id": id, "name": name, "by": by, "decision": seq, "destroyed": destroyed, "errors": c.errors }),
+    );
+    bail!("{said}; but the release didn't finish: {} (run `wicket node release {id}` again to finish it)", c.errors.join("; "))
+}
+
+/// Finishes the release of placed node `id` (its instance id) if its ledger side didn't finish: a
+/// step failed, or the process stopped after the node was marked released. Decided from the ledger
+/// ([`left`]): what the node still has from before its release ended, undone as `cleanup` does.
+/// `wicket node release` runs it for a released node, and the reconciler for recent ones
+/// ([`finish_released`]). Ok(None) if there is nothing left to do; Err if a step fails again.
+pub fn finish_incomplete(l: &mut Ledger, id: &str, by: &str, retire: Retire) -> Result<Option<String>> {
+    let row = l.placed_node(id)?.with_context(|| format!("no placed node {id}"))?;
+    if row.status != "released" {
+        bail!("placed node {id} is {}, not a release to finish", row.status);
+    }
+    let until = row.ended_at.with_context(|| format!("placed node {id} is released but has no end time"))?;
+    // A release this module made says how; one made another way destroyed nothing it can tell.
+    let (seq, destroyed) = match row.detail.as_deref().and_then(parse_released) {
+        Some((seq, destroyed)) => (Some(seq), destroyed),
+        None => (None, false),
+    };
+    if left(l, &row.name, until)?.is_empty(destroyed) {
+        return Ok(None);
+    }
+    let name = row.name;
+    let c = cleanup(l, &name, until, by, seq, destroyed, retire);
+    record(l, "placement.node_release_finished", id, &name, by, seq, destroyed, &c, format!("finished releasing {name}")).map(Some)
+}
+
+/// A release that ended under this long ago may still be finishing: the reconciler leaves it.
+pub const FINISH_GRACE_SECS: i64 = 120;
+/// A retry that failed under this long ago isn't tried again by the reconciler yet.
+pub const FINISH_RETRY_SECS: i64 = 600;
+/// How far back the reconciler looks for releases to finish.
+pub const FINISH_WINDOW_SECS: i64 = 7 * 24 * 3600;
+
+/// The reconciler's part (#812 review): every node a release of this module's marked released in the
+/// last [`FINISH_WINDOW_SECS`] whose ledger side isn't done is finished ([`finish_incomplete`], as
+/// `by`). One that ended under [`FINISH_GRACE_SECS`] ago is left (its release may still be running),
+/// as is one whose last try failed under [`FINISH_RETRY_SECS`] ago. Returns each node tried (its
+/// instance id) and what happened; with `dry_run`, what would be tried, and nothing is.
+pub fn finish_released(l: &mut Ledger, by: &str, retire: Retire, now: i64, dry_run: bool) -> Result<Vec<(String, Result<String>)>> {
+    let mut todo = vec![];
+    for row in l.placed_nodes(&["released"])? {
+        let (Some(until), Some((_, destroyed))) = (row.ended_at, row.detail.as_deref().and_then(parse_released)) else { continue };
+        if until > now - FINISH_GRACE_SECS || until < now - FINISH_WINDOW_SECS || left(l, &row.name, until)?.is_empty(destroyed) {
+            continue;
+        }
+        todo.push(row);
+    }
+    if todo.is_empty() {
+        return Ok(vec![]);
+    }
+    let failed: Vec<(i64, String)> = l
+        .audit_of_kind("placement.node_release_incomplete")?
+        .into_iter()
+        .filter(|r| r.ts > now - FINISH_RETRY_SECS)
+        .filter_map(|r| serde_json::from_str::<Value>(&r.body).ok()?["id"].as_str().map(|id| (r.ts, id.to_string())))
+        .collect();
+    let mut done = vec![];
+    for row in todo.into_iter().filter(|r| !failed.iter().any(|(_, id)| id == &r.id)) {
+        let r = if dry_run {
+            Ok(format!("would finish releasing placed node {}", row.name))
+        } else {
+            finish_incomplete(l, &row.id, by, retire).map(|s| s.unwrap_or_else(|| format!("placed node {}: nothing left to do", row.name)))
+        };
+        done.push((row.id, r));
+    }
+    Ok(done)
 }
 
 /// After the provider answered: the ledger's side of a release.
-#[allow(clippy::too_many_arguments)]
-fn finish(
-    l: &mut Ledger,
-    n: &PastLease,
-    by: &str,
-    seq: i64,
-    node: Option<wicket_placement::NodeHandle>,
-    r: Released,
-    stopped: Vec<String>,
-    retire: fn(&mut Ledger, &wicket_placement::NodeHandle) -> Result<bool>,
-) -> Result<String> {
+fn finish(l: &mut Ledger, n: &PastLease, by: &str, seq: i64, destroyed: bool, r: Released, retire: Retire) -> Result<String> {
     let id = &n.id;
-    // Its own placer saw it gone, or never had it: no machine was destroyed by this release.
-    let destroyed = r != Released::AlreadyGone && node.is_some();
     let mut said = if destroyed { format!("{id}: {r:?}") } else { format!("{id} was already gone") };
-    if !l.placed_node_ended(id, "released", &format!("released by {by}"))? {
-        // Something else (another release, the reconciler) ended it first: it records the rest.
-        l.audit(
-            &TenantId::single(),
-            None,
-            "placement.node_release_already_ended",
-            &json!({ "id": id, "name": n.name, "by": by, "decision": seq, "destroyed": destroyed }),
-        )?;
-        said.push_str("; it had already been ended by another release, which recorded the rest");
-        return Ok(said);
-    }
-    let name = node.as_ref().map(|h| h.name.clone()).unwrap_or_else(|| n.name.clone());
-    // Files of runs a fetch didn't bring back went with it (#300): a human chose that. Only when
-    // this release destroyed it: a machine the provider says is gone may be another account's.
-    let lost = if destroyed { l.forget_uncollected_on_node(&name)? } else { 0 };
-    if lost > 0 {
-        said.push_str(&format!("; {lost} run(s)' uncollected files went with it"));
-    }
-    // Its runs' boxes went with the machine: their authority goes too, so nothing waits on them.
-    let reason = format!("its node {name} was released");
-    let mut revoked = vec![];
-    for run in &n.running {
-        if l.identity(run)?.is_some() {
-            l.revoke(run, by, &reason)?;
+    // Marked released with how, in one write: a retry reads it from the row.
+    match l.placed_node_ended(id, "released", &released_detail(by, seq, destroyed)) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Something else (another release, the reconciler) ended it first: it records the rest.
             l.audit(
                 &TenantId::single(),
-                Some(&wicket_core::RunId(run.clone())),
-                "identity.revoked",
-                &json!({ "run": run, "by": by, "reason": reason, "decision": seq }),
+                None,
+                "placement.node_release_already_ended",
+                &json!({ "id": id, "name": n.name, "by": by, "decision": seq, "destroyed": destroyed }),
             )?;
-            revoked.push(run.clone());
+            said.push_str("; it had already been ended by another release, which recorded the rest");
+            return Ok(said);
+        }
+        Err(e) => {
+            let _ = l.audit(
+                &TenantId::single(),
+                None,
+                "placement.node_release_incomplete",
+                &json!({ "id": id, "name": n.name, "by": by, "decision": seq, "destroyed": destroyed,
+                         "errors": [format!("marking it released: {e:#}")] }),
+            );
+            return Err(anyhow::Error::from(e).context(format!("{said}; but it couldn't be marked released")));
         }
     }
-    if !revoked.is_empty() {
-        said.push_str(&format!("; revoked run {}", revoked.join(", ")));
-    }
-    l.audit(
-        &TenantId::single(),
-        None,
-        "placement.node_released",
-        &json!({ "id": id, "name": name, "uncollected_runs_lost": lost, "by": by, "decision": seq, "destroyed": destroyed,
-                 "services_stopped": stopped, "runs_revoked": revoked }),
-    )?;
-    if let Some(h) = &node {
-        if retire(l, h)? {
-            said.push_str(&format!("; revoked node {}", h.name));
-        }
-    }
-    Ok(said)
+    let until = l.placed_node(id).ok().flatten().and_then(|r| r.ended_at).unwrap_or_else(wicket_store::now);
+    // The ledger's name for it: its runs, services and files are recorded under it.
+    let c = cleanup(l, &n.name, until, by, Some(seq), destroyed, retire);
+    record(l, "placement.node_released", id, &n.name, by, Some(seq), destroyed, &c, said)
 }
 
 #[cfg(test)]
@@ -359,7 +587,7 @@ mod tests {
         l.audit_tail(100).unwrap().into_iter().map(|r| r.2).collect()
     }
 
-    fn no_retire(_: &mut Ledger, _: &wicket_placement::NodeHandle) -> Result<bool> {
+    fn no_retire(_: &mut Ledger, _: &str, _: i64) -> Result<bool> {
         Ok(false)
     }
 
@@ -412,17 +640,29 @@ mod tests {
         running(&l, "run_busy", "placed-a");
         running(&l, "run_svc", "placed-a");
         l.record_service_instance("run_svc", "cache", "placed-a", &TenantId::single().0, "sha", NOW).unwrap();
+        // A run with no identity (a program's, say) is on it too.
+        l.run_started(&TenantId::single(), &wicket_core::RunId("run_anon".into()), "z", "p").unwrap();
+        l.set_run_node("run_anon", "placed-a").unwrap();
+        // And a service instance on the machine whose release will fail.
+        running(&l, "run_svc_b", "placed-b");
+        l.record_service_instance("run_svc_b", "cache", "placed-b", &TenantId::single().0, "sha", NOW).unwrap();
         let by = human("default: anything\n");
 
         let n = view(&l, "i-1", NOW).unwrap().unwrap();
-        assert_eq!((n.running.clone(), n.services.clone()), (vec!["run_busy".to_string()], vec!["cache:run_svc".to_string()]));
+        assert_eq!(
+            (n.running.clone(), n.services.clone()),
+            (vec!["run_anon".to_string(), "run_busy".to_string()], vec!["cache:run_svc".to_string()])
+        );
         assert!(n.consequence().contains("stops the service instances cache:run_svc"), "{}", n.consequence());
         let (n, seq) = decide(&l, "i-1", &console(&by, &n.effect_sha256()), NOW).unwrap();
         let said = release(&mut l, &p, &n, "passkey:laptop", seq, no_retire, NOW).await.unwrap();
-        assert!(said.contains("i-1") && said.contains("revoked run run_busy"), "{said}");
+        assert!(said.contains("i-1") && said.contains("ended run run_anon, run_busy as lost"), "{said}");
         assert!(deleted(&st, "i-1"));
         assert_eq!(l.placed_node("i-1").unwrap().unwrap().status, "released");
         assert!(l.revoked("run_busy").unwrap().is_some() && l.revoked("run_svc").unwrap().is_some());
+        for run in ["run_busy", "run_anon"] {
+            assert_eq!(l.run_status(run).unwrap().as_deref(), Some("lost"), "{run} is ended, identity or not");
+        }
         let ks = kinds(&l);
         let stop = ks.iter().position(|k| k == "service.instance_stopped").expect("the instance is stopped");
         assert!(stop < ks.iter().position(|k| k == "placement.node_released").unwrap());
@@ -434,7 +674,10 @@ mod tests {
             (Some(seq), Some("passkey:laptop"), Some(true)),
             "{b}"
         );
-        assert_eq!((b["services_stopped"].clone(), b["runs_revoked"].clone()), (json!(["run_svc"]), json!(["run_busy"])));
+        assert_eq!(
+            (b["services_stopped"].clone(), b["runs_revoked"].clone(), b["runs_ended"].clone()),
+            (json!(["run_svc"]), json!(["run_busy"]), json!(["run_anon", "run_busy"]))
+        );
 
         // A second release of the same node (another tab): it is no longer an active placed node.
         let e = release(&mut l, &p, &n, "passkey:laptop", seq, no_retire, NOW).await.unwrap_err();
@@ -446,6 +689,7 @@ mod tests {
         assert!(release(&mut l, &p, &n, "passkey:laptop", seq, no_retire, NOW).await.is_err(), "not this installation's machine");
         assert!(!deleted(&st, "i-2"));
         assert_eq!(l.placed_node("i-2").unwrap().unwrap().status, "active", "it is as it was");
+        assert!(l.revoked("run_svc_b").unwrap().is_none(), "its service instance too: stopped only after a release");
         let rec = l.audit_tail(1).unwrap().pop().unwrap();
         assert_eq!(rec.2, "placement.node_release_failed");
         assert_eq!(serde_json::from_str::<Value>(&rec.4).unwrap()["decision"].as_i64(), Some(seq));
@@ -481,6 +725,140 @@ mod tests {
         assert!(format!("{e:#}").contains("changed after it was decided on"), "{e:#}");
         assert!(!deleted(&st, "i-3"));
         assert_eq!(l.placed_node("i-3").unwrap().unwrap().status, "active");
+    }
+
+    /// #812 review: a step after the node was marked released that fails doesn't stop the rest; it is
+    /// recorded as incomplete, and a retry finishes it. A run that ended on its own meanwhile keeps
+    /// how it ended.
+    #[tokio::test]
+    async fn a_release_that_doesnt_finish_is_recorded_and_a_retry_finishes_it() {
+        let (p, _st) = mock(&[("i-1", true)]).await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        placed(&l, "i-1", "placed-a", NOW - 60);
+        running(&l, "run_a", "placed-a");
+        let by = human("default: anything\n");
+        let n = view(&l, "i-1", NOW).unwrap().unwrap();
+        let (n, seq) = decide(&l, "i-1", &console(&by, &n.effect_sha256()), NOW).unwrap();
+        fn broken(_: &mut Ledger, _: &str, _: i64) -> Result<bool> {
+            anyhow::bail!("the enrolment couldn't be revoked")
+        }
+        let e = release(&mut l, &p, &n, "passkey:laptop", seq, broken, NOW).await.unwrap_err();
+        assert!(format!("{e:#}").contains("didn't finish") && format!("{e:#}").contains("again to finish it"), "{e:#}");
+        // Everything else was done.
+        assert_eq!(l.placed_node("i-1").unwrap().unwrap().status, "released");
+        assert_eq!(l.run_status("run_a").unwrap().as_deref(), Some("lost"));
+        let ks = kinds(&l);
+        assert!(ks.contains(&"placement.node_released".to_string()), "{ks:?}");
+        assert!(ks.contains(&"reconcile.run_lost".to_string()), "run.lost triggers fire: {ks:?}");
+        // Recorded once, with whether it was destroyed (#812 review).
+        let incomplete: Vec<Value> =
+            l.audit_of_kind("placement.node_release_incomplete").unwrap().iter().map(|r| serde_json::from_str(&r.body).unwrap()).collect();
+        assert_eq!(incomplete.len(), 1, "{incomplete:?}");
+        assert_eq!(incomplete[0]["destroyed"].as_bool(), Some(true), "{incomplete:?}");
+        assert_eq!(l.placed_node("i-1").unwrap().unwrap().detail.as_deref(), Some(released_detail("passkey:laptop", seq, true).as_str()));
+
+        // A retry finishes it (here, revoking the enrolment by name), once. What is left is read
+        // from the ledger: the retire function is the only thing left to do, so it says so.
+        fn retire_ok(_: &mut Ledger, name: &str, _: i64) -> Result<bool> {
+            Ok(name == "placed-a")
+        }
+        fn enrolled(l: &Ledger) -> bool {
+            l.node("placed-a").unwrap().is_some()
+        }
+        assert!(!enrolled(&l), "the test's node was never enrolled");
+        // Nothing is left in the ledger (the run ended, no enrolment), so there is nothing to finish.
+        assert_eq!(finish_incomplete(&mut l, "i-1", "alex", retire_ok).unwrap(), None);
+        // A run that was revoked already isn't revoked, or audited, again by a retry.
+        assert_eq!(kinds(&l).iter().filter(|k| *k == "identity.revoked").count(), 1);
+        assert!(format!("{:#}", finish_incomplete(&mut l, "i-9", "alex", retire_ok).unwrap_err()).contains("no placed node"));
+    }
+
+    /// #812 review: a release whose process stopped just after the node was marked released (no
+    /// record of what is left) is finished by the reconciler from the ledger: the released machine's
+    /// runs end as lost, its services stop, its files go (it was destroyed, which the row says). A
+    /// machine given the same name since keeps its runs, services and files. Not while the release
+    /// may still be running, and not again soon after a retry failed.
+    #[tokio::test]
+    async fn a_release_stopped_after_it_was_marked_released_is_finished_without_touching_a_new_machine_of_its_name() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        placed(&l, "i-1", "placed-a", NOW - 60);
+        running(&l, "run_a", "placed-a");
+        running(&l, "run_svc", "placed-a");
+        l.record_service_instance("run_svc", "cache", "placed-a", &TenantId::single().0, "sha", NOW).unwrap();
+        running(&l, "run_files", "placed-a");
+        l.run_ended(&wicket_core::RunId("run_files".into()), "ok", "done").unwrap();
+        l.set_run_uncollected("run_files", Some("placed-a")).unwrap();
+        // The release's destroy, then marking it released, then the process stops.
+        assert!(l.placed_node_ended("i-1", "released", &released_detail("passkey:laptop", 7, true)).unwrap());
+        let until = l.placed_node("i-1").unwrap().unwrap().ended_at.unwrap();
+
+        // A new machine under the same name, after the release (runs record when they start, by the
+        // second).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        placed(&l, "i-9", "placed-a", NOW + 3600);
+        running(&l, "run_new", "placed-a");
+        running(&l, "run_svc_new", "placed-a");
+        l.record_service_instance("run_svc_new", "cache2", "placed-a", &TenantId::single().0, "sha", until + 1).unwrap();
+        running(&l, "run_new_files", "placed-a");
+        l.run_ended(&wicket_core::RunId("run_new_files".into()), "ok", "done").unwrap();
+        l.set_run_uncollected("run_new_files", Some("placed-a")).unwrap();
+        let left_now = left(&l, "placed-a", until).unwrap();
+        assert_eq!(
+            (left_now.runs.clone(), left_now.uncollected.clone(), left_now.instances.iter().map(|i| i.run.clone()).collect::<Vec<_>>()),
+            (vec!["run_a".to_string()], vec!["run_files".to_string()], vec!["run_svc".to_string()])
+        );
+
+        let now = wicket_store::now();
+        // Just released: its release may still be finishing.
+        assert!(finish_released(&mut l, "wicket reconcile", no_retire, now, false).unwrap().is_empty());
+        // Later, but a retry failed a moment ago: not yet.
+        l.audit(&TenantId::single(), None, "placement.node_release_incomplete", &json!({ "id": "i-1", "errors": ["x"] })).unwrap();
+        assert!(finish_released(&mut l, "wicket reconcile", no_retire, now + FINISH_GRACE_SECS + 1, false).unwrap().is_empty());
+        let later = now + FINISH_RETRY_SECS + 1;
+        let dry = finish_released(&mut l, "wicket reconcile", no_retire, later, true).unwrap();
+        assert_eq!((dry.len(), dry[0].0.as_str()), (1, "i-1"));
+        assert_eq!(l.run_status("run_a").unwrap().as_deref(), Some("running"), "a dry run does nothing");
+
+        let done = finish_released(&mut l, "wicket reconcile", no_retire, later, false).unwrap();
+        assert_eq!(done.len(), 1);
+        let said = done[0].1.as_ref().unwrap();
+        assert!(said.contains("ended run run_a as lost") && said.contains("stopped service instance run_svc"), "{said}");
+        assert_eq!(l.run_status("run_a").unwrap().as_deref(), Some("lost"));
+        assert!(l.revoked("run_a").unwrap().is_some());
+        assert!(l.uncollected_runs_on_node("placed-a").unwrap() == ["run_new_files"], "only the released machine's files go");
+        let b: Value = serde_json::from_str(&l.audit_of_kind("placement.node_release_finished").unwrap().pop().unwrap().body).unwrap();
+        assert_eq!(
+            (b["decision"].as_i64(), b["destroyed"].as_bool(), b["uncollected_runs_lost"].as_i64(), b["by"].as_str()),
+            (Some(7), Some(true), Some(1), Some("wicket reconcile")),
+            "{b}"
+        );
+        // The machine given its name since is untouched.
+        assert_eq!(l.run_status("run_new").unwrap().as_deref(), Some("running"));
+        assert!(l.revoked("run_new").unwrap().is_none() && l.revoked("run_svc_new").unwrap().is_none());
+        assert!(l.live_service_instances().unwrap().iter().any(|i| i.run == "run_svc_new"));
+        assert_eq!(l.placed_node("i-9").unwrap().unwrap().status, "active");
+
+        // Finished: nothing left, for the reconciler or `wicket node release`.
+        assert!(finish_released(&mut l, "wicket reconcile", no_retire, later + FINISH_RETRY_SECS, false).unwrap().is_empty());
+        assert_eq!(finish_incomplete(&mut l, "i-1", "alex", no_retire).unwrap(), None);
+        // A node released another way (the reconciler, at its lease's end) isn't the reconciler's to finish.
+        assert_eq!(parse_released("its lease ended at x and no run is placed on it"), None);
+        assert_eq!(parse_released(&released_detail("root (x)", 3, false)), Some((3, false)));
+    }
+
+    /// A run that ends on its own while the provider is asked (after the decision's re-check) keeps
+    /// how it ended: only runs still `running` are ended as lost.
+    #[test]
+    fn a_run_that_ended_meanwhile_isnt_rewritten_as_lost() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        running(&l, "run_done", "placed-a");
+        running(&l, "run_live", "placed-a");
+        l.run_ended(&wicket_core::RunId("run_done".into()), "succeeded", "done").unwrap();
+        let c = cleanup(&mut l, "placed-a", wicket_store::now(), "alex", Some(1), true, no_retire);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        assert_eq!(c.ended, ["run_live"]);
+        assert_eq!(l.run_status("run_done").unwrap().as_deref(), Some("succeeded"));
+        assert_eq!(l.run_status("run_live").unwrap().as_deref(), Some("lost"));
     }
 
     #[test]
