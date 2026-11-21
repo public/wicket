@@ -6,7 +6,7 @@ use super::*;
 
 const BASE: &str = "task: summarise the README\nagent: { name: reader }\nzone:\n  name: docs\n  reach:\n    - { host: api.github.com, methods: [GET], paths: ['/repos/acme/app/**'] }\n  forbid:\n    - { host: api.github.com, paths: ['/repos/acme/app/settings/**'] }\n  inject:\n    - { host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: gh }\n  llm: { max_requests: 10, max_output_tokens: 1000 }\n";
 
-fn with_manifest(tag: &str) -> T {
+pub(super) fn with_manifest(tag: &str) -> T {
     let mut t = setup(&format!("manifests-{tag}"));
     t.state.vault_dir = t.dir.join("vault");
     let v = wicket_proxy::vault::Vault::new(t.state.vault_dir.clone());
