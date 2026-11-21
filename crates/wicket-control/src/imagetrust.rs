@@ -145,6 +145,12 @@ pub async fn check(
         None => None,
     };
     let subject = Subject { digest: pin, repository: w.repository.as_deref().unwrap_or_default() };
+    let past = || format!("its signatures weren't fetched within the run's {} s for them", FETCH_DEADLINE.as_secs());
+    // Past the deadline already: nothing is fetched. (`timeout_at` polls the fetch once before it
+    // looks at the clock, and a fast registry can answer within that one poll.)
+    if tokio::time::Instant::now() >= deadline {
+        return done(out, past());
+    }
     let found = tokio::time::timeout_at(deadline, async {
         let mut why = vec![];
         for scheme in signature::schemes() {
@@ -173,7 +179,7 @@ pub async fn check(
             out
         }
         Ok(Err(why)) => done(out, format!("no signature verified ({why})")),
-        Err(_) => done(out, format!("its signatures weren't fetched within the run's {} s for them", FETCH_DEADLINE.as_secs())),
+        Err(_) => done(out, past()),
     }
 }
 
@@ -450,9 +456,12 @@ mod tests {
         let image = format!("{}/team/agent@{}", s.host, s.pin);
         let mut p = policy(&s, "require-signed", "signed");
         p.registries[0].secret = Some("reg".into());
-        // A deadline already past: nothing is fetched, and the image is refused for it.
+        // A deadline already past: nothing is fetched (however fast the registry answers), and the
+        // image is refused for it.
+        let hits = s.hits();
         let o = check(&p, &image, Some(&s.pin), None, tokio::time::Instant::now(), |_, _| Ok("u:p".into())).await;
         assert!(o.refused() && why(&o).contains("weren't fetched within the run's"), "{o:?}");
+        assert_eq!(s.hits(), hits, "nothing fetched past the deadline");
         // The credential's read is in the audit when it is handed over, before any fetch.
         let (l, m, run) = (Ledger::open_in_memory().unwrap(), manifest(""), RunId::new());
         let seen = std::cell::Cell::new(None);
