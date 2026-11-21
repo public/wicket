@@ -281,6 +281,16 @@ enum Cmd {
     /// still running on its node.
     #[command(hide = true)]
     Attach { run: String },
+    /// A supervisor host (#582 step 5): holds shard `shard` (its nodes, `--node`) under a lease,
+    /// renews it while its runtime moves, and answers wicketd's heartbeat. wicketd starts these; it
+    /// supervises no runs yet.
+    #[command(hide = true)]
+    Supervise {
+        #[arg(long)]
+        shard: String,
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+    },
     /// Run an agent command line that another program launches, inside a wicket box.
     ///
     /// Run an agent command line that another program launches, inside a wicket box: the harness's
@@ -710,6 +720,7 @@ async fn run() -> Result<()> {
         | Cmd::Agents { .. }
         | Cmd::WhyHere { .. }) => cmd::run::dispatch(c).await,
         Cmd::Authority { run, json } => cmd::authority::run(&run, json),
+        Cmd::Supervise { shard, nodes } => supervise(&shard, &nodes).await,
         Cmd::Capacity { cmd } => cmd::capacity::dispatch(cmd).await,
         Cmd::Manifest { cmd } => cmd::manifest::dispatch(cmd).await,
         Cmd::Top { once, json } => top::control_top(once, json).await,
@@ -732,6 +743,38 @@ async fn run() -> Result<()> {
         c @ Cmd::Itself { .. } => cmd::itself::dispatch(c).await,
         c @ (Cmd::Serve { .. } | Cmd::Operator { .. } | Cmd::Program { .. }) => cmd::operator::dispatch(c).await,
         c @ Cmd::Dev { .. } => cmd::dev::dispatch(c).await,
+    }
+}
+
+/// `wicket supervise`: a supervisor host until SIGTERM or SIGINT (a clean stop, exit 0) or until
+/// its shard is taken (exit 3, refused).
+async fn supervise(shard: &str, nodes: &[String]) -> Result<()> {
+    use wicket_control::supervise::{heartbeat_socket, Ended, Host, HostTimes};
+    let nodes: Vec<&str> = nodes.iter().map(String::as_str).collect();
+    let owner = wicket_home::owner::owner_label();
+    let sock = heartbeat_socket(&wicket_home::data_dir(), shard);
+    let times = HostTimes::default();
+    let host = Host::start(&wicket_home::ledger_path(), &sock, shard, &owner, &nodes, times).map_err(|e| {
+        match e.downcast_ref::<wicket_store::StoreError>() {
+            // Another host's lease is live: wicketd tries again once it has lapsed or been fenced.
+            Some(held @ wicket_store::StoreError::ShardHeld(..)) => wicket_home::exit::refused(held.to_string()),
+            _ => e,
+        }
+    })?;
+    say_err!("[supervise] shard {shard} at epoch {} as {owner}, nodes {:?}", host.lease.epoch, nodes);
+    let stop = async {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("a SIGTERM handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    };
+    match host.run(times, stop).await? {
+        Ended::Stopped => {
+            say_err!("[supervise] shard {shard}: stopped");
+            Ok(())
+        }
+        Ended::Lost => Err(wicket_home::exit::refused(format!("shard {shard} was taken by another supervisor host at a higher epoch"))),
     }
 }
 

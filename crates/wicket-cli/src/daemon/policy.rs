@@ -127,6 +127,7 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Image { .. } => Forward(Privileged),
         Cmd::Serve { .. } => Refuse("the console runs as the wicket user under systemd: systemctl status wicket-console"),
         Cmd::Daemon { .. } => Refuse("the daemon runs as the wicket user under systemd: systemctl status wicketd"),
+        Cmd::Supervise { .. } => Refuse("supervisor hosts are wicketd's own children: wicketd starts them (supervise: hosts)"),
         Cmd::Program { cmd: ProgramCmd::Digest { .. } } => Local,
         // Reads a manifest the caller names, in the caller's own process.
         Cmd::Zone { .. } => Local,
