@@ -93,7 +93,13 @@ fn assets(out: &Path) {
         icons.push((format!("/static/{rel}"), path.clone()));
         files.push((path, ctype, true, b));
     }
-    let with_icons = |text: String| icons.iter().fold(text, |t, (from, to)| t.replace(&format!("\"{from}\""), &format!("\"{to}\"")));
+    // Each icon's path, quoted (double or single), becomes its hashed one in the manifest and the
+    // service worker; one left unswapped would be a 404 (the test checks sw.js).
+    let with_icons = |text: String| {
+        icons.iter().fold(text, |t, (from, to)| {
+            t.replace(&format!("\"{from}\""), &format!("\"{to}\"")).replace(&format!("'{from}'"), &format!("'{to}'"))
+        })
+    };
     let manifest = with_icons(String::from_utf8(src("manifest.webmanifest")).expect("utf-8")).into_bytes();
     let manifest_path = named("manifest", "webmanifest", &manifest);
     files.push((manifest_path.clone(), "application/manifest+json", true, manifest));

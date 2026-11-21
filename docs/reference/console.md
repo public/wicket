@@ -328,7 +328,8 @@ cargo build` embeds it as written, to read in a browser's debugger. The page's t
 (`serve/tests/console_ui.js`), and `ci/console-browsers.sh` runs it as served in Chromium, Firefox and
 WebKit: it writes what `wicket serve` sends (`wicket dev console-assets DIR`: the page, its files and
 its headers) and serves that against the preview's mock API, failing on any error, CSP violation or
-Trusted Types report, a card replaced by an unchanged poll, or a page that scrolls sideways.
+Trusted Types violation, a card replaced by an unchanged poll, a page that scrolls sideways, or a raw
+`innerHTML` write that doesn't throw; and they mount a run's session view under the same policy.
 
 **Every file under `/static/` is named by its content's hash** (`console.<hash>.js`,
 `icon-192.<hash>.png`, `manifest.<hash>.webmanifest`, …) and sent with `Cache-Control: public,
@@ -638,10 +639,18 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
   passkey-signed, so a stolen cookie alone approves nothing, and registers no notification device.
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
-  'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
-  and Trusted Types reported but not yet enforced (`Content-Security-Policy-Report-Only:
-  require-trusted-types-for 'script'; trusted-types lit-html`, [#739](https://github.com/public/wicket/issues/739)),
-  no CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
+  'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self';
+  require-trusted-types-for 'script'; trusted-types lit-html wicket-sw`. Trusted Types are enforced
+  ([#739](https://github.com/public/wicket/issues/739)): on the console's page, HTML reaches the page
+  only through lit-html's templates, whose values are set as text, and a browser throws on any other
+  `innerHTML`-style write from a string. The one script URL, the service worker's, comes from
+  `wicket-sw`, a policy that makes `/sw.js` and nothing else. A run's session page (`/session`) has
+  the same policy but allows only Vue's (`trusted-types vue`). Vue's passes any string through, for
+  its static nodes and for any `v-html` or `innerHTML` binding, so there Trusted Types stop only code
+  outside Vue; what keeps an agent's text out of HTML is that the view has no such binding, which
+  `ci/session-view.sh` checks. The browser tests check each page's policy and that the service worker
+  still registers.
+  No CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
   `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
 - **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS
   handshake, the request headers and the body, 2 minutes per connection, 16 KiB and 64 header lines, 64 KiB
