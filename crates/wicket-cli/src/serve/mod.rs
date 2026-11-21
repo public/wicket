@@ -66,7 +66,7 @@ pub(crate) mod capacity;
 mod enrol;
 mod fence;
 pub(crate) mod limits;
-mod manifests;
+pub(crate) mod manifests;
 mod messages;
 mod names;
 pub(crate) mod net;
@@ -968,7 +968,7 @@ where
             // A manifest, viewed (#172): an operator's session only.
             p if p.starts_with("/api/manifests/") => match &sess {
                 Some((_, SessionKind::Operator { .. })) => match p["/api/manifests/".len()..].split_once('/') {
-                    Some((root, name)) => match manifests::view(state, root, name) {
+                    Some((root, name)) => match manifests::view(&manifests::Place::of(state), root, name) {
                         Ok(v) => to_response(ok(v)),
                         Err(e) => to_response(err(StatusCode::NOT_FOUND, format!("{e:#}"))),
                     },
@@ -1136,7 +1136,7 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
         },
         // Validates edited manifest YAML and diffs its authority (#172): read-only, so unsigned.
         "/api/manifests/check" => match &sess {
-            Some((_, SessionKind::Operator { .. })) => match manifests::check(state, body) {
+            Some((_, SessionKind::Operator { .. })) => match manifests::check(&manifests::Place::of(state), body) {
                 Ok(v) => ok(v),
                 Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
             },
@@ -1348,33 +1348,8 @@ fn str_field<'a>(body: &'a Value, k: &str) -> Option<&'a str> {
 /// Resolves an allowlisted manifest: a root by name and a plain file name in it (no separators, no
 /// dot-files, `.yaml`/`.yml`), which must be a regular file (not a symlink). Returns its path and bytes.
 /// A manifest's file name: letters, digits, '.', '_', '-', ending .yaml or .yml, no `..`.
-fn check_manifest_name(name: &str) -> Result<()> {
-    let ok_name = name.len() <= 128
-        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && !name.contains("..")
-        && (name.ends_with(".yaml") || name.ends_with(".yml"));
-    if !ok_name {
-        bail!("{name:?} is not a manifest file name (letters, digits, '.', '_', '-'; ending .yaml or .yml)");
-    }
-    Ok(())
-}
-
 fn resolve_manifest(state: &State, root: &str, name: &str) -> Result<(PathBuf, Vec<u8>)> {
-    check_manifest_name(name)?;
-    let Some((_, dir)) = state.roots.iter().find(|(r, _)| r == root) else {
-        bail!(
-            "{root:?} is not a directory runs can be started from (have: {})",
-            state.roots.iter().map(|r| r.0.as_str()).collect::<Vec<_>>().join(", ")
-        );
-    };
-    let path = dir.join(name);
-    let meta = std::fs::symlink_metadata(&path).with_context(|| format!("{root}/{name}"))?;
-    if !meta.file_type().is_file() {
-        bail!("{root}/{name} is not a regular file");
-    }
-    let bytes = std::fs::read(&path)?;
-    Ok((path, bytes))
+    manifests::resolve(&state.roots, root, name)
 }
 
 fn list_manifests(state: &State) -> Vec<Value> {
@@ -1554,7 +1529,7 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         }
         Some(kind @ ("save_manifest" | "restore_manifest")) => {
             let (save, v) =
-                manifests::prepare(state, kind, body, &state.tenant.0).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+                manifests::prepare(&manifests::Place::of(state), kind, body, &state.tenant.0).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             Ok((Action::SaveManifest(Box::new(save)), v))
         }
         Some("push_subscribe") => {
@@ -1853,7 +1828,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::Secret(_) => unreachable!("action_finish applies secret actions"),
         Action::SendMessage { .. } => unreachable!("action_finish sends messages"),
         Action::SaveManifest(save) => {
-            manifests::apply(state, save)?;
+            manifests::apply(&manifests::Place::of(state), save)?;
             let signed_action: Value =
                 signed.get("action_json").and_then(|j| j.as_str()).and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
             l.audit(
