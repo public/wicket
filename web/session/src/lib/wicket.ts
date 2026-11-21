@@ -153,15 +153,6 @@ export function requestState(status: unknown): { word: string; cls: string } {
   }
 }
 
-/** A request's reason, labelled as the agent's words, as the console's card labels it (console.js
- * `asks`): a wicket.internal request's text mixes wicket's words with the agent's, and is never
- * shown as wicket's. */
-export function reasonLine(e: { host: string; reason: string }): string {
-  if (!e.reason) return '';
-  const q = `“${strip(e.reason)}”`;
-  return e.host === 'wicket.internal' ? `The request's text, with the agent's words in it: ${q}` : `Why: ${q}`;
-}
-
 /** The run's ACP socket, and the subprotocols that carry the open's ticket. */
 export function socket(run: string, ticket: string): { url: string; protocols: string[] } {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -174,6 +165,20 @@ export function runFromLocation(): string {
   return /^[A-Za-z0-9_-]{1,64}$/.test(r) ? r : '';
 }
 
+/** A capacity ask's lease, as the endpoint sends it (the console's `lease_view`): wicket's terms,
+ * and the agent's own words (`region`, `reason`) apart. */
+export interface Lease {
+  provider: string;
+  vcpus: number;
+  memory_mib: number;
+  isolation?: string;
+  region?: string;
+  duration_secs: number;
+  hourly_cap_usd: string;
+  reserved_usd: string;
+  reason?: string;
+}
+
 /** wicket's own escalation, as the endpoint describes it in `_meta.wicket.escalation`. */
 export interface Escalation {
   id: string;
@@ -184,6 +189,46 @@ export interface Escalation {
   reason: string;
   prefix: boolean;
   status: string;
+  /** A capacity ask's lease (#731). */
+  lease?: Lease | null;
+  /** What the agent claimed when it asked (an update's `reason` and `commit`, #731). */
+  claims?: Record<string, unknown> | null;
+}
+
+/** How a request reads, in parts kept apart (#731, as the console's cards): `what`, wicket's words
+ * from fields it checked; `said`, the agent's words, each labelled and quoted; `mixed`, a reason
+ * that holds the agent's words among wicket's, sent whole, never shown as wicket's alone. */
+export interface AskParts {
+  what: string;
+  said: [string, string][];
+  mixed: string;
+}
+
+const span = (secs: number) => (secs % 3600 === 0 ? `${secs / 3600} h` : secs % 60 === 0 ? `${secs / 60} min` : `${secs} s`);
+
+export function askParts(e: Escalation): AskParts {
+  const raw = `${strip(e.method)} ${strip(e.host)}${strip(e.path)}`;
+  if (e.host !== 'wicket.internal') return { what: raw + (e.prefix ? '… (every path under it)' : ''), said: e.reason ? [['Why', strip(e.reason)]] : [], mixed: '' };
+  const x = e.lease;
+  if (e.method === 'CAPACITY' && x) {
+    const said: [string, string][] = [];
+    if (x.region) said.push(['Region', strip(x.region)]);
+    if (x.reason) said.push(['Why', strip(x.reason)]);
+    const vcpus = Number(x.vcpus) || 0;
+    return {
+      what: `Lease a node: ${vcpus} vCPU${vcpus === 1 ? '' : 's'}, ${Number(x.memory_mib) || 0} MiB, ${strip(x.isolation || 'default')} isolation, for ${span(Number(x.duration_secs) || 0)} on ${strip(x.provider)}, at most ${strip(x.hourly_cap_usd)}/h, ${strip(x.reserved_usd)} reserved`,
+      said,
+      mixed: '',
+    };
+  }
+  const c = e.claims;
+  if (e.method === 'UPDATE' && c) {
+    const said: [string, string][] = [];
+    if (c.commit) said.push(['Commit', strip(c.commit)]);
+    if (c.reason) said.push(['Why', strip(c.reason)]);
+    return { what: `Install wicket build ${strip(e.path).split('/').filter(Boolean)[1]?.slice(0, 12) ?? ''}…`, said, mixed: '' };
+  }
+  return { what: raw, said: [], mixed: e.reason ? strip(e.reason) : '' };
 }
 
 /** The escalation a permission request or tool call carries, if it is wicket's. Only the endpoint

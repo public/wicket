@@ -5,7 +5,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import type { PermissionRequest } from '../lib/types';
-import { decideBody, reasonLine, riskLabel } from '../lib/wicket';
+import { askParts, decideBody, riskLabel } from '../lib/wicket';
 import { signed } from '../lib/sign';
 
 const props = defineProps<{
@@ -16,6 +16,9 @@ const emit = defineEmits<{
   select: [optionId: string];
   cancel: [];
 }>();
+
+// wicket's terms, the agent's words and mixed text, kept apart (#731).
+const parts = computed(() => (props.request.escalation ? askParts(props.request.escalation) : null));
 
 // Once options only (#66): an "always" option would be a policy write.
 const options = computed(() => props.request.options.filter((o) => o.kind === 'allow_once' || o.kind === 'reject_once'));
@@ -45,9 +48,10 @@ async function choose(optionId: string, kind: string) {
   <div class="ask" :class="{ escalation: request.escalation }">
     <div class="label">{{ request.escalation ? 'Request waiting for you' : 'The agent asks (not enforced by wicket)' }}</div>
     <template v-if="request.escalation">
-      <div class="op">{{ request.escalation.method }} {{ request.escalation.host }}{{ request.escalation.path }}<template v-if="request.escalation.prefix">… (every path under it)</template></div>
+      <div class="op">{{ parts?.what }}</div>
       <div class="meta">{{ riskLabel(request.escalation.risk) }} · request {{ request.escalation.id }}</div>
-      <div v-if="request.escalation.reason" class="why">{{ reasonLine(request.escalation) }}</div>
+      <div v-for="[label, words] in parts?.said ?? []" :key="label" class="why">{{ label }} (the agent's words): “{{ words }}”</div>
+      <div v-if="parts?.mixed" class="why">The request's text, with the agent's words in it: “{{ parts.mixed }}”</div>
     </template>
     <div v-else class="op">{{ request.toolCall.title }}</div>
     <div class="buttons">

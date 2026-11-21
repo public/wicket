@@ -754,13 +754,20 @@ impl Bridge {
         for r in new {
             self.shown.insert(r.id.clone());
             let tc = format!("{RESERVED_ID}escalation:{}", r.id);
+            // The request's terms as fields (#731), as the console's cards have them: a capacity ask's
+            // lease, and what an agent claimed when it asked (an update's reason and commit). The page
+            // shows wicket's terms from these and the agent's words quoted as its, never the reason
+            // (which wicket wrote around them) as wicket's alone.
+            let lease = l.lease_for_request(&r.id).ok().flatten().map(|x| super::lease_view(&x));
+            let claims = l.request_claims(&r.id).ok().flatten();
             let esc = json!({ "id": r.id, "method": r.method, "host": r.host, "path": r.path, "risk": r.risk,
                               "reason": wicket_core::text::clip(&r.reason, 500), "prefix": r.scope_prefix, "status": "pending",
-                              "decide": "/api/decide/begin" });
+                              "decide": "/api/decide/begin", "lease": lease, "claims": claims });
             let title = format!("wicket request {}: {} {}{}", r.id, r.method, r.host, r.path);
             out.push(self.update(json!({
                 "sessionUpdate": "tool_call", "toolCallId": tc, "title": title, "kind": "fetch", "status": "pending",
-                "rawInput": { "method": r.method, "host": r.host, "path": r.path, "risk": r.risk, "reason": r.reason },
+                // Its reason is in the escalation, shown as the dialog splits it: not here, as raw input.
+                "rawInput": { "method": r.method, "host": r.host, "path": r.path, "risk": r.risk },
                 "_meta": { "wicket": { "escalation": esc } },
             })));
             let rpc = format!("wicket-{}", self.next_id);
