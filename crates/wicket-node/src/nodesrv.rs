@@ -198,6 +198,8 @@ struct BoxState {
     listeners: HashMap<String, tokio::task::JoinHandle<()>>,
     /// What a restarted `serve` adopts it from.
     record: BoxRecord,
+    /// Whether what it writes is counted from Docker's attach stream (#824): `record.out_written`.
+    counted: bool,
     /// The control connection that started or last resumed it: its stdio, events, asks and
     /// tunnels go there.
     owner: Option<u64>,
@@ -1352,7 +1354,8 @@ async fn adopt_previous(node: &Arc<Node>) {
                     Some(z) if z.name == rec.start.zone => match serve_box(node, &rec.start, &dir, z, None).await {
                         Ok(tasks) => {
                             say_err!("[node] {run}: adopted box {} from a previous serve", b.name);
-                            wire(node, None, rec, dir, tasks, ids());
+                            let written = node.docker.written_from_now(&b.name).await;
+                            wire(node, None, rec, dir, tasks, ids(), written);
                         }
                         Err(e) => {
                             say_err!("[node] {run}: could not adopt box {} ({e:#}); stopping it", b.name);
@@ -1390,7 +1393,7 @@ async fn adopt_previous(node: &Arc<Node>) {
 /// resuming control host gets it all and its exit.
 async fn wire_exited(node: &Arc<Node>, rec: BoxRecord, dir: PathBuf, code: i32) {
     let _ = code;
-    wire(node, None, rec, dir, vec![], ids());
+    wire(node, None, rec, dir, vec![], ids(), None);
 }
 
 /// `Msg::BoxCtl`: pause, unpause, list processes, or rewrite the hosts file of a run's box.
@@ -1671,7 +1674,7 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     let cap = bs.output_cap.max(64 << 10);
     // Detached, so the box outlives this `serve` (a restarted one adopts it, `adopt_previous`).
     let run_wall = (std::time::SystemTime::now(), Instant::now());
-    docker.start_detached(&spec, cap).await?;
+    let written = docker.start_detached(&spec, cap).await?;
     let run_end = (std::time::SystemTime::now(), Instant::now());
     if bs.timings {
         if let Ok(Some((created, started))) = docker.start_times(&name).await {
@@ -1689,11 +1692,12 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
         out_end: [0, 0],
         out_tail: [String::new(), String::new()],
         out_saved_ms: 0,
+        out_written: [0, 0],
     };
     rec.save(&dir)?;
     saved.end();
     let wired = t.span("wire");
-    wire(node, owner, rec, dir, tasks, spec.user.clone());
+    wire(node, owner, rec, dir, tasks, spec.user.clone(), written);
     wired.end();
     total.end();
     say_err!("[node] box {name} started ({})", ident.id);
@@ -1851,6 +1855,11 @@ struct BoxRecord {
     out_tail: [String; 2],
     #[serde(default)]
     out_saved_ms: i64,
+    /// What it has written to its stdout and stderr, as far as this node has counted (#824): from
+    /// its start, plus what it wrote after an adopting `serve` attached (what it wrote between the
+    /// two isn't counted).
+    #[serde(default)]
+    out_written: [u64; 2],
 }
 
 /// How many of a stream's last bytes a box's record keeps, to find its place in a replay.
@@ -1949,7 +1958,15 @@ impl StdinFeed {
 /// Connects a running box to this `serve`: its stdin (`docker attach`), its output from the start
 /// (`docker logs`, so a restarted `serve` replays it and the control host drops what it already has),
 /// its exit, and its timeout, counted from when it started.
-fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, tasks: Vec<tokio::task::JoinHandle<()>>, user: String) {
+fn wire(
+    node: &Arc<Node>,
+    owner: Option<u64>,
+    rec: BoxRecord,
+    dir: PathBuf,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    user: String,
+    written: Option<wicket_sandbox::Written>,
+) {
     let bs = &rec.start;
     let name = rec.name.clone();
     let mut tasks = tasks;
@@ -2003,9 +2020,11 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             memory_mib: bs.memory.parse::<u64>().map(|b| b >> 20).unwrap_or(0),
             listeners: HashMap::new(),
             owner,
+            counted: written.is_some() || rec.out_written != [0, 0],
             record: rec.clone(),
         },
     );
+
     // A box read before (adopted): Docker's logs since a little before the last save, lined up on
     // the last bytes read (rotation may have dropped their start).
     let since =
@@ -2020,6 +2039,20 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             tokio::spawn(read_output(node.clone(), bs.run.clone(), name.clone(), i, r, tail, bs.output_cap, bs.output_stop))
         })
         .collect();
+    // What it writes, counted as Docker lets it write (#824): with on_output_full: stop it is
+    // stopped once that passes the cap, whatever this node has read of it. Its exit waits for the
+    // count, as for the readers.
+    if let Some(w) = written {
+        readers.push(tokio::spawn(count_written(
+            node.clone(),
+            bs.run.clone(),
+            name.clone(),
+            w,
+            rec.out_written,
+            bs.output_cap,
+            bs.output_stop,
+        )));
+    }
     // The log reader lives as long as its readers.
     let (run, done) = (bs.run.clone(), logs.done);
     readers.push(tokio::spawn(async move {
@@ -2170,25 +2203,7 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
         n.send_run(&run, frame);
         if over {
             stopped = true;
-            let why =
-                format!("[wicket] the box's output passed its zone's limits.output ({cap} bytes): stopping it (on_output_full: stop)\n");
-            say_err!("[node] {run}: {}", why.trim());
-            let frame = {
-                let mut boxes = n.boxes.lock().expect("boxes");
-                boxes.get_mut(&run).map(|b| {
-                    let at = b.out[1].write(why.as_bytes());
-                    Frame::Data { stream: b.streams[2], offset: at, bytes: why.as_bytes().to_vec() }
-                })
-            };
-            if let Some(f) = frame {
-                n.send_run(&run, f);
-            }
-            n.stopped
-                .lock()
-                .expect("stopped")
-                .entry(run.clone())
-                .or_insert_with(|| format!("its output passed limits.output ({cap} bytes; on_output_full: stop)"));
-            let _ = n.docker.kill(&name).await;
+            stop_for_output(&n, &run, &name, cap).await;
         }
         if eof {
             ended = true;
@@ -2221,6 +2236,53 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
     // The tail as of the end of this read, for a `serve` that comes after.
     if let Some(b) = n.boxes.lock().expect("boxes").get_mut(&run) {
         save_output(b);
+    }
+}
+
+/// Stops a box whose output passed its zone's `limits.output` (on_output_full: stop), saying why on
+/// its stderr; once, whichever count passed it first (what it wrote, or what this node read).
+async fn stop_for_output(n: &Arc<Node>, run: &str, name: &str, cap: u64) {
+    let why = format!("its output passed limits.output ({cap} bytes; on_output_full: stop)");
+    {
+        let mut stopped = n.stopped.lock().expect("stopped");
+        if stopped.get(run).is_some_and(|w| *w == why) {
+            return;
+        }
+        stopped.entry(run.to_string()).or_insert_with(|| why.clone());
+    }
+    let say = format!("[wicket] the box's output passed its zone's limits.output ({cap} bytes): stopping it (on_output_full: stop)\n");
+    say_err!("[node] {run}: {}", say.trim());
+    let frame = {
+        let mut boxes = n.boxes.lock().expect("boxes");
+        boxes.get_mut(run).map(|b| {
+            let at = b.out[1].write(say.as_bytes());
+            Frame::Data { stream: b.streams[2], offset: at, bytes: say.as_bytes().to_vec() }
+        })
+    };
+    if let Some(f) = frame {
+        n.send_run(run, f);
+    }
+    let _ = n.docker.kill(name).await;
+}
+
+/// Keeps a box's count of what it has written (#824) in its record, `base` (counted before an
+/// adoption) plus `w`, until the count's stream ends; with `stop`, stops it once that passes `cap`.
+async fn count_written(n: Arc<Node>, run: String, name: String, mut w: wicket_sandbox::Written, base: [u64; 2], cap: u64, stop: bool) {
+    loop {
+        let now = *w.borrow_and_update();
+        let total = [base[0] + now[0], base[1] + now[1]];
+        let over = {
+            let mut boxes = n.boxes.lock().expect("boxes");
+            let Some(b) = boxes.get_mut(&run) else { return };
+            b.record.out_written = total;
+            stop && total[0] + total[1] > cap
+        };
+        if over {
+            stop_for_output(&n, &run, &name, cap).await;
+        }
+        if w.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -2372,17 +2434,21 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
         if let Some(f) = b.stdin.take() {
             f.close();
         }
-        (b.record.out_end, b.record.start.output_cap, b.record.start.tenant.clone())
+        let written = b.counted.then_some(b.record.out_written);
+        (b.record.out_end, written, b.record.start.output_cap, b.record.start.tenant.clone())
     });
-    // What the box wrote, against what its node keeps of it (#151): counted from what this node read,
-    // so what Docker rotated away unread isn't in it, and the drop is a lower bound.
-    if let Some(([o, e], cap, tenant)) = output {
-        let dropped = (o + e).saturating_sub(cap);
+    // What the box wrote, against what its node keeps of it (#151): what it wrote as Docker's attach
+    // stream counted it (#824; at least: an adopted box's count misses what it wrote before its
+    // `serve` attached), and what this node read, which misses what Docker rotated away unread. The
+    // drop is a lower bound, from the larger.
+    if let Some(([o, e], written, cap, tenant)) = output {
+        let w = written.map(|[wo, we]| wo + we);
+        let dropped = (o + e).max(w.unwrap_or(0)).saturating_sub(cap);
         let _ = n.audit.lock().expect("audit").audit(
             &wicket_core::TenantId(tenant),
             Some(&wicket_core::RunId(run.to_string())),
             "box.output",
-            &serde_json::json!({ "stdout_read": o, "stderr_read": e, "cap": cap, "dropped_from_host_at_least": dropped }),
+            &serde_json::json!({ "stdout_read": o, "stderr_read": e, "written_at_least": w, "cap": cap, "dropped_from_host_at_least": dropped }),
         );
         n.ship_audit();
     }
@@ -3018,6 +3084,75 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert_eq!(a.feed(b"yy\nyy\nz"), Some(b"yy\nz".to_vec()));
     }
 
+    /// #824: with on_output_full: stop, a box is stopped once what it *wrote* passes its cap, though
+    /// this node read none of it (a reader that fell behind while Docker rotated the rest away); an
+    /// adopted box's count adds what was counted before. The count is kept in its record.
+    #[tokio::test]
+    async fn a_box_is_stopped_on_what_it_wrote_not_on_what_was_read() {
+        let inst = Install::new("nodesrv-written");
+        let node = test_node(&inst);
+        let cap = 1 << 20;
+        let add = |run: &str| {
+            let mut rec = fake_record(run);
+            rec.start.output_cap = cap;
+            rec.start.output_stop = true;
+            node.boxes.lock().unwrap().insert(
+                run.into(),
+                BoxState {
+                    streams: [1, 2, 3],
+                    name: format!("wicket-{run}"),
+                    dir: inst.dir.join("runs").join(run),
+                    stdin: None,
+                    stdin_next: 0,
+                    out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
+                    exited: None,
+                    ended: false,
+                    tasks: vec![],
+                    user: String::new(),
+                    cpus: 0.0,
+                    memory_mib: 0,
+                    listeners: HashMap::new(),
+                    owner: None,
+                    record: rec,
+                    counted: true,
+                },
+            );
+        };
+        let written = |run: &str| node.boxes.lock().unwrap()[run].record.out_written;
+        let why = |run: &str| node.stopped.lock().unwrap().get(run).cloned();
+        let settle = || tokio::time::sleep(std::time::Duration::from_millis(50));
+        add("run_w");
+        let (tx, rx) = tokio::sync::watch::channel([0u64; 2]);
+        let task = tokio::spawn(count_written(node.clone(), "run_w".into(), "wicket-run_w".into(), rx, [0, 0], cap, true));
+        tx.send_replace([600 << 10, 100 << 10]);
+        settle().await;
+        assert_eq!(written("run_w"), [600 << 10, 100 << 10]);
+        assert_eq!(why("run_w"), None, "under its cap: running");
+        tx.send_replace([20_000_000, 100 << 10]);
+        settle().await;
+        assert_eq!(why("run_w").as_deref(), Some("its output passed limits.output (1048576 bytes; on_output_full: stop)"));
+        let said = String::from_utf8(node.boxes.lock().unwrap()["run_w"].out[1].since(0).1).unwrap();
+        assert!(said.contains("passed its zone's limits.output (1048576 bytes): stopping it (on_output_full: stop)"), "{said}");
+        assert_eq!(node.boxes.lock().unwrap()["run_w"].out[0].end(), 0, "though nothing was read");
+        // Said once, however much more it writes before it is gone.
+        tx.send_replace([30_000_000, 100 << 10]);
+        settle().await;
+        assert_eq!(String::from_utf8(node.boxes.lock().unwrap()["run_w"].out[1].since(0).1).unwrap().matches("stopping it").count(), 1);
+        drop(tx);
+        task.await.unwrap();
+        assert_eq!(written("run_w"), [30_000_000, 100 << 10]);
+        // Adopted: what was counted before the restart counts toward the cap too.
+        add("run_a");
+        let (tx, rx) = tokio::sync::watch::channel([0u64; 2]);
+        let task = tokio::spawn(count_written(node.clone(), "run_a".into(), "wicket-run_a".into(), rx, [900 << 10, 0], cap, true));
+        tx.send_replace([200 << 10, 0]);
+        settle().await;
+        assert_eq!(written("run_a"), [1100 << 10, 0]);
+        assert!(why("run_a").is_some(), "900 KiB before and 200 KiB after pass 1 MiB");
+        drop(tx);
+        task.await.unwrap();
+    }
+
     pub(super) fn fake_record(run: &str) -> BoxRecord {
         BoxRecord {
             start: BoxStart {
@@ -3065,6 +3200,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             out_end: [0, 0],
             out_tail: [String::new(), String::new()],
             out_saved_ms: 0,
+            out_written: [0, 0],
         }
     }
 
@@ -3359,6 +3495,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 listeners: HashMap::new(),
                 owner: Some(1),
                 record: fake_record("run_old"),
+                counted: false,
             },
         );
         node.admitted("run_old");
@@ -3413,6 +3550,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 listeners: HashMap::new(),
                 owner: Some(1),
                 record: rec,
+                counted: false,
             },
         );
         node.seen.starting("run_b", "z2", 2000);
@@ -3500,6 +3638,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 listeners: HashMap::new(),
                 owner: Some(2),
                 record: fake_record("run_a"),
+                counted: false,
             },
         );
         // A control host from before protocol versions, or three versions apart, is refused.
@@ -3580,6 +3719,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             listeners: HashMap::new(),
             owner: None,
             record: fake_record(RUN),
+            counted: false,
         };
         st.record.start.run = RUN.into();
         node.boxes.lock().unwrap().insert(RUN.into(), st);
@@ -3753,6 +3893,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                     listeners: HashMap::new(),
                     owner: Some(gen),
                     record: fake_record(run),
+                    counted: false,
                 },
             );
         }
@@ -4596,6 +4737,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             listeners: HashMap::new(),
             owner: None,
             record: rec,
+            counted: false,
         };
         node.boxes.lock().unwrap().insert(run.into(), st);
     }

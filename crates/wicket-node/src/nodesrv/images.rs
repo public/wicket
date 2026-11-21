@@ -443,6 +443,7 @@ sys.exit(2)
                 listeners: HashMap::new(),
                 owner: Some(1),
                 record: rec,
+                counted: false,
             },
         );
 

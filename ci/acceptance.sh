@@ -518,6 +518,11 @@ flood_drop() { w audit --tail 400 | grep "$flood" | grep box.output | grep -oE '
 wait_for 30 '[ -n "$(flood_drop)" ]' || true
 echo "   box.output: dropped_from_host_at_least $(flood_drop)"
 check "  and its audit records the bytes dropped from the host (at least)" '[ "$(flood_drop)" -ge 1000000 ]'
+# All it wrote, counted as Docker let it write (#824): 20,000,000 bytes, a newline, the 30,000 paced
+# lines of 94 bytes and the end marker's 15 (its stderr may add a few).
+flood_written() { w audit --tail 400 | grep "$flood" | grep box.output | grep -oE 'written_at_least[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | tail -1; }
+echo "   box.output: written_at_least $(flood_written)"
+check "  and what it wrote, every byte: written_at_least" '[ "$(flood_written)" -ge 22820016 ]'
 HOME=$HOMEW "$W" run "$(manifest flood-stop)" --image "$IMAGE_TAG" >"$work/flood-stop.log" 2>&1 || true
 flood_stop=$(run_id_of "$work/flood-stop.log")
 our_runs+=("$flood_stop")

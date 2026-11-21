@@ -281,6 +281,47 @@ pub struct ExitInfo {
     pub finished_at: Option<String>,
 }
 
+/// What a box has written to its stdout and stderr so far (#824), counted from Docker's attach
+/// stream: Docker doesn't let a box write past an attached reader, so nothing it wrote goes
+/// uncounted, unlike its logs, which rotate away what a lagging reader hasn't read. Changes as the
+/// box writes; ends (`changed` is an error) when the stream does.
+pub type Written = tokio::sync::watch::Receiver<[u64; 2]>;
+
+/// Counts the payload bytes of Docker's multiplexed stream (frames of an 8-byte header, the stream
+/// (1 stdout, 2 stderr) and a big-endian length, then that many bytes), however it is split.
+#[derive(Default)]
+pub struct FrameCounter {
+    head: [u8; 8],
+    have: usize,
+    left: u64,
+    stream: usize,
+}
+
+impl FrameCounter {
+    /// Adds what `data` carries to `counts`, by stream.
+    pub fn feed(&mut self, mut data: &[u8], counts: &mut [u64; 2]) {
+        while !data.is_empty() {
+            if self.left == 0 {
+                let k = (8 - self.have).min(data.len());
+                self.head[self.have..self.have + k].copy_from_slice(&data[..k]);
+                self.have += k;
+                data = &data[k..];
+                if self.have < 8 {
+                    return;
+                }
+                self.have = 0;
+                self.stream = if self.head[0] == 2 { 1 } else { 0 };
+                self.left = u32::from_be_bytes([self.head[4], self.head[5], self.head[6], self.head[7]]) as u64;
+                continue;
+            }
+            let k = self.left.min(data.len() as u64);
+            counts[self.stream] += k;
+            self.left -= k;
+            data = &data[k as usize..];
+        }
+    }
+}
+
 /// A box's stdout and stderr, followed ([`Docker::logs`]).
 pub struct Logs {
     pub stdout: tokio::io::DuplexStream,
@@ -671,7 +712,11 @@ impl Docker {
     /// Starts the box detached (`docker run -d`, kept after it exits so its exit code can be read):
     /// a supervisor that restarts reads its output from the start ([`Docker::logs`]). An interactive
     /// box's stdin is the node's to relay (its `sock/stdin.sock`), never Docker's.
-    pub async fn start_detached(&self, spec: &SandboxSpec, log_cap: u64) -> Result<()> {
+    ///
+    /// Through the Engine API, what the box writes is counted from before it starts ([`Written`]):
+    /// its attach stream is opened between create and start. None through the CLI, or if Docker
+    /// refused the attach (the box starts all the same).
+    pub async fn start_detached(&self, spec: &SandboxSpec, log_cap: u64) -> Result<Option<Written>> {
         let _t = self.span("run");
         if let Some(e) = self.engine().await {
             // `docker run -d` is these two calls (the CLI makes the same ones, after its own start).
@@ -682,11 +727,12 @@ impl Docker {
             }
             let id: serde_json::Value = serde_json::from_slice(&b).context("docker create's answer")?;
             let id = id["Id"].as_str().context("docker create: no Id")?;
+            let written = attach_written(e, id).await.ok();
             let (st, b) = e.call(Method::POST, &format!("/containers/{}/start", engine::enc(id, false)), None).await?;
             if !st.is_success() && st != StatusCode::NOT_MODIFIED {
                 bail!("docker run failed: {}", engine::message(&b));
             }
-            return Ok(());
+            return Ok(written);
         }
         let half = log_half(log_cap);
         let args: Vec<String> = self
@@ -709,7 +755,14 @@ impl Docker {
         if !out.status.success() {
             bail!("docker run failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// What a running box writes from now on ([`Written`]): for a box this node adopted, whose
+    /// count from its start went with the `serve` that started it. None through the CLI, or if
+    /// Docker refused the attach.
+    pub async fn written_from_now(&self, name: &str) -> Option<Written> {
+        attach_written(self.engine().await?, name).await.ok()
     }
 
     /// A box's stdout and stderr as Docker still has them (from its start, unless rotated; or since
@@ -1298,6 +1351,35 @@ async fn logs_api(e: &engine::Engine, name: &str, since: Option<&str>, w: &mut [
     Ok(())
 }
 
+/// Attaches to a box's stdout and stderr (no stdin, no replay of its logs) and counts what it writes
+/// ([`Written`]), by a task of its own, until the stream ends. Docker has the attach in place once
+/// it answers, so a box started after this returns has every byte counted.
+async fn attach_written(e: &engine::Engine, id: &str) -> Result<Written> {
+    use http_body_util::BodyExt;
+    let resp = e.send(Method::POST, &format!("/containers/{}/attach?stream=1&stdout=1&stderr=1", engine::enc(id, false)), None).await?;
+    if !resp.status().is_success() {
+        let b = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+        bail!("docker attach failed: {}", engine::message(&b));
+    }
+    let raw = resp.headers().get(hyper::header::CONTENT_TYPE).is_some_and(|c| c.as_bytes() == b"application/vnd.docker.raw-stream");
+    let (tx, rx) = tokio::sync::watch::channel([0u64; 2]);
+    let mut body = resp.into_body();
+    tokio::spawn(async move {
+        let mut c = FrameCounter::default();
+        let mut counts = [0u64; 2];
+        while let Some(Ok(f)) = body.frame().await {
+            let Ok(d) = f.into_data() else { continue };
+            if raw {
+                counts[0] += d.len() as u64;
+            } else {
+                c.feed(&d, &mut counts);
+            }
+            tx.send_replace(counts);
+        }
+    });
+    Ok(rx)
+}
+
 /// Follows the image events through the Engine API until they end: for how long, if they were
 /// followed at all.
 async fn follow_events_api(e: &engine::Engine, since: u64, cache: &ImageCache) -> Option<std::time::Duration> {
@@ -1779,6 +1861,66 @@ mod tests {
         assert!(e.starts_with("docker run failed: Conflict."), "{e}");
         let e = fake.docker().wait("wicket-x").await.unwrap_err().to_string();
         assert!(e.contains("already in use"), "{e}");
+    }
+
+    /// #824: Docker's multiplexed stream counted by stream, however its frames are split.
+    #[test]
+    fn frames_are_counted_however_they_are_split() {
+        let frame = |stream: u8, n: usize| {
+            let mut f = vec![stream, 0, 0, 0];
+            f.extend_from_slice(&(n as u32).to_be_bytes());
+            f.extend(std::iter::repeat_n(b'x', n));
+            f
+        };
+        let mut all = frame(1, 70_000);
+        all.extend(frame(2, 5));
+        all.extend(frame(1, 0));
+        all.extend(frame(1, 3));
+        for size in [1, 2, 7, 8, 9, 4096, all.len()] {
+            let (mut c, mut counts) = (FrameCounter::default(), [0u64; 2]);
+            for piece in all.chunks(size) {
+                c.feed(piece, &mut counts);
+            }
+            assert_eq!(counts, [70_003, 5], "in pieces of {size}");
+        }
+    }
+
+    /// #824: through the Engine API a box's attach stream is opened between its create and its
+    /// start, so all it writes is counted; a refused attach doesn't stop it starting.
+    #[tokio::test]
+    async fn what_a_box_writes_is_counted_from_before_it_starts() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let rx = std::sync::Mutex::new(Some(rx));
+        let fake = FakeEngine::start("attach", move |m, p, _| match (m, p) {
+            ("POST", "/containers/create?name=wicket-x") => Reply::Json(201, serde_json::json!({"Id": "abc", "Warnings": []})),
+            ("POST", "/containers/abc/attach?stream=1&stdout=1&stderr=1") => match rx.lock().unwrap().take() {
+                Some(rx) => Reply::Stream("application/vnd.docker.multiplexed-stream", rx),
+                None => Reply::Json(500, serde_json::json!({"message": "attached twice"})),
+            },
+            ("POST", "/containers/abc/start") => Reply::Status(204),
+            _ => Reply::Json(500, serde_json::json!({"message": "unexpected"})),
+        });
+        let mut w = fake.docker().start_detached(&spec(), 1 << 20).await.unwrap().expect("counted");
+        let seen: Vec<String> = fake.seen().into_iter().map(|(_, p)| p).collect();
+        let at = |p: &str| seen.iter().position(|s| s.starts_with(p)).unwrap_or_else(|| panic!("{p} not in {seen:?}"));
+        assert!(at("/containers/abc/attach") < at("/containers/abc/start"), "attached before it starts: {seen:?}");
+        for (stream, n) in [(1u8, 300_000usize), (2, 40), (1, 700_000)] {
+            let mut f = vec![stream, 0, 0, 0];
+            f.extend_from_slice(&(n as u32).to_be_bytes());
+            f.extend(std::iter::repeat_n(b'y', n));
+            tx.send(f).unwrap();
+        }
+        drop(tx);
+        while w.changed().await.is_ok() {}
+        assert_eq!(*w.borrow(), [1_000_000, 40]);
+        // Refused: the box starts, uncounted.
+        let fake = FakeEngine::start("attach-refused", |m, p, _| match (m, p) {
+            ("POST", "/containers/create?name=wicket-x") => Reply::Json(201, serde_json::json!({"Id": "abc", "Warnings": []})),
+            ("POST", "/containers/abc/start") => Reply::Status(204),
+            _ => Reply::Json(500, serde_json::json!({"message": "no attach here"})),
+        });
+        assert!(fake.docker().start_detached(&spec(), 1 << 20).await.unwrap().is_none());
+        assert!(fake.seen().contains(&("POST".into(), "/containers/abc/start".into())));
     }
 
     /// #676: a kill Docker refused is an error, so it isn't taken for a stopped box; one of a box
