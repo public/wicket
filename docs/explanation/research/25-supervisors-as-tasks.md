@@ -605,6 +605,16 @@ rolled back by running the previous build.
    refuses it with exit 75 (try again); a lease thread that ends without losing the shard ends the
    host (exit 1). It supervises no runs yet, and nothing starts one yet: wicketd does that next.
 
+   wicketd's host manager (`supervise.hosts: N` in `wicket.yaml`; `supervise::Manager`, with
+   `ProcIo` for the real processes): every 5 s it reaps its hosts by pid, asks every shard's socket
+   for a heartbeat (so after a wicketd restart, or a re-exec that lost its child handles, it adopts
+   the hosts that answer, and the one-shard case has a heartbeat to judge by), runs `Fencer`, starts
+   hosts backed off per shard (1 s doubling to 60 s), and fences in the order of §3.1: the epoch in
+   the ledger, then a SIGKILL only to the pid whose label matches the holder, then a fresh host. Not
+   yet: per-host memory cgroups (`Delegate=yes` needs the unit from `deploy/install.sh`), and
+   rebalancing when nodes are added (a node enrolled after a host started joins its shard at that
+   host's next start).
+
    **Conditions on the PR that first writes a host label** (`host:<shard>:<epoch>` in `runs.owner`;
    #781 review):
    - **The reconciler reads `runs.host` before `runs.owner`, in that same PR.** This build reads a
