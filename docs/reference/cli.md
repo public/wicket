@@ -9,11 +9,13 @@ only: [the daemon](daemon.md#who-may-run-what) lists which commands need `sudo`.
 numbers with units (`90s`, `10m`, `1h`, `1h 30m`; the units in [the manifest
 reference](manifest.md)).
 
+[Console and CLI parity](parity.md) lists where each operator action is: the console, the CLI, or only the host, and why.
+
 ## Output for scripts
 
 The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
-`agents`, `links`, `grant list`, `standing list`, `names list`, `node list`, `lease list`, `service list`, `audit`,
-`message inbox`, `message receipts` and `message principals`, and so does `names show` (one name: an object). With it, stdout holds one JSON document
+`agents`, `links`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `lease list`, `service list`, `audit`,
+`message inbox`, `message receipts` and `message principals`, and so do `names show` (one name: an object), `authority` (one run's) and `audit explain` (one record's). With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -43,6 +45,11 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | a name's `connections`, each | `seq`, `ts`, `node`, `run`, `kind` (`name.conn`, `name.conn.refused`), `record` (the node's record, its label left out) |
 | `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts` (what it was enrolled or renewed with), `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null; the CA's also its `hosts`, which a runtime widening may take past the enrolled ones), `ca_policy` (`mode`: `fixed`, `auto` or `allowed`, with its `allowed` hosts), `ca_wants` (what live runs want of its CA: `host`, `run`, `why`, `at`), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
 | `wicket node ca --json` | `name`, `status`, `tenant`, `ca` (the active CA's `serial`, `issued_at`, `not_after`, `expired` and `hosts`, or null), `enrolled_hosts`, `policy` (as `ca_policy`), `wants` (each `host`, `run`, `why`, `at`, `covered` and `state`: `covered`, `at the next renewal`, `refused by the node's CA policy` or `over the cap`), `next_renewal` (the `hosts` it signs and those `dropped` over the cap), `widenings` (the last 20 `node.ca_widened`: `seq`, `at`, `ca_serial`, `added`, `removed`, `wanted_by`) |
+| `wicket capacity list --json` | `id`, `state` (`live`, `expired`, `revoked`), `principal`, `terms`, `expires_at`, `decided_by`, `created_at`, `used` and `left` (what its uses take now, and what they leave) |
+| a capacity grant's `terms` | `plans` and `regions` (those it covers), `hourly_micros` and `hourly_usd` (the most its nodes cost an hour together), `daily_micros` and `daily_usd` (a day), `nodes` (at once) |
+| a capacity grant's `used` and `left` | `nodes`, `hourly_usd`, `daily_usd` |
+| `wicket authority --json` | `run`, `status`, `node`, `revoked` (its `at`, `by` and `reason`, or null), `policy` (the org policy `version` it was minted under, the `installed` one, and whether that is `current`), `feed` (its node feed's `epoch` and `version`, or null: not read), `deadline` (`until_ms` and `stopped`, or null), `holdings` (what its node holds for it: `secrets` by name, its budget `slice` and `updated_ms`; or null), `token` (`held`, and `why` when it isn't; when it is, `box_path`, `epoch`, `zone`, `reach`, `forbid`, `loads`, `issued_by`, `issuer_until_ms`, `blocks` and `grants` decoded, and `zone_cedar`) |
+| `wicket audit explain --json` | `seq`, `run`, `policy` (the version the run was minted under), `recorded` (as decided: `at`, `outcome`, `detail`, `risk`, `method`, `host`, `path`, `decided_on`), `against_token_now` (`available`, then `decision`, `why` and `zone_says`, or `why` not) |
 | `wicket lease list --json` | `id`, `status` (`pending`, `approved`, `active`, `ended`, `denied`, `withdrawn`, `failed`), `run` (the run that holds it), `provider`, `request` (the request a person decides; null: none yet), `node` (the enrolled node's name; null: none yet), `node_id` (the provider's id for it), `hourly_cap_micro_usd`, `reserved_micro_usd`, `billed_micro_usd` (null: not ended), `duration_secs`, `created_at`, `not_after` (null: no node yet), `ended_at`, `detail` |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
 | `wicket message inbox --json` | `message_id`, `kind`, `from` (the sender's principal id, as its envelope verified), `agent`, `zone` and `run` (an agent sender's; null for an operator), `acting_for` (the chain the sender acts for), `reply_to`, `priority` (`now`, `next`, `later`), `in_reply_to`, `sent_at`, `read_at` (null: unread until now), `body` (the sender's data) |
@@ -98,6 +105,11 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket grant list`](#wicket-grant-list)
   - [`wicket grant revoke`](#wicket-grant-revoke)
   - [`wicket grant renew`](#wicket-grant-renew)
+- [`wicket capacity`](#wicket-capacity)
+  - [`wicket capacity list`](#wicket-capacity-list)
+  - [`wicket capacity grant`](#wicket-capacity-grant)
+  - [`wicket capacity renew`](#wicket-capacity-renew)
+  - [`wicket capacity revoke`](#wicket-capacity-revoke)
 - [`wicket standing`](#wicket-standing)
   - [`wicket standing list`](#wicket-standing-list)
   - [`wicket standing show`](#wicket-standing-show)
@@ -112,7 +124,9 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket names deny`](#wicket-names-deny)
   - [`wicket names renew`](#wicket-names-renew)
   - [`wicket names revoke`](#wicket-names-revoke)
+- [`wicket authority`](#wicket-authority)
 - [`wicket audit`](#wicket-audit)
+  - [`wicket audit explain`](#wicket-audit-explain)
   - [`wicket audit compact`](#wicket-audit-compact)
   - [`wicket audit export`](#wicket-audit-export)
 - [`wicket node`](#wicket-node)
@@ -227,8 +241,10 @@ Approvals and grants:
   approve    Approve a pending request. The grant is never wider than the request
   deny       Deny a pending request
   grant      Grants made by approvals
+  capacity   Capacity grants: what a principal may lease without asking
   standing   Standing reach: a reach rule an agent asked for once, approved once for its later runs
   names      Names for boxes: internal names, and the public names a human approves
+  authority  A run's authority now: its token as its node's feed holds it, and its grants
   audit      Show or verify the hash-chained audit log, or export it to the configured sinks
 
 Nodes and placement:
@@ -890,6 +906,96 @@ Options:
   -h, --help       Print help
 ```
 
+## `wicket capacity`
+
+```text
+Capacity grants: what a principal may lease without asking.
+
+Standing capacity grants (#256): a principal may lease nodes within a grant's terms (how many at once, money an hour and a day, plans and regions) without asking, until it lapses. The console's Capacity card, from the host (#713).
+
+Usage: wicket capacity <COMMAND>
+
+Commands:
+  list    Capacity grants, newest first, with what their uses take and leave. Only live ones unless --all
+  grant   Issue a capacity grant: the principal may lease nodes within these terms without asking, until it lapses (at most 24h; renew it for longer). Audited as a decision, like the console's
+  renew   Renew a live capacity grant: it lasts --ttl from now (at most 24h)
+  revoke  Revoke a capacity grant: nothing more is approved under it. Nodes already made under it keep their own leases
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `wicket capacity list`
+
+```text
+Capacity grants, newest first, with what their uses take and leave. Only live ones unless --all
+
+Usage: wicket capacity list [OPTIONS]
+
+Options:
+      --all   Also revoked and expired grants
+      --json  Print JSON (docs/reference/cli.md, "Output for scripts"), as the console's Capacity card has them
+  -h, --help  Print help
+```
+
+### `wicket capacity grant`
+
+```text
+Issue a capacity grant: the principal may lease nodes within these terms without asking, until it lapses (at most 24h; renew it for longer). Audited as a decision, like the console's
+
+Usage: wicket capacity grant [OPTIONS] --nodes <NODES> --max-hourly-usd <MAX_HOURLY_USD> --max-daily-usd <MAX_DAILY_USD> --plans <PLANS> --regions <REGIONS> <PRINCIPAL>
+
+Arguments:
+  <PRINCIPAL>  Who may use it: an identity (`spiffe://…`), or an operator as `unix/<user>` or `passkey/<name>`
+
+Options:
+      --nodes <NODES>
+          How many nodes it covers at once
+      --max-hourly-usd <MAX_HOURLY_USD>
+          The most its nodes may cost an hour together, in dollars (e.g. 0.05)
+      --max-daily-usd <MAX_DAILY_USD>
+          The most its nodes may cost a day together, in dollars
+      --plans <PLANS>
+          The provider plans it covers (comma-separated, e.g. vc2-1c-2gb)
+      --regions <REGIONS>
+          The regions it covers (comma-separated, e.g. lhr)
+      --ttl <TTL>
+          How long it lasts [default: 8h]
+  -h, --help
+          Print help
+```
+
+### `wicket capacity renew`
+
+```text
+Renew a live capacity grant: it lasts --ttl from now (at most 24h)
+
+Usage: wicket capacity renew [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --ttl <TTL>  [default: 8h]
+  -h, --help       Print help
+```
+
+### `wicket capacity revoke`
+
+```text
+Revoke a capacity grant: nothing more is approved under it. Nodes already made under it keep their own leases
+
+Usage: wicket capacity revoke <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+  -h, --help  Print help
+```
+
 ## `wicket standing`
 
 ```text
@@ -1112,6 +1218,27 @@ Options:
   -h, --help  Print help
 ```
 
+## `wicket authority`
+
+```text
+A run's authority now: its token as its node's feed holds it, and its grants.
+
+A run's authority (#173), as the console's view of it (#713): its status, node and org policy version, its deadline and what its node holds for it, and its token as the node's feed holds it now: what its zone may reach and never reach, each block decoded (zone, grant or spawn; who signed it, and whether it is revoked) and each grant with who approved it. No token, signature, secret value or key is printed.
+
+Usage: wicket authority [OPTIONS] <RUN>
+
+Arguments:
+  <RUN>
+          
+
+Options:
+      --json
+          
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ## `wicket audit`
 
 ```text
@@ -1120,6 +1247,7 @@ Show or verify the hash-chained audit log, or export it to the configured sinks
 Usage: wicket audit [OPTIONS] [COMMAND]
 
 Commands:
+  explain  Explain an activity record's decision on a request (by its seq, as `wicket audit` lists it): what was recorded when it was decided, and what the run's token as its node's feed holds it now decides, with why. The console's "explain" (#173, #713). Changes nothing
   compact  Switch the ledger to giving pruned audit space back (`auto_vacuum = incremental`), with one VACUUM (#582). Run it as the wicket user with wicketd, the console and the reconciler stopped: the whole file is rewritten under an exclusive lock (about a minute per 2.5 GB), and it needs as much free space again beside the ledger. Ledgers made by this build don't need it
   export   Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which feed the sinks too; each sink is fed by one process at a time. The only process that writes to a `path: "-"` (stdout) sink
   help     Print this message or the help of the given subcommand(s)
@@ -1131,6 +1259,21 @@ Options:
       --issuer-jwk <ISSUER_JWK>  The issuer public key (JWK, as `wicket identity issuer` prints it) checkpoints must be signed with. Default: this installation's issuer key
       --json                     The records as JSON instead of text
   -h, --help                     Print help
+```
+
+### `wicket audit explain`
+
+```text
+Explain an activity record's decision on a request (by its seq, as `wicket audit` lists it): what was recorded when it was decided, and what the run's token as its node's feed holds it now decides, with why. The console's "explain" (#173, #713). Changes nothing
+
+Usage: wicket audit explain [OPTIONS] <SEQ>
+
+Arguments:
+  <SEQ>  
+
+Options:
+      --json  
+  -h, --help  Print help
 ```
 
 ### `wicket audit compact`

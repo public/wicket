@@ -63,6 +63,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Agents](reference/agents.md): identity, children, messages, sessions, hibernation
 - [Nodes](reference/nodes.md): enrolment, `node serve`, placement, leases, the reconciler
 - [Console](reference/console.md): passkeys, signed actions, sessions, authority views, manifests, what it enforces on the internet
+- [Console and CLI parity](reference/parity.md): every operator action, its console path and its command, or why it is host-only
 - [Audit](reference/audit.md): the writer, export, checkpoints, record kinds
 
 ## Explanation

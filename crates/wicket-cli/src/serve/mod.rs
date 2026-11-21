@@ -61,8 +61,8 @@
 //! remains a break-glass path and is audited as such.
 
 mod acme;
-mod authority;
-mod capacity;
+pub(crate) mod authority;
+pub(crate) mod capacity;
 mod enrol;
 mod fence;
 pub(crate) mod limits;

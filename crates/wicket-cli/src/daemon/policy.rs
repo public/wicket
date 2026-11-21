@@ -12,8 +12,8 @@
 
 use super::Peer;
 use crate::{
-    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, RequestCmd, SecretCmd,
-    SelfCmd, ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
+    CapacityCmd, Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, RequestCmd,
+    SecretCmd, SelfCmd, ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -66,7 +66,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // Hibernating and waking steer an agent the way prompting its session does; waking reruns its
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
-        Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } => Forward(Read),
+        Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } | Cmd::Authority { .. } => Forward(Read),
         // A message reaches an agent as a session's prompt would (it can wake one); reading your
         // own inbox, receipts and who you may write to touches only your own messages (#252).
         Cmd::Message { cmd: crate::MessageCmd::Send { .. } } => Forward(Run),
@@ -87,6 +87,10 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Names { cmd: NamesCmd::List { .. } | NamesCmd::Show { .. } } => Forward(Read),
         Cmd::Names { cmd: NamesCmd::Approve { .. } | NamesCmd::Deny { .. } | NamesCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Names { cmd: NamesCmd::Revoke { .. } } => Forward(Revoke),
+        // Issuing or renewing a capacity grant lets a principal spend without asking: a decision.
+        Cmd::Capacity { cmd: CapacityCmd::List { .. } } => Forward(Read),
+        Cmd::Capacity { cmd: CapacityCmd::Grant { .. } | CapacityCmd::Renew { .. } } => Forward(Privileged),
+        Cmd::Capacity { cmd: CapacityCmd::Revoke { .. } } => Forward(Revoke),
         // A trigger wakes and messages agents later, as its owner (the caller): what `wake` and
         // `session` do now. Pausing and removing one only narrows.
         Cmd::Trigger { cmd } => match cmd {
@@ -384,6 +388,29 @@ mod tests {
             (&["standing", "deny", "s-1"], Route::Forward(Privileged)),
             (&["standing", "renew", "s-1"], Route::Forward(Privileged)),
             (&["standing", "revoke", "s-1"], Route::Forward(Revoke)),
+            (&["capacity", "list", "--all", "--json"], Route::Forward(Read)),
+            (
+                &[
+                    "capacity",
+                    "grant",
+                    "unix/alex",
+                    "--nodes",
+                    "1",
+                    "--max-hourly-usd",
+                    "0.05",
+                    "--max-daily-usd",
+                    "1",
+                    "--plans",
+                    "vc2-1c-2gb",
+                    "--regions",
+                    "lhr",
+                ],
+                Route::Forward(Privileged),
+            ),
+            (&["capacity", "renew", "g-1", "--ttl", "1h"], Route::Forward(Privileged)),
+            (&["capacity", "revoke", "g-1"], Route::Forward(Revoke)),
+            (&["authority", "r1", "--json"], Route::Forward(Read)),
+            (&["audit", "explain", "12"], Route::Forward(Read)),
             (&["trigger", "list"], Route::Forward(Read)),
             (&["trigger", "show", "t-1"], Route::Forward(Read)),
             (&["trigger", "fire", "t-1", "--dry-run"], Route::Forward(Read)),
