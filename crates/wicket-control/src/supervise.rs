@@ -139,8 +139,9 @@ impl Lease {
     }
 }
 
-/// A host process wicketd started, as it knows it: whose shard, the holder label it took the shard
-/// as, its last heartbeat with its runtime moving, and whether wicketd has reaped it.
+/// A host process as wicketd knows it (one it started, or one found answering on its shard's socket
+/// after wicketd restarted): the holder label it took the shard as, its last heartbeat with its
+/// runtime moving, and whether it has exited.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proc {
     pub owner: String,
@@ -455,6 +456,199 @@ impl Host {
     }
 }
 
+// ---- wicketd's side: starting, heartbeating and fencing hosts (migration step 1, item 2) ----
+
+/// What the manager does to host processes, so its rules can be tested without them.
+pub trait HostIo {
+    /// Starts a host for `shard` with `nodes`; its pid.
+    fn spawn(&mut self, shard: &str, nodes: &[String]) -> anyhow::Result<u32>;
+    /// Reaps `pid` if it has exited (it is wicketd's child), or says whether it has gone (it isn't).
+    fn gone(&mut self, pid: u32) -> bool;
+    /// Shard `shard`'s heartbeat, if a host answers on its socket.
+    fn heartbeat(&mut self, shard: &str) -> Option<Heartbeat>;
+    /// SIGKILLs the process an owner label names, only if that process is still the one the label
+    /// names (its start time matches).
+    fn kill(&mut self, owner: &str);
+    /// Whether the process an owner label names runs (`wicket_home::owner::owner_alive`).
+    fn alive(&self, owner: &str) -> Option<bool>;
+}
+
+/// A pid from an owner label (`machine:pid:start`).
+fn pid_of(owner: &str) -> Option<u32> {
+    owner.split(':').nth(1)?.parse().ok()
+}
+
+/// The longest wicketd waits before starting a host for a shard again.
+pub const START_BACKOFF_MAX_SECS: i64 = 60;
+
+/// wicketd's host manager: one [`Manager::tick`] every [`RENEW_SECS`]. It keeps what it knows of
+/// each shard's host process (started by it, or found answering on the shard's socket after
+/// wicketd restarted), asks [`Fencer`] what to do, and does it: start (backed off per shard), or
+/// fence (the ledger's epoch first, the kill only once that worked, then a fresh start).
+pub struct Manager {
+    pub shards: Vec<String>,
+    procs: BTreeMap<String, Proc>,
+    fencer: Fencer,
+    backoff: BTreeMap<String, (i64, i64)>,
+}
+
+/// What one tick did, for wicketd's log and the tests.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tick {
+    pub started: Vec<String>,
+    pub fenced: Vec<String>,
+    pub watched: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+impl Manager {
+    /// A manager of `hosts` shards (`0` to `hosts - 1`).
+    pub fn new(hosts: usize) -> Manager {
+        Manager {
+            shards: (0..hosts).map(shard_name).collect(),
+            procs: BTreeMap::new(),
+            fencer: Fencer::default(),
+            backoff: BTreeMap::new(),
+        }
+    }
+
+    /// One pass at `now`: learn each shard's process, decide, act.
+    pub fn tick(&mut self, l: &Ledger, io: &mut dyn HostIo, now: i64) -> Tick {
+        let mut out = Tick::default();
+        let hosts = match l.supervisor_hosts() {
+            Ok(h) => h,
+            Err(e) => {
+                // A ledger that can't be read decides nothing: no host is started or fenced on it.
+                out.errors.push(format!("reading the supervisor hosts: {e}"));
+                return out;
+            }
+        };
+        for s in self.shards.clone() {
+            if let Some(p) = self.procs.get_mut(&s) {
+                if !p.exited && pid_of(&p.owner).is_some_and(|pid| io.gone(pid)) {
+                    p.exited = true;
+                }
+            }
+            if let Some(hb) = io.heartbeat(&s).filter(|hb| hb.shard == s) {
+                let p = self.procs.entry(s.clone()).or_insert(Proc { owner: hb.owner.clone(), ok_at: 0, exited: false });
+                if p.owner != hb.owner {
+                    *p = Proc { owner: hb.owner.clone(), ok_at: 0, exited: false };
+                }
+                if !hb.stuck {
+                    p.ok_at = now;
+                }
+            }
+        }
+        let nodes = shard_nodes_now(l, self.shards.len());
+        let actions = {
+            let io: &dyn HostIo = io;
+            self.fencer.decide(&self.shards, &hosts, &self.procs, &|o: &str| io.alive(o), now)
+        };
+        for a in actions {
+            match a {
+                Action::Watch(s) => out.watched.push(s),
+                Action::Fence { shard, holder, gone } => match l.fence_shard(&shard, &holder, gone, now) {
+                    Ok(Some(_)) => {
+                        if !gone {
+                            io.kill(&holder);
+                        }
+                        self.procs.remove(&shard);
+                        out.fenced.push(shard);
+                    }
+                    Ok(None) => {}
+                    Err(e) => out.errors.push(format!("fencing shard {shard}: {e}")),
+                },
+                Action::Start(shard) => {
+                    let (next_at, wait) = self.backoff.get(&shard).copied().unwrap_or((0, 0));
+                    if now < next_at {
+                        continue;
+                    }
+                    let i: usize = shard.parse().unwrap_or(0);
+                    match io.spawn(&shard, nodes.get(i).map(Vec::as_slice).unwrap_or(&[])) {
+                        Ok(_) => {
+                            // A host that keeps dying waits longer each time; one that stays up
+                            // for the longest wait resets it (`settle`).
+                            let wait = (wait * 2).clamp(1, START_BACKOFF_MAX_SECS);
+                            self.backoff.insert(shard.clone(), (now + wait, wait));
+                            self.procs.remove(&shard);
+                            out.started.push(shard);
+                        }
+                        Err(e) => out.errors.push(format!("starting shard {shard}'s host: {e}")),
+                    }
+                }
+            }
+        }
+        // A shard whose host has been heartbeating for the longest wait starts from 1 s again.
+        for (s, p) in &self.procs {
+            if !p.exited && p.ok_at > 0 {
+                if let Some((next_at, _)) = self.backoff.get(s).copied() {
+                    if now >= next_at + START_BACKOFF_MAX_SECS {
+                        self.backoff.remove(s);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The nodes of each of `hosts` shards now: the local node and every enrolled node ([`assign`]).
+fn shard_nodes_now(l: &Ledger, hosts: usize) -> Vec<Vec<String>> {
+    let enrolled = l.nodes().map(|n| n.into_iter().map(|n| n.name).collect::<Vec<_>>()).unwrap_or_default();
+    assign(std::iter::once(crate::localnode::NAME).chain(enrolled.iter().map(String::as_str)), hosts)
+}
+
+/// The real [`HostIo`]: `exe supervise` children, their sockets under `data_dir`, and signals.
+pub struct ProcIo {
+    pub exe: std::path::PathBuf,
+    pub data_dir: std::path::PathBuf,
+    /// Extra environment for the children (tests point `WICKET_HOME` at their own directory).
+    pub env: Vec<(String, String)>,
+}
+
+impl HostIo for ProcIo {
+    fn spawn(&mut self, shard: &str, nodes: &[String]) -> anyhow::Result<u32> {
+        let mut c = std::process::Command::new(&self.exe);
+        c.arg("supervise").arg("--shard").arg(shard);
+        for n in nodes {
+            c.arg("--node").arg(n);
+        }
+        c.envs(self.env.iter().map(|(k, v)| (k, v))).stdin(std::process::Stdio::null());
+        let child = c.spawn()?;
+        // Reaped by pid in `gone`, not through the handle: after a re-exec wicketd has no handles.
+        let pid = child.id();
+        std::mem::forget(child);
+        Ok(pid)
+    }
+
+    fn gone(&mut self, pid: u32) -> bool {
+        let mut status = 0;
+        // SAFETY: a plain syscall on a pid; WNOHANG never blocks.
+        match unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) } {
+            0 => false,
+            p if p == pid as i32 => true,
+            // Not this process's child (it was started before a re-exec, or by someone else).
+            _ => !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        }
+    }
+
+    fn heartbeat(&mut self, shard: &str) -> Option<Heartbeat> {
+        heartbeat(&heartbeat_socket(&self.data_dir, shard), std::time::Duration::from_secs(2)).ok()
+    }
+
+    fn kill(&mut self, owner: &str) {
+        let Some(pid) = pid_of(owner) else { return };
+        if wicket_home::owner::owner_label_of(pid).as_deref() == Some(owner) {
+            // SAFETY: a plain syscall, to the process the label names (checked just above).
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
+
+    fn alive(&self, owner: &str) -> Option<bool> {
+        wicket_home::owner::owner_alive(owner)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,5 +941,154 @@ mod tests {
         assert_eq!(l.supervisor_host("0").unwrap().unwrap().lease_until, lease_until, "never renewed without progress");
         assert!(!host.lost());
         host.finish(Ended::Lost).unwrap();
+    }
+
+    /// A fake of host processes: the test says which heartbeat each shard answers, which pids have
+    /// gone, and reads what was spawned and killed.
+    #[derive(Default)]
+    struct FakeIo {
+        next_pid: u32,
+        spawned: Vec<(String, Vec<String>, u32)>,
+        beats: BTreeMap<String, Heartbeat>,
+        gone: std::collections::BTreeSet<u32>,
+        killed: Vec<String>,
+        alive: BTreeMap<String, bool>,
+    }
+
+    impl HostIo for FakeIo {
+        fn spawn(&mut self, shard: &str, nodes: &[String]) -> anyhow::Result<u32> {
+            self.next_pid += 1;
+            self.spawned.push((shard.into(), nodes.to_vec(), self.next_pid));
+            Ok(self.next_pid)
+        }
+        fn gone(&mut self, pid: u32) -> bool {
+            self.gone.contains(&pid)
+        }
+        fn heartbeat(&mut self, shard: &str) -> Option<Heartbeat> {
+            self.beats.get(shard).cloned()
+        }
+        fn kill(&mut self, owner: &str) {
+            self.killed.push(owner.into());
+        }
+        fn alive(&self, owner: &str) -> Option<bool> {
+            self.alive.get(owner).copied()
+        }
+    }
+
+    /// What a started host does: takes its shard and answers its heartbeat.
+    fn host_takes(l: &Ledger, io: &mut FakeIo, shard: &str, pid: u32, now: i64) -> String {
+        let owner = format!("m:{pid}:1");
+        let t = l.take_shard(shard, &owner, &[], LEASE_SECS, now).unwrap();
+        io.beats.insert(shard.into(), Heartbeat { shard: shard.into(), owner: owner.clone(), epoch: t.epoch, progress: 1, stuck: false });
+        io.alive.insert(owner.clone(), true);
+        owner
+    }
+
+    #[test]
+    fn the_manager_starts_every_shard_with_its_nodes_then_leaves_healthy_hosts_alone() {
+        let l = ledger();
+        let mut io = FakeIo::default();
+        let mut m = Manager::new(2);
+        let t = m.tick(&l, &mut io, 100);
+        assert_eq!(t.started, ["0", "1"]);
+        assert!(io.spawned[0].1.iter().any(|n| n == crate::localnode::NAME), "the local node is shard 0's: {:?}", io.spawned);
+        host_takes(&l, &mut io, "0", 1, 100);
+        host_takes(&l, &mut io, "1", 2, 100);
+        for now in [105, 110, 115] {
+            for s in ["0", "1"] {
+                l.renew_shard_lease(s, &io.beats[s].owner.clone(), 1, LEASE_SECS, now).unwrap();
+            }
+            assert_eq!(m.tick(&l, &mut io, now), Tick::default(), "at {now}");
+        }
+        assert_eq!(io.spawned.len(), 2);
+    }
+
+    #[test]
+    fn after_wicketd_restarts_it_adopts_answering_hosts_instead_of_starting_more() {
+        let l = ledger();
+        let mut io = FakeIo::default();
+        host_takes(&l, &mut io, "0", 7, 100);
+        host_takes(&l, &mut io, "1", 8, 100);
+        let mut m = Manager::new(2);
+        assert_eq!(m.tick(&l, &mut io, 101), Tick::default());
+        assert!(io.spawned.is_empty());
+    }
+
+    #[test]
+    fn an_exited_host_is_fenced_without_a_kill_and_started_again_backed_off() {
+        let l = ledger();
+        let mut io = FakeIo::default();
+        let mut m = Manager::new(2);
+        m.tick(&l, &mut io, 100);
+        let owner = host_takes(&l, &mut io, "0", 1, 100);
+        host_takes(&l, &mut io, "1", 2, 100);
+        m.tick(&l, &mut io, 101);
+        // Host 0 dies: reaped, its socket silent.
+        io.gone.insert(1);
+        io.beats.remove("0");
+        io.alive.insert(owner, false);
+        let t = m.tick(&l, &mut io, 102);
+        assert_eq!(t.fenced, ["0"]);
+        assert!(io.killed.is_empty(), "a gone process isn't killed");
+        assert_eq!(l.supervisor_host("0").unwrap().unwrap().epoch, 2, "the fence raised the epoch");
+        // The fenced shard has no holder: started again (its first start was 2 s ago, past its 1 s).
+        assert_eq!(m.tick(&l, &mut io, 102).started, ["0"]);
+        // It dies at once, again and again: each start waits twice as long as the one before.
+        let mut starts = vec![102];
+        for now in 103..=120 {
+            let pid = io.next_pid;
+            io.gone.insert(pid);
+            if m.tick(&l, &mut io, now).started == ["0"] {
+                starts.push(now);
+            }
+        }
+        assert_eq!(starts, [102, 104, 108, 116], "backed off: 2, 4, 8 s");
+    }
+
+    #[test]
+    fn a_wedged_host_is_fenced_then_killed_even_when_it_is_the_only_one() {
+        for hosts in [1, 2] {
+            let l = ledger();
+            let mut io = FakeIo::default();
+            let mut m = Manager::new(hosts);
+            let owner = host_takes(&l, &mut io, "0", 1, 100);
+            if hosts == 2 {
+                host_takes(&l, &mut io, "1", 2, 100);
+            }
+            // Adopted at once (its heartbeat answers), then it wedges: stuck, and its lease lapses at 130.
+            m.tick(&l, &mut io, 101);
+            io.beats.get_mut("0").unwrap().stuck = true;
+            let mut fenced_at = None;
+            for now in (105..=200).step_by(5) {
+                if hosts == 2 {
+                    l.renew_shard_lease("1", "m:2:1", 1, LEASE_SECS, now).unwrap();
+                }
+                let t = m.tick(&l, &mut io, now);
+                if t.fenced == ["0"] {
+                    fenced_at = Some(now);
+                    break;
+                }
+            }
+            let at = fenced_at.unwrap_or_else(|| panic!("{hosts} host(s): never fenced"));
+            assert!(at >= 130 + STALL_WINDOW_SECS, "{hosts} host(s): fenced at {at}, before its lease had lapsed for the window");
+            assert_eq!(io.killed, [owner], "{hosts} host(s): killed after the fence");
+        }
+    }
+
+    #[test]
+    fn a_late_reap_of_an_old_host_doesnt_fence_its_successor() {
+        let l = ledger();
+        let mut io = FakeIo::default();
+        let mut m = Manager::new(1);
+        m.tick(&l, &mut io, 100);
+        host_takes(&l, &mut io, "0", 1, 100);
+        m.tick(&l, &mut io, 101);
+        // Another process took over (the old one fenced elsewhere and replaced); the old pid is
+        // reaped only now.
+        l.fence_shard("0", "m:1:1", true, 102).unwrap();
+        host_takes(&l, &mut io, "0", 9, 102);
+        io.gone.insert(1);
+        let t = m.tick(&l, &mut io, 103);
+        assert!(t.fenced.is_empty() && t.started.is_empty(), "{t:?}");
     }
 }

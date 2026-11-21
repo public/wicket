@@ -88,6 +88,16 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         let exe = d.exe.clone();
         std::thread::spawn(move || hand_over_runs(&exe, followed));
     }
+    // Supervisor hosts (#582 step 5), when the installation asks for them (`supervise.hosts`):
+    // started, heartbeated and fenced by this process alone, so two never race for a shard.
+    match wicket_agent::acp::load_supervise(&wicket_agent::acp::settings_path()) {
+        Ok(s) if s.hosts > 0 => {
+            let (exe, data) = (d.exe.clone(), d.data_dir.clone());
+            std::thread::Builder::new().name("supervisor-hosts".into()).spawn(move || manage_hosts(s.hosts, exe, data))?;
+        }
+        Ok(_) => {}
+        Err(e) => say_err!("wicketd: no supervisor hosts: {e}"),
+    }
     // `wicket self update` moves the daemon to the new build last: on SIGHUP it re-executes itself
     // at once, handing its running commands (long-lived runs among them) to the new image
     // ([`handoff`]). Only commands not yet started (admission, uploads: seconds) are waited for;
@@ -112,6 +122,38 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// wicketd's host manager (#582 step 5): a [`Manager`](wicket_control::supervise::Manager) tick
+/// every few seconds, on a ledger connection of its own, reopened when it fails. Runs for wicketd's
+/// life; after a re-exec the new image adopts the hosts that answer on their sockets.
+fn manage_hosts(hosts: usize, exe: PathBuf, data_dir: PathBuf) {
+    use wicket_control::supervise::{Manager, ProcIo, RENEW_SECS};
+    let mut m = Manager::new(hosts);
+    let mut io = ProcIo { exe, data_dir: data_dir.clone(), env: Vec::new() };
+    let mut ledger = None;
+    say_err!("wicketd: {hosts} supervisor host(s)");
+    loop {
+        if ledger.is_none() {
+            ledger = Ledger::open(&data_dir.join("ledger.db")).map_err(|e| say_err!("wicketd: supervisor hosts: the ledger: {e}")).ok();
+        }
+        if let Some(l) = &ledger {
+            let t = m.tick(l, &mut io, wicket_store::now());
+            for s in &t.started {
+                say_err!("wicketd: started shard {s}'s supervisor host");
+            }
+            for s in &t.fenced {
+                say_err!("wicketd: fenced shard {s}'s supervisor host (a higher epoch, then a fresh host)");
+            }
+            if !t.errors.is_empty() {
+                for e in &t.errors {
+                    say_err!("wicketd: supervisor hosts: {e}");
+                }
+                ledger = None;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(RENEW_SECS));
+    }
 }
 
 /// What wicketd does on SIGHUP before it re-executes: refuses new commands, waits for the ones

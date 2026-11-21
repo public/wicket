@@ -110,6 +110,29 @@ struct InstallationSettings {
     acp: ClaudeAdapterSettings,
     #[serde(default)]
     names: wicket_names::NamesConfig,
+    #[serde(default)]
+    supervise: SuperviseSettings,
+}
+
+/// `supervise:` (#582 step 5): whether wicketd runs supervisor hosts, and how many. Absent or
+/// `hosts: 0`: none, and runs are supervised by a process each, as before.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuperviseSettings {
+    #[serde(default)]
+    pub hosts: usize,
+}
+
+/// The most supervisor hosts `supervise.hosts` may ask for.
+pub const MAX_SUPERVISOR_HOSTS: usize = 16;
+
+/// The installation's `supervise:` settings from `p`, checked.
+pub fn load_supervise(p: &std::path::Path) -> Result<SuperviseSettings, String> {
+    let s = load_installation(p)?.supervise;
+    if s.hosts > MAX_SUPERVISOR_HOSTS {
+        return Err(format!("the installation settings {}: supervise.hosts is {}, more than {MAX_SUPERVISOR_HOSTS}", p.display(), s.hosts));
+    }
+    Ok(s)
 }
 
 /// The whole settings file at `p`. A missing or empty file means every default; a file that can't
@@ -851,6 +874,19 @@ mod tests {
         assert!(names("names:\n  pubic: {}\n").is_err(), "a misspelt key");
         let _ = std::fs::remove_file(&f);
         assert_eq!(load_names(&f).unwrap(), wicket_names::NamesConfig::default());
+        // supervise (#582 step 5): off unless asked for, bounded, and its keys checked.
+        let sup = |body: Option<&str>| {
+            let _ = std::fs::remove_file(&f);
+            if let Some(b) = body {
+                std::fs::write(&f, b).unwrap();
+            }
+            load_supervise(&f)
+        };
+        assert_eq!(sup(None).unwrap().hosts, 0);
+        assert_eq!(sup(Some("acp: {}\n")).unwrap().hosts, 0);
+        assert_eq!(sup(Some("supervise:\n  hosts: 2\n")).unwrap().hosts, 2);
+        assert!(sup(Some("supervise:\n  hosts: 17\n")).unwrap_err().contains("more than 16"));
+        assert!(sup(Some("supervise:\n  host: 2\n")).is_err(), "a misspelt key");
         let _ = std::fs::remove_dir_all(d);
     }
     use super::*;

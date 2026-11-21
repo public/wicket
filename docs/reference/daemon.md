@@ -88,6 +88,27 @@ revoke: { groups: [wicket-operators] }   # identity revoke, grant revoke, unlink
 | `wicket-reconcile` | `wicket reconcile --every 1m` | |
 | `wicket-state` | `wicket state replicate` | starts only once `/var/lib/wicket/state-store.yaml` exists |
 
+### Supervisor hosts
+
+With `supervise.hosts: N` in `/etc/wicket/wicket.yaml` ([configuration](configuration.md#wicketyaml)),
+wicketd runs N supervisor hosts (`wicket supervise`, [#582](https://github.com/public/wicket/issues/582)
+step 5) as its own children, so they live in its cgroup and under its unit's hardening. Each holds a
+shard of the nodes (the local node is in shard 0) under a 30 s lease in the ledger. Every 5 s wicketd:
+
+- asks each host for its heartbeat on `<data dir>/supervise/<shard>.sock`. The heartbeat never
+  touches the ledger, so a ledger stall doesn't silence it. After wicketd restarts, it adopts the
+  hosts that answer there instead of starting more;
+- starts a host for a shard that has none: never started, stopped cleanly, or fenced. A host that
+  keeps dying waits twice as long each time, up to 60 s;
+- fences a host whose process has exited, or whose heartbeat says its runtime is stuck (or has
+  stopped answering) once its lease has been lapsed for 15 s. The fence raises the shard's epoch in
+  the ledger first, so the old host can't renew or write. Only then is the old host SIGKILLed (by
+  the pid its label names, checked against its start time), and a fresh one started. A ledger stall
+  alone fences no one: the heartbeats go on answering.
+
+A host stopped with SIGTERM writes its clean-stop marker, and its shard is free at once. The hosts
+supervise no runs yet: runs are still a process each.
+
 ### Limits
 
 Every run has a supervisor process (`wicket run`, `attach` or `wake`). It lives in the cgroup of
