@@ -108,7 +108,7 @@ multihost() {
   log "multi-host ($nodes): a lease, a box on the node, the node e2e flow, then revoke"
   if [ "$nodes" = local ]; then node_local_setup; else node_vultr_setup; fi
   cap_ws=$(workdir cap)
-  HOME=$HOMEW "$W" run "$(manifest cap)" --workdir "$cap_ws" --image "$IMAGE_TAG" >"$work/cap.log" 2>&1 &
+  HOME=$HOMEW "$W" run "$(manifest cap)" --workdir "$cap_ws" --image "$IMAGE_TAG" --node local >"$work/cap.log" 2>&1 &
   cap_pid=$!
   pids+=("$cap_pid")
   wait_for 60 '[ -n "$(run_id_of "$work/cap.log")" ]' || true
@@ -318,4 +318,74 @@ offline_flow() {
   w wake "$r" >"$work/wake-after.log" 2>&1 || true
   check "  once the node reported the box stopped, a wake is no longer fenced" '! grep -q "not woken yet" "$work/wake-after.log" && w audit --tail 3000 | grep agent.wake_refused | grep -q "$r"'
   check "  and still nothing of the credential on disk" '! grep -rlsF "$value" "$nd"'
+}
+
+# The agent-to-agent protocol across nodes (#252), --nodes local: msg-b (ci/acceptance/msg-b.yaml)
+# on acc-n1 and msg-a (msg-a.yaml) on the control host's own node. msg-a finds msg-b through the
+# gateway, messages it and follows the receipt to read; msg-b answers (a reply needs no
+# accept_from) and then writes to msg-a unasked, which is refused with a receipt that says why.
+# Then a human: `wicket message send` to msg-a, which reads it as its operator's and answers into
+# the operator's `wicket message inbox`, with receipts on both sides.
+messages_flow() {
+  log "messages between boxes on two nodes, and with their operator"
+  local wb wa rb ra pb pa
+  wb=$(workdir msg-b)
+  HOME=$HOMEW "$W" run "$(manifest msg-b)" --workdir "$wb" --image "$IMAGE_TAG" --node "$NODE" >"$work/msg-b.log" 2>&1 &
+  pb=$!
+  pids+=("$pb")
+  wait_for 90 '[ -n "$(run_id_of "$work/msg-b.log")" ]' || true
+  rb=$(run_id_of "$work/msg-b.log")
+  our_runs+=("$rb")
+  local nd=$nodehome/.local/share/wicket-node
+  # msg-b's results: on acc-n1 while its box runs, then the copy taken before it is let go.
+  bres() { cat "$work/msg-b.json" 2>/dev/null || cat "$nd/runs/$rb/workspace/out/result.json" 2>/dev/null; }
+  bf() { bres | jq -r ".$1 // empty" 2>/dev/null; }
+  wait_for 120 '[ "$(bf started)" = 1 ]' || true
+  wa=$(workdir msg-a)
+  HOME=$HOMEW "$W" run "$(manifest msg-a)" --workdir "$wa" --image "$IMAGE_TAG" --node local >"$work/msg-a.log" 2>&1 &
+  pa=$!
+  pids+=("$pa")
+  wait_for 90 '[ -n "$(run_id_of "$work/msg-a.log")" ]' || true
+  ra=$(run_id_of "$work/msg-a.log")
+  our_runs+=("$ra")
+  ares() { data "runs/$ra/workspace/out/result.json" 2>/dev/null; }
+  af() { ares | jq -r ".$1 // empty" 2>/dev/null; }
+  # Box to box, across the nodes.
+  wait_for 300 '[ -n "$(af reply)" ] && [ "$(bf done)" = 1 ]' || true
+  # Keep msg-b's results, then let its box end (it waits for out/go): it must be gone before
+  # offline_flow cuts acc-n1's channel.
+  cat "$nd/runs/$rb/workspace/out/result.json" >"$work/msg-b.json" 2>/dev/null || true
+  touch "$nd/runs/$rb/workspace/out/go" 2>/dev/null || true
+  echo "   msg-a: $(ares | head -c 1500)"
+  echo "   msg-b: $(bres | head -c 1500)"
+  check "msg-a, on the control host's node, found msg-b on $NODE through the gateway" \
+    '[ "$(af b_entry | jq -r .agent)" = msg-b ] && [ "$(af b_entry | jq -r .may_send_to)" = true ]'
+  check "  messaged it, and its receipt says read" 'af sent | grep -q "^sent" && af receipt | grep -q "\"state\": *\"read\""'
+  check "  msg-b read it with msg-a verified as the sender, and its reply came back across" \
+    '[ "$(bf got | jq -r .from.id)" = "$(af you)" ] && [ "$(af reply | jq -r .from.id)" = "$(af b)" ] && [ "$(af reply | jq -r .in_reply_to)" = "$(af mid)" ] && [ "$(af reply | jq -r .body)" = "pong from msg-b" ]'
+  check "  msg-b writing to msg-a unasked is refused, with a receipt that says why" \
+    'bf unasked | grep -q "^refused: m-" && bf unasked | grep -q "does not accept messages from you"'
+  check "  and the refusal is on the record" '[ -n "$(af you)" ] && w audit --tail 3000 | grep message.refused | grep -q "$(af you)"'
+  # The operator: the human who started msg-a is the one it acts for.
+  check "msg-a lists the operator it acts for" '[ -n "$(af operator)" ] && [ -n "$(af you)" ] && [ "$(w message principals --json 2>"$work/msg-principals.err" | jq -r --arg a "$(af you)" ".[] | select(.id == \$a) | .relation")" = "acts for you" ]'
+  wait_for 120 'data_ls "runs/$ra/workspace/out" | grep -qx await-operator' || true
+  w message send "$(af you)" "status, please" --json >"$work/msg-send.json" 2>"$work/msg-send.err" || true
+  check "  wicket message send reached msg-a, signed as the operator" '[ "$(jq -r .receipt.state "$work/msg-send.json")" != refused ] && jq -r .id "$work/msg-send.json" | grep -q "^m-"'
+  wait_for 120 '[ "$(af done)" = 1 ]' || true
+  check "  msg-a read it as its operator's message" \
+    '[ "$(af op_msg | jq -r .from.relation)" = "your operator" ] && [ "$(af op_msg | jq -r .from.id)" = "$(af operator)" ] && [ "$(af op_msg | jq -r .body)" = "status, please" ]'
+  w message inbox --json >"$work/msg-inbox.json" 2>"$work/msg-inbox.err" || true
+  check "  and its answer is in the operator's inbox, verified" \
+    'jq -e --arg a "$(af you)" --arg m "$(jq -r .id "$work/msg-send.json")" "map(select(.from == \$a and .in_reply_to == \$m and .body == \"seen, thanks\")) | length == 1" "$work/msg-inbox.json" >/dev/null'
+  w message receipts --json >"$work/msg-receipts.json" 2>"$work/msg-receipts.err" || true
+  check "  and the operator's receipt says read" \
+    'jq -e --arg m "$(jq -r .id "$work/msg-send.json")" "map(select(.message_id == \$m and .state == \"read\")) | length == 1" "$work/msg-receipts.json" >/dev/null'
+  # msg-a's own receipt: the operator's read of its message is on the record, for that message id.
+  local back; back=$(af op_reply | grep -o 'm-[a-z0-9]*' | head -1 || true)
+  check "  and msg-a's receipt for its answer says read, once the operator read it" \
+    '[ -n "$back" ] && w audit --tail 3000 | grep message.read | grep -q "\"$back\""'
+  # Both runs end, and msg-b's box is gone from acc-n1 before the next flow cuts its channel.
+  wait_for 120 '! kill -0 "$pa" 2>/dev/null && ! kill -0 "$pb" 2>/dev/null' || true
+  wait_for 60 '[ -z "$(box_of "$rb")" ]' || true
+  check "  both runs ended, and msg-b's box is gone from $NODE" '! kill -0 "$pa" 2>/dev/null && ! kill -0 "$pb" 2>/dev/null && [ -z "$(box_of "$rb")" ]'
 }

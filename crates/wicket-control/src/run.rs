@@ -159,6 +159,10 @@ pub struct RunOpts<'a> {
     /// A child's supervisor, run in its parent's process (#257 slice 4c): its parent asks it to stop
     /// its box and end, as an operator's ^C does.
     pub stop: Option<Arc<tokio::sync::Notify>>,
+    /// Place a fresh run with no node named through the scheduler (#579), waiting in its queue up to
+    /// this long (`wicket run --wait`). Only a fresh, top-level run is placed ([`placed_by_scheduler`]);
+    /// None: this host's own node, as a spawn or a re-attach is.
+    pub place_wait: Option<std::time::Duration>,
 }
 
 /// What a run's supervisor keeps in `<run dir>/ctl/run.json` so another can take over (#151).
@@ -319,6 +323,38 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     run_to_end(o).await.map(|_| ())
 }
 
+/// Whether an urgent message would reach the agent if it read it now (#252 review): its sender
+/// isn't revoked, the org policy lets this box hear from it, and its envelope verifies for this
+/// principal, as `await_message` checks. An agent's envelope must come from the run that sent it;
+/// an operator's (#252) has no run, and the org policy names it by its id. Only such a message may
+/// interrupt a turn.
+fn would_deliver(
+    l: &wicket_store::Ledger,
+    u: &wicket_store::UrgentMessage,
+    issuer: Option<&wicket_identity::VerifyingKey>,
+    me: Option<&str>,
+    org: Option<&wicket_authz::OrgLayer>,
+) -> bool {
+    let (Some(issuer), Some(me)) = (issuer, me) else { return false };
+    let Ok((sender, p)) = wicket_identity::verify_any_envelope(&u.envelope, issuer, u.created_at) else { return false };
+    let from = sender.principal();
+    let (zone, ok) = match &sender {
+        wicket_identity::Sender::Agent(c) => (c.zone.clone(), c.run == u.from_run),
+        wicket_identity::Sender::Operator(_) => (String::new(), u.from_run.is_empty()),
+    };
+    if !ok
+        || p.get("to").and_then(|v| v.as_str()) != Some(me)
+        || p.get("jti").and_then(|v| v.as_str()) != Some(u.id.as_str())
+        || u.from_principal.as_deref() != Some(from)
+    {
+        return false;
+    }
+    if !u.from_run.is_empty() && l.revoked_in_chain(&u.from_run).ok().flatten().is_some() {
+        return false;
+    }
+    org.is_none_or(|o| o.allows_message_from(&zone, Some(from)))
+}
+
 /// Whether a run's final status (as [`run_to_end`] returns it) is its box failing: a non-zero exit,
 /// out of memory, over a cap, or its timeout. `wicket run` and `wicket wrap` exit 1 then (#574).
 pub fn box_failed(status: &str) -> bool {
@@ -340,6 +376,9 @@ pub struct RunEnd {
 
 /// [`run`], returning how it ended.
 pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
+    // #579: which runs the scheduler places, from the options as given (`--node local` names this
+    // host's own node: it pins the run there).
+    let fresh = Fresh::of(&o);
     let RunOpts {
         manifest: manifest_path,
         workdir,
@@ -356,6 +395,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         attach,
         adopt,
         stop,
+        place_wait,
     } = o;
     // Where the box start's time goes (#287), from here: in the run's record, and printed with
     // WICKET_TIMINGS=1.
@@ -474,6 +514,16 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     if record.is_none() {
         wicket_agent::acp::check_installation(&m).map_err(anyhow::Error::msg)?;
     }
+    // The installation's names settings (#575): ones that can't work stop a start, as above. A
+    // supervisor re-attaching keeps the box going without public names rather than stop it.
+    let names_settings = match wicket_agent::acp::names_settings() {
+        Ok(n) => Some(Arc::new(n)),
+        Err(e) if record.is_none() => bail!(e),
+        Err(e) => {
+            say!("[wicket] {e}: this run asks for no public names until it is started again");
+            None
+        }
+    };
     // A program runs only the source it was approved as (its digest), copied into the box.
     let program_src = match &m.program {
         Some(_) if record.is_some() => None,
@@ -519,18 +569,42 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // starts it by its id.
     let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
     let image_name = image.to_string();
-    if record.is_none() && wake.is_none() {
-        // The operator's policy first (`images.yaml`'s `require_digests`): a tag is refused before
-        // anything is asked of a grant.
-        crate::images_policy::require_pinned(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
-        // The one "may this digest run" check (#258): a pinned image is accepted by a grant on its
-        // digest, which the operator running the manifest records. A child's image is pinned to
-        // its parent's, as its parent's zone allows (decided where it is spawned): not regranted.
-        if let (Some(pin), None) = (&image_pin, &parent_run) {
-            let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
-            let u = crate::digest::accept_image(&Ledger::open(&ledger_path())?, &m.tenant, &m.zone.name, image, pin, &by)?;
-            say!("[wicket] image {image} accepted by grant {} from {}", u.grant, u.decided_by);
+    // The run's id, before anything is admitted, so what admitting it audits names it.
+    let run = match run_id {
+        Some(id) => {
+            check_run_id(&id).with_context(|| "--run-id".to_string())?;
+            RunId(id)
         }
+        None => RunId::new(),
+    };
+    // The image, admitted before anything is asked of a grant or a node (`imagetrust::admit`): the
+    // operator's `require_digests`, then the `trust` policy's signatures (#191), then the grant on
+    // its digest (#258). The signature that verified it is what `run.image` records.
+    let mut signed: Option<wicket_chan::signature::Verified> = None;
+    if crate::imagetrust::admits(record.is_some(), wake.is_some()) {
+        let default_image = crate::image::effective(crate::image::DEFAULT);
+        let policy = crate::images_policy::load_with_keys()?;
+        let by = crate::operators::Operator::cli(&m.tenant.0).map(|o| o.id).unwrap_or_else(|_| crate::operator());
+        let ledger = Ledger::open(&ledger_path())?;
+        let cache = crate::imagetrust::cache_dir();
+        let admit = crate::imagetrust::Admit {
+            policy: &policy,
+            ledger: &ledger,
+            manifest: &m,
+            run: &run,
+            image,
+            default_image: &default_image,
+            parent: parent_run.as_deref(),
+            by: &by,
+            cache: Some(&cache),
+        };
+        signed = crate::imagetrust::admit(admit, |name, hosts| {
+            for h in hosts {
+                vault.get_for(name, h)?;
+            }
+            vault.get(name)
+        })
+        .await?;
     }
     // The workload's name, and what runs it: an agent's harness, or a program's command.
     let (workload, workload_runs) = match (&m.agent, &m.program) {
@@ -538,21 +612,58 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         (_, Some(p)) => (p.name.clone(), "program".to_string()),
         _ => unreachable!("validated"),
     };
-    // An optional injection whose secret isn't set is as if it weren't there (#175): dropped from
-    // the zone every enforcement point sees (this run's proxies, the node's feed and routing), so
-    // its host's requests go without it, and the host is spliced if reach allows it wholesale.
-    let unset_injections = m.zone.drop_unset_optional_injections(|s| vault.get(s).is_ok());
-    for i in &unset_injections {
-        say!("[wicket] optional secret {:?} is not set: requests to {} go without it", i.secret, i.host);
-    }
+    // The zone's injections are fixed at start, their secrets looked up at each request (#415): an
+    // optional one whose secret isn't set yet stays in the zone, and its host's requests go without
+    // it until it is set (#175). A required one must be set to start.
     for i in &m.zone.inject {
-        if let Err(e) = vault.get(&i.secret) {
-            return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host));
+        match vault.get(&i.secret) {
+            Err(_) if i.optional => {
+                say!("[wicket] optional secret {:?} is not set: requests to {} go without it until it is", i.secret, i.host)
+            }
+            Err(e) => return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host)),
+            Ok(_) => {}
         }
     }
     // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
     // its pinned ssh (a revoked one is refused), or this host's own built-in node over its unix socket.
     timings.since("checks", lap);
+    // #579: a fresh run with no node named goes where the scheduler places it, as a woken agent
+    // does: this host's own node is one candidate among the enrolled ones. With no other node
+    // enrolled, it goes on this host's own, as before, whatever its placement terms.
+    let others = || -> Result<bool> {
+        Ok(Ledger::open(&ledger_path())?.nodes()?.iter().any(|n| n.status == "active" && n.name != crate::localnode::NAME))
+    };
+    // The room the scheduler reserved for it is given back if the run fails before its start
+    // settles it (bound, or released below).
+    let mut held_room = HeldRoom(None);
+    let scheduled: Option<String> = match place_wait.filter(|_| placed_by_scheduler(&fresh)) {
+        Some(_) if !others()? => None,
+        None => None,
+        Some(wait) => {
+            let who = crate::hibernate::Placing { what: format!("run {run}"), claim: None, wait_flag: "wicket run --wait" };
+            match crate::hibernate::place_box(&who, &m, None, &run, None, wait).await {
+                Ok(n) => {
+                    held_room.0 = Some(run.0.clone());
+                    n.filter(|n| n != crate::localnode::NAME)
+                }
+                Err(e) => {
+                    // Boxes it asked to hibernate for room are asked no more, and room it held goes
+                    // back.
+                    if let Ok(l) = Ledger::open(&ledger_path()) {
+                        let _ = crate::hibernate::withdraw_preemptions_for(
+                            &l,
+                            &run,
+                            &m.tenant,
+                            wicket_feed::now_ms(),
+                            "the run failed to start",
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    };
+    let node = node.or(scheduled.as_deref());
     let lap = std::time::Instant::now();
     let node: Option<Node> = node.map(|n| crate::enrol::resolve_installed(n, ssh_key)).transpose()?;
     timings.since("node.resolve", lap);
@@ -570,13 +681,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
     // or wrapped). Its proxies are its own, as on any node.
     let shares_host = node.is_none();
 
-    let run = match run_id {
-        Some(id) => {
-            check_run_id(&id).with_context(|| "--run-id".to_string())?;
-            RunId(id)
-        }
-        None => RunId::new(),
-    };
     // A long-lived agent (#70): one wicket launches itself, here, so it can be hibernated and
     // rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
@@ -714,15 +818,6 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 "session_id": long_lived.then(|| session.id.clone()), "resumed": session.resume,
             }),
         )?;
-        // One note per run for each optional injection left out (#175), not one per request.
-        for i in &unset_injections {
-            l.audit(
-                &m.tenant,
-                Some(&run),
-                "inject.skipped",
-                &serde_json::json!({ "host": i.host, "secret": i.secret, "why": "optional secret not set" }),
-            )?;
-        }
     }
 
     // No CA of the run's (#257 slice 5): the control host terminates no TLS, so a box trusts only
@@ -761,6 +856,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 node: old.node,
                 principal: old.principal,
                 act: old.act,
+                kind: old.kind,
             };
             let key = wicket_identity::AgentKey::generate();
             let now = wicket_store::now();
@@ -772,6 +868,13 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 l.audit(&m.tenant, Some(&run), "identity.rotated", &serde_json::json!({
                     "id": claims.sub, "identity_sha256": wicket_identity::identity_digest(&jws), "expires_at": claims.exp, "reattached": true,
                 }))?;
+                // Standing names freed while nobody supervised it are taken up again, as at a
+                // start (#716 review, F12); not without the names settings (above).
+                if names_settings.is_some() {
+                    for n in crate::names::claim_for_run(&l, &m.tenant, &run, &claims.sub, &m.zone) {
+                        say!("[wicket] {run} holds its standing name {} ({}, port {})", n.label, n.id, n.port);
+                    }
+                }
             }
             id_spec = Some(spec);
             Some(Arc::new(wicket_proxy::IdentityCell::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() })))
@@ -822,6 +925,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 node: node_name.clone(),
                 principal,
                 act,
+                // Signed, so discovery can say what a principal is (#252).
+                kind: m.program.is_some().then(|| wicket_identity::KIND_PROGRAM.to_string()),
             };
             let jws = issuer.issue(&spec, now, ttl, &key.public());
             id_spec = Some(spec);
@@ -844,6 +949,11 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     "issuer_kid": wicket_identity::key_id(&issuer.verifying_key()), "manifest_sha256": claims.manifest_sha256, "image": image, "node": node_name,
                     "acting_for": claims.chain(), "expires_at": claims.exp,
                 }))?;
+                // Standing names (#575): the run holds the live ones bound to its agent or zone
+                // that no run holds, under the zone's name as the ask stored it.
+                for n in crate::names::claim_for_run(&l, &m.tenant, &run, &claims.sub, &m.zone) {
+                    say!("[wicket] {run} holds its standing name {} ({}, port {})", n.label, n.id, n.port);
+                }
             }
             Some(Arc::new(wicket_proxy::IdentityCell::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() })))
         }
@@ -874,6 +984,16 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         }
         d
     };
+    // Who may interrupt this agent's turn with a `now` message (#252): its parent and the operator
+    // it acts for ([`wicket_core::message::interrupts`]).
+    let (parent_principal, acting_for, my_principal) = {
+        let l = ledger.lock().expect("ledger");
+        let parent = parent_run.as_deref().and_then(|p| l.identity(p).ok().flatten()).map(|i| i.spiffe_id);
+        let op = identity.as_ref().and_then(|c| c.current().claims.principal.get("sub").and_then(|s| s.as_str()).map(String::from));
+        (parent, op, identity.as_ref().map(|c| c.current().claims.sub.clone()))
+    };
+    // The issuer's key, to check an urgent message's envelope as delivery would before it interrupts.
+    let issuer_key = crate::issuer().ok().map(|i| i.verifying_key());
     // The installation's org policy for this box (#51): compiled once, into its token at mint and
     // for the control host's own checks (forwarded hosts, injections, spawns, messages).
     let org_policy = crate::policy::for_run(&run.0, record.is_some())?;
@@ -1059,6 +1179,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         fence: fence.clone(),
         waker: long_lived.then(|| Arc::new(|agent: &str, by: &str| crate::hibernate::trigger_wake(agent, by)) as wicket_proxy::Waker),
         lifecycle: m.program.is_none().then(|| want_tx.clone()),
+        names: names_settings.clone(),
     };
     let proxies_lap = std::time::Instant::now();
     // The run's model budget and spend: its node's model proxy is the box's only one and the counter
@@ -1409,15 +1530,22 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
             spawn: spawn_ctx.clone(),
             adopt: adopter.clone(),
             timings: timings.clone(),
+            names: names_settings.clone(),
         })
         .await;
         // The room it reserved (#579): counted until the node reports the box, or given back.
+        held_room.0 = None;
         {
             let l = ledger.lock().expect("ledger");
             let _ = match &nb {
                 Ok(_) => l.placement_bound(&run.0, wicket_feed::now_ms()),
                 Err(_) => l.placement_released(&run.0),
             };
+            // What preemption may choose from (#579 step 4): every box's terms, from its start.
+            if nb.is_ok() {
+                let r = wicket_placement::schedule::Request::of(&m);
+                let _ = l.record_run_terms(&run.0, r.vcpus, r.memory_mib, r.priority, r.preemptible, wicket_feed::now_ms());
+            }
         }
         let nb = nb?;
         // A takeover that has its box, and still holds it one backoff interval later, clears its
@@ -1425,11 +1553,13 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         if record.is_some() {
             let held = known_attach_failures(&ledger.lock().expect("ledger"), &run.0, &dir).map(|f| attach_backoff_secs(f.count));
             if let Some(secs) = held {
-                let (ledger, tenant, run, dir) = (ledger.clone(), m.tenant.clone(), run.0.clone(), dir.clone());
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(secs.unsigned_abs())).await;
-                    attach_recovered(&ledger.lock().expect("ledger"), &tenant, &run, &dir);
-                });
+                clear_after_hold(
+                    ledger.clone(),
+                    m.tenant.clone(),
+                    run.0.clone(),
+                    dir.clone(),
+                    std::time::Duration::from_secs(secs.unsigned_abs()),
+                );
             }
         }
         timings.since("box_start", box_lap);
@@ -1453,7 +1583,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     &m.tenant,
                     Some(&run),
                     "run.image",
-                    &serde_json::json!({ "image": image_name, "digest": d, "pinned": image_pin }),
+                    &crate::imagetrust::run_image_body(&image_name, d, image_pin.as_deref(), signed.as_ref()),
                 )?;
                 say!("  image {image_name} started as {d}");
             }
@@ -1722,9 +1852,20 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
         let what = if asked.finish { "finish" } else { "hibernate" };
         say!("[wicket] the agent asked to {what} before this supervisor took the run over: at the end of its turn");
     }
-    let mut hib_asked = asked.hibernate;
+    // The hibernate asked, and whether it is preemption's (#579 step 4) and no other: dropped if
+    // preemption gives up on it before the quiet point, or before it hibernates out of a linger.
+    let mut hib = crate::hibernate::HibAsk { asked: asked.hibernate, ..Default::default() };
+    // Its children still running: what preemption won't stop (hibernating ends the run).
+    let live_children = || children.lock().map(|k| k.iter().filter(|(_, s)| !s.thread.is_finished()).count()).unwrap_or(0);
     let mut finish_asked = asked.finish;
     let mut notified_msgs = 0i64;
+    // The `now` messages seen while a turn ran: each is weighed once (#252 review), so a burst of
+    // them interrupts one turn, not one each.
+    let mut interrupted: std::collections::HashSet<String> = Default::default();
+    // When each sender last interrupted a turn: at most once per INTERRUPT_EVERY_SECS.
+    let mut last_interrupt: std::collections::HashMap<String, std::time::Instant> = Default::default();
+    // Whether the running turn is an operator's prompt: only that operator may interrupt it.
+    let mut prompt_turn = false;
     // The turn state last reported as the run's presence (#252).
     let mut reported_turn: Option<bool> = None;
     let mut superseded = false;
@@ -1946,7 +2087,8 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     }
                     wicket_proxy::Want::Hibernate => {
                         say!("[wicket] the agent asked to hibernate{when}");
-                        hib_asked = true;
+                        // Its own request stands whatever preemption does.
+                        hib.ask(false);
                     }
                 }
             }
@@ -2050,6 +2192,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                         }
                     }
                     turn_running = true;
+                    prompt_turn = true;
                 }
                 // A `session/cancel` from the console's session view (#327): the running turn, if any.
                 // Prompts still queued behind it stay queued.
@@ -2123,11 +2266,77 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     }
                 }
                 if let Some(f) = &fence {
-                    // An operator's `wicket hibernate`.
-                    if ledger.lock().ok().and_then(|l| l.take_agent_want(&f.agent, f.generation).ok().flatten()).as_deref() == Some("hibernate") {
-                        hib_asked = true;
+                    // An operator's `wicket hibernate`, or preemption's request (#579 step 4).
+                    let want = ledger.lock().ok().and_then(|l| l.take_agent_want(&f.agent, f.generation).ok().flatten());
+                    let by_preemption = want.as_deref() == Some(crate::hibernate::PREEMPT_WANT);
+                    if want.as_deref() == Some("hibernate") || by_preemption {
+                        // An operator's request stands whatever preemption does.
+                        hib.ask(by_preemption);
                         if turn_running {
-                            say!("[wicket] hibernate asked: at the end of this turn");
+                            say!("[wicket] hibernate asked{}: at the end of this turn", if by_preemption { " (to make room)" } else { "" });
+                        }
+                    }
+                }
+                // A `now` message from its parent or its operator interrupts the running turn (#252),
+                // as an operator's cancel does; the notice below tells the agent at the turn's end.
+                // From anyone else it waits for the turn.
+                if turn_running && !finish_asked {
+                    let urgent: Vec<_> = ledger
+                        .lock()
+                        .ok()
+                        .and_then(|l| l.urgent_messages(&run.0).ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|u| !interrupted.contains(&u.id))
+                        .collect();
+                    // Weighed once: whether or not one of these interrupts, none does again.
+                    interrupted.extend(urgent.iter().map(|u| u.id.clone()));
+                    let now_i = std::time::Instant::now();
+                    let first = urgent.into_iter().find(|u| {
+                        let sender = u.from_principal.as_deref();
+                        let rested = sender.is_none_or(|s| {
+                            last_interrupt.get(s).is_none_or(|t| {
+                                now_i.duration_since(*t).as_secs() >= wicket_core::message::INTERRUPT_EVERY_SECS
+                            })
+                        });
+                        rested
+                            && wicket_core::message::interrupts("now", sender, parent_principal.as_deref(), acting_for.as_deref(), prompt_turn)
+                            && ledger.lock().is_ok_and(|l| {
+                                would_deliver(&l, u, issuer_key.as_ref(), my_principal.as_deref(), org_layer.as_deref())
+                            })
+                    });
+                    let first = first.map(|u| {
+                        if let Some(s) = &u.from_principal {
+                            last_interrupt.insert(s.clone(), now_i);
+                        }
+                        (u.id, u.from_principal)
+                    });
+                    if let Some((id, from)) = first {
+                        use tokio::io::AsyncWriteExt;
+                        let out = match (acp.as_mut(), control.as_mut()) {
+                            (Some(c), _) => c.cancel(),
+                            (None, Some(c)) => c.interrupt(),
+                            _ => vec![],
+                        };
+                        let sent = !out.is_empty();
+                        if sent {
+                            say!("[wicket] an urgent message ({id}) from {}: interrupting the running turn", from.as_deref().unwrap_or("?"));
+                            if let Some(c) = &acp {
+                                let _ = write_json(&acp_state, c);
+                            }
+                            let input: String = out.iter().map(|l| format!("{l}\n")).collect();
+                            if let Some(log) = acp_log.as_mut() {
+                                log.wrote(transcript_f.offset(), &input);
+                            }
+                            if let Some(si) = stdin.as_mut() {
+                                if si.write_all(input.as_bytes()).await.is_err() {
+                                    stdin = None;
+                                }
+                            }
+                        }
+                        if let Ok(l) = ledger.lock() {
+                            let outcome = if sent { "interrupted" } else { "this run's harness can't be interrupted" };
+                            let _ = l.audit(&m.tenant, Some(&run), "run.turn_interrupt", &serde_json::json!({ "message": id, "from": from, "outcome": outcome }));
                         }
                     }
                 }
@@ -2139,7 +2348,9 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 }
                 if !turn_running && !finish_asked && waiting > notified_msgs {
                     use tokio::io::AsyncWriteExt;
-                    let t = format!("[wicket] {waiting} message(s) from other agents (or your parent's next brief) are waiting: read them with wicket's await_message tool.");
+                    let urgent = ledger.lock().ok().and_then(|l| l.urgent_messages(&run.0).ok()).map_or(0, |u| u.len());
+                    let urgent = if urgent > 0 { format!(" ({urgent} asked to be read now)") } else { String::new() };
+                    let t = format!("[wicket] {waiting} message(s) from other agents, your operator or your parent{urgent} are waiting: read them with wicket's await_message tool.");
                     say!("{t}");
                     if let Some(si) = stdin.as_mut() {
                         if let Some(log) = acp_log.as_mut() {
@@ -2153,9 +2364,18 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     }
                     notified_msgs = waiting;
                     turn_running = true;
+                    prompt_turn = false;
                 }
-                if !turn_running && !hibernating && hib_asked && lingering.is_none() {
-                    hib_asked = false;
+                // A hibernate asked only to make room (#579 step 4): not if preemption gave up, the
+                // request is stale or its wake gone, or a child runs (hibernating would stop it).
+                if hib.asked && hib.for_preemption {
+                    if let Some(why) = preemption_declined(&ledger, &m.tenant, &run, live_children()) {
+                        hib.decline();
+                        say!("[wicket] not hibernating to make room: {why}");
+                    }
+                }
+                if !turn_running && !hibernating && hib.asked && lingering.is_none() {
+                    let for_preemption = hib.take();
                     match &fence {
                         None => say!("[wicket] not hibernated: only a long-lived agent wicket started itself can hibernate"),
                         Some(f) => match stopper.check_quiet(&box_user, &|c: &str| harness.is_some_and(|h| h.is_runtime(&m, c)), &agent_cmd).await {
@@ -2172,6 +2392,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                                 say!("[wicket] not quiet yet: {note}");
                                 set_state("active", Some(&note));
                                 lingering = Some(Linger::Hibernate);
+                                hib.linger(for_preemption);
                                 linger.as_mut().reset(tokio::time::Instant::now() + exit_grace);
                             }
                             Err(why) => {
@@ -2190,6 +2411,7 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                     // waiting for a quiet box gives way: the agent asked to finish since.)
                     if lingering != Some(Linger::Finish) {
                         lingering = Some(Linger::Finish);
+                        hib.linger_ends();
                         linger.as_mut().reset(tokio::time::Instant::now() + exit_grace);
                     }
                 }
@@ -2216,9 +2438,18 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 Some(Linger::Hibernate) if turn_running => {
                     // A turn began meanwhile (a message): hibernate at its end, with a grace of its own.
                     say!("[wicket] a turn began before the box was quiet: hibernating at its end");
-                    hib_asked = true;
+                    // Still only preemption's, if it was and nothing else asked since: it can
+                    // still be withdrawn.
+                    hib.turn_began_in_linger();
                 }
                 Some(Linger::Hibernate) if hibernating || stdin.is_none() || fence.is_none() => {}
+                Some(Linger::Hibernate)
+                    if hib.linger_over()
+                        && preemption_declined(&ledger, &m.tenant, &run, live_children()).inspect(|why| {
+                            let note = format!("not hibernated to make room: {why}");
+                            say!("[wicket] {note}; the agent goes on running, and nothing is stopped");
+                            set_state("active", Some(&note));
+                        }).is_some() => {}
                 Some(Linger::Hibernate) => {
                     let agent = fence.as_ref().map(|f| f.agent.as_str()).unwrap_or_default();
                     let is_harness = |c: &str| harness.is_some_and(|h| h.is_runtime(&m, c));
@@ -2368,8 +2599,12 @@ pub async fn run_to_end(o: RunOpts<'_>) -> Result<RunEnd> {
                 // Loudly (#300): the box's work isn't here. Its node keeps it (not forgotten).
                 let msg = format!("fetching the box's files from node {node_name} failed: {e:#} (the node keeps them)");
                 // The run holds its node until they are collected: the reconciler doesn't release
-                // it with them (#324).
-                let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
+                // it with them (#324). Unless a supervisor before this one fetched them already
+                // (this one took the run over after its fetch, #590): then the files are here.
+                let here = ledger.lock().expect("ledger").files_collected(&run.0).unwrap_or(false);
+                if !here {
+                    let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
+                }
                 say!("[wicket] {msg}");
                 say_err!("[wicket] {msg}");
                 let _ = ledger.lock().expect("ledger").audit(
@@ -2751,6 +2986,26 @@ pub fn record_attach_failure(l: &Ledger, run: &str, run_dir: &Path, why: &str, a
     (now, audit)
 }
 
+/// Clears `run`'s failed takeovers once this takeover has held its box for `hold` (#676), unless
+/// another failure was recorded meanwhile (another process's, or this one's as it failed): those
+/// count on.
+fn clear_after_hold(
+    ledger: Arc<Mutex<Ledger>>,
+    tenant: wicket_core::TenantId,
+    run: String,
+    run_dir: std::path::PathBuf,
+    hold: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let before = known_attach_failures(&ledger.lock().expect("ledger"), &run, &run_dir);
+    tokio::spawn(async move {
+        tokio::time::sleep(hold).await;
+        let l = ledger.lock().expect("ledger");
+        if known_attach_failures(&l, &run, &run_dir) == before {
+            attach_recovered(&l, &tenant, &run, &run_dir);
+        }
+    })
+}
+
 /// A takeover of `run` (in `run_dir`) has held its box for one backoff interval (#676): its failed
 /// ones, if any, are cleared and audited as over (`run.attach_recovered`), so the reconciler no
 /// longer backs off from it.
@@ -2786,8 +3041,6 @@ fn attach_failed_in(l: &Ledger, run: &str, run_dir: &Path, why: &str, now_ms: i6
     if l.run_status(run).ok().flatten().as_deref() != Some("running") {
         return;
     }
-    let tenant = l.run_tenant(run).ok().flatten().unwrap_or_else(wicket_core::TenantId::single);
-    let clipped = wicket_agent::clip(why, 300);
     // Its box may still run on its node (#676: a manifest a later version no longer loads fails the
     // takeover, not the box; a standby restored from the state store has no run record to take it
     // over from, #154): not ended while held, or the ledger's fence on its agent would lift with
@@ -2795,28 +3048,44 @@ fn attach_failed_in(l: &Ledger, run: &str, run_dir: &Path, why: &str, now_ms: i6
     // node after MAX_ATTACH_FAILURES.
     let cap_ms = l.run_authority(run).ok().flatten().map(|(_, cap)| cap.saturating_mul(1000));
     let fenced = crate::noderun::fenced_in(run_dir, now_ms, cap_ms);
-    if let Some(h) = crate::noderun::held_until(l, run, now_ms, fenced, crate::noderun::has_run_record(run_dir)) {
-        let (failures, audit) = record_attach_failure(l, run, run_dir, &clipped, now_ms / 1000);
-        if audit {
-            let _ = l.audit(
-                &tenant,
-                Some(&RunId(run.to_string())),
-                "run.attach_failed",
-                &serde_json::json!({
-                    "why": clipped,
-                    "node": h.node,
-                    "fenced": crate::noderun::held_for(h.until_ms),
-                    "held_by": if h.by_ledger { "ledger" } else { "run records" },
-                    "failures": failures.count,
-                }),
-            );
+    let held = crate::noderun::held_until(l, run, now_ms, fenced, crate::noderun::has_run_record(run_dir));
+    attach_failed_held(l, run, run_dir, why, now_ms, held);
+}
+
+/// [`attach_failed_in`] once whether the run's box may still run is known (`held`): held, its
+/// failure is recorded and the run left running; not held, it is lost. A ledger that couldn't be
+/// read to tell is said, and counts as held: the failure is recorded beside the run (no ledger
+/// needed), so the reconciler backs off and stops the box after MAX_ATTACH_FAILURES as for any other.
+fn attach_failed_held(l: &Ledger, run: &str, run_dir: &Path, why: &str, now_ms: i64, held: Result<Option<crate::noderun::Held>>) {
+    let tenant = l.run_tenant(run).ok().flatten().unwrap_or_else(wicket_core::TenantId::single);
+    let clipped = wicket_agent::clip(why, 300);
+    let (reason, node, fenced, held_by) = match held {
+        Ok(Some(h)) => (clipped.clone(), h.node, crate::noderun::held_for(h.until_ms), if h.by_ledger { "ledger" } else { "run records" }),
+        Ok(None) => {
+            let reason = format!("its supervisor is gone and it could not be taken over: {clipped}");
+            // And its agent, if it was the agent's activation (#474).
+            let _ = l.run_lost(run, &reason);
+            let _ = l.audit(&tenant, Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
+            return;
         }
-        return;
+        Err(e) => {
+            say_err!("[wicket] run {run}: the ledger couldn't be read to tell whether its box may still run, so it is kept: {e:#}");
+            let reason = wicket_agent::clip(
+                &format!("{clipped} (and the ledger couldn't be read to tell whether its box may still run: {e:#})"),
+                400,
+            );
+            (reason, "its node".to_string(), "until the ledger can be read".to_string(), "unreadable ledger")
+        }
+    };
+    let (failures, audit) = record_attach_failure(l, run, run_dir, &reason, now_ms / 1000);
+    if audit {
+        let _ = l.audit(
+            &tenant,
+            Some(&RunId(run.to_string())),
+            "run.attach_failed",
+            &serde_json::json!({ "why": reason, "node": node, "fenced": fenced, "held_by": held_by, "failures": failures.count }),
+        );
     }
-    let reason = format!("its supervisor is gone and it could not be taken over: {clipped}");
-    // And its agent, if it was the agent's activation (#474).
-    let _ = l.run_lost(run, &reason);
-    let _ = l.audit(&tenant, Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
 }
 
 /// Starts a new supervisor for `run` (`wicket attach <run>`), detached, its output in
@@ -2917,6 +3186,87 @@ impl tokio::io::AsyncWrite for Counted {
     }
 }
 
+/// The room the scheduler reserved for a run (#579), given back when dropped while it holds the
+/// run: the run failed before its start settled the reservation.
+struct HeldRoom(Option<String>);
+
+impl Drop for HeldRoom {
+    fn drop(&mut self) {
+        if let Some(run) = self.0.take() {
+            if let Ok(l) = Ledger::open(&ledger_path()) {
+                let _ = l.placement_released(&run);
+            }
+        }
+    }
+}
+
+/// What a run is, for whether the scheduler places it ([`placed_by_scheduler`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Fresh {
+    pub named_node: bool,
+    pub reattach: bool,
+    pub wrapped: bool,
+    pub wake: bool,
+    pub adopted: bool,
+    pub child: bool,
+    pub lease: bool,
+    pub in_place_workspace: bool,
+}
+
+impl Fresh {
+    /// What `o` asks for: a node named (`local` included, which pins the run to this host's own), a
+    /// re-attach, a wrapped session, a wake, an adopted child, a spawn, a lease's run, an in-place
+    /// workspace.
+    pub(crate) fn of(o: &RunOpts<'_>) -> Fresh {
+        Fresh {
+            named_node: o.node.is_some(),
+            reattach: o.attach,
+            wrapped: o.wrap.is_some(),
+            wake: o.wake.is_some(),
+            adopted: o.adopt.is_some(),
+            child: o.parent_run.is_some(),
+            lease: o.lease.is_some(),
+            in_place_workspace: o.workspace_dir.is_some(),
+        }
+    }
+}
+
+/// Whether the scheduler places a run (#579): a fresh, top-level run with no node named. A node named
+/// (`--node`, a lease's), a re-attach and an adopted child keep their node; a wake is placed by its
+/// own wait; a spawn goes where its parent runs or its hint says; a wrapped session and an in-place
+/// `--workspace-dir` use this host's own directories and stay on its node.
+pub(crate) fn placed_by_scheduler(f: &Fresh) -> bool {
+    !(f.named_node || f.reattach || f.wrapped || f.wake || f.adopted || f.child || f.lease || f.in_place_workspace)
+}
+
+/// Whether a hibernate asked only to make room is declined now (#579 step 4), and why
+/// (`hibernate::preempted_hibernate`). Declined, preemption's mark is cleared (so the wake gives up on
+/// this agent at once) and it is audited as `placement.preempt_declined`, once: with no mark (given
+/// up on, or declined already) there is nothing to clear or record.
+fn preemption_declined(ledger: &Mutex<Ledger>, tenant: &wicket_core::TenantId, run: &RunId, live_children: usize) -> Option<String> {
+    let now = wicket_feed::now_ms();
+    let l = ledger.lock().ok()?;
+    // A ledger that can't be read declines (preemption can ask again), and says why.
+    let mark = l.preemption_mark(&run.0, now).unwrap_or_else(|e| {
+        say!("[wicket] couldn't read what preemption asks of this run: {e:#}");
+        None
+    });
+    let why = crate::hibernate::preempted_hibernate(true, mark.as_ref(), live_children, now).err()?;
+    // No mark: preemption gave up on it already (and audited that), or this supervisor declined it
+    // already (a re-check out of a linger): it declines, with nothing more to record.
+    if let Some(m) = &mark {
+        // Only the request it read: one a later wake made since (this one past its deadline) stands.
+        let _ = l.clear_preempted(&run.0, m.for_run.as_deref().unwrap_or_default(), Some(m.asked_ms));
+        let _ = l.audit(
+            tenant,
+            Some(run),
+            "placement.preempt_declined",
+            &serde_json::json!({ "run": run.0, "for": m.for_run, "why": why, "children": live_children }),
+        );
+    }
+    Some(why.to_string())
+}
+
 /// What the agent asked of its own run, as the ledger records it (`Ledger::record_run_want`,
 /// #444): a finish, or (only without one) a hibernate.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -2971,6 +3321,145 @@ mod tests {
 
     use super::*;
 
+    /// #252 review: only a message delivery would accept may interrupt a turn: its envelope
+    /// verifies for this principal, from the run that sent it, and its sender isn't revoked.
+    #[test]
+    fn only_a_deliverable_urgent_message_interrupts() {
+        use wicket_core::{RunId, TenantId};
+        let issuer = wicket_identity::Issuer::generate("w.test");
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let key = wicket_identity::AgentKey::generate();
+        let now = wicket_store::now();
+        let spec = wicket_identity::IdentitySpec {
+            tenant: t.0.clone(),
+            zone: "z".into(),
+            agent: "lead".into(),
+            run: "run_p".into(),
+            parent_run: None,
+            manifest_sha256: "m".into(),
+            image: "img".into(),
+            node: "local".into(),
+            principal: serde_json::Value::Null,
+            act: None,
+            kind: None,
+        };
+        let jws = issuer.issue(&spec, now, 600, &key.public());
+        let sub = wicket_identity::spiffe_id("w.test", &t.0, "z", "lead");
+        l.run_started(&t, &RunId("run_p".into()), "z", "lead").unwrap();
+        l.put_identity(&wicket_store::IdentityRow {
+            run: "run_p".into(),
+            tenant: t.0.clone(),
+            spiffe_id: sub.clone(),
+            zone: "z".into(),
+            agent: "lead".into(),
+            parent_run: None,
+            accept_from: vec![],
+            jws: jws.clone(),
+            issued_at: now,
+        })
+        .unwrap();
+        let me = "spiffe://w.test/t/default/z/z/a/child";
+        let msg = |id: &str, to: &str| wicket_store::UrgentMessage {
+            id: id.into(),
+            from_run: "run_p".into(),
+            from_principal: Some(sub.clone()),
+            envelope: wicket_identity::sign_envelope(&key, &jws, &serde_json::json!({ "jti": id, "iat": now, "to": to })),
+            created_at: now,
+        };
+        let k = issuer.verifying_key();
+        assert!(would_deliver(&l, &msg("m-1", me), Some(&k), Some(me), None));
+        assert!(!would_deliver(&l, &msg("m-2", "spiffe://w.test/t/default/z/z/a/other"), Some(&k), Some(me), None), "someone else's");
+        let mut forged = msg("m-3", me);
+        forged.from_principal = Some("spiffe://w.test/t/default/op/unix/alice".into());
+        assert!(!would_deliver(&l, &forged, Some(&k), Some(me), None), "a sender its envelope doesn't name");
+        assert!(!would_deliver(&l, &msg("m-4", me), Some(&wicket_identity::Issuer::generate("w.test").verifying_key()), Some(me), None));
+        let org = wicket_authz::OrgLayer {
+            version: "v".into(),
+            http: None,
+            forbid: vec![],
+            spawn: None,
+            msg_from: Some(vec!["ops".into()]),
+            inject: None,
+        };
+        assert!(!would_deliver(&l, &msg("m-5", me), Some(&k), Some(me), Some(&org)), "the org policy");
+        // An operator's `now` message (#252): no run; verified as the operator's, and the org
+        // policy names it by its id.
+        let ok = wicket_identity::AgentKey::generate();
+        let odoc = issuer.issue_operator(&t.0, "unix", "alice", now, 300, &ok.public());
+        let alice = wicket_identity::operator_id("w.test", &t.0, "unix", "alice");
+        let op_msg = wicket_store::UrgentMessage {
+            id: "m-op".into(),
+            from_run: String::new(),
+            from_principal: Some(alice.clone()),
+            envelope: wicket_identity::sign_operator_envelope(&ok, &odoc, &serde_json::json!({ "jti": "m-op", "iat": now, "to": me })),
+            created_at: now,
+        };
+        assert!(would_deliver(&l, &op_msg, Some(&k), Some(me), None));
+        assert!(!would_deliver(&l, &op_msg, Some(&k), Some(me), Some(&org)), "the org policy, by the operator's id");
+        let with_alice = wicket_authz::OrgLayer { msg_from: Some(vec!["ops".into(), alice.clone()]), ..org.clone() };
+        assert!(would_deliver(&l, &op_msg, Some(&k), Some(me), Some(&with_alice)));
+        assert!(
+            !would_deliver(&l, &wicket_store::UrgentMessage { from_run: "run_p".into(), ..op_msg.clone() }, Some(&k), Some(me), None),
+            "an operator's envelope from a run"
+        );
+        l.revoke("run_p", "test", "gone").unwrap();
+        assert!(!would_deliver(&l, &msg("m-6", me), Some(&k), Some(me), None), "a revoked sender");
+    }
+
+    /// #579 (review): built from the run options as given: `--node local` pins a run to this host's
+    /// own node; only a bare `wicket run` is placed.
+    #[test]
+    fn a_run_with_node_local_is_not_placed_by_the_scheduler() {
+        let opts = |node: Option<&'static str>, workspace_dir: Option<&'static Path>| RunOpts {
+            manifest: Path::new("m.yaml"),
+            workdir: None,
+            workspace_dir,
+            task: None,
+            image: None,
+            node,
+            ssh_key: None,
+            run_id: None,
+            parent_run: None,
+            lease: None,
+            wrap: None,
+            wake: None,
+            attach: false,
+            adopt: None,
+            stop: None,
+            place_wait: Some(std::time::Duration::ZERO),
+        };
+        assert!(placed_by_scheduler(&Fresh::of(&opts(None, None))), "a bare wicket run");
+        assert!(!placed_by_scheduler(&Fresh::of(&opts(Some(crate::localnode::NAME), None))), "--node local pins it");
+        assert!(!placed_by_scheduler(&Fresh::of(&opts(Some("n1"), None))));
+        assert!(!placed_by_scheduler(&Fresh::of(&opts(None, Some(Path::new("/w"))))), "an in-place workspace");
+        let child = RunOpts { parent_run: Some("run_p".into()), ..opts(None, None) };
+        assert!(!placed_by_scheduler(&Fresh::of(&child)), "a spawn");
+        let attach = RunOpts { attach: true, ..opts(None, None) };
+        assert!(!placed_by_scheduler(&Fresh::of(&attach)), "a re-attach");
+    }
+
+    /// #579: the scheduler places a fresh, top-level run with no node named, and nothing else.
+    #[test]
+    fn only_a_fresh_top_level_run_is_placed_by_the_scheduler() {
+        assert!(placed_by_scheduler(&Fresh::default()));
+        let kept: [fn(&mut Fresh); 8] = [
+            |f| f.named_node = true,
+            |f| f.reattach = true,
+            |f| f.wrapped = true,
+            |f| f.wake = true,
+            |f| f.adopted = true,
+            |f| f.child = true,
+            |f| f.lease = true,
+            |f| f.in_place_workspace = true,
+        ];
+        for set in kept {
+            let mut f = Fresh::default();
+            set(&mut f);
+            assert!(!placed_by_scheduler(&f), "{f:?} keeps its node");
+        }
+    }
+
     /// #676: failed takeovers are counted across tries, a new reason is told apart from a repeat
     /// (the audit records only a change), and the wait between tries doubles from a minute to at
     /// most an hour. A record that can't be written is carried by the audit instead, once per wait;
@@ -3017,6 +3506,52 @@ mod tests {
         assert_eq!(known_attach_failures(&l, "run_a", &d), None);
         attach_recovered(&l, &t, "run_b", &e);
         assert_eq!(known_attach_failures(&l, "run_b", &e), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #676: a takeover that fails while the ledger can't be read to tell whether its box may still
+    /// run keeps the run and records the failure beside it, so the reconciler backs off from it.
+    #[test]
+    fn a_failed_takeover_on_an_unreadable_ledger_is_recorded_not_lost() {
+        let d = std::env::temp_dir().join(format!("wicket-attach-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        let l = Ledger::open_in_memory().unwrap();
+        l.run_started(&wicket_core::TenantId::single(), &RunId("run_u".into()), "z", "a").unwrap();
+        let now = wicket_store::now();
+        attach_failed_held(&l, "run_u", &d, "no node", now * 1000, Err(anyhow::anyhow!("disk I/O error")));
+        assert_eq!(l.run_status("run_u").unwrap().as_deref(), Some("running"));
+        let f = attach_failures(&d).expect("recorded beside the run");
+        assert_eq!(f.count, 1);
+        assert!(f.why.contains("disk I/O error"), "{}", f.why);
+        let (_, _, body) = l.last_run_audit("run_u", &["run.attach_failed"]).unwrap().unwrap();
+        assert_eq!(body["held_by"].as_str(), Some("unreadable ledger"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #676: a takeover's failures are cleared only once it has held its box for its hold, and not
+    /// if another failure was recorded meanwhile.
+    #[tokio::test]
+    async fn failures_clear_only_after_the_box_was_held() {
+        let d = std::env::temp_dir().join(format!("wicket-attach-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        let l = Arc::new(Mutex::new(Ledger::open_in_memory().unwrap()));
+        let t = wicket_core::TenantId::single();
+        let n = wicket_store::now();
+        record_attach_failure(&l.lock().unwrap(), "run_a", &d, "no node", n);
+        let h = clear_after_hold(l.clone(), t.clone(), "run_a".into(), d.clone(), std::time::Duration::from_millis(50));
+        assert!(known_attach_failures(&l.lock().unwrap(), "run_a", &d).is_some(), "not before its hold");
+        h.await.unwrap();
+        assert_eq!(known_attach_failures(&l.lock().unwrap(), "run_a", &d), None);
+        assert!(l.lock().unwrap().last_run_audit("run_a", &["run.attach_recovered"]).unwrap().is_some());
+
+        // A failure recorded during the hold: it counts on.
+        record_attach_failure(&l.lock().unwrap(), "run_a", &d, "no node", n + 1);
+        let h = clear_after_hold(l.clone(), t, "run_a".into(), d.clone(), std::time::Duration::from_millis(50));
+        record_attach_failure(&l.lock().unwrap(), "run_a", &d, "no node", n + 2);
+        h.await.unwrap();
+        assert_eq!(known_attach_failures(&l.lock().unwrap(), "run_a", &d).map(|f| f.count), Some(2));
         let _ = std::fs::remove_dir_all(&d);
     }
 

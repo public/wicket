@@ -430,7 +430,7 @@ pub struct EndState {
 /// - **Work collected before release** (`collected`). No placed node is released while a run's box
 ///   runs on it, or while a run's files on it are uncollected (a fetch failed, and nothing was
 ///   collected since). A run's uncollected files may go only with a node a human released, files and
-///   all (`wicket node release`, whose record counts the runs).
+///   all (`wicket node release`, whose record, or its retry's, counts the runs).
 /// - **No message delivered twice, and a refusal says so** (`messages`). No message is pushed to
 ///   a box twice (`node.message_pushed`, shipped by its node), none wicket refused is pushed at
 ///   all, and every refusal records why.
@@ -446,8 +446,10 @@ pub fn check_end_state(l: &Ledger) -> Result<EndState> {
             s.findings.push(finding("collected", &run, format!("node {name} was {status} while the run's box was running on it")));
         }
     }
+    // Files go with a human's release, or with the retry that finished one (#812 review).
     let mut forgot: HashSet<String> = HashSet::new();
-    for r in l.audit_of_kind("placement.node_released")? {
+    let records = l.audit_of_kind("placement.node_released")?.into_iter().chain(l.audit_of_kind("placement.node_release_finished")?);
+    for r in records {
         let b: Value = serde_json::from_str(&r.body).unwrap_or(Value::Null);
         if b["uncollected_runs_lost"].as_u64().unwrap_or(0) > 0 {
             forgot.extend(b["name"].as_str().map(String::from));
@@ -462,7 +464,9 @@ pub fn check_end_state(l: &Ledger) -> Result<EndState> {
         }
     }
     for (run, node) in &failed {
-        if !l.collected(run)?.is_empty() {
+        // Only files on this host count (#590 review): a taken result or an allowed push leaves
+        // them on the node, which must still hold the run.
+        if l.files_collected(run)? {
             continue;
         }
         let held: Option<String> =
@@ -483,7 +487,7 @@ pub fn check_end_state(l: &Ledger) -> Result<EndState> {
     }
     // Messages.
     s.messages = l.conn.query_row(
-        "SELECT (SELECT count(*) FROM messages WHERE kind = 'message') + (SELECT count(*) FROM message_refusals WHERE id NOT IN (SELECT id FROM messages))",
+        &format!("SELECT (SELECT count(*) FROM messages WHERE {}) + (SELECT count(*) FROM message_refusals WHERE id NOT IN (SELECT id FROM messages))", crate::PEER),
         [],
         |r| r.get::<_, i64>(0),
     )? as usize;
@@ -576,6 +580,11 @@ mod tests {
         fetch_failed(&l, "r_fetched", "n1");
         l.record_collected("r_fetched", "fetched").unwrap();
         l.set_run_uncollected("r_fetched", None).unwrap();
+        // A taken result, before the fetch that failed: the files are still on the node (#590 review).
+        run_on(&l, "r_outbox", "n1");
+        l.record_collected("r_outbox", "outbox").unwrap();
+        fetch_failed(&l, "r_outbox", "n1");
+        l.run_ended(&RunId("r_outbox".into()), "succeeded", "").unwrap();
         l.run_ended(&RunId("r_files".into()), "failed", "").unwrap();
         l.run_ended(&RunId("r_fetched".into()), "succeeded", "").unwrap();
         // Held, not released: nothing broken.
@@ -587,6 +596,7 @@ mod tests {
             vec![
                 "collected r_box: node n1 was released while the run's box was running on it".to_string(),
                 "collected r_files: node n1 was released with the run's files on it uncollected".to_string(),
+                "collected r_outbox: node n1 was released with the run's files on it uncollected".to_string(),
             ]
         );
     }

@@ -4,7 +4,9 @@
 //! the authority roots and the feed ([`roots`]), and what a run needs of the rest: nodes'
 //! enrolment, placement and leases ([`enrol`], [`localnode`], [`node`],
 //! [`nodecreate`], [`capacity`]), grants and their effects ([`grant`], [`effect`]), operators
-//! ([`operators`]), policy ([`policy`]) and images ([`image`]).
+//! ([`operators`]), policy ([`policy`]) and images ([`image`], [`imagetrust`]). Supervisor hosts,
+//! which will hold many runs' supervisors, their shards, leases and fencing: [`supervise`] (#582
+//! step 5).
 //!
 //! A library split from wicket-cli, which imports its modules under their old names. These were
 //! one cycle of modules there, and still are here; what they needed of the CLI's other modules
@@ -25,18 +27,22 @@ pub mod capacity;
 pub mod digest;
 pub mod effect;
 pub mod enrol;
+pub mod fence;
 // The control host's gateway tools (#257), a crate of their own: what the simulation calls.
 pub use wicket_gateway as gateway;
 pub mod gitguard;
 pub mod grant;
 pub mod hibernate;
 pub mod image;
+pub mod imagetrust;
 pub mod links;
 pub mod localnode;
 pub mod names;
+pub mod namesync;
 pub mod node;
 pub mod nodecall;
 pub mod nodecreate;
+pub mod noderelease;
 pub mod noderun;
 pub mod operators;
 pub mod policy;
@@ -49,6 +55,8 @@ pub mod snapstore;
 pub mod spawn;
 pub mod standing;
 pub mod storegc;
+pub mod supervise;
 pub mod transcript;
 pub mod triggers;
+pub mod vultrdns;
 pub mod whyhere;

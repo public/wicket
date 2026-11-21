@@ -9,7 +9,12 @@ use crate::*;
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
         Cmd::Reconcile { dry_run, every } => reconcile::command(dry_run, every).await,
-        Cmd::Lease { cmd: LeaseCmd::List } => capacity::list(),
+        Cmd::Lease { cmd: LeaseCmd::List { json } } => {
+            if json {
+                return crate::cmd::print_json(&capacity::list_json(&Ledger::open(&ledger_path())?)?);
+            }
+            capacity::list()
+        }
         Cmd::Lease { cmd: LeaseCmd::Release { id } } => {
             let l = Ledger::open(&ledger_path())?;
             let x = l.lease(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no lease {id}")))?;
@@ -45,7 +50,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             NodeCmd::Create(args) => nodecreate::create(*args).await,
-            NodeCmd::Release { common, id } => nodecreate::release(common, id).await,
+            NodeCmd::Release { common, id, reason, yes } => nodecreate::release(common, id, reason, wicket_home::cli_is_root(), yes).await,
             NodeCmd::Plans { common, region, plan_type } => nodecreate::plans(common, region, plan_type).await,
             NodeCmd::Revoke { name } => {
                 let mut l = Ledger::open(&ledger_path())?;
@@ -53,17 +58,179 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 println!("revoked node {name}; its CA serials {} go on the feed's revocation list", serials.join(", "));
                 Ok(())
             }
+            NodeCmd::Ca { name, json } => ca(&name, json),
+            NodeCmd::Fences { json } => fences(json),
             NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => enrol::renew_ca(&name, hosts, ca_ttl, cert_ttl).await,
-            NodeCmd::Set { name, ca_hosts, labels, taints } => set(&name, ca_hosts.as_deref(), &labels, &taints),
+            NodeCmd::Set { name, ca_hosts, labels, taints, public_ipv4, public_ipv6 } => {
+                set(&name, ca_hosts.as_deref(), &labels, &taints, public_ipv4.as_deref(), public_ipv6.as_deref())
+            }
             NodeCmd::Install { name, ssh_key, no_service } => crate::update::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
+            NodeCmd::Intake { listen, tls_cert, tls_key, socket, dir, trusted_proxy } => {
+                let trusted = trusted_proxy.iter().map(|c| c.parse::<crate::serve::limits::Cidr>()).collect::<Result<Vec<_>>>()?;
+                let sock = socket
+                    .unwrap_or_else(|| dir.unwrap_or_else(wicket_node::nodesrv::NodePaths::default_root).join("ctl").join("intake.sock"));
+                crate::intake::serve(listen, crate::intake::tls_pair(tls_cert, tls_key)?, sock, std::sync::Arc::new(trusted)).await
+            }
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
             NodeCmd::Forget { run, force } => noderun::forget_command(&run, force, &operator()).await,
-            NodeCmd::ReleaseFence { run, reason } => noderun::release_fence_command(&run, &reason, &operator(), wicket_home::cli_is_root()),
+            NodeCmd::FeedCheckpoint { name } => {
+                // An enrolled node's name only: it names a directory (#796 re-review).
+                if Ledger::open(&ledger_path())?.node(&name)?.is_none() {
+                    return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
+                }
+                let epoch = noderun::checkpoint_feed(&name)?;
+                let held = noderun::node_feed_holds_ports(&name)?;
+                Ledger::open(&ledger_path())?.audit(
+                    &TenantId::single(),
+                    None,
+                    "feed.checkpointed",
+                    &serde_json::json!({ "node": name, "epoch": epoch, "holds_ports": held, "by": operator() }),
+                )?;
+                println!(
+                    "node {name}: feed checkpointed at epoch {epoch}; {}",
+                    match held {
+                        true => "it still holds a box's record with host ports (revoke the public names published there first)",
+                        false => "no box's record in it holds host ports: a build before protocol 21 can open it",
+                    }
+                );
+                Ok(())
+            }
+            NodeCmd::ReleaseFence { run, reason, break_glass } => {
+                noderun::release_fence_command(&run, &reason, &operator(), break_glass.then_some(wicket_home::cli_is_root()))
+            }
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
+}
+
+/// `wicket node fences`: the console's Agents held on lost servers card.
+fn fences(json: bool) -> Result<()> {
+    let l = Ledger::open(&ledger_path())?;
+    let t = TenantId::single();
+    // As the dashboard reads them: running runs, and the last runs (one may have ended while fenced).
+    let recent: Vec<String> = l.runs(&t, 15)?.into_iter().map(|r| r.id).collect();
+    let rows = crate::serve::fence::view_in(&wicket_home::data_dir().join("runs"), &t.0, &l, &recent)?;
+    if json {
+        return crate::cmd::print_json(&rows.into());
+    }
+    if rows.is_empty() {
+        println!("no runs held on lost servers");
+    }
+    for r in &rows {
+        println!("{}", fence_line(&r["fence"]));
+    }
+    Ok(())
+}
+
+/// One line for `wicket node fences`.
+pub(crate) fn fence_line(f: &serde_json::Value) -> String {
+    let s = |k: &str| f[k].as_str().map(|v| wicket_agent::clip(v, 200)).unwrap_or_else(|| "-".into());
+    let ms = |k: &str| f[k].as_i64().map_or("never".to_string(), |m| wicket_core::time::unix_rfc3339(m / 1000));
+    let until = f["fenced_until_ms"].as_i64().map_or("until its node confirms, or it is released".to_string(), |m| {
+        format!("until {}", wicket_core::time::unix_rfc3339(m / 1000))
+    });
+    format!(
+        "{}  node {} ({}, last reported {})  fenced {until}: {}\n  release: wicket node release-fence {} --reason ...",
+        s("run"),
+        s("node"),
+        s("node_status"),
+        ms("node_seen_ms"),
+        s("why"),
+        s("run")
+    )
+}
+
+/// `wicket node ca`: a node's CA, as the console's node view shows it (#573).
+fn ca(name: &str, json: bool) -> Result<()> {
+    let l = Ledger::open(&ledger_path())?;
+    let now = wicket_store::now();
+    let v = enrol::ca_view(&l, name, now)?.ok_or_else(|| wicket_home::exit::not_found(format!("no node {name} was enrolled")))?;
+    if json {
+        return crate::cmd::print_json(&v);
+    }
+    print!("{}", ca_text(&v));
+    Ok(())
+}
+
+/// [`enrol::ca_view`] as text.
+fn ca_text(v: &serde_json::Value) -> String {
+    use std::fmt::Write;
+    let s = |x: &serde_json::Value| x.as_str().unwrap_or("").to_string();
+    let list = |x: &serde_json::Value| {
+        let xs: Vec<String> = x.as_array().into_iter().flatten().filter_map(|h| h.as_str().map(String::from)).collect();
+        if xs.is_empty() {
+            "none".to_string()
+        } else {
+            xs.join(", ")
+        }
+    };
+    let time = |x: &serde_json::Value| x.as_i64().map(wicket_core::time::unix_rfc3339).unwrap_or_default();
+    let mut o = String::new();
+    let _ = writeln!(o, "node {} ({})", s(&v["name"]), s(&v["status"]));
+    match v["ca"].as_object() {
+        Some(_) => {
+            let c = &v["ca"];
+            let end = if c["expired"].as_bool() == Some(true) { "EXPIRED" } else { "until" };
+            let _ = writeln!(
+                o,
+                "CA {} issued {}, {end} {}: hosts {}",
+                s(&c["serial"]),
+                time(&c["issued_at"]),
+                time(&c["not_after"]),
+                list(&c["hosts"])
+            );
+        }
+        None => {
+            let _ = writeln!(o, "no active CA");
+        }
+    }
+    let _ = writeln!(o, "enrolled with: {}", list(&v["enrolled_hosts"]));
+    let policy: wicket_store::CaHosts = serde_json::from_value(v["policy"].clone()).unwrap_or(wicket_store::CaHosts::Fixed);
+    let _ = writeln!(o, "policy: {}", enrol::ca_policy_line(&policy));
+    let wants = v["wants"].as_array().cloned().unwrap_or_default();
+    if wants.is_empty() {
+        let _ = writeln!(o, "wanted by live runs: nothing beyond its hosts");
+    } else {
+        let _ = writeln!(o, "wanted by live runs:");
+        for w in wants {
+            let _ = writeln!(o, "  {}  {}  since {}  {}: {}", s(&w["host"]), s(&w["run"]), time(&w["at"]), s(&w["state"]), s(&w["why"]));
+        }
+    }
+    if let Some(n) = v["next_renewal"].as_object() {
+        let dropped = list(&n["dropped"]);
+        let _ = writeln!(
+            o,
+            "next renewal signs: {}{}",
+            list(&n["hosts"]),
+            if dropped == "none" { String::new() } else { format!(" (over the cap: {dropped})") }
+        );
+    }
+    let widenings = v["widenings"].as_array().cloned().unwrap_or_default();
+    if widenings.is_empty() {
+        let _ = writeln!(o, "widenings: none on record");
+    } else {
+        let _ = writeln!(o, "widenings, newest first:");
+        for w in widenings {
+            let by: Vec<String> = w["wanted_by"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|b| format!("{} for {} ({})", s(&b["host"]), s(&b["run"]), s(&b["why"])))
+                .collect();
+            let by = if by.is_empty() { String::new() } else { format!("; wanted by {}", by.join(", ")) };
+            let _ = writeln!(
+                o,
+                "  {}  CA {}: added {}; removed {}{by}",
+                time(&w["at"]),
+                s(&w["ca_serial"]),
+                list(&w["added"]),
+                list(&w["removed"])
+            );
+        }
+    }
+    o
 }
 
 /// What `--label` and `--taint` say: set or remove, by key.
@@ -107,13 +274,35 @@ fn marks(labels: &[String], taints: &[String]) -> Result<Vec<Mark>> {
 
 /// `wicket node set`: a node's CA policy, labels and taints, each change audited. Everything is
 /// parsed before anything is written.
-fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String]) -> Result<()> {
-    anyhow::ensure!(ca_hosts.is_some() || !labels.is_empty() || !taints.is_empty(), "say what to set: --ca-hosts, --label or --taint");
+/// A `--public-ipv4` or `--public-ipv6` value: an address, or `none` to clear it.
+fn address<T: std::str::FromStr>(flag: &str, v: Option<&str>) -> Result<wicket_store::AddressChange<T>> {
+    use wicket_store::AddressChange as A;
+    match v {
+        None => Ok(A::Keep),
+        Some("none") => Ok(A::Clear),
+        Some(a) => a.parse().map(A::Set).map_err(|_| wicket_home::exit::usage(format!("--{flag} {a:?}: an address, or none"))),
+    }
+}
+
+fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String], ipv4: Option<&str>, ipv6: Option<&str>) -> Result<()> {
+    anyhow::ensure!(
+        ca_hosts.is_some() || !labels.is_empty() || !taints.is_empty() || ipv4.is_some() || ipv6.is_some(),
+        "say what to set: --ca-hosts, --label, --taint, --public-ipv4 or --public-ipv6"
+    );
     let policy = ca_hosts.map(|c| wicket_store::CaHosts::parse(c).map_err(anyhow::Error::msg)).transpose()?;
     let marks = marks(labels, taints)?;
+    let (v4, v6) = (address::<std::net::Ipv4Addr>("public-ipv4", ipv4)?, address::<std::net::Ipv6Addr>("public-ipv6", ipv6)?);
     let l = Ledger::open(&ledger_path())?;
     if l.node(name)?.is_none() {
         return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
+    }
+    if ipv4.is_some() || ipv6.is_some() {
+        // The authority the console's change needs (kind `node` at R4, #575 review, L5), checked
+        // and any refusal audited as the console's are.
+        let by = wicket_control::grant::Granter::Human(crate::operators::Operator::cli(&wicket_core::TenantId::single().0)?);
+        let a = wicket_control::names::set_node_addresses(&l, &by, name, None, v4, v6, serde_json::json!({ "via": "cli" }))?;
+        let show = |a: Option<String>| a.unwrap_or_else(|| "none".into());
+        println!("node {name}: public IPv4 {}, IPv6 {}", show(a.ipv4.map(|a| a.to_string())), show(a.ipv6.map(|a| a.to_string())));
     }
     let tenant = wicket_core::TenantId::single();
     if let Some(policy) = policy {
@@ -156,6 +345,32 @@ fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String])
 mod set_tests {
     use super::*;
     use wicket_core::placement::Taint;
+
+    /// `wicket node ca` says each want's state and the widenings, from the view the console shows.
+    #[test]
+    fn a_nodes_ca_reads_as_text() {
+        let v = serde_json::json!({
+            "name": "n1", "status": "active",
+            "ca": { "serial": "ab12", "issued_at": 0, "not_after": 0, "expired": true, "hosts": ["api.example.com", "a.example.org"] },
+            "enrolled_hosts": ["api.example.com"], "policy": { "mode": "auto" },
+            "wants": [{ "host": "b.example.org", "run": "run_a", "why": "reach", "at": 0, "state": "at the next renewal" }],
+            "next_renewal": { "hosts": ["api.example.com", "b.example.org"], "dropped": ["c.example.org"] },
+            "widenings": [{ "at": 0, "ca_serial": "ab12", "added": ["a.example.org"], "removed": [],
+                            "wanted_by": [{ "host": "a.example.org", "run": "run_a", "why": "reach" }] }],
+        });
+        let t = ca_text(&v);
+        for want in [
+            "node n1 (active)",
+            "CA ab12 issued 1970-01-01T00:00:00Z, EXPIRED 1970-01-01T00:00:00Z: hosts api.example.com, a.example.org",
+            "enrolled with: api.example.com",
+            "policy: auto (to every inspected host its boxes need)",
+            "  b.example.org  run_a  since 1970-01-01T00:00:00Z  at the next renewal: reach",
+            "next renewal signs: api.example.com, b.example.org (over the cap: c.example.org)",
+            "CA ab12: added a.example.org; removed none; wanted by a.example.org for run_a (reach)",
+        ] {
+            assert!(t.contains(want), "{want:?} in:\n{t}");
+        }
+    }
 
     #[test]
     fn labels_and_taints_parse_as_set_or_remove() {
@@ -243,12 +458,23 @@ pub enum NodeCmd {
     /// of yours that covers it, otherwise waiting for an operator.
     Create(Box<nodecreate::CreateArgs>),
     /// Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and
-    /// revoke its enrolment.
+    /// revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the
+    /// provider is asked, `placement.node_release_destroying` just before it is asked to destroy the
+    /// machine, then `placement.node_released` or `placement.node_release_failed`, the records the
+    /// console's release of a node past its lease writes too. On a node already released
+    /// it finishes a release whose ledger side didn't (`placement.node_release_finished`), or says
+    /// there is nothing left; the provider isn't asked again.
     Release {
         #[command(flatten)]
         common: nodecreate::Common,
         /// The provider's instance id, or the node's name.
         id: String,
+        /// Why: it goes on the audit record.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Don't ask before releasing it (a terminal is asked, as shown, first).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// List a provider's (Vultr's) plans in a region, with their hourly price.
     Plans {
@@ -285,6 +511,35 @@ pub enum NodeCmd {
         #[arg(long, hide = true)]
         idle_exit: Option<u64>,
     },
+    /// On the node: webhook intake for triggers (#578; docs/explanation/trigger-intake.md). Takes
+    /// deliveries for the triggers the control host assigned to this node, checks their token and
+    /// signature, and hands what it verified to this node's `wicket node serve`, which the control
+    /// host pulls from. It holds no ledger and no authority (the `wicket-intake` service runs this).
+    Intake {
+        /// Where to listen (e.g. `0.0.0.0:8443`).
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        /// A certificate chain (PEM) to serve TLS with; without it, plain HTTP behind a reverse
+        /// proxy that has TLS.
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        /// The certificate's private key (PEM).
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+        /// The node's intake socket, which `wicket node serve` listens on for intake (default:
+        /// `<node dir>/ctl/intake.sock`, for intake run as the node's own user). Run as its own
+        /// user, intake is given the socket the node's `intake_socket` names.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// The node's directory, for the default socket (default: $WICKET_NODE_HOME or
+        /// ~/.local/share/wicket-node).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// A reverse proxy in front of intake (an address or a CIDR range; repeatable), whose
+        /// `X-Forwarded-For` names the client. Without one, the client is the peer.
+        #[arg(long = "trusted-proxy")]
+        trusted_proxy: Vec<String>,
+    },
     /// On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA,
     /// its control connections, feed, load, memory and disk; each box's state, uptime, CPU and
     /// memory, model use and budget slice left, egress counts and queued asks; and the last egress
@@ -300,6 +555,13 @@ pub enum NodeCmd {
         #[arg(long, conflicts_with = "once")]
         json: bool,
     },
+    /// Write a checkpoint of a node's feed now (#575 step 4c): of the state as it is, so a build
+    /// before protocol 21 can open the feed once no box's record there holds host ports any more
+    /// (`wicket self rollback` says when that is needed). Audited as `feed.checkpointed`.
+    FeedCheckpoint {
+        /// The node.
+        name: String,
+    },
     /// Let a run's node delete the run's files, its workspace among them. Refused while the run's
     /// work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation
     /// bundle), unless --force; a forced delete is audited.
@@ -310,16 +572,21 @@ pub enum NodeCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Release a run's fence without its node (root only, audited as `run.fence_released`): for a
-    /// run whose node can't confirm its box stopped (unreachable or revoked) and whose fence
-    /// wouldn't otherwise end, as when its records don't say when its authority ends. Its agent
-    /// can then be woken. The box may still be running on its node.
+    /// Release a run's fence without its node (audited as `run.fence_released`): for a run whose
+    /// node can't confirm its box stopped (revoked, or no longer enrolled) and whose fence wouldn't
+    /// otherwise end. Its agent can then be woken. The box may still be running on its node. As the
+    /// console releases one (#713): within your operators.yaml authority (`fence` at R4), and only a
+    /// fence whose node is revoked or gone. --break-glass, as root: any fence, whatever its node.
     ReleaseFence {
         /// The run.
         run: String,
         /// Why: it goes on the audit record.
         #[arg(long)]
         reason: String,
+        /// Root only: release any fence, an enrolled node's too, without the operators.yaml check
+        /// (audited with granter `root`).
+        #[arg(long)]
+        break_glass: bool,
     },
     /// On the node: join stdin and stdout to `node serve`'s control socket (what the control host
     /// runs over ssh).
@@ -332,7 +599,8 @@ pub enum NodeCmd {
     /// (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the
     /// node has every label the box's `placement.node_selector` names, and the box tolerates every
     /// taint the node has. A CA widening is a renewal over the run's channel, audited as
-    /// `node.ca_widened`.
+    /// `node.ca_widened`. Its public addresses (#575) are where its boxes' public names point:
+    /// only you set them, never the node.
     Set {
         name: String,
         /// `fixed` (never: its hosts change only with renew-ca), `auto` (to every inspected host its
@@ -346,6 +614,31 @@ pub enum NodeCmd {
         /// `key` or `key=value` taints the node (one taint per key), `key-` removes it. Repeatable.
         #[arg(long = "taint")]
         taints: Vec<String>,
+        /// The node's public IPv4 address (an address on the public internet: the router's, for a
+        /// node behind NAT that forwards its port range), or `none`.
+        #[arg(long)]
+        public_ipv4: Option<String>,
+        /// The node's public IPv6 address, or `none`.
+        #[arg(long)]
+        public_ipv6: Option<String>,
+    },
+    /// A node's CA (#573): the hosts its active CA is constrained to and those it was enrolled
+    /// with, how it may be widened at runtime (`wicket node set --ca-hosts`), what live runs want of
+    /// it and whether its CA covers each, what the next renewal signs, and its last widenings
+    /// (`node.ca_widened`). The console's node view shows the same.
+    Ca {
+        name: String,
+        /// Print it as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Runs held on lost servers (#690, #713): each run whose box may still be running on a node that
+    /// can never end its fence (revoked, or no longer enrolled), so its agent isn't woken and the run
+    /// isn't ended. The console's card lists the same; `wicket node release-fence` releases one.
+    Fences {
+        /// Print JSON, as the console's card has them.
+        #[arg(long)]
+        json: bool,
     },
     /// Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity
     /// certificate for its node key, over its pinned ssh: also how a node whose identity certificate
@@ -366,7 +659,11 @@ pub enum NodeCmd {
 #[derive(Subcommand)]
 pub enum LeaseCmd {
     /// Every lease: status, holder run, node, money reserved, end.
-    List,
+    List {
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// End a lease now: what runs on it stops and its node is destroyed (one reconcile pass).
     Release { id: String },
 }

@@ -60,18 +60,18 @@ An instance wicket started offers its `port` under the service's name once its b
 
 ## `placement`
 
-What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. Today it decides where a woken agent goes ([nodes](nodes.md#placement)); `wicket run --node` and a spawn's placement hint name the node themselves.
+What a box asks of its node ([#579](https://github.com/public/wicket/issues/579)), beside its [`limits`](#limits), which placement reserves as its requests. It decides where a fresh `wicket run` without `--node` and a woken agent go ([nodes](nodes.md#placement)), when another node than this host's own is enrolled; `wicket run --node` (`local` included) and a spawn's placement hint name the node themselves.
 
 | field | type | default | meaning |
 |---|---|---|---|
 | `node_selector` | map of string to string | none | Labels the node must have, each with this value (`gpu: a100`). |
 | `tolerations` | list of strings | none | Node taints the box may go on despite: `key` (any value) or `key=value`. A node's taint keeps off every box that doesn't tolerate it. |
 | `priority` | integer, -1000 to 1000 | `0` | Where the box waits for a node among its own tenant's boxes, and which boxes it may displace: higher first. It never moves another tenant's boxes. A spawned box's is at most its parent's, approved or not. |
-| `preemptible` | boolean | `false` | The box may be stopped to make room for a box of higher priority. A spawned box of a preemptible parent is preemptible too. |
+| `preemptible` | boolean | `false` | A long-lived agent's box may be asked to hibernate to make room for a box of its tenant of higher priority. A spawned box of a preemptible parent is preemptible too. |
 | `affinity` | list | none | What the box wants on its node: `{ service: <name> }` (a service its `zone.uses` names, whose instance runs there) or `{ volume: <name> }` (a volume its `zone.volumes` declares with `keep: true`, which the node holds). Preferred, unless `required: true`. |
 | `anti_affinity` | list | none | What the box wants off its node: `{ zone: <name> }` (any box of that zone) or `{ principal: spiffe://… }` (that agent's boxes). Preferred, unless `required: true`. |
 
-A node that lacks a required affinity, or runs a box a required anti-affinity names, is out; of the nodes left, the one meeting the most preferences goes first, then bin-packing decides. Placement decides where a box goes and nothing more: its authority is issued as for any run, and the node's own admission still decides. A node is seen with the boxes of the box's own tenant running there, the service instances it may use there, and, for a kept volume, whether a box of the box's zone runs there or ran there within the volume's retention; never another tenant's boxes. Waiting wakes are served first come, first served across tenants, and by `priority` within one ([nodes](nodes.md#placement)). Preemption by `preemptible` comes in the next step of [#579](https://github.com/public/wicket/issues/579).
+A node that lacks a required affinity, or runs a box a required anti-affinity names, is out; of the nodes left, the one meeting the most preferences goes first, then bin-packing decides. Placement decides where a box goes and nothing more: its authority is issued as for any run, and the node's own admission still decides. A node is seen with the boxes of the box's own tenant running there, the service instances it may use there, and, for a kept volume, whether a box of the box's zone runs there or ran there within the volume's retention; never another tenant's boxes. Waiting wakes are served first come, first served across tenants, and by `priority` within one ([nodes](nodes.md#placement)). A waiting wake with no node for it may ask its own tenant's long-lived agents marked `preemptible`, of a lower priority, to hibernate to make room, each audited as `placement.preempted`; nothing is revoked, an agent with a live child is never chosen (hibernating would stop the child), and one that doesn't hibernate within 5 minutes is left alone ([nodes](nodes.md#placement)). Programs are never preempted, by design: a program has no stop that keeps its work.
 
 Keys are lowercase letters and digits with `.`, `_`, `-` or `/` inside, at most 63; values are letters, digits, `.`, `_` and `-`, at most 63. A manifest without `placement` reads the same to a node that doesn't know it; one with it needs its node on this release or later when it spawns there.
 
@@ -217,7 +217,7 @@ rulesets or branch protection).
 | `header` | string | required | The one header it goes in (`Authorization`). |
 | `format` | string | `{secret}` | The header's value. `{secret}` is the secret; `{basic:USER}` is `base64(USER:secret)`, so `Basic {basic:x-access-token}` is HTTP Basic with a token as password. Must contain one of the two. |
 | `secret` | string | required | The vault secret's name. Its host binding must cover `host`, or the run is refused. |
-| `optional` | boolean | `false` | If the secret isn't in the vault, send requests to the host without it instead of refusing to start. |
+| `optional` | boolean | `false` | If the secret isn't in the vault, send requests to the host without it instead of refusing to start. The secret is read at each request, so one set later is used from the next (#415). |
 
 A credential is only ever sent over HTTPS: plain HTTP to a host with an inject rule is refused.
 

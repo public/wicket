@@ -9,14 +9,15 @@ use crate::*;
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
         Cmd::Policy { cmd } => match cmd {
-            PolicyCmd::Show => policy::show(),
+            PolicyCmd::Show { json: false } => policy::show(),
+            PolicyCmd::Show { json: true } => super::authority::policy(),
             PolicyCmd::Check { file, entities } => {
                 policy::sanity(&file)?;
                 policy::check(&file, entities.as_deref())
             }
-            PolicyCmd::Apply { file, entities, keep_runs } => {
+            PolicyCmd::Apply { file, entities, keep_runs, dry_run, decision } => {
                 policy::sanity(&file)?;
-                policy::apply(&file, entities.as_deref(), keep_runs).await
+                policy::apply(&file, entities.as_deref(), keep_runs, dry_run, decision).await
             }
             PolicyCmd::Zone { manifest } => policy::zone(&manifest),
         },
@@ -50,8 +51,12 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
 
 #[derive(Subcommand)]
 pub enum PolicyCmd {
-    /// The org policy's version, and the running runs minted under another.
-    Show,
+    /// The org policy's version, and the running runs minted under another. --json: the console's
+    /// policy view (#713), every kept version with its Cedar and when and by whom it was applied.
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate and compile an org policy without installing it.
     Check {
         file: PathBuf,
@@ -60,7 +65,8 @@ pub enum PolicyCmd {
         entities: Option<PathBuf>,
     },
     /// Install an org policy, and revoke the running runs minted under an older version (their boxes
-    /// stop; new runs get the new policy).
+    /// stop; new runs get the new policy). The console applies one the same way, signed with a
+    /// passkey on what --dry-run shows.
     Apply {
         file: PathBuf,
         #[arg(long)]
@@ -68,6 +74,16 @@ pub enum PolicyCmd {
         /// Leave running runs on the policy they were minted under until they end.
         #[arg(long)]
         keep_runs: bool,
+        /// Change nothing: print what applying it would do (its version and the one it replaces,
+        /// what it changes against the applied policy for each running zone and group, whether it
+        /// mints for every running run's zone, and the runs it would revoke) and the effect the
+        /// console signs.
+        #[arg(long)]
+        dry_run: bool,
+        /// The console's signed decision to apply it (its audit sequence): applied only if it is
+        /// still what that decision previewed, once.
+        #[arg(long, hide = true, conflicts_with = "dry_run")]
+        decision: Option<i64>,
     },
     /// A zone's policy as Cedar, generated from a manifest (what its boxes' tokens are compiled from).
     Zone { manifest: PathBuf },

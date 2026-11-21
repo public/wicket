@@ -366,6 +366,7 @@ async fn run(route: Route, s: Setup, tag: &str, answer: Answer, delay: u64) -> S
         fence: s.stale.then(|| crate::Fence { agent: "agent-gone".into(), generation: 1 }),
         waker: None,
         lifecycle: None,
+        names: None,
     };
     let llm = crate::llm::Llm::new(c.clone()).unwrap();
     let mut out = None;

@@ -37,7 +37,7 @@ use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf, RunState, Tunne
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use nodeca::LiveCa;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -58,9 +58,12 @@ mod conn;
 mod gateway;
 #[path = "nodegw.rs"]
 mod gw;
+mod imagegc;
 mod images;
+pub mod intake;
 mod links;
 mod nodeca;
+mod ports;
 mod volumes;
 use conn::*;
 use gateway::*;
@@ -248,6 +251,9 @@ struct Node {
     links: Mutex<HashMap<u64, Link>>,
     boxes: Mutex<HashMap<String, BoxState>>,
     asks: Mutex<HashMap<u64, oneshot::Sender<Msg>>>,
+    /// Secrets a run couldn't get from an unreachable control host, by run and name (#415): audited
+    /// once per outage, until a fetch succeeds.
+    unreachable: Mutex<HashSet<(String, String)>>,
     /// The control host's tools asked for a box (#257 slice 4b), waiting on their [`Msg::Called`]:
     /// by call id, with the connection each went out on (dropped with it).
     calls: Mutex<HashMap<u64, PendingCall>>,
@@ -298,6 +304,8 @@ struct Node {
     /// renewal's new key waiting for its certificate.
     live_ca: Arc<LiveCa>,
     ca_pending: Mutex<Option<nodeca::Pending>>,
+    /// Webhook intake's table, spool and refusals (#578 step 4).
+    intake: intake::Intake,
 }
 
 impl Node {
@@ -871,13 +879,31 @@ impl Node {
                 n.asks.lock().expect("asks").remove(&id);
                 let why = match reply {
                     Some(Msg::SecretFetched { secret: Some(f), .. }) => {
+                        n.unreachable.lock().expect("unreachable").remove(&(run.clone(), name.clone()));
                         n.audit_note(&run, "node.secret_fetched", serde_json::json!({ "secret": name }));
                         return Ok(*f);
                     }
-                    Some(Msg::SecretFetched { error: Some(e), .. }) => format!("credential {name} refused by the control host: {e}"),
-                    _ => format!("credential {name} not cached on this node; control host unreachable"),
+                    Some(Msg::SecretFetched { error: Some(e), .. }) => {
+                        crate::nodesecrets::Unfetched::Refused(format!("credential {name} refused by the control host: {e}"))
+                    }
+                    _ => crate::nodesecrets::Unfetched::Unreachable(format!(
+                        "credential {name} not cached on this node; control host unreachable"
+                    )),
                 };
-                n.audit_note(&run, "node.secret_unavailable", serde_json::json!({ "secret": name, "why": why }));
+                // Unreachable: once per run, secret and outage (#415), not at each of the box's requests.
+                let first = match &why {
+                    crate::nodesecrets::Unfetched::Unreachable(_) => {
+                        n.unreachable.lock().expect("unreachable").insert((run.clone(), name.clone()))
+                    }
+                    // The control host answered: the outage, if any, is over (#415).
+                    crate::nodesecrets::Unfetched::Refused(_) => {
+                        n.unreachable.lock().expect("unreachable").remove(&(run.clone(), name.clone()));
+                        true
+                    }
+                };
+                if first {
+                    n.audit_note(&run, "node.secret_unavailable", serde_json::json!({ "secret": name, "why": why.to_string() }));
+                }
                 Err(why)
             })
         })
@@ -1044,6 +1070,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         links: Mutex::new(HashMap::new()),
         boxes: Mutex::new(HashMap::new()),
         asks: Mutex::new(HashMap::new()),
+        unreachable: Mutex::new(HashSet::new()),
         calls: Mutex::new(HashMap::new()),
         opens: Mutex::new(HashMap::new()),
         next: AtomicU64::new(0),
@@ -1069,6 +1096,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         feed_stalled: Default::default(),
         live_ca: Default::default(),
         ca_pending: Default::default(),
+        intake: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -1092,7 +1120,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             true => crate::reexec::control_root(),
             false => n.paths.root.join("versions"),
         };
-        crate::reexec::reexec_on_hangup(n.paths.root.join("serve.pid"), versions, move || {
+        crate::reexec::reexec_on_hangup_with(n.paths.root.join("serve.pid"), versions, move || {
             for b in n.boxes.lock().expect("boxes").values_mut() {
                 save_output(b);
             }
@@ -1101,13 +1129,21 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             }
             n.ship_audit();
             // The secret cache goes to the new process in a sealed memfd, never a file (#152): the
-            // descriptor is left open across the exec only, and named in the environment.
+            // exec alone passes the descriptor on and names it in the new process's environment,
+            // never this one's (#818). The handover is held across the exec, the cache frozen until
+            // then; if the exec fails it is dropped, closing the memfd.
             match n.secrets.export() {
-                Ok(fd) => {
-                    use std::os::fd::IntoRawFd;
-                    std::env::set_var(crate::nodesecrets::HANDOVER_ENV, fd.into_raw_fd().to_string());
+                Ok(h) => {
+                    let carried = crate::reexec::Carried {
+                        env: vec![(crate::nodesecrets::HANDOVER_ENV.to_string(), h.raw_fd().to_string())],
+                        fds: vec![h.raw_fd()],
+                    };
+                    (Some(h), carried)
                 }
-                Err(e) => say_err!("[node] the secret cache can't be handed over ({e:#}); it is fetched again"),
+                Err(e) => {
+                    say_err!("[node] the secret cache can't be handed over ({e:#}); it is fetched again");
+                    (None, crate::reexec::Carried::default())
+                }
             }
         });
     }
@@ -1206,6 +1242,12 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             }
         });
     }
+    // Webhook intake's socket (#578 step 4): `wicket node intake` reaches this node through it,
+    // checked by peer uid (`node.json`'s `intake_socket` and `intake_uid`, else `ctl/intake.sock`).
+    let (intake_sock, intake_uid) = intake::endpoint(&node.paths.root, &ctl);
+    if let Err(e) = intake::serve_socket(node.clone(), intake_sock, intake_uid) {
+        say_err!("[node] intake socket: {e:#}");
+    }
     let mode = node.replica.lock().expect("replica").mode((node.clock)());
     say_err!("[node] {name}: serving on {} (build {}, feed {mode:?})", ctl.display(), &node.build[..12]);
     {
@@ -1215,6 +1257,40 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             loop {
                 t.tick().await;
                 n.ship_audit();
+            }
+        });
+    }
+    // The images it was given and no box has used for a while are removed (#191).
+    if let Some(days) = imagegc::keep_days(&node.paths) {
+        say_err!("[node] removes the images it was given once unused for {days} days");
+        let n = node.clone();
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(imagegc::SWEEP_EVERY);
+            loop {
+                t.tick().await;
+                imagegc::sweep(&n).await;
+            }
+        });
+    }
+    // Its boxes' public names' host ports (#575 step 4c), from its replica alone.
+    {
+        let n = node.clone();
+        let range = match ports::publish_range(&n.paths.root) {
+            Ok(r) => r,
+            Err(e) => {
+                say_err!("[node] {e}: this node publishes no host ports");
+                None
+            }
+        };
+        if let Some(r) = &range {
+            say_err!("[node] publishes host ports {}-{} for its boxes' public names", r.start(), r.end());
+        }
+        tokio::spawn(async move {
+            let mut st = ports::Published::default();
+            let mut t = tokio::time::interval(ports::TICK);
+            loop {
+                t.tick().await;
+                ports::tick(&n, range.as_ref(), &mut st);
             }
         });
     }
@@ -1446,6 +1522,11 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     // What an image reference is comes from the node's cache while no image has changed since it
     // was inspected (#287); the pin is checked against it all the same.
     checks.end();
+    // Held from here until the box is live (`wire`), so no image sweep removes it meanwhile (#191).
+    let _image_held = match &bs.image_pin {
+        Some(pin) => Some(imagegc::hold(&node.paths.root, pin, (node.clock)()).await),
+        None => None,
+    };
     let ident = match &bs.image_pin {
         Some(pin) => {
             let by_ref = docker.image_identity_cached(&node.idents, &bs.image).await?.filter(|i| i.is(pin));
@@ -2032,6 +2113,7 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
     let t0 = std::time::Instant::now();
     let mut last_save = std::time::Instant::now();
     let mut stopped = false;
+    let mut ended = false;
     loop {
         // While lining up, a quiet box's replay mustn't be held back: reads time out at 3 s.
         let read = match aligner {
@@ -2071,6 +2153,7 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
         };
         if data.is_empty() {
             if eof {
+                ended = true;
                 break;
             }
             continue;
@@ -2111,7 +2194,31 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
             let _ = n.docker.kill(&name).await;
         }
         if eof {
+            ended = true;
             break;
+        }
+    }
+    // Docker ends a box's logs when the box stops. A stream that ends while the box still runs
+    // (#824) is recorded: what the box writes from then on isn't read. Docker may end the stream a
+    // moment before the box's state says it stopped, so it is asked again after 2 s.
+    if ended && !stopped {
+        let running = || async { n.docker.state(&name).await.ok().flatten().is_some_and(|(r, _)| r) };
+        if running().await {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if running().await {
+                let at = n.boxes.lock().expect("boxes").get(&run).map(|b| b.out[i].end()).unwrap_or(0);
+                let stream = if i == 0 { "stdout" } else { "stderr" };
+                say_err!(
+                    "[node] {run}: Docker ended the box's {stream} while it still runs: nothing it writes now is read (at offset {at})"
+                );
+                let _ = n.audit.lock().expect("audit").audit(
+                    &wicket_core::TenantId::single(),
+                    Some(&wicket_core::RunId(run.clone())),
+                    "box.output.ended_early",
+                    &serde_json::json!({ "stream": stream, "offset": at }),
+                );
+                n.ship_audit();
+            }
         }
     }
     // The tail as of the end of this read, for a `serve` that comes after.
@@ -2318,6 +2425,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     }
     // What was sent for the run (secrets, its budget slice) goes with its box (#152, #153).
     n.secrets.release(run);
+    n.unreachable.lock().expect("unreachable").retain(|(r, _)| r != run);
     n.slices.drop_run(run);
     n.queue.drop_run(run);
     n.edge.drop_run(run);
@@ -2385,6 +2493,7 @@ async fn serve_box(
         fence: None,
         waker: None,
         lifecycle: None,
+        names: None,
     };
     let ca = node.ca();
     let minter: Arc<dyn Minter> = ca.clone();
@@ -2844,6 +2953,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             links: Mutex::new(HashMap::new()),
             boxes: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
+            unreachable: Mutex::new(HashSet::new()),
             calls: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
             next: AtomicU64::new(0),
@@ -2869,6 +2979,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             feed_stalled: Default::default(),
             live_ca: Default::default(),
             ca_pending: Default::default(),
+            intake: Default::default(),
         })
     }
 
@@ -3128,6 +3239,25 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         // With no reserve left to release, the frame isn't tried again; the feed is stalled.
         assert!(node.feed_storage_failed(b"x", &full).is_none());
         assert!(node.feed_stalled.lock().unwrap().is_some());
+    }
+
+    /// #589: a snapshot below the epoch held, signed before it, is dropped as superseded, never
+    /// applied; the node puts it on its audit record (shipped to the control host), so a replayed
+    /// old snapshot stays visible where it used to be refused as a rollback.
+    #[tokio::test]
+    async fn a_superseded_snapshot_is_on_the_nodes_record() {
+        let mut f = PortsFeed::new("nodesrv-superseded");
+        f.commit(vec![wicket_feed::Change::Revoke { kind: wicket_feed::RevokeKind::Token, id: "b0".into(), until: f.now() + 60_000 }]);
+        let old = f.p.snapshot(f.now());
+        f.commit(vec![wicket_feed::Change::Revoke { kind: wicket_feed::RevokeKind::Token, id: "b1".into(), until: f.now() + 60_000 }]);
+        let held = f.node.replica.lock().unwrap().state().unwrap().epoch;
+        super::conn::accept_feed(&f.node, old.to_line().trim_end().as_bytes()).expect("superseded, not refused");
+        assert_eq!(f.node.replica.lock().unwrap().state().unwrap().epoch, held, "never applied");
+        let recs: Vec<_> = f.audit().into_iter().filter(|(k, ..)| k == "feed.snapshot_superseded").collect();
+        assert_eq!(recs.len(), 1, "{:?}", f.audit());
+        let what = recs[0].2["what"].as_str().unwrap();
+        assert!(what.contains(&format!("held ({held})")), "{what}");
+        assert!(f.audit().iter().all(|(k, ..)| k != "feed.refused"));
     }
 
     /// #377: a box is admitted only into memory that is actually free, counting what the boxes
@@ -3813,6 +3943,636 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         }
     }
 
+    /// #575 step 4c: a box's published host port is listened on here from the replica alone, a
+    /// connection's bytes reach the box's port (a fake `docker exec` that echoes), and a record
+    /// without the port closes the listener and drops the live connection, each audited.
+    #[tokio::test]
+    async fn a_published_port_relays_into_its_box_until_its_record_drops_it() {
+        use tokio::io::AsyncReadExt;
+        use wicket_feed::{Change, Issuer, KeyCert, Publisher, PublisherConfig};
+        let inst = Install::new("nodesrv-ports");
+        let echo = inst.dir.join("fake-docker");
+        std::fs::write(&echo, "#!/bin/sh\nexec cat\n").unwrap();
+        std::fs::set_permissions(&echo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut node = test_node(&inst);
+        Arc::get_mut(&mut node).unwrap().docker = Docker::with_command(vec![echo.display().to_string()]);
+        // A port the OS says is free.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let zone = "{ name: web }";
+        // The node's feed, with run_web's record carrying the port (as `fed_boxes`, by hand).
+        let root = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+        let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
+        let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
+        let cfg = PublisherConfig { ttl_ms: 30_000, refresh_ms: 100, retain: 100 };
+        let mut p =
+            Publisher::open_with(&inst.dir.join("pub"), "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
+        let mut r = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
+        let now = (node.clock)();
+        let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
+        let issuer = Issuer::root(
+            &authz_root,
+            "t0",
+            "run:run_web",
+            "run_web",
+            0,
+            &z,
+            &[],
+            u64::try_from(now / 1000 + 3600).unwrap(),
+            vec![approver.public()],
+        )
+        .unwrap();
+        let mut a = issuer.publish(&approver, &[]).unwrap();
+        a.ports = vec![wicket_feed::PublishedPort {
+            name: "n-1".into(),
+            label: "demo".into(),
+            host_port: port,
+            box_port: 3000,
+            until_ms: i64::MAX,
+        }];
+        let hello = r.hello();
+        p.commit(vec![Change::PutZone { zone: a.clone() }], now).unwrap();
+        for f in p.catch_up(&hello, now).unwrap() {
+            r.accept(&f, now).unwrap();
+        }
+        *node.replica.lock().unwrap() = r;
+        add_box(&node, &inst, "run_web", zone);
+
+        // Outside the node's range: not opened.
+        let mut st = ports::Published::default();
+        ports::tick(&node, Some(&(port + 1..=port + 1)), &mut st);
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "not in the range: nothing listens");
+        // In it: a connection's bytes reach the box and come back.
+        let range = port..=port;
+        ports::tick(&node, Some(&range), &mut st);
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // The name is gone from the box's record: the port closes, the live connection with it.
+        let mut without = a.clone();
+        without.ports.clear();
+        let hello = node.replica.lock().unwrap().hello();
+        p.commit(vec![Change::PutZone { zone: without }], now + 1).unwrap();
+        for f in p.catch_up(&hello, now + 1).unwrap() {
+            node.replica.lock().unwrap().accept(&f, now + 1).unwrap();
+        }
+        ports::tick(&node, Some(&range), &mut st);
+        let mut rest = vec![];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut rest)).await;
+        assert!(read.is_ok(), "the live connection is dropped");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "nothing listens once the name is gone");
+        let kinds: Vec<String> = node.audit.lock().unwrap().audit_tail(50).unwrap().into_iter().map(|a| a.2).collect();
+        for k in ["name.port.opened", "name.port.closed"] {
+            assert!(kinds.iter().any(|x| x == k), "{k} in {kinds:?}");
+        }
+    }
+
+    /// A node for the host-port tests (#575 step 4c, #796 review): a fake `docker exec` that echoes
+    /// and appends its arguments as a line to `execs` each time it runs, a clock the test moves (`skew`, ms), and a
+    /// feed whose records the test publishes ([`PortsFeed::put`]) and revokes.
+    struct PortsFeed {
+        inst: Install,
+        node: Arc<Node>,
+        skew: Arc<AtomicI64>,
+        execs: PathBuf,
+        p: wicket_feed::Publisher<BoxAuthority>,
+        authz_root: wicket_authz::SigningKey,
+        approver: wicket_authz::SigningKey,
+    }
+
+    impl PortsFeed {
+        fn new(name: &str) -> PortsFeed {
+            use wicket_feed::{KeyCert, Publisher, PublisherConfig};
+            let inst = Install::new(name);
+            let execs = inst.dir.join("execs");
+            let docker = inst.dir.join("fake-docker");
+            std::fs::write(&docker, format!("#!/bin/sh\necho \"$*\" >> '{}'\nexec cat\n", execs.display())).unwrap();
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut node = test_node(&inst);
+            let skew = Arc::new(AtomicI64::new(0));
+            {
+                let n = Arc::get_mut(&mut node).unwrap();
+                n.docker = Docker::with_command(vec![docker.display().to_string()]);
+                let (base, s) = (node_clock(), skew.clone());
+                n.clock = Arc::new(move || base() + s.load(Ordering::SeqCst));
+            }
+            let root = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let key = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+            let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+            let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+            let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
+            let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
+            let cfg = PublisherConfig { ttl_ms: 30_000, refresh_ms: 100, retain: 100 };
+            let p =
+                Publisher::open_with(&inst.dir.join("pub"), "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
+            *node.replica.lock().unwrap() = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
+            PortsFeed { inst, node, skew, execs, p, authz_root, approver }
+        }
+
+        fn now(&self) -> i64 {
+            (self.node.clock)()
+        }
+
+        /// Box `run`'s record (a running box on this node), publishing `ports` as `(host, until_ms)`:
+        /// the record and its block 0's revocation id.
+        fn put(&mut self, run: &str, ports: &[(u16, i64)]) -> (BoxAuthority, String) {
+            let zone = "{ name: web }";
+            let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
+            let not_after = u64::try_from(self.now() / 1000 + 3600).unwrap();
+            let who = format!("run:{run}");
+            let issuer =
+                wicket_feed::Issuer::root(&self.authz_root, "t0", &who, run, 0, &z, &[], not_after, vec![self.approver.public()]).unwrap();
+            let mut a = issuer.publish(&self.approver, &[]).unwrap();
+            a.ports = ports
+                .iter()
+                .enumerate()
+                .map(|(i, (host_port, until_ms))| wicket_feed::PublishedPort {
+                    name: format!("n-{i}"),
+                    label: "demo".into(),
+                    host_port: *host_port,
+                    box_port: 3000,
+                    until_ms: *until_ms,
+                })
+                .collect();
+            self.commit(vec![wicket_feed::Change::PutZone { zone: a.clone() }]);
+            if !self.node.boxes.lock().unwrap().contains_key(run) {
+                add_box(&self.node, &self.inst, run, zone);
+            }
+            (a, issuer.block_ids()[0].clone())
+        }
+
+        /// Revokes a token block, as `NodeCtl::revoke` publishes it.
+        fn revoke(&mut self, id: &str) {
+            let until = self.now() + 3_600_000;
+            self.commit(vec![wicket_feed::Change::Revoke { kind: wicket_feed::RevokeKind::Token, id: id.into(), until }]);
+        }
+
+        fn commit(&mut self, changes: Vec<wicket_feed::Change<BoxAuthority>>) {
+            let now = self.now();
+            let hello = self.node.replica.lock().unwrap().hello();
+            self.p.commit(changes, now).unwrap();
+            for f in self.p.catch_up(&hello, now).unwrap() {
+                self.node.replica.lock().unwrap().accept(&f, now).unwrap();
+            }
+        }
+
+        fn execs(&self) -> usize {
+            std::fs::read_to_string(&self.execs).map(|s| s.lines().count()).unwrap_or(0)
+        }
+
+        /// The audit records so far: `(kind, run, body)`.
+        fn audit(&self) -> Vec<(String, Option<String>, serde_json::Value)> {
+            let rows = self.node.audit.lock().unwrap().audit_tail(500).unwrap();
+            rows.into_iter().map(|r| (r.2, r.3, serde_json::from_str(&r.4).unwrap_or_default())).collect()
+        }
+
+        /// Waits (up to 5 s) for an audit record of `kind` that `f` accepts.
+        async fn await_audit(&self, kind: &str, f: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+            for _ in 0..100 {
+                if let Some((.., b)) = self.audit().into_iter().find(|(k, _, b)| k == kind && f(b)) {
+                    return b;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("no {kind} as wanted in {:?}", self.audit());
+        }
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A connection on `port` that has been relayed: `ping` sent and echoed back.
+    async fn relayed(port: u16) -> tokio::net::TcpStream {
+        relayed_from(1, port).await
+    }
+
+    /// A connection to `port` on loopback from 127.0.0.`n`: a peer of its own to the node's limits.
+    async fn connect_from(n: u8, port: u16) -> tokio::net::TcpStream {
+        let s = tokio::net::TcpSocket::new_v4().unwrap();
+        s.bind(std::net::SocketAddr::from((std::net::Ipv4Addr::new(127, 0, 0, n), 0))).unwrap();
+        s.connect(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))).await.unwrap()
+    }
+
+    /// [`relayed`], from 127.0.0.`n`.
+    async fn relayed_from(n: u8, port: u16) -> tokio::net::TcpStream {
+        use tokio::io::AsyncReadExt;
+        let mut c = connect_from(n, port).await;
+        c.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf, b"ping");
+        c
+    }
+
+    /// Whether `c` is still open: nothing read, no end, for 200 ms.
+    async fn still_open(c: &mut tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut b = [0u8; 1];
+        tokio::time::timeout(std::time::Duration::from_millis(200), c.read(&mut b)).await.is_err()
+    }
+
+    /// The sum of `field` over the `name.conn.refused` records so far, once it reaches `want`
+    /// (waited for up to 5 s; a tick's flush may split them).
+    async fn await_refused(f: &PortsFeed, field: &str, want: u64) {
+        let sum = || f.audit().iter().filter(|(k, ..)| k == "name.conn.refused").map(|(.., b)| b[field].as_u64().unwrap_or(0)).sum::<u64>();
+        for _ in 0..100 {
+            if sum() >= want {
+                assert_eq!(sum(), want, "{field} in {:?}", f.audit());
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{field}: {} of {want} in {:?}", sum(), f.audit());
+    }
+
+    /// Whether `c` is ended by the other side within 5 s (end of file or a reset).
+    async fn ends(c: &mut tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut rest = vec![];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut rest)).await.is_ok()
+    }
+
+    /// #796 review: a port whose own end passes closes, by the node's clock alone, and the
+    /// connection it cuts is still recorded (M4).
+    #[tokio::test]
+    async fn a_published_port_closes_when_its_end_passes() {
+        let mut f = PortsFeed::new("nodesrv-ports-expiry");
+        let port = free_port();
+        let until = f.now() + 3_000;
+        f.put("run_web", &[(port, until)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        f.skew.fetch_add(5_000, Ordering::SeqCst);
+        ports::tick(&f.node, Some(&range), &mut st);
+        assert!(ends(&mut c).await, "the live connection is cut");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "nothing listens past the port's end");
+        let a = f.audit();
+        assert!(a.iter().any(|(k, r, _)| k == "name.port.closed" && r.as_deref() == Some("run_web")), "{a:?}");
+        let cut = f.await_audit("name.conn", |b| b["cut"] == true).await;
+        assert_eq!(cut["bytes_in"], 4, "{cut}");
+    }
+
+    /// #796 review: revoking the box's token (block 0, as `NodeCtl::revoke` does) closes its port
+    /// and the connection on it, recorded as cut.
+    #[tokio::test]
+    async fn a_revoked_boxs_port_closes() {
+        let mut f = PortsFeed::new("nodesrv-ports-revoke");
+        let port = free_port();
+        let (_, block0) = f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        f.revoke(&block0);
+        ports::tick(&f.node, Some(&range), &mut st);
+        assert!(ends(&mut c).await, "the live connection is cut");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "nothing listens once revoked");
+        let closed = f.await_audit("name.port.closed", |_| true).await;
+        assert!(closed["why"].as_str().unwrap().contains("authority ended"), "{closed}");
+        f.await_audit("name.conn", |b| b["cut"] == true).await;
+    }
+
+    /// #796 review, M4: a port two boxes claim is opened for neither, and the failure is filed
+    /// under each claiming run, once.
+    #[tokio::test]
+    async fn a_contested_port_opens_for_neither_and_is_filed_under_both() {
+        let mut f = PortsFeed::new("nodesrv-ports-contested");
+        let port = free_port();
+        f.put("run_aaa", &[(port, i64::MAX)]);
+        f.put("run_bbb", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        ports::tick(&f.node, Some(&range), &mut st);
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "neither gets it");
+        let failed: Vec<Option<String>> =
+            f.audit().into_iter().filter(|(k, _, b)| k == "name.port.failed" && b["port"] == port).map(|(_, r, _)| r).collect();
+        assert_eq!(failed.len(), 2, "once for each: {failed:?}");
+        for run in ["run_aaa", "run_bbb"] {
+            assert!(failed.contains(&Some(run.into())), "{run} in {failed:?}");
+        }
+    }
+
+    /// #796 review, H2: a connection that sends nothing is closed after the first-byte timeout
+    /// without a `docker exec`, and counted; one that speaks is relayed.
+    #[tokio::test]
+    async fn a_silent_connection_is_closed_without_an_exec() {
+        let mut f = PortsFeed::new("nodesrv-ports-silent");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().first_byte = std::time::Duration::from_millis(300);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut quiet = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert!(ends(&mut quiet).await, "closed for saying nothing");
+        assert_eq!(f.execs(), 0, "no exec for a silent connection");
+        let _c = relayed(port).await;
+        assert_eq!(f.execs(), 1);
+        let r = f.await_audit("name.conn.refused", |b| b["silent"] == 1).await;
+        assert_eq!(r["refused"], 0, "{r}");
+    }
+
+    /// #796 review, H2: one peer address holds at most `per_peer` connections on a port; past it
+    /// a connection is refused before any exec, and counted. Connections ending past the
+    /// per-tick record count are recorded as one aggregate.
+    #[tokio::test]
+    async fn a_peer_over_its_cap_is_refused_and_many_ends_aggregate() {
+        let mut f = PortsFeed::new("nodesrv-ports-peer");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        {
+            let l = Arc::get_mut(&mut st.limits).unwrap();
+            l.per_peer = 2;
+            l.conn_records = 2;
+        }
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let (a, b) = (relayed(port).await, relayed(port).await);
+        let mut third = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let _ = third.write_all(b"ping").await;
+        assert!(ends(&mut third).await, "a third from the same address is refused");
+        assert_eq!(f.execs(), 2, "no exec for the refused one");
+        f.await_audit("name.conn.refused", |b| b["over_peer"] == 1).await;
+        // Once one ends, the address may connect again; three ending in a tick aggregate.
+        drop((a, b));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(relayed(port).await);
+        // (Whether they land in one serve tick is timing: ports' own test checks the aggregate.)
+        let n = f.await_audit("name.conn", |b| b["aggregate"] == true || b["phase"] == "end").await;
+        assert!(n["port"] == port, "{n}");
+    }
+
+    /// #796 review, M1: revoking the run itself (not a block of its token) closes its port, as
+    /// every other decision the node makes refuses it.
+    #[tokio::test]
+    async fn a_revoked_run_closes_its_port() {
+        let mut f = PortsFeed::new("nodesrv-ports-revoke-run");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        let until = f.now() + 3_600_000;
+        f.commit(vec![wicket_feed::Change::Revoke { kind: wicket_feed::RevokeKind::Run, id: "run_web".into(), until }]);
+        ports::tick(&f.node, Some(&range), &mut st);
+        assert!(ends(&mut c).await, "the live connection is cut");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err(), "nothing listens for a revoked run");
+    }
+
+    /// #796 review, M1: offline (no live statement, the control host out of reach), the node
+    /// still publishes from what it holds, as it decides everything else then.
+    #[tokio::test]
+    async fn an_offline_node_keeps_its_ports() {
+        let mut f = PortsFeed::new("nodesrv-ports-offline");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        f.skew.fetch_add(40_000, Ordering::SeqCst);
+        let mode = f.node.replica.lock().unwrap().mode(f.now());
+        assert_eq!(mode, wicket_feed::Mode::Offline);
+        ports::tick(&f.node, Some(&range), &mut st);
+        drop(relayed(port).await);
+    }
+
+    /// #796 review, H2: a connection with no bytes either way for the idle timeout is closed,
+    /// and recorded.
+    #[tokio::test]
+    async fn an_idle_connection_is_closed() {
+        let mut f = PortsFeed::new("nodesrv-ports-idle");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().idle = std::time::Duration::from_millis(300);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        assert!(ends(&mut c).await, "closed for carrying nothing");
+        let rec = f.await_audit("name.conn", |b| b["phase"] == "end").await;
+        assert_eq!((rec["bytes_in"].clone(), rec["bytes_out"].clone()), (4.into(), 4.into()), "{rec}");
+        // N2 (#796 review): every end the node causes is `cut`, with why.
+        assert_eq!((rec["why"].clone(), rec["cut"].clone()), ("idle".into(), true.into()), "{rec}");
+    }
+
+    /// #796 re-review, M4: a relayed connection's start is on record while it is live, with the
+    /// peer and an id; its end, after, carries the same id. The exec in the box is given the node's
+    /// idle and after-close limits (H2).
+    #[tokio::test]
+    async fn a_connections_start_is_recorded_while_it_is_live() {
+        let mut f = PortsFeed::new("nodesrv-ports-start");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let c = relayed(port).await;
+        let start = f.await_audit("name.conn", |b| b["phase"] == "start").await;
+        assert!(start["peer"].as_str().unwrap().starts_with("127.0.0.1:"), "{start}");
+        assert!(f.audit().iter().all(|(_, _, b)| b["phase"] != "end"), "live: no end yet");
+        let argv = std::fs::read_to_string(&f.execs).unwrap();
+        assert!(
+            argv.contains("-e WICKET_FWD_IDLE_SECS=300 -e WICKET_FWD_AFTER_CLOSE_SECS=30")
+                && argv.contains("wicket-fwd --dial 127.0.0.1:3000"),
+            "{argv}"
+        );
+        drop(c);
+        let end = f.await_audit("name.conn", |b| b["phase"] == "end").await;
+        assert_eq!(end["conn"], start["conn"], "{end}");
+        let a = f.audit();
+        let at = |phase: &str| a.iter().position(|(_, _, b)| b["phase"] == phase).unwrap();
+        assert!(at("start") < at("end"), "{a:?}");
+    }
+
+    /// #796 re-review, H2: connections waiting for their first byte have their own cap per peer:
+    /// past it a silent one is refused at once and counted, and the waiting ones don't stop a
+    /// connection that speaks once they are gone.
+    #[tokio::test]
+    async fn silent_connections_from_one_peer_are_capped() {
+        let mut f = PortsFeed::new("nodesrv-ports-waiting");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().first_byte = std::time::Duration::from_millis(800);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut quiet = vec![];
+        for _ in 0..ports::MAX_WAITING_PER_PEER {
+            quiet.push(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut over = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let started = std::time::Instant::now();
+        assert!(ends(&mut over).await, "refused");
+        assert!(started.elapsed() < std::time::Duration::from_millis(600), "at once, not at the first-byte timeout");
+        let r = f.await_audit("name.conn.refused", |b| b["waiting"] == 1).await;
+        assert_eq!(r["max_waiting_per_peer"], ports::MAX_WAITING_PER_PEER, "{r}");
+        for mut q in quiet {
+            assert!(ends(&mut q).await, "closed for saying nothing");
+        }
+        drop(relayed(port).await);
+        assert_eq!(f.execs(), 1, "no exec for the silent ones");
+    }
+
+    /// #796 re-review, H2: at default limits, a browser's burst of six connections from one
+    /// address, each speaking at once, is relayed: the waiting cap doesn't refuse it.
+    #[tokio::test]
+    async fn a_burst_of_speaking_connections_is_relayed() {
+        let mut f = PortsFeed::new("nodesrv-ports-burst");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let burst: Vec<_> = (0..6).map(|_| tokio::spawn(relayed(port))).collect();
+        for c in burst {
+            c.await.expect("relayed");
+        }
+        assert_eq!(f.execs(), 6);
+    }
+
+    /// #796 re-review, H2: a relay that keeps moving bytes is still cut at its lifetime, and
+    /// recorded `cut`, why `lifetime`.
+    #[tokio::test]
+    async fn a_relay_is_cut_at_its_lifetime() {
+        let mut f = PortsFeed::new("nodesrv-ports-lifetime");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().lifetime = std::time::Duration::from_millis(1200);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = relayed(port).await;
+        // A byte every 200 ms: never idle.
+        let mut buf = [0u8; 1];
+        let mut cut = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if c.write_all(b".").await.is_err()
+                || !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), c.read(&mut buf)).await, Ok(Ok(1)))
+            {
+                cut = true;
+                break;
+            }
+        }
+        assert!(cut, "cut at its lifetime");
+        let end = f.await_audit("name.conn", |b| b["phase"] == "end").await;
+        assert_eq!((end["cut"].clone(), end["why"].clone()), (true.into(), "lifetime".into()), "{end}");
+        assert!(end["ms"].as_u64().unwrap() >= 1200, "{end}");
+    }
+
+    /// R1 (#796 review): a port's waiting pool full of silent sockets from three peers doesn't
+    /// refuse a newcomer: it evicts the oldest waiter (closed at once, well before the first-byte
+    /// timeout, and counted `evicted`) and the newcomer, speaking, is relayed. A peer at its own
+    /// waiting cap is refused, evicting no one.
+    #[tokio::test]
+    async fn the_oldest_waiter_is_evicted_for_a_newcomer() {
+        let mut f = PortsFeed::new("nodesrv-ports-evict");
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().first_byte = std::time::Duration::from_secs(8);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        // 6 + 6 + 4: the pool of 16, in the order they're accepted.
+        let mut quiet = vec![];
+        for (n, k) in [(2, ports::MAX_WAITING_PER_PEER), (3, ports::MAX_WAITING_PER_PEER), (4, 4)] {
+            for _ in 0..k {
+                quiet.push(connect_from(n, port).await);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        assert_eq!(quiet.len(), ports::MAX_WAITING);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        let _c = relayed_from(5, port).await;
+        assert!(ends(&mut quiet[0]).await, "the oldest waiter is evicted");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "at once, not at the first-byte timeout");
+        assert!(still_open(&mut quiet[1]).await, "only the oldest");
+        // A seventh from a peer at its own waiting cap: refused, and no other peer's waiter goes.
+        let mut over = connect_from(3, port).await;
+        assert!(ends(&mut over).await, "refused");
+        assert!(still_open(&mut quiet[1]).await && still_open(&mut quiet[6]).await, "nothing evicted for it");
+        assert_eq!(f.execs(), 1, "one exec: the newcomer's");
+        await_refused(&f, "evicted", 1).await;
+        await_refused(&f, "waiting", 1).await;
+    }
+
+    /// R1 (#796 review): one peer's relays are capped over the whole node, across its ports:
+    /// past it a connection on another port is refused before any exec, counted `node_peer`;
+    /// another address still gets through.
+    #[tokio::test]
+    async fn a_peers_relays_are_capped_across_ports() {
+        let mut f = PortsFeed::new("nodesrv-ports-node-peer");
+        let (l1, l2) = (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (p1, p2) = (l1.local_addr().unwrap().port(), l2.local_addr().unwrap().port());
+        drop((l1, l2));
+        f.put("run_web", &[(p1, i64::MAX), (p2, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().node_per_peer = 2;
+        let range = p1.min(p2)..=p1.max(p2);
+        ports::tick(&f.node, Some(&range), &mut st);
+        let (_a, _b) = (relayed(p1).await, relayed(p2).await);
+        let mut third = connect_from(1, p1).await;
+        let _ = third.write_all(b"ping").await;
+        assert!(ends(&mut third).await, "a third relay for the same address, on either port, is refused");
+        assert_eq!(f.execs(), 2, "no exec for the refused one");
+        let r = f.await_audit("name.conn.refused", |b| b["node_peer"] == 1).await;
+        assert_eq!((r["port"].clone(), r["refused"].clone(), r["max_node_per_peer"].clone()), (p1.into(), 1.into(), 2.into()), "{r}");
+        let _c = relayed_from(2, p2).await;
+        assert_eq!(f.execs(), 3);
+    }
+
+    /// N1, N2 (#796 review): after the peer's half-close, the relay isn't cut while bytes still
+    /// go to the peer (a download), only once none have for `after_close`; that end is `cut`,
+    /// why `after close`.
+    #[tokio::test]
+    async fn after_close_waits_while_bytes_flow_to_the_peer() {
+        use tokio::io::AsyncReadExt;
+        let mut f = PortsFeed::new("nodesrv-ports-after-close");
+        // A box's service that answers once its input ends: a byte every 100 ms for a second, then
+        // nothing, its side still open.
+        let docker = f.inst.dir.join("fake-docker-download");
+        let script = "#!/bin/sh\ncat >/dev/null\ni=0\nwhile [ $i -lt 10 ]; do printf x; sleep 0.1; i=$((i+1)); done\nexec sleep 30\n";
+        std::fs::write(&docker, script).unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Arc::get_mut(&mut f.node).unwrap().docker = Docker::with_command(vec![docker.display().to_string()]);
+        let port = free_port();
+        f.put("run_web", &[(port, i64::MAX)]);
+        let mut st = ports::Published::default();
+        Arc::get_mut(&mut st.limits).unwrap().after_close = std::time::Duration::from_millis(500);
+        let range = port..=port;
+        ports::tick(&f.node, Some(&range), &mut st);
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        c.shutdown().await.unwrap();
+        let mut got = vec![];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut got)).await.expect("cut in time").unwrap();
+        assert_eq!(got, b"xxxxxxxxxx", "the whole download, though it outlasts after_close");
+        let end = f.await_audit("name.conn", |b| b["phase"] == "end").await;
+        assert_eq!(
+            (end["cut"].clone(), end["why"].clone(), end["bytes_out"].clone()),
+            (true.into(), "after close".into(), 10.into()),
+            "{end}"
+        );
+        assert!(end["ms"].as_u64().unwrap() >= 1400, "a second of download, then after_close: {end}");
+    }
+
     fn add_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {
         let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
         let mut rec = fake_record(run);
@@ -4288,6 +5048,57 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         bs.start_by = Some(now_s + 3600);
         let e = start_box_steps(&node, None, bs, Arc::new(Timings::new())).await.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(!e.contains("past its lease"), "{e}");
+    }
+
+    /// #415: a secret a run can't get while its control host is unreachable is audited once per
+    /// outage, not per request; an answer from the control host (a refusal too) ends the outage, so
+    /// the next one is audited again.
+    #[tokio::test]
+    async fn an_unreachable_control_host_is_audited_once_per_outage() {
+        const RUN: &str = "run_uuuuuuuuuuuuuuuuuuuuuuuuuu";
+        let inst = Install::new("nodesrv-unreachable");
+        let node = test_node(&inst);
+        fed_box(&node, &inst, RUN, "name: z\n");
+        let unavailable =
+            || node.audit.lock().unwrap().audit_tail(100).unwrap().iter().filter(|r| r.2 == "node.secret_unavailable").count();
+        let fetch = node.fetcher();
+        // No connection for the run: unreachable, audited once however often it is asked.
+        for _ in 0..3 {
+            assert!(matches!(fetch(RUN.into(), "gh".into()).await, Err(crate::nodesecrets::Unfetched::Unreachable(_))));
+        }
+        assert_eq!(unavailable(), 1);
+        // Connected: the control host answers, refusing it, which is audited and ends the outage.
+        let mut c = connect_run(&node, 2, &inst, RUN).await;
+        c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        for _ in 0..500 {
+            if node.owner(RUN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let answering = tokio::spawn(async move {
+            loop {
+                if let Frame::Msg(Msg::SecretFetch { id, .. }) = next_msg(&mut c).await {
+                    let refused = Msg::SecretFetched { id, secret: None, error: Some("not set".into()) };
+                    c.write_all(&Frame::Msg(refused).encode()).await.unwrap();
+                    return c;
+                }
+            }
+        });
+        assert!(matches!(fetch(RUN.into(), "gh".into()).await, Err(crate::nodesecrets::Unfetched::Refused(_))));
+        assert_eq!(unavailable(), 2, "the refusal");
+        // Cut off again: a new outage, audited again.
+        drop(answering.await.unwrap());
+        for _ in 0..500 {
+            if node.owner(RUN).is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        for _ in 0..3 {
+            assert!(fetch(RUN.into(), "gh".into()).await.is_err());
+        }
+        assert_eq!(unavailable(), 3, "one more for the new outage");
     }
 
     #[tokio::test]
