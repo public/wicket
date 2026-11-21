@@ -135,13 +135,13 @@ The operator sees, in `wicket names show` and on the console's card:
   data), as approval cards do for `direct` mode, and a zone the org policy marks confidential can't
   be given a public name at all;
 - the nodes the box may run on that can publish (below);
-- for a standing ask, the evidence and terms as `wicket standing` shows them.
+- for a standing request, the evidence and terms as `wicket standing` shows them.
 
 A human approves with a passkey (console) or `wicket names approve` (`deny`). No agent's `decide`
 can approve a public name, as no agent approves standing reach.
 
-**Standing names reuse standing reach (#572)** where it fits. A standing ask is a row with the same
-life (pending, approved or denied, revoked, lapsed), bound to the agent's principal or its zone
+**Standing names reuse standing reach (#572)** where it fits. A standing name's row has the same life as
+standing reach's (a pending standing request, then approved or denied, revoked, lapsed), bound to the agent's principal or its zone
 (`Bound`), and to the zone's digest, so a manifest that reuses the zone's name with other reach
 doesn't inherit it. It lasts 30 days by default (`--lasts`), or until revoked. Each later run of
 the workload gets the name back when it starts, without asking. What differs from a reach rule: a

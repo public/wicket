@@ -41,6 +41,21 @@ One word for each thing, used the same way in the CLI's help, the docs and wicke
 - A **grant** is authority one principal gives another, within its own: a resource, a principal, a
   lifetime, and an amount or a number of uses. Every approval is a grant, and so is a box's own
   authority.
+- **Standing reach** is the feature by which an agent asks once for a reach rule for its later
+  runs, and a human approves it once ([#572](https://github.com/public/wicket/issues/572)). The agent
+  asks with `request_access` and `scope: standing`
+  ([`request_access`](../reference/mcp-tools.md#request_access)):
+  - a **standing request** is one such ask while it is pending (`s-…`): the rule, the agent's reason,
+    and the ledger's evidence (the blocked requests it covers, from the last 14 days). An operator
+    decides it once, in the console or with `wicket standing approve` or `deny`;
+  - a **standing rule** is an approved one: the reach rule (as asked, or narrowed to the evidence),
+    for the agent that asked or for every agent of its zone, lasting 30 days by default until
+    renewed or revoked. Each later run takes it up when it starts, as a block of its token, and its
+    node decides requests by it, within the zone's ceiling and the org layer.
+
+  Say "standing request" and "standing rule", not "standing ask". A standing rule is not a
+  **standing grant**: that is a grant which lasts beyond one run, as a release key's
+  ([updates](updates.md)) or a [capacity grant](../reference/console.md#capacity-grants) does.
 - A **lease** is a grant of capacity: a node for a time, its worst-case cost reserved
   ([placement and leases](#placement-and-leases)). Nothing else is a lease, and "lease" is the only word for a node's rented time: a long-lived agent's
   holder has a **claim** on it, and a node has a budget slice.

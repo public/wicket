@@ -3,6 +3,7 @@
 
 # The glossary itself names the words it replaces.
 docs/explanation/concepts.md | Say "box", not "sandbox" or "container"
+docs/explanation/concepts.md | Say "standing request" and "standing rule", not "standing ask"
 # Points at what is deferred.
 docs/explanation/concepts.md | service zones, crews, mandates, Kubernetes placement
 docs/explanation/design.md | research/15-mandates-user-delegation.md

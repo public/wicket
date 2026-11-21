@@ -1,5 +1,5 @@
-//! The console's Standing reach card (#572): an agent's asks for standing reach, decided once, and
-//! the approved rules, renewed or revoked there.
+//! The console's standing reach cards (#572): an agent's standing requests, decided once, and the
+//! standing rules approved, renewed or revoked there.
 //!
 //! - **Approve** (`standing_approve`), **deny** (`standing_deny`) and **renew** (`standing_renew`)
 //!   are passkey-signed actions, as decide is. The signed JSON names the rule (as asked, or narrowed
@@ -20,7 +20,7 @@ use wicket_store::{Ledger, OperatorCredential, Standing, StandingBound, Standing
 fn pending(state: &State, l: &Ledger, id: &str) -> Result<Standing, Reply> {
     let s = l.standing(id).map_err(|e| err(http::StatusCode::NOT_FOUND, e))?;
     if s.tenant != state.tenant.0 {
-        return Err(err(http::StatusCode::NOT_FOUND, format!("no standing ask {id}")));
+        return Err(err(http::StatusCode::NOT_FOUND, format!("no standing request {id}")));
     }
     Ok(s)
 }

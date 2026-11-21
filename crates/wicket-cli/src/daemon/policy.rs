@@ -67,9 +67,10 @@ pub fn route(cmd: &Cmd) -> Route {
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
         Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } | Cmd::Authority { .. } => Forward(Read),
-        // A message reaches an agent as a session's prompt would (it can wake one); reading your
-        // own inbox, receipts and who you may write to touches only your own messages (#252).
-        Cmd::Message { cmd: crate::MessageCmd::Send { .. } } => Forward(Run),
+        // A message, and a brief continuing an agent you started, reach an agent as a session's
+        // prompt would (either can wake one); reading your own inbox, receipts, delegations and who
+        // you may write to touches only your own (#252).
+        Cmd::Message { cmd: crate::MessageCmd::Send { .. } | crate::MessageCmd::Continue { .. } } => Forward(Run),
         Cmd::Message { .. } => Forward(Read),
         // Rewriting the ledger (#582) needs wicketd stopped: never through it.
         Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(
@@ -384,6 +385,10 @@ mod tests {
             (&["hibernate", "r1"], Route::Forward(Run)),
             (&["wake", "a1", "hello"], Route::Forward(Run)),
             (&["agents"], Route::Forward(Read)),
+            (&["message", "send", "spiffe://d/t/t/z/z/a/a", "hi"], Route::Forward(Run)),
+            (&["message", "continue", "worker", "next"], Route::Forward(Run)),
+            (&["message", "inbox"], Route::Forward(Read)),
+            (&["message", "delegations"], Route::Forward(Read)),
             (&["pending"], Route::Forward(Read)),
             (&["links"], Route::Forward(Read)),
             (&["audit", "--verify"], Route::Forward(Read)),
