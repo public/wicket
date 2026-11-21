@@ -103,7 +103,9 @@ function renderAgentLog(s, run) {
   const act = g.wicketActivity;
   // An explanation opened or arrived: the agent's log is drawn again (while its page is open).
   if (act && !act.redraws.has(redrawLog)) act.redraws.add(redrawLog);
-  draw(mine.length && act ? repeat(mine, op => op.seq, op => act.lineView(op, false)) : html`<div class="empty">Nothing recorded for it in the latest activity.</div>`, box);
+  // Its lines are activity.js's: without it, the log says it can't be shown, not that nothing happened.
+  draw(!act ? html`<div class="blocked">${UNLOADED}</div>`
+    : mine.length ? repeat(mine, op => op.seq, op => act.lineView(op, false)) : html`<div class="empty">Nothing recorded for it in the latest activity.</div>`, box);
 }
 function redrawLog() { if (logOf && view === "agent") renderAgentLog(...logOf); }
 

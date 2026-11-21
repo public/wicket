@@ -618,7 +618,7 @@ function renderPending(s) {
 // the page from being drawn.
 // What each view module draws: if it didn't load (a failed fetch, an old browser), each of these says
 // so, rather than look empty (no requests waiting, no agents).
-const VIEW_BOXES = { wicketInbox: ["pending"], wicketAgents: ["runs", "start", "agent-head"] };
+const VIEW_BOXES = { wicketInbox: ["pending"], wicketAgents: ["runs", "start", "agent-head", "agent-log"], wicketActivity: ["audit", "decided"] };
 const UNLOADED = "This can't be shown: part of this page didn't load. Reload the page; if it stays, check the browser's console.";
 function drawn(mod, f, ...args) {
   if (!globalThis[mod]) {

@@ -129,8 +129,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
 
   // Without inbox.js (here, as when the module fails to load), the cards' place says they can't be
   // shown, rather than that nothing is waiting.
-  // So for the Agents view without agents.js.
-  for (const id of ["pending", "runs", "start"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
+  // So for the Agents view without agents.js, and Activity without activity.js.
+  for (const id of ["pending", "runs", "start", "audit", "decided"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
 
   // The cards just moved (inbox.js says so): a tap right then is ignored.
   state = { ...base, pending: [A, B] };
