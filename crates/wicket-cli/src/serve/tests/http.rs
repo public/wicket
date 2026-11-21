@@ -98,6 +98,8 @@ const ROUTES: &[&str] = &[
     "/api/links/cut",
     "/api/triggers/pause",
     "/api/sessions/end",
+    "/api/capacity/revoke",
+    "/api/standing/revoke",
     "/api",
     "/admin",
     "/.env",

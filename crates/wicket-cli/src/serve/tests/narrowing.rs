@@ -125,16 +125,85 @@ fn an_operator_ends_only_their_own_console_sessions() {
     let live = |tenant: &str| {
         t.ledger().console_sessions(&TenantId(tenant.into()), wicket_store::now()).unwrap().into_iter().map(|s| s.id).collect::<Vec<_>>()
     };
-    // Another passkey's, another tenant's, or too short a prefix: not found, and still live.
-    for id in [&another[..16], &theirs[..16], &mine[..4]] {
+    // Another passkey's or another tenant's: not found. Too short a prefix, or not hex: a bad
+    // request, refused before any session is looked at. All still live.
+    for id in [&another[..16], &theirs[..16]] {
         let r = t.post("/api/sessions/end", json!({ "id": id }));
         assert_eq!(r.status, StatusCode::NOT_FOUND, "{id}: {:?}", r.body);
     }
+    for id in [&mine[..4], "zzzzzzzzzzzzzzzz"] {
+        let r = t.post("/api/sessions/end", json!({ "id": id }));
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{id}: {:?}", r.body);
+    }
+    // A prefix two of its own share: ambiguous, and neither is ended.
+    let twin = format!("{}{}", &mine[..16], "dd".repeat(24));
+    session(&twin, &t.cred, "t0");
+    let r = t.post("/api/sessions/end", json!({ "id": &mine[..16] }));
+    assert_eq!(r.status, StatusCode::CONFLICT, "{:?}", r.body);
+    assert!(r.body.to_string().contains("ambiguous"), "{:?}", r.body);
+    assert!(live("t0").contains(&mine) && live("t0").contains(&twin));
     assert!(live("t0").contains(&another) && live(OTHER).contains(&theirs));
     // One of its own, as the list names it: ended, and audited.
-    let r = t.post("/api/sessions/end", json!({ "id": &mine[..16] }));
+    let r = t.post("/api/sessions/end", json!({ "id": &mine[..17] }));
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-    assert!(!live("t0").contains(&mine) && live("t0").contains(&another));
+    assert!(r.cookie.is_none(), "another session of its own: this one's cookie stays");
+    assert!(!live("t0").contains(&mine) && live("t0").contains(&another) && live("t0").contains(&twin));
     let rec = last(&t, "operator.sessions_revoked");
     assert_eq!((&rec["sessions"], rec["by"].as_str(), rec["via"].as_str()), (&json!([mine]), Some("passkey:laptop"), Some("console")));
+}
+
+/// Ending the very session the request came with signs it out: its cookie is cleared, and it can do
+/// nothing more.
+#[test]
+fn ending_this_session_signs_it_out() {
+    let t = setup("end-this");
+    let this = super::super::session_id(t.sid.as_ref().unwrap());
+    let r = t.post("/api/sessions/end", json!({ "id": &this[..16] }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert!(r.cookie.as_deref().is_some_and(|c| c.contains("Max-Age=0")), "cleared: {:?}", r.cookie);
+    assert_eq!(t.post("/api/links/cut", json!({ "id": "lk-1" })).status, StatusCode::UNAUTHORIZED, "signed out");
+}
+
+/// A bootstrap session (an enrolment link's) can do none of these; nor can a session whose passkey
+/// was removed after it signed in. A repeat of one changes nothing and says so, once recorded.
+#[test]
+fn only_an_enrolled_operator_narrows_and_a_repeat_changes_nothing() {
+    let t = setup("narrow-who");
+    let token = "be".repeat(32);
+    let now = wicket_store::now();
+    t.ledger()
+        .add_console_session(
+            &TenantId::single(),
+            &ConsoleSession {
+                id: super::super::session_id(&token),
+                kind: "bootstrap".into(),
+                credential: Some("enrol-link".into()),
+                client: "192.0.2.1".into(),
+                created_at: now,
+                last_seen_at: now,
+                expires_at: now + 600,
+            },
+        )
+        .unwrap();
+    let boot = Ctx { sid: Some(token), client: LOCAL };
+    for p in ["/api/grants/revoke", "/api/links/cut", "/api/triggers/pause", "/api/sessions/end"] {
+        assert_eq!(post(&t.state, p, &boot, &json!({ "id": "x" })).unwrap().status, StatusCode::UNAUTHORIZED, "{p}");
+    }
+    // A repeat: refused, and recorded once.
+    t.ledger().add_link(&link("lk-1", "t0")).unwrap();
+    let tid = trigger(&t.ledger(), "t0", "hook");
+    for (p, id, kind) in [("/api/links/cut", "lk-1".to_string(), "link.cut"), ("/api/triggers/pause", tid.clone(), "trigger.paused")] {
+        assert_eq!(t.post(p, json!({ "id": id })).status, StatusCode::OK, "{p}");
+        let again = t.post(p, json!({ "id": id }));
+        assert_eq!(again.status, StatusCode::CONFLICT, "{p}: {:?}", again.body);
+        assert!(again.body.to_string().contains("already"), "{p}: {:?}", again.body);
+        assert_eq!(t.audit_kinds().iter().filter(|(k, _)| k == kind).count(), 1, "{kind} once");
+    }
+    // The passkey removed after signing in: its session can't act (no longer a session of an
+    // enrolled passkey, or, between the two reads, refused as one).
+    t.ledger().add_link(&link("lk-2", "t0")).unwrap();
+    t.ledger().reset_operator_credentials(&TenantId::single()).unwrap();
+    let r = t.post("/api/links/cut", json!({ "id": "lk-2" }));
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{:?}", r.body);
+    assert_eq!(t.ledger().link("lk-2").unwrap().unwrap().status, "open");
 }

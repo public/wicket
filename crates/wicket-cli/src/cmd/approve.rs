@@ -99,11 +99,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Unlink { id } => {
             let l = Ledger::open(&ledger_path())?;
-            if cut_link(&l, &TenantId::single(), &id, &operator(), serde_json::json!({ "via": "cli" }))? {
-                println!("cut {id}; its relay closes it within a few seconds");
-            } else {
-                println!("{id} was already closed");
-            }
+            cut_link(&l, &TenantId::single(), &id, &operator(), serde_json::json!({ "via": "cli" }))?;
+            println!("cut {id}; its relay closes it within a few seconds");
             Ok(())
         }
         Cmd::Deny { id } => {
@@ -280,19 +277,19 @@ pub(crate) fn revoke_grant(l: &Ledger, tenant: &TenantId, id: &str, by: &str, ex
 }
 
 /// Cuts link `id` of `tenant` as `by` (#713: `wicket unlink`, and the console's `/api/links/cut`),
-/// audited as `link.cut` with `extra` (`via`): whether it was open. Another tenant's link is not
-/// found, as one that doesn't exist.
-pub(crate) fn cut_link(l: &Ledger, tenant: &TenantId, id: &str, by: &str, extra: serde_json::Value) -> Result<bool> {
+/// audited as `link.cut` with `extra` (`via`). Another tenant's link is not found, as one that
+/// doesn't exist; one already closed is refused, as a revoked grant is.
+pub(crate) fn cut_link(l: &Ledger, tenant: &TenantId, id: &str, by: &str, extra: serde_json::Value) -> Result<()> {
     let r = l.link(id)?.filter(|r| r.tenant == tenant.0).ok_or_else(|| wicket_home::exit::not_found(format!("no link {id}")))?;
     if !l.close_link(id, by, "cut by the operator")? {
-        return Ok(false);
+        return Err(wicket_home::exit::refused(format!("{id} is already closed")));
     }
     let mut record = serde_json::json!({ "id": id, "by": by, "from": r.from_run, "to": r.to_run, "port": r.port });
     if let (Some(rec), serde_json::Value::Object(x)) = (record.as_object_mut(), extra) {
         rec.extend(x);
     }
     l.audit(tenant, None, "link.cut", &record)?;
-    Ok(true)
+    Ok(())
 }
 
 /// `wicket links --json`.
