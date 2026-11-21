@@ -480,15 +480,27 @@ pids+=("$flood_pid")
 wait_for 30 '[ -n "$(run_id_of "$work/flood.log")" ]' || true
 flood=$(run_id_of "$work/flood.log")
 our_runs+=("$flood")
+flood_fails=$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)
+echo "   run ${flood:-?}"
 # The control host's transcript: the previous file, then the current one. (What the run shows of a
 # program's output stops at limits.output, so the end is looked for here.)
 flood_transcript() { data "runs/$flood/transcript.1.jsonl" 2>/dev/null; data "runs/$flood/transcript.jsonl" 2>/dev/null; }
-wait_for 120 'flood_transcript | grep -q acc-flood-done' || true
+# The host's log of the box, read while the box is alive (#824): its path as soon as the box is up,
+# and the most it held, sampled each second until the end reaches the transcript or the box is gone.
+wait_for 30 '[ -n "$(box_of "$flood")" ]' || true
 flood_box=$(box_of "$flood" | head -1)
 flood_logpath=$($DOCKER inspect -f '{{.LogPath}}' "$flood_box" 2>/dev/null || true)
 flood_kept=
-[ -z "$flood_logpath" ] || flood_kept=$(sudo -n sh -c 'du -cb "$1"* | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
-echo "   20 MB burst, then 3 MB paced; ${flood_kept:-?} bytes kept in the host's log"
+for _ in $(seq 120); do
+  if [ -n "$flood_logpath" ]; then
+    k=$(sudo -n sh -c 'du -cb "$1"* 2>/dev/null | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
+    [ -z "$k" ] || [ "$k" -le "${flood_kept:-0}" ] || flood_kept=$k
+  fi
+  flood_transcript | grep -q acc-flood-done && break
+  [ -n "$(box_of "$flood")" ] || break
+  sleep 1
+done
+echo "   20 MB burst, then 3 MB paced; at most ${flood_kept:-?} bytes kept in the host's log (${flood_logpath:-no log path})"
 check "a flooding box's output kept on the host stays within limits.output (1m)" '[ -n "$flood_kept" ] && [ "$flood_kept" -le $((1100 * 1024)) ]'
 wait "$flood_pid" 2>/dev/null || true
 # What it keeps of the paced lines (the newest, at least 5,000 of them): consecutive, each once, in
@@ -509,7 +521,18 @@ check "  and its audit records the bytes dropped from the host (at least)" '[ "$
 HOME=$HOMEW "$W" run "$(manifest flood-stop)" --image "$IMAGE_TAG" >"$work/flood-stop.log" 2>&1 || true
 flood_stop=$(run_id_of "$work/flood-stop.log")
 our_runs+=("$flood_stop")
+echo "   on_output_full: stop: run ${flood_stop:-?}"
 check "with on_output_full: stop, the box is stopped, saying why, and its run ends" 'grep -q "on_output_full: stop" "$work/flood-stop.log" && [ -z "$(box_of "$flood_stop")" ] && w audit --tail 300 | grep -E "run\.end" | grep -q "$flood_stop"'
+# A failed flood check (#824): what the node and the audit say of each run, kept for the summary.
+if [ "$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)" -gt "$flood_fails" ]; then
+  for r in "$flood" "$flood_stop"; do
+    [ -n "$r" ] || continue
+    echo "== run $r: its audit records"
+    w audit --tail 3000 | grep -F "$r" | grep -E 'run\.end|run\.output|box\.exit_cause|box\.output' | cut -c1-600
+    echo "== run $r: the local node's log of it"
+    data "local-node/serve/serve.log" 2>/dev/null | grep -F "$r" | tail -40
+  done >"$work/flood-diag.log" 2>&1
+fi
 # A box that outgrows its memory limit (#185): the kernel kills it, and the run says why.
 HOME=$HOMEW "$W" run "$(manifest oom)" --image "$IMAGE_TAG" >"$work/oom.log" 2>&1 || true
 oom_run=$(run_id_of "$work/oom.log")
@@ -917,7 +940,8 @@ n_fail=$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)
 echo "$n_ok ok, $n_fail failed"
 if [ "$fail" != 0 ]; then
   echo "== mock model log (tail)"; tail -20 "$work/mock.log"
-  for f in lead hib1 hib2 acp1 acp2 linger orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
+  for f in lead hib1 hib2 acp1 acp2 linger orphan decisions flood flood-stop; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
+  [ -f "$work/flood-diag.log" ] && { echo "== the flood runs (#824)"; cat "$work/flood-diag.log"; }
   # The restart check's supervisors (#151): the first, each one reconcile started, and the local
   # node's serve. In GitHub Actions, also as annotations: readable from the API without the log.
   shown() {   # $1: title, $2: file, $3: lines

@@ -2113,6 +2113,7 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
     let t0 = std::time::Instant::now();
     let mut last_save = std::time::Instant::now();
     let mut stopped = false;
+    let mut ended = false;
     loop {
         // While lining up, a quiet box's replay mustn't be held back: reads time out at 3 s.
         let read = match aligner {
@@ -2152,6 +2153,7 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
         };
         if data.is_empty() {
             if eof {
+                ended = true;
                 break;
             }
             continue;
@@ -2192,7 +2194,31 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
             let _ = n.docker.kill(&name).await;
         }
         if eof {
+            ended = true;
             break;
+        }
+    }
+    // Docker ends a box's logs when the box stops. A stream that ends while the box still runs
+    // (#824) is recorded: what the box writes from then on isn't read. Docker may end the stream a
+    // moment before the box's state says it stopped, so it is asked again after 2 s.
+    if ended && !stopped {
+        let running = || async { n.docker.state(&name).await.ok().flatten().is_some_and(|(r, _)| r) };
+        if running().await {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if running().await {
+                let at = n.boxes.lock().expect("boxes").get(&run).map(|b| b.out[i].end()).unwrap_or(0);
+                let stream = if i == 0 { "stdout" } else { "stderr" };
+                say_err!(
+                    "[node] {run}: Docker ended the box's {stream} while it still runs: nothing it writes now is read (at offset {at})"
+                );
+                let _ = n.audit.lock().expect("audit").audit(
+                    &wicket_core::TenantId::single(),
+                    Some(&wicket_core::RunId(run.clone())),
+                    "box.output.ended_early",
+                    &serde_json::json!({ "stream": stream, "offset": at }),
+                );
+                n.ship_audit();
+            }
         }
     }
     // The tail as of the end of this read, for a `serve` that comes after.
