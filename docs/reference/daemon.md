@@ -90,6 +90,53 @@ revoke: { groups: [wicket-operators] }   # identity revoke, grant revoke, unlink
 | `wicket-reconcile` | `wicket reconcile --every 1m` | |
 | `wicket-state` | `wicket state replicate` | starts only once `/var/lib/wicket/state-store.yaml` exists |
 
+### Supervisor hosts
+
+**Experimental, and off by default (`supervise.hosts: 0`).** With `supervise.hosts: N` in
+`/etc/wicket/wicket.yaml` ([configuration](configuration.md#wicketyaml)), wicketd runs N supervisor
+hosts (`wicket supervise`, [#582](https://github.com/public/wicket/issues/582) step 5) as its own
+children, so they live in its cgroup and under its unit's hardening. Each holds a shard of the nodes
+(the local node is in shard 0) under a 30 s lease in the ledger. Every 5 s wicketd:
+
+- asks each host for its heartbeat on `<data dir>/supervise/<shard>.sock`. The heartbeat never
+  touches the ledger, so a ledger stall doesn't silence it. After wicketd restarts, it adopts the
+  hosts that answer there instead of starting more, and judges a holder that runs but doesn't
+  answer (frozen, wedged) as silent from its own start;
+- starts a host for a shard that has none: never started, stopped cleanly, or fenced. A shard
+  with no node in it gets none until a node is enrolled into it. A host just started has 10 s to
+  take its shard and answer; one that doesn't is killed, unless it has taken the shard (a host takes
+  it before it answers): then it is judged as a silent holder, fenced before it is killed. A host that keeps dying waits twice as
+  long each time, up to 60 s. A host never takes a shard another still holds, even one whose lease
+  has lapsed: it exits 75, and wicketd fences that holder first. And no host is started for a shard
+  while a process killed for it still runs: two hosts of a shard never overlap;
+- fences a host whose process has exited (a zombie counts), or whose heartbeat says its runtime is
+  stuck (or has stopped answering) once its lease has been lapsed for 15 s. The holder is recorded
+  in `<data dir>/supervise/manager.json`, then the fence raises the shard's epoch in the ledger, so
+  the old host can't renew or write; only then is it SIGKILLed (by the pid its label names, checked
+  against its start time). A wicketd restarted in between kills it again from that record. A fresh
+  host starts once it is gone;
+- fences no one for a ledger stall: the heartbeats go on answering, and when every host says its
+  lease thread is waiting at once and wicketd's own small write to the ledger stalls too, that is the
+  ledger: for up to 2 minutes, a host whose runtime still moves counts as answering;
+- asks the hosts of shards outside `0..N` (after `supervise.hosts` was lowered) to stop, with
+  SIGTERM, and fences and kills one still running after 60 s, even one that still renews its lease;
+  a gone one's shard is fenced at once, so its nodes can move.
+
+A host stopped with SIGTERM writes its clean-stop marker, and its shard is free at once. **Hosts
+survive `systemctl stop wicketd`**: the unit has `KillMode=process`, as its commands do, so they go
+on holding their shards and answering, and the next wicketd adopts them. To stop them, set
+`supervise.hosts: 0` and restart wicketd: while any shard has a holder on this machine, or its
+record `<data dir>/supervise/manager.json` is there, it runs the manager with no shards, which asks
+every host to stop, and fences and kills one still running 60 s later. Once none is left it removes
+the record and stops managing. To stop one by hand, send SIGTERM to its pid: the middle
+field of its holder label (`machine:pid:start`) in the ledger's `supervisor_hosts`, or its line in
+`ps -eo pid,args`.
+
+**Raising `supervise.hosts`** moves nodes into the new shards, but a host never moves a node away
+from a live holder: a new shard's host exits 75 (and is started again, backed off) until the host
+holding its nodes has restarted and given them up. The hosts supervise no runs yet: runs are still a
+process each.
+
 ### Limits
 
 Every run has a supervisor process (`wicket run`, `attach` or `wake`). It lives in the cgroup of
