@@ -32,6 +32,11 @@ function runEls(s, x, page) {
   if (!m || m.key !== key) {
     m = { key, started: relEl(x.started_at, "started ", s.now), ended: x.ended_at ? relEl(x.ended_at, "ended ", s.now) : null, id: idEl(x.id) };
     runMemo.set(id, m);
+  } else {
+    // refreshRel forgets a time that was off the page (an agent's page while it showed another
+    // message): kept again, so it stays true.
+    relEls.add(m.started);
+    if (m.ended) relEls.add(m.ended);
   }
   return m;
 }
@@ -71,7 +76,8 @@ function renderRuns(s) {
   for (const k of [...runMemo.keys()]) if (k.startsWith("list:") && !live.has(k)) runMemo.delete(k);
   draw(runs.length ? repeat(runs, x => x.id, x => runRow(s, x, false)) : html`<div class="empty">No runs yet.</div>`, box);
   const key = JSON.stringify(runs);
-  if (lastRuns !== null && key !== lastRuns) layoutMoved();
+  // The first draw too: rows that just appeared are as new under a tap as rows that just moved.
+  if (key !== lastRuns) layoutMoved();
   lastRuns = key;
 }
 
@@ -186,14 +192,20 @@ function renderStart(s) {
   // image its box starts from (#171), or why it can't start.
   const hosts = html`${m && m.valid ? (m.image ? html`<div>${"image " + strip(m.image)}</div>` : html`<div class="pend">${"image refused: " + strip(m.image_error)}</div>`) : nothing}${((m && m.hosts) || []).map(h => html`<div><span class=${h.mode === "spliced" ? "pend" : "ok"}>${(h.mode === "spliced" ? "spliced" : "inspected").padEnd(10)}</span>${strip(h.host) + (h.mode === "spliced" ? " (every method and path; not inspected)" : " (" + strip(h.why) + ")")}</div>`)}`;
   const pick = e => { startPick = e.target.value; renderStart(lastState || s); };
+  // What is started is what the select shows: read from it, not from what was last drawn.
   const go = e => {
-    if (!startPick) return;
-    const task = e.target.closest("#start").querySelector("textarea");
-    const [root, manifest] = JSON.parse(startPick);
+    const start = e.target.closest("#start");
+    const sel = start.querySelector("select"), task = start.querySelector("textarea");
+    if (!sel.value || sel.selectedOptions[0]?.disabled) return;
+    const [root, manifest] = JSON.parse(sel.value);
     signed({ action: "start_run", root, manifest, task: task.value });
     task.value = "";
   };
-  draw(html`<select @change=${pick}>${ms.map(x => html`<option .value=${pickOf(x)} ?disabled=${!x.valid} ?selected=${pickOf(x) === startPick}>${strip(x.root + "/" + x.name) + (x.valid ? " · " + strip(x.agent ? "agent " + x.agent : "program " + x.program) + " · zone " + strip(x.zone) : " · invalid")}</option>`)}</select><div class="meta">${hosts}</div><textarea placeholder="Task (optional; replaces the manifest's task, agents only)"></textarea><div class="buttons"><button class="approve" @click=${go}>Start run</button></div><div class="meta">The run's principal is you (this passkey), not the host user.</div>`, box);
+  // Options keyed by manifest, each one's selectedness a property: a list that shifts on a poll keeps
+  // the picked one picked, and the select shows startPick.
+  draw(html`<select @change=${pick}>${repeat(ms, pickOf, x => html`<option .value=${pickOf(x)} ?disabled=${!x.valid} .selected=${pickOf(x) === startPick}>${strip(x.root + "/" + x.name) + (x.valid ? " · " + strip(x.agent ? "agent " + x.agent : "program " + x.program) + " · zone " + strip(x.zone) : " · invalid")}</option>`)}</select><div class="meta">${hosts}</div><textarea placeholder="Task (optional; replaces the manifest's task, agents only)"></textarea><div class="buttons"><button class="approve" @click=${go}>Start run</button></div><div class="meta">The run's principal is you (this passkey), not the host user.</div>`, box);
+  const sel = box.querySelector("select");
+  if (sel && startPick && sel.value !== startPick) sel.value = startPick;
 }
 
 g.wicketAgents = { renderRuns, renderAgentHead, renderAgentLog, showAuthority, renderStart };

@@ -612,19 +612,28 @@ function renderCounts(waiting, alerts) {
 // fake DOM of console_ui.js) they draw nothing.
 function renderPending(s) {
   pendingLoaded = true;
-  // The cards are inbox.js's: if it didn't load (a failed fetch, an old browser), say so where they
-  // would be, rather than show nothing waiting.
-  if (!globalThis.wicketInbox) {
-    const box = document.getElementById("pending");
-    if (box) box.replaceChildren(el("div", "blocked", "The requests can't be shown: part of this page didn't load. Reload the page; if it stays, check the browser's console."));
-    return;
-  }
   inbox("renderPending", s);
 }
 // A failure drawing the Inbox is logged (the browser tests fail on it) and doesn't stop the rest of
 // the page from being drawn.
+// What each view module draws: if it didn't load (a failed fetch, an old browser), each of these says
+// so, rather than look empty (no requests waiting, no agents).
+const VIEW_BOXES = { wicketInbox: ["pending"], wicketAgents: ["runs", "start", "agent-head"] };
+const UNLOADED = "This can't be shown: part of this page didn't load. Reload the page; if it stays, check the browser's console.";
 function drawn(mod, f, ...args) {
-  try { if (globalThis[mod]) globalThis[mod][f](...args); } catch (e) { console.error(mod + "." + f + " failed:", e); }
+  if (!globalThis[mod]) {
+    for (const id of VIEW_BOXES[mod] || []) {
+      const box = document.getElementById(id);
+      if (box && !(box.textContent || "").startsWith("This can't be shown")) box.replaceChildren(el("div", "blocked", UNLOADED));
+    }
+    return;
+  }
+  // A failure, then or later (showAuthority is async), is logged (the browser tests fail on it) and
+  // doesn't stop the rest of the page from being drawn.
+  try {
+    const r = globalThis[mod][f](...args);
+    if (r && typeof r.catch === "function") r.catch(e => console.error(mod + "." + f + " failed:", e));
+  } catch (e) { console.error(mod + "." + f + " failed:", e); }
 }
 const inbox = (f, s) => drawn("wicketInbox", f, s);
 // The cards moved: taps are ignored for a moment (`settled`), so one can't land on a card that just

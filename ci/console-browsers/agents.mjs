@@ -10,7 +10,8 @@
 // a running agent with an identity, and Stop names the agent; what a run can reach leads its page,
 // with every kind of grant in words and the token's internals under Details; its activity is its own
 // records; Start lists the manifests, shows what the picked one reaches, keeps what was typed across
-// polls and asks the server to start exactly the one picked; and an agent's strings stay text.
+// polls and asks the server to start exactly the one the select shows, even after the list shifts;
+// an agent's strings stay text; and without agents.js each of its places says it can't be shown.
 import assert from "node:assert";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
@@ -88,7 +89,7 @@ async function check(engine) {
     assert.strictEqual(await page.evaluate(() => settled()), false, "taps wait after the list changed");
     assert.ok(await page.evaluate(() => document.querySelector('#runs .run').__mark === 1), "the row is updated in place");
     // A live session only for a running ACP agent; a remote session only at an https URL.
-    state = { ...base, runs: [run("run_l", { acp: true }), run("run_d", { acp: true, status: "exited" }), run("run_r", { remote_url: "https://claude.ai/code/x" }), run("run_j", { remote_url: "javascript:alert(1)" })] };
+    state = { ...base, runs: [run("run_l", { acp: true }), run("run_d", { acp: true, status: "exited" }), run("run_r", { remote_url: "https://remote.example/session/x" }), run("run_j", { remote_url: "javascript:alert(1)" })] };
     await poll();
     assert.strictEqual(await page.locator('#runs a.session[href="/session?run=run_l"]').count(), 1);
     assert.strictEqual(await page.locator("#runs a.session").count(), 2, "one live session and one remote session");
@@ -157,12 +158,38 @@ async function check(engine) {
     assert.strictEqual(await page.inputValue("#start textarea"), "");
     await page.waitForTimeout(900);
     await page.click("#confirm-cancel");
+    await page.waitForSelector("#confirm", { state: "hidden" });
+    // Two picks, then a poll that shifts the list (a manifest added above them): the select still
+    // shows the last pick, and Start asks for what the select shows.
+    await page.selectOption("#start select", { label: "manifests/docs.yaml · agent writer · zone docs" });
+    await page.selectOption("#start select", { label: "examples/fetch.yaml · program fetch · zone jobs" });
+    const added = { root: "manifests", name: "aaa.yaml", valid: true, agent: "first", zone: "z", image: "img", hosts: [] };
+    state = { ...state, manifests: [added, manifests[2], manifests[1], manifests[0]] };
+    await poll();
+    const shown = await page.$eval("#start select", s => s.selectedOptions[0].textContent);
+    assert.strictEqual(shown, "examples/fetch.yaml · program fetch · zone jobs");
+    await page.waitForTimeout(900);
+    await page.click("#start button.approve");
+    await page.waitForSelector("#confirm:not([hidden])");
+    assert.deepStrictEqual([begun.at(-1).root, begun.at(-1).manifest], ["examples", "fetch.yaml"], "what the select shows is what is started");
+    await page.waitForTimeout(900);
+    await page.click("#confirm-cancel");
     // No manifests: it says where to put one.
     state = { ...base, runs: [A], manifests: [] };
     await poll();
     await page.waitForFunction(() => document.getElementById("start").innerText.includes("No manifests to start"), null, { timeout: 5000 });
 
     if (problems.length) throw new Error(problems.join("\n  "));
+
+    // If agents.js doesn't load, the runs, Start and an agent's page say they can't be shown.
+    const bare = await (await browser.newContext()).newPage();
+    await bare.route("**/agents.js", r => r.abort());
+    await bare.route("**/api/**", r => { const p = new URL(r.request().url()).pathname;
+      return r.fulfill({ contentType: "application/json", body: JSON.stringify(p === "/api/me" ? { who: { state: "operator", credential: "AbCd" } } : p === "/api/state" ? { ...base, runs: [A] } : p === "/api/push" ? { public_key: "BAEC", devices: [], min_interval_secs: 30 } : {}) }); });
+    await bare.goto(url + "#agents");
+    for (const id of ["runs", "start"]) await bare.waitForFunction(i => document.getElementById(i).textContent.includes("can't be shown"), id, { timeout: 10000 });
+    await bare.evaluate(() => { location.hash = "#agent/run_a"; });
+    await bare.waitForFunction(() => document.getElementById("agent-head").textContent.includes("can't be shown"), null, { timeout: 10000 });
     console.log(`${engine} agents: ok`);
   } finally {
     await browser.close();

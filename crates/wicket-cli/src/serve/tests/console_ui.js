@@ -130,9 +130,10 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // they stay put across polls, move only when the list does, and say what the server grants is
   // ci/console-browsers/inbox.mjs's. Here, their buttons' path: act(), with its settle guard.
 
-  // Without inbox.js (here, as when the module fails to load), the cards' place says the requests
-  // can't be shown, rather than that nothing is waiting.
-  assert.ok(ids.pending.textContent.includes("The requests can't be shown"), ids.pending.textContent);
+  // Without inbox.js (here, as when the module fails to load), the cards' place says they can't be
+  // shown, rather than that nothing is waiting.
+  // So for the Agents view without agents.js.
+  for (const id of ["pending", "runs", "start"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
 
   // The cards just moved (inbox.js says so): a tap right then is ignored.
   state = { ...base, pending: [A, B] };
