@@ -4,6 +4,8 @@ The console (`wicket serve`) shows what's waiting for you, runs, recent decision
 or deny from a browser or phone. Its options are in the [command line reference](cli.md#wicket-serve); [put the console on the
 internet](../how-to/put-the-console-on-the-internet.md) sets it up behind TLS.
 
+[Console and CLI parity](parity.md) lists where each operator action is: the console, the CLI, or only the host, and why.
+
 ## Passkeys
 
 It uses **passkeys**:
@@ -94,8 +96,8 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   unread first), your receipts and the agents you may write to; `POST /api/messages/read` with
   `{"ids": [...]}` marks your own messages read, with the session alone. A message grants nothing:
   prompting an agent is its session.
-- **release a run's fence** (`release_fence`, #690), the console's path beside root's `wicket node
-  release-fence`. A run is fenced while its box may still be running on a node that hasn't confirmed
+- **release a run's fence** (`release_fence`, #690), the console's path beside `wicket node
+  release-fence`, which decides as it does (root's `--break-glass` releases any fence). A run is fenced while its box may still be running on a node that hasn't confirmed
   it stopped (see [the wake fence](nodes.md)): its agent isn't woken and the run isn't ended. Every
   box a node runs is fenced while its authority is live, so the **Agents held on lost servers** card (Settings) lists only
   fences whose node can never end them: the node is revoked or no longer enrolled. An enrolled node's
@@ -421,7 +423,8 @@ its authority view. [Nodes: placement](nodes.md#placement) says how a node is ch
 ## Manifests
 
 The **Manifests** section lists the manifests runs can be started from (#172). The installation's
-`manifests` directory can be edited; `examples/` is read-only.
+`manifests` directory can be edited; `examples/` is read-only. `wicket manifest list`, `show`,
+`check`, `save` and `restore` do the same on the host (#713), with the same checks and records.
 
 - **Viewing** a manifest (`GET /api/manifests/<root>/<name>`) shows:
   - whether it validates, with the error `wicket run` would give;

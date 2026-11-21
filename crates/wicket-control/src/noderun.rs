@@ -3331,6 +3331,15 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 
 #[cfg(test)]
 mod tests {
+    /// #713: `wicket node release-fence --break-glass` is root's: anyone else is refused before
+    /// anything is read. Without it, the release is the console's (an operator within its authority).
+    #[test]
+    fn break_glass_is_roots_only() {
+        let e = release_fence_command(&wicket_core::RunId::new().0, "lost", "alex", Some(false)).unwrap_err();
+        assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::Refused as i32, "{e:#}");
+        assert!(format!("{e:#}").contains("--break-glass"));
+    }
+
     /// #415: the control host tells a run's node of a secret it fetched that changed or went, and of
     /// one it was refused that can now be released; each once, until the node fetches it again.
     #[test]
@@ -4215,15 +4224,19 @@ pub fn forget_refused(l: &wicket_store::Ledger, node: &str, run: &str, no_files:
     ))
 }
 
-/// `wicket node release-fence <run>` (#676): root releases a run's fence without its node, for a
-/// run its node can't confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end.
-/// Refused to anyone but root, and for a run that isn't fenced. Audited as `run.fence_released`
-/// with who, why and the fence it lifted; its agent can then be woken, and the reconciler ends the
-/// run on its next pass if its node is gone. The box may still be running there: whoever releases
-/// it takes that on.
-pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> anyhow::Result<()> {
+/// `wicket node release-fence <run>` (#676): releases a run's fence without its node, for a run its
+/// node can't confirm stopped whose fence wouldn't otherwise end. As the console's `release_fence`
+/// (#713): within the operator's `operators.yaml` authority, and only a fence whose node is revoked
+/// or no longer enrolled. With `break_glass` (`Some(whether the caller is root)`), root's release of
+/// any fence; refused to anyone else. Refused for a run that isn't fenced. Audited as
+/// `run.fence_released` with who, why and the fence it lifted; its agent can then be woken, and the
+/// reconciler ends the run on its next pass if its node is gone. The box may still be running
+/// there: whoever releases it takes that on.
+pub fn release_fence_command(run: &str, reason: &str, by: &str, break_glass: Option<bool>) -> anyhow::Result<()> {
     crate::run::check_run_id(run)?;
-    anyhow::ensure!(root, "only root releases a run's fence (its box may still be running on its node)");
+    if break_glass == Some(false) {
+        return Err(wicket_home::exit::refused("only root releases a fence with --break-glass (its box may still be running on its node)"));
+    }
     anyhow::ensure!(!reason.trim().is_empty(), "say why with --reason: it goes on the audit record");
     let l = wicket_store::Ledger::open(&crate::ledger_path())?;
     let runs = crate::data_dir().join("runs");
@@ -4231,11 +4244,19 @@ pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> a
     let Some(f) = crate::fence::fence_of(&l, &runs, run, now)? else {
         anyhow::bail!("run {run} isn't fenced: its node confirmed its box stopped, or its authority has ended");
     };
-    // The same decision and record as the console's (#690), as root: any fence, whatever its node says.
-    let identity = crate::operators::Operator::cli(&f.tenant).ok().map(|o| o.id);
-    let by = crate::fence::Decider::Root { label: by.to_string(), identity };
     let r = crate::fence::Release { run, reason, shown: &f.effect_sha256, now_ms: now, extra: serde_json::json!({ "via": "cli" }) };
-    let f = crate::fence::release(&l, &runs, &by, r)?;
+    let f = match break_glass {
+        // Root's break-glass (#690): any fence, whatever its node says.
+        Some(_) => {
+            let identity = crate::operators::Operator::cli(&f.tenant).ok().map(|o| o.id);
+            crate::fence::release(&l, &runs, &crate::fence::Decider::Root { label: by.to_string(), identity }, r)?
+        }
+        // The console's decision and record: the operator's authority, a revoked or gone node only.
+        None => {
+            let human = crate::grant::Granter::Human(crate::operators::Operator::cli(&f.tenant)?);
+            crate::fence::release(&l, &runs, &crate::fence::Decider::Operator(&human), r)?
+        }
+    };
     say!("released run {run}'s fence on node {}; its box may still be running there", f.node);
     Ok(())
 }

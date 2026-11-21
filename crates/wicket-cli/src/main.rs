@@ -59,6 +59,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 pub(crate) use cmd::approve::GrantCmd;
 pub(crate) use cmd::approve::RequestCmd;
+pub(crate) use cmd::capacity::CapacityCmd;
 // Re-verifies signed console actions offline; the console's tests check their records with it.
 #[cfg(test)]
 pub(crate) use cmd::audit::verify_signed_decisions;
@@ -67,6 +68,7 @@ pub(crate) use cmd::dev::DevCmd;
 pub(crate) use cmd::identity::IdentityCmd;
 pub(crate) use cmd::image::ImageCmd;
 pub(crate) use cmd::itself::SelfCmd;
+pub(crate) use cmd::manifest::ManifestCmd;
 pub(crate) use cmd::message::MessageCmd;
 pub(crate) use cmd::names::NamesCmd;
 pub(crate) use cmd::node::LeaseCmd;
@@ -93,9 +95,24 @@ use wicket_store::Ledger;
 const AREAS: &[(&str, &[&str])] = &[
     (
         "Runs and agents",
-        &["run", "session", "message", "top", "agents", "hibernate", "trigger", "wrap", "links", "unlink", "zone", "program", "image"],
+        &[
+            "run",
+            "session",
+            "message",
+            "top",
+            "agents",
+            "hibernate",
+            "trigger",
+            "wrap",
+            "links",
+            "unlink",
+            "manifest",
+            "zone",
+            "program",
+            "image",
+        ],
     ),
-    ("Approvals and grants", &["pending", "request", "approve", "deny", "grant", "standing", "names", "audit"]),
+    ("Approvals and grants", &["pending", "request", "approve", "deny", "grant", "capacity", "standing", "names", "authority", "audit"]),
     ("Nodes and placement", &["node", "lease", "service", "why-here", "reconcile"]),
     (
         "The installation",
@@ -244,6 +261,18 @@ enum Cmd {
     /// Why a run's box went on the node it did, or why it went nowhere (#579): what it asked for,
     /// the nodes it may go on in order, and every reason each other node was out.
     WhyHere {
+        run: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// A run's authority now: its token as its node's feed holds it, and its grants.
+    ///
+    /// A run's authority (#173), as the console's view of it (#713): its status, node and org policy
+    /// version, its deadline and what its node holds for it, and its token as the node's feed holds
+    /// it now: what its zone may reach and never reach, each block decoded (zone, grant or spawn;
+    /// who signed it, and whether it is revoked) and each grant with who approved it. No token,
+    /// signature, secret value or key is printed.
+    Authority {
         run: String,
         #[arg(long)]
         json: bool,
@@ -463,6 +492,25 @@ enum Cmd {
         #[command(subcommand)]
         cmd: LeaseCmd,
     },
+    /// Capacity grants: what a principal may lease without asking.
+    ///
+    /// Standing capacity grants (#256): a principal may lease nodes within a grant's terms (how many
+    /// at once, money an hour and a day, plans and regions) without asking, until it lapses. The
+    /// console's Capacity card, from the host (#713).
+    Capacity {
+        #[command(subcommand)]
+        cmd: CapacityCmd,
+    },
+    /// Manifests runs start from: view, check, save and restore them.
+    ///
+    /// The manifests runs can be started from (#172), as the console's viewer and editor have them
+    /// (#713): list and show them, check an edited one against the saved version, and save or restore
+    /// one in the installation's `manifests` root, which keeps the version it replaces and audits the
+    /// save with what it widens.
+    Manifest {
+        #[command(subcommand)]
+        cmd: ManifestCmd,
+    },
     /// How a manifest's zone treats each host it reaches: inspected or spliced, and why.
     ///
     /// The zone view of a manifest: for each host its reach names, whether the egress proxy inspects
@@ -661,6 +709,9 @@ async fn run() -> Result<()> {
         | Cmd::Wake { .. }
         | Cmd::Agents { .. }
         | Cmd::WhyHere { .. }) => cmd::run::dispatch(c).await,
+        Cmd::Authority { run, json } => cmd::authority::run(&run, json),
+        Cmd::Capacity { cmd } => cmd::capacity::dispatch(cmd).await,
+        Cmd::Manifest { cmd } => cmd::manifest::dispatch(cmd).await,
         Cmd::Top { once, json } => top::control_top(once, json).await,
         c @ (Cmd::Pending { .. } | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await
