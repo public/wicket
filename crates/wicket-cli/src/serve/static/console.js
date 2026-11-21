@@ -1241,12 +1241,22 @@ async function subId(sub) {
   const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sub.endpoint)));
   return Array.from(h.slice(0, 8), b => b.toString(16).padStart(2, "0")).join("");
 }
+// The service worker's URL as Trusted Types require it (#739): registering one is a script-URL sink,
+// so the URL comes from a policy of wicket's own that makes "/sw.js" and nothing else. Made once
+// (a policy name can be created only once); without Trusted Types, the plain string.
+let swPolicy = null;
+function swUrl() {
+  const tt = typeof window !== "undefined" && window.trustedTypes;
+  if (!tt) return "/sw.js";
+  swPolicy = swPolicy || tt.createPolicy("wicket-sw", { createScriptURL: u => { if (u !== "/sw.js") throw new TypeError("wicket-sw makes only /sw.js"); return u; } });
+  return swPolicy.createScriptURL("/sw.js");
+}
 async function enablePush() {
   // First, while the click still counts as the user's gesture.
   const perm = await Notification.requestPermission();
   if (perm !== "granted") { toast(perm === "denied" ? "Notifications are blocked for this site in the browser's settings." : "Notifications not allowed."); return; }
   try {
-    const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    const reg = await navigator.serviceWorker.register(swUrl(), { scope: "/" });
     await navigator.serviceWorker.ready;
     const info = await pushInfo();
     let sub = await reg.pushManager.getSubscription();

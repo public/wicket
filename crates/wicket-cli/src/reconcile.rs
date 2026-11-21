@@ -938,7 +938,8 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
         for i in ledger.live_service_instances()?.into_iter().filter(|i| i.node == row.name) {
             let why = format!("its node {} is being released", row.name);
             match wicket_control::services::stop(ledger, &i, &why) {
-                Ok(()) => record(ledger, "service_stopped", format!("service {} instance {}: {why}", i.service, i.run), true),
+                Ok(true) => record(ledger, "service_stopped", format!("service {} instance {}: {why}", i.service, i.run), true),
+                Ok(false) => {}
                 Err(e) => record(ledger, "error", format!("stopping service {} instance {}: {e:#}", i.service, i.run), false),
             }
         }
@@ -977,7 +978,21 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
 /// (#812 review): a failed step, or a process that stopped after the node was marked released
 /// (a console release runs in the background, and an update restarts it).
 async fn placed_nodes(ledger: &mut Ledger, now: i64, dry_run: bool) -> Result<Vec<Done>> {
-    let mut done = released_nodes(ledger, now, dry_run)?;
+    placed_nodes_with(ledger, now, dry_run, released_nodes).await
+}
+
+/// [`placed_nodes`], finishing releases with `finish`.
+async fn placed_nodes_with(
+    ledger: &mut Ledger,
+    now: i64,
+    dry_run: bool,
+    finish: fn(&mut Ledger, i64, bool) -> Result<Vec<Done>>,
+) -> Result<Vec<Done>> {
+    // A failure here is reported and the pass goes on: the lease-end releases after it stop
+    // billing nodes, which costs money while they wait.
+    let mut done = finish(ledger, now, dry_run).unwrap_or_else(|e| {
+        vec![Done { kind: "error", target: "released placed nodes".into(), detail: format!("finishing their releases: {e:#}") }]
+    });
     done.extend(placed_groups(ledger, now, dry_run).await?);
     Ok(done)
 }
@@ -1582,6 +1597,21 @@ pub mod setup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #819 review: a failure finishing released nodes' releases is reported, and the pass goes on
+    /// to the lease-end releases (which stop billing nodes) instead of stopping there.
+    #[tokio::test]
+    async fn a_failure_finishing_releases_doesnt_stop_the_lease_end_releases() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        fn broken(_: &mut Ledger, _: i64, _: bool) -> Result<Vec<Done>> {
+            anyhow::bail!("the ledger is locked")
+        }
+        let done = placed_nodes_with(&mut l, wicket_store::now(), false, broken).await.expect("the pass goes on");
+        assert!(
+            done.iter().any(|d| d.kind == "error" && d.target == "released placed nodes" && d.detail.contains("the ledger is locked")),
+            "{done:?}"
+        );
+    }
     use crate::capacity::PlacementConfig;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};

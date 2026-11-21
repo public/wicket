@@ -257,10 +257,10 @@ fn set(name: &str, ca_hosts: Option<&str>, labels: &[String], taints: &[String],
         return Err(wicket_home::exit::not_found(format!("node {name} is not enrolled")));
     }
     if ipv4.is_some() || ipv6.is_some() {
-        let a = l.set_node_addresses(name, v4, v6, &operator()).map_err(|e| match e {
-            wicket_store::StoreError::Refused(m) => wicket_home::exit::refused(m),
-            e => e.into(),
-        })?;
+        // The authority the console's change needs (kind `node` at R4, #575 review, L5), checked
+        // and any refusal audited as the console's are.
+        let by = wicket_control::grant::Granter::Human(crate::operators::Operator::cli(&wicket_core::TenantId::single().0)?);
+        let a = wicket_control::names::set_node_addresses(&l, &by, name, None, v4, v6, serde_json::json!({ "via": "cli" }))?;
         let show = |a: Option<String>| a.unwrap_or_else(|| "none".into());
         println!("node {name}: public IPv4 {}, IPv6 {}", show(a.ipv4.map(|a| a.to_string())), show(a.ipv6.map(|a| a.to_string())));
     }
@@ -419,8 +419,9 @@ pub enum NodeCmd {
     Create(Box<nodecreate::CreateArgs>),
     /// Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and
     /// revoke its enrolment. Audited as `placement.node_release_decided` (as root's) before the
-    /// provider is asked, then `placement.node_released` or `placement.node_release_failed`, the
-    /// records the console's release of a node past its lease writes too. On a node already released
+    /// provider is asked, `placement.node_release_destroying` just before it is asked to destroy the
+    /// machine, then `placement.node_released` or `placement.node_release_failed`, the records the
+    /// console's release of a node past its lease writes too. On a node already released
     /// it finishes a release whose ledger side didn't (`placement.node_release_finished`), or says
     /// there is nothing left; the provider isn't asked again.
     Release {

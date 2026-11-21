@@ -82,13 +82,92 @@ fn another_enrolled_passkey_cant_finish_the_sessions_signed_action() {
         let b: Value = serde_json::from_str(b).unwrap();
         assert_eq!((b["credential"].as_str(), b["session_credential"].as_str()), (Some(other.1.as_str()), Some(t.cred.as_str())), "{what}");
     }
-    // Nothing was done: the request is pending, the run not revoked, no grant, secret or release.
+    // Nothing was done: only the refusals were recorded (checked above, kind by kind); the request
+    // is pending, the run not revoked, no grant made, the secret not stored, the fence not released.
     let l = t.ledger();
     assert_eq!(l.request(&rid).unwrap().status, "pending");
     assert!(l.revoked("run_d").unwrap().is_none());
     assert!(l.capacity_grants(&TenantId::single().0, None, false).unwrap().is_empty());
+    assert!(wicket_proxy::vault::Vault::new(t.state.vault_dir.clone()).get("gh").is_err(), "no secret stored");
+    assert!(!t.audit_kinds().iter().any(|(k, _)| k == "run.fence_released" || k == "secret.set"));
+    // Nor was the other passkey's sign counter touched: its signature was never verified.
+    let others = l.operator_credentials(&TenantId::single()).unwrap();
+    assert_eq!(others.iter().find(|c| c.id == other.1).unwrap().sign_count, 0);
     drop(l);
     // The session's own passkey still signs.
     let r = t.act(json!({ "action": "decide", "id": rid, "decision": "deny" }));
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+}
+
+/// The rest of the signed actions (#811 review): standing reach, capacity renewal, push, node
+/// release, opening a session, starting a run, saving a manifest and applying the org policy.
+#[test]
+fn every_other_signed_action_is_refused_to_another_passkey() {
+    let mut t = super::manifests::with_manifest("signer-rest");
+    let other = second_passkey(&t);
+    let tenant = TenantId::single();
+    t.running("run_s", "lead");
+    // Standing reach: two asks (one to approve, one to deny), the first approved by the session.
+    let (ask_a, ask_b) = {
+        let l = t.ledger();
+        let run = RunId("run_s".into());
+        let rule: wicket_core::manifest::ReachRule =
+            wicket_core::yaml::from_str("{ host: ci.example, methods: [GET], paths: ['/jobs/**'] }").unwrap();
+        let rule_b: wicket_core::manifest::ReachRule =
+            wicket_core::yaml::from_str("{ host: ci2.example, methods: [GET], paths: ['/x/**'] }").unwrap();
+        let a = l.ask_standing(&tenant, &run, "z", "zd", "spiffe://w.test/t/t0/z/z/a/lead", &rule, "ci").unwrap().0;
+        let b = l.ask_standing(&tenant, &run, "z", "zd", "spiffe://w.test/t/t0/z/z/a/lead", &rule_b, "ci").unwrap().0;
+        (a, b)
+    };
+    let r = t.act(json!({ "action": "standing_approve", "id": ask_a }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    // A capacity grant, made by the session, to renew.
+    let r = t.act(json!({ "action": "capacity_grant", "principal": "unix/alex", "plans": "vc2-1c-2gb", "regions": ["lhr"],
+                          "max_hourly_usd": "0.05", "max_daily_usd": "1", "nodes": 1, "ttl_secs": 3600 }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let grant = t.ledger().capacity_grants(&tenant.0, None, false).unwrap().pop().unwrap().id;
+    // A device, registered by the session, to turn its details on.
+    let (p, a) = super::notify::keys();
+    let r = t.act(json!({ "action": "push_subscribe", "endpoint": "https://fcm.googleapis.com/fcm/send/x", "p256dh": p, "auth": a }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let device = t.state.push.as_ref().unwrap().store.list(&t.cred)[0].id.clone();
+    // A placed node past its lease.
+    super::placed::placed(&t.ledger(), "i-past", "placed-a", wicket_store::now() - 60);
+    let org = include_str!("../../../../../examples/policy/org.cedar");
+    let kinds = [
+        ("standing_approve", json!({ "action": "standing_approve", "id": ask_b })),
+        ("standing_deny", json!({ "action": "standing_deny", "id": ask_b })),
+        ("standing_renew", json!({ "action": "standing_renew", "id": ask_a })),
+        ("capacity_renew", json!({ "action": "capacity_renew", "id": grant, "ttl_secs": 3600 })),
+        (
+            "push_subscribe",
+            json!({ "action": "push_subscribe", "endpoint": "https://fcm.googleapis.com/fcm/send/y", "p256dh": p, "auth": a }),
+        ),
+        ("push_details", json!({ "action": "push_details", "id": device, "details": true })),
+        ("node_release", json!({ "action": "node_release", "id": "i-past", "reason": "done" })),
+        ("open_session", json!({ "action": "open_session", "run": "run_s" })),
+        ("start_run", json!({ "action": "start_run", "root": "manifests", "manifest": "docs.yaml" })),
+        (
+            "save_manifest",
+            json!({ "action": "save_manifest", "name": "docs.yaml", "yaml": "task: other\nagent: { name: reader }\nzone: { name: docs, llm: { max_requests: 10, max_output_tokens: 1000 } }\n" }),
+        ),
+        ("policy_apply", json!({ "action": "policy_apply", "cedar": org, "reason": "x" })),
+    ];
+    for (what, body) in kinds {
+        let before = t.ledger().audit_tail(1000).unwrap().len();
+        let r = signed_by_other(&mut t, &other, body);
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{what}: {:?}", r.body);
+        let after = t.ledger().audit_tail(1000).unwrap();
+        assert_eq!(after.len(), before + 1, "{what}: only the refusal is recorded");
+        assert_eq!(after.last().unwrap().2, "operator.action_refused", "{what}");
+    }
+    // Nothing was done.
+    let l = t.ledger();
+    assert_eq!(l.standing(&ask_b).unwrap().status, "pending");
+    assert_eq!(l.placed_node("i-past").unwrap().unwrap().status, "active");
+    assert!(t.launched.lock().unwrap().is_empty(), "no run started");
+    assert_eq!(std::fs::read_to_string(t.dir.join("manifests/docs.yaml")).unwrap().lines().next(), Some("task: summarise the README"));
+    assert!(!t.state.push.as_ref().unwrap().store.list(&t.cred)[0].details, "details still off");
+    assert_eq!(t.state.push.as_ref().unwrap().store.list(&t.cred).len(), 1, "no second device");
+    assert!(!t.dir.join("policy/staged").exists(), "no policy staged");
 }

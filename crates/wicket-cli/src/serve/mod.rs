@@ -68,6 +68,7 @@ mod fence;
 pub(crate) mod limits;
 mod manifests;
 mod messages;
+mod names;
 pub(crate) mod net;
 mod nodes;
 mod orgpolicy;
@@ -243,6 +244,36 @@ enum Action {
         run: String,
         reason: String,
         effect: String,
+    },
+    /// Approve an ask for a public name (#575 step 4d): for the agent or its zone, for `ttl_secs`
+    /// (None: until revoked, or a run-scoped name), on the effect and the target (the asking run's
+    /// node and its addresses) the passkey signed.
+    NameApprove {
+        id: String,
+        bound: wicket_store::StandingBound,
+        ttl_secs: Option<u64>,
+        effect: String,
+        target: Box<Value>,
+    },
+    NameDeny {
+        id: String,
+    },
+    /// Move a live standing name's lapse to `ttl_secs` from now (None: until revoked), if it still
+    /// lapses at `previous`, as shown.
+    NameRenew {
+        id: String,
+        ttl_secs: Option<u64>,
+        previous: Option<i64>,
+    },
+    NameRevoke {
+        id: String,
+    },
+    /// Set or clear a node's public addresses, if they are still `old`, as shown.
+    NodeAddresses {
+        node: String,
+        ipv4: wicket_store::AddressChange<std::net::Ipv4Addr>,
+        ipv6: wicket_store::AddressChange<std::net::Ipv6Addr>,
+        old: wicket_store::NodeAddresses,
     },
     /// Apply an org policy (#712), on the preview the passkey signed.
     PolicyApply(Box<orgpolicy::PolicyApply>),
@@ -811,7 +842,6 @@ fn field_b64(v: &Value, k: &str) -> Option<Vec<u8>> {
     v.get(k).and_then(|s| s.as_str()).and_then(|s| unb64u(s).ok())
 }
 
-/// Options for an action's assertion: any of the operator's passkeys may sign.
 /// The options for an action's passkey assertion: only the session's own passkey may sign it
 /// ([`action_finish`] refuses any other, #802).
 fn assertion_options(state: &State, key: &str, cred: &str) -> Value {
@@ -826,8 +856,13 @@ where
     B: hyper::body::Body,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let session_page = req.uri().path() == "/session";
     let mut r = dispatch(req, state, peer).await;
     web::secure_headers(r.headers_mut(), state.hsts);
+    // A run's session page allows Vue's Trusted Types policy, and only it (#739).
+    if session_page {
+        r.headers_mut().insert(http::header::CONTENT_SECURITY_POLICY, http::HeaderValue::from_static(web::SESSION_CSP));
+    }
     r
 }
 
@@ -871,13 +906,8 @@ where
         }
         if let Some(a) = web::ASSETS.files.get(&path) {
             let mut r = send(a);
-            let cache = if a.immutable {
-                "public, max-age=31536000, immutable"
-            } else if path == "/sw.js" {
-                "no-cache"
-            } else {
-                "public, max-age=3600"
-            };
+            // Every file but /sw.js is named by its hash (#574); the worker is asked for anew.
+            let cache = if a.immutable { "public, max-age=31536000, immutable" } else { "no-cache" };
             r.headers_mut().insert("cache-control", http::HeaderValue::from_static(cache));
             return r;
         }
@@ -918,6 +948,21 @@ where
             // Notifications: the VAPID public key and this operator's devices.
             "/api/push" => match &sess {
                 Some((_, SessionKind::Operator { cred })) => to_response(push_view(state, cred)),
+                _ => denied(),
+            },
+            // The Names card (#575 step 4d): an operator's session only.
+            "/api/names" => match &sess {
+                Some((_, SessionKind::Operator { .. })) => match state.ledger().and_then(|l| names::view(state, &l)) {
+                    Ok(v) => to_response(ok(v)),
+                    Err(e) => to_response(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+                },
+                _ => denied(),
+            },
+            p if p.starts_with("/api/names/") => match &sess {
+                Some((_, SessionKind::Operator { .. })) => match names::detail(state, &p["/api/names/".len()..]) {
+                    Ok(v) => to_response(ok(v)),
+                    Err(r) => to_response(r),
+                },
                 _ => denied(),
             },
             // A manifest, viewed (#172): an operator's session only.
@@ -1559,12 +1604,17 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         Some("standing_deny") => standing::build_deny(state, &l, body),
         Some("standing_renew") => standing::build_renew(state, &l, body),
         Some("release_fence") => fence::build_release(state, oc, &l, body),
+        Some("name_approve") => names::build_approve(state, oc, &l, body),
+        Some("name_deny") => names::build_deny(state, oc, &l, body),
+        Some("name_renew") => names::build_renew(state, oc, &l, body),
+        Some("name_revoke") => names::build_revoke(state, &l, body),
+        Some("node_addresses") => names::build_node_addresses(state, oc, &l, body),
         Some("policy_apply") => orgpolicy::build(state, &l, oc, body),
         Some("node_release") => placed::build(state, &l, oc, body),
         Some("enrol_link") => enrol::build(state, oc, body),
         Some("send_message") => messages::build_send(state, oc, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence, node_release, policy_apply, enrol_link or send_message",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant, capacity_renew, standing_approve, standing_deny, standing_renew, release_fence, node_release, policy_apply, name_approve, name_deny, name_renew, name_revoke, node_addresses, enrol_link or send_message",
         )),
     }
 }
@@ -1628,6 +1678,11 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     let Some((_, SessionKind::Operator { cred: session_cred })) = sess.as_ref().filter(|_| same_session) else {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
     };
+    // Every signed action is the session's operator's (#802). An assertion that names another
+    // passkey is refused before it is verified, so the other passkey's sign counter isn't touched.
+    if let Some(named) = body.get("id").and_then(Value::as_str).filter(|n| *n != session_cred.as_str()) {
+        return refuse_other_passkey(state, named, session_cred, &action_json);
+    }
     let a = match verify_assertion(state, ch, body) {
         Ok(a) => a,
         Err(r) => {
@@ -1644,27 +1699,22 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
             return r;
         }
     };
-    // Every signed action is the session's operator's (#802): another enrolled passkey's signature,
-    // on this session's challenge, would act as that passkey while the page and the signed JSON
-    // name the session's. Refused, and audited, before anything action-specific.
+    // And the passkey that verified is the one named (verify_assertion looks it up by that id).
     if a.oc.id != *session_cred {
-        if let Ok(l) = state.ledger() {
-            let _ = l.audit(
-                &state.tenant,
-                None,
-                "operator.action_refused",
-                &json!({ "credential": a.oc.id, "session_credential": session_cred, "action": action_json,
-                         "reason": "signed with another passkey than the session's" }),
-            );
-        }
-        return err(StatusCode::FORBIDDEN, "sign with the passkey you signed in with");
+        return refuse_other_passkey(state, &a.oc.id, session_cred, &action_json);
     }
     let mut signed = json!({
         "credential": a.oc.id, "rp_id": state.rp.rp_id, "origin": state.rp.origin,
         "nonce": b64u(&nonce), "client_data_json": b64u(&a.cdj), "authenticator_data": b64u(&a.ad), "signature": b64u(&a.sig),
     });
-    // Decisions keep the field name they have always had, so older records and verifiers agree.
-    let field = if matches!(*action, Action::Decide { .. }) { "decision_json" } else { "action_json" };
+    // Decisions keep the field name they have always had, so older records and verifiers agree. A
+    // decision on a public name (#575 step 4d) is one too: its record is a `decision`, and its
+    // signed JSON says the decision, as a request's does.
+    let field = if matches!(*action, Action::Decide { .. } | Action::NameApprove { .. } | Action::NameDeny { .. }) {
+        "decision_json"
+    } else {
+        "action_json"
+    };
     signed[field] = action_json.into();
     if let Action::OpenSession { run } = &*action {
         return match session::open(state, run, &a.oc, &console_session, signed) {
@@ -1709,6 +1759,22 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
         Ok(msg) => ok(json!({ "ok": msg })),
         Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
     }
+}
+
+/// Refuses a signed action whose assertion names another passkey than the session's (#802), and
+/// audits it (`operator.action_refused`; `credential` is the id the assertion named). Nothing else is
+/// done or written.
+fn refuse_other_passkey(state: &State, named: &str, session_cred: &str, action_json: &str) -> Reply {
+    if let Ok(l) = state.ledger() {
+        let _ = l.audit(
+            &state.tenant,
+            None,
+            "operator.action_refused",
+            &json!({ "credential": named.chars().take(200).collect::<String>(), "session_credential": session_cred, "action": action_json,
+                     "reason": "signed with another passkey than the session's" }),
+        );
+    }
+    err(StatusCode::FORBIDDEN, "sign with the passkey you signed in with")
 }
 
 /// Applies a signed action and audits it with the operator's passkey and the signed triple.
@@ -1869,6 +1935,13 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::StandingDeny { id } => standing::apply_deny(state, &l, oc, id, signed),
         Action::StandingRenew { id, ttl_secs } => standing::apply_renew(state, &l, oc, id, *ttl_secs, signed),
         Action::ReleaseFence { run, reason, effect } => fence::apply_release(state, &l, oc, run, reason, effect, signed),
+        Action::NameApprove { id, bound, ttl_secs, effect, target } => {
+            names::apply_approve(state, &l, oc, id, *bound, *ttl_secs, effect, target, signed)
+        }
+        Action::NameDeny { id } => names::apply_deny(state, &l, oc, id, signed),
+        Action::NameRenew { id, ttl_secs, previous } => names::apply_renew(state, &l, oc, id, *ttl_secs, *previous, signed),
+        Action::NameRevoke { id } => names::apply_revoke(&l, oc, id, signed),
+        Action::NodeAddresses { node, ipv4, ipv6, old } => names::apply_node_addresses(state, &l, oc, node, *ipv4, *ipv6, old, signed),
         Action::PolicyApply(a) => orgpolicy::apply(state, &l, oc, a, signed),
         Action::NodeRelease { id, reason, effect_sha256 } => placed::apply(state, &l, oc, id, reason, effect_sha256, signed),
     }
@@ -2137,7 +2210,7 @@ fn dashboard(state: &State) -> Result<Value> {
                 "now": wicket_store::now(), "tenant": state.tenant.0, "ledger_error": "the ledger can't be read",
                 "pending": [], "decided": [], "runs": [], "manifests": list_manifests(state), "secrets": secrets::view(state),
                 "passkeys": [], "placed": [], "health": health_view(state, wicket_feed::now_ms())?.0, "capacity": [],
-                "standing": { "asks": [], "rules": [] }, "fenced": [], "audit": [],
+                "standing": { "asks": [], "rules": [] }, "fenced": [], "names": names::empty(), "audit": [],
             }));
         }
     };
@@ -2207,6 +2280,12 @@ fn dashboard(state: &State) -> Result<Value> {
         "capacity": capacity::view(&l, &t.0)?,
         "standing": standing::view(&l, &t.0)?,
         "fenced": fence::view(state, &l, &recent)?,
+        // The Names card (#575 step 4d): a names setting that can't be read is the card's to say,
+        // not a reason the page can't load.
+        "names": names::view(state, &l).unwrap_or_else(|e| {
+            tracing::warn!("dashboard: the names card: {e:#}");
+            json!({ "names": [], "public": null, "settings_error": format!("{e:#}"), "warning": wicket_control::names::WARNING })
+        }),
         "audit": audit,
         // The audit table against its limit on this host, and the prune checkpoint (#582).
         "audit_retention": crate::statesync::audit_retention(&l, false).ok().map(|r| json!({
@@ -2411,6 +2490,7 @@ mod tests {
     mod https;
     mod manifests;
     mod messages;
+    mod names_card;
     mod nodes;
     mod notify;
     mod orgpolicy;

@@ -231,6 +231,38 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
     let f = fixture("leak");
     super::nodes::enrol(&mut f.t.ledger(), "n1", &TenantId::single().0, &["api.example.com"]);
     let n = needles(&f);
+    // A public name of the run with the token, approved, with a connection its node shipped
+    // (#575 review, L6): the names views scanned are real ones, not an empty card.
+    let _h = super::names_card::Hooks;
+    super::names_card::set_settings(Some(Ok(super::names_card::names_cfg("boxes.example.com"))));
+    let nid = {
+        let l = f.t.ledger();
+        let ask = wicket_store::NameAsk {
+            tenant: &TenantId::single(),
+            run: &RunId(RUN.into()),
+            zone: ZONE,
+            zone_digest: "zd",
+            principal: "spiffe://wicket.local/t/agent",
+            label: "leaky",
+            port: 3000,
+            service: Some("http"),
+            reason: "a demo",
+            scope: wicket_store::NameScope::Standing,
+        };
+        let id = l.ask_public(&ask).unwrap().0;
+        let public = super::names_card::names_cfg("boxes.example.com").public.unwrap();
+        let terms = wicket_store::NameTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: Some(3600) };
+        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &terms, &public.domain());
+        l.approve_name(&id, &terms, "passkey:laptop", Some(&shown), &public).unwrap();
+        let conn = json!({ "name": id, "port": 3000, "phase": "start", "conn": "c1", "peer": "192.0.2.9:5000" });
+        let outer = json!({ "node": crate::localnode::NAME, "seq": 1, "ts": 1, "tenant": "t0", "run": RUN, "kind": "name.conn", "body": conn.to_string() });
+        l.audit(&TenantId::single(), Some(&RunId(RUN.into())), "node.audit", &outer).unwrap();
+        id
+    };
+    let (s, d, body) = get(&f.t, &format!("/api/names/{nid}")).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert!(body.contains("leaky.boxes.example.com"), "the settings reached the handler: {body}");
+    assert!(d["connections"].as_array().is_some_and(|c| !c.is_empty()), "{d}");
     // The scanner finds them where they are: in the stored record itself.
     assert!(!leaks(&serde_json::to_string(&f.record).unwrap(), &n).is_empty(), "the scanner must catch the raw record");
     // A placement decision recorded for the run, so the scan sees one.
@@ -255,6 +287,9 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         format!("/api/explain/{}", f.op_seq + 1),
         "/api/explain/999999".into(),
         "/api/explain/x".into(),
+        "/api/names".into(),
+        format!("/api/names/{nid}"),
+        "/api/names/n-nope".into(),
         "/api/nodes/n1/ca".into(),
         "/api/nodes/nope/ca".into(),
     ];
@@ -294,6 +329,8 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         "/api/runs/run_01authz0000000000000000000/authority",
         "/api/runs/run_01authz0000000000000000000/placement",
         "/api/explain/1",
+        "/api/names",
+        "/api/names/n-1",
         "/api/nodes/n1/ca",
     ] {
         let (s, _, body) = super::http::call(&f.t.state, "GET", p, &[], b"").await;

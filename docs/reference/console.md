@@ -84,6 +84,8 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   the value.
 - **issue and renew a capacity grant** (`capacity_grant`, `capacity_renew`): see
   [capacity grants](#capacity-grants). Revoking one needs only the session.
+- **approve, deny, renew and revoke names, and set a node's public addresses** (`name_approve`,
+  `name_deny`, `name_renew`, `name_revoke`, `node_addresses`): see [names](#names).
 - **send a message to an agent** (`send_message`, #252), as `wicket message send` does: the passkey
   signs the recipient, the text, its priority and the message it answers, and wicket sends it as
   `spiffe://<domain>/t/<tenant>/op/passkey/<name>`, signed with a short-lived operator identity. The
@@ -130,17 +132,21 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   `decision.refused`). The decision is audited first (`placement.node_release_decided`, with your
   passkey and operator identity, the record root's command writes too, `granter` `human` or `root`,
   `via` `console` or `cli`); if it can't be written, nothing is released. Then, in the background, with the server's own provider key: if it is still what you signed and still
-  active, the provider destroys it; then its service instances are stopped, the runs on it are
-  ended as lost (and revoked, if they have an identity; a run that ended on its own meanwhile keeps how
-  it ended), and `placement.node_released` (with the decision's sequence) is written and its enrolment
-  revoked. If one of those steps fails the others are still done, `placement.node_release_incomplete` says
-  which, and `wicket node release <id>` on the host finishes it; so does the reconciler, a few minutes
+  active, the provider destroys it (recorded just before, once the provider has it,
+  `placement.node_release_destroying`); then its
+  service instances are stopped, the runs on it are ended as lost (and revoked, if they have an
+  identity; a run that ended on its own meanwhile keeps how it ended), its enrolment is revoked, last
+  and only once the rest is done, and then `placement.node_released` (with the decision's sequence) is
+  written. If one of the steps before the enrolment fails the others are still done and the
+  enrolment is kept (until it is revoked, nothing new runs on the server's name),
+  `placement.node_release_incomplete` says which, and `wicket node release <id>` on the host finishes it; so does the reconciler, a few minutes
   later, including after a restart in the middle of a release. A retry reads what the released server
   still has from the ledger, and only what was there before it was released: a new server given the
   same name since keeps its runs, services and files.
   Otherwise `placement.node_release_failed` (it is as it was) or
   `placement.node_release_already_ended` (another release got there first). Files it keeps are
-  forgotten only when this release destroyed it. The page's button waits for the Lit servers card
+  forgotten only when a release destroyed it: this one, or an earlier one that asked the provider and
+  never finished. The page's button waits for the Lit servers card
   (#758); until then the action is there for the page and for scripts.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
@@ -174,6 +180,61 @@ their own leases. Whatever the grant, the node's money is reserved first against
 [`placement.yaml`](configuration.md#placementyaml), which leases share (#256), before anything is
 asked or created. An operator whose authority in [`operators.yaml`](configuration.md#operatorsyaml)
 doesn't include `capacity` may not issue or renew one.
+
+## Names
+
+The **Names** card (#575 step 4d; [names for boxes](../explanation/box-dns.md)) lists the names of
+the console's tenant: asks for public names waiting for you, live names (internal and public), and
+those that ended, were denied or withdrawn in the last 7 days. Its data is the dashboard's `names`
+(`/api/state`), or `GET /api/names`, the same object: `names` (the rows), `public` (the boxes
+domain and provider, or null without public names), `settings_error` (why `wicket.yaml`'s `names`
+can't be read, or null) and `warning` (what a public name means). Each row has the shape `wicket
+names list --json` prints ([output for scripts](cli.md#output-for-scripts)): wicket's `state`
+(`pending`, `live`, `waiting`, `taken` in the zone, `out_of_sync`, `lapsed`, `denied`, `withdrawn`,
+`ended`) with `why`, the full `name`, its `owner` (principal, zone, the asking run, the holding
+run), its `target` (node, that node's public IPv4 and IPv6, host port, box port), its scope,
+binding and lifetime, who decided it, and, under `agent`, what the agent wrote (its label, service
+and reason) as it wrote it: the card shows these quoted, and wicket's own text never quotes them.
+The state is what the reconciler would do now and what its last recorded plan (`name.plan`) found:
+a name it can't publish yet is `waiting` with why; one whose name the zone holds records at that
+wicket didn't make is `taken`; one whose records the ledger doesn't list as made is
+`out_of_sync`. The `noop` provider publishes nothing, so its names are `live` once wanted, and say
+so. `GET /api/names/<id>` is one name (as `wicket names show --json`), adding its `records` as the
+ledger lists them (zone and provider), the last plan's entries for it (`plan`: each zone's
+conflicts at the name and changes to it, and why it was waiting) and its last `connections`, newest
+first (the node's `name.conn` and `name.conn.refused` records, looked for among the newest 2000
+node records, at most 50). A name of another tenant is not found (404), as an unknown one is. Both
+routes need an operator's session.
+
+Each decision is a signed action (`/api/action/begin`, then `/api/action/finish`): single-use,
+for two minutes, in the session that began it. The passkey signs:
+- **`name_approve`** `{id, for: agent|zone, lasts: 30d|<duration>|forever}`: the name's id, its
+  full name (`fqdn`), label, zone and zone digest, principal, the asking run, the box's port and
+  service, its scope, who it is for and how long (`for`, `ttl_secs`, `lasts`; for a run-scoped
+  name: null, as its run lasts), `target` (the node the asking run is on now, and that node's
+  public addresses), the warning, and the effect (`effect_sha256`, `wicket_store::name_effect`).
+  When applied, the effect is recomputed under `wicket.yaml` as it is then, and the node and its
+  addresses read again: if either changed, the approval is refused (409), and the refusal is on the
+  record (`decision.refused`). The decision (`decision`, `via: console`, with the signed triple) is
+  written first, in the same write as the approval: if it can't be written, nothing is approved.
+- **`name_deny`** `{id}`: the name's id, full name, label, zone, principal, the asking run and the
+  box's port.
+- **`name_renew`** `{id, lasts}`: a live standing name's id, full name, zone, principal, who it is
+  for, the new lifetime (`ttl_secs`, null: until revoked) and when it lapsed before
+  (`previous_until`); a name whose lifetime changed since you were shown it is refused. Audited
+  `name.renewed`, first, in the same write.
+- **`name_revoke`** `{id}`: a live name's id, full name, zone, principal and holder. Audited
+  `name.revoked`.
+- **`node_addresses`** `{node, ipv4?, ipv6?}` (each an address, `none` to clear it, or absent to
+  keep it): the node, and each address before and after (`ipv4: {from, to}`, `ipv6: {from, to}`).
+  Only addresses on the public internet. When applied, a node whose addresses changed since is refused. Audited
+  `node.addresses`, first, in the same write, as `wicket node set --public-ipv4/6` is.
+
+Approving, denying and renewing need an authority in [`operators.yaml`](configuration.md#operatorsyaml)
+that covers `name` at R4, and setting a node's addresses one that covers `node` at R4: refused at
+begin (403) otherwise, and checked again when applied (refusals audited as `decision.refused`).
+Revoking only narrows: any signed-in operator may. `wicket audit --verify` re-verifies each of
+these records' signatures and that each record says what was signed.
 
 ## Sessions
 
@@ -271,7 +332,8 @@ cargo build` embeds it as written, to read in a browser's debugger. The page's t
 (`serve/tests/console_ui.js`), and `ci/console-browsers.sh` runs it as served in Chromium, Firefox and
 WebKit: it writes what `wicket serve` sends (`wicket dev console-assets DIR`: the page, its files and
 its headers) and serves that against the preview's mock API, failing on any error, CSP violation or
-Trusted Types report, a card replaced by an unchanged poll, or a page that scrolls sideways.
+Trusted Types violation, a card replaced by an unchanged poll, a page that scrolls sideways, or a raw
+`innerHTML` write that doesn't throw; and they mount a run's session view under the same policy.
 
 **Every file under `/static/` is named by its content's hash** (`console.<hash>.js`,
 `icon-192.<hash>.png`, `manifest.<hash>.webmanifest`, …) and sent with `Cache-Control: public,
@@ -581,10 +643,18 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
   passkey-signed, so a stolen cookie alone approves nothing, and registers no notification device.
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
-  'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
-  and Trusted Types reported but not yet enforced (`Content-Security-Policy-Report-Only:
-  require-trusted-types-for 'script'; trusted-types lit-html`, [#739](https://github.com/public/wicket/issues/739)),
-  no CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
+  'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self';
+  require-trusted-types-for 'script'; trusted-types lit-html wicket-sw`. Trusted Types are enforced
+  ([#739](https://github.com/public/wicket/issues/739)): on the console's page, HTML reaches the page
+  only through lit-html's templates, whose values are set as text, and a browser throws on any other
+  `innerHTML`-style write from a string. The one script URL, the service worker's, comes from
+  `wicket-sw`, a policy that makes `/sw.js` and nothing else. A run's session page (`/session`) has
+  the same policy but allows only Vue's (`trusted-types vue`). Vue's passes any string through, for
+  its static nodes and for any `v-html` or `innerHTML` binding, so there Trusted Types stop only code
+  outside Vue; what keeps an agent's text out of HTML is that the view has no such binding, which
+  `ci/session-view.sh` checks. The browser tests check each page's policy and that the service worker
+  still registers.
+  No CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
   `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
 - **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS
   handshake, the request headers and the body, 2 minutes per connection, 16 KiB and 64 header lines, 64 KiB

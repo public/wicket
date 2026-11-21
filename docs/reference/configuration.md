@@ -77,11 +77,17 @@ default: anything            # for operators not listed: anything (the default),
 operators:
   unix/alice: anything
   passkey/laptop:
-    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority, fence, policy
+    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, tool, name, authority, fence, policy, node
     hosts: ["*.example.com"] # for http requests: these hosts only (absent: any)
     max_risk: R2             # the highest risk it may decide (absent: any)
   unix/auditor: nothing      # may list requests, decides none
 ```
+
+Kind `node` (at R4) is setting a node's public addresses, in the console or with
+`wicket node set --public-ipv4/--public-ipv6`: a public name's records point at them. With
+`default: anything`, or no `operators.yaml` at all, every passkey and every CLI operator may set
+them, as they may decide public names (`name`); list the operators, or give the default a scope,
+to narrow it.
 
 `capacity` covers a CAPACITY request and, at R4, releasing a placed server past its lease from the console
 (#710): it stops the boxes still running there and loses the files it keeps.

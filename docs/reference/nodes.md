@@ -211,10 +211,11 @@ wicket node revoke n1
   sends again every revoke that may have been lost on a link that died (a secret revoked and not
   fetched since) as it was first sent: one for a change (rotated, rebound or removed) as a change,
   which ends the uses the run shared with children the node started while cut off, and any other as a
-  resend, which leaves them. It then revokes at once each secret that changed meanwhile, as a change. A secret the node holds as released and unchanged stays with it, so after
-  a self-update its new `serve` keeps the cache handed over and fetches nothing again (#818). A
-  re-attached supervisor reads what an earlier one released, and the digest each went with, from
-  `ctl/holdings.json` (a mark instead for one revoked since, which it revokes again as it was). An answer a revoke
+  resend, which leaves them. It then revokes at once each secret that changed meanwhile, as a change.
+  A secret the node holds as released and unchanged stays with it, so after a self-update its new
+  `serve` keeps the cache handed over and fetches nothing again (#818). A re-attached supervisor reads
+  what an earlier one released, and the digest each went with, from `ctl/holdings.json` (a mark
+  instead for one revoked since, which it revokes again as it was). An answer a revoke
   overtook is not taken. From the handover's snapshot to the exec no fetch starts, so the control
   host records no release the new process lacks; a revoke that dies with the old process is sent
   again to the new one. Only a node at protocol 23 is sent an optional rule whose secret isn't set;
@@ -513,7 +514,8 @@ knows when it decides, among every enrolled, active node not held by a capacity 
   records where a public name of a box on the node points (`none` clears one; audited `node.addresses`,
   ledger schema 34). Only addresses on the public internet are taken: for a node behind NAT that forwards
   its port range one to one, the router's. They are the operator's alone: a node never sets its own, since
-  a node that could name its address could point a name at someone else's server. A node with neither
+  a node that could name its address could point a name at someone else's server, and only an operator
+  whose authority covers kind `node` (`operators.yaml`, at R4) may set them. A node with neither
   can't publish.
 - **Filter.** Out are: a node that starts no box (`full`); one without the vCPUs and memory the box's limits
   ask for, by its report and its admission's room ([above](#health-admission-and-disk-377)); a label or

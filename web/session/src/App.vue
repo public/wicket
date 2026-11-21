@@ -1,7 +1,7 @@
 <!-- wicket's session view (#327): one boxed run's ACP session in the console, opened from the run's row.
      Forked from acp-ui (formulahendry/acp-ui@cd9c3cb, MIT): the chat layout follows upstream's
-     ChatView.vue without its markdown (upstream renders agent text with `marked` into v-html,
-     unsanitized, which would let an agent put its own HTML, such as fake approve buttons, on the
+     ChatView.vue without its markdown (upstream renders agent text with `marked` into a raw-HTML
+     binding, unsanitized, which would let an agent put its own HTML, such as fake approve buttons, on the
      operator's console). Every string here is text interpolation. -->
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, shallowRef, watch } from 'vue';
