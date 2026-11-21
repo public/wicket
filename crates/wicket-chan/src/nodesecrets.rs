@@ -315,6 +315,24 @@ impl Drop for Fetching<'_> {
 /// Where a self-update's re-exec finds the cache handed over (#162): a sealed memfd's descriptor.
 pub const HANDOVER_ENV: &str = "WICKET_NODE_SECRETS_FD";
 
+/// The descriptor [`HANDOVER_ENV`] named, taken out of the environment by [`take_handover_env`]
+/// (once, and imported once).
+static HANDED: std::sync::OnceLock<std::sync::Mutex<Option<i32>>> = std::sync::OnceLock::new();
+
+fn handover_env() -> std::sync::Mutex<Option<i32>> {
+    std::sync::Mutex::new(std::env::var(HANDOVER_ENV).ok().and_then(|v| v.parse::<i32>().ok()))
+}
+
+/// Takes [`HANDOVER_ENV`] out of this process's environment, keeping what it names for
+/// [`Cache::import_handover`]. Called first thing in `main`, before the runtime starts any thread
+/// (#818): changing the environment while other threads may read it is a race, and no child should
+/// inherit the variable.
+pub fn take_handover_env() {
+    if HANDED.set(handover_env()).is_ok() && std::env::var_os(HANDOVER_ENV).is_some() {
+        std::env::remove_var(HANDOVER_ENV);
+    }
+}
+
 /// The cache's handed-over form (in a memfd, never a file).
 #[derive(Serialize, Deserialize)]
 struct Handed {
@@ -544,8 +562,7 @@ impl Cache {
     /// Takes the cache handed over by the process that exec'd this one, if any: [`HANDOVER_ENV`]
     /// names a sealed memfd, which is read, then closed. Anything else there is refused.
     pub fn import_handover(&self) -> Result<usize> {
-        let Some(n) = std::env::var(HANDOVER_ENV).ok().and_then(|v| v.parse::<i32>().ok()) else { return Ok(0) };
-        std::env::remove_var(HANDOVER_ENV);
+        let Some(n) = HANDED.get_or_init(handover_env).lock().expect("handed").take() else { return Ok(0) };
         // SAFETY: the descriptor the previous process left open for this one; owned from here.
         let owned = unsafe { OwnedFd::from_raw_fd(n) };
         self.import(owned)

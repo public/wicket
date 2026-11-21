@@ -214,8 +214,9 @@ wicket node revoke n1
   resend, which leaves them. It then revokes at once each secret that changed meanwhile, as a change.
   A secret the node holds as released and unchanged stays with it, so after a self-update its new
   `serve` keeps the cache handed over and fetches nothing again (#818). A re-attached supervisor reads
-  what an earlier one released, and the digest each went with, from `ctl/holdings.json` (a mark
-  instead for one revoked since, which it revokes again as it was). An answer a revoke
+  what an earlier one released, and the digest each went with, from `ctl/holdings.json`. In place of
+  the digest it finds a mark for a secret revoked for a change, which it revokes again as a change,
+  and nothing for one revoked otherwise, which it revokes again as a resend. An answer a revoke
   overtook is not taken. From the handover's snapshot to the exec no fetch starts, so the control
   host records no release the new process lacks; a revoke that dies with the old process is sent
   again to the new one. Only a node at protocol 23 is sent an optional rule whose secret isn't set;

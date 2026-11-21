@@ -59,6 +59,12 @@ pub fn reexec_with(versions: &Path, carried: &Carried) -> anyhow::Error {
         },
     };
     let err = carrying(std::process::Command::new(&exe), carried).args(std::env::args_os().skip(1)).exec();
+    // The exec failed, perhaps after its last step cleared the carried descriptors' close-on-exec
+    // flag: set again before anything else, so no child another thread starts inherits them (#818).
+    for fd in &carried.fds {
+        // SAFETY: fcntl on a descriptor the caller holds open.
+        unsafe { libc::fcntl(*fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     anyhow::anyhow!("re-executing {}: {err}", exe.display())
 }
 

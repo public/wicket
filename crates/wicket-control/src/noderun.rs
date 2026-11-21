@@ -1776,8 +1776,9 @@ async fn on_frame(
                     send(Frame::Feed(f.to_line().trim_end().as_bytes().to_vec()));
                 }
                 // The node drops what it held for the run with its box: no digest of a secret is
-                // kept in the run's directory past it (#818).
-                for d in p.fetched.values_mut() {
+                // kept in the run's directory past it (#818). A secret revoked for a change keeps
+                // that mark, so a revoke of it still goes as a change.
+                for d in p.fetched.values_mut().filter(|d| d.as_str() != CHANGED) {
                     *d = REVOKED.into();
                 }
                 save_holdings(sh, p);
@@ -3482,6 +3483,7 @@ mod tests {
         let none: crate::nodesecrets::Fetcher =
             std::sync::Arc::new(|_, _| Box::pin(async { Err(crate::nodesecrets::Unfetched::Unreachable("cut off".into())) }));
         let child = cache.source(CHILD, none);
+        assert!(child.has("gh"), "the child holds the parent's copy, shared");
         for (name, resend) in &revokes {
             match resend {
                 true => cache.revoke_resent(RUN, name),
