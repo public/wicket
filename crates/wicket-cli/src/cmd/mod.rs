@@ -2,10 +2,14 @@
 
 pub mod approve;
 pub mod audit;
+pub mod authority;
+pub mod capacity;
 pub mod dev;
 pub mod identity;
 pub mod image;
 pub mod itself;
+pub mod manifest;
+pub mod message;
 pub mod names;
 pub mod node;
 pub mod operator;
@@ -45,4 +49,4 @@ pub fn test_ledger(tag: &str) -> (std::path::PathBuf, wicket_store::Ledger) {
 }
 
 #[cfg(test)]
-mod json_tests;
+pub(crate) mod json_tests;

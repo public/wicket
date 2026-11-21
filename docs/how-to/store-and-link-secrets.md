@@ -131,6 +131,9 @@ zone:
 - `{basic:USER}` renders an HTTP Basic credential with the secret as password: git over HTTPS with a
   token.
 - `optional: true` sends requests without it if the secret isn't set, instead of refusing to start.
+- Running boxes follow the vault: a secret set, rotated or removed after a box started is used, or
+  left out, from its next request, with no restart (on a remote node within about 2 s). A required
+  rule whose secret is removed fails its host's requests until it is set again.
 - A manifest that injects a secret toward a host outside its binding, or points `llm.upstream` at
   another host, is refused, and the proxies check again before sending.
 

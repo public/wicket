@@ -1,0 +1,11 @@
+# Acceptance, multi-host (ci/acceptance/nodes.sh, messages_flow, #252): msg-b, on acc-n1, accepts
+# messages from msg-a's zone and answers one; writing to msg-a unasked is refused.
+task: Answer msg-a.
+program:
+  name: msg-b
+  command: [bash, /workspace/b.sh]
+zone:
+  name: acc-msg-b
+  isolation: gvisor
+  accept_from: [acc-msg-a]
+  limits: { memory: 256m, cpus: 1, timeout: 12m }

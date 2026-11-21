@@ -342,6 +342,21 @@ impl Ledger {
         Ok(n == 1)
     }
 
+    /// Asks `want` of active agent `id` only if nothing is asked of it yet (an operator's request
+    /// stands). True if asked.
+    pub fn want_agent_if_unasked(&self, id: &str, want: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE agents SET want = ?2, note = NULL, updated_at = ?3 WHERE id = ?1 AND state = 'active' AND want IS NULL",
+            params![id, want, now()],
+        )? > 0)
+    }
+
+    /// Withdraws a request `want` made of agent `id` that its supervisor hasn't taken yet (#579 step
+    /// 4: a preemption given up on). True if it was still pending.
+    pub fn withdraw_agent_want(&self, id: &str, want: &str) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE agents SET want = NULL WHERE id = ?1 AND want = ?2", params![id, want])? > 0)
+    }
+
     /// Takes what an operator asked of this activation, once.
     pub fn take_agent_want(&self, id: &str, generation: i64) -> Result<Option<String>> {
         let w: Option<String> = self
@@ -363,9 +378,33 @@ impl Ledger {
     /// new state, or None when `run` wasn't an agent's current activation.
     pub fn run_lost(&self, run: &str, why: &str) -> Result<Option<String>> {
         let tx = self.conn.unchecked_transaction()?;
+        let state = self.lose_run(run, why)?;
+        tx.commit()?;
+        Ok(state)
+    }
+
+    /// [`Ledger::run_lost`], only if `run` is still running, checked and ended in one transaction: a
+    /// run that ended meanwhile keeps how it ended (#812 review). `then` runs inside that transaction
+    /// once the run is ended (its revocation, its audit records), so it happens with the end or not
+    /// at all: never to a run that ended on its own, and never skipped for one this ended. Whether it
+    /// was ended.
+    pub fn run_lost_if_running(&self, run: &str, why: &str, then: impl FnOnce(&Ledger) -> Result<()>) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let status: Option<String> = tx.query_row("SELECT status FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?;
+        let running = status.as_deref() == Some("running");
+        if running {
+            self.lose_run(run, why)?;
+            then(self)?;
+        }
+        tx.commit()?;
+        Ok(running)
+    }
+
+    /// The writes of [`Ledger::run_lost`], inside the caller's transaction.
+    fn lose_run(&self, run: &str, why: &str) -> Result<Option<String>> {
         self.run_ended(&wicket_core::RunId(run.to_string()), "lost", why)?;
         let note = format!("its run {run} was lost: {why}");
-        let n = tx.execute(
+        let n = self.conn.execute(
             "UPDATE agents SET state = CASE WHEN head IS NULL THEN 'ended' ELSE 'hibernated' END, claim_until = NULL, \
              want = NULL, note = ?2, updated_at = ?3 \
              WHERE run = ?1 AND state IN ('active', 'waking', 'hibernating') \
@@ -374,9 +413,8 @@ impl Ledger {
         )?;
         let state = match n {
             0 => None,
-            _ => tx.query_row("SELECT state FROM agents WHERE run = ?1", params![run], |r| r.get(0)).optional()?,
+            _ => self.conn.query_row("SELECT state FROM agents WHERE run = ?1", params![run], |r| r.get(0)).optional()?,
         };
-        tx.commit()?;
         Ok(state)
     }
 
@@ -393,6 +431,22 @@ impl Ledger {
             params![run],
             |r| r.get(0),
         )?)
+    }
+
+    /// The peer messages waiting for `run` that ask to be read `now` (#252), oldest first, as
+    /// they would be delivered: whether one may interrupt a turn is the supervisor's call, after
+    /// the checks delivery makes ([`wicket_core::message::interrupts`]).
+    pub fn urgent_messages(&self, run: &str) -> Result<Vec<UrgentMessage>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, from_run, from_principal, envelope, created_at FROM messages
+              WHERE to_run = ?1 AND {} AND delivered_at IS NULL AND taken_at IS NULL AND priority = 'now'
+              ORDER BY created_at, rowid",
+            crate::PEER
+        ))?;
+        let rows = st.query_map(params![run], |r| {
+            Ok(UrgentMessage { id: r.get(0)?, from_run: r.get(1)?, from_principal: r.get(2)?, envelope: r.get(3)?, created_at: r.get(4)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Prompts and notices queued for `run` and not yet handed to it.
@@ -421,6 +475,16 @@ pub(crate) fn insert_agent(conn: &rusqlite::Connection, a: &NewAgent) -> Result<
     )?;
     conn.execute("INSERT INTO agent_runs (run, agent, generation, started_at) VALUES (?1, ?2, 1, ?3)", params![a.run, a.id, t])?;
     Ok(())
+}
+
+/// A waiting `now` message ([`Ledger::urgent_messages`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UrgentMessage {
+    pub id: String,
+    pub from_run: String,
+    pub from_principal: Option<String>,
+    pub envelope: String,
+    pub created_at: i64,
 }
 
 #[cfg(test)]

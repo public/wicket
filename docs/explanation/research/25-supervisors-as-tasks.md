@@ -194,8 +194,8 @@ reconcile┴─ wicket attach (D) ─ssh─┘   wicket supervise #k, epoch e  (
 
 - A host has one **node link** per node in its shard: one connection (one ssh session, one
   `node attach` process on the node) over which every run on that node talks.
-- **The node-link protocol (proposed; the first free version when it's built, 22 or later, since 20
-  is #651's DNS host ports and 21 #578's webhook intake): `Run { run, frame }`.**
+- **The node-link protocol (proposed; the first free version when it's built, 21 or later, since 20
+  is #578's webhook intake): `Run { run, frame }`.**
   - It wraps today's per-run frames, so `Msg::Data`, `Started`, `Exited`, `Call`, `Ask`, `Audit` and
     the rest are unchanged inside it.
   - The handshake is scoped to a host and carries its **shard grant** (`scope: "host:<k>"`; §3.1):
@@ -333,9 +333,12 @@ Proposed:
 
 ### 3.1 Host leases, epochs and fencing
 
-**Tables** (expand steps, at the next free schema number when it is built: 33 to 35 are taken):
-- `supervisor_hosts`: `host`, `owner` (`machine:pid:start`), `lease_until`, `updated_at`;
-- `shard_nodes`: `node` → `host`, `epoch`;
+**Tables** (schema 42, an expand step, built: `wicket-store/src/hosts.rs`):
+- `supervisor_hosts`, one row per shard: `host` (the shard's name), `owner` (`machine:pid:start`, the
+  process holding it), `epoch`, `lease_until`, `stopping` (the clean-stop marker, §3.4), `adopting`
+  (the safe-mode batch, §3.4), `updated_at`. The epoch is the shard's, so it sits here rather than on
+  each of its nodes;
+- `shard_nodes`: `node` → `host`;
 - `runs.host`.
 
 **The lease.**
@@ -585,7 +588,40 @@ would quarantine the wrong runs, or, with #688, stop a whole shard's boxes. So:
 Each step ships on its own, keeps the previous behaviour behind a setting until the next, and can be
 rolled back by running the previous build.
 
-1. **Two hosts, static by node, opt-in.**
+1. **Two hosts, static by node, opt-in.** Built so far: the ledger's shards, leases, epochs and
+   epoch-conditional writes (schema 42, `wicket-store/src/hosts.rs`); the static shard of a node,
+   the lease renewed only on runtime progress, and wicketd's start-or-fence rule
+   (`wicket-control/src/supervise.rs`); and the rollback reading below (`wicket-home/src/owner.rs`).
+   Nothing starts a host yet.
+
+   **Conditions on the PR that first writes a host label** (`host:<shard>:<epoch>` in `runs.owner`;
+   #781 review):
+   - **The reconciler reads `runs.host` before `runs.owner`, in that same PR.** This build reads a
+     host label as a gone owner (the rollback reading), so without it, this build's own reconciler
+     would adopt a live host's runs with `wicket attach`.
+   - **Raise the floor to 42 and add `previous_build` entries** for the queries an older build runs on
+     `runs.owner`: a host label misleads a build that predates it, which is then no longer a safe
+     rollback target while hosts hold runs.
+   - **`as_shard` doesn't nest.** Methods that open their own transaction (`immediate`, `run_ended`'s
+     own, the start's) can't run inside it, and the audit writer (`AuditWriter`) writes on its own
+     connection, outside the epoch check. Each host write path has to be made epoch-conditional on
+     its own terms (a plain-statement variant inside `as_shard`, or the epoch check in the method's
+     own transaction), and the audit writer's records checked against the shard where they matter.
+   - **`runs.host` goes stale**: a run that ends keeps it, and a run started on a node after its
+     shard was taken has none until the shard is taken again. The start must set it in its one
+     transaction (from `shard_nodes`), and readers must treat it as meaningful only for running runs.
+   - **Only running runs are labelled**, and a run has no `runs.node` until its box is placed
+     (`set_run_node`, the local node included), so `take_shard` labels neither a run not yet placed
+     nor one that isn't `running`. The start (and an adoption) must set `runs.host` itself, and a
+     hibernated run woken later gets it from its new start.
+   - **A renewal doesn't need a live lease**, on purpose: after a ledger stall every lease has
+     lapsed, and a host must be able to renew its own. What stops a lapsed holder is its epoch moving:
+     `fence_shard`, or `take_shard` moving one of its nodes, which fences it in the same transaction.
+   - **The first renewal needs progress too** (fixed here: `Lease::take` records the runtime's
+     progress at the take, so a runtime that wedges right after taking its shard still lapses).
+   - **One clock.** Leases, heartbeats and the stall window are wall-clock seconds from the control
+     host's clock: every host and wicketd run on that one machine in this version. Hosts on other
+     machines (§9) need the epoch at the node, not lease times compared across clocks.
    - `wicket supervise` runs today's supervisor, `run_to_end`, as **a thread per run** with a
      current-thread runtime each, as child supervisors do. That is one thread a run, up to the host's
      bound (2,000), plus each runtime's blocking threads while they're busy (ledger and file work).
@@ -612,7 +648,7 @@ rolled back by running the previous build.
    - The protocol is unchanged.
 3. **One channel per node** (the node-link protocol, §2.2).
    - A node link per node in the host, with today's per-run channel for nodes below the node-link
-     version (22 or later, §2.2).
+     version (21 or later, §2.2).
    - The node side demultiplexes.
    - Feed deltas are batched across runs on a node.
 4. **Dynamic shards.** Hand-off by lease, the shard reconciler, the global reconciler's slow pass, and
@@ -642,7 +678,8 @@ rolled back by running the previous build.
     - every node link is up with a fresh feed.
   - Then each other host in turn, with the same gate. A failed gate switches the canary back to the
     old build and stops the rollout. The hosts not yet restarted stay on the old build.
-- **Rollback.**
+- **Rollback.** (See the conditions in §5.1, step 1: the floor rises to 42 when hosts first write
+  their labels.)
   - An older build doesn't know `runs.host` or `supervisor_hosts`. Its reconciler reads `runs.owner`,
     which a host writes as `host:<k>:<epoch>`: an older build must see that as "not alive" and adopt
     with a process.

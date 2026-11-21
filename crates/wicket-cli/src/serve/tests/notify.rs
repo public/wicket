@@ -4,7 +4,7 @@
 use super::http::call;
 use super::*;
 
-fn keys() -> (String, String) {
+pub(super) fn keys() -> (String, String) {
     let k = p256::SecretKey::from_slice(&[0x11; 32]).unwrap();
     use p256::elliptic_curve::sec1::ToSec1Point;
     (b64u(k.public_key().to_sec1_point(false).as_bytes()), b64u(&[5u8; 16]))
@@ -290,4 +290,37 @@ async fn the_unread_alert_survives_a_ledger_that_cant_be_opened() {
     let out = notify_health(&t.state, &mut h, &mut known, now).await;
     assert_eq!(out.len(), 1, "pushed to the device of the passkey known before");
     assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+/// Asks for public names are pushed like other asks, and an ask that is stale by the time the
+/// notifier looks (here: of a run that isn't running) is swept, not pushed (#696 review).
+#[tokio::test]
+async fn asks_for_public_names_are_pushed_and_stale_ones_are_not() {
+    let t = setup("pushnames");
+    let tn = TenantId::single();
+    let ask = |run: &str, label: &str| {
+        let r = RunId(run.into());
+        let a = wicket_store::NameAsk {
+            tenant: &tn,
+            run: &r,
+            zone: "z",
+            zone_digest: "zd",
+            principal: "spiffe://w.test/t/t0/z/z/a/lead",
+            label,
+            port: 3000,
+            service: Some("http"),
+            reason: "asked by the agent: the demo",
+            scope: wicket_store::NameScope::Run,
+        };
+        t.ledger().ask_public(&a).unwrap().0
+    };
+    t.ledger().run_started(&tn, &RunId("run_live".into()), "z", "lead").unwrap();
+    let live = ask("run_live", "demo");
+    // Asked for a run that isn't running: the next sweep withdraws it.
+    let gone = ask("run_gone", "other");
+    let w = waiting(&t.state).unwrap();
+    let ids: Vec<&str> = w.iter().map(|w| w.id.as_str()).collect();
+    assert_eq!(ids, vec![live.as_str()], "{ids:?}");
+    assert_eq!(w[0].summary, "lead asks for the public name demo (port 3000)");
+    assert_eq!(t.ledger().name(&gone).unwrap().status, "withdrawn");
 }

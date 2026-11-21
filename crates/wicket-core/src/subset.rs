@@ -4,6 +4,7 @@
 //! can narrow its request or ask a human for the difference (request_access).
 
 use crate::manifest::{host_matches, Isolation, UnlistedHosts, ZoneSpec};
+use crate::text::{shown, shown_list};
 use std::time::Duration;
 
 /// What the constructing agent has: its zone and what's left of its budgets.
@@ -67,7 +68,7 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     // so 0 is never within a finite parent. Written so that NaN or an unreadable value fails.
     match (parse_bytes(&c.limits.memory), parse_bytes(&p.limits.memory)) {
         (Some(cm), Some(pm)) if cm >= 1 && cm <= pm => {}
-        _ => v.push(format!("memory {}: more than this zone's {} (or zero, or unreadable)", c.limits.memory, p.limits.memory)),
+        _ => v.push(format!("memory {}: more than this zone's {} (or zero, or unreadable)", shown(&c.limits.memory, 20), p.limits.memory)),
     }
     let (cc, pc) = (c.limits.cpus, p.limits.cpus);
     if !(cc.is_finite() && cc >= crate::manifest::MIN_CPUS && cc <= pc) {
@@ -75,7 +76,7 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     }
     match (parse_bytes(&c.limits.output), parse_bytes(&p.limits.output)) {
         (Some(c), Some(p)) if c >= 1 && c <= p => {}
-        _ => v.push(format!("output {}: more than this zone's {} (or zero, or unreadable)", c.limits.output, p.limits.output)),
+        _ => v.push(format!("output {}: more than this zone's {} (or zero, or unreadable)", shown(&c.limits.output, 20), p.limits.output)),
     }
     if c.limits.on_output_full != p.limits.on_output_full && p.limits.on_output_full == crate::manifest::OnOutputFull::Stop {
         v.push("on_output_full: this zone stops a box whose output is full; a child can't keep going".into());
@@ -85,9 +86,11 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     }
     match c.limits.timeout() {
         Ok(t) if !t.is_zero() && t <= parent.time_remaining => {}
-        _ => {
-            v.push(format!("timeout {}: more than the {}s this zone has left (or zero)", c.limits.timeout, parent.time_remaining.as_secs()))
-        }
+        _ => v.push(format!(
+            "timeout {}: more than the {}s this zone has left (or zero)",
+            shown(&c.limits.timeout, 20),
+            parent.time_remaining.as_secs()
+        )),
     }
     // A child's authority (#153) is its own token's block, attenuated from its parent's: it can't
     // outlast the parent's, whatever it says, but one that asks for more is refused here too.
@@ -95,22 +98,22 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
         (Ok(ca), Ok(pa)) if ca <= pa => {}
         _ => v.push(format!(
             "authority {}: longer than this zone's {} (or unreadable)",
-            c.limits.authority.as_deref().unwrap_or(&c.limits.timeout),
+            shown(c.limits.authority.as_deref().unwrap_or(&c.limits.timeout), 20),
             p.limits.authority.as_deref().unwrap_or(&p.limits.timeout)
         )),
     }
     // By digest where either side is pinned (#192): one matcher, wherever a spawn is decided.
     if crate::image::matching(ask.image, &parent.images).is_none() {
-        v.push(format!("image {}: not one this zone may start (allowed: {})", ask.image, parent.images.join(", ")));
+        v.push(format!("image {}: not one this zone may start (allowed: {})", shown(ask.image, 120), shown_list(&parent.images, 120, 8)));
     }
     for i in &c.images {
         if crate::image::matching(i, &parent.images).is_none() {
-            v.push(format!("images: {i} is not one this zone may start"));
+            v.push(format!("images: {} is not one this zone may start", shown(i, 120)));
         }
     }
     for z in &c.accept_from {
         if z != &p.name && !p.accept_from.contains(z) {
-            v.push(format!("accept_from {z}: this zone doesn't accept messages from it either"));
+            v.push(format!("accept_from {}: this zone doesn't accept messages from it either", shown(z, 120)));
         }
     }
     // Escalation rights narrow too (#50): a zone can't give a child a right it lacks.
@@ -143,14 +146,19 @@ pub fn unapprovable(child: &ZoneSpec, parent: &ZoneSpec) -> Vec<String> {
     match (&child.llm, &parent.llm) {
         (Some(cl), Some(pl)) if cl.provider != pl.provider || cl.secret != pl.secret || cl.upstream != pl.upstream => v.push(format!(
             "the model route must be this zone's own: asked for provider {}, secret {}, upstream {}; this zone's is {}, {}, {}",
-            cl.provider, cl.secret, cl.upstream, pl.provider, pl.secret, pl.upstream
+            shown(&cl.provider, 40),
+            shown(&cl.secret, 80),
+            shown(&cl.upstream, 200),
+            pl.provider,
+            pl.secret,
+            pl.upstream
         )),
         _ => {}
     }
     // #579 step 3: using a service is having its reach, so a child uses only what its parent may.
     for u in &child.uses {
         if !parent.uses.contains(u) {
-            v.push(format!("use service {u}: only the services this zone uses can be passed on"));
+            v.push(format!("use service {}: only the services this zone uses can be passed on", shown(u, 80)));
         }
     }
     for i in &child.inject {
@@ -158,7 +166,9 @@ pub fn unapprovable(child: &ZoneSpec, parent: &ZoneSpec) -> Vec<String> {
         if !same {
             v.push(format!(
                 "inject secret {} into {} {}: only this zone's own credential injections can be passed on",
-                i.secret, i.host, i.header
+                shown(&i.secret, 80),
+                shown(&i.host, 120),
+                shown(&i.header, 60)
             ));
         }
     }
@@ -187,11 +197,11 @@ pub fn reach_within(outer: &ZoneSpec, inner: &ZoneSpec) -> Result<(), Vec<String
 fn model_violations(c: &crate::manifest::LlmSpec, p: &crate::manifest::LlmSpec) -> Vec<String> {
     let Some(pm) = &p.models else { return vec![] };
     match &c.models {
-        None => vec![format!("any model: this zone allows only {}", pm.join(", "))],
+        None => vec![format!("any model: this zone allows only {}", shown_list(pm, 128, 8))],
         Some(cm) => cm
             .iter()
             .filter(|m| !pm.iter().any(|q| crate::manifest::model_covers(q, m)))
-            .map(|m| format!("model {m}: this zone allows only {}", pm.join(", ")))
+            .map(|m| format!("model {}: this zone allows only {}", shown(m, 128), shown_list(pm, 128, 8)))
             .collect(),
     }
 }
@@ -219,8 +229,10 @@ fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
                 });
                 if !covered {
                     v.push(format!(
-                        "reach rule {i}: {m} {}{path} is not within this zone's reach{}",
-                        r.host,
+                        "reach rule {i}: {} {}{} is not within this zone's reach{}",
+                        shown(m, 60),
+                        shown(&r.host, 120),
+                        shown(path, 200),
                         if r.allow_dangerous { " (with allow_dangerous)" } else { "" }
                     ));
                 }
@@ -235,7 +247,10 @@ fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
         let parent: Vec<u8> =
             p.reach.iter().filter(|q| host_covers(&q.host, &r.host)).flat_map(|q| q.decode_slash.iter().copied()).collect();
         if let Some(n) = r.decode_slash.iter().find(|n| !parent.contains(n)) {
-            v.push(format!("reach rule {i}: decode_slash segment {n} for {}: this zone doesn't decide an encoded slash there", r.host));
+            v.push(format!(
+                "reach rule {i}: decode_slash segment {n} for {}: this zone doesn't decide an encoded slash there",
+                shown(&r.host, 120)
+            ));
         }
     }
     // The parent's forbid rules bind the child too: each forbidden path must stay forbidden, by a child
@@ -244,13 +259,17 @@ fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
     for (i, f) in p.forbid.iter().enumerate() {
         let kept = f.paths.iter().all(|fp| c.forbid.iter().any(|g| host_covers(&g.host, &f.host) && path_covered(&g.paths, fp)));
         if !kept {
-            v.push(format!("forbid rule {i} ({} {}) of this zone must be kept", f.host, f.paths.join(", ")));
+            v.push(format!("forbid rule {i} ({} {}) of this zone must be kept", shown(&f.host, 120), shown_list(&f.paths, 200, 8)));
         }
     }
     for i in &c.inject {
         let same = p.inject.iter().any(|q| q.host == i.host && q.header == i.header && q.format == i.format && q.secret == i.secret);
         if !same {
-            v.push(format!("inject {} {}: only this zone's own credential injections can be passed on", i.host, i.header));
+            v.push(format!(
+                "inject {} {}: only this zone's own credential injections can be passed on",
+                shown(&i.host, 120),
+                shown(&i.header, 60)
+            ));
         }
     }
     v

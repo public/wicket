@@ -20,7 +20,7 @@ use wicket_store::{CapacityGrant, CapacityTerms, Ledger, OperatorCredential};
 /// The default lifetime the card offers: 8 hours.
 pub const DEFAULT_TTL_SECS: u64 = 8 * 3600;
 
-fn usd(m: i64) -> String {
+pub(crate) fn usd(m: i64) -> String {
     MicroUsd(m.max(0) as u64).to_string()
 }
 
@@ -44,25 +44,41 @@ pub fn principal(tenant: &str, s: &str) -> Result<String, String> {
     }
 }
 
+/// Plans or regions as the card and `wicket capacity grant` (#713) take them: each trimmed, empty
+/// ones dropped, and each item split at commas.
+pub(crate) fn names<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    items.into_iter().flat_map(|s| s.split(',')).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+}
+
 fn list(body: &Value, k: &str) -> Vec<String> {
     match body.get(k) {
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-        Some(Value::String(s)) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+        Some(Value::Array(a)) => names(a.iter().filter_map(|v| v.as_str())),
+        Some(Value::String(s)) => names([s.as_str()]),
         _ => vec![],
     }
 }
 
+/// A dollar amount (`0.05`, or `$0.05`) as micro-USD, for the card and `wicket capacity grant`
+/// (#713): `what` names it in the error.
+pub(crate) fn dollars_of(what: &str, s: &str) -> Result<i64, String> {
+    let s = s.trim();
+    MicroUsd::parse_dollars(s).and_then(|m| i64::try_from(m.0).ok()).ok_or_else(|| format!("{what}: {s:?} is not a dollar amount"))
+}
+
 fn dollars(body: &Value, k: &str) -> Result<i64, String> {
-    let s = match body.get(k) {
-        Some(Value::String(s)) => s.trim().trim_start_matches('$').to_string(),
-        Some(Value::Number(n)) => n.to_string(),
-        _ => return Err(format!("{k} required")),
-    };
-    MicroUsd::parse_dollars(&s).map(|m| m.0 as i64).ok_or_else(|| format!("{k}: {s:?} is not a dollar amount"))
+    match body.get(k) {
+        Some(Value::String(s)) => dollars_of(k, s),
+        Some(Value::Number(n)) => dollars_of(k, &n.to_string()),
+        _ => Err(format!("{k} required")),
+    }
 }
 
 fn ttl(body: &Value) -> Result<u64, String> {
-    let t = body.get("ttl_secs").and_then(Value::as_u64).unwrap_or(DEFAULT_TTL_SECS);
+    check_ttl(body.get("ttl_secs").and_then(Value::as_u64).unwrap_or(DEFAULT_TTL_SECS))
+}
+
+/// A capacity grant's lifetime, in seconds, as the card and `wicket capacity` (#713) take it.
+pub(crate) fn check_ttl(t: u64) -> Result<u64, String> {
     if t == 0 || Duration::from_secs(t) > grant::MAX_TTL {
         return Err("a capacity grant lasts more than 0 and at most 24h; renew it for longer".into());
     }
@@ -70,7 +86,7 @@ fn ttl(body: &Value) -> Result<u64, String> {
 }
 
 /// The JSON a capacity grant's terms are signed and shown as.
-fn terms_json(t: &CapacityTerms) -> Value {
+pub(crate) fn terms_json(t: &CapacityTerms) -> Value {
     json!({ "plans": t.plans, "regions": t.regions, "hourly_micros": t.hourly, "hourly_usd": usd(t.hourly),
             "daily_micros": t.daily, "daily_usd": usd(t.daily), "nodes": t.nodes })
 }
@@ -110,13 +126,19 @@ pub(super) fn build_renew(state: &State, l: &Ledger, body: &Value) -> Result<(Ac
 }
 
 fn live(state: &State, l: &Ledger, id: &str) -> Result<CapacityGrant, Reply> {
+    live_grant(l, &state.tenant.0, id).map_err(|(status, m)| err(status, m))
+}
+
+/// The tenant's capacity grant `id`, if it is live: what a renewal renews, on the card and with
+/// `wicket capacity renew` (#713). Not found, or ended (conflict), with why.
+pub(crate) fn live_grant(l: &Ledger, tenant: &str, id: &str) -> Result<CapacityGrant, (http::StatusCode, String)> {
     let g = l
         .capacity_grant(id)
-        .map_err(|e| err(http::StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .filter(|g| g.tenant == state.tenant.0)
-        .ok_or_else(|| err(http::StatusCode::NOT_FOUND, format!("no capacity grant {id}")))?;
+        .map_err(|e| (http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        .filter(|g| g.tenant == tenant)
+        .ok_or_else(|| (http::StatusCode::NOT_FOUND, format!("no capacity grant {id}")))?;
     if !g.live(wicket_store::now()) {
-        return Err(err(http::StatusCode::CONFLICT, format!("capacity grant {id} has ended: issue a new one")));
+        return Err((http::StatusCode::CONFLICT, format!("capacity grant {id} has ended: issue a new one")));
     }
     Ok(g)
 }
@@ -190,12 +212,26 @@ pub(super) fn revoke(state: &State, oc: &OperatorCredential, body: &Value) -> Re
 
 /// The card: every live capacity grant, with what its uses take and leave.
 pub(crate) fn view(l: &Ledger, tenant: &str) -> anyhow::Result<Vec<Value>> {
+    view_of(l, tenant, false)
+}
+
+/// The card's grants, or with `all` also revoked and expired ones (`wicket capacity list --all`,
+/// #713). `state` says which: `live`, `expired` or `revoked`.
+pub(crate) fn view_of(l: &Ledger, tenant: &str, all: bool) -> anyhow::Result<Vec<Value>> {
     let mut out = vec![];
-    for g in l.capacity_grants(tenant, None, false)? {
+    let now = wicket_store::now();
+    for g in l.capacity_grants(tenant, None, all)? {
         let u = l.capacity_used(&g.id)?;
         let t = &g.terms;
+        let state = if g.revoked {
+            "revoked"
+        } else if g.live(now) {
+            "live"
+        } else {
+            "expired"
+        };
         out.push(json!({
-            "id": g.id, "principal": g.principal, "terms": terms_json(t), "expires_at": g.expires_at, "decided_by": g.decided_by,
+            "id": g.id, "state": state, "principal": g.principal, "terms": terms_json(t), "expires_at": g.expires_at, "decided_by": g.decided_by,
             "created_at": g.created_at,
             "used": { "nodes": u.nodes, "hourly_usd": usd(u.hourly), "daily_usd": usd(u.daily) },
             "left": { "nodes": t.nodes.saturating_sub(u.nodes), "hourly_usd": usd(t.hourly - u.hourly), "daily_usd": usd(t.daily - u.daily) },
@@ -228,5 +264,9 @@ mod tests {
         assert_eq!(list(&b, "regions"), vec!["lhr"]);
         assert_eq!(ttl(&json!({})).unwrap(), DEFAULT_TTL_SECS);
         assert!(ttl(&json!({ "ttl_secs": 86_401 })).is_err() && ttl(&json!({ "ttl_secs": 0 })).is_err());
+        // One parser for both surfaces (#713 review): a leading $, and no amount that wraps.
+        assert_eq!(dollars_of("--max-daily-usd", "$1.5").unwrap(), 1_500_000);
+        assert!(dollars_of("--max-daily-usd", "99999999999999999999").is_err());
+        assert_eq!(names(["a, b", " ", "c"]), vec!["a", "b", "c"]);
     }
 }

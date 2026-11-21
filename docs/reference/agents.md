@@ -62,9 +62,11 @@ These are general features for any workload:
   it, and `wicket run --image` overrides it.
 - **`agent.env`** sets non-secret variables (wicket's own are refused). **`agent.adapter_settings`** passes
   allowlisted settings to the agent's adapter, e.g. turning off commit attribution.
-- **`inject` rules can be `optional`:** while the secret isn't in the vault, the rule is as if it weren't
-  there (requests go without the header, noted once per run in the audit log, and a host allowed
-  wholesale is spliced). `{basic:USER}` renders an HTTP Basic credential (e.g. git over HTTPS with a token).
+- **`inject` rules can be `optional`:** while the secret isn't in the vault, requests to its host go
+  without the header. A rule's secret is read at each request, not at start (#415), so one set,
+  rotated or removed while the box runs is used, or left out, from its next request, with no restart
+  (on a node within about 2 s). Each change is noted once in the audit log (`inject.skipped`,
+  `inject.available`). The host is inspected whether or not the secret is set. `{basic:USER}` renders an HTTP Basic credential (e.g. git over HTTPS with a token).
 
 `examples/self-hosting/` uses all of these to run an agent on wicket's own source; see its README and
 [run wicket in wicket](../how-to/run-wicket-in-wicket.md).

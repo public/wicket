@@ -29,17 +29,18 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 
 | command | class |
 |---|---|
-| `run`, `wrap`, `session`, `hibernate`, `wake`, `trigger create\|resume\|renew` | run |
-| `agents`, `pending`, `links`, `audit` (and `audit export`), `doctor` | read |
-| `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list` (without `--provider`), `state check`, `self status`, `trigger list\|show\|fire` | read |
-| `unlink`, `grant revoke`, `identity revoke`, `lease release`, `trigger pause\|rm` | revoke |
-| `approve`, `deny`, `grant renew` | privileged |
+| `run`, `wrap`, `session`, `hibernate`, `wake`, `trigger create\|resume\|renew`, `manifest save\|restore` | run |
+| `agents`, `pending`, `links`, `audit` (and `audit explain`, `audit export`), `authority`, `capacity list`, `manifest list\|show\|check`, `doctor` | read |
+| `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list` (without `--provider`), `node ca\|fences`, `policy show`, `state check`, `self status`, `trigger list\|show\|fire` | read |
+| `unlink`, `grant revoke`, `capacity revoke`, `identity revoke`, `lease release`, `trigger pause\|rm` | revoke |
+| `approve`, `deny`, `grant renew`, `capacity grant\|renew` | privileged |
+| `audit --verify` with `--against <file>` or `--issuer-jwk` (wicket's user would read the file; a `store:<sink>` is read) | privileged |
 | `secret set\|link\|hosts\|rm` | privileged |
 | `image` | privileged |
 | `operator enrol-link\|reset\|revoke-session` | privileged |
 | `identity init` | privileged |
 | `reconcile` | privileged |
-| `node token\|enrol\|revoke\|renew-ca\|install\|create\|release\|plans`, `node list --provider` | privileged |
+| `node token\|enrol\|revoke\|renew-ca\|install\|create\|release\|release-fence\|plans`, `node list --provider` | privileged |
 | `state check --probe`, `state kit`, `state restore`, `keys …` | privileged |
 | `self update\|rollback\|prune\|trust-key` | root only |
 | `program digest`, `zone`, `node serve`, `self keygen\|sign`, `dev …` | local |
@@ -47,7 +48,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 
 Arguments only wicket itself passes are refused from any caller: `run --run-id` and `--ssh-key`,
 and `wake --by`. (A child run's parent, lease and takeover are no arguments: its supervisor runs
-in its parent's process.) Manifests, `--workdir`, and a trigger's `--file` and `--event` are sent to the daemon as
+in its parent's process.) Manifests, `--workdir`, a trigger's `--file` and `--event`, and `manifest check` and `save`'s `--file` are sent to the daemon as
 content; mounting a directory in place (`run --workspace-dir`, and `wrap`, which mounts its
 launcher's directory) is root's only.
 

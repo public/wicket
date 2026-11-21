@@ -449,21 +449,38 @@ fn asked(l: &Ledger, id: &str, v: &Verdict) -> Result<crate::operators::Asked> {
 /// Records that `by` was refused deciding `id`, and returns the refusal. If the record can't be
 /// written, the refusal stands and says so.
 fn refused(l: &Ledger, by: &Granter, id: &str, v: &Verdict, why: anyhow::Error) -> anyhow::Error {
-    let (granter, identity) = match by {
-        Granter::Human(o) => ("human", Some(o.id.clone())),
-        Granter::Agent(a) => ("agent", l.identity(&a.run.0).ok().flatten().map(|i| i.spiffe_id)),
-        Granter::Capacity { grant, .. } => ("capacity_grant", l.capacity_grant(grant).ok().flatten().map(|g| g.decided_by)),
-    };
     let decision = match v {
         Verdict::Approve(_) => "approve",
         Verdict::Deny => "deny",
         Verdict::Renew(_) => "renew",
     };
+    refused_as(l, by, id, decision, why)
+}
+
+/// [`refused`] for a decision of another kind's record (a standing ask, a public name, a trigger):
+/// one refusal record (`decision.refused`) for every kind.
+pub(crate) fn refused_as(l: &Ledger, by: &Granter, id: &str, decision: &str, why: anyhow::Error) -> anyhow::Error {
+    refused_in(l, &TenantId::single(), by, id, decision, why)
+}
+
+/// [`refused_as`], on `tenant`'s audit record: the tenant of what was refused (#575 review, L4).
+pub(crate) fn refused_in(l: &Ledger, tenant: &TenantId, by: &Granter, id: &str, decision: &str, why: anyhow::Error) -> anyhow::Error {
+    let (granter, identity) = match by {
+        Granter::Human(o) => ("human", Some(o.id.clone())),
+        Granter::Agent(a) => ("agent", l.identity(&a.run.0).ok().flatten().map(|i| i.spiffe_id)),
+        Granter::Capacity { grant, .. } => ("capacity_grant", l.capacity_grant(grant).ok().flatten().map(|g| g.decided_by)),
+    };
     let record = serde_json::json!({
         "target": id, "decision": decision, "by": by.label(), "granter": granter, "granter_identity": identity,
         "why": format!("{why:#}"),
     });
-    match l.audit(&TenantId::single(), None, "decision.refused", &record) {
+    refusal_recorded(l, tenant, &record, why)
+}
+
+/// `why`, after `record` (a `decision.refused` body) is written to `tenant`'s audit log: exit code
+/// 3, saying whether the refusal is on the record.
+pub(crate) fn refusal_recorded(l: &Ledger, tenant: &TenantId, record: &serde_json::Value, why: anyhow::Error) -> anyhow::Error {
+    match l.audit(tenant, None, "decision.refused", record) {
         // Exit code 3 (#574), unless what it names wasn't there (4: the cause says so).
         Ok(_) => why.context(wicket_home::exit::Exit::refused("refused (the refusal is on the audit record)")),
         Err(e) => why.context(wicket_home::exit::Exit::refused(format!("refused (the refusal could not be recorded: {e})"))),
@@ -786,10 +803,27 @@ fn check_prefix(req: &Request, p: &str) -> std::result::Result<(), String> {
     Err(format!("prefix {p} doesn't cover {}'s path {}{}", req.id, req.path, if req.scope_prefix { ", nor lie within it" } else { "" }))
 }
 
-fn merge(record: &mut serde_json::Value, extra: serde_json::Value) {
+/// The operator deciding a kind only a human decides (standing reach, public names, triggers);
+/// `what` names the kind in the refusal.
+pub(crate) fn human<'a>(by: &'a Granter, what: &str) -> Result<&'a crate::operators::Operator> {
+    match by {
+        Granter::Human(o) => Ok(o),
+        _ => bail!("{what} is decided by a human operator, not {}", by.label()),
+    }
+}
+
+/// `extra`'s fields (the console's: how it was decided, and the signed action), merged into an
+/// audit record.
+pub(crate) fn merge(record: &mut serde_json::Value, extra: serde_json::Value) {
     if let (Some(r), serde_json::Value::Object(x)) = (record.as_object_mut(), extra) {
         r.extend(x);
     }
+}
+
+/// [`merge`], returning the record.
+pub(crate) fn merged(mut record: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    merge(&mut record, extra);
+    record
 }
 
 #[cfg(test)]
@@ -1052,6 +1086,7 @@ mod tests {
                     node: "local".into(),
                     principal: serde_json::json!({"type": "human", "id": "alice"}),
                     act: None,
+                    kind: None,
                 };
                 let k = if run == "run_p" { key.public() } else { wicket_identity::AgentKey::generate().public() };
                 let doc = issuer.issue(&spec, wicket_store::now(), 3600, &k);

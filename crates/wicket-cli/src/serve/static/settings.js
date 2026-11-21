@@ -15,21 +15,33 @@ const g = globalThis;
 
 // Revoke on a capacity grant or a standing rule: unsigned, since it only narrows, but asked in the
 // page first, and set apart from Renew. The question replaces the row's buttons until answered.
-const asking = new Set();
+// Each row's question, by key: "ask" (shown), "sending" (Revoke tapped), "sent" (done: shown, still
+// disabled, until the next poll draws the row as it is now). A failed revoke asks again.
+const asking = new Map();
 let last = null;
-const again = () => { if (last) renderSettings(last); };
+// Drawn again for a change on the page, not a poll: what was sent waits for the poll.
+const again = () => { if (last) renderSettings(last, false); };
 function revokeButtons(key, question, others, go) {
-  if (!asking.has(key)) {
+  const state = asking.get(key);
+  if (!state) {
     const ask = () => {
       if (!settled()) { toast("The list just changed: check the row and tap again."); return; }
-      asking.add(key); again(); layoutMoved();
+      asking.set(key, "ask"); again(); layoutMoved();
     };
     return html`<div class="buttons">${others}<button class="deny apart" @click=${ask}>Revoke…</button></div>`;
   }
   // The question moved the row: a second tap of a double tap mustn't land on its Revoke.
-  const yes = async e => { if (!settled()) return; e.target.disabled = true; await go(); asking.delete(key); again(); };
-  return html`<div class="buttons"><div class="callout warn ask">${question}</div><button class="deny" @click=${yes}>Revoke</button><button @click=${() => { asking.delete(key); again(); }}>Cancel</button></div>`;
+  const yes = async () => {
+    if (!settled() || asking.get(key) !== "ask") return;
+    asking.set(key, "sending"); again();
+    asking.set(key, (await go()) ? "sent" : "ask"); again();
+  };
+  return html`<div class="buttons"><div class="callout warn ask">${question}</div><button class="deny" ?disabled=${state !== "ask"} @click=${yes}>Revoke</button><button ?disabled=${state !== "ask"} @click=${() => { asking.delete(key); again(); }}>Cancel</button></div>`;
 }
+// Whether a revoke went through (its toast says so either way); a poll is asked for.
+const revoked = async (path, id) => {
+  try { toast((await post(path, { id })).ok); refresh(); return true; } catch (e) { toastError(e); return false; }
+};
 
 // Rows kept across polls by their id: when one changes or the order does, the layout moved, and
 // taps wait a moment (console.js's `settled`), as on the request cards.
@@ -61,7 +73,7 @@ function capacityTtl() {
 function capacityRow(gr) {
   const t = gr.terms || {}, u = gr.used || {}, left = gr.left || {};
   const nodes = n => plural(Number(n) || 0, "node");
-  const revoke = async () => { try { toast((await post("/api/capacity/revoke", { id: gr.id })).ok); } catch (e) { toastError(e); } refresh(); };
+  const revoke = () => revoked("/api/capacity/revoke", gr.id);
   return html`<div class="row cap"><div class="run-head">${principal("cap:" + gr.id, gr.principal)}<span class="mono quiet">${strip(gr.id)}</span></div><div class="meta">${"Allows: " + nodes(t.nodes) + " at once of " + (t.plans || []).map(strip).join(" or ") + " in " + (t.regions || []).map(strip).join(", ") +
     ", up to " + money(t.hourly_usd) + "/h and " + money(t.daily_usd) + " a day"}</div><div class="meta">${"Used today: " + nodes(u.nodes) + ", " + money(u.hourly_usd) + "/h, " + money(u.daily_usd)}</div><div class="meta">${"Left today: " + nodes(left.nodes) + ", " + money(left.hourly_usd) + "/h, " + money(left.daily_usd)}</div><div class="meta">Ends ${time(gr.expires_at)}${" · granted by " + strip(gr.decided_by)}</div>${revokeButtons("cap:" + gr.id, "Revoke capacity grant " + strip(gr.id) + "? Nothing more is approved under it, from now.",
     html`<button class="approve" @click=${() => signed({ action: "capacity_renew", id: gr.id, ttl_secs: capacityTtl() })}>Renew</button>`, revoke)}</div>`;
@@ -87,7 +99,7 @@ function standingRuleRow(r) {
   const rr = r.rule || {};
   const to = r.for === "zone" ? html`<span class="run-name">${"every agent in zone " + strip(r.zone)}</span>` : principal("rule:" + r.id, r.principal);
   const until = r.expires_at ? (r.live ? "ends " + at(r.expires_at) : "lapsed " + at(r.expires_at)) : "until revoked";
-  const revoke = async () => { try { toast((await post("/api/standing/revoke", { id: r.id })).ok); } catch (e) { toastError(e); } refresh(); };
+  const revoke = () => revoked("/api/standing/revoke", r.id);
   // On the row, not only in its title (#715 review): a rule that allows requests that can't be undone.
   return html`<div class="row cap"><div title=${"standing reach " + strip(r.id) + ": " + ruleText(r.rule)}>${to}<span>${" may " + verbsOf(rr.methods) + " "}</span><span class="mono">${strip(rr.host)}</span>${rr.allow_dangerous ? html` <span class="risk r4">including requests that can't be undone</span>` : nothing}</div><div class="meta">${(rr.paths || []).map(strip).join("  ") + " · " + until + " · allowed by " + strip(r.decided_by)}</div>${revokeButtons("rule:" + r.id, "Revoke standing reach " + strip(r.id) + "? Runs it allows lose it at once.",
     html`<button class="approve" ?disabled=${!r.live} @click=${() => signedSettled({ action: "standing_renew", id: r.id })}>Renew (30 days)</button>`, revoke)}</div>`;
@@ -151,6 +163,26 @@ function placedRow(p) {
   return html`<div class="lease"><div class="run-head"><span class="run-name mono">${strip(p.name)}</span>${p.past_lease ? nothing : html`<span class="meta">lease ends ${time(p.lease_until)}</span>`}</div><div class="meta mono quiet">${strip(p.id)}</div>${after}</div>`;
 }
 
+// ---- agents held on lost servers (#690) ----
+
+// A fenced run: its box may still be running on a node that is revoked or no longer enrolled, so its
+// agent isn't woken. Released (signed, with a reason) from a form in its own row: the row is kept
+// across polls, so what is typed survives, and it can only release this run.
+const releasing = new Set();
+function fencedRow(x) {
+  const f = x.fence || {};
+  const open = releasing.has(x.id);
+  const close = e => { const t = e.target.closest(".lease").querySelector("textarea"); if (t) t.value = ""; releasing.delete(x.id); again(); };
+  const go = e => {
+    const text = e.target.closest(".lease").querySelector("textarea");
+    if (!text.value.trim()) { toast("Say why: the reason goes in the activity log."); return; }
+    signed({ action: "release_fence", run: x.id, reason: text.value }, () => { text.value = ""; releasing.delete(x.id); again(); });
+  };
+  const ask = e => { releasing.add(x.id); again(); e.target.closest(".lease").querySelector("textarea").focus(); };
+  return html`<div class="lease"><div class="run-head"><span class="run-name mono">${strip(x.id)}</span><span class="meta">${f.fenced_until_ms ? html`fenced until ${time(f.fenced_until_ms / 1000)}` : "fenced until its node confirms the box stopped"}</span></div><div class="meta">${"node " + strip(f.node) + " (" + strip(f.node_status) + ")"}${f.node_seen_ms ? html` · last reported ${time(f.node_seen_ms / 1000)}` : " · never reported"}</div><div class="meta">${strip(f.why)}</div><div class="buttons"><button class="deny" @click=${ask}>Release…</button></div><div class="stack" ?hidden=${!open}><label class="meta">${"Release " + strip(x.id) + "'s fence: its agent can be woken and the run ended, while its box may still be running on node " +
+    strip(f.node) + ". Only if that node will never run it again. Say why (it goes in the activity log):"}</label><textarea></textarea><div class="buttons"><button class="deny" @click=${go}>Release</button><button @click=${close}>Cancel</button></div></div></div>`;
+}
+
 // ---- keys and passwords, task setups, organisation rules, passkeys ----
 
 // The vault by name (console.js's secrets section says how a value is handled): the server sends no
@@ -189,21 +221,39 @@ async function renderPolicy() {
   } catch (e) { draw(html`<div class="blocked">${strip(e.message)}</div>`, box); }
 }
 
-// Your passkeys, and signing out.
-const signOut = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
-const operatorView = s => html`${(s.passkeys || []).map(k => html`<div class="row"><span>${"passkey: " + strip(k.name)}</span><span class="mono">${String(k.id).slice(0, 16) + "…"}</span></div>`)}<div class="buttons"><button @click=${signOut}>Sign out</button></div><div class="note">${code("To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device.", ["wicket operator enrol-link"])}</div>`;
+// Your passkeys; adding a device (#711: a signed enrol_link, whose one-time link console.js keeps in
+// `enrolLink` and shows here until it expires); and signing out, which forgets the link and this
+// module's open questions.
+const signOut = async () => {
+  enrolLink = null; reset();
+  try { await post("/api/logout"); } catch (e) { /* signed out anyway */ }
+  boot();
+};
+function operatorView(s) {
+  const link = enrolLink && enrolLink.until > Date.now() ? enrolLink : null;
+  if (!link) enrolLink = null;
+  return html`${(s.passkeys || []).map(k => html`<div class="row"><span>${"passkey: " + strip(k.name)}</span><span class="mono">${String(k.id).slice(0, 16) + "…"}</span></div>`)}<div class="buttons"><button @click=${() => signed({ action: "enrol_link" })}>Add a device</button><button @click=${signOut}>Sign out</button></div>${link
+    ? html`<div class="callout"><div>${"Open this on the new device (once, until " + new Date(link.until).toLocaleTimeString() + "):"}</div><code class="block">${link.link}</code>${copyButton(link.link)}</div>` : nothing}<div class="note">${code("Adding a device makes a one-time link, signed with your passkey; the new device is you, with your authority. Or on the host: `wicket operator enrol-link`.", ["wicket operator enrol-link"])}</div>`;
+}
 
 // ---- the view ----
 
-let formDrawn = false;
-function renderSettings(s) {
+// The capacity form's element, once drawn: drawn again only if the page's element is a new one.
+const formsDrawn = new WeakSet();
+function renderSettings(s, poll = true) {
   last = s;
+  // A question or a release form for a row that is gone goes with it; a poll ends a sent revoke's wait.
+  const live = new Set([...(s.capacity || []).map(g => "cap:" + g.id), ...(((s.standing || {}).rules) || []).map(r => "rule:" + r.id)]);
+  for (const [k, v] of [...asking]) if (!live.has(k) || (poll && v === "sent")) asking.delete(k);
+  const fenced = new Set((s.fenced || []).map(x => x.id));
+  for (const id of [...releasing]) if (!fenced.has(id)) releasing.delete(id);
   const st = s.standing || {};
   keyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: each request waits for a decision.");
+  keyed("fenced", s.fenced || [], fencedRow, "None: no agent's box is held on a node that is revoked or no longer enrolled. An enrolled node's boxes are released by the node, or by revoking it first.");
   keyed("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
   principals.done();
   const form = document.getElementById("capacity-form");
-  if (form && !formDrawn) { draw(capacityForm(), form); formDrawn = true; }
+  if (form && !formsDrawn.has(form)) { draw(capacityForm(), form); formsDrawn.add(form); }
   const health = document.getElementById("health");
   if (health) draw(healthView(s), health);
   const placed = document.getElementById("placed");
@@ -217,4 +267,7 @@ function renderSettings(s) {
   renderPolicy();
 }
 
-g.wicketSettings = { renderSettings };
+// Signed out: no question or form left open for the next sign-in.
+function reset() { asking.clear(); releasing.clear(); last = null; }
+
+g.wicketSettings = { renderSettings, reset };

@@ -53,6 +53,7 @@ async function check(engine) {
   page.on("console", m => { if (m.type() === "error") problems.push("console: " + m.text()); });
   let state = { ...base, capacity: [grant] };
   const begun = [], posted = [];
+  let failRevoke = false, failedRevokes = 0;
   await page.route("**/api/**", async route => {
     const r = route.request(), p = new URL(r.url()).pathname;
     const body = r.postData() ? JSON.parse(r.postData()) : null;
@@ -63,7 +64,10 @@ async function check(engine) {
       begun.push(body);
       return reply({ action: { v: 1, ...body, standing: body.id, grant: body.id }, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] }, expires_in_ms: 120000 });
     }
-    if (p === "/api/capacity/revoke" || p === "/api/standing/revoke") { posted.push([p, body]); return reply({ ok: "revoked" }); }
+    if (p === "/api/capacity/revoke" || p === "/api/standing/revoke") {
+      if (failRevoke) { failRevoke = false; failedRevokes++; return reply({ error: "the ledger is busy" }, 503); }
+      posted.push([p, body]); return reply({ ok: "revoked" });
+    }
     if (p === "/api/push") return reply({ public_key: "BAEC", devices: [], min_interval_secs: 30 });
     if (p === "/api/policy") return reply(policy);
     if (p === "/api/logout") { posted.push([p, body]); return reply({ ok: "signed out" }); }
@@ -113,6 +117,15 @@ async function check(engine) {
     await btn("Revoke…").click();
     await btn("Revoke").click();
     assert.strictEqual(posted.length, 0, "a tap just after the question appeared is ignored");
+    // A revoke that fails keeps the question, to answer again.
+    await settle();
+    failRevoke = true;
+    await btn("Revoke").click();
+    await until(() => failedRevokes === 1);
+    await page.waitForFunction(() => { const b = [...document.querySelectorAll("#capacity button")].find(x => x.textContent === "Revoke"); return b && !b.disabled; });
+    assert.ok((await cap.textContent()).includes("Revoke capacity grant g-cap1?"), "the question stays after a failed revoke");
+    const failedToast = problems.findIndex(p => p.includes("status of 503"));
+    if (failedToast >= 0) problems.splice(failedToast, 1);
     await settle();
     await btn("Revoke").click();
     await until(() => posted.length);
@@ -252,6 +265,35 @@ async function check(engine) {
     state = { ...base, standing: { asks: [], rules: [{ ...rule, rule: { ...rule.rule, allow_dangerous: true } }] } };
     await poll();
     assert.ok((await sr.textContent()).includes("including requests that can't be undone"));
+    // Agents held on lost servers (#690): the run, its node and why, as text; Release… opens an empty
+    // reason form in the row, kept across a poll; an empty reason isn't sent; the release is signed.
+    const fenced = { id: "run_f", fence: { run: "run_f", node: "n1", node_status: "revoked", node_seen_ms: null, fenced_until_ms: null,
+      source: "unknown", why: "node n1 is <b>revoked</b> and won't confirm it" } };
+    state = { ...base, fenced: [fenced] };
+    await poll();
+    await page.evaluate(() => { location.hash = "#settings"; });
+    const fr = await page.locator("#fenced").textContent();
+    for (const want of ["run_f", "fenced until its node confirms the box stopped", "node n1 (revoked) · never reported", "node n1 is <b>revoked</b>"]) assert.ok(fr.includes(want), want + " in " + fr);
+    assert.strictEqual(await page.locator("#fenced b").count(), 0, "the reason stays text");
+    await page.locator("#fenced button", { hasText: "Release…" }).click();
+    assert.strictEqual(await page.inputValue("#fenced textarea"), "", "the form opens empty: a reason is typed, not offered");
+    const nBegun = begun.length;
+    await page.locator("#fenced button", { hasText: /^Release$/ }).click();
+    await page.waitForTimeout(300);
+    assert.strictEqual(begun.length, nBegun, "an empty reason isn't sent");
+    await page.fill("#fenced textarea", "n1 was destroyed");
+    await poll();
+    assert.strictEqual(await page.inputValue("#fenced textarea"), "n1 was destroyed", "what was typed survives a poll");
+    // And a poll that changes the row (its node reported): the form stays open with what was typed.
+    state = { ...base, fenced: [{ ...fenced, fence: { ...fenced.fence, node_seen_ms: (NOW - 60) * 1000 } }] };
+    await poll();
+    assert.ok((await page.locator("#fenced").textContent()).includes("last reported"));
+    assert.strictEqual(await page.inputValue("#fenced textarea"), "n1 was destroyed", "what was typed survives the row changing");
+    assert.ok(await page.locator("#fenced textarea").isVisible());
+    await settle();
+    await signs(page.locator("#fenced button", { hasText: /^Release$/ }));
+    assert.deepStrictEqual([begun.at(-1).action, begun.at(-1).run, begun.at(-1).reason], ["release_fence", "run_f", "n1 was destroyed"]);
+    await cancelSheet();
     // Keys and passwords: by name, kind, hosts and users; each button opens the form (console.js's).
     state = { ...base, secrets, manifests, passkeys: [{ name: "laptop", id: "0123456789abcdef0123" }] };
     await poll();
@@ -282,11 +324,21 @@ async function check(engine) {
     const pol = await page.locator("#policy").textContent();
     assert.ok(pol.includes(HOSTILE) && pol.includes("version v2 (current)") && pol.includes("version v1kept") && pol.includes("zone docs · policy v2 · running"), pol);
     assert.strictEqual(await page.locator("#policy img").count(), 0);
-    // Passkeys, and the command that adds one, with Copy; Sign out posts it.
+    // Passkeys; Add a device signs an enrol_link, and the link it returns is shown, with Copy, until it
+    // expires (#711); the host's command too, with Copy; Sign out posts it and forgets the link.
     assert.ok((await page.locator("#operator").textContent()).includes("passkey: laptop0123456789abcdef…"));
     assert.strictEqual(await page.locator("#operator code").textContent(), "wicket operator enrol-link");
     assert.strictEqual(await page.locator("#operator button.copy").count(), 1);
+    await settle();
+    await signs(page.locator("#operator button", { hasText: "Add a device" }));
+    assert.strictEqual(begun.at(-1).action, "enrol_link");
+    await cancelSheet();
+    await page.evaluate(() => showEnrolLink({ link: "https://c.example/enrol?t=abc", expires_in_secs: 300 }));
+    await poll();
+    assert.ok((await page.locator("#operator").textContent()).includes("https://c.example/enrol?t=abc"));
+    assert.strictEqual(await page.locator("#operator button.copy").count(), 2, "the link has its own Copy");
     await page.locator("#operator button", { hasText: "Sign out" }).click();
+    assert.strictEqual(await page.evaluate(() => enrolLink), null, "signing out forgets the link");
     await until(() => posted.some(([p]) => p === "/api/logout"));
     assert.ok(posted.some(([p]) => p === "/api/logout"));
     await page.evaluate(() => { location.hash = "#settings"; });
@@ -297,9 +349,19 @@ async function check(engine) {
     assert.ok((await page.locator("#capacity").innerText()).includes("No capacity grants"));
     assert.strictEqual(await page.locator("#capacity code").textContent(), "wicket node create");
     assert.ok((await sr.innerText()).includes("No standing rules"));
+    assert.ok((await page.locator("#fenced").innerText()).startsWith("None: no agent's box is held"));
     assert.ok((await page.locator("#secrets").innerText()).includes("No secrets in the vault."));
 
     if (problems.length) throw new Error(problems.join("\n  "));
+
+    // If settings.js (or ui.js, which every view imports) doesn't load, Settings' lists and the
+    // Inbox's asks say they can't be shown, rather than look empty.
+    const bare = await (await browser.newContext()).newPage();
+    await bare.route("**/settings.js", r => r.abort());
+    await bare.route("**/api/**", r => { const p = new URL(r.request().url()).pathname;
+      return r.fulfill({ contentType: "application/json", body: JSON.stringify(p === "/api/me" ? { who: { state: "operator", credential: "AbCd" } } : p === "/api/state" ? base : p === "/api/push" ? { public_key: "BAEC", devices: [], min_interval_secs: 30 } : {}) }); });
+    await bare.goto(url + "#settings");
+    for (const id of ["standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"]) await bare.waitForFunction(i => document.getElementById(i).textContent.includes("can't be shown"), id, { timeout: 10000 });
     console.log(`${engine} settings: ok`);
   } finally {
     await browser.close();

@@ -2,6 +2,7 @@
 //!
 //! This crate is the part of public names that needs nothing else of wicket:
 //!
+//! - [`config`]: the installation's `names:` settings (`wicket.yaml`) and their checks.
 //! - [`label`]: the rules a name's label must meet (one DNS label, no IDNs, no reserved label or
 //!   lookalike of one).
 //! - [`record`]: DNS records, and which box name a record belongs to.
@@ -16,6 +17,7 @@
 //! record is wicket's only if both the ledger lists it as created by this installation and the zone
 //! holds an owner record for its name with this installation's id ([`plan::Owned::owns`]).
 
+pub mod config;
 pub mod label;
 pub mod plan;
 pub mod provider;
@@ -24,6 +26,7 @@ pub mod record;
 #[cfg(test)]
 mod props;
 
+pub use config::{own_ports, own_ports_from, NamesConfig, PortRange, ProviderKind, PublicConfig};
 pub use label::{check_label, check_shape, zone_part, LabelError, Rules};
 pub use plan::{plan, Change, Conflict, Desired, Owned, Plan, PlanError};
 pub use provider::{Applied, Caps, DnsProvider, MemoryProvider, NoopProvider, ProviderError};

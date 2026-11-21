@@ -28,7 +28,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "fenced", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 const EPOCH = 1700000000000;
@@ -126,6 +126,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // The cards themselves are drawn by inbox.js with lit-html (#574), which needs a real DOM: that
   // they stay put across polls, move only when the list does, and say what the server grants is
   // ci/console-browsers/inbox.mjs's. Here, their buttons' path: act(), with its settle guard.
+
+  // Without inbox.js (here, as when the module fails to load), the cards' place says they can't be
+  // shown, rather than that nothing is waiting.
+  // So for the Agents view without agents.js, Activity without activity.js, and Settings without
+  // settings.js.
+  for (const id of ["pending", "standing-asks", "runs", "start", "audit", "decided", "standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
 
   // The cards just moved (inbox.js says so): a tap right then is ignored.
   state = { ...base, pending: [A, B] };
@@ -527,6 +533,18 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.match(run("at(1700000000, 1700000000 + 7200)"), /^\d\d:\d\d \(2 h ago\)$|^[A-Z][a-z]{2} \d\d:\d\d \(2 h ago\)$/);
   assert.strictEqual(run("at(0)"), "\u2014");
   assert.deepStrictEqual(["$0.0500", "$1.0000", "$0.0140", "$12.3400", "n/a"].map(v => run("money(" + JSON.stringify(v) + ")")), ["$0.05", "$1.00", "$0.014", "$12.34", "n/a"]);
+  // Renewing and issuing a grant widen what may be spent: each is signed from a sheet that says so.
+  const terms = { plans: ["vc2-1c-2gb"], regions: ["lhr"], hourly_usd: "$0.0500", daily_usd: "$1.0000", nodes: 2 };
+  await advance(1000);
+  nextAction = { v: 1, action: "capacity_renew", grant: "g-cap1", principal: "spiffe://x/t/t0/op/unix/alex", terms, ttl_secs: 28800 };
+  run('signed({ action: "capacity_renew", id: "g-cap1", ttl_secs: 28800 })'); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Renew capacity grant g-cap1"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  await advance(1000);
+  nextAction = { v: 1, action: "capacity_grant", principal: "spiffe://x/t/t0/op/unix/alex", terms, ttl_secs: 14400 };
+  run('signed({ action: "capacity_grant", principal: "unix/alex", plans: "vc2-1c-2gb", regions: "lhr", max_hourly_usd: "0.05", max_daily_usd: "1", nodes: 2, ttl_secs: 14400 })'); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Grant spiffe://x/t/t0/op/unix/alex 2 node(s) at once"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
   // #707 review: the rows' words, each kind of activity line, a past lease, a decided request.
   const T = s => run(s).textContent;
   for (const [op, want] of [
@@ -539,6 +557,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     [{ kind: "node.audit", body: { node: "n1", body: JSON.stringify({ kind: "box.restart" }) } }, "node n1: box.restart"],
     // #715 review: who decided is named; a parent agent isn't "you".
     [{ kind: "decision", body: { request: "r-7", decision: "approve", by: "agent:run_p" } }, "allowedr-7 by run_p (a parent agent)"],
+    [{ kind: "run.fence_released", run: "run_f", body: { node: "n1", by: "passkey:laptop", signed: {}, why: "n1 was destroyed" } }, "run_f released from server n1 by laptop, signed with a passkey, though its box may still be running there: n1 was destroyed"],
+    [{ kind: "run.fence_release_failed", run: "run_f", body: { node: "n1", by: "root", error: "renewed" } }, "run_f is still held: its release from server n1 couldn't be made: renewed"],
     [{ kind: "something.new", run: "run_z", body: {} }, "something.new \u00b7 run_z"],
   ]) { const l = JSON.parse(run("JSON.stringify(sentence(" + JSON.stringify({ seq: 1, ...op }) + "))")); assert.ok((l.tag + l.text).endsWith(want), want + " in " + l.tag + l.text); }
   // A decision on a run's request can be explained (activity.js draws its "why?"); others can't.
@@ -576,7 +596,52 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await run("refresh()"); await flush();
   assert.deepStrictEqual([ids["standing-pointer"].textContent, ids["standing-pointer"].hidden], ["Asking to be always allowed (1)", false]);
   assert.strictEqual(sandbox.document.title, "(1) wicket");
+  // Approving an ask narrowed to its evidence, and denying one, are signed from sheets that say what
+  // is allowed, and for how long, or that it is refused.
+  const askRule = { host: "ci.example", methods: ["GET", "POST"], paths: ["/jobs/**"], allow_dangerous: false };
+  const narrowed = { host: "ci.example", methods: ["GET"], paths: ["/jobs/1/logs"], allow_dangerous: false };
+  await advance(1000);
+  nextAction = { v: 1, action: "standing_approve", standing: "s-1", principal: "spiffe://x/t/t0/z/work/a/worker", zone: "work", rule: narrowed, for: "agent", ttl_secs: 2592000, narrowed: true, effect_sha256: "ab".repeat(32) };
+  run('signed({ action: "standing_approve", id: "s-1", for: "agent", narrow: true })'); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Approve standing reach s-1 narrowed to its evidence: { host: ci.example, methods: [GET], paths: ['/jobs/1/logs'] }"), ids["confirm-what"].textContent);
+  assert.ok(ids["confirm-what"].textContent.includes("for 30 days"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  await advance(1000);
+  nextAction = { v: 1, action: "standing_deny", standing: "s-1", rule: askRule };
+  run('signed({ action: "standing_deny", id: "s-1" })'); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Deny standing reach s-1"), ids["confirm-what"].textContent);
+  assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: deny"]);
+  ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console standing reach: ok");
+  // Fenced runs (#690): the row and its reason form are settings.js's (ci/console-browsers/settings.mjs).
+  // The release is signed from a confirmation that says what it does, marked as dangerous.
+  const fenced = { id: "run_f", fence: { run: "run_f", node: "n1", node_status: "revoked", node_seen_ms: null, fenced_until_ms: null,
+    source: "unknown", why: "node n1 is <b>revoked</b> and won't confirm it", effect_sha256: "cd".repeat(32) } };
+  await advance(1000);
+  nextAction = { v: 1, action: "release_fence", run: "run_f", node: "n1", node_status: "revoked", fenced_until_ms: null, why: fenced.fence.why, reason: "n1 was destroyed", effect_sha256: "cd".repeat(32) };
+  run('signed({ action: "release_fence", run: "run_f", reason: "n1 was destroyed" })'); await flush();
+  assert.deepStrictEqual((({ action, run, reason }) => [action, run, reason])(began().pop().body), ["release_fence", "run_f", "n1 was destroyed"]);
+  const fw = ids["confirm-what"].textContent;
+  assert.ok(fw.startsWith("Release run run_f's fence on node n1 (revoked, never reported), fenced until its node confirms the box stopped") && fw.includes("reason: n1 was destroyed") && fw.includes("effect cdcdcdcd"), fw);
+  assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: release"]);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  console.log("console fenced runs: ok");
+
+  // #711: Add a device signs an enrol_link (the button and the link's display are settings.js's,
+  // ci/console-browsers/settings.mjs); the sheet says who the device is enrolled as, and the link
+  // the server returns is kept until it expires, and forgotten by boot(), however it is reached.
+  await advance(1000);
+  nextAction = { v: 1, action: "enrol_link", tenant: "t0", credential: "cred-1", name: "laptop", enrols_as: "passkey/laptop", ttl_secs: 300, uses: 1 };
+  run('signed({ action: "enrol_link" })'); await flush();
+  assert.strictEqual(began().pop().body.action, "enrol_link");
+  const ew = ids["confirm-what"].textContent;
+  assert.ok(ew.startsWith("Make a one-time link that enrols another device as laptop (passkey/laptop, the same operator and authority)") && ew.includes("for 5 minutes"), ew);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  run("showEnrolLink({ link: 'https://c.example/enrol?t=def', expires_in_secs: 300 })");
+  assert.strictEqual(JSON.parse(run("JSON.stringify(enrolLink)")).link, "https://c.example/enrol?t=def");
+  await run("boot()"); await flush();
+  assert.strictEqual(run("enrolLink"), null);
+  console.log("console enrol a device: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open
   // console is told, and one notification says so; tapping it opens the console's notifications.

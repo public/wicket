@@ -27,6 +27,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Create nodes on Vultr](how-to/create-nodes-on-vultr.md), and leases for agents
 - [Hibernate and wake an agent](how-to/hibernate-and-wake-an-agent.md)
 - [Wake an agent on a schedule](how-to/wake-an-agent-on-a-schedule.md)
+- [Fire a trigger from a webhook](how-to/trigger-from-a-webhook.md): GitHub events and signed webhooks
 - [Drive a box from the Claude apps](how-to/drive-a-box-from-the-claude-apps.md)
 - [Run a program instead of an agent](how-to/run-a-program.md)
 - [Run an ACP agent](how-to/run-an-acp-agent.md)
@@ -39,6 +40,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Keep state off the host, and restore](how-to/state-off-host-and-restore.md)
 - [Update wicket and roll back](how-to/update-and-roll-back.md)
 - [Update from CI-signed builds](how-to/update-from-ci.md), and follow main
+- [Rotate the release signing key](how-to/rotate-the-release-key.md): where it lives, and replacing it
 - [Run wicket in wicket](how-to/run-wicket-in-wicket.md)
 - [Use wicket's skills](how-to/use-wickets-skills.md) in Claude Code: the plugin, and the skill every box has
 - [Run the gates for a change](how-to/run-the-gates-for-a-change.md)
@@ -61,6 +63,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Agents](reference/agents.md): identity, children, messages, sessions, hibernation
 - [Nodes](reference/nodes.md): enrolment, `node serve`, placement, leases, the reconciler
 - [Console](reference/console.md): passkeys, signed actions, sessions, authority views, manifests, what it enforces on the internet
+- [Console and CLI parity](reference/parity.md): every operator action, its console path and its command, or why it is host-only
 - [Audit](reference/audit.md): the writer, export, checkpoints, record kinds
 
 ## Explanation

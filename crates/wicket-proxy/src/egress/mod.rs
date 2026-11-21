@@ -61,8 +61,11 @@ pub struct Egress {
     /// The run's model proxy, which vets and accounts model calls that reach the model host through
     /// here (a wrapped session's, #112).
     model_gate: std::sync::OnceLock<Arc<crate::llm::Llm>>,
-    /// Optional injections skipped for want of their secret, each noted once (#175).
+    /// Box-supplied placeholders dropped for a host, each noted once.
     skipped: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Per inject rule (`host\nsecret`), whether the last request for it carried its credential
+    /// (#415): a change either way is audited once, not each request.
+    carried: std::sync::Mutex<std::collections::HashMap<String, outgoing::Injection>>,
     /// Registered domains checked for existence this run, and what was found (#19): each is asked
     /// about once, and at most [`MAX_DOMAIN_CHECKS`] are.
     registered: std::sync::Mutex<std::collections::HashMap<String, crate::exists::Exists>>,
@@ -205,6 +208,7 @@ impl Egress {
             strikes: Default::default(),
             model_gate: Default::default(),
             skipped: Default::default(),
+            carried: Default::default(),
             registered: Default::default(),
             wild: Default::default(),
         }))
@@ -542,6 +546,7 @@ mod tests {
             fence: None,
             waker: None,
             lifecycle: None,
+            names: None,
         };
         (c, dir)
     }
@@ -677,7 +682,7 @@ mod tests {
         let ledger = c.ledger.clone();
         let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
         let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
-        assert!(!e.credentials_for("api.github.com"), "no credential goes to the host");
+        assert!(e.credentials_for("api.github.com"), "the zone declares one, so plain HTTP is refused even while it is unset (#415)");
         for auth in [None, Some("Bearer the-box-own")] {
             let mut b = http::Request::get("/x").header("host", "api.github.com");
             if let Some(a) = auth {
@@ -694,6 +699,104 @@ mod tests {
         assert!(prepare(c, "api.github.com", None).await.is_err(), "a required injection with no secret still fails");
         for t in ["optional-unset", "required-unset"] {
             let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
+        }
+    }
+
+    /// #415: a running box picks up a secret set, rotated or removed after it started: each request
+    /// reads it, so the next one carries it, carries the new value, or goes without it (an optional
+    /// rule) or fails (a required one). Each change is audited once, not per request.
+    #[tokio::test]
+    async fn a_secret_set_rotated_or_removed_while_the_run_lasts_is_used_from_the_next_request() {
+        let inject = |optional: bool| {
+            format!("reach: [{{host: api.github.com, methods: [GET]}}], inject: [{{host: api.github.com, header: Authorization, format: 'Bearer {{secret}}', secret: late, optional: {optional}}}]")
+        };
+        async fn auth(e: &super::Egress) -> anyhow::Result<Option<String>> {
+            let req =
+                http::Request::get("/x").header("host", "api.github.com").body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+            let out = e.prepare(req, "api.github.com", "https", "/x", true).await?;
+            Ok(out.headers.get("authorization").map(|v| v.to_str().unwrap().to_string()))
+        }
+        for optional in [true, false] {
+            let tag = format!("late-{optional}");
+            let (c, dir) = ctx(&inject(optional), vec![], &tag);
+            let (ledger, vault) = (c.ledger.clone(), c.vault.clone());
+            let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+            let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
+            let unset = |r: anyhow::Result<Option<String>>| match optional {
+                true => r.unwrap().is_none(),
+                false => r.is_err(),
+            };
+            assert!(unset(auth(&e).await), "not set at start");
+            assert!(unset(auth(&e).await));
+            vault.set("late", "v1").unwrap();
+            vault.set_hosts("late", &["api.github.com".into()]).unwrap();
+            assert_eq!(auth(&e).await.unwrap().as_deref(), Some("Bearer v1"), "set: the next request carries it");
+            vault.set("late", "v2").unwrap();
+            assert_eq!(auth(&e).await.unwrap().as_deref(), Some("Bearer v2"), "rotated: the new value");
+            vault.remove("late").unwrap();
+            assert!(unset(auth(&e).await), "removed: gone from the next request");
+            assert!(unset(auth(&e).await));
+            let kinds: Vec<String> =
+                ledger.lock().unwrap().audit_tail(100).unwrap().into_iter().map(|r| r.2).filter(|k| k.starts_with("inject.")).collect();
+            let gone = if optional { "inject.skipped" } else { "inject.unavailable" };
+            assert_eq!(kinds, [gone, "inject.available", gone], "{optional}: once per change");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A node's cache of one secret, `gh`, that the control host may hold or not (#415): a fetch takes
+    /// what it holds now, and a revoke drops the copy.
+    struct NodeCopy {
+        upstream: std::sync::Mutex<Option<String>>,
+        held: std::sync::Mutex<Option<String>>,
+    }
+    impl crate::vault::SecretSource for NodeCopy {
+        fn get(&self, name: &str) -> anyhow::Result<String> {
+            self.held.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("secret {name:?} is not cached on this node for this run"))
+        }
+        fn hosts(&self, name: &str) -> Vec<String> {
+            self.held.lock().unwrap().iter().filter(|_| name == "gh").map(|_| "api.github.com".to_string()).collect()
+        }
+        fn has(&self, _: &str) -> bool {
+            self.held.lock().unwrap().is_some()
+        }
+        fn fetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                let v = self.upstream.lock().unwrap().clone();
+                *self.held.lock().unwrap() = v.clone();
+                v.map(|_| ()).ok_or_else(|| anyhow::anyhow!("credential {name} refused by the control host: not set"))
+            })
+        }
+    }
+
+    /// #415 on a node: a required rule's secret removed on the control host (the node's copy revoked)
+    /// fails its host's next request, and plain HTTP never carries a credential, whatever the guard
+    /// before the decision found (an older node's took an unfetched optional secret as none).
+    #[tokio::test]
+    async fn on_a_node_a_removed_required_secret_fails_closed_and_nothing_goes_over_plain_http() {
+        let src = std::sync::Arc::new(NodeCopy { upstream: std::sync::Mutex::new(Some("node-token".into())), held: Default::default() });
+        for optional in [false, true] {
+            let zone = format!("reach: [{{host: api.github.com, methods: [GET]}}], inject: [{{host: api.github.com, header: Authorization, format: 'Bearer {{secret}}', secret: gh, optional: {optional}}}]");
+            let (mut c, dir) = ctx(&zone, vec![], &format!("node-{optional}"));
+            c.vault = crate::vault::Vault::from_source(src.clone());
+            let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+            let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
+            let req =
+                || http::Request::get("/x").header("host", "api.github.com").body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+            *src.upstream.lock().unwrap() = Some("node-token".into());
+            let out = e.prepare(req(), "api.github.com", "https", "/x", true).await.unwrap();
+            assert_eq!(out.headers.get("authorization").unwrap(), "Bearer node-token");
+            let plain = e.prepare(req(), "api.github.com", "http", "/x", true).await.err().expect("refused").to_string();
+            assert!(plain.contains("never sends a credential") && plain.contains("plain HTTP"), "{plain}");
+            // Removed on the control host, which revokes the node's copy.
+            *src.upstream.lock().unwrap() = None;
+            *src.held.lock().unwrap() = None;
+            let out = e.prepare(req(), "api.github.com", "https", "/x", true).await;
+            match optional {
+                true => assert!(out.unwrap().headers.get("authorization").is_none(), "goes without it"),
+                false => assert!(out.is_err(), "a required rule fails closed"),
+            }
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 

@@ -607,7 +607,28 @@ pub fn list() -> Result<()> {
             None if n.status == "active" => format!("no identity certificate (wicket node renew-ca {})", n.name),
             None => "no identity certificate".into(),
         };
-        say!("{}  {}  {}  host key {}  hosts {}  {}  {}", n.name, n.status, n.target, n.host_key_fp, n.hosts.join(","), ca, id);
+        // The hosts its active CA is constrained to (#573): what its boxes can use now, which a
+        // runtime widening may have taken past the hosts it was enrolled with.
+        let active = wicket_node::controlca::active(&l, &n.name);
+        let hosts = match &active {
+            Some(c) if c.hosts != n.hosts => format!("CA hosts {} (enrolled with {})", c.hosts.join(","), n.hosts.join(",")),
+            Some(c) => format!("CA hosts {}", c.hosts.join(",")),
+            None => format!("hosts {}", n.hosts.join(",")),
+        };
+        say!("{}  {}  {}  host key {}  {}  {}  {}", n.name, n.status, n.target, n.host_key_fp, hosts, ca, id);
+        // A node with no CA (the built-in local node) has no CA policy to show.
+        if n.status != "revoked" && active.is_some() {
+            let policy = l.node_ca_policy(&n.name)?;
+            let wants = l.node_ca_wants(&n.name)?;
+            let ca_hosts = active.map(|c| c.hosts).unwrap_or_default();
+            let waiting: Vec<String> = wants
+                .iter()
+                .filter(|w| !wicket_core::splice::uncovered(&ca_hosts, std::slice::from_ref(&w.host)).is_empty())
+                .map(|w| format!("{} ({})", w.host, w.run))
+                .collect();
+            let waiting = if waiting.is_empty() { String::new() } else { format!("; wanted, not in its CA yet: {}", waiting.join(", ")) };
+            say!("  CA policy {}{waiting} (wicket node ca {})", ca_policy_line(&policy), n.name);
+        }
         if n.status != "revoked" {
             if let Some(lease) = crate::nodecreate::lease_summary(&l, &n.name, now)? {
                 say!("  {lease}");
@@ -626,22 +647,103 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
-/// `wicket node list --json`: the enrolled nodes (revoked ones too), with their active CA and
-/// identity certificate (null: none), labels and taints. Times are Unix seconds.
+/// `wicket node list --json`: the enrolled nodes (revoked ones too), with their active CA (its
+/// serial, end and the hosts it is constrained to) and identity certificate (null: none), labels and
+/// taints, public addresses (null: none), and the CA's policy and wants (#573). Times are Unix
+/// seconds.
 pub fn list_json(l: &Ledger) -> Result<serde_json::Value> {
     let mut out = vec![];
     for n in l.nodes()? {
         let cert = |not_after: i64, serial: &str| serde_json::json!({ "serial": serial, "not_after": not_after });
-        let ca = l.node_cas(&n.name)?.into_iter().find(|c| c.status == "active").map(|c| cert(c.not_after, &c.serial));
+        let ca = l.node_cas(&n.name)?.into_iter().find(|c| c.status == "active").map(|c| {
+            let mut v = cert(c.not_after, &c.serial);
+            v["hosts"] = c.hosts.into();
+            v
+        });
         let id = l.node_certs(&n.name)?.into_iter().find(|c| c.status == "active").map(|c| cert(c.not_after, &c.serial));
+        let addr = l.node_addresses(&n.name)?;
         out.push(serde_json::json!({
             "name": n.name, "status": n.status, "target": n.target, "host_key_fp": n.host_key_fp, "hosts": n.hosts,
             "enrolled_at": n.enrolled_at, "revoked_at": n.revoked_at, "ca": ca, "identity": id,
             "labels": l.node_labels(&n.name)?,
             "taints": l.node_taints(&n.name)?.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            "public_ipv4": addr.ipv4.map(|a| a.to_string()), "public_ipv6": addr.ipv6.map(|a| a.to_string()),
+            // How its CA may be widened, and what live runs want of it (#573; `wicket node ca` has
+            // whether each is covered, and the widenings).
+            "ca_policy": l.node_ca_policy(&n.name)?, "ca_wants": l.node_ca_wants(&n.name)?,
         }));
     }
     Ok(serde_json::Value::Array(out))
+}
+
+/// How many of a node's CA widenings [`ca_view`] shows, newest first.
+pub const CA_WIDENINGS_SHOWN: usize = 20;
+
+/// A node's CA as an operator is shown it (#573): the hosts its active CA is constrained to, the
+/// hosts it was enrolled or renewed with (`nodes.hosts`), how it may be widened at runtime, what
+/// live runs want of it (and whether the active CA covers each, or the policy or the cap leaves it
+/// out), what the next renewal signs, and its last widenings from the audit log (fewer once
+/// retention prunes them). The console's node view and `wicket node ca` show this, so both say the
+/// same. None: no node of that name was ever enrolled.
+pub fn ca_view(l: &Ledger, name: &str, now: i64) -> Result<Option<serde_json::Value>> {
+    use serde_json::json;
+    let Some(n) = l.node(name)? else { return Ok(None) };
+    let ca = wicket_node::controlca::active(l, name);
+    let policy = l.node_ca_policy(name)?;
+    let target = wicket_node::controlca::target(l, name);
+    let ca_hosts = ca.as_ref().map(|c| c.hosts.clone()).unwrap_or_default();
+    let wants: Vec<serde_json::Value> = l
+        .node_ca_wants(name)?
+        .into_iter()
+        .map(|w| {
+            let covered = ca.is_some() && wicket_core::splice::uncovered(&ca_hosts, std::slice::from_ref(&w.host)).is_empty();
+            // Why a want the CA doesn't cover isn't in it yet: the policy refuses it, the cap left
+            // it out, or the next renewal adds it.
+            let state = if covered {
+                "covered"
+            } else if !policy.allows(&w.host) {
+                "refused by the node's CA policy"
+            } else if target.as_ref().is_some_and(|t| t.dropped.contains(&w.host)) {
+                "over the cap"
+            } else {
+                "at the next renewal"
+            };
+            json!({ "host": w.host, "run": w.run, "why": w.why, "at": w.at, "covered": covered, "state": state })
+        })
+        .collect();
+    let mut widenings = vec![];
+    for r in l.audit_of_kind("node.ca_widened")?.into_iter().rev() {
+        let b: serde_json::Value = serde_json::from_str(&r.body).unwrap_or_default();
+        // Only this machine's: a name can be enrolled again (another machine, perhaps another
+        // tenant's), and its earlier widenings aren't this one's.
+        if b["name"].as_str() != Some(name) || r.ts < n.enrolled_at || r.tenant != n.tenant {
+            continue;
+        }
+        widenings.push(json!({ "seq": r.seq, "at": r.ts, "ca_serial": b["ca_serial"], "added": b["added"],
+                               "removed": b["removed"], "wanted_by": b["wanted_by"] }));
+        if widenings.len() == CA_WIDENINGS_SHOWN {
+            break;
+        }
+    }
+    Ok(Some(json!({
+        "name": n.name, "status": n.status, "tenant": n.tenant,
+        "ca": ca.map(|c| json!({ "serial": c.serial, "issued_at": c.issued_at, "not_after": c.not_after,
+                                 "expired": c.not_after <= now, "hosts": c.hosts })),
+        "enrolled_hosts": n.hosts,
+        "policy": policy,
+        "wants": wants,
+        "next_renewal": target.map(|t| json!({ "hosts": t.hosts, "dropped": t.dropped })),
+        "widenings": widenings,
+    })))
+}
+
+/// The one-line form of a node's CA policy, for `wicket node list` and `node ca`.
+pub fn ca_policy_line(p: &wicket_store::CaHosts) -> String {
+    match p {
+        wicket_store::CaHosts::Fixed => "fixed (widened only by wicket node renew-ca)".into(),
+        wicket_store::CaHosts::Auto => "auto (to every inspected host its boxes need)".into(),
+        wicket_store::CaHosts::Allowed(h) => format!("widened to what matches {}", h.join(", ")),
+    }
 }
 
 pub fn pinned_node(nodes_dir: &Path, row: &NodeRow, ssh_key: Option<&Path>) -> Result<Node> {

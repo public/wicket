@@ -18,6 +18,54 @@
 //!   started with: each run records its manifest's text when it starts.
 
 use super::State;
+
+/// Where the views and saves read and write: the manifest roots, the data directory (the org
+/// policy) and the vault (secrets by name). The console's state has them, and `wicket manifest`
+/// (#713) makes one on the host, so both see and write the same thing.
+pub(crate) struct Place<'a> {
+    pub roots: &'a [(String, PathBuf)],
+    pub data: &'a Path,
+    pub vault_dir: &'a Path,
+}
+
+impl<'a> Place<'a> {
+    pub(super) fn of(state: &'a State) -> Place<'a> {
+        Place { roots: &state.roots, data: &state.data, vault_dir: &state.vault_dir }
+    }
+}
+
+/// A manifest file name a root may hold: letters, digits, '.', '_', '-'; ending .yaml or .yml.
+pub(crate) fn check_name(name: &str) -> Result<()> {
+    let ok_name = name.len() <= 128
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !name.contains("..")
+        && (name.ends_with(".yaml") || name.ends_with(".yml"));
+    if !ok_name {
+        return Err(wicket_home::exit::usage(format!(
+            "{name:?} is not a manifest file name (letters, digits, '.', '_', '-'; ending .yaml or .yml)"
+        )));
+    }
+    Ok(())
+}
+
+/// Manifest `name` in `root`: its path and bytes. A regular file only (no symlink out of the root).
+pub(crate) fn resolve(roots: &[(String, PathBuf)], root: &str, name: &str) -> Result<(PathBuf, Vec<u8>)> {
+    check_name(name)?;
+    let Some((_, dir)) = roots.iter().find(|(r, _)| r == root) else {
+        return Err(wicket_home::exit::not_found(format!(
+            "{root:?} is not a directory runs can be started from (have: {})",
+            roots.iter().map(|r| r.0.as_str()).collect::<Vec<_>>().join(", ")
+        )));
+    };
+    let path = dir.join(name);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| wicket_home::exit::not_found(format!("{root}/{name}: {e}")))?;
+    if !meta.file_type().is_file() {
+        return Err(wicket_home::exit::refused(format!("{root}/{name} is not a regular file")));
+    }
+    let bytes = std::fs::read(&path)?;
+    Ok((path, bytes))
+}
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::Digest;
@@ -70,8 +118,40 @@ fn fields(m: &Manifest, text: &str) -> Vec<Value> {
     all.into_iter().map(|(path, value)| json!({ "path": path, "value": value, "default": !written(&raw, &path) })).collect()
 }
 
+/// Every manifest in every root, with its agent or program, zone, image and hosts: the dashboard's
+/// `manifests`, and `wicket manifest list` (#713).
+pub(crate) fn list(roots: &[(String, PathBuf)]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (root, dir) in roots {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let mut names: Vec<String> = rd.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect();
+        names.sort();
+        for name in names {
+            if let Ok((_, bytes)) = resolve(roots, root, &name) {
+                let m = std::str::from_utf8(&bytes).ok().and_then(|t| wicket_agent::load(t).ok());
+                out.push(json!({
+                    "root": root, "name": name,
+                    "agent": m.as_ref().and_then(|m| m.agent.as_ref().map(|a| a.name.clone())),
+                    "program": m.as_ref().and_then(|m| m.program.as_ref().map(|p| p.name.clone())),
+                    "zone": m.as_ref().map(|m| m.zone.name.clone()),
+                    // The image its box starts from (#171), or why it can't start.
+                    "image": m.as_ref().and_then(|m| crate::run::manifest_image(m).ok()),
+                    "image_error": m.as_ref().and_then(|m| crate::run::manifest_image(m).err().map(|e| format!("{e:#}"))),
+                    // The zone view (#62): which hosts the egress proxy inspects, which it splices.
+                    "hosts": m.as_ref().map(|m| wicket_core::splice::view(&m.zone).into_iter().map(|(h, i)| match i {
+                        wicket_core::splice::Inspection::Spliced { rule } => json!({ "host": h, "mode": "spliced", "rule": rule }),
+                        wicket_core::splice::Inspection::Inspected(why) => json!({ "host": h, "mode": "inspected", "why": why }),
+                    }).collect::<Vec<_>>()),
+                    "valid": m.is_some(),
+                }));
+            }
+        }
+    }
+    out
+}
+
 /// What a manifest grants, in plain parts.
-fn grants(state: &State, m: &Manifest) -> Value {
+fn grants(state: &Place, m: &Manifest) -> Value {
     let z = &m.zone;
     let hosts: Vec<Value> = wicket_core::splice::view(z)
         .into_iter()
@@ -80,7 +160,7 @@ fn grants(state: &State, m: &Manifest) -> Value {
             wicket_core::splice::Inspection::Inspected(why) => json!({ "host": h, "mode": "inspected", "why": why }),
         })
         .collect();
-    let vault = wicket_proxy::vault::Vault::new(state.vault_dir.clone());
+    let vault = wicket_proxy::vault::Vault::new(state.vault_dir.to_path_buf());
     let inject: Vec<Value> = z
         .inject
         .iter()
@@ -118,7 +198,7 @@ fn grants(state: &State, m: &Manifest) -> Value {
 
 /// The installation's org policy for this manifest's zone (#51), as a mint would compile it: its
 /// layer, and whether the zone's ceiling passes it. Null without an applied org policy.
-fn org_effect(state: &State, m: &Manifest) -> Value {
+fn org_effect(state: &Place, m: &Manifest) -> Value {
     let d = state.data.join("policy");
     let Some(v) = crate::policy::installed_in(&d) else {
         return Value::Null;
@@ -248,13 +328,16 @@ fn history(dir: &Path, name: &str) -> Vec<Value> {
     v.into_iter().map(|(at, sha, file)| json!({ "version": file, "saved_before": at, "sha256_prefix": sha })).collect()
 }
 
-fn root_dir<'a>(state: &'a State, root: &str) -> Result<&'a PathBuf> {
+fn root_dir<'a>(state: &Place<'a>, root: &str) -> Result<&'a PathBuf> {
     state.roots.iter().find(|(r, _)| r == root).map(|(_, d)| d).with_context(|| format!("no manifest root {root:?}"))
 }
 
 /// `GET /api/manifests/<root>/<name>`.
-pub(super) fn view(state: &State, root: &str, name: &str) -> Result<Value> {
-    let (_, bytes) = super::resolve_manifest(state, root, name)?;
+pub(crate) fn view(state: &Place, root: &str, name: &str) -> Result<Value> {
+    let (_, bytes) = resolve(state.roots, root, name)?;
+    if bytes.len() > MAX_MANIFEST {
+        return Err(wicket_home::exit::refused(format!("{root}/{name} is over {MAX_MANIFEST} bytes")));
+    }
     let text = String::from_utf8(bytes.clone()).context("the manifest is not UTF-8")?;
     let parsed = parse(&text);
     let writable = root == WRITABLE_ROOT;
@@ -273,13 +356,13 @@ pub(super) fn view(state: &State, root: &str, name: &str) -> Result<Value> {
 }
 
 /// `POST /api/manifests/check`: `{ "name", "yaml" }` against the saved version in the writable root.
-pub(super) fn check(state: &State, body: &Value) -> Result<Value> {
+pub(crate) fn check(state: &Place, body: &Value) -> Result<Value> {
     let name = body["name"].as_str().context("name required")?;
     let yaml = body["yaml"].as_str().context("yaml required")?;
     if yaml.len() > MAX_MANIFEST {
         bail!("the manifest is over {MAX_MANIFEST} bytes");
     }
-    let saved = super::resolve_manifest(state, WRITABLE_ROOT, name).ok().and_then(|(_, b)| String::from_utf8(b).ok());
+    let saved = resolve(state.roots, WRITABLE_ROOT, name).ok().and_then(|(_, b)| String::from_utf8(b).ok());
     let new = parse(yaml);
     let old = saved.as_deref().and_then(|t| parse(t).ok());
     Ok(json!({
@@ -298,7 +381,7 @@ pub const MAX_MANIFEST: usize = 64 * 1024;
 
 /// A save or restore, checked at `begin`: what is written, and the JSON the passkey signs.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Save {
+pub(crate) struct Save {
     pub name: String,
     pub yaml: String,
     pub sha256: String,
@@ -306,10 +389,10 @@ pub(super) struct Save {
 }
 
 /// Builds a `save_manifest` (`{ name, yaml }`) or `restore_manifest` (`{ name, version }`) action.
-pub(super) fn prepare(state: &State, kind: &str, body: &Value, tenant: &str) -> Result<(Save, Value)> {
+pub(crate) fn prepare(state: &Place, kind: &str, body: &Value, tenant: &str) -> Result<(Save, Value)> {
     let name = body["name"].as_str().context("name required")?.to_string();
     // The name rules are resolve_manifest's; the file need not exist yet for a save.
-    super::check_manifest_name(&name)?;
+    check_name(&name)?;
     let dir = root_dir(state, WRITABLE_ROOT)?;
     let (yaml, restored_from) = match kind {
         "save_manifest" => (body["yaml"].as_str().context("yaml required")?.to_string(), None),
@@ -345,9 +428,42 @@ pub(super) fn prepare(state: &State, kind: &str, body: &Value, tenant: &str) -> 
     Ok((Save { name, yaml, sha256: sha, previous_sha256 }, v))
 }
 
+/// Applies a save or restore `s` as `by` and audits it (`manifest.saved`): what the console does
+/// with a signed one, and `wicket manifest save` and `restore` (#713) with what they showed
+/// (`action`, as [`prepare`] made it). `extra` joins the record (the console's signature, or how).
+pub(crate) fn save_and_record(
+    state: &Place,
+    l: &wicket_store::Ledger,
+    t: &wicket_core::TenantId,
+    s: &Save,
+    action: &Value,
+    by: &str,
+    extra: Value,
+) -> Result<()> {
+    // What the file was, to put back if the save can't be recorded (fail closed, as a grant is).
+    let path = root_dir(state, WRITABLE_ROOT)?.join(&s.name);
+    let before = std::fs::read(&path).ok();
+    apply(state, s)?;
+    let mut record = json!({ "action": action["action"], "root": WRITABLE_ROOT, "name": s.name, "sha256": s.sha256,
+                             "previous_sha256": s.previous_sha256, "restored_from": action["restored_from"],
+                             "widens": action["widens"], "widening": action["widening"], "changes": action["changes"], "by": by });
+    if let (Some(r), Value::Object(x)) = (record.as_object_mut(), extra) {
+        r.extend(x);
+    }
+    if let Err(e) = l.audit(t, None, "manifest.saved", &record) {
+        let undone = match &before {
+            Some(b) => std::fs::write(&path, b),
+            None => std::fs::remove_file(&path),
+        };
+        let what = if undone.is_ok() { "so it was undone" } else { "and undoing it failed too" };
+        return Err(anyhow::Error::from(e).context(format!("the save of {} could not be recorded in the audit log, {what}", s.name)));
+    }
+    Ok(())
+}
+
 /// Applies a signed save: the file must still be the version it replaces; that version is kept in
 /// the history; the new one is written in its place.
-pub(super) fn apply(state: &State, s: &Save) -> Result<()> {
+pub(crate) fn apply(state: &Place, s: &Save) -> Result<()> {
     let dir = root_dir(state, WRITABLE_ROOT)?.clone();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(&s.name);

@@ -12,8 +12,8 @@
 
 use super::Peer;
 use crate::{
-    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd,
-    ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
+    CapacityCmd, Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, ManifestCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd,
+    ProgramCmd, RequestCmd, SecretCmd, SelfCmd, ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -66,12 +66,23 @@ pub fn route(cmd: &Cmd) -> Route {
         // Hibernating and waking steer an agent the way prompting its session does; waking reruns its
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
-        Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } => Forward(Read),
+        Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } | Cmd::Authority { .. } => Forward(Read),
+        // A message reaches an agent as a session's prompt would (it can wake one); reading your
+        // own inbox, receipts and who you may write to touches only your own messages (#252).
+        Cmd::Message { cmd: crate::MessageCmd::Send { .. } } => Forward(Run),
+        Cmd::Message { .. } => Forward(Read),
         // Rewriting the ledger (#582) needs wicketd stopped: never through it.
         Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(
             "`wicket audit compact` runs with wicketd stopped, as the wicket user: sudo systemctl stop wicketd wicket-console wicket-reconcile; sudo -u wicket WICKET_HOME=/var/lib/wicket wicket audit compact",
         ),
-        Cmd::Pending { .. } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
+        // Files `--against` and `--issuer-jwk` name are read by wicket's user: a caller could name
+        // one only wicket may read (#713 review). Root's only; a `store:<sink>` names no file.
+        Cmd::Audit { against, issuer_jwk, .. }
+            if issuer_jwk.is_some() || against.iter().any(|a| !a.to_string_lossy().starts_with("store:")) =>
+        {
+            Forward(Privileged)
+        }
+        Cmd::Pending { .. } | Cmd::Request { cmd: RequestCmd::List { .. } } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
         // Renewing a grant or a box's authority grants more time: a decision, as approving is.
@@ -81,13 +92,21 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Standing { cmd: StandingCmd::Approve { .. } | StandingCmd::Deny { .. } | StandingCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Standing { cmd: StandingCmd::Revoke { .. } } => Forward(Revoke),
         Cmd::Names { cmd: NamesCmd::List { .. } | NamesCmd::Show { .. } } => Forward(Read),
-        Cmd::Names { cmd: NamesCmd::Approve { .. } | NamesCmd::Deny { .. } } => Forward(Privileged),
+        Cmd::Names { cmd: NamesCmd::Approve { .. } | NamesCmd::Deny { .. } | NamesCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Names { cmd: NamesCmd::Revoke { .. } } => Forward(Revoke),
+        // Issuing or renewing a capacity grant lets a principal spend without asking: a decision.
+        // Saving a manifest changes what a later start from it runs, as `run` starts what it names;
+        // the console lets any signed-in operator save one.
+        Cmd::Manifest { cmd: ManifestCmd::List { .. } | ManifestCmd::Show { .. } | ManifestCmd::Check { .. } } => Forward(Read),
+        Cmd::Manifest { cmd: ManifestCmd::Save { .. } | ManifestCmd::Restore { .. } } => Forward(Run),
+        Cmd::Capacity { cmd: CapacityCmd::List { .. } } => Forward(Read),
+        Cmd::Capacity { cmd: CapacityCmd::Grant { .. } | CapacityCmd::Renew { .. } } => Forward(Privileged),
+        Cmd::Capacity { cmd: CapacityCmd::Revoke { .. } } => Forward(Revoke),
         // A trigger wakes and messages agents later, as its owner (the caller): what `wake` and
         // `session` do now. Pausing and removing one only narrows.
         Cmd::Trigger { cmd } => match cmd {
             TriggerCmd::List | TriggerCmd::Show { .. } | TriggerCmd::Fire { .. } => Forward(Read),
-            TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } => Forward(Run),
+            TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } | TriggerCmd::RotateUrl { .. } => Forward(Run),
             TriggerCmd::Pause { .. } | TriggerCmd::Rm { .. } => Forward(Revoke),
         },
         Cmd::Secret { cmd } => match cmd {
@@ -97,7 +116,10 @@ pub fn route(cmd: &Cmd) -> Route {
             // Setting a secret changes what the proxies present upstream, linking one makes the
             // wicket user read a file the caller names, and binding one to hosts decides where it
             // may go.
-            SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } | SecretCmd::Rm { .. } => Forward(Privileged),
+            // Making one a verify secret (#578) decides which deliveries a trigger believes.
+            SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } | SecretCmd::Verify { .. } | SecretCmd::Rm { .. } => {
+                Forward(Privileged)
+            }
         },
         // Reads a directory the caller names, as the wicket user.
         // Reads Docker, as the wicket user: what `wicket zone pin` resolves tags through.
@@ -124,11 +146,11 @@ pub fn route(cmd: &Cmd) -> Route {
         // Both stop things, and a reconcile pass can create machines a lease needs.
         Cmd::Reconcile { .. } | Cmd::Attach { .. } => Forward(Privileged),
         Cmd::Lease { cmd } => match cmd {
-            LeaseCmd::List => Forward(Read),
+            LeaseCmd::List { .. } => Forward(Read),
             LeaseCmd::Release { .. } => Forward(Revoke),
         },
         Cmd::Node { cmd } => match cmd {
-            NodeCmd::List { provider: false, .. } => Forward(Read),
+            NodeCmd::List { provider: false, .. } | NodeCmd::Ca { .. } | NodeCmd::Fences { .. } => Forward(Read),
             // Uses the provider's API key from the vault.
             NodeCmd::List { provider: true, .. } | NodeCmd::Plans { .. } => Forward(Privileged),
             // Spends money (a CAPACITY request decided by a grant or an operator), or destroys a machine.
@@ -141,14 +163,16 @@ pub fn route(cmd: &Cmd) -> Route {
             | NodeCmd::Install { .. } => Forward(Privileged),
             // Deletes a run's files on its node, perhaps uncollected work.
             NodeCmd::Forget { .. } => Forward(Privileged),
+            // Writes the node's feed as the wicket user, under its lock (#575 step 4c).
+            NodeCmd::FeedCheckpoint { .. } => Forward(Privileged),
             // Lifts a run's fence while its box may still run (#676); the command itself also
             // refuses anyone but root.
             NodeCmd::ReleaseFence { .. } => Forward(Privileged),
-            NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } => Local,
+            NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } | NodeCmd::Intake { .. } => Local,
         },
         // Applying an org policy changes what every box may do, and revokes runs.
         Cmd::Policy { cmd } => match cmd {
-            PolicyCmd::Show => Forward(Read),
+            PolicyCmd::Show { .. } => Forward(Read),
             PolicyCmd::Apply { .. } => Forward(Privileged),
             // Read files the caller names, in the caller's own process.
             PolicyCmd::Check { .. } | PolicyCmd::Zone { .. } => Local,
@@ -363,6 +387,9 @@ mod tests {
             (&["pending"], Route::Forward(Read)),
             (&["links"], Route::Forward(Read)),
             (&["audit", "--verify"], Route::Forward(Read)),
+            (&["audit", "--verify", "--against", "store:s3"], Route::Forward(Read)),
+            (&["audit", "--verify", "--against", "/var/lib/wicket/x.jsonl"], Route::Forward(Privileged)),
+            (&["audit", "--verify", "--against", "store:s3", "--issuer-jwk", "k.json"], Route::Forward(Privileged)),
             (&["doctor"], Route::Forward(Read)),
             (&["approve", "R1"], Route::Forward(Privileged)),
             (&["approve", "R1", "--unlimited", "--ttl", "1h"], Route::Forward(Privileged)),
@@ -375,6 +402,36 @@ mod tests {
             (&["standing", "deny", "s-1"], Route::Forward(Privileged)),
             (&["standing", "renew", "s-1"], Route::Forward(Privileged)),
             (&["standing", "revoke", "s-1"], Route::Forward(Revoke)),
+            (&["capacity", "list", "--all", "--json"], Route::Forward(Read)),
+            (
+                &[
+                    "capacity",
+                    "grant",
+                    "unix/alex",
+                    "--nodes",
+                    "1",
+                    "--max-hourly-usd",
+                    "0.05",
+                    "--max-daily-usd",
+                    "1",
+                    "--plans",
+                    "vc2-1c-2gb",
+                    "--regions",
+                    "lhr",
+                ],
+                Route::Forward(Privileged),
+            ),
+            (&["capacity", "renew", "g-1", "--ttl", "1h"], Route::Forward(Privileged)),
+            (&["capacity", "revoke", "g-1"], Route::Forward(Revoke)),
+            (&["authority", "r1", "--json"], Route::Forward(Read)),
+            (&["policy", "show", "--json"], Route::Forward(Read)),
+            (&["node", "fences", "--json"], Route::Forward(Read)),
+            (&["manifest", "list", "--json"], Route::Forward(Read)),
+            (&["manifest", "show", "examples/claude.yaml"], Route::Forward(Read)),
+            (&["manifest", "check", "w.yaml", "--file", "w.yaml"], Route::Forward(Read)),
+            (&["manifest", "save", "w.yaml", "--file", "w.yaml", "--dry-run"], Route::Forward(Run)),
+            (&["manifest", "restore", "w.yaml", "1-abc.yaml"], Route::Forward(Run)),
+            (&["audit", "explain", "12"], Route::Forward(Read)),
             (&["trigger", "list"], Route::Forward(Read)),
             (&["trigger", "show", "t-1"], Route::Forward(Read)),
             (&["trigger", "fire", "t-1", "--dry-run"], Route::Forward(Read)),
@@ -387,6 +444,7 @@ mod tests {
             (&["secret", "set", "claude-oauth"], Route::Forward(Privileged)),
             (&["secret", "set", "gh", "--hosts", "api.github.com"], Route::Forward(Privileged)),
             (&["secret", "hosts", "gh", "--hosts", "*.attacker.example"], Route::Forward(Privileged)),
+            (&["secret", "verify", "gh-hook"], Route::Forward(Privileged)),
             (&["secret", "link", "x", "--file", "/etc/shadow"], Route::Forward(Privileged)),
             (&["image"], Route::Forward(Privileged)),
             (&["program", "digest", "."], Route::Local),
@@ -407,6 +465,7 @@ mod tests {
             (&["node", "token"], Route::Forward(Privileged)),
             (&["node", "revoke", "n1"], Route::Forward(Privileged)),
             (&["node", "serve"], Route::Local),
+            (&["node", "intake", "--listen", "0.0.0.0:8443"], Route::Local),
             (&["node", "attach"], Route::Local),
             (&["node", "list", "--provider"], Route::Forward(Privileged)),
             (&["node", "plans"], Route::Forward(Privileged)),

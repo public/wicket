@@ -329,6 +329,25 @@ pub fn protocol_needed(zone: &wicket_core::ZoneSpec) -> u32 {
     }
 }
 
+/// Readies `zone` for a node talking `proto` (None: not known), given which secrets `is_set` (#415).
+/// At [`wicket_chan::chan::LIVE_SECRETS`] or later every rule goes. Otherwise, a node whose protocol
+/// isn't known included (a re-attach whose note was lost: what the node's feed holds can't tell a
+/// node at 23 from one below that had every secret set), it is taken as older: its optional
+/// `inject` rules whose secrets aren't set now are dropped, and returned. That fails narrow: such a
+/// host's requests go without the secret for the run's life, and the session is never ended for
+/// it. Also whether the zone goes out with optional rules whatever their secrets, which only a node
+/// at that protocol may then carry.
+pub fn zone_for_node(
+    zone: &mut ZoneSpec,
+    proto: Option<u32>,
+    is_set: impl Fn(&str) -> bool,
+) -> (Vec<wicket_core::manifest::InjectRule>, bool) {
+    match proto.is_some_and(|p| p >= wicket_chan::chan::LIVE_SECRETS) {
+        true => (vec![], zone.inject.iter().any(|i| i.optional)),
+        false => (zone.drop_unset_optional_injections(is_set), false),
+    }
+}
+
 /// Refuses to publish `zone`'s record to node `name` unless the node is known to read it: decided
 /// before the record goes in the node's feed, which every session to the node carries (#664).
 pub fn check_protocol(name: &str, zone: &wicket_core::ZoneSpec) -> Result<()> {
@@ -643,9 +662,15 @@ pub struct Start {
     /// Where the box start's time goes (#287): this host's steps, the node's (`node.start.*`), and
     /// the box's first output and first model request when they come.
     pub timings: Arc<Timings>,
+    /// The installation's `names:` settings as the run read them when it started (#575): the host
+    /// ports its public names are published on come from them. None: no public names.
+    pub names: Option<Arc<wicket_names::NamesConfig>>,
 }
 
 struct Shared {
+    /// The zone was published with its optional `inject` rules whatever their secrets (#415): only a
+    /// node at protocol 23 may carry its record.
+    optional_rules: bool,
     node: String,
     tenant: TenantId,
     run: RunId,
@@ -671,6 +696,8 @@ struct Shared {
     /// Re-attaching to a box already on the node (#151), and the grants its token carries already.
     attach: bool,
     carried: Vec<LiveGrant>,
+    /// The host ports the box's first record carried (#575 step 4c).
+    ports_at_start: Vec<wicket_feed::PublishedPort>,
     /// Who in the box made a request, as the run reads the agent's event stream (for asks the node
     /// didn't attribute).
     attribute: Option<wicket_proxy::Attributor>,
@@ -694,6 +721,8 @@ struct Shared {
     timings: Arc<Timings>,
     /// The box's first output has been seen (#287: `box.first_output`).
     first_output: AtomicBool,
+    /// The installation's `names:` settings (#575 step 4c).
+    names: Option<Arc<wicket_names::NamesConfig>>,
 }
 
 /// Mints box `run`'s block 0, until `not_after` (Unix seconds): by the authority root, or by its
@@ -727,15 +756,27 @@ fn mint_token(
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
 pub async fn start(s: Start) -> Result<NodeBox> {
+    let mut s = s;
     let t = s.timings.clone();
     let keys = t.span("token.keys");
     let name = s.node.clone();
+    // A node below protocol 23 would take an optional rule whose secret isn't set as no credential
+    // for its host until a fetch, letting plain HTTP to it through (#415). It gets the zone as
+    // before: without such rules, whose hosts then go without them for the run's whole life.
     // Before anything is minted or published: the record goes in the node's feed, which every
     // session to it carries, so a node that can't read it is never sent it (#664).
     check_protocol(&name, &s.zone)?;
     let issuer = Arc::new(crate::issuer()?);
     let cfg = feed_config();
     let feed = SharedFeed::open(&name, cfg.clone())?;
+    let (dropped, optional_rules) = zone_for_node(&mut s.zone, node_protocol_now(&name), |n| s.vault.has(n));
+    for i in dropped {
+        say!(
+            "[wicket] node {name} doesn't take secrets set later (protocol 23): requests to {} go without {:?} for this run",
+            i.host,
+            i.secret
+        );
+    }
     let now = wicket_feed::now_ms();
     let paths = crate::enrol::Paths::installation();
     // Every grant has a lifetime (#153), block 0 included: the zone's `limits.authority` (default
@@ -773,9 +814,14 @@ pub async fn start(s: Start) -> Result<NodeBox> {
                 .collect()
         }
     };
-    let authority = token_issuer.publish(&approver, &carried).context("the box's token")?;
+    let mut authority = token_issuer.publish(&approver, &carried).context("the box's token")?;
+    // And, for a node that reads them, the host ports its public names have already (#575 step 4c):
+    // a re-attach's token without them would close the node's listeners until the first sync.
+    authority.ports = match (s.names.as_ref().and_then(|n| n.public.as_ref()), reads_ports(&name)) {
+        (Some(public), true) => ports_for(&s.ledger.lock().expect("ledger"), public, &s.run, &name, wicket_store::now()),
+        _ => vec![],
+    };
     // What the node attenuates a child's token from, deciding its spawns (#164).
-    let mut s = s;
     if let Some(sp) = s.start.edge.as_mut().and_then(|e| e.spawn.as_mut()) {
         use base64::Engine;
         sp.base = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_issuer.base.to_bytes()?);
@@ -785,7 +831,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     // drop them: a run killed hard) go in the same delta, so the feed and the node's snapshot don't
     // grow with every run.
     let published = t.span("feed.publish");
-    let target_epoch = {
+    let (target_epoch, ports_at_start) = {
         let mut publisher = feed.lock()?;
         let ended: Vec<String> = {
             let l = s.ledger.lock().expect("ledger");
@@ -802,9 +848,21 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         // Again under the feed's lock, just before the record goes in: the node's live sessions
         // (any process's) may have connected at an older protocol since the check above (#691).
         check_protocol(&name, &s.zone)?;
+        gate_ports(&mut changes, node_protocol_now(&name));
+        // What the node's record carries, as committed (#796 review, L2).
+        let carried_ports = changes
+            .iter()
+            .find_map(|c| match c {
+                Change::PutZone { zone } => Some(zone.ports.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
         publisher.commit(changes, now).context("publishing the box's token")?;
-        publisher.epoch()
+        (publisher.epoch(), carried_ports)
     };
+    // That token carries grants only: a re-attached run's standing rules aren't in it until its
+    // first sync puts them back, so none reads as on the node meanwhile (#752 review, F1).
+    s.ledger.lock().expect("ledger").standing_requeued(&s.run.0).context("recording the box's standing rules")?;
     published.end();
     let recording = t.span("authority.record");
     let token_root = (token_issuer.block_ids()[0].clone(), until_s.saturating_mul(1000));
@@ -830,6 +888,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         stdin_base: std::sync::OnceLock::new(),
     });
     let shared = Arc::new(Shared {
+        optional_rules,
         node: name.clone(),
         tenant: s.tenant,
         run: s.run,
@@ -858,6 +917,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         adopt: s.adopt.clone(),
         attach: s.attach,
         carried,
+        ports_at_start,
         pull: match &s.start.image_pin {
             Some(_) => crate::images_policy::load()?.registry_for(&s.start.image).map(|(r, repository)| crate::registry::Source {
                 host: r.host,
@@ -871,6 +931,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         pulling: AtomicBool::new(false),
         timings: t.clone(),
         first_output: AtomicBool::new(false),
+        names: s.names.clone(),
     });
     let (stdin_ours, stdin_theirs) = tokio::io::duplex(256 * 1024);
     let (stdout_theirs, stdout_ours) = tokio::io::duplex(1 << 20);
@@ -1058,7 +1119,8 @@ fn want_ca_hosts(sh: &Shared) -> Vec<String> {
 
 /// Makes sure node `node` has image `pin` (#191): if it hasn't, this host's runtime exports it as an
 /// OCI image layout, and the node verifies it against the pin before importing it. If this host
-/// hasn't it either, nothing is sent, and the node refuses the box as before.
+/// hasn't it either, it fails saying so: the image can't reach the node (it may have removed it
+/// once unused, #191).
 ///
 /// With `pull` (the image's registry is allowed in `images.yaml`), the node pulls it from there
 /// itself first, host-side; if that fails, this host sends it if it can.
@@ -1096,8 +1158,11 @@ pub async fn deliver_image(
                 e.context(format!("pulling it from {}, and this host hasn't it to send", pull.map(|p| p.host.as_str()).unwrap_or("")))
             );
         }
-        say!("[wicket] node {node} hasn't image {pin}, and this host hasn't it to send");
-        return Ok(());
+        // Not here either (a node may have removed an image it was given once unused, #191): said
+        // plainly, rather than the node's refusal later.
+        bail!(
+            "node {node} hasn't image {image} ({pin}), and this host hasn't it to send: load it here (docker pull {image}), or list its registry in images.yaml so the node pulls it"
+        );
     }
     say!("[wicket] sending image {image} ({pin}) to node {node}");
     let t0 = std::time::Instant::now();
@@ -1164,6 +1229,9 @@ struct Progress {
     slice: Option<wicket_proxy::llm::Slice>,
     /// The secrets released to the node for this run, and what each was (to tell a change).
     fetched: std::collections::HashMap<String, String>,
+    /// The secrets the run's zone uses that were refused to its node (an optional one not set yet,
+    /// #415): the node is told when one can be released, and a refusal is audited once while it lasts.
+    refused: HashSet<String>,
     /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
     remint_failed: i64,
     /// What changed in the ledger since this connection's loops last looked (#582 step 2), and when
@@ -1176,6 +1244,8 @@ struct Progress {
     /// The standing rules (#572) the box's token carries now, by id, with the end each was
     /// published with.
     standing: std::collections::HashMap<String, u64>,
+    /// The host ports the box's token carries now (#575 step 4c).
+    ports: Vec<wicket_feed::PublishedPort>,
 }
 
 async fn manage(
@@ -1203,13 +1273,18 @@ async fn manage(
         proto: 0,
         slice_sent: false,
         slice: None,
-        fetched: std::collections::HashMap::new(),
+        // What an earlier supervisor of the run released to its node, with the digest each went with
+        // (#415, #818): the first connection revokes what changed since, or may be stale, and leaves
+        // the rest with the node.
+        fetched: released_before(&sh.dir),
+        refused: HashSet::new(),
         remint_failed: 0,
         watch: wicket_store::ChangeWatch::new(),
         grants_full: std::time::Instant::now(),
         ident_full: std::time::Instant::now(),
         link: wicket_node::status::LinkRecord { node: sh.node.clone(), ..Default::default() },
         standing: std::collections::HashMap::new(),
+        ports: sh.ports_at_start.clone(),
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
@@ -1384,6 +1459,18 @@ async fn session(
             wicket_chan::chan::DECODE_SLASH
         );
     }
+    // The same for a node that has gone back below protocol 23 since its zone went out with its
+    // optional rules whatever their secrets (#415): it would let plain HTTP to such a host through.
+    if p.proto < wicket_chan::chan::LIVE_SECRETS && sh.optional_rules {
+        p.ever = false;
+        bail!(
+            "node {} talks protocol {}, and run {}'s zone went out with optional secrets read per request, which needs {}: update the node (wicket self update --nodes)",
+            sh.node,
+            p.proto,
+            sh.run,
+            wicket_chan::chan::LIVE_SECRETS
+        );
+    }
     let now = wicket_feed::now_ms();
     let catching = std::time::Instant::now();
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
@@ -1397,6 +1484,24 @@ async fn session(
     p.slice_sent = false;
     if let Some(f) = slice_due(sh, p) {
         send(f);
+    }
+    // A revoke sent on a link that died may never have arrived (#415): those are sent again, with
+    // every refusal. A secret the node holds as released stays (#818: after a self-update its new
+    // process has it, handed over), unless it changed meanwhile, which is told now.
+    let release = |name: &str| {
+        crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, name, sh.ctl.authority_until())
+            .ok()
+            .map(|f| crate::nodesecrets::digest(&f))
+    };
+    let revokes = connect_revokes(&mut p.fetched, &mut p.refused, release);
+    if revokes.iter().any(|(_, resend)| !resend) {
+        save_holdings(sh, p);
+    }
+    for (name, resend) in revokes {
+        if !resend {
+            say!("[wicket] secret {name} changed on this host: node {} fetches it again for {}", sh.node, sh.run);
+        }
+        send(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name, resend }));
     }
     if first {
         sh.timings.since("budget.slice", slicing);
@@ -1649,7 +1754,7 @@ async fn on_frame(
                 if !sh.ctl.keep {
                     // Decided first: a guard in the match's scrutinee would be held into its arms,
                     // which lock the ledger again (a deadlock).
-                    let refused = forget_refused(&sh.ledger.lock().expect("ledger"), &sh.node, &sh.run.0);
+                    let refused = forget_refused(&sh.ledger.lock().expect("ledger"), &sh.node, &sh.run.0, true);
                     match refused {
                         None => send(Frame::Msg(Msg::Forget { run })),
                         Some(why) => {
@@ -1670,6 +1775,13 @@ async fn on_frame(
                 if let Ok(f) = dropped {
                     send(Frame::Feed(f.to_line().trim_end().as_bytes().to_vec()));
                 }
+                // The node drops what it held for the run with its box: no digest of a secret is
+                // kept in the run's directory past it (#818). A secret revoked for a change keeps
+                // that mark, so a revoke of it still goes as a change.
+                for d in p.fetched.values_mut().filter(|d| d.as_str() != CHANGED) {
+                    *d = REVOKED.into();
+                }
+                save_holdings(sh, p);
                 p.exited = true;
             }
             Msg::Event { run, event } if run == sh.run.0 => {
@@ -2046,7 +2158,7 @@ pub fn record_authority(run_dir: &Path, node: &str, until_ms: i64) -> Result<()>
     write_authority(run_dir, &AuthorityRecord { node: node.into(), until_ms, stopped, released_by: None })
 }
 
-fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
+pub(crate) fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
     use std::io::Write;
     let p = authority_file(run_dir);
     let dir = p.parent().expect("ctl");
@@ -2079,8 +2191,20 @@ pub fn confirm_stopped(run_dir: &Path) {
 /// An operator releases run `run_dir`'s fence without its node (#676): for a run its node can't
 /// confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end. Marked as if the
 /// node had confirmed, with who did it; the caller audits it (`run.fence_released`).
-pub fn release_fence(run_dir: &Path, by: &str) -> Result<()> {
-    let mut a = read_authority(run_dir).unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
+///
+/// `expected` is the authority record the decision was made on: its node and `until_ms`, or None
+/// if the run had none (#708). Refused if the record is no longer that (renewed, confirmed, or
+/// written since), so a renewal between the decision and this write isn't overwritten.
+pub fn release_fence(run_dir: &Path, by: &str, expected: Option<(&str, i64)>) -> Result<()> {
+    let now = read_authority(run_dir);
+    let current = now.as_ref().filter(|a| !a.stopped).map(|a| (a.node.as_str(), a.until_ms));
+    if now.as_ref().is_some_and(|a| a.stopped) || current != expected {
+        anyhow::bail!(
+            "{}'s authority record changed since the fence was shown (renewed, or its node confirmed the box stopped): look again",
+            run_dir.display()
+        );
+    }
+    let mut a = now.unwrap_or_else(|| AuthorityRecord { node: "its node".into(), ..Default::default() });
     a.stopped = true;
     a.released_by = Some(by.to_string());
     write_authority(run_dir, &a)
@@ -2146,17 +2270,27 @@ pub struct Held {
 /// the ledger's hard end of its box's authority holds it, plus 1 s and the skew, as
 /// `Ledger::agent_fenced_until` has it. The cap rather than the latest renewal: a renewal the
 /// standby's copy hasn't caught up with may have moved the box's end on.
-pub fn held_until(l: &wicket_store::Ledger, run: &str, now_ms: i64, fenced: Option<(String, i64)>, has_record: bool) -> Option<Held> {
+///
+/// A ledger that can't be read is an error, never "not held": the caller doesn't end a run whose
+/// box it couldn't rule out.
+pub fn held_until(
+    l: &wicket_store::Ledger,
+    run: &str,
+    now_ms: i64,
+    fenced: Option<(String, i64)>,
+    has_record: bool,
+) -> anyhow::Result<Option<Held>> {
     if let Some((node, until_ms)) = fenced {
-        return Some(Held { node, until_ms, by_ledger: false });
+        return Ok(Some(Held { node, until_ms, by_ledger: false }));
     }
     if has_record {
-        return None;
+        return Ok(None);
     }
-    let (_, cap) = l.run_authority(run).ok().flatten()?;
+    let Some((_, cap)) = l.run_authority(run)? else { return Ok(None) };
     let until_ms = cap.saturating_add(1 + wicket_store::WAKE_SKEW_SECS).saturating_mul(1000);
+    // Only the hold's words: a node that can't be read is "its node".
     let node = l.run_node(run).ok().flatten().unwrap_or_else(|| "its node".into());
-    (now_ms < until_ms).then_some(Held { node, until_ms, by_ledger: true })
+    Ok((now_ms < until_ms).then_some(Held { node, until_ms, by_ledger: true }))
 }
 
 /// How long a hold lasts, in words: its end, or, for a fence this host can't bound, until its node
@@ -2211,6 +2345,14 @@ pub const UNKNOWN_END: i64 = i64::MAX;
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Holdings {
     pub secrets: Vec<String>,
+    /// What each secret was when released (#818: [`crate::nodesecrets::digest`], a SHA-256 over the
+    /// value and its binding, never the value), so a supervisor that takes the run over tells a
+    /// secret that changed from one the node still holds as released, and doesn't make the node
+    /// fetch again what a self-update handed to its new process. A secret revoked and not fetched
+    /// since has none, or `changed` for one revoked because it changed (sent again as a change, #415).
+    /// In the run's own directory, private to wicket's user, as the vault is.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub digests: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slice: Option<wicket_proxy::llm::Slice>,
     /// When this was last written (Unix ms).
@@ -2218,11 +2360,26 @@ pub struct Holdings {
 }
 
 fn save_holdings(sh: &Shared, p: &Progress) {
-    let mut secrets: Vec<String> = p.fetched.keys().cloned().collect();
-    secrets.sort();
-    let h = Holdings { secrets, slice: p.slice, updated_ms: wicket_feed::now_ms() };
+    let h = holdings_of(&p.fetched, p.slice, wicket_feed::now_ms());
     let f = sh.dir.join("ctl").join("holdings.json");
-    let _ = wicket_chan::files::replace(&f, "tmp", &serde_json::to_vec(&h).unwrap_or_default());
+    if let Err(e) = wicket_chan::files::replace(&f, "tmp", &serde_json::to_vec(&h).unwrap_or_default()) {
+        say_err!(
+            "[wicket] run {}'s holdings on node {} can't be written ({e:#}): a supervisor that takes it over revokes all it released",
+            sh.run,
+            sh.node
+        );
+    }
+}
+
+/// What a run's holdings record (#152, #818): the secrets released to its node, and the digest each
+/// went with; for one revoked for a change and not fetched since, [`CHANGED`] in its place, and for
+/// one revoked otherwise none ([`REVOKED`]): a supervisor that takes the run over revokes either
+/// again, as it was revoked.
+fn holdings_of(fetched: &std::collections::HashMap<String, String>, slice: Option<wicket_proxy::llm::Slice>, now_ms: i64) -> Holdings {
+    let mut secrets: Vec<String> = fetched.keys().cloned().collect();
+    secrets.sort();
+    let digests = fetched.iter().filter(|(_, d)| d.as_str() != REVOKED).map(|(n, d)| (n.clone(), d.clone())).collect();
+    Holdings { secrets, digests, slice, updated_ms: now_ms }
 }
 
 pub fn read_holdings(run_dir: &Path) -> Option<Holdings> {
@@ -2321,15 +2478,20 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
         None => crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, name, sh.ctl.authority_until()),
     };
     let (ok, why) = match &r {
-        Ok(f) => {
-            if for_pull.is_none() {
-                p.fetched.insert(name.to_string(), crate::nodesecrets::digest(f));
-                save_holdings(sh, p);
-            }
-            (true, None)
-        }
+        Ok(_) => (true, None),
         Err(e) => (false, Some(e.clone())),
     };
+    if for_pull.is_none() {
+        let digest = r.as_ref().ok().map(crate::nodesecrets::digest);
+        let uses = crate::nodesecrets::zone_uses(&sh.zone, &sh.swaps, name);
+        let audit = record_answer(&mut p.fetched, &mut p.refused, name, digest, uses);
+        if ok {
+            save_holdings(sh, p);
+        }
+        if !audit {
+            return Msg::SecretFetched { id, secret: None, error: why };
+        }
+    }
     let _ = sh.ledger.lock().expect("ledger").audit(
         &sh.tenant,
         Some(&sh.run),
@@ -2342,23 +2504,142 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
     }
 }
 
-/// Secrets this run's node fetched that have since changed, been rebound or removed on this host:
-/// the node is told to drop them (#152).
+/// Records the answer to a node's fetch of `name` for the run: `released`'s digest, or None if it was
+/// refused, of a name the run's zone or swaps `uses` or not. Whether to audit it: a release always;
+/// a refusal of a name the zone uses only when first refused (#415: an optional rule's secret not
+/// set yet is asked about again after a while, and is tracked so the node can be told when it's set).
+fn record_answer(
+    fetched: &mut std::collections::HashMap<String, String>,
+    refused: &mut HashSet<String>,
+    name: &str,
+    released: Option<String>,
+    uses: bool,
+) -> bool {
+    match released {
+        Some(d) => {
+            refused.remove(name);
+            fetched.insert(name.to_string(), d);
+            true
+        }
+        None if uses => refused.insert(name.to_string()),
+        None => true,
+    }
+}
+
+/// What an earlier supervisor of the run in `run_dir` released to its node, from its holdings (#415):
+/// each with the digest it was released with, so the first check revokes only what changed since
+/// (#818), or marked [`REVOKED`] if none was kept (revoked since, or holdings from before digests),
+/// so the first connection revokes it.
+fn released_before(run_dir: &Path) -> std::collections::HashMap<String, String> {
+    let Some(h) = read_holdings(run_dir) else { return Default::default() };
+    h.secrets
+        .into_iter()
+        .map(|n| {
+            let d = h.digests.get(&n).cloned().unwrap_or_else(|| REVOKED.to_string());
+            (n, d)
+        })
+        .collect()
+}
+
+/// What a new connection revokes, given what `release` would release now (#415, #818): first again
+/// each revoke that may have been lost ([`revoke_lost`], `resend`), then each secret that changed
+/// meanwhile, or refused one now released ([`changed_secrets`], not `resend`: it cascades to the
+/// children the node shared it with). Not a secret the node holds as released and unchanged.
+fn connect_revokes(
+    fetched: &mut std::collections::HashMap<String, String>,
+    refused: &mut HashSet<String>,
+    release: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, bool)> {
+    let lost = revoke_lost(fetched, refused);
+    let changed = changed_secrets(fetched, refused, release);
+    // A refusal now released is in both: once, as resent (the node only forgets the refusal).
+    let changed: Vec<String> = changed.into_iter().filter(|n| !lost.iter().any(|(l, _)| l == n)).collect();
+    lost.into_iter().chain(changed.into_iter().map(|n| (n, false))).collect()
+}
+
+/// What [`Progress::fetched`] holds for a secret revoked and not fetched since (#415): no release's
+/// digest, so it is never taken for one, and the name is revoked again on the next connection, as a
+/// resend (it leaves the uses the node shared with children it started while cut off). For a box that
+/// exited, and for holdings with no digest for it.
+const REVOKED: &str = "revoked";
+
+/// [`REVOKED`], for a secret revoked because it changed (rotated, rebound, removed): sent again on
+/// the next connection as the change it was, not a resend, so it still ends the uses shared with
+/// children if the first one was lost. Kept in the run's holdings as such.
+const CHANGED: &str = "changed";
+
+/// Whether `d` marks a secret revoked rather than a release's digest.
+fn marked(d: &str) -> bool {
+    d == REVOKED || d == CHANGED
+}
+
+/// Secrets this run's node fetched that have since changed, been rebound or removed on this host,
+/// and secrets refused to it that can now be released (#415): the node is told to drop what it holds
+/// of each, or knows of it, and the next use fetches it again (#152).
 fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
-    let mut out = vec![];
-    let names: Vec<String> = p.fetched.keys().cloned().collect();
-    for name in names {
-        let now = crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, &name, sh.ctl.authority_until())
+    let release = |name: &str| {
+        crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, name, sh.ctl.authority_until())
             .ok()
-            .map(|f| crate::nodesecrets::digest(&f));
-        if now.as_deref() != p.fetched.get(&name).map(String::as_str) {
-            p.fetched.remove(&name);
-            save_holdings(sh, p);
-            say!("[wicket] secret {name} changed on this host: node {} drops its copy for {}", sh.node, sh.run);
-            out.push(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name }));
+            .map(|f| crate::nodesecrets::digest(&f))
+    };
+    let changed = changed_secrets(&mut p.fetched, &mut p.refused, release);
+    if !changed.is_empty() {
+        // Marked revoked: a supervisor that takes over revokes them again rather than trust them.
+        save_holdings(sh, p);
+    }
+    changed
+        .into_iter()
+        .map(|name| {
+            say!("[wicket] secret {name} changed on this host: node {} fetches it again for {}", sh.node, sh.run);
+            Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name, resend: false })
+        })
+        .collect()
+}
+
+/// The names to tell a node changed, given what `release` would release now (its digest, or None if
+/// refused): each fetched one whose digest differs (then marked [`CHANGED`] until fetched again), and
+/// each refused one now released (forgotten, so its next refusal is recorded again).
+fn changed_secrets(
+    fetched: &mut std::collections::HashMap<String, String>,
+    refused: &mut HashSet<String>,
+    release: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> =
+        fetched.iter().filter(|(n, d)| !marked(d) && release(n).as_deref() != Some(d.as_str())).map(|(n, _)| n.clone()).collect();
+    out.sort();
+    for n in &out {
+        fetched.insert(n.clone(), CHANGED.into());
+    }
+    let mut now_set: Vec<String> = refused.iter().filter(|n| release(n).is_some()).cloned().collect();
+    now_set.sort();
+    for n in &now_set {
+        refused.remove(n);
+    }
+    out.extend(now_set);
+    out
+}
+
+/// What a new connection revokes again (#415), as one sent on a link that died may never have
+/// arrived, each with whether it goes as a resend: a secret revoked for a change ([`CHANGED`]) as the
+/// change it was (not a resend, so it ends uses shared with children), one revoked otherwise
+/// ([`REVOKED`]) and every refusal (which the node then asks about again) as resends. Not a secret the
+/// node holds as released and unchanged (#818: a self-update hands the node's cache to its new
+/// process, which keeps using it); one that changed meanwhile is found by [`changed_secrets`], run on
+/// the connection right after.
+fn revoke_lost(fetched: &std::collections::HashMap<String, String>, refused: &HashSet<String>) -> Vec<(String, bool)> {
+    let mut out: std::collections::BTreeMap<String, bool> = refused.iter().map(|n| (n.clone(), true)).collect();
+    for (n, d) in fetched {
+        match d.as_str() {
+            CHANGED => {
+                out.insert(n.clone(), false);
+            }
+            REVOKED => {
+                out.entry(n.clone()).or_insert(true);
+            }
+            _ => {}
         }
     }
-    out
+    out.into_iter().collect()
 }
 
 /// The op a node asks about, as the control host classifies it, and why it needs a grant, as this
@@ -2559,17 +2840,36 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         false => Ok(vec![]),
     };
     let (node, run) = (sh.node.clone(), sh.run.0.clone());
+    let before = p.standing.clone();
     let (more, changed) =
         sync_standing(&mut p.standing, &mut p.live, &mut p.waiting, rules, p.proto, top_level, now_s, &issuer, &loads, &mut |m| {
             say!("[wicket] {run} on node {node}: {m}")
         });
     changes.extend(more);
     rebuild |= changed;
+    // The host ports of the box's public names (#575 step 4c), for a node that reads them.
+    let ports = if p.proto >= wicket_chan::chan::PORTS && reads_ports(&sh.node) { wanted_ports(sh, now_s) } else { vec![] };
+    rebuild |= ports != p.ports;
+    // Where each rule is on its way to the node (#572), for `await_grant` on it: the ones put in
+    // (or renewed) are handed now and published with this delta; the ones taken out are gone.
+    let (handed_rules, gone_rules) = standing_moves(&before, &p.standing);
+    {
+        let l = sh.ledger.lock().expect("ledger");
+        if p.standing.is_empty() {
+            // None in its token (none bind it, or its node is below protocol 17): none is on its
+            // way, whatever an earlier supervisor recorded (#752 review, F2).
+            let _ = l.standing_none(&sh.run.0);
+        } else {
+            let _ = l.standing_withdrawn(&sh.run.0, &gone_rules);
+            let _ = l.standing_handed(&sh.run.0, &sh.node, &handed_rules);
+        }
+    }
     if !rebuild {
         return vec![];
     }
     let renewing = match issuer.publish(&sh.approver, &p.live) {
-        Ok(a) => {
+        Ok(mut a) => {
+            a.ports = ports.clone();
             changes.push(Change::PutZone { zone: a });
             reminted
         }
@@ -2584,11 +2884,21 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     let n = p.live.len();
     let revokes: Vec<Change<BoxAuthority>> = changes.iter().filter(|c| matches!(c, Change::Revoke { .. })).cloned().collect();
     // Whether the rebuilt token went out (not only its revocations): a renewal counts only then.
+    let has_token = changes.iter().any(|c| matches!(c, Change::PutZone { .. }));
     let token_out;
+    let ports_out;
     let committed = {
         let Ok(mut p) = sh.ctl.publisher.lock() else { return vec![] };
+        // Again under the feed's lock (#691): every live session to the node reads ports, or none
+        // go (an older node's strict parse would refuse the record, and its whole feed with it).
+        let mut changes = changes;
+        gate_ports(&mut changes, node_protocol_now(&sh.node));
+        ports_out = changes.iter().find_map(|c| match c {
+            Change::PutZone { zone } => Some(zone.ports.clone()),
+            _ => None,
+        });
         let mut r = p.commit(changes, wicket_feed::now_ms());
-        token_out = r.is_ok();
+        token_out = r.is_ok() && has_token;
         if r.is_err() && !revokes.is_empty() {
             // The rebuilt token was refused: the revocations must still go out.
             say!(
@@ -2601,7 +2911,18 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         r.map(|f| (f, p.epoch()))
     };
     if let Ok((_, epoch)) = &committed {
-        let _ = sh.ledger.lock().expect("ledger").grants_published(&handed, *epoch as i64);
+        let l = sh.ledger.lock().expect("ledger");
+        let _ = l.grants_published(&handed, *epoch as i64);
+        // Every rule handed and not yet published went with the token, this tick's or one whose
+        // commit failed before (#752 review, F2).
+        if token_out {
+            let _ = l.standing_published(&sh.run.0, *epoch as i64);
+        }
+        drop(l);
+        // What the node's record carries now: the ports, or none if they were held back.
+        if let (true, Some(out)) = (token_out, ports_out) {
+            p.ports = out;
+        }
         if let Some((i, until)) = renewing.filter(|_| token_out) {
             renewed(sh, i, until);
         }
@@ -2820,6 +3141,185 @@ fn sync_standing(
     (changes, rebuild)
 }
 
+/// The nodes whose feed a control-host build before protocol 21 couldn't open (#575 step 4c): its
+/// checkpoint, or a record after it, carries host ports, which that build's strict parse of a box's
+/// record refuses (#475: rows an older build mishandles block going back to it). Such a build loads
+/// the checkpoint and parses in full only the records after it; the ones before it it reads for
+/// their chain alone.
+pub fn feeds_holding_ports() -> Result<Vec<String>> {
+    let mut out = vec![];
+    for e in std::fs::read_dir(crate::data_dir().join("nodes")).into_iter().flatten().flatten() {
+        let dir = e.path().join("feed");
+        if dir.join("deltas.jsonl").exists() && feed_holds_ports(&dir)? {
+            out.push(e.file_name().to_string_lossy().to_string());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Writes a checkpoint of node `name`'s feed now, under its lock (#575 step 4c): the state as it is,
+/// so records with host ports that no box's record holds any more are behind it. Its epoch.
+pub fn checkpoint_feed(name: &str) -> Result<u64> {
+    let _lock = feed_lock(&crate::data_dir().join("nodes").join(name))?;
+    let mut p = open_feed(name, feed_config())?;
+    p.checkpoint(wicket_feed::now_ms()).map_err(|e| anyhow::anyhow!("checkpointing node {name}'s feed: {e}"))?;
+    Ok(p.epoch())
+}
+
+/// Whether node `name`'s feed holds a box record with host ports where a build before protocol 21
+/// parses it (see [`feeds_holding_ports`]): for a node going back to such a build.
+pub fn node_feed_holds_ports(name: &str) -> Result<bool> {
+    let dir = crate::data_dir().join("nodes").join(name).join("feed");
+    Ok(dir.join("deltas.jsonl").exists() && feed_holds_ports(&dir)?)
+}
+
+/// Whether the feed in `dir` holds a box record with host ports where an older build parses it.
+fn feed_holds_ports(dir: &Path) -> Result<bool> {
+    use base64::Engine;
+    let with_ports = |v: &serde_json::Value| v.get("ports").and_then(|p| p.as_array()).is_some_and(|a| !a.is_empty());
+    // The checkpoint's state, and where the records it doesn't cover start.
+    let mut from = 0u64;
+    if let Ok(text) = std::fs::read_to_string(dir.join(wicket_feed::CHECKPOINT)) {
+        if let Ok(c) = serde_json::from_str::<serde_json::Value>(&text) {
+            let snap: Option<serde_json::Value> = c.get("snap").and_then(|s| s.as_str()).and_then(|s| serde_json::from_str(s).ok());
+            if let (Some(snap), Some(end)) = (snap, c.get("end").and_then(|e| e.as_u64())) {
+                if snap.get("zones").and_then(|z| z.as_array()).is_some_and(|zs| zs.iter().any(with_ports)) {
+                    return Ok(true);
+                }
+                from = end;
+            }
+        }
+    }
+    let log = std::fs::read(dir.join("deltas.jsonl")).with_context(|| format!("reading {}", dir.display()))?;
+    let rest = log.get(usize::try_from(from).unwrap_or(usize::MAX)..).unwrap_or_default();
+    for line in rest.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let Some(payload) = line.split(|b| *b == b'.').nth(1) else { continue };
+        let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else { continue };
+        let Ok(d) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
+        let puts = d.get("changes").and_then(|c| c.as_array()).into_iter().flatten();
+        if puts.filter(|c| c.get("op").and_then(|o| o.as_str()) == Some("put_zone")).any(|c| c.get("zone").is_some_and(with_ports)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// While this file is in the data directory (written by `wicket self update` for an update of the
+/// control host from a build before protocol 21, removed once its health gate has ended), no
+/// supervisor puts ports in a box's record (#796 review, M3); in a node's directory
+/// (`nodes/<node>/update-gating`, for that node's update), none for boxes on that node. The build
+/// a failed gate would roll back to couldn't read a feed holding them. The file holds when it stops
+/// holding ports back (Unix seconds: the gate's window and a margin), so an update that died
+/// mid-gate doesn't hold them for ever; one that can't be read counts for [`GATING_MAX_SECS`] from
+/// its writing.
+pub const UPDATE_GATING: &str = "update-gating";
+/// How long an [`UPDATE_GATING`] file whose end can't be read holds ports back.
+pub const GATING_MAX_SECS: u64 = 30 * 60;
+
+/// Whether the [`UPDATE_GATING`] file at `p` holds ports back now.
+pub fn gating_at(p: &Path) -> bool {
+    if let Some(until) = std::fs::read_to_string(p).ok().and_then(|t| t.trim().parse::<i64>().ok()) {
+        return wicket_store::now() < until;
+    }
+    std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() < GATING_MAX_SECS)
+}
+
+/// Whether an update's health gate holds back ports for boxes on `node` now: the control host's or
+/// that node's ([`UPDATE_GATING`]).
+fn update_gating(node: &str) -> bool {
+    let data = crate::data_dir();
+    gating_at(&data.join(UPDATE_GATING)) || gating_at(&data.join("nodes").join(node).join(UPDATE_GATING))
+}
+
+/// Whether node `node` reads published ports (#575 step 4c): every live session to it talks
+/// [`wicket_chan::chan::PORTS`] or later (or, with none live, the one last noted did), and no
+/// update's health gate holds them back ([`UPDATE_GATING`]).
+fn reads_ports(node: &str) -> bool {
+    node_protocol_now(node).is_some_and(|p| p >= wicket_chan::chan::PORTS) && !update_gating(node)
+}
+
+/// Holds back the host ports of the records in `changes` unless the node talks
+/// [`wicket_chan::chan::PORTS`] (`node_proto`, as [`node_protocol_now`] says now): an older node's
+/// strict parse would refuse the record, and its whole feed with it. Whether it held any back.
+fn gate_ports(changes: &mut [Change<BoxAuthority>], node_proto: Option<u32>) -> bool {
+    if node_proto.is_some_and(|p| p >= wicket_chan::chan::PORTS) {
+        return false;
+    }
+    let mut held = false;
+    for c in changes.iter_mut() {
+        if let Change::PutZone { zone } = c {
+            held |= !zone.ports.is_empty();
+            zone.ports.clear();
+        }
+    }
+    held
+}
+
+/// The host ports the box's public names are published on now (#575 step 4c): each live public
+/// name it holds that may be published on its node ([`crate::namesync::may_publish`], as the
+/// names reconciler decides it), with the port allocated to it there (the one it had on another
+/// node if that is free here; its rows on other nodes released). None without `names.public`.
+fn wanted_ports(sh: &Shared, now_s: i64) -> Vec<wicket_feed::PublishedPort> {
+    let Some(public) = sh.names.as_ref().and_then(|n| n.public.as_ref()) else { return vec![] };
+    let l = sh.ledger.lock().expect("ledger");
+    ports_for(&l, public, &sh.run, &sh.node, now_s)
+}
+
+/// [`wanted_ports`] for run `run` on node `node`, under `public`.
+fn ports_for(l: &Ledger, public: &wicket_names::PublicConfig, run: &RunId, node: &str, now_s: i64) -> Vec<wicket_feed::PublishedPort> {
+    let held = match l.names_held_by(run) {
+        Ok(h) => h,
+        Err(e) => {
+            say!("[wicket] {run}: could not read its names ({e}); its token keeps no ports");
+            return vec![];
+        }
+    };
+    let mut out = vec![];
+    for n in held.into_iter().filter(|n| n.kind == wicket_store::NameKind::Public) {
+        match crate::namesync::may_publish(l, public, &n, now_s) {
+            Ok(crate::namesync::Publish::On { node: on, .. }) if on == node => {}
+            Ok(_) => continue,
+            Err(e) => {
+                say!("[wicket] {}: could not tell whether {} may be published ({e:#})", run, n.label);
+                continue;
+            }
+        }
+        let proto = crate::namesync::PROTO;
+        let prefer = l.port_elsewhere(&n.id, node, proto).ok().flatten();
+        let port = match l.allocate_port(node, proto, &n.id, public.ports.range(), prefer) {
+            Ok(p) => p,
+            Err(e) => {
+                say!("[wicket] {}: no host port for {} on node {}: {e}", run, n.label, node);
+                continue;
+            }
+        };
+        let _ = l.release_ports_elsewhere(&n.id, node);
+        out.push(wicket_feed::PublishedPort {
+            name: n.id.clone(),
+            label: n.label.clone(),
+            host_port: port,
+            box_port: n.port,
+            until_ms: n.expires_at.map(|e| e.saturating_mul(1000)).unwrap_or(i64::MAX),
+        });
+    }
+    out.sort_by_key(|p| p.host_port);
+    out
+}
+
+/// The standing rules a sync put into a run's token or changed (renewed), and the ones it took
+/// out: from the published rules (id → end) before and after it.
+fn standing_moves(
+    before: &std::collections::HashMap<String, u64>,
+    after: &std::collections::HashMap<String, u64>,
+) -> (Vec<String>, Vec<String>) {
+    let mut handed: Vec<String> = after.iter().filter(|(id, end)| before.get(*id) != Some(end)).map(|(id, _)| id.clone()).collect();
+    let mut gone: Vec<String> = before.keys().filter(|id| !after.contains_key(*id)).cloned().collect();
+    handed.sort();
+    gone.sort();
+    (handed, gone)
+}
+
 /// The installation CA, for renewing nodes' CAs over their channels (#416, wicket-node's
 /// `controlca`), if this control host has one (never created here).
 fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
@@ -2831,6 +3331,347 @@ fn installation_ca() -> Option<wicket_proxy::ca::InstallationCa> {
 
 #[cfg(test)]
 mod tests {
+    /// #713: `wicket node release-fence --break-glass` is root's: anyone else is refused before
+    /// anything is read. Without it, the release is the console's (an operator within its authority).
+    #[test]
+    fn break_glass_is_roots_only() {
+        let e = release_fence_command(&wicket_core::RunId::new().0, "lost", "alex", Some(false)).unwrap_err();
+        assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::Refused as i32, "{e:#}");
+        assert!(format!("{e:#}").contains("--break-glass"));
+    }
+
+    /// #415: the control host tells a run's node of a secret it fetched that changed or went, and of
+    /// one it was refused that can now be released; each once, until the node fetches it again.
+    #[test]
+    fn a_node_is_told_of_secrets_changed_removed_or_newly_set() {
+        let vault = std::cell::RefCell::new(std::collections::HashMap::from([("held".to_string(), "d1".to_string())]));
+        let release = |n: &str| vault.borrow().get(n).cloned();
+        let mut fetched = std::collections::HashMap::from([("held".to_string(), "d1".to_string())]);
+        let mut refused = HashSet::from(["later".to_string()]);
+        assert!(changed_secrets(&mut fetched, &mut refused, release).is_empty(), "nothing changed");
+        vault.borrow_mut().insert("later".into(), "d2".into());
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["later"], "set since it was refused");
+        assert!(refused.is_empty());
+        vault.borrow_mut().insert("held".into(), "d3".into());
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["held"], "rotated");
+        assert_eq!(fetched["held"], CHANGED, "kept, marked as changed, until fetched again");
+        assert!(changed_secrets(&mut fetched, &mut refused, release).is_empty(), "told once per connection");
+        fetched.insert("held".into(), "d3".into());
+        vault.borrow_mut().remove("held");
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["held"], "removed");
+    }
+
+    /// #415: a refusal of a secret the zone uses is audited once while it lasts and tracked; one of
+    /// a name it doesn't use is audited each time and never tracked (a node can't grow the set); a
+    /// release is always audited, and ends the refusal.
+    #[test]
+    fn a_refusal_is_recorded_once_and_a_release_ends_it() {
+        let (mut fetched, mut refused) = (std::collections::HashMap::new(), HashSet::new());
+        assert!(record_answer(&mut fetched, &mut refused, "late", None, true), "first refusal: audited");
+        assert!(!record_answer(&mut fetched, &mut refused, "late", None, true), "again: not");
+        assert!(record_answer(&mut fetched, &mut refused, "other", None, false));
+        assert!(record_answer(&mut fetched, &mut refused, "other", None, false), "not the zone's: each time");
+        assert_eq!(refused, HashSet::from(["late".to_string()]));
+        assert!(record_answer(&mut fetched, &mut refused, "late", Some("d".into()), true));
+        assert!(refused.is_empty() && fetched["late"] == "d");
+        assert!(record_answer(&mut fetched, &mut refused, "late", None, true), "refused again after a release: audited");
+    }
+
+    /// #415, skew: a node below protocol 23, or one whose protocol isn't known yet, gets the zone
+    /// without an optional rule whose secret isn't set (it would take the host as having no
+    /// credential, and let plain HTTP through); a node at 23 gets every rule, and its session then
+    /// needs 23.
+    #[test]
+    fn an_older_node_gets_no_optional_rule_whose_secret_is_unset() {
+        let zone = || -> ZoneSpec {
+            wicket_core::yaml::from_str(
+                "name: z\ninject:\n  - { host: a.example, header: Authorization, secret: unset, optional: true }\n  - { host: b.example, header: Authorization, secret: set, optional: true }\n  - { host: c.example, header: X-Key, secret: required }\n",
+            )
+            .unwrap()
+        };
+        let is_set = |n: &str| n != "unset";
+        for proto in [None, Some(wicket_chan::chan::LIVE_SECRETS - 1)] {
+            let mut z = zone();
+            let (dropped, optional_rules) = zone_for_node(&mut z, proto, is_set);
+            assert_eq!(dropped.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["unset"], "{proto:?}");
+            assert_eq!(z.inject.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["set", "required"]);
+            assert!(!optional_rules);
+        }
+        let mut z = zone();
+        let (dropped, optional_rules) = zone_for_node(&mut z, Some(wicket_chan::chan::LIVE_SECRETS), is_set);
+        assert!(dropped.is_empty() && z.inject.len() == 3 && optional_rules);
+        // Re-attached with the node's protocol note lost: taken as older, whatever the feed holds,
+        // so the session is never ended for it, and a rule whose secret isn't set now stays out.
+        let mut z = zone();
+        let (dropped, optional_rules) = zone_for_node(&mut z, None, |_| true);
+        assert!(dropped.is_empty() && z.inject.len() == 3 && !optional_rules, "every secret set: nothing dropped, no 23 needed");
+    }
+
+    /// #415 with #818: a re-attached supervisor starts from what an earlier one recorded it released
+    /// (`ctl/holdings.json`), with the digest each was released with. One unchanged is left with the
+    /// node (a self-update handed it to the node's new process, which isn't made to fetch it again);
+    /// one changed since is revoked by the first check; one with no digest (revoked since, or from
+    /// before digests) is revoked again on the first connection. A run with no holdings starts from
+    /// nothing.
+    #[test]
+    fn a_reattached_supervisor_revokes_only_what_changed_or_may_be_stale() {
+        let dir = std::env::temp_dir().join(format!("wicket-holdings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(released_before(&dir).is_empty());
+        std::fs::create_dir_all(dir.join("ctl")).unwrap();
+        let h = Holdings {
+            secrets: vec!["gh".into(), "model".into(), "old".into()],
+            digests: [("gh".to_string(), "d-gh".to_string()), ("model".to_string(), "d-model".to_string())].into(),
+            slice: None,
+            updated_ms: 1,
+        };
+        std::fs::write(dir.join("ctl").join("holdings.json"), serde_json::to_vec(&h).unwrap()).unwrap();
+        let mut fetched = released_before(&dir);
+        assert_eq!(fetched.len(), 3);
+        assert_eq!(fetched["old"], REVOKED);
+        assert_eq!(revoke_lost(&fetched, &HashSet::new()), [("old".to_string(), true)], "only the one that may be stale");
+        // The first check: model unchanged (left with the node), gh rotated since.
+        let release = |n: &str| match n {
+            "gh" => Some("d-gh-rotated".to_string()),
+            "model" => Some("d-model".to_string()),
+            _ => None,
+        };
+        assert_eq!(changed_secrets(&mut fetched, &mut HashSet::new(), release), ["gh"]);
+        assert_eq!(fetched["model"], "d-model");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #818, the lost-revoke path end to end: a secret that changes is revoked and marked as changed,
+    /// in its holdings too, so a supervisor that takes the run over (from those holdings) revokes it
+    /// again on its first connection as the change it was: on the node that also ends the uses shared
+    /// with a child it started while cut off, which a resend wouldn't. One unchanged is left with the
+    /// node; one changed while cut off is revoked at connect as a change; a refusal is resent once;
+    /// a box's exit leaves no digest, and its names go as resends.
+    #[test]
+    fn a_revoke_lost_with_its_supervisor_is_sent_again_by_the_next() {
+        let vault = std::cell::RefCell::new(std::collections::HashMap::from([
+            ("gh".to_string(), "d1".to_string()),
+            ("model".to_string(), "m1".to_string()),
+        ]));
+        let release = |n: &str| vault.borrow().get(n).cloned();
+        let mut fetched = std::collections::HashMap::from([("gh".to_string(), "d1".to_string()), ("model".to_string(), "m1".to_string())]);
+        let mut refused = HashSet::new();
+        // gh rotates: the check revokes it (that revoke may die with the link) and marks it changed.
+        vault.borrow_mut().insert("gh".into(), "d2".into());
+        assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["gh"]);
+        let h = holdings_of(&fetched, None, 1);
+        assert_eq!(h.secrets, ["gh", "model"]);
+        assert_eq!(h.digests, [("gh".to_string(), CHANGED.to_string()), ("model".to_string(), "m1".to_string())].into());
+        // The next supervisor reads those holdings.
+        let dir = std::env::temp_dir().join(format!("wicket-lost-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ctl")).unwrap();
+        std::fs::write(dir.join("ctl").join("holdings.json"), serde_json::to_vec(&h).unwrap()).unwrap();
+        let mut fetched = released_before(&dir);
+        assert_eq!(fetched["gh"], CHANGED);
+        // Meanwhile model was rebound, and an optional secret refused earlier got set.
+        vault.borrow_mut().insert("model".into(), "m2".into());
+        vault.borrow_mut().insert("late".into(), "l1".into());
+        let mut refused = HashSet::from(["late".to_string()]);
+        let revokes = connect_revokes(&mut fetched, &mut refused, release);
+        assert_eq!(revokes, [("gh".to_string(), false), ("late".to_string(), true), ("model".to_string(), false)]);
+        // On the node: the run held gh and shared it with a child it started while cut off. The
+        // revoke, as a change, ends the child's use too.
+        const RUN: &str = "run_pppppppppppppppppppppppppp";
+        const CHILD: &str = "run_cccccccccccccccccccccccccc";
+        let cache = crate::nodesecrets::Cache::new(std::sync::Arc::new(|| 1_000));
+        let f = crate::nodesecrets::Fetched {
+            name: "gh".into(),
+            value: "v1".into(),
+            hosts: vec!["h".into()],
+            not_after: 5_000,
+            upstream_expiry: None,
+        };
+        cache.put(RUN, &f);
+        cache.share(RUN, CHILD, &["gh".into()], 5_000);
+        let none: crate::nodesecrets::Fetcher =
+            std::sync::Arc::new(|_, _| Box::pin(async { Err(crate::nodesecrets::Unfetched::Unreachable("cut off".into())) }));
+        let child = cache.source(CHILD, none);
+        assert!(child.has("gh"), "the child holds the parent's copy, shared");
+        for (name, resend) in &revokes {
+            match resend {
+                true => cache.revoke_resent(RUN, name),
+                false => cache.revoke(RUN, name),
+            }
+        }
+        assert!(!child.has("gh"), "the child's shared use of the rotated secret ended");
+        // Each connection says the marked ones again, as they were revoked; an unchanged secret never.
+        assert_eq!(connect_revokes(&mut fetched, &mut refused, release), [("gh".to_string(), false), ("model".to_string(), false)]);
+        let mut fresh = std::collections::HashMap::from([("model".to_string(), "m2".to_string())]);
+        assert!(connect_revokes(&mut fresh, &mut HashSet::new(), release).is_empty(), "left with the node");
+        // The box exits: no digest is kept, and a takeover's revokes go as resends.
+        for d in fresh.values_mut() {
+            *d = REVOKED.into();
+        }
+        let h = holdings_of(&fresh, None, 2);
+        assert!(h.digests.is_empty());
+        std::fs::write(dir.join("ctl").join("holdings.json"), serde_json::to_vec(&h).unwrap()).unwrap();
+        assert_eq!(revoke_lost(&released_before(&dir), &HashSet::new()), [("model".to_string(), true)]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #415 with #818: a new connection sends again the revokes that may have been lost (each secret
+    /// marked revoked) and every refusal, but not a secret the node holds as released and unchanged:
+    /// after a self-update the node's new process holds it, handed over through a memfd.
+    #[test]
+    fn a_new_connection_resends_only_revokes_that_may_be_lost() {
+        let fetched = std::collections::HashMap::from([("live".to_string(), "d1".to_string()), ("lost".to_string(), REVOKED.to_string())]);
+        let refused = HashSet::from(["later".to_string(), "lost".to_string()]);
+        assert_eq!(revoke_lost(&fetched, &refused), [("later".to_string(), true), ("lost".to_string(), true)]);
+        assert_eq!(fetched["live"], "d1", "left as released");
+        // Marked revoked, a name isn't taken as changed again on the same connection.
+        let mut fetched = fetched;
+        assert!(changed_secrets(&mut fetched, &mut HashSet::new(), |_| Some("d1".into())).is_empty());
+    }
+
+    /// #575 step 4c: a run's published ports are its public names that may be published on its
+    /// node, each with a port from the range, kept when asked again, the same port on a node the
+    /// box moves to (the old node's released), and none once the name is revoked.
+    #[test]
+    fn a_runs_public_names_get_host_ports_on_its_node() {
+        use wicket_store::{AddressChange, NameAsk, NameScope, NameTerms, StandingBound};
+        let l = Ledger::open_in_memory().unwrap();
+        let public: wicket_names::PublicConfig = serde_json::from_value(serde_json::json!({
+            "provider": "noop", "zone": "boxes.example.com", "owner": "a1b2c3d4", "ports": "20000-20009"
+        }))
+        .unwrap();
+        for (n, ip) in [("n1", [8, 8, 4, 4]), ("n2", [8, 8, 8, 8])] {
+            l.enrol_builtin_node(&wicket_store::NodeRow {
+                name: n.into(),
+                tenant: "t0".into(),
+                target: "unix:/x/ctl.sock".into(),
+                host_key: String::new(),
+                host_key_fp: String::new(),
+                node_key: "00".into(),
+                ssh_key: None,
+                hosts: vec![],
+                enrolled_at: 1,
+                status: "active".into(),
+                revoked_at: None,
+            })
+            .unwrap();
+            l.set_node_addresses(n, AddressChange::Set(std::net::Ipv4Addr::from(ip)), AddressChange::Keep, "op").unwrap();
+        }
+        let t = TenantId::single();
+        let run = RunId("run_web".into());
+        l.run_started(&t, &run, "web", "demo").unwrap();
+        l.set_run_node(&run.0, "n1").unwrap();
+        let ask = NameAsk {
+            tenant: &t,
+            run: &run,
+            zone: "web",
+            zone_digest: "zd",
+            principal: "spiffe://t/z/web/a/demo",
+            label: "demo",
+            port: 3000,
+            service: Some("http"),
+            reason: "the demo",
+            scope: NameScope::Run,
+        };
+        let (id, _) = l.ask_public(&ask).unwrap();
+        let terms = NameTerms { bound: StandingBound::Agent, ttl_secs: None };
+        let effect = wicket_store::name_effect(&l.name(&id).unwrap(), &terms, "boxes.example.com");
+        l.approve_name(&id, &terms, "op", Some(&effect), &public).unwrap();
+        let now = wicket_store::now();
+        let ports = ports_for(&l, &public, &run, "n1", now);
+        assert_eq!(ports.len(), 1);
+        let p = ports[0].clone();
+        assert!((20000..=20009).contains(&p.host_port) && p.box_port == 3000 && p.label == "demo" && p.until_ms == i64::MAX, "{p:?}");
+        assert_eq!(ports_for(&l, &public, &run, "n1", now), ports, "kept");
+        // Not on a node it isn't on.
+        assert!(ports_for(&l, &public, &run, "n2", now).is_empty());
+        // The box moves to n2: the same port there, n1's released (quarantined).
+        l.set_run_node(&run.0, "n2").unwrap();
+        let moved = ports_for(&l, &public, &run, "n2", now);
+        assert_eq!(moved[0].host_port, p.host_port);
+        assert!(l.quarantined_ports().unwrap().iter().any(|(n, _, port, _)| n == "n1" && *port == p.host_port));
+        // Revoked: none.
+        l.revoke_name(&id, "op").unwrap();
+        assert!(ports_for(&l, &public, &run, "n2", now).is_empty());
+    }
+
+    /// #575 step 4c, #475: a feed whose checkpoint, or a record after it, carries host ports is
+    /// one an older control-host build couldn't open; once a checkpoint covers a state without
+    /// them, it can.
+    #[test]
+    fn a_feed_holding_ports_blocks_going_back() {
+        use wicket_feed::{Issuer, KeyCert, Publisher, PublisherConfig};
+        let dir = std::env::temp_dir().join(format!("wicket-feed-ports-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = wicket_identity::SigningKey::from_bytes(&[7; 32]);
+        let key = wicket_identity::SigningKey::from_bytes(&[8; 32]);
+        let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+        let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
+        let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
+        let cfg = PublisherConfig { ttl_ms: 30_000, refresh_ms: 100, retain: 100 };
+        let mut p = Publisher::open_with(&dir, "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
+        let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str("{ name: web }").unwrap();
+        let issuer = Issuer::root(&authz_root, "t0", "run:r", "r", 0, &z, &[], 4_000_000_000, vec![approver.public()]).unwrap();
+        let plain = issuer.publish(&approver, &[]).unwrap();
+        let mut with = plain.clone();
+        with.ports =
+            vec![wicket_feed::PublishedPort { name: "n-1".into(), label: "demo".into(), host_port: 20001, box_port: 3000, until_ms: 9 }];
+        let now = 1_000;
+        p.commit(vec![Change::PutZone { zone: plain.clone() }], now).unwrap();
+        assert!(!feed_holds_ports(&dir).unwrap());
+        let with2 = with.clone();
+        p.commit(vec![Change::PutZone { zone: with }], now + 1).unwrap();
+        assert!(feed_holds_ports(&dir).unwrap(), "a record with ports after the checkpoint");
+        // Its name revoked: the record without them, and a checkpoint covering that state.
+        p.set_checkpoint_every(1);
+        p.commit(vec![Change::PutZone { zone: plain }], now + 2).unwrap();
+        assert!(!feed_holds_ports(&dir).unwrap(), "the checkpoint covers a state without ports");
+        // A checkpoint whose state holds ports (a box published with them as it was written).
+        p.commit(vec![Change::PutZone { zone: with2 }], now + 3).unwrap();
+        assert!(feed_holds_ports(&dir).unwrap(), "the checkpoint's state holds ports");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #575 step 4c: ports go in a record only for a node every live session of which talks 21;
+    /// otherwise they are held back (an older node would refuse the record, and its whole feed),
+    /// and a record without any is untouched.
+    #[test]
+    fn ports_are_held_back_from_a_node_that_cant_read_them() {
+        let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str("{ name: web }").unwrap();
+        let root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+        let issuer = wicket_feed::Issuer::root(&root, "t0", "run:r", "r", 0, &z, &[], 4_000_000_000, vec![approver.public()]).unwrap();
+        let mut a = issuer.publish(&approver, &[]).unwrap();
+        a.ports =
+            vec![wicket_feed::PublishedPort { name: "n-1".into(), label: "demo".into(), host_port: 20001, box_port: 3000, until_ms: 9 }];
+        let record = |a: &BoxAuthority| vec![Change::DropZone { name: "old".into() }, Change::PutZone { zone: a.clone() }];
+        let ports_of = |c: &[Change<BoxAuthority>]| match &c[1] {
+            Change::PutZone { zone } => zone.ports.len(),
+            _ => unreachable!(),
+        };
+        for (proto, kept) in
+            [(Some(wicket_chan::chan::PORTS), true), (Some(wicket_chan::chan::PORTS + 1), true), (Some(20), false), (None, false)]
+        {
+            let mut c = record(&a);
+            assert_eq!(gate_ports(&mut c, proto), !kept, "{proto:?}");
+            assert_eq!(ports_of(&c), usize::from(kept), "{proto:?}");
+        }
+        let mut none = a.clone();
+        none.ports.clear();
+        let mut c = record(&none);
+        assert!(!gate_ports(&mut c, Some(19)), "nothing to hold back");
+    }
+
+    /// #572: what a sync put into a run's token or renewed, and what it took out.
+    #[test]
+    fn standing_moves_are_what_a_sync_changed() {
+        let m = |v: &[(&str, u64)]| v.iter().map(|(k, e)| (k.to_string(), *e)).collect::<std::collections::HashMap<_, _>>();
+        let (handed, gone) = super::standing_moves(&m(&[("s-a", 1), ("s-b", 1), ("s-c", 1)]), &m(&[("s-a", 1), ("s-b", 2), ("s-d", 1)]));
+        assert_eq!(handed, vec!["s-b".to_string(), "s-d".to_string()]);
+        assert_eq!(gone, vec!["s-c".to_string()]);
+    }
 
     /// A failed renewal keeps the publisher only on a valid certificate of the version on disk.
     #[test]
@@ -3141,6 +3982,7 @@ mod tests {
     fn a_runs_holdings_read_as_one_line() {
         let h = Holdings {
             secrets: vec!["claude-oauth".into(), "gh".into()],
+            digests: Default::default(),
             slice: Some(wicket_proxy::llm::Slice { requests: 75, output_tokens: 100_000, input_tokens: None }),
             updated_ms: 0,
         };
@@ -3245,7 +4087,7 @@ mod tests {
         assert!(fenced_in(&d, 2_000, None).is_none(), "no record of either kind: no box was started");
         std::fs::write(d.join("ctl/run.json"), b"not json").unwrap();
         // An operator releases it (#676): the fence lifts, the record says who.
-        release_fence(&d, "root@cli").unwrap();
+        release_fence(&d, "root@cli", None).unwrap();
         assert!(fenced_in(&d, 2_000, None).is_none(), "released");
         assert_eq!(read_authority(&d).unwrap().released_by.as_deref(), Some("root@cli"));
         std::fs::remove_file(d.join("ctl/authority.json")).unwrap();
@@ -3364,38 +4206,58 @@ mod tests {
 
 /// Why `run`'s files on `node` aren't deleted yet (#377): its work hasn't been collected, and it is
 /// a remote node's (this host's own node keeps a run's files as its run directory). None: they may be.
-pub fn forget_refused(l: &wicket_store::Ledger, node: &str, run: &str) -> Option<String> {
-    if node == crate::localnode::NAME || l.collected(run).is_ok_and(|c| !c.is_empty()) {
+///
+/// Collected means its files came here (fetched or bundled) or a push of them was allowed (#590
+/// review), as the node hold and the simulation's invariant count it: a taken result alone
+/// (`outbox`) leaves a workspace that was to be fetched on the node. Unless `no_files`: a box whose
+/// workspace isn't kept to be fetched (`ctl.keep` off), where the result is all there is.
+pub fn forget_refused(l: &wicket_store::Ledger, node: &str, run: &str, no_files: bool) -> Option<String> {
+    let collected = |l: &wicket_store::Ledger| -> wicket_store::Result<bool> {
+        let how = l.collected(run)?;
+        Ok(l.files_collected(run)? || how.iter().any(|(h, _)| h == "pushed" || (no_files && h == "outbox")))
+    };
+    if node == crate::localnode::NAME || collected(l).unwrap_or(false) {
         return None;
     }
     Some(format!(
-        "run {run}'s work hasn't been collected (no fetch, outbox, push or bundle is recorded): node {node} keeps its workspace; `wicket node forget {run} --force` deletes it"
+        "run {run}'s work hasn't been collected (no fetch, push or bundle is recorded): node {node} keeps its workspace; `wicket node forget {run} --force` deletes it"
     ))
 }
 
-/// `wicket node release-fence <run>` (#676): root releases a run's fence without its node, for a
-/// run its node can't confirm stopped (unreachable or revoked) whose fence wouldn't otherwise end.
-/// Refused to anyone but root, and for a run that isn't fenced. Audited as `run.fence_released`
-/// with who, why and the fence it lifted; its agent can then be woken, and the reconciler ends the
-/// run on its next pass if its node is gone. The box may still be running there: whoever releases
-/// it takes that on.
-pub fn release_fence_command(run: &str, reason: &str, by: &str, root: bool) -> anyhow::Result<()> {
+/// `wicket node release-fence <run>` (#676): releases a run's fence without its node, for a run its
+/// node can't confirm stopped whose fence wouldn't otherwise end. As the console's `release_fence`
+/// (#713): within the operator's `operators.yaml` authority, and only a fence whose node is revoked
+/// or no longer enrolled. With `break_glass` (`Some(whether the caller is root)`), root's release of
+/// any fence; refused to anyone else. Refused for a run that isn't fenced. Audited as
+/// `run.fence_released` with who, why and the fence it lifted; its agent can then be woken, and the
+/// reconciler ends the run on its next pass if its node is gone. The box may still be running
+/// there: whoever releases it takes that on.
+pub fn release_fence_command(run: &str, reason: &str, by: &str, break_glass: Option<bool>) -> anyhow::Result<()> {
     crate::run::check_run_id(run)?;
-    anyhow::ensure!(root, "only root releases a run's fence (its box may still be running on its node)");
+    if break_glass == Some(false) {
+        return Err(wicket_home::exit::refused("only root releases a fence with --break-glass (its box may still be running on its node)"));
+    }
     anyhow::ensure!(!reason.trim().is_empty(), "say why with --reason: it goes on the audit record");
     let l = wicket_store::Ledger::open(&crate::ledger_path())?;
-    let Some((node, until)) = fenced_until(&l, run, wicket_feed::now_ms()) else {
+    let runs = crate::data_dir().join("runs");
+    let now = wicket_feed::now_ms();
+    let Some(f) = crate::fence::fence_of(&l, &runs, run, now)? else {
         anyhow::bail!("run {run} isn't fenced: its node confirmed its box stopped, or its authority has ended");
     };
-    release_fence(&crate::data_dir().join("runs").join(run), by)?;
-    let until_ms = (until != UNKNOWN_END).then_some(until);
-    l.audit(
-        &l.run_tenant(run)?.unwrap_or_else(wicket_core::TenantId::single),
-        Some(&wicket_core::RunId(run.into())),
-        "run.fence_released",
-        &serde_json::json!({ "node": node, "by": by, "why": reason, "fenced_until_ms": until_ms }),
-    )?;
-    say!("released run {run}'s fence on node {node}; its box may still be running there");
+    let r = crate::fence::Release { run, reason, shown: &f.effect_sha256, now_ms: now, extra: serde_json::json!({ "via": "cli" }) };
+    let f = match break_glass {
+        // Root's break-glass (#690): any fence, whatever its node says.
+        Some(_) => {
+            let identity = crate::operators::Operator::cli(&f.tenant).ok().map(|o| o.id);
+            crate::fence::release(&l, &runs, &crate::fence::Decider::Root { label: by.to_string(), identity }, r)?
+        }
+        // The console's decision and record: the operator's authority, a revoked or gone node only.
+        None => {
+            let human = crate::grant::Granter::Human(crate::operators::Operator::cli(&f.tenant)?);
+            crate::fence::release(&l, &runs, &crate::fence::Decider::Operator(&human), r)?
+        }
+    };
+    say!("released run {run}'s fence on node {}; its box may still be running there", f.node);
     Ok(())
 }
 
@@ -3407,7 +4269,7 @@ pub async fn forget_command(run: &str, force: bool, by: &str) -> anyhow::Result<
     let (node, refused) = {
         let l = ledger.lock().expect("ledger");
         let node = l.run_node(run)?.with_context(|| format!("run {run} wasn't placed on a node"))?;
-        let refused = forget_refused(&l, &node, run);
+        let refused = forget_refused(&l, &node, run, false);
         (node, refused)
     };
     match (&refused, force) {
@@ -3442,16 +4304,23 @@ pub async fn forget_command(run: &str, force: bool, by: &str) -> anyhow::Result<
 
 #[cfg(test)]
 mod forget_tests {
-    /// #377: a remote node's files for a run whose work was never collected stay; collected any
-    /// way, or on this host's own node, they may go.
+    /// #377: a remote node's files for a run whose work was never collected stay; fetched,
+    /// bundled or pushed, or on this host's own node, they may go. A taken result alone leaves a
+    /// workspace that was to be fetched (#590 review), but is all a box without one has.
     #[test]
     fn an_uncollected_workspace_is_not_forgotten() {
         let l = wicket_store::Ledger::open_in_memory().unwrap();
-        let why = super::forget_refused(&l, "n1", "run_a").expect("refused");
+        let why = super::forget_refused(&l, "n1", "run_a", false).expect("refused");
         assert!(why.contains("hasn't been collected") && why.contains("--force"), "{why}");
-        assert!(super::forget_refused(&l, crate::localnode::NAME, "run_a").is_none(), "this host's own node keeps them anyway");
+        assert!(super::forget_refused(&l, crate::localnode::NAME, "run_a", false).is_none(), "this host's own node keeps them anyway");
         l.record_collected("run_a", "outbox").unwrap();
-        assert!(super::forget_refused(&l, "n1", "run_a").is_none());
+        assert!(super::forget_refused(&l, "n1", "run_a", false).is_some(), "an outbox alone: the workspace is still to fetch");
+        assert!(super::forget_refused(&l, "n1", "run_a", true).is_none(), "an outbox is all a box without a kept workspace has");
+        for how in ["pushed", "fetched", "bundled"] {
+            let run = format!("run_{how}");
+            l.record_collected(&run, how).unwrap();
+            assert!(super::forget_refused(&l, "n1", &run, false).is_none(), "{how}");
+        }
     }
 
     /// #453: a message the gateway gave on a link that dropped before its node said the box had
