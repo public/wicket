@@ -2,6 +2,8 @@
 
 pub mod approve;
 pub mod audit;
+pub mod authority;
+pub mod capacity;
 pub mod dev;
 pub mod identity;
 pub mod image;

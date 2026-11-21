@@ -14,6 +14,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                     "--json lists the audit records: not with export (`wicket audit export --status` shows the sinks)",
                 ));
             }
+            if let Some(AuditCmd::Explain { seq, json }) = cmd {
+                return super::authority::explain(seq, json);
+            }
             if let Some(AuditCmd::Compact { yes }) = cmd {
                 return compact(yes);
             }
@@ -223,6 +226,14 @@ fn free_bytes(dir: &std::path::Path) -> Result<i64> {
 
 #[derive(Subcommand)]
 pub enum AuditCmd {
+    /// Explain an activity record's decision on a request (by its seq, as `wicket audit` lists it):
+    /// what was recorded when it was decided, and what the run's token as its node's feed holds it
+    /// now decides, with why. The console's "explain" (#173, #713). Changes nothing.
+    Explain {
+        seq: i64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Switch the ledger to giving pruned audit space back (`auto_vacuum = incremental`), with one
     /// VACUUM (#582). Run it as the wicket user with wicketd, the console and the reconciler
     /// stopped: the whole file is rewritten under an exclusive lock (about a minute per 2.5 GB),

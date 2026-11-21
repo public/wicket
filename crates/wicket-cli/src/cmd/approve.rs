@@ -149,6 +149,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         Cmd::Grant { cmd: GrantCmd::Revoke { id } } => {
             let l = Ledger::open(&ledger_path())?;
             let g = l.grant(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no grant {id}")))?;
+            // A capacity grant is revoked as `wicket capacity revoke` and the console revoke one
+            // (#713): checked, and audited as a decision.
+            if l.capacity_grant(&id)?.is_some() {
+                grant::revoke_capacity_grant(&l, &operator(), &TenantId::single(), &id, serde_json::json!({ "via": "cli" }))?;
+                println!("revoked capacity grant {id}: nothing more is approved under it");
+                return Ok(());
+            }
             l.revoke_grant(&id)?;
             l.audit(&TenantId::single(), None, "grant.revoked", &serde_json::json!({ "grant": id, "by": operator(), "node": g.node }))?;
             match &g.node {

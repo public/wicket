@@ -4,6 +4,8 @@ The console (`wicket serve`) shows what's waiting for you, runs, recent decision
 or deny from a browser or phone. Its options are in the [command line reference](cli.md#wicket-serve); [put the console on the
 internet](../how-to/put-the-console-on-the-internet.md) sets it up behind TLS.
 
+Every console action is in the CLI too, unless it's host-only by design: [console and CLI parity](parity.md).
+
 ## Passkeys
 
 It uses **passkeys**:

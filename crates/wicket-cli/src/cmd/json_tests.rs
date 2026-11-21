@@ -429,3 +429,62 @@ fn message_inbox_receipts_and_principals_json() {
     .unwrap();
     assert_eq!(super::message::principals_json(&l, &t, &bob, &issuer.verifying_key()).unwrap(), serde_json::json!([]));
 }
+
+/// #713: `wicket capacity list --json` prints the console's Capacity card, and `--all` adds ended
+/// grants with their state.
+#[test]
+fn capacity_list_json() {
+    let (_d, l) = super::test_ledger("capacity");
+    let t = TenantId::single();
+    let terms = wicket_store::CapacityTerms {
+        plans: vec!["vc2-1c-2gb".into()],
+        regions: vec!["lhr".into()],
+        hourly: 50_000,
+        daily: 1_000_000,
+        nodes: 2,
+    };
+    let live = l.issue_capacity_grant(&t.0, "spiffe://w.test/t/t0/op/unix/alex", &terms, 3600, "op").unwrap();
+    let gone = l.issue_capacity_grant(&t.0, "spiffe://w.test/t/t0/op/unix/alex", &terms, 3600, "op").unwrap();
+    l.revoke_grant(&gone).unwrap();
+    let v = serde_json::Value::from(crate::serve::capacity::view_of(&l, &t.0, false).unwrap());
+    assert_eq!(v.as_array().map(Vec::len), Some(1), "{v:#}");
+    assert_eq!((v[0]["id"].as_str(), v[0]["state"].as_str()), (Some(live.as_str()), Some("live")));
+    assert_eq!((v[0]["terms"]["hourly_usd"].as_str(), v[0]["left"]["nodes"].as_u64()), (Some("$0.0500"), Some(2)), "{v:#}");
+    documented_as("`wicket capacity list --json`", &v);
+    documented_as("a capacity grant's `terms`", &v[0]["terms"]);
+    documented_as("a capacity grant's `used` and `left`", &v[0]["used"]);
+    documented_as("a capacity grant's `used` and `left`", &v[0]["left"]);
+    // The card shows the live one only; the list's --all, both.
+    assert_eq!(crate::serve::capacity::view(&l, &t.0).unwrap().len(), 1);
+    let all = crate::serve::capacity::view_of(&l, &t.0, true).unwrap();
+    assert_eq!(all.iter().map(|g| g["state"].as_str().unwrap()).collect::<Vec<_>>(), vec!["revoked", "live"]);
+    let text = super::capacity::line(&v[0]);
+    assert!(
+        text.contains(&live) && text.contains("2 node(s) at once (left 2)") && text.contains("plans vc2-1c-2gb, regions lhr"),
+        "{text}"
+    );
+}
+
+/// #713: `wicket authority --json` and `wicket audit explain --json` print the console's views of
+/// authority, the same fields whether or not the run's node feed can be read.
+#[test]
+fn authority_and_explain_json() {
+    let (d, l) = super::test_ledger("authority");
+    let t = TenantId::single();
+    let run = RunId::new();
+    l.run_started(&t, &run, "work", "worker").unwrap();
+    let body = serde_json::json!({ "kind": "egress", "method": "GET", "host": "api.example.com", "path": "/v1", "outcome": "allow", "detail": "reach" });
+    let seq = l.audit(&t, Some(&run), "op", &body).unwrap();
+    let ledger = d.join("ledger.db");
+    let views = crate::serve::authority::Views { ledger: &ledger, data: &d, tenant: &t, authz_root: None };
+    let v = crate::serve::authority::run_authority(&views, &run.0).unwrap();
+    assert_eq!((v["run"].as_str(), v["token"]["held"].as_bool(), v["feed"].is_null()), (Some(run.0.as_str()), Some(false), true), "{v:#}");
+    documented_as("`wicket authority --json`", &v);
+    let x = crate::serve::authority::explain(&views, seq).unwrap();
+    assert_eq!((x["recorded"]["outcome"].as_str(), x["against_token_now"]["available"].as_bool()), (Some("allow"), Some(false)), "{x:#}");
+    documented_as("`wicket audit explain --json`", &x);
+    // A record that isn't a decision on a request has nothing to explain.
+    let other = l.audit(&t, None, "grant.revoked", &serde_json::json!({ "grant": "g-1" })).unwrap();
+    assert!(crate::serve::authority::explain(&views, other).is_err());
+    assert!(crate::serve::authority::run_authority(&views, "run_nope").is_err());
+}

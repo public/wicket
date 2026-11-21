@@ -20,8 +20,25 @@ use std::path::PathBuf;
 use wicket_core::{Op, RunId, TenantId};
 use wicket_feed::{BoxAuthority, RevokeKind};
 
+/// What the views read: the ledger, the data directory, the tenant and the authority root. The
+/// console's state has them, and `wicket authority` and `wicket audit explain` (#713) make one on
+/// the host, so both print the same view.
+pub(crate) struct Views<'a> {
+    pub ledger: &'a std::path::Path,
+    pub data: &'a std::path::Path,
+    pub tenant: &'a TenantId,
+    pub authz_root: Option<&'a wicket_authz::PublicKey>,
+}
+
+impl Views<'_> {
+    fn ledger(&self) -> Result<wicket_store::Ledger> {
+        Ok(wicket_store::Ledger::open(self.ledger)?)
+    }
+}
+
 /// The GET endpoints here, for an operator's session. None: not one of them.
 pub(super) fn get(state: &State, path: &str) -> Option<Result<Value>> {
+    let state = &Views { ledger: &state.ledger, data: &state.data, tenant: &state.tenant, authz_root: state.authz_root.as_ref() };
     if path == "/api/policy" {
         return Some(policy(state));
     }
@@ -34,13 +51,13 @@ pub(super) fn get(state: &State, path: &str) -> Option<Result<Value>> {
     None
 }
 
-fn policy_dir(state: &State) -> PathBuf {
+fn policy_dir(state: &Views) -> PathBuf {
     state.data.join("policy")
 }
 
 /// The org policy: the applied version's Cedar and entities, every kept version with when and by
 /// whom it was applied, and the running runs by the version they were minted under.
-fn policy(state: &State) -> Result<Value> {
+fn policy(state: &Views) -> Result<Value> {
     let d = policy_dir(state);
     let installed = crate::policy::installed_in(&d);
     let current = match &installed {
@@ -99,13 +116,13 @@ fn policy(state: &State) -> Result<Value> {
 }
 
 /// A run's node's feed state, read without writing, and its entry for the run.
-fn feed_entry(state: &State, node: &str, run: &str) -> Result<(wicket_feed::State<BoxAuthority>, bool)> {
+fn feed_entry(state: &Views, node: &str, run: &str) -> Result<(wicket_feed::State<BoxAuthority>, bool)> {
     if node.is_empty() || !node.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
         bail!("node {node:?}");
     }
     let root = state.authz_root.context("this installation's authority root isn't readable here")?;
     let dir = state.data.join("nodes").join(node).join("feed");
-    let st = wicket_feed::read_state::<BoxAuthority>(&dir, node, root).with_context(|| format!("node {node}'s feed"))?;
+    let st = wicket_feed::read_state::<BoxAuthority>(&dir, node, *root).with_context(|| format!("node {node}'s feed"))?;
     let has = st.zones.contains_key(run);
     Ok((st, has))
 }
@@ -127,11 +144,11 @@ fn block_kind(i: usize, external: bool) -> &'static str {
     }
 }
 
-fn run_authority(state: &State, run: &str) -> Result<Value> {
+pub(crate) fn run_authority(state: &Views, run: &str) -> Result<Value> {
     crate::run::check_run_id(run)?;
     let l = state.ledger()?;
     // The console's tenant only: another tenant's run is not found, as one that doesn't exist.
-    if l.run_tenant(run)?.as_ref() != Some(&state.tenant) {
+    if l.run_tenant(run)?.as_ref() != Some(state.tenant) {
         bail!("no run {run}");
     }
     let status = l.run_status(run)?.with_context(|| format!("no run {run}"))?;
@@ -152,6 +169,8 @@ fn run_authority(state: &State, run: &str) -> Result<Value> {
             "installed": installed,
             "current": policy.is_some() && policy == installed,
         },
+        // The node's feed, once read (#713: always a field, null when it can't be read).
+        "feed": Value::Null,
         "deadline": auth.as_ref().map(|a| json!({ "until_ms": a.until_ms, "stopped": a.stopped })),
         // What the node holds for the run (#152): secrets by name only, and its budget slice.
         "holdings": holdings.as_ref().map(|h| json!({
@@ -243,7 +262,7 @@ fn recorded_decision(kind: &str, body: &str) -> Option<Value> {
     (d["kind"] == "egress" && d["host"].is_string() && d["method"].is_string() && d["path"].is_string()).then_some(d)
 }
 
-fn explain(state: &State, seq: i64) -> Result<Value> {
+pub(crate) fn explain(state: &Views, seq: i64) -> Result<Value> {
     let l = state.ledger()?;
     let r = l.audit_record_at(seq)?.with_context(|| format!("no activity record {seq}"))?;
     let d = recorded_decision(&r.kind, &r.body).context("this record isn't a decision on a request")?;
