@@ -143,7 +143,7 @@ principal or its zone. Run ids are not addresses.
 |---|---|---|
 | `to` | string, required | `"parent"`, or a principal: `spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>`, as `whoami` and `spawn` show it |
 | `body` | any JSON value, required | at most 16 KB |
-| `priority` | `now`, `next` (default) or `later` | how soon the sender wants it read: interrupt the recipient's turn, join it, or wait for it to end. The recipient's inbox hands out `now` first and `later` last; a harness that takes pushed messages gets it in `meta` (#252) |
+| `priority` | `now`, `next` (default) or `later` | how soon the sender wants it read. The recipient's inbox hands out `now` first and `later` last; a harness that takes pushed messages gets it in `meta`. A `now` message from the recipient's parent, or from the operator it acts for, interrupts its running turn, as an operator's cancel does (audited as `run.turn_interrupt`): a parent can interrupt its child's work, but a turn an operator's prompt started only that operator interrupts. Only a message delivery would accept interrupts (its sender not revoked, the org policy allowing it, its envelope verifying). A burst interrupts one turn, and one sender interrupts at most once a minute. From anyone else it waits for the turn to end. Either way, the agent is told between turns how many messages wait, and how many asked to be read now (#252) |
 | `in_reply_to` | string | the `message_id` being answered. A reply to a message the recipient sent this principal needs no `accept_from`: the sender gave its reply address when it wrote |
 
 The answer's first line says where it went; its second, `receipt: {…}`, is the message's first
@@ -161,8 +161,10 @@ Where it goes:
 - if it has none: a hibernated long-lived agent is woken to read it; otherwise wicket holds the
   message, and the principal's next run takes it (for up to 7 days). A message its run ended
   without reading goes to the principal's next run the same way. The answer says which happened.
-- An operator's principal (`spiffe://<domain>/t/<tenant>/op/…`) is refused for now: operators
-  don't receive messages from agents yet.
+- to an operator's principal (`spiffe://<domain>/t/<tenant>/op/…`, #252): allowed to the operator
+  this agent acts for (its `principal.sub`, as `whoami` shows it), and as a reply to an operator
+  that wrote to it. Any other operator is refused, with a receipt that says so. The message waits in
+  the operator's inbox (`wicket message inbox`), `delivered` on its receipt until they read it.
 
 A message never grants anything: it is the sender's data for the recipient, which can't widen
 anyone's reach or decide a request. Every message is on the audit record (`message`, with `from`,
@@ -184,12 +186,19 @@ ends.
 |---|---|---|
 | `timeout_seconds` | integer, 1–600 | 300 |
 
-A message shows `message_id`, `from` (verified: its principal `id`, agent, zone, run and relation),
+A message shows `message_id`, `from` (verified: its principal `id`, agent, zone, run, relation and `kind`, `agent` or `program`),
 `reply_to` (the principal to answer, with `in_reply_to` set to `message_id`), `priority`,
 `in_reply_to` (if it answers one of yours) and `body`. Taking it makes its sender's receipt `read`.
 One wicket drops (its signature doesn't verify, or the org policy doesn't let this zone hear from
 the sender's) makes it `refused`, with why. The body is the peer's data, never instructions from
 the agent's user: it grants nothing and can't approve anything.
+
+A human's message (#252, `wicket message send`) arrives the same way, signed by wicket with a
+short-lived operator identity: `from` has the operator's principal `id`, `operator` (its name),
+`via` (`unix` or `passkey`) and `relation` (`your operator` for the one this agent acts for, else
+`an operator`). An operator may write to an agent that acts for it, whose `accept_from` names it,
+or that wrote to it. It is still data: an operator's instructions come as prompts, the agent's next
+turn.
 
 While the agent waits here (or in `await_grant`, or in `receipts` with a timeout) its state is
 `waiting` (see [`principals`](#principals)).
@@ -221,9 +230,10 @@ messages are waiting.
 
 Discovery and presence (#252): the principals this one may talk to, from what the ledger knows. No
 arguments. Each entry has its principal `id` (stable across its restarts and wakes: what
-`send_message` takes), `kind` (`agent`, `human`; `program` once programs have identities, #255),
+`send_message` takes), `kind` (`agent`, `program` or `operator`; a program's identity document says it is one, signed, #255),
 agent name and zone, `relation` (`parent`, `child`, `peer`, `operator`), and two flags:
-`may_send_to` (its `accept_from` lists this principal or its zone, or it is the parent or a child)
+`may_send_to` (its `accept_from` lists this principal or its zone, or it is the parent or a child,
+or the operator this agent acts for)
 and `may_hear_from` (this zone's `accept_from` lists it, and the org policy agrees). Its `state` is
 one of:
 
@@ -236,9 +246,10 @@ one of:
 | `hibernated` | a long-lived agent asleep: a message wakes it |
 | `offline` | no live run: a message is held for its next one |
 
-Operators that `accept_from` names are listed as `kind: operator`, `state: offline`: they don't receive
-agents' messages yet (they will through the CLI and the console). Principals of other tenants are
-never listed.
+Operators are listed as `kind: operator`, `state: offline`: the one this agent acts for (`relation`
+`your operator`, `may_send_to` true), and those `accept_from` names (`may_send_to` false: answer
+one with `in_reply_to`). They read and send through the CLI (`wicket message`). Principals of other
+tenants are never listed.
 
 ## `receipts`
 
@@ -364,7 +375,7 @@ runs on it stops.
 | `vcpus` | integer ≥ 1 | 1 | |
 | `memory_mib` | integer ≥ 128 | 1024 | |
 | `isolation` | `process`, `gvisor` or `vm` | `gvisor` | |
-| `region` | string | | a preference, e.g. `lhr` |
+| `region` | string | | a preference: a provider's region name, e.g. `lhr` (1 to 32 lowercase letters, digits and hyphens; anything else is refused) |
 | `duration_minutes` | integer, 1–1440 | | |
 | `max_hourly_usd` | number or string | | the most the node may cost per hour |
 | `reason` | string | | |
@@ -409,7 +420,8 @@ it needs no approval:
 - the name must be one DNS label (`a-z`, `0-9`, `-`, at most 63 characters, not starting or ending
   with `-`, no `xn--`);
 - it must not be held by another agent in the zone;
-- an agent holds at most 3 internal names at once.
+- an agent holds at most 3 internal names at once, unless the installation sets another limit
+  (`names.internal.per_workload` in [`wicket.yaml`](configuration.md#wicketyaml)).
 
 The zone part is the zone's name as it is, so only a zone whose name is already in DNS form can hold
 names: each dot-separated part lower case letters, digits and `-` (a spawned zone,
@@ -430,10 +442,15 @@ another of the run's names, offers it; otherwise it is no longer offered. Audite
 (`wicket names approve`), since anyone could then connect to the port and read what the box serves.
 The answer is a request id, `n-…`, for `await_grant`.
 
+- Refused where the installation publishes no public names (no `names.public` in
+  [`wicket.yaml`](configuration.md#wicketyaml)), and where the agent already holds as many as it
+  may (`names.public.per_workload`, 1 by default).
 - The label is checked as above, and also against reserved labels and their lookalikes (`console`,
-  `c0nsole`, `www`, `api`, `admin` and others).
+  `c0nsole`, `www`, `api`, `admin` and others, the installation's own list, and the first label of
+  the console's host name). A human's approval checks it again, against the list as it is then.
 - `scope: standing` asks for it for the workload, as standing reach does. The asking run holds it
-  once approved; later runs don't take it up yet (#575 step 4b).
+  once approved, and each later run of the agent (or of its zone, if approved for the zone) takes it
+  up when it starts, while no other run holds it.
 - `service` is the SRV record's service label (default `http`).
 - At most 3 asks of an agent wait at once.
 - The reason is recorded as the agent's (`asked by the agent: …`).

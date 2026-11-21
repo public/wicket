@@ -239,6 +239,14 @@ function describe(a) {
       " \u00b7 for " + to + " \u00b7 " + days + (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
   }
   if (a.action === "standing_deny") return "Deny standing reach " + s(a.standing) + ": " + ruleText(a.rule);
+  if (a.action === "release_fence") return "Release run " + s(a.run) + "'s fence on node " + s(a.node) + " (" + s(a.node_status) +
+    (a.node_seen_ms ? ", last reported " + whenMs(a.node_seen_ms) : ", never reported") + "), fenced " +
+    (a.fenced_until_ms ? "until " + whenMs(a.fenced_until_ms) : "until its node confirms the box stopped") +
+    ": its agent can be woken while its box may still be running there \u00b7 " + s(a.why) + " \u00b7 reason: " + s(a.reason) +
+    (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
+  // #711: a link for another device of the operator's, as the same passkey operator.
+  if (a.action === "enrol_link") return "Make a one-time link that enrols another device as " + s(a.name) + " (" + s(a.enrols_as) + ", the same operator and authority)\n" +
+    "It works once, for " + Math.round((a.ttl_secs || 0) / 60) + " minutes, and is shown only now. Open it on the new device.";
   if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
@@ -292,8 +300,8 @@ async function openSheet(body, extra) {
   renderUpdate(document.getElementById("confirm-update"), begin.action.update);
   state.textContent = "";
   delete go.dataset.waiting;
-  const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny"].includes(begin.action.action);
-  go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
+  const deny = begin.action.decision === "deny" || ["revoke", "delete_secret", "standing_deny", "release_fence"].includes(begin.action.action);
+  go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete", release_fence: "release" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
   go.disabled = true; setTimeout(() => { if (sheet === sheetToken) go.disabled = false; }, SETTLE_MS);
@@ -320,7 +328,7 @@ async function openSheet(body, extra) {
     clearInterval(expiryTimer);
     state.textContent = "Waiting for your passkey\u2026";
     announce(state.textContent);
-    try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
+    try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); if (j.link) showEnrolLink(j); }
     catch (e) { toastError(e, null, true); }
     closeConfirm();
   };
@@ -607,8 +615,24 @@ function renderPending(s) {
 }
 // A failure drawing the Inbox is logged (the browser tests fail on it) and doesn't stop the rest of
 // the page from being drawn.
+// What each view module draws: if it didn't load (a failed fetch, an old browser), each of these says
+// so, rather than look empty (no requests waiting, no agents).
+const VIEW_BOXES = { wicketInbox: ["pending"], wicketAgents: ["runs", "start", "agent-head", "agent-log"], wicketActivity: ["audit", "decided"] };
+const UNLOADED = "This can't be shown: part of this page didn't load. Reload the page; if it stays, check the browser's console.";
 function drawn(mod, f, ...args) {
-  try { if (globalThis[mod]) globalThis[mod][f](...args); } catch (e) { console.error(mod + "." + f + " failed:", e); }
+  if (!globalThis[mod]) {
+    for (const id of VIEW_BOXES[mod] || []) {
+      const box = document.getElementById(id);
+      if (box && !(box.textContent || "").startsWith("This can't be shown")) box.replaceChildren(el("div", "blocked", UNLOADED));
+    }
+    return;
+  }
+  // A failure, then or later (showAuthority is async), is logged (the browser tests fail on it) and
+  // doesn't stop the rest of the page from being drawn.
+  try {
+    const r = globalThis[mod][f](...args);
+    if (r && typeof r.catch === "function") r.catch(e => console.error(mod + "." + f + " failed:", e));
+  } catch (e) { console.error(mod + "." + f + " failed:", e); }
 }
 const inbox = (f, s) => drawn("wicketInbox", f, s);
 // The cards moved: taps are ignored for a moment (`settled`), so one can't land on a card that just
@@ -694,6 +718,8 @@ function sentence(op) {
     case "run.start": return logLine(op, "start", "", r + " started: agent " + strip(b.agent) + " in zone " + strip(b.zone));
     // operator.message is from before `wicket say` was removed (#198); prompts are session.prompt.
     case "operator.message": case "session.prompt": return logLine(op, "message", "", "a message of " + plural(b.chars || 0, "character") + " to " + r + by(b) + (b.via ? " in the " + strip(b.via) : ""));
+    case "run.fence_released": return logLine(op, "released", "blocked", r + " released from server " + strip(b.node) + by(b) + ", though its box may still be running there: " + strip(b.why));
+    case "run.fence_release_failed": return logLine(op, "still held", "blocked", r + " is still held: its release from server " + strip(b.node) + " couldn't be made: " + strip(b.error));
     case "identity.revoked": return logLine(op, "stopped", "blocked", r + " stopped" + by(b) + ": " + strip(b.reason));
     case "run.console_start": return logLine(op, "started", "", r + " started from " + strip(b.manifest) + " by " + byName(b.by) + ", signed with a passkey");
     case "run.exit_cause": return logLine(op, "failed", "blocked", r + " failed (exit status " + strip(b.code) + "): " + strip(b.cause));
@@ -754,13 +780,24 @@ function submitRunForm(ev) {
   closeRunForm();
 }
 
+// #711: the enrolment link a signed enrol_link returned, shown in the passkeys card until it expires
+// (it lives only in this page: reloading drops it).
+let enrolLink = null;
+function showEnrolLink(j) { enrolLink = { link: String(j.link), until: Date.now() + (Number(j.expires_in_secs) || 0) * 1000 }; }
 function renderOperator(s) {
   const box = document.getElementById("operator"); box.replaceChildren();
   for (const k of s.passkeys) { const d = el("div", "row"); d.append(el("span", "", "passkey: " + strip(k.name)), el("span", "mono", String(k.id).slice(0, 16) + "…")); box.append(d); }
   const b = el("div", "buttons");
-  const out = el("button", "", "Sign out"); out.onclick = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
-  b.append(out); box.append(b);
-  box.append(codeText("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device.", ["wicket operator enrol-link"]));
+  const out = el("button", "", "Sign out"); out.onclick = async () => { enrolLink = null; try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
+  const add = el("button", "", "Add a device"); add.onclick = () => signed({ action: "enrol_link" });
+  b.append(add, out); box.append(b);
+  if (enrolLink && enrolLink.until > Date.now()) {
+    const d = el("div", "callout");
+    d.append(el("div", "", "Open this on the new device (once, until " + new Date(enrolLink.until).toLocaleTimeString() + "):"),
+      el("code", "block", enrolLink.link), copyButton(enrolLink.link));
+    box.append(d);
+  } else enrolLink = null;
+  box.append(codeText("div", "note", "Adding a device makes a one-time link, signed with your passkey; the new device is you, with your authority. Or on the host: `wicket operator enrol-link`.", ["wicket operator enrol-link"]));
 }
 
 // ---- notifications (Web Push) ----
@@ -797,12 +834,22 @@ async function subId(sub) {
   const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sub.endpoint)));
   return Array.from(h.slice(0, 8), b => b.toString(16).padStart(2, "0")).join("");
 }
+// The service worker's URL as Trusted Types require it (#739): registering one is a script-URL sink,
+// so the URL comes from a policy of wicket's own that makes "/sw.js" and nothing else. Made once
+// (a policy name can be created only once); without Trusted Types, the plain string.
+let swPolicy = null;
+function swUrl() {
+  const tt = typeof window !== "undefined" && window.trustedTypes;
+  if (!tt) return "/sw.js";
+  swPolicy = swPolicy || tt.createPolicy("wicket-sw", { createScriptURL: u => { if (u !== "/sw.js") throw new TypeError("wicket-sw makes only /sw.js"); return u; } });
+  return swPolicy.createScriptURL("/sw.js");
+}
 async function enablePush() {
   // First, while the click still counts as the user's gesture.
   const perm = await Notification.requestPermission();
   if (perm !== "granted") { toast(perm === "denied" ? "Notifications are blocked for this site in the browser's settings." : "Notifications not allowed."); return; }
   try {
-    const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    const reg = await navigator.serviceWorker.register(swUrl(), { scope: "/" });
     await navigator.serviceWorker.ready;
     const info = await pushInfo();
     let sub = await reg.pushManager.getSubscription();
@@ -927,6 +974,9 @@ function openHealth() {
 // Signed out, the server answers /api/me with 401 and tells the page nothing else: the page offers
 // passkey sign-in (and says where enrolment links come from) whatever the server's state.
 async function boot() {
+  // An unused enrolment link enrols a device as the operator who made it, so it never outlives
+  // their session in this tab: whoever signs in next starts without it (#711).
+  enrolLink = null;
   // Signed out is what the server says (401, 403, or who: none); a server that can't answer now (a
   // restart's 502, a network error) is retried, not shown as a sign-in (#574).
   let r;

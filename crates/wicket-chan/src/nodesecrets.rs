@@ -13,6 +13,12 @@
 //!   or the upstream token's own expiry if earlier. The node drops a secret when the last run that
 //!   used it ends or can no longer use it, and when the control host says it changed or was removed
 //!   (it checks every 2 s while connected): the next use fetches it again.
+//! - **Refused, not set yet** (#415). A run's zone is fixed at start, but the vault isn't: an optional
+//!   injection whose secret isn't set yet is refused by the control host, and the node remembers that
+//!   for the run (never a value) for [`REFUSAL_HELD_MS`], so a run's requests don't each ask again.
+//!   The control host says when such a secret becomes available (as a change, [`crate::chan::Msg::SecretRevoke`]),
+//!   and the next use fetches it; a control host that doesn't say is asked again once the refusal is
+//!   that old.
 //! - **Cut off.** A secret already held keeps working; one first needed while the control host is
 //!   unreachable fails clearly, and is audited, until it is back. A restart of `serve` while cut off
 //!   loses the cache: credentialed hosts and model calls stop until the control host is back, while
@@ -70,6 +76,12 @@ pub fn zone_secrets(zone: &wicket_core::ZoneSpec) -> BTreeMap<String, Vec<String
         m.entry(r.secret.clone()).or_default().push(r.host.clone());
     }
     m
+}
+
+/// Whether `zone`, or one of the run's credential swaps, uses vault secret `name` (#415: the control
+/// host tracks a refusal of only such a name).
+pub fn zone_uses(zone: &wicket_core::ZoneSpec, swaps: &[wicket_proxy::CredentialSwap], name: &str) -> bool {
+    zone_secrets(zone).contains_key(name) || swaps.iter().any(|s| matches!(&s.real, wicket_proxy::SwapSource::Vault(n) if n == name))
 }
 
 /// The control host's side: whether run `run` (in `zone`) may have `name` on its node, and if so the
@@ -175,10 +187,70 @@ struct Entry {
     upstream_expiry: Option<i64>,
     /// The runs that fetched it, and until when each may use it (Unix ms).
     users: HashMap<String, i64>,
+    /// Users given it by [`Cache::share`] rather than fetching it (a child the node started), and
+    /// the run each was shared from: a revoke for that run ends theirs too.
+    shared_from: HashMap<String, String>,
+}
+
+impl Entry {
+    /// Ends `run`'s use, and the uses shared from it (and from those, a child's child).
+    fn drop_user(&mut self, run: &str) {
+        let mut gone = vec![run.to_string()];
+        while let Some(r) = gone.pop() {
+            self.users.remove(&r);
+            self.shared_from.remove(&r);
+            gone.extend(self.shared_from.iter().filter(|(_, from)| **from == r).map(|(to, _)| to.clone()));
+        }
+    }
+}
+
+/// Why a node didn't get a secret from its control host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unfetched {
+    /// The control host answered no: the zone doesn't use it, the vault doesn't hold it (yet), or its
+    /// binding doesn't cover the hosts the zone uses it for. Remembered for the run a while (#415).
+    Refused(String),
+    /// It couldn't be asked, or didn't answer: the next use asks again.
+    Unreachable(String),
+}
+
+impl std::fmt::Display for Unfetched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unfetched::Refused(w) | Unfetched::Unreachable(w) => f.write_str(w),
+        }
+    }
 }
 
 /// How a node fetches a secret for a run: over the run's own connection to its control host.
-pub type Fetcher = Arc<dyn Fn(String, String) -> futures_util::future::BoxFuture<'static, Result<Fetched, String>> + Send + Sync>;
+pub type Fetcher = Arc<dyn Fn(String, String) -> futures_util::future::BoxFuture<'static, Result<Fetched, Unfetched>> + Send + Sync>;
+
+/// How long a node takes a control host's refusal of a secret for a run as its answer (#415), unless
+/// the control host says sooner that the secret changed: it does within about 2 s.
+pub const REFUSAL_HELD_MS: i64 = 30_000;
+
+/// How long a node fails a secret's fetch at once after its control host couldn't be asked (#415),
+/// so a box's requests while cut off (or over a dead link not yet noticed) don't each wait for it.
+pub const UNREACHABLE_HELD_MS: i64 = 2_000;
+
+/// How many times a fetch is made again when a revoke overtook its answer (#415).
+const OVERTAKEN_TRIES: usize = 3;
+
+/// Whether `name` is a run's own value rather than a vault secret: a swap's value
+/// ([`crate::chan::swap_value_key`]), whose name has a `.`, which no vault secret's has (#773).
+fn is_run_value(name: &str) -> bool {
+    name.contains('.')
+}
+
+/// Where the cache keeps `name` for `run`: a vault secret under its name, one value shared by every
+/// run that uses it; a run's own value under the run too, so no other run can read or replace it
+/// (#773: two runs' `swap.0` are different credentials).
+fn slot(run: &str, name: &str) -> String {
+    match is_run_value(name) {
+        true => format!("{name}@{run}"),
+        false => name.to_string(),
+    }
+}
 
 /// One fetch in flight for a run and a secret.
 type Inflight = Arc<tokio::sync::Mutex<()>>;
@@ -189,10 +261,77 @@ pub struct Cache {
     clock: wicket_proxy::decide::Clock,
     /// One fetch at a time per run and secret: concurrent first uses share it.
     inflight: Mutex<HashMap<(String, String), Inflight>>,
+    /// Secrets the control host refused a run, or couldn't be asked for (#415), by run and name:
+    /// until when that answer holds, and why. Never a value.
+    refused: Mutex<HashMap<(String, String), (i64, String)>>,
+    /// Revokes so far, by run and name (#415): an answer to a fetch that a revoke overtook is
+    /// stale, and not taken.
+    revokes: Mutex<HashMap<(String, String), u64>>,
+    /// Being handed over to a re-exec'd `serve` (#818): no fetch starts from the snapshot to the
+    /// exec, so the control host records no release the new process wouldn't have.
+    frozen: std::sync::atomic::AtomicBool,
+    /// Fetches under way: the snapshot waits for them, so what they take is in it.
+    fetching: std::sync::atomic::AtomicUsize,
+}
+
+/// How long [`Cache::export`] waits for fetches under way. One asks for 10 s at most, but asks again
+/// when a revoke overtakes its answer ([`OVERTAKEN_TRIES`] times, so up to 30 s); past this wait the
+/// export fails and the update goes on without the cache, whose secrets the new process fetches again.
+const EXPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// The cache handed over to a re-exec'd `serve` ([`Cache::export`]): the sealed memfd, and the
+/// cache frozen until the exec. The memfd stays close-on-exec, so no child this process starts
+/// meanwhile inherits it: the exec passes it on alone, clearing that flag in its last step, and
+/// names it to the new process in its environment ([`HANDOVER_ENV`], set for the exec only, never in
+/// this process's). Held across the exec; dropped only if the exec fails, which closes the memfd and
+/// lets fetches start again.
+pub struct Handover {
+    fd: OwnedFd,
+    cache: Arc<Cache>,
+}
+
+impl Handover {
+    /// The memfd's number, for [`HANDOVER_ENV`].
+    pub fn raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl Drop for Handover {
+    fn drop(&mut self) {
+        self.cache.frozen.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Counts a fetch under way for [`Cache::export`] while it lives.
+struct Fetching<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for Fetching<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Where a self-update's re-exec finds the cache handed over (#162): a sealed memfd's descriptor.
 pub const HANDOVER_ENV: &str = "WICKET_NODE_SECRETS_FD";
+
+/// The descriptor [`HANDOVER_ENV`] named, taken out of the environment by [`take_handover_env`]
+/// (once, and imported once).
+static HANDED: std::sync::OnceLock<std::sync::Mutex<Option<i32>>> = std::sync::OnceLock::new();
+
+fn handover_env() -> std::sync::Mutex<Option<i32>> {
+    std::sync::Mutex::new(std::env::var(HANDOVER_ENV).ok().and_then(|v| v.parse::<i32>().ok()))
+}
+
+/// Takes [`HANDOVER_ENV`] out of this process's environment, keeping what it names for
+/// [`Cache::import_handover`]. Called first thing in `main`, before the runtime starts any thread
+/// (#818): changing the environment while other threads may read it is a race, and no child should
+/// inherit the variable.
+pub fn take_handover_env() {
+    if HANDED.set(handover_env()).is_ok() && std::env::var_os(HANDOVER_ENV).is_some() {
+        std::env::remove_var(HANDOVER_ENV);
+    }
+}
 
 /// The cache's handed-over form (in a memfd, never a file).
 #[derive(Serialize, Deserialize)]
@@ -202,6 +341,8 @@ struct Handed {
     hosts: Vec<String>,
     upstream_expiry: Option<i64>,
     users: HashMap<String, i64>,
+    #[serde(default)]
+    shared_from: HashMap<String, String>,
 }
 
 impl Drop for Handed {
@@ -212,7 +353,15 @@ impl Drop for Handed {
 
 impl Cache {
     pub fn new(clock: wicket_proxy::decide::Clock) -> Arc<Cache> {
-        Arc::new(Cache { entries: Mutex::new(HashMap::new()), clock, inflight: Mutex::new(HashMap::new()) })
+        Arc::new(Cache {
+            entries: Mutex::new(HashMap::new()),
+            clock,
+            inflight: Mutex::new(HashMap::new()),
+            refused: Mutex::new(HashMap::new()),
+            revokes: Mutex::new(HashMap::new()),
+            frozen: std::sync::atomic::AtomicBool::new(false),
+            fetching: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
     /// Keeps this process's memory out of core dumps and `ptrace` attach by other processes of the
@@ -230,11 +379,12 @@ impl Cache {
     /// Takes a secret fetched for `run`.
     pub fn put(&self, run: &str, f: &Fetched) {
         let mut m = self.entries.lock().expect("cache");
-        let e = m.entry(f.name.clone()).or_insert_with(|| Entry {
+        let e = m.entry(slot(run, &f.name)).or_insert_with(|| Entry {
             value: Locked::new(&f.value),
             hosts: vec![],
             upstream_expiry: None,
             users: HashMap::new(),
+            shared_from: HashMap::new(),
         });
         if e.value.0.as_ref() != f.value.as_bytes() {
             e.value = Locked::new(&f.value);
@@ -242,6 +392,8 @@ impl Cache {
         e.hosts = f.hosts.clone();
         e.upstream_expiry = f.upstream_expiry;
         e.users.insert(run.into(), f.not_after);
+        // Fetched for itself now, not shared: a revoke for its parent no longer ends it.
+        e.shared_from.remove(run);
     }
 
     /// A child the node started for `from`'s box (#164) uses the secrets in `names` that `from`
@@ -251,10 +403,13 @@ impl Cache {
     pub fn share(&self, from: &str, to: &str, names: &[String], until: i64) -> Vec<String> {
         let mut m = self.entries.lock().expect("cache");
         let mut shared = vec![];
-        for n in names {
+        // A run's own values (its swaps') are never shared: only vault secrets, which are one value
+        // for every run of the control host.
+        for n in names.iter().filter(|n| !is_run_value(n)) {
             if let Some(e) = m.get_mut(n) {
                 if let Some(u) = e.users.get(from).copied() {
                     e.users.insert(to.into(), u.min(until));
+                    e.shared_from.insert(to.into(), from.into());
                     shared.push(n.clone());
                 }
             }
@@ -262,20 +417,51 @@ impl Cache {
         shared
     }
 
-    /// Run `run` no longer uses `name` (the control host says it changed or was removed): dropped if
-    /// no run uses it any more.
+    /// Run `run` no longer uses `name` (the control host says it changed or was removed), nor do the
+    /// runs it was shared with: dropped if no run uses it any more. A refusal of it is forgotten too
+    /// (it may have been set since, #415), and a fetch in flight for it is stale: the next use asks
+    /// again.
     pub fn revoke(&self, run: &str, name: &str) {
+        self.revoke_as(run, name, true)
+    }
+
+    /// [`Cache::revoke`] resent by a new connection (#415): it may have been sent before, or never,
+    /// and nothing need have changed. The run's own copy goes (it fetches again on its next use), but
+    /// not the uses it shared with children the node started while cut off, which can't fetch until
+    /// the control host takes them over.
+    pub fn revoke_resent(&self, run: &str, name: &str) {
+        self.revoke_as(run, name, false)
+    }
+
+    fn revoke_as(&self, run: &str, name: &str, cascade: bool) {
+        let key = (run.to_string(), name.to_string());
+        // Counted only for a secret this run has fetched (its fetch may be under way): a revoke for a
+        // run that has ended, or never fetched it, leaves nothing behind.
+        if self.inflight.lock().expect("inflight").contains_key(&key) {
+            *self.revokes.lock().expect("revokes").entry(key.clone()).or_default() += 1;
+        }
+        self.refused.lock().expect("refused").remove(&key);
         let mut m = self.entries.lock().expect("cache");
-        if let Some(e) = m.get_mut(name) {
-            e.users.remove(run);
+        let at = slot(run, name);
+        if let Some(e) = m.get_mut(&at) {
+            match cascade {
+                true => e.drop_user(run),
+                false => {
+                    e.users.remove(run);
+                    e.shared_from.remove(run);
+                }
+            }
             if e.users.is_empty() {
-                m.remove(name);
+                m.remove(&at);
             }
         }
     }
 
     /// A run has ended: every secret only it used is dropped.
     pub fn release(&self, run: &str) {
+        self.refused.lock().expect("refused").retain(|(r, _), _| r != run);
+        self.revokes.lock().expect("revokes").retain(|(r, _), _| r != run);
+        self.inflight.lock().expect("inflight").retain(|(r, _), _| r != run);
         let mut m = self.entries.lock().expect("cache");
         m.retain(|_, e| {
             e.users.remove(run);
@@ -308,9 +494,32 @@ impl Cache {
     }
 
     /// Hands the cache over to a re-exec'd `serve` (#162): a memfd holding it, sealed against any
-    /// change, its close-on-exec flag cleared, so only the exec'd process inherits it. The caller
-    /// passes its number in [`HANDOVER_ENV`].
-    pub fn export(&self) -> Result<OwnedFd> {
+    /// change, and close-on-exec: the caller's exec clears that flag as its last step, so only the
+    /// exec'd process inherits it, and names it in [`HANDOVER_ENV`] for that process alone. The
+    /// caller holds the [`Handover`] across the exec.
+    ///
+    /// Frozen first (#818): no fetch starts from here to the exec, and the snapshot waits for those
+    /// under way, so every release the control host records is in it. A revoke that comes after the
+    /// snapshot dies with this process; the control host marks the secret revoked and sends it again
+    /// on the new process's connection. Blocks: call it off the runtime.
+    pub fn export(self: &Arc<Self>) -> Result<Handover> {
+        use std::sync::atomic::Ordering;
+        self.frozen.store(true, Ordering::SeqCst);
+        let unfreeze = |e: anyhow::Error| {
+            self.frozen.store(false, Ordering::SeqCst);
+            e
+        };
+        let deadline = std::time::Instant::now() + EXPORT_WAIT;
+        while self.fetching.load(Ordering::SeqCst) > 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(unfreeze(anyhow::anyhow!("a fetch didn't finish in {} s", EXPORT_WAIT.as_secs())));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        self.snapshot().map(|fd| Handover { fd, cache: self.clone() }).map_err(unfreeze)
+    }
+
+    fn snapshot(&self) -> Result<OwnedFd> {
         let handed: Vec<Handed> = self
             .entries
             .lock()
@@ -323,6 +532,7 @@ impl Cache {
                     hosts: e.hosts.clone(),
                     upstream_expiry: e.upstream_expiry,
                     users: e.users.clone(),
+                    shared_from: e.shared_from.clone(),
                 })
             })
             .collect::<Result<_>>()?;
@@ -346,17 +556,13 @@ impl Cache {
         if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
             bail!("sealing the memfd: {}", std::io::Error::last_os_error());
         }
-        // Inherited across the exec only: the caller execs right after this.
-        // SAFETY: fcntl on our own fd.
-        unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, 0) };
         Ok(owned)
     }
 
     /// Takes the cache handed over by the process that exec'd this one, if any: [`HANDOVER_ENV`]
     /// names a sealed memfd, which is read, then closed. Anything else there is refused.
     pub fn import_handover(&self) -> Result<usize> {
-        let Some(n) = std::env::var(HANDOVER_ENV).ok().and_then(|v| v.parse::<i32>().ok()) else { return Ok(0) };
-        std::env::remove_var(HANDOVER_ENV);
+        let Some(n) = HANDED.get_or_init(handover_env).lock().expect("handed").take() else { return Ok(0) };
         // SAFETY: the descriptor the previous process left open for this one; owned from here.
         let owned = unsafe { OwnedFd::from_raw_fd(n) };
         self.import(owned)
@@ -381,7 +587,13 @@ impl Cache {
         for h in handed {
             m.insert(
                 h.name.clone(),
-                Entry { value: Locked::new(&h.value), hosts: h.hosts.clone(), upstream_expiry: h.upstream_expiry, users: h.users.clone() },
+                Entry {
+                    value: Locked::new(&h.value),
+                    hosts: h.hosts.clone(),
+                    upstream_expiry: h.upstream_expiry,
+                    users: h.users.clone(),
+                    shared_from: h.shared_from.clone(),
+                },
             );
         }
         Ok(n)
@@ -397,7 +609,7 @@ struct RunSecrets {
 impl wicket_proxy::vault::SecretSource for RunSecrets {
     fn get(&self, name: &str) -> Result<String> {
         let m = self.cache.entries.lock().expect("cache");
-        match m.get(name) {
+        match m.get(&slot(&self.run, name)) {
             Some(e) if self.cache.usable(e, &self.run) => e.value.text(),
             _ => bail!("secret {name:?} is not cached on this node for this run"),
         }
@@ -405,12 +617,12 @@ impl wicket_proxy::vault::SecretSource for RunSecrets {
 
     fn hosts(&self, name: &str) -> Vec<String> {
         let m = self.cache.entries.lock().expect("cache");
-        m.get(name).filter(|e| self.cache.usable(e, &self.run)).map(|e| e.hosts.clone()).unwrap_or_default()
+        m.get(&slot(&self.run, name)).filter(|e| self.cache.usable(e, &self.run)).map(|e| e.hosts.clone()).unwrap_or_default()
     }
 
     fn has(&self, name: &str) -> bool {
         let m = self.cache.entries.lock().expect("cache");
-        m.get(name).is_some_and(|e| self.cache.usable(e, &self.run))
+        m.get(&slot(&self.run, name)).is_some_and(|e| self.cache.usable(e, &self.run))
     }
 
     fn fetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
@@ -436,14 +648,47 @@ impl RunSecrets {
         if !again && wicket_proxy::vault::SecretSource::has(self, name) {
             return Ok(());
         }
-        match (self.fetch)(self.run.clone(), name.to_string()).await {
-            Ok(f) if f.name == name => {
-                self.cache.put(&self.run, &f);
-                Ok(())
+        let key = (self.run.clone(), name.to_string());
+        if !again {
+            // Refused, or unreachable, a moment ago (#415): the same answer, without asking again on
+            // every request.
+            let now = (self.cache.clock)();
+            if let Some((_, why)) = self.cache.refused.lock().expect("refused").get(&key).filter(|(until, _)| now < *until) {
+                bail!("{why}");
             }
-            Ok(_) => bail!("the control host sent another secret"),
-            Err(e) => bail!("{e}"),
         }
+        // Counted, then checked, so a handover either waits for this fetch or this fetch sees it (#818).
+        self.cache.fetching.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _counted = Fetching(&self.cache.fetching);
+        if self.cache.frozen.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("secret {name:?} can't be fetched while the node hands its cache to its new process");
+        }
+        for _ in 0..OVERTAKEN_TRIES {
+            let revokes = self.cache.revokes.lock().expect("revokes").get(&key).copied().unwrap_or(0);
+            let answer = (self.fetch)(self.run.clone(), name.to_string()).await;
+            // A revoke that came while this was asked makes its answer stale (#415): ask again.
+            if self.cache.revokes.lock().expect("revokes").get(&key).copied().unwrap_or(0) != revokes {
+                continue;
+            }
+            let now = (self.cache.clock)();
+            return match answer {
+                Ok(f) if f.name == name => {
+                    self.cache.refused.lock().expect("refused").remove(&key);
+                    self.cache.put(&self.run, &f);
+                    Ok(())
+                }
+                Ok(_) => bail!("the control host sent another secret"),
+                Err(e) => {
+                    let held = match &e {
+                        Unfetched::Refused(_) => REFUSAL_HELD_MS,
+                        Unfetched::Unreachable(_) => UNREACHABLE_HELD_MS,
+                    };
+                    self.cache.refused.lock().expect("refused").insert(key, (now + held, e.to_string()));
+                    bail!("{e}")
+                }
+            };
+        }
+        bail!("secret {name:?} kept changing on the control host while it was fetched")
     }
 }
 
@@ -654,9 +899,9 @@ mod tests {
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 if up.load(Ordering::SeqCst) == 0 {
-                    return Err("credential not cached on this node; control host unreachable".into());
+                    return Err(Unfetched::Unreachable("credential not cached on this node; control host unreachable".into()));
                 }
-                release(&z, &v, &name, 60_000)
+                release(&z, &v, &name, 60_000).map_err(Unfetched::Refused)
             })
         })
     }
@@ -670,7 +915,11 @@ mod tests {
         let za = zone("name: za\ninject: [{ host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: gh }]\n");
         let zb = zone("name: zb\ninject: [{ host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: other }]\n");
         let (up, calls) = (Arc::new(AtomicI64::new(1)), Arc::new(AtomicU64::new(0)));
-        let cache = Cache::new(Arc::new(|| 1_000));
+        let now = Arc::new(AtomicI64::new(1_000));
+        let cache = Cache::new({
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        });
         let a = Vault::from_source(cache.source(RA, fetcher(v.clone(), za.clone(), up.clone(), calls.clone())));
         let b = Vault::from_source(cache.source(RB, fetcher(v.clone(), zb.clone(), up.clone(), calls.clone())));
         assert!(cache.names().is_empty(), "nothing prefetched");
@@ -688,7 +937,11 @@ mod tests {
         assert_eq!(a.get("gh").unwrap(), VALUE);
         let e = b.ensure("other").await.unwrap_err().to_string();
         assert!(e.contains("not cached on this node") && e.contains("unreachable"), "{e}");
+        // Each use while cut off fails at once for a moment, rather than wait on the control host.
+        assert!(b.ensure("other").await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "not asked again at once");
         up.store(1, Ordering::SeqCst);
+        now.fetch_add(UNREACHABLE_HELD_MS, Ordering::SeqCst);
         b.ensure("other").await.unwrap();
         assert_eq!(cache.names(), ["gh", "other"]);
         // A run ends: what only it used goes.
@@ -725,6 +978,163 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
+    /// #415: a secret set, rotated or removed after a run started reaches the run's node without a
+    /// restart. Unset, the control host's refusal is held for the run (not asked per request) until
+    /// the control host says it changed; then the next use takes the new state: set, rotated, gone.
+    #[tokio::test]
+    async fn a_secret_set_rotated_or_removed_after_start_follows_the_vault() {
+        let d = tmp("follow");
+        let v = Vault::new(d.join("vault"));
+        let z = zone(
+            "name: za\ninject: [{ host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: gh, optional: true }]\n",
+        );
+        let now = Arc::new(AtomicI64::new(1_000));
+        let clock: wicket_proxy::decide::Clock = {
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let (up, calls) = (Arc::new(AtomicI64::new(1)), Arc::new(AtomicU64::new(0)));
+        let cache = Cache::new(clock);
+        let a = Vault::from_source(cache.source(RA, fetcher(v.clone(), z, up, calls.clone())));
+        // Not set: refused once, and that answer held for the run's next uses.
+        for _ in 0..5 {
+            assert!(a.ensure("gh").await.is_err());
+            assert!(!a.has("gh"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a refusal isn't asked again per request");
+        // Set: the control host says so (as a change), and the next use carries it.
+        v.set("gh", VALUE).unwrap();
+        v.set_hosts("gh", &["api.github.com".into()]).unwrap();
+        cache.revoke(RA, "gh");
+        a.ensure("gh").await.unwrap();
+        assert_eq!(a.get_for("gh", "api.github.com").unwrap(), VALUE);
+        // Rotated: dropped on the control host's word, and the new value fetched.
+        v.set("gh", "ghp_wicket-test-rotated").unwrap();
+        cache.revoke(RA, "gh");
+        assert!(!a.has("gh"));
+        a.ensure("gh").await.unwrap();
+        assert_eq!(a.get_for("gh", "api.github.com").unwrap(), "ghp_wicket-test-rotated");
+        // Removed: gone at once, and refused from then on.
+        v.remove("gh").unwrap();
+        cache.revoke(RA, "gh");
+        assert!(!a.has("gh") && a.get("gh").is_err());
+        assert!(a.ensure("gh").await.is_err());
+        assert!(cache.names().is_empty());
+        // A control host that never says: the refusal is asked about again once it is old.
+        let asked = calls.load(Ordering::SeqCst);
+        v.set("gh", VALUE).unwrap();
+        v.set_hosts("gh", &["api.github.com".into()]).unwrap();
+        assert!(a.ensure("gh").await.is_err(), "held");
+        now.fetch_add(REFUSAL_HELD_MS, Ordering::SeqCst);
+        a.ensure("gh").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), asked + 1);
+        // A run's refusals end with it.
+        v.remove("gh").unwrap();
+        cache.revoke(RA, "gh");
+        assert!(a.ensure("gh").await.is_err());
+        cache.release(RA);
+        assert!(cache.refused.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// #415: a revoke for a run ends the uses shared from it with a child the node started (and that
+    /// child's), not only the run's own; a child that fetched it for itself keeps it.
+    #[test]
+    fn a_revoke_ends_the_uses_shared_from_the_run() {
+        let cache = Cache::new(Arc::new(|| 1_000));
+        let f = Fetched { name: "gh".into(), value: VALUE.into(), hosts: vec!["h".into()], not_after: 5_000, upstream_expiry: None };
+        cache.put(RA, &f);
+        assert_eq!(cache.share(RA, RB, &["gh".into()], 5_000), ["gh"]);
+        assert_eq!(cache.share(RB, "run_cccccccccccccccccccccccccc", &["gh".into()], 5_000), ["gh"]);
+        cache.revoke(RA, "gh");
+        assert!(cache.names().is_empty(), "the child's and grandchild's shared uses went with it");
+        cache.put(RA, &f);
+        cache.share(RA, RB, &["gh".into()], 5_000);
+        cache.put(RB, &f);
+        cache.revoke(RA, "gh");
+        assert_eq!(cache.names(), ["gh"], "fetched for itself, the child keeps it");
+        cache.revoke(RB, "gh");
+        assert!(cache.names().is_empty());
+    }
+
+    /// #415: a revoke a new connection resends (nothing need have changed) drops the run's own copy
+    /// only: a child the node started while cut off keeps its shared use, since it can't fetch until
+    /// the control host takes it over. A revoke for a change ends it.
+    #[test]
+    fn a_resent_revoke_leaves_the_uses_shared_with_children() {
+        let cache = Cache::new(Arc::new(|| 1_000));
+        let f = Fetched { name: "gh".into(), value: VALUE.into(), hosts: vec!["h".into()], not_after: 5_000, upstream_expiry: None };
+        cache.put(RA, &f);
+        cache.share(RA, RB, &["gh".into()], 5_000);
+        let fail: Fetcher = Arc::new(|_, _| Box::pin(async { Err(Unfetched::Unreachable("unreachable".into())) }));
+        let (a, b) = (Vault::from_source(cache.source(RA, fail.clone())), Vault::from_source(cache.source(RB, fail)));
+        cache.revoke_resent(RA, "gh");
+        assert!(!a.has("gh"), "the run fetches its own again");
+        assert_eq!(b.get("gh").unwrap(), VALUE, "the child keeps its shared use");
+        // The parent fetches again; a real change then ends the child's use too.
+        cache.put(RA, &f);
+        cache.share(RA, RB, &["gh".into()], 5_000);
+        cache.revoke(RA, "gh");
+        assert!(!b.has("gh") && cache.names().is_empty());
+    }
+
+    /// #415: a revoke that arrives while a fetch is answered makes that answer stale: it isn't
+    /// taken, and the secret is asked for again.
+    #[tokio::test]
+    async fn an_answer_a_revoke_overtook_is_not_taken() {
+        let cache = Cache::new(Arc::new(|| 1_000));
+        let calls = Arc::new(AtomicU64::new(0));
+        let fetch: Fetcher = {
+            let (cache, calls) = (cache.clone(), calls.clone());
+            Arc::new(move |run, name| {
+                let (cache, calls) = (cache.clone(), calls.clone());
+                Box::pin(async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    // The first answer is overtaken by a revoke (the value changed meanwhile).
+                    if n == 0 {
+                        cache.revoke(&run, &name);
+                    }
+                    Ok(Fetched { name, value: format!("v{n}"), hosts: vec!["h".into()], not_after: 5_000, upstream_expiry: None })
+                })
+            })
+        };
+        let a = Vault::from_source(cache.source(RA, fetch));
+        a.ensure("gh").await.unwrap();
+        assert_eq!((a.get("gh").unwrap().as_str(), calls.load(Ordering::SeqCst)), ("v1", 2), "the stale answer was dropped");
+    }
+
+    /// #773: two runs' swap values share a key (`swap.0`) but are different credentials: each run
+    /// reads only its own, a second run's fetch replaces nothing of the first's, a revoke of one
+    /// leaves the other, and a child is never given its parent's.
+    #[tokio::test]
+    async fn a_runs_swap_value_is_its_own() {
+        let cache = Cache::new(Arc::new(|| 1_000));
+        let value = |v: &str| Fetched {
+            name: "swap.0".into(),
+            value: v.into(),
+            hosts: vec!["m.example".into()],
+            not_after: 5_000,
+            upstream_expiry: None,
+        };
+        cache.put(RA, &value("session-a"));
+        cache.put(RB, &value("session-b"));
+        let fail: Fetcher = Arc::new(|_, _| Box::pin(async { Err(Unfetched::Unreachable("unreachable".into())) }));
+        let a = Vault::from_source(cache.source(RA, fail.clone()));
+        let b = Vault::from_source(cache.source(RB, fail.clone()));
+        assert_eq!(a.get_for("swap.0", "m.example").unwrap(), "session-a");
+        assert_eq!(b.get_for("swap.0", "m.example").unwrap(), "session-b");
+        // A third run with no value of its own reads none.
+        let c = Vault::from_source(cache.source("run_cccccccccccccccccccccccccc", fail));
+        assert!(!c.has("swap.0") && c.get("swap.0").is_err());
+        assert!(cache.share(RA, "run_cccccccccccccccccccccccccc", &["swap.0".into()], 5_000).is_empty(), "never shared");
+        assert!(!c.has("swap.0"));
+        cache.revoke(RB, "swap.0");
+        assert!(!b.has("swap.0"));
+        assert_eq!(a.get("swap.0").unwrap(), "session-a");
+        cache.release(RA);
+        assert!(cache.names().is_empty());
+    }
+
     fn grep_tree(d: &Path, needle: &str) -> bool {
         let Ok(rd) = std::fs::read_dir(d) else { return false };
         rd.flatten().any(|e| {
@@ -750,7 +1160,7 @@ mod tests {
         let mut g = f.clone();
         g.not_after = 20_000;
         cache.put(RB, &g);
-        let fail: Fetcher = Arc::new(|_, _| Box::pin(async { Err("unreachable".to_string()) }));
+        let fail: Fetcher = Arc::new(|_, _| Box::pin(async { Err(Unfetched::Unreachable("unreachable".into())) }));
         let a = Vault::from_source(cache.source(RA, fail.clone()));
         let b = Vault::from_source(cache.source(RB, fail));
         assert!(a.has("m") && b.has("m"));
@@ -767,21 +1177,86 @@ mod tests {
     fn the_cache_hands_over_through_a_sealed_memfd() {
         let cache = Cache::new(Arc::new(|| 1_000));
         cache.put(RA, &Fetched { name: "m".into(), value: VALUE.into(), hosts: vec!["h".into()], not_after: 5_000, upstream_expiry: None });
-        let fd = cache.export().unwrap();
+        let handover = cache.export().unwrap();
+        let fd = handover.fd.try_clone().unwrap();
         let link = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
         assert!(link.to_string_lossy().starts_with("/memfd:wicket-node-secrets"), "{}", link.display());
         // Sealed: it can't be written to or grown.
         let mut f = std::fs::File::from(fd.try_clone().unwrap());
         assert!(std::io::Write::write_all(&mut f, b"x").is_err());
         // SAFETY: fcntl on our own fd.
-        assert_eq!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC, 0, "inherited by the exec");
+        assert_ne!(
+            unsafe { libc::fcntl(handover.raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "no child inherits it: only the exec passes it on"
+        );
         let next = Cache::new(Arc::new(|| 1_000));
         assert_eq!(next.import(fd).unwrap(), 1);
-        let v = Vault::from_source(next.source(RA, Arc::new(|_, _| Box::pin(async { Err("no".to_string()) }))));
+        let v = Vault::from_source(next.source(RA, Arc::new(|_, _| Box::pin(async { Err(Unfetched::Unreachable("no".into())) }))));
         assert_eq!(v.get_for("m", "h").unwrap(), VALUE);
         // Anything but a sealed memfd is refused.
         let plain = std::fs::File::open("/dev/null").unwrap();
         assert!(Cache::new(Arc::new(|| 0)).import(OwnedFd::from(plain)).is_err());
+    }
+
+    /// #818: from the handover's snapshot to the exec, no fetch starts (the control host would record
+    /// a release the new process doesn't have, and never revoke the value it does); a fetch under way
+    /// is waited for, so what it takes is in the snapshot. If the exec fails, dropping the handover
+    /// closes the memfd and lets fetches go again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_freezes_the_cache_until_the_exec() {
+        let cache = Cache::new(Arc::new(|| 1_000));
+        let (asked, answer) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let fetch: Fetcher = {
+            let (asked, answer) = (asked.clone(), answer.clone());
+            Arc::new(move |_, name| {
+                let (asked, answer) = (asked.clone(), answer.clone());
+                Box::pin(async move {
+                    asked.notify_one();
+                    answer.notified().await;
+                    Ok(Fetched { name, value: "v-new".into(), hosts: vec!["h".into()], not_after: 5_000, upstream_expiry: None })
+                })
+            })
+        };
+        let a = Vault::from_source(cache.source(RA, fetch));
+        // A fetch under way when the handover starts: the snapshot waits for it, and holds it.
+        let under_way = tokio::spawn({
+            let a = a.clone();
+            async move { a.ensure("gh").await }
+        });
+        asked.notified().await;
+        let exporting = tokio::task::spawn_blocking({
+            let cache = cache.clone();
+            move || cache.export()
+        });
+        while !cache.frozen.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert!(!exporting.is_finished(), "waits for the fetch under way");
+        // Frozen meanwhile: a fetch of another secret doesn't start.
+        let e = a.ensure("other").await.unwrap_err().to_string();
+        assert!(e.contains("hands its cache to its new process"), "{e}");
+        answer.notify_one();
+        under_way.await.unwrap().unwrap();
+        let handover = exporting.await.unwrap().unwrap();
+        let next = Cache::new(Arc::new(|| 1_000));
+        assert_eq!(next.import(handover.fd.try_clone().unwrap()).unwrap(), 1, "the fetch under way is in the snapshot");
+        assert!(a.ensure("third").await.is_err(), "still frozen until the exec");
+        // The exec failed: the handover is dropped, and its memfd closed (that number, if open
+        // again, is another file).
+        let n = handover.raw_fd();
+        let ino = |fd: i32| std::fs::metadata(format!("/proc/self/fd/{fd}")).ok().map(|m| std::os::unix::fs::MetadataExt::ino(&m));
+        let was = ino(n);
+        assert!(was.is_some());
+        drop(handover);
+        assert_ne!(ino(n), was, "closed");
+        let again = tokio::spawn({
+            let a = a.clone();
+            async move { a.ensure("third").await }
+        });
+        asked.notified().await;
+        answer.notify_one();
+        again.await.unwrap().unwrap();
     }
 
     #[test]

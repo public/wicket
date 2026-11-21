@@ -13,6 +13,7 @@ pub mod gateway;
 pub mod h3;
 pub mod link;
 pub mod llm;
+pub mod opmsg;
 pub mod provider;
 pub mod secret_helper;
 pub mod sockpath;
@@ -75,6 +76,9 @@ pub struct RunCtx {
     /// Where the agent's own lifetime requests go (`finish`, `hibernate`, #249): to its supervisor,
     /// which acts at the end of the agent's turn. None for programs.
     pub lifecycle: Option<Lifecycle>,
+    /// The installation's `names:` settings (`wicket.yaml`, #575), read when the run started. None:
+    /// every default, and no public names.
+    pub names: Option<Arc<wicket_names::NamesConfig>>,
 }
 
 /// An activation's fencing token: the agent's generation when it was woken.
@@ -99,6 +103,20 @@ pub enum Want {
 
 /// Sends the agent's lifetime requests to its supervisor.
 pub type Lifecycle = tokio::sync::mpsc::UnboundedSender<Want>;
+
+/// Whether `region` is a region's name as providers write them (`ewr`, `us-east-1`): 1 to 32
+/// lowercase letters, digits and hyphens, starting with a letter or digit. The agent chooses it,
+/// and it is written into a capacity request's terms (#731): no other text may pass for them.
+pub fn check_region(region: &str) -> Result<(), String> {
+    let ok = (1..=32).contains(&region.len())
+        && region.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && region.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("region must be a provider's region name: 1 to 32 lowercase letters, digits and hyphens (e.g. ewr), not {region:?}"))
+    }
+}
 
 /// What an agent asks for with `request_capacity` (#7): a node for a while, at most this price.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -396,7 +414,7 @@ impl RunCtx {
             Recipient::Principal(id) => match wicket_identity::Principal::parse(id) {
                 Some(wicket_identity::Principal::Agent { .. }) => (id.to_string(), None),
                 Some(wicket_identity::Principal::Operator { .. }) => {
-                    return Err(format!("{id} is an operator: operators don't receive messages from agents yet (#250); write to your result instead").into())
+                    return opmsg::agent_to_operator(self, &me, &mut l, id, kind, body, opts, size, now);
                 }
                 None => {
                     return Err(format!(
@@ -410,26 +428,7 @@ impl RunCtx {
             Some(r) if r.tenant == self.tenant.0 => r,
             _ => return Err(format!("no agent {principal}: none has run as it in this tenant").into()),
         };
-        // The run it is for: the preferred one while it runs, else the principal's live run. A
-        // long-lived agent (#70) with none is woken to read it if it is hibernated; any other
-        // principal's message is held for its next run.
-        let running = |l: &wicket_store::Ledger, r: &str| l.run_status(r).ok().flatten().as_deref() == Some("running");
-        let mut to_run = match prefer.clone().filter(|p| running(&l, p)) {
-            Some(p) => Some(p),
-            None => l.live_run_of(&self.tenant.0, &principal).map_err(|e| e.to_string())?,
-        };
-        let mut wake: Option<String> = None;
-        if to_run.is_none() {
-            let agent = match l.agent_of_run(&rec.run).map_err(|e| e.to_string())? {
-                Some((id, _)) => l.agent(&id).map_err(|e| e.to_string())?,
-                None => None,
-            };
-            match agent {
-                Some(a) if a.restorable && a.state == "hibernated" && self.waker.is_some() => wake = Some(a.id),
-                Some(a) if a.restorable && wicket_store::AGENT_HELD.contains(&a.state.as_str()) => to_run = Some(a.run),
-                _ => {}
-            }
-        }
+        let (to_run, wake) = route(&l, &self.tenant.0, &principal, &rec, prefer.clone(), self.waker.is_some())?;
         // A reply (#252): to a message this principal sent us, which gave its reply address.
         let replies = match opts.in_reply_to {
             None => false,
@@ -480,8 +479,12 @@ impl RunCtx {
             "reply_to": me.claims.sub, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
         });
         let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
-        let meta =
-            wicket_store::MessageMeta { from_principal: Some(&me.claims.sub), priority: opts.priority, in_reply_to: opts.in_reply_to };
+        let meta = wicket_store::MessageMeta {
+            from_principal: Some(&me.claims.sub),
+            priority: opts.priority,
+            in_reply_to: opts.in_reply_to,
+            operator: false,
+        };
         // A wake's claim moves the message to the new run, as the new run's identity does a held one.
         let routed =
             l.post_message(&id, &self.tenant, &self.run.0, &principal, to_run.as_deref(), &env, &meta).map_err(|e| e.to_string())?;
@@ -552,6 +555,38 @@ impl RunCtx {
         let _ = self.events.send(ev);
         Ok(())
     }
+}
+
+/// The run a message to agent `principal` (whose latest identity is `rec`) is for: `prefer` while
+/// it runs, else the principal's live run. A long-lived agent (#70) with none is woken to read it
+/// if it is hibernated and `can_wake` (the second value: the agent to wake); any other principal's
+/// message is held for its next run (None).
+pub(crate) fn route(
+    l: &wicket_store::Ledger,
+    tenant: &str,
+    principal: &str,
+    rec: &wicket_store::IdentityRow,
+    prefer: Option<String>,
+    can_wake: bool,
+) -> std::result::Result<(Option<String>, Option<String>), String> {
+    let running = |r: &str| l.run_status(r).ok().flatten().as_deref() == Some("running");
+    let mut to_run = match prefer.filter(|p| running(p)) {
+        Some(p) => Some(p),
+        None => l.live_run_of(tenant, principal).map_err(|e| e.to_string())?,
+    };
+    let mut wake: Option<String> = None;
+    if to_run.is_none() {
+        let agent = match l.agent_of_run(&rec.run).map_err(|e| e.to_string())? {
+            Some((id, _)) => l.agent(&id).map_err(|e| e.to_string())?,
+            None => None,
+        };
+        match agent {
+            Some(a) if a.restorable && a.state == "hibernated" && can_wake => wake = Some(a.id),
+            Some(a) if a.restorable && wicket_store::AGENT_HELD.contains(&a.state.as_str()) => to_run = Some(a.run),
+            _ => {}
+        }
+    }
+    Ok((to_run, wake))
 }
 
 /// Whether an event's audit record must be committed before the request it describes goes ahead:
@@ -737,6 +772,7 @@ mod fence_tests {
             fence: Some(Fence { agent, generation: 1 }),
             waker: None,
             lifecycle: None,
+            names: None,
         }
     }
 

@@ -12,6 +12,7 @@ pub mod effect;
 pub mod escalation;
 pub mod git;
 pub mod image;
+pub mod intake;
 pub mod link;
 pub mod manifest;
 pub mod message;

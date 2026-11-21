@@ -18,7 +18,9 @@ wicket-identity.workspace = true
 wicket-feed.workspace = true
 wicket-authz.workspace = true
 serde.workspace = true
+wicket-names.workspace = true
 serde_json.workspace = true
+socket2.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 hex.workspace = true
@@ -37,6 +39,7 @@ bytes.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
+wicket-sandbox = { workspace = true, features = ["testkit"] }
 wicket-chan = { workspace = true, features = ["testkit"] }
 wicket-home = { workspace = true, features = ["testkit"] }
 getrandom = { workspace = true, features = ["sys_rng"] }

@@ -28,7 +28,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "stale", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-update", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "fenced", "capacity", "capacity-form", "standing-asks", "standing-rules", "standing-pointer", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 const EPOCH = 1700000000000;
@@ -126,6 +126,11 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // The cards themselves are drawn by inbox.js with lit-html (#574), which needs a real DOM: that
   // they stay put across polls, move only when the list does, and say what the server grants is
   // ci/console-browsers/inbox.mjs's. Here, their buttons' path: act(), with its settle guard.
+
+  // Without inbox.js (here, as when the module fails to load), the cards' place says they can't be
+  // shown, rather than that nothing is waiting.
+  // So for the Agents view without agents.js, and Activity without activity.js.
+  for (const id of ["pending", "runs", "start", "audit", "decided"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
 
   // The cards just moved (inbox.js says so): a tap right then is ignored.
   state = { ...base, pending: [A, B] };
@@ -547,6 +552,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
     [{ kind: "node.audit", body: { node: "n1", body: JSON.stringify({ kind: "box.restart" }) } }, "node n1: box.restart"],
     // #715 review: who decided is named; a parent agent isn't "you".
     [{ kind: "decision", body: { request: "r-7", decision: "approve", by: "agent:run_p" } }, "allowedr-7 by run_p (a parent agent)"],
+    [{ kind: "run.fence_released", run: "run_f", body: { node: "n1", by: "passkey:laptop", signed: {}, why: "n1 was destroyed" } }, "run_f released from server n1 by laptop, signed with a passkey, though its box may still be running there: n1 was destroyed"],
+    [{ kind: "run.fence_release_failed", run: "run_f", body: { node: "n1", by: "root", error: "renewed" } }, "run_f is still held: its release from server n1 couldn't be made: renewed"],
     [{ kind: "something.new", run: "run_z", body: {} }, "something.new \u00b7 run_z"],
   ]) { const l = JSON.parse(run("JSON.stringify(sentence(" + JSON.stringify({ seq: 1, ...op }) + "))")); assert.ok((l.tag + l.text).endsWith(want), want + " in " + l.tag + l.text); }
   // A decision on a run's request can be explained (activity.js draws its "why?"); others can't.
@@ -585,6 +592,46 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.deepStrictEqual([ids["standing-pointer"].textContent, ids["standing-pointer"].hidden], ["Asking to be always allowed (1)", false]);
   assert.strictEqual(sandbox.document.title, "(1) wicket");
   console.log("console standing reach: ok");
+  // Fenced runs (#690): the row and its reason form are settings.js's (ci/console-browsers/settings.mjs).
+  // The release is signed from a confirmation that says what it does, marked as dangerous.
+  const fenced = { id: "run_f", fence: { run: "run_f", node: "n1", node_status: "revoked", node_seen_ms: null, fenced_until_ms: null,
+    source: "unknown", why: "node n1 is <b>revoked</b> and won't confirm it", effect_sha256: "cd".repeat(32) } };
+  await advance(1000);
+  nextAction = { v: 1, action: "release_fence", run: "run_f", node: "n1", node_status: "revoked", fenced_until_ms: null, why: fenced.fence.why, reason: "n1 was destroyed", effect_sha256: "cd".repeat(32) };
+  run('signed({ action: "release_fence", run: "run_f", reason: "n1 was destroyed" })'); await flush();
+  assert.deepStrictEqual((({ action, run, reason }) => [action, run, reason])(began().pop().body), ["release_fence", "run_f", "n1 was destroyed"]);
+  const fw = ids["confirm-what"].textContent;
+  assert.ok(fw.startsWith("Release run run_f's fence on node n1 (revoked, never reported), fenced until its node confirms the box stopped") && fw.includes("reason: n1 was destroyed") && fw.includes("effect cdcdcdcd"), fw);
+  assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: release"]);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  console.log("console fenced runs: ok");
+
+  // #711: Add a device signs an enrol_link; the sheet says who the device is enrolled as, and the
+  // link the server returns is shown once in the passkeys card.
+  state = { ...base, pending: [], passkeys: [{ id: "cred-1", name: "laptop" }] };
+  await run("refresh()"); await flush();
+  await advance(1000);
+  assert.ok(!ids.operator.textContent.includes("run `wicket operator enrol-link` on the host and open"), ids.operator.textContent);
+  nextAction = { v: 1, action: "enrol_link", tenant: "t0", credential: "cred-1", name: "laptop", enrols_as: "passkey/laptop", ttl_secs: 300, uses: 1 };
+  ids.operator.all(n => n.tagName === "button" && n.textContent === "Add a device")[0].click(); await flush();
+  assert.strictEqual(began().pop().body.action, "enrol_link");
+  const ew = ids["confirm-what"].textContent;
+  assert.ok(ew.startsWith("Make a one-time link that enrols another device as laptop (passkey/laptop, the same operator and authority)") && ew.includes("for 5 minutes"), ew);
+  run("showEnrolLink({ link: 'https://c.example/enrol?t=abc', expires_in_secs: 300 })");
+  ids["confirm-cancel"].listeners.click(); await flush();
+  await run("refresh()"); await flush();
+  assert.ok(ids.operator.textContent.includes("https://c.example/enrol?t=abc"), ids.operator.textContent);
+  // Signing out forgets the link: whoever signs in next on this tab doesn't see it.
+  ids.operator.all(n => n.tagName === "button" && n.textContent === "Sign out")[0].click(); await flush();
+  assert.strictEqual(run("enrolLink"), null);
+  await run("refresh()"); await flush();
+  assert.ok(!ids.operator.textContent.includes("https://c.example/enrol?t=abc"), ids.operator.textContent);
+  // boot() forgets it too, however it is reached.
+  run("showEnrolLink({ link: 'https://c.example/enrol?t=def', expires_in_secs: 300 })");
+  await run("boot()"); await flush();
+  assert.strictEqual(run("enrolLink"), null);
+  assert.ok(!ids.operator.textContent.includes("t=def"), ids.operator.textContent);
+  console.log("console enrol a device: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open
   // console is told, and one notification says so; tapping it opens the console's notifications.

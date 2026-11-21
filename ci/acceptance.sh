@@ -33,6 +33,10 @@
 #     session, where a prompt asked during the replay isn't approved;
 #   - an orphaned box (its `wicket run` killed hard) is taken over by `wicket reconcile`, and after
 #     it is revoked a dry run has nothing to change;
+#   - (--nodes local) messages across nodes (#252): a box on each node finds the other through the
+#     gateway, messages it with a receipt that reaches read, gets its reply, and a message written
+#     unasked is refused with a receipt; a human's `wicket message send` reaches one box as its
+#     operator's, whose answer lands in `wicket message inbox`, with receipts on both sides;
 #   - (--nodes local) a node on its own (#152, #153): a box on the other node keeps working through a
 #     165 s cut of its control channel, its model calls included (the credential sealed to the node),
 #     an out-of-reach request is queued there and raised on reconnect, a secret removed meanwhile is
@@ -55,9 +59,11 @@ set -euo pipefail
 # A command that fails outside a check (under `set -e`, it ends the run) names its line and
 # command, and in GitHub Actions is an annotation too. The 11-18 nightly's installed run ended with
 # neither. Written to fd 3, this script's own stdout, so a command substitution doesn't capture it.
+# Only the script's own shell aborts: a command failing in a subshell (a check's, or a command
+# substitution's) is that subshell's to answer for, and said "ABORTED" where nothing was (#753).
 exec 3>&1
 set -E
-trap 'rc=$?; echo "ABORTED (exit $rc) at line $LINENO: $BASH_COMMAND" >&3; [ -z "${GITHUB_ACTIONS:-}" ] || echo "::error title=acceptance (${mode:-?}) aborted::line $LINENO: $(sed "s/%/%25/g" <<<"$BASH_COMMAND")" >&3' ERR
+trap 'rc=$?; if [ "$BASH_SUBSHELL" = 0 ]; then echo "ABORTED (exit $rc) at line $LINENO: $BASH_COMMAND" >&3; [ -z "${GITHUB_ACTIONS:-}" ] || echo "::error title=acceptance (${mode:-?}) aborted::line $LINENO: $(sed "s/%/%25/g" <<<"$BASH_COMMAND")" >&3; fi' ERR
 cd "$(dirname "$0")/.."
 
 mode=dev nodes=
@@ -159,7 +165,8 @@ all_descendants() {
 teardown() {
   local status=$?
   set +e
-  trap - EXIT INT TERM
+  # Teardown removes what may not be there: none of its failures is an abort.
+  trap - ERR EXIT INT TERM
   if [ "$nodes" = vultr ]; then vultr_teardown; fi
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
   sleep 1
@@ -473,15 +480,27 @@ pids+=("$flood_pid")
 wait_for 30 '[ -n "$(run_id_of "$work/flood.log")" ]' || true
 flood=$(run_id_of "$work/flood.log")
 our_runs+=("$flood")
+flood_fails=$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)
+echo "   run ${flood:-?}"
 # The control host's transcript: the previous file, then the current one. (What the run shows of a
 # program's output stops at limits.output, so the end is looked for here.)
 flood_transcript() { data "runs/$flood/transcript.1.jsonl" 2>/dev/null; data "runs/$flood/transcript.jsonl" 2>/dev/null; }
-wait_for 120 'flood_transcript | grep -q acc-flood-done' || true
+# The host's log of the box, read while the box is alive (#824): its path as soon as the box is up,
+# and the most it held, sampled each second until the end reaches the transcript or the box is gone.
+wait_for 30 '[ -n "$(box_of "$flood")" ]' || true
 flood_box=$(box_of "$flood" | head -1)
 flood_logpath=$($DOCKER inspect -f '{{.LogPath}}' "$flood_box" 2>/dev/null || true)
 flood_kept=
-[ -z "$flood_logpath" ] || flood_kept=$(sudo -n sh -c 'du -cb "$1"* | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
-echo "   20 MB burst, then 3 MB paced; ${flood_kept:-?} bytes kept in the host's log"
+for _ in $(seq 120); do
+  if [ -n "$flood_logpath" ]; then
+    k=$(sudo -n sh -c 'du -cb "$1"* 2>/dev/null | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
+    [ -z "$k" ] || [ "$k" -le "${flood_kept:-0}" ] || flood_kept=$k
+  fi
+  flood_transcript | grep -q acc-flood-done && break
+  [ -n "$(box_of "$flood")" ] || break
+  sleep 1
+done
+echo "   20 MB burst, then 3 MB paced; at most ${flood_kept:-?} bytes kept in the host's log (${flood_logpath:-no log path})"
 check "a flooding box's output kept on the host stays within limits.output (1m)" '[ -n "$flood_kept" ] && [ "$flood_kept" -le $((1100 * 1024)) ]'
 wait "$flood_pid" 2>/dev/null || true
 # What it keeps of the paced lines (the newest, at least 5,000 of them): consecutive, each once, in
@@ -499,10 +518,26 @@ flood_drop() { w audit --tail 400 | grep "$flood" | grep box.output | grep -oE '
 wait_for 30 '[ -n "$(flood_drop)" ]' || true
 echo "   box.output: dropped_from_host_at_least $(flood_drop)"
 check "  and its audit records the bytes dropped from the host (at least)" '[ "$(flood_drop)" -ge 1000000 ]'
+# All it wrote, counted as Docker let it write (#824): 20,000,000 bytes, a newline, the 30,000 paced
+# lines of 94 bytes and the end marker's 15 (its stderr may add a few).
+flood_written() { w audit --tail 400 | grep "$flood" | grep box.output | grep -oE 'written_at_least[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | tail -1; }
+echo "   box.output: written_at_least $(flood_written)"
+check "  and what it wrote, every byte: written_at_least" '[ "$(flood_written)" -ge 22820016 ]'
 HOME=$HOMEW "$W" run "$(manifest flood-stop)" --image "$IMAGE_TAG" >"$work/flood-stop.log" 2>&1 || true
 flood_stop=$(run_id_of "$work/flood-stop.log")
 our_runs+=("$flood_stop")
+echo "   on_output_full: stop: run ${flood_stop:-?}"
 check "with on_output_full: stop, the box is stopped, saying why, and its run ends" 'grep -q "on_output_full: stop" "$work/flood-stop.log" && [ -z "$(box_of "$flood_stop")" ] && w audit --tail 300 | grep -E "run\.end" | grep -q "$flood_stop"'
+# A failed flood check (#824): what the node and the audit say of each run, kept for the summary.
+if [ "$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)" -gt "$flood_fails" ]; then
+  for r in "$flood" "$flood_stop"; do
+    [ -n "$r" ] || continue
+    echo "== run $r: its audit records"
+    w audit --tail 3000 | grep -F "$r" | grep -E 'run\.end|run\.output|box\.exit_cause|box\.output' | cut -c1-600
+    echo "== run $r: the local node's log of it"
+    data "local-node/serve/serve.log" 2>/dev/null | grep -F "$r" | tail -40
+  done >"$work/flood-diag.log" 2>&1
+fi
 # A box that outgrows its memory limit (#185): the kernel kills it, and the run says why.
 HOME=$HOMEW "$W" run "$(manifest oom)" --image "$IMAGE_TAG" >"$work/oom.log" 2>&1 || true
 oom_run=$(run_id_of "$work/oom.log")
@@ -586,6 +621,7 @@ if [ -n "$nodes" ]; then
   escape_flow
 fi
 if [ "$nodes" = local ]; then
+  messages_flow
   offline_flow
 fi
 
@@ -614,7 +650,7 @@ restart_start() {   # $1: label, then wicket run options
 restart_flow() {
   log "a control-host restart: boxes survive, reconcile adopts their runs"
   local runs=() labels=() boxes=() r l b
-  r=$(restart_start local); runs+=("$r"); labels+=(local)
+  r=$(restart_start local --node local); runs+=("$r"); labels+=(local)
   if [ "$nodes" = local ]; then r=$(restart_start node --node "$NODE"); runs+=("$r"); labels+=("$NODE"); fi
   for r in "${runs[@]}"; do boxes+=("$(box_of "$r")"); done
   restart_runs=("${runs[@]}")
@@ -805,7 +841,8 @@ install_flow() {
   p=$(data pids/daemon.pid 2>/dev/null | head -1 || true)
   starts() { grep -c "wicketd: /run/wicket/wicketd.sock as" /tmp/wicketd.log 2>/dev/null || true; }
   before=$(starts)
-  attach0=$(data "runs/$r/ctl/attach.log" 2>/dev/null | wc -l)
+  # Missing until a takeover writes it: none read as no lines, not an abort (#753).
+  attach0=$({ data "runs/$r/ctl/attach.log" 2>/dev/null || true; } | wc -l)
   sudo -n "$sh" --binary "$d/wicket" --operator "$(id -un)" --skip-gvisor --skip-image --trust-domain acc.wicket.test >"$work/install.log" 2>&1 || true
   check "  install.sh installed the new build" '[ "$(basename "$(readlink /var/lib/wicket-versions/current)")" = "$id" ]'
   if [ ! -d /run/systemd/system ]; then
@@ -817,7 +854,7 @@ install_flow() {
   wait_for 40 'grep -qE "runs: [0-9]+ handed over" /tmp/wicketd.log' || true
   check "  the new wicketd moved this host's node's serve to the new build" \
     'grep -q "wicketd: this host'"'"'s node: serve (pid [0-9]*) re-executed as the new build" /tmp/wicketd.log'
-  serve=$(data local-node/serve/serve.exe 2>/dev/null | sed -n 2p)
+  serve=$({ data local-node/serve/serve.exe 2>/dev/null || true; } | sed -n 2p)
   check "  and the serve runs it" '[ "$serve" = "$(readlink -f /var/lib/wicket-versions/current/wicket)" ]'
   check "  and handed the run over, adopted by the new build" \
     'grep -oE "runs: [0-9]+ handed over, [0-9]+ adopted" /tmp/wicketd.log | tail -1 | awk "{ exit !(\$2 >= 1 && \$2 == \$5) }"'
@@ -846,7 +883,7 @@ CEDAR
   wroot policy apply "$work/org.cedar" >"$work/policy-apply.log" 2>&1 || cat "$work/policy-apply.log"
   v1=$(sed -n 's/^org policy \([0-9a-f]*\) applied.*/\1/p' "$work/policy-apply.log")
   check "wicket policy apply installs the org policy" '[ -n "$v1" ] && w policy show | grep -q "org policy $v1"'
-  HOME=$HOMEW "$W" run "$(manifest org)" --image "$IMAGE_TAG" >"$work/org.log" 2>&1 &
+  HOME=$HOMEW "$W" run "$(manifest org)" --image "$IMAGE_TAG" --node local >"$work/org.log" 2>&1 &
   org_pid=$!
   pids+=("$org_pid")
   wait_for 90 'grep -q acc-org-done "$work/org.log" 2>/dev/null' || true
@@ -908,7 +945,8 @@ n_fail=$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)
 echo "$n_ok ok, $n_fail failed"
 if [ "$fail" != 0 ]; then
   echo "== mock model log (tail)"; tail -20 "$work/mock.log"
-  for f in lead hib1 hib2 acp1 acp2 linger orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
+  for f in lead hib1 hib2 acp1 acp2 linger orphan decisions flood flood-stop; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
+  [ -f "$work/flood-diag.log" ] && { echo "== the flood runs (#824)"; cat "$work/flood-diag.log"; }
   # The restart check's supervisors (#151): the first, each one reconcile started, and the local
   # node's serve. In GitHub Actions, also as annotations: readable from the API without the log.
   shown() {   # $1: title, $2: file, $3: lines

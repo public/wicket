@@ -147,6 +147,10 @@ impl PlacementConfig {
         }
         for h in &c.static_hosts {
             crate::enrol::validate_name(&h.name)?;
+            // The shape an agent's region preference is held to (#731), so the two compare.
+            if let Some(r) = &h.region {
+                wicket_proxy::check_region(r).map_err(anyhow::Error::msg).with_context(|| format!("static_hosts {}: region", h.name))?;
+            }
         }
         Ok(c)
     }
@@ -251,6 +255,10 @@ pub fn hook(tenant: TenantId, run: RunId, zone: String, ledger: Arc<Mutex<Ledger
 
 /// Files a capacity ask: a pending lease with its money reserved, and the request a human decides.
 pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId, zone: &str, a: &CapacityAsk) -> Result<CapacityState> {
+    // Checked where the request is written, whoever asks (#731).
+    if let Some(r) = &a.region {
+        wicket_proxy::check_region(r).map_err(anyhow::Error::msg)?;
+    }
     let iso =
         IsolationTier::parse(&a.isolation).with_context(|| format!("isolation must be process, gvisor or vm, not {:?}", a.isolation))?;
     let max = MicroUsd::parse_dollars(&a.max_hourly_usd).with_context(|| format!("{:?} is not a dollar amount", a.max_hourly_usd))?;
@@ -316,7 +324,16 @@ pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId
     let reason = format!("capacity lease {id}: {what}, {money}. Asked by the agent: {}", a.reason);
     // The lease as asked is what the approval is for (#369): the reconciler provisions it only as
     // it was decided on.
-    let rid = l.file_request(&op, Some(&lease_args(&row)), &reason, None)?.id().to_string();
+    let filed = l.file_request(&op, Some(&lease_args(&row)), &reason, None)?;
+    let rid = filed.id().to_string();
+    // The agent's own words, apart from wicket's (#715, #731), for the console to quote as its.
+    if matches!(filed, wicket_store::Filed::New(_) | wicket_store::Filed::Existing(_)) {
+        // Not a failure of the ask: the request is filed and the lease linked below either way. The
+        // card then shows only wicket's sentence, so say why the agent's words are missing.
+        if let Err(e) = l.set_request_claims(&rid, &serde_json::json!({ "reason": a.reason, "region": a.region })) {
+            tracing::warn!(request = %rid, error = %e, "the agent's own words could not be stored with its capacity ask");
+        }
+    }
     l.set_lease_request(&id, &rid)?;
     l.audit(
         tenant,
@@ -366,6 +383,24 @@ pub fn lease_of_request(l: &Ledger, r: &wicket_store::Request) -> Result<Option<
         return Ok(None);
     }
     Ok(l.lease_for_request(&r.id)?.filter(|x| x.run == r.run && x.tenant == r.tenant).map(|x| x.id))
+}
+
+/// `wicket lease list --json`: the rows the text shows, money in micro-USD, times in Unix seconds.
+pub fn list_json(l: &Ledger) -> Result<serde_json::Value> {
+    Ok(serde_json::Value::Array(
+        l.leases(&[])?
+            .into_iter()
+            .map(|x| {
+                serde_json::json!({
+                    "id": x.id, "status": x.status, "run": x.run, "provider": x.provider, "request": x.request_id,
+                    "node": x.node_name, "node_id": x.node_id,
+                    "hourly_cap_micro_usd": x.hourly_cap, "reserved_micro_usd": x.reserved, "billed_micro_usd": x.billed,
+                    "duration_secs": x.duration_secs, "created_at": x.created_at, "not_after": x.not_after, "ended_at": x.ended_at,
+                    "detail": x.detail,
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// `wicket lease list`.

@@ -1,12 +1,14 @@
 //! A local mock of the Vultr API v2 for tests (feature `mock`): plans, instances (create, list by
-//! tag with paging, get, tag, delete), the bearer key check, injected responses, and a record of every
-//! request. No real API is ever called.
+//! tag with paging, get, tag, delete), DNS domains and their records (#575 step 5a: get a domain,
+//! list records with paging, create, update, delete), the bearer key check, injected responses
+//! (the next request's, or a chosen request's), and a record of every request. No real API is ever
+//! called.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// The API key the mock accepts.
@@ -32,6 +34,13 @@ pub struct Mock {
     pub next_id: u32,
     /// GET /instances/{id} returns the instance with its tags removed (a tag changed after the list).
     pub strip_on_get: bool,
+    /// DNS domains the account serves, each with its records as the API lists them (`id`, `type`,
+    /// `name` relative to the domain, `data`, `priority`, `ttl`).
+    pub domains: BTreeMap<String, Vec<Value>>,
+    /// Called with each request after the key check: a response to give instead of handling it
+    /// (a chosen page or write failing).
+    #[allow(clippy::type_complexity)]
+    pub fail_when: Option<Box<dyn FnMut(&Seen) -> Option<(u16, Value)> + Send>>,
 }
 
 pub type Shared = Arc<Mutex<Mock>>;
@@ -70,8 +79,14 @@ fn handle(m: &mut Mock, s: &Seen) -> (u16, Value) {
     if s.auth.as_deref() != Some(format!("Bearer {KEY}").as_str()) {
         return (401, json!({"error": "Invalid API token.", "status": 401}));
     }
+    if let Some(r) = m.fail_when.as_mut().and_then(|f| f(s)) {
+        return r;
+    }
     let tag = s.query.iter().find(|(k, _)| k == "tag").map(|(_, v)| v.clone());
     let segs: Vec<&str> = s.path.trim_start_matches("/v2/").split('/').collect();
+    if segs.first() == Some(&"domains") {
+        return dns(m, s, &segs[1..]);
+    }
     match (s.method.as_str(), segs.as_slice()) {
         ("GET", ["plans"]) => {
             let ty = s.query.iter().find(|(k, _)| k == "type").map(|(_, v)| v.as_str()).unwrap_or("all");
@@ -133,6 +148,63 @@ fn handle(m: &mut Mock, s: &Seen) -> (u16, Value) {
                 (204, Value::Null)
             } else {
                 (404, json!({"error": "Invalid instance-id.", "status": 404}))
+            }
+        }
+        _ => (404, json!({"error": "Not found", "status": 404})),
+    }
+}
+
+/// A DNS record as the API lists it.
+pub fn record(id: &str, rtype: &str, name: &str, data: &str, priority: i64, ttl: u32) -> Value {
+    json!({ "id": id, "type": rtype, "name": name, "data": data, "priority": priority, "ttl": ttl })
+}
+
+fn dns(m: &mut Mock, s: &Seen, segs: &[&str]) -> (u16, Value) {
+    let no_domain = || (404, json!({"error": "Invalid domain.", "status": 404}));
+    let no_record = || (404, json!({"error": "Invalid record.", "status": 404}));
+    let Some(domain) = segs.first().map(|d| d.to_string()) else { return no_domain() };
+    if !m.domains.contains_key(&domain) {
+        return no_domain();
+    }
+    m.next_id += 1;
+    let next = m.next_id;
+    let records = m.domains.get_mut(&domain).expect("domain");
+    match (s.method.as_str(), &segs[1..]) {
+        ("GET", []) => (200, json!({ "domain": { "domain": domain, "date_created": "2026-11-11T10:00:00+00:00", "dns_sec": "disabled" } })),
+        ("GET", ["records"]) => (200, page("records", records, &s.query)),
+        ("POST", ["records"]) => {
+            for k in ["name", "type", "data"] {
+                if s.body.get(k).is_none() {
+                    return (400, json!({"error": format!("Missing {k}"), "status": 400}));
+                }
+            }
+            let r = json!({
+                "id": format!("6e3b1c2a-0000-4000-8000-{next:012}"),
+                "type": s.body["type"], "name": s.body["name"], "data": s.body["data"],
+                "priority": s.body.get("priority").cloned().unwrap_or(json!(0)),
+                "ttl": s.body.get("ttl").cloned().unwrap_or(json!(300)),
+            });
+            records.push(r.clone());
+            (201, json!({ "record": r }))
+        }
+        ("PATCH", ["records", id]) => match records.iter_mut().find(|r| r["id"] == *id) {
+            Some(r) => {
+                for k in ["name", "data", "ttl", "priority"] {
+                    if let Some(v) = s.body.get(k) {
+                        r[k] = v.clone();
+                    }
+                }
+                (204, Value::Null)
+            }
+            None => no_record(),
+        },
+        ("DELETE", ["records", id]) => {
+            let before = records.len();
+            records.retain(|r| r["id"] != *id);
+            if records.len() < before {
+                (204, Value::Null)
+            } else {
+                no_record()
             }
         }
         _ => (404, json!({"error": "Not found", "status": 404})),

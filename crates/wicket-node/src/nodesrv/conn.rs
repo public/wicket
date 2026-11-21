@@ -166,37 +166,61 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
     result
 }
 
+/// One feed frame from a control connection: accepted (tried again once if it couldn't be
+/// persisted, #377), and on the record if refused, or if a snapshot in it was superseded (#589).
+pub(super) fn accept_feed(node: &Node, bytes: &[u8]) -> Result<(), wicket_feed::Refusal> {
+    let now = (node.clock)();
+    let before = node.replica.lock().expect("replica").stats.superseded_snapshots;
+    let mut r = node.replica.lock().expect("replica").accept_bytes(bytes, now);
+    // Not persisted for want of space (#377): the node's reserve is released and the frame
+    // tried again; still failing, it is asked for again once the disk can be written.
+    if let Err(e) = r.clone() {
+        if e.kind() == "storage" {
+            if let Some(again) = node.feed_storage_failed(bytes, &e) {
+                r = again;
+            }
+        }
+    }
+    if let Err(e) = &r {
+        say_err!("[node] feed frame refused: {} ({e})", e.kind());
+        let _ = node.audit.lock().expect("audit").audit(
+            &wicket_core::TenantId::single(),
+            None,
+            "feed.refused",
+            &serde_json::json!({ "kind": e.kind(), "why": e.to_string() }),
+        );
+    }
+    // A snapshot dropped as superseded (#589): another run's catch-up overtaken, or an old
+    // one replayed. Never applied, but on the record, as a refusal is.
+    let superseded = {
+        let rep = node.replica.lock().expect("replica");
+        (rep.stats.superseded_snapshots > before).then(|| rep.stats.last_superseded_snapshot.clone().unwrap_or_default())
+    };
+    let dropped = superseded.is_some();
+    if let Some(what) = superseded {
+        say_err!("[node] feed snapshot superseded: {what}");
+        let _ = node.audit.lock().expect("audit").audit(
+            &wicket_core::TenantId::single(),
+            None,
+            "feed.snapshot_superseded",
+            &serde_json::json!({ "what": what }),
+        );
+    }
+    if r.is_ok() && !dropped {
+        if let Ok(f) = wicket_feed::Frame::parse(bytes) {
+            if matches!(f.kind, wicket_feed::FrameKind::Delta | wicket_feed::FrameKind::Snap) {
+                let epoch = node.replica.lock().expect("replica").state().map(|s| s.epoch);
+                say_err!("[node] feed {} applied, epoch {} (at {} ms)", f.kind.as_str(), epoch.unwrap_or(0), wicket_feed::now_ms());
+            }
+        }
+    }
+    r
+}
+
 pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Result<()> {
     match f {
         Frame::Feed(bytes) => {
-            let now = (node.clock)();
-            let mut r = node.replica.lock().expect("replica").accept_bytes(&bytes, now);
-            // Not persisted for want of space (#377): the node's reserve is released and the frame
-            // tried again; still failing, it is asked for again once the disk can be written.
-            if let Err(e) = r.clone() {
-                if e.kind() == "storage" {
-                    if let Some(again) = node.feed_storage_failed(&bytes, &e) {
-                        r = again;
-                    }
-                }
-            }
-            if let Err(e) = &r {
-                say_err!("[node] feed frame refused: {} ({e})", e.kind());
-                let _ = node.audit.lock().expect("audit").audit(
-                    &wicket_core::TenantId::single(),
-                    None,
-                    "feed.refused",
-                    &serde_json::json!({ "kind": e.kind(), "why": e.to_string() }),
-                );
-            }
-            if r.is_ok() {
-                if let Ok(f) = wicket_feed::Frame::parse(&bytes) {
-                    if matches!(f.kind, wicket_feed::FrameKind::Delta | wicket_feed::FrameKind::Snap) {
-                        let epoch = node.replica.lock().expect("replica").state().map(|s| s.epoch);
-                        say_err!("[node] feed {} applied, epoch {} (at {} ms)", f.kind.as_str(), epoch.unwrap_or(0), wicket_feed::now_ms());
-                    }
-                }
-            }
+            let r = accept_feed(node, &bytes);
             node.send_to(gen, node.feed_status(r.as_ref().err()));
         }
         Frame::Data { stream, offset, bytes } if stream & TUNNEL_BIT != 0 => {
@@ -333,7 +357,8 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     l.set_slice(Some(slice));
                 }
             }
-            Msg::SecretRevoke { run, name } => node.secrets.revoke(&run, &name),
+            Msg::SecretRevoke { run, name, resend: false } => node.secrets.revoke(&run, &name),
+            Msg::SecretRevoke { run, name, resend: true } => node.secrets.revoke_resent(&run, &name),
             m @ Msg::SecretFetched { .. } => {
                 let Msg::SecretFetched { id, .. } = &m else { unreachable!() };
                 if let Some(tx) = node.asks.lock().expect("asks").remove(id) {
@@ -439,6 +464,9 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
             }
             Msg::PutTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, true),
             Msg::ImageHave { id, digest } => images::have(node, gen, id, digest),
+            Msg::IntakeSync { id, triggers, ack, serving, hold } => {
+                super::intake::sync(node.clone(), gen, id, triggers, ack, serving, hold)
+            }
             Msg::PutImage { stream, digest, name } => images::put(node, gen, stream, digest, name),
             Msg::PullImage { id, run, digest, name, from } => images::pull(node, gen, id, run, digest, name, from),
             Msg::GetTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, false),

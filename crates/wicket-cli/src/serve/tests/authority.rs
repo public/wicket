@@ -229,27 +229,131 @@ async fn the_policy_page_shows_the_applied_cedar_its_versions_and_runs() {
 #[tokio::test]
 async fn authority_views_never_carry_a_token_signature_secret_or_key() {
     let f = fixture("leak");
+    super::nodes::enrol(&mut f.t.ledger(), "n1", &TenantId::single().0, &["api.example.com"]);
     let n = needles(&f);
+    // A public name of the run with the token, approved, with a connection its node shipped
+    // (#575 review, L6): the names views scanned are real ones, not an empty card.
+    let _h = super::names_card::Hooks;
+    super::names_card::set_settings(Some(Ok(super::names_card::names_cfg("boxes.example.com"))));
+    let nid = {
+        let l = f.t.ledger();
+        let ask = wicket_store::NameAsk {
+            tenant: &TenantId::single(),
+            run: &RunId(RUN.into()),
+            zone: ZONE,
+            zone_digest: "zd",
+            principal: "spiffe://wicket.local/t/agent",
+            label: "leaky",
+            port: 3000,
+            service: Some("http"),
+            reason: "a demo",
+            scope: wicket_store::NameScope::Standing,
+        };
+        let id = l.ask_public(&ask).unwrap().0;
+        let public = super::names_card::names_cfg("boxes.example.com").public.unwrap();
+        let terms = wicket_store::NameTerms { bound: wicket_store::StandingBound::Agent, ttl_secs: Some(3600) };
+        let shown = wicket_store::name_effect(&l.name(&id).unwrap(), &terms, &public.domain());
+        l.approve_name(&id, &terms, "passkey:laptop", Some(&shown), &public).unwrap();
+        let conn = json!({ "name": id, "port": 3000, "phase": "start", "conn": "c1", "peer": "192.0.2.9:5000" });
+        let outer = json!({ "node": crate::localnode::NAME, "seq": 1, "ts": 1, "tenant": "t0", "run": RUN, "kind": "name.conn", "body": conn.to_string() });
+        l.audit(&TenantId::single(), Some(&RunId(RUN.into())), "node.audit", &outer).unwrap();
+        id
+    };
+    let (s, d, body) = get(&f.t, &format!("/api/names/{nid}")).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert!(body.contains("leaky.boxes.example.com"), "the settings reached the handler: {body}");
+    assert!(d["connections"].as_array().is_some_and(|c| !c.is_empty()), "{d}");
     // The scanner finds them where they are: in the stored record itself.
     assert!(!leaks(&serde_json::to_string(&f.record).unwrap(), &n).is_empty(), "the scanner must catch the raw record");
+    // A placement decision recorded for the run, so the scan sees one.
+    f.t.ledger()
+        .record_placement_decision(
+            RUN,
+            &json!({ "request": { "vcpus": 1.0, "memory_mib": 512 }, "ca_hosts": ["api.example.com"], "node": "local",
+                     "candidates": 1, "ranked": ["local"], "ranked_more": 0, "refused": [], "refused_more": 0, "behind": null })
+            .to_string(),
+            wicket_feed::now_ms(),
+        )
+        .unwrap();
     let paths = [
         "/api/me".to_string(),
         "/api/state".into(),
         "/api/policy".into(),
+        "/api/messages".into(),
         format!("/api/runs/{RUN}/authority"),
         "/api/runs/run_nope/authority".into(),
+        format!("/api/runs/{RUN}/placement"),
         format!("/api/explain/{}", f.op_seq),
         format!("/api/explain/{}", f.op_seq + 1),
         "/api/explain/999999".into(),
         "/api/explain/x".into(),
+        "/api/names".into(),
+        format!("/api/names/{nid}"),
+        "/api/names/n-nope".into(),
+        "/api/nodes/n1/ca".into(),
+        "/api/nodes/nope/ca".into(),
+    ];
+    // The views that answer must answer (an error page would scan clean and prove nothing).
+    let answers = [
+        "/api/me".to_string(),
+        "/api/state".into(),
+        "/api/policy".into(),
+        format!("/api/runs/{RUN}/authority"),
+        format!("/api/runs/{RUN}/placement"),
+        format!("/api/explain/{}", f.op_seq),
     ];
     for p in paths {
         let (s, _, body) = get(&f.t, &p).await;
+        if answers.contains(&p) {
+            assert_eq!(s, StatusCode::OK, "{p}: {body}");
+        }
         assert!(leaks(&body, &n).is_empty(), "{p} ({s}) leaks {:?}", leaks(&body, &n));
     }
+    // The POST views too (#252): marking messages read answers with ids, never more.
+    let r = f.t.post("/api/messages/read", serde_json::json!({ "ids": ["m-1", f.gid] }));
+    let body = r.body.to_string();
+    assert!(leaks(&body, &n).is_empty(), "/api/messages/read ({}) leaks {:?}", r.status, leaks(&body, &n));
+    // The org policy preview (#712), of the applied policy and of another.
+    let org = include_str!("../../../../../examples/policy/org.cedar");
+    for body in
+        [json!({ "cedar": org }), json!({ "cedar": org, "entities": include_str!("../../../../../examples/policy/org-entities.json") })]
+    {
+        let r = f.t.post("/api/policy/preview", body);
+        assert_eq!(r.status, StatusCode::OK, "the preview answered: {:?}", r.body);
+        let text = r.body.to_string();
+        assert!(leaks(&text, &n).is_empty(), "/api/policy/preview ({}) leaks {:?}", r.status, leaks(&text, &n));
+    }
     // Signed out: the same views refuse, and say nothing.
-    for p in ["/api/policy", "/api/runs/run_01authz0000000000000000000/authority", "/api/explain/1"] {
+    for p in [
+        "/api/policy",
+        "/api/runs/run_01authz0000000000000000000/authority",
+        "/api/runs/run_01authz0000000000000000000/placement",
+        "/api/explain/1",
+        "/api/names",
+        "/api/names/n-1",
+        "/api/nodes/n1/ca",
+    ] {
         let (s, _, body) = super::http::call(&f.t.state, "GET", p, &[], b"").await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{p}: {body}");
     }
+}
+
+/// #713: `wicket authority` and `wicket audit explain` print these views from the host. With a
+/// held token, the JSON has the fields the CLI reference lists, and the text names each block and
+/// grant.
+#[test]
+fn the_cli_prints_the_same_views_with_a_held_token() {
+    let f = fixture("cli");
+    let s = &f.t.state;
+    let views = crate::serve::authority::Views { ledger: &s.ledger, data: &s.data, tenant: &s.tenant, authz_root: s.authz_root.as_ref() };
+    let a = crate::serve::authority::run_authority(&views, RUN).unwrap();
+    assert_eq!((a["token"]["held"].as_bool(), a["feed"]["epoch"].is_u64()), (Some(true), true), "{a}");
+    crate::cmd::json_tests::documented_as("`wicket authority --json`", &a);
+    let text = crate::cmd::authority::authority_text(&a);
+    assert!(text.contains("block 0 (zone)") && text.contains("block 1 (grant), signed by"), "{text}");
+    assert!(text.contains(&format!("grant {}  POST api.example.com/v1/items  approved by passkey:laptop", f.gid)), "{text}");
+    let x = crate::serve::authority::explain(&views, f.op_seq).unwrap();
+    crate::cmd::json_tests::documented_as("`wicket audit explain --json`", &x);
+    let text = crate::cmd::authority::explain_text(&x);
+    assert!(text.contains("against its token now: allow:"), "{text}");
 }

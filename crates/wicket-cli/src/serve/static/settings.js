@@ -151,6 +151,26 @@ function placedRow(p) {
   return html`<div class="lease"><div class="run-head"><span class="run-name mono">${strip(p.name)}</span>${p.past_lease ? nothing : html`<span class="meta">lease ends ${time(p.lease_until)}</span>`}</div><div class="meta mono quiet">${strip(p.id)}</div>${after}</div>`;
 }
 
+// ---- agents held on lost servers (#690) ----
+
+// A fenced run: its box may still be running on a node that is revoked or no longer enrolled, so its
+// agent isn't woken. Released (signed, with a reason) from a form in its own row: the row is kept
+// across polls, so what is typed survives, and it can only release this run.
+const releasing = new Set();
+function fencedRow(x) {
+  const f = x.fence || {};
+  const open = releasing.has(x.id);
+  const close = e => { const t = e.target.closest(".lease").querySelector("textarea"); if (t) t.value = ""; releasing.delete(x.id); again(); };
+  const go = e => {
+    const text = e.target.closest(".lease").querySelector("textarea");
+    if (!text.value.trim()) { toast("Say why: the reason goes in the activity log."); return; }
+    signed({ action: "release_fence", run: x.id, reason: text.value }, () => { text.value = ""; releasing.delete(x.id); again(); });
+  };
+  const ask = () => { releasing.add(x.id); again(); };
+  return html`<div class="lease"><div class="run-head"><span class="run-name mono">${strip(x.id)}</span><span class="meta">${f.fenced_until_ms ? html`fenced until ${time(f.fenced_until_ms / 1000)}` : "fenced until its node confirms the box stopped"}</span></div><div class="meta">${"node " + strip(f.node) + " (" + strip(f.node_status) + ")"}${f.node_seen_ms ? html` · last reported ${time(f.node_seen_ms / 1000)}` : " · never reported"}</div><div class="meta">${strip(f.why)}</div><div class="buttons"><button class="deny" @click=${ask}>Release…</button></div><div class="stack" ?hidden=${!open}><label class="meta">${"Release " + strip(x.id) + "'s fence: its agent can be woken and the run ended, while its box may still be running on node " +
+    strip(f.node) + ". Only if that node will never run it again. Say why (it goes in the activity log):"}</label><textarea></textarea><div class="buttons"><button class="deny" @click=${go}>Release</button><button @click=${close}>Cancel</button></div></div></div>`;
+}
+
 // ---- the view ----
 
 let formDrawn = false;
@@ -158,6 +178,7 @@ function renderSettings(s) {
   last = s;
   const st = s.standing || {};
   keyed("standing-rules", st.rules || [], standingRuleRow, "No standing rules: each request waits for a decision.");
+  keyed("fenced", s.fenced || [], fencedRow, "None: no agent's box is held on a node that is revoked or no longer enrolled. An enrolled node's boxes are released by the node, or by revoking it first.");
   keyed("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
   principals.done();
   const form = document.getElementById("capacity-form");

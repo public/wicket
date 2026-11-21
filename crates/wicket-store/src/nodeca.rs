@@ -192,6 +192,9 @@ impl Ledger {
 pub(crate) fn forget_node_ca(conn: &rusqlite::Connection, node: &str) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM node_ca_policy WHERE node = ?1", params![node])?;
     conn.execute("DELETE FROM node_ca_wants WHERE node = ?1", params![node])?;
+    // Nor public addresses (#716 review, F2): a released node's address may be someone else's
+    // server now, and a machine enrolled again under its name is another machine.
+    conn.execute("DELETE FROM node_addresses WHERE node = ?1", params![node])?;
     Ok(())
 }
 

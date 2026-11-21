@@ -8,7 +8,8 @@
 // the same element across polls; the filters show one kind of line and say which is on; a decision
 // on a run's request has a "why?" that opens the server's explanation under it, which stays open
 // across polls and closes on a second tap, and an agent's page has the same; recent decisions say
-// allowed or refused, never "undefined"; and an agent's strings stay text.
+// allowed or refused, never "undefined"; an agent's strings stay text; and without activity.js its
+// places say they can't be shown.
 import assert from "node:assert";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
@@ -117,6 +118,17 @@ async function check(engine) {
     assert.strictEqual((await page.locator("#decided").innerText()).trim(), "No decisions yet.");
 
     if (problems.length) throw new Error(problems.join("\n  "));
+
+    // If activity.js doesn't load, the log, the decisions and an agent's log say they can't be shown,
+    // rather than that nothing happened.
+    const bare = await (await browser.newContext()).newPage();
+    await bare.route("**/activity.js", r => r.abort());
+    await bare.route("**/api/**", r => { const p = new URL(r.request().url()).pathname;
+      return r.fulfill({ contentType: "application/json", body: JSON.stringify(p === "/api/me" ? { who: { state: "operator", credential: "AbCd" } } : p === "/api/state" ? base : p === "/api/push" ? { public_key: "BAEC", devices: [], min_interval_secs: 30 } : {}) }); });
+    await bare.goto(url + "#activity");
+    for (const id of ["audit", "decided"]) await bare.waitForFunction(i => document.getElementById(i).textContent.includes("can't be shown"), id, { timeout: 10000 });
+    await bare.evaluate(() => { location.hash = "#agent/run_a"; });
+    await bare.waitForFunction(() => document.getElementById("agent-log").textContent.includes("can't be shown"), null, { timeout: 10000 });
     console.log(`${engine} activity: ok`);
   } finally {
     await browser.close();

@@ -239,12 +239,37 @@ async function check(engine) {
     state = { ...base, standing: { asks: [], rules: [{ ...rule, rule: { ...rule.rule, allow_dangerous: true } }] } };
     await poll();
     assert.ok((await sr.textContent()).includes("including requests that can't be undone"));
+    // Agents held on lost servers (#690): the run, its node and why, as text; Release… opens an empty
+    // reason form in the row, kept across a poll; an empty reason isn't sent; the release is signed.
+    const fenced = { id: "run_f", fence: { run: "run_f", node: "n1", node_status: "revoked", node_seen_ms: null, fenced_until_ms: null,
+      source: "unknown", why: "node n1 is <b>revoked</b> and won't confirm it" } };
+    state = { ...base, fenced: [fenced] };
+    await poll();
+    await page.evaluate(() => { location.hash = "#settings"; });
+    const fr = await page.locator("#fenced").textContent();
+    for (const want of ["run_f", "fenced until its node confirms the box stopped", "node n1 (revoked) · never reported", "node n1 is <b>revoked</b>"]) assert.ok(fr.includes(want), want + " in " + fr);
+    assert.strictEqual(await page.locator("#fenced b").count(), 0, "the reason stays text");
+    await page.locator("#fenced button", { hasText: "Release…" }).click();
+    assert.strictEqual(await page.inputValue("#fenced textarea"), "", "the form opens empty: a reason is typed, not offered");
+    const nBegun = begun.length;
+    await page.locator("#fenced button", { hasText: /^Release$/ }).click();
+    await page.waitForTimeout(300);
+    assert.strictEqual(begun.length, nBegun, "an empty reason isn't sent");
+    await page.fill("#fenced textarea", "n1 was destroyed");
+    await poll();
+    assert.strictEqual(await page.inputValue("#fenced textarea"), "n1 was destroyed", "what was typed survives a poll");
+    await settle();
+    await signs(page.locator("#fenced button", { hasText: /^Release$/ }));
+    assert.deepStrictEqual([begun.at(-1).action, begun.at(-1).run, begun.at(-1).reason], ["release_fence", "run_f", "n1 was destroyed"]);
+    await cancelSheet();
+
     // Nothing: each list says so.
     state = { ...base };
     await poll();
     assert.ok((await page.locator("#capacity").innerText()).includes("No capacity grants"));
     assert.strictEqual(await page.locator("#capacity code").textContent(), "wicket node create");
     assert.ok((await sr.innerText()).includes("No standing rules"));
+    assert.ok((await page.locator("#fenced").innerText()).startsWith("None: no agent's box is held"));
 
     if (problems.length) throw new Error(problems.join("\n  "));
     console.log(`${engine} settings: ok`);

@@ -23,8 +23,10 @@ const field = (label, value, cls) => html`<dt>${label}</dt><dd class=${cls || ""
 // the run id, the age) are made once per card content and kept, so a poll that changes nothing
 // changes nothing on the page.
 const memo = new Map();
+// What a card is drawn from: when it changes, the card can grow or its buttons change.
+const cardKey = p => JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run, p.lease, p.claims, p.once_terms]);
 function card(s, p) {
-  const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run, p.lease, p.claims, p.once_terms]);
+  const key = cardKey(p);
   let m = memo.get(p.id);
   if (!m || m.key !== key) {
     const [who, idOk] = whoAsks(p.identity || {});
@@ -71,8 +73,10 @@ function card(s, p) {
   </div>`;
 }
 
-// The order and set of cards last drawn: when they change, the layout moved, and taps are ignored
-// for a moment (console.js's `settled`), so a tap can't land on a card that just moved under it.
+// The cards last drawn, each by its id and what it is drawn from: when any changes (one comes, goes,
+// moves, or changes in place, which can grow it or change its buttons), and on the first draw, the
+// layout moved, and taps are ignored for a moment (console.js's `settled`), so a tap can't land on a
+// card, or a button, that just moved under it.
 let lastOrder = null;
 let openId = "";
 
@@ -81,9 +85,9 @@ function renderPending(s) {
   if (!box) return;
   const live = new Set(s.pending.map(p => p.id));
   for (const id of [...memo.keys()]) if (!live.has(id)) memo.delete(id);
-  const order = s.pending.map(p => p.id).join(",");
+  const order = JSON.stringify(s.pending.map(p => [p.id, cardKey(p)]));
   draw(s.pending.length ? repeat(s.pending, p => p.id, p => card(s, p)) : html`<div class="empty">Nothing is waiting for you.</div>`, box);
-  if (lastOrder !== null && order !== lastOrder) layoutMoved();
+  if (order !== lastOrder) layoutMoved();
   lastOrder = order;
 }
 
