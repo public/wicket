@@ -61,7 +61,10 @@ connections end (`wicket session <run>` opens one again). At its start, the new 
 re-executes this host's own node's `serve` as its build (SIGHUP, as `wicket self update` does) when
 the restart left it on another (#529), then hands each run whose supervisor runs another build to its own (#475): the supervisor is stopped without
 its box, and the new build's reconciler starts one that re-attaches, so no run keeps an old build's
-supervisor across an install. To end runs too, end them first (`wicket identity revoke <run>`, or `wicket
+supervisor across an install. Only a supervisor whose binary it reads, and finds to be another, is
+stopped (#844): one it can't read is left running, saying so and recording `self.supervisor_unknown`,
+and one that has already exited is skipped. If the new build's own binary can't be read, the handover
+fails (`self.handover_failed`, and a non-zero result) and stops none. To end runs too, end them first (`wicket identity revoke <run>`, or `wicket
 hibernate` for a long-lived agent).
 
 ## The policy file

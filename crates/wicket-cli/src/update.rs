@@ -1520,6 +1520,21 @@ fn reexec_serve(local: &Path, bin: &Path) -> Option<String> {
 /// ledger whose newer rows it may not understand, so the expand/contract rule
 /// (docs/explanation/updates.md, "Migrations") only has to hold for the seconds of a handover.
 pub fn stop_stale_supervisors(ledger: &Ledger, bin: &Path) -> Result<Vec<String>> {
+    // Without this build's own binary nothing can be told apart, and every old build's supervisor
+    // would stay (#475): the handover fails, on the record, rather than leave them quietly (#844).
+    let want = match std::fs::canonicalize(bin) {
+        Ok(w) => w,
+        Err(e) => {
+            let why = format!("this build's binary {} can't be read ({e})", bin.display());
+            let _ = ledger.audit(
+                &TenantId::single(),
+                None,
+                "self.handover_failed",
+                &serde_json::json!({ "why": why, "by": crate::operator() }),
+            );
+            anyhow::bail!("handing runs over to this build: {why}; no supervisor was stopped");
+        }
+    };
     let mut killed = vec![];
     for (run, owner) in ledger.running_runs()? {
         let Some(o) = owner else { continue };
@@ -1527,8 +1542,25 @@ pub fn stop_stale_supervisors(ledger: &Ledger, bin: &Path) -> Result<Vec<String>
             continue;
         }
         let Some(pid) = o.split(':').nth(1).and_then(|p| p.parse::<u32>().ok()) else { continue };
-        if pid == std::process::id() || !runs_other_build(pid, bin) {
+        if pid == std::process::id() {
             continue;
+        }
+        match build_of(pid, &want) {
+            Build::Other => {}
+            Build::Same | Build::Gone => continue,
+            // Fail safe (#844): a supervisor this can't tell about is left to the health gate,
+            // never stopped on a guess; on the record, so one that stays on an old build is seen.
+            Build::Unknown(why) => {
+                say(format!("run {run}'s supervisor (pid {pid}) is left running: {why}"));
+                let tenant = ledger.run_tenant(&run).ok().flatten().unwrap_or_else(TenantId::single);
+                let _ = ledger.audit(
+                    &tenant,
+                    Some(&wicket_core::RunId(run.clone())),
+                    "self.supervisor_unknown",
+                    &serde_json::json!({ "run": run, "pid": pid, "why": why }),
+                );
+                continue;
+            }
         }
         // SAFETY: a plain syscall.
         if unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0 {
@@ -1545,13 +1577,39 @@ pub fn stop_stale_supervisors(ledger: &Ledger, bin: &Path) -> Result<Vec<String>
     Ok(killed.into_iter().map(|(r, _)| r).collect())
 }
 
-/// Whether process `pid` runs a binary other than `bin`. One whose binary can't be read is taken
-/// as another: handing a run over to the same build costs a re-attach, keeping an old one costs
-/// its prompts (#475).
-fn runs_other_build(pid: u32, bin: &Path) -> bool {
-    let want = std::fs::canonicalize(bin).ok();
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
-    want.is_none() || exe != want
+/// What build process `pid` runs, against `bin`.
+#[derive(Debug, PartialEq, Eq)]
+enum Build {
+    /// `bin` itself.
+    Same,
+    /// Another binary, read and compared.
+    Other,
+    /// Exited, not yet reaped (a zombie): it supervises nothing.
+    Gone,
+    /// It can't be told, and why: its binary can't be read.
+    Unknown(String),
+}
+
+/// Which build process `pid` runs (#844), against this build's binary `want` (canonical): another
+/// only when its binary is read and differs. A process whose binary can't be read is unknown, not
+/// another (stopping a supervisor of this build on a failed read would cost its run a takeover for
+/// nothing), and a zombie is gone.
+fn build_of(pid: u32, want: &Path) -> Build {
+    if proc_state(pid) == Some('Z') {
+        return Build::Gone;
+    }
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(exe) if exe == want => Build::Same,
+        Ok(_) => Build::Other,
+        Err(e) => Build::Unknown(format!("its binary can't be read ({e})")),
+    }
+}
+
+/// A process's state letter (`R`, `S`, `Z`, …) from `/proc/<pid>/stat`: the field after its name's
+/// closing parenthesis (a name may hold spaces and parentheses itself).
+fn proc_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.trim_start().chars().next()
 }
 
 /// Runs `bin`'s reconciler, which starts a new supervisor (`wicket attach`, on `bin`) for each run
@@ -2159,17 +2217,13 @@ mod tests {
     /// are left alone.
     #[test]
     fn only_supervisors_on_another_build_are_stopped() {
-        let old = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        let same = std::process::Command::new("sh").args(["-c", "sleep 30; :"]).spawn().unwrap();
+        let mut old = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut same = std::process::Command::new("sh").args(["-c", "sleep 30; :"]).spawn().unwrap();
         let (old_pid, same_pid) = (old.id(), same.id());
         let bin = std::fs::canonicalize(format!("/proc/{same_pid}/exe")).unwrap();
-        let reaper = |mut c: std::process::Child| std::thread::spawn(move || c.wait());
-        let (old_t, _same_t) = (reaper(old), reaper(same));
         if std::fs::canonicalize(format!("/proc/{old_pid}/exe")).unwrap() == bin {
             eprintln!("sleep and sh are one binary here: nothing to tell apart");
-            // SAFETY: plain syscalls on this test's own children.
-            unsafe { libc::kill(old_pid as i32, libc::SIGKILL) };
-            unsafe { libc::kill(same_pid as i32, libc::SIGKILL) };
+            let _ = (old.kill(), same.kill(), old.wait(), same.wait());
             return;
         }
         let l = Ledger::open_in_memory().unwrap();
@@ -2177,12 +2231,75 @@ mod tests {
             l.run_started(&TenantId::single(), &wicket_core::RunId(run.into()), "z", "claude").unwrap();
             l.set_run_owner(run, &crate::owner::owner_label_of(pid).unwrap()).unwrap();
         }
+        // Only the other build's supervisor: never this build's, whatever state it is in by now
+        // (#844: something ended `sh` early in a loaded run, and its zombie read as another build).
         assert_eq!(stop_stale_supervisors(&l, &bin).unwrap(), vec!["run_old".to_string()]);
-        assert!(old_t.join().unwrap().is_ok(), "stopped and reaped");
-        let owner = l.running_runs().unwrap().into_iter().find(|(r, _)| r == "run_same").and_then(|(_, o)| o).unwrap();
-        assert_eq!(crate::owner::owner_alive(&owner), Some(true));
-        // SAFETY: as above.
-        unsafe { libc::kill(same_pid as i32, libc::SIGKILL) };
+        assert!(old.wait().is_ok(), "stopped and reaped");
+        // This test's own child, reaped only here: if it ended early, say what ended it.
+        match exited(same_pid) {
+            Some(how) => eprintln!("run_same's sh ended before the check ({how}): left alone, as a zombie supervises nothing"),
+            None => {
+                let owner = l.running_runs().unwrap().into_iter().find(|(r, _)| r == "run_same").and_then(|(_, o)| o).unwrap();
+                assert_eq!(crate::owner::owner_alive(&owner), Some(true), "this build's supervisor runs on");
+            }
+        }
+        let _ = (same.kill(), same.wait());
+    }
+
+    /// Whether this test's child `pid` has exited, without reaping it (`waitid` with `WNOWAIT`):
+    /// how, if it has.
+    fn exited(pid: u32) -> Option<String> {
+        // SAFETY: waitid on this test's own child, into a zeroed siginfo.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+        // SAFETY: si_pid and si_status are set by a waitid that found a child.
+        let (found, status) = unsafe { (info.si_pid(), info.si_status()) };
+        (r == 0 && found != 0).then(|| match info.si_code {
+            libc::CLD_KILLED | libc::CLD_DUMPED => format!("killed by signal {status}"),
+            _ => format!("exited with {status}"),
+        })
+    }
+
+    /// #844: a zombie is gone (it supervises nothing), and a process or build whose binary can't
+    /// be read is unknown: never taken for another build, so never stopped on a guess.
+    #[test]
+    fn only_a_build_read_and_different_is_another() {
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        // Exited, not reaped: wait for it without reaping (WNOWAIT), then ask.
+        // SAFETY: waitid on this test's own child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) }, 0);
+        let sh = std::fs::canonicalize("/bin/sh").unwrap();
+        assert_eq!(build_of(pid, &sh), Build::Gone);
+        assert!(c.wait().is_ok());
+        // No such process: its binary can't be read.
+        assert!(matches!(build_of(u32::MAX, &sh), Build::Unknown(w) if w.contains("its binary can't be read")));
+        let me = std::process::id();
+        // This build's own binary can't be read: the handover fails, on the record, and stops nothing.
+        let l = Ledger::open_in_memory().unwrap();
+        let e = stop_stale_supervisors(&l, Path::new("/nonexistent/wicket")).unwrap_err();
+        assert!(format!("{e:#}").contains("no supervisor was stopped"), "{e:#}");
+        assert_eq!(l.audit_of_kind("self.handover_failed").unwrap().len(), 1);
+        // A live process whose binary can't be read (pid 1, to anyone but root): left running, and
+        // on the record, so a supervisor kept on an old build this way is seen later.
+        if std::fs::read_link("/proc/1/exe").is_err() {
+            let l = Ledger::open_in_memory().unwrap();
+            l.run_started(&TenantId::single(), &wicket_core::RunId("run_init".into()), "z", "claude").unwrap();
+            l.set_run_owner("run_init", &crate::owner::owner_label_of(1).unwrap()).unwrap();
+            assert!(stop_stale_supervisors(&l, &sh).unwrap().is_empty(), "not stopped on a guess");
+            let r = l.audit_of_kind("self.supervisor_unknown").unwrap();
+            let b: serde_json::Value = serde_json::from_str(&r[0].body).unwrap();
+            assert_eq!((b["run"].as_str(), b["pid"].as_u64()), (Some("run_init"), Some(1)), "{b}");
+            assert!(b["why"].as_str().unwrap().contains("its binary can't be read"), "{b}");
+        }
+        // Read and compared: this process is its own build, and not /bin/sh's (unless it is).
+        let exe = std::fs::canonicalize("/proc/self/exe").unwrap();
+        assert_eq!(build_of(me, &exe), Build::Same);
+        if exe != sh {
+            assert_eq!(build_of(me, &sh), Build::Other);
+        }
+        assert!(proc_state(me).is_some_and(|c| c != 'Z'), "a live process isn't a zombie");
     }
 
     fn tmp(tag: &str) -> PathBuf {
