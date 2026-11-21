@@ -275,7 +275,52 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
             wicket_feed::now_ms(),
         )
         .unwrap();
+    // The host-only lists the console shows now (#713), each with something in it: a link, a
+    // webhook trigger (its URL token never shown), a service; the run's grant, identity and node,
+    // and this session, are the fixture's.
+    {
+        let l = f.t.ledger();
+        l.add_link(&wicket_store::LinkRow {
+            id: "lk-1".into(),
+            tenant: TenantId::single().0,
+            from_run: RUN.into(),
+            to_run: RUN.into(),
+            port: 8080,
+            name: "api".into(),
+            addr: "10.0.0.2".into(),
+            by_run: RUN.into(),
+            basis: "child".into(),
+            status: "open".into(),
+            created_at: 1,
+            closed_at: None,
+            closed_by: None,
+            close_reason: None,
+        })
+        .unwrap();
+        let spec: wicket_core::trigger::TriggerSpec = wicket_core::yaml::from_str(
+            "trigger: hook\nsource: { webhook: { verify: { hmac_sha256: hook-key } } }\naction: { wake: agent }\n",
+        )
+        .unwrap();
+        l.create_trigger("t0", "spiffe://wicket.local/t/t0/op/passkey/laptop", &spec, "passkey:laptop", false, None).unwrap();
+        l.add_service("npm-cache", "/data/services/npm-cache/manifest.yaml", &"ab".repeat(32), "t0", "root").unwrap();
+    }
+    let host_lists = ["/api/grants", "/api/links", "/api/triggers", "/api/nodes", "/api/services", "/api/identities", "/api/sessions"];
+    for p in host_lists {
+        let (s, v, body) = get(&f.t, p).await;
+        assert_eq!(s, StatusCode::OK, "{p}: {body}");
+        assert!(v.as_array().is_some_and(|a| !a.is_empty()), "{p} lists something: {body}");
+        // A session's token, or its whole hash, is never in a view.
+        let sid = f.t.sid.clone().unwrap();
+        assert!(!body.contains(&sid) && !body.contains(&super::super::session_id(&sid)), "{p} shows a session token or its hash");
+    }
     let paths = [
+        "/api/grants".to_string(),
+        "/api/links".into(),
+        "/api/triggers".into(),
+        "/api/nodes".into(),
+        "/api/services".into(),
+        "/api/identities".into(),
+        "/api/sessions".into(),
         "/api/me".to_string(),
         "/api/state".into(),
         "/api/policy".into(),

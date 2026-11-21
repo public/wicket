@@ -79,6 +79,7 @@ mod secrets;
 pub mod session;
 mod standing;
 pub(crate) mod tls;
+mod views;
 mod web;
 pub(crate) use web::write_console_assets;
 
@@ -978,7 +979,13 @@ where
             },
             // Read-only views of authority (#173), of nodes (#573), and why a run went where it did
             // (#579): an operator's session only.
-            p => match (authority::get(state, p).or_else(|| nodes::get(state, p)).or_else(|| placement::get(state, p)), &sess) {
+            p => match (
+                authority::get(state, p)
+                    .or_else(|| nodes::get(state, p))
+                    .or_else(|| placement::get(state, p))
+                    .or_else(|| views::get(state, p)),
+                &sess,
+            ) {
                 (Some(r), Some((_, SessionKind::Operator { .. }))) => match r {
                     Ok(v) => to_response(ok(v)),
                     Err(e) => to_response(err(StatusCode::NOT_FOUND, e)),

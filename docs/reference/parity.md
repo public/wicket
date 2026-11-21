@@ -21,7 +21,7 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | --- | --- | --- |
 | List pending requests, standing asks and name asks | `/api/state` (`pending`) | `wicket pending` |
 | Approve or deny a request | `decide` | `wicket approve`, `wicket deny` |
-| List grants | `/api/state` (`decided`: the last 15 decisions) | `wicket grant list` |
+| List grants | `/api/grants` (live, expired and revoked: the last 200) | `wicket grant list` |
 | Renew a grant or a box's authority | none yet (#713) | `wicket grant renew` |
 | Revoke a grant | none yet (#713); a capacity grant: `/api/capacity/revoke` | `wicket grant revoke` |
 | Issue a capacity grant | `capacity_grant` | `wicket capacity grant` |
@@ -57,9 +57,10 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | Read your inbox, receipts and who you may write to | `/api/messages`, `/api/messages/read` | `wicket message inbox`, `receipts`, `principals` |
 | Hibernate an agent | none yet (#713) | `wicket hibernate` (a message, or `wicket session`, wakes it) |
 | Create, pause, resume, renew, fire or remove a trigger, or rotate its URL | none yet (#713) | `wicket trigger …` |
-| List or show triggers | none yet (#713) | `wicket trigger list`, `show` |
+| List triggers | `/api/triggers` | `wicket trigger list` |
+| Show a trigger, with its agent and last firings | none yet (#713) | `wicket trigger show` |
 | Cut a link between boxes | none yet (#713) | `wicket unlink` |
-| List links | none yet (#713) | `wicket links` |
+| List links | `/api/links` | `wicket links` |
 
 ## Manifests and policy
 
@@ -90,7 +91,7 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 
 | Action | Console | CLI |
 | --- | --- | --- |
-| List nodes | `/api/state` (`placed`: nodes `wicket node create` made); the rest: none yet (#713) | `wicket node list` |
+| List nodes | `/api/nodes` (and `/api/state`'s `placed`: nodes `wicket node create` made) | `wicket node list` |
 | A node's CA: hosts, policy, wants and widenings | `/api/nodes/<node>/ca` | `wicket node ca` |
 | Release a node `wicket node create` made | `node_release` | `wicket node release` |
 | Release a run's fence on a lost node | `release_fence` | `wicket node release-fence` (root, or without wicketd) |
@@ -100,7 +101,8 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | Make a join token, enrol, revoke or forget a node, or renew its CA | none yet (#713) | `wicket node token`, `enrol`, `revoke`, `forget`, `renew-ca` |
 | Set a node's CA hosts, labels or taints | none yet (#713) | `wicket node set` |
 | List or release capacity leases | a lease's request in `/api/state` (`pending`); releasing one: none yet (#713) | `wicket lease list`, `wicket lease release` |
-| List, add or remove per-node services | none yet (#713) | `wicket service list`, `add`, `remove` |
+| List per-node services | `/api/services` | `wicket service list` |
+| Add or remove a per-node service | none yet (#713) | `wicket service add`, `remove` |
 | Make what exists agree with the ledger now | none yet (#713): the reconciler runs as a service | `wicket reconcile` |
 | Install a node, or serve it | host-only: runs on the node, as root over ssh or under systemd | `wicket node install`, `serve`, `intake`, `top` |
 | Keep a node feed's checkpoint across a rollback | host-only: part of an update on the host | `wicket node feed-checkpoint` |
@@ -114,7 +116,8 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | List passkeys | `/api/state` (`passkeys`) | `wicket operator list` |
 | Revoke every passkey | host-only: the break-glass for a lost or stolen passkey | `wicket operator reset` |
 | Sign out | `/api/logout` | not applicable: the CLI has no session |
-| List console sessions, or end one | none yet (#713); signing out ends your own | `wicket operator sessions`, `revoke-session` |
+| List console sessions | `/api/sessions` | `wicket operator sessions` |
+| End a console session | none yet (#713); signing out ends your own | `wicket operator revoke-session` |
 | Turn notifications on a device on or off | `push_subscribe`, `/api/push/remove`, `push_details` | not applicable: a browser's push subscription |
 
 ## The installation
@@ -127,7 +130,8 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | Compact the ledger, or feed the audit sinks | host-only: compacting needs wicketd stopped; a sink is a process on the host | `wicket audit compact`, `wicket audit export` |
 | Health | `/api/state` (`health`) | `wicket top`, `wicket doctor` |
 | Set up the identity issuer | host-only: bootstraps trust | `wicket identity init` |
-| Show or list identities, or the issuer key | none yet (#713) | `wicket identity show`, `list`, `issuer` |
+| List identities | `/api/identities` | `wicket identity list` |
+| Show one identity, or the issuer key | none yet (#713) | `wicket identity show`, `issuer` |
 | Approve an agent's update request | `decide` (installs the build it names) | `wicket approve`, or `wicket self apply-update` |
 | Update, roll back, prune, or trust an update key | host-only: installs binaries and units on the host | `wicket self …` |
 | State store: replicate, snapshot, restore, recovery kit | host-only: for recovering when the control host is gone | `wicket state …` |

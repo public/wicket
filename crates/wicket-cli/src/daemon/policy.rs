@@ -105,7 +105,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // A trigger wakes and messages agents later, as its owner (the caller): what `wake` and
         // `session` do now. Pausing and removing one only narrows.
         Cmd::Trigger { cmd } => match cmd {
-            TriggerCmd::List | TriggerCmd::Show { .. } | TriggerCmd::Fire { .. } => Forward(Read),
+            TriggerCmd::List { .. } | TriggerCmd::Show { .. } | TriggerCmd::Fire { .. } => Forward(Read),
             TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } | TriggerCmd::RotateUrl { .. } => Forward(Run),
             TriggerCmd::Pause { .. } | TriggerCmd::Rm { .. } => Forward(Revoke),
         },
@@ -134,12 +134,12 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Service { cmd: ServiceCmd::List { .. } } => Forward(Read),
         Cmd::Service { .. } => Forward(Privileged),
         Cmd::Operator { cmd } => match cmd {
-            OperatorCmd::List | OperatorCmd::Sessions => Forward(Read),
+            OperatorCmd::List | OperatorCmd::Sessions { .. } => Forward(Read),
             // A passkey enrolled by the operator's uid could approve in the console.
             OperatorCmd::EnrolLink { .. } | OperatorCmd::Reset | OperatorCmd::RevokeSession { .. } => Forward(Privileged),
         },
         Cmd::Identity { cmd } => match cmd {
-            IdentityCmd::Issuer | IdentityCmd::Show { .. } | IdentityCmd::List => Forward(Read),
+            IdentityCmd::Issuer | IdentityCmd::Show { .. } | IdentityCmd::List { .. } => Forward(Read),
             IdentityCmd::Revoke { .. } => Forward(Revoke),
             IdentityCmd::Init { .. } => Forward(Privileged),
         },
