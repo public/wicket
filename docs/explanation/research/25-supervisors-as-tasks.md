@@ -592,7 +592,18 @@ rolled back by running the previous build.
    epoch-conditional writes (schema 42, `wicket-store/src/hosts.rs`); the static shard of a node,
    the lease renewed only on runtime progress, and wicketd's start-or-fence rule
    (`wicket-control/src/supervise.rs`); and the rollback reading below (`wicket-home/src/owner.rs`).
-   Nothing starts a host yet.
+   The host process, `wicket supervise --shard <k> --node <n>…` (hidden; refused through wicketd's
+   socket): it takes its shard only if it is free (never held, fenced, or stopped cleanly: a lapsed
+   holder's is left to wicketd's fence, kill and fresh start), ticks a progress counter on its
+   runtime every second, renews its lease every 5 s from a thread with its own ledger connection
+   (only when the counter moved), and answers a heartbeat on `<data>/supervise/<k>.sock` (0600, one
+   JSON line: shard, holder, epoch, progress, `lease_ok`, `lost`, and `stuck`, sampled per request:
+   the counter standing still for 3 s, the lease thread not through its loop for three renewal
+   intervals, or the shard lost) from another thread that never touches the ledger. SIGTERM stops
+   the heartbeat, unlinks the socket (only the one it bound: a successor binds the same path), then
+   writes the clean-stop marker and exits 0. A lost shard exits 3 without writing; a held shard
+   refuses it with exit 75 (try again); a lease thread that ends without losing the shard ends the
+   host (exit 1). It supervises no runs yet, and nothing starts one yet: wicketd does that next.
 
    **Conditions on the PR that first writes a host label** (`host:<shard>:<epoch>` in `runs.owner`;
    #781 review):
