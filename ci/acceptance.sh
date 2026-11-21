@@ -634,6 +634,7 @@ check "  and its audit allowed nothing but GET example.com/ (and resolved no oth
 if [ -n "$nodes" ]; then
   multihost
   escape_flow
+  widen_flow
 fi
 if [ "$nodes" = local ]; then
   messages_flow

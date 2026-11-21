@@ -123,6 +123,7 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Image { .. } => Forward(Privileged),
         Cmd::Serve { .. } => Refuse("the console runs as the wicket user under systemd: systemctl status wicket-console"),
         Cmd::Daemon { .. } => Refuse("the daemon runs as the wicket user under systemd: systemctl status wicketd"),
+        Cmd::Supervise { .. } => Refuse("supervisor hosts are wicketd's own children: wicketd starts them (supervise: hosts)"),
         Cmd::Program { cmd: ProgramCmd::Digest { .. } } => Local,
         // Reads a manifest the caller names, in the caller's own process.
         Cmd::Zone { .. } => Local,
@@ -488,6 +489,7 @@ mod tests {
         }
         assert!(matches!(route(&cmd(&["serve"])), Route::Refuse(_)));
         assert!(matches!(route(&cmd(&["daemon"])), Route::Refuse(_)));
+        assert!(matches!(route(&cmd(&["supervise", "--shard", "0", "--node", "local"])), Route::Refuse(_)), "hosts are wicketd's own");
         assert!(matches!(route(&cmd(&["audit", "compact", "--yes"])), Route::Refuse(_)), "never with wicketd running");
     }
 

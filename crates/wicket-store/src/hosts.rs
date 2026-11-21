@@ -122,8 +122,23 @@ impl Ledger {
     /// stopped. Every take raises the epoch. One transaction: the epoch, the shard's nodes (a node
     /// moves here from any other shard) and every running run on them (`runs.host`).
     pub fn take_shard(&self, host: &str, owner: &str, nodes: &[&str], lease_secs: i64, now: i64) -> Result<Taken> {
+        self.take_shard_as(host, owner, nodes, lease_secs, now, false)
+    }
+
+    /// [`Ledger::take_shard`], but only a free shard: one nobody holds (never held, or fenced) or
+    /// whose holder stopped cleanly. A lapsed holder's is refused too ([`StoreError::ShardHeld`],
+    /// 0 s), so a host process never takes over another by itself: that is wicketd's fence, then its
+    /// kill, then a fresh start (note 25, §3.1). What `wicket supervise` takes with.
+    pub fn take_free_shard(&self, host: &str, owner: &str, nodes: &[&str], lease_secs: i64, now: i64) -> Result<Taken> {
+        self.take_shard_as(host, owner, nodes, lease_secs, now, true)
+    }
+
+    fn take_shard_as(&self, host: &str, owner: &str, nodes: &[&str], lease_secs: i64, now: i64, only_free: bool) -> Result<Taken> {
         self.immediate::<_, StoreError>(|l| {
             let cur = l.supervisor_host(host)?;
+            if let Some(c) = cur.as_ref().filter(|c| only_free && c.owner.is_some() && !c.stopping) {
+                return Err(StoreError::ShardHeld(host.to_string(), (c.lease_until - now).max(0)));
+            }
             if let Some(c) = cur.as_ref().filter(|c| c.owner.as_deref().is_some_and(|o| o != owner) && !c.stopping && c.lease_until > now) {
                 return Err(StoreError::ShardHeld(host.to_string(), c.lease_until - now));
             }
@@ -403,6 +418,18 @@ mod tests {
         // A lapsed lease is fenced without the process having exited.
         assert_eq!(l.fence_shard("0", B, false, 140).unwrap(), None, "the lease runs to 141");
         assert_eq!(l.fence_shard("0", B, false, 141).unwrap(), Some(4));
+    }
+
+    #[test]
+    fn a_free_take_refuses_a_lapsed_holder_and_takes_a_fenced_or_stopped_shard() {
+        let l = ledger_with_runs();
+        l.take_free_shard("0", A, &["n1"], 30, 100).unwrap();
+        // Lapsed, but still held: only wicketd's fence frees it.
+        assert!(matches!(l.take_free_shard("0", B, &["n1"], 30, 200), Err(StoreError::ShardHeld(_, 0))));
+        assert_eq!(l.fence_shard("0", A, false, 200).unwrap(), Some(2));
+        assert_eq!(l.take_free_shard("0", B, &["n1"], 30, 200).unwrap().epoch, 3);
+        assert!(l.mark_shard_stopping("0", B, 3, 201).unwrap());
+        assert_eq!(l.take_free_shard("0", A, &["n1"], 30, 201).unwrap().epoch, 4, "a clean stop frees it at once");
     }
 
     #[test]
