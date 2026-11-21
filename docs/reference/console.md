@@ -183,6 +183,46 @@ their own leases. Whatever the grant, the node's money is reserved first against
 asked or created. An operator whose authority in [`operators.yaml`](configuration.md#operatorsyaml)
 doesn't include `capacity` may not issue or renew one.
 
+## Standing reach
+
+[Standing reach](../explanation/concepts.md#the-nouns) (#572) is a reach rule an agent asks for once,
+for its later runs, and an operator approves once. The console shows it in two places, from the
+dashboard's `standing` (`/api/state`: `asks`, the pending standing requests, and `rules`, the
+standing rules).
+
+**A standing request** is a card in the inbox's **Needs you**, under its own heading (**Asking to be
+always allowed**, with how many), counted with the other requests. It shows:
+- who asked (the agent and its zone) and what it wants to be always allowed: the methods, and the
+  host and paths, as a manifest's rule would say them, with a warning when the rule includes
+  requests that can't be undone (`allow_dangerous`);
+- the agent's reason, quoted;
+- **So far**: the ledger's evidence, the blocked requests the rule covers in the last 14 days (how
+  many, on how many days, how many were allowed, refused or not decided), and under **Details** the
+  ten most asked method and path pairs;
+- what the rule allows beyond its evidence, each as a warning.
+
+Its choices go narrowest first, and each is a decision signed with your passkey:
+- **Always: only what it used** approves the rule narrowed to the method and path pairs its evidence
+  shows were granted (offered only when there is evidence to narrow to);
+- **Always: as asked** approves the rule as the agent asked;
+- **Always, for every agent in zone …** approves it for the zone: every agent of that zone, in each
+  later run;
+- **Don't allow** denies it.
+
+An approval lasts 30 days. The signed JSON names the rule, who it is for (`agent` or `zone`), its
+lifetime and its effect; an approval of a request that changed since it was shown is refused. `wicket standing approve` and `deny`
+decide the same requests ([cli](cli.md#wicket-standing)).
+
+**A standing rule** is a row of the **Always allowed** card in **Settings**: who it is for (the agent,
+or every agent in a zone), what it may do on which host and paths, when it lapses (or "until
+revoked"), and who allowed it. **Renew (30 days)** is a signed decision that moves its lapse to 30
+days from now. **Revoke** needs only the session, since it only narrows: the rule allows nothing
+from then on, on a box's node once its run publishes the revocation, and it is audited as
+`standing.revoked` with the operator.
+
+A standing rule never lifts the zone's ceiling or the org layer: a box's node decides each request by
+the rule within them, as it does a grant.
+
 ## Names
 
 The **Names** card (#575 step 4d; [names for boxes](../explanation/box-dns.md)) lists the names of
@@ -317,8 +357,11 @@ WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
 ```
 
 **Its views are moving to [lit-html](https://lit.dev/docs/libraries/standalone-templates/)** (#574),
-one at a time: the Inbox (`static/inbox.js`), Agents and an agent's page (`static/agents.js`), then
-Activity (`static/activity.js`).
+one at a time: the Inbox (`static/inbox.js`), Agents and an agent's page (`static/agents.js`),
+Activity (`static/activity.js`) and Settings (`static/settings.js`); what they share is
+`static/ui.js`. Three forms stay `console.js`'s, built from elements and text as before: a secret's
+form (its value goes only with the signed action's finish), the manifest editor, and enabling
+notifications.
 lit-html's published modules are committed under `static/vendor/lit-html/`, unchanged, with their version, licence and hashes in `VENDOR.toml`
 (`ci/vendor-lit.sh` updates them; `ci/vendor-check.py` checks them). The console's modules import it
 by name (`import { html } from "lit-html"`), and `build.rs` rewrites each such import to the vendored
@@ -407,6 +450,29 @@ that stays a signed action.
 key. Each view is built from named fields, never by serializing a stored record, and a test fetches
 every console endpoint and scans each answer for the token, any 24-byte run of its bytes (base64url,
 base64 and hex, except runs inside a public key), identity JWSs and private keys.
+## Lists from the host
+
+Read-only, behind the session like the rest of the page (#713). Each answers with what its CLI
+command's `--json` prints ([the CLI reference](cli.md#output-for-scripts) lists the fields), through
+the same function: `GET /api/grants` (`wicket grant list --all`, the last 200), `/api/links`
+(`wicket links`, the last 200), `/api/triggers` (`wicket trigger list`), `/api/nodes`
+(`wicket node list`), `/api/services` (`wicket service list`), `/api/identities` (`wicket identity
+list`) and `/api/sessions` (`wicket operator sessions`). None carries a token, a signature, a key,
+a trigger's document or a session's token: an identity is its verified fields, and a session its
+token's hash's first 16 hex digits, which nothing signs in with.
+
+Four of them can be narrowed from the console (#713), with the session alone (as revoking a
+capacity grant or standing reach: each only takes something away): `POST /api/grants/revoke`,
+`/api/links/cut`, `/api/triggers/pause` and `/api/sessions/end`, each with `{"id"}`. Each goes
+through its command's function (`wicket grant revoke`, `unlink`, `trigger pause`), for the
+console's tenant only (another tenant's id is not found), and is audited with the passkey's operator
+and `via: console`. A session is one of the operator's own, named as `/api/sessions` names it (at
+least its 16 hex digits; a prefix two of its own share is ambiguous); another passkey's is ended on
+the host (`wicket operator revoke-session`). Ending the session the request came with signs it out:
+its cookie is cleared. Each answers 404 for an id it doesn't know (another tenant's among them), 409
+for one already so (a grant revoked, a link closed, a trigger paused: nothing is recorded again) or
+an ambiguous prefix, and 400 for an id that isn't one.
+
 ## Placement view
 
 Why a run went where it did ([#579](https://github.com/public/wicket/issues/579)), read-only and behind

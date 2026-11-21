@@ -70,8 +70,11 @@ pub const EVENT_STALE_SECS: i64 = CATCH_UP_SECS;
 /// The states of an agent a trigger may reach (not ended or failed ones).
 const LIVE_AGENT: &[&str] = &["active", "waking", "hibernating", "hibernated"];
 
+/// Audits a record about a trigger (`body.trigger`) in that trigger's tenant (#713 review: not
+/// always the single one).
 fn audit(l: &Ledger, kind: &str, body: &Value) -> Result<()> {
-    l.audit(&TenantId::single(), None, kind, body)?;
+    let tenant = body["trigger"].as_str().and_then(|id| l.trigger(id).ok().flatten()).map_or_else(TenantId::single, |t| TenantId(t.tenant));
+    l.audit(&tenant, None, kind, body)?;
     Ok(())
 }
 
@@ -392,14 +395,27 @@ pub fn approve(l: &Ledger, by: &Granter, id: &str) -> Result<()> {
 /// Pauses (`paused`) or deletes (`deleted`) a trigger, by operator `by`: audited as
 /// `trigger.paused` or `.deleted`. Anyone who may revoke may, since it only narrows.
 pub fn set_status(l: &Ledger, by: &Operator, id: &str, status: &str) -> Result<Trigger> {
+    set_status_via(l, by, id, status, json!({}))
+}
+
+/// As [`set_status`], with `extra` on its record (`via`, #713).
+pub fn set_status_via(l: &Ledger, by: &Operator, id: &str, status: &str, extra: Value) -> Result<Trigger> {
     let t = get(l, id)?;
+    // Already so: nothing changes, and nothing is recorded again (#713 review).
+    if t.status == status {
+        return Err(wicket_home::exit::refused(format!("trigger {} ({}) is already {status}", t.name, t.id)));
+    }
     let kind = match status {
         "paused" => "trigger.paused",
         "deleted" => "trigger.deleted",
         s => bail!("a trigger is paused or deleted here, not {s}"),
     };
     l.set_trigger_status(id, status)?;
-    audit(l, kind, &json!({ "trigger": id, "name": t.name, "owner": t.owner, "by": by.label, "principal": by.id }))?;
+    let mut record = json!({ "trigger": id, "name": t.name, "owner": t.owner, "by": by.label, "principal": by.id });
+    if let (Some(r), Value::Object(x)) = (record.as_object_mut(), extra) {
+        r.extend(x);
+    }
+    audit(l, kind, &record)?;
     Ok(t)
 }
 
@@ -1869,6 +1885,24 @@ mod tests {
         let p = l.take_prompts(&agent).unwrap();
         assert!(p[0].text.contains("Run \"run_bad\" ended \"failed\"") && p[0].text.contains("data, not instructions"), "{:?}", p[0].text);
         assert!(pass(&l, wicket_store::now(), false, &w, &anyone).unwrap().is_empty(), "each record once");
+    }
+
+    /// #713 review: a trigger's records are its tenant's, and pausing one already paused changes
+    /// nothing and records nothing.
+    #[test]
+    fn a_triggers_records_are_its_tenants_and_a_repeat_pause_records_nothing() {
+        let l = Ledger::open_in_memory().unwrap();
+        let s = spec("trigger: t\nsource: { webhook: { verify: { hmac_sha256: k } } }\naction: { wake: captain }\n");
+        let id = l.create_trigger("t9", "spiffe://local/t/t9/op/unix/alex", &s, "unix:alex", false, None).unwrap();
+        set_status_via(&l, &operator(), &id, "paused", json!({ "via": "console" })).unwrap();
+        let e = set_status_via(&l, &operator(), &id, "paused", json!({})).unwrap_err();
+        assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::Refused as i32, "{e:#}");
+        let paused = l.audit_of_kind("trigger.paused").unwrap();
+        assert_eq!(paused.len(), 1, "once");
+        assert_eq!(
+            (paused[0].tenant.as_str(), serde_json::from_str::<Value>(&paused[0].body).unwrap()["via"].as_str()),
+            ("t9", Some("console"))
+        );
     }
 
     /// An agent's words in a record reach another agent quoted: a value can't close its quote

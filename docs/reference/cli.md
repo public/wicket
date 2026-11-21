@@ -14,8 +14,8 @@ reference](manifest.md)).
 ## Output for scripts
 
 The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
-`agents`, `links`, `manifest list`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `node fences`, `lease list`, `service list`, `audit`,
-`message inbox`, `message receipts` and `message principals`, and so do `names show` (one name: an object), `manifest show` and `manifest check` (one manifest's), `authority` (one run's), `audit explain` (one record's) and `policy show` (the org policy's). With it, stdout holds one JSON document
+`agents`, `links`, `manifest list`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `node fences`, `lease list`, `service list`, `trigger list`, `identity list`, `operator sessions`, `audit`,
+`message inbox`, `message receipts`, `message principals` and `message delegations`, and so do `names show` (one name: an object), `manifest show` and `manifest check` (one manifest's), `authority` (one run's), `audit explain` (one record's) and `policy show` (the org policy's). With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -29,7 +29,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | Output | Fields |
 | --- | --- |
 | `wicket pending --json`, a request | `kind` (`request`), `id`, `run`, `zone`, `method`, `host`, `path`, `prefix` (the whole path prefix asked for), `risk`, `reason`, `created_at`, `attribution` (who in the box asked, as the agent reported it: untrusted) |
-| `wicket pending --json`, a standing ask | `kind` (`standing`), `id`, `run`, `zone`, `principal`, `rule`, `reason`, `created_at` |
+| `wicket pending --json`, a standing request | `kind` (`standing`), `id`, `run`, `zone`, `principal`, `rule`, `reason`, `created_at` |
 | `wicket pending --json`, an ask for a public name | `kind` (`name`), `id`, `run` (the asking run), `zone`, `principal`, `label`, `port` (the box's own), `service`, `scope` (`run`, `standing`), `reason` (the agent's, prefixed `asked by the agent: `), `created_at` |
 | a standing `rule` | `host`, `methods`, `paths`, `allow_dangerous` |
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
@@ -56,12 +56,16 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket policy show --json` | `installed` (the applied version, or null), `current` (the applied policy's `version`, whether it `matches_applied` (a hand edit since makes every mint refuse), its `cedar` and `entities`; or null), `versions` (each kept `version`, whether it is `current`, each time it was `applied` (`seq`, `at`, `by`, `previous`) and its `cedar`), `runs` (each running `run`, its `zone`, the `policy` it was minted under and its `status`) |
 | `wicket node fences --json` | `id` (the run), `fence` |
 | a run's `fence` | `run`, `tenant`, `node`, `fenced_until_ms` (null: until its node confirms its box stopped), `source` (where that end comes from: `authority`, `run_record`, `ledger` or `unknown`), `node_status` (`revoked`, or `unknown`: no longer enrolled), `node_seen_ms` (its last report, or null), `why`, `release_refused` (null: listed fences can be released), `effect_sha256` (what a release is bound to) |
+| `wicket trigger list --json` | `id`, `name`, `state` (wicket's words: `active`, `paused`, `waiting for approval`, `lapsed …`, `done …`), `status` (`active`, `paused`, `done`), `approval` (`none`, `pending`, `approved`), `owner`, `created_by`, `created_at`, `until` (null: until removed), `decided_by`, `next_due` (its next firing, null when it isn't live), `source` and `action` (in words; never its document or a webhook's URL) |
+| `wicket identity list --json` | `run`, `status` (the run's), `identity` (as verified: its fields, never its signed document) |
+| `wicket operator sessions --json` | `id` (the first 16 hex digits of its token's SHA-256, as `revoke-session` takes it), `kind` (`operator`, `bootstrap`), `credential` (an operator session's passkey; null for a bootstrap one), `client`, `created_at`, `last_seen_at`, `expires_at` |
 | `wicket lease list --json` | `id`, `status` (`pending`, `approved`, `active`, `ended`, `denied`, `withdrawn`, `failed`), `run` (the run that holds it), `provider`, `request` (the request a person decides; null: none yet), `node` (the enrolled node's name; null: none yet), `node_id` (the provider's id for it), `hourly_cap_micro_usd`, `reserved_micro_usd`, `billed_micro_usd` (null: not ended), `duration_secs`, `created_at`, `not_after` (null: no node yet), `ended_at`, `detail` |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
 | `wicket message inbox --json` | `message_id`, `kind`, `from` (the sender's principal id, as its envelope verified), `agent`, `zone` and `run` (an agent sender's; null for an operator), `acting_for` (the chain the sender acts for), `reply_to`, `priority` (`now`, `next`, `later`), `in_reply_to`, `sent_at`, `read_at` (null: unread until now), `body` (the sender's data) |
 | `wicket message inbox --json`, a message that doesn't verify | `message_id`, `dropped` (why) |
 | `wicket message receipts --json` | `message_id`, `to`, `state` (`delivered`, `read`, `held`, `refused`, `expired`), `why`, `release` (a held message: who can release it), `run`, `sent_at`, `read_at`, `expires_at`, `priority`, `in_reply_to` |
 | `wicket message principals --json` | `id`, `kind` (`agent`, `program`), `agent`, `zone`, `relation` (`acts for you`, `accepts you`), `state` (`running`, `busy`, `idle`, `waiting`, `hibernated`, `offline`) |
+| `wicket message delegations --json` (and `wicket message continue --json`, one) | `id` (`d-…`), `name`, `agent` (its principal), `run`, `state` (`working`, `reported`, `ended`), `turn` (its briefs so far), `brief_message`, `report_message`, `created_at`, `updated_at` |
 | `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
 | `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
 | an agent's `used` | `requests`, `input_tokens`, `output_tokens`, `secs` |
@@ -80,6 +84,8 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket message inbox`](#wicket-message-inbox)
   - [`wicket message receipts`](#wicket-message-receipts)
   - [`wicket message principals`](#wicket-message-principals)
+  - [`wicket message continue`](#wicket-message-continue)
+  - [`wicket message delegations`](#wicket-message-delegations)
 - [`wicket top`](#wicket-top)
 - [`wicket agents`](#wicket-agents)
 - [`wicket hibernate`](#wicket-hibernate)
@@ -345,11 +351,13 @@ Messages with agents (#252), as an operator: the same signed envelopes, rules an
 Usage: wicket message <COMMAND>
 
 Commands:
-  send        Send a signed message to an agent: one that acts for you, whose accept_from names you, or that wrote to you (--in-reply-to). Prints its id and receipt
-  inbox       Messages agents sent you, verified, unread first by priority. They are marked read (their senders' receipts say so) unless --peek
-  receipts    The receipts of the messages you sent, newest first: delivered, read, held (why, and who can release it), refused (why) or expired
-  principals  The agents you may write to, with their state: those that act for you or whose accept_from names you
-  help        Print this message or the help of the given subcommand(s)
+  send         Send a signed message to an agent: one that acts for you, whose accept_from names you, or that wrote to you (--in-reply-to). Prints its id and receipt
+  inbox        Messages agents sent you, verified, unread first by priority. They are marked read (their senders' receipts say so) unless --peek
+  receipts     The receipts of the messages you sent, newest first: delivered, read, held (why, and who can release it), refused (why) or expired
+  principals   The agents you may write to, with their state: those that act for you or whose accept_from names you
+  continue     Give an agent you started another brief, once its report on the last one is in your inbox: its session wakes with it, its context intact (what continue_child is for an agent)
+  delegations  The agents you started and delegated to, newest first: each one's state (working on a brief, reported, or ended) and how many briefs it has had
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -408,6 +416,35 @@ Options:
 The agents you may write to, with their state: those that act for you or whose accept_from names you
 
 Usage: wicket message principals [OPTIONS]
+
+Options:
+      --json  JSON instead of text
+  -h, --help  Print help
+```
+
+### `wicket message continue`
+
+```text
+Give an agent you started another brief, once its report on the last one is in your inbox: its session wakes with it, its context intact (what continue_child is for an agent)
+
+Usage: wicket message continue [OPTIONS] <AGENT> <BRIEF>...
+
+Arguments:
+  <AGENT>     The agent: its name, principal or delegation id (d-…, as `wicket message delegations` shows it)
+  <BRIEF>...  The brief, as one string
+
+Options:
+      --priority <PRIORITY>  How soon you want it read: now, next or later [default: next]
+      --json                 JSON instead of text
+  -h, --help                 Print help
+```
+
+### `wicket message delegations`
+
+```text
+The agents you started and delegated to, newest first: each one's state (working on a brief, reported, or ended) and how many briefs it has had
+
+Usage: wicket message delegations [OPTIONS]
 
 Options:
       --json  JSON instead of text
@@ -529,9 +566,10 @@ Options:
 ```text
 Triggers that aren't removed: each with its state, source, action and next firing
 
-Usage: wicket trigger list
+Usage: wicket trigger list [OPTIONS]
 
 Options:
+      --json  Print JSON (docs/reference/cli.md, "Output for scripts"), as the console has them
   -h, --help  Print help
 ```
 
@@ -1117,10 +1155,10 @@ Standing reach (#572): a reach rule an agent asked for once, approved once for i
 Usage: wicket standing <COMMAND>
 
 Commands:
-  list     Standing rules: pending asks, and approved rules (with when they lapse). --all adds denied, revoked and lapsed ones
-  show     One ask or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
-  approve  Approve a standing ask (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
-  deny     Deny a standing ask
+  list     Standing requests (pending) and standing rules (approved, with when they lapse). --all adds denied, revoked and lapsed ones
+  show     One standing request or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
+  approve  Approve a standing request (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
+  deny     Deny a standing request
   renew    Move an approved rule's lapse to --ttl from now (or `forever`)
   revoke   Revoke an approved rule: it allows nothing from now on (a box's node, once its run publishes the revocation)
   help     Print this message or the help of the given subcommand(s)
@@ -1133,7 +1171,7 @@ Options:
 ### `wicket standing list`
 
 ```text
-Standing rules: pending asks, and approved rules (with when they lapse). --all adds denied, revoked and lapsed ones
+Standing requests (pending) and standing rules (approved, with when they lapse). --all adds denied, revoked and lapsed ones
 
 Usage: wicket standing list [OPTIONS]
 
@@ -1146,7 +1184,7 @@ Options:
 ### `wicket standing show`
 
 ```text
-One ask or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
+One standing request or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
 
 Usage: wicket standing show <ID>
 
@@ -1160,7 +1198,7 @@ Options:
 ### `wicket standing approve`
 
 ```text
-Approve a standing ask (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
+Approve a standing request (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
 
 Usage: wicket standing approve [OPTIONS] <ID>
 
@@ -1178,7 +1216,7 @@ Options:
 ### `wicket standing deny`
 
 ```text
-Deny a standing ask
+Deny a standing request
 
 Usage: wicket standing deny <ID>
 
@@ -2041,9 +2079,10 @@ Options:
 ```text
 List live console sessions (id, passkey, client address, times)
 
-Usage: wicket operator sessions
+Usage: wicket operator sessions [OPTIONS]
 
 Options:
+      --json  Print JSON (docs/reference/cli.md, "Output for scripts"), as the console has them
   -h, --help  Print help
 ```
 
@@ -2259,9 +2298,10 @@ Options:
 ```text
 List every agent identity issued, verified
 
-Usage: wicket identity list
+Usage: wicket identity list [OPTIONS]
 
 Options:
+      --json  Print JSON (docs/reference/cli.md, "Output for scripts"), as the console has them
   -h, --help  Print help
 ```
 
@@ -2815,7 +2855,7 @@ without reading the message (which goes to stderr, after `Error: `).
 | --- | --- | --- |
 | 0 | Done. | |
 | 1 | Failed, for any reason the others don't name. | The ledger can't be opened; a node doesn't answer; the daemon's policy file can't be read; asking for a spend's approval failed; `wicket run` whose box failed (a non-zero exit, out of memory, over a cap) or timed out (see below). |
-| 2 | A usage error: the command line is wrong. Nothing was changed. | An unknown flag; a duration that isn't one (`--ttl 5q`; every duration flag takes `90s`, `10m`, `1h 30m` or a number of seconds); `wicket approve s-…` (a standing ask: `wicket standing approve`). |
+| 2 | A usage error: the command line is wrong. Nothing was changed. | An unknown flag; a duration that isn't one (`--ttl 5q`; every duration flag takes `90s`, `10m`, `1h 30m` or a number of seconds); `wicket approve s-…` (a standing request: `wicket standing approve`). |
 | 3 | Refused: wicket won't do it as asked. | The daemon's policy doesn't allow this caller the command; a decision outside the decider's authority; deciding a request that is already decided; terms wider than the request; answering no at `approve`'s or `standing approve`'s confirmation; a spend an operator denied, or over the installation's money limit; a lease that is already ended; a session on a run that isn't running; `self update` of an artifact whose signature doesn't verify. |
 | 4 | Not found: what the command names doesn't exist. | `no such request r-…`; no grant, link, lease, run, agent, node, service, trigger or identity by that name; no placement decision for the run. |
 | 5 | It needs an approval nobody has given yet. | `wicket node create` whose spend no capacity grant covers and no operator decided within `--wait` (or `--wait 0`); `wicket self update` of an artifact no trusted key signed and no operator approved. |

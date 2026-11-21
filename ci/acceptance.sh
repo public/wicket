@@ -237,10 +237,15 @@ elif [ "${ACC_AUDIT_SINK:-}" = 1 ]; then
 fi
 
 port=$(free_port)
-# Every agent's turn runs one command: its workspace's drive.sh, or, for the lead's child agent (an
-# empty workspace), spawn a leaf box and stay up until revoked.
+# Every agent's turn runs one command: its workspace's drive.sh; for the cap agent's delegate on the
+# other node (`helper`, #252), a turn that reports where it ran and stays open for its next brief;
+# or, for the lead's child agent (an empty workspace), spawn a leaf box and stay up until revoked.
 leaf='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spawn","arguments":{"name":"leaf","kind":"program","zone":{"limits":{"memory":"128m","cpus":1,"timeout":"4m"}},"command":["sleep","3000"]}}}'
-mock_cmd="[ -f /workspace/drive.sh ] && exec bash /workspace/drive.sh; curl -s -m 120 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$leaf'; sleep 500"
+whoami='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}'
+# Its brief, when continued, is a message to read (a continuation's report counts once it is read).
+brief='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"await_message","arguments":{"timeout_seconds":5}}}'
+helper="who=\$(curl -s -m 20 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$whoami' | jq -r '.result.content[0].text'); if [ \"\$(jq -r .agent <<<\"\$who\" 2>/dev/null)\" = helper ]; then echo \"helper turn, decided on \$(jq -r .decided_on <<<\"\$who\")\"; curl -s -m 30 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$brief' >/dev/null; echo 'wicket-mock: stay'; exit 0; fi"
+mock_cmd="[ -f /workspace/drive.sh ] && exec bash /workspace/drive.sh; $helper; curl -s -m 120 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$leaf'; sleep 500"
 HOME=$HOMEW "$W" dev mock-llm --listen "127.0.0.1:$port" --command "$mock_cmd" 2>"$work/mock.log" &
 pids+=("$!")
 wait_for 10 "(exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null"
@@ -491,17 +496,27 @@ wait_for 30 '[ -n "$(box_of "$flood")" ]' || true
 flood_box=$(box_of "$flood" | head -1)
 flood_logpath=$($DOCKER inspect -f '{{.LogPath}}' "$flood_box" 2>/dev/null || true)
 flood_kept=
+# The log is a path in the Docker daemon's file system: where that isn't this one (the installed
+# system runs in a container on the host's Docker), it can't be read here, and there is nothing to
+# measure (#824: `du` of a missing file is 0, which passed this check without measuring anything).
+flood_log_here=
+[ -z "$flood_logpath" ] || ! sudo -n test -f "$flood_logpath" 2>/dev/null || flood_log_here=1
 for _ in $(seq 120); do
-  if [ -n "$flood_logpath" ]; then
+  if [ -n "$flood_log_here" ]; then
     k=$(sudo -n sh -c 'du -cb "$1"* 2>/dev/null | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
-    [ -z "$k" ] || [ "$k" -le "${flood_kept:-0}" ] || flood_kept=$k
+    if [ -n "$k" ] && { [ -z "$flood_kept" ] || [ "$k" -gt "$flood_kept" ]; }; then flood_kept=$k; fi
   fi
   flood_transcript | grep -q acc-flood-done && break
   [ -n "$(box_of "$flood")" ] || break
   sleep 1
 done
-echo "   20 MB burst, then 3 MB paced; at most ${flood_kept:-?} bytes kept in the host's log (${flood_logpath:-no log path})"
-check "a flooding box's output kept on the host stays within limits.output (1m)" '[ -n "$flood_kept" ] && [ "$flood_kept" -le $((1100 * 1024)) ]'
+if [ -n "$flood_logpath" ] && [ -z "$flood_log_here" ]; then
+  echo "   20 MB burst, then 3 MB paced; the host's log ($flood_logpath) is in another file system than this one"
+  skip "a flooding box's output kept on the host stays within limits.output (1m)" "its Docker's log isn't on this file system"
+else
+  echo "   20 MB burst, then 3 MB paced; at most ${flood_kept:-?} bytes kept in the host's log (${flood_logpath:-no log path})"
+  check "a flooding box's output kept on the host stays within limits.output (1m)" '[ -n "$flood_kept" ] && [ "$flood_kept" -gt 0 ] && [ "$flood_kept" -le $((1100 * 1024)) ]'
+fi
 wait "$flood_pid" 2>/dev/null || true
 # What it keeps of the paced lines (the newest, at least 5,000 of them): consecutive, each once, in
 # order, through the last.
@@ -619,6 +634,7 @@ check "  and its audit allowed nothing but GET example.com/ (and resolved no oth
 if [ -n "$nodes" ]; then
   multihost
   escape_flow
+  widen_flow
 fi
 if [ "$nodes" = local ]; then
   messages_flow

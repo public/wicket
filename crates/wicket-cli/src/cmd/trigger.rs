@@ -31,7 +31,11 @@ pub enum TriggerCmd {
     #[command(name = "rotate-url")]
     RotateUrl { trigger: String },
     /// Triggers that aren't removed: each with its state, source, action and next firing.
-    List,
+    List {
+        /// Print JSON (docs/reference/cli.md, "Output for scripts"), as the console has them.
+        #[arg(long)]
+        json: bool,
+    },
     /// One trigger (its id, or its name): its document, agent, state, next firing and last firings.
     Show { trigger: String },
     /// Pause a trigger: it fires nothing until resumed (the time it was paused is not caught up).
@@ -64,6 +68,11 @@ fn when(t: i64) -> String {
     wicket_core::time::unix_rfc3339(t)
 }
 
+/// A trigger's words cleaned for showing (`c`, for the console too).
+pub(crate) fn clean(s: &str) -> String {
+    c(s)
+}
+
 fn c(s: &str) -> String {
     wicket_agent::clip(s, 300)
 }
@@ -78,6 +87,22 @@ fn state(t: &wicket_store::Trigger, now: i64) -> String {
         (_, _, Some(u)) => format!("active, until {}", when(u)),
         _ => "active".into(),
     }
+}
+
+/// `wicket trigger list --json`, and the console's `/api/triggers` (#713): named fields only, never
+/// the document (a webhook's URL token is in none of them). What its owner or an agent wrote (the
+/// name, the source and action as words) is cleaned, as the text is.
+pub(crate) fn list_json(rows: &[wicket_store::Trigger], now: i64) -> serde_json::Value {
+    rows.iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id, "name": c(&t.name), "state": state(t, now), "status": t.status, "approval": t.approval,
+                "owner": c(&t.owner), "created_by": c(&t.created_by), "created_at": t.created_at, "until": t.until,
+                "decided_by": t.decided_by.as_deref().map(c), "next_due": tr::next_due(t, now).filter(|_| t.live(now)),
+                "source": c(&tr::source_text(&t.spec)), "action": c(&tr::action_text(&t.spec)),
+            })
+        })
+        .collect()
 }
 
 /// One line for `wicket trigger list`.
@@ -204,8 +229,11 @@ pub async fn dispatch(c: TriggerCmd) -> Result<()> {
             print_url(&node, &format!("/hook/{}/{token}", t.id));
             Ok(())
         }
-        TriggerCmd::List => {
+        TriggerCmd::List { json } => {
             let rows = l.triggers(&TenantId::single().0, None)?;
+            if json {
+                return crate::cmd::print_json(&list_json(&rows, now));
+            }
             if rows.is_empty() {
                 println!("no triggers");
             }

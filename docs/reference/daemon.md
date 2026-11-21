@@ -34,7 +34,6 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 | `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list` (without `--provider`), `node ca\|fences`, `policy show`, `state check`, `self status`, `trigger list\|show\|fire` | read |
 | `unlink`, `grant revoke`, `capacity revoke`, `identity revoke`, `lease release`, `trigger pause\|rm` | revoke |
 | `approve`, `deny`, `grant renew`, `capacity grant\|renew` | privileged |
-| `audit --verify` with `--against <file>` or `--issuer-jwk` (wicket's user would read the file; a `store:<sink>` is read) | privileged |
 | `secret set\|link\|hosts\|rm` | privileged |
 | `image` | privileged |
 | `operator enrol-link\|reset\|revoke-session` | privileged |
@@ -48,7 +47,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 
 Arguments only wicket itself passes are refused from any caller: `run --run-id` and `--ssh-key`,
 and `wake --by`. (A child run's parent, lease and takeover are no arguments: its supervisor runs
-in its parent's process.) Manifests, `--workdir`, a trigger's `--file` and `--event`, and `manifest check` and `save`'s `--file` are sent to the daemon as
+in its parent's process.) Manifests, `--workdir`, a trigger's `--file` and `--event`, `manifest check` and `save`'s `--file`, and `audit --verify`'s `--against` files (a `store:<sink>` names no file) and `--issuer-jwk` are sent to the daemon as
 content; mounting a directory in place (`run --workspace-dir`, and `wrap`, which mounts its
 launcher's directory) is root's only.
 
@@ -62,7 +61,10 @@ connections end (`wicket session <run>` opens one again). At its start, the new 
 re-executes this host's own node's `serve` as its build (SIGHUP, as `wicket self update` does) when
 the restart left it on another (#529), then hands each run whose supervisor runs another build to its own (#475): the supervisor is stopped without
 its box, and the new build's reconciler starts one that re-attaches, so no run keeps an old build's
-supervisor across an install. To end runs too, end them first (`wicket identity revoke <run>`, or `wicket
+supervisor across an install. Only a supervisor whose binary it reads, and finds to be another, is
+stopped (#844): one it can't read is left running, saying so and recording `self.supervisor_unknown`,
+and one that has already exited is skipped. If the new build's own binary can't be read, the handover
+fails (`self.handover_failed`, and a non-zero result) and stops none. To end runs too, end them first (`wicket identity revoke <run>`, or `wicket
 hibernate` for a long-lived agent).
 
 ## The policy file

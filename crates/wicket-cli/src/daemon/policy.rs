@@ -67,21 +67,17 @@ pub fn route(cmd: &Cmd) -> Route {
         // stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
         Cmd::Agents { .. } | Cmd::Top { .. } | Cmd::WhyHere { .. } | Cmd::Authority { .. } => Forward(Read),
-        // A message reaches an agent as a session's prompt would (it can wake one); reading your
-        // own inbox, receipts and who you may write to touches only your own messages (#252).
-        Cmd::Message { cmd: crate::MessageCmd::Send { .. } } => Forward(Run),
+        // A message, and a brief continuing an agent you started, reach an agent as a session's
+        // prompt would (either can wake one); reading your own inbox, receipts, delegations and who
+        // you may write to touches only your own (#252).
+        Cmd::Message { cmd: crate::MessageCmd::Send { .. } | crate::MessageCmd::Continue { .. } } => Forward(Run),
         Cmd::Message { .. } => Forward(Read),
         // Rewriting the ledger (#582) needs wicketd stopped: never through it.
         Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(
             "`wicket audit compact` runs with wicketd stopped, as the wicket user: sudo systemctl stop wicketd wicket-console wicket-reconcile; sudo -u wicket WICKET_HOME=/var/lib/wicket wicket audit compact",
         ),
-        // Files `--against` and `--issuer-jwk` name are read by wicket's user: a caller could name
-        // one only wicket may read (#713 review). Root's only; a `store:<sink>` names no file.
-        Cmd::Audit { against, issuer_jwk, .. }
-            if issuer_jwk.is_some() || against.iter().any(|a| !a.to_string_lossy().starts_with("store:")) =>
-        {
-            Forward(Privileged)
-        }
+        // `audit --verify`'s `--against` and `--issuer-jwk` files go to wicketd as content
+        // (daemon::client::self_uploads), so it reads no path its caller names: read, as the rest.
         Cmd::Pending { .. } | Cmd::Request { cmd: RequestCmd::List { .. } } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
@@ -105,7 +101,7 @@ pub fn route(cmd: &Cmd) -> Route {
         // A trigger wakes and messages agents later, as its owner (the caller): what `wake` and
         // `session` do now. Pausing and removing one only narrows.
         Cmd::Trigger { cmd } => match cmd {
-            TriggerCmd::List | TriggerCmd::Show { .. } | TriggerCmd::Fire { .. } => Forward(Read),
+            TriggerCmd::List { .. } | TriggerCmd::Show { .. } | TriggerCmd::Fire { .. } => Forward(Read),
             TriggerCmd::Create { .. } | TriggerCmd::Resume { .. } | TriggerCmd::Renew { .. } | TriggerCmd::RotateUrl { .. } => Forward(Run),
             TriggerCmd::Pause { .. } | TriggerCmd::Rm { .. } => Forward(Revoke),
         },
@@ -135,12 +131,12 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Service { cmd: ServiceCmd::List { .. } } => Forward(Read),
         Cmd::Service { .. } => Forward(Privileged),
         Cmd::Operator { cmd } => match cmd {
-            OperatorCmd::List | OperatorCmd::Sessions => Forward(Read),
+            OperatorCmd::List | OperatorCmd::Sessions { .. } => Forward(Read),
             // A passkey enrolled by the operator's uid could approve in the console.
             OperatorCmd::EnrolLink { .. } | OperatorCmd::Reset | OperatorCmd::RevokeSession { .. } => Forward(Privileged),
         },
         Cmd::Identity { cmd } => match cmd {
-            IdentityCmd::Issuer | IdentityCmd::Show { .. } | IdentityCmd::List => Forward(Read),
+            IdentityCmd::Issuer | IdentityCmd::Show { .. } | IdentityCmd::List { .. } => Forward(Read),
             IdentityCmd::Revoke { .. } => Forward(Revoke),
             IdentityCmd::Init { .. } => Forward(Privileged),
         },
@@ -385,12 +381,16 @@ mod tests {
             (&["hibernate", "r1"], Route::Forward(Run)),
             (&["wake", "a1", "hello"], Route::Forward(Run)),
             (&["agents"], Route::Forward(Read)),
+            (&["message", "send", "spiffe://d/t/t/z/z/a/a", "hi"], Route::Forward(Run)),
+            (&["message", "continue", "worker", "next"], Route::Forward(Run)),
+            (&["message", "inbox"], Route::Forward(Read)),
+            (&["message", "delegations"], Route::Forward(Read)),
             (&["pending"], Route::Forward(Read)),
             (&["links"], Route::Forward(Read)),
             (&["audit", "--verify"], Route::Forward(Read)),
             (&["audit", "--verify", "--against", "store:s3"], Route::Forward(Read)),
-            (&["audit", "--verify", "--against", "/var/lib/wicket/x.jsonl"], Route::Forward(Privileged)),
-            (&["audit", "--verify", "--against", "store:s3", "--issuer-jwk", "k.json"], Route::Forward(Privileged)),
+            (&["audit", "--verify", "--against", "/var/lib/wicket/x.jsonl"], Route::Forward(Read)),
+            (&["audit", "--verify", "--against", "store:s3", "--issuer-jwk", "k.json"], Route::Forward(Read)),
             (&["doctor"], Route::Forward(Read)),
             (&["approve", "R1"], Route::Forward(Privileged)),
             (&["approve", "R1", "--unlimited", "--ttl", "1h"], Route::Forward(Privileged)),

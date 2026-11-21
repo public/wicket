@@ -1,0 +1,13 @@
+# Acceptance (ci/acceptance.sh, #573): a box whose reach names an inspected host its node's CA
+# wasn't enrolled for. With the node's CA policy `auto`, the control host widens the CA to it at
+# runtime, without a `wicket node renew-ca`, and the box's request through the egress proxy works.
+task: Fetch a host the node's CA wasn't enrolled for.
+program:
+  name: widen
+  command: [bash, /workspace/widen.sh]
+zone:
+  name: acc-widen
+  isolation: gvisor
+  reach:
+    - { host: www.example.org, methods: [GET], paths: ["/"] }
+  limits: { memory: 256m, cpus: 1, timeout: 4m }

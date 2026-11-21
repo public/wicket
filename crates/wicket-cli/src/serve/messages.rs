@@ -134,7 +134,7 @@ pub(super) fn apply_send(
     let ledger = std::sync::Mutex::new(state.ledger()?);
     let waker: wicket_proxy::Waker = Arc::new(|a: &str, by: &str| crate::hibernate::trigger_wake(a, by));
     let op = OperatorSender { tenant: &state.tenant, via: "passkey", name: &oc.name, signed: Some(&signed) };
-    let opts = wicket_proxy::SendOpts { priority, in_reply_to };
+    let opts = wicket_proxy::SendOpts { priority, in_reply_to, run: None };
     match opmsg::send_as_operator(&ledger, issuer, op, to, "message", json!(text), opts, Some(&waker)) {
         Ok(s) => {
             let state = ledger.lock().map_err(|_| anyhow::anyhow!("ledger lock"))?.receipt(&s.id)?.map(|r| r.state).unwrap_or_default();

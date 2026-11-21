@@ -43,7 +43,8 @@ pub fn continue_child(ctx: &RunCtx, args: &Value) -> (String, bool) {
         Ok(f) => f,
         Err(e) => return (e, true),
     };
-    let Some(d) = found.iter().find(|d| d.parent_principal == me).cloned() else {
+    // An agent's own children: never a human's delegation (no parent run), even of the same principal.
+    let Some(d) = found.iter().find(|d| d.parent_principal == me && !d.parent_run.is_empty()).cloned() else {
         return if found.is_empty() {
             refuse(&format!("no child {child:?} was delegated to in this tenant; spawn one"))
         } else {
@@ -53,27 +54,26 @@ pub fn continue_child(ctx: &RunCtx, args: &Value) -> (String, bool) {
     };
     let live = ctx.ledger.lock().ok().and_then(|l| l.run_status(&d.child_run).ok().flatten());
     if d.state == "ended" || live.as_deref() != Some("running") {
-        return (
-            format!(
-                "not continued: {} ({}) has ended (its run is {}); its context is gone with it. spawn a new child instead.",
-                d.name,
-                d.id,
-                live.unwrap_or_else(|| "unknown".into())
-            ),
-            true,
-        );
+        return refuse(&format!(
+            "{} ({}) has ended (its run is {}); its context is gone with it. spawn a new child instead.",
+            d.name,
+            d.id,
+            live.unwrap_or_else(|| "unknown".into())
+        ));
     }
     if d.state == "working" {
-        return (
-            format!(
-                "not continued: {} is still working on turn {} of {}. Its report comes to you as a message (await_message); continue it after that. To add to its current brief, send_message to {}.",
-                d.name, d.turn, d.id, d.child_principal
-            ),
-            true,
-        );
+        return refuse(&format!(
+            "{} is still working on turn {} of {}. Its report comes to you as a message (await_message); continue it after that. To add to its current brief, send_message to {}.",
+            d.name, d.turn, d.id, d.child_principal
+        ));
     }
     let body = json!({ "delegation": d.id, "turn": d.turn + 1, "brief": brief });
-    match ctx.send(&Recipient::Principal(&d.child_principal), "brief", body, SendOpts { priority, in_reply_to: None }) {
+    match ctx.send(
+        &Recipient::Principal(&d.child_principal),
+        "brief",
+        body,
+        SendOpts { priority, in_reply_to: None, run: Some(&d.child_run) },
+    ) {
         Ok(s) => {
             let l = ctx.ledger.lock().expect("ledger");
             if !l.delegation_continued(&d.id, &s.id).unwrap_or(false) {

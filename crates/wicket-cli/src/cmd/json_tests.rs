@@ -79,7 +79,7 @@ fn pending_json_lists_requests_standing_asks_and_names() {
     assert_eq!(a[0]["host"], "api.example.com");
     assert_eq!((a[2]["id"].as_str(), a[2]["label"].as_str(), a[2]["port"].as_u64()), (Some(nid.as_str()), Some("demo"), Some(3000)));
     documented_as("`wicket pending --json`, a request", &a[0]);
-    documented_as("`wicket pending --json`, a standing ask", &a[1]);
+    documented_as("`wicket pending --json`, a standing request", &a[1]);
     documented_as("a standing `rule`", &a[1]["rule"]);
     documented_as("`wicket pending --json`, an ask for a public name", &a[2]);
     // The text listing has it too, with the commands that decide it.
@@ -105,9 +105,9 @@ fn approve_and_deny_redirect_names_and_standing_asks() {
     assert_eq!(msg("n-01abc", "deny").as_deref(), Some("n-01abc is an ask for a public name: wicket names deny n-01abc"));
     assert_eq!(
         msg("s-01abc", "approve").as_deref(),
-        Some("s-01abc is a standing ask: wicket standing show s-01abc, then wicket standing approve s-01abc")
+        Some("s-01abc is a standing request: wicket standing show s-01abc, then wicket standing approve s-01abc")
     );
-    assert_eq!(msg("s-01abc", "deny").as_deref(), Some("s-01abc is a standing ask: wicket standing deny s-01abc"));
+    assert_eq!(msg("s-01abc", "deny").as_deref(), Some("s-01abc is a standing request: wicket standing deny s-01abc"));
     assert!(msg("r-01abc", "approve").is_none());
     let e = crate::cmd::approve::elsewhere("n-1", "deny").unwrap();
     assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::Usage as i32);
@@ -549,4 +549,78 @@ fn policy_show_and_node_fences_json() {
     assert!(text.contains(&format!("wicket node release-fence {} --reason", run.0)), "{text}");
     // Another tenant's views list nothing of this one's.
     assert!(crate::serve::fence::view_in(&d.join("runs"), "t9", &l, &[]).unwrap().is_empty());
+}
+
+/// #713: `wicket trigger list --json`, `identity list --json` and `operator sessions --json`, the
+/// console's `/api/triggers`, `/api/identities` and `/api/sessions`: named fields, nothing to sign
+/// in or verify with, what was written cleaned.
+#[test]
+fn trigger_identity_and_session_lists_json() {
+    let (_d, l) = super::test_ledger("host-lists");
+    let t = TenantId::single();
+    let spec: wicket_core::trigger::TriggerSpec =
+        wicket_core::yaml::from_str("trigger: hook\nsource: { webhook: { verify: { hmac_sha256: hook-key } } }\naction: { wake: agent }\n")
+            .unwrap();
+    l.create_trigger(&t.0, "spiffe://w.test/t/t0/op/unix/alex", &spec, "unix:al\u{1b}[2Jex", false, None).unwrap();
+    let v = super::trigger::list_json(&l.triggers(&t.0, None).unwrap(), wicket_store::now());
+    assert_eq!((v[0]["state"].as_str(), v[0]["source"].as_str()), (Some("active"), Some("webhook")), "{v:#}");
+    assert!(!v[0]["created_by"].as_str().unwrap().contains('\u{1b}'), "cleaned: {v:#}");
+    documented_as("`wicket trigger list --json`", &v);
+    let run = RunId::new();
+    l.run_started(&t, &run, "work", "worker").unwrap();
+    l.put_identity(&wicket_store::IdentityRow {
+        run: run.0.clone(),
+        tenant: t.0.clone(),
+        spiffe_id: "spiffe://w.test/t/t0/z/work/a/worker".into(),
+        zone: "work".into(),
+        agent: "worker".into(),
+        parent_run: None,
+        accept_from: vec![],
+        jws: "eyJhbGciOiJFZERTQSJ9.c2VjcmV0LWNsYWltcw.c2lnbmF0dXJl".into(),
+        issued_at: 1,
+    })
+    .unwrap();
+    let v = super::identity::list_json(&l, &l.identities().unwrap(), |l, r| wicket_home::verified_identity(l, r, None)).unwrap();
+    assert_eq!(v[0]["run"], run.0.as_str());
+    assert!(!v.to_string().contains("eyJhbGciOiJFZERTQSJ9"), "never the signed document: {v:#}");
+    // Unverifiable here (no issuer key): said in words, never by a file's path.
+    assert!(!v[0]["identity"]["error"].as_str().unwrap_or("").contains('/'), "{v:#}");
+    documented_as("`wicket identity list --json`", &v);
+    let token = "ab".repeat(32);
+    let id = crate::serve::session_id(&token);
+    let session = |kind: &str, cred: &str| wicket_store::ConsoleSession {
+        id: if kind == "operator" { id.clone() } else { "cd".repeat(32) },
+        kind: kind.into(),
+        credential: Some(cred.into()),
+        client: "192.0.2.1".into(),
+        created_at: 1,
+        last_seen_at: 2,
+        expires_at: i64::MAX,
+    };
+    let v = super::operator::sessions_json(&[session("operator", "cred-laptop"), session("bootstrap", "enrol-link-id")]);
+    assert_eq!((v[0]["id"].as_str().map(str::len), v[0]["credential"].as_str()), (Some(16), Some("cred-laptop")), "{v:#}");
+    assert!(v[1]["credential"].is_null(), "a bootstrap session's enrolment link isn't shown: {v:#}");
+    assert!(!v.to_string().contains(&id) && !v.to_string().contains(&token), "{v:#}");
+    documented_as("`wicket operator sessions --json`", &v);
+}
+
+/// #252: a human's delegation, as `wicket message delegations --json` prints it.
+#[test]
+fn message_delegations_json() {
+    let (_d, l) = super::test_ledger("delegations");
+    l.record_delegation(&wicket_store::NewDelegation {
+        id: "d-1",
+        tenant: "default",
+        parent_run: "",
+        parent_principal: "spiffe://w.test/t/default/op/unix/alice",
+        child_run: "run_1",
+        child_principal: "spiffe://w.test/t/default/z/work/a/worker",
+        name: "worker",
+        brief: "the task",
+    })
+    .unwrap();
+    let rows = l.delegations_of("default", "spiffe://w.test/t/default/op/unix/alice", 10).unwrap();
+    let v = serde_json::Value::Array(rows.iter().map(super::message::delegation_json).collect());
+    assert_eq!((v[0]["state"].as_str(), v[0]["turn"].as_i64()), (Some("working"), Some(1)), "{v:#}");
+    documented_as("`wicket message delegations --json` (and `wicket message continue --json`, one)", &v);
 }

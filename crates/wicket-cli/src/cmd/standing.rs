@@ -6,8 +6,8 @@ use wicket_control::standing as st;
 
 #[derive(Subcommand)]
 pub enum StandingCmd {
-    /// Standing rules: pending asks, and approved rules (with when they lapse). --all adds denied,
-    /// revoked and lapsed ones.
+    /// Standing requests (pending) and standing rules (approved, with when they lapse). --all adds
+    /// denied, revoked and lapsed ones.
     List {
         #[arg(long)]
         all: bool,
@@ -15,10 +15,10 @@ pub enum StandingCmd {
         #[arg(long)]
         json: bool,
     },
-    /// One ask or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and
+    /// One standing request or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and
     /// what it would allow beyond them.
     Show { id: String },
-    /// Approve a standing ask (`s-…`), once: the rule as asked, or --narrow to what its evidence
+    /// Approve a standing request (`s-…`), once: the rule as asked, or --narrow to what its evidence
     /// used. For the agent that asked (each later run of it), or --for zone (every agent of its zone).
     Approve {
         id: String,
@@ -35,7 +35,7 @@ pub enum StandingCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Deny a standing ask.
+    /// Deny a standing request.
     Deny { id: String },
     /// Move an approved rule's lapse to --ttl from now (or `forever`).
     Renew {

@@ -33,4 +33,21 @@ for _ in $(seq 15); do
   sleep 2
 done
 put connect_fetch "$f"
+# Delegation across nodes (#252): an agent child on the leased node; its report on its task comes
+# back as a message, continue_child gives it another brief, and its report on that comes back too.
+if [ -f /workspace/delegate ]; then   # --nodes local: the node reaches the mock model
+  report() {
+    local m
+    for _ in $(seq 20); do
+      m=$(gw await_message '{"timeout_seconds":30}')
+      [ "$(jq -r .kind <<<"$m" 2>/dev/null)" = report ] && { printf '%s' "$m"; return; }
+    done
+  }
+  put helper "$(gw spawn "$(jq -nc --arg l "$lease" '{name:"helper",kind:"agent",task:"Run the command you are given.",placement:{lease:$l},
+    zone:{limits:{memory:"768m",cpus:1,timeout:"10m"}}}')")"
+  put report1 "$(report)"
+  put continued "$(gw continue_child '{"child":"helper","brief":"Once more, please."}')"
+  put report2 "$(report)"
+  put delegations "$(gw delegations '{}')"
+fi
 put done 1
