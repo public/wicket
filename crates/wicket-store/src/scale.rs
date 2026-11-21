@@ -111,7 +111,7 @@ impl Ledger {
     /// tables (see the module's doc), at most [`ARCHIVE_BATCH`] of each. Returns (grants, requests).
     pub fn archive_ended(&self, now: i64) -> Result<(usize, usize)> {
         let cutoff = now - ARCHIVE_AFTER_SECS;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::write_tx(&self.conn)?;
         same_columns(&tx, "grants", "grants_archive")?;
         same_columns(&tx, "requests", "requests_archive")?;
         tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS moving (id TEXT PRIMARY KEY); DELETE FROM moving;")?;

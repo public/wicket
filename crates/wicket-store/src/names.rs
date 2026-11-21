@@ -392,7 +392,7 @@ impl Ledger {
     pub fn register_internal(&self, ask: &NameAsk<'_>, limit: usize, standing_ttl_secs: u64) -> Result<NameRow> {
         // Names held by runs that ended without letting go don't count or block (#575 review, M2).
         self.sweep_stale_names()?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::write_tx(&self.conn)?;
         let t = now();
         if let Some(n) = self.internal_name(ask.tenant, ask.zone, ask.label)? {
             if n.principal != ask.principal || n.zone_digest != ask.zone_digest {
@@ -730,7 +730,7 @@ impl Ledger {
         let held = self.names_held_by(run)?;
         // `run_ended` calls this, sometimes inside its caller's transaction: then that one holds
         // these writes, and a nested one would be refused.
-        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let own = if self.conn.is_autocommit() { Some(crate::write_tx(&self.conn)?) } else { None };
         let c = &self.conn;
         let t = now();
         // The ports its names exposed are its no more.
@@ -945,7 +945,7 @@ impl Ledger {
             )));
         }
         let t = now();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::write_tx(&self.conn)?;
         let free = |p: u16| -> Result<bool> {
             let r: Option<(Option<String>, Option<i64>)> = tx
                 .query_row(
@@ -1122,7 +1122,7 @@ impl Ledger {
     /// A record written again is as new (#748: the age guard of [`Ledger::forget_unlisted`] counts
     /// from its last write). Inside a caller's transaction, its writes join it.
     pub fn owned_before_apply(&self, zone: &Zone, provider: &str, plan: &Plan) -> Result<()> {
-        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let own = if self.conn.is_autocommit() { Some(crate::write_tx(&self.conn)?) } else { None };
         let t = now();
         for c in &plan.changes {
             if let Change::Create(r) | Change::Update { to: r, .. } = c {
@@ -1231,7 +1231,7 @@ impl Ledger {
                 Change::Delete(_) => None,
             })
             .collect();
-        let own = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
+        let own = if self.conn.is_autocommit() { Some(crate::write_tx(&self.conn)?) } else { None };
         for c in &plan.changes {
             if let Change::Delete(r) | Change::Update { from: r, .. } = c {
                 if !written.contains(&r.key()) {
