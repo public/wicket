@@ -79,7 +79,7 @@ fn pending_json_lists_requests_standing_asks_and_names() {
     assert_eq!(a[0]["host"], "api.example.com");
     assert_eq!((a[2]["id"].as_str(), a[2]["label"].as_str(), a[2]["port"].as_u64()), (Some(nid.as_str()), Some("demo"), Some(3000)));
     documented_as("`wicket pending --json`, a request", &a[0]);
-    documented_as("`wicket pending --json`, a standing ask", &a[1]);
+    documented_as("`wicket pending --json`, a standing request", &a[1]);
     documented_as("a standing `rule`", &a[1]["rule"]);
     documented_as("`wicket pending --json`, an ask for a public name", &a[2]);
     // The text listing has it too, with the commands that decide it.
@@ -105,9 +105,9 @@ fn approve_and_deny_redirect_names_and_standing_asks() {
     assert_eq!(msg("n-01abc", "deny").as_deref(), Some("n-01abc is an ask for a public name: wicket names deny n-01abc"));
     assert_eq!(
         msg("s-01abc", "approve").as_deref(),
-        Some("s-01abc is a standing ask: wicket standing show s-01abc, then wicket standing approve s-01abc")
+        Some("s-01abc is a standing request: wicket standing show s-01abc, then wicket standing approve s-01abc")
     );
-    assert_eq!(msg("s-01abc", "deny").as_deref(), Some("s-01abc is a standing ask: wicket standing deny s-01abc"));
+    assert_eq!(msg("s-01abc", "deny").as_deref(), Some("s-01abc is a standing request: wicket standing deny s-01abc"));
     assert!(msg("r-01abc", "approve").is_none());
     let e = crate::cmd::approve::elsewhere("n-1", "deny").unwrap();
     assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::Usage as i32);
