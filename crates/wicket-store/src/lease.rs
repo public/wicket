@@ -456,7 +456,7 @@ impl Ledger {
     /// Ends an active placed node: `released` (destroyed, or found gone) or `left` (the provider
     /// refused: no longer owned, or protected). False if it had already ended.
     pub fn placed_node_ended(&self, id: &str, status: &str, detail: &str) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::write_tx(&self.conn)?;
         let n = tx.execute(
             "UPDATE placed_nodes SET status = ?2, detail = ?3, held_by = NULL, ended_at = ?4 WHERE id = ?1 AND status = 'active'",
             params![id, status, detail, now()],

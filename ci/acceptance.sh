@@ -237,10 +237,15 @@ elif [ "${ACC_AUDIT_SINK:-}" = 1 ]; then
 fi
 
 port=$(free_port)
-# Every agent's turn runs one command: its workspace's drive.sh, or, for the lead's child agent (an
-# empty workspace), spawn a leaf box and stay up until revoked.
+# Every agent's turn runs one command: its workspace's drive.sh; for the cap agent's delegate on the
+# other node (`helper`, #252), a turn that reports where it ran and stays open for its next brief;
+# or, for the lead's child agent (an empty workspace), spawn a leaf box and stay up until revoked.
 leaf='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spawn","arguments":{"name":"leaf","kind":"program","zone":{"limits":{"memory":"128m","cpus":1,"timeout":"4m"}},"command":["sleep","3000"]}}}'
-mock_cmd="[ -f /workspace/drive.sh ] && exec bash /workspace/drive.sh; curl -s -m 120 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$leaf'; sleep 500"
+whoami='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}'
+# Its brief, when continued, is a message to read (a continuation's report counts once it is read).
+brief='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"await_message","arguments":{"timeout_seconds":5}}}'
+helper="who=\$(curl -s -m 20 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$whoami' | jq -r '.result.content[0].text'); if [ \"\$(jq -r .agent <<<\"\$who\" 2>/dev/null)\" = helper ]; then echo \"helper turn, decided on \$(jq -r .decided_on <<<\"\$who\")\"; curl -s -m 30 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$brief' >/dev/null; echo 'wicket-mock: stay'; exit 0; fi"
+mock_cmd="[ -f /workspace/drive.sh ] && exec bash /workspace/drive.sh; $helper; curl -s -m 120 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$leaf'; sleep 500"
 HOME=$HOMEW "$W" dev mock-llm --listen "127.0.0.1:$port" --command "$mock_cmd" 2>"$work/mock.log" &
 pids+=("$!")
 wait_for 10 "(exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null"

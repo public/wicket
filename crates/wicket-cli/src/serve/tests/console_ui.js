@@ -131,7 +131,10 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // shown, rather than that nothing is waiting.
   // So for the Agents view without agents.js, Activity without activity.js, and Settings without
   // settings.js.
-  for (const id of ["pending", "standing-asks", "runs", "start", "audit", "decided", "standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
+  for (const id of ["pending", "standing-asks", "runs", "start", "audit", "decided", "standing-rules", "capacity", "capacity-form", "health", "placed", "fenced", "secrets", "manifests", "policy", "operator"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
+  // Signing out doesn't need settings.js: without it, the passkeys card still has Sign out.
+  const plainOut = ids.operator.all(n => n.tagName === "button" && n.textContent === "Sign out")[0];
+  assert.ok(plainOut, ids.operator.textContent);
 
   // The cards just moved (inbox.js says so): a tap right then is ignored.
   state = { ...base, pending: [A, B] };
@@ -484,21 +487,14 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // A tap on a notification while the console is open marks that request's card: inbox.mjs's.
   console.log("console notifications: ok");
 
-  // Secrets: listed by name, kind, hosts and users; a value is typed into a password field cleared on
-  // submit, begin carries only its salted sha256, and the value goes only with finish.
+  // Secrets: a value is typed into a password field cleared on submit, begin carries only its salted
+  // sha256, and the value goes only with finish. (The list, which opens this form, is settings.js's,
+  // checked in browsers: ci/console-browsers/settings.mjs.)
   const SECRET = "s3cret-VALUE-typed-in";
   const gh = { name: "gh", kind: "value", reference: null, hosts: ["api.github.com"], set_at: 1700000000,
     used_by: [{ root: "manifests", manifest: "d.yaml", zone: "docs", use: "inject", host: "api.github.com", header: "authorization", format: "Bearer {secret}", optional: false }],
     zones: ["docs"], runs: [{ run: "run_a", zone: "docs" }] };
-  const login = { name: "login", kind: "reference", reference: { file: "/home/you/.claude/.credentials.json", pointer: "/a/token" }, hosts: [], set_at: 1700000000, used_by: [], zones: [], runs: [] };
-  state = { ...base, pending: [], secrets: { secrets: [gh, login], missing: [{ name: "HOSTILE<b>", zones: ["z"], used_by: [] }], link_cli_only: "references are made on the host: wicket secret link NAME --file PATH" } };
-  await run("refresh()"); await flush();
-  const sx = ids.secrets.textContent;
-  for (const want of ["gh", "sent only to api.github.com", "sent to api.github.com in its authorization header, as Bearer {secret}", "running now: run_a", "read from a file on the host", "/home/you/.claude/.credentials.json#/a/token", "needed, not set", "wicket secret link"]) assert.ok(sx.includes(want), want + " in " + sx);
-  const sbtn = label => ids.secrets.all(n => n.tagName === "button" && n.textContent.startsWith(label));
-  assert.strictEqual(sbtn("Replace value").length, 1, "a reference's value isn't set here");
-  assert.strictEqual(sbtn("Hosts").length, 2, "a reference's hosts can be changed");
-  sbtn("Replace value")[0].click(); await flush();
+  run("openSecret('set', " + JSON.stringify(gh) + ")"); await flush();
   assert.strictEqual(ids["secret-edit"].hidden, false);
   const input = id => ids["secret-edit-body"].all(n => n.id === id)[0];
   const vIn = input("secret-value");
@@ -519,9 +515,8 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await advance(1000); await ids["confirm-go"].click(); await flush(); await flush();
   const sfin = calls.filter(c => c.path === "/api/action/finish").pop().body;
   assert.strictEqual(sfin.value, SECRET, "the value goes with finish");
-  assert.ok(!ids.secrets.textContent.includes(SECRET));
   // Delete: a warning naming the zones and runs that use it, then the signed confirmation.
-  sbtn("Delete")[0].click(); await flush();
+  run("openSecret('delete', " + JSON.stringify(gh) + ")"); await flush();
   const warn = ids["secret-edit-body"].textContent;
   assert.ok(warn.includes("docs") && warn.includes("run_a"), warn);
   nextAction = { v: 1, action: "delete_secret", name: "gh", kind: "value", zones: ["docs"], runs: ["run_a"], hosts: [] };
@@ -635,31 +630,20 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console fenced runs: ok");
 
-  // #711: Add a device signs an enrol_link; the sheet says who the device is enrolled as, and the
-  // link the server returns is shown once in the passkeys card.
-  state = { ...base, pending: [], passkeys: [{ id: "cred-1", name: "laptop" }] };
-  await run("refresh()"); await flush();
+  // #711: Add a device signs an enrol_link (the button and the link's display are settings.js's,
+  // ci/console-browsers/settings.mjs); the sheet says who the device is enrolled as, and the link
+  // the server returns is kept until it expires, and forgotten by boot(), however it is reached.
   await advance(1000);
-  assert.ok(!ids.operator.textContent.includes("run `wicket operator enrol-link` on the host and open"), ids.operator.textContent);
   nextAction = { v: 1, action: "enrol_link", tenant: "t0", credential: "cred-1", name: "laptop", enrols_as: "passkey/laptop", ttl_secs: 300, uses: 1 };
-  ids.operator.all(n => n.tagName === "button" && n.textContent === "Add a device")[0].click(); await flush();
+  run('signed({ action: "enrol_link" })'); await flush();
   assert.strictEqual(began().pop().body.action, "enrol_link");
   const ew = ids["confirm-what"].textContent;
   assert.ok(ew.startsWith("Make a one-time link that enrols another device as laptop (passkey/laptop, the same operator and authority)") && ew.includes("for 5 minutes"), ew);
-  run("showEnrolLink({ link: 'https://c.example/enrol?t=abc', expires_in_secs: 300 })");
   ids["confirm-cancel"].listeners.click(); await flush();
-  await run("refresh()"); await flush();
-  assert.ok(ids.operator.textContent.includes("https://c.example/enrol?t=abc"), ids.operator.textContent);
-  // Signing out forgets the link: whoever signs in next on this tab doesn't see it.
-  ids.operator.all(n => n.tagName === "button" && n.textContent === "Sign out")[0].click(); await flush();
-  assert.strictEqual(run("enrolLink"), null);
-  await run("refresh()"); await flush();
-  assert.ok(!ids.operator.textContent.includes("https://c.example/enrol?t=abc"), ids.operator.textContent);
-  // boot() forgets it too, however it is reached.
   run("showEnrolLink({ link: 'https://c.example/enrol?t=def', expires_in_secs: 300 })");
+  assert.strictEqual(JSON.parse(run("JSON.stringify(enrolLink)")).link, "https://c.example/enrol?t=def");
   await run("boot()"); await flush();
   assert.strictEqual(run("enrolLink"), null);
-  assert.ok(!ids.operator.textContent.includes("t=def"), ids.operator.textContent);
   console.log("console enrol a device: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open

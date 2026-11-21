@@ -7,7 +7,7 @@
 // every signed action is console.js's.
 import { html, nothing } from "lit-html";
 import { repeat } from "lit-html/directives/repeat.js";
-import { draw, time, code, copyButton, serverText, serverLine, keeper } from "./ui.js";
+import { draw, time, kv, code, copyButton, serverText, serverLine, keeper } from "./ui.js";
 
 const g = globalThis;
 
@@ -183,6 +183,54 @@ function fencedRow(x) {
     strip(f.node) + ". Only if that node will never run it again. Say why (it goes in the activity log):"}</label><textarea></textarea><div class="buttons"><button class="deny" @click=${go}>Release</button><button @click=${close}>Cancel</button></div></div></div>`;
 }
 
+// ---- keys and passwords, task setups, organisation rules, passkeys ----
+
+// The vault by name (console.js's secrets section says how a value is handled): the server sends no
+// value, nor anything derived from one. Each button opens console.js's form, which signs.
+function secretUse(u) {
+  const where = "Used by " + u.manifest + " (zone " + u.zone + ")";
+  return strip(u.use === "llm" ? where + " as the model key" + (u.provider ? " (" + u.provider + ")" : "")
+    : where + ": sent to " + u.host + " in its " + u.header + " header" + (u.format ? ", as " + u.format : "") + (u.optional ? " (optional)" : ""));
+}
+function secretsView(v) {
+  const uses = list => (list || []).map(u => html`<div class="meta">${secretUse(u)}</div>`);
+  const stored = x => html`<div class="secret"><div class="row"><span class="mono">${strip(x.name)}</span><span class="risk ${x.kind === "reference" ? "r2" : "r0"}">${x.kind === "reference" ? "read from a file on the host" : "stored"}</span></div><div class="meta">${(x.hosts || []).length ? "sent only to " + x.hosts.map(strip).join(", ") : "bound to no host: sent nowhere"}</div>${x.reference ? html`<div class="meta">${"refers to " + strip(x.reference.file) + (x.reference.pointer ? "#" + strip(x.reference.pointer) : "") + ", read at each use"}</div>` : nothing}<div class="meta">${x.set_at ? "last set " + at(x.set_at) : "last set: unknown"}</div>${uses(x.used_by)}${(x.used_by || []).length ? nothing : html`<div class="meta">no listed manifest uses it</div>`}${(x.runs || []).length ? html`<div class="meta">${"running now: " + x.runs.map(r => strip(r.run)).join(", ")}</div>` : nothing}<div class="buttons">${x.kind !== "reference" ? html`<button @click=${() => openSecret("set", x)}>Replace value…</button>` : nothing}<button @click=${() => openSecret("hosts", x)}>Hosts…</button><button class="deny" @click=${() => openSecret("delete", x)}>Delete…</button></div></div>`;
+  const missing = m => html`<div class="secret"><div class="row"><span class="mono">${strip(m.name)}</span><span class="risk r3">needed, not set</span></div>${uses(m.used_by)}<div class="buttons"><button class="approve" @click=${() => openSecret("set", { name: m.name, hosts: (m.used_by || []).filter(u => u.host).map(u => u.host), missing: true })}>Set…</button></div></div>`;
+  const none = !(v.secrets || []).length && !(v.missing || []).length;
+  return html`${repeat(v.secrets || [], x => x.name, stored)}${repeat(v.missing || [], m => m.name, missing)}${none ? html`<div class="empty">No secrets in the vault.</div>` : nothing}<div class="buttons"><button @click=${() => openSecret("set", null)}>New secret…</button></div><div class="note">${"Values are never shown, here or anywhere. " + strip(v.link_cli_only ||
+    "References (a file on the host, like a harness login) are made on the host: wicket secret link.")}</div>`;
+}
+
+// The task setups (#172) the server lists; each opens in console.js's editor.
+const manifestsView = ms => html`${repeat(ms, m => m.root + "/" + m.name, m => html`<div class="row"><span class=${m.valid ? "mono" : "blocked mono"}>${strip(m.root + "/" + m.name) + (m.valid ? "" : " · invalid")}</span><button class="link" @click=${() => openManifest(m.root, m.name)}>${m.root === "manifests" ? "view / edit" : "view"}</button></div>`)}<button class="link" @click=${() => openManifest("manifests", null)}>new manifest</button>`;
+
+// The organisation's rules (#173): fetched at most every 30 s, as they change rarely.
+let policyAt = 0;
+async function renderPolicy() {
+  if (policyAt && performance.now() - policyAt < 30000) return;
+  policyAt = performance.now();
+  const box = document.getElementById("policy");
+  if (!box) return;
+  try {
+    const p = await getJson("/api/policy");
+    draw(html`${!p.installed ? html`<div class="note">No org policy applied: tokens carry their zone's policy only (wicket policy apply).</div>`
+      : html`${kv("applied", p.installed + (p.current.matches_applied === false ? " · org.cedar was changed by hand: every mint is refused until it is applied" : ""))}<pre class="src">${p.current.cedar || ""}</pre>`}${p.versions.map(v => {
+      const a = v.applied.length ? v.applied[v.applied.length - 1] : null;
+      return kv("version " + v.version + (v.current ? " (current)" : ""), a ? "applied " + at(a.at) + " by " + a.by : "kept");
+    })}${p.runs.map(r => kv(r.run, "zone " + r.zone + " · policy " + (r.policy || "none") + " · " + r.status))}`, box);
+  } catch (e) { draw(html`<div class="blocked">${strip(e.message)}</div>`, box); }
+}
+
+// Your passkeys; adding a device (#711: a signed enrol_link, whose one-time link console.js keeps in
+// `enrolLink` and shows here until it expires); and signing out (console.js's signOut, which forgets
+// the link and this module's open questions).
+function operatorView(s) {
+  const link = enrolLink && enrolLink.until > Date.now() ? enrolLink : null;
+  if (!link) enrolLink = null;
+  return html`${(s.passkeys || []).map(k => html`<div class="row"><span>${"passkey: " + strip(k.name)}</span><span class="mono">${String(k.id).slice(0, 16) + "…"}</span></div>`)}<div class="buttons"><button @click=${() => signed({ action: "enrol_link" })}>Add a device</button><button @click=${signOut}>Sign out</button></div>${link
+    ? html`<div class="callout"><div>${"Open this on the new device (once, until " + new Date(link.until).toLocaleTimeString() + "):"}</div><code class="block">${link.link}</code>${copyButton(link.link)}</div>` : nothing}<div class="note">${code("Adding a device makes a one-time link, signed with your passkey; the new device is you, with your authority. Or on the host: `wicket operator enrol-link`.", ["wicket operator enrol-link"])}</div>`;
+}
+
 // ---- the view ----
 
 // The capacity form's element, once drawn: drawn again only if the page's element is a new one.
@@ -205,6 +253,13 @@ function renderSettings(s, poll = true) {
   if (health) draw(healthView(s), health);
   const placed = document.getElementById("placed");
   if (placed) draw((s.placed || []).length ? s.placed.map(placedRow) : html`<div class="empty">No leased nodes.</div>`, placed);
+  const secrets = document.getElementById("secrets");
+  if (secrets) draw(secretsView(s.secrets || { secrets: [], missing: [] }), secrets);
+  const manifests = document.getElementById("manifests");
+  if (manifests) draw(manifestsView(s.manifests || []), manifests);
+  const operator = document.getElementById("operator");
+  if (operator) draw(operatorView(s), operator);
+  renderPolicy();
 }
 
 // Signed out: no question or form left open for the next sign-in.
