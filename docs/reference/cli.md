@@ -14,8 +14,8 @@ reference](manifest.md)).
 ## Output for scripts
 
 The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
-`agents`, `links`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `lease list`, `service list`, `audit`,
-`message inbox`, `message receipts` and `message principals`, and so do `names show` (one name: an object), `authority` (one run's) and `audit explain` (one record's). With it, stdout holds one JSON document
+`agents`, `links`, `manifest list`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `lease list`, `service list`, `audit`,
+`message inbox`, `message receipts` and `message principals`, and so do `names show` (one name: an object), `manifest show` and `manifest check` (one manifest's), `authority` (one run's) and `audit explain` (one record's). With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -34,6 +34,9 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | a standing `rule` | `host`, `methods`, `paths`, `allow_dangerous` |
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
+| `wicket manifest list --json` | `root`, `name`, `agent` and `program` (its agent's or program's name, or null), `zone`, `image` (the image its box starts from, or null) and `image_error` (why it has none), `hosts` (each `host` and its `mode`: `inspected` with `why`, or `spliced` with `rule`), `valid` |
+| `wicket manifest show --json` | `root`, `name`, `sha256`, `yaml` (the file), `valid`, `error` (why it doesn't validate, or null), `fields` (each `path`, its `value` and `default`: whether the file leaves it unset), `grants` (what it grants, as the console shows it; null if it doesn't validate), `writable` (in the `manifests` root), `history` (its saved versions, newest first: `version`, `saved_before`, `sha256_prefix`) |
+| `wicket manifest check --json` | `valid`, `error`, `sha256`, `saved_sha256` (the saved version's, or null), `diff` (against it: `new`, `widens`, `widening` and `changes`; null if it doesn't validate), `grants` and `fields` (as `manifest show --json` has them) |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
 | `wicket names list --json` | `id`, `kind` (`internal`, `public`), `status` (the ledger's: `pending`, `live`, `denied`, `withdrawn`, `ended`), `state` (wicket's: `pending`, `live`, `waiting`, `taken` in the zone by records wicket didn't make, `out_of_sync`, `lapsed`, `denied`, `withdrawn`, `ended`), `why` (wicket's words for the state, or null), `name` (the full name: `<label>.<zone>.wicket.internal`, or under the boxes domain; null for a public ask on an installation without public names), `scope` (`run`, `standing`), `for` (`agent`, `zone`, or null), `expires_at` (null: until revoked, or as its run lasts), `created_at`, `decided_by`, `decided_at`, `ended_at`, `end_reason`, `owner`, `target`, `agent` (what the agent wrote) |
 | a name's `owner` | `principal`, `zone`, `run` (the run that asked), `holder` (the run that holds it now, or null) |
@@ -90,6 +93,12 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 - [`wicket wrap`](#wicket-wrap)
 - [`wicket links`](#wicket-links)
 - [`wicket unlink`](#wicket-unlink)
+- [`wicket manifest`](#wicket-manifest)
+  - [`wicket manifest list`](#wicket-manifest-list)
+  - [`wicket manifest show`](#wicket-manifest-show)
+  - [`wicket manifest check`](#wicket-manifest-check)
+  - [`wicket manifest save`](#wicket-manifest-save)
+  - [`wicket manifest restore`](#wicket-manifest-restore)
 - [`wicket zone`](#wicket-zone)
   - [`wicket zone pin`](#wicket-zone-pin)
 - [`wicket program`](#wicket-program)
@@ -231,6 +240,7 @@ Runs and agents:
   wrap       Run an agent command line that another program launches, inside a wicket box
   links      Links between boxes (expose/connect/link), newest first
   unlink     Cut a link between boxes: its relay closes it and drops its connections within seconds
+  manifest   Manifests runs start from: view, check, save and restore them, as the console's editor does
   zone       How a manifest's zone treats each host it reaches: inspected or spliced, and why
   program    Programs: deterministic workloads that run without an agent
   image      Build the agent image
@@ -657,6 +667,103 @@ Arguments:
 
 Options:
   -h, --help  Print help
+```
+
+## `wicket manifest`
+
+```text
+Manifests runs start from: view, check, save and restore them, as the console's editor does.
+
+The manifests runs can be started from (#172), as the console's viewer and editor have them (#713): list and show them, check an edited one against the saved version, and save or restore one in the installation's `manifests` root, which keeps the version it replaces and audits the save with what it widens.
+
+Usage: wicket manifest <COMMAND>
+
+Commands:
+  list     The manifests runs can be started from, in every root: each one's agent or program, zone, image, and whether it validates
+  show     One manifest: whether it validates, its image, the hosts it reaches and how (inspected or spliced), the secrets it injects by name and whether the vault has them, the org policy's effect on its zone, and, in the `manifests` root, its saved versions
+  check    Check an edited manifest against the saved version of `name` in the `manifests` root: whether it validates, and what it adds, removes and widens. Writes nothing
+  save     Save a manifest into the `manifests` root as `name`, as the console's editor does: the version it replaces is kept in its history, and the save is audited with what it widens
+  restore  Restore a saved version of a manifest in the `manifests` root (`wicket manifest show` lists them), as a save: the current version is kept in the history too
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `wicket manifest list`
+
+```text
+The manifests runs can be started from, in every root: each one's agent or program, zone, image, and whether it validates
+
+Usage: wicket manifest list [OPTIONS]
+
+Options:
+      --json  Print JSON (docs/reference/cli.md, "Output for scripts"), as the console's dashboard lists them
+  -h, --help  Print help
+```
+
+### `wicket manifest show`
+
+```text
+One manifest: whether it validates, its image, the hosts it reaches and how (inspected or spliced), the secrets it injects by name and whether the vault has them, the org policy's effect on its zone, and, in the `manifests` root, its saved versions
+
+Usage: wicket manifest show [OPTIONS] <MANIFEST>
+
+Arguments:
+  <MANIFEST>  `<root>/<name>` (e.g. `examples/claude.yaml`), or a name in the `manifests` root
+
+Options:
+      --json  Print JSON: every field with its effective value and whether it was written, and the rest
+  -h, --help  Print help
+```
+
+### `wicket manifest check`
+
+```text
+Check an edited manifest against the saved version of `name` in the `manifests` root: whether it validates, and what it adds, removes and widens. Writes nothing
+
+Usage: wicket manifest check [OPTIONS] --file <FILE> <NAME>
+
+Arguments:
+  <NAME>  The name it would be saved as (e.g. `worker.yaml`)
+
+Options:
+      --file <FILE>  The edited manifest (YAML)
+      --json         
+  -h, --help         Print help
+```
+
+### `wicket manifest save`
+
+```text
+Save a manifest into the `manifests` root as `name`, as the console's editor does: the version it replaces is kept in its history, and the save is audited with what it widens
+
+Usage: wicket manifest save [OPTIONS] --file <FILE> <NAME>
+
+Arguments:
+  <NAME>  
+
+Options:
+      --file <FILE>  The new version (YAML)
+      --dry-run      Show what it changes; write nothing
+  -h, --help         Print help
+```
+
+### `wicket manifest restore`
+
+```text
+Restore a saved version of a manifest in the `manifests` root (`wicket manifest show` lists them), as a save: the current version is kept in the history too
+
+Usage: wicket manifest restore [OPTIONS] <NAME> <VERSION>
+
+Arguments:
+  <NAME>     
+  <VERSION>  The version, as `show` lists it (`<unix seconds>-<sha256 prefix>.yaml`)
+
+Options:
+      --dry-run  Show what it changes; write nothing
+  -h, --help     Print help
 ```
 
 ## `wicket zone`
@@ -1325,7 +1432,7 @@ Commands:
   top              On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
   feed-checkpoint  Write a checkpoint of a node's feed now (#575 step 4c): of the state as it is, so a build before protocol 21 can open the feed once no box's record there holds host ports any more (`wicket self rollback` says when that is needed). Audited as `feed.checkpointed`
   forget           Let a run's node delete the run's files, its workspace among them. Refused while the run's work hasn't been collected (its files fetched, its outbox taken, a push or a hibernation bundle), unless --force; a forced delete is audited
-  release-fence    Release a run's fence without its node (root only, audited as `run.fence_released`): for a run whose node can't confirm its box stopped (unreachable or revoked) and whose fence wouldn't otherwise end, as when its records don't say when its authority ends. Its agent can then be woken. The box may still be running on its node
+  release-fence    Release a run's fence without its node (audited as `run.fence_released`): for a run whose node can't confirm its box stopped (revoked, or no longer enrolled) and whose fence wouldn't otherwise end. Its agent can then be woken. The box may still be running on its node. As the console releases one (#713): within your operators.yaml authority (`fence` at R4), and only a fence whose node is revoked or gone. --break-glass, as root: any fence, whatever its node
   set              Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`. Its public addresses (#575) are where its boxes' public names point: only you set them, never the node
   ca               A node's CA (#573): the hosts its active CA is constrained to and those it was enrolled with, how it may be widened at runtime (`wicket node set --ca-hosts`), what live runs want of it and whether its CA covers each, what the next renewal signs, and its last widenings (`node.ca_widened`). The console's node view shows the same
   renew-ca         Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
@@ -1587,15 +1694,16 @@ Options:
 ### `wicket node release-fence`
 
 ```text
-Release a run's fence without its node (root only, audited as `run.fence_released`): for a run whose node can't confirm its box stopped (unreachable or revoked) and whose fence wouldn't otherwise end, as when its records don't say when its authority ends. Its agent can then be woken. The box may still be running on its node
+Release a run's fence without its node (audited as `run.fence_released`): for a run whose node can't confirm its box stopped (revoked, or no longer enrolled) and whose fence wouldn't otherwise end. Its agent can then be woken. The box may still be running on its node. As the console releases one (#713): within your operators.yaml authority (`fence` at R4), and only a fence whose node is revoked or gone. --break-glass, as root: any fence, whatever its node
 
-Usage: wicket node release-fence --reason <REASON> <RUN>
+Usage: wicket node release-fence [OPTIONS] --reason <REASON> <RUN>
 
 Arguments:
   <RUN>  The run
 
 Options:
       --reason <REASON>  Why: it goes on the audit record
+      --break-glass      Root only: release any fence, an enrolled node's too, without the operators.yaml check (audited with granter `root`)
   -h, --help             Print help
 ```
 

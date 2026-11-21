@@ -12,7 +12,7 @@
 
 use super::Peer;
 use crate::{
-    CapacityCmd, Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, RequestCmd,
+    CapacityCmd, Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, ManifestCmd, NamesCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, RequestCmd,
     SecretCmd, SelfCmd, ServiceCmd, StandingCmd, StateCmd, TriggerCmd,
 };
 use serde::Deserialize;
@@ -88,6 +88,10 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Names { cmd: NamesCmd::Approve { .. } | NamesCmd::Deny { .. } | NamesCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Names { cmd: NamesCmd::Revoke { .. } } => Forward(Revoke),
         // Issuing or renewing a capacity grant lets a principal spend without asking: a decision.
+        // Saving a manifest changes what a later start from it runs, as `run` starts what it names;
+        // the console lets any signed-in operator save one.
+        Cmd::Manifest { cmd: ManifestCmd::List { .. } | ManifestCmd::Show { .. } | ManifestCmd::Check { .. } } => Forward(Read),
+        Cmd::Manifest { cmd: ManifestCmd::Save { .. } | ManifestCmd::Restore { .. } } => Forward(Run),
         Cmd::Capacity { cmd: CapacityCmd::List { .. } } => Forward(Read),
         Cmd::Capacity { cmd: CapacityCmd::Grant { .. } | CapacityCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Capacity { cmd: CapacityCmd::Revoke { .. } } => Forward(Revoke),
@@ -410,6 +414,11 @@ mod tests {
             (&["capacity", "renew", "g-1", "--ttl", "1h"], Route::Forward(Privileged)),
             (&["capacity", "revoke", "g-1"], Route::Forward(Revoke)),
             (&["authority", "r1", "--json"], Route::Forward(Read)),
+            (&["manifest", "list", "--json"], Route::Forward(Read)),
+            (&["manifest", "show", "examples/claude.yaml"], Route::Forward(Read)),
+            (&["manifest", "check", "w.yaml", "--file", "w.yaml"], Route::Forward(Read)),
+            (&["manifest", "save", "w.yaml", "--file", "w.yaml", "--dry-run"], Route::Forward(Run)),
+            (&["manifest", "restore", "w.yaml", "1-abc.yaml"], Route::Forward(Run)),
             (&["audit", "explain", "12"], Route::Forward(Read)),
             (&["trigger", "list"], Route::Forward(Read)),
             (&["trigger", "show", "t-1"], Route::Forward(Read)),

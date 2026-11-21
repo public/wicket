@@ -54,7 +54,7 @@ async fn a_manifest_shows_every_field_its_defaults_and_its_secrets_by_name() {
 #[test]
 fn the_authority_diff_says_what_changes_and_what_widens() {
     let t = with_manifest("diff");
-    let check = |yaml: &str| crate::serve::manifests::check(&t.state, &json!({ "name": "docs.yaml", "yaml": yaml })).unwrap();
+    let check = |yaml: &str| crate::serve::manifests::check(&crate::serve::manifests::Place::of(&t.state), &json!({ "name": "docs.yaml", "yaml": yaml })).unwrap();
     // A new reach rule: widens.
     let wider =
         BASE.replace("paths: ['/repos/acme/app/**'] }", "paths: ['/repos/acme/app/**'] }\n    - { host: api.example.com, methods: [GET] }");
@@ -162,4 +162,48 @@ fn an_unsigned_invalid_or_stale_save_changes_nothing() {
     assert_refused(&t.post("/api/action/finish", a), StatusCode::CONFLICT, "changed after you were shown it");
     assert!(std::fs::read_to_string(&path).unwrap().contains("rewrite"));
     assert!(t.audit_kinds().iter().all(|(k, _)| k != "manifest.saved"));
+}
+
+/// #713: `wicket manifest` lists, shows, checks, saves and restores through the console's own
+/// functions: the same JSON (the fields the CLI reference lists), the same history, and the same
+/// `manifest.saved` record, with `via: cli` instead of a signature.
+#[test]
+fn the_cli_lists_shows_checks_saves_and_restores_as_the_console_does() {
+    use crate::cmd::json_tests::documented_as;
+    use crate::serve::manifests::{self, Place};
+    let t = with_manifest("cli");
+    let p = Place::of(&t.state);
+    let list = Value::from(manifests::list(p.roots));
+    let docs = list.as_array().unwrap().iter().find(|m| m["name"] == "docs.yaml").cloned().unwrap();
+    documented_as("`wicket manifest list --json`", &docs);
+    assert!(crate::cmd::manifest::line(&docs).starts_with("manifests/docs.yaml  agent reader  zone docs  "), "{docs}");
+    let v = manifests::view(&p, "manifests", "docs.yaml").unwrap();
+    documented_as("`wicket manifest show --json`", &v);
+    let text = crate::cmd::manifest::show_text(&v);
+    assert!(text.contains("injects secret gh (set) into authorization on api.github.com"), "{text}");
+    assert!(text.contains("host api.github.com: inspected"), "{text}");
+    // A check: what the edit adds, and that it widens.
+    let wider = BASE.replace("paths: ['/repos/acme/app/**'] }", "paths: ['/repos/acme/app/**'] }\n    - { host: api.example.com, methods: [GET] }");
+    let c = manifests::check(&p, &json!({ "name": "docs.yaml", "yaml": wider })).unwrap();
+    documented_as("`wicket manifest check --json`", &c);
+    let text = crate::cmd::manifest::diff_text(&c["diff"]);
+    assert!(text.contains("+ reach") && text.contains("api.example.com") && text.contains("WIDENS"), "{text}");
+    // A save: the old version kept, the new one written, the record the console's.
+    let l = t.ledger();
+    let (save, action) = manifests::prepare(&p, "save_manifest", &json!({ "name": "docs.yaml", "yaml": wider }), "t0").unwrap();
+    manifests::save_and_record(&p, &l, &TenantId::single(), &save, &action, "alex@cli", json!({ "via": "cli" })).unwrap();
+    assert_eq!(std::fs::read_to_string(t.dir.join("manifests/docs.yaml")).unwrap(), wider);
+    let r: Value = serde_json::from_str(&l.audit_latest_unscoped("manifest.saved").unwrap().unwrap()).unwrap();
+    assert_eq!((r["action"].as_str(), r["by"].as_str(), r["via"].as_str(), r["widens"].as_bool()), (Some("save_manifest"), Some("alex@cli"), Some("cli"), Some(true)), "{r}");
+    assert!(r.get("signed").is_none(), "{r}");
+    // Saving the same bytes again changes nothing, and is refused.
+    assert!(manifests::prepare(&p, "save_manifest", &json!({ "name": "docs.yaml", "yaml": wider }), "t0").is_err());
+    // A restore of the version it replaced: from the history, as a save.
+    let v = manifests::view(&p, "manifests", "docs.yaml").unwrap();
+    let version = v["history"][0]["version"].as_str().unwrap().to_string();
+    let (save, action) = manifests::prepare(&p, "restore_manifest", &json!({ "name": "docs.yaml", "version": version }), "t0").unwrap();
+    assert_eq!(action["restored_from"], version.as_str());
+    manifests::save_and_record(&p, &l, &TenantId::single(), &save, &action, "alex@cli", json!({ "via": "cli" })).unwrap();
+    assert_eq!(std::fs::read_to_string(t.dir.join("manifests/docs.yaml")).unwrap(), BASE);
+    assert_eq!(manifests::view(&p, "manifests", "docs.yaml").unwrap()["history"].as_array().map(Vec::len), Some(2));
 }
