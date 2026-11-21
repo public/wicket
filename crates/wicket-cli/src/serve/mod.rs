@@ -1353,33 +1353,7 @@ fn resolve_manifest(state: &State, root: &str, name: &str) -> Result<(PathBuf, V
 }
 
 fn list_manifests(state: &State) -> Vec<Value> {
-    let mut out = Vec::new();
-    for (root, dir) in &state.roots {
-        let Ok(rd) = std::fs::read_dir(dir) else { continue };
-        let mut names: Vec<String> = rd.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect();
-        names.sort();
-        for name in names {
-            if let Ok((_, bytes)) = resolve_manifest(state, root, &name) {
-                let m = std::str::from_utf8(&bytes).ok().and_then(|t| wicket_agent::load(t).ok());
-                out.push(json!({
-                    "root": root, "name": name,
-                    "agent": m.as_ref().and_then(|m| m.agent.as_ref().map(|a| a.name.clone())),
-                    "program": m.as_ref().and_then(|m| m.program.as_ref().map(|p| p.name.clone())),
-                    "zone": m.as_ref().map(|m| m.zone.name.clone()),
-                    // The image its box starts from (#171), or why it can't start.
-                    "image": m.as_ref().and_then(|m| crate::run::manifest_image(m).ok()),
-                    "image_error": m.as_ref().and_then(|m| crate::run::manifest_image(m).err().map(|e| format!("{e:#}"))),
-                    // The zone view (#62): which hosts the egress proxy inspects, which it splices.
-                    "hosts": m.as_ref().map(|m| wicket_core::splice::view(&m.zone).into_iter().map(|(h, i)| match i {
-                        wicket_core::splice::Inspection::Spliced { rule } => json!({ "host": h, "mode": "spliced", "rule": rule }),
-                        wicket_core::splice::Inspection::Inspected(why) => json!({ "host": h, "mode": "inspected", "why": why }),
-                    }).collect::<Vec<_>>()),
-                    "valid": m.is_some(),
-                }));
-            }
-        }
-    }
-    out
+    manifests::list(&state.roots)
 }
 
 /// Resolves and checks an action at `begin`, and builds the exact JSON the passkey will sign.
@@ -1828,18 +1802,9 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::Secret(_) => unreachable!("action_finish applies secret actions"),
         Action::SendMessage { .. } => unreachable!("action_finish sends messages"),
         Action::SaveManifest(save) => {
-            manifests::apply(&manifests::Place::of(state), save)?;
             let signed_action: Value =
                 signed.get("action_json").and_then(|j| j.as_str()).and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
-            l.audit(
-                t,
-                None,
-                "manifest.saved",
-                &json!({ "action": signed_action["action"], "root": manifests::WRITABLE_ROOT, "name": save.name, "sha256": save.sha256,
-                         "previous_sha256": save.previous_sha256, "restored_from": signed_action["restored_from"],
-                         "widens": signed_action["widens"], "widening": signed_action["widening"], "changes": signed_action["changes"],
-                         "by": by, "signed": signed }),
-            )?;
+            manifests::save_and_record(&manifests::Place::of(state), &l, t, save, &signed_action, &by, json!({ "signed": signed }))?;
             Ok(format!(
                 "saved {}/{} (sha256 {}…); the previous version is kept in its history",
                 manifests::WRITABLE_ROOT,

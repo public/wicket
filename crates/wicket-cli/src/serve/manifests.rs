@@ -116,6 +116,38 @@ fn fields(m: &Manifest, text: &str) -> Vec<Value> {
     all.into_iter().map(|(path, value)| json!({ "path": path, "value": value, "default": !written(&raw, &path) })).collect()
 }
 
+/// Every manifest in every root, with its agent or program, zone, image and hosts: the dashboard's
+/// `manifests`, and `wicket manifest list` (#713).
+pub(crate) fn list(roots: &[(String, PathBuf)]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (root, dir) in roots {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let mut names: Vec<String> = rd.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect();
+        names.sort();
+        for name in names {
+            if let Ok((_, bytes)) = resolve(roots, root, &name) {
+                let m = std::str::from_utf8(&bytes).ok().and_then(|t| wicket_agent::load(t).ok());
+                out.push(json!({
+                    "root": root, "name": name,
+                    "agent": m.as_ref().and_then(|m| m.agent.as_ref().map(|a| a.name.clone())),
+                    "program": m.as_ref().and_then(|m| m.program.as_ref().map(|p| p.name.clone())),
+                    "zone": m.as_ref().map(|m| m.zone.name.clone()),
+                    // The image its box starts from (#171), or why it can't start.
+                    "image": m.as_ref().and_then(|m| crate::run::manifest_image(m).ok()),
+                    "image_error": m.as_ref().and_then(|m| crate::run::manifest_image(m).err().map(|e| format!("{e:#}"))),
+                    // The zone view (#62): which hosts the egress proxy inspects, which it splices.
+                    "hosts": m.as_ref().map(|m| wicket_core::splice::view(&m.zone).into_iter().map(|(h, i)| match i {
+                        wicket_core::splice::Inspection::Spliced { rule } => json!({ "host": h, "mode": "spliced", "rule": rule }),
+                        wicket_core::splice::Inspection::Inspected(why) => json!({ "host": h, "mode": "inspected", "why": why }),
+                    }).collect::<Vec<_>>()),
+                    "valid": m.is_some(),
+                }));
+            }
+        }
+    }
+    out
+}
+
 /// What a manifest grants, in plain parts.
 fn grants(state: &Place, m: &Manifest) -> Value {
     let z = &m.zone;
@@ -389,6 +421,29 @@ pub(crate) fn prepare(state: &Place, kind: &str, body: &Value, tenant: &str) -> 
         "widens": d["widens"], "widening": d["widening"], "changes": d["changes"],
     });
     Ok((Save { name, yaml, sha256: sha, previous_sha256 }, v))
+}
+
+/// Applies a save or restore `s` as `by` and audits it (`manifest.saved`): what the console does
+/// with a signed one, and `wicket manifest save` and `restore` (#713) with what they showed
+/// (`action`, as [`prepare`] made it). `extra` joins the record (the console's signature, or how).
+pub(crate) fn save_and_record(
+    state: &Place,
+    l: &wicket_store::Ledger,
+    t: &wicket_core::TenantId,
+    s: &Save,
+    action: &Value,
+    by: &str,
+    extra: Value,
+) -> Result<()> {
+    apply(state, s)?;
+    let mut record = json!({ "action": action["action"], "root": WRITABLE_ROOT, "name": s.name, "sha256": s.sha256,
+                             "previous_sha256": s.previous_sha256, "restored_from": action["restored_from"],
+                             "widens": action["widens"], "widening": action["widening"], "changes": action["changes"], "by": by });
+    if let (Some(r), Value::Object(x)) = (record.as_object_mut(), extra) {
+        r.extend(x);
+    }
+    l.audit(t, None, "manifest.saved", &record)?;
+    Ok(())
 }
 
 /// Applies a signed save: the file must still be the version it replaces; that version is kept in

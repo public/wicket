@@ -7,6 +7,7 @@ pub mod capacity;
 pub mod dev;
 pub mod identity;
 pub mod image;
+pub mod manifest;
 pub mod itself;
 pub mod message;
 pub mod names;
