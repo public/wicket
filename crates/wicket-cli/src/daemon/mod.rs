@@ -514,6 +514,41 @@ impl Daemon {
                 }
                 Plan { argv, cwd: default_cwd(), stage: Some(st), caller }
             }
+            // `audit --verify`'s exports and issuer key go as content (#713 review): wicketd reads
+            // none of the paths its caller names; a `store:<sink>` is passed on as it is.
+            Cmd::Audit { tail, verify: true, against, issuer_jwk, json: _, cmd: None }
+                if issuer_jwk.is_some() || against.iter().any(|a| !client::is_store_sink(a)) =>
+            {
+                let files = against.iter().filter(|a| !client::is_store_sink(a)).count();
+                if files > client::AGAINST_ROLES.len() {
+                    bail!("at most {} exports to verify against through wicketd", client::AGAINST_ROLES.len());
+                }
+                let mut roots: Vec<(String, PathBuf)> = client::AGAINST_ROLES
+                    .iter()
+                    .take(files)
+                    .enumerate()
+                    .map(|(i, r)| (r.to_string(), PathBuf::from(format!("against-{i}.export"))))
+                    .collect();
+                if issuer_jwk.is_some() {
+                    roots.push(("issuer-jwk".into(), "issuer.jwk".into()));
+                }
+                let st = upload::Stage::new(&stage_parent, roots)?;
+                let mut argv = vec!["audit".to_string(), "--tail".into(), tail.to_string(), "--verify".into()];
+                let mut k = 0;
+                for a in against {
+                    argv.push("--against".into());
+                    if client::is_store_sink(a) {
+                        argv.push(a.display().to_string());
+                    } else {
+                        argv.push(st.dir.join(format!("against-{k}.export")).display().to_string());
+                        k += 1;
+                    }
+                }
+                if issuer_jwk.is_some() {
+                    argv.extend(["--issuer-jwk".into(), st.dir.join("issuer.jwk").display().to_string()]);
+                }
+                Plan { argv, cwd: self.data_dir.clone(), stage: Some(st), caller }
+            }
             // A trigger's document and a sample event go as content, as the key does.
             Cmd::Trigger { cmd: crate::TriggerCmd::Create { lasts, .. } } => {
                 let st = upload::Stage::new(&stage_parent, vec![("trigger".into(), "trigger.yaml".into())])?;
@@ -639,6 +674,16 @@ fn check_staged(cmd: &Cmd, hello: &Hello, st: &upload::Stage, vault_dir: &Path) 
         Cmd::Manifest { cmd: crate::ManifestCmd::Check { .. } | crate::ManifestCmd::Save { .. } } => Some("edit"),
         _ => None,
     };
+    // `audit --verify`'s exports and issuer key: each one file, as named.
+    if let Cmd::Audit { cmd: None, .. } = cmd {
+        for (role, _) in client::self_uploads(cmd) {
+            let p = st.root(role).context("no upload role")?;
+            if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) {
+                bail!("the {role} did not arrive as a file");
+            }
+        }
+        return Ok(());
+    }
     if let Some(role) = one_file {
         let p = st.root(role).context("no upload role")?;
         if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) {

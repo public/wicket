@@ -34,7 +34,6 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 | `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list` (without `--provider`), `node ca\|fences`, `policy show`, `state check`, `self status`, `trigger list\|show\|fire` | read |
 | `unlink`, `grant revoke`, `capacity revoke`, `identity revoke`, `lease release`, `trigger pause\|rm` | revoke |
 | `approve`, `deny`, `grant renew`, `capacity grant\|renew` | privileged |
-| `audit --verify` with `--against <file>` or `--issuer-jwk` (wicket's user would read the file; a `store:<sink>` is read) | privileged |
 | `secret set\|link\|hosts\|rm` | privileged |
 | `image` | privileged |
 | `operator enrol-link\|reset\|revoke-session` | privileged |
@@ -48,7 +47,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 
 Arguments only wicket itself passes are refused from any caller: `run --run-id` and `--ssh-key`,
 and `wake --by`. (A child run's parent, lease and takeover are no arguments: its supervisor runs
-in its parent's process.) Manifests, `--workdir`, a trigger's `--file` and `--event`, and `manifest check` and `save`'s `--file` are sent to the daemon as
+in its parent's process.) Manifests, `--workdir`, a trigger's `--file` and `--event`, `manifest check` and `save`'s `--file`, and `audit --verify`'s `--against` files (a `store:<sink>` names no file) and `--issuer-jwk` are sent to the daemon as
 content; mounting a directory in place (`run --workspace-dir`, and `wrap`, which mounts its
 launcher's directory) is root's only.
 
