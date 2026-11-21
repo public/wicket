@@ -120,12 +120,19 @@ fn assets(out: &Path) {
         h.update(b);
     }
     let dir = format!("/static/m.{}", &hex::encode(h.finalize())[..16]);
+    // lit-html's files preloaded (with their hashes, so the imports are checked too), then each of the
+    // console's own modules as a script of its own.
     let mut module_tags = String::new();
-    for (rel, b) in &modules[1..] {
+    for ((rel, b), _) in modules.iter().zip(MODULES).filter(|(_, (_, own))| !own) {
         module_tags.push_str(&format!("<link rel=\"modulepreload\" href=\"{dir}/{rel}\" integrity=\"{}\">\n", sri(b)));
     }
-    let (entry, entry_body) = &modules[0];
-    module_tags.push_str(&format!("<script type=\"module\" src=\"{dir}/{entry}\" integrity=\"{}\"></script>", sri(entry_body)));
+    let own: Vec<String> = modules
+        .iter()
+        .zip(MODULES)
+        .filter(|(_, (_, own))| *own)
+        .map(|((rel, b), _)| format!("<script type=\"module\" src=\"{dir}/{rel}\" integrity=\"{}\"></script>", sri(b)))
+        .collect();
+    module_tags.push_str(&own.join("\n"));
     let (sjs, scss) = (built("session.js"), built("session.css"));
     let (sjs_path, sjs_sri, scss_path, scss_sri) = (named("session", "js", &sjs), sri(&sjs), named("session", "css", &scss), sri(&scss));
     let icon_of = |rel: &str| icons.iter().find(|(from, _)| from == &format!("/static/{rel}")).map(|(_, to)| to.clone()).expect("an icon");
@@ -227,6 +234,7 @@ fn console(out: &Path) {
 /// vendored lit-html files they import (false: copied as they are).
 const MODULES: &[(&str, bool)] = &[
     ("inbox.js", true),
+    ("agents.js", true),
     ("vendor/lit-html/lit-html.js", false),
     ("vendor/lit-html/directive.js", false),
     ("vendor/lit-html/directive-helpers.js", false),
