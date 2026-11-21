@@ -977,7 +977,11 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
 /// (#812 review): a failed step, or a process that stopped after the node was marked released
 /// (a console release runs in the background, and an update restarts it).
 async fn placed_nodes(ledger: &mut Ledger, now: i64, dry_run: bool) -> Result<Vec<Done>> {
-    let mut done = released_nodes(ledger, now, dry_run)?;
+    // A failure here is reported and the pass goes on: the lease-end releases after it stop
+    // billing nodes, which costs money while they wait.
+    let mut done = released_nodes(ledger, now, dry_run).unwrap_or_else(|e| {
+        vec![Done { kind: "error", target: "released placed nodes".into(), detail: format!("finishing their releases: {e:#}") }]
+    });
     done.extend(placed_groups(ledger, now, dry_run).await?);
     Ok(done)
 }

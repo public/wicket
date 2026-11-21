@@ -236,7 +236,10 @@ pub fn remove(l: &Ledger, name: &str, by: &str) -> Result<usize> {
 
 /// Stops an instance: its run is revoked (its supervisor stops its box), audited.
 pub fn stop(l: &Ledger, i: &wicket_store::Instance, why: &str) -> Result<()> {
-    l.revoke(&i.run, BY, why)?;
+    // One stopped already (revoked: its box going) isn't stopped, or audited, again (#812 review).
+    if !l.revoke(&i.run, BY, why)? {
+        return Ok(());
+    }
     l.audit(
         &wicket_core::TenantId::single(),
         Some(&wicket_core::RunId(i.run.clone())),
