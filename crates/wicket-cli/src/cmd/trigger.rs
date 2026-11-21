@@ -68,6 +68,11 @@ fn when(t: i64) -> String {
     wicket_core::time::unix_rfc3339(t)
 }
 
+/// A trigger's words cleaned for showing (`c`, for the console too).
+pub(crate) fn clean(s: &str) -> String {
+    c(s)
+}
+
 fn c(s: &str) -> String {
     wicket_agent::clip(s, 300)
 }
