@@ -590,6 +590,9 @@ enum Cmd {
 }
 
 fn main() {
+    // Before any other thread exists: the secret cache a node's re-exec handed over is named in the
+    // environment, which is read and cleared now, not once the runtime's threads run (#818).
+    wicket_chan::nodesecrets::take_handover_env();
     let first = std::env::args().nth(1);
     let rt = runtime(first.as_deref()).expect("a tokio runtime");
     if let Err(e) = rt.block_on(run()) {

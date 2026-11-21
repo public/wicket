@@ -1120,7 +1120,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             true => crate::reexec::control_root(),
             false => n.paths.root.join("versions"),
         };
-        crate::reexec::reexec_on_hangup(n.paths.root.join("serve.pid"), versions, move || {
+        crate::reexec::reexec_on_hangup_with(n.paths.root.join("serve.pid"), versions, move || {
             for b in n.boxes.lock().expect("boxes").values_mut() {
                 save_output(b);
             }
@@ -1129,17 +1129,20 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             }
             n.ship_audit();
             // The secret cache goes to the new process in a sealed memfd, never a file (#152): the
-            // descriptor is left open across the exec only, and named in the environment. The
-            // handover is held across the exec, the cache frozen until then (#818); if the exec
-            // fails it is dropped, closing the memfd and unsetting the variable.
+            // exec alone passes the descriptor on and names it in the new process's environment,
+            // never this one's (#818). The handover is held across the exec, the cache frozen until
+            // then; if the exec fails it is dropped, closing the memfd.
             match n.secrets.export() {
                 Ok(h) => {
-                    std::env::set_var(crate::nodesecrets::HANDOVER_ENV, h.raw_fd().to_string());
-                    Some(h)
+                    let carried = crate::reexec::Carried {
+                        env: vec![(crate::nodesecrets::HANDOVER_ENV.to_string(), h.raw_fd().to_string())],
+                        fds: vec![h.raw_fd()],
+                    };
+                    (Some(h), carried)
                 }
                 Err(e) => {
                     say_err!("[node] the secret cache can't be handed over ({e:#}); it is fetched again");
-                    None
+                    (None, crate::reexec::Carried::default())
                 }
             }
         });
