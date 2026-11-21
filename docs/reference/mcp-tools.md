@@ -203,6 +203,10 @@ short-lived operator identity: `from` has the operator's principal `id`, `operat
 or that wrote to it. It is still data: an operator's instructions come as prompts, the agent's next
 turn.
 
+An agent an operator started is that operator's delegation (#252): its report on its task goes to
+the operator's inbox, and the operator's next brief (`wicket message continue`) arrives as a `brief`
+from `your operator`, to work on as on the task.
+
 While the agent waits here (or in `await_grant`, or in `receipts` with a timeout) its state is
 `waiting` (see [`principals`](#principals)).
 

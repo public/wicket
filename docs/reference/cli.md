@@ -15,7 +15,7 @@ reference](manifest.md)).
 
 The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
 `agents`, `links`, `manifest list`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `node fences`, `lease list`, `service list`, `audit`,
-`message inbox`, `message receipts` and `message principals`, and so do `names show` (one name: an object), `manifest show` and `manifest check` (one manifest's), `authority` (one run's), `audit explain` (one record's) and `policy show` (the org policy's). With it, stdout holds one JSON document
+`message inbox`, `message receipts`, `message principals` and `message delegations`, and so do `names show` (one name: an object), `manifest show` and `manifest check` (one manifest's), `authority` (one run's), `audit explain` (one record's) and `policy show` (the org policy's). With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -62,6 +62,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket message inbox --json`, a message that doesn't verify | `message_id`, `dropped` (why) |
 | `wicket message receipts --json` | `message_id`, `to`, `state` (`delivered`, `read`, `held`, `refused`, `expired`), `why`, `release` (a held message: who can release it), `run`, `sent_at`, `read_at`, `expires_at`, `priority`, `in_reply_to` |
 | `wicket message principals --json` | `id`, `kind` (`agent`, `program`), `agent`, `zone`, `relation` (`acts for you`, `accepts you`), `state` (`running`, `busy`, `idle`, `waiting`, `hibernated`, `offline`) |
+| `wicket message delegations --json` (and `wicket message continue --json`, one) | `id` (`d-…`), `name`, `agent` (its principal), `run`, `state` (`working`, `reported`, `ended`), `turn` (its briefs so far), `brief_message`, `report_message`, `created_at`, `updated_at` |
 | `wicket audit --json` | `seq`, `ts`, `kind`, `run`, `body` (the record's JSON) |
 | `wicket agents --json` | `id`, `name`, `zone`, `state`, `generation`, `run`, `session_id`, `bundle_bytes`, `head`, `restorable`, `note`, `workspace`, `updated_at`, `used` |
 | an agent's `used` | `requests`, `input_tokens`, `output_tokens`, `secs` |
@@ -80,6 +81,8 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket message inbox`](#wicket-message-inbox)
   - [`wicket message receipts`](#wicket-message-receipts)
   - [`wicket message principals`](#wicket-message-principals)
+  - [`wicket message continue`](#wicket-message-continue)
+  - [`wicket message delegations`](#wicket-message-delegations)
 - [`wicket top`](#wicket-top)
 - [`wicket agents`](#wicket-agents)
 - [`wicket hibernate`](#wicket-hibernate)
@@ -345,11 +348,13 @@ Messages with agents (#252), as an operator: the same signed envelopes, rules an
 Usage: wicket message <COMMAND>
 
 Commands:
-  send        Send a signed message to an agent: one that acts for you, whose accept_from names you, or that wrote to you (--in-reply-to). Prints its id and receipt
-  inbox       Messages agents sent you, verified, unread first by priority. They are marked read (their senders' receipts say so) unless --peek
-  receipts    The receipts of the messages you sent, newest first: delivered, read, held (why, and who can release it), refused (why) or expired
-  principals  The agents you may write to, with their state: those that act for you or whose accept_from names you
-  help        Print this message or the help of the given subcommand(s)
+  send         Send a signed message to an agent: one that acts for you, whose accept_from names you, or that wrote to you (--in-reply-to). Prints its id and receipt
+  inbox        Messages agents sent you, verified, unread first by priority. They are marked read (their senders' receipts say so) unless --peek
+  receipts     The receipts of the messages you sent, newest first: delivered, read, held (why, and who can release it), refused (why) or expired
+  principals   The agents you may write to, with their state: those that act for you or whose accept_from names you
+  continue     Give an agent you started another brief, once its report on the last one is in your inbox: its session wakes with it, its context intact (what continue_child is for an agent)
+  delegations  The agents you started and delegated to, newest first: each one's state (working on a brief, reported, or ended) and how many briefs it has had
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -408,6 +413,35 @@ Options:
 The agents you may write to, with their state: those that act for you or whose accept_from names you
 
 Usage: wicket message principals [OPTIONS]
+
+Options:
+      --json  JSON instead of text
+  -h, --help  Print help
+```
+
+### `wicket message continue`
+
+```text
+Give an agent you started another brief, once its report on the last one is in your inbox: its session wakes with it, its context intact (what continue_child is for an agent)
+
+Usage: wicket message continue [OPTIONS] <AGENT> <BRIEF>...
+
+Arguments:
+  <AGENT>     The agent: its name, principal or delegation id (d-…, as `wicket message delegations` shows it)
+  <BRIEF>...  The brief, as one string
+
+Options:
+      --priority <PRIORITY>  How soon you want it read: now, next or later [default: next]
+      --json                 JSON instead of text
+  -h, --help                 Print help
+```
+
+### `wicket message delegations`
+
+```text
+The agents you started and delegated to, newest first: each one's state (working on a brief, reported, or ended) and how many briefs it has had
+
+Usage: wicket message delegations [OPTIONS]
 
 Options:
       --json  JSON instead of text
