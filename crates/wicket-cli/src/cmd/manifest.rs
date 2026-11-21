@@ -175,6 +175,35 @@ pub(crate) fn show_text(v: &Value) -> String {
     out
 }
 
+/// What would stop a run of the new version, said before it is saved (#713 review): the org policy
+/// refusing its zone, and a secret it injects that the vault lacks or doesn't bind to that host.
+pub(crate) fn warnings(p: &Place, save: &manifests::Save) -> Vec<String> {
+    let Ok(c) = manifests::check(p, &json!({ "name": save.name, "yaml": save.yaml })) else { return vec![] };
+    let g = &c["grants"];
+    let mut out = vec![];
+    if g["org_policy"]["mints"] == false || g["org_policy"]["error"].is_string() {
+        let why = if g["org_policy"]["error"].is_string() { s(&g["org_policy"]["error"]) } else { s(&g["org_policy"]["refused"]) };
+        out.push(format!("the org policy {} refuses its zone: {why}", s(&g["org_policy"]["version"])));
+    }
+    for i in g["inject"].as_array().into_iter().flatten() {
+        if i["secret_set"] != true {
+            out.push(format!("it injects secret {}, which the vault doesn't have", s(&i["secret"])));
+        } else if i["bound_to_host"] != true {
+            out.push(format!("it injects secret {} into {}, which the secret isn't bound to", s(&i["secret"]), s(&i["host"])));
+        }
+    }
+    out
+}
+
+/// An edited manifest's text: refused over the most a manifest may be, before it is read.
+pub(crate) fn read_edit(file: &std::path::Path) -> Result<String> {
+    let len = std::fs::metadata(file).with_context(|| format!("reading {}", file.display()))?.len();
+    if len > manifests::MAX_MANIFEST as u64 {
+        return Err(wicket_home::exit::refused(format!("the manifest is over {} bytes", manifests::MAX_MANIFEST)));
+    }
+    std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))
+}
+
 /// `save` and `restore`: what it changes, then (unless `dry_run`) the write and its record.
 fn save(kind: &str, body: Value, dry_run: bool) -> Result<()> {
     let t = TenantId::single();
@@ -188,8 +217,12 @@ fn save(kind: &str, body: Value, dry_run: bool) -> Result<()> {
             println!("(dry run: nothing written)");
             return Ok(());
         }
+        for w in warnings(p, &save) {
+            eprintln!("warning: {w}");
+        }
         let l = Ledger::open(&ledger_path())?;
-        manifests::save_and_record(p, &l, &t, &save, &action, &operator(), json!({ "via": "cli" }))?;
+        let identity = crate::operators::Operator::cli(&t.0).ok().map(|o| o.id);
+        manifests::save_and_record(p, &l, &t, &save, &action, &operator(), json!({ "via": "cli", "granter_identity": identity }))?;
         println!("{}", if save.previous_sha256.is_some() { "saved; the previous version is kept in its history" } else { "saved" });
         Ok(())
     })
@@ -212,7 +245,7 @@ pub async fn dispatch(c: ManifestCmd) -> Result<()> {
         }
         ManifestCmd::Show { manifest, json } => {
             let (root, name) = split(&manifest);
-            let v = with_place(|p| manifests::view(p, root, name)).map_err(|e| wicket_home::exit::not_found(format!("{e:#}")))?;
+            let v = with_place(|p| manifests::view(p, root, name))?;
             if json {
                 return super::print_json(&v);
             }
@@ -220,7 +253,7 @@ pub async fn dispatch(c: ManifestCmd) -> Result<()> {
             Ok(())
         }
         ManifestCmd::Check { name, file, json } => {
-            let yaml = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let yaml = read_edit(&file)?;
             let v = with_place(|p| manifests::check(p, &json!({ "name": name, "yaml": yaml })))?;
             if json {
                 return super::print_json(&v);
@@ -232,7 +265,7 @@ pub async fn dispatch(c: ManifestCmd) -> Result<()> {
             Ok(())
         }
         ManifestCmd::Save { name, file, dry_run } => {
-            let yaml = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let yaml = read_edit(&file)?;
             save("save_manifest", json!({ "name": name, "yaml": yaml }), dry_run)
         }
         ManifestCmd::Restore { name, version, dry_run } => save("restore_manifest", json!({ "name": name, "version": version }), dry_run),

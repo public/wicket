@@ -1804,7 +1804,16 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::SaveManifest(save) => {
             let signed_action: Value =
                 signed.get("action_json").and_then(|j| j.as_str()).and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
-            manifests::save_and_record(&manifests::Place::of(state), &l, t, save, &signed_action, &by, json!({ "signed": signed }))?;
+            let identity = crate::operators::Operator::console(&t.0, &oc.name).ok().map(|o| o.id);
+            manifests::save_and_record(
+                &manifests::Place::of(state),
+                &l,
+                t,
+                save,
+                &signed_action,
+                &by,
+                json!({ "granter_identity": identity, "signed": signed }),
+            )?;
             Ok(format!(
                 "saved {}/{} (sha256 {}…); the previous version is kept in its history",
                 manifests::WRITABLE_ROOT,

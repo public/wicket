@@ -550,6 +550,10 @@ impl Daemon {
                 let argv = vec!["trigger".into(), "fire".into(), id.clone(), "--event".into(), file, "--dry-run".into()];
                 Plan { argv, cwd: self.data_dir.clone(), stage: Some(st), caller }
             }
+            // `wicket manifest` reads the manifest roots, one of which is `<cwd>/examples` (#713
+            // review): in the data directory, never a directory the caller chose, which could
+            // point wicket's user at files the caller can't read.
+            Cmd::Manifest { .. } => Plan { argv: hello.argv.clone(), cwd: self.data_dir.clone(), stage: None, caller },
             _ => Plan { argv: hello.argv.clone(), cwd: default_cwd(), stage: None, caller },
         })
     }

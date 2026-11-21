@@ -34,6 +34,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 | `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list` (without `--provider`), `state check`, `self status`, `trigger list\|show\|fire` | read |
 | `unlink`, `grant revoke`, `capacity revoke`, `identity revoke`, `lease release`, `trigger pause\|rm` | revoke |
 | `approve`, `deny`, `grant renew`, `capacity grant\|renew` | privileged |
+| `audit --verify` with `--against <file>` or `--issuer-jwk` (wicket's user would read the file; a `store:<sink>` is read) | privileged |
 | `secret set\|link\|hosts\|rm` | privileged |
 | `image` | privileged |
 | `operator enrol-link\|reset\|revoke-session` | privileged |

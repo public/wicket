@@ -215,3 +215,31 @@ fn the_cli_lists_shows_checks_saves_and_restores_as_the_console_does() {
     assert_eq!(std::fs::read_to_string(t.dir.join("manifests/docs.yaml")).unwrap(), BASE);
     assert_eq!(manifests::view(&p, "manifests", "docs.yaml").unwrap()["history"].as_array().map(Vec::len), Some(2));
 }
+
+/// #713 review: a save from the host warns of a secret it injects that the vault lacks or doesn't
+/// bind to that host; an edit or a manifest over the limit is refused before it is read whole.
+#[test]
+fn the_cli_warns_of_unbound_secrets_and_refuses_oversized_manifests() {
+    use crate::serve::manifests::{self, Place};
+    let t = with_manifest("cli-warn");
+    let p = Place::of(&t.state);
+    let unbound = BASE.replace("secret: gh }", "secret: gh }\n    - { host: api.example.com, header: x-key, format: '{secret}', secret: gh }\n    - { host: api.example.com, header: x-other, format: '{secret}', secret: absent }");
+    let (save, _) = manifests::prepare(&p, "save_manifest", &json!({ "name": "docs.yaml", "yaml": unbound }), "t0").unwrap();
+    let w = crate::cmd::manifest::warnings(&p, &save);
+    assert!(w.iter().any(|w| w.contains("secret gh into api.example.com, which the secret isn't bound to")), "{w:?}");
+    assert!(w.iter().any(|w| w.contains("secret absent, which the vault doesn't have")), "{w:?}");
+    let (save, _) =
+        manifests::prepare(&p, "save_manifest", &json!({ "name": "docs.yaml", "yaml": format!("{BASE}# edited\n") }), "t0").unwrap();
+    assert!(crate::cmd::manifest::warnings(&p, &save).is_empty());
+    // Over the limit: refused, as such.
+    let big = t.dir.join("big.yaml");
+    std::fs::write(&big, "#".repeat(manifests::MAX_MANIFEST + 1)).unwrap();
+    let e = crate::cmd::manifest::read_edit(&big).unwrap_err();
+    assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::Refused as i32, "{e:#}");
+    std::fs::copy(&big, t.dir.join("manifests/big.yaml")).unwrap();
+    let e = manifests::view(&p, "manifests", "big.yaml").unwrap_err();
+    assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::Refused as i32, "{e:#}");
+    // A missing one is not found.
+    let e = manifests::view(&p, "manifests", "nope.yaml").unwrap_err();
+    assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::NotFound as i32, "{e:#}");
+}

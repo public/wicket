@@ -320,6 +320,46 @@ fn an_edited_manifest_goes_to_the_daemon_as_content() {
     assert_eq!(argv, ["manifest", "check", "worker.yaml", "--file", stage.join("edit.yaml").to_str().unwrap(), "--json"]);
 }
 
+/// #713 review: `manifest list` and `show` run in the data directory, never the caller's: a caller's
+/// `examples` symlinked to wicket's own files isn't a root they can read through.
+#[test]
+fn manifest_views_never_run_in_the_callers_directory() {
+    use clap::Parser;
+    let dir = tmp();
+    let data = dir.0.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let caller = dir.0.join("caller");
+    std::fs::create_dir_all(&caller).unwrap();
+    std::os::unix::fs::symlink(&data, caller.join("examples")).unwrap();
+    let d = Daemon {
+        data_dir: data.clone(),
+        policy_path: dir.0.join("policy.yaml"),
+        uid: 4242,
+        user: "wicket".into(),
+        exe: "/bin/false".into(),
+        vault_dir: dir.0.join("vault"),
+    };
+    let peer = proto::Peer { pid: 1, uid: 1000, gid: 1000, user: "alex".into(), groups: vec![] };
+    for args in
+        [&["manifest", "list"][..], &["manifest", "show", "examples/operators.yaml"], &["manifest", "restore", "w.yaml", "1-a.yaml"]]
+    {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let cmd = crate::Cli::try_parse_from(std::iter::once("wicket".to_string()).chain(argv.clone())).unwrap().cmd;
+        let hello = Hello {
+            version: "0".into(),
+            argv,
+            cwd: caller.display().to_string(),
+            log: None,
+            dir_fd: false,
+            manifest_name: None,
+            program_source: None,
+            codes: false,
+        };
+        let plan = d.plan(&peer, &Basis::Root, &cmd, &hello, None).unwrap();
+        assert_eq!(plan.cwd, data, "{args:?}");
+    }
+}
+
 /// #564: `self trust-key` and `self update` name files that may be root's alone (`/root/k.pub`),
 /// which wicketd, as the wicket user, can't read. They go as content, as a run's manifest does,
 /// and the command runs on the staged copies.

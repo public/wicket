@@ -42,7 +42,9 @@ pub(crate) fn check_name(name: &str) -> Result<()> {
         && !name.contains("..")
         && (name.ends_with(".yaml") || name.ends_with(".yml"));
     if !ok_name {
-        bail!("{name:?} is not a manifest file name (letters, digits, '.', '_', '-'; ending .yaml or .yml)");
+        return Err(wicket_home::exit::usage(format!(
+            "{name:?} is not a manifest file name (letters, digits, '.', '_', '-'; ending .yaml or .yml)"
+        )));
     }
     Ok(())
 }
@@ -51,15 +53,15 @@ pub(crate) fn check_name(name: &str) -> Result<()> {
 pub(crate) fn resolve(roots: &[(String, PathBuf)], root: &str, name: &str) -> Result<(PathBuf, Vec<u8>)> {
     check_name(name)?;
     let Some((_, dir)) = roots.iter().find(|(r, _)| r == root) else {
-        bail!(
+        return Err(wicket_home::exit::not_found(format!(
             "{root:?} is not a directory runs can be started from (have: {})",
             roots.iter().map(|r| r.0.as_str()).collect::<Vec<_>>().join(", ")
-        );
+        )));
     };
     let path = dir.join(name);
-    let meta = std::fs::symlink_metadata(&path).with_context(|| format!("{root}/{name}"))?;
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| wicket_home::exit::not_found(format!("{root}/{name}: {e}")))?;
     if !meta.file_type().is_file() {
-        bail!("{root}/{name} is not a regular file");
+        return Err(wicket_home::exit::refused(format!("{root}/{name} is not a regular file")));
     }
     let bytes = std::fs::read(&path)?;
     Ok((path, bytes))
@@ -333,6 +335,9 @@ fn root_dir<'a>(state: &Place<'a>, root: &str) -> Result<&'a PathBuf> {
 /// `GET /api/manifests/<root>/<name>`.
 pub(crate) fn view(state: &Place, root: &str, name: &str) -> Result<Value> {
     let (_, bytes) = resolve(state.roots, root, name)?;
+    if bytes.len() > MAX_MANIFEST {
+        return Err(wicket_home::exit::refused(format!("{root}/{name} is over {MAX_MANIFEST} bytes")));
+    }
     let text = String::from_utf8(bytes.clone()).context("the manifest is not UTF-8")?;
     let parsed = parse(&text);
     let writable = root == WRITABLE_ROOT;
@@ -435,6 +440,9 @@ pub(crate) fn save_and_record(
     by: &str,
     extra: Value,
 ) -> Result<()> {
+    // What the file was, to put back if the save can't be recorded (fail closed, as a grant is).
+    let path = root_dir(state, WRITABLE_ROOT)?.join(&s.name);
+    let before = std::fs::read(&path).ok();
     apply(state, s)?;
     let mut record = json!({ "action": action["action"], "root": WRITABLE_ROOT, "name": s.name, "sha256": s.sha256,
                              "previous_sha256": s.previous_sha256, "restored_from": action["restored_from"],
@@ -442,7 +450,14 @@ pub(crate) fn save_and_record(
     if let (Some(r), Value::Object(x)) = (record.as_object_mut(), extra) {
         r.extend(x);
     }
-    l.audit(t, None, "manifest.saved", &record)?;
+    if let Err(e) = l.audit(t, None, "manifest.saved", &record) {
+        let undone = match &before {
+            Some(b) => std::fs::write(&path, b),
+            None => std::fs::remove_file(&path),
+        };
+        let what = if undone.is_ok() { "so it was undone" } else { "and undoing it failed too" };
+        return Err(anyhow::Error::from(e).context(format!("the save of {} could not be recorded in the audit log, {what}", s.name)));
+    }
     Ok(())
 }
 

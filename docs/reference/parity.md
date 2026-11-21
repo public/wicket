@@ -93,7 +93,7 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | List nodes | `/api/state` (`placed`: nodes `wicket node create` made); the rest: none yet (#713) | `wicket node list` |
 | A node's CA: hosts, policy, wants and widenings | `/api/nodes/<node>/ca` | `wicket node ca` |
 | Release a node `wicket node create` made | `node_release` | `wicket node release` |
-| Release a run's fence on a lost node | `release_fence` | `wicket node release-fence` |
+| Release a run's fence on a lost node | `release_fence` | `wicket node release-fence` (root, or without wicketd) |
 | Release any fence, an enrolled node's too | host-only: root's break-glass, for a node the console can't decide on (it may still be running the box) | `wicket node release-fence --break-glass` |
 | List runs fenced on lost nodes | `/api/state` (`fenced`) | none yet (#713) |
 | Create a node from a provider, or list its plans | none yet (#713) | `wicket node create`, `wicket node plans` |
