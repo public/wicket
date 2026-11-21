@@ -235,6 +235,7 @@ fn console(out: &Path) {
 const MODULES: &[(&str, bool)] = &[
     ("inbox.js", true),
     ("agents.js", true),
+    ("activity.js", true),
     ("vendor/lit-html/lit-html.js", false),
     ("vendor/lit-html/directive.js", false),
     ("vendor/lit-html/directive-helpers.js", false),

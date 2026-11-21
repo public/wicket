@@ -92,18 +92,22 @@ function renderAgentHead(s, run) {
     : html`<h2>Agent</h2><p class="note">This agent run isn't in the latest list (only the 15 most recent are).</p>`, box);
 }
 
-// What it did: its records, newest first. A line is made once per record and kept, so it (and its
-// "why?") stays put across polls.
-const lines = new Map();
+// What it did: its records, newest first, each line as the Activity view draws it (activity.js),
+// kept by its record across polls, so it (and its "why?") stays put.
+let logOf = null;
 function renderAgentLog(s, run) {
   const box = document.getElementById("agent-log");
   if (!box) return;
+  logOf = [s, run];
   const mine = ((s && s.audit) || []).filter(op => op.run === run).slice().reverse();
-  const seqs = new Set(mine.map(op => op.seq));
-  for (const k of [...lines.keys()]) if (!seqs.has(k)) lines.delete(k);
-  const lineOf = op => { let e = lines.get(op.seq); if (!e) { e = line(op); lines.set(op.seq, e); } return e; };
-  draw(mine.length ? repeat(mine, op => op.seq, lineOf) : html`<div class="empty">Nothing recorded for it in the latest activity.</div>`, box);
+  const act = g.wicketActivity;
+  // An explanation opened or arrived: the agent's log is drawn again (while its page is open).
+  if (act && !act.redraws.has(redrawLog)) act.redraws.add(redrawLog);
+  // Its lines are activity.js's: without it, the log says it can't be shown, not that nothing happened.
+  draw(!act ? html`<div class="blocked">${UNLOADED}</div>`
+    : mine.length ? repeat(mine, op => op.seq, op => act.lineView(op, false)) : html`<div class="empty">Nothing recorded for it in the latest activity.</div>`, box);
 }
+function redrawLog() { if (logOf && view === "agent") renderAgentLog(...logOf); }
 
 // ---- what a run can reach (#173, #651) ----
 
