@@ -64,7 +64,7 @@ mod acme;
 pub(crate) mod authority;
 pub(crate) mod capacity;
 mod enrol;
-mod fence;
+pub(crate) mod fence;
 pub(crate) mod limits;
 pub(crate) mod manifests;
 mod messages;

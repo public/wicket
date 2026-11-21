@@ -59,6 +59,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             NodeCmd::Ca { name, json } => ca(&name, json),
+            NodeCmd::Fences { json } => fences(json),
             NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => enrol::renew_ca(&name, hosts, ca_ttl, cert_ttl).await,
             NodeCmd::Set { name, ca_hosts, labels, taints, public_ipv4, public_ipv6 } => {
                 set(&name, ca_hosts.as_deref(), &labels, &taints, public_ipv4.as_deref(), public_ipv6.as_deref())
@@ -102,6 +103,43 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
+}
+
+/// `wicket node fences`: the console's Agents held on lost servers card.
+fn fences(json: bool) -> Result<()> {
+    let l = Ledger::open(&ledger_path())?;
+    let t = TenantId::single();
+    // As the dashboard reads them: running runs, and the last runs (one may have ended while fenced).
+    let recent: Vec<String> = l.runs(&t, 15)?.into_iter().map(|r| r.id).collect();
+    let rows = crate::serve::fence::view_in(&wicket_home::data_dir().join("runs"), &t.0, &l, &recent)?;
+    if json {
+        return crate::cmd::print_json(&rows.into());
+    }
+    if rows.is_empty() {
+        println!("no runs held on lost servers");
+    }
+    for r in &rows {
+        println!("{}", fence_line(&r["fence"]));
+    }
+    Ok(())
+}
+
+/// One line for `wicket node fences`.
+pub(crate) fn fence_line(f: &serde_json::Value) -> String {
+    let s = |k: &str| f[k].as_str().map(|v| wicket_agent::clip(v, 200)).unwrap_or_else(|| "-".into());
+    let ms = |k: &str| f[k].as_i64().map_or("never".to_string(), |m| wicket_core::time::unix_rfc3339(m / 1000));
+    let until = f["fenced_until_ms"].as_i64().map_or("until its node confirms, or it is released".to_string(), |m| {
+        format!("until {}", wicket_core::time::unix_rfc3339(m / 1000))
+    });
+    format!(
+        "{}  node {} ({}, last reported {})  fenced {until}: {}\n  release: wicket node release-fence {} --reason ...",
+        s("run"),
+        s("node"),
+        s("node_status"),
+        ms("node_seen_ms"),
+        s("why"),
+        s("run")
+    )
 }
 
 /// `wicket node ca`: a node's CA, as the console's node view shows it (#573).
@@ -591,6 +629,14 @@ pub enum NodeCmd {
     Ca {
         name: String,
         /// Print it as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Runs held on lost servers (#690, #713): each run whose box may still be running on a node that
+    /// can never end its fence (revoked, or no longer enrolled), so its agent isn't woken and the run
+    /// isn't ended. The console's card lists the same; `wicket node release-fence` releases one.
+    Fences {
+        /// Print JSON, as the console's card has them.
         #[arg(long)]
         json: bool,
     },

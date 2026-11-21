@@ -9,7 +9,8 @@ use crate::*;
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
         Cmd::Policy { cmd } => match cmd {
-            PolicyCmd::Show => policy::show(),
+            PolicyCmd::Show { json: false } => policy::show(),
+            PolicyCmd::Show { json: true } => super::authority::policy(),
             PolicyCmd::Check { file, entities } => {
                 policy::sanity(&file)?;
                 policy::check(&file, entities.as_deref())
@@ -50,8 +51,12 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
 
 #[derive(Subcommand)]
 pub enum PolicyCmd {
-    /// The org policy's version, and the running runs minted under another.
-    Show,
+    /// The org policy's version, and the running runs minted under another. --json: the console's
+    /// policy view (#713), every kept version with its Cedar and when and by whom it was applied.
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate and compile an org policy without installing it.
     Check {
         file: PathBuf,

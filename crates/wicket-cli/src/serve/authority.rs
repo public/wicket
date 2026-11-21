@@ -57,7 +57,7 @@ fn policy_dir(state: &Views) -> PathBuf {
 
 /// The org policy: the applied version's Cedar and entities, every kept version with when and by
 /// whom it was applied, and the running runs by the version they were minted under.
-fn policy(state: &Views) -> Result<Value> {
+pub(crate) fn policy(state: &Views) -> Result<Value> {
     let d = policy_dir(state);
     let installed = crate::policy::installed_in(&d);
     let current = match &installed {

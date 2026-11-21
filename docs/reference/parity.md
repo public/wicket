@@ -70,10 +70,10 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | Check an edited manifest against the saved one | `/api/manifests/check` | `wicket manifest check` |
 | Save or restore a manifest version | `save_manifest`, `restore_manifest` | `wicket manifest save`, `restore` (editing the file by hand keeps no history and isn't audited) |
 | Pin a manifest's images by digest | none yet (#713) | `wicket zone pin` |
-| View the org policy, its versions and the runs under each | `/api/policy` | `wicket policy show` (its version and the runs); the versions' Cedar: none yet (#713) |
+| View the org policy, its versions and the runs under each | `/api/policy` | `wicket policy show` (`--json`: each version's Cedar too) |
 | Preview or apply an org policy | `/api/policy/preview`, `policy_apply` | `wicket policy apply --dry-run`, `wicket policy apply` |
 | Check an org policy without applying it | `/api/policy/preview` (it validates and compiles it) | `wicket policy check` |
-| A manifest's zone policy as Cedar | a running run's: `/api/runs/<run>/authority` (`zone_cedar`); a manifest's: none yet (#713) | `wicket policy zone` |
+| A manifest's zone policy as Cedar | a running run's: `/api/runs/<run>/authority` (`zone_cedar`); a manifest's: none yet (#713) | `wicket policy zone` (a manifest file) |
 
 ## Secrets
 
@@ -95,7 +95,7 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | Release a node `wicket node create` made | `node_release` | `wicket node release` |
 | Release a run's fence on a lost node | `release_fence` | `wicket node release-fence` (root, or without wicketd) |
 | Release any fence, an enrolled node's too | host-only: root's break-glass, for a node the console can't decide on (it may still be running the box) | `wicket node release-fence --break-glass` |
-| List runs fenced on lost nodes | `/api/state` (`fenced`) | none yet (#713) |
+| List runs fenced on lost nodes | `/api/state` (`fenced`) | `wicket node fences` |
 | Create a node from a provider, or list its plans | none yet (#713) | `wicket node create`, `wicket node plans` |
 | Make a join token, enrol, revoke or forget a node, or renew its CA | none yet (#713) | `wicket node token`, `enrol`, `revoke`, `forget`, `renew-ca` |
 | Set a node's CA hosts, labels or taints | none yet (#713) | `wicket node set` |

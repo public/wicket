@@ -14,8 +14,8 @@ reference](manifest.md)).
 ## Output for scripts
 
 The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
-`agents`, `links`, `manifest list`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `lease list`, `service list`, `audit`,
-`message inbox`, `message receipts` and `message principals`, and so do `names show` (one name: an object), `manifest show` and `manifest check` (one manifest's), `authority` (one run's) and `audit explain` (one record's). With it, stdout holds one JSON document
+`agents`, `links`, `manifest list`, `grant list`, `capacity list`, `standing list`, `names list`, `node list`, `node fences`, `lease list`, `service list`, `audit`,
+`message inbox`, `message receipts` and `message principals`, and so do `names show` (one name: an object), `manifest show` and `manifest check` (one manifest's), `authority` (one run's), `audit explain` (one record's) and `policy show` (the org policy's). With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -53,6 +53,9 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | a capacity grant's `used` and `left` | `nodes`, `hourly_usd`, `daily_usd` |
 | `wicket authority --json` | `run`, `status`, `node`, `revoked` (its `at`, `by` and `reason`, or null), `policy` (the org policy `version` it was minted under, the `installed` one, and whether that is `current`), `feed` (its node feed's `epoch` and `version`, or null: not read), `deadline` (`until_ms` and `stopped`, or null), `holdings` (what its node holds for it: `secrets` by name, its budget `slice` and `updated_ms`; or null), `token` (`held`, and `why` when it isn't; when it is, `box_path`, `epoch`, `zone`, `reach`, `forbid`, `loads`, `issued_by`, `issuer_until_ms`, `blocks` and `grants` decoded, and `zone_cedar`) |
 | `wicket audit explain --json` | `seq`, `run`, `policy` (the version the run was minted under), `recorded` (as decided: `at`, `outcome`, `detail`, `risk`, `method`, `host`, `path`, `decided_on`), `against_token_now` (`available`, then `decision`, `why` and `zone_says`, or `why` not) |
+| `wicket policy show --json` | `installed` (the applied version, or null), `current` (the applied policy's `version`, whether it `matches_applied` (a hand edit since makes every mint refuse), its `cedar` and `entities`; or null), `versions` (each kept `version`, whether it is `current`, each time it was `applied` (`seq`, `at`, `by`, `previous`) and its `cedar`), `runs` (each running `run`, its `zone`, the `policy` it was minted under and its `status`) |
+| `wicket node fences --json` | `id` (the run), `fence` |
+| a run's `fence` | `run`, `tenant`, `node`, `fenced_until_ms` (null: until its node confirms its box stopped), `source` (where that end comes from: `authority`, `run_record`, `ledger` or `unknown`), `node_status` (`revoked`, or `unknown`: no longer enrolled), `node_seen_ms` (its last report, or null), `why`, `release_refused` (null: listed fences can be released), `effect_sha256` (what a release is bound to) |
 | `wicket lease list --json` | `id`, `status` (`pending`, `approved`, `active`, `ended`, `denied`, `withdrawn`, `failed`), `run` (the run that holds it), `provider`, `request` (the request a person decides; null: none yet), `node` (the enrolled node's name; null: none yet), `node_id` (the provider's id for it), `hourly_cap_micro_usd`, `reserved_micro_usd`, `billed_micro_usd` (null: not ended), `duration_secs`, `created_at`, `not_after` (null: no node yet), `ended_at`, `detail` |
 | `wicket service list --json` | `name`, `sha256`, `manifest`, `tenant`, `added_by`, `added_at` |
 | `wicket message inbox --json` | `message_id`, `kind`, `from` (the sender's principal id, as its envelope verified), `agent`, `zone` and `run` (an agent sender's; null for an operator), `acting_for` (the chain the sender acts for), `reply_to`, `priority` (`now`, `next`, `later`), `in_reply_to`, `sent_at`, `read_at` (null: unread until now), `body` (the sender's data) |
@@ -155,6 +158,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket node release-fence`](#wicket-node-release-fence)
   - [`wicket node set`](#wicket-node-set)
   - [`wicket node ca`](#wicket-node-ca)
+  - [`wicket node fences`](#wicket-node-fences)
   - [`wicket node renew-ca`](#wicket-node-renew-ca)
 - [`wicket lease`](#wicket-lease)
   - [`wicket lease list`](#wicket-lease-list)
@@ -1435,6 +1439,7 @@ Commands:
   release-fence    Release a run's fence without its node (audited as `run.fence_released`): for a run whose node can't confirm its box stopped (revoked, or no longer enrolled) and whose fence wouldn't otherwise end. Its agent can then be woken. The box may still be running on its node. As the console releases one (#713): within your operators.yaml authority (`fence` at R4), and only a fence whose node is revoked or gone. --break-glass, as root: any fence, whatever its node
   set              Set what placement and the control host know of an enrolled node: its labels and taints (#579), and how its CA may be widened at runtime (#573). A box goes on a node only if the node has every label the box's `placement.node_selector` names, and the box tolerates every taint the node has. A CA widening is a renewal over the run's channel, audited as `node.ca_widened`. Its public addresses (#575) are where its boxes' public names point: only you set them, never the node
   ca               A node's CA (#573): the hosts its active CA is constrained to and those it was enrolled with, how it may be widened at runtime (`wicket node set --ca-hosts`), what live runs want of it and whether its CA covers each, what the next renewal signs, and its last widenings (`node.ca_widened`). The console's node view shows the same
+  fences           Runs held on lost servers (#690, #713): each run whose box may still be running on a node that can never end its fence (revoked, or no longer enrolled), so its agent isn't woken and the run isn't ended. The console's card lists the same; `wicket node release-fence` releases one
   renew-ca         Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
   help             Print this message or the help of the given subcommand(s)
 
@@ -1738,6 +1743,18 @@ Arguments:
 
 Options:
       --json  Print it as JSON
+  -h, --help  Print help
+```
+
+### `wicket node fences`
+
+```text
+Runs held on lost servers (#690, #713): each run whose box may still be running on a node that can never end its fence (revoked, or no longer enrolled), so its agent isn't woken and the run isn't ended. The console's card lists the same; `wicket node release-fence` releases one
+
+Usage: wicket node fences [OPTIONS]
+
+Options:
+      --json  Print JSON, as the console's card has them
   -h, --help  Print help
 ```
 
@@ -2273,7 +2290,7 @@ The installation's org policy in Cedar (#51): a ceiling and forbids over every z
 Usage: wicket policy <COMMAND>
 
 Commands:
-  show   The org policy's version, and the running runs minted under another
+  show   The org policy's version, and the running runs minted under another. --json: the console's policy view (#713), every kept version with its Cedar and when and by whom it was applied
   check  Validate and compile an org policy without installing it
   apply  Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy). The console applies one the same way, signed with a passkey on what --dry-run shows
   zone   A zone's policy as Cedar, generated from a manifest (what its boxes' tokens are compiled from)
@@ -2287,11 +2304,12 @@ Options:
 ### `wicket policy show`
 
 ```text
-The org policy's version, and the running runs minted under another
+The org policy's version, and the running runs minted under another. --json: the console's policy view (#713), every kept version with its Cedar and when and by whom it was applied
 
-Usage: wicket policy show
+Usage: wicket policy show [OPTIONS]
 
 Options:
+      --json  
   -h, --help  Print help
 ```
 
