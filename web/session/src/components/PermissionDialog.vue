@@ -5,7 +5,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import type { PermissionRequest } from '../lib/types';
-import { decideBody, reasonLine, riskLabel } from '../lib/wicket';
+import { askParts, decideBody, riskLabel } from '../lib/wicket';
 import { signed } from '../lib/sign';
 
 const props = defineProps<{
@@ -16,6 +16,9 @@ const emit = defineEmits<{
   select: [optionId: string];
   cancel: [];
 }>();
+
+// wicket's terms, the agent's words and mixed text, kept apart (#731).
+const parts = computed(() => (props.request.escalation ? askParts(props.request.escalation) : null));
 
 // Once options only (#66): an "always" option would be a policy write.
 const options = computed(() => props.request.options.filter((o) => o.kind === 'allow_once' || o.kind === 'reject_once'));
@@ -45,9 +48,11 @@ async function choose(optionId: string, kind: string) {
   <div class="ask" :class="{ escalation: request.escalation }">
     <div class="label">{{ request.escalation ? 'Request waiting for you' : 'The agent asks (not enforced by wicket)' }}</div>
     <template v-if="request.escalation">
-      <div class="op">{{ request.escalation.method }} {{ request.escalation.host }}{{ request.escalation.path }}<template v-if="request.escalation.prefix">… (every path under it)</template></div>
+      <div class="op">{{ parts?.what }}</div>
       <div class="meta">{{ riskLabel(request.escalation.risk) }} · request {{ request.escalation.id }}</div>
-      <div v-if="request.escalation.reason" class="why">{{ reasonLine(request.escalation) }}</div>
+      <!-- The agent's words in an element of their own (#731 review): wicket's label beside it, never one run of text with it. -->
+      <div v-for="[label, words] in parts?.said ?? []" :key="label" class="why"><span class="whose">{{ label }}, the agent's words:</span> <q class="said">{{ words }}</q></div>
+      <div v-if="parts?.mixed" class="why"><span class="whose">The request's text, with the agent's words in it:</span> <q class="said">{{ parts.mixed }}</q></div>
     </template>
     <div v-else class="op">{{ request.toolCall.title }}</div>
     <div class="buttons">
@@ -75,4 +80,6 @@ async function choose(optionId: string, kind: string) {
 .why { color: var(--soft); font-size: 14px; margin-top: 6px; white-space: pre-wrap; }
 .buttons { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .buttons button { flex: 1 1 140px; }
+.said { display: block; margin: 2px 0 0 8px; padding-left: 8px; border-left: 3px solid var(--muted, #888); font-style: italic; white-space: pre-wrap; overflow-wrap: anywhere; }
+.whose { font-weight: 600; }
 </style>

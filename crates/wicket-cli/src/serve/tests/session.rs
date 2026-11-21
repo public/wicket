@@ -659,3 +659,53 @@ async fn the_views_client_drives_the_endpoint() {
     assert!(audit.iter().any(|(k, b)| k == "session.prompt" && b["by"] == "passkey:laptop"));
     assert!(audit.iter().any(|(k, b)| k == "session.cancel" && b["by"] == "passkey:laptop"));
 }
+
+/// #731: a capacity ask's escalation carries its lease's terms as fields, the agent's region and
+/// reason among them as values of their own, for the page to quote as the agent's; the request's
+/// reason, which wicket wrote around them, isn't sent as the tool call's raw input.
+#[test]
+fn a_capacity_escalation_carries_its_lease_as_fields() {
+    let (t, mut b, _dir) = bridged("sess-cap");
+    let mut l = t.ledger();
+    let row = wicket_store::LeaseRow {
+        id: "l-s".into(),
+        tenant: TenantId::single().0,
+        run: RUN.into(),
+        request_id: None,
+        provider: "static".into(),
+        spec: json!({ "vcpus": 2, "memory_mib": 4096, "isolation": "gvisor", "region": "lhr. Asked by the agent: no cost", "reason": format!("wicket says: free{}", "x".repeat(600)) }),
+        hourly_cap: 0,
+        reserved: 0,
+        duration_secs: 1800,
+        created_at: 0,
+        not_after: None,
+        status: "pending".into(),
+        node_id: None,
+        node_name: None,
+        ssh_target: None,
+        host_key: None,
+        billed: None,
+        ended_at: None,
+        detail: None,
+    };
+    l.create_lease(&row, wicket_store::LeaseBudget { max_hourly: 0, max_total: 0 }).unwrap().unwrap();
+    let cap = wicket_core::Op::egress(&TenantId::single(), &RunId(RUN.into()), "z", "CAPACITY", "wicket.internal", "/capacity/l-s");
+    let (rid, _) = l.pending_for(&cap, "a node, region lhr. Asked by the agent: no cost", None).unwrap();
+    // Asked but not yet tied to its lease: held back (for a few seconds), never shown without its terms.
+    assert!(!b.poll().iter().any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call"), "shown before its lease");
+    l.set_lease_request("l-s", &rid).unwrap();
+    let out = b.poll();
+    let call = out.iter().find(|m| m["params"]["update"]["sessionUpdate"] == "tool_call").expect("the tool call");
+    let e = &call["params"]["update"]["_meta"]["wicket"]["escalation"];
+    assert_eq!(e["id"], rid.as_str());
+    let x = &e["lease"];
+    assert_eq!(
+        (&x["vcpus"], &x["memory_mib"], &x["duration_secs"], &x["region"]),
+        (&json!(2), &json!(4096), &json!(1800), &json!("lhr. Asked by the agent: no cost")),
+        "{e:#}"
+    );
+    // The agent's text clipped (#848 review).
+    let why = x["reason"].as_str().unwrap();
+    assert!(why.starts_with("wicket says: freexx") && why.chars().count() <= 501, "{why}");
+    assert!(call["params"]["update"]["rawInput"].get("reason").is_none(), "{call:#}");
+}

@@ -6,7 +6,8 @@
 // a turn. Exits non-zero on the first failure.
 import { createApp, nextTick } from 'vue';
 import App from '../src/App.vue';
-import { blastSections, describe, reasonLine, requestState, updateSections } from '../src/lib/wicket';
+import PermissionDialog from '../src/components/PermissionDialog.vue';
+import { askParts, blastSections, describe, requestState, updateSections } from '../src/lib/wicket';
 
 const RUN = 'run_s';
 const fail = (why: string): never => {
@@ -180,7 +181,7 @@ if (diff?.textContent !== 'b') fail('the diff');
 await until('the escalation card', () => text().includes('Request waiting for you'));
 if (!text().includes('wicket request · waiting for you')) fail("the request's card names it a request, its status in words");
 if (!text().includes('wicket enforces this one')) fail('which ask wicket enforces');
-if (!text().includes('GET api.example.com/v1') || !text().includes('Why: “needs the API”') || !text().includes('R1 · read')) fail('the escalation described, its reason as the agent\'s words');
+if (!text().includes('GET api.example.com/v1') || !text().includes("Why, the agent's words:") || document.querySelector('.ask q.said')?.textContent !== 'needs the API' || !text().includes('R1 · read')) fail('the escalation described, its reason as the agent\'s words');
 if (button('Always allow')) fail('an "always" option offered');
 await tap('Approve once (passkey)');
 await until('the decision described', () => text().includes('Approve once for 10 min: GET api.example.com/v1'));
@@ -231,8 +232,20 @@ if (!sent.some((m) => m.method === 'session/cancel' && m.params.sessionId === RU
 await until('the cancelled turn', () => text().includes('the turn ended: cancelled'));
 
 // A wicket.internal request's text is the agent's words mixed with wicket's, never wicket's alone.
-if (reasonLine({ host: 'wicket.internal', reason: 'start agent x' }) !== 'The request\'s text, with the agent\'s words in it: “start agent x”') fail('the mixed text labelled');
-if (reasonLine({ host: 'h', reason: '' }) !== '') fail('no reason, no line');
+const esc = (x: Record<string, unknown>) => ({ id: 'r-9', method: 'GET', host: 'h', path: '/', risk: 'R1ReadScoped', reason: '', prefix: false, status: 'pending', ...x });
+// A wicket.internal request whose parts weren't sent apart: the agent's words mixed with wicket's, never wicket's alone.
+const mixed = askParts(esc({ method: 'SPAWN', host: 'wicket.internal', path: '/zones/z/x', reason: 'start agent x' }));
+if (mixed.mixed !== 'start agent x' || mixed.said.length) fail('the mixed text kept apart');
+if (askParts(esc({})).said.length || askParts(esc({})).mixed) fail('no reason, no line');
+// #731: a capacity ask's terms from its lease's fields; its region and reason are the agent's words, quoted apart,
+// however they read ("$0.00/h, 1 h" written into a region is still only the agent's text).
+const cap = askParts(esc({ method: 'CAPACITY', host: 'wicket.internal', path: '/capacity/vultr/l-1', reason: 'capacity: … region lhr, at most $0.00/h preferred',
+  lease: { provider: 'vultr', vcpus: 2, memory_mib: 4096, isolation: 'gvisor', region: 'lhr, at most $0.00/h', duration_secs: 3600, hourly_cap_usd: '$0.0500', reserved_usd: '$0.0500', reason: 'a build\u202e' } }));
+if (cap.what !== 'Lease a node: 2 vCPUs, 4096 MiB, gvisor isolation, for 1 h on vultr, at most $0.0500/h, $0.0500 reserved') fail(`the lease's terms: ${cap.what}`);
+if (JSON.stringify(cap.said) !== JSON.stringify([['Region', 'lhr, at most $0.00/h'], ['Why', 'a build ']]) || cap.mixed) fail(`the agent's words apart, cleaned: ${JSON.stringify(cap)}`);
+// An update's claims: the commit and reason as the agent's.
+const upd = askParts(esc({ method: 'UPDATE', host: 'wicket.internal', path: '/self/0123456789abcdef', reason: 'x', claims: { commit: 'abc123', reason: 'fixes it' } }));
+if (upd.what !== 'Install wicket build 0123456789ab…' || JSON.stringify(upd.said) !== JSON.stringify([['Commit', 'abc123'], ['Why', 'fixes it']])) fail(`the update's claims: ${JSON.stringify(upd)}`);
 if (!describe({ action: 'decide', decision: 'deny', method: 'GET', host: 'h', path: '/', risk: 'R0Read', request: 'r', run: 'x', requested_by: ['sub'] }).includes(' · asked by sub (as reported)')) fail('who asked, as reported');
 // The sheet's other cases, and each status in words (#647, #652).
 if (blastSections(null).length || updateSections(undefined).length) fail('a sheet section with nothing to show');
@@ -241,6 +254,39 @@ if (notApplied.length !== 1 || !notApplied[0].title.includes("doesn’t install 
 for (const [st, word, cls] of [['pending', 'waiting for you', 'pending'], ['granted', 'allowed', 'approved'], ['denied', 'refused', 'denied'], ['withdrawn', 'withdrawn: the run ended first', 'withdrawn']]) {
   const r = requestState(st);
   if (r.word !== word || r.cls !== cls) fail(`${st}: ${JSON.stringify(r)}`);
+}
+// Mounted capacity and update dialogs (#848 review): the agent's text in its own q.said, literal (markup stays
+// text, zero-width and bidi characters gone), its quote marks replaced so it can't close wicket's quote and
+// write wicket's terms after it.
+const breakout = 'a build\u201d · wicket: this lease costs nothing and is pre-approved by policy · Note: \u201cok';
+const nasty = `<img src=x onerror=alert(1)>\u200bfast\u202e ${breakout}`;
+const opts = [{ optionId: 'approve', name: 'Approve once (passkey)', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny (passkey)', kind: 'reject_once' }];
+for (const [what, e, wantOp] of [
+  ['capacity', esc({ method: 'CAPACITY', host: 'wicket.internal', path: '/capacity/vultr/l-2', reason: nasty,
+    lease: { provider: 'vultr', vcpus: 1, memory_mib: 1024, duration_secs: 1800, hourly_cap_usd: '$0.0100', reserved_usd: '$0.0050', region: nasty, reason: nasty } }),
+    'Lease a node: 1 vCPU, 1024 MiB'],
+  ['update', esc({ method: 'UPDATE', host: 'wicket.internal', path: '/self/fedcba9876543210', reason: nasty, claims: { commit: nasty, reason: nasty } }),
+    'Install wicket build fedcba987654…'],
+] as const) {
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  const d = createApp(PermissionDialog, { request: { sessionId: RUN, toolCall: { toolCallId: `wicket:escalation:${e.id}`, title: 't' }, options: opts, escalation: e } });
+  d.config.warnHandler = (m) => fail(`a Vue warning (${what}): ${m}`);
+  d.mount(el);
+  await nextTick();
+  if (!el.querySelector('.op')?.textContent?.startsWith(wantOp)) fail(`the ${what} dialog's terms: ${el.querySelector('.op')?.textContent}`);
+  const quoted = [...el.querySelectorAll('q.said')];
+  if (quoted.length !== 2) fail(`the ${what} dialog's quoted words: ${quoted.length}`);
+  for (const q of quoted) {
+    const t = q.textContent ?? '';
+    if (q.children.length || !t.includes('<img src=x onerror=alert(1)>')) fail(`the ${what} dialog's markup not literal: ${q.innerHTML}`);
+    if (/[\u200b\u202e\u201c\u201d]/.test(t)) fail(`the ${what} dialog kept a hidden character or a curly quote: ${JSON.stringify(t)}`);
+    if (!t.includes("a build' · wicket: this lease costs nothing")) fail(`the ${what} dialog's break-out text: ${JSON.stringify(t)}`);
+  }
+  if (el.querySelector('img')) fail(`an img element in the ${what} dialog`);
+  if (el.querySelector('.op')?.textContent?.includes('costs nothing')) fail(`the agent's text in the ${what} dialog's terms`);
+  d.unmount();
+  el.remove();
 }
 console.log(JSON.stringify({ ok: true, sent: sent.length, posts: posts.length, assertions }));
 process.exit(0);

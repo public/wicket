@@ -75,6 +75,20 @@ pub const TICKET_TTL: Duration = Duration::from_secs(60);
 pub const SUBPROTOCOL: &str = "acp.v1";
 /// The subprotocol prefix that carries the ticket.
 pub const TICKET_PREFIX: &str = "wicket.ticket.";
+/// How long a capacity ask or an update waits to be shown for its lease or claims (#731 review).
+const FIELDS_WAIT_SECS: i64 = 5;
+
+/// An escalation's fields with every string an agent may have written clipped (#731 review): a
+/// lease's reason and region, an update's claims. Long text can't push the decision out of view.
+fn clip_strings(v: Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(wicket_core::text::clip(&s, 500)),
+        Value::Object(m) => Value::Object(m.into_iter().map(|(k, v)| (k, clip_strings(v))).collect()),
+        Value::Array(a) => Value::Array(a.into_iter().map(clip_strings).collect()),
+        v => v,
+    }
+}
+
 /// The tool-call id prefix that only wicket's own escalation prompts use.
 pub const RESERVED_ID: &str = "wicket:";
 /// Longest message the browser may send (a prompt is at most the console's MAX_TEXT anyway).
@@ -752,15 +766,38 @@ impl Bridge {
         let now: BTreeSet<String> = pending.iter().filter(|r| r.run == self.run).map(|r| r.id.clone()).collect();
         let new: Vec<&wicket_store::Request> = pending.iter().filter(|r| r.run == self.run && !self.shown.contains(&r.id)).collect();
         for r in new {
+            // A capacity ask's lease, and an update's claims, are written just after its request
+            // (#731 review): it waits a few seconds for them rather than show once without them.
+            let fields = match r.method.as_str() {
+                "CAPACITY" => l.lease_for_request(&r.id).ok().flatten().is_some(),
+                "UPDATE" => l.request_claims(&r.id).ok().flatten().is_some(),
+                _ => true,
+            };
+            if !fields && wicket_store::now() - r.created_at < FIELDS_WAIT_SECS {
+                continue;
+            }
             self.shown.insert(r.id.clone());
             let tc = format!("{RESERVED_ID}escalation:{}", r.id);
+            // The request's terms as fields (#731), as the console's cards have them: a capacity ask's
+            // lease, and what an agent claimed when it asked (an update's reason and commit). The page
+            // shows wicket's terms from these and the agent's words quoted as its, never the reason
+            // (which wicket wrote around them) as wicket's alone.
+            // The lease the request names, only (its path ends with the lease's id).
+            let lease = l
+                .lease_for_request(&r.id)
+                .ok()
+                .flatten()
+                .filter(|x| r.path.rsplit('/').next() == Some(x.id.as_str()))
+                .map(|x| clip_strings(super::lease_view(&x)));
+            let claims = l.request_claims(&r.id).ok().flatten().map(clip_strings);
             let esc = json!({ "id": r.id, "method": r.method, "host": r.host, "path": r.path, "risk": r.risk,
                               "reason": wicket_core::text::clip(&r.reason, 500), "prefix": r.scope_prefix, "status": "pending",
-                              "decide": "/api/decide/begin" });
+                              "decide": "/api/decide/begin", "lease": lease, "claims": claims });
             let title = format!("wicket request {}: {} {}{}", r.id, r.method, r.host, r.path);
             out.push(self.update(json!({
                 "sessionUpdate": "tool_call", "toolCallId": tc, "title": title, "kind": "fetch", "status": "pending",
-                "rawInput": { "method": r.method, "host": r.host, "path": r.path, "risk": r.risk, "reason": r.reason },
+                // Its reason is in the escalation, shown as the dialog splits it: not here, as raw input.
+                "rawInput": { "method": r.method, "host": r.host, "path": r.path, "risk": r.risk },
                 "_meta": { "wicket": { "escalation": esc } },
             })));
             let rpc = format!("wicket-{}", self.next_id);

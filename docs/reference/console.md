@@ -292,7 +292,11 @@ run's *session* link in **Runs** (shown for running ACP runs, whose supervisor k
 - its plan, with each entry's status;
 - other principals' prompts (the task, other operators, wicket's notices), each with who sent it;
 - **wicket's escalations** for the run, inline: what was asked (method, host, path, risk, reason)
-  with **Approve once (passkey)** and **Deny (passkey)**. A tap asks `/api/decide/begin` for the
+  as the front page's cards say it (#731): wicket's terms from the request's fields (a capacity ask's
+  lease: its resources, provider, duration and money; an update's build), and what the agent wrote
+  (a lease's region and reason, an update's commit and reason) quoted and labelled as its words; a
+  reason that holds the agent's words among wicket's, with no fields to split it by, is shown as
+  such, never as wicket's alone. With **Approve once (passkey)** and **Deny (passkey)**. A tap asks `/api/decide/begin` for the
   decision, the confirmation at the top states it (as on the front page), and its own button has the
   passkey sign it through `/api/decide/finish`: the same signed decide action as the front page's
   cards (#256), approving once for 10 minutes. An escalation decided elsewhere (the front page,

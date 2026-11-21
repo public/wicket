@@ -11,7 +11,10 @@ import ToolCallCard from './components/ToolCallCard.vue';
 import PermissionDialog from './components/PermissionDialog.vue';
 import SignSheet from './components/SignSheet.vue';
 import { addUser, handleSessionUpdate, messages, reset } from './session';
-import { requestState, riskLabel, runFromLocation, socket } from './lib/wicket';
+import { requestState, riskLabel, runFromLocation, socket, statusClass, strip } from './lib/wicket';
+
+// The plan statuses ACP names: an agent's other value is `other`, never a class of its choosing (#731 review).
+const PLAN_STATUSES = ['pending', 'in_progress', 'completed'] as const;
 import { sheet, signed } from './lib/sign';
 import type { PermissionRequest } from './lib/types';
 
@@ -158,13 +161,13 @@ function onKey(e: KeyboardEvent) {
         <div v-if="m.plan?.length" class="plan">
           <div class="label">Plan</div>
           <ol>
-            <li v-for="(p, i) in m.plan" :key="i" :class="p.status">{{ p.content }} <span class="status">{{ p.status }}</span></li>
+            <li v-for="(p, i) in m.plan" :key="i" :class="statusClass(p.status, PLAN_STATUSES)">{{ p.content }} <span class="status">{{ p.status }}</span></li>
           </ol>
         </div>
         <template v-for="tc in m.toolCalls ?? []" :key="tc.toolCallId">
           <div v-if="tc.escalation" class="escalation" :class="requestState(tc.escalation.status).cls">
             <span class="label">wicket request · {{ requestState(tc.escalation.status).word }}</span>
-            <span class="mono">{{ tc.escalation.method }} {{ tc.escalation.host }}{{ tc.escalation.path }}</span>
+            <span class="mono">{{ strip(tc.escalation.method) }} {{ strip(tc.escalation.host) }}{{ strip(tc.escalation.path) }}</span>
             <span class="meta">{{ riskLabel(tc.escalation.risk) }} · request {{ tc.escalation.id }}</span>
           </div>
           <ToolCallCard v-else :tool-call="tc" />
