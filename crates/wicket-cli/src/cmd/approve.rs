@@ -99,14 +99,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Unlink { id } => {
             let l = Ledger::open(&ledger_path())?;
-            let r = l.link(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no link {id}")))?;
-            if l.close_link(&id, &operator(), "cut by the operator")? {
-                l.audit(
-                    &TenantId::single(),
-                    None,
-                    "link.cut",
-                    &serde_json::json!({ "id": id, "by": operator(), "from": r.from_run, "to": r.to_run, "port": r.port }),
-                )?;
+            if cut_link(&l, &TenantId::single(), &id, &operator(), serde_json::json!({ "via": "cli" }))? {
                 println!("cut {id}; its relay closes it within a few seconds");
             } else {
                 println!("{id} was already closed");
@@ -148,20 +141,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Grant { cmd: GrantCmd::Revoke { id } } => {
             let l = Ledger::open(&ledger_path())?;
-            let g = l.grant(&id)?.ok_or_else(|| wicket_home::exit::not_found(format!("no grant {id}")))?;
-            // A capacity grant is revoked as `wicket capacity revoke` and the console revoke one
-            // (#713): checked, and audited as a decision.
-            if l.capacity_grant(&id)?.is_some() {
-                grant::revoke_capacity_grant(&l, &operator(), &TenantId::single(), &id, serde_json::json!({ "via": "cli" }))?;
-                println!("revoked capacity grant {id}: nothing more is approved under it");
-                return Ok(());
-            }
-            l.revoke_grant(&id)?;
-            l.audit(&TenantId::single(), None, "grant.revoked", &serde_json::json!({ "grant": id, "by": operator(), "node": g.node }))?;
-            match &g.node {
-                Some(n) => println!("revoked {id}; its run pushes the revocation to node {n}"),
-                None => println!("revoked {id}"),
-            }
+            println!("{}", revoke_grant(&l, &TenantId::single(), &id, &operator(), serde_json::json!({ "via": "cli" }))?);
             Ok(())
         }
         Cmd::Grant { cmd: GrantCmd::Renew { id, ttl } } => {
@@ -272,6 +252,48 @@ pub(crate) fn pending_json(l: &Ledger) -> Result<serde_json::Value> {
         }));
     }
     Ok(serde_json::Value::Array(out))
+}
+
+
+/// Revokes grant `id` of `tenant` as `by` (#713: `wicket grant revoke`, and the console's
+/// `/api/grants/revoke`): a capacity grant as `wicket capacity revoke` does (audited as a decision),
+/// any other audited as `grant.revoked`, with `extra` (`via`). Another tenant's grant is not found,
+/// as one that doesn't exist. What was done, in words.
+pub(crate) fn revoke_grant(l: &Ledger, tenant: &TenantId, id: &str, by: &str, extra: serde_json::Value) -> Result<String> {
+    let g = l.grant(id)?.filter(|g| g.tenant == tenant.0).ok_or_else(|| wicket_home::exit::not_found(format!("no grant {id}")))?;
+    if l.capacity_grant(id)?.is_some() {
+        grant::revoke_capacity_grant(l, by, tenant, id, extra)?;
+        return Ok(format!("revoked capacity grant {id}: nothing more is approved under it"));
+    }
+    if g.revoked {
+        return Err(wicket_home::exit::refused(format!("grant {id} is already revoked")));
+    }
+    l.revoke_grant(id)?;
+    let mut record = serde_json::json!({ "grant": id, "by": by, "node": g.node });
+    if let (Some(r), serde_json::Value::Object(x)) = (record.as_object_mut(), extra) {
+        r.extend(x);
+    }
+    l.audit(tenant, None, "grant.revoked", &record)?;
+    Ok(match &g.node {
+        Some(n) => format!("revoked {id}; its run pushes the revocation to node {n}"),
+        None => format!("revoked {id}"),
+    })
+}
+
+/// Cuts link `id` of `tenant` as `by` (#713: `wicket unlink`, and the console's `/api/links/cut`),
+/// audited as `link.cut` with `extra` (`via`): whether it was open. Another tenant's link is not
+/// found, as one that doesn't exist.
+pub(crate) fn cut_link(l: &Ledger, tenant: &TenantId, id: &str, by: &str, extra: serde_json::Value) -> Result<bool> {
+    let r = l.link(id)?.filter(|r| r.tenant == tenant.0).ok_or_else(|| wicket_home::exit::not_found(format!("no link {id}")))?;
+    if !l.close_link(id, by, "cut by the operator")? {
+        return Ok(false);
+    }
+    let mut record = serde_json::json!({ "id": id, "by": by, "from": r.from_run, "to": r.to_run, "port": r.port });
+    if let (Some(rec), serde_json::Value::Object(x)) = (record.as_object_mut(), extra) {
+        rec.extend(x);
+    }
+    l.audit(tenant, None, "link.cut", &record)?;
+    Ok(true)
 }
 
 /// `wicket links --json`.

@@ -392,6 +392,11 @@ pub fn approve(l: &Ledger, by: &Granter, id: &str) -> Result<()> {
 /// Pauses (`paused`) or deletes (`deleted`) a trigger, by operator `by`: audited as
 /// `trigger.paused` or `.deleted`. Anyone who may revoke may, since it only narrows.
 pub fn set_status(l: &Ledger, by: &Operator, id: &str, status: &str) -> Result<Trigger> {
+    set_status_via(l, by, id, status, json!({}))
+}
+
+/// As [`set_status`], with `extra` on its record (`via`, #713).
+pub fn set_status_via(l: &Ledger, by: &Operator, id: &str, status: &str, extra: Value) -> Result<Trigger> {
     let t = get(l, id)?;
     let kind = match status {
         "paused" => "trigger.paused",
@@ -399,7 +404,11 @@ pub fn set_status(l: &Ledger, by: &Operator, id: &str, status: &str) -> Result<T
         s => bail!("a trigger is paused or deleted here, not {s}"),
     };
     l.set_trigger_status(id, status)?;
-    audit(l, kind, &json!({ "trigger": id, "name": t.name, "owner": t.owner, "by": by.label, "principal": by.id }))?;
+    let mut record = json!({ "trigger": id, "name": t.name, "owner": t.owner, "by": by.label, "principal": by.id });
+    if let (Some(r), Value::Object(x)) = (record.as_object_mut(), extra) {
+        r.extend(x);
+    }
+    audit(l, kind, &record)?;
     Ok(t)
 }
 
