@@ -1129,13 +1129,18 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             }
             n.ship_audit();
             // The secret cache goes to the new process in a sealed memfd, never a file (#152): the
-            // descriptor is left open across the exec only, and named in the environment.
+            // descriptor is left open across the exec only, and named in the environment. The
+            // handover is held across the exec, the cache frozen until then (#818); if the exec
+            // fails it is dropped, closing the memfd and unsetting the variable.
             match n.secrets.export() {
-                Ok(fd) => {
-                    use std::os::fd::IntoRawFd;
-                    std::env::set_var(crate::nodesecrets::HANDOVER_ENV, fd.into_raw_fd().to_string());
+                Ok(h) => {
+                    std::env::set_var(crate::nodesecrets::HANDOVER_ENV, h.raw_fd().to_string());
+                    Some(h)
                 }
-                Err(e) => say_err!("[node] the secret cache can't be handed over ({e:#}); it is fetched again"),
+                Err(e) => {
+                    say_err!("[node] the secret cache can't be handed over ({e:#}); it is fetched again");
+                    None
+                }
             }
         });
     }

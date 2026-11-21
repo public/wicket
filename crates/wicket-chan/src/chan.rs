@@ -521,9 +521,10 @@ pub enum Msg {
     },
     /// A secret the node fetched for `run` changed or was removed on the control host: the node
     /// drops the run's use of it (the next use fetches it again). From [`LIVE_SECRETS`], also sent
-    /// for a secret the node was refused that can now be released, and for every secret released to
-    /// the run when a connection (re)starts (one sent on a link that died may never have arrived):
-    /// the node forgets the refusal or drops its copy, and the next use asks again. A node that
+    /// for a secret the node was refused that can now be released, and again when a connection
+    /// (re)starts for each revoke that may have been lost on a link that died (never for a secret
+    /// the node holds as released and unchanged, #818): the node forgets the refusal or drops its
+    /// copy, and the next use asks again. A node that
     /// holds neither does nothing.
     SecretRevoke {
         run: String,
