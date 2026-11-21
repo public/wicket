@@ -23,7 +23,7 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | Approve or deny a request | `decide` | `wicket approve`, `wicket deny` |
 | List grants | `/api/grants` (live, expired and revoked: the last 200) | `wicket grant list` |
 | Renew a grant or a box's authority | none yet (#713) | `wicket grant renew` |
-| Revoke a grant | none yet (#713); a capacity grant: `/api/capacity/revoke` | `wicket grant revoke` |
+| Revoke a grant | `/api/grants/revoke` (a capacity grant: also `/api/capacity/revoke`) | `wicket grant revoke` |
 | Issue a capacity grant | `capacity_grant` | `wicket capacity grant` |
 | Renew a capacity grant | `capacity_renew` | `wicket capacity renew` (or `wicket grant renew`) |
 | Revoke a capacity grant | `/api/capacity/revoke` | `wicket capacity revoke` (or `wicket grant revoke`) |
@@ -56,10 +56,11 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | Send an agent a message | `send_message` | `wicket message send` |
 | Read your inbox, receipts and who you may write to | `/api/messages`, `/api/messages/read` | `wicket message inbox`, `receipts`, `principals` |
 | Hibernate an agent | none yet (#713) | `wicket hibernate` (a message, or `wicket session`, wakes it) |
-| Create, pause, resume, renew, fire or remove a trigger, or rotate its URL | none yet (#713) | `wicket trigger …` |
+| Pause a trigger | `/api/triggers/pause` | `wicket trigger pause` |
+| Create, resume, renew, fire or remove a trigger, or rotate its URL | none yet (#713) | `wicket trigger …` |
 | List triggers | `/api/triggers` | `wicket trigger list` |
 | Show a trigger, with its agent and last firings | none yet (#713) | `wicket trigger show` |
-| Cut a link between boxes | none yet (#713) | `wicket unlink` |
+| Cut a link between boxes | `/api/links/cut` | `wicket unlink` |
 | List links | `/api/links` | `wicket links` |
 
 ## Manifests and policy
@@ -117,7 +118,8 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | Revoke every passkey | host-only: the break-glass for a lost or stolen passkey | `wicket operator reset` |
 | Sign out | `/api/logout` | not applicable: the CLI has no session |
 | List console sessions | `/api/sessions` | `wicket operator sessions` |
-| End a console session | none yet (#713); signing out ends your own | `wicket operator revoke-session` |
+| End one of your own console sessions | `/api/sessions/end` (or sign out, for this one) | `wicket operator revoke-session` |
+| End another passkey's console session, or all of them | host-only: root's, the break-glass for a passkey that may be someone else's | `wicket operator revoke-session`, `--all` |
 | Turn notifications on a device on or off | `push_subscribe`, `/api/push/remove`, `push_details` | not applicable: a browser's push subscription |
 
 ## The installation

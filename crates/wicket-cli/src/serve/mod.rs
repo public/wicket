@@ -1170,6 +1170,14 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
             },
             _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
         },
+        // The host's narrowing actions (#713): the session alone, as revoking a capacity grant.
+        p if views::posts(p) => match &sess {
+            Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
+                Some(oc) => views::post(state, &oc, p, body),
+                None => err(StatusCode::UNAUTHORIZED, "the passkey you signed in with is no longer enrolled"),
+            },
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
         "/api/capacity/revoke" => match &sess {
             Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
                 Some(oc) => capacity::revoke(state, &oc, body),
@@ -2449,6 +2457,7 @@ mod tests {
     mod manifests;
     mod messages;
     mod names_card;
+    mod narrowing;
     mod nodes;
     mod notify;
     mod orgpolicy;

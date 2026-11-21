@@ -254,7 +254,6 @@ pub(crate) fn pending_json(l: &Ledger) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Array(out))
 }
 
-
 /// Revokes grant `id` of `tenant` as `by` (#713: `wicket grant revoke`, and the console's
 /// `/api/grants/revoke`): a capacity grant as `wicket capacity revoke` does (audited as a decision),
 /// any other audited as `grant.revoked`, with `extra` (`via`). Another tenant's grant is not found,

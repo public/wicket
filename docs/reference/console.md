@@ -459,6 +459,14 @@ list`) and `/api/sessions` (`wicket operator sessions`). None carries a token, a
 a trigger's document or a session's token: an identity is its verified fields, and a session its
 token's hash's first 16 hex digits, which nothing signs in with.
 
+Four of them can be narrowed from the console (#713), with the session alone (as revoking a
+capacity grant or standing reach: each only takes something away): `POST /api/grants/revoke`,
+`/api/links/cut`, `/api/triggers/pause` and `/api/sessions/end`, each with `{"id"}`. Each goes
+through its command's function (`wicket grant revoke`, `unlink`, `trigger pause`), for the
+console's tenant only (another tenant's id is not found), and is audited with the passkey's operator
+and `via: console`. A session is one of the operator's own, named as `/api/sessions` names it (at
+least its 16 hex digits); another passkey's is ended on the host (`wicket operator revoke-session`).
+
 ## Placement view
 
 Why a run went where it did ([#579](https://github.com/public/wicket/issues/579)), read-only and behind
