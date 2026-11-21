@@ -301,7 +301,7 @@ impl Ledger {
         )?;
         if waiting as usize >= MAX_PENDING {
             return Err(StoreError::Refused(format!(
-                "{waiting} of this agent's standing asks are already waiting for a decision (at most {MAX_PENDING}): wait for them"
+                "{waiting} of this agent's standing requests are already waiting for a decision (at most {MAX_PENDING}): wait for them"
             )));
         }
         let evidence = self.standing_evidence(tenant, principal, rule, now() - EVIDENCE_SECS)?;

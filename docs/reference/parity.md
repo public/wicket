@@ -19,7 +19,7 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 
 | Action | Console | CLI |
 | --- | --- | --- |
-| List pending requests, standing asks and name asks | `/api/state` (`pending`) | `wicket pending` |
+| List pending requests, standing requests and name asks | `/api/state` (`pending`) | `wicket pending` |
 | Approve or deny a request | `decide` | `wicket approve`, `wicket deny` |
 | List grants | `/api/state` (`decided`: the last 15 decisions) | `wicket grant list` |
 | Renew a grant or a box's authority | none yet (#713) | `wicket grant renew` |

@@ -29,7 +29,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | Output | Fields |
 | --- | --- |
 | `wicket pending --json`, a request | `kind` (`request`), `id`, `run`, `zone`, `method`, `host`, `path`, `prefix` (the whole path prefix asked for), `risk`, `reason`, `created_at`, `attribution` (who in the box asked, as the agent reported it: untrusted) |
-| `wicket pending --json`, a standing ask | `kind` (`standing`), `id`, `run`, `zone`, `principal`, `rule`, `reason`, `created_at` |
+| `wicket pending --json`, a standing request | `kind` (`standing`), `id`, `run`, `zone`, `principal`, `rule`, `reason`, `created_at` |
 | `wicket pending --json`, an ask for a public name | `kind` (`name`), `id`, `run` (the asking run), `zone`, `principal`, `label`, `port` (the box's own), `service`, `scope` (`run`, `standing`), `reason` (the agent's, prefixed `asked by the agent: `), `created_at` |
 | a standing `rule` | `host`, `methods`, `paths`, `allow_dangerous` |
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
@@ -1117,10 +1117,10 @@ Standing reach (#572): a reach rule an agent asked for once, approved once for i
 Usage: wicket standing <COMMAND>
 
 Commands:
-  list     Standing rules: pending asks, and approved rules (with when they lapse). --all adds denied, revoked and lapsed ones
-  show     One ask or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
-  approve  Approve a standing ask (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
-  deny     Deny a standing ask
+  list     Standing requests (pending) and standing rules (approved, with when they lapse). --all adds denied, revoked and lapsed ones
+  show     One standing request or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
+  approve  Approve a standing request (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
+  deny     Deny a standing request
   renew    Move an approved rule's lapse to --ttl from now (or `forever`)
   revoke   Revoke an approved rule: it allows nothing from now on (a box's node, once its run publishes the revocation)
   help     Print this message or the help of the given subcommand(s)
@@ -1133,7 +1133,7 @@ Options:
 ### `wicket standing list`
 
 ```text
-Standing rules: pending asks, and approved rules (with when they lapse). --all adds denied, revoked and lapsed ones
+Standing requests (pending) and standing rules (approved, with when they lapse). --all adds denied, revoked and lapsed ones
 
 Usage: wicket standing list [OPTIONS]
 
@@ -1146,7 +1146,7 @@ Options:
 ### `wicket standing show`
 
 ```text
-One ask or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
+One standing request or rule: the rule, who it is for, the ledger's evidence (the requests it covers), and what it would allow beyond them
 
 Usage: wicket standing show <ID>
 
@@ -1160,7 +1160,7 @@ Options:
 ### `wicket standing approve`
 
 ```text
-Approve a standing ask (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
+Approve a standing request (`s-…`), once: the rule as asked, or --narrow to what its evidence used. For the agent that asked (each later run of it), or --for zone (every agent of its zone)
 
 Usage: wicket standing approve [OPTIONS] <ID>
 
@@ -1178,7 +1178,7 @@ Options:
 ### `wicket standing deny`
 
 ```text
-Deny a standing ask
+Deny a standing request
 
 Usage: wicket standing deny <ID>
 
@@ -2815,7 +2815,7 @@ without reading the message (which goes to stderr, after `Error: `).
 | --- | --- | --- |
 | 0 | Done. | |
 | 1 | Failed, for any reason the others don't name. | The ledger can't be opened; a node doesn't answer; the daemon's policy file can't be read; asking for a spend's approval failed; `wicket run` whose box failed (a non-zero exit, out of memory, over a cap) or timed out (see below). |
-| 2 | A usage error: the command line is wrong. Nothing was changed. | An unknown flag; a duration that isn't one (`--ttl 5q`; every duration flag takes `90s`, `10m`, `1h 30m` or a number of seconds); `wicket approve s-…` (a standing ask: `wicket standing approve`). |
+| 2 | A usage error: the command line is wrong. Nothing was changed. | An unknown flag; a duration that isn't one (`--ttl 5q`; every duration flag takes `90s`, `10m`, `1h 30m` or a number of seconds); `wicket approve s-…` (a standing request: `wicket standing approve`). |
 | 3 | Refused: wicket won't do it as asked. | The daemon's policy doesn't allow this caller the command; a decision outside the decider's authority; deciding a request that is already decided; terms wider than the request; answering no at `approve`'s or `standing approve`'s confirmation; a spend an operator denied, or over the installation's money limit; a lease that is already ended; a session on a run that isn't running; `self update` of an artifact whose signature doesn't verify. |
 | 4 | Not found: what the command names doesn't exist. | `no such request r-…`; no grant, link, lease, run, agent, node, service, trigger or identity by that name; no placement decision for the run. |
 | 5 | It needs an approval nobody has given yet. | `wicket node create` whose spend no capacity grant covers and no operator decided within `--wait` (or `--wait 0`); `wicket self update` of an artifact no trusted key signed and no operator approved. |

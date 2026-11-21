@@ -7,6 +7,7 @@
 #   - "sandbox node": a node (a machine that runs boxes);
 #   - "escalation request": a request ("escalation" is the act of asking, not a separate thing);
 #   - "wicket place": the command is `wicket node create`, `release`, `plans` and `list` (#358);
+#   - "standing ask": a pending one is a "standing request", an approved one a "standing rule" (#657);
 #   - "mandate", "crew": deferred designs (#259), outside docs/explanation/research/ and
 #     design.md's "22. Deferred" section;
 #   - "sandbox" where "box" is meant, in the user docs (README.md, docs/README.md, docs/how-to/,
@@ -43,6 +44,7 @@ RULES = [
     (re.compile(r"\bsandbox[- ]nodes?\b", re.I), 'say "node"', lambda p: True),
     (re.compile(r"\bescalation[- ]requests?\b", re.I), 'say "request" ("escalation" is the act of asking)', lambda p: True),
     (re.compile(r"\bwicket place\b", re.I), 'say "wicket node create" (or release, plans, list): nodes have one noun (#358)', lambda p: True),
+    (re.compile(r"\bstanding[- ]asks?\b", re.I), 'say "standing request" (pending) or "standing rule" (approved) (#657)', lambda p: True),
     (re.compile(r"\b(?:mandates?|crews?)\b", re.I), "a deferred design (#259): only in research and design.md's Deferred section", lambda p: True),
     (re.compile(r"\bsandbox(?:es)?\b", re.I), 'say "box" ("sandbox" is only gVisor\'s layer)', lambda p: p.startswith(BOX_DOCS)),
 ]
