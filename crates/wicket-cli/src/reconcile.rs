@@ -1158,6 +1158,8 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     if !dry_run {
         done.extend(intake_pass(&ledger, now).await);
     }
+    // The trigger engine (#578 step 5): the runs `start` triggers queued, this pass's included.
+    done.extend(engine_pass(&ledger, now, dry_run));
     let asked = node_runs(&ledger, dry_run).await?;
     let local = Docker::from_env();
     done.extend(machines_pass(&mut ledger, asked, &local, now, dry_run).await?);
@@ -1377,6 +1379,55 @@ fn triggers_pass(
             })
             .collect(),
         Err(e) => vec![Done { kind: "error", target: "triggers".into(), detail: format!("{e:#}") }],
+    }
+}
+
+/// The trigger engine's pass ([`wicket_control::triggers::engine::pass`]), as the pass's report: a
+/// trigger's manifest is resolved as the console resolves it (`<root>/<name>`, or a name in the
+/// `manifests` root, [`crate::serve::manifest_roots`]), and its run launched as the console
+/// launches one.
+fn engine_pass(ledger: &Ledger, now: i64, dry_run: bool) -> Vec<Done> {
+    use wicket_control::triggers::engine;
+    let exe = match wicket_node::reexec::self_exe() {
+        Ok(e) => e,
+        Err(e) => return vec![Done { kind: "error", target: "trigger engine".into(), detail: format!("{e:#}") }],
+    };
+    let roots = crate::serve::manifest_roots();
+    let read = |name: &str| -> Result<Vec<u8>> {
+        let (root, file) = name.split_once('/').unwrap_or((crate::serve::manifests::WRITABLE_ROOT, name));
+        Ok(crate::serve::manifests::resolve(&roots, root, file)?.1)
+    };
+    let launch = |x: &engine::Launch| {
+        crate::serve::launch_detached(
+            &exe,
+            &crate::serve::Launch {
+                run: x.run.clone(),
+                manifest: x.manifest.clone(),
+                task: x.task.clone(),
+                principal: x.principal.clone(),
+                log: x.log.clone(),
+                image: None,
+            },
+        )
+    };
+    let runs = crate::data_dir().join("runs");
+    let eng = engine::Engine { read: &read, runs: &runs, launch: &launch };
+    match engine::pass(ledger, now, dry_run, &eng, &trigger_owner_may) {
+        Ok(fired) => fired
+            .into_iter()
+            .map(|f| Done {
+                kind: match f.status.as_str() {
+                    "started" => "trigger_started",
+                    "due" => "trigger_due",
+                    "skipped" => "trigger_skipped",
+                    "paused" => "trigger_paused",
+                    _ => "trigger_failed",
+                },
+                target: format!("trigger {} ({})", f.name, f.trigger),
+                detail: f.detail,
+            })
+            .collect(),
+        Err(e) => vec![Done { kind: "error", target: "trigger engine".into(), detail: format!("{e:#}") }],
     }
 }
 

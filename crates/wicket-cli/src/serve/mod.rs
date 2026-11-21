@@ -541,10 +541,10 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     net::run(listener, acceptor, state).await
 }
 
-/// Starts `wicket run` for a console launch as its own process (its own process group, so stopping
-/// the console doesn't stop the run), logging to the run's directory. The run's principal is passed
+/// Starts `wicket run` for a console launch (or a trigger's, #578) as its own process (its own
+/// process group, so stopping the console doesn't stop the run), logging to the run's directory. The run's principal is passed
 /// in WICKET_PRINCIPAL (see crate::cli_principal).
-fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
+pub(crate) fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let log = std::fs::File::create(&l.log).with_context(|| format!("creating {}", l.log.display()))?;
     let mut cmd = std::process::Command::new(exe);
