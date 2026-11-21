@@ -2205,7 +2205,9 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
             if running().await {
                 let at = n.boxes.lock().expect("boxes").get(&run).map(|b| b.out[i].end()).unwrap_or(0);
                 let stream = if i == 0 { "stdout" } else { "stderr" };
-                say_err!("[node] {run}: Docker ended the box's {stream} while it still runs: nothing it writes now is read (at offset {at})");
+                say_err!(
+                    "[node] {run}: Docker ended the box's {stream} while it still runs: nothing it writes now is read (at offset {at})"
+                );
                 let _ = n.audit.lock().expect("audit").audit(
                     &wicket_core::TenantId::single(),
                     Some(&wicket_core::RunId(run.clone())),
