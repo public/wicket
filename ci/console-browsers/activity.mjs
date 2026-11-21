@@ -19,7 +19,10 @@ const [url, ...wanted] = process.argv.slice(2);
 if (!url) { console.error("usage: node activity.mjs URL [chromium] [firefox] [webkit]"); process.exit(2); }
 const engines = wanted.length ? wanted : ["chromium", "firefox", "webkit"];
 
-const HOSTILE = "/x<img src=x onerror=alert(1)>";
+// An agent's path with markup, a right-to-left override and a zero-width space in it: the markup stays
+// text, and the two marks are shown as spaces (console.js's strip), never acted on.
+const HOSTILE = "/x<img src=x onerror=alert(1)>\u202etxt.exe\u200b";
+const SHOWN = HOSTILE.replace(/[\u202e\u200b]/g, " ");
 const NOW = Math.floor(Date.now() / 1000);
 const egress = (seq, outcome, path, run = "run_a") => ({ seq, ts: NOW - 100 + seq, kind: "op", run, body: { kind: "egress", outcome, method: "GET", host: "h.example", path } });
 const audit = [
@@ -44,12 +47,13 @@ async function check(engine) {
   page.on("console", m => { if (m.type() === "error") problems.push("console: " + m.text()); });
   let state = { ...base };
   const asked = [];
+  let failNext = false;
   await page.route("**/api/**", async route => {
     const p = new URL(route.request().url()).pathname;
     const reply = (v, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(v) });
     if (p === "/api/me") return reply({ who: { state: "operator", credential: "AbCd" } });
     if (p === "/api/state") return reply(state);
-    if (p.startsWith("/api/explain/")) { asked.push(p); return reply(explained); }
+    if (p.startsWith("/api/explain/")) { asked.push(p); if (failNext) { failNext = false; return reply({ error: "the node didn't answer" }, 502); } return reply(explained); }
     if (p === "/api/push") return reply({ public_key: "BAEC", devices: [], min_interval_secs: 30 });
     return reply({});
   });
@@ -61,7 +65,7 @@ async function check(engine) {
     await page.evaluate(() => { location.hash = "#activity"; });
     await page.waitForSelector("#audit .logline");
     // Newest first; each line a tag and words; an agent's path stays text.
-    assert.deepStrictEqual(await shown(), ["node node n1: box.restart", "allowed r-7 by phone", `blocked builder: read h.example${HOSTILE} why?`,
+    assert.deepStrictEqual(await shown(), ["node node n1: box.restart", "allowed r-7 by phone", `blocked builder: read h.example${SHOWN} why?`,
       "allowed builder: read h.example/ok why?", "start builder started: agent builder in zone z"]);
     assert.strictEqual(await page.locator("#audit img").count(), 0, "an agent's markup stays text");
     assert.ok(await page.locator("#audit .logline time").first().getAttribute("datetime"));
@@ -72,7 +76,7 @@ async function check(engine) {
     // The filters: one kind of line each, the pressed one said.
     const chip = label => page.locator("#filters button", { hasText: label });
     await chip("Blocked").click();
-    assert.deepStrictEqual(await shown(), [`blocked builder: read h.example${HOSTILE} why?`]);
+    assert.deepStrictEqual(await shown(), [`blocked builder: read h.example${SHOWN} why?`]);
     assert.deepStrictEqual(await page.$$eval("#filters button", bs => bs.filter(b => b.getAttribute("aria-pressed") === "true").map(b => b.textContent)), ["Blocked"]);
     await chip("Decisions").click();
     assert.deepStrictEqual(await shown(), ["allowed r-7 by phone"]);
@@ -84,12 +88,13 @@ async function check(engine) {
     assert.strictEqual((await shown()).length, 5);
     // "why?" opens the server's explanation under its line; it stays open across a poll; a second
     // tap closes it without asking again.
-    const why = page.locator("#audit .logline", { hasText: HOSTILE }).locator("button", { hasText: "why?" });
+    const why = page.locator("#audit .logline", { hasText: SHOWN }).locator("button", { hasText: "why?" });
     await why.click();
     await page.waitForSelector("#audit .explained pre");
     const ex = await page.locator("#audit .explained").innerText();
-    assert.ok(ex.includes("block 0: check if " + HOSTILE) && ex.includes("recorded") && ex.includes("Against the run's token"), ex);
+    assert.ok(ex.includes("block 0: check if " + SHOWN) && ex.includes("recorded") && ex.includes("Against the run's token"), ex);
     assert.strictEqual(await page.locator("#audit .explained img").count(), 0);
+    assert.ok(!(await page.locator("#view-activity").textContent()).match(/[\u202e\u200b]/), "no bidi or zero-width mark reaches the page");
     assert.strictEqual(await why.getAttribute("aria-expanded"), "true");
     assert.deepStrictEqual(asked, ["/api/explain/3"]);
     await poll();
@@ -99,6 +104,18 @@ async function check(engine) {
     await why.click();
     assert.strictEqual(await page.locator("#audit .explained").count(), 1);
     assert.strictEqual(asked.length, 1, "asked once");
+    // A failed explanation is asked for again on the next tap, not kept.
+    failNext = true;
+    const why2 = page.locator("#audit .logline", { hasText: "/ok" }).locator("button", { hasText: "why?" });
+    await why2.click();
+    await page.waitForFunction(() => document.querySelector("#audit .explained .blocked"));
+    await why2.click();
+    await page.waitForFunction(() => document.querySelectorAll("#audit .explained pre").length === 2);
+    assert.strictEqual(asked.length, 3, "asked again after it failed");
+    await why2.click();
+    // The browser logs the failure the test asked for: that one entry isn't a problem.
+    const failed = problems.findIndex(p => p.includes("status of 502"));
+    if (failed >= 0) problems.splice(failed, 1);
     // Recent decisions: allowed or refused, or the server's word; never "undefined".
     const pills = await page.$$eval("#decided .pill", ps => ps.map(p => [p.className, p.textContent]));
     assert.deepStrictEqual(pills, [["pill ", "expired"], ["pill good", "allowed"]]);

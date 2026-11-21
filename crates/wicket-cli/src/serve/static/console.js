@@ -1030,7 +1030,6 @@ const kv = (k, v) => { const d = el("div", "row"); d.append(el("span", "meta", k
 const when = t => at(t);
 const whenMs = ms => ms ? at(ms / 1000) : "\u2014";
 
-
 let policyShown = 0;
 async function renderPolicy() {
   // The policy changes rarely: fetched at most every 30 s.
@@ -1317,7 +1316,6 @@ async function submitSecret(ev) {
   else signed({ action: "delete_secret", name: m.name });
 }
 
-// A decided request: its outcome as a pill, what it was for, and when it was asked (#645).
 // The Inbox's first line: how things are, each part a link to where it is (#574 redesign).
 function renderStatus(s) {
   inbox("renderStatus", s);

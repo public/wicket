@@ -290,7 +290,7 @@ fn bare_imports(src: &str, path: &Path, rel: &str) -> String {
         };
         // Only a file that is vendored and served (MODULES), so an import can't name one that isn't.
         let vendored = format!("vendor/lit-html/{file}");
-        if !MODULES.iter().any(|(rel, own)| !own && *rel == vendored) {
+        if !MODULES.iter().any(|(rel, kind)| matches!(kind, Module::Vendored) && *rel == vendored) {
             panic!(
                 "{}: import from {spec:?}: static/{vendored} isn't among the vendored modules build.rs serves (MODULES)",
                 path.display()
