@@ -288,7 +288,7 @@ enum Cmd {
     Supervise {
         #[arg(long)]
         shard: String,
-        #[arg(long = "node")]
+        #[arg(long = "node", required = true)]
         nodes: Vec<String>,
     },
     /// Run an agent command line that another program launches, inside a wicket box.
@@ -747,26 +747,35 @@ async fn run() -> Result<()> {
 }
 
 /// `wicket supervise`: a supervisor host until SIGTERM or SIGINT (a clean stop, exit 0) or until
-/// its shard is taken (exit 3, refused).
+/// its shard is taken (exit 3, refused). A shard another host holds, lapsed or not, exits 75 (try
+/// again: wicketd fences it first). Any other failure exits 1; one after the take (the socket can't
+/// be bound, the runtime fails) leaves the shard held without a marker, so wicketd sees a process
+/// that has gone and fences it at once.
 async fn supervise(shard: &str, nodes: &[String]) -> Result<()> {
-    use wicket_control::supervise::{heartbeat_socket, Ended, Host, HostTimes};
+    use wicket_control::supervise::{heartbeat_socket, valid_shard, Ended, Host, HostTimes};
+    if !valid_shard(shard) {
+        return Err(wicket_home::exit::usage(format!("--shard {shard:?}: a shard is a number")));
+    }
+    // The handlers first: a SIGTERM between the take and the handlers would otherwise end the
+    // process without its clean-stop marker.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("a SIGTERM handler")?;
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).context("a SIGINT handler")?;
     let nodes: Vec<&str> = nodes.iter().map(String::as_str).collect();
     let owner = wicket_home::owner::owner_label();
     let sock = heartbeat_socket(&wicket_home::data_dir(), shard);
     let times = HostTimes::default();
     let host = Host::start(&wicket_home::ledger_path(), &sock, shard, &owner, &nodes, times).map_err(|e| {
         match e.downcast_ref::<wicket_store::StoreError>() {
-            // Another host's lease is live: wicketd tries again once it has lapsed or been fenced.
-            Some(held @ wicket_store::StoreError::ShardHeld(..)) => wicket_home::exit::refused(held.to_string()),
+            // Another host holds it: wicketd tries again once it has fenced that one.
+            Some(held @ wicket_store::StoreError::ShardHeld(..)) => wicket_home::exit::try_again(held.to_string()),
             _ => e,
         }
     })?;
     say_err!("[supervise] shard {shard} at epoch {} as {owner}, nodes {:?}", host.lease.epoch, nodes);
     let stop = async {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("a SIGTERM handler");
         tokio::select! {
             _ = term.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
+            _ = int.recv() => {}
         }
     };
     match host.run(times, stop).await? {

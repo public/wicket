@@ -130,7 +130,7 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
 fn manage_hosts(hosts: usize, exe: PathBuf, data_dir: PathBuf) {
     use wicket_control::supervise::{Manager, ProcIo, RENEW_SECS};
     let mut m = Manager::new(hosts);
-    let mut io = ProcIo { exe, data_dir: data_dir.clone(), env: Vec::new() };
+    let mut io = ProcIo { exe, data_dir: data_dir.clone(), env: Vec::new(), spawned: Vec::new() };
     let mut ledger = None;
     say_err!("wicketd: {hosts} supervisor host(s)");
     loop {

@@ -98,8 +98,11 @@ shard of the nodes (the local node is in shard 0) under a 30 s lease in the ledg
 - asks each host for its heartbeat on `<data dir>/supervise/<shard>.sock`. The heartbeat never
   touches the ledger, so a ledger stall doesn't silence it. After wicketd restarts, it adopts the
   hosts that answer there instead of starting more;
-- starts a host for a shard that has none: never started, stopped cleanly, or fenced. A host that
-  keeps dying waits twice as long each time, up to 60 s;
+- starts a host for a shard that has none: never started, stopped cleanly, or fenced. A shard
+  with no node in it gets none until a node is enrolled into it. A host just started has 10 s to
+  take its shard and answer before another is started for it (sooner if it exits), and a host that
+  keeps dying waits twice as long each time, up to 60 s. A host never takes a shard another still
+  holds, even one whose lease has lapsed: it exits 75, and wicketd fences that holder first;
 - fences a host whose process has exited, or whose heartbeat says its runtime is stuck (or has
   stopped answering) once its lease has been lapsed for 15 s. The fence raises the shard's epoch in
   the ledger first, so the old host can't renew or write. Only then is the old host SIGKILLed (by

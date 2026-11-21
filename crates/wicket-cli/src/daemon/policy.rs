@@ -489,6 +489,7 @@ mod tests {
         }
         assert!(matches!(route(&cmd(&["serve"])), Route::Refuse(_)));
         assert!(matches!(route(&cmd(&["daemon"])), Route::Refuse(_)));
+        assert!(matches!(route(&cmd(&["supervise", "--shard", "0", "--node", "local"])), Route::Refuse(_)), "hosts are wicketd's own");
         assert!(matches!(route(&cmd(&["audit", "compact", "--yes"])), Route::Refuse(_)), "never with wicketd running");
     }
 

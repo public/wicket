@@ -593,13 +593,17 @@ rolled back by running the previous build.
    the lease renewed only on runtime progress, and wicketd's start-or-fence rule
    (`wicket-control/src/supervise.rs`); and the rollback reading below (`wicket-home/src/owner.rs`).
    The host process, `wicket supervise --shard <k> --node <n>…` (hidden; refused through wicketd's
-   socket): it takes its shard, ticks a progress counter on its runtime every second, renews its
-   lease every 5 s from a thread with its own ledger connection (only when the counter moved), and
-   answers a heartbeat on `<data>/supervise/<k>.sock` (0600, one JSON line: shard, holder, epoch,
-   progress, and `stuck` once the counter has stood still for 3 s) from another thread that never
-   touches the ledger. SIGTERM writes the clean-stop marker and exits 0; a lost shard exits 3
-   without writing; a live holder refuses it with exit 3. It supervises no runs yet, and nothing
-   starts one yet: wicketd does that next.
+   socket): it takes its shard only if it is free (never held, fenced, or stopped cleanly: a lapsed
+   holder's is left to wicketd's fence, kill and fresh start), ticks a progress counter on its
+   runtime every second, renews its lease every 5 s from a thread with its own ledger connection
+   (only when the counter moved), and answers a heartbeat on `<data>/supervise/<k>.sock` (0600, one
+   JSON line: shard, holder, epoch, progress, `lease_ok`, `lost`, and `stuck`, sampled per request:
+   the counter standing still for 3 s, the lease thread not through its loop for three renewal
+   intervals, or the shard lost) from another thread that never touches the ledger. SIGTERM stops
+   the heartbeat, unlinks the socket (only the one it bound: a successor binds the same path), then
+   writes the clean-stop marker and exits 0. A lost shard exits 3 without writing; a held shard
+   refuses it with exit 75 (try again); a lease thread that ends without losing the shard ends the
+   host (exit 1). It supervises no runs yet, and nothing starts one yet: wicketd does that next.
 
    wicketd's host manager (`supervise.hosts: N` in `wicket.yaml`; `supervise::Manager`, with
    `ProcIo` for the real processes): every 5 s it reaps its hosts by pid, asks every shard's socket

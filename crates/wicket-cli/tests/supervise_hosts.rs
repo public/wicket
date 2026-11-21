@@ -13,6 +13,20 @@ impl Drop for Home {
     }
 }
 
+/// The real host processes, every one SIGKILLed when the test ends, pass or fail: a leftover
+/// would hold the test's output open, and take a shard in a fresh ledger once the home is gone.
+struct Io(ProcIo);
+
+impl Drop for Io {
+    fn drop(&mut self) {
+        for p in &self.0.spawned {
+            unsafe { libc::kill(*p as i32, libc::SIGKILL) };
+            let mut st = 0;
+            unsafe { libc::waitpid(*p as i32, &mut st, 0) };
+        }
+    }
+}
+
 fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     let t = Instant::now();
     loop {
@@ -35,30 +49,48 @@ fn the_manager_starts_hosts_fences_a_dead_one_and_starts_it_again() {
     let _ = std::fs::remove_dir_all(&h.0);
     std::fs::create_dir_all(&h.0).unwrap();
     let ledger = wicket_store::Ledger::open(&h.0.join("ledger.db")).unwrap();
-    let mut io = ProcIo {
+    // A second node, so shard 1 (of 2) has one: n2's shard is 1 (FNV-1a, pinned in supervise's tests).
+    ledger
+        .enrol_builtin_node(&wicket_store::NodeRow {
+            name: "n2".into(),
+            tenant: "t0".into(),
+            target: "local".into(),
+            host_key: String::new(),
+            host_key_fp: String::new(),
+            node_key: "00".into(),
+            ssh_key: None,
+            hosts: vec![],
+            enrolled_at: 0,
+            status: "active".into(),
+            revoked_at: None,
+        })
+        .unwrap();
+    let mut guard = Io(ProcIo {
         exe: env!("CARGO_BIN_EXE_wicket").into(),
         data_dir: h.0.clone(),
         env: vec![("WICKET_HOME".into(), h.0.display().to_string()), ("WICKET_DAEMON_SOCKET".into(), "/nonexistent".into())],
-    };
+        spawned: Vec::new(),
+    });
+    let io = &mut guard.0;
     let mut m = Manager::new(2);
-    let t = m.tick(&ledger, &mut io, wicket_store::now());
+    let t = m.tick(&ledger, io, wicket_store::now());
     assert_eq!(t.started, ["0", "1"], "{t:?}");
     let beats = wait_for("both hosts answer", || Some((io.heartbeat("0")?, io.heartbeat("1")?)));
     assert_eq!((beats.0.epoch, beats.1.epoch), (1, 1));
     // Healthy: nothing to do.
-    let t = m.tick(&ledger, &mut io, wicket_store::now());
+    let t = m.tick(&ledger, io, wicket_store::now());
     assert!(t.started.is_empty() && t.fenced.is_empty() && t.errors.is_empty(), "{t:?}");
 
     // Host 0 dies hard.
     unsafe { libc::kill(pid(&beats.0.owner), libc::SIGKILL) };
     wait_for("host 0 fenced", || {
-        let t = m.tick(&ledger, &mut io, wicket_store::now());
+        let t = m.tick(&ledger, io, wicket_store::now());
         (t.fenced == ["0"]).then_some(())
     });
     assert_eq!(ledger.supervisor_host("0").unwrap().unwrap().epoch, 2, "fenced at a higher epoch");
     // A fresh host takes it at the next epoch.
     let fresh = wait_for("a fresh host 0", || {
-        m.tick(&ledger, &mut io, wicket_store::now());
+        m.tick(&ledger, io, wicket_store::now());
         io.heartbeat("0").filter(|b| b.owner != beats.0.owner)
     });
     assert_eq!(fresh.epoch, 3);
