@@ -274,13 +274,17 @@ pub struct Cache {
     fetching: std::sync::atomic::AtomicUsize,
 }
 
-/// How long [`Cache::export`] waits for fetches under way (each gives up after 10 s).
+/// How long [`Cache::export`] waits for fetches under way. One asks for 10 s at most, but asks again
+/// when a revoke overtakes its answer ([`OVERTAKEN_TRIES`] times, so up to 30 s); past this wait the
+/// export fails and the update goes on without the cache, whose secrets the new process fetches again.
 const EXPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
 
-/// The cache handed over to a re-exec'd `serve` ([`Cache::export`]): the sealed memfd, inherited
-/// across the exec only, and the cache frozen until then. Held across the exec; dropped only if the
-/// exec fails, which closes the memfd, unsets [`HANDOVER_ENV`] (so no later child inherits either)
-/// and lets fetches start again.
+/// The cache handed over to a re-exec'd `serve` ([`Cache::export`]): the sealed memfd, and the
+/// cache frozen until the exec. The memfd stays close-on-exec, so no child this process starts
+/// meanwhile inherits it: the exec passes it on alone, clearing that flag in its last step, and
+/// names it to the new process in its environment ([`HANDOVER_ENV`], set for the exec only, never in
+/// this process's). Held across the exec; dropped only if the exec fails, which closes the memfd and
+/// lets fetches start again.
 pub struct Handover {
     fd: OwnedFd,
     cache: Arc<Cache>,
@@ -295,9 +299,6 @@ impl Handover {
 
 impl Drop for Handover {
     fn drop(&mut self) {
-        if std::env::var(HANDOVER_ENV).ok().and_then(|v| v.parse::<i32>().ok()) == Some(self.fd.as_raw_fd()) {
-            std::env::remove_var(HANDOVER_ENV);
-        }
         self.cache.frozen.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -416,7 +417,11 @@ impl Cache {
 
     fn revoke_as(&self, run: &str, name: &str, cascade: bool) {
         let key = (run.to_string(), name.to_string());
-        *self.revokes.lock().expect("revokes").entry(key.clone()).or_default() += 1;
+        // Counted only for a secret this run has fetched (its fetch may be under way): a revoke for a
+        // run that has ended, or never fetched it, leaves nothing behind.
+        if self.inflight.lock().expect("inflight").contains_key(&key) {
+            *self.revokes.lock().expect("revokes").entry(key.clone()).or_default() += 1;
+        }
         self.refused.lock().expect("refused").remove(&key);
         let mut m = self.entries.lock().expect("cache");
         let at = slot(run, name);
@@ -438,6 +443,7 @@ impl Cache {
     pub fn release(&self, run: &str) {
         self.refused.lock().expect("refused").retain(|(r, _), _| r != run);
         self.revokes.lock().expect("revokes").retain(|(r, _), _| r != run);
+        self.inflight.lock().expect("inflight").retain(|(r, _), _| r != run);
         let mut m = self.entries.lock().expect("cache");
         m.retain(|_, e| {
             e.users.remove(run);
@@ -470,8 +476,9 @@ impl Cache {
     }
 
     /// Hands the cache over to a re-exec'd `serve` (#162): a memfd holding it, sealed against any
-    /// change, its close-on-exec flag cleared, so only the exec'd process inherits it. The caller
-    /// passes its number in [`HANDOVER_ENV`] and holds the [`Handover`] across the exec.
+    /// change, and close-on-exec: the caller's exec clears that flag as its last step, so only the
+    /// exec'd process inherits it, and names it in [`HANDOVER_ENV`] for that process alone. The
+    /// caller holds the [`Handover`] across the exec.
     ///
     /// Frozen first (#818): no fetch starts from here to the exec, and the snapshot waits for those
     /// under way, so every release the control host records is in it. A revoke that comes after the
@@ -531,9 +538,6 @@ impl Cache {
         if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
             bail!("sealing the memfd: {}", std::io::Error::last_os_error());
         }
-        // Inherited across the exec only: the caller execs right after this.
-        // SAFETY: fcntl on our own fd.
-        unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, 0) };
         Ok(owned)
     }
 
@@ -1164,7 +1168,11 @@ mod tests {
         let mut f = std::fs::File::from(fd.try_clone().unwrap());
         assert!(std::io::Write::write_all(&mut f, b"x").is_err());
         // SAFETY: fcntl on our own fd.
-        assert_eq!(unsafe { libc::fcntl(handover.raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC, 0, "inherited by the exec");
+        assert_ne!(
+            unsafe { libc::fcntl(handover.raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "no child inherits it: only the exec passes it on"
+        );
         let next = Cache::new(Arc::new(|| 1_000));
         assert_eq!(next.import(fd).unwrap(), 1);
         let v = Vault::from_source(next.source(RA, Arc::new(|_, _| Box::pin(async { Err(Unfetched::Unreachable("no".into())) }))));
@@ -1177,7 +1185,7 @@ mod tests {
     /// #818: from the handover's snapshot to the exec, no fetch starts (the control host would record
     /// a release the new process doesn't have, and never revoke the value it does); a fetch under way
     /// is waited for, so what it takes is in the snapshot. If the exec fails, dropping the handover
-    /// closes the memfd, unsets HANDOVER_ENV (no later child inherits it) and lets fetches go again.
+    /// closes the memfd and lets fetches go again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_handover_freezes_the_cache_until_the_exec() {
         let cache = Cache::new(Arc::new(|| 1_000));
@@ -1204,7 +1212,9 @@ mod tests {
             let cache = cache.clone();
             move || cache.export()
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while !cache.frozen.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
         assert!(!exporting.is_finished(), "waits for the fetch under way");
         // Frozen meanwhile: a fetch of another secret doesn't start.
         let e = a.ensure("other").await.unwrap_err().to_string();
@@ -1215,10 +1225,14 @@ mod tests {
         let next = Cache::new(Arc::new(|| 1_000));
         assert_eq!(next.import(handover.fd.try_clone().unwrap()).unwrap(), 1, "the fetch under way is in the snapshot");
         assert!(a.ensure("third").await.is_err(), "still frozen until the exec");
-        // The exec failed: the handover is dropped.
-        std::env::set_var(HANDOVER_ENV, handover.raw_fd().to_string());
+        // The exec failed: the handover is dropped, and its memfd closed (that number, if open
+        // again, is another file).
+        let n = handover.raw_fd();
+        let ino = |fd: i32| std::fs::metadata(format!("/proc/self/fd/{fd}")).ok().map(|m| std::os::unix::fs::MetadataExt::ino(&m));
+        let was = ino(n);
+        assert!(was.is_some());
         drop(handover);
-        assert!(std::env::var(HANDOVER_ENV).is_err(), "no later child is told of it");
+        assert_ne!(ino(n), was, "closed");
         let again = tokio::spawn({
             let a = a.clone();
             async move { a.ensure("third").await }

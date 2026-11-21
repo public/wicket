@@ -1498,6 +1498,9 @@ async fn session(
         save_holdings(sh, p);
     }
     for (name, resend) in revokes {
+        if !resend {
+            say!("[wicket] secret {name} changed on this host: node {} fetches it again for {}", sh.node, sh.run);
+        }
         send(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name, resend }));
     }
     if first {
@@ -2345,7 +2348,8 @@ pub struct Holdings {
     /// value and its binding, never the value), so a supervisor that takes the run over tells a
     /// secret that changed from one the node still holds as released, and doesn't make the node
     /// fetch again what a self-update handed to its new process. A secret revoked and not fetched
-    /// since has none. In the run's own directory, private to wicket's user, as the vault is.
+    /// since has none, or `changed` for one revoked because it changed (sent again as a change, #415).
+    /// In the run's own directory, private to wicket's user, as the vault is.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub digests: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2367,8 +2371,9 @@ fn save_holdings(sh: &Shared, p: &Progress) {
 }
 
 /// What a run's holdings record (#152, #818): the secrets released to its node, and the digest each
-/// went with, but none for one revoked and not fetched since ([`REVOKED`]), which a supervisor that
-/// takes the run over then revokes again.
+/// went with; for one revoked for a change and not fetched since, [`CHANGED`] in its place, and for
+/// one revoked otherwise none ([`REVOKED`]): a supervisor that takes the run over revokes either
+/// again, as it was revoked.
 fn holdings_of(fetched: &std::collections::HashMap<String, String>, slice: Option<wicket_proxy::llm::Slice>, now_ms: i64) -> Holdings {
     let mut secrets: Vec<String> = fetched.keys().cloned().collect();
     secrets.sort();
@@ -2547,13 +2552,25 @@ fn connect_revokes(
     let lost = revoke_lost(fetched, refused);
     let changed = changed_secrets(fetched, refused, release);
     // A refusal now released is in both: once, as resent (the node only forgets the refusal).
-    let changed: Vec<String> = changed.into_iter().filter(|n| !lost.contains(n)).collect();
-    lost.into_iter().map(|n| (n, true)).chain(changed.into_iter().map(|n| (n, false))).collect()
+    let changed: Vec<String> = changed.into_iter().filter(|n| !lost.iter().any(|(l, _)| l == n)).collect();
+    lost.into_iter().chain(changed.into_iter().map(|n| (n, false))).collect()
 }
 
 /// What [`Progress::fetched`] holds for a secret revoked and not fetched since (#415): no release's
-/// digest, so it is never taken for one, and the name is revoked again on the next connection.
+/// digest, so it is never taken for one, and the name is revoked again on the next connection, as a
+/// resend (it leaves the uses the node shared with children it started while cut off). For a box that
+/// exited, and for holdings with no digest for it.
 const REVOKED: &str = "revoked";
+
+/// [`REVOKED`], for a secret revoked because it changed (rotated, rebound, removed): sent again on
+/// the next connection as the change it was, not a resend, so it still ends the uses shared with
+/// children if the first one was lost. Kept in the run's holdings as such.
+const CHANGED: &str = "changed";
+
+/// Whether `d` marks a secret revoked rather than a release's digest.
+fn marked(d: &str) -> bool {
+    d == REVOKED || d == CHANGED
+}
 
 /// Secrets this run's node fetched that have since changed, been rebound or removed on this host,
 /// and secrets refused to it that can now be released (#415): the node is told to drop what it holds
@@ -2579,21 +2596,18 @@ fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
 }
 
 /// The names to tell a node changed, given what `release` would release now (its digest, or None if
-/// refused): each fetched one whose digest differs (then marked [`REVOKED`] until fetched again), and
+/// refused): each fetched one whose digest differs (then marked [`CHANGED`] until fetched again), and
 /// each refused one now released (forgotten, so its next refusal is recorded again).
 fn changed_secrets(
     fetched: &mut std::collections::HashMap<String, String>,
     refused: &mut HashSet<String>,
     release: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
-    let mut out: Vec<String> = fetched
-        .iter()
-        .filter(|(n, d)| d.as_str() != REVOKED && release(n).as_deref() != Some(d.as_str()))
-        .map(|(n, _)| n.clone())
-        .collect();
+    let mut out: Vec<String> =
+        fetched.iter().filter(|(n, d)| !marked(d) && release(n).as_deref() != Some(d.as_str())).map(|(n, _)| n.clone()).collect();
     out.sort();
     for n in &out {
-        fetched.insert(n.clone(), REVOKED.into());
+        fetched.insert(n.clone(), CHANGED.into());
     }
     let mut now_set: Vec<String> = refused.iter().filter(|n| release(n).is_some()).cloned().collect();
     now_set.sort();
@@ -2605,16 +2619,26 @@ fn changed_secrets(
 }
 
 /// What a new connection revokes again (#415), as one sent on a link that died may never have
-/// arrived: each secret revoked and not fetched since ([`REVOKED`]), and every refusal, which the
-/// node then asks about again. Not a secret the node holds as released and unchanged (#818: a
-/// self-update hands the node's cache to its new process, which keeps using it); one that changed
-/// meanwhile is found by [`changed_secrets`], run on the connection right after.
-fn revoke_lost(fetched: &std::collections::HashMap<String, String>, refused: &HashSet<String>) -> Vec<String> {
-    let mut out: Vec<String> =
-        fetched.iter().filter(|(_, d)| d.as_str() == REVOKED).map(|(n, _)| n).chain(refused.iter()).cloned().collect();
-    out.sort();
-    out.dedup();
-    out
+/// arrived, each with whether it goes as a resend: a secret revoked for a change ([`CHANGED`]) as the
+/// change it was (not a resend, so it ends uses shared with children), one revoked otherwise
+/// ([`REVOKED`]) and every refusal (which the node then asks about again) as resends. Not a secret the
+/// node holds as released and unchanged (#818: a self-update hands the node's cache to its new
+/// process, which keeps using it); one that changed meanwhile is found by [`changed_secrets`], run on
+/// the connection right after.
+fn revoke_lost(fetched: &std::collections::HashMap<String, String>, refused: &HashSet<String>) -> Vec<(String, bool)> {
+    let mut out: std::collections::BTreeMap<String, bool> = refused.iter().map(|n| (n.clone(), true)).collect();
+    for (n, d) in fetched {
+        match d.as_str() {
+            CHANGED => {
+                out.insert(n.clone(), false);
+            }
+            REVOKED => {
+                out.entry(n.clone()).or_insert(true);
+            }
+            _ => {}
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// The op a node asks about, as the control host classifies it, and why it needs a grant, as this
@@ -3320,7 +3344,7 @@ mod tests {
         assert!(refused.is_empty());
         vault.borrow_mut().insert("held".into(), "d3".into());
         assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["held"], "rotated");
-        assert_eq!(fetched["held"], REVOKED, "kept, marked, until fetched again");
+        assert_eq!(fetched["held"], CHANGED, "kept, marked as changed, until fetched again");
         assert!(changed_secrets(&mut fetched, &mut refused, release).is_empty(), "told once per connection");
         fetched.insert("held".into(), "d3".into());
         vault.borrow_mut().remove("held");
@@ -3395,7 +3419,7 @@ mod tests {
         let mut fetched = released_before(&dir);
         assert_eq!(fetched.len(), 3);
         assert_eq!(fetched["old"], REVOKED);
-        assert_eq!(revoke_lost(&fetched, &HashSet::new()), ["old"], "only the one that may be stale");
+        assert_eq!(revoke_lost(&fetched, &HashSet::new()), [("old".to_string(), true)], "only the one that may be stale");
         // The first check: model unchanged (left with the node), gh rotated since.
         let release = |n: &str| match n {
             "gh" => Some("d-gh-rotated".to_string()),
@@ -3407,11 +3431,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// #818, the lost-revoke path end to end: a secret that changes is revoked and marked, its
-    /// holdings then keep no digest for it, so a supervisor that takes the run over (from those
-    /// holdings) revokes it again on its first connection, as resent; one unchanged is left with the
-    /// node; one changed while cut off is revoked at connect as a change (which cascades), and a
-    /// refusal is resent once.
+    /// #818, the lost-revoke path end to end: a secret that changes is revoked and marked as changed,
+    /// in its holdings too, so a supervisor that takes the run over (from those holdings) revokes it
+    /// again on its first connection as the change it was: on the node that also ends the uses shared
+    /// with a child it started while cut off, which a resend wouldn't. One unchanged is left with the
+    /// node; one changed while cut off is revoked at connect as a change; a refusal is resent once;
+    /// a box's exit leaves no digest, and its names go as resends.
     #[test]
     fn a_revoke_lost_with_its_supervisor_is_sent_again_by_the_next() {
         let vault = std::cell::RefCell::new(std::collections::HashMap::from([
@@ -3421,32 +3446,62 @@ mod tests {
         let release = |n: &str| vault.borrow().get(n).cloned();
         let mut fetched = std::collections::HashMap::from([("gh".to_string(), "d1".to_string()), ("model".to_string(), "m1".to_string())]);
         let mut refused = HashSet::new();
-        // gh rotates: the check revokes it (that revoke may die with the link) and marks it.
+        // gh rotates: the check revokes it (that revoke may die with the link) and marks it changed.
         vault.borrow_mut().insert("gh".into(), "d2".into());
         assert_eq!(changed_secrets(&mut fetched, &mut refused, release), ["gh"]);
         let h = holdings_of(&fetched, None, 1);
         assert_eq!(h.secrets, ["gh", "model"]);
-        assert_eq!(h.digests, [("model".to_string(), "m1".to_string())].into(), "none kept for the revoked one");
+        assert_eq!(h.digests, [("gh".to_string(), CHANGED.to_string()), ("model".to_string(), "m1".to_string())].into());
         // The next supervisor reads those holdings.
         let dir = std::env::temp_dir().join(format!("wicket-lost-revoke-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("ctl")).unwrap();
         std::fs::write(dir.join("ctl").join("holdings.json"), serde_json::to_vec(&h).unwrap()).unwrap();
         let mut fetched = released_before(&dir);
-        assert_eq!(fetched["gh"], REVOKED);
-        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(fetched["gh"], CHANGED);
         // Meanwhile model was rebound, and an optional secret refused earlier got set.
         vault.borrow_mut().insert("model".into(), "m2".into());
         vault.borrow_mut().insert("late".into(), "l1".into());
         let mut refused = HashSet::from(["late".to_string()]);
-        assert_eq!(
-            connect_revokes(&mut fetched, &mut refused, release),
-            [("gh".to_string(), true), ("late".to_string(), true), ("model".to_string(), false)]
-        );
-        // Nothing more to say on that connection, and an unchanged secret is never revoked.
-        assert!(connect_revokes(&mut fetched, &mut refused, release).iter().all(|(_, resend)| *resend));
-        let mut fetched = std::collections::HashMap::from([("model".to_string(), "m2".to_string())]);
-        assert!(connect_revokes(&mut fetched, &mut HashSet::new(), release).is_empty(), "left with the node");
+        let revokes = connect_revokes(&mut fetched, &mut refused, release);
+        assert_eq!(revokes, [("gh".to_string(), false), ("late".to_string(), true), ("model".to_string(), false)]);
+        // On the node: the run held gh and shared it with a child it started while cut off. The
+        // revoke, as a change, ends the child's use too.
+        const RUN: &str = "run_pppppppppppppppppppppppppp";
+        const CHILD: &str = "run_cccccccccccccccccccccccccc";
+        let cache = crate::nodesecrets::Cache::new(std::sync::Arc::new(|| 1_000));
+        let f = crate::nodesecrets::Fetched {
+            name: "gh".into(),
+            value: "v1".into(),
+            hosts: vec!["h".into()],
+            not_after: 5_000,
+            upstream_expiry: None,
+        };
+        cache.put(RUN, &f);
+        cache.share(RUN, CHILD, &["gh".into()], 5_000);
+        let none: crate::nodesecrets::Fetcher =
+            std::sync::Arc::new(|_, _| Box::pin(async { Err(crate::nodesecrets::Unfetched::Unreachable("cut off".into())) }));
+        let child = cache.source(CHILD, none);
+        for (name, resend) in &revokes {
+            match resend {
+                true => cache.revoke_resent(RUN, name),
+                false => cache.revoke(RUN, name),
+            }
+        }
+        assert!(!child.has("gh"), "the child's shared use of the rotated secret ended");
+        // Each connection says the marked ones again, as they were revoked; an unchanged secret never.
+        assert_eq!(connect_revokes(&mut fetched, &mut refused, release), [("gh".to_string(), false), ("model".to_string(), false)]);
+        let mut fresh = std::collections::HashMap::from([("model".to_string(), "m2".to_string())]);
+        assert!(connect_revokes(&mut fresh, &mut HashSet::new(), release).is_empty(), "left with the node");
+        // The box exits: no digest is kept, and a takeover's revokes go as resends.
+        for d in fresh.values_mut() {
+            *d = REVOKED.into();
+        }
+        let h = holdings_of(&fresh, None, 2);
+        assert!(h.digests.is_empty());
+        std::fs::write(dir.join("ctl").join("holdings.json"), serde_json::to_vec(&h).unwrap()).unwrap();
+        assert_eq!(revoke_lost(&released_before(&dir), &HashSet::new()), [("model".to_string(), true)]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// #415 with #818: a new connection sends again the revokes that may have been lost (each secret
@@ -3456,7 +3511,7 @@ mod tests {
     fn a_new_connection_resends_only_revokes_that_may_be_lost() {
         let fetched = std::collections::HashMap::from([("live".to_string(), "d1".to_string()), ("lost".to_string(), REVOKED.to_string())]);
         let refused = HashSet::from(["later".to_string(), "lost".to_string()]);
-        assert_eq!(revoke_lost(&fetched, &refused), ["later", "lost"]);
+        assert_eq!(revoke_lost(&fetched, &refused), [("later".to_string(), true), ("lost".to_string(), true)]);
         assert_eq!(fetched["live"], "d1", "left as released");
         // Marked revoked, a name isn't taken as changed again on the same connection.
         let mut fetched = fetched;
