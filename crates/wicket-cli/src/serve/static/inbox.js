@@ -5,23 +5,13 @@
 // console.js is still a classic script: its helpers (strip, asks, act, …) are globals, and this
 // module calls them; the signing path (act, signed, describe and the sheet) is console.js's and
 // unchanged. console.js calls window.wicketInbox's functions where it drew these itself.
-import { html, render, nothing } from "lit-html";
+import { html, nothing } from "lit-html";
 import { repeat } from "lit-html/directives/repeat.js";
+import { draw, time, wrapped } from "./ui.js";
 
 // console.js's helpers are named bare: a classic script's top-level `const` and `function`
 // declarations are global names a module can use, though `const`s aren't properties of globalThis.
 const g = globalThis;
-
-// lit-html renders after what a container already holds: the first time, it is emptied of the
-// page's own placeholder.
-const owned = new WeakSet();
-function draw(value, box) {
-  if (!owned.has(box)) { box.replaceChildren(); owned.add(box); }
-  render(value, box);
-}
-
-// A URL broken only after its slashes and dots, so it wraps at a segment, not mid-word.
-const wrapped = (cls, text) => html`<div class=${cls}>${String(text).split(/(?<=[/.?&])/).map(part => html`${part}<wbr>`)}</div>`;
 
 // The "Where" of a request: its host, then its path quieter and wrapped at its slashes.
 const where = p => html`<div class="where"><span class="host">${strip(p.host)}</span>${p.path && p.path !== "/" ? wrapped("path", strip(p.path) + (p.scope_prefix ? "…" : "")) : nothing}${p.scope_prefix ? html`<div class="meta">and every page under it</div>` : nothing}</div>`;
@@ -128,4 +118,34 @@ function renderProblems(s) {
   draw(list.length ? list.map(([tone, text, href]) => html`<a class="problem ${tone}" href=${href}>${text}</a>`) : html`<div class="empty">Nothing is wrong.</div>`, box);
 }
 
-g.wicketInbox = { renderPending, renderStatus, renderProblems, setOpen };
+// An agent's ask to be always allowed something (#572): the same card as a request, with its
+// evidence, and the Always choices narrowest first. Approved once (signed): as asked or narrowed to
+// the evidence, for the agent or its zone, 30 days.
+function standingAsk(a) {
+  const e = a.evidence || {}, r = a.rule || {};
+  const agent = String(a.principal || "").split("/a/").pop();
+  const methods = (r.methods || []).map(strip).join(", ");
+  // The narrowest choice first, and the default; the widest (a whole zone) marked as such.
+  const buttons = html`<button class=${a.narrowed ? "approve" : ""} ?disabled=${!a.narrowed} @click=${() => signedSettled({ action: "standing_approve", id: a.id, for: "agent", narrow: true })}>${a.narrowed ? "Always: only what it used" : "Always: only what it used (nothing to narrow to)"}</button><button class=${a.narrowed ? "" : "approve"} @click=${() => signedSettled({ action: "standing_approve", id: a.id, for: "agent" })}>Always: as asked</button><button class="deny" @click=${() => signedSettled({ action: "standing_approve", id: a.id, for: "zone" })}>${"Always, for every agent in zone " + strip(a.zone)}</button><button class="deny apart" @click=${() => signedSettled({ action: "standing_deny", id: a.id })}>Don't allow</button>`;
+  const ops = e.ops || [];
+  // The pill says only what the rule says (#715 review): dangerous requests included or not, and
+  // its methods. Whether a POST changes data depends on the API, so it isn't guessed here.
+  return html`<div class="card req always"><div class="req-head"><span class="risk ${r.allow_dangerous ? "r4" : ""}">${(r.allow_dangerous ? "Includes requests that can't be undone: " : "") + methods}</span>${time(a.created_at, a.created_at ? rel(a.created_at) : "—", "age")}</div><dl class="fields">${field("Who", html`<span title=${strip(a.principal)}><strong>${strip(agent)}</strong>${" · zone " + strip(a.zone)}</span>`)}${field("Wants to", "always be allowed to " + verbsOf(r.methods), "said")}${field("Where", html`<div class="where"><span class="host">${strip(r.host)}</span><div class="path">${(r.paths || []).map(strip).join("  ")}</div></div>`)}${field("Why", "\u201c" + strip(a.reason) + "\u201d", "why")}${field("So far", plural(e.requests || 0, "request") + " like this in " + plural(e.days || 0, "day") + "; allowed " + (e.granted || 0) +
+    (e.denied ? ", refused " + e.denied : "") + (e.undecided ? ", " + e.undecided + " not decided" : ""))}</dl>${(a.beyond || []).map(x => html`<div class="callout warn">${"Wider than what it used: " + strip(x)}</div>`)}<div class="buttons ladder">${buttons}</div><div class="meta">\u201cAlways\u201d lasts 30 days, and you can remove it in Settings.</div><details class="more req-more"><summary>Details</summary>${a.narrowed ? html`<div class="meta">${"Only what it used: methods " + (a.narrowed.methods || []).map(strip).join(", ") + ", paths " + (a.narrowed.paths || []).map(strip).join(", ")}</div>` : nothing}<div class="meta">${"Methods: " + methods + (r.allow_dangerous ? " \u00b7 dangerous requests too (R3, R4)" : "")}</div><div class="meta">${"Paths: " + (r.paths || []).map(strip).join(", ")}</div><div class="meta">${"Asked by " + strip(agent) + " (zone " + strip(a.zone) + ") \u00b7 for its later runs with this zone definition" +
+    (a.zone_digest ? " (" + strip(a.zone_digest).slice(0, 12) + "\u2026)" : "")}</div><div class="meta">${"Evidence: " + e.granted + " granted of " + e.requests + " blocked request(s) it covers in the last 14 days (" +
+    e.denied + " denied, " + e.undecided + " undecided), in " + e.runs + " run(s) on " + e.days + " day(s)" + (ops.length >= 10 ? ", the 10 most asked:" : ops.length ? ":" : "")}</div>${ops.map(o => html`<div class="meta mono">${o.count + " \u00d7 " + strip(o.method) + " " + strip(o.path) + " (" + o.granted + " granted)"}</div>`)}${e.own_asks ? html`<div class="meta">${"and " + e.own_asks + " ask(s) ahead of its own, not counted as evidence"}</div>` : nothing}<div class="meta">${"standing reach " + strip(a.id) + " \u00b7 asked " + at(a.created_at)}</div></details></div>`;
+}
+
+// The asks, kept across polls by their id; when they change, the layout moved (`settled`).
+let lastAsks = null;
+function renderStandingAsks(s) {
+  const box = document.getElementById("standing-asks");
+  if (!box) return;
+  const asks = (s.standing || {}).asks || [];
+  draw(asks.length ? repeat(asks, a => a.id, standingAsk) : html`<div class="empty">No agent is asking for standing reach.</div>`, box);
+  const key = JSON.stringify(asks);
+  if (lastAsks !== null && key !== lastAsks) layoutMoved();
+  lastAsks = key;
+}
+
+g.wicketInbox = { renderPending, renderStatus, renderProblems, setOpen, renderStandingAsks };

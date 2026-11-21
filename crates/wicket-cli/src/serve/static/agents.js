@@ -8,17 +8,9 @@
 // console.html's own and stays console.js's, as does every signed action.
 import { html, render, nothing } from "lit-html";
 import { repeat } from "lit-html/directives/repeat.js";
+import { draw, time, kv } from "./ui.js";
 
 const g = globalThis;
-
-// lit-html renders after what a container already holds: the first time, it is emptied.
-const owned = new WeakSet();
-function draw(value, box) {
-  if (!owned.has(box)) { box.replaceChildren(); owned.add(box); }
-  render(value, box);
-}
-
-const time = (t, text) => html`<time title=${t ? iso(t) : nothing} datetime=${t ? iso(t) : nothing}>${text === undefined ? at(t) : text}</time>`;
 
 // ---- a run, in the list and as the head of its page ----
 
@@ -116,7 +108,6 @@ function redrawLog() { if (logOf && view === "agent") renderAgentLog(...logOf); 
 // the zone's Cedar) folded under Details. Every string is text: block sources hold strings an agent
 // chose (a grant's path).
 const pathsText = p => (p || ["/**"]).map(strip).join(" ");
-const kv = (k, v) => html`<div class="row"><span class="meta">${k}</span><span class="mono">${strip(v)}</span></div>`;
 const whenMs = ms => ms ? at(ms / 1000) : "—";
 function reachLine(text, end, note) {
   const meta = end !== undefined || note ? html`<div class="meta">${end === undefined ? nothing : end}${note ? (end !== undefined ? " · " : "") + note : nothing}</div>` : nothing;
