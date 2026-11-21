@@ -460,6 +460,11 @@ fn refused(l: &Ledger, by: &Granter, id: &str, v: &Verdict, why: anyhow::Error) 
 /// [`refused`] for a decision of another kind's record (a standing ask, a public name, a trigger):
 /// one refusal record (`decision.refused`) for every kind.
 pub(crate) fn refused_as(l: &Ledger, by: &Granter, id: &str, decision: &str, why: anyhow::Error) -> anyhow::Error {
+    refused_in(l, &TenantId::single(), by, id, decision, why)
+}
+
+/// [`refused_as`], on `tenant`'s audit record: the tenant of what was refused (#575 review, L4).
+pub(crate) fn refused_in(l: &Ledger, tenant: &TenantId, by: &Granter, id: &str, decision: &str, why: anyhow::Error) -> anyhow::Error {
     let (granter, identity) = match by {
         Granter::Human(o) => ("human", Some(o.id.clone())),
         Granter::Agent(a) => ("agent", l.identity(&a.run.0).ok().flatten().map(|i| i.spiffe_id)),
@@ -469,7 +474,13 @@ pub(crate) fn refused_as(l: &Ledger, by: &Granter, id: &str, decision: &str, why
         "target": id, "decision": decision, "by": by.label(), "granter": granter, "granter_identity": identity,
         "why": format!("{why:#}"),
     });
-    match l.audit(&TenantId::single(), None, "decision.refused", &record) {
+    refusal_recorded(l, tenant, &record, why)
+}
+
+/// `why`, after `record` (a `decision.refused` body) is written to `tenant`'s audit log: exit code
+/// 3, saying whether the refusal is on the record.
+pub(crate) fn refusal_recorded(l: &Ledger, tenant: &TenantId, record: &serde_json::Value, why: anyhow::Error) -> anyhow::Error {
+    match l.audit(tenant, None, "decision.refused", record) {
         // Exit code 3 (#574), unless what it names wasn't there (4: the cause says so).
         Ok(_) => why.context(wicket_home::exit::Exit::refused("refused (the refusal is on the audit record)")),
         Err(e) => why.context(wicket_home::exit::Exit::refused(format!("refused (the refusal could not be recorded: {e})"))),

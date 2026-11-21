@@ -539,11 +539,62 @@ impl Ledger {
         public: &wicket_names::PublicConfig,
     ) -> Result<String> {
         // One write lock: the limit counted and the approval see the same names. Names past their
-        // lifetime end first, so they hold neither a label nor a slot (#716 review, F1).
-        self.immediate(|l| {
+        // lifetime end first, so they hold neither a label nor a slot (#716 review, F1). Inside a
+        // caller's transaction (the decision's audit record written first, #575 step 4d), it joins it.
+        let f = |l: &Ledger| {
             l.lapse_names(now())?;
             l.approve_name_in(id, terms, by, shown, public)
-        })
+        };
+        if self.conn.is_autocommit() {
+            self.immediate(f)
+        } else {
+            f(self)
+        }
+    }
+
+    /// Moves live standing name `id`'s lapse to `until` (None: until revoked) (#575 step 4d). Who
+    /// decided it stays who approved it; the renewal's audit record says who renewed it. Refused for
+    /// a run-scoped name (it lasts as its run does), one that isn't live, or one whose lifetime is
+    /// already over (it lapses; its agent asks again). The name as it is now.
+    pub fn renew_name(&self, id: &str, until: Option<i64>) -> Result<NameRow> {
+        self.renew_name_from(id, until, None)
+    }
+
+    /// [`Ledger::renew_name`], only if its end is still `shown` (Some: what a person was shown,
+    /// None or until revoked), checked in the same write (#575 step 4d): a renewal decided on an
+    /// end that has changed since is refused.
+    pub fn renew_name_from(&self, id: &str, until: Option<i64>, shown: Option<Option<i64>>) -> Result<NameRow> {
+        let n = self.conn.execute(
+            "UPDATE names SET expires_at = ?2
+             WHERE id = ?1 AND status = 'live' AND scope = 'standing' AND (expires_at IS NULL OR expires_at > ?3)
+               AND (?4 = 0 OR expires_at IS ?5)",
+            params![id, until, now(), shown.is_some() as i64, shown.flatten()],
+        )?;
+        if n == 0 {
+            let n = self.name(id)?;
+            if shown.is_some_and(|s| n.status == "live" && s != n.expires_at) {
+                return Err(StoreError::Refused(format!("{id}'s lifetime changed since it was shown: look again")));
+            }
+            let why = match (n.status.as_str(), n.scope) {
+                (_, NameScope::Run) => "it is run-scoped: it lasts as its run does".to_string(),
+                ("live", _) => "its lifetime is over: it lapses, and its agent asks again".to_string(),
+                (s, _) => format!("it is {s}, not live"),
+            };
+            return Err(StoreError::Refused(format!("{id} can't be renewed: {why}")));
+        }
+        self.name(id)
+    }
+
+    /// The names of `tenant` that ended, were denied or were withdrawn at `since` or later (by
+    /// when that happened), newest first, at most `limit`: a card's recent history (#575 step 4d).
+    pub fn recent_names(&self, tenant: &TenantId, since: i64, limit: usize) -> Result<Vec<NameRow>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM names WHERE tenant = ?1 AND status IN ('ended', 'denied', 'withdrawn')
+               AND COALESCE(ended_at, decided_at, created_at) >= ?2
+             ORDER BY COALESCE(ended_at, decided_at, created_at) DESC, id LIMIT ?3"
+        ))?;
+        let rows = st.query_map(params![tenant.0, since, limit as i64], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     fn approve_name_in(
@@ -1020,6 +1071,33 @@ impl Ledger {
             .collect())
     }
 
+    /// The records this installation created for box name `base` (its own records, its owner
+    /// record and its SRV records), in any zone: `(zone, provider, record)` (#575 step 4d).
+    pub fn owned_records_of(&self, base: &str) -> Result<Vec<(String, String, Record)>> {
+        let base = base.trim_end_matches('.').to_ascii_lowercase();
+        let mut st = self.conn.prepare(
+            "SELECT zone, provider, name, rtype, value, ttl FROM name_records WHERE name = ?1 OR name LIKE ?2 ESCAPE '\\' ORDER BY zone, name, rtype, value",
+        )?;
+        let like = format!("%.{}", base.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let rows = st
+            .query_map(params![base, like], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, u32>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(zone, provider, name, t, value, ttl)| Some((zone, provider, Record { name, rtype: rtype(&t)?, value, ttl })))
+            .filter(|(_, _, r)| r.base() == base)
+            .collect())
+    }
+
     /// The records `provider` created in `zone` for this installation: the plan's ledger half for
     /// that provider (#778 review, R2: another provider's rows are never its to change).
     pub fn owned_records_by(&self, zone: &Zone, provider: &str) -> Result<Vec<Record>> {
@@ -1249,6 +1327,89 @@ mod tests {
         let (again, _) = l.ask_public(&ask(&t, &r1, P1, "demo2", NameScope::Standing)).unwrap();
         let effect = name_effect(&l.name(&again).unwrap(), &terms, &p.domain());
         l.approve_name(&again, &terms, "op", Some(&effect), &p).unwrap();
+    }
+
+    /// #575 step 4d: a live standing name is renewed (until a new end, or until revoked); a
+    /// run-scoped one, one that isn't live and one already past its lifetime aren't.
+    #[test]
+    fn only_a_live_standing_name_is_renewed() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let p = public();
+        let terms = NameTerms { bound: Bound::Agent, ttl_secs: Some(3600) };
+        let (id, _) = l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Standing)).unwrap();
+        let refused = |r: Result<NameRow>, why: &str| match r {
+            Err(StoreError::Refused(m)) => assert!(m.contains(why), "{m}"),
+            r => panic!("{r:?}"),
+        };
+        refused(l.renew_name(&id, None), "pending, not live");
+        let effect = name_effect(&l.name(&id).unwrap(), &terms, &p.domain());
+        l.approve_name(&id, &terms, "op", Some(&effect), &p).unwrap();
+        let until = now() + 7200;
+        assert_eq!(l.renew_name(&id, Some(until)).unwrap().expires_at, Some(until));
+        let n = l.renew_name(&id, None).unwrap();
+        assert_eq!((n.expires_at, n.decided_by.as_deref()), (None, Some("op")), "still who approved it");
+        // Past its lifetime: it lapses, it isn't renewed.
+        l.conn.execute("UPDATE names SET expires_at = ?2 WHERE id = ?1", params![id, now() - 1]).unwrap();
+        refused(l.renew_name(&id, None), "lifetime is over");
+        let (run_scoped, _) = l.ask_public(&ask(&t, &r1, P2, "other", NameScope::Run)).unwrap();
+        let effect = name_effect(&l.name(&run_scoped).unwrap(), &terms, &p.domain());
+        l.approve_name(&run_scoped, &terms, "op", Some(&effect), &p).unwrap();
+        refused(l.renew_name(&run_scoped, None), "run-scoped");
+        assert!(matches!(l.renew_name("n-nope", None), Err(StoreError::NoSuchRequest(_))));
+    }
+
+    /// #575 step 4d: an approval joins its caller's transaction (its decision recorded first), and
+    /// is undone with it.
+    #[test]
+    fn an_approval_joins_its_callers_transaction() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let terms = NameTerms { bound: Bound::Agent, ttl_secs: Some(3600) };
+        let (id, _) = l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Standing)).unwrap();
+        let effect = name_effect(&l.name(&id).unwrap(), &terms, &public().domain());
+        let r: Result<()> = l.immediate(|l| {
+            l.audit(&t, None, "decision", &serde_json::json!({ "decision": "approve", "name": id }))?;
+            l.approve_name(&id, &terms, "op", Some(&effect), &public())?;
+            Err(StoreError::Refused("rolled back".into()))
+        });
+        assert!(r.is_err());
+        assert_eq!(l.name(&id).unwrap().status, "pending", "undone with its caller");
+        assert!(l.audit_of_kind("decision").unwrap().is_empty());
+        l.immediate(|l| l.approve_name(&id, &terms, "op", Some(&effect), &public())).unwrap();
+        assert_eq!(l.name(&id).unwrap().status, "live");
+    }
+
+    /// #575 step 4d: a name's recent history is bounded, and its records are those of its own name.
+    #[test]
+    fn recent_names_and_a_names_records() {
+        let l = ledger();
+        let t = TenantId("t".into());
+        let r1 = RunId("run-1".into());
+        let (a, _) = l.ask_public(&ask(&t, &r1, P1, "demo", NameScope::Standing)).unwrap();
+        let (b, _) = l.ask_public(&ask(&t, &r1, P2, "other", NameScope::Standing)).unwrap();
+        l.deny_name(&a, "op").unwrap();
+        l.deny_name(&b, "op").unwrap();
+        l.conn.execute("UPDATE names SET decided_at = 5 WHERE id = ?1", params![b]).unwrap();
+        let got: Vec<String> = l.recent_names(&t, 100, 10).unwrap().into_iter().map(|n| n.id).collect();
+        assert_eq!(got, vec![a.clone()], "the old one is past the window");
+        assert_eq!(l.recent_names(&t, 0, 1).unwrap().len(), 1, "bounded");
+        assert!(l.recent_names(&TenantId("other".into()), 0, 10).unwrap().is_empty());
+        let zone = Zone::new("boxes.example.com");
+        let ip = Ipv4Addr::new(192, 0, 2, 1);
+        let mine = [
+            Record::a("demo.boxes.example.com", ip, 60),
+            Record::srv("demo.boxes.example.com", "http", 30000, 60),
+            Record::a("ademo.boxes.example.com", ip, 60),
+            Record::a("x.demo.boxes.example.com.evil", ip, 60),
+        ];
+        let p = Plan { changes: mine.iter().cloned().map(Change::Create).collect(), conflicts: vec![] };
+        l.owned_before_apply(&zone, "memory", &p).unwrap();
+        let got = l.owned_records_of("demo.boxes.example.com").unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().all(|(z, prov, r)| z == "boxes.example.com" && prov == "memory" && r.base() == "demo.boxes.example.com"));
     }
 
     /// #716 review: two processes opening a ledger made before `names.domain` both open it.

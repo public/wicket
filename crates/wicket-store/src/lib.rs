@@ -1960,6 +1960,15 @@ impl Ledger {
             .optional()?)
     }
 
+    /// The newest `limit` records of `kind`, newest first: a bounded read of the log's tail by the
+    /// `audit_kind` index, for views that look for a few recent records with no index of their own
+    /// (a name's last connections, #575 step 4d).
+    pub fn audit_newest_of_kind(&self, kind: &str, limit: usize) -> Result<Vec<AuditRow>> {
+        let mut st = self.conn.prepare("SELECT seq, ts, kind, run, body FROM audit WHERE kind = ?1 ORDER BY seq DESC LIMIT ?2")?;
+        let rows = st.query_map(params![kind, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Recomputes the whole chain: from seq 1, or after a prune (#582) from the anchor on (kinds
     /// the host keeps below it aren't chained), whose record must be the first and hash to what
     /// the anchor's checkpoint signed (its own `prev` is a deleted record's, taken as stored). An
@@ -2561,21 +2570,58 @@ mod node_tests {
         );
     }
 
+    /// #575 step 4d: the console's change of a node's addresses is made only on the addresses it
+    /// showed, and its record (with what the caller adds) is written in the same write, first.
+    #[test]
+    fn a_checked_address_change_binds_the_addresses_shown() {
+        use crate::{AddressChange as A, NodeAddresses};
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "01")).unwrap();
+        let (a, b) = (std::net::Ipv4Addr::new(1, 1, 1, 1), std::net::Ipv4Addr::new(8, 8, 8, 8));
+        let none = NodeAddresses::default();
+        let x = serde_json::json!({ "action": "node_addresses" });
+        l.set_node_addresses_checked("n1", Some(&none), A::Set(a), A::Keep, "ann", x.clone()).unwrap();
+        // Shown none, but it has one now: refused, and nothing written.
+        let e = l.set_node_addresses_checked("n1", Some(&none), A::Set(b), A::Keep, "ann", x.clone()).unwrap_err();
+        assert!(matches!(&e, StoreError::Refused(m) if m.contains("changed since")), "{e}");
+        assert_eq!(l.node_addresses("n1").unwrap().ipv4, Some(a));
+        let rec = l.audit_of_kind("node.addresses").unwrap();
+        assert_eq!(rec.len(), 1);
+        assert!(rec[0].body.contains("\"action\":\"node_addresses\""), "{}", rec[0].body);
+        // A record that can't be written: no change.
+        l.fail_audit_inserts_for_tests().unwrap();
+        let shown = NodeAddresses { ipv4: Some(a), ipv6: None };
+        assert!(l.set_node_addresses_checked("n1", Some(&shown), A::Set(b), A::Keep, "ann", x).is_err());
+        assert_eq!(l.node_addresses("n1").unwrap().ipv4, Some(a), "not made");
+    }
+
+    /// #575 step 4d: the newest records of a kind, newest first and bounded.
+    #[test]
+    fn the_newest_records_of_a_kind() {
+        let l = Ledger::open_in_memory().unwrap();
+        for i in 0..5 {
+            l.audit(&TenantId::single(), None, if i % 2 == 0 { "node.audit" } else { "other" }, &serde_json::json!({ "i": i })).unwrap();
+        }
+        let got = l.audit_newest_of_kind("node.audit", 2).unwrap();
+        assert_eq!(got.iter().map(|r| r.4.clone()).collect::<Vec<_>>(), vec!["{\"i\":4}".to_string(), "{\"i\":2}".to_string()]);
+    }
+
     /// #716 review, F2 and F4: a node's addresses go with its enrolment, a revoked node gets none,
     /// and no two active nodes share one.
     #[test]
     fn node_addresses_follow_the_enrolment_and_are_one_nodes() {
         use crate::AddressChange as A;
         let mut l = Ledger::open_in_memory().unwrap();
-        let v4: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let v4 = std::net::Ipv4Addr::new(1, 1, 1, 1);
         for (n, serial) in [("n1", "01"), ("n2", "02")] {
             let t = l.create_node_token(&TenantId::single(), n, 3600).unwrap();
             l.enrol_node(&t, &node(n), &ca(n, serial)).unwrap();
         }
         l.set_node_addresses("n1", A::Set(v4), A::Keep, "ann").unwrap();
         assert!(
-            matches!(l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("n1")),
-            "another active node has it"
+            matches!(l.set_node_addresses("n2", A::Set(v4), A::Keep, "ann"), Err(StoreError::Refused(m)) if m.contains("already another node's") && !m.contains("n1")),
+            "another active node has it, unnamed"
         );
         l.revoke_node("n1").unwrap();
         assert!(l.node_addresses("n1").unwrap().is_empty(), "revoked: no address");

@@ -85,6 +85,8 @@ const ROUTES: &[&str] = &[
     "/api/push/subscribe",
     "/api/push/remove",
     "/api/push/details",
+    "/api/names",
+    "/api/names/n-1",
     "/api",
     "/admin",
     "/.env",
