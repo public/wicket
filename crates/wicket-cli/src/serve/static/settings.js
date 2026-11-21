@@ -197,12 +197,12 @@ function secretsView(v) {
   const stored = x => html`<div class="secret"><div class="row"><span class="mono">${strip(x.name)}</span><span class="risk ${x.kind === "reference" ? "r2" : "r0"}">${x.kind === "reference" ? "read from a file on the host" : "stored"}</span></div><div class="meta">${(x.hosts || []).length ? "sent only to " + x.hosts.map(strip).join(", ") : "bound to no host: sent nowhere"}</div>${x.reference ? html`<div class="meta">${"refers to " + strip(x.reference.file) + (x.reference.pointer ? "#" + strip(x.reference.pointer) : "") + ", read at each use"}</div>` : nothing}<div class="meta">${x.set_at ? "last set " + at(x.set_at) : "last set: unknown"}</div>${uses(x.used_by)}${(x.used_by || []).length ? nothing : html`<div class="meta">no listed manifest uses it</div>`}${(x.runs || []).length ? html`<div class="meta">${"running now: " + x.runs.map(r => strip(r.run)).join(", ")}</div>` : nothing}<div class="buttons">${x.kind !== "reference" ? html`<button @click=${() => openSecret("set", x)}>Replace value…</button>` : nothing}<button @click=${() => openSecret("hosts", x)}>Hosts…</button><button class="deny" @click=${() => openSecret("delete", x)}>Delete…</button></div></div>`;
   const missing = m => html`<div class="secret"><div class="row"><span class="mono">${strip(m.name)}</span><span class="risk r3">needed, not set</span></div>${uses(m.used_by)}<div class="buttons"><button class="approve" @click=${() => openSecret("set", { name: m.name, hosts: (m.used_by || []).filter(u => u.host).map(u => u.host), missing: true })}>Set…</button></div></div>`;
   const none = !(v.secrets || []).length && !(v.missing || []).length;
-  return html`${(v.secrets || []).map(stored)}${(v.missing || []).map(missing)}${none ? html`<div class="empty">No secrets in the vault.</div>` : nothing}<div class="buttons"><button @click=${() => openSecret("set", null)}>New secret…</button></div><div class="note">${"Values are never shown, here or anywhere. " + strip(v.link_cli_only ||
+  return html`${repeat(v.secrets || [], x => x.name, stored)}${repeat(v.missing || [], m => m.name, missing)}${none ? html`<div class="empty">No secrets in the vault.</div>` : nothing}<div class="buttons"><button @click=${() => openSecret("set", null)}>New secret…</button></div><div class="note">${"Values are never shown, here or anywhere. " + strip(v.link_cli_only ||
     "References (a file on the host, like a harness login) are made on the host: wicket secret link.")}</div>`;
 }
 
 // The task setups (#172) the server lists; each opens in console.js's editor.
-const manifestsView = ms => html`${ms.map(m => html`<div class="row"><span class=${m.valid ? "mono" : "blocked mono"}>${strip(m.root + "/" + m.name) + (m.valid ? "" : " · invalid")}</span><button class="link" @click=${() => openManifest(m.root, m.name)}>${m.root === "manifests" ? "view / edit" : "view"}</button></div>`)}<button class="link" @click=${() => openManifest("manifests", null)}>new manifest</button>`;
+const manifestsView = ms => html`${repeat(ms, m => m.root + "/" + m.name, m => html`<div class="row"><span class=${m.valid ? "mono" : "blocked mono"}>${strip(m.root + "/" + m.name) + (m.valid ? "" : " · invalid")}</span><button class="link" @click=${() => openManifest(m.root, m.name)}>${m.root === "manifests" ? "view / edit" : "view"}</button></div>`)}<button class="link" @click=${() => openManifest("manifests", null)}>new manifest</button>`;
 
 // The organisation's rules (#173): fetched at most every 30 s, as they change rarely.
 let policyAt = 0;
@@ -222,13 +222,8 @@ async function renderPolicy() {
 }
 
 // Your passkeys; adding a device (#711: a signed enrol_link, whose one-time link console.js keeps in
-// `enrolLink` and shows here until it expires); and signing out, which forgets the link and this
-// module's open questions.
-const signOut = async () => {
-  enrolLink = null; reset();
-  try { await post("/api/logout"); } catch (e) { /* signed out anyway */ }
-  boot();
-};
+// `enrolLink` and shows here until it expires); and signing out (console.js's signOut, which forgets
+// the link and this module's open questions).
 function operatorView(s) {
   const link = enrolLink && enrolLink.until > Date.now() ? enrolLink : null;
   if (!link) enrolLink = null;

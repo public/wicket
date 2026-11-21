@@ -618,13 +618,24 @@ function renderPending(s) {
 // What each view module draws: if it didn't load (a failed fetch, an old browser), each of these says
 // so, rather than look empty (no requests waiting, no agents).
 const VIEW_BOXES = { wicketInbox: ["pending", "standing-asks"], wicketAgents: ["runs", "start", "agent-head", "agent-log"], wicketActivity: ["audit", "decided"],
-  wicketSettings: ["standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"] };
+  wicketSettings: ["standing-rules", "capacity", "capacity-form", "health", "placed", "fenced", "secrets", "manifests", "policy", "operator"] };
+// Sign out (settings.js's button calls it too): the one-time enrolment link and any open question go
+// with the session (#711), and the page asks to sign in again.
+async function signOut() {
+  enrolLink = null;
+  if (globalThis.wicketSettings) globalThis.wicketSettings.reset();
+  try { await post("/api/logout"); } catch (e) { /* signed out anyway */ }
+  boot();
+}
 const UNLOADED = "This can't be shown: part of this page didn't load. Reload the page; if it stays, check the browser's console.";
 function drawn(mod, f, ...args) {
   if (!globalThis[mod]) {
     for (const id of VIEW_BOXES[mod] || []) {
       const box = document.getElementById(id);
-      if (box && !(box.textContent || "").startsWith("This can't be shown")) box.replaceChildren(el("div", "blocked", UNLOADED));
+      if (!box || (box.textContent || "").startsWith("This can't be shown")) continue;
+      box.replaceChildren(el("div", "blocked", UNLOADED));
+      // Signing out is a security control: it mustn't need a module to have loaded.
+      if (id === "operator") { const out = el("button", "", "Sign out"); out.onclick = signOut; const b = el("div", "buttons"); b.append(out); box.append(b); }
     }
     return;
   }
@@ -1011,8 +1022,6 @@ function openDetail(title) {
   return body;
 }
 
-const kv = (k, v) => { const d = el("div", "row"); d.append(el("span", "meta", k), el("span", "mono", strip(v))); return d; };
-const when = t => at(t);
 const whenMs = ms => ms ? at(ms / 1000) : "\u2014";
 
 

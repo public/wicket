@@ -308,7 +308,17 @@ async function check(engine) {
     assert.strictEqual(await page.locator("#secret-edit").isHidden(), false);
     assert.strictEqual(await page.locator("#secret-value").getAttribute("type"), "password");
     assert.strictEqual(await page.inputValue("#secret-name"), "gh");
-    await page.click("#secret-edit-cancel");
+    // A typed value is cleared as it is submitted, and never reaches the list.
+    const SECRET = "s3cret-VALUE-typed-in";
+    await page.fill("#secret-value", SECRET);
+    await settle();
+    await signs(page.locator("#secret-edit-go"));
+    assert.strictEqual(begun.at(-1).action, "set_secret");
+    assert.ok(!JSON.stringify(begun.at(-1)).includes(SECRET), "begin never carries the value");
+    await cancelSheet();
+    await poll();
+    assert.ok(!(await page.locator("#secrets").textContent()).includes(SECRET), "the value isn't in the list");
+    assert.ok(!(await page.locator("body").textContent()).includes(SECRET), "nor anywhere on the page");
     await sbtn("Set…").click();
     assert.strictEqual(await page.inputValue("#secret-name"), "HOSTILE<b>");
     assert.strictEqual(await page.inputValue("#secret-hosts"), "e.example");
@@ -329,6 +339,7 @@ async function check(engine) {
     assert.ok((await page.locator("#operator").textContent()).includes("passkey: laptop0123456789abcdef…"));
     assert.strictEqual(await page.locator("#operator code").textContent(), "wicket operator enrol-link");
     assert.strictEqual(await page.locator("#operator button.copy").count(), 1);
+    assert.ok(!(await page.locator("#operator").textContent()).includes("on the host and open"), "Add a device is the way; the host's command is the other");
     await settle();
     await signs(page.locator("#operator button", { hasText: "Add a device" }));
     assert.strictEqual(begun.at(-1).action, "enrol_link");
@@ -342,6 +353,15 @@ async function check(engine) {
     await until(() => posted.some(([p]) => p === "/api/logout"));
     assert.ok(posted.some(([p]) => p === "/api/logout"));
     await page.evaluate(() => { location.hash = "#settings"; });
+    await page.waitForSelector("#operator button");
+    await poll();
+    assert.ok(!(await page.locator("#operator").textContent()).includes("enrol?t="), "no link after signing out");
+    // boot() forgets one too, however it is reached.
+    await page.evaluate(() => showEnrolLink({ link: "https://c.example/enrol?t=def", expires_in_secs: 300 }));
+    await page.evaluate(() => boot());
+    await page.waitForSelector("#operator button");
+    await poll();
+    assert.ok(!(await page.locator("#operator").textContent()).includes("enrol?t="), "no link after boot()");
 
     // Nothing: each list says so.
     state = { ...base };
@@ -358,10 +378,16 @@ async function check(engine) {
     // Inbox's asks say they can't be shown, rather than look empty.
     const bare = await (await browser.newContext()).newPage();
     await bare.route("**/settings.js", r => r.abort());
+    let bareLogout = 0;
     await bare.route("**/api/**", r => { const p = new URL(r.request().url()).pathname;
+      if (p === "/api/logout") bareLogout++;
       return r.fulfill({ contentType: "application/json", body: JSON.stringify(p === "/api/me" ? { who: { state: "operator", credential: "AbCd" } } : p === "/api/state" ? base : p === "/api/push" ? { public_key: "BAEC", devices: [], min_interval_secs: 30 } : {}) }); });
     await bare.goto(url + "#settings");
-    for (const id of ["standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"]) await bare.waitForFunction(i => document.getElementById(i).textContent.includes("can't be shown"), id, { timeout: 10000 });
+    for (const id of ["standing-rules", "capacity", "capacity-form", "health", "placed", "fenced", "secrets", "manifests", "policy", "operator"]) await bare.waitForFunction(i => document.getElementById(i).textContent.includes("can't be shown"), id, { timeout: 10000 });
+    // Signing out doesn't need settings.js: the passkeys card keeps a Sign out that works.
+    await bare.locator("#operator button", { hasText: "Sign out" }).click();
+    for (let i = 0; i < 100 && !bareLogout; i++) await bare.waitForTimeout(50);
+    assert.strictEqual(bareLogout, 1, "Sign out posted without settings.js");
     console.log(`${engine} settings: ok`);
   } finally {
     await browser.close();

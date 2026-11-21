@@ -131,7 +131,10 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   // shown, rather than that nothing is waiting.
   // So for the Agents view without agents.js, Activity without activity.js, and Settings without
   // settings.js.
-  for (const id of ["pending", "standing-asks", "runs", "start", "audit", "decided", "standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
+  for (const id of ["pending", "standing-asks", "runs", "start", "audit", "decided", "standing-rules", "capacity", "capacity-form", "health", "placed", "fenced", "secrets", "manifests", "policy", "operator"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
+  // Signing out doesn't need settings.js: without it, the passkeys card still has Sign out.
+  const plainOut = ids.operator.all(n => n.tagName === "button" && n.textContent === "Sign out")[0];
+  assert.ok(plainOut, ids.operator.textContent);
 
   // The cards just moved (inbox.js says so): a tap right then is ignored.
   state = { ...base, pending: [A, B] };
