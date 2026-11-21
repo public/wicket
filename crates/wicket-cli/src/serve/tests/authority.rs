@@ -229,6 +229,7 @@ async fn the_policy_page_shows_the_applied_cedar_its_versions_and_runs() {
 #[tokio::test]
 async fn authority_views_never_carry_a_token_signature_secret_or_key() {
     let f = fixture("leak");
+    super::nodes::enrol(&mut f.t.ledger(), "n1", &TenantId::single().0, &["api.example.com"]);
     let n = needles(&f);
     // A public name of the run with the token, approved, with a connection its node shipped
     // (#575 review, L6): the names views scanned are real ones, not an empty card.
@@ -289,6 +290,8 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         "/api/names".into(),
         format!("/api/names/{nid}"),
         "/api/names/n-nope".into(),
+        "/api/nodes/n1/ca".into(),
+        "/api/nodes/nope/ca".into(),
     ];
     // The views that answer must answer (an error page would scan clean and prove nothing).
     let answers = [
@@ -328,6 +331,7 @@ async fn authority_views_never_carry_a_token_signature_secret_or_key() {
         "/api/explain/1",
         "/api/names",
         "/api/names/n-1",
+        "/api/nodes/n1/ca",
     ] {
         let (s, _, body) = super::http::call(&f.t.state, "GET", p, &[], b"").await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{p}: {body}");

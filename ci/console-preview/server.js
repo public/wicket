@@ -31,16 +31,29 @@ const HEADERS = ASSETS ? JSON.parse(fs.readFileSync(path.join(ASSETS, "headers.j
 const T0 = Date.now();
 
 const types = { ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
+// The served path of a page and of the service worker are fixed; everything else under /static/ is
+// named by hash in the dump, and its type is its extension's.
 const cookie = req => Object.fromEntries((req.headers.cookie || "").split(/;\s*/).filter(Boolean).map(c => c.split("=")));
 const polls = new Map();
 
-function page(res) {
-  if (ASSETS) return send(res, 200, "text/html; charset=utf-8", fs.readFileSync(path.join(ASSETS, "index.html")));
+// With --assets, a file's Brotli copy (`<file>.br`, as wicket dev console-assets writes it) to a
+// browser that accepts `br`, as wicket sends it (#574).
+function sendFile(req, res, type, f) {
+  const accepts = /(^|,)\s*(br|\*)\s*(;\s*q=(?!0(\.0+)?\s*(,|$))[\d.]+)?\s*(,|$)/i.test(req.headers["accept-encoding"] || "");
+  if (ASSETS && accepts && fs.existsSync(f + ".br")) return send(res, 200, type, fs.readFileSync(f + ".br"), { "content-encoding": "br", vary: "accept-encoding" });
+  return send(res, 200, type, fs.readFileSync(f), ASSETS && fs.existsSync(f + ".br") ? { vary: "accept-encoding" } : undefined);
+}
+
+function page(req, res) {
+  if (ASSETS) return sendFile(req, res, "text/html; charset=utf-8", path.join(ASSETS, "index.html"));
   // As serve/web.rs builds it, without the content hashes (the files are read fresh on each load).
   const html = fs.readFileSync(path.join(STATIC, "console.html"), "utf8")
     .replace("{{css}}", "/static/console.css").replace("{{js}}", "/static/console.js")
     // The modules as written (#574): the entry; it imports lit-html from static/vendor/ itself.
     .replace("{{modules}}", '<script type="module" src="/static/inbox.js"></script>')
+    // The manifest and icons by their source names (wicket names them by hash).
+    .replace("{{manifest}}", "/manifest.webmanifest").replace("{{icon_svg}}", "/static/icon.svg")
+    .replace("{{apple_touch_icon}}", "/static/apple-touch-icon.png")
     .replace(/ integrity="\{\{(css|js)_sri\}\}"/g, "");
   send(res, 200, "text/html; charset=utf-8", html);
 }
@@ -80,7 +93,7 @@ http.createServer((req, res) => {
   if (p === "/" || p === "/index.html") {
     const want = url.searchParams.get("fixture");
     if (want) { res.setHeader("set-cookie", "fixture=" + want + "; Path=/; SameSite=Strict"); scenario = want; polls.set(want, 0); }
-    return page(res);
+    return page(req, res);
   }
   if (p.startsWith("/static/") || p === "/sw.js" || p === "/manifest.webmanifest") {
     // With --assets, the file at its served path (the dump holds nothing else); else the source, by
@@ -96,7 +109,7 @@ http.createServer((req, res) => {
         (_, kw, q, sub) => kw + q + up + "vendor/lit-html" + (sub || "/lit-html.js") + q);
       return send(res, 200, types[".js"], js);
     }
-    return send(res, 200, types[path.extname(f)] || "application/octet-stream", fs.readFileSync(f));
+    return sendFile(req, res, types[path.extname(f)] || "application/octet-stream", f);
   }
   if (p === "/api/me") {
     if (scenario === "signedout" || (scenario === "expired" && (polls.get(scenario) || 0) > 1)) return json(res, { error: "sign in" }, 401);

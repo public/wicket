@@ -252,6 +252,8 @@ fn node_list_json() {
     assert_eq!((v[0]["name"].as_str(), v[0]["ca"].is_null()), (Some("local"), true), "{v:#}");
     assert_eq!((v[0]["public_ipv4"].as_str(), v[0]["public_ipv6"].is_null()), (Some("1.1.1.1"), true), "{v:#}");
     documented_as("`wicket node list --json`", &v);
+    let ca = wicket_control::enrol::ca_view(&l, "local", 2).unwrap().unwrap();
+    documented_as("`wicket node ca --json`", &ca);
 }
 
 #[test]
