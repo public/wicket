@@ -44,21 +44,33 @@ pub fn principal(tenant: &str, s: &str) -> Result<String, String> {
     }
 }
 
+/// Plans or regions as the card and `wicket capacity grant` (#713) take them: each trimmed, empty
+/// ones dropped, and each item split at commas.
+pub(crate) fn names<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    items.into_iter().flat_map(|s| s.split(',')).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+}
+
 fn list(body: &Value, k: &str) -> Vec<String> {
     match body.get(k) {
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-        Some(Value::String(s)) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+        Some(Value::Array(a)) => names(a.iter().filter_map(|v| v.as_str())),
+        Some(Value::String(s)) => names([s.as_str()]),
         _ => vec![],
     }
 }
 
+/// A dollar amount (`0.05`, or `$0.05`) as micro-USD, for the card and `wicket capacity grant`
+/// (#713): `what` names it in the error.
+pub(crate) fn dollars_of(what: &str, s: &str) -> Result<i64, String> {
+    let s = s.trim();
+    MicroUsd::parse_dollars(s).and_then(|m| i64::try_from(m.0).ok()).ok_or_else(|| format!("{what}: {s:?} is not a dollar amount"))
+}
+
 fn dollars(body: &Value, k: &str) -> Result<i64, String> {
-    let s = match body.get(k) {
-        Some(Value::String(s)) => s.trim().trim_start_matches('$').to_string(),
-        Some(Value::Number(n)) => n.to_string(),
-        _ => return Err(format!("{k} required")),
-    };
-    MicroUsd::parse_dollars(&s).map(|m| m.0 as i64).ok_or_else(|| format!("{k}: {s:?} is not a dollar amount"))
+    match body.get(k) {
+        Some(Value::String(s)) => dollars_of(k, s),
+        Some(Value::Number(n)) => dollars_of(k, &n.to_string()),
+        _ => Err(format!("{k} required")),
+    }
 }
 
 fn ttl(body: &Value) -> Result<u64, String> {
@@ -252,5 +264,9 @@ mod tests {
         assert_eq!(list(&b, "regions"), vec!["lhr"]);
         assert_eq!(ttl(&json!({})).unwrap(), DEFAULT_TTL_SECS);
         assert!(ttl(&json!({ "ttl_secs": 86_401 })).is_err() && ttl(&json!({ "ttl_secs": 0 })).is_err());
+        // One parser for both surfaces (#713 review): a leading $, and no amount that wraps.
+        assert_eq!(dollars_of("--max-daily-usd", "$1.5").unwrap(), 1_500_000);
+        assert!(dollars_of("--max-daily-usd", "99999999999999999999").is_err());
+        assert_eq!(names(["a, b", " ", "c"]), vec!["a", "b", "c"]);
     }
 }

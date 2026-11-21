@@ -1,12 +1,15 @@
 # Console and CLI parity
 
-Every operator action is in both the [console](console.md) and the [CLI](cli.md), unless there's a
-stated reason it can't be (#713). This page lists each action and where it is. Host-only is the
-exception: it's for actions on files or processes on the control host, and for bootstrapping trust
-before any passkey exists. A gap that is still to be filled says "none yet" and names its issue.
+Every operator action belongs in both the [console](console.md) and the [CLI](cli.md), unless
+there's a stated reason it can't be (#713). This page lists where each action is today. Host-only is
+the exception: it's for actions on files or processes on the control host, and for bootstrapping
+trust before any passkey exists. A gap that is still to be filled says "none yet" and names its
+issue.
 
-Each side applies its own authority check. The console signs a changing action with a passkey, and
-that operator's `operators.yaml` authority is checked before the passkey is asked for. The CLI runs
+Each side applies its own authority check. The console signs a changing action with a passkey. A
+decision is checked against that operator's `operators.yaml` authority: for most actions before the
+passkey is asked for, and for a capacity grant or its renewal when the signed action is applied
+(refused then, and audited). The CLI runs
 as a host user: `wicketd` sorts each command into a class (read, run, revoke or privileged; see the
 [daemon](daemon.md)), and a decision is also checked against that operator's `operators.yaml`
 authority. Both sides go through the same functions and write the same audit records. A
@@ -95,7 +98,7 @@ console-signed record also keeps its signature (`wicket audit --verify` checks i
 | Make a join token, enrol, revoke or forget a node, or renew its CA | none yet (#713) | `wicket node token`, `enrol`, `revoke`, `forget`, `renew-ca` |
 | Set a node's CA hosts, labels or taints | none yet (#713) | `wicket node set` |
 | List or release capacity leases | a lease's request in `/api/state` (`pending`); releasing one: none yet (#713) | `wicket lease list`, `wicket lease release` |
-| Add or remove a per-node service | none yet (#713) | `wicket service add`, `remove` |
+| List, add or remove per-node services | none yet (#713) | `wicket service list`, `add`, `remove` |
 | Make what exists agree with the ledger now | none yet (#713): the reconciler runs as a service | `wicket reconcile` |
 | Install a node, or serve it | host-only: runs on the node, as root over ssh or under systemd | `wicket node install`, `serve`, `intake`, `top` |
 | Keep a node feed's checkpoint across a rollback | host-only: part of an update on the host | `wicket node feed-checkpoint` |

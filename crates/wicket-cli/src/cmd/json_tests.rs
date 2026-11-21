@@ -31,7 +31,7 @@ fn documented() -> BTreeMap<String, Vec<String>> {
 }
 
 /// `v`'s fields are what the table's row `row` says.
-fn documented_as(row: &str, v: &serde_json::Value) {
+pub(crate) fn documented_as(row: &str, v: &serde_json::Value) {
     let doc = documented();
     let want = doc.get(row).unwrap_or_else(|| panic!("docs/reference/cli.md has no row {row:?}; it has {:?}", doc.keys()));
     assert_eq!(&keys(v), want, "{row}: {v:#}");
@@ -487,4 +487,38 @@ fn authority_and_explain_json() {
     let other = l.audit(&t, None, "grant.revoked", &serde_json::json!({ "grant": "g-1" })).unwrap();
     assert!(crate::serve::authority::explain(&views, other).is_err());
     assert!(crate::serve::authority::run_authority(&views, "run_nope").is_err());
+}
+
+/// #713 review: `wicket audit explain` explains the tenant's own records only, as `wicket
+/// authority` shows its own runs only: another tenant's is not found, as a missing one is.
+#[test]
+fn explain_is_for_the_tenants_own_records() {
+    let (d, l) = super::test_ledger("explain-tenant");
+    let (t, other) = (TenantId::single(), TenantId("t9".into()));
+    let run = RunId::new();
+    let body = serde_json::json!({ "kind": "egress", "method": "GET", "host": "api.example.com", "path": "/v1", "outcome": "allow" });
+    let theirs = l.audit(&other, Some(&run), "op", &body).unwrap();
+    let ledger = d.join("ledger.db");
+    let views = crate::serve::authority::Views { ledger: &ledger, data: &d, tenant: &t, authz_root: None };
+    let e = crate::serve::authority::explain(&views, theirs).unwrap_err();
+    assert_eq!(format!("{e:#}"), format!("no activity record {theirs}"));
+    assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::NotFound as i32);
+    let e = crate::serve::authority::explain(&views, theirs + 100).unwrap_err();
+    assert_eq!(wicket_home::exit::status_of(&e), wicket_home::exit::Code::NotFound as i32);
+    // Their tenant's views explain it.
+    let views = crate::serve::authority::Views { ledger: &ledger, data: &d, tenant: &other, authz_root: None };
+    assert!(crate::serve::authority::explain(&views, theirs).is_ok());
+}
+
+/// #713 review: a block's source and signer are cleaned for the terminal, as every other field:
+/// the source carries hosts and paths agents asked for (#731).
+#[test]
+fn authority_text_cleans_what_agents_asked_for() {
+    let v = serde_json::json!({ "run": "r", "status": "running", "node": "n", "policy": {}, "token": { "held": true, "loads": true,
+        "zone": "z", "epoch": 1, "issued_by": "root", "reach": [], "forbid": [],
+        "blocks": [{ "index": 1, "kind": "grant", "signed_by": "k\u{1b}[31m", "revoked": false, "revocation_fingerprint": "f",
+                     "source": "right(\"evil\u{1b}[2J.example\", \"/\u{7}x\");\nnext" }], "grants": [] } });
+    let text = super::authority::authority_text(&v);
+    assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'), "{text:?}");
+    assert!(text.contains("evil") && text.contains("      next\n"), "{text}");
 }

@@ -384,13 +384,17 @@ impl Ledger {
     }
 
     /// [`Ledger::run_lost`], only if `run` is still running, checked and ended in one transaction: a
-    /// run that ended meanwhile keeps how it ended (#812 review). Whether it was ended.
-    pub fn run_lost_if_running(&self, run: &str, why: &str) -> Result<bool> {
+    /// run that ended meanwhile keeps how it ended (#812 review). `then` runs inside that transaction
+    /// once the run is ended (its revocation, its audit records), so it happens with the end or not
+    /// at all: never to a run that ended on its own, and never skipped for one this ended. Whether it
+    /// was ended.
+    pub fn run_lost_if_running(&self, run: &str, why: &str, then: impl FnOnce(&Ledger) -> Result<()>) -> Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
         let status: Option<String> = tx.query_row("SELECT status FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?;
         let running = status.as_deref() == Some("running");
         if running {
             self.lose_run(run, why)?;
+            then(self)?;
         }
         tx.commit()?;
         Ok(running)

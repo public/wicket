@@ -195,6 +195,7 @@ async fn every_response_carries_the_security_headers() {
     let cookie = format!("__Host-wicket_sid={sid}");
     // The hashed console.js (not the service worker, which isn't immutable).
     let js = ASSETS.files.keys().find(|k| k.ends_with(".js") && *k != "/sw.js").unwrap().clone();
+    let manifest = served("/static/manifest.");
     for https in [false, true] {
         t.state.hsts = https;
         type Req<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
@@ -202,7 +203,7 @@ async fn every_response_carries_the_security_headers() {
             ("GET", "/", vec![]),
             ("GET", "/session", vec![]),
             ("GET", &js, vec![]),
-            ("GET", "/manifest.webmanifest", vec![]),
+            ("GET", &manifest, vec![("accept-encoding", "br")]),
             ("GET", "/api/state", vec![]),
             ("GET", "/api/state", vec![("cookie", &cookie)]),
             ("GET", "/api/me", vec![("cookie", &cookie)]),
@@ -216,7 +217,11 @@ async fn every_response_carries_the_security_headers() {
         for (method, path, h) in &requests {
             let (status, headers, _) = call(&t.state, method, path, h, b"").await;
             let get = |k: &str| headers.get(k).map(|v| v.to_str().unwrap().to_string());
-            assert_eq!(get("content-security-policy").as_deref(), Some(CSP), "{method} {path} {status}");
+            // A run's session page has its own policy, which allows Vue's; everything else the
+            // console's (#739). Never a report-only one.
+            let csp = if path.starts_with("/session") { crate::serve::web::SESSION_CSP } else { CSP };
+            assert_eq!(get("content-security-policy").as_deref(), Some(csp), "{method} {path} {status}");
+            assert!(get("content-security-policy-report-only").is_none(), "{method} {path}");
             assert_eq!(get("x-content-type-options").as_deref(), Some("nosniff"));
             assert_eq!(get("referrer-policy").as_deref(), Some("no-referrer"));
             assert_eq!(get("cross-origin-opener-policy").as_deref(), Some("same-origin"));
@@ -231,6 +236,19 @@ async fn every_response_carries_the_security_headers() {
         }
     }
     assert!(CSP.contains("default-src 'none'") && CSP.contains("script-src 'self';") && !CSP.contains("unsafe"));
+    // Trusted Types (#739): required for scripts, and exactly these policies, each at most once
+    // (no 'allow-duplicates'), no wildcard and no default policy.
+    let tt = |csp: &str| -> Vec<String> {
+        assert!(csp.contains("require-trusted-types-for 'script'"), "{csp}");
+        let list = csp.split(';').map(str::trim).find_map(|d| d.strip_prefix("trusted-types ")).unwrap_or_else(|| panic!("{csp}"));
+        list.split_whitespace().map(String::from).collect()
+    };
+    assert_eq!(tt(CSP), ["lit-html", "wicket-sw"]);
+    assert_eq!(tt(crate::serve::web::SESSION_CSP), ["vue"]);
+    for csp in [CSP, crate::serve::web::SESSION_CSP] {
+        let list = tt(csp);
+        assert!(!list.iter().any(|p| p == "'allow-duplicates'" || p == "*" || p == "default"), "{csp}");
+    }
     assert!(HSTS.contains("max-age=63072000") && HSTS.contains("includeSubDomains") && HSTS.contains("preload"));
     // Hashed assets are immutable; everything with data is no-store.
     let (_, h, _) = call(&t.state, "GET", &js, &[], b"").await;
@@ -371,7 +389,11 @@ async fn static_files_are_sent_brotli_compressed_to_browsers_that_accept_it() {
         brotli_decompressor::BrotliDecompress(&mut &a.1[..], &mut decoded).unwrap();
         assert_eq!(decoded, a.0.body, "{path}");
     }
-    assert!(crate::serve::web::accepts(Some("gzip;q=1.0, br;q=0.5"), "br") && !crate::serve::web::accepts(Some("*;q=0"), "br"));
+    let accepts = |h| crate::serve::web::accepts(Some(h), "br");
+    assert!(accepts("gzip;q=1.0, br;q=0.5") && !accepts("*;q=0"));
+    // Refused by name beats `*`; an entry whose q-value doesn't parse, or is out of range, is ignored
+    // (#747 review), as the preview server does too.
+    assert!(!accepts("br;q=0, *") && !accepts("br;q=abc") && accepts("br;q=abc, *") && !accepts("br;q=2") && accepts("BR"));
 }
 
 /// #327: the session view's page, as embedded (the built bundle, or the placeholder a build without
@@ -399,7 +421,7 @@ async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
     let (status, h, body) = call(&t.state, "GET", "/session?run=run_x", &[], b"").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h["content-type"], "text/html; charset=utf-8");
-    assert_eq!(h["content-security-policy"], CSP);
+    assert_eq!(h["content-security-policy"], crate::serve::web::SESSION_CSP, "the session page's own policy (#739)");
     assert_eq!(h["cache-control"], "no-store");
     assert_eq!(body, page, "the same page for every run: it reads the run from its URL");
     for (ext, ctype, bytes) in
@@ -1028,6 +1050,8 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
     // The real session token is never used: the fuzzer has only what an outsider could have.
     let seed = std::env::var("WICKET_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x5eed_1234_abcd_0001u64);
     let mut rng = Rng(seed);
+    // The static files at their hashed paths (#574), and the old unhashed ones, now 404s.
+    let (manifest, icon) = (served("/static/manifest."), served("/static/icon."));
     let paths = [
         "/",
         "/enrol",
@@ -1043,6 +1067,9 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
         "/api/logout",
         "/manifest.webmanifest",
         "/static/icon.svg",
+        manifest.as_str(),
+        icon.as_str(),
+        "/sw.js",
         "//api/state",
         "/api/state/",
         "/API/STATE",
@@ -1064,6 +1091,7 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
         "content-length",
         "transfer-encoding",
         "authorization",
+        "accept-encoding",
     ];
     let values = [
         "1",
@@ -1082,6 +1110,10 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
         "99999999999999999999",
         "",
         "Bearer x",
+        "br",
+        "gzip, deflate, br",
+        "br;q=0, *",
+        "*;q=nope",
     ];
     let bodies: [&[u8]; 8] = [
         b"",

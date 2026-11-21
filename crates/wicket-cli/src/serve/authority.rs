@@ -148,10 +148,11 @@ pub(crate) fn run_authority(state: &Views, run: &str) -> Result<Value> {
     crate::run::check_run_id(run)?;
     let l = state.ledger()?;
     // The console's tenant only: another tenant's run is not found, as one that doesn't exist.
+    let no_run = || wicket_home::exit::not_found(format!("no run {run}"));
     if l.run_tenant(run)?.as_ref() != Some(state.tenant) {
-        bail!("no run {run}");
+        return Err(no_run());
     }
-    let status = l.run_status(run)?.with_context(|| format!("no run {run}"))?;
+    let status = l.run_status(run)?.ok_or_else(no_run)?;
     let node = l.run_node(run)?.unwrap_or_else(|| crate::localnode::NAME.to_string());
     let policy = l.run_policy(run)?;
     let installed = crate::policy::installed_in(&policy_dir(state));
@@ -264,9 +265,13 @@ fn recorded_decision(kind: &str, body: &str) -> Option<Value> {
 
 pub(crate) fn explain(state: &Views, seq: i64) -> Result<Value> {
     let l = state.ledger()?;
-    let r = l.audit_record_at(seq)?.with_context(|| format!("no activity record {seq}"))?;
-    let d = recorded_decision(&r.kind, &r.body).context("this record isn't a decision on a request")?;
-    let run = r.run.clone().context("this decision names no run")?;
+    // The console's tenant only: another tenant's record is not found, as one that doesn't exist.
+    let r = l
+        .audit_record_at(seq)?
+        .filter(|r| r.tenant == state.tenant.0)
+        .ok_or_else(|| wicket_home::exit::not_found(format!("no activity record {seq}")))?;
+    let d = recorded_decision(&r.kind, &r.body).ok_or_else(|| wicket_home::exit::refused("this record isn't a decision on a request"))?;
+    let run = r.run.clone().ok_or_else(|| wicket_home::exit::refused("this decision names no run"))?;
     crate::run::check_run_id(&run)?;
     let s = |k: &str| d[k].as_str().unwrap_or("").to_string();
     let recorded = json!({

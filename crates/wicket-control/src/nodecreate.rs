@@ -125,12 +125,35 @@ pub fn release_placer(owner: &str, secret: &str) -> Result<Placer<VultrProvider,
 /// on it keeps it until it ends; the reconciler releases it then. Returns the lease's end, if the
 /// node has one: the run's box start carries it (`BoxStart::start_by`), and the node refuses a start
 /// that reaches it later (#395: this check and the start are seconds apart).
+///
+/// Refuses one, too, on a node whose release hasn't finished (#819 review): its machine was
+/// destroyed but it is still enrolled (its enrolment is revoked last, once the rest is done), and
+/// work started there after its release would be on no machine, and never ended by its retry.
 pub fn refuse_past_lease(ledger: &Ledger, node: &str, now: i64) -> Result<Option<i64>> {
-    let Some(p) = ledger.placed_nodes(&["active"])?.into_iter().find(|p| p.name == node) else { return Ok(None) };
+    let Some(p) = ledger.placed_nodes(&["active"])?.into_iter().find(|p| p.name == node) else {
+        refuse_releasing(ledger, node)?;
+        return Ok(None);
+    };
     if p.lease_until <= now {
         bail!("{}", past_lease(node, p.lease_until));
     }
     Ok(Some(p.lease_until))
+}
+
+/// Refuses work on `node` if the latest placed node of that name is released and the machine
+/// enrolled before its release still is: the release hasn't finished.
+fn refuse_releasing(ledger: &Ledger, node: &str) -> Result<()> {
+    let latest = ledger.placed_nodes(&[])?.into_iter().filter(|p| p.name == node).max_by_key(|p| (p.ended_at, p.created_at));
+    let Some(p) = latest.filter(|p| p.status == "released") else { return Ok(()) };
+    let until = p.ended_at.unwrap_or(i64::MAX);
+    if ledger.node(node)?.is_some_and(|r| r.status != "revoked" && r.enrolled_at <= until) {
+        bail!(
+            "node {node} was released (placed node {}) and its release hasn't finished: nothing new runs there (`wicket node release {}` finishes it)",
+            p.id,
+            p.id
+        );
+    }
+    Ok(())
 }
 
 /// After a placed node is released: revokes its enrolment, if it is still enrolled under its name
@@ -144,9 +167,10 @@ pub fn retire_enrolment(ledger: &mut Ledger, n: &NodeHandle) -> Result<bool> {
     Ok(true)
 }
 
-/// After a release whose first try didn't revoke its enrolment: revokes node `name`'s, if it is
-/// still enrolled and was enrolled before the release ended at `ended_at` (so it is that machine,
-/// not one enrolled under its name since). Returns whether it revoked.
+/// A placed node's release (#710, [`crate::noderelease::Retire`]), and its retry: revokes node
+/// `name`'s enrolment, if it is still enrolled and was enrolled by the time the release ended
+/// (`ended_at`), so it is the released machine, not one enrolled under its name since. Returns
+/// whether it revoked.
 pub fn retire_enrolment_named(ledger: &mut Ledger, name: &str, ended_at: i64) -> Result<bool> {
     let enrolled = ledger.node(name)?.filter(|r| r.status != "revoked" && r.enrolled_at <= ended_at);
     if enrolled.is_none() {
@@ -597,6 +621,23 @@ pub async fn create(args: CreateArgs) -> Result<()> {
     Ok(())
 }
 
+/// `wicket node release` on a node the ledger has as released (`arg`: its instance id, or by name the
+/// latest release of a node so named, since names are reused): finishes its release if its ledger
+/// side didn't (a step failed, or the process stopped), as `by`. What happened, in words; None if
+/// `arg` isn't a released node. Err if finishing it failed.
+pub fn release_released(l: &mut Ledger, arg: &str, by: &str, retire: crate::noderelease::Retire) -> Result<Option<String>> {
+    let released = l.placed_nodes(&["released"])?;
+    let row = released
+        .iter()
+        .find(|r| r.id == arg)
+        .or_else(|| released.iter().filter(|r| r.name == arg).max_by_key(|r| (r.ended_at, r.created_at)));
+    let Some(row) = row else { return Ok(None) };
+    Ok(Some(match crate::noderelease::finish_incomplete(l, &row.id, by, retire)? {
+        Some(said) => said,
+        None => format!("{} ({}) was already released: nothing is left to finish", row.name, row.id),
+    }))
+}
+
 /// The provider's instance id for `arg`: the id of the active node `create` recorded under that
 /// name, else `arg` itself (an instance id).
 fn instance_id(l: &Ledger, arg: &str) -> Result<String> {
@@ -640,19 +681,9 @@ pub async fn release(common: Common, id: String, reason: Option<String>, root: b
         say!("{said}");
         return Ok(());
     }
-    // A node the ledger has as released: its release is finished if its ledger side didn't (a step
-    // failed, or the process stopped), and never released again through the provider. By instance
-    // id, or by name the latest release of a node so named (names are reused).
-    let released = l.placed_nodes(&["released"])?;
-    let row = released
-        .iter()
-        .find(|r| r.id == id)
-        .or_else(|| released.iter().filter(|r| r.name == id).max_by_key(|r| (r.ended_at, r.created_at)));
-    if let Some(row) = row {
-        match nr::finish_incomplete(&mut l, &row.id, &crate::operator(), retire_enrolment_named)? {
-            Some(said) => say!("{said}"),
-            None => say!("{} ({}) was already released: nothing is left to finish", row.name, row.id),
-        }
+    // A node the ledger has as released is never released again through the provider.
+    if let Some(said) = release_released(&mut l, &id, &crate::operator(), retire_enrolment_named)? {
+        say!("{said}");
         return Ok(());
     }
     drop(l);
@@ -1265,5 +1296,110 @@ mod tests {
         let reason = decider.await.unwrap();
         assert!(reason.contains("plan vc2-1c-2gb in lhr") && reason.contains("worst case"), "{reason}");
         assert_eq!(st.lock().unwrap().instances.len(), 1);
+    }
+
+    /// #812 re-review: `wicket node release` on a released node finishes that release, and by name
+    /// the latest release of a node so named (names are reused); it never reaches the provider (it
+    /// has no placer). An argument that isn't a released node falls through (None).
+    #[test]
+    fn release_on_a_released_node_finishes_the_latest_release_of_that_name() {
+        use crate::noderelease::released_detail;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let row = |id: &str, created_at: i64| wicket_store::PlacedNodeRow {
+            id: id.into(),
+            backend: "vultr".into(),
+            name: "n1".into(),
+            owner: "example".into(),
+            api_key_secret: "vultr-api-key".into(),
+            created_at,
+            lease_until: created_at + 3600,
+            status: String::new(),
+            held_by: None,
+            ended_at: None,
+            detail: None,
+            hourly: None,
+        };
+        let t = TenantId::single();
+        l.run_started(&t, &wicket_core::RunId("run_old".into()), "z", "a").unwrap();
+        l.set_run_node("run_old", "n1").unwrap();
+        for (id, created) in [("i-old", 100), ("i-new", 200)] {
+            l.record_placed_node(&row(id, created)).unwrap();
+            assert!(l.placed_node_ended(id, "released", &released_detail("root", 1, true)).unwrap());
+        }
+        fn no_retire(_: &mut Ledger, _: &str, _: i64) -> Result<bool> {
+            Ok(false)
+        }
+        assert_eq!(release_released(&mut l, "n2", "root", no_retire).unwrap(), None, "not a released node");
+        let said = release_released(&mut l, "n1", "root", no_retire).unwrap().unwrap();
+        assert!(said.contains("ended run run_old as lost"), "{said}");
+        let b: serde_json::Value =
+            serde_json::from_str(&l.audit_of_kind("placement.node_release_finished").unwrap().pop().unwrap().body).unwrap();
+        assert_eq!(b["id"], "i-new", "the latest release of n1: {b}");
+        // Nothing left: said so, by name or id, and still not through the provider.
+        for arg in ["n1", "i-old"] {
+            let said = release_released(&mut l, arg, "root", no_retire).unwrap().unwrap();
+            assert!(said.contains("nothing is left to finish"), "{said}");
+        }
+    }
+
+    /// #819 review: a node whose release hasn't finished (its machine destroyed, its enrolment kept
+    /// until the rest is done) takes no new work: `wicket run --node` and per-node services check
+    /// this. A machine enrolled under the name after the release, and a release that finished, do.
+    #[test]
+    fn a_node_whose_release_hasnt_finished_takes_no_new_work() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let enrol = |l: &mut Ledger, at: i64| {
+            let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+            let row = wicket_store::NodeRow {
+                name: "n1".into(),
+                tenant: TenantId::single().0,
+                target: "wicket@203.0.113.7".into(),
+                host_key: "ssh-ed25519 AAAA".into(),
+                host_key_fp: "SHA256:x".into(),
+                node_key: "00".repeat(32),
+                ssh_key: None,
+                hosts: vec![],
+                enrolled_at: at,
+                status: "active".into(),
+                revoked_at: None,
+            };
+            let ca = wicket_store::NodeCaRow {
+                serial: format!("n1-{at}"),
+                node: "n1".into(),
+                issued_at: at,
+                not_after: at + 3600,
+                hosts: vec![],
+                status: "active".into(),
+            };
+            l.enrol_node(&t, &row, &ca).unwrap();
+        };
+        let now = wicket_store::now();
+        enrol(&mut l, now - 600);
+        let placed = wicket_store::PlacedNodeRow {
+            id: "i-1".into(),
+            backend: "vultr".into(),
+            name: "n1".into(),
+            owner: "example".into(),
+            api_key_secret: "vultr-api-key".into(),
+            created_at: now - 900,
+            lease_until: now + 3600,
+            status: String::new(),
+            held_by: None,
+            ended_at: None,
+            detail: None,
+            hourly: None,
+        };
+        l.record_placed_node(&placed).unwrap();
+        assert_eq!(refuse_past_lease(&l, "n1", now).unwrap(), Some(now + 3600), "active, in its lease");
+        assert!(l.placed_node_ended("i-1", "released", "released by root (decision 1, destroyed)").unwrap());
+        let e = refuse_past_lease(&l, "n1", now).unwrap_err();
+        assert!(format!("{e:#}").contains("release hasn't finished"), "{e:#}");
+        assert_eq!(refuse_past_lease(&l, "n2", now).unwrap(), None, "a node never placed");
+        // Finished (its enrolment revoked), then a new machine enrolled under the name: it takes work.
+        l.revoke_node("n1").unwrap();
+        assert_eq!(refuse_past_lease(&l, "n1", now).unwrap(), None);
+        let until = l.placed_node("i-1").unwrap().unwrap().ended_at.unwrap();
+        enrol(&mut l, until + 1);
+        assert_eq!(refuse_past_lease(&l, "n1", now).unwrap(), None);
     }
 }

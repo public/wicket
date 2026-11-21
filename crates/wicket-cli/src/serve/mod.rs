@@ -856,8 +856,13 @@ where
     B: hyper::body::Body,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let session_page = req.uri().path() == "/session";
     let mut r = dispatch(req, state, peer).await;
     web::secure_headers(r.headers_mut(), state.hsts);
+    // A run's session page allows Vue's Trusted Types policy, and only it (#739).
+    if session_page {
+        r.headers_mut().insert(http::header::CONTENT_SECURITY_POLICY, http::HeaderValue::from_static(web::SESSION_CSP));
+    }
     r
 }
 
@@ -901,13 +906,8 @@ where
         }
         if let Some(a) = web::ASSETS.files.get(&path) {
             let mut r = send(a);
-            let cache = if a.immutable {
-                "public, max-age=31536000, immutable"
-            } else if path == "/sw.js" {
-                "no-cache"
-            } else {
-                "public, max-age=3600"
-            };
+            // Every file but /sw.js is named by its hash (#574); the worker is asked for anew.
+            let cache = if a.immutable { "public, max-age=31536000, immutable" } else { "no-cache" };
             r.headers_mut().insert("cache-control", http::HeaderValue::from_static(cache));
             return r;
         }

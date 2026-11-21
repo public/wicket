@@ -20,14 +20,17 @@ const fx = require("./fixture.js");
 
 const STATIC = path.join(__dirname, "../../crates/wicket-cli/src/serve/static");
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; " +
-  "manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+  "manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; " +
+  "require-trusted-types-for 'script'; trusted-types lit-html wicket-sw";
 const args = process.argv.slice(2);
 const ai = args.indexOf("--assets");
 const ASSETS = ai >= 0 ? path.resolve(args.splice(ai, 2)[1]) : null;
 const port = Number(args[0] || process.env.PORT || 8790);
 // The security headers: as wicket sends them with --assets; otherwise the CSP, kept equal to
 // serve/web.rs's by hand.
-const HEADERS = ASSETS ? JSON.parse(fs.readFileSync(path.join(ASSETS, "headers.json"), "utf8")) : { "content-security-policy": CSP };
+// The session page's policy is its own (#739); the rest share the console's.
+const { "session-content-security-policy": SESSION_CSP, ...HEADERS } = ASSETS ? JSON.parse(fs.readFileSync(path.join(ASSETS, "headers.json"), "utf8")) : { "content-security-policy": CSP };
+if (ASSETS && !SESSION_CSP) { console.error(path.join(ASSETS, "headers.json") + " has no session-content-security-policy: write it with this wicket's `wicket dev console-assets`"); process.exit(2); }
 const T0 = Date.now();
 
 const types = { ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
@@ -38,10 +41,23 @@ const polls = new Map();
 
 // With --assets, a file's Brotli copy (`<file>.br`, as wicket dev console-assets writes it) to a
 // browser that accepts `br`, as wicket sends it (#574).
-function sendFile(req, res, type, f) {
-  const accepts = /(^|,)\s*(br|\*)\s*(;\s*q=(?!0(\.0+)?\s*(,|$))[\d.]+)?\s*(,|$)/i.test(req.headers["accept-encoding"] || "");
-  if (ASSETS && accepts && fs.existsSync(f + ".br")) return send(res, 200, type, fs.readFileSync(f + ".br"), { "content-encoding": "br", vary: "accept-encoding" });
-  return send(res, 200, type, fs.readFileSync(f), ASSETS && fs.existsSync(f + ".br") ? { vary: "accept-encoding" } : undefined);
+// As wicket's `accepts` (serve/web.rs): br named, or else `*`, with q above 0; br named with q=0 is
+// refused even beside `*`; an entry whose q doesn't parse is ignored.
+function acceptsBr(header) {
+  let named = null, star = null;
+  for (const item of String(header || "").split(",")) {
+    const [name, ...params] = item.split(";").map(x => x.trim());
+    const qp = params.find(p => /^q=/i.test(p));
+    let q = 1;
+    if (qp) { q = Number(qp.slice(2)); if (!/^\s*[\d.]+\s*$/.test(qp.slice(2)) || !(q >= 0 && q <= 1)) continue; }
+    if (name.toLowerCase() === "br") named = q > 0; else if (name === "*") star = q > 0;
+  }
+  return named ?? star ?? false;
+}
+function sendFile(req, res, type, f, extra) {
+  const accepts = acceptsBr(req.headers["accept-encoding"]);
+  if (ASSETS && accepts && fs.existsSync(f + ".br")) return send(res, 200, type, fs.readFileSync(f + ".br"), { "content-encoding": "br", vary: "accept-encoding", ...extra });
+  return send(res, 200, type, fs.readFileSync(f), { ...(ASSETS && fs.existsSync(f + ".br") ? { vary: "accept-encoding" } : {}), ...extra });
 }
 
 function page(req, res) {
@@ -95,6 +111,8 @@ http.createServer((req, res) => {
     if (want) { res.setHeader("set-cookie", "fixture=" + want + "; Path=/; SameSite=Strict"); scenario = want; polls.set(want, 0); }
     return page(req, res);
   }
+  // A run's session view (#327), as wicket sends it; only with --assets (it is a separate build).
+  if (p === "/session" && ASSETS) return sendFile(req, res, "text/html; charset=utf-8", path.join(ASSETS, "session.html"), { "content-security-policy": SESSION_CSP });
   if (p.startsWith("/static/") || p === "/sw.js" || p === "/manifest.webmanifest") {
     // With --assets, the file at its served path (the dump holds nothing else); else the source, by
     // its path under static/ (the modules import lit-html from static/vendor/).
