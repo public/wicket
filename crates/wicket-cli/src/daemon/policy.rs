@@ -76,13 +76,8 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Audit { cmd: Some(crate::AuditCmd::Compact { .. }), .. } => Refuse(
             "`wicket audit compact` runs with wicketd stopped, as the wicket user: sudo systemctl stop wicketd wicket-console wicket-reconcile; sudo -u wicket WICKET_HOME=/var/lib/wicket wicket audit compact",
         ),
-        // Files `--against` and `--issuer-jwk` name are read by wicket's user: a caller could name
-        // one only wicket may read (#713 review). Root's only; a `store:<sink>` names no file.
-        Cmd::Audit { against, issuer_jwk, .. }
-            if issuer_jwk.is_some() || against.iter().any(|a| !a.to_string_lossy().starts_with("store:")) =>
-        {
-            Forward(Privileged)
-        }
+        // `audit --verify`'s `--against` and `--issuer-jwk` files go to wicketd as content
+        // (daemon::client::self_uploads), so it reads no path its caller names: read, as the rest.
         Cmd::Pending { .. } | Cmd::Request { cmd: RequestCmd::List { .. } } | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
@@ -393,8 +388,8 @@ mod tests {
             (&["links"], Route::Forward(Read)),
             (&["audit", "--verify"], Route::Forward(Read)),
             (&["audit", "--verify", "--against", "store:s3"], Route::Forward(Read)),
-            (&["audit", "--verify", "--against", "/var/lib/wicket/x.jsonl"], Route::Forward(Privileged)),
-            (&["audit", "--verify", "--against", "store:s3", "--issuer-jwk", "k.json"], Route::Forward(Privileged)),
+            (&["audit", "--verify", "--against", "/var/lib/wicket/x.jsonl"], Route::Forward(Read)),
+            (&["audit", "--verify", "--against", "store:s3", "--issuer-jwk", "k.json"], Route::Forward(Read)),
             (&["doctor"], Route::Forward(Read)),
             (&["approve", "R1"], Route::Forward(Privileged)),
             (&["approve", "R1", "--unlimited", "--ttl", "1h"], Route::Forward(Privileged)),

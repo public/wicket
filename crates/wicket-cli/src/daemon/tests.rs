@@ -304,6 +304,53 @@ fn staged(args: &[&str], cwd: &Path) -> (Vec<String>, PathBuf, Result<()>, (uplo
     (plan.argv, at, checked, (st, dir))
 }
 
+/// #713 review: `audit --verify --against` and `--issuer-jwk` name files that may be only their
+/// caller's (an export they hold), which wicketd, as the wicket user, must never read by path: they
+/// go as content, the command runs on the staged copies, and a `store:<sink>` is passed on as named.
+#[test]
+fn audit_exports_and_issuer_keys_go_to_the_daemon_as_content() {
+    let src = tmp();
+    std::fs::write(src.0.join("export.jsonl"), "an export").unwrap();
+    std::fs::write(src.0.join("issuer.jwk"), "a key").unwrap();
+    let (e, k) = (src.0.join("export.jsonl"), src.0.join("issuer.jwk"));
+    let args = ["audit", "--verify", "--against", e.to_str().unwrap(), "--against", "store:s3", "--issuer-jwk", k.to_str().unwrap()];
+    let (argv, stage, checked, _st) = staged(&args, &src.0);
+    checked.unwrap();
+    let (se, sk) = (stage.join("against-0.export"), stage.join("issuer.jwk"));
+    assert_eq!(
+        argv,
+        [
+            "audit",
+            "--tail",
+            "40",
+            "--verify",
+            "--against",
+            se.to_str().unwrap(),
+            "--against",
+            "store:s3",
+            "--issuer-jwk",
+            sk.to_str().unwrap()
+        ]
+    );
+    assert_eq!((std::fs::read_to_string(&se).unwrap(), std::fs::read_to_string(&sk).unwrap()), ("an export".into(), "a key".into()));
+    assert!(!argv.iter().any(|a| a.starts_with(src.0.to_str().unwrap())), "no path of the caller's reaches wicket's user: {argv:?}");
+    // A file its caller can't read never leaves the caller (who reads it to send it): wicketd isn't
+    // asked to read it in its place. (Root reads every file, so this needs another user.)
+    // SAFETY: a plain getter.
+    if unsafe { libc::geteuid() } != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&e, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let cmd = {
+            use clap::Parser;
+            crate::Cli::try_parse_from(["wicket", "audit", "--verify", "--against", e.to_str().unwrap()]).unwrap().cmd
+        };
+        let mut frames = vec![];
+        let sent: Result<Vec<()>, _> = client::self_uploads(&cmd).into_iter().map(|(r, p)| upload::send(&mut frames, r, &p)).collect();
+        assert!(sent.is_err(), "the caller can't read it, so it isn't sent");
+        std::fs::set_permissions(&e, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 /// #713: `manifest check` and `manifest save` name an edited manifest the caller may alone be able
 /// to read: it goes as content, and the command runs on the staged copy, its flags kept.
 #[test]
