@@ -13,14 +13,24 @@ use std::sync::LazyLock;
 
 /// The policy on every response. Nothing inline, nothing from elsewhere, no framing, no `<base>`;
 /// `manifest-src` lets the browser read the web app manifest (with `default-src 'none'` it couldn't).
+///
+/// Trusted Types are enforced (#739): a page may write HTML or script only through a policy it is
+/// allowed. The console's page allows two: lit-html's, which passes only lit-html's own templates
+/// (every value in them is set as text), and `wicket-sw`, console.js's, which makes the service
+/// worker's URL, "/sw.js", and nothing else. No code of the console's can set `innerHTML` or the like
+/// from a string: a browser with Trusted Types throws if it tries.
 pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; \
-manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; \
+require-trusted-types-for 'script'; trusted-types lit-html wicket-sw";
 
-/// Trusted Types, reported but not yet enforced (#739): the console's DOM writes must go through text
-/// or lit-html's templates, never a raw HTML or script sink. Browsers that support it report a write
-/// that would break that (in the console and as a `securitypolicyviolation` event, which the browser
-/// tests fail on); it moves into [`CSP`] once every screen is on Lit.
-pub const CSP_REPORT_ONLY: &str = "require-trusted-types-for 'script'; trusted-types lit-html";
+/// A run's session page (#327, `/session`): the same policy, but its only Trusted Types policy is
+/// Vue's, the session view's framework. Vue's passes any string through (`createHTML: v => v`), for
+/// its static nodes and for any `v-html` or `innerHTML` binding, so here Trusted Types stop only code
+/// outside Vue: what keeps an agent's text out of HTML is that the view has no such binding, which
+/// ci/session-view.sh checks.
+pub const SESSION_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; \
+manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; \
+require-trusted-types-for 'script'; trusted-types vue";
 
 /// Strict-Transport-Security for HTTPS origins: two years, subdomains, and eligible for the browsers'
 /// preload lists (submitting the domain to hstspreload.org is the operator's step).
@@ -30,7 +40,7 @@ pub struct Asset {
     pub ctype: &'static str,
     pub body: Bytes,
     /// The same bytes, Brotli-compressed at build time (#574), for a browser that accepts `br`; `None`
-    /// for a file it doesn't make smaller (a PNG).
+    /// for a file it doesn't make smaller.
     pub br: Option<Bytes>,
     /// Named by content hash: cacheable forever.
     pub immutable: bool,
@@ -47,18 +57,22 @@ impl Asset {
     }
 }
 
-/// Whether an `Accept-Encoding` value accepts `coding`: named, or `*`, with a q-value above 0.
+/// Whether an `Accept-Encoding` value accepts `coding`: named, or else `*`, with a q-value above 0. A
+/// coding named with q=0 is refused even if `*` is accepted; an entry whose q-value doesn't parse is
+/// ignored.
 pub fn accepts(accept: Option<&str>, coding: &str) -> bool {
     let mut named = None;
     let mut star = None;
     for item in accept.unwrap_or("").split(',') {
         let mut parts = item.split(';');
         let name = parts.next().unwrap_or("").trim();
-        let q = parts
-            .filter_map(|p| p.trim().strip_prefix("q=").or_else(|| p.trim().strip_prefix("Q=")))
-            .next()
-            .and_then(|q| q.trim().parse::<f32>().ok())
-            .unwrap_or(1.0);
+        let q = match parts.filter_map(|p| p.trim().strip_prefix("q=").or_else(|| p.trim().strip_prefix("Q="))).next() {
+            None => 1.0,
+            Some(q) => match q.trim().parse::<f32>() {
+                Ok(q) if (0.0..=1.0).contains(&q) => q,
+                _ => continue,
+            },
+        };
         if name.eq_ignore_ascii_case(coding) {
             named = Some(q > 0.0);
         } else if name == "*" {
@@ -87,11 +101,10 @@ pub fn console_js() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/console.js"))
 }
 
-/// Everything wicket serves from its own bytes, as build.rs made it (#574): (path, content type,
-/// cacheable for good, bytes, Brotli copy). Files under `/static/` are named by their content's hash;
-/// the pages and `/sw.js` keep fixed names; the pages' references to the others are filled in.
-/// One file as build.rs wrote it: its path, content type, whether it is immutable, the bytes, and
-/// their Brotli copy (none when it wasn't smaller).
+/// One file wicket serves from its own bytes, as build.rs made it (#574): its path, content type,
+/// whether it is immutable, the bytes, and their Brotli copy (none when it wasn't smaller). Files under
+/// `/static/` are named by their content's hash; the pages and `/sw.js` keep fixed names; the pages'
+/// references to the others are filled in.
 type Built = (&'static str, &'static str, bool, &'static [u8], Option<&'static [u8]>);
 const BUILT: &[Built] = include!(concat!(env!("OUT_DIR"), "/assets.rs"));
 
@@ -115,7 +128,6 @@ pub fn secure_headers(h: &mut HeaderMap, hsts: bool) {
         h.insert(k, HeaderValue::from_static(v));
     };
     set(h, "content-security-policy", CSP);
-    set(h, "content-security-policy-report-only", CSP_REPORT_ONLY);
     set(h, "x-content-type-options", "nosniff");
     set(h, "referrer-policy", "no-referrer");
     set(h, "x-frame-options", "DENY");
@@ -137,7 +149,8 @@ pub fn secure_headers(h: &mut HeaderMap, hsts: bool) {
     }
 }
 
-/// Writes the console as `wicket serve` sends it into `dir` (#574): `index.html` (the page), each
+/// Writes the console as `wicket serve` sends it into `dir` (#574): `index.html` (the page),
+/// `session.html` (a run's session view), each
 /// file at its served path (`static/console.<hash>.js`, `sw.js`, …) with its Brotli copy as
 /// `<file>.br` where there is one, and `headers.json` with the
 /// security headers, for the browser tests (ci/console-browsers.sh) to serve the same bytes under the
@@ -145,6 +158,7 @@ pub fn secure_headers(h: &mut HeaderMap, hsts: bool) {
 pub fn write_console_assets(dir: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("index.html"), &ASSETS.page.body)?;
+    std::fs::write(dir.join("session.html"), &ASSETS.session_page.body)?;
     if let Some(br) = &ASSETS.page.br {
         std::fs::write(dir.join("index.html.br"), br)?;
     }
@@ -159,6 +173,7 @@ pub fn write_console_assets(dir: &std::path::Path) -> std::io::Result<()> {
             std::fs::write(p.with_file_name(format!("{}.br", p.file_name().and_then(|n| n.to_str()).unwrap_or_default())), br)?;
         }
     }
-    let headers = serde_json::json!({ "content-security-policy": CSP, "content-security-policy-report-only": CSP_REPORT_ONLY });
+    // The session page's policy apart, for a server of the dump to send with session.html.
+    let headers = serde_json::json!({ "content-security-policy": CSP, "session-content-security-policy": SESSION_CSP });
     std::fs::write(dir.join("headers.json"), serde_json::to_vec_pretty(&headers)?)
 }

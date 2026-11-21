@@ -15,6 +15,7 @@
 #     no eval (the console's CSP refuses it) and no source maps;
 #   - reproducible (#190): node_modules and dist removed, `npm ci` and the build again, the same
 #     bytes. The bundle's sha256 is printed (the signed build's log keeps it);
+#   - no raw-HTML binding (v-html, innerHTML, outerHTML) in web/session/src (#739);
 #   - with --test: the view's UI under jsdom (check/ui.ts: the real App mounted, opening, the stream
 #     rendered, an escalation decided with the passkey, a prompt, a stop), its client against the
 #     real endpoint (the ignored endpoint test, under node), and the serve tests with the bundle
@@ -26,6 +27,13 @@ view=$repo/web/session
 test=false
 [ "${1:-}" = --test ] && test=true
 
+# No raw-HTML binding in the view's source (#739): Vue's Trusted Types policy passes any string
+# through, so on /session it is this, not the browser, that keeps an agent's text out of HTML.
+# Upstream acp-ui renders agent text with `marked` into v-html: a re-sync must not bring it back.
+if raw=$(grep -rnEi 'v-html|inner-?html|outer-?html|insertAdjacentHTML' "$view/src"); then
+  printf 'web/session/src: a raw-HTML binding, which would let an agent write HTML on the console:\n%s\n' "$raw" >&2
+  exit 1
+fi
 echo "node $(node --version), npm $(npm --version)" >&2
 build() {
   rm -rf "$view/node_modules" "$view/dist" "$view/check-dist"

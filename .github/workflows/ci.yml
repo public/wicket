@@ -411,8 +411,9 @@ jobs:
         run: ci/session-view.sh --test
 
   # #574: the console in Chromium, Firefox and WebKit (ci/console-browsers.sh): the page as `wicket
-  # serve` sends it (minified by build.rs, under its CSP and the Trusted Types report-only policy),
-  # against the preview's mock API. Playwright comes from ci/console-browsers' lockfile.
+  # serve` sends it (minified by build.rs, under its CSP with Trusted Types enforced, #739), against
+  # the preview's mock API; and a run's session view, built here (ci/session-view.sh), under the same
+  # policy. Playwright comes from ci/console-browsers' lockfile.
   console-browsers:
     name: Console in browsers
     needs: select
@@ -433,7 +434,10 @@ jobs:
       - name: Node (pinned)
         run: ci/install-node.sh
       - name: Build, serve and test in each browser
-        run: ci/console-browsers.sh --install
+        run: |
+          WICKET_SESSION_VIEW=$(ci/session-view.sh)
+          export WICKET_SESSION_VIEW WICKET_SESSION_VIEW_REQUIRED=1
+          ci/console-browsers.sh --install
 
   # #51: SymCC (with cvc5, checksum-verified) on its fixtures, and on the example org policies a
   # change touches: narrows or widens. A solver timeout or `unknown` fails.

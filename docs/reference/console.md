@@ -134,17 +134,21 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   `decision.refused`). The decision is audited first (`placement.node_release_decided`, with your
   passkey and operator identity, the record root's command writes too, `granter` `human` or `root`,
   `via` `console` or `cli`); if it can't be written, nothing is released. Then, in the background, with the server's own provider key: if it is still what you signed and still
-  active, the provider destroys it; then its service instances are stopped, the runs on it are
-  ended as lost (and revoked, if they have an identity; a run that ended on its own meanwhile keeps how
-  it ended), and `placement.node_released` (with the decision's sequence) is written and its enrolment
-  revoked. If one of those steps fails the others are still done, `placement.node_release_incomplete` says
-  which, and `wicket node release <id>` on the host finishes it; so does the reconciler, a few minutes
+  active, the provider destroys it (recorded just before, once the provider has it,
+  `placement.node_release_destroying`); then its
+  service instances are stopped, the runs on it are ended as lost (and revoked, if they have an
+  identity; a run that ended on its own meanwhile keeps how it ended), its enrolment is revoked, last
+  and only once the rest is done, and then `placement.node_released` (with the decision's sequence) is
+  written. If one of the steps before the enrolment fails the others are still done and the
+  enrolment is kept (until it is revoked, nothing new runs on the server's name),
+  `placement.node_release_incomplete` says which, and `wicket node release <id>` on the host finishes it; so does the reconciler, a few minutes
   later, including after a restart in the middle of a release. A retry reads what the released server
   still has from the ledger, and only what was there before it was released: a new server given the
   same name since keeps its runs, services and files.
   Otherwise `placement.node_release_failed` (it is as it was) or
   `placement.node_release_already_ended` (another release got there first). Files it keeps are
-  forgotten only when this release destroyed it. The page's button waits for the Lit servers card
+  forgotten only when a release destroyed it: this one, or an earlier one that asked the provider and
+  never finished. The page's button waits for the Lit servers card
   (#758); until then the action is there for the page and for scripts.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
@@ -330,7 +334,8 @@ cargo build` embeds it as written, to read in a browser's debugger. The page's t
 (`serve/tests/console_ui.js`), and `ci/console-browsers.sh` runs it as served in Chromium, Firefox and
 WebKit: it writes what `wicket serve` sends (`wicket dev console-assets DIR`: the page, its files and
 its headers) and serves that against the preview's mock API, failing on any error, CSP violation or
-Trusted Types report, a card replaced by an unchanged poll, or a page that scrolls sideways.
+Trusted Types violation, a card replaced by an unchanged poll, a page that scrolls sideways, or a raw
+`innerHTML` write that doesn't throw; and they mount a run's session view under the same policy.
 
 **Every file under `/static/` is named by its content's hash** (`console.<hash>.js`,
 `icon-192.<hash>.png`, `manifest.<hash>.webmanifest`, …) and sent with `Cache-Control: public,
@@ -640,10 +645,18 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
   passkey-signed, so a stolen cookie alone approves nothing, and registers no notification device.
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
-  'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
-  and Trusted Types reported but not yet enforced (`Content-Security-Policy-Report-Only:
-  require-trusted-types-for 'script'; trusted-types lit-html`, [#739](https://github.com/public/wicket/issues/739)),
-  no CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
+  'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self';
+  require-trusted-types-for 'script'; trusted-types lit-html wicket-sw`. Trusted Types are enforced
+  ([#739](https://github.com/public/wicket/issues/739)): on the console's page, HTML reaches the page
+  only through lit-html's templates, whose values are set as text, and a browser throws on any other
+  `innerHTML`-style write from a string. The one script URL, the service worker's, comes from
+  `wicket-sw`, a policy that makes `/sw.js` and nothing else. A run's session page (`/session`) has
+  the same policy but allows only Vue's (`trusted-types vue`). Vue's passes any string through, for
+  its static nodes and for any `v-html` or `innerHTML` binding, so there Trusted Types stop only code
+  outside Vue; what keeps an agent's text out of HTML is that the view has no such binding, which
+  `ci/session-view.sh` checks. The browser tests check each page's policy and that the service worker
+  still registers.
+  No CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
   `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
 - **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS
   handshake, the request headers and the body, 2 minutes per connection, 16 KiB and 64 header lines, 64 KiB

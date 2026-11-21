@@ -1,12 +1,13 @@
 // The console in real browsers (#574): what `wicket serve` sends (minified, content-hashed, under
-// its CSP and the Trusted Types report-only policy), against the preview's mock API.
+// its CSP with Trusted Types enforced, #739), against the preview's mock API.
 //
 //   node test.mjs URL [chromium] [firefox] [webkit]      (ci/console-browsers.sh runs it)
 //
 // For each browser, at a desktop and a phone size: the page loads with no error, no CSP violation and
-// no Trusted Types report; the Inbox shows the request cards, and an unchanged card is the same
-// element after a poll; every view opens; a choice opens the signing sheet, which Cancel closes; and
-// nothing scrolls sideways. A failure names the browser, the size and what broke.
+// no Trusted Types violation; the Inbox shows the request cards, and an unchanged card is the same
+// element after a poll; every view opens; a choice opens the signing sheet, which Cancel closes;
+// nothing scrolls sideways; and a raw innerHTML write throws. Then, once per browser, a run's session
+// view mounts under the same policy. A failure names the browser, the size and what broke.
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const pw = require("playwright");
@@ -18,16 +19,21 @@ const SIZES = [["desktop", { viewport: { width: 1440, height: 900 } }], ["phone"
 const AGENT = "#agent/run_01JDRELEASEQQQQQQQQQQQQQQQ";
 
 // Collects what the page reports: console errors, uncaught errors, and every securitypolicyviolation
-// (the enforced CSP's and the report-only Trusted Types policy's), recorded from before any script.
+// (the CSP's, Trusted Types' included), recorded from before any script.
 async function watch(page) {
   const problems = [];
-  // WebKit ignores a report-only policy without a `report-to`, and logs that as an error: a note
-  // about the header, not a problem of the page's. Chromium and Firefox still report under it.
-  const reportOnly = /delivered in report-only mode, but does not specify a 'report-to'/;
-  page.on("console", m => { if (m.type() === "error" && !reportOnly.test(m.text())) problems.push("console: " + m.text()); });
+  page.on("console", m => { if (m.type() === "error") problems.push("console: " + m.text()); });
   page.on("pageerror", e => problems.push("error: " + e.message));
   await page.addInitScript(() => {
     window.__violations = [];
+    // What navigator.serviceWorker.register is given (#739): a TrustedScriptURL, under Trusted Types.
+    // Notifications are "allowed" here without a prompt, so the page's own button gets that far.
+    window.__swArgs = [];
+    if (navigator.serviceWorker) {
+      const register = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+      navigator.serviceWorker.register = (u, o) => { window.__swArgs.push(window.TrustedScriptURL && u instanceof window.TrustedScriptURL ? "trusted" : typeof u); return register(u, o); };
+    }
+    if (window.Notification) Notification.requestPermission = async () => "granted";
     document.addEventListener("securitypolicyviolation", e => window.__violations.push(e.effectiveDirective + " " + e.disposition + " " + (e.blockedURI || e.sample || "")));
   });
   return async () => problems.concat((await page.evaluate(() => window.__violations || [])).map(v => "violation: " + v));
@@ -66,13 +72,85 @@ async function check(engine, name, opts) {
     if (wide > 1) fail(`the page scrolls sideways by ${wide} px`);
     const problems = await seen();
     if (problems.length) fail("\n  " + problems.join("\n  "));
+    // Trusted Types are enforced (#739): a string written to an HTML sink throws. Checked last, since
+    // the browser reports the attempt. A browser without Trusted Types is named, not failed.
+    const tt = await page.evaluate(() => {
+      if (!window.trustedTypes) return "none";
+      try { document.createElement("div").innerHTML = "<b>x</b>"; return "allowed"; } catch (e) { return e instanceof TypeError ? "throws" : String(e); }
+    });
+    if (tt !== "throws" && tt !== "none") fail("a raw innerHTML write: " + tt + " (Trusted Types aren't enforced)");
+    // Enabling notifications registers the service worker with a TrustedScriptURL from wicket-sw,
+    // console.js's policy, which makes nothing but /sw.js: the page's own button, so the call site is
+    // what is checked (#739). Then: wicket-sw can't be made a second time, nor a policy the CSP
+    // doesn't list.
+    // The page offers the button only where push works (console.js's pushSupported: a service worker,
+    // PushManager and Notification); elsewhere it says how to get it (WebKit at phone size, here).
+    await page.evaluate(() => { location.hash = "#settings"; });
+    const push = await page.evaluate(() => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window);
+    if (!push) {
+      await page.waitForFunction(() => document.getElementById("push").textContent.includes("can't receive notifications here"), null, { timeout: 5000 })
+        .catch(() => fail("no push here, and the page doesn't say so"));
+      console.log(`${engine} ${name}: no push here, registering not checked`);
+    } else {
+      await page.locator("#push button", { hasText: "Enable notifications" }).click();
+      await page.waitForFunction(() => window.__swArgs.length > 0, null, { timeout: 5000 }).catch(() => fail("Enable notifications didn't register the service worker"));
+      const args = await page.evaluate(() => window.__swArgs);
+      if (args[0] !== (tt === "none" ? "string" : "trusted")) fail(`navigator.serviceWorker.register was given a ${args[0]}, not a TrustedScriptURL`);
+    }
+    const policies = await page.evaluate(() => {
+      if (!window.trustedTypes) return "ok";
+      // The page's own wicket-sw first (it is made on first use), so the duplicate is a second one.
+      swUrl();
+      for (const name of ["wicket-sw", "not-listed"]) {
+        try { window.trustedTypes.createPolicy(name, { createScriptURL: u => u }); return `a policy named ${name} was made`; } catch (e) { /* refused, as it should be */ }
+      }
+      return "ok";
+    });
+    if (policies !== "ok") fail(policies);
+    if (tt === "none") console.log(`${engine} ${name}: no Trusted Types in this browser`);
     console.log(`${engine} ${name}: ok (${cards} cards)`);
   } finally {
     await browser.close();
   }
 }
 
+// A run's session view (#327; a Vue build, when wicket was built with it): it mounts under its own
+// CSP, whose only Trusted Types policy is Vue's, with nothing reported, and a raw innerHTML write
+// outside Vue throws. (Vue's policy passes any string: ci/session-view.sh keeps v-html out of the view.) The
+// mock API has no session endpoint, so what it asks the server for fails; only the policy is checked.
+async function session(engine) {
+  const browser = await pw[engine].launch();
+  try {
+    const page = await (await browser.newContext()).newPage();
+    const seen = await watch(page);
+    const r = await page.goto(url + "session?run=run_01JDRELEASEQQQQQQQQQQQQQQQ");
+    if (!r || r.status() !== 200) {
+      if (process.env.WICKET_SESSION_VIEW_REQUIRED) throw new Error(`${engine} session: not served (${r && r.status()})`);
+      return console.log(`${engine} session: not served by the preview, skipped`);
+    }
+    await page.waitForFunction(() => document.getElementById("app")?.hasChildNodes(), null, { timeout: 10000 })
+      .catch(() => { throw new Error(`${engine} session: nothing mounted on #app`); });
+    const built = await page.evaluate(() => !document.body.textContent.includes("no session view"));
+    const violations = (await seen()).filter(p => p.startsWith("violation") || p.startsWith("error: Failed to set") || p.includes("TrustedHTML"));
+    if (violations.length) throw new Error(`${engine} session:\n  ` + violations.join("\n  "));
+    // Its policy is Vue's alone: a string written to an HTML sink outside Vue throws (#739).
+    const tt = await page.evaluate(() => {
+      if (!window.trustedTypes) return "none";
+      try { document.createElement("div").innerHTML = "<b>x</b>"; return "allowed"; } catch (e) { return e instanceof TypeError ? "throws" : String(e); }
+    });
+    if (tt !== "throws" && tt !== "none") throw new Error(`${engine} session: a raw innerHTML write: ${tt}`);
+    // CI builds the view (WICKET_SESSION_VIEW_REQUIRED): the placeholder there means it wasn't.
+    if (!built && process.env.WICKET_SESSION_VIEW_REQUIRED) throw new Error(`${engine} session: the placeholder, not the built view`);
+    console.log(`${engine} session: ok (${built ? "the built view" : "the placeholder"})`);
+  } finally {
+    await browser.close();
+  }
+}
+
 let failed = 0;
+for (const engine of engines) {
+  try { await session(engine); } catch (e) { failed++; console.error(String(e.message || e)); }
+}
 for (const engine of engines) {
   for (const [name, opts] of SIZES) {
     try { await check(engine, name, opts); } catch (e) { failed++; console.error(String(e.message || e)); }
