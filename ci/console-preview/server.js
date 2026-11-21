@@ -66,7 +66,7 @@ function page(req, res) {
   const html = fs.readFileSync(path.join(STATIC, "console.html"), "utf8")
     .replace("{{css}}", "/static/console.css").replace("{{js}}", "/static/console.js")
     // The modules as written (#574); they import lit-html from static/vendor/ themselves.
-    .replace("{{modules}}", ["inbox.js", "agents.js", "activity.js"].map(m => '<script type="module" src="/static/' + m + '"></script>').join("\n"))
+    .replace("{{modules}}", ["inbox.js", "agents.js", "activity.js", "settings.js"].map(m => '<script type="module" src="/static/' + m + '"></script>').join("\n"))
     // The manifest and icons by their source names (wicket names them by hash).
     .replace("{{manifest}}", "/manifest.webmanifest").replace("{{icon_svg}}", "/static/icon.svg")
     .replace("{{apple_touch_icon}}", "/static/apple-touch-icon.png")
