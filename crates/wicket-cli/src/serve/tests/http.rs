@@ -807,6 +807,11 @@ async fn the_enrolment_link_is_single_use_and_its_failures_look_like_any_401() {
     let (status, _, body) = call(&t.state, "GET", "/api/me", &[("cookie", &c)], b"").await;
     assert_eq!((status, json_of(&body)["who"]["state"].as_str()), (StatusCode::OK, Some("bootstrap")));
     assert_eq!(call(&t.state, "GET", "/api/state", &[("cookie", &c)], b"").await.0, StatusCode::UNAUTHORIZED);
+    // Nor the host's lists (#713).
+    for p in ["/api/grants", "/api/links", "/api/triggers", "/api/nodes", "/api/services", "/api/identities", "/api/sessions"] {
+        let (status, _, body) = call(&t.state, "GET", p, &[("cookie", &c)], b"").await;
+        assert_eq!((status, body.as_str()), (StatusCode::UNAUTHORIZED, DENIED), "{p} for a bootstrap session");
+    }
     let say = json!({ "action": "revoke", "run": "r", "reason": "hi" });
     assert_eq!(post_json(&t.state, "/api/action/begin", Some(&boot), &say).await.0, StatusCode::UNAUTHORIZED);
     // Used: the same link is now just another 401, from anywhere.

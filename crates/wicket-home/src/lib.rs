@@ -44,14 +44,25 @@ pub fn ledger_path() -> PathBuf {
 /// is checked against the issuer and against the ledger's own row, so an edited row is caught.
 /// `at` is the time to check validity at (now for live runs, issue time for history).
 pub fn verified_identity(l: &Ledger, run: &str, at: Option<i64>) -> serde_json::Value {
+    verified_identity_by(l, run, at, || Ok(issuer()?.verifying_key()))
+}
+
+/// As [`verified_identity`], checked against the issuer key `key` gives (a test's own issuer, say).
+/// A key that can't be had is said in words, never by its file's path.
+pub fn verified_identity_by(
+    l: &Ledger,
+    run: &str,
+    at: Option<i64>,
+    key: impl Fn() -> anyhow::Result<wicket_identity::VerifyingKey>,
+) -> serde_json::Value {
     let row = match l.identity(run) {
         Ok(Some(r)) => r,
         Ok(None) => return serde_json::json!({ "verified": false, "run": run, "error": "no identity was issued for this run" }),
         Err(e) => return serde_json::json!({ "verified": false, "run": run, "error": e.to_string() }),
     };
     let check = || -> anyhow::Result<wicket_identity::AgentClaims> {
-        let issuer = issuer()?;
-        let c = wicket_identity::verify_identity(&row.jws, &issuer.verifying_key(), at.unwrap_or(row.issued_at))?;
+        let key = key().map_err(|_| anyhow::anyhow!("this installation's issuer key can't be read here"))?;
+        let c = wicket_identity::verify_identity(&row.jws, &key, at.unwrap_or(row.issued_at))?;
         if c.run != row.run
             || c.tenant != row.tenant
             || c.zone != row.zone

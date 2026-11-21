@@ -580,12 +580,14 @@ fn trigger_identity_and_session_lists_json() {
         issued_at: 1,
     })
     .unwrap();
-    let v = super::identity::list_json(&l).unwrap();
+    let v = super::identity::list_json(&l, &l.identities().unwrap(), |l, r| wicket_home::verified_identity(l, r, None)).unwrap();
     assert_eq!(v[0]["run"], run.0.as_str());
     assert!(!v.to_string().contains("eyJhbGciOiJFZERTQSJ9"), "never the signed document: {v:#}");
+    // Unverifiable here (no issuer key): said in words, never by a file's path.
+    assert!(!v[0]["identity"]["error"].as_str().unwrap_or("").contains('/'), "{v:#}");
     documented_as("`wicket identity list --json`", &v);
     let token = "ab".repeat(32);
-    let id = "ef".repeat(32);
+    let id = crate::serve::session_id(&token);
     let session = |kind: &str, cred: &str| wicket_store::ConsoleSession {
         id: if kind == "operator" { id.clone() } else { "cd".repeat(32) },
         kind: kind.into(),

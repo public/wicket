@@ -40,7 +40,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 }
                 IdentityCmd::List { json } => {
                     if json {
-                        return crate::cmd::print_json(&list_json(&l)?);
+                        return crate::cmd::print_json(&list_json(&l, &l.identities()?, |l, r| verified_identity(l, r, None))?);
                     }
                     for row in l.identities()? {
                         let status = l.run_status(&row.run)?.unwrap_or_default();
@@ -57,11 +57,15 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
 /// `wicket identity list --json`, and the console's `/api/identities` (#713): each run's identity as
 /// `verified_identity` checks it (its fields, never its signed document or a key), and its run's
 /// status.
-pub(crate) fn list_json(l: &Ledger) -> Result<serde_json::Value> {
+pub(crate) fn list_json(
+    l: &Ledger,
+    rows: &[wicket_store::IdentityRow],
+    check: impl Fn(&Ledger, &str) -> serde_json::Value,
+) -> Result<serde_json::Value> {
     let mut out = vec![];
-    for row in l.identities()? {
+    for row in rows {
         let status = l.run_status(&row.run)?.unwrap_or_default();
-        out.push(serde_json::json!({ "run": row.run, "status": status, "identity": verified_identity(l, &row.run, None) }));
+        out.push(serde_json::json!({ "run": row.run, "status": status, "identity": check(l, &row.run) }));
     }
     Ok(out.into())
 }
