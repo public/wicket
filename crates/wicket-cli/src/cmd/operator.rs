@@ -33,8 +33,11 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                         println!("(prefix the console's origin, e.g. https://console.example.com)");
                     }
                 }
-                OperatorCmd::Sessions => {
+                OperatorCmd::Sessions { json } => {
                     let now = wicket_store::now();
+                    if json {
+                        return crate::cmd::print_json(&sessions_json(&l.console_sessions(&TenantId::single(), now)?));
+                    }
                     let ago = |t: i64| wicket_core::time::format_duration(Duration::from_secs((now - t).max(0) as u64)).to_string();
                     for s in l.console_sessions(&TenantId::single(), now)? {
                         println!(
@@ -90,6 +93,22 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
     }
 }
 
+/// `wicket operator sessions --json`, and the console's `/api/sessions` (#713). A session's `id` is
+/// the first 16 hex digits of its token's SHA-256, as the text shows it and `revoke-session` takes
+/// it: nothing a request could sign in with. A bootstrap session's credential (its enrolment link's
+/// id) is left out.
+pub(crate) fn sessions_json(rows: &[wicket_store::ConsoleSession]) -> serde_json::Value {
+    rows.iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id.get(..16).unwrap_or(&s.id), "kind": s.kind,
+                "credential": if s.kind == "operator" { s.credential.clone() } else { None },
+                "client": s.client, "created_at": s.created_at, "last_seen_at": s.last_seen_at, "expires_at": s.expires_at,
+            })
+        })
+        .collect()
+}
+
 #[derive(Subcommand)]
 pub enum OperatorCmd {
     /// List enrolled passkeys.
@@ -109,7 +128,11 @@ pub enum OperatorCmd {
         origin: Option<String>,
     },
     /// List live console sessions (id, passkey, client address, times).
-    Sessions,
+    Sessions {
+        /// Print JSON (docs/reference/cli.md, "Output for scripts"), as the console has them.
+        #[arg(long)]
+        json: bool,
+    },
     /// End console sessions now: one by its id (or a unique prefix of it), or all with --all.
     RevokeSession {
         id: Option<String>,

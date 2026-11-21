@@ -38,7 +38,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                         if fresh { "revoked" } else { "already revoked" }
                     );
                 }
-                IdentityCmd::List => {
+                IdentityCmd::List { json } => {
+                    if json {
+                        return crate::cmd::print_json(&list_json(&l, &l.identities()?, |l, r| verified_identity(l, r, None))?);
+                    }
                     for row in l.identities()? {
                         let status = l.run_status(&row.run)?.unwrap_or_default();
                         println!("{}  {:<10} {}", row.run, status, identity_line(&verified_identity(&l, &row.run, None)));
@@ -49,6 +52,22 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         _ => unreachable!("dispatched to the wrong command group"),
     }
+}
+
+/// `wicket identity list --json`, and the console's `/api/identities` (#713): each run's identity as
+/// `verified_identity` checks it (its fields, never its signed document or a key), and its run's
+/// status.
+pub(crate) fn list_json(
+    l: &Ledger,
+    rows: &[wicket_store::IdentityRow],
+    check: impl Fn(&Ledger, &str) -> serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut out = vec![];
+    for row in rows {
+        let status = l.run_status(&row.run)?.unwrap_or_default();
+        out.push(serde_json::json!({ "run": row.run, "status": status, "identity": check(l, &row.run) }));
+    }
+    Ok(out.into())
 }
 
 #[derive(Subcommand)]
@@ -65,7 +84,11 @@ pub enum IdentityCmd {
     /// Verify and show the identity wicket issued for a run.
     Show { run: String },
     /// List every agent identity issued, verified.
-    List,
+    List {
+        /// Print JSON (docs/reference/cli.md, "Output for scripts"), as the console has them.
+        #[arg(long)]
+        json: bool,
+    },
     /// Revoke a run's identity at once (e.g. if its environment may be compromised): its box is
     /// stopped, its messages are no longer delivered, and its requests can't be approved.
     Revoke {
