@@ -110,21 +110,28 @@ children, so they live in its cgroup and under its unit's hardening. Each holds 
   while a process killed for it still runs: two hosts of a shard never overlap;
 - fences a host whose process has exited (a zombie counts), or whose heartbeat says its runtime is
   stuck (or has stopped answering) once its lease has been lapsed for 15 s. The holder is recorded
-  in `<data dir>/supervise/dying.json`, then the fence raises the shard's epoch in the ledger, so
+  in `<data dir>/supervise/manager.json`, then the fence raises the shard's epoch in the ledger, so
   the old host can't renew or write; only then is it SIGKILLed (by the pid its label names, checked
   against its start time). A wicketd restarted in between kills it again from that record. A fresh
   host starts once it is gone;
 - fences no one for a ledger stall: the heartbeats go on answering, and when every host says its
-  lease thread is waiting at once, that is the ledger, and a host whose runtime still moves counts as
-  answering;
+  lease thread is waiting at once and wicketd's own small write to the ledger stalls too, that is the
+  ledger: for up to 2 minutes, a host whose runtime still moves counts as answering;
 - asks the hosts of shards outside `0..N` (after `supervise.hosts` was lowered) to stop, with
-  SIGTERM.
+  SIGTERM, and fences and kills one still running after 60 s; a gone one's shard is fenced at once,
+  so its nodes can move.
 
 A host stopped with SIGTERM writes its clean-stop marker, and its shard is free at once. **Hosts
 survive `systemctl stop wicketd`**: the unit has `KillMode=process`, as its commands do, so they go
-on holding their shards and answering, and the next wicketd adopts them. To stop them, SIGTERM
-them (`pkill -TERM -f 'wicket supervise'`), or set `supervise.hosts: 0` and restart wicketd,
-then stop the remaining ones the same way. The hosts supervise no runs yet: runs are still a
+on holding their shards and answering, and the next wicketd adopts them. To stop them, set
+`supervise.hosts: 0` and restart wicketd: it asks every host above the setting to stop, and fences
+and kills one still running 60 s later. To stop one by hand, send SIGTERM to its pid: the middle
+field of its holder label (`machine:pid:start`) in the ledger's `supervisor_hosts`, or its line in
+`ps -eo pid,args`.
+
+**Raising `supervise.hosts`** moves nodes into the new shards, but a host never moves a node away
+from a live holder: a new shard's host exits 75 (and is started again, backed off) until the host
+holding its nodes has restarted and given them up. The hosts supervise no runs yet: runs are still a
 process each.
 
 ### Limits

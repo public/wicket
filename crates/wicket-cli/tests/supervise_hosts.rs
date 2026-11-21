@@ -21,11 +21,13 @@ impl Drop for Io {
     fn drop(&mut self) {
         for o in self.0.spawned.clone() {
             let p = pid(&o);
+            // Only that very process (a reaped host's pid may be anyone's now), and only then its
+            // blocking reap: it is this test's child.
             if wicket_home::owner::owner_label_of(p as u32).as_deref() == Some(o.as_str()) {
                 unsafe { libc::kill(p, libc::SIGKILL) };
+                let mut st = 0;
+                unsafe { libc::waitpid(p, &mut st, 0) };
             }
-            let mut st = 0;
-            unsafe { libc::waitpid(p, &mut st, 0) };
         }
     }
 }

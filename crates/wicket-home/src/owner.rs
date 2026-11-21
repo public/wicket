@@ -71,19 +71,29 @@ pub fn is_host_label(label: &str) -> bool {
 
 /// Whether the process an owner label names is still running: None if it's on another machine (or
 /// the label is unreadable), so this machine can't tell. A supervisor host's label is `Some(false)`:
-/// see the module's documentation. A zombie (exited, not yet reaped by its parent) isn't running.
+/// see the module's documentation. A zombie (exited, not yet reaped by its parent) isn't running,
+/// but only once every thread has gone: a killed process's main thread is a zombie at once while a
+/// thread in uninterruptible IO lives on, holding the process's files and locks.
 pub fn owner_alive(label: &str) -> Option<bool> {
     if is_host_label(label) {
         return Some(false);
     }
     let (pid, start) = local_label(label)?;
-    Some(stat(pid).is_some_and(|(state, s)| s == start && state != 'Z'))
+    Some(match stat(pid) {
+        Some((state, s)) if s == start => state != 'Z' || threads(pid) > 1,
+        _ => false,
+    })
 }
 
-/// Whether the process an owner label names is a zombie: it exited and its parent hasn't reaped it.
-/// Only then may its parent reap it by pid, knowing it is that process.
+/// Whether the process an owner label names is a zombie with nothing left of it: every thread gone,
+/// its parent not yet having reaped it.
 pub fn owner_zombie(label: &str) -> bool {
-    local_label(label).is_some_and(|(pid, start)| stat(pid) == Some(('Z', start)))
+    local_label(label).is_some_and(|(pid, start)| stat(pid) == Some(('Z', start)) && threads(pid) <= 1)
+}
+
+/// How many threads a process has left (its `/proc/<pid>/task` entries, the main one included).
+fn threads(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/task")).map(|d| d.count()).unwrap_or(0)
 }
 
 /// An owner label of this machine's: its pid and start time.
@@ -182,5 +192,27 @@ mod tests {
         assert_eq!(owner_alive(&label), Some(false));
         assert_eq!(owner_alive(&owner_label()), Some(true));
         assert!(!owner_zombie(&owner_label()));
+    }
+
+    #[test]
+    fn a_zombie_main_thread_with_a_live_thread_is_still_running() {
+        // A process whose main thread has exited (pthread_exit) while another sleeps: its main thread
+        // reads Z, as a SIGKILLed one stuck in IO would.
+        let script =
+            "import threading,time,ctypes\nt=threading.Thread(target=time.sleep,args=(2,));t.start()\nctypes.CDLL(None).pthread_exit(None)";
+        let Ok(mut child) = std::process::Command::new("python3").args(["-c", script]).spawn() else {
+            eprintln!("no python3: skipped");
+            return;
+        };
+        let label = owner_label_of(child.id()).unwrap();
+        let t = std::time::Instant::now();
+        while stat(child.id()).map(|(s, _)| s) != Some('Z') {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "its main thread never exited");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(owner_alive(&label), Some(true), "a thread lives on");
+        assert!(!owner_zombie(&label));
+        child.wait().unwrap();
+        assert_eq!(owner_alive(&label), Some(false));
     }
 }
