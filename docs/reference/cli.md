@@ -12,8 +12,8 @@ reference](manifest.md)).
 ## Output for scripts
 
 The commands that list things take `--json`: `pending` (and `request list`, its other name), `top`,
-`agents`, `links`, `grant list`, `standing list`, `node list`, `lease list`, `service list`, `audit`,
-`message inbox`, `message receipts` and `message principals`. With it, stdout holds one JSON document
+`agents`, `links`, `grant list`, `standing list`, `names list`, `node list`, `lease list`, `service list`, `audit`,
+`message inbox`, `message receipts` and `message principals`, and so does `names show` (one name: an object). With it, stdout holds one JSON document
 and nothing else: a list is an array, `[]` when there is nothing to list, and `top --json` is one
 frame, an object. Messages and warnings go to stderr. For the outputs the table below lists, a
 field is never renamed or removed, and its meaning doesn't change; new fields may be added, so a
@@ -33,6 +33,14 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
 | `wicket links --json` | `id`, `status` (`open`, `closed`), `from_run`, `to_run`, `name`, `host` (the name the connecting box reaches it at), `port`, `by_run`, `basis`, `created_at`, `closed_at`, `close_reason` |
 | `wicket grant list --json` | `id`, `state` (`live`, `expired`, `revoked`), `zone`, `run` (null: any run in the zone), `method`, `host`, `path`, `prefix`, `quota` (a quota grant's `resource` and `amount`, money in micro-USD; else null), `uses_left` (null: unlimited, or a quota), `expires_at`, `node`, `request`, `decided_by`, `created_at` |
 | `wicket standing list --json` | `id`, `status` (`pending`, `approved`, `denied`, `revoked`), `state` (`status`, or `lapsed` for an approved rule past `expires_at`), `rule`, `for` (`agent`, `zone`, or null while undecided), `principal`, `zone`, `run`, `reason`, `created_at`, `decided_at`, `decided_by`, `expires_at` (null: until revoked), `revoked_at` |
+| `wicket names list --json` | `id`, `kind` (`internal`, `public`), `status` (the ledger's: `pending`, `live`, `denied`, `withdrawn`, `ended`), `state` (wicket's: `pending`, `live`, `waiting`, `taken` in the zone by records wicket didn't make, `out_of_sync`, `lapsed`, `denied`, `withdrawn`, `ended`), `why` (wicket's words for the state, or null), `name` (the full name: `<label>.<zone>.wicket.internal`, or under the boxes domain; null for a public ask on an installation without public names), `scope` (`run`, `standing`), `for` (`agent`, `zone`, or null), `expires_at` (null: until revoked, or as its run lasts), `created_at`, `decided_by`, `decided_at`, `ended_at`, `end_reason`, `owner`, `target`, `agent` (what the agent wrote) |
+| a name's `owner` | `principal`, `zone`, `run` (the run that asked), `holder` (the run that holds it now, or null) |
+| a name's `target` | `node` (the holder's node, or null), `public_ipv4` and `public_ipv6` (that node's, or null), `host_port` (a public name's on that node, or null), `box_port` |
+| a name's `agent` | `label`, `service`, `reason` (as the agent wrote them) |
+| `wicket names show --json` | `id`, `kind`, `status`, `state`, `why`, `name`, `scope`, `for`, `expires_at`, `created_at`, `decided_by`, `decided_at`, `ended_at`, `end_reason`, `owner`, `target`, `agent` (as `names list --json` has them), `records` (the records the ledger says this installation made for it), `plan` (the last reconcile's plan for it, or null), `connections` (its last connections, newest first, at most 50) |
+| a name's `records`, each | `zone`, `provider`, `name`, `type`, `value`, `ttl` |
+| a name's `plan` | `provider`, `zones` (each zone with a conflict at the name or a change to it: its `zone`, `conflicts`, `changes`, `applied`, `error`), `waiting` (why it was waiting, or null) |
+| a name's `connections`, each | `seq`, `ts`, `node`, `run`, `kind` (`name.conn`, `name.conn.refused`), `record` (the node's record, its label left out) |
 | `wicket node list --json` | `name`, `status` (`active`, `revoked`), `target`, `host_key_fp`, `hosts` (what it was enrolled or renewed with), `enrolled_at`, `revoked_at`, `ca` and `identity` (the active certificate's `serial` and `not_after`, or null; the CA's also its `hosts`, which a runtime widening may take past the enrolled ones), `ca_policy` (`mode`: `fixed`, `auto` or `allowed`, with its `allowed` hosts), `ca_wants` (what live runs want of its CA: `host`, `run`, `why`, `at`), `labels` (an object), `taints` (`key` or `key=value`), `public_ipv4` and `public_ipv6` (the addresses its boxes' public names point at, as its operator set them, or null). Left out, as the text shows them: a node's lease, what it holds for runs, and nodes leased but not enrolled (`wicket lease list`, `wicket top --json`) |
 | `wicket node ca --json` | `name`, `status`, `tenant`, `ca` (the active CA's `serial`, `issued_at`, `not_after`, `expired` and `hosts`, or null), `enrolled_hosts`, `policy` (as `ca_policy`), `wants` (each `host`, `run`, `why`, `at`, `covered` and `state`: `covered`, `at the next renewal`, `refused by the node's CA policy` or `over the cap`), `next_renewal` (the `hosts` it signs and those `dropped` over the cap), `widenings` (the last 20 `node.ca_widened`: `seq`, `at`, `ca_serial`, `added`, `removed`, `wanted_by`) |
 | `wicket lease list --json` | `id`, `status` (`pending`, `approved`, `active`, `ended`, `denied`, `withdrawn`, `failed`), `run` (the run that holds it), `provider`, `request` (the request a person decides; null: none yet), `node` (the enrolled node's name; null: none yet), `node_id` (the provider's id for it), `hourly_cap_micro_usd`, `reserved_micro_usd`, `billed_micro_usd` (null: not ended), `duration_secs`, `created_at`, `not_after` (null: no node yet), `ended_at`, `detail` |
@@ -102,6 +110,7 @@ attribution) is as it wrote it: shown to a person, it needs the cleaning the tex
   - [`wicket names show`](#wicket-names-show)
   - [`wicket names approve`](#wicket-names-approve)
   - [`wicket names deny`](#wicket-names-deny)
+  - [`wicket names renew`](#wicket-names-renew)
   - [`wicket names revoke`](#wicket-names-revoke)
 - [`wicket audit`](#wicket-audit)
   - [`wicket audit compact`](#wicket-audit-compact)
@@ -1006,6 +1015,7 @@ Commands:
   show     One name or ask: the label, port, who asked, and, for a public name, what approving it means
   approve  Approve an ask for a public name (`n-…`). A standing name is for the agent that asked (each later run of it takes it up when it starts), or --for zone (every agent of its zone), for --lasts
   deny     Deny an ask for a public name
+  renew    Renew a live standing name: it lapses --lasts from now. A run-scoped name lasts as its run does, and one past its lifetime is asked for again
   revoke   Revoke a live name, public or internal: it ends now, whoever holds it
   help     Print this message or the help of the given subcommand(s)
 
@@ -1023,6 +1033,7 @@ Usage: wicket names list [OPTIONS]
 
 Options:
       --all   
+      --json  Print JSON (docs/reference/cli.md, "Output for scripts"): each name's state and why, full name, owner, target and lifetime, as the console's Names card has them
   -h, --help  Print help
 ```
 
@@ -1031,12 +1042,13 @@ Options:
 ```text
 One name or ask: the label, port, who asked, and, for a public name, what approving it means
 
-Usage: wicket names show <ID>
+Usage: wicket names show [OPTIONS] <ID>
 
 Arguments:
   <ID>  
 
 Options:
+      --json  Print JSON: the name as `list --json` has it, with its records as the ledger lists them, the last reconcile's plan for it and its last connections
   -h, --help  Print help
 ```
 
@@ -1069,6 +1081,21 @@ Arguments:
 
 Options:
   -h, --help  Print help
+```
+
+### `wicket names renew`
+
+```text
+Renew a live standing name: it lapses --lasts from now. A run-scoped name lasts as its run does, and one past its lifetime is asked for again
+
+Usage: wicket names renew [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --lasts <LASTS>  How long from now (at most 366d), or `forever`: until revoked [default: 30d]
+  -h, --help           Print help
 ```
 
 ### `wicket names revoke`

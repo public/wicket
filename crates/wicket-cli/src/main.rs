@@ -42,6 +42,7 @@ mod doctor;
 mod intake;
 mod invariants;
 mod mock;
+mod names_view;
 mod pin;
 mod reconcile;
 mod rootcopy;

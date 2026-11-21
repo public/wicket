@@ -84,6 +84,8 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   the value.
 - **issue and renew a capacity grant** (`capacity_grant`, `capacity_renew`): see
   [capacity grants](#capacity-grants). Revoking one needs only the session.
+- **approve, deny, renew and revoke names, and set a node's public addresses** (`name_approve`,
+  `name_deny`, `name_renew`, `name_revoke`, `node_addresses`): see [names](#names).
 - **send a message to an agent** (`send_message`, #252), as `wicket message send` does: the passkey
   signs the recipient, the text, its priority and the message it answers, and wicket sends it as
   `spiffe://<domain>/t/<tenant>/op/passkey/<name>`, signed with a short-lived operator identity. The
@@ -174,6 +176,61 @@ their own leases. Whatever the grant, the node's money is reserved first against
 [`placement.yaml`](configuration.md#placementyaml), which leases share (#256), before anything is
 asked or created. An operator whose authority in [`operators.yaml`](configuration.md#operatorsyaml)
 doesn't include `capacity` may not issue or renew one.
+
+## Names
+
+The **Names** card (#575 step 4d; [names for boxes](../explanation/box-dns.md)) lists the names of
+the console's tenant: asks for public names waiting for you, live names (internal and public), and
+those that ended, were denied or withdrawn in the last 7 days. Its data is the dashboard's `names`
+(`/api/state`), or `GET /api/names`, the same object: `names` (the rows), `public` (the boxes
+domain and provider, or null without public names), `settings_error` (why `wicket.yaml`'s `names`
+can't be read, or null) and `warning` (what a public name means). Each row has the shape `wicket
+names list --json` prints ([output for scripts](cli.md#output-for-scripts)): wicket's `state`
+(`pending`, `live`, `waiting`, `taken` in the zone, `out_of_sync`, `lapsed`, `denied`, `withdrawn`,
+`ended`) with `why`, the full `name`, its `owner` (principal, zone, the asking run, the holding
+run), its `target` (node, that node's public IPv4 and IPv6, host port, box port), its scope,
+binding and lifetime, who decided it, and, under `agent`, what the agent wrote (its label, service
+and reason) as it wrote it: the card shows these quoted, and wicket's own text never quotes them.
+The state is what the reconciler would do now and what its last recorded plan (`name.plan`) found:
+a name it can't publish yet is `waiting` with why; one whose name the zone holds records at that
+wicket didn't make is `taken`; one whose records the ledger doesn't list as made is
+`out_of_sync`. The `noop` provider publishes nothing, so its names are `live` once wanted, and say
+so. `GET /api/names/<id>` is one name (as `wicket names show --json`), adding its `records` as the
+ledger lists them (zone and provider), the last plan's entries for it (`plan`: each zone's
+conflicts at the name and changes to it, and why it was waiting) and its last `connections`, newest
+first (the node's `name.conn` and `name.conn.refused` records, looked for among the newest 2000
+node records, at most 50). A name of another tenant is not found (404), as an unknown one is. Both
+routes need an operator's session.
+
+Each decision is a signed action (`/api/action/begin`, then `/api/action/finish`): single-use,
+for two minutes, in the session that began it. The passkey signs:
+- **`name_approve`** `{id, for: agent|zone, lasts: 30d|<duration>|forever}`: the name's id, its
+  full name (`fqdn`), label, zone and zone digest, principal, the asking run, the box's port and
+  service, its scope, who it is for and how long (`for`, `ttl_secs`, `lasts`; for a run-scoped
+  name: null, as its run lasts), `target` (the node the asking run is on now, and that node's
+  public addresses), the warning, and the effect (`effect_sha256`, `wicket_store::name_effect`).
+  When applied, the effect is recomputed under `wicket.yaml` as it is then, and the node and its
+  addresses read again: if either changed, the approval is refused (409), and the refusal is on the
+  record (`decision.refused`). The decision (`decision`, `via: console`, with the signed triple) is
+  written first, in the same write as the approval: if it can't be written, nothing is approved.
+- **`name_deny`** `{id}`: the name's id, full name, label, zone, principal, the asking run and the
+  box's port.
+- **`name_renew`** `{id, lasts}`: a live standing name's id, full name, zone, principal, who it is
+  for, the new lifetime (`ttl_secs`, null: until revoked) and when it lapsed before
+  (`previous_until`); a name whose lifetime changed since you were shown it is refused. Audited
+  `name.renewed`, first, in the same write.
+- **`name_revoke`** `{id}`: a live name's id, full name, zone, principal and holder. Audited
+  `name.revoked`.
+- **`node_addresses`** `{node, ipv4?, ipv6?}` (each an address, `none` to clear it, or absent to
+  keep it): the node, and each address before and after (`ipv4: {from, to}`, `ipv6: {from, to}`).
+  Only addresses on the public internet. When applied, a node whose addresses changed since is refused. Audited
+  `node.addresses`, first, in the same write, as `wicket node set --public-ipv4/6` is.
+
+Approving, denying and renewing need an authority in [`operators.yaml`](configuration.md#operatorsyaml)
+that covers `name` at R4, and setting a node's addresses one that covers `node` at R4: refused at
+begin (403) otherwise, and checked again when applied (refusals audited as `decision.refused`).
+Revoking only narrows: any signed-in operator may. `wicket audit --verify` re-verifies each of
+these records' signatures and that each record says what was signed.
 
 ## Sessions
 

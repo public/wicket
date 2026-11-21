@@ -390,10 +390,43 @@ fn says_what_was_signed(
     let same = |k: &str| decided.get(k) == v.get(k);
     let field = |k: &str| decided.get(k).unwrap_or(&serde_json::Value::Null);
     let says = |k: &str, x: &str| v.get(k).and_then(|d| d.as_str()) == Some(x);
+    // The record's `k` is what the signed JSON has at pointer `p` (absent and null alike).
+    let at = |k: &str, p: &str| v.get(k).unwrap_or(&serde_json::Value::Null) == decided.pointer(p).unwrap_or(&serde_json::Value::Null);
     let action = decided.get("action").and_then(|a| a.as_str());
+    // Neither a name's record nor its signed action is on a run.
+    let no_run = run.is_none() && decided.get("run").is_none();
     let ok = match (kind, action) {
+        // A public name approved or denied on the console (#575 step 4d): the name, where it is
+        // (wicket's full name and the zone), the agent's label as shown (apart, under `agent`;
+        // review, L7) and, for an approval, its effect.
+        ("decision", Some("name_approve")) if as_decision => {
+            says("decision", "approve")
+                && same("decision")
+                && ["name", "fqdn", "zone", "principal", "effect_sha256"].iter().all(|k| same(k))
+                && at("label", "/agent/label")
+        }
+        ("decision", Some("name_deny")) if as_decision => {
+            says("decision", "deny") && same("decision") && same("name") && at("label", "/agent/label")
+        }
         // A request decided on the console.
-        ("decision", _) if as_decision => same("request") && same("decision"),
+        ("decision", _) if as_decision => same("request") && same("decision") && same("name"),
+        // A name renewed or revoked on the console (#575 review, L1): of the action signed, on the
+        // name signed.
+        ("name.renewed", _) => {
+            action == Some("name_renew") && says("action", "name_renew") && no_run && ["name", "zone", "principal"].iter().all(|k| same(k))
+        }
+        ("name.revoked", _) => action == Some("name_revoke") && says("action", "name_revoke") && no_run && same("name") && same("zone"),
+        // A node's public addresses: the node signed, each address from and to those signed.
+        ("node.addresses", _) => {
+            action == Some("node_addresses")
+                && says("action", "node_addresses")
+                && no_run
+                && at("name", "/node")
+                && at("ipv4", "/ipv4/to")
+                && at("was_ipv4", "/ipv4/from")
+                && at("ipv6", "/ipv6/to")
+                && at("was_ipv6", "/ipv6/from")
+        }
         // A capacity grant has no id until it is made: its record says the signed principal, terms
         // and lifetime.
         ("decision", Some("capacity_grant")) => {
@@ -561,5 +594,61 @@ mod tests {
         // A release recorded on another run; a decision whose signed action decides nothing.
         assert!(says_what_was_signed("run.fence_released", false, Some("run_2"), &fence.1, &fence.0).is_err());
         assert!(says_what_was_signed("decision", false, None, &json!({ "decision": "deny" }), &json!({ "action": "revoke" })).is_err());
+    }
+
+    /// #575 step 4d and review, L1 and L7: a name's approval, denial, renewal and revocation, and a
+    /// node's addresses, each match what was signed, and a record changed in any field the
+    /// signature covers doesn't.
+    #[test]
+    fn a_name_decision_record_says_what_was_signed() {
+        use serde_json::json;
+        let agent = json!({ "label": "demo", "service": "http", "reason": "r" });
+        let v4 = |d: u8| std::net::Ipv4Addr::new(192, 0, 2, d).to_string();
+        let cases = [
+            (
+                "decision",
+                true,
+                json!({ "action": "name_approve", "decision": "approve", "name": "n-1", "fqdn": "demo.boxes.example.com", "zone": "z",
+                        "principal": "p", "effect_sha256": "e", "agent": agent }),
+                json!({ "decision": "approve", "name": "n-1", "label": "demo", "fqdn": "demo.boxes.example.com", "zone": "z",
+                        "principal": "p", "effect_sha256": "e" }),
+            ),
+            (
+                "decision",
+                true,
+                json!({ "action": "name_deny", "decision": "deny", "name": "n-1", "agent": agent }),
+                json!({ "decision": "deny", "name": "n-1", "label": "demo" }),
+            ),
+            (
+                "name.renewed",
+                false,
+                json!({ "action": "name_renew", "name": "n-1", "zone": "z", "principal": "p", "ttl_secs": 60, "agent": agent }),
+                json!({ "action": "name_renew", "name": "n-1", "zone": "z", "principal": "p" }),
+            ),
+            (
+                "name.revoked",
+                false,
+                json!({ "action": "name_revoke", "name": "n-1", "zone": "z", "agent": agent }),
+                json!({ "action": "name_revoke", "name": "n-1", "zone": "z" }),
+            ),
+            (
+                "node.addresses",
+                false,
+                json!({ "action": "node_addresses", "node": "n1", "ipv4": { "from": v4(1), "to": v4(2) }, "ipv6": { "from": null, "to": null } }),
+                json!({ "action": "node_addresses", "name": "n1", "ipv4": v4(2), "was_ipv4": v4(1), "ipv6": null, "was_ipv6": null }),
+            ),
+        ];
+        for (kind, as_decision, signed, record) in &cases {
+            assert_eq!(says_what_was_signed(kind, *as_decision, None, record, signed), Ok(()), "{record}");
+            for k in record.as_object().unwrap().keys() {
+                let mut r = record.clone();
+                r[k] = json!("changed");
+                assert!(says_what_was_signed(kind, *as_decision, None, &r, signed).is_err(), "{kind} with {k} changed passed");
+            }
+            // Recorded on a run, or as another kind's action.
+            assert!(says_what_was_signed(kind, *as_decision, Some("run_1"), record, signed).is_err() || *kind == "decision");
+        }
+        let (_, _, revoke, rec) = &cases[3];
+        assert!(says_what_was_signed("name.renewed", false, None, rec, revoke).is_err(), "a revocation isn't a renewal");
     }
 }
