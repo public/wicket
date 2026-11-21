@@ -129,8 +129,9 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
 
   // Without inbox.js (here, as when the module fails to load), the cards' place says they can't be
   // shown, rather than that nothing is waiting.
-  // So for the Agents view without agents.js, and Activity without activity.js.
-  for (const id of ["pending", "runs", "start", "audit", "decided"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
+  // So for the Agents view without agents.js, Activity without activity.js, and Settings without
+  // settings.js.
+  for (const id of ["pending", "standing-asks", "runs", "start", "audit", "decided", "standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"]) assert.ok(ids[id].textContent.includes("can't be shown"), id + ": " + ids[id].textContent);
 
   // The cards just moved (inbox.js says so): a tap right then is ignored.
   state = { ...base, pending: [A, B] };
@@ -540,6 +541,18 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.match(run("at(1700000000, 1700000000 + 7200)"), /^\d\d:\d\d \(2 h ago\)$|^[A-Z][a-z]{2} \d\d:\d\d \(2 h ago\)$/);
   assert.strictEqual(run("at(0)"), "\u2014");
   assert.deepStrictEqual(["$0.0500", "$1.0000", "$0.0140", "$12.3400", "n/a"].map(v => run("money(" + JSON.stringify(v) + ")")), ["$0.05", "$1.00", "$0.014", "$12.34", "n/a"]);
+  // Renewing and issuing a grant widen what may be spent: each is signed from a sheet that says so.
+  const terms = { plans: ["vc2-1c-2gb"], regions: ["lhr"], hourly_usd: "$0.0500", daily_usd: "$1.0000", nodes: 2 };
+  await advance(1000);
+  nextAction = { v: 1, action: "capacity_renew", grant: "g-cap1", principal: "spiffe://x/t/t0/op/unix/alex", terms, ttl_secs: 28800 };
+  run('signed({ action: "capacity_renew", id: "g-cap1", ttl_secs: 28800 })'); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Renew capacity grant g-cap1"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  await advance(1000);
+  nextAction = { v: 1, action: "capacity_grant", principal: "spiffe://x/t/t0/op/unix/alex", terms, ttl_secs: 14400 };
+  run('signed({ action: "capacity_grant", principal: "unix/alex", plans: "vc2-1c-2gb", regions: "lhr", max_hourly_usd: "0.05", max_daily_usd: "1", nodes: 2, ttl_secs: 14400 })'); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Grant spiffe://x/t/t0/op/unix/alex 2 node(s) at once"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
   // #707 review: the rows' words, each kind of activity line, a past lease, a decided request.
   const T = s => run(s).textContent;
   for (const [op, want] of [
@@ -591,6 +604,22 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   await run("refresh()"); await flush();
   assert.deepStrictEqual([ids["standing-pointer"].textContent, ids["standing-pointer"].hidden], ["Asking to be always allowed (1)", false]);
   assert.strictEqual(sandbox.document.title, "(1) wicket");
+  // Approving an ask narrowed to its evidence, and denying one, are signed from sheets that say what
+  // is allowed, and for how long, or that it is refused.
+  const askRule = { host: "ci.example", methods: ["GET", "POST"], paths: ["/jobs/**"], allow_dangerous: false };
+  const narrowed = { host: "ci.example", methods: ["GET"], paths: ["/jobs/1/logs"], allow_dangerous: false };
+  await advance(1000);
+  nextAction = { v: 1, action: "standing_approve", standing: "s-1", principal: "spiffe://x/t/t0/z/work/a/worker", zone: "work", rule: narrowed, for: "agent", ttl_secs: 2592000, narrowed: true, effect_sha256: "ab".repeat(32) };
+  run('signed({ action: "standing_approve", id: "s-1", for: "agent", narrow: true })'); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Approve standing reach s-1 narrowed to its evidence: { host: ci.example, methods: [GET], paths: ['/jobs/1/logs'] }"), ids["confirm-what"].textContent);
+  assert.ok(ids["confirm-what"].textContent.includes("for 30 days"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  await advance(1000);
+  nextAction = { v: 1, action: "standing_deny", standing: "s-1", rule: askRule };
+  run('signed({ action: "standing_deny", id: "s-1" })'); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Deny standing reach s-1"), ids["confirm-what"].textContent);
+  assert.deepStrictEqual([ids["confirm-go"].className, ids["confirm-go"].textContent], ["deny", "Sign: deny"]);
+  ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console standing reach: ok");
   // Fenced runs (#690): the row and its reason form are settings.js's (ci/console-browsers/settings.mjs).
   // The release is signed from a confirmation that says what it does, marked as dangerous.

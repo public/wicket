@@ -12,7 +12,7 @@ export function draw(value, box) {
 
 // A time: the text given (else its local time and how long ago), its exact time in `title` and
 // `datetime`.
-export const time = (t, text) => html`<time title=${t ? iso(t) : nothing} datetime=${t ? iso(t) : nothing}>${text === undefined ? at(t) : text}</time>`;
+export const time = (t, text, cls) => html`<time class=${cls || nothing} title=${t ? iso(t) : nothing} datetime=${t ? iso(t) : nothing}>${text === undefined ? at(t) : text}</time>`;
 
 // A label and its value, on a row.
 export const kv = (k, v) => html`<div class="row"><span class="meta">${k}</span><span class="mono">${strip(v)}</span></div>`;

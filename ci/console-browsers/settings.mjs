@@ -43,6 +43,7 @@ async function check(engine) {
   page.on("console", m => { if (m.type() === "error") problems.push("console: " + m.text()); });
   let state = { ...base, capacity: [grant] };
   const begun = [], posted = [];
+  let failRevoke = false, failedRevokes = 0;
   await page.route("**/api/**", async route => {
     const r = route.request(), p = new URL(r.url()).pathname;
     const body = r.postData() ? JSON.parse(r.postData()) : null;
@@ -53,7 +54,10 @@ async function check(engine) {
       begun.push(body);
       return reply({ action: { v: 1, ...body, standing: body.id, grant: body.id }, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] }, expires_in_ms: 120000 });
     }
-    if (p === "/api/capacity/revoke" || p === "/api/standing/revoke") { posted.push([p, body]); return reply({ ok: "revoked" }); }
+    if (p === "/api/capacity/revoke" || p === "/api/standing/revoke") {
+      if (failRevoke) { failRevoke = false; failedRevokes++; return reply({ error: "the ledger is busy" }, 503); }
+      posted.push([p, body]); return reply({ ok: "revoked" });
+    }
     if (p === "/api/push") return reply({ public_key: "BAEC", devices: [], min_interval_secs: 30 });
     return reply({});
   });
@@ -100,6 +104,15 @@ async function check(engine) {
     await btn("Revoke…").click();
     await btn("Revoke").click();
     assert.strictEqual(posted.length, 0, "a tap just after the question appeared is ignored");
+    // A revoke that fails keeps the question, to answer again.
+    await settle();
+    failRevoke = true;
+    await btn("Revoke").click();
+    await until(() => failedRevokes === 1);
+    await page.waitForFunction(() => { const b = [...document.querySelectorAll("#capacity button")].find(x => x.textContent === "Revoke"); return b && !b.disabled; });
+    assert.ok((await cap.textContent()).includes("Revoke capacity grant g-cap1?"), "the question stays after a failed revoke");
+    const failedToast = problems.findIndex(p => p.includes("status of 503"));
+    if (failedToast >= 0) problems.splice(failedToast, 1);
     await settle();
     await btn("Revoke").click();
     await until(() => posted.length);
@@ -258,6 +271,12 @@ async function check(engine) {
     await page.fill("#fenced textarea", "n1 was destroyed");
     await poll();
     assert.strictEqual(await page.inputValue("#fenced textarea"), "n1 was destroyed", "what was typed survives a poll");
+    // And a poll that changes the row (its node reported): the form stays open with what was typed.
+    state = { ...base, fenced: [{ ...fenced, fence: { ...fenced.fence, node_seen_ms: (NOW - 60) * 1000 } }] };
+    await poll();
+    assert.ok((await page.locator("#fenced").textContent()).includes("last reported"));
+    assert.strictEqual(await page.inputValue("#fenced textarea"), "n1 was destroyed", "what was typed survives the row changing");
+    assert.ok(await page.locator("#fenced textarea").isVisible());
     await settle();
     await signs(page.locator("#fenced button", { hasText: /^Release$/ }));
     assert.deepStrictEqual([begun.at(-1).action, begun.at(-1).run, begun.at(-1).reason], ["release_fence", "run_f", "n1 was destroyed"]);
@@ -272,6 +291,15 @@ async function check(engine) {
     assert.ok((await page.locator("#fenced").innerText()).startsWith("None: no agent's box is held"));
 
     if (problems.length) throw new Error(problems.join("\n  "));
+
+    // If settings.js (or ui.js, which every view imports) doesn't load, Settings' lists and the
+    // Inbox's asks say they can't be shown, rather than look empty.
+    const bare = await (await browser.newContext()).newPage();
+    await bare.route("**/settings.js", r => r.abort());
+    await bare.route("**/api/**", r => { const p = new URL(r.request().url()).pathname;
+      return r.fulfill({ contentType: "application/json", body: JSON.stringify(p === "/api/me" ? { who: { state: "operator", credential: "AbCd" } } : p === "/api/state" ? base : p === "/api/push" ? { public_key: "BAEC", devices: [], min_interval_secs: 30 } : {}) }); });
+    await bare.goto(url + "#settings");
+    for (const id of ["standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"]) await bare.waitForFunction(i => document.getElementById(i).textContent.includes("can't be shown"), id, { timeout: 10000 });
     console.log(`${engine} settings: ok`);
   } finally {
     await browser.close();

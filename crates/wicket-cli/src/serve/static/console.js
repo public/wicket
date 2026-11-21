@@ -617,7 +617,8 @@ function renderPending(s) {
 // the page from being drawn.
 // What each view module draws: if it didn't load (a failed fetch, an old browser), each of these says
 // so, rather than look empty (no requests waiting, no agents).
-const VIEW_BOXES = { wicketInbox: ["pending"], wicketAgents: ["runs", "start", "agent-head", "agent-log"], wicketActivity: ["audit", "decided"] };
+const VIEW_BOXES = { wicketInbox: ["pending", "standing-asks"], wicketAgents: ["runs", "start", "agent-head", "agent-log"], wicketActivity: ["audit", "decided"],
+  wicketSettings: ["standing-rules", "capacity", "capacity-form", "health", "placed", "fenced"] };
 const UNLOADED = "This can't be shown: part of this page didn't load. Reload the page; if it stays, check the browser's console.";
 function drawn(mod, f, ...args) {
   if (!globalThis[mod]) {
@@ -788,7 +789,7 @@ function renderOperator(s) {
   const box = document.getElementById("operator"); box.replaceChildren();
   for (const k of s.passkeys) { const d = el("div", "row"); d.append(el("span", "", "passkey: " + strip(k.name)), el("span", "mono", String(k.id).slice(0, 16) + "…")); box.append(d); }
   const b = el("div", "buttons");
-  const out = el("button", "", "Sign out"); out.onclick = async () => { enrolLink = null; try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
+  const out = el("button", "", "Sign out"); out.onclick = async () => { enrolLink = null; if (globalThis.wicketSettings) globalThis.wicketSettings.reset(); try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
   const add = el("button", "", "Add a device"); add.onclick = () => signed({ action: "enrol_link" });
   b.append(add, out); box.append(b);
   if (enrolLink && enrolLink.until > Date.now()) {
@@ -1374,7 +1375,7 @@ async function refreshOnce() {
   if (gen !== pollGen) return;
   // Only the server saying the session is gone signs the page out; anything else is a moment's
   // trouble, said as such, and the poll carries on.
-  if (r.status === 401 || r.status === 403) { sessionEnded = true; boot(); return; }
+  if (r.status === 401 || r.status === 403) { sessionEnded = true; if (globalThis.wicketSettings) globalThis.wicketSettings.reset(); boot(); return; }
   if (!r.ok) { showStale("HTTP " + r.status); return; }
   lastHeard = Date.now();
   showStale(null);
