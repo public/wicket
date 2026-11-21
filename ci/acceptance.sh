@@ -496,17 +496,27 @@ wait_for 30 '[ -n "$(box_of "$flood")" ]' || true
 flood_box=$(box_of "$flood" | head -1)
 flood_logpath=$($DOCKER inspect -f '{{.LogPath}}' "$flood_box" 2>/dev/null || true)
 flood_kept=
+# The log is a path in the Docker daemon's file system: where that isn't this one (the installed
+# system runs in a container on the host's Docker), it can't be read here, and there is nothing to
+# measure (#824: `du` of a missing file is 0, which passed this check without measuring anything).
+flood_log_here=
+[ -z "$flood_logpath" ] || ! sudo -n test -f "$flood_logpath" 2>/dev/null || flood_log_here=1
 for _ in $(seq 120); do
-  if [ -n "$flood_logpath" ]; then
+  if [ -n "$flood_log_here" ]; then
     k=$(sudo -n sh -c 'du -cb "$1"* 2>/dev/null | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
-    [ -z "$k" ] || [ "$k" -le "${flood_kept:-0}" ] || flood_kept=$k
+    if [ -n "$k" ] && { [ -z "$flood_kept" ] || [ "$k" -gt "$flood_kept" ]; }; then flood_kept=$k; fi
   fi
   flood_transcript | grep -q acc-flood-done && break
   [ -n "$(box_of "$flood")" ] || break
   sleep 1
 done
-echo "   20 MB burst, then 3 MB paced; at most ${flood_kept:-?} bytes kept in the host's log (${flood_logpath:-no log path})"
-check "a flooding box's output kept on the host stays within limits.output (1m)" '[ -n "$flood_kept" ] && [ "$flood_kept" -le $((1100 * 1024)) ]'
+if [ -n "$flood_logpath" ] && [ -z "$flood_log_here" ]; then
+  echo "   20 MB burst, then 3 MB paced; the host's log ($flood_logpath) is in another file system than this one"
+  skip "a flooding box's output kept on the host stays within limits.output (1m)" "its Docker's log isn't on this file system"
+else
+  echo "   20 MB burst, then 3 MB paced; at most ${flood_kept:-?} bytes kept in the host's log (${flood_logpath:-no log path})"
+  check "a flooding box's output kept on the host stays within limits.output (1m)" '[ -n "$flood_kept" ] && [ "$flood_kept" -gt 0 ] && [ "$flood_kept" -le $((1100 * 1024)) ]'
+fi
 wait "$flood_pid" 2>/dev/null || true
 # What it keeps of the paced lines (the newest, at least 5,000 of them): consecutive, each once, in
 # order, through the last.
